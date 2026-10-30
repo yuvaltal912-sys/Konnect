@@ -954,11 +954,16 @@ fn function_names(lines: &[DeckLine]) -> Vec<String> {
         if !(word.starts_with(".func") || word.starts_with(".para")) {
             continue;
         }
-        let lower = line.text.to_lowercase();
+        let code = &line.text[..comment_start(line.text.as_bytes(), false)];
+        let lower = code.to_lowercase();
         for (at, _) in lower.match_indices('(') {
             let before = lower[..at].trim_end();
             let is_word = |c: char| c.is_alphanumeric() || c == '_';
-            let start = before.rfind(|c| !is_word(c)).map_or(0, |gap| gap + 1);
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !is_word(*c))
+                .map_or(0, |(gap, c)| gap + c.len_utf8());
             names.push(before[start..].to_string());
         }
     }
@@ -1612,6 +1617,17 @@ mod tests {
     fn a_stray_endc_ends_the_card_above_it() {
         let rendered = deck("R1 a 0\n.endc\n+ 1k\n").unwrap().render();
         assert!(!rendered.contains("+ 1k"));
+    }
+
+    #[test]
+    fn a_multibyte_character_before_a_bracket_does_not_panic() {
+        for line in [
+            ".param Tj=25 ; 25\u{b0}C (junction)",
+            ".func f\u{b0}(x) {x}",
+            ".param x=25\u{b0}(1)",
+        ] {
+            assert!(deck(line).is_ok(), "{line}");
+        }
     }
 
     #[test]
