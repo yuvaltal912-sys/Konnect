@@ -56,7 +56,7 @@ const KNOWN_DIRECTIVES: [&str; 26] = [
 ];
 /// Options that only tune the solver or the log. Other names set interpreter
 /// variables, and some of those are paths: `measoutfile` writes to one.
-const KNOWN_OPTIONS: [&str; 71] = [
+const KNOWN_OPTIONS: [&str; 78] = [
     "abstol",
     "accept",
     "acct",
@@ -128,8 +128,6 @@ const KNOWN_OPTIONS: [&str; 71] = [
     "sparse",
     "srcsteps",
     "temp",
-];
-const KNOWN_OPTIONS_MORE: [&str; 7] = [
     "tnom",
     "trap",
     "trtol",
@@ -980,7 +978,7 @@ fn check_options(card: &str) -> Result<(), String> {
             .unwrap_or(rest.len());
         let (name, after_name) = rest.split_at(end);
         let name = name.to_lowercase();
-        if !KNOWN_OPTIONS.contains(&name.as_str()) && !KNOWN_OPTIONS_MORE.contains(&name.as_str()) {
+        if !KNOWN_OPTIONS.contains(&name.as_str()) {
             return Err(format!(
                 "The option {} is not one Konnect allows, because some options set file paths.",
                 shown_name(&name)
