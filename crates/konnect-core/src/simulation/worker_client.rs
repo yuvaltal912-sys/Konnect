@@ -20,6 +20,8 @@ pub struct SimulationSettings {
     pub ngspice_code_models_dir: String,
     /// Load `digital.cm`. Deck vetting refuses its two dangerous models.
     pub allow_digital_models: bool,
+    /// Extra folders a model include may read from.
+    pub model_dirs: Vec<PathBuf>,
 }
 
 /// What a tool needs to reach the worker. Set once by the standalone binary,
@@ -37,6 +39,10 @@ impl SimulationRuntime {
             worker_exe,
             settings,
         }
+    }
+
+    pub(crate) fn model_dirs(&self) -> &[PathBuf] {
+        &self.settings.model_dirs
     }
 
     /// The running executable as the worker. Only `main` calls this: in the

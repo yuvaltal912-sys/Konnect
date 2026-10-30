@@ -3,13 +3,14 @@
 use super::{cli, get_path, sch_export, ToolContext, ToolDef};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
+use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
 use crate::simulation::kicad_netlist::{self, ElementEntry, NetEntry, SpiceNetlist};
 use crate::simulation::snapshot;
 use crate::simulation::worker_client::{probe_engine, EngineStatus};
 use crate::tool;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,7 +86,12 @@ async fn handle_check_simulation_readiness(
         &ctx.config.kicad_cli,
     )
     .await;
-    let design = inspect_design(&ctx.config.kicad_cli, &schematic).await;
+    let model_dirs = ctx
+        .simulation
+        .get()
+        .map(|runtime| runtime.model_dirs().to_vec())
+        .unwrap_or_default();
+    let design = inspect_design(&ctx.config.kicad_cli, &schematic, &model_dirs).await;
     Ok(CallToolResult::json(&readiness_report(
         &engine, &design, net_filter, limit,
     )))
@@ -96,15 +102,61 @@ struct Design {
     nets: Vec<NetEntry>,
     elements: Vec<ElementEntry>,
     locks_present: Vec<String>,
+    compatibility: Compatibility,
+    deck: Result<FlatDeck, Refusal>,
+    ignored_model_dirs: Vec<String>,
 }
 
-async fn inspect_design(kicad_cli: &str, schematic: &Path) -> anyhow::Result<Design> {
+/// KiCad wipes its per-user IBIS cache on every SPICE export, from any project,
+/// so an export and the read of its includes must not interleave with another.
+static EXPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Folders an include may read from, canonical to compare with resolved paths,
+/// and any configured folder that was left out. A root that holds the user's
+/// home folder would stop the check meaning anything, so it is never used.
+fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
+    let usable = |path: &Path| {
+        path.parent().is_some() && !home.as_ref().is_some_and(|home| home.starts_with(path))
+    };
+    let cache = dirs::cache_dir()
+        .into_iter()
+        .chain(std::env::var_os("KICAD_CACHE_HOME").map(PathBuf::from))
+        .flat_map(|dir| [dir.join("KiCad"), dir.join("kicad")]);
+    let mut roots: Vec<PathBuf> = std::iter::once(project_dir.to_path_buf())
+        .chain(crate::kicad_install::share_roots())
+        .chain(cache)
+        .filter_map(|path| path.canonicalize().ok())
+        .filter(|path| usable(path))
+        .collect();
+    let mut ignored = Vec::new();
+    for dir in model_dirs {
+        match dir.canonicalize() {
+            Ok(path) if dir.is_absolute() && usable(&path) => roots.push(path),
+            _ => ignored.push(dir.display().to_string()),
+        }
+    }
+    (roots, ignored)
+}
+
+async fn inspect_design(
+    kicad_cli: &str,
+    schematic: &Path,
+    model_dirs: &[PathBuf],
+) -> anyhow::Result<Design> {
     let scratch = tempfile::Builder::new()
         .prefix("konnect-sim-export-")
         .tempdir()?;
     let source = scratch.path().join("src");
     std::fs::create_dir(&source)?;
     let snapshot = snapshot::take_snapshot(schematic, &source)?;
+    let project_dir = schematic
+        .canonicalize()?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let compatibility = Compatibility::from_project_file(&schematic.with_extension("kicad_pro"));
+    let _export_guard = EXPORT_LOCK.lock().await;
     let netlists = cli::export_simulation_netlists(
         kicad_cli,
         &snapshot.root_sheet,
@@ -114,7 +166,18 @@ async fn inspect_design(kicad_cli: &str, schematic: &Path) -> anyhow::Result<Des
     .await?;
     let kicad = kicad_netlist::parse(&netlists.kicad)?;
     let spice = SpiceNetlist::parse(&netlists.spice);
+    let (allowed_roots, ignored_model_dirs) = allowed_roots(&project_dir, model_dirs);
+    let deck = flatten::flatten(&DeckInputs {
+        netlist: &netlists.spice,
+        testbench: &[],
+        project_dir: &project_dir,
+        allowed_roots: &allowed_roots,
+        compatibility,
+    });
     Ok(Design {
+        compatibility,
+        deck,
+        ignored_model_dirs,
         nets: kicad_netlist::net_entries(&kicad, &spice),
         elements: kicad_netlist::element_entries(&kicad, &spice),
         locks_present: snapshot
@@ -170,16 +233,32 @@ fn readiness_report(
             "detail": export_detail(&format!("{error:#}")),
         }),
     };
+    let deck_check = match design.as_ref().map(|design| &design.deck) {
+        Ok(Ok(_)) => json!({ "name": "deck_vetting", "ran": true, "passed": true }),
+        Ok(Err(refusal)) => json!({
+            "name": "deck_vetting",
+            "ran": true,
+            "passed": false,
+            "refusal": refusal,
+        }),
+        Err(_) => json!({
+            "name": "deck_vetting",
+            "ran": false,
+            "reason": "The netlist could not be exported.",
+        }),
+    };
     let checks = [
         engine_check,
         export_check,
+        deck_check,
         json!({
             "name": "preflight",
             "ran": false,
             "reason": "Preflight checks are not implemented in this build."
         }),
     ];
-    let failed = (engine_ran && !engine.available) || design.is_err();
+    let deck_refused = matches!(design, Ok(design) if design.deck.is_err());
+    let failed = (engine_ran && !engine.available) || design.is_err() || deck_refused;
     let ready = if failed { json!(false) } else { Value::Null };
 
     let mut report = json!({
@@ -196,6 +275,17 @@ fn readiness_report(
         });
         report["nets"] = json!(listing(nets, limit));
         report["elements"] = json!(listing(design.elements.iter(), limit));
+        report["engine"]["compatibility"] = json!(design.compatibility.ngbehavior);
+        if !design.ignored_model_dirs.is_empty() {
+            report["ignored_model_dirs"] = json!(design.ignored_model_dirs);
+        }
+        if let Ok(deck) = &design.deck {
+            report["deck"] = json!({
+                "line_count": deck.line_count(),
+                "inlined_file_count": deck.inlined_files.len(),
+                "dropped_directives": deck.dropped_directives,
+            });
+        }
         report["source_evidence"] = json!({
             "excludes_unsaved_editor_state": true,
             "locks_present": design.locks_present,
@@ -245,6 +335,9 @@ mod tests {
             nets: kicad_netlist::net_entries(&kicad, &spice),
             elements: kicad_netlist::element_entries(&kicad, &spice),
             locks_present: vec!["/p/~top.kicad_sch.lck".to_string()],
+            compatibility: Compatibility::DEFAULT,
+            deck: Ok(FlatDeck::default()),
+            ignored_model_dirs: Vec::new(),
         })
     }
 
@@ -269,6 +362,58 @@ mod tests {
         assert!(report["ready"].is_null());
         assert_eq!(report["checks"][0]["passed"], true);
         assert_eq!(report["checks"][1]["passed"], true);
+        assert_eq!(report["checks"][2]["passed"], true);
+        assert_eq!(report["checks"][3]["ran"], false);
+    }
+
+    #[test]
+    fn a_refused_deck_is_not_ready_and_says_where() {
+        let mut refused = design().unwrap();
+        refused.deck = Err(Refusal {
+            code: flatten::RefusalCode::EncryptedModel,
+            origin: "/p/tps.lib".to_string(),
+            line: Some(2),
+            detail: "encrypted".to_string(),
+        });
+        let report = readiness_report(&engine("ok", true), &Ok(refused), "", 25);
+        assert_eq!(report["ready"], false);
+        assert_eq!(report["checks"][2]["passed"], false);
+        assert_eq!(report["checks"][2]["refusal"]["code"], "encrypted_model");
+        assert_eq!(report["checks"][2]["refusal"]["line"], 2);
+        assert!(report.get("deck").is_none());
+    }
+
+    #[test]
+    fn a_model_folder_that_cannot_be_used_is_reported_rather_than_lost() {
+        let project = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let dirs = [
+            extra.path().to_path_buf(),
+            PathBuf::from("/"),
+            home.clone(),
+            PathBuf::from("~/spice"),
+            PathBuf::from("relative"),
+            PathBuf::from("."),
+            extra.path().join("absent"),
+        ];
+        let (roots, ignored) = allowed_roots(project.path(), &dirs);
+        assert!(roots.contains(&project.path().canonicalize().unwrap()));
+        assert!(roots.contains(&extra.path().canonicalize().unwrap()));
+        assert!(!roots.iter().any(|root| root.parent().is_none()));
+        assert_eq!(ignored.len(), 6, "{ignored:?}");
+    }
+
+    #[test]
+    fn a_project_that_holds_the_home_folder_is_not_a_root() {
+        let home = dirs::home_dir().unwrap().canonicalize().unwrap();
+        let (roots, _) = allowed_roots(&home, &[]);
+        assert!(!roots.contains(&home));
+    }
+
+    #[test]
+    fn a_failed_export_cannot_claim_the_deck_was_vetted() {
+        let report = readiness_report(&engine("ok", true), &Err(anyhow::anyhow!("failed")), "", 25);
         assert_eq!(report["checks"][2]["ran"], false);
     }
 
@@ -419,7 +564,9 @@ mod tests {
             let root = project(project_dir.path());
             let fake = exporting_cli(tools.path());
 
-            let design = inspect_design(fake.to_str().unwrap(), &root).await.unwrap();
+            let design = inspect_design(fake.to_str().unwrap(), &root, &[])
+                .await
+                .unwrap();
             assert_eq!(design.elements.len(), 5);
             assert!(design.nets.iter().any(|net| net.kicad_name == "/rect_out"));
 
@@ -437,7 +584,7 @@ mod tests {
             let read_only = std::fs::Permissions::from_mode(0o555);
             std::fs::set_permissions(project_dir.path(), read_only).unwrap();
 
-            let result = inspect_design(fake.to_str().unwrap(), &root).await;
+            let result = inspect_design(fake.to_str().unwrap(), &root, &[]).await;
 
             let writable = std::fs::Permissions::from_mode(0o755);
             std::fs::set_permissions(project_dir.path(), writable).unwrap();
@@ -461,7 +608,7 @@ mod tests {
                  exit 2\n",
                 "",
             );
-            let error = inspect_design(fake.to_str().unwrap(), &root)
+            let error = inspect_design(fake.to_str().unwrap(), &root, &[])
                 .await
                 .err()
                 .unwrap();
@@ -485,7 +632,9 @@ mod tests {
                  done\n",
                 "",
             );
-            assert!(inspect_design(fake.to_str().unwrap(), &root).await.is_err());
+            assert!(inspect_design(fake.to_str().unwrap(), &root, &[])
+                .await
+                .is_err());
         }
 
         #[tokio::test]

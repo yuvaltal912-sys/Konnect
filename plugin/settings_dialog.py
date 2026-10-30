@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "ngspice_library": "",
     "ngspice_code_models_dir": "",
     "ngspice_allow_digital_models": True,
+    "ngspice_model_dirs": [],
 }
 
 LOG_LEVELS = ["error", "warn", "info", "debug", "trace"]
@@ -324,6 +325,7 @@ class KonnectSettingsDialog(wx.Dialog):
             "ngspice_allow_digital_models": self.settings.get(
                 "ngspice_allow_digital_models", True
             ),
+            "ngspice_model_dirs": self.settings.get("ngspice_model_dirs", []),
         }
 
     def _update_server_status(self):

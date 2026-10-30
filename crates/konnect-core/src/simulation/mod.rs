@@ -5,6 +5,7 @@
 //! crate holds everything that needs no `unsafe`; the FFI lives with the worker
 //! in the `konnect` binary crate.
 
+pub(crate) mod flatten;
 pub(crate) mod kicad_netlist;
 pub(crate) mod net_names;
 pub mod protocol;

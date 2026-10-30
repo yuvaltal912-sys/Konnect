@@ -211,8 +211,15 @@ list above is not consulted, and `get_installation_info` reports
 `source: "explicit_path"` with no skipped candidates. Relevant fields include `kicad_cli`,
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
 `ngspice_library`, `ngspice_code_models_dir`, `ngspice_allow_digital_models`,
+`ngspice_model_dirs`,
 `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
+
+`ngspice_model_dirs` lists extra folders a simulation model include may read
+from, as absolute paths. The project, KiCad's libraries and KiCad's own cache are
+always allowed. An include anywhere else stops the run, and the simulation tools
+name the file. A folder that does not exist, or that holds your home folder, is
+ignored, and `check_simulation_readiness` reports it in `ignored_model_dirs`.
 
 A blank or whitespace-only configured `jlcpcb_db_path` means unset for all
 JLCPCB database tools. They use the platform default (`%APPDATA%/konnect/jlcpcb.db`

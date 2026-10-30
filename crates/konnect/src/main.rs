@@ -196,6 +196,7 @@ async fn main() -> Result<()> {
             ngspice_library: config.ngspice_library.clone(),
             ngspice_code_models_dir: config.ngspice_code_models_dir.clone(),
             allow_digital_models: config.ngspice_allow_digital_models,
+            model_dirs: config.ngspice_model_dirs.clone(),
         },
     ) {
         Ok(runtime) => handler.set_simulation_runtime(std::sync::Arc::new(runtime)),

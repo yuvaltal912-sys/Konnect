@@ -148,7 +148,18 @@ fn digital_models_are_left_out_on_request() {
 
 /// One tool call through a real server over stdio, as an MCP client makes it.
 fn call_over_stdio(tool: &str, arguments: Value) -> Value {
+    call_with_config(tool, arguments, "")
+}
+
+/// The tests give the server its own `HOME`, which KiCad ignores: it still writes
+/// IBIS models to the user's real cache. A test that needs them allows it here.
+fn call_with_config(tool: &str, arguments: Value, config: &str) -> Value {
     let home = tempfile::tempdir().unwrap();
+    for config_dir in [".config/konnect", "Library/Application Support/konnect"] {
+        let config_dir = home.path().join(config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), config).unwrap();
+    }
     let requests = [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18", "capabilities": {},
@@ -288,4 +299,91 @@ fn a_lock_on_the_project_is_disclosed_and_does_not_stop_the_check() {
         .unwrap();
     assert_eq!(locks.len(), 1, "{report}");
     assert!(lock.exists());
+}
+
+fn project_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for path in std::fs::read_dir(folder)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+        {
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "kicad_pro") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn every_simulation_demo_flattens_or_names_its_export_failure() {
+    let kicad_cache = PathBuf::from(std::env::var_os("HOME").unwrap()).join("Library/Caches/KiCad");
+    let model_dirs = format!("ngspice_model_dirs = [{:?}]\n", kicad_cache);
+    let mut vetted = 0;
+    for project_file in project_files(&demos().join("simulation")) {
+        let source = project_file.parent().unwrap();
+        let name = project_file.file_name().unwrap().to_owned();
+        let project = tempfile::tempdir().unwrap();
+        copy_tree(source, project.path());
+        let schematic = project.path().join(name).with_extension("kicad_sch");
+        let report = call_with_config(
+            "check_simulation_readiness",
+            json!({ "schematic": schematic }),
+            &model_dirs,
+        );
+        let demo = source.file_name().unwrap().to_string_lossy().into_owned();
+        eprintln!("{demo}: {} {}", report["checks"][2], report["deck"]);
+        if report["checks"][1]["passed"] == false {
+            assert_eq!(report["checks"][2]["ran"], false, "{demo}: {report}");
+            continue;
+        }
+        assert_eq!(report["checks"][2]["passed"], true, "{demo}: {report}");
+        assert!(report["deck"]["line_count"].as_u64().unwrap() > 0, "{demo}");
+        vetted += 1;
+    }
+    assert_eq!(vetted, 17, "Q17ng alone is expected to fail its export");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_control_block_in_a_real_schematic_is_reported_as_dropped() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/sallen_key"), project.path());
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": project.path().join("sallen_key.kicad_sch") }),
+    );
+    assert_eq!(report["checks"][2]["passed"], true, "{report}");
+    let dropped = report["deck"]["dropped_directives"].as_array().unwrap();
+    assert!(
+        dropped.iter().any(|item| item == ".control block"),
+        "{report}"
+    );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_project_relative_include_in_schematic_text_is_read_from_the_project() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    std::fs::write(project.path().join("bare.lib"), ".param from_bare=1\n").unwrap();
+    std::fs::write(project.path().join("rooted.lib"), ".param from_rooted=1\n").unwrap();
+    let path = project.path().join("rectifier.kicad_sch");
+    let sheet = std::fs::read_to_string(&path).unwrap();
+    let text = r#"(text ".include \"bare.lib\"\n.include \"${KIPRJMOD}/rooted.lib\""
+        (exclude_from_sim no) (at 50 50 0) (effects (font (size 1.27 1.27)))
+        (uuid "11111111-2222-4333-8444-555555555555"))
+        (sheet_instances"#;
+    assert!(sheet.contains("(sheet_instances"));
+    std::fs::write(&path, sheet.replacen("(sheet_instances", text, 1)).unwrap();
+
+    let report = call_over_stdio("check_simulation_readiness", json!({ "schematic": path }));
+    assert_eq!(report["checks"][2]["passed"], true, "{report}");
+    assert_eq!(report["deck"]["inlined_file_count"], 3, "{report}");
 }

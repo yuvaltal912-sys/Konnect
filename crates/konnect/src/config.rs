@@ -49,6 +49,11 @@ pub struct Config {
     #[serde(default = "default_allow_digital_models")]
     pub ngspice_allow_digital_models: bool,
 
+    /// Extra folders a model include may read from, beyond the project and
+    /// KiCad's libraries.
+    #[serde(default)]
+    pub ngspice_model_dirs: Vec<PathBuf>,
+
     /// Log level (error, warn, info, debug, trace)
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -274,6 +279,7 @@ impl Default for Config {
             ngspice_library: String::new(),
             ngspice_code_models_dir: String::new(),
             ngspice_allow_digital_models: default_allow_digital_models(),
+            ngspice_model_dirs: Vec::new(),
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,
