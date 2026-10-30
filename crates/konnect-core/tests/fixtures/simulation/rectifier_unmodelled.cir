@@ -1,0 +1,9 @@
+.title KiCad schematic
+.tran 1u 10m
+
+R1 /signal_in Net-_D1-A_ 1k
+D1 __D1
+V1 __V1
+C1 /rect_out GND 100n
+R2 /rect_out GND 100k
+.end

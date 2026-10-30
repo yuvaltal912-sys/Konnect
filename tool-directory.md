@@ -488,7 +488,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `check_simulation_readiness` | Report whether a schematic can be simulated, and why not, without running a simulation. |
+| `check_simulation_readiness` | Report whether a schematic can be simulated, and why not, without running a simulation. Works from the saved files on a private copy, so the project is not touched and unsaved editor changes are not seen. |
 
 ## Appendix: Structural observations
 

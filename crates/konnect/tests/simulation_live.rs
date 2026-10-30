@@ -9,7 +9,9 @@
 
 use konnect_core::kicad_install::{find_code_models_dir, find_ngspice_library};
 use konnect_core::simulation::protocol::{ProbeReport, PROTOCOL_VERSION, WORKER_SUBCOMMAND};
-use std::path::Path;
+use serde_json::{json, Value};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn worker(args: &[&str]) -> Output {
@@ -92,7 +94,7 @@ fn the_worker_is_not_advertised_in_help() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains(WORKER_SUBCOMMAND));
 }
 
-fn real_library() -> std::path::PathBuf {
+fn real_library() -> PathBuf {
     find_ngspice_library("", "kicad-cli")
         .library
         .expect("an installed KiCad with libngspice")
@@ -142,4 +144,148 @@ fn digital_models_are_left_out_on_request() {
         .code_models_loaded
         .iter()
         .any(|name| name == "analog"));
+}
+
+/// One tool call through a real server over stdio, as an MCP client makes it.
+fn call_over_stdio(tool: &str, arguments: Value) -> Value {
+    let home = tempfile::tempdir().unwrap();
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "live-test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "load_toolset", "arguments": {"name": "simulation"}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": tool, "arguments": arguments}}),
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .env("HOME", home.path())
+        .env("KONNECT_STATE_DIR", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for request in &requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|message| message["id"] == 3)
+        .expect("a tool response");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+fn demos() -> PathBuf {
+    PathBuf::from(std::env::var_os("KICAD_DEMOS").expect("KICAD_DEMOS names KiCad's demos folder"))
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_real_project_is_read_from_a_snapshot_and_left_untouched() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let before = file_names(project.path());
+
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": project.path().join("rectifier.kicad_sch") }),
+    );
+
+    assert_eq!(report["checks"][0]["passed"], true, "{report}");
+    assert_eq!(report["checks"][1]["passed"], true, "{report}");
+    assert!(report["ready"].is_null(), "{report}");
+    assert_eq!(file_names(project.path()), before);
+    let nets = report["nets"]["items"].as_array().unwrap();
+    assert!(nets.iter().any(|net| net["kicad_name"] == "/rect_out"
+        && net["spice_name"] == "/rect_out"
+        && net["in_deck"] == true));
+    let elements = report["elements"]["items"].as_array().unwrap();
+    assert!(
+        elements.iter().all(|element| element["modelled"] == true),
+        "{report}"
+    );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn every_sheet_of_a_real_hierarchy_is_exported() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/subsheets"), project.path());
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": project.path().join("mainsheet.kicad_sch"), "limit": 200 }),
+    );
+    assert_eq!(report["checks"][1]["passed"], true, "{report}");
+    let nets = report["nets"]["items"].as_array().unwrap();
+    assert!(nets
+        .iter()
+        .any(|net| net["kicad_name"].as_str().unwrap().starts_with("/subsheet")));
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_missing_model_library_fails_the_export_check() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    std::fs::remove_file(project.path().join("diode.mod")).unwrap();
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": project.path().join("rectifier.kicad_sch") }),
+    );
+    assert_eq!(report["ready"], false, "{report}");
+    assert_eq!(report["checks"][1]["passed"], false, "{report}");
+    assert!(report["checks"][1]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("diode.mod"));
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_lock_on_the_project_is_disclosed_and_does_not_stop_the_check() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let lock = project.path().join("~rectifier.kicad_pro.lck");
+    std::fs::write(&lock, r#"{"hostname":"other","username":"someone"}"#).unwrap();
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": project.path().join("rectifier.kicad_sch") }),
+    );
+    assert_eq!(report["checks"][1]["passed"], true, "{report}");
+    let locks = report["source_evidence"]["locks_present"]
+        .as_array()
+        .unwrap();
+    assert_eq!(locks.len(), 1, "{report}");
+    assert!(lock.exists());
 }

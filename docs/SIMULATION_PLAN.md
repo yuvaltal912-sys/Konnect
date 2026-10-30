@@ -537,9 +537,9 @@ No new workspace member, because that breaks the Nix build unless the flake chan
 | `crates/konnect-core/src/tools/simulation.rs` | `tools()`, `tool!` registrations, `handle_*`, schema helpers | `tools/sch_export.rs`; `point_schema()` in `footprint_graphics.rs` |
 | `crates/konnect-core/src/simulation/mod.rs` | Module root | Existing modules |
 | `crates/konnect-core/src/simulation/protocol.rs` | `request.json`, `status.json`, protocol version; shared with the worker | New; both crates depend on it |
-| `crates/konnect-core/src/simulation/snapshot.rs` | Snapshot and `Sim.Library` rewrite | Port of `snapshot_tree`; the viewer is outside the workspace |
+| `crates/konnect-core/src/simulation/snapshot.rs` | Snapshot, `Sim.Library` rewrite, non-bailing hierarchy walk, lock disclosure including `.kicad_pro` | Port of `snapshot_tree`; the viewer is outside the workspace |
 | `crates/konnect-core/src/simulation/flatten.rs` | Flatten, vet, invariant | Pure parsers such as `specctra.rs` |
-| `crates/konnect-core/src/simulation/preflight.rs`, `net_names.rs`, `element.rs` | Checks, name port, element parser | Pure parsers |
+| `crates/konnect-core/src/simulation/preflight.rs`, `net_names.rs`, `kicad_netlist.rs`, `element.rs` | Checks, name port, KiCad and SPICE netlist parsing, element parser | Pure parsers |
 | `crates/konnect-core/src/simulation/raw.rs` | Raw file parser | `specctra_ses.rs` |
 | `crates/konnect-core/src/simulation/measure.rs` | Measurements | Pure functions, tests beside the code |
 | `crates/konnect-core/src/simulation/worker_client.rs` | Spawn, supervise, classify | `freerouting_mcp.rs` |
@@ -561,7 +561,6 @@ No new workspace member, because that breaks the Nix build unless the flake chan
 | `crates/konnect-core/src/router/registry.rs` | `ToolsetMeta { name: "simulation", category: "simulation", tool_count, .. }`, `build_tools_for` arm | `sch_export`. A missing arm panics |
 | `crates/konnect-core/src/tools/cli.rs` | `export_spice_netlist`, `.stdin(Stdio::null())` in `run_cli_captured` | `verify_nonempty_file` |
 | `crates/konnect-core/src/tools/sch_export.rs` | `owning_project_root` to `pub(crate)` | Existing helper |
-| `crates/konnect-core/src/tools/pcb_sync.rs`, `konnect-sexp/src/writer.rs` | Non-bailing hierarchy walk; `.kicad_pro` lock path helper | `saved_hierarchy_files`, `kicad_editor_lock_path` |
 | `crates/konnect-core/src/kicad_install.rs` | Library and code-model discovery | `find_cli`; order: config key, sibling of the resolved `kicad-cli`, KiCad install locations, system loader. On macOS map `Contents/MacOS` to `Contents/PlugIns/sim` |
 | `crates/konnect-core/src/runtime_info.rs` | `ngspice` block from `--probe` | `kicad` block; same resolver as the tools |
 | `crates/konnect-core/src/mcp/error.rs` | `SimulationFailed`, `short_code()` arm | Existing kinds, plus the `DEV.md` table |

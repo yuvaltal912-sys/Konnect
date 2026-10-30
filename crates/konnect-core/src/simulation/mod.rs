@@ -5,7 +5,10 @@
 //! crate holds everything that needs no `unsafe`; the FFI lives with the worker
 //! in the `konnect` binary crate.
 
+pub(crate) mod kicad_netlist;
+pub(crate) mod net_names;
 pub mod protocol;
+pub(crate) mod snapshot;
 pub(crate) mod worker_client;
 
 pub use worker_client::{SimulationRuntime, SimulationSettings};

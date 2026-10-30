@@ -393,11 +393,28 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
 
 /// [`run_cli`], keeping stderr as well.
 async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<CliOutput> {
+    run_cli_owned(cli, args, timeout_dur, false).await
+}
+
+/// [`run_cli_captured`], optionally killing the child on timeout. Only callers
+/// running on a private copy may ask for that: a killed `kicad-cli` strands its
+/// project lock, so killing one on a live project would leave the lock there.
+async fn run_cli_owned(
+    cli: &str,
+    args: &[&str],
+    timeout_dur: Duration,
+    kill_on_timeout: bool,
+) -> Result<CliOutput> {
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Stdin is the MCP pipe in stdio mode; a child must not hold it.
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(kill_on_timeout);
 
     #[cfg(test)]
     let child = test_support::spawn_cli(&mut cmd)
@@ -1438,6 +1455,47 @@ pub async fn export_netlist(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
+}
+
+/// Both netlists of one schematic, as `kicad-cli` wrote them.
+pub(crate) struct SimulationNetlists {
+    pub spice: String,
+    pub kicad: String,
+}
+
+/// Export a snapshot's KiCad-format and SPICE netlists into `directory`.
+///
+/// Any nonzero exit fails: KiCad exits 2 after a library problem but still
+/// writes a file. The SPICE export runs last, and its caller must read any
+/// includes at once, because it can wipe KiCad's per-user IBIS cache.
+pub(crate) async fn export_simulation_netlists(
+    cli: &str,
+    schematic: &Path,
+    directory: &Path,
+    timeout_dur: Duration,
+) -> Result<SimulationNetlists> {
+    let kicad = directory.join("netlist.net");
+    let spice = directory.join("netlist.cir");
+    for (format, output) in [("kicadsexpr", &kicad), ("spice", &spice)] {
+        let output_arg = output.to_string_lossy();
+        let schematic_arg = schematic.to_string_lossy();
+        let args = [
+            "sch",
+            "export",
+            "netlist",
+            "--output",
+            &output_arg,
+            "--format",
+            format,
+            &schematic_arg,
+        ];
+        run_cli_owned(cli, &args, timeout_dur, true).await?;
+        verify_nonempty_file(output, "Netlist").await?;
+    }
+    Ok(SimulationNetlists {
+        spice: tokio::fs::read_to_string(&spice).await?,
+        kicad: tokio::fs::read_to_string(&kicad).await?,
+    })
 }
 
 // ─── PCB Export ──────────────────────────────────────────────────────────────
