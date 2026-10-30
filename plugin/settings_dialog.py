@@ -24,6 +24,9 @@ DEFAULT_SETTINGS = {
     "log_level": "info",
     "transport": "stdio",
     "native_specctra_bridge": False,
+    "ngspice_library": "",
+    "ngspice_code_models_dir": "",
+    "ngspice_allow_digital_models": True,
 }
 
 LOG_LEVELS = ["error", "warn", "info", "debug", "trace"]
@@ -315,6 +318,12 @@ class KonnectSettingsDialog(wx.Dialog):
             "log_level": LOG_LEVELS[self.log_level_ctrl.GetSelection()],
             "transport": TRANSPORTS[self.transport_ctrl.GetSelection()],
             "native_specctra_bridge": self.native_bridge_ctrl.GetValue(),
+            # No field for these yet: keep what the user set by hand.
+            "ngspice_library": self.settings.get("ngspice_library", ""),
+            "ngspice_code_models_dir": self.settings.get("ngspice_code_models_dir", ""),
+            "ngspice_allow_digital_models": self.settings.get(
+                "ngspice_allow_digital_models", True
+            ),
         }
 
     def _update_server_status(self):

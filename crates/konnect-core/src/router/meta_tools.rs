@@ -667,6 +667,7 @@ async fn handle_get_installation_info(ctx: &std::sync::Arc<ToolContext>) -> Call
         &ctx.config,
         &ctx.config_resolution,
         ctx.guidance.get().map(|probe| probe.as_ref()),
+        ctx.simulation.get().map(|runtime| runtime.as_ref()),
     )
     .await;
     CallToolResult::json(&info)

@@ -2,6 +2,7 @@ mod config;
 mod install;
 mod manifest;
 mod run_registry;
+mod sim_worker;
 mod transaction_cli;
 mod transport;
 
@@ -37,6 +38,7 @@ const SUBCOMMANDS: &[&str] = &[
     "skill",
     "hook",
     "transaction",
+    konnect_core::simulation::protocol::WORKER_SUBCOMMAND,
 ];
 
 fn classify(args: &[String]) -> Cli<'_> {
@@ -101,6 +103,9 @@ async fn main() -> Result<()> {
             return install::print_hook_output(name);
         }
         Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]),
+        Cli::Subcommand(konnect_core::simulation::protocol::WORKER_SUBCOMMAND) => {
+            return sim_worker::run(&args[2..]);
+        }
         Cli::Subcommand(_) | Cli::Server => {}
     }
 
@@ -185,6 +190,16 @@ async fn main() -> Result<()> {
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
+    }
+    match konnect_core::simulation::SimulationRuntime::for_current_executable(
+        konnect_core::simulation::SimulationSettings {
+            ngspice_library: config.ngspice_library.clone(),
+            ngspice_code_models_dir: config.ngspice_code_models_dir.clone(),
+            allow_digital_models: config.ngspice_allow_digital_models,
+        },
+    ) {
+        Ok(runtime) => handler.set_simulation_runtime(std::sync::Arc::new(runtime)),
+        Err(error) => tracing::warn!("simulation worker unavailable: {error:#}"),
     }
 
     match config.transport {

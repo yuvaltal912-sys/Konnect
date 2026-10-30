@@ -210,6 +210,7 @@ described here, so its path does not answer "which file configured the server".
 list above is not consulted, and `get_installation_info` reports
 `source: "explicit_path"` with no skipped candidates. Relevant fields include `kicad_cli`,
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
+`ngspice_library`, `ngspice_code_models_dir`, `ngspice_allow_digital_models`,
 `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 

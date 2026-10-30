@@ -47,6 +47,7 @@ pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]
 mod schematic_placement_tests;
+pub mod simulation;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
@@ -269,6 +270,11 @@ pub struct ToolContext {
     /// Reads installed guidance for drift. Set once by the standalone binary,
     /// which owns the bundle; absent in embedded and test contexts (#728).
     pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
+    /// How to reach the simulation worker. Set once by the standalone binary,
+    /// which contains it; absent in embedded and test contexts, where
+    /// `current_exe()` is not a Konnect binary.
+    pub(crate) simulation:
+        std::sync::OnceLock<std::sync::Arc<crate::simulation::SimulationRuntime>>,
 }
 
 impl ToolContext {
@@ -283,6 +289,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            simulation: std::sync::OnceLock::new(),
         }
     }
 
@@ -301,6 +308,7 @@ impl ToolContext {
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
+            simulation: std::sync::OnceLock::new(),
         }
     }
 

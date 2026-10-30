@@ -146,6 +146,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "manufacturing",
         tool_count: 3,
     },
+    ToolsetMeta {
+        name: "simulation",
+        description: "Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run",
+        category: "simulation",
+        tool_count: 1,
+    },
 ];
 
 static TOOL_CATALOGUE: OnceLock<HashMap<&'static str, Vec<ToolDef>>> = OnceLock::new();
@@ -193,6 +199,7 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "design_review" => Some(design_review::tools()),
         "templates" => Some(templates::tools()),
         "manufacturing" => Some(manufacturing::tools()),
+        "simulation" => Some(simulation::tools()),
         _ => None,
     }
 }
