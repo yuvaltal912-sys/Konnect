@@ -110,6 +110,19 @@ fn unreadable(dir: &Path, detail: impl Into<String>) -> CallToolResult {
     )
 }
 
+/// A run that another server prunes while this one reads it loses its files one by
+/// one, and what went last is not what to report: if the run is gone, say so.
+fn or_not_found(
+    root: &Path,
+    run_id: &str,
+    otherwise: &dyn Fn() -> CallToolResult,
+) -> CallToolResult {
+    match runs::locate(root, run_id) {
+        Ok(_) => otherwise(),
+        Err(_) => run_not_found(run_id, "there is no such run"),
+    }
+}
+
 pub(super) fn list(
     ctx: &ToolContext,
     schematic: &Path,
@@ -132,14 +145,22 @@ pub(super) fn list(
     let sources = std::cell::OnceCell::new();
     let mut total = 0usize;
     let mut without_record = 0usize;
+    let mut unreadable_record = 0usize;
     let mut shown: Vec<Value> = Vec::new();
     for id in &ids {
-        let record = runs::locate(&root, id)
-            .ok()
-            .and_then(|dir| runs::read_record(&dir).ok());
-        let Some(record) = record else {
-            without_record += 1;
-            continue;
+        let record = runs::locate(&root, id).map(|dir| runs::read_record(&dir));
+        let record = match record {
+            Ok(Ok(record)) => record,
+            // The record exists and cannot be used: damaged, too big, or written by
+            // another version. The run is there, so it is not "without a record".
+            Ok(Err(RecordError::Unusable(_))) => {
+                unreadable_record += 1;
+                continue;
+            }
+            Ok(Err(RecordError::Missing)) | Err(_) => {
+                without_record += 1;
+                continue;
+            }
         };
         total += 1;
         if shown.len() < limit {
@@ -160,6 +181,7 @@ pub(super) fn list(
         "shown": shown.len(),
         "truncated": shown.len() < total,
         "without_record": without_record,
+        "unreadable_record": unreadable_record,
         "runs": shown,
     })))
 }
@@ -230,6 +252,10 @@ pub(super) fn measure(
     let refuse = |result: CallToolResult| (result, target.clone());
     question.check().map_err(refuse)?;
     let root = state_root(ctx).map_err(refuse)?;
+    // A run that another server prunes while this one reads it loses its files one
+    // by one, and what was lost last is not what to report.
+    let lost =
+        |otherwise: &dyn Fn() -> CallToolResult| or_not_found(&root, question.run_id, otherwise);
     let dir = runs::locate(&root, question.run_id).map_err(|error| {
         refuse(match error {
             LocateError::InvalidId => invalid("run_id", "run_id is not a run id"),
@@ -238,12 +264,16 @@ pub(super) fn measure(
     })?;
     let record = runs::read_record(&dir).map_err(|error| {
         refuse(match error {
-            RecordError::Missing => run_not_found(
-                question.run_id,
-                "the run has no record: it failed, was made before records were kept, or \
-                 its record could not be saved",
-            ),
-            RecordError::Unusable(detail) => unreadable(&dir, format!("its record: {detail}")),
+            RecordError::Missing => lost(&|| {
+                run_not_found(
+                    question.run_id,
+                    "the run has no record: it failed, was made before records were kept, or \
+                     its record could not be saved",
+                )
+            }),
+            RecordError::Unusable(detail) => {
+                lost(&|| unreadable(&dir, format!("its record: {detail}")))
+            }
         })
     })?;
     // From here the schematic is known, and names the work in the outcome.
@@ -251,6 +281,15 @@ pub(super) fn measure(
     let refuse = |result: CallToolResult| (result, target.clone());
     let analysis = Analysis::from_record(&record.analysis)
         .ok_or_else(|| refuse(unreadable(&dir, "its record holds no analysis")))?;
+    // The run's own message says "signals but no measurements", and a stored call
+    // needs a measurement, so it would send the caller round in a circle.
+    if matches!(&analysis, Analysis::DcSweep(sweep) if sweep.sweeps.len() > 1) {
+        return Err(refuse(invalid(
+            "measurements",
+            "A dc_sweep with two sweeps takes no measurements, live or stored: its whole \
+             grid is in the run's results.csv, with both sweeps' values.",
+        )));
+    }
     let wanted = Wanted::for_analysis(
         &analysis,
         question.signals,
@@ -261,16 +300,19 @@ pub(super) fn measure(
     let status: RunStatus = runs::read_plain(&dir.join(STATUS_FILE), runs::MAX_STATUS_BYTES)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| refuse(unreadable(&dir, "its status file is missing or damaged")))?;
+        .ok_or_else(|| {
+            refuse(lost(&|| {
+                unreadable(&dir, "its status file is missing or damaged")
+            }))
+        })?;
     // The raw parser reads whatever it is given, so a link or a pipe is stopped here.
     if !std::fs::symlink_metadata(dir.join(RAW_FILE)).is_ok_and(|meta| meta.is_file()) {
-        return Err(refuse(unreadable(
-            &dir,
-            "its raw file is missing or not a plain file",
-        )));
+        return Err(refuse(lost(&|| {
+            unreadable(&dir, "its raw file is missing or not a plain file")
+        })));
     }
     let plot = read_results(&dir, &status)
-        .map_err(|error| refuse(unreadable(&dir, format!("its raw file: {error}"))))?;
+        .map_err(|error| refuse(lost(&|| unreadable(&dir, format!("its raw file: {error}")))))?;
 
     let partial = record.run_status == RunState::Partial;
     let evaluation = Evaluation {
@@ -297,8 +339,10 @@ pub(super) fn measure(
     let mut body = json!({
         "run_id": question.run_id,
         "analysis_kind": analysis.kind(),
+        "analysis": record.result,
         "run_status": record.run_status.as_str(),
         "simulated_circuit": record.simulated_circuit,
+        "circuit": record.circuit,
         "coverage_ratio": record.coverage_ratio,
         "inputs_changed_since_run": CurrentSources::of(&record.schematic).changed_since(&record),
         // What the run itself reported comes first: a peak that reads low there
@@ -322,13 +366,15 @@ pub(super) fn measure(
             crate::simulation::signals::resolve(&plot, signal, evaluation.names).is_err()
         })
         .map(|(text, _)| text.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect();
     if let (false, Some(warnings)) = (unsaved_power.is_empty(), body["warnings"].as_array_mut()) {
         warnings.push(json!({
             "code": "power_not_saved",
-            "detail": "This run holds no data for p(REF). A run saves it only if it asked for \
-                       it in signals or measurements, and not for a code model or a coupling. \
-                       Run again with it, if the part can have one.",
+            "detail": "This run holds no data for these. A run saves p(REF) only if it asked \
+                       for it in signals or measurements, and never for a code model or a \
+                       coupling. Run again with it, if the part is named right and can have one.",
             "items": unsaved_power,
         }));
     }
@@ -412,6 +458,8 @@ mod tests {
                 run_status: RunState::Complete,
                 stopped: None,
                 simulated_circuit: String::new(),
+                circuit: Value::Null,
+                result: Value::Null,
                 coverage_ratio: 1.0,
                 inputs_hash: hash.to_string(),
                 inlined_files: Vec::new(),
@@ -442,6 +490,8 @@ mod tests {
                 run_status: RunState::Complete,
                 stopped: None,
                 simulated_circuit: String::new(),
+                circuit: Value::Null,
+                result: Value::Null,
                 coverage_ratio: 1.0,
                 inputs_hash: inputs_hash(Sha256::default(), &[]).unwrap(),
                 inlined_files: files,
@@ -473,5 +523,69 @@ mod tests {
             .set_len(MAX_MODEL_BYTES + 1)
             .unwrap();
         assert_eq!(sources.changed_since(&record(vec![big])), Some(true));
+    }
+
+    #[test]
+    fn a_run_pruned_while_it_is_read_is_not_found_and_not_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("simulation/3fa9c1d27b04").join(ID);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reason = |result: &CallToolResult| {
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            body["error"]["reason"].as_str().unwrap().to_string()
+        };
+        let otherwise = || unreadable(&dir, "its raw file");
+        assert_eq!(
+            reason(&or_not_found(root.path(), ID, &otherwise)),
+            "results_unreadable"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            reason(&or_not_found(root.path(), ID, &otherwise)),
+            "run_not_found"
+        );
+    }
+
+    #[test]
+    fn a_model_file_past_the_size_limit_is_not_read_even_if_it_would_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.lib");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_MODEL_BYTES + 1)
+            .unwrap();
+        let hasher = Sha256::default();
+        // The hash the run would have recorded, so reading the file reads unchanged.
+        let recorded = inputs_hash(hasher.clone(), std::slice::from_ref(&big)).unwrap();
+        let record = RunRecord::new(runs::RecordFields {
+            schematic: PathBuf::new(),
+            analysis: json!({ "kind": "operating_point" }),
+            run_status: RunState::Complete,
+            stopped: None,
+            simulated_circuit: String::new(),
+            circuit: Value::Null,
+            result: Value::Null,
+            coverage_ratio: 1.0,
+            inputs_hash: recorded,
+            inlined_files: vec![big.clone()],
+            nets: Vec::new(),
+            elements: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let sources = CurrentSources(Some(hasher));
+        assert_eq!(sources.changed_since(&record), Some(true));
+        // At the limit, the same file is read and matches.
+        std::fs::File::options()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(MAX_MODEL_BYTES)
+            .unwrap();
+        let mut record = record;
+        record.inputs_hash = inputs_hash(Sha256::default(), std::slice::from_ref(&big)).unwrap();
+        assert_eq!(sources.changed_since(&record), Some(false));
     }
 }

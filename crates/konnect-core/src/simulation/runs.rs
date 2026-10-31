@@ -20,6 +20,9 @@ const CREATE_ATTEMPTS: usize = 8;
 /// without the circuit.
 pub(crate) const RECORD_FILE: &str = "run.json";
 const RECORD_VERSION: u32 = 1;
+/// A folder with no record is a failed run, once it is this old. Younger, it may be
+/// a run another server has not finished.
+const FAILED_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 /// Far above any real record, which holds the net and element names of one design.
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 /// The worker's `status.json` is a few hundred bytes.
@@ -124,6 +127,12 @@ pub(crate) struct RunRecord {
     pub run_status: RunState,
     pub stopped: Option<Stopped>,
     pub simulated_circuit: String,
+    /// What was excluded, added and approximated, for a `modified` circuit.
+    #[serde(default)]
+    pub circuit: Value,
+    /// The `analysis` object the run returned: where it ended and how many points.
+    #[serde(default)]
+    pub result: Value,
     pub coverage_ratio: f64,
     pub inputs_hash: String,
     /// Model files the deck inlined, which the hash covers.
@@ -146,6 +155,8 @@ impl RunRecord {
             run_status: fields.run_status,
             stopped: fields.stopped,
             simulated_circuit: fields.simulated_circuit,
+            circuit: fields.circuit,
+            result: fields.result,
             coverage_ratio: fields.coverage_ratio,
             inputs_hash: fields.inputs_hash,
             inlined_files: fields.inlined_files,
@@ -167,6 +178,8 @@ pub(crate) struct RecordFields {
     pub run_status: RunState,
     pub stopped: Option<Stopped>,
     pub simulated_circuit: String,
+    pub circuit: Value,
+    pub result: Value,
     pub coverage_ratio: f64,
     pub inputs_hash: String,
     pub inlined_files: Vec<PathBuf>,
@@ -342,13 +355,35 @@ fn prune(project: &Path, current: &str) -> usize {
         .filter(|name| is_valid_id(name) && name != current)
         .collect();
     runs.sort();
-    let surplus = runs.len().saturating_sub(KEEP_RUNS - 1);
+    // A run that failed has no data to lose, so it goes before one that has some:
+    // twenty failed attempts must not push out the run whose response was lost.
+    let (failed, kept): (Vec<String>, Vec<String>) = runs
+        .into_iter()
+        .partition(|name| failed_long_ago(&project.join(name)));
+    let surplus = (failed.len() + kept.len()).saturating_sub(KEEP_RUNS - 1);
     let gone = |name: &&String| match std::fs::remove_dir_all(project.join(name)) {
         Ok(()) => false,
         // Another server pruned the same run first.
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
-    runs[..surplus].iter().filter(gone).count()
+    failed
+        .iter()
+        .chain(&kept)
+        .take(surplus)
+        .filter(gone)
+        .count()
+}
+
+/// A run folder that has held no record for an hour. Younger, it may be a run
+/// another server is still making. A link is not asked about at all.
+fn failed_long_ago(dir: &Path) -> bool {
+    let has_record = std::fs::symlink_metadata(dir.join(RECORD_FILE)).is_ok();
+    let old = std::fs::symlink_metadata(dir)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= FAILED_AFTER);
+    !has_record && old
 }
 
 #[cfg(test)]
@@ -496,6 +531,8 @@ mod tests {
                 node: None,
             }),
             simulated_circuit: "modified".to_string(),
+            circuit: serde_json::json!({ "excluded_references": ["J1"] }),
+            result: serde_json::json!({ "kind": "transient", "points": 7 }),
             coverage_ratio: 0.5,
             inputs_hash: "abc".to_string(),
             inlined_files: vec![PathBuf::from("/p/m.lib")],
@@ -760,5 +797,76 @@ mod tests {
     fn the_time_in_an_id_reads_as_a_date() {
         assert_eq!(created_at(ID).as_deref(), Some("2026-10-30T13:35:12Z"));
         assert_eq!(created_at("short"), None);
+    }
+
+    fn make_old(dir: &Path) {
+        let long_ago = SystemTime::now() - FAILED_AFTER - std::time::Duration::from_secs(60);
+        std::fs::File::open(dir)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_attempts_go_before_a_run_with_data() {
+        let folder = tempfile::tempdir().unwrap();
+        let recorded = |second: usize| format!("3fa9c1d27b04-20260101T0000{second:02}-0000");
+        let failed = |second: usize| format!("3fa9c1d27b04-20260102T0000{second:02}-0000");
+        // Nineteen runs with data, older than six failed attempts.
+        for second in 0..19 {
+            let dir = folder.path().join(recorded(second));
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
+        }
+        for second in 0..6 {
+            let dir = folder.path().join(failed(second));
+            std::fs::create_dir(&dir).unwrap();
+            make_old(&dir);
+        }
+        let current = "3fa9c1d27b04-20260103T000000-0000";
+        std::fs::create_dir(folder.path().join(current)).unwrap();
+        assert_eq!(prune(folder.path(), current), 0);
+        let left = |name: &String| folder.path().join(name).exists();
+        assert!(
+            (0..19).map(recorded).all(|name| left(&name)),
+            "a run with data went"
+        );
+        // Twenty folders stay, counting the current one: the six failed ones are out.
+        assert!((0..6).map(failed).all(|name| !left(&name)));
+    }
+
+    #[test]
+    fn a_folder_with_no_record_that_is_young_may_be_a_run_in_flight() {
+        let folder = tempfile::tempdir().unwrap();
+        for second in 0..20 {
+            let dir = folder
+                .path()
+                .join(format!("3fa9c1d27b04-20260101T0000{second:02}-0000"));
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
+        }
+        // Newer than all of them and not yet recorded, as another server's run is.
+        let young = "3fa9c1d27b04-20260102T000000-0000";
+        std::fs::create_dir(folder.path().join(young)).unwrap();
+        let current = "3fa9c1d27b04-20260103T000000-0000";
+        std::fs::create_dir(folder.path().join(current)).unwrap();
+        prune(folder.path(), current);
+        assert!(
+            folder.path().join(young).exists(),
+            "a run in flight was removed"
+        );
+        // The oldest two with data went to make room.
+        assert!(!folder
+            .path()
+            .join("3fa9c1d27b04-20260101T000000-0000")
+            .exists());
+        assert!(!folder
+            .path()
+            .join("3fa9c1d27b04-20260101T000001-0000")
+            .exists());
+        assert!(folder
+            .path()
+            .join("3fa9c1d27b04-20260101T000002-0000")
+            .exists());
     }
 }

@@ -308,6 +308,9 @@ mod tests {
         assert_eq!(field("=1+1"), "'=1+1");
         assert_eq!(field("-x"), "'-x");
         assert_eq!(field("@sum"), "'@sum");
+        assert_eq!(field("+1"), "'+1");
+        assert_eq!(field("\tcell"), "'\tcell");
+        assert_eq!(field("\rcell"), "\"'\rcell\"");
         assert_eq!(field("v(a,b)"), "\"v(a,b)\"");
         assert_eq!(field("a\"b"), "\"a\"\"b\"");
         assert_eq!(field("v(/out)"), "v(/out)");

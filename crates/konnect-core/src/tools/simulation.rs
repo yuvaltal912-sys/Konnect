@@ -1688,6 +1688,8 @@ impl RunEnd<'_> {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            circuit: body["circuit"].clone(),
+            result: body["analysis"].clone(),
             coverage_ratio: body["analysis"]["coverage_ratio"].as_f64().unwrap_or(0.0),
             inputs_hash: self.design.inputs_hash.clone(),
             inlined_files: self.deck.inlined_files.clone(),
@@ -4877,6 +4879,13 @@ mod tests {
             assert_eq!(body["coverage_ratio"], 1.0);
             assert_eq!(body["inputs_changed_since_run"], false);
             assert_eq!(body["analysis_kind"], "transient");
+            // Where the run ended and what it left out come with its measurements.
+            assert_eq!(body["analysis"], run["analysis"], "{body}");
+            assert_eq!(body["circuit"], run["circuit"], "{body}");
+            assert_eq!(
+                body["circuit"]["excluded_references"],
+                json!(["D1", "R1", "V1"])
+            );
             // The run's own answer and the stored one are the same measurement.
             assert_eq!(
                 run["measurements"][0]["value"],
@@ -5169,6 +5178,8 @@ mod tests {
                     run_status: RunState::Complete,
                     stopped: None,
                     simulated_circuit: circuit.to_string(),
+                    circuit: Value::Null,
+                    result: Value::Null,
                     coverage_ratio: 1.0,
                     inputs_hash: String::new(),
                     inlined_files: Vec::new(),
@@ -5429,7 +5440,8 @@ mod tests {
             );
             let (_, list) = listed(&scene, json!({})).await;
             assert_eq!(list["total"], 0);
-            assert_eq!(list["without_record"], 1);
+            // A folder stands where the record belongs: there, and not usable.
+            assert_eq!(list["unreadable_record"], 1, "{list}");
         }
 
         #[tokio::test]
@@ -5612,6 +5624,8 @@ mod tests {
             assert!(!failed, "{body}");
             let warnings = body["warnings"].to_string();
             assert!(warnings.contains("no_point_at_start"), "{warnings}");
+            // The warning points at a number, and the body has it.
+            assert_eq!(body["analysis"]["first_point_seconds"], 0.5, "{body}");
             // What belonged to the run's own call is not carried.
             assert!(!warnings.contains("csv_not_written"), "{warnings}");
             assert!(!warnings.contains("old_runs_kept"), "{warnings}");
@@ -5688,6 +5702,72 @@ mod tests {
             .await;
             assert!(failed, "{body}");
             assert_eq!(body["error"]["reason"], "results_unreadable", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_record_that_cannot_be_used_is_counted_apart_from_a_missing_one() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let record = first_run_dir(&scene).join(runs::RECORD_FILE);
+            std::fs::write(&record, "{ not json").unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["total"], 0, "{list}");
+            assert_eq!(list["unreadable_record"], 1, "{list}");
+            assert_eq!(list["without_record"], 0, "{list}");
+            std::fs::remove_file(&record).unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["unreadable_record"], 0, "{list}");
+            assert_eq!(list["without_record"], 1, "{list}");
+            let _ = run;
+        }
+
+        #[tokio::test]
+        async fn a_stored_two_sweep_run_says_why_it_takes_no_measurement_and_where_the_grid_is() {
+            let grid: Vec<(f64, f64)> = (0..9).map(|n| ((n % 3) as f64, n as f64)).collect();
+            let job = format!("{}\n{}", copy_dc(&grid), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                    { "target": "R2", "start_value": 1000.0, "stop_value": 3000.0, "step_value": 1000.0 },
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            let (_, run) = call(&scene, arguments).await;
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            let message = body["error"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+                + body["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("results.csv"), "{body}");
+            assert!(!message.contains("takes signals but"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_power_signal_asked_twice_is_named_once() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let (_, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["p(R2)"],
+                        "measurements": [{ "kind": "max", "signal": "p(R2)" }] }),
+            )
+            .await;
+            let warning = body["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|warning| warning["code"] == "power_not_saved")
+                .unwrap_or_else(|| panic!("{body}"));
+            assert_eq!(warning["items"], json!(["p(R2)"]), "{warning}");
         }
     }
 }
