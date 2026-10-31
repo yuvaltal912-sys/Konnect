@@ -158,6 +158,7 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - A real segfault inside libngspice has not been reproduced on 44.2. The crash path is proven with a fake worker and with `SIGABRT` on the real one.
 - `.op` has no pause test, so `bg_halt` cannot stop one. It ends at the worker's own deadline.
 - `class-d`, `laser_driver` and `v_i_sources` report `engine_messages`. `laser_driver` and `v_i_sources` are true positives. The `class-d` lines were not rechecked after progress notes were filtered out.
+- The protection stand-ins are approximations with known edges, all in the skill: the fuse opens in one step with no arc, so inductance ahead of it rings (E97); the reverse stand-in leaks near zero volts because of its 10 mV knee; the eFuse resistance rises near its limit. The independent review of PR 8 found these, not wrong numbers.
 - The hosted CI has never run on this fork. It needs the owner's click in the Actions tab.
 - Q17 is an accepted limit: `filesource`, `d_source`, `d_state` and table models read a numeric data file named in the deck.
 - Local scratch scripts for mutation runs and dogfooding were never committed. The recipes above replace them.

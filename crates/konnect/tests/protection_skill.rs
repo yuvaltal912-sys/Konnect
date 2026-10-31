@@ -14,29 +14,68 @@ fn skill() -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
-#[test]
-fn every_line_of_every_tested_deck_is_in_the_skill() {
-    let skill = skill();
-    let mut decks = 0;
-    for entry in std::fs::read_dir(fixtures()).unwrap().flatten() {
-        if entry
-            .path()
-            .extension()
-            .is_none_or(|extension| extension != "sp")
-        {
-            continue;
+/// The text of every fenced block in a document, one string per block.
+fn code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.starts_with("```") {
+            match open.take() {
+                Some(lines) => blocks.push(lines.join("\n")),
+                None => open = Some(Vec::new()),
+            }
+        } else if let Some(lines) = open.as_mut() {
+            lines.push(line);
         }
-        decks += 1;
-        let text = std::fs::read_to_string(entry.path()).unwrap();
-        for line in text.lines() {
+    }
+    blocks
+}
+
+fn decks() -> Vec<(String, String)> {
+    let mut decks = Vec::new();
+    for entry in std::fs::read_dir(fixtures()).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "sp") {
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            decks.push((
+                name,
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .trim_end()
+                    .to_owned(),
+            ));
+        }
+    }
+    decks.sort();
+    decks
+}
+
+#[test]
+fn every_tested_deck_is_one_whole_block_of_the_skill() {
+    let blocks = code_blocks(&skill());
+    let decks = decks();
+    assert_eq!(decks.len(), 6, "the five scenarios and the spliced example");
+    for (name, deck) in &decks {
+        assert!(
+            blocks.iter().any(|block| block == deck),
+            "{name}.sp is not a block of the skill, line for line and in order"
+        );
+    }
+}
+
+#[test]
+fn a_deck_adds_no_card_that_konnect_refuses_or_that_changes_the_circuit() {
+    for (name, deck) in decks() {
+        for line in deck.lines().filter(|line| !line.starts_with('*')) {
+            let line = line.to_lowercase();
+            let refused = [".probe", ".ic ", ".nodeset", ".options", ".control"];
+            let coupling = line.starts_with('k');
             assert!(
-                skill.lines().any(|shown| shown == line),
-                "{} is not in the skill: {line}",
-                entry.path().display()
+                !coupling && !refused.iter().any(|card| line.starts_with(card)),
+                "{name}: {line}"
             );
         }
     }
-    assert_eq!(decks, 6, "the five scenarios and the spliced example");
 }
 
 #[test]
@@ -64,15 +103,5 @@ fn the_skill_says_what_a_stand_in_is_and_is_not() {
         "### Reversed battery",
     ] {
         assert!(section.contains(scenario), "no {scenario}");
-    }
-    // No stand-in adds a card that Konnect refuses or that changes the circuit.
-    for line in section
-        .lines()
-        .filter(|line| line.starts_with('.') || line.starts_with("K"))
-    {
-        let line = line.to_lowercase();
-        for refused in [".probe", ".ic ", ".nodeset", ".options"] {
-            assert!(!line.starts_with(refused), "{line}");
-        }
     }
 }

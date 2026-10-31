@@ -1348,7 +1348,7 @@ fn an_i2t_fuse_opens_when_the_integral_reaches_its_rating_and_stays_open() {
     // From `protection/reference.py`, which integrates i squared by RK4: the fuse
     // trips at 2.002 A2s, 5.020498 ms.
     near(measured(&result, "before"), 0.9979210, 1e-6);
-    near(at(&result, "open"), 5.020498e-3, 5e-7);
+    near(at(&result, "open"), 5.020498e-3, 1e-7);
     // A step cannot stop the integral on the rating: it overshoots by at most
     // one step of the prospective current squared, 400 A and 0.1 us.
     let let_through = measured(&result, "let_through");
@@ -1426,10 +1426,11 @@ fn an_undervoltage_lockout_closes_at_its_on_threshold_and_opens_at_its_off_thres
     );
 
     assert_clean_and_modified(&result);
-    // The 1 V per ms ramp reaches 10 V at 10 ms and falls through 9 V at 19 ms,
-    // within one 10 us step each: 10 mV.
-    near(at(&result, "on"), 10e-3, 2e-5);
-    near(at(&result, "off"), 19e-3, 2e-5);
+    // The 1 V per ms ramp reaches 10 V at 10 ms and falls through 9 V at 19 ms. A
+    // crossing is interpolated inside the one-step jump, so each is right to within
+    // one 10 us step: 10 mV.
+    near(at(&result, "on"), 10e-3, 1e-5);
+    near(at(&result, "off"), 19e-3, 1e-5);
     // At 9.5 V it is off on the way up and on on the way down: the hysteresis.
     near(measured(&result, "between_up"), 1.14e-7, 1e-6);
     near(measured(&result, "between_down"), 9.4920899, 1e-5);
@@ -1533,4 +1534,58 @@ fn every_stand_in_runs_under_initial_conditions_and_keeps_its_device_currents() 
             expected.abs() * 1e-5 + 1e-8,
         );
     }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_lockout_narrower_than_the_supply_sag_chatters_and_stops_the_run() {
+    // 3 ohm ahead of the input: the 12 ohm load pulls 10 V down to 8, below the off point.
+    let mut deck = protection_deck("uvlo");
+    deck[1] = "VSRC vsrc 0 PWL(0 0 14m 14 28m 0)".to_string();
+    deck.push("RSAG vsrc vin 3".to_string());
+    let result = run_on_testbench(
+        &deck,
+        json!({
+            "analysis": transient(28e-3, 1e-5),
+            "measurements": [{ "name": "top", "kind": "max", "signal": "v(out)" }],
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "partial", "{result}");
+    assert_eq!(result["stopped"]["reason"], "no_convergence", "{result}");
+    let reached = result["analysis"]["simulated_to_seconds"].as_f64().unwrap();
+    near(reached, 10e-3, 1e-6);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn exp_in_an_expression_is_linear_above_an_argument_of_fourteen() {
+    // Why the decks write powers with `**`. If the engine ever fixes this, the
+    // skill's warning can go.
+    let lines = lines(&[
+        "VX x 0 1",
+        "RX x 0 1k",
+        "BEXP e 0 V='exp(ln(1G))'",
+        "RE e 0 1k",
+        "BPOW p 0 V='1G**1'",
+        "RP p 0 1k",
+        "BLOW l 0 V='exp(10)'",
+        "RL l 0 1k",
+    ]);
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": transient(1e-3, 1e-4),
+            "measurements": [
+                { "name": "exp", "kind": "value_at", "signal": "v(e)", "at_seconds": 1e-4 },
+                { "name": "pow", "kind": "value_at", "signal": "v(p)", "at_seconds": 1e-4 },
+                { "name": "low", "kind": "value_at", "signal": "v(l)", "at_seconds": 1e-4 },
+            ],
+        }),
+    );
+
+    // exp(14) * (1 + 20.723 - 14): 9.288e6 where the exact value is 1e9.
+    near(measured(&result, "exp"), 9.288032e6, 1.0);
+    near(measured(&result, "pow"), 1e9, 1.0);
+    near(measured(&result, "low"), 10f64.exp(), 1e-6);
 }

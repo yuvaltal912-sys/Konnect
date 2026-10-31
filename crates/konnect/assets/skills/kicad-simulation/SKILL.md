@@ -102,7 +102,7 @@ Rules for all five:
 
 ### Output short
 
-A resistor across the output that falls from 1 G to 5 mohm at `sh_t0`. It is the fault the next three blocks are tested against. `max_step_seconds` 1e-6 is plenty.
+A resistor across the output that falls from 1 G to 5 mohm at `sh_t0`. The fuse and eFuse blocks include it as their fault. `max_step_seconds` 1e-6 is plenty.
 
 ```
 * Output short. Your circuit supplies the first three elements; the rest is the fault.
@@ -119,7 +119,7 @@ This harness gives 480.04 A and 2.399 V at the output, as 12 V over 20 mohm plus
 
 ### I²t fuse
 
-Opens for good once the integral of the current squared reaches `fz_rated`, in A²s. `v(fz_q)` is that integral. The fuse must sit in series, with `VFZS` in the path to read the current. Add the short above to see it open.
+Opens for good once the integral of the current squared reaches `fz_rated`, in A²s. `v(fz_q)` is that integral. The fuse must sit in series, with `VFZS` in the path to read the current. The block includes the short, so it opens at 5 ms.
 
 ```
 * I2t fuse into a short. Your circuit supplies the supply, RSRC and the load.
@@ -141,11 +141,11 @@ SFZ fz_a out fz_ctl 0 SWFZ
 .model SWFZ SW(Vt=0 Vh={fz_rated/1000} Ron=5m Roff=1Meg)
 ```
 
-The step cannot land on the rating, so the integral overshoots the trip by up to the prospective current squared times `max_step_seconds`: 0.016 A²s at 400 A and 0.1 µs, and 0.004 A²s was seen. For a 1 percent error, use `max_step_seconds` of `0.01 * fz_rated / I²`, and narrow the run to the moments around the fault. The fuse never closes again and never cools: a long overload below the rating still builds the integral.
+The step cannot land on the rating, so the integral overshoots the trip by up to the prospective current squared times `max_step_seconds`: 0.016 A²s at 400 A and 0.1 µs, and 0.004 A²s was seen. For a 1 percent error, use `max_step_seconds` of `0.01 * fz_rated / I²`, and narrow the run to the moments around the fault. The fuse trips 0.1 percent above `fz_rated`, switching from 5 mohm to 1 Mohm (edit them in `.model SWFZ`), and never closes again or cools: a long overload below the rating still builds the integral. It opens in one step and has no arc. With inductance ahead of it the opening makes a voltage spike and the current rings afterwards: 1 µH gave 21.9 kV and -5 mA at 9.9 ms instead of 12 µA, and the run still read `complete`. Do not trust voltages across an opening fuse in an inductive circuit.
 
 ### eFuse current limit
 
-Behaves as `ef_ron` below `ef_ilim` and holds `ef_ilim` above it, for as long as the fault lasts. There is no timer, no foldback and no thermal shutdown, so it never trips. It also conducts backwards, so pair it with the reversed battery block.
+Behaves as `ef_ron` below `ef_ilim` and holds `ef_ilim` above it, for as long as the fault lasts. There is no timer, no foldback and no thermal shutdown, so it never trips. Its resistance rises as the current nears the limit: from the formula, 1.1 times `ef_ron` at half the limit and 1.9 times at 95 percent. It also conducts backwards, so pair it with the reversed battery block.
 
 ```
 * eFuse current limit into a short. Your circuit supplies the supply and the load.
@@ -162,7 +162,7 @@ BEFZ vbat out I='ef_ilim*tanh(v(vbat,out)/(ef_ilim*ef_ron))'
 
 ### Undervoltage lockout
 
-A switch that closes when its own input rises above `uv_on` and opens when it falls below `uv_off`. Feed it a slow ramp, because the switch changes in one step. The threshold error is the ramp rate times `max_step_seconds`: 10 mV for 1 V per ms and 10 µs. The hysteresis must be wider than the sag when the load connects: with a 3 ohm source ahead of it, the 12 V load pulled the input from 10 V to 8 V, the stand-in chattered and the run stopped in `no_convergence`.
+A switch that closes when its own input rises above `uv_on` and opens when it falls below `uv_off`. Keep `uv_on` above `uv_off`: swapped values run with no warning. Feed it a slow ramp, because the switch changes in one step. The thresholds are right to within the ramp rate times `max_step_seconds`: 10 mV for 1 V per ms and 10 µs. The hysteresis must be wider than the sag when the load connects: with a 3 ohm source ahead of it, the 12 V load pulled the input from 10 V to 8 V, the stand-in chattered and the run stopped in `no_convergence`.
 
 ```
 * Undervoltage lockout on a slow ramp. Your circuit supplies the input and the load.
@@ -187,7 +187,7 @@ RLOAD out 0 12
 BRB vbat out I='v(vbat,out)*(1/rb_roff+(1/rb_ron-1/rb_roff)*0.5*(1+tanh(v(vbat,out)/rb_knee)))'
 ```
 
-At -12 V this reads 1.0 µA of leakage and -12 µV at the output. At +12 V the output is 11.970 V.
+At -12 V this reads 1.0 µA of leakage and -12 µV at the output. At +12 V the output is 11.970 V. The knee `rb_knee` of 10 mV limits both ends. `rb_ron` is the resistance only where its drop is well above about 30 mV: 5 mohm at 1 A dropped 6.4 mV and not 5.0. Blocking reaches `rb_roff` only beyond about 100 mV in reverse. Near zero volts it leaks, from the formula 45 mA at 5 mV, 75 µA at 50 mV and 83 nA at 1 V.
 
 ### In your own schematic
 
