@@ -32,5 +32,11 @@ closed forms, bisection for the nonlinear loads, and RK4 at 1 ns for the fuse's
 integral. The live tests compare `run_simulation` with what it prints, and a test fails
 if a line of a deck is missing from the skill.
 
+`ac_loop.sp` is a hand-written testbench: a loop gain of three real poles, at 100 Hz,
+1 kHz and 10 kHz, with a DC gain of 100. The deck behind E29 was not kept, so this
+replaces it. `ac_loop_reference.py` solves its formulas by bisection with no SPICE
+engine, and the live test compares `run_simulation` with what it prints: a crossover
+at 3013.7 Hz, a phase margin of 3.486 degrees and a gain margin of 1.742 dB.
+
 KiCad-owned formats: do not hand-edit these. Regenerate them with the commands
 above if a KiCad version changes the output.
