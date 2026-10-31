@@ -4,7 +4,7 @@ Start with `docs/SIMULATION_HANDOFF.md`. It says where the work stands, what com
 
 ## Rules
 
-- Reply to the owner in Hebrew. Keep it short, with one clear recommendation.
+- Reply in the language the owner last used. Keep it short, with one clear recommendation.
 - Update `docs/SIMULATION_HANDOFF.md` in the same commit that changes where the work stands.
 - Work on one PR at a time, and ask before starting the next one.
 - Commit only on a feature branch, and push only to the `fork` remote. `origin` is the archived upstream and is read-only.

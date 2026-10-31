@@ -847,20 +847,23 @@ fn dc_groups(circuit: &Circuit) -> Groups {
 fn deck_structure(deck: &FlatDeck) -> Check {
     let mut open_blocks = Vec::new();
     let mut stray = Vec::new();
+    // By prefix, as ngspice matches them: `.ENDSUBCKT` and `.ends,f` both close.
     for (text, _, _) in deck.lines() {
         let line = text.trim().to_lowercase();
-        let word = line.split(|c: char| c.is_whitespace() || c == '(').next();
-        match word.unwrap_or_default() {
-            ".if" => open_blocks.push(".if"),
-            ".subckt" => open_blocks.push(".subckt"),
-            ".endif" if open_blocks.last() == Some(&".if") => {
-                open_blocks.pop();
+        if line.starts_with(".endif") {
+            match open_blocks.last() {
+                Some(&".if") => drop(open_blocks.pop()),
+                _ => stray.push(".endif".to_string()),
             }
-            ".ends" if open_blocks.last() == Some(&".subckt") => {
-                open_blocks.pop();
+        } else if line.starts_with(".ends") {
+            match open_blocks.last() {
+                Some(&".subckt") => drop(open_blocks.pop()),
+                _ => stray.push(".ends".to_string()),
             }
-            word @ (".endif" | ".ends") => stray.push(word.to_string()),
-            _ => {}
+        } else if line.starts_with(".if") {
+            open_blocks.push(".if");
+        } else if line.starts_with(".subckt") {
+            open_blocks.push(".subckt");
         }
     }
     let unclosed = open_blocks.iter().map(|block| format!("{block} left open"));
@@ -1808,6 +1811,16 @@ mod tests {
         passes(&deck(circuit), "deck_structure");
         let balanced = format!("{circuit}\n.subckt x a b\nR2 a b 1k\n.if (1)\n.endif\n.ends x");
         passes(&deck(&balanced), "deck_structure");
+        for closed in [
+            ".SUBCKT tt a b\nR2 a b 1k\n.ENDSUBCKT",
+            ".subckt tt a b\nR2 a b 1k\n.ends,tt",
+            ".subckt tt a b\nR2 a b 1k\n.ends;tt",
+            ".if (1)\nR2 a 0 1k\n.endif;x",
+            ".if (1)\nR2 a 0 1k\n.else\nR3 a 0 1k\n.endif",
+            ".if(1)\n.elseif(0)\n.endif",
+        ] {
+            passes(&deck(&format!("{circuit}\n{closed}")), "deck_structure");
+        }
         for (extra, item) in [
             (".if (0)", ".if left open"),
             (".IF(1)", ".if left open"),

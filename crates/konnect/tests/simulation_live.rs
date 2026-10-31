@@ -603,6 +603,15 @@ fn a_run_past_its_budget_halts_softly_and_keeps_its_data() {
 
 #[test]
 #[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_engine_closes_a_subcircuit_the_way_preflight_does() {
+    let deck = ".title t\n.SUBCKT tt a b\nR1 a b 1k\n.ENDSUBCKT\nV1 c 0 1\nX1 c 0 tt\n.op\n.end\n";
+    let run = WorkerRun::prepare(deck, None, 5_000);
+
+    assert_eq!(run.finish().sim_status, Some(0), "{}", run.log());
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
 fn a_budget_that_ends_before_the_engine_starts_still_halts_softly() {
     let run = WorkerRun::prepare(SLOW_DECK, None, 1);
 

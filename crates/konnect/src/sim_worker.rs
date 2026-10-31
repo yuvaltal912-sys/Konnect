@@ -47,7 +47,6 @@ const WORKER_GRACE: Duration = Duration::from_secs(10);
 const OUT_OF_TIME: i32 = 124;
 const STATUS_MARKER: &str = "KONNECT_SIM_STATUS=";
 const POLL: Duration = Duration::from_millis(5);
-const HALT_REPEAT: Duration = Duration::from_millis(250);
 /// A chatty deck must not fill the disk.
 const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Lines kept in memory, which only need to reach the banner and code models.
@@ -452,16 +451,15 @@ impl Engine {
 
     /// Wait for the run, halting it softly at the deadline. A halt sent before
     /// the engine's thread starts marks the engine as stopped, and every later one
-    /// finds nothing to stop, so none goes until the thread says it is running.
-    /// `bg_halt` is cooperative, so a run that ignores it ends at the worker's own
-    /// deadline.
+    /// finds nothing to stop, so it waits until the thread says it is running. It
+    /// goes once: `bg_halt` is cooperative and leaves its flag set if the run does
+    /// not answer in time, so a run that ignores it ends at the worker's deadline.
     fn wait_for_run(&self, deadline: Instant) -> Option<HaltReason> {
         let mut halted = None;
-        let mut next_halt = deadline;
         while !RUN_FINISHED.load(Ordering::SeqCst) && !EXIT_CALLED.load(Ordering::SeqCst) {
-            if RUN_STARTED.load(Ordering::SeqCst) && Instant::now() >= next_halt {
+            if halted.is_none() && RUN_STARTED.load(Ordering::SeqCst) && Instant::now() >= deadline
+            {
                 halted = Some(HaltReason::Timeout);
-                next_halt = Instant::now() + HALT_REPEAT;
                 let _ = self.run_command("bg_halt");
             }
             std::thread::sleep(POLL);

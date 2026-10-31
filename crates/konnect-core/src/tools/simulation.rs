@@ -20,7 +20,7 @@ use crate::tool;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,10 @@ const MAX_LOG_ITEMS: usize = 12;
 const MAX_LOG_ITEM_CHARS: usize = 300;
 /// The worker runs with no init file on purpose, so this says nothing.
 const SPINIT_NOTICE: &str = "Warning: can't find the initialization file";
-const MODEL_LINE_NOTE: &str = "A line quoting a model file. See the log.";
+const MODEL_LINES_NOTE: &str = "lines quoting a model file are in the log.";
+const MIN_PRIVATE_WORD: usize = 4;
+/// Progress such as gmin stepping, which says nothing about the circuit.
+const ENGINE_NOTE: &str = "Note:";
 /// The engine's status variable, which ends the part of a log worth reading.
 const STATUS_NAME: &str = "sim_status";
 const OPERATING_POINT_FILE: &str = "operating_point.json";
@@ -279,11 +282,10 @@ async fn usable_engine(
     if engine.available {
         return Ok(engine);
     }
-    let not_found = engine.probe_status == "not_found";
-    let reason = if not_found {
-        "engine_not_found"
-    } else {
-        "engine_load_failed"
+    let reason = match engine.probe_status {
+        "not_found" => "engine_not_found",
+        "timed_out" => "timed_out",
+        _ => "engine_load_failed",
     };
     let detail = engine.detail.clone().unwrap_or_default();
     Err(simulation_failure(
@@ -561,41 +563,58 @@ fn operating_point_covered(plot: &Plot) -> bool {
     plot.points == 1 && !plot.is_truncated() && !plot.variables.is_empty()
 }
 
+/// Split as the engine would rewrite them: it turns a non-ASCII byte into `_`.
 fn words(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|c: char| !c.is_alphanumeric())
+    text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
+        .map(str::to_ascii_lowercase)
 }
 
-/// What the engine said went wrong. It rewrites deck lines and quotes pieces of
-/// them, and text from a model file is not ours to repeat, so a line is shown only
-/// if none of its words come from model files alone. A false match hides a line,
-/// which stays in the log.
-fn engine_complaints(log: &str, deck: &FlatDeck) -> Vec<String> {
-    let mut model_words = HashSet::new();
+/// What the engine said went wrong, and how many lines were held back. It rewrites
+/// deck lines, quotes pieces of them and cuts long words, and text from a model
+/// file is not ours to repeat. So a line stays in the log if any of its words
+/// starts a word found only in model files. Short words are not evidence: `is`
+/// comes from every diode model and from most of the engine's sentences. A value
+/// computed from a model parameter cannot be recognised, and may still show.
+fn engine_complaints(log: &str, deck: &FlatDeck) -> (Vec<String>, usize) {
+    let mut model_words = BTreeSet::new();
     let mut own_words = HashSet::new();
     for (text, _, included) in deck.lines() {
-        let target = if included {
-            &mut model_words
+        if included {
+            model_words.extend(words(text));
         } else {
-            &mut own_words
-        };
-        target.extend(words(text));
+            own_words.extend(words(text));
+        }
     }
+    model_words.retain(|word| !own_words.contains(word));
+    let quotes_model = |line: &str| {
+        words(line)
+            .filter(|word| word.len() >= MIN_PRIVATE_WORD)
+            .any(|word| {
+                let next = model_words.range(word.clone()..).next();
+                next.is_some_and(|model_word: &String| model_word.starts_with(&word))
+            })
+    };
     let ours = log.lines().take_while(|line| !line.contains(STATUS_NAME));
-    ours.filter_map(|line| line.strip_prefix("stderr "))
-        .filter(|line| !line.starts_with(SPINIT_NOTICE))
-        .map(|line| {
-            let private =
-                words(line).any(|word| model_words.contains(&word) && !own_words.contains(&word));
-            if private {
-                MODEL_LINE_NOTE.to_string()
-            } else {
-                line.chars().take(MAX_LOG_ITEM_CHARS).collect()
-            }
-        })
+    let lines = ours
+        .filter_map(|line| line.strip_prefix("stderr "))
+        .filter(|line| !line.starts_with(SPINIT_NOTICE) && !line.starts_with(ENGINE_NOTE));
+    let (hidden, shown): (Vec<&str>, Vec<&str>) = lines.partition(|line| quotes_model(line));
+    let shown = shown
+        .iter()
         .take(MAX_LOG_ITEMS)
-        .collect()
+        .map(|line| line.chars().take(MAX_LOG_ITEM_CHARS).collect())
+        .collect();
+    (shown, hidden.len())
+}
+
+/// The complaints as items, naming any lines left in the log.
+fn complaint_items(log: &str, deck: &FlatDeck) -> Vec<String> {
+    let (mut items, hidden) = engine_complaints(log, deck);
+    if hidden > 0 {
+        items.push(format!("{hidden} {MODEL_LINES_NOTE}"));
+    }
+    items
 }
 
 fn failure_message(reason: &str) -> &'static str {
@@ -633,7 +652,7 @@ impl RunEnd<'_> {
             "results_unreadable" => "results",
             _ => "run",
         };
-        let mut items = engine_complaints(&self.engine_log(), self.deck);
+        let mut items = complaint_items(&self.engine_log(), self.deck);
         if let WorkerEnd::Died(how) = self.end {
             items.insert(0, how.clone());
         }
@@ -709,7 +728,7 @@ impl RunEnd<'_> {
             }));
         }
         // A run can finish after the engine ignored a parameter or changed a value.
-        let messages = engine_complaints(&self.engine_log(), self.deck);
+        let messages = complaint_items(&self.engine_log(), self.deck);
         if !messages.is_empty() {
             warnings.push(json!({
                 "code": "engine_messages",
@@ -1606,29 +1625,67 @@ mod tests {
         );
         let log = "stdout noise\n\
                    stderr Warning: can't find the initialization file spinit.\n\
+                   stderr Note: Starting dynamic gmin stepping\n\
                    stderr r77 b probe_int_0_r77 1k secrettoken=3\n\
                    stderr unknown parameter (secrettoken)\n\
                    stderr Expression err: secretparam*2}\n\
+                   stderr unknown parameter (secret__word)\n\
+                   stderr .model ddd d(secrettok ...\n\
                    stderr r1 own 0 1k\n\
                    stderr could not find a valid modelname\n\
                    stderr Error: sim_status: no such variable.\n\
                    stderr after the marker\n";
         assert_eq!(
-            engine_complaints(log, &deck),
+            complaint_items(log, &deck),
             [
-                MODEL_LINE_NOTE,
-                MODEL_LINE_NOTE,
-                MODEL_LINE_NOTE,
                 "r1 own 0 1k",
                 "could not find a valid modelname",
+                "5 lines quoting a model file are in the log.",
             ]
         );
     }
 
     #[test]
+    fn a_short_model_word_does_not_hide_a_line_about_the_schematic() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("diode.lib");
+        std::fs::write(&model, ".model dx D(IS=1e-14 N=1)\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR9 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stderr Warning: Value of resistor r9 is too small, set to 1.000000e-12\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn a_long_model_warning_cannot_crowd_out_the_schematics_lines() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("big.lib");
+        std::fs::write(&model, ".param vendorsecret=1\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = format!(
+            "{}stderr r1 own 0 1k\n",
+            "stderr bad vendorsecret\n".repeat(50)
+        );
+        let (shown, hidden) = engine_complaints(&log, &deck);
+        assert_eq!(shown, ["r1 own 0 1k"]);
+        assert_eq!(hidden, 50);
+    }
+
+    #[test]
     fn complaints_are_bounded() {
         let log = format!("stderr {}\n", "x".repeat(5_000)).repeat(100);
-        let complaints = engine_complaints(&log, &FlatDeck::default());
+        let (complaints, _) = engine_complaints(&log, &FlatDeck::default());
         assert_eq!(complaints.len(), MAX_LOG_ITEMS);
         assert_eq!(complaints[0].chars().count(), MAX_LOG_ITEM_CHARS);
     }
@@ -1887,6 +1944,24 @@ mod tests {
                 warnings.contains("unrecognized parameter (bogus)"),
                 "{body}"
             );
+        }
+
+        #[tokio::test]
+        async fn a_probe_past_the_budget_reads_as_out_of_time() {
+            let scene = scene("touch worker-ran");
+            let body = "case \"$*\" in *--probe*) exec /bin/sleep 20 ;; esac\n";
+            let worker = write_script(scene.tools.path(), "fake-worker", body, "");
+            let mut runtime = (**scene.ctx.simulation.get().unwrap()).clone();
+            runtime.set_worker_exe(worker);
+            let ctx = context("kicad-cli");
+            ctx.simulation.set(Arc::new(runtime)).ok();
+            let scene = Scene { ctx, ..scene };
+            let mut arguments = args(&scene.root);
+            arguments["timeout_seconds"] = json!(1);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "timed_out", "{body}");
+            assert_eq!(body["error"]["stage"], "engine");
         }
 
         #[tokio::test]

@@ -57,6 +57,11 @@ impl SimulationRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_worker_exe(&mut self, worker_exe: PathBuf) {
+        self.worker_exe = worker_exe;
+    }
+
     pub(crate) fn state_root(&self) -> Result<PathBuf, konnect_sexp::SexpError> {
         #[cfg(test)]
         if let Some(root) = &self.state_root {
