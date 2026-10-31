@@ -200,10 +200,19 @@ pub(crate) enum RecordError {
 /// A name that is already there, such as a link, is replaced and not followed.
 pub(crate) fn write_record(dir: &Path, record: &RunRecord) -> std::io::Result<()> {
     let partial = dir.join(format!("{RECORD_FILE}.partial"));
-    std::fs::write(&partial, serde_json::to_vec(record)?)?;
-    std::fs::rename(&partial, dir.join(RECORD_FILE)).inspect_err(|_| {
-        std::fs::remove_file(&partial).ok();
-    })
+    // Whatever stands at the temporary name, a link included, is removed and not
+    // written through.
+    std::fs::remove_file(&partial).ok();
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &serde_json::to_vec(record)?));
+    written
+        .and_then(|()| std::fs::rename(&partial, dir.join(RECORD_FILE)))
+        .inspect_err(|_| {
+            std::fs::remove_file(&partial).ok();
+        })
 }
 
 /// A file's bytes, if it is a plain file of at most `cap` bytes. A link, a device
@@ -740,13 +749,32 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        // A read of this would block for ever, so a test that fails hangs.
+        // Were the pipe read, the read would wait for a writer: give it one, so a
+        // missing guard fails the test and does not hang it.
+        let writer = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(writer);
+        });
         assert!(read_plain(&fifo, 100).is_err());
         let real = dir.path().join("real");
         std::fs::write(&real, "{}").unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(read_plain(&link, 100).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_never_written_through_a_link_at_its_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, "mine").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(format!("{RECORD_FILE}.partial")))
+            .unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert_eq!(read_record(dir.path()), Ok(record()));
     }
 
     #[test]
@@ -799,6 +827,7 @@ mod tests {
         assert_eq!(created_at("short"), None);
     }
 
+    #[cfg(unix)]
     fn make_old(dir: &Path) {
         let long_ago = SystemTime::now() - FAILED_AFTER - std::time::Duration::from_secs(60);
         std::fs::File::open(dir)
@@ -807,6 +836,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_attempts_go_before_a_run_with_data() {
         let folder = tempfile::tempdir().unwrap();

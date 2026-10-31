@@ -145,7 +145,7 @@ A negative `step_value` sweeps down, and its sign must point from the start towa
 
 Every run that left data is kept: the newest 20 for each project. Nothing here simulates again.
 
-`list_simulation_runs` takes the schematic and lists its runs, newest first: `run_id`, `created_at`, `analysis_kind`, `run_status` (`complete` or `partial`), `simulated_circuit`, `coverage_ratio` and `inputs_changed_since_run`. `without_record` counts folders that hold no usable run, such as one that failed.
+`list_simulation_runs` takes the schematic and lists its runs, newest first: `run_id`, `created_at`, `analysis_kind`, `run_status` (`complete` or `partial`), `simulated_circuit`, `coverage_ratio` and `inputs_changed_since_run`. `without_record` counts folders with no record, such as a run that failed, and `unreadable_record` those whose record is damaged.
 
 `measure_simulation_run` takes a `run_id` and `measurements`, with optional `signals` and `envelope_points`, and works them out from the stored data. It takes the same kinds as `run_simulation`, and a kind the run's analysis cannot take is refused, so `bandwidth_3db` on a transient is `invalid_argument`.
 
@@ -158,7 +158,7 @@ Every run that left data is kept: the newest 20 for each project. Nothing here s
 }
 ```
 
-- **Always relay `run_status` and `simulated_circuit`.** A measurement on a `partial` run covers only the data it has, so the result is `partial` too, with `stopped` saying why. A `modified` run does not describe the schematic as drawn.
+- **Always relay `run_status` and `simulated_circuit`.** A measurement on a `partial` run covers only the data it has, so the result is `partial` too, with `stopped` saying why. A `modified` run does not describe the schematic as drawn, and `circuit` says what was excluded and added.
 - **`inputs_changed_since_run: true`** means the saved schematic, the project file or a model file differs from what the run used. The numbers still describe the old circuit. Say so, and run again if the answer matters. `null` means the sheets could not be read.
 - **`p(REF)` only exists if the run asked for it.** Otherwise the signal is `signal_not_found` with a `power_not_saved` warning: run again with it in `signals` or `measurements`.
 - **A `dc_sweep` with two sweeps takes no measurements.** The whole grid is in `artifacts.csv_path`, with the second sweep's value in its own column.

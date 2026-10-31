@@ -87,7 +87,8 @@ pub(crate) fn write(path: &Path, plot: &Plot, layout: &Layout) -> std::io::Resul
 }
 
 /// Fill a new file beside `path` and rename it into place, so `path` is either
-/// absent or whole, and a name that is taken is never overwritten.
+/// absent or whole. A name that is already taken is refused when it is checked, and
+/// the folder is the run's own, so nothing else makes the file in between.
 fn publish(
     path: &Path,
     fill: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,

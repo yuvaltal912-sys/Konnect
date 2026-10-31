@@ -515,6 +515,11 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(made.success());
+            // A writer, so that a read would return and fail the test, not hang it.
+            let writer = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::OpenOptions::new().write(true).open(writer);
+            });
             assert_eq!(sources.changed_since(&record(vec![fifo])), Some(true));
         }
         let big = dir.path().join("big.lib");
