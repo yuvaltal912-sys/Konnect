@@ -21,7 +21,9 @@ const CREATE_ATTEMPTS: usize = 8;
 pub(crate) const RECORD_FILE: &str = "run.json";
 const RECORD_VERSION: u32 = 1;
 /// Far above any real record, which holds the net and element names of one design.
-const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+/// The worker's `status.json` is a few hundred bytes.
+pub(crate) const MAX_STATUS_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunFolder {
@@ -105,6 +107,7 @@ impl RunState {
 pub(crate) struct Stopped {
     pub reason: String,
     pub at_point: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
 }
 
@@ -128,6 +131,10 @@ pub(crate) struct RunRecord {
     /// Kept to resolve a net or reference to the engine's name.
     pub nets: Vec<NetEntry>,
     pub elements: Vec<ElementEntry>,
+    /// What the run said about itself that a later measurement is read with: the
+    /// engine's messages, a missing first point, a sweep that ended short.
+    #[serde(default)]
+    pub warnings: Vec<Value>,
 }
 
 impl RunRecord {
@@ -144,6 +151,7 @@ impl RunRecord {
             inlined_files: fields.inlined_files,
             nets: fields.nets,
             elements: fields.elements,
+            warnings: fields.warnings,
         }
     }
 
@@ -164,6 +172,7 @@ pub(crate) struct RecordFields {
     pub inlined_files: Vec<PathBuf>,
     pub nets: Vec<NetEntry>,
     pub elements: Vec<ElementEntry>,
+    pub warnings: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -174,26 +183,46 @@ pub(crate) enum RecordError {
     Unusable(String),
 }
 
+/// Write beside the final name and rename, so a reader never sees half a record.
+/// A name that is already there, such as a link, is replaced and not followed.
 pub(crate) fn write_record(dir: &Path, record: &RunRecord) -> std::io::Result<()> {
-    std::fs::write(dir.join(RECORD_FILE), serde_json::to_vec(record)?)
+    let partial = dir.join(format!("{RECORD_FILE}.partial"));
+    std::fs::write(&partial, serde_json::to_vec(record)?)?;
+    std::fs::rename(&partial, dir.join(RECORD_FILE)).inspect_err(|_| {
+        std::fs::remove_file(&partial).ok();
+    })
+}
+
+/// A file's bytes, if it is a plain file of at most `cap` bytes. A link, a device
+/// or a pipe in the store is never read: a record or a status file is only ever
+/// written there as a plain file.
+pub(crate) fn read_plain(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("it is not a plain file"));
+    }
+    if meta.len() > cap {
+        return Err(std::io::Error::other(format!("it is {} bytes", meta.len())));
+    }
+    std::fs::read(path)
 }
 
 pub(crate) fn read_record(dir: &Path) -> Result<RunRecord, RecordError> {
-    let path = dir.join(RECORD_FILE);
-    let size = match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => return Err(RecordError::Unusable("it is not a plain file".to_string())),
+    let bytes = match read_plain(&dir.join(RECORD_FILE), MAX_RECORD_BYTES) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(RecordError::Missing)
         }
         Err(error) => return Err(RecordError::Unusable(error.to_string())),
     };
-    if size > MAX_RECORD_BYTES {
-        return Err(RecordError::Unusable(format!("it is {size} bytes")));
-    }
-    let bytes = std::fs::read(&path).map_err(|error| RecordError::Unusable(error.to_string()))?;
-    let record: RunRecord =
-        serde_json::from_slice(&bytes).map_err(|error| RecordError::Unusable(error.to_string()))?;
+    // The parser's own message can quote the text it choked on.
+    let record: RunRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        RecordError::Unusable(format!(
+            "it does not parse, at line {} column {}",
+            error.line(),
+            error.column()
+        ))
+    })?;
     match record.version == RECORD_VERSION {
         true => Ok(record),
         false => Err(RecordError::Unusable(format!(
@@ -472,6 +501,7 @@ mod tests {
             inlined_files: vec![PathBuf::from("/p/m.lib")],
             nets: Vec::new(),
             elements: Vec::new(),
+            warnings: vec![serde_json::json!({ "code": "engine_messages" })],
         })
     }
 
@@ -620,13 +650,110 @@ mod tests {
 
     #[test]
     fn a_record_past_the_size_limit_is_not_read() {
+        // Valid JSON padded with spaces, which would parse if it were read.
         let dir = tempfile::tempdir().unwrap();
-        let file = std::fs::File::create(dir.path().join(RECORD_FILE)).unwrap();
-        file.set_len(MAX_RECORD_BYTES + 1).unwrap();
-        assert!(matches!(
-            read_record(dir.path()),
-            Err(RecordError::Unusable(_))
-        ));
+        let mut text = serde_json::to_string(&record()).unwrap();
+        text.push_str(&" ".repeat(MAX_RECORD_BYTES as usize));
+        std::fs::write(dir.path().join(RECORD_FILE), text).unwrap();
+        let Err(RecordError::Unusable(why)) = read_record(dir.path()) else {
+            panic!("a record past the limit must not be read")
+        };
+        assert!(why.contains("bytes"), "{why}");
+        // At the limit it is read.
+        let mut text = serde_json::to_string(&record()).unwrap();
+        let room = MAX_RECORD_BYTES as usize - text.len();
+        text.push_str(&" ".repeat(room));
+        std::fs::write(dir.path().join(RECORD_FILE), text).unwrap();
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_record_error_never_quotes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RECORD_FILE),
+            "{\"version\": \"secret-text\"}",
+        )
+        .unwrap();
+        let Err(RecordError::Unusable(why)) = read_record(dir.path()) else {
+            panic!("not a record")
+        };
+        assert!(!why.contains("secret-text"), "{why}");
+        assert!(why.contains("line 1"), "{why}");
+    }
+
+    #[test]
+    fn only_a_small_plain_file_is_read_for_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("status.json");
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(read_plain(&file, 2).unwrap(), b"{}");
+        assert!(read_plain(&file, 1).is_err());
+        assert!(read_plain(dir.path(), 100).is_err(), "a folder");
+        assert!(read_plain(&dir.path().join("none"), 100).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_a_link_is_never_read_for_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // A read of this would block for ever, so a test that fails hangs.
+        assert!(read_plain(&fifo, 100).is_err());
+        let real = dir.path().join("real");
+        std::fs::write(&real, "{}").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_plain(&link, 100).is_err());
+    }
+
+    #[test]
+    fn a_record_is_replaced_whole_and_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        let mut newer = record();
+        newer.coverage_ratio = 1.0;
+        write_record(dir.path(), &newer).unwrap();
+        assert_eq!(read_record(dir.path()), Ok(newer));
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [RECORD_FILE]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_does_not_follow_a_link_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, "mine").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(RECORD_FILE)).unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_stopped_node_that_is_unknown_is_left_out() {
+        let stopped = Stopped {
+            reason: "timeout".to_string(),
+            at_point: 3,
+            node: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&stopped).unwrap(),
+            serde_json::json!({ "reason": "timeout", "at_point": 3 })
+        );
+        let read: Stopped = serde_json::from_str(r#"{"reason":"timeout","at_point":3}"#).unwrap();
+        assert_eq!(read, stopped);
     }
 
     #[test]

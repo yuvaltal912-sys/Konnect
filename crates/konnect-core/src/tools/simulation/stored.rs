@@ -9,7 +9,7 @@ use super::{
 };
 use crate::mcp::protocol::CallToolResult;
 use crate::outcome::{self, OutcomeStatus};
-use crate::simulation::protocol::{RunStatus, LOG_FILE, STATUS_FILE};
+use crate::simulation::protocol::{RunStatus, LOG_FILE, RAW_FILE, STATUS_FILE};
 use crate::simulation::runs::{self, LocateError, RecordError, RunRecord, RunState};
 use crate::simulation::signals::{Names, Signal};
 use crate::simulation::snapshot;
@@ -18,6 +18,10 @@ use crate::tools::ToolContext;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
+
+/// The most a model file may weigh for its hash to be taken again. A run's own
+/// model files add up to no more than the deck inlines, which is this much.
+const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Most result rows `list_simulation_runs` returns, as its schema says.
 pub(super) const MAX_LISTED_RUNS: u64 = 50;
@@ -48,13 +52,15 @@ pub(super) struct CurrentSources(pub(super) Option<Sha256>);
 impl CurrentSources {
     pub(super) fn of(schematic: &Path) -> Self {
         let hash = (|| {
+            // Named for the file as the disk spells it, as `run_simulation` does.
+            let schematic = schematic.canonicalize().ok()?;
             let scratch = tempfile::Builder::new()
                 .prefix("konnect-sim-check-")
                 .tempdir()
                 .ok()?;
             let source = scratch.path().join("src");
             std::fs::create_dir(&source).ok()?;
-            snapshot::take_snapshot(schematic, &source).ok()?;
+            snapshot::take_snapshot(&schematic, &source).ok()?;
             hash_sources(&source).ok()
         })();
         Self(hash)
@@ -65,6 +71,15 @@ impl CurrentSources {
     /// be read, because nothing can then be said.
     fn changed_since(&self, record: &RunRecord) -> Option<bool> {
         let hasher = self.0.clone()?;
+        // The record names these files, and a store can be written by anyone who
+        // can write the state folder, so only a plain file of a sane size is read.
+        let readable = |path: &PathBuf| {
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_MODEL_BYTES)
+        };
+        if !record.inlined_files.iter().all(readable) {
+            return Some(true);
+        }
         Some(match inputs_hash(hasher, &record.inlined_files) {
             Ok(now) => now != record.inputs_hash,
             Err(_) => true,
@@ -113,37 +128,37 @@ pub(super) fn list(
     })?;
     // A folder with no usable record is a run that failed, or one made before
     // records were kept. It has no data to offer, so it is counted and not listed.
-    let mut recorded = Vec::new();
+    // One record is held at a time, whatever the store holds.
+    let sources = std::cell::OnceCell::new();
+    let mut total = 0usize;
     let mut without_record = 0usize;
+    let mut shown: Vec<Value> = Vec::new();
     for id in &ids {
         let record = runs::locate(&root, id)
             .ok()
             .and_then(|dir| runs::read_record(&dir).ok());
-        match record {
-            Some(record) => recorded.push((id, record)),
-            None => without_record += 1,
-        }
-    }
-    let sources = CurrentSources::of(schematic);
-    let shown: Vec<Value> = recorded
-        .iter()
-        .take(limit)
-        .map(|(id, record)| {
-            json!({
+        let Some(record) = record else {
+            without_record += 1;
+            continue;
+        };
+        total += 1;
+        if shown.len() < limit {
+            let sources = sources.get_or_init(|| CurrentSources::of(schematic));
+            shown.push(json!({
                 "run_id": id,
                 "created_at": runs::created_at(id),
                 "analysis_kind": record.analysis_kind(),
                 "run_status": record.run_status.as_str(),
                 "simulated_circuit": record.simulated_circuit,
                 "coverage_ratio": record.coverage_ratio,
-                "inputs_changed_since_run": sources.changed_since(record),
-            })
-        })
-        .collect();
+                "inputs_changed_since_run": sources.changed_since(&record),
+            }));
+        }
+    }
     Ok(CallToolResult::json(&json!({
-        "total": recorded.len(),
+        "total": total,
         "shown": shown.len(),
-        "truncated": shown.len() < recorded.len(),
+        "truncated": shown.len() < total,
         "without_record": without_record,
         "runs": shown,
     })))
@@ -207,7 +222,11 @@ pub(super) fn measure(
     ctx: &ToolContext,
     question: &Question<'_>,
 ) -> Result<CallToolResult, (CallToolResult, String)> {
-    let target = question.run_id.to_string();
+    // A client's text is not repeated unless it is an id.
+    let target = match runs::is_valid_id(question.run_id) {
+        true => question.run_id.to_string(),
+        false => "(not a run id)".to_string(),
+    };
     let refuse = |result: CallToolResult| (result, target.clone());
     question.check().map_err(refuse)?;
     let root = state_root(ctx).map_err(refuse)?;
@@ -221,7 +240,8 @@ pub(super) fn measure(
         refuse(match error {
             RecordError::Missing => run_not_found(
                 question.run_id,
-                "the run has no record, because it failed or was made before records were kept",
+                "the run has no record: it failed, was made before records were kept, or \
+                 its record could not be saved",
             ),
             RecordError::Unusable(detail) => unreadable(&dir, format!("its record: {detail}")),
         })
@@ -238,10 +258,17 @@ pub(super) fn measure(
         question.envelope_points,
     )
     .map_err(refuse)?;
-    let status: RunStatus = std::fs::read(dir.join(STATUS_FILE))
+    let status: RunStatus = runs::read_plain(&dir.join(STATUS_FILE), runs::MAX_STATUS_BYTES)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or_else(|| refuse(unreadable(&dir, "its status file is missing or damaged")))?;
+    // The raw parser reads whatever it is given, so a link or a pipe is stopped here.
+    if !std::fs::symlink_metadata(dir.join(RAW_FILE)).is_ok_and(|meta| meta.is_file()) {
+        return Err(refuse(unreadable(
+            &dir,
+            "its raw file is missing or not a plain file",
+        )));
+    }
     let plot = read_results(&dir, &status)
         .map_err(|error| refuse(unreadable(&dir, format!("its raw file: {error}"))))?;
 
@@ -274,7 +301,9 @@ pub(super) fn measure(
         "simulated_circuit": record.simulated_circuit,
         "coverage_ratio": record.coverage_ratio,
         "inputs_changed_since_run": CurrentSources::of(&record.schematic).changed_since(&record),
-        "warnings": [],
+        // What the run itself reported comes first: a peak that reads low there
+        // reads low here.
+        "warnings": record.warnings,
     });
     if let Some(stopped) = &record.stopped {
         body["stopped"] = json!(stopped);
@@ -297,14 +326,19 @@ pub(super) fn measure(
     if let (false, Some(warnings)) = (unsaved_power.is_empty(), body["warnings"].as_array_mut()) {
         warnings.push(json!({
             "code": "power_not_saved",
-            "detail": "p(REF) is in a run's data only if that run asked for it in signals or \
-                       measurements. Run again with it.",
+            "detail": "This run holds no data for p(REF). A run saves it only if it asked for \
+                       it in signals or measurements, and not for a code model or a coupling. \
+                       Run again with it, if the part can have one.",
             "items": unsaved_power,
         }));
     }
 
-    let requested = question.requested();
-    let status = match partial || signal_missing || failed > 0 {
+    // One unit for each measurement, and one for the summaries if any were asked
+    // for, as `run_simulation` lets its range unit stand for them.
+    let summaries = usize::from(!wanted.signals.is_empty());
+    let requested = question.requested() + summaries;
+    let failed = failed + summaries * usize::from(signal_missing);
+    let status = match partial || failed > 0 {
         true => OutcomeStatus::Partial,
         false => OutcomeStatus::Complete,
     };
@@ -383,6 +417,7 @@ mod tests {
                 inlined_files: Vec::new(),
                 nets: Vec::new(),
                 elements: Vec::new(),
+                warnings: Vec::new(),
             })
         };
         let unreadable = CurrentSources(None);
@@ -395,5 +430,48 @@ mod tests {
         let mut gone = record(&same);
         gone.inlined_files = vec![PathBuf::from("/nonexistent/model.lib")];
         assert_eq!(sources.changed_since(&gone), Some(true));
+    }
+
+    #[test]
+    fn a_model_file_that_is_not_a_plain_file_is_a_change_and_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |files: Vec<PathBuf>| {
+            RunRecord::new(runs::RecordFields {
+                schematic: PathBuf::new(),
+                analysis: json!({ "kind": "operating_point" }),
+                run_status: RunState::Complete,
+                stopped: None,
+                simulated_circuit: String::new(),
+                coverage_ratio: 1.0,
+                inputs_hash: inputs_hash(Sha256::default(), &[]).unwrap(),
+                inlined_files: files,
+                nets: Vec::new(),
+                elements: Vec::new(),
+                warnings: Vec::new(),
+            })
+        };
+        let sources = CurrentSources(Some(Sha256::default()));
+        assert_eq!(sources.changed_since(&record(Vec::new())), Some(false));
+        // A folder, a pipe (which would block a read for ever), and a file past the limit.
+        assert_eq!(
+            sources.changed_since(&record(vec![dir.path().to_path_buf()])),
+            Some(true)
+        );
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("pipe");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            assert_eq!(sources.changed_since(&record(vec![fifo])), Some(true));
+        }
+        let big = dir.path().join("big.lib");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_MODEL_BYTES + 1)
+            .unwrap();
+        assert_eq!(sources.changed_since(&record(vec![big])), Some(true));
     }
 }

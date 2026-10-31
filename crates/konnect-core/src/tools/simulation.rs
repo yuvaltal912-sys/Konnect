@@ -1693,6 +1693,7 @@ impl RunEnd<'_> {
             inlined_files: self.deck.inlined_files.clone(),
             nets: self.design.nets.clone(),
             elements: self.design.elements.clone(),
+            warnings: carried_warnings(body),
         });
         if let Err(error) = runs::write_record(&self.run.dir, &record) {
             if let Some(warnings) = body["warnings"].as_array_mut() {
@@ -1933,6 +1934,27 @@ impl RunEnd<'_> {
     }
 }
 
+/// What a run said about itself that a later measurement should be read with.
+/// Left out are what concerns this call alone: files it wrote, runs it pruned, and
+/// the nets that its own signals share, which a new measurement works out again.
+fn carried_warnings(body: &Value) -> Vec<Value> {
+    const THIS_CALL_ONLY: [&str; 4] = [
+        "old_runs_kept",
+        "csv_not_written",
+        "run_record_not_saved",
+        "nets_share_engine_node",
+    ];
+    let warnings = body["warnings"].as_array().into_iter().flatten();
+    warnings
+        .filter(|warning| {
+            warning["code"]
+                .as_str()
+                .is_some_and(|code| !THIS_CALL_ONLY.contains(&code))
+        })
+        .cloned()
+        .collect()
+}
+
 /// The warning for a CSV that was not written, or none if it was.
 fn table_problem(written: &std::io::Result<export::Written>) -> Option<Value> {
     match written {
@@ -2112,9 +2134,11 @@ async fn inspect_design(
         .tempdir()?;
     let source = scratch.path().join("src");
     std::fs::create_dir(&source)?;
+    // The copy is named for the file as the disk spells it, so the hash of the
+    // sheets does not depend on how the caller typed the path.
+    let schematic = &schematic.canonicalize()?;
     let snapshot = snapshot::take_snapshot(schematic, &source)?;
     let project_dir = schematic
-        .canonicalize()?
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
@@ -4781,6 +4805,15 @@ mod tests {
             assert_eq!(entry["inputs_changed_since_run"], false);
             let created = entry["created_at"].as_str().unwrap();
             assert!(created.ends_with('Z') && created.contains('T'), "{created}");
+            // The record keeps the names a later call needs to find a signal.
+            let record = runs::read_record(&first_run_dir(&scene)).unwrap();
+            assert!(record.nets.iter().any(|net| net.kicad_name == "/rect_out"));
+            assert!(record
+                .elements
+                .iter()
+                .any(|element| element.reference == "R2"));
+            assert_eq!(record.schematic, scene.root.canonicalize().unwrap());
+            assert_eq!(record.inputs_hash, run["source_evidence"]["inputs_hash"]);
         }
 
         #[tokio::test]
@@ -4804,8 +4837,11 @@ mod tests {
             assert!(!failed, "{body}");
             assert_eq!(run_dirs(&scene).len(), 1);
             assert_eq!(body["outcome"]["status"], "complete", "{body}");
-            assert_eq!(body["outcome"]["requested"], 2);
-            assert_eq!(body["outcome"]["completed"], 2);
+            assert_eq!(
+                body["outcome"]["requested"], 3,
+                "two measurements and the summaries"
+            );
+            assert_eq!(body["outcome"]["completed"], 3);
             assert_eq!(body["measurements"][0]["value"], 0.0);
             assert_eq!(body["measurements"][1]["value"], 2.0);
             assert_eq!(body["signal_summaries"][0]["final"], 2.0);
@@ -4887,6 +4923,10 @@ mod tests {
                 assert_eq!(body["error"]["kind"], "invalid_argument", "{id:?}: {body}");
                 assert_eq!(body["error"]["field"], "run_id", "{id:?}: {body}");
                 assert_eq!(body["outcome"]["status"], "failed", "{id:?}: {body}");
+                assert_eq!(
+                    body["outcome"]["target"], "(not a run id)",
+                    "{id:?}: {body}"
+                );
             }
             // Not a string at all.
             let (failed, body) = measured(
@@ -5082,9 +5122,9 @@ mod tests {
                 "{body}"
             );
             assert_eq!(body["outcome"]["status"], "partial", "{body}");
-            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["requested"], 3);
             assert_eq!(body["outcome"]["completed"], 1);
-            assert_eq!(body["outcome"]["failed"], 1);
+            assert_eq!(body["outcome"]["failed"], 2);
             let warnings = body["warnings"].to_string();
             assert!(warnings.contains("power_not_saved"), "{warnings}");
             assert!(warnings.contains("p(R2)"), "{warnings}");
@@ -5108,6 +5148,7 @@ mod tests {
                     inlined_files: Vec::new(),
                     nets: Vec::new(),
                     elements: Vec::new(),
+                    warnings: Vec::new(),
                 })
             };
             let mut made = Vec::new();
@@ -5447,8 +5488,9 @@ mod tests {
             assert!(!failed, "{body}");
             assert_eq!(body["signal_summaries"][0]["finding"], "signal_not_found");
             assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
             assert_eq!(body["outcome"]["completed"], 1);
-            assert_eq!(body["outcome"]["failed"], 0);
+            assert_eq!(body["outcome"]["failed"], 1);
             assert!(
                 !body["warnings"].to_string().contains("power_not_saved"),
                 "{body}"
@@ -5492,6 +5534,134 @@ mod tests {
             .await;
             assert!(failed);
             assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_model_file_the_run_inlined_is_an_input_that_can_change() {
+            let scene = scene(&transient_job());
+            let model = scene.project.path().join("part.lib");
+            std::fs::write(&model, ".model DX D(IS=1e-14)\n").unwrap();
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["testbench"]["spice_lines"] = json!([".include part.lib"]);
+            let (failed, run) = call(&scene, arguments).await;
+            assert!(!failed, "{run}");
+            let record = runs::read_record(&first_run_dir(&scene)).unwrap();
+            assert_eq!(record.inlined_files.len(), 1, "{record:?}");
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], false, "{body}");
+            std::fs::write(&model, ".model DX D(IS=2e-14)\n").unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["inputs_changed_since_run"], true, "{list}");
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+            std::fs::remove_file(&model).unwrap();
+            let (_, body) = measured(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+        }
+
+        #[tokio::test]
+        async fn what_the_run_warned_of_comes_with_a_later_measurement() {
+            // No point at time zero under uic: a peak at the start reads low.
+            let raw = "cat > results.raw <<'RAW'\nTitle: t\nPlotname: Transient Analysis\n\
+                Flags: real\nNo. Variables: 2\nNo. Points: 3\nVariables:\n\t0\ttime\ttime\n\
+                \t1\tv(a)\tvoltage\nValues:\n0\t5e-1\n\t1.0\n1\t1.0\n\t2.0\n2\t2.0\n\t3.0\n\nRAW";
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["analysis"]["use_initial_conditions"] = json!(true);
+            let (failed, run) = call(&scene, arguments).await;
+            assert!(!failed, "{run}");
+            assert!(
+                run["warnings"].to_string().contains("no_point_at_start"),
+                "{run}"
+            );
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("no_point_at_start"), "{warnings}");
+            // What belonged to the run's own call is not carried.
+            assert!(!warnings.contains("csv_not_written"), "{warnings}");
+            assert!(!warnings.contains("old_runs_kept"), "{warnings}");
+        }
+
+        #[tokio::test]
+        async fn the_sheets_are_named_as_the_disk_spells_them_whatever_the_caller_typed() {
+            let scene = scene(&transient_job());
+            let shouted = scene.root.with_file_name("TOP.KICAD_SCH");
+            // A disk that tells the two apart has no such file, and nothing to test.
+            if !shouted.exists() {
+                return;
+            }
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["schematic"] = json!(shouted);
+            let (failed, run) = call(&scene, arguments).await;
+            assert!(!failed, "{run}");
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let (_, body) = measured(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], false, "{body}");
+            for schematic in [&scene.root, &shouted] {
+                let result =
+                    handle_list_simulation_runs(&json!({ "schematic": schematic }), &scene.ctx)
+                        .await
+                        .unwrap();
+                let (_, list) = read_body(result);
+                assert_eq!(list["total"], 1, "{list}");
+                assert_eq!(list["runs"][0]["inputs_changed_since_run"], false, "{list}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_status_file_or_raw_file_that_is_a_link_is_never_read() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let dir = first_run_dir(&scene);
+            let outside = tempfile::tempdir().unwrap();
+            for name in [crate::simulation::protocol::STATUS_FILE, RAW_FILE] {
+                let file = dir.join(name);
+                let kept = outside.path().join(name);
+                std::fs::rename(&file, &kept).unwrap();
+                std::os::unix::fs::symlink(&kept, &file).unwrap();
+                let (failed, body) = measured(&scene, ask.clone()).await;
+                assert!(failed, "{name}: {body}");
+                assert_eq!(
+                    body["error"]["reason"], "results_unreadable",
+                    "{name}: {body}"
+                );
+                std::fs::remove_file(&file).unwrap();
+                std::fs::rename(&kept, &file).unwrap();
+            }
+            let (failed, body) = measured(&scene, ask).await;
+            assert!(!failed, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_status_file_past_its_limit_is_not_read() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            let status = dir.join(crate::simulation::protocol::STATUS_FILE);
+            let mut text = std::fs::read_to_string(&status).unwrap();
+            text.push_str(&" ".repeat(runs::MAX_STATUS_BYTES as usize));
+            std::fs::write(&status, text).unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "results_unreadable", "{body}");
         }
     }
 }

@@ -78,19 +78,40 @@ pub(crate) fn write(path: &Path, plot: &Plot, layout: &Layout) -> std::io::Resul
     if cells > MAX_CELLS {
         return Ok(Written::TooLarge { cells });
     }
+    publish(path, |out| match layout {
+        Layout::Table => write_table(out, plot),
+        Layout::Series => write_rows(out, plot, None),
+        Layout::Sweep { inner, outer } => write_rows(out, plot, Some((inner, outer))),
+    })
+    .map(Written::Bytes)
+}
+
+/// Fill a new file beside `path` and rename it into place, so `path` is either
+/// absent or whole, and a name that is taken is never overwritten.
+fn publish(
+    path: &Path,
+    fill: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<u64> {
+    if path.symlink_metadata().is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)?;
+        .open(&partial)?;
     let mut out = BufWriter::new(file);
-    match layout {
-        Layout::Table => write_table(&mut out, plot)?,
-        Layout::Series => write_rows(&mut out, plot, None)?,
-        Layout::Sweep { inner, outer } => write_rows(&mut out, plot, Some((inner, outer)))?,
-    }
-    out.flush()?;
+    let done = fill(&mut out)
+        .and_then(|()| out.flush())
+        .and_then(|()| std::fs::metadata(&partial))
+        .and_then(|meta| std::fs::rename(&partial, path).map(|()| meta.len()));
     drop(out);
-    Ok(Written::Bytes(std::fs::metadata(path)?.len()))
+    if done.is_err() {
+        std::fs::remove_file(&partial).ok();
+    }
+    done
 }
 
 fn write_table(out: &mut impl Write, plot: &Plot) -> std::io::Result<()> {
@@ -321,5 +342,21 @@ mod tests {
         std::fs::write(&path, "mine").unwrap();
         assert!(write(&path, &plot, &Layout::Series).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_neither_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let failed = publish(&path, |out| {
+            out.write_all(b"half a row")?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let written = publish(&path, |out| out.write_all(b"whole")).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "whole");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
