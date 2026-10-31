@@ -14,7 +14,15 @@
 use konnect_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
 
-const SKIP: &[&str] = &["target", "node_modules", ".git", ".claude", "dist", "build"];
+const SKIP: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    ".claude",
+    "dist",
+    "build",
+    "graphify-out",
+];
 const NL: char = '\n';
 
 fn main() {
