@@ -1092,8 +1092,7 @@ mod reliability_contract_dispatch_tests {
         assert_eq!(body["outcome"]["target"], schematic.display().to_string());
     }
 
-    #[tokio::test]
-    async fn a_simulation_refusal_keeps_its_outcome_through_the_served_dispatch() {
+    async fn served_simulation(analysis: Value) -> Value {
         let handler = McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
@@ -1117,7 +1116,7 @@ mod reliability_contract_dispatch_tests {
                     "name": "run_simulation",
                     "arguments": {
                         "schematic": schematic.display().to_string(),
-                        "analysis": {"kind": "operating_point"}
+                        "analysis": analysis
                     }
                 }
             }))
@@ -1126,9 +1125,24 @@ mod reliability_contract_dispatch_tests {
         let result = response.result.expect("successful JSON-RPC response");
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().expect("JSON text");
-        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        serde_json::from_str(text).expect("tool body is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_simulation_refusal_keeps_its_outcome_through_the_served_dispatch() {
+        let body = served_simulation(json!({"kind": "operating_point"})).await;
         assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
         assert_eq!(body["outcome"]["status"], "failed", "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_transient_with_no_stop_time_is_named_through_the_served_dispatch() {
+        let body = served_simulation(json!({"kind": "transient"})).await;
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(
+            body["error"]["field"], "analysis.stop_time_seconds",
+            "{body}"
+        );
     }
 }
 

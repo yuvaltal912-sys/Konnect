@@ -6,14 +6,16 @@ use crate::mcp::protocol::CallToolResult;
 use crate::outcome::{self, OutcomeStatus};
 use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
 use crate::simulation::kicad_netlist::{self, ElementEntry, KiCadNetlist, NetEntry, SpiceNetlist};
+use crate::simulation::measure::{self, Measurement};
 use crate::simulation::preflight::{self, Preflight};
 use crate::simulation::protocol::{
     RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION, RAW_FILE, REQUEST_FILE,
 };
 use crate::simulation::raw::Plot;
+use crate::simulation::signals::{self, Names, NotFound, Signal};
 use crate::simulation::worker_client::{
     classify, probe_engine, read_results, run_worker, EngineStatus, SimulationRuntime, Verdict,
-    WorkerEnd, PROBE_TIMEOUT,
+    WorkerEnd, MAX_RAW_LIMIT, PROBE_TIMEOUT,
 };
 use crate::simulation::{runs, snapshot};
 use crate::tool;
@@ -32,6 +34,18 @@ const MAX_SPICE_LINES: usize = 200;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 40;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_ROW_LIMIT: u64 = 40;
+const DEFAULT_RAW_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_RAW_BYTES: u64 = 1024 * 1024;
+const MAX_SIGNALS: usize = 16;
+const MAX_MEASUREMENTS: usize = 32;
+const MAX_ENVELOPE_POINTS: u64 = 64;
+/// The print step as a share of the stop time. Too small a share kills the engine
+/// outright, as `.tran 1n 10` does, because it sizes memory from this ratio.
+const PRINT_STEPS: f64 = 2000.0;
+/// The shortest and longest stop times run on the engine.
+const STOP_TIME_RANGE: std::ops::RangeInclusive<f64> = 1e-15..=1e12;
+/// How close to the stop time a run must end to count as covering it.
+const COVERAGE_TOLERANCE: f64 = 1e-6;
 const SOURCE: &str = "saved_schematic_snapshot";
 /// "Engine ran" and "requested range covered", so a run with no measurements can
 /// still read as partial.
@@ -45,6 +59,8 @@ const MODEL_LINES_NOTE: &str = "lines quoting a model file are in the log.";
 const MIN_PRIVATE_WORD: usize = 4;
 /// Progress such as gmin stepping, which says nothing about the circuit.
 const ENGINE_NOTE: &str = "Note:";
+/// The engine answering Konnect's own halt, which `stopped` already reports.
+const HALT_NOTICES: [&str; 2] = ["doAnalyses: pause requested", "run simulation interrupted"];
 /// The engine's status variable, which ends the part of a log worth reading.
 const STATUS_NAME: &str = "sim_status";
 const OPERATING_POINT_FILE: &str = "operating_point.json";
@@ -76,6 +92,73 @@ fn testbench_schema() -> Value {
     })
 }
 
+fn analysis_schema() -> Value {
+    json!({
+        "oneOf": [{
+            "type": "object",
+            "properties": {
+                "kind": { "const": "transient" },
+                "stop_time_seconds": { "type": "number", "exclusiveMinimum": 0 },
+                "max_step_seconds": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Largest internal step. Default is stop_time_seconds / 2000"
+                },
+                "start_save_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Save no data before this time"
+                },
+                "use_initial_conditions": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Start from .ic values and skip the operating point"
+                }
+            },
+            "required": ["kind", "stop_time_seconds"]
+        }, {
+            "type": "object",
+            "properties": { "kind": { "const": "operating_point" } },
+            "required": ["kind"]
+        }]
+    })
+}
+
+fn measurement_schema() -> Value {
+    let kinds: Vec<&str> = measure::KINDS.iter().map(|(name, _)| *name).collect();
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Label to repeat in the result" },
+            "kind": { "enum": kinds },
+            "signal": {
+                "type": "string",
+                "description": "v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF)"
+            },
+            "from_seconds": { "type": "number", "description": "Window start. Default is the first point" },
+            "to_seconds": { "type": "number", "description": "Window end. Default is the last point" },
+            "at_seconds": { "type": "number", "description": "For value_at" },
+            "level": { "type": "number", "description": "For crossing" },
+            "direction": {
+                "enum": ["rising", "falling", "either"],
+                "default": "either",
+                "description": "For crossing"
+            },
+            "final_value": {
+                "type": "number",
+                "description": "For rise_time, fall_time, overshoot_percent and settling_time. Default is the value at the end of the window"
+            },
+            "band_percent": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "default": 2,
+                "description": "For settling_time: a share of the final value or the step, whichever is larger"
+            }
+        },
+        "required": ["kind", "signal"]
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![tool!(
         "check_simulation_readiness",
@@ -99,19 +182,32 @@ pub fn tools() -> Vec<ToolDef> {
         |args, ctx| async move { handle_check_simulation_readiness(args, ctx).await }
     ), tool!(
         "run_simulation",
-        "Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn.",
+        "Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point or a transient. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time.",
         json!({
             "type": "object",
             "properties": {
                 "schematic": { "type": "string", "description": "Root .kicad_sch path" },
-                "analysis": {
-                    "oneOf": [{
-                        "type": "object",
-                        "properties": { "kind": { "const": "operating_point" } },
-                        "required": ["kind"]
-                    }]
-                },
+                "analysis": analysis_schema(),
                 "testbench": testbench_schema(),
+                "signals": {
+                    "type": "array",
+                    "maxItems": MAX_SIGNALS,
+                    "items": { "type": "string" },
+                    "description": "Signals to summarise: v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF). Transient only. Net names as KiCad shows them"
+                },
+                "measurements": {
+                    "type": "array",
+                    "maxItems": MAX_MEASUREMENTS,
+                    "items": measurement_schema(),
+                    "description": "Values to work out from the run, with time weighting. Transient only"
+                },
+                "envelope_points": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_ENVELOPE_POINTS,
+                    "default": 0,
+                    "description": "Buckets of min and max to add to each summary"
+                },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
@@ -125,6 +221,13 @@ pub fn tools() -> Vec<ToolDef> {
                     "maximum": MAX_TIMEOUT_SECONDS,
                     "default": DEFAULT_TIMEOUT_SECONDS,
                     "description": "Budget for the whole call, export included"
+                },
+                "max_raw_bytes": {
+                    "type": "integer",
+                    "minimum": MIN_RAW_BYTES,
+                    "maximum": MAX_RAW_LIMIT,
+                    "default": DEFAULT_RAW_BYTES,
+                    "description": "Stop the run softly when its data reaches this size, keeping what it has"
                 }
             },
             "required": ["schematic", "analysis"]
@@ -251,13 +354,33 @@ async fn handle_run_simulation(args: &Value, ctx: &ToolContext) -> anyhow::Resul
         .as_u64()
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
         .clamp(1, MAX_TIMEOUT_SECONDS);
+    let max_raw_bytes = args["max_raw_bytes"]
+        .as_u64()
+        .unwrap_or(DEFAULT_RAW_BYTES)
+        .clamp(MIN_RAW_BYTES, MAX_RAW_LIMIT);
+    let envelope_points = args["envelope_points"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(MAX_ENVELOPE_POINTS) as usize;
     let testbench = Testbench::from_args(&args["testbench"]);
+    let wanted = Wanted::from_args(
+        &args["analysis"],
+        &args["signals"],
+        &args["measurements"],
+        envelope_points,
+    );
+    let (analysis, wanted) = match wanted {
+        Ok(wanted) => wanted,
+        Err(refusal) => return Ok(failed_outcome(refusal, &target)),
+    };
     let request = RunArguments {
         schematic: &schematic,
-        kind: args["analysis"]["kind"].as_str().unwrap_or_default(),
+        analysis,
+        wanted,
         testbench: &testbench,
         limit,
         budget: Duration::from_secs(timeout),
+        max_raw_bytes,
     };
     Ok(match run_analysis(&request, ctx).await {
         Ok(result) => result,
@@ -267,10 +390,231 @@ async fn handle_run_simulation(args: &Value, ctx: &ToolContext) -> anyhow::Resul
 
 struct RunArguments<'a> {
     schematic: &'a Path,
-    kind: &'a str,
+    analysis: Analysis,
+    wanted: Wanted,
     testbench: &'a Testbench,
     limit: usize,
     budget: Duration,
+    max_raw_bytes: u64,
+}
+
+fn invalid(field: impl Into<String>, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.into(),
+            reason: reason.clone(),
+        },
+        reason,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Transient {
+    stop: f64,
+    max_step: Option<f64>,
+    start_save: Option<f64>,
+    use_initial_conditions: bool,
+}
+
+impl Transient {
+    /// Every value here reaches the deck, so each must be a number the engine can
+    /// take. Serde leaves only finite numbers, and a nonsense one fails loudly.
+    fn from_args(analysis: &Value) -> Result<Self, CallToolResult> {
+        let number = |field: &str| -> Result<Option<f64>, CallToolResult> {
+            let value = &analysis[field];
+            if value.is_null() {
+                return Ok(None);
+            }
+            match value.as_f64() {
+                Some(number) if number.is_finite() => Ok(Some(number)),
+                _ => Err(invalid(
+                    format!("analysis.{field}"),
+                    format!("{field} must be a finite number"),
+                )),
+            }
+        };
+        let Some(stop) = number("stop_time_seconds")? else {
+            return Err(invalid(
+                "analysis.stop_time_seconds",
+                "A transient needs stop_time_seconds",
+            ));
+        };
+        if !STOP_TIME_RANGE.contains(&stop) {
+            return Err(invalid(
+                "analysis.stop_time_seconds",
+                format!(
+                    "stop_time_seconds must be from {:e} to {:e}",
+                    STOP_TIME_RANGE.start(),
+                    STOP_TIME_RANGE.end()
+                ),
+            ));
+        }
+        let max_step = number("max_step_seconds")?;
+        if max_step.is_some_and(|step| step <= 0.0 || step < stop * f64::EPSILON) {
+            return Err(invalid(
+                "analysis.max_step_seconds",
+                "max_step_seconds must be above 0 and within reach of the stop time",
+            ));
+        }
+        let start_save = number("start_save_seconds")?;
+        if start_save.is_some_and(|start| start < 0.0 || start >= stop) {
+            return Err(invalid(
+                "analysis.start_save_seconds",
+                "start_save_seconds must fall before the stop time",
+            ));
+        }
+        Ok(Self {
+            stop,
+            max_step,
+            start_save,
+            use_initial_conditions: analysis["use_initial_conditions"]
+                .as_bool()
+                .unwrap_or(false),
+        })
+    }
+
+    /// Only numbers formatted here, never text from a caller.
+    fn line(&self) -> String {
+        let mut line = format!(".tran {:e} {:e}", self.stop / PRINT_STEPS, self.stop);
+        if self.start_save.is_some() || self.max_step.is_some() {
+            line.push_str(&format!(" {:e}", self.start_save.unwrap_or(0.0)));
+        }
+        if let Some(step) = self.max_step {
+            line.push_str(&format!(" {step:e}"));
+        }
+        if self.use_initial_conditions {
+            line.push_str(" uic");
+        }
+        line
+    }
+
+    fn reached(plot: &Plot) -> Option<f64> {
+        plot.real(plot.variable("time")?).last()
+    }
+
+    fn covered(&self, plot: &Plot) -> bool {
+        !plot.is_truncated()
+            && Self::reached(plot)
+                .is_some_and(|last| last >= self.stop * (1.0 - COVERAGE_TOLERANCE))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Analysis {
+    OperatingPoint,
+    Transient(Transient),
+}
+
+impl Analysis {
+    fn from_args(analysis: &Value) -> Result<Self, CallToolResult> {
+        match analysis["kind"].as_str().unwrap_or_default() {
+            "operating_point" => Ok(Self::OperatingPoint),
+            "transient" => Transient::from_args(analysis).map(Self::Transient),
+            other => Err(invalid(
+                "analysis.kind",
+                format!("Unknown analysis kind: {other}"),
+            )),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::OperatingPoint => "operating_point",
+            Self::Transient(_) => "transient",
+        }
+    }
+
+    fn line(&self) -> String {
+        match self {
+            Self::OperatingPoint => OPERATING_POINT.to_string(),
+            Self::Transient(transient) => transient.line(),
+        }
+    }
+
+    fn covered(&self, plot: &Plot) -> bool {
+        match self {
+            Self::OperatingPoint => operating_point_covered(plot),
+            Self::Transient(transient) => transient.covered(plot),
+        }
+    }
+}
+
+/// What the caller wants back from a run, checked before anything starts.
+#[derive(Debug, Clone, Default)]
+struct Wanted {
+    /// As written, to repeat in the result.
+    signals: Vec<(String, Signal)>,
+    measurements: Vec<Measurement>,
+    envelope_points: usize,
+}
+
+impl Wanted {
+    fn from_args(
+        analysis: &Value,
+        signals: &Value,
+        measurements: &Value,
+        envelope_points: usize,
+    ) -> Result<(Analysis, Self), CallToolResult> {
+        let analysis = Analysis::from_args(analysis)?;
+        let no_items = Vec::new();
+        let signals = signals.as_array().unwrap_or(&no_items);
+        let measurements = measurements.as_array().unwrap_or(&no_items);
+        if signals.len() > MAX_SIGNALS {
+            return Err(invalid("signals", format!("At most {MAX_SIGNALS} signals")));
+        }
+        if measurements.len() > MAX_MEASUREMENTS {
+            return Err(invalid(
+                "measurements",
+                format!("At most {MAX_MEASUREMENTS} measurements"),
+            ));
+        }
+        let Analysis::Transient(transient) = analysis else {
+            let fits = signals.is_empty() && measurements.is_empty() && envelope_points == 0;
+            return match fits {
+                true => Ok((analysis, Self::default())),
+                false => Err(invalid(
+                    "measurements",
+                    "signals, measurements and envelope_points need a transient",
+                )),
+            };
+        };
+        if envelope_points > 0 && signals.is_empty() {
+            return Err(invalid("envelope_points", "envelope_points needs signals"));
+        }
+        let signals = signals
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let text = entry.as_str().unwrap_or_default();
+                match Signal::parse(text) {
+                    Ok(signal) => Ok((text.to_string(), signal)),
+                    Err(reason) => Err(invalid(format!("signals[{index}]"), reason)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let measurements = measurements
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                measure::parse(entry, index, transient.stop)
+                    .map_err(|bad| invalid(bad.field, bad.reason))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            analysis,
+            Self {
+                signals,
+                measurements,
+                envelope_points,
+            },
+        ))
+    }
+
+    fn all_signals(&self) -> impl Iterator<Item = &Signal> {
+        let summaries = self.signals.iter().map(|(_, signal)| signal);
+        summaries.chain(self.measurements.iter().map(|wanted| &wanted.signal))
+    }
 }
 
 async fn usable_engine(
@@ -373,18 +717,46 @@ fn preflight_refusal(preflight: &Preflight, kind: &str) -> Option<CallToolResult
     ))
 }
 
+/// The names of the elements at the deck's top level, as the deck spells them.
+fn top_level_elements(deck: &FlatDeck) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    for (text, _, _) in deck.lines() {
+        let Some(first) = text.split_whitespace().next() else {
+            continue;
+        };
+        let lower = first.to_ascii_lowercase();
+        if lower.starts_with(".subckt") {
+            depth += 1;
+        } else if lower.starts_with(".ends") {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && !first.starts_with(['.', '+']) {
+            names.push(first);
+        }
+    }
+    names
+}
+
+/// Konnect's own lines after the vetted deck. They hold nothing from a caller:
+/// the analysis is numbers formatted here, and a probe names a deck element.
+fn own_lines(analysis: &Analysis, event_nodes: bool, probes: &[String]) -> Vec<String> {
+    let mut lines = vec![SAVE_ALL_VOLTAGES.to_string()];
+    if !event_nodes {
+        lines.push(SAVE_ALL_CURRENTS.to_string());
+    }
+    lines.extend_from_slice(probes);
+    lines.push(analysis.line());
+    lines
+}
+
 fn prepare_run(
     run: &runs::RunFolder,
     deck: &FlatDeck,
-    event_nodes: bool,
+    own_lines: &[String],
     request: &RunRequest,
 ) -> anyhow::Result<()> {
-    let own_lines: &[&str] = if event_nodes {
-        &[SAVE_ALL_VOLTAGES, OPERATING_POINT]
-    } else {
-        &[SAVE_ALL_VOLTAGES, SAVE_ALL_CURRENTS, OPERATING_POINT]
-    };
-    std::fs::write(run.dir.join(DECK_FILE), deck.render_with(own_lines))?;
+    let own_lines: Vec<&str> = own_lines.iter().map(String::as_str).collect();
+    std::fs::write(run.dir.join(DECK_FILE), deck.render_with(&own_lines))?;
     std::fs::write(run.dir.join(REQUEST_FILE), serde_json::to_vec(request)?)?;
     Ok(())
 }
@@ -394,16 +766,6 @@ async fn run_analysis(
     ctx: &ToolContext,
 ) -> Result<CallToolResult, CallToolResult> {
     let started = Instant::now();
-    if request.kind != "operating_point" {
-        let reason = format!("Unknown analysis kind: {}", request.kind);
-        return Err(CallToolResult::error_kind(
-            ToolErrorKind::InvalidArgument {
-                field: "analysis.kind".to_string(),
-                reason: reason.clone(),
-            },
-            reason,
-        ));
-    }
     check_root_schematic(request.schematic)?;
     let Some(runtime) = ctx.simulation.get() else {
         return Err(simulation_failure(
@@ -437,7 +799,7 @@ async fn run_analysis(
     if let Some(refusal) = design
         .preflight
         .as_ref()
-        .and_then(|preflight| preflight_refusal(preflight, request.kind))
+        .and_then(|preflight| preflight_refusal(preflight, request.analysis.kind()))
     {
         return Err(refusal);
     }
@@ -465,12 +827,22 @@ async fn run_analysis(
         compatibility: design.compatibility.ngbehavior.map(str::to_owned),
         input_path: Some(design.project_dir.clone()),
         budget_ms: budget.as_millis() as u64,
+        max_raw_bytes: request.max_raw_bytes,
     };
     let event_nodes = design
         .preflight
         .as_ref()
         .is_some_and(|preflight| preflight.event_nodes);
-    prepare_run(&run, deck, event_nodes, &worker_request)
+    let probes = signals::power_probes(
+        request.wanted.all_signals(),
+        Names {
+            nets: &design.nets,
+            elements: &design.elements,
+        },
+        &top_level_elements(deck),
+    );
+    let own_lines = own_lines(&request.analysis, event_nodes, &probes);
+    prepare_run(&run, deck, &own_lines, &worker_request)
         .map_err(|error| store_failure(format!("Failed to prepare the run: {error:#}")))?;
     let end = run_worker(runtime, &run.dir, &library, budget)
         .await
@@ -598,7 +970,8 @@ fn engine_complaints(log: &str, deck: &FlatDeck) -> (Vec<String>, usize) {
     let ours = log.lines().take_while(|line| !line.contains(STATUS_NAME));
     let lines = ours
         .filter_map(|line| line.strip_prefix("stderr "))
-        .filter(|line| !line.starts_with(SPINIT_NOTICE) && !line.starts_with(ENGINE_NOTE));
+        .filter(|line| !line.starts_with(SPINIT_NOTICE) && !line.starts_with(ENGINE_NOTE))
+        .filter(|line| !HALT_NOTICES.iter().any(|notice| line.starts_with(notice)));
     let (hidden, shown): (Vec<&str>, Vec<&str>) = lines.partition(|line| quotes_model(line));
     let shown = shown
         .iter()
@@ -625,6 +998,7 @@ fn failure_message(reason: &str) -> &'static str {
         "circuit_not_parsed" => "The simulator could not parse the circuit.",
         "no_convergence" => "The analysis did not converge and left no data.",
         "timed_out" => "The time budget ran out before the simulator left any data.",
+        "size_limit" => "The size limit stopped the run before it left data that could be read.",
         "results_unreadable" => "The simulator finished but its results could not be read.",
         _ => "The simulation failed.",
     }
@@ -672,7 +1046,9 @@ impl RunEnd<'_> {
         let results = self
             .status()
             .map(|status| read_results(&self.run.dir, status));
-        let verdict = classify(self.end, results.as_ref(), operating_point_covered);
+        let verdict = classify(self.end, results.as_ref(), |plot| {
+            self.request.analysis.covered(plot)
+        });
         let stopped = match verdict {
             Verdict::Failed(reason) => return Err(self.failure(reason)),
             Verdict::Partial(reason) => Some(reason),
@@ -681,27 +1057,144 @@ impl RunEnd<'_> {
         let Some(Ok(plot)) = &results else {
             return Err(self.failure("results_unreadable"));
         };
+        let (body, failed) = match &self.request.analysis {
+            Analysis::OperatingPoint => (
+                self.operating_point_body(plot, stopped),
+                usize::from(stopped.is_some()),
+            ),
+            Analysis::Transient(transient) => self.transient_body(transient, plot, stopped),
+        };
+        let requested = FIXED_OUTCOME_UNITS + self.request.wanted.measurements.len();
+        let status = match failed {
+            0 => OutcomeStatus::Complete,
+            _ => OutcomeStatus::Partial,
+        };
+        let outcome = outcome::summary(
+            status,
+            self.request.schematic.display().to_string(),
+            SOURCE,
+            requested,
+            requested - failed,
+            failed,
+            None,
+        );
+        Ok(outcome::attach(CallToolResult::json(&body), outcome))
+    }
+
+    fn names(&self) -> Names<'_> {
+        Names {
+            nets: &self.design.nets,
+            elements: &self.design.elements,
+        }
+    }
+
+    /// The body and how many outcome units failed. The "range covered" unit also
+    /// stands for the signals asked for: `signals` has no units of its own.
+    fn transient_body(
+        &self,
+        transient: &Transient,
+        plot: &Plot,
+        stopped: Option<&'static str>,
+    ) -> (Value, usize) {
+        let wanted = &self.request.wanted;
+        let partial = stopped.is_some();
+        let time: Vec<f64> = plot
+            .variable("time")
+            .map(|index| plot.real(index).collect())
+            .unwrap_or_default();
+        let mut shared_nets = BTreeSet::new();
+        let mut signal_missing = false;
+        let mut summaries = Vec::new();
+        for (text, signal) in &wanted.signals {
+            match signals::resolve(plot, signal, self.names()) {
+                Ok(found) => {
+                    shared_nets.extend(found.shared_nets);
+                    summaries.push(measure::summary(
+                        &time,
+                        &found.values,
+                        text,
+                        signal.unit(),
+                        wanted.envelope_points,
+                    ));
+                }
+                Err(not_found) => {
+                    signal_missing = true;
+                    let report = json!({ "signal": text, "finding": "signal_not_found" });
+                    summaries.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        let mut failed_measurements = 0;
+        let mut measurements = Vec::new();
+        for request in &wanted.measurements {
+            match signals::resolve(plot, &request.signal, self.names()) {
+                Ok(found) => {
+                    failed_measurements += usize::from(partial);
+                    shared_nets.extend(found.shared_nets);
+                    let reading = measure::measure(&time, &found.values, request);
+                    measurements.push(reading.report(request, partial));
+                }
+                Err(not_found) => {
+                    failed_measurements += 1;
+                    let report = measure::missing_report(request, partial);
+                    measurements.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        let reached = Transient::reached(plot).unwrap_or(0.0);
+        let analysis = json!({
+            "kind": self.request.analysis.kind(),
+            "stop_time_seconds": transient.stop,
+            "simulated_to_seconds": reached,
+            "coverage_ratio": (reached / transient.stop).min(1.0),
+            "points": plot.points,
+        });
+        let mut body = self.result_body(plot, analysis, stopped);
+        if !wanted.measurements.is_empty() {
+            body["measurements"] = json!(measurements);
+        }
+        if !wanted.signals.is_empty() {
+            body["signal_summaries"] = json!(summaries);
+        }
+        if !shared_nets.is_empty() {
+            if let Some(warnings) = body["warnings"].as_array_mut() {
+                warnings.push(json!({
+                    "code": "nets_share_engine_node",
+                    "detail": "ngspice reads these nets as one node, so their signals are the same.",
+                    "items": shared_nets,
+                }));
+            }
+        }
+        let failed = usize::from(partial || signal_missing) + failed_measurements;
+        (body, failed)
+    }
+
+    fn operating_point_body(&self, plot: &Plot, stopped: Option<&'static str>) -> Value {
         let rows = operating_point_rows(plot, &self.design.nets);
         std::fs::write(
             self.run.dir.join(OPERATING_POINT_FILE),
             serde_json::to_vec_pretty(&rows).unwrap_or_default(),
         )
         .ok();
-        let body = self.result_body(plot, &rows, stopped);
-        let (status, completed) = match stopped {
-            Some(_) => (OutcomeStatus::Partial, 1),
-            None => (OutcomeStatus::Complete, FIXED_OUTCOME_UNITS),
+        let coverage = if operating_point_covered(plot) {
+            1.0
+        } else {
+            0.0
         };
-        let outcome = outcome::summary(
-            status,
-            self.request.schematic.display().to_string(),
-            SOURCE,
-            FIXED_OUTCOME_UNITS,
-            completed,
-            FIXED_OUTCOME_UNITS - completed,
-            None,
-        );
-        Ok(outcome::attach(CallToolResult::json(&body), outcome))
+        let analysis = json!({
+            "kind": self.request.analysis.kind(),
+            "coverage_ratio": coverage,
+            "points": plot.points,
+        });
+        let mut body = self.result_body(plot, analysis, stopped);
+        body["operating_point"] = json!({
+            "total": rows.len(),
+            "shown": rows.len().min(self.request.limit),
+            "truncated": self.request.limit < rows.len(),
+            "rows": rows.iter().take(self.request.limit).collect::<Vec<_>>(),
+        });
+        body["artifacts"]["table_path"] = json!(self.path(OPERATING_POINT_FILE));
+        body
     }
 
     fn warnings(&self) -> Vec<Value> {
@@ -766,24 +1259,25 @@ impl RunEnd<'_> {
         (if modified { "modified" } else { "as_drawn" }, circuit)
     }
 
-    fn result_body(&self, plot: &Plot, rows: &[OperatingPointRow], stopped: Option<&str>) -> Value {
+    /// The node a stopped analysis names, if the engine's message is one that may
+    /// be repeated.
+    fn trouble_node(&self) -> Option<String> {
+        let (lines, _) = engine_complaints(&self.engine_log(), self.deck);
+        lines.iter().find_map(|line| {
+            let (_, rest) = line.split_once("node \"")?;
+            rest.split('"').next().map(str::to_owned)
+        })
+    }
+
+    fn result_body(&self, plot: &Plot, analysis: Value, stopped: Option<&str>) -> Value {
         let (simulated_circuit, circuit) = self.circuit();
         let status = self.status();
         let raw_bytes = std::fs::metadata(self.run.dir.join(RAW_FILE)).map_or(0, |file| file.len());
-        let coverage = if operating_point_covered(plot) {
-            1.0
-        } else {
-            0.0
-        };
         let mut body = json!({
             "run_id": self.run.id,
             "simulated_circuit": simulated_circuit,
             "circuit": circuit,
-            "analysis": {
-                "kind": self.request.kind,
-                "coverage_ratio": coverage,
-                "points": plot.points,
-            },
+            "analysis": analysis,
             "engine": {
                 "name": "ngspice",
                 "version": status.and_then(|status| status.engine_version.as_ref()),
@@ -796,27 +1290,31 @@ impl RunEnd<'_> {
                 "locks_present": self.design.locks_present,
                 "inputs_hash": self.design.inputs_hash,
             },
-            "operating_point": {
-                "total": rows.len(),
-                "shown": rows.len().min(self.request.limit),
-                "truncated": self.request.limit < rows.len(),
-                "rows": rows.iter().take(self.request.limit).collect::<Vec<_>>(),
-            },
             "warnings": self.warnings(),
             "artifacts": {
                 "dir": self.run.dir.display().to_string(),
                 "deck_path": self.path(DECK_FILE),
                 "raw_path": self.path(RAW_FILE),
                 "log_path": self.path(LOG_FILE),
-                "table_path": self.path(OPERATING_POINT_FILE),
                 "raw_bytes": raw_bytes,
             },
         });
         if let Some(reason) = stopped {
-            body["stopped"] = json!({ "reason": reason });
+            body["stopped"] = json!({ "reason": reason, "at_point": plot.points });
+            if let Some(node) = self.trouble_node() {
+                body["stopped"]["node"] = json!(node);
+            }
         }
         body
     }
+}
+
+/// Name the pins a part really has, so `i(M1)` shows the way to `i(M1:d)`.
+fn with_pins(mut report: Value, not_found: &NotFound) -> Value {
+    if !not_found.pins.is_empty() {
+        report["pins"] = json!(not_found.pins);
+    }
+    report
 }
 
 #[derive(Default)]
@@ -1746,13 +2244,172 @@ mod tests {
         assert_ne!(hash(), second);
     }
 
+    fn transient(analysis: Value) -> Result<Transient, CallToolResult> {
+        Transient::from_args(&analysis)
+    }
+
+    #[test]
+    fn a_transient_line_holds_only_numbers_written_here() {
+        let line = |analysis: Value| transient(analysis).unwrap().line();
+        assert_eq!(line(json!({ "stop_time_seconds": 10 })), ".tran 5e-3 1e1");
+        assert_eq!(
+            line(json!({ "stop_time_seconds": 1, "max_step_seconds": 1e-6 })),
+            ".tran 5e-4 1e0 0e0 1e-6"
+        );
+        assert_eq!(
+            line(json!({ "stop_time_seconds": 1, "start_save_seconds": 0.5 })),
+            ".tran 5e-4 1e0 5e-1"
+        );
+        assert_eq!(
+            line(json!({
+                "stop_time_seconds": 1,
+                "start_save_seconds": 0.5,
+                "max_step_seconds": 1e-3,
+                "use_initial_conditions": true
+            })),
+            ".tran 5e-4 1e0 5e-1 1e-3 uic"
+        );
+    }
+
+    #[test]
+    fn a_transient_the_engine_could_not_take_is_refused_with_its_field() {
+        let refused = |analysis: Value, field: &str| {
+            let result = transient(analysis).unwrap_err();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["field"], field, "{body}");
+        };
+        let stop = "analysis.stop_time_seconds";
+        refused(json!({}), stop);
+        refused(json!({ "stop_time_seconds": 0 }), stop);
+        refused(json!({ "stop_time_seconds": -1 }), stop);
+        refused(json!({ "stop_time_seconds": "soon" }), stop);
+        refused(json!({ "stop_time_seconds": 1e-16 }), stop);
+        refused(json!({ "stop_time_seconds": 1e13 }), stop);
+        let step = "analysis.max_step_seconds";
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": 0 }),
+            step,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": -1 }),
+            step,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": 1e-20 }),
+            step,
+        );
+        let start = "analysis.start_save_seconds";
+        refused(
+            json!({ "stop_time_seconds": 1, "start_save_seconds": 1 }),
+            start,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "start_save_seconds": -1 }),
+            start,
+        );
+    }
+
+    fn time_plot(last: f64) -> Plot {
+        let text = format!(
+            "Title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\n\
+             No. Points: 2\nVariables:\n\t0\ttime\ttime\n\t1\tv(a)\tvoltage\nValues:\n\
+             0\t0.0\n\t1.0\n1\t{last:e}\n\t2.0\n"
+        );
+        crate::simulation::raw::parse(text.as_bytes())
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn a_transient_is_covered_only_by_reaching_its_stop_time() {
+        let run = transient(json!({ "stop_time_seconds": 1.0 })).unwrap();
+        assert!(run.covered(&time_plot(1.0)));
+        assert!(run.covered(&time_plot(1.0 - 1e-7)));
+        assert!(!run.covered(&time_plot(1.0 - 1e-5)));
+        assert!(!run.covered(&time_plot(0.5)));
+        assert!(!run.covered(&op_plot()));
+    }
+
+    #[test]
+    fn a_file_cut_short_never_covers_a_transient() {
+        let run = transient(json!({ "stop_time_seconds": 1.0 })).unwrap();
+        let mut plot = time_plot(1.0);
+        plot.declared_points += 1;
+        assert!(!run.covered(&plot));
+    }
+
+    #[test]
+    fn only_a_transient_takes_signals_and_measurements() {
+        let op = json!({ "kind": "operating_point" });
+        let run = json!({ "kind": "transient", "stop_time_seconds": 1 });
+        let none = Value::Null;
+        let signals = json!(["v(a)"]);
+        let measurements = json!([{ "kind": "max", "signal": "v(a)" }]);
+        assert!(Wanted::from_args(&op, &none, &none, 0).is_ok());
+        assert!(Wanted::from_args(&op, &signals, &none, 0).is_err());
+        assert!(Wanted::from_args(&op, &none, &measurements, 0).is_err());
+        assert!(Wanted::from_args(&op, &none, &none, 4).is_err());
+        assert!(Wanted::from_args(&run, &signals, &measurements, 4).is_ok());
+    }
+
+    #[test]
+    fn an_envelope_with_no_signals_or_a_bad_signal_is_refused() {
+        let run = json!({ "kind": "transient", "stop_time_seconds": 1 });
+        let none = Value::Null;
+        assert!(Wanted::from_args(&run, &none, &none, 4).is_err());
+        assert!(Wanted::from_args(&run, &json!(["x(a)"]), &none, 0).is_err());
+        let many = json!(vec!["v(a)"; MAX_SIGNALS + 1]);
+        assert!(Wanted::from_args(&run, &many, &none, 0).is_err());
+        let wanted = json!({ "kind": "max", "signal": "v(a)" });
+        let many = json!(vec![wanted; MAX_MEASUREMENTS + 1]);
+        assert!(Wanted::from_args(&run, &none, &many, 0).is_err());
+    }
+
+    #[test]
+    fn subcircuit_bodies_are_not_top_level_elements() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let netlist = ".title t\nR1 a 0 1k\n.subckt s a\nR2 a 0 1k\n.SUBCKT t a\nR3 a 0 1k\n.ends\nR4 a 0 1k\n.ENDS s\nM1 a a 0 0 n\n.model n NMOS\n+ VTO=1\n.end\n";
+        let deck = flat(netlist, root.path(), &roots);
+        assert_eq!(top_level_elements(&deck), ["R1", "M1"]);
+    }
+
+    #[test]
+    fn a_probe_goes_ahead_of_the_analysis_and_after_the_saves() {
+        let run = Analysis::Transient(transient(json!({ "stop_time_seconds": 1 })).unwrap());
+        let probes = [".probe p(R1)".to_string()];
+        assert_eq!(
+            own_lines(&run, false, &probes),
+            [".save all", ".probe alli", ".probe p(R1)", ".tran 5e-4 1e0"]
+        );
+        assert_eq!(
+            own_lines(&Analysis::OperatingPoint, true, &[]),
+            [".save all", ".op"]
+        );
+    }
+
+    #[test]
+    fn the_engine_answering_a_halt_is_not_a_complaint() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let deck = flat(".title t\nR1 a 0 1k\n.end\n", root.path(), &roots);
+        let log = "stderr doAnalyses: pause requested\nstderr run simulation interrupted\n\
+                   stderr something else\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert_eq!(shown, ["something else"]);
+        assert_eq!(hidden, 0);
+    }
+
     mod with_fake_cli {
         use super::*;
         use crate::tools::cli::test_support::write_script;
 
         const OP_FIXTURE: &str = "tests/fixtures/simulation/raw/op.ascii.raw";
         /// Good status fields, for a fake worker to write.
-        const GOOD: &str = r#""protocol":2,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#;
+        const GOOD: &str = r#""protocol":3,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#;
 
         /// Answers a probe as a working engine, then does `job` in the run folder.
         fn fake_worker(dir: &Path, job: &str) -> PathBuf {
@@ -1776,6 +2433,195 @@ mod tests {
         fn copy_raw() -> String {
             let raw = Path::new(env!("CARGO_MANIFEST_DIR")).join(OP_FIXTURE);
             format!("cp '{}' results.raw", raw.display())
+        }
+
+        /// A transient of three points: `v(a)` climbs 0, 1, 2 over 2 s.
+        fn copy_transient() -> String {
+            "cat > results.raw <<'RAW'\nTitle: t\nPlotname: Transient Analysis\nFlags: real\n\
+             No. Variables: 3\nNo. Points: 3\nVariables:\n\t0\ttime\ttime\n\
+             \t1\tv(a)\tvoltage\n\t2\ti(m1:d)\tcurrent\nValues:\n\
+             0\t0.0\n\t0.0\n\t5.0\n1\t1.0\n\t1.0\n\t5.0\n2\t2.0\n\t2.0\n\t5.0\n\nRAW"
+                .to_string()
+        }
+
+        fn transient_args(root: &Path, stop: f64) -> Value {
+            let mut arguments = args(root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": stop });
+            arguments["signals"] = json!(["v(a)"]);
+            arguments["measurements"] = json!([
+                { "name": "top", "kind": "max", "signal": "v(a)" },
+                { "kind": "crossing", "signal": "v(a)", "level": 9.0 }
+            ]);
+            arguments
+        }
+
+        #[tokio::test]
+        async fn a_finished_transient_counts_every_unit_and_a_null_is_not_a_failure() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (failed, body) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["outcome"]["requested"], 4);
+            assert_eq!(body["outcome"]["completed"], 4);
+            assert_eq!(body["analysis"]["coverage_ratio"], 1.0);
+            assert_eq!(body["analysis"]["simulated_to_seconds"], 2.0);
+            assert_eq!(body["analysis"]["stop_time_seconds"], 2.0);
+            assert_eq!(body["analysis"]["points"], 3);
+            assert_eq!(body["measurements"][0]["value"], 2.0);
+            assert_eq!(body["measurements"][0]["window_truncated"], false);
+            assert!(body["measurements"][1]["value"].is_null());
+            assert_eq!(body["measurements"][1]["finding"], "level_not_reached");
+            assert_eq!(body["signal_summaries"][0]["final"], 2.0);
+            assert!(body.get("operating_point").is_none());
+            assert!(body.get("stopped").is_none());
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains("\n.tran 1e-3 2e0\n.end"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn no_summaries_or_measurements_come_back_unless_asked_for() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": 2.0 });
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["outcome"]["requested"], 2, "{body}");
+            assert!(body.get("signal_summaries").is_none(), "{body}");
+            assert!(body.get("measurements").is_none(), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_stops_early_is_partial_and_keeps_its_data_flagged() {
+            for reason in ["timeout", "size_limit"] {
+                let halted = format!("\"{reason}\"");
+                let job = format!("{}\n{}", copy_transient(), status_json("0", &halted, true));
+                let scene = scene(&job);
+                let (failed, body) = call(&scene, transient_args(&scene.root, 4.0)).await;
+                assert!(!failed, "{body}");
+                assert_eq!(body["outcome"]["status"], "partial", "{body}");
+                assert_eq!(body["outcome"]["requested"], 4);
+                assert_eq!(body["outcome"]["completed"], 1);
+                assert_eq!(body["outcome"]["failed"], 3);
+                assert_eq!(body["stopped"]["reason"], reason);
+                assert_eq!(body["stopped"]["at_point"], 3);
+                assert_eq!(body["analysis"]["coverage_ratio"], 0.5);
+                assert_eq!(body["measurements"][0]["value"], 2.0, "{body}");
+                assert_eq!(body["measurements"][0]["window_truncated"], true);
+                assert_eq!(body["measurements"][1]["window_truncated"], true);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_run_short_of_its_stop_time_is_never_complete() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, body) = call(&scene, transient_args(&scene.root, 4.0)).await;
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["stopped"]["reason"], "incomplete_coverage");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_lost_convergence_names_the_node() {
+            let job = format!(
+                "echo 'stderr doAnalyses: TRAN:  Timestep too small: trouble with node \"x1\"' \
+                 > engine.log\n{}\n{}",
+                copy_transient(),
+                status_json("1", "null", true)
+            );
+            let scene = scene(&job);
+            let (_, body) = call(&scene, transient_args(&scene.root, 4.0)).await;
+            assert_eq!(body["stopped"]["reason"], "no_convergence", "{body}");
+            assert_eq!(body["stopped"]["node"], "x1", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_signal_the_run_does_not_hold_is_partial_and_names_it() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["signals"] = json!(["v(zzz)"]);
+            arguments["measurements"] = json!([
+                { "kind": "max", "signal": "v(a)" },
+                { "kind": "max", "signal": "i(M1)" }
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 4);
+            assert_eq!(body["outcome"]["failed"], 2);
+            assert_eq!(body["measurements"][0]["value"], 2.0);
+            assert_eq!(body["measurements"][1]["finding"], "signal_not_found");
+            assert_eq!(body["measurements"][1]["pins"], json!(["d"]));
+            assert_eq!(body["signal_summaries"][0]["finding"], "signal_not_found");
+            assert!(body.get("stopped").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_summary_signal_alone_can_make_a_run_partial() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": 2.0 });
+            arguments["signals"] = json!(["v(zzz)"]);
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["completed"], 1);
+        }
+
+        #[tokio::test]
+        async fn a_measurement_that_does_not_fit_is_refused_before_the_engine_starts() {
+            let scene = scene("touch worker-ran");
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["measurements"] = json!([{ "kind": "max", "signal": "nonsense" }]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "measurements[0].signal");
+            assert_eq!(body["outcome"]["status"], "failed");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_size_limit_that_left_no_data_says_so() {
+            fails_with(
+                &status_json("0", "\"size_limit\"", false),
+                "size_limit",
+                "run",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_power_probe_names_the_deck_element_and_never_the_callers_text() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["testbench"]["spice_lines"] = json!(["VX a 0 1", "RX a 0 1k"]);
+            arguments["signals"] = json!(["p(rx)", "p(NOPE)", "p(rx)"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert_eq!(deck.matches(".probe p(").count(), 1, "{deck}");
+            assert!(deck.contains("\n.probe p(RX)\n"), "{deck}");
+            assert!(!deck.to_lowercase().contains("nope"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn the_worker_is_told_the_size_limit() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["max_raw_bytes"] = json!(5_000_000);
+            call(&scene, arguments).await;
+            let dirs = run_dirs(&scene);
+            let request: RunRequest =
+                serde_json::from_slice(&std::fs::read(dirs[0].join(REQUEST_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(request.max_raw_bytes, 5_000_000);
         }
 
         struct Scene {
@@ -1879,6 +2725,10 @@ mod tests {
             let tail: Vec<&str> = deck.lines().rev().take(4).collect();
             assert_eq!(tail, [".end", ".op", ".probe alli", ".save all"], "{deck}");
             assert!(dirs[0].join(OPERATING_POINT_FILE).is_file());
+            assert!(body["artifacts"]["table_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(OPERATING_POINT_FILE));
             assert!(!scene.project.path().join("results.raw").exists());
         }
 
@@ -1950,7 +2800,7 @@ mod tests {
             let lost = status_json("0", "null", true);
             fails_with(&lost, "results_unreadable", "results").await;
             fails_with("exit 124", "timed_out", "run").await;
-            let exited = "cat > status.json <<'JSON'\n{\"protocol\":2,\"load_error\":null,\
+            let exited = "cat > status.json <<'JSON'\n{\"protocol\":3,\"load_error\":null,\
                  \"engine_version\":null,\"code_models_loaded\":[],\"code_models_failed\":[],\
                  \"exit_status\":1,\"sim_status\":null,\
                  \"halted_reason\":null,\"results_written\":false}\nJSON"

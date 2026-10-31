@@ -19,8 +19,11 @@ const KILL_GRACE: Duration = Duration::from_secs(15);
 /// The exit code of a worker that left at its own deadline.
 const OUT_OF_TIME_EXIT: i32 = 124;
 const WORKER_OUTPUT_FILE: &str = "worker.out";
-/// Far above any raw file the first analyses write.
-const MAX_RAW_BYTES: u64 = 1024 * 1024 * 1024;
+/// The most a caller may ask a run to keep.
+pub(crate) const MAX_RAW_LIMIT: u64 = 1024 * 1024 * 1024;
+/// The worker halts just after the limit, not on it, so the read limit stands
+/// clear of the largest file a halted run can leave.
+const MAX_RAW_READ: u64 = MAX_RAW_LIMIT + MAX_RAW_LIMIT / 4;
 
 /// Simulation settings from the server configuration.
 #[derive(Debug, Clone, Default)]
@@ -325,7 +328,7 @@ pub(crate) fn read_results(run_dir: &Path, status: &RunStatus) -> Result<Plot, r
     if !status.results_written {
         return Err(raw::RawError::NoResults);
     }
-    let mut plots = raw::read(&run_dir.join(RAW_FILE), MAX_RAW_BYTES)?;
+    let mut plots = raw::read(&run_dir.join(RAW_FILE), MAX_RAW_READ)?;
     plots.pop().ok_or(raw::RawError::NoResults)
 }
 
@@ -353,10 +356,11 @@ pub(crate) fn classify(
     let plot = results.and_then(|results| results.as_ref().ok());
     let has_points = plot.is_some_and(|plot| plot.points > 0);
     if let Some(reason) = status.halted_reason {
-        let HaltReason::Timeout = reason;
-        return match has_points {
-            true => Verdict::Partial("timeout"),
-            false => Verdict::Failed("timed_out"),
+        return match (reason, has_points) {
+            (HaltReason::Timeout, true) => Verdict::Partial("timeout"),
+            (HaltReason::Timeout, false) => Verdict::Failed("timed_out"),
+            (HaltReason::SizeLimit, true) => Verdict::Partial("size_limit"),
+            (HaltReason::SizeLimit, false) => Verdict::Failed("size_limit"),
         };
     }
     match (sim_status, has_points) {
@@ -563,6 +567,10 @@ mod tests {
             halted_reason: Some(HaltReason::Timeout),
             ..status(Some(0))
         };
+        let oversize = RunStatus {
+            halted_reason: Some(HaltReason::SizeLimit),
+            ..status(Some(0))
+        };
 
         assert_eq!(verdict(status(Some(0)), &good), Verdict::Complete);
         assert_eq!(
@@ -584,6 +592,15 @@ mod tests {
         assert_eq!(verdict(halted.clone(), &good), Verdict::Partial("timeout"));
         assert_eq!(verdict(halted.clone(), &none), Verdict::Failed("timed_out"));
         assert_eq!(verdict(halted, &empty), Verdict::Failed("timed_out"));
+        assert_eq!(
+            verdict(oversize.clone(), &good),
+            Verdict::Partial("size_limit")
+        );
+        assert_eq!(
+            verdict(oversize.clone(), &none),
+            Verdict::Failed("size_limit")
+        );
+        assert_eq!(verdict(oversize, &empty), Verdict::Failed("size_limit"));
         assert_eq!(
             verdict(status(Some(0)), &none),
             Verdict::Failed("results_unreadable")

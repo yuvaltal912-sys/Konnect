@@ -489,7 +489,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `check_simulation_readiness` | Report whether a schematic can be simulated, and why not, without running a simulation. Works from the saved files on a private copy, so the project is not touched and unsaved editor changes are not seen. Also vets the deck: every include is inlined, and anything that could run commands is removed or refused. Then checks models, values, ground, net names and connectivity, including any testbench changes given. |
-| `run_simulation` | Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. |
+| `run_simulation` | Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point or a transient. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time. |
 
 ## Appendix: Structural observations
 

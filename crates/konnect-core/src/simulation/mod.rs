@@ -8,11 +8,13 @@
 pub(crate) mod element;
 pub(crate) mod flatten;
 pub(crate) mod kicad_netlist;
+pub(crate) mod measure;
 pub(crate) mod net_names;
 pub(crate) mod preflight;
 pub mod protocol;
 pub mod raw;
 pub(crate) mod runs;
+pub(crate) mod signals;
 pub(crate) mod snapshot;
 pub(crate) mod worker_client;
 

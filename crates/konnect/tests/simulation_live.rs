@@ -534,6 +534,7 @@ impl WorkerRun {
             compatibility: Some("ltpsa".to_string()),
             input_path: input_path.map(Path::to_path_buf),
             budget_ms,
+            max_raw_bytes: 1 << 40,
         };
         std::fs::write(dir.path().join(".spiceinit"), "").unwrap();
         std::fs::write(dir.path().join(DECK_FILE), deck).unwrap();
@@ -543,6 +544,14 @@ impl WorkerRun {
         )
         .unwrap();
         Self { dir }
+    }
+
+    fn limit_size(&mut self, max_raw_bytes: u64) {
+        let path = self.dir.path().join(REQUEST_FILE);
+        let mut request: RunRequest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        request.max_raw_bytes = max_raw_bytes;
+        std::fs::write(path, serde_json::to_vec(&request).unwrap()).unwrap();
     }
 
     fn command(&self) -> Command {
@@ -579,6 +588,307 @@ impl WorkerRun {
         let path = self.dir.path().join(RAW_FILE);
         raw::read(&path, u64::MAX).unwrap().remove(0)
     }
+}
+
+/// The worked deck, as a testbench on a schematic emptied of its own parts.
+fn soft_start_lines() -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/simulation/soft_start.sp");
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines().map(str::to_owned).collect()
+}
+
+fn run_on_testbench(lines: &[String], arguments: Value) -> Value {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let mut request = arguments;
+    request["schematic"] = json!(project.path().join("rectifier.kicad_sch"));
+    request["testbench"] = json!({ "exclude_references": ["*"], "spice_lines": lines });
+    call_over_stdio("run_simulation", request)
+}
+
+fn measured(result: &Value, name: &str) -> f64 {
+    let items = result["measurements"].as_array().unwrap();
+    let item = items.iter().find(|item| item["name"] == name);
+    let item = item.unwrap_or_else(|| panic!("no {name} in {result}"));
+    item["value"].as_f64().unwrap_or_else(|| panic!("{item}"))
+}
+
+fn near(actual: f64, expected: f64, tolerance: f64) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{actual} is not {expected} within {tolerance}"
+    );
+}
+
+const SOFT_START_MEASUREMENTS: fn() -> Value = || {
+    json!([
+        { "name": "inrush_peak", "kind": "peak_abs", "signal": "i(VBAT)" },
+        { "name": "inrush_i2t", "kind": "i2t", "signal": "i(VBAT)", "to_seconds": 60e-3 },
+        { "name": "rail_before", "kind": "value_at", "signal": "v(vout)", "at_seconds": 59.9e-3 },
+        { "name": "rail_low", "kind": "min", "signal": "v(vout)", "from_seconds": 60e-3 },
+        { "name": "device_peak", "kind": "max", "signal": "i(M1:d)" },
+        { "name": "dissipation", "kind": "max", "signal": "p(M1)" },
+    ])
+};
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_soft_start_and_load_step_match_a_reference_worked_out_without_spice() {
+    let result = run_on_testbench(
+        &soft_start_lines(),
+        json!({
+            "analysis": {
+                "kind": "transient",
+                "stop_time_seconds": 0.14,
+                "max_step_seconds": 5e-7,
+            },
+            "signals": ["v(vout)", "v(drain,vout)"],
+            "envelope_points": 8,
+            "measurements": SOFT_START_MEASUREMENTS(),
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["outcome"]["requested"], 8);
+    assert_eq!(result["outcome"]["completed"], 8);
+    assert_eq!(result["simulated_circuit"], "modified");
+    assert_eq!(result["analysis"]["coverage_ratio"], 1.0);
+    // From `soft_start_reference.py`. A delivering source reads negative.
+    near(measured(&result, "inrush_peak"), -16.9040, 2e-3);
+    near(measured(&result, "device_peak"), 16.9040, 2e-3);
+    near(measured(&result, "inrush_i2t"), 0.24465, 2e-4);
+    let (before, low) = (
+        measured(&result, "rail_before"),
+        measured(&result, "rail_low"),
+    );
+    near(before, 11.98087, 1e-4);
+    near(low, 11.88536, 1e-4);
+    near((before - low) * 1e3, 95.507, 0.1);
+    let peak = &result["measurements"][0];
+    near(peak["at_seconds"].as_f64().unwrap(), 10.8566e-3, 2e-6);
+    // Near 16 A across most of the 12 V, as the ramp starts.
+    let dissipation = measured(&result, "dissipation");
+    assert!((150.0..200.0).contains(&dissipation), "{dissipation}");
+
+    let summary = &result["signal_summaries"][0];
+    assert_eq!(summary["unit"], "V");
+    near(summary["final"].as_f64().unwrap(), 11.98087, 1e-4);
+    assert_eq!(summary["envelope"]["max"].as_array().unwrap().len(), 8);
+    let headroom = &result["signal_summaries"][1];
+    near(headroom["max"].as_f64().unwrap(), 12.0, 1e-3);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_default_step_lands_within_one_percent_of_the_reference() {
+    let result = run_on_testbench(
+        &soft_start_lines(),
+        json!({
+            "analysis": { "kind": "transient", "stop_time_seconds": 0.14 },
+            "measurements": SOFT_START_MEASUREMENTS(),
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    near(measured(&result, "inrush_peak"), -16.9040, 0.17);
+    near(measured(&result, "inrush_i2t"), 0.24465, 0.0025);
+    let droop = measured(&result, "rail_before") - measured(&result, "rail_low");
+    near(droop * 1e3, 95.507, 1.0);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn rise_overshoot_and_settling_match_a_simulated_circuit_of_known_shape() {
+    // An RC at 1 ms, and a series RLC at 1 krad/s with damping 0.2.
+    let lines: Vec<String> = [
+        "V1 in 0 PULSE(0 1 0 1n 1n 1 2)",
+        "R1 in rc 1k",
+        "C1 rc 0 1u",
+        "R2 in a 400",
+        "L1 a b 1",
+        "C2 b 0 1u",
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": {
+                "kind": "transient",
+                "stop_time_seconds": 0.05,
+                "max_step_seconds": 1e-6,
+            },
+            "measurements": [
+                { "name": "rise", "kind": "rise_time", "signal": "v(rc)", "final_value": 1 },
+                { "name": "half", "kind": "crossing", "signal": "v(rc)", "level": 0.5 },
+                { "name": "over", "kind": "overshoot_percent", "signal": "v(b)", "final_value": 1 },
+                { "name": "settle", "kind": "settling_time", "signal": "v(b)", "final_value": 1 },
+                { "name": "charge", "kind": "i2t", "signal": "i(R1)" },
+                { "name": "rms", "kind": "rms", "signal": "i(R1)" },
+            ],
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    let tau = 1e-3_f64;
+    near(measured(&result, "rise"), tau * 9f64.ln(), 2e-6);
+    near(measured(&result, "half"), tau * 2f64.ln(), 2e-6);
+    // Peak at 100 e^(-pi 0.2 / sqrt(1 - 0.04)), and the closed form's last exit
+    // from a 2 percent band, bisected apart from this code.
+    let expected = 100.0 * (-std::f64::consts::PI * 0.2 / 0.96f64.sqrt()).exp();
+    near(measured(&result, "over"), expected, 0.01);
+    near(measured(&result, "settle"), 0.0196019, 5e-6);
+    // i = 1 mA e^(-t/tau), so the integral of its square is 1e-6 tau / 2.
+    near(measured(&result, "charge"), 5e-10, 2e-11);
+    near(measured(&result, "rms"), (5e-10f64 / 0.05).sqrt(), 1e-6);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_schematic_as_drawn_answers_by_kicads_net_names_and_references() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let before = file_names(project.path());
+
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": schematic }),
+    );
+    let names: Vec<String> = report["nets"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|net| net["kicad_name"].as_str().unwrap().to_string())
+        .filter(|name| name != "GND")
+        .collect();
+    let signals: Vec<String> = names.iter().map(|name| format!("v({name})")).collect();
+    let mut wanted = signals.clone();
+    wanted.extend(["i(R1)", "p(R1)", "i(C1)"].map(str::to_owned));
+    let result = call_over_stdio(
+        "run_simulation",
+        json!({
+            "schematic": schematic,
+            "analysis": { "kind": "transient", "stop_time_seconds": 0.05 },
+            "signals": wanted,
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["simulated_circuit"], "as_drawn");
+    let summaries = result["signal_summaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), wanted.len());
+    for summary in summaries {
+        assert!(summary.get("finding").is_none(), "{summary}");
+        assert!(summary["max"].as_f64().unwrap().abs() > 0.0, "{summary}");
+    }
+    assert_eq!(summaries[names.len()]["unit"], "A");
+    assert_eq!(summaries[names.len() + 1]["unit"], "W");
+    assert_eq!(file_names(project.path()), before);
+}
+
+/// Far more points than a budget of seconds or a small size limit allows.
+const RUNAWAY_STEP: f64 = 2e-9;
+
+fn runaway(extra: Value) -> Value {
+    let mut arguments = json!({
+        "analysis": {
+            "kind": "transient",
+            "stop_time_seconds": 0.14,
+            "max_step_seconds": RUNAWAY_STEP,
+        },
+        "signals": ["v(gate)"],
+        "measurements": [
+            { "name": "top", "kind": "max", "signal": "v(gate)" },
+            { "name": "gate", "kind": "value_at", "signal": "v(gate)", "at_seconds": 5e-6 },
+        ],
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        arguments[key] = value.clone();
+    }
+    run_on_testbench(&soft_start_lines(), arguments)
+}
+
+fn assert_stopped_with_data(result: &Value, reason: &str) {
+    assert_eq!(result["outcome"]["status"], "partial", "{result}");
+    assert_eq!(result["stopped"]["reason"], reason, "{result}");
+    assert_eq!(result["outcome"]["requested"], 4);
+    assert_eq!(result["outcome"]["completed"], 1);
+    assert_eq!(result["outcome"]["failed"], 3);
+    let ratio = result["analysis"]["coverage_ratio"].as_f64().unwrap();
+    assert!(ratio > 0.0 && ratio < 1.0, "{ratio}");
+    assert_eq!(result["stopped"]["at_point"], result["analysis"]["points"]);
+    assert!(result["analysis"]["points"].as_u64().unwrap() > 1000);
+    assert!(result["measurements"][0]["value"].is_number(), "{result}");
+    assert_eq!(result["measurements"][0]["window_truncated"], true);
+    assert_eq!(result["signal_summaries"][0]["final"], 0.0);
+    let warnings = result["warnings"].to_string();
+    assert!(!warnings.contains("pause requested"), "{warnings}");
+    assert!(result["artifacts"]["raw_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_transient_past_its_budget_reads_partial_with_its_data_kept() {
+    let result = runaway(json!({ "timeout_seconds": 2 }));
+    assert_stopped_with_data(&result, "timeout");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_transient_at_its_size_limit_reads_partial_with_its_data_kept() {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    let result = runaway(json!({ "max_raw_bytes": LIMIT }));
+    assert_stopped_with_data(&result, "size_limit");
+    let bytes = result["artifacts"]["raw_bytes"].as_u64().unwrap();
+    assert!((LIMIT..LIMIT + LIMIT / 2).contains(&bytes), "{bytes}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_transient_that_loses_convergence_keeps_what_it_had_and_names_the_node() {
+    let lines: Vec<String> = [
+        "V1 a 0 PWL(0 0 1m 1 3m 1)",
+        "B1 x 0 I=1/(1e-9+0*V(a))*(V(x)-1)*exp(1000*time*V(a)*V(x))",
+        "R1 x 0 1k",
+        "R2 a 0 1k",
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": { "kind": "transient", "stop_time_seconds": 3e-3 },
+            "measurements": [{ "name": "top", "kind": "max", "signal": "v(a)" }],
+        }),
+    );
+
+    assert_eq!(result["stopped"]["reason"], "no_convergence", "{result}");
+    assert_eq!(result["stopped"]["node"], "b1#branch", "{result}");
+    assert_eq!(result["outcome"]["status"], "partial");
+    let reached = result["analysis"]["simulated_to_seconds"].as_f64().unwrap();
+    assert!(reached > 1e-3 && reached < 3e-3, "{reached}");
+    assert_eq!(result["measurements"][0]["window_truncated"], true);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_size_limit_counts_every_vector_the_engine_saves() {
+    const LIMIT: u64 = 1 << 21;
+    let mut run = WorkerRun::prepare(SLOW_DECK, None, 30_000);
+    run.limit_size(LIMIT);
+
+    let status = run.finish();
+
+    assert_eq!(status.halted_reason, Some(HaltReason::SizeLimit));
+    assert_eq!(status.sim_status, Some(0));
+    assert!(status.results_written);
+    let plot = run.plot();
+    let bytes = 8 * plot.points as u64 * plot.variables.len() as u64;
+    assert!((LIMIT..LIMIT + LIMIT / 2).contains(&bytes), "{bytes}");
 }
 
 const SLOW_DECK: &str =

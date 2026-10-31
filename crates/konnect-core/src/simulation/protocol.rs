@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump when a worker argument or report field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The subcommand the worker answers to. Hidden from `--help`.
 pub const WORKER_SUBCOMMAND: &str = "sim-worker";
@@ -36,6 +36,8 @@ pub struct RunRequest {
     pub input_path: Option<PathBuf>,
     /// When to halt the run softly. The worker leaves by itself a little later.
     pub budget_ms: u64,
+    /// When to halt the run softly because of the data it has made.
+    pub max_raw_bytes: u64,
 }
 
 /// Why the worker stopped a run that was still going.
@@ -43,6 +45,7 @@ pub struct RunRequest {
 #[serde(rename_all = "snake_case")]
 pub enum HaltReason {
     Timeout,
+    SizeLimit,
 }
 
 /// What the worker saw. Return codes prove nothing, so this holds the evidence
