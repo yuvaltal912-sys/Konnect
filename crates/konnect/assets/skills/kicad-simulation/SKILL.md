@@ -176,7 +176,7 @@ SUV vin out vin 0 SWUV
 
 ### Reversed battery
 
-`dc_sweep` is not available yet, so ramp the battery with a slow transient, which `run_simulation` does. The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Use `max_step_seconds` 1e-5 on 24 ms. With no reactive part the ramp rate does not matter. With a capacitor on the output, ramp slower than its time constant. `i(VBAT)` reads positive when leakage flows back into the battery.
+A DC sweep is not available yet, so ramp the battery with a slow transient, which `run_simulation` does. The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Use `max_step_seconds` 1e-5 on 24 ms. With no reactive part the ramp rate does not matter. With a capacitor on the output, ramp slower than its time constant. `i(VBAT)` reads positive when leakage flows back into the battery.
 
 ```
 * Reversed battery on a slow ramp from -12 V to 12 V. Your circuit supplies the battery and the load.
