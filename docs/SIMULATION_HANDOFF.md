@@ -85,6 +85,12 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect/tests/simulation_live.rs` | Ignored tests that need KiCad |
 | `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance |
 
+## Graph
+
+A knowledge graph of the code and docs lives in `graphify-out/`, on this Mac only. Git ignores it, along with `.codex/` and the local skill copy, so a fresh clone has none of them. `AGENTS.md` says how to use it. The git hooks here keep it current after each commit, with no LLM cost. `.graphifyignore` leaves out app icons and test data.
+
+To build it elsewhere, run `graphify extract . --backend claude-cli`, then `graphify cluster-only . --no-viz --backend=claude-cli`.
+
 ## Verify
 
 Run this on every PR, after the last commit:
