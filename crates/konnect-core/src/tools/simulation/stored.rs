@@ -304,7 +304,6 @@ pub(super) fn measure(
     }
 
     let requested = question.requested();
-    let failed = failed.min(requested);
     let status = match partial || signal_missing || failed > 0 {
         true => OutcomeStatus::Partial,
         false => OutcomeStatus::Complete,

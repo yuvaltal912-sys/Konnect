@@ -20,7 +20,7 @@ Simulation runs on the saved schematic, on a private copy, in a separate process
 ## Toolset Loading
 
 ```
-load_toolset('simulation')    # check_simulation_readiness, run_simulation
+load_toolset('simulation')    # check_simulation_readiness, run_simulation, list_simulation_runs, measure_simulation_run
 ```
 
 ## Workflow
@@ -34,6 +34,7 @@ load_toolset('simulation')    # check_simulation_readiness, run_simulation
    - `{ "kind": "ac", "start_hz": 10, "stop_hz": 1e6 }` for gain, bandwidth and stability margins.
    - `{ "kind": "dc_sweep", "sweeps": [{ "target": "V1", "start_value": 0, "stop_value": 12, "step_value": 0.1 }] }` for a transfer curve or a polarity sweep.
 5. Report the results, and state `simulated_circuit` if it is `modified`.
+6. Want another number from the same run? Use `measure_simulation_run` with the `run_id`, and do not simulate again. Lost the response? `list_simulation_runs` finds the run.
 
 ## Transient Runs
 
@@ -139,6 +140,31 @@ Varies up to two things and solves the circuit at each step: a voltage source, a
 ```
 
 A negative `step_value` sweeps down, and its sign must point from the start toward the stop. Measurements and windows follow the order of the sweep: `from_sweep` 12 and `to_sweep` 0 on a sweep that falls from 12. One sweep takes `min`, `max`, `peak_to_peak`, `peak_abs`, `value_at` (`at_sweep`) and `crossing`, and a place on the sweep comes back in the sweep's unit. An average over a sweep has no meaning, so it is refused. With two sweeps the first varies fastest, `signals` cover the whole grid (`at_start` and `at_stop` are its first and last point), and measurements are refused: the data is in `artifacts.raw_path`.
+
+## Stored Runs
+
+Every run that left data is kept: the newest 20 for each project. Nothing here simulates again.
+
+`list_simulation_runs` takes the schematic and lists its runs, newest first: `run_id`, `created_at`, `analysis_kind`, `run_status` (`complete` or `partial`), `simulated_circuit`, `coverage_ratio` and `inputs_changed_since_run`. `without_record` counts folders that hold no usable run, such as one that failed.
+
+`measure_simulation_run` takes a `run_id` and `measurements`, with optional `signals` and `envelope_points`, and works them out from the stored data. It takes the same kinds as `run_simulation`, and a kind the run's analysis cannot take is refused, so `bandwidth_3db` on a transient is `invalid_argument`.
+
+```json
+{
+  "run_id": "3fa9c1d27b04-20261030T133512-7f3a",
+  "measurements": [
+    { "name": "rail_low", "kind": "min", "signal": "v(/VOUT)", "from_seconds": 0.06 }
+  ]
+}
+```
+
+- **Always relay `run_status` and `simulated_circuit`.** A measurement on a `partial` run covers only the data it has, so the result is `partial` too, with `stopped` saying why. A `modified` run does not describe the schematic as drawn.
+- **`inputs_changed_since_run: true`** means the saved schematic, the project file or a model file differs from what the run used. The numbers still describe the old circuit. Say so, and run again if the answer matters. `null` means the sheets could not be read.
+- **`p(REF)` only exists if the run asked for it.** Otherwise the signal is `signal_not_found` with a `power_not_saved` warning: run again with it in `signals` or `measurements`.
+- **A `dc_sweep` with two sweeps takes no measurements.** The whole grid is in `artifacts.csv_path`, with the second sweep's value in its own column.
+- **Only the newest 20 runs are kept.** An older id is `run_not_found`.
+
+Every run also writes `artifacts.csv_path`: the data as text for a spreadsheet or a script. A transient has `time` and one column a signal. An AC sweep has `frequency`, then `.real` and `.imag` columns for each signal. A DC sweep is headed by what it varies, such as `V1 (V)`. An operating point reads down the rows. A run too big for it has `csv_path: null` and a `csv_not_written` warning, and the raw file has the data.
 
 ## Protection Scenarios
 
@@ -272,7 +298,7 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 - **`circuit.approximations`:** parts whose behaviour rests on an assumption. Say so when they matter.
 - **`warnings`:** read them. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means only node voltages and voltage source currents were saved.
 - **`operating_point.rows`:** currents read positive into a device's first pin, so a delivering source reads negative.
-- **Full data:** `artifacts.table_path` holds every row, and `artifacts.deck_path` holds the deck that ran.
+- **Full data:** `artifacts.table_path` holds every row, `artifacts.csv_path` holds the whole plot as CSV, and `artifacts.deck_path` holds the deck that ran.
 
 ## When It Fails
 
@@ -295,6 +321,8 @@ Branch on `error.reason`, and show `error.items`.
 | `engine_crashed` | The simulator process died | The server is unaffected. Read the log |
 | `unbalanced_deck_block` | A `.if` or `.subckt` is left open | Close it. Check `spice_lines` first |
 | `engine_not_found` | No libngspice was found | Set `ngspice_library`, using the listed locations |
+| `run_not_found` | `measure_simulation_run` has no run with that id: it was pruned, failed, or never existed | `list_simulation_runs` shows what is kept |
+| `results_unreadable` | The stored run's data or record cannot be read | Run again |
 
 A run that stops early with data is not an error. For `stopped.reason: "size_limit"`, raise `max_raw_bytes`, shorten the run or raise `max_step_seconds`. For `timeout`, do the same with `timeout_seconds`. For `no_convergence`, `stopped.node` names where it failed.
 

@@ -1647,28 +1647,20 @@ impl RunEnd<'_> {
     /// so a refusal or an error is a warning and `csv_path` stays null.
     fn add_table(&self, body: &mut Value, plot: &Plot) {
         let path = self.run.dir.join(CSV_FILE);
-        let problem = match export::write(&path, plot, &self.table_layout(plot)) {
-            Ok(export::Written::Bytes(bytes)) => {
+        let written = export::write(&path, plot, &self.table_layout(plot));
+        match table_problem(&written) {
+            None => {
                 body["artifacts"]["csv_path"] = json!(self.path(CSV_FILE));
-                body["artifacts"]["csv_bytes"] = json!(bytes);
-                return;
+                if let Ok(export::Written::Bytes(bytes)) = written {
+                    body["artifacts"]["csv_bytes"] = json!(bytes);
+                }
             }
-            Ok(export::Written::TooLarge { cells }) => json!({
-                "code": "csv_not_written",
-                "detail": format!(
-                    "The data holds {cells} values, past the {} that results.csv takes. \
-                     The raw file has all of it.",
-                    export::MAX_CELLS
-                ),
-            }),
-            Err(error) => json!({
-                "code": "csv_not_written",
-                "detail": format!("results.csv could not be written: {error}"),
-            }),
-        };
-        body["artifacts"]["csv_path"] = Value::Null;
-        if let Some(warnings) = body["warnings"].as_array_mut() {
-            warnings.push(problem);
+            Some(problem) => {
+                body["artifacts"]["csv_path"] = Value::Null;
+                if let Some(warnings) = body["warnings"].as_array_mut() {
+                    warnings.push(problem);
+                }
+            }
         }
     }
 
@@ -1938,6 +1930,25 @@ impl RunEnd<'_> {
             }
         }
         body
+    }
+}
+
+/// The warning for a CSV that was not written, or none if it was.
+fn table_problem(written: &std::io::Result<export::Written>) -> Option<Value> {
+    match written {
+        Ok(export::Written::Bytes(_)) => None,
+        Ok(export::Written::TooLarge { cells }) => Some(json!({
+            "code": "csv_not_written",
+            "detail": format!(
+                "The data holds {cells} values, past the {} that results.csv takes. The raw \
+                 file has all of it.",
+                export::MAX_CELLS
+            ),
+        })),
+        Err(error) => Some(json!({
+            "code": "csv_not_written",
+            "detail": format!("results.csv could not be written: {error}"),
+        })),
     }
 }
 
@@ -3140,6 +3151,21 @@ mod tests {
         ] {
             assert_eq!(Analysis::from_record(&broken), None, "{broken}");
         }
+    }
+
+    #[test]
+    fn a_csv_left_unwritten_is_a_warning_that_says_why() {
+        assert_eq!(table_problem(&Ok(export::Written::Bytes(10))), None);
+        let large = table_problem(&Ok(export::Written::TooLarge { cells: 30_000_000 })).unwrap();
+        assert_eq!(large["code"], "csv_not_written");
+        let detail = large["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("30000000") && detail.contains("raw file"),
+            "{detail}"
+        );
+        let broken = table_problem(&Err(std::io::Error::other("disk full"))).unwrap();
+        assert_eq!(broken["code"], "csv_not_written");
+        assert!(broken["detail"].as_str().unwrap().contains("disk full"));
     }
 
     #[test]
@@ -5337,6 +5363,135 @@ mod tests {
             let (_, list) = listed(&scene, json!({})).await;
             assert_eq!(list["total"], 0);
             assert_eq!(list["without_record"], 1);
+        }
+
+        #[tokio::test]
+        async fn a_stored_run_is_read_with_the_names_it_was_made_with() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            // Its data names the nets and parts as the engine does.
+            std::fs::write(
+                dir.join(RAW_FILE),
+                "Title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 3\n\
+                 No. Points: 2\nVariables:\n\t0\ttime\ttime\n\t1\tv(/out_x)\tvoltage\n\
+                 \t2\ti(vbt1)\tcurrent\nValues:\n0\t0.0\n\t1.0\n\t3.0\n1\t2.0\n\t4.0\n\t6.0\n\n",
+            )
+            .unwrap();
+            let path = dir.join(runs::RECORD_FILE);
+            let mut record: RunRecord =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record.nets = vec![crate::simulation::kicad_netlist::NetEntry {
+                kicad_name: "/Out".to_string(),
+                spice_name: "/out_x".to_string(),
+                in_deck: true,
+                pin_count: 2,
+            }];
+            record.elements = vec![crate::simulation::kicad_netlist::ElementEntry {
+                reference: "BT1".to_string(),
+                element_name: Some("VBT1".to_string()),
+                modelled: true,
+                excluded: false,
+            }];
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "measurements": [
+                    { "kind": "max", "signal": "v(/Out)" },
+                    { "kind": "max", "signal": "i(BT1)" },
+                ] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["measurements"][0]["value"], 4.0, "{body}");
+            assert_eq!(body["measurements"][1]["value"], 6.0, "{body}");
+        }
+
+        #[tokio::test]
+        async fn power_a_run_saved_is_measured_without_a_warning() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            std::fs::write(
+                dir.join(RAW_FILE),
+                "Title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\n\
+                 No. Points: 2\nVariables:\n\t0\ttime\ttime\n\t1\tr2:power\tpower\n\
+                 Values:\n0\t0.0\n\t1.0\n1\t2.0\n\t9.0\n\n",
+            )
+            .unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["p(R2)"],
+                        "measurements": [{ "kind": "max", "signal": "p(R2)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["measurements"][0]["value"], 9.0, "{body}");
+            assert!(
+                !body["warnings"].to_string().contains("power_not_saved"),
+                "{body}"
+            );
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_summary_signal_the_run_lacks_makes_the_outcome_partial_alone() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(nowhere)"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["signal_summaries"][0]["finding"], "signal_not_found");
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["completed"], 1);
+            assert_eq!(body["outcome"]["failed"], 0);
+            assert!(
+                !body["warnings"].to_string().contains("power_not_saved"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_run_that_covered_half_its_range_lists_that_share() {
+            let scene = scene(&transient_job());
+            // Data to 2 s of a 4 s stop, from an engine that reported success.
+            let (_, run) = call(&scene, transient_args(&scene.root, 4.0)).await;
+            assert_eq!(run["outcome"]["status"], "partial", "{run}");
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["run_status"], "partial", "{list}");
+            assert_eq!(list["runs"][0]["coverage_ratio"], 0.5, "{list}");
+            let (_, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert_eq!(body["coverage_ratio"], 0.5, "{body}");
+            assert_eq!(body["stopped"]["reason"], "incomplete_coverage", "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_operating_point_run_is_listed_and_has_nothing_to_measure() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, run) = call(&scene, args(&scene.root)).await;
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(
+                list["runs"][0]["analysis_kind"], "operating_point",
+                "{list}"
+            );
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
         }
     }
 }
