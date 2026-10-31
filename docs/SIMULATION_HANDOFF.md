@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 7 open and PR 8 not started.
+**Last updated:** 2026-10-31, with PR 1 to 7 merged to `main` and PR 8 in progress.
 
 ## Start here
 
@@ -30,21 +30,21 @@ Decisions already made by the owner:
 
 ## PR stack
 
-Each PR is based on the one before it. None is merged.
+PRs 1 to 7 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
-| 1 to 3 | [#1](https://github.com/yuvaltal912-sys/Konnect/pull/1) | `feat/simulation` | Open |
-| 4 | [#2](https://github.com/yuvaltal912-sys/Konnect/pull/2) | `feat/simulation-preflight` | Open |
-| 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Open |
-| 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Open |
-| 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Open |
-| 8 | Not opened | | **Next, once the owner approves** |
+| 1 to 3 | [#1](https://github.com/yuvaltal912-sys/Konnect/pull/1) | `feat/simulation` | Merged |
+| 4 | [#2](https://github.com/yuvaltal912-sys/Konnect/pull/2) | `feat/simulation-preflight` | Merged |
+| 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Merged |
+| 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Merged |
+| 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
+| 8 | Not opened | `feat/simulation-protection` | **In progress** |
 | 9 to 11 | Not opened | | Not started |
 
-## Now: nothing is running
+## Now: PR 8 in progress
 
-PR 7 is done and open. Ask the owner before starting PR 8. A real transient runs through `run_simulation`: `soft_start.sp` matches a reference worked out with no SPICE engine to every digit it prints, at `max_step_seconds` 0.5 µs. A run that stops early reads `partial` with its data kept, for the budget, the size limit and lost convergence.
+PR 7 is merged. PR 8 is on `feat/simulation-protection`. Ask the owner before starting PR 9. A real transient runs through `run_simulation`: `soft_start.sp` matches a reference worked out with no SPICE engine to every digit it prints, at `max_step_seconds` 0.5 µs. A run that stops early reads `partial` with its data kept, for the budget, the size limit and lost convergence.
 
 ### What PR 7 changed that the next PR needs to know
 
