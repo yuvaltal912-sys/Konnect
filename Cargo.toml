@@ -78,6 +78,7 @@ base64 = "0.23"
 
 # Platform directories (home dir, config dir)
 dirs = "7"
+libloading = "0.9"
 winreg = "0.56"
 
 # SVG parsing (import_svg_logo)

@@ -1,0 +1,17 @@
+.title KiCad schematic
+.tran 1u 10m
+
+V1 GND /in DC SINE(0 1.5 1k 0 0 0 0) 
+R1 /in /subsheet1/in 100
+C1 /subsheet1/in GND 1u
+R2 /out2 GND 1k
+R3 /out1 GND 1k
+C2 Net-_C2-Pad1_ GND 1u
+R4 /subsheet1/in Net-_C2-Pad1_ 100
+R6 Net-_C2-Pad1_ /out1 100
+R7 Net-_C3-Pad1_ /out2 1k
+R9 Net-_C3-Pad1_ /subsheet2/node 1k
+R8 Net-_C3-Pad1_ /subsheet2/node 1k
+R5 /in Net-_C3-Pad1_ 1k
+C3 Net-_C3-Pad1_ GND 10u
+.end

@@ -33,6 +33,130 @@ pub fn find_gui(configured_binary: &str, configured_cli: &str) -> Option<PathBuf
         .or_else(|| gui_candidates().into_iter().find(|path| path.is_file()))
 }
 
+/// Where libngspice was found, and everywhere that was checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NgspiceSearch {
+    pub library: Option<PathBuf>,
+    pub searched: Vec<PathBuf>,
+}
+
+/// Find libngspice.
+///
+/// A nonblank setting is the only place looked, so a typo is reported rather
+/// than quietly replaced by another copy. A blank one looks beside the resolved
+/// `kicad-cli` first, so a selected KiCad cannot run a different KiCad's engine,
+/// then at the usual install locations.
+pub fn find_ngspice_library(configured: &str, configured_cli: &str) -> NgspiceSearch {
+    let configured = configured.trim();
+    let searched = if configured.is_empty() {
+        let mut paths = find_cli(configured_cli)
+            .map(|cli| ngspice_near_cli(&cli))
+            .unwrap_or_default();
+        for path in ngspice_candidates() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
+    } else {
+        vec![PathBuf::from(configured)]
+    };
+    NgspiceSearch {
+        library: searched.iter().find(|path| path.is_file()).cloned(),
+        searched,
+    }
+}
+
+/// Find the code-model folder for a library. As in KiCad, `spice2poly.cm` marks
+/// it. Debian and Ubuntu put these in the `ngspice` package, not `libngspice0`,
+/// so `None` is a normal answer there.
+pub fn find_code_models_dir(configured: &str, library: &Path) -> Option<PathBuf> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return Some(PathBuf::from(configured)).filter(|path| path.is_dir());
+    }
+    let library_dir = library.parent()?;
+    [
+        Some(library_dir.join("ngspice")),
+        library_dir
+            .parent()
+            .map(|root| root.join("lib").join("ngspice")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|dir| dir.join("spice2poly.cm").is_file())
+}
+
+fn ngspice_library_names() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["ngspice.dll", "libngspice-0.dll", "libngspice-1.dll"]
+    } else if cfg!(target_os = "macos") {
+        &["libngspice.0.dylib", "libngspice.dylib"]
+    } else {
+        &["libngspice.so.0", "libngspice.so"]
+    }
+}
+
+/// `installation_root_from_binary` needs a `bin` folder, which a macOS bundle
+/// does not have: `Contents/MacOS/kicad-cli` pairs with `Contents/PlugIns/sim`.
+fn ngspice_near_cli(cli: &Path) -> Vec<PathBuf> {
+    let Some(cli_dir) = cli.parent() else {
+        return Vec::new();
+    };
+    let dirs = if cli_dir.file_name().is_some_and(|name| name == "MacOS") {
+        cli_dir
+            .parent()
+            .map(|contents| vec![contents.join("PlugIns").join("sim")])
+            .unwrap_or_default()
+    } else {
+        let mut dirs = vec![cli_dir.to_path_buf()];
+        if let Some(root) = installation_root_from_binary(cli) {
+            dirs.push(root.join("lib"));
+        }
+        dirs
+    };
+    dirs.iter()
+        .flat_map(|dir| ngspice_library_names().iter().map(|name| dir.join(name)))
+        .collect()
+}
+
+fn ngspice_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let dirs: Vec<PathBuf> = installation_roots()
+        .into_iter()
+        .map(|root| root.join("bin"))
+        .collect();
+    #[cfg(target_os = "macos")]
+    let dirs: Vec<PathBuf> = {
+        let mut dirs = vec![PathBuf::from(
+            "/Applications/KiCad/KiCad.app/Contents/PlugIns/sim",
+        )];
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(
+                PathBuf::from(home).join("Applications/KiCad/KiCad.app/Contents/PlugIns/sim"),
+            );
+        }
+        dirs.push(PathBuf::from("/opt/homebrew/lib"));
+        dirs.push(PathBuf::from("/usr/local/lib"));
+        dirs
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let dirs: Vec<PathBuf> = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/usr/local/lib",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+
+    dirs.iter()
+        .flat_map(|dir| ngspice_library_names().iter().map(|name| dir.join(name)))
+        .collect()
+}
+
 fn cli_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -338,6 +462,88 @@ fn windows_registry_install_roots() -> Vec<PathBuf> {
     }
 
     roots
+}
+
+#[cfg(test)]
+mod ngspice_tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_library_is_the_only_place_looked() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("typo.so");
+        let search = find_ngspice_library(missing.to_str().unwrap(), "");
+        assert_eq!(search.library, None);
+        assert_eq!(search.searched, vec![missing]);
+    }
+
+    #[test]
+    fn a_configured_library_that_exists_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("lib.so");
+        std::fs::write(&library, "").unwrap();
+        let search = find_ngspice_library(library.to_str().unwrap(), "");
+        assert_eq!(search.library, Some(library));
+    }
+
+    #[test]
+    fn a_macos_bundle_pairs_its_cli_with_its_plugins_folder() {
+        let contents = Path::new("/Apps/KiCad.app/Contents");
+        let paths = ngspice_near_cli(&contents.join("MacOS/kicad-cli"));
+        assert!(!paths.is_empty());
+        assert!(paths
+            .iter()
+            .all(|path| path.parent() == Some(&*contents.join("PlugIns").join("sim"))));
+    }
+
+    #[test]
+    fn a_bin_folder_pairs_with_itself_and_its_lib_folder() {
+        let paths = ngspice_near_cli(Path::new("/opt/kicad/bin/kicad-cli"));
+        let parents: Vec<_> = paths.iter().filter_map(|path| path.parent()).collect();
+        assert!(parents.contains(&Path::new("/opt/kicad/bin")));
+        assert!(parents.contains(&Path::new("/opt/kicad/lib")));
+    }
+
+    #[test]
+    fn code_models_sit_beside_the_library_or_in_the_lib_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let beside = root.path().join("sim");
+        std::fs::create_dir_all(beside.join("ngspice")).unwrap();
+        std::fs::write(beside.join("ngspice/spice2poly.cm"), "").unwrap();
+        assert_eq!(
+            find_code_models_dir("", &beside.join("libngspice.dylib")),
+            Some(beside.join("ngspice"))
+        );
+
+        let windows = root.path().join("win");
+        std::fs::create_dir_all(windows.join("lib/ngspice")).unwrap();
+        std::fs::write(windows.join("lib/ngspice/spice2poly.cm"), "").unwrap();
+        assert_eq!(
+            find_code_models_dir("", &windows.join("bin/ngspice.dll")),
+            Some(windows.join("lib").join("ngspice"))
+        );
+    }
+
+    #[test]
+    fn a_folder_without_the_marker_is_not_a_code_model_folder() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("ngspice")).unwrap();
+        assert_eq!(find_code_models_dir("", &root.path().join("lib.so")), None);
+    }
+
+    #[test]
+    fn a_configured_code_model_folder_must_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert_eq!(
+            find_code_models_dir(missing.to_str().unwrap(), Path::new("/x/lib.so")),
+            None
+        );
+        assert_eq!(
+            find_code_models_dir(root.path().to_str().unwrap(), Path::new("/x/lib.so")),
+            Some(root.path().to_path_buf())
+        );
+    }
 }
 
 #[cfg(test)]

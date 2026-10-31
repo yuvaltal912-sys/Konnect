@@ -36,6 +36,24 @@ pub struct Config {
     #[serde(default)]
     pub jlcpcb_db_path: Option<PathBuf>,
 
+    /// libngspice path. Blank finds KiCad's own copy.
+    #[serde(default)]
+    pub ngspice_library: String,
+
+    /// ngspice code-model folder. Blank looks beside the library.
+    #[serde(default)]
+    pub ngspice_code_models_dir: String,
+
+    /// Load ngspice's digital code models. Deck vetting refuses the two that
+    /// can start programs or load libraries; this turns all of them off.
+    #[serde(default = "default_allow_digital_models")]
+    pub ngspice_allow_digital_models: bool,
+
+    /// Extra folders a model include may read from, beyond the project and
+    /// KiCad's libraries.
+    #[serde(default)]
+    pub ngspice_model_dirs: Vec<PathBuf>,
+
     /// Log level (error, warn, info, debug, trace)
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -125,6 +143,10 @@ fn default_kicad_cli() -> String {
     } else {
         "kicad-cli".to_string()
     }
+}
+
+fn default_allow_digital_models() -> bool {
+    true
 }
 
 fn default_kicad_binary() -> String {
@@ -254,6 +276,10 @@ impl Default for Config {
             transport: TransportMode::default(),
             http_address: default_http_address(),
             jlcpcb_db_path: None,
+            ngspice_library: String::new(),
+            ngspice_code_models_dir: String::new(),
+            ngspice_allow_digital_models: default_allow_digital_models(),
+            ngspice_model_dirs: Vec::new(),
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,

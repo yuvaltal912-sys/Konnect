@@ -16,6 +16,7 @@ pub(crate) async fn collect(
     config: &ServerConfig,
     resolution: &ConfigResolution,
     guidance: Option<&dyn GuidanceProbe>,
+    simulation: Option<&crate::simulation::SimulationRuntime>,
 ) -> Value {
     let running_version = env!("CARGO_PKG_VERSION");
     let executable_path = installed_executable_path().ok();
@@ -39,6 +40,9 @@ pub(crate) async fn collect(
         Some(path) => probe_command_version(path, VersionCommand::KiCad).await,
         None => VersionProbe::not_found(),
     };
+
+    let ngspice =
+        crate::simulation::worker_client::probe_engine(simulation, &config.kicad_cli).await;
 
     let ipc_endpoint = if config.ipc_address.trim().is_empty() {
         None
@@ -74,6 +78,7 @@ pub(crate) async fn collect(
             "probe_status": kicad_probe.status,
             "version": kicad_probe.version,
         },
+        "ngspice": ngspice,
         "ipc": {
             "configured": ipc_endpoint.is_some(),
             "source": "resolved_server_config",

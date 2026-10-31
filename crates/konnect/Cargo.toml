@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 toml.workspace = true
 dirs.workspace = true
 fs4.workspace = true
+libloading.workspace = true
 
 [build-dependencies]
 

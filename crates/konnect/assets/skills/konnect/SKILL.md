@@ -103,6 +103,7 @@ unload_toolset("name")  → Remove a toolset when done
 | Config | config |
 | Templates | templates |
 | Manufacturing | manufacturing |
+| Simulation | simulation |
 
 ## Agent Routing and Mutation Ownership
 

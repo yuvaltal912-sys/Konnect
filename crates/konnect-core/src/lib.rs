@@ -10,6 +10,7 @@ pub mod observability;
 pub mod outcome;
 pub mod router;
 pub(crate) mod runtime_info;
+pub mod simulation;
 pub(crate) mod specctra;
 pub(crate) mod specctra_ses;
 #[cfg(test)]
