@@ -1,0 +1,17 @@
+# git already hides target/ and other build output.
+.claude/
+graphify-out/
+
+# Images cost one vision call each, and these are app icons.
+crates/schematic-viewer/icons/
+*.png
+*.svg
+
+# Test data: KiCad files, engine output and golden files, not design.
+crates/konnect-core/tests/fixtures/
+*.kicad_sch
+*.kicad_pcb
+*.kicad_mod
+*.kicad_pro
+*.raw
+*.tsv

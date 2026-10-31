@@ -308,6 +308,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `ambiguous_target` | More than one observed UUID, reference/unit, field, instance, or requested PCB document identity matches the requested target, or component instance records conflict across projects, units, or hierarchy paths — carries `target` and the stable `candidates`; the caller must choose rather than retrying blindly |
 | `stale_target` | A previously bound PCB document is no longer uniquely open, saved symbol instance metadata disagrees with the proven hierarchy, or prospective component state lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; the edit, annotation, and grouping preflight refuses before writing |
 | `mutation_outcome_uncertain` | A schematic edit committed, but immediate readback could not prove its requested result — carries `operation`, `path`, and `reason`; reload and inspect the named file before retrying because it may have changed |
+| `simulation_failed` | A simulation stopped before giving a result: the engine is missing or crashed, the export failed, preflight refused the deck, or the run left no data — carries `stage`, a fixed `reason`, `log_path`, and `items`; branch on `reason` and fix what `items` names |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
 | `invalid_configuration` | A Konnect preferences file (`config.json`, `.konnect/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
@@ -366,7 +367,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 229 tools (236 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 230 tools (237 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -451,12 +452,12 @@ direct handler calls still require checked readers for their domain rules.
 
 ## Current Stats
 
-- **22 toolsets, 229 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **22 toolsets, 230 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 236 tools (229 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 237 tools (230 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

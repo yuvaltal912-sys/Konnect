@@ -447,6 +447,17 @@ local-data directory. Set `KONNECT_STATE_DIR` to an absolute directory to
 override that location. A relative override is rejected rather than falling
 back to project-local sidecars.
 
+## `run_simulation` times out, or the client stops waiting
+
+`timeout_seconds` is a budget for the whole call, export included. At the budget the
+run halts softly and keeps its data, which reads as `partial` with
+`stopped.reason: timeout`. With no data it fails with reason `timed_out`.
+
+Many MCP clients stop waiting at 60 seconds, and Konnect sends no progress during a
+run, so the default budget is 40. Raise it only as far as the client allows. If the
+client gave up first, the run still finished and its files are under Konnect's
+state folder, in `simulation/`.
+
 ## Tools don't appear after `load_toolset`
 
 After a successful `load_toolset` call the server sends a
@@ -479,7 +490,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 236 tools from the first call.
+startup, so `tools/list` carries all 237 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.

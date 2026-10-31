@@ -313,7 +313,13 @@ fn reject_non_file_lock_path(path: &Path) -> Result<(), SexpError> {
 }
 
 fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
-    let state_root = match std::env::var_os("KONNECT_STATE_DIR") {
+    document_lock_path_in(&state_root()?, path)
+}
+
+/// Where Konnect keeps its own files: `KONNECT_STATE_DIR`, or the platform's local
+/// data folder.
+pub fn state_root() -> Result<PathBuf, SexpError> {
+    match std::env::var_os("KONNECT_STATE_DIR") {
         Some(value) if !value.is_empty() => {
             let root = PathBuf::from(value);
             if !root.is_absolute() {
@@ -321,7 +327,7 @@ fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
                     "KONNECT_STATE_DIR must be an absolute path".to_owned(),
                 ));
             }
-            root
+            Ok(root)
         }
         _ => dirs::data_local_dir()
             .map(|root| root.join("konnect"))
@@ -330,9 +336,8 @@ fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
                     "no platform local-data directory is available; set KONNECT_STATE_DIR to an absolute path"
                         .to_owned(),
                 )
-            })?,
-    };
-    document_lock_path_in(&state_root, path)
+            }),
+    }
 }
 
 fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, SexpError> {

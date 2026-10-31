@@ -179,6 +179,18 @@ pub(crate) struct Compatibility {
     pub ngbehavior: Option<&'static str>,
 }
 
+impl RefusalCode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsafeDeckContent => "unsafe_deck_content",
+            Self::ModelLibraryMissing => "model_library_missing",
+            Self::EncryptedModel => "encrypted_model",
+            Self::UnreadableModel => "unreadable_model",
+            Self::UnsupportedLibraryForm => "unsupported_library_form",
+        }
+    }
+}
+
 impl Compatibility {
     /// KiCad's default when a project has no setting.
     pub const DEFAULT: Self = Self {
@@ -276,11 +288,18 @@ impl FlatDeck {
         })
     }
 
-    /// The deck the engine receives.
+    /// The deck as vetted.
     pub(crate) fn render(&self) -> String {
+        self.render_with(&[])
+    }
+
+    /// The deck with lines Konnect wrote itself, such as the analysis. They go
+    /// after the vetting, so they must never carry text from a caller.
+    pub(crate) fn render_with(&self, own_lines: &[&str]) -> String {
         let mut deck = format!("{DECK_TITLE}\n");
-        for line in &self.lines {
-            deck.push_str(&line.text);
+        let vetted = self.lines.iter().map(|line| line.text.as_str());
+        for line in vetted.chain(own_lines.iter().copied()) {
+            deck.push_str(line);
             deck.push('\n');
         }
         deck.push_str(".end\n");

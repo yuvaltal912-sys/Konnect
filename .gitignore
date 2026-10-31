@@ -59,3 +59,8 @@ __pycache__/
 # Order matters: last match wins, so these must follow the negation.
 crates/konnect-ipc/tests/fixtures/live_ipc.kicad_pro
 crates/konnect-core/tests/fixtures/test.kicad_pro
+
+# graphify
+graphify-out/
+.claude/skills/graphify/
+.codex/

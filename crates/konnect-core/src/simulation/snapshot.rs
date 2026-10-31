@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 
 const SIM_LIBRARY_PROPERTY: &str = "(property \"Sim.Library\" \"";
 
+/// A sub-sheet the snapshot cannot place inside its private copy.
+#[derive(Debug, thiserror::Error)]
+#[error("sheet {} is outside the project folder {}", sheet.display(), project_dir.display())]
+pub(crate) struct SheetOutsideProject {
+    sheet: PathBuf,
+    project_dir: PathBuf,
+}
+
 #[derive(Debug)]
 pub(crate) struct Snapshot {
     /// The copied root sheet, for `kicad-cli`.
@@ -35,12 +43,9 @@ pub(crate) fn take_snapshot(root: &Path, into: &Path) -> Result<Snapshot> {
     for sheet in hierarchy_files(&project_dir.join(root_name))? {
         let relative = sheet
             .strip_prefix(&project_dir)
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "sheet {} is outside the project folder {}",
-                    sheet.display(),
-                    project_dir.display()
-                )
+            .map_err(|_| SheetOutsideProject {
+                sheet: sheet.clone(),
+                project_dir: project_dir.clone(),
             })?
             .to_path_buf();
         let source = std::fs::read_to_string(&sheet)

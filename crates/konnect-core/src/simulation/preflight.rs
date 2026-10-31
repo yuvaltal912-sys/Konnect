@@ -136,6 +136,9 @@ pub(crate) struct Preflight {
     pub checks: Vec<Check>,
     pub warnings: Vec<Warning>,
     pub unmodelled_symbols: Vec<UnmodelledSymbol>,
+    /// The circuit has digital or other event-driven nodes. ngspice stops with a
+    /// fatal error if `.probe alli` meets one.
+    pub event_nodes: bool,
 }
 
 pub(crate) struct Inputs<'a> {
@@ -156,6 +159,7 @@ pub(crate) fn run(inputs: &Inputs<'_>) -> Preflight {
     let reads_shorthand = inputs.compatibility.reads_value_shorthand();
     let mut checks = vec![
         model_coverage(&unmodelled_symbols),
+        deck_structure(inputs.deck),
         component_values(&circuit, reads_shorthand),
         ground(&circuit, inputs.nets),
         net_names(inputs),
@@ -167,6 +171,7 @@ pub(crate) fn run(inputs: &Inputs<'_>) -> Preflight {
         checks.push(testbench_nodes(&circuit, inputs.nets));
     }
     Preflight {
+        event_nodes: has_event_nodes(&circuit),
         checks,
         warnings: warnings(inputs, &circuit, unmodelled_symbols.len()),
         unmodelled_symbols,
@@ -666,7 +671,7 @@ fn ground(circuit: &Circuit, nets: &[NetEntry]) -> Check {
 /// The node ngspice will really use. It lowers case, reads `gnd` as `0`, and
 /// replaces each byte it cannot print with `_`. The worker runs in the C locale,
 /// where that is every non-ASCII byte, so `/\u{5e9}` and `/\u{5ea}` are one node.
-fn engine_node(spice_name: &str) -> String {
+pub(crate) fn engine_node(spice_name: &str) -> String {
     let node: String = spice_name
         .bytes()
         .map(|byte| {
@@ -835,6 +840,49 @@ fn dc_groups(circuit: &Circuit) -> Groups {
         paths.add(element, &mut groups);
     }
     groups
+}
+
+/// An open `.if` or `.subckt` swallows the analysis line Konnect adds after it,
+/// and the engine then reports a failure that says nothing of the cause.
+fn deck_structure(deck: &FlatDeck) -> Check {
+    let mut open_blocks = Vec::new();
+    let mut stray = Vec::new();
+    // By prefix, as ngspice matches them: `.ENDSUBCKT` and `.ends,f` both close.
+    for (text, _, _) in deck.lines() {
+        let line = text.trim().to_lowercase();
+        if line.starts_with(".endif") {
+            match open_blocks.last() {
+                Some(&".if") => drop(open_blocks.pop()),
+                _ => stray.push(".endif".to_string()),
+            }
+        } else if line.starts_with(".ends") {
+            match open_blocks.last() {
+                Some(&".subckt") => drop(open_blocks.pop()),
+                _ => stray.push(".ends".to_string()),
+            }
+        } else if line.starts_with(".if") {
+            open_blocks.push(".if");
+        } else if line.starts_with(".subckt") {
+            open_blocks.push(".subckt");
+        }
+    }
+    let unclosed = open_blocks.iter().map(|block| format!("{block} left open"));
+    let items: Vec<String> = stray.into_iter().chain(unclosed).collect();
+    if items.is_empty() {
+        Check::passed("deck_structure")
+    } else {
+        Check::failed("deck_structure", "unbalanced_deck_block", items)
+    }
+}
+
+/// Digital parts, and the event-driven parts in `xtraevt`. A kind this misses
+/// fails loudly in the engine, never silently.
+fn has_event_nodes(circuit: &Circuit) -> bool {
+    circuit.code_models_used.iter().any(|name| {
+        circuit.models.get(name).is_some_and(|kind| {
+            DIGITAL_MODELS.contains(&kind.as_str()) || kind.starts_with("real_")
+        })
+    })
 }
 
 fn code_models(circuit: &Circuit, allow_digital_models: bool) -> Check {
@@ -1755,6 +1803,48 @@ mod tests {
             },
         );
         passes(&preflight, "net_names");
+    }
+
+    #[test]
+    fn an_open_block_would_swallow_the_analysis() {
+        let circuit = "V1 a 0 1\nR1 a 0 1k";
+        passes(&deck(circuit), "deck_structure");
+        let balanced = format!("{circuit}\n.subckt x a b\nR2 a b 1k\n.if (1)\n.endif\n.ends x");
+        passes(&deck(&balanced), "deck_structure");
+        for closed in [
+            ".SUBCKT tt a b\nR2 a b 1k\n.ENDSUBCKT",
+            ".subckt tt a b\nR2 a b 1k\n.ends,tt",
+            ".subckt tt a b\nR2 a b 1k\n.ends;tt",
+            ".if (1)\nR2 a 0 1k\n.endif;x",
+            ".if (1)\nR2 a 0 1k\n.else\nR3 a 0 1k\n.endif",
+            ".if(1)\n.elseif(0)\n.endif",
+        ] {
+            passes(&deck(&format!("{circuit}\n{closed}")), "deck_structure");
+        }
+        for (extra, item) in [
+            (".if (0)", ".if left open"),
+            (".IF(1)", ".if left open"),
+            (".subckt x a b", ".subckt left open"),
+            (".endif", ".endif"),
+            (".ends", ".ends"),
+        ] {
+            let items = fails(
+                &deck(&format!("{circuit}\n{extra}")),
+                "deck_structure",
+                "unbalanced_deck_block",
+            );
+            assert_eq!(items, [item]);
+        }
+    }
+
+    #[test]
+    fn event_nodes_come_from_digital_and_real_valued_parts() {
+        let analog = "V1 a 0 1\nR1 a 0 1k\nA1 a b amp\n.model amp gain(gain=2)\nR2 b 0 1k";
+        assert!(!deck(analog).event_nodes);
+        let digital = "V1 a 0 1\nR1 a 0 1k\nA1 [a] [b] inv\n.model inv d_inverter\nR2 b 0 1k";
+        assert!(deck(digital).event_nodes);
+        let real = "V1 a 0 1\nR1 a 0 1k\nA1 a b dly\n.model dly real_delay\nR2 b 0 1k";
+        assert!(deck(real).event_nodes);
     }
 
     #[test]

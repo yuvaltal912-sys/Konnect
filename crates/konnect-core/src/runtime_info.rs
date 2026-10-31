@@ -41,8 +41,12 @@ pub(crate) async fn collect(
         None => VersionProbe::not_found(),
     };
 
-    let ngspice =
-        crate::simulation::worker_client::probe_engine(simulation, &config.kicad_cli).await;
+    let ngspice = crate::simulation::worker_client::probe_engine(
+        simulation,
+        &config.kicad_cli,
+        crate::simulation::worker_client::PROBE_TIMEOUT,
+    )
+    .await;
 
     let ipc_endpoint = if config.ipc_address.trim().is_empty() {
         None

@@ -192,6 +192,9 @@ This is hardening, not a sandbox. See R4.
 | `unreadable_model` | NUL bytes or invalid UTF-8 outside comments | Refused | [verified: run E19] |
 | `model_library_missing` | Unresolved include, or `kicad-cli` reported a missing library | Refused | [verified: run E12] |
 | `unsafe_deck_content` | Refused forms above, or a path outside the allowed roots, with file and line | Refused | [verified: run E18 to E20, E50 to E52] |
+| `unbalanced_deck_block` | A `.if` or `.subckt` left open, or a stray `.endif` or `.ends`, matched by prefix as ngspice does. An open block swallows the analysis line Konnect adds, and the engine then reports a failure that hides the cause | Refused | [verified: run E89] |
+| `device_currents_not_saved` | Digital or event-driven parts are present, so `.probe alli` is left out and only voltages and source currents are saved | Warning, in the result | [verified: run E88] |
+| `engine_messages` | What the engine ignored or changed in a run that finished, such as an unknown model parameter or a resistor raised to its minimum | Warning, in the result | [verified: run E89] |
 | `code_models_missing` | No `.cm` files found. Decks needing them will fail to parse | Warning | [verified: run E34] |
 | `unpowered_net` | A group with no independent source. Dependent sources do not count, and a subcircuit counts only if its body holds a source | Warning | [verified: run E63, E85] |
 | `inferred_from_value` | An R, L, C, V or I element whose `lib_id` is not a plain R, L, C or source symbol, such as an NTC named `RT1` | Warning, disclosed in the result | [verified: source E4] |
@@ -218,7 +221,7 @@ The element parser needs a node count per device letter. A device it cannot pars
 
 | Signals | Result |
 |---|---|
-| Worker died, or no `status.json` | error `engine_crashed` |
+| Worker died, or no `status.json` | error `engine_crashed`, or `timed_out` if the server killed it or it left at its own deadline |
 | Exit callback fired at any stage. It can fire during a run, leaving `sim_status=0` and an empty plot | error `engine_failed` [verified: run E73] |
 | `$sim_status` undefined after `run` | error `circuit_not_parsed` [verified: run E15] |
 | `sim_status=1`, zero points | error `no_convergence` [verified: run E13] |
@@ -463,8 +466,9 @@ Failure matrix. Decision: **one new error kind plus the existing envelope.** Add
 | Netlist export fails or times out | `netlist_export_failed` or `netlist_export_timed_out`, with reporter text |
 | Sheet outside the project | `sheet_outside_project` |
 | Preflight refusal | The finding's code from section 2.2 |
-| Circuit does not parse | `circuit_not_parsed`. Log lines are echoed only if they came from the schematic or `spice_lines`; others give file and line |
+| Circuit does not parse | `circuit_not_parsed`. A log line is echoed only if none of its words start a word found only in model files, and hidden lines are counted. A value computed from a model parameter cannot be recognised, so it can still show [verified: run E89] |
 | Library fatal error at any stage | `engine_failed` |
+| Run folder cannot be created or written | `run_store_failed` |
 | No convergence, no data | `no_convergence`, node and point when known |
 | Timeout, no data | `timed_out` |
 | Worker crash | `engine_crashed`, signal or exit code |
@@ -702,9 +706,9 @@ Recorded here so every implementation session follows them.
 | Q15 | Do real vendor sets with their own nested includes flatten correctly? Tested only on a real library split into nested files [verified: run E76] | Sample vendor libraries in PR 3 |
 | Q16 | Settled, by removing the dependency. String expressions can only reach a `.model` type or name field, and both must now be literal. Tested forms in E79, with a negative control for each | Closed in PR 3 |
 | Q17 | Decided for v1, as an accepted limit: `filesource`, `d_source`, `d_state`, `table2d` and `table3d` read a data file named in the deck. They run no code, and refusing them would break legal XSPICE stimulus. A deck can therefore read a numeric file it can name [verified: run E83]. Revisit with an OS sandbox | Accepted, R4 |
-| Q20 | Settled for the C locale: every non-ASCII byte in a name becomes `_` [verified: run E86], and non-ASCII values read correctly. The worker sets no locale, so confirm it runs under C. Signals must then be looked up by the engine's name, such as `v(/__)`, not the label | Live test, PR 6 |
-| Q18 | XSPICE auto-bridging can read `bridge_<family>_*.subcir` after parsing, from the working folder or `sourcepath`, and that file reaches the engine unvetted [verified: run E83]. The worker's working folder holds only an empty `.spiceinit`, and `sourcepath` is refused as an option. Prove this with a live test | Live test, PR 6 |
-| Q19 | Does `ngCM_Input_Path` set to the project let code models find relative data files such as `test-3d-1.table`? From an empty working folder they fail loudly [verified: run E84] | Live test, PR 6 |
+| Q20 | Settled. The worker runs with a cleared environment, in the C locale. Every non-ASCII byte in a name becomes `_`, so `/\u05e9` reads back as `v(/__)` [verified: run E86, E88]. `run_simulation` maps a node back to the KiCad name when exactly one net makes it | Done |
+| Q18 | Settled. An auto-bridge file in the project folder is not read: the worker's working folder is the run folder, and `sourcepath` is refused as an option. The same file in the run folder is read, which proves the test can see the difference [verified: run E88] | Done |
+| Q19 | Settled. `ngCM_Input_Path` set to the project lets code models find relative data files, and without it they stop with a fatal error [verified: run E88] | Done |
 | Q13 | Does FFT computed from a stored transient match KiCad's `linearize` and `fft` result? | FFT PR |
 
 ## 6. Test plan
@@ -831,6 +835,8 @@ Recorded here so every implementation session follows them.
 | E85 | Five independent review rounds of preflight, each case run through libngspice 44.2 or a real `kicad-cli` export on a scratch copy; `4k7`, `R47` and `4n7` run by mode | Wrong results it now catches: `100n 50V` read as 50 F, `3V3` as 3 V, `1MOhm` and `1MHz` as milli, `22P` exported as 2.2e+16, labels holding `=`, `.if(` read as live. Wrong refusals removed: series capacitors and isolated windings, which give correct AC and transient results; `.param` names as values; `47R`, `100n_X7R`, `5VDC`; `DC(5)` and `(1k)`; `R = (expr)`; `tc=a,b`. Also a panic on `\u00b0` before a bracket, and a cubic slowdown. A potentiometer counts as no reference. KiCad's 17 exportable demos all report ready. Known gaps left as they are: a body line in a text `.subckt` can match a symbol's name, a call with the wrong pin count fails in the engine with no typed refusal, and values that fail loudly in the engine, such as `DC 9V Battery`, are left to it |
 | E86 | Ran Hebrew node names through libngspice 44.2 under the C locale and under UTF-8; read `inp_casefix` | C: `/\u05e9` and `/\u05ea` both became `/__`, one node. UTF-8: only bytes 0x80 to 0x9F changed, so `/\u05d0` and `/\u05d1` still merged. `inp_casefix` replaces any byte `isprint` rejects |
 | E87 | Generated six decks through libngspice 44.2 in text and binary, and compared the parser with the engine's in-memory vectors; ran the parser against noise, pz, sens, tf, disto, sp, `.save` and event decks; cut files at every byte and fuzzed them | Every value matched. 328,884 cuts and 600,000 fuzz cases: no panic. A 2 GB binary file parsed in 1.1 s at a 4 GB peak. Traps listed under Reading results |
+| E88 | Ran the worker on libngspice 44.2 and `run_simulation` on 13 KiCad demos | 9 ran on the first pass. `class-d` and `up-down-counter` stopped: `.probe alli` is fatal next to any event node (`Evtcheck_nodes`), so those circuits now save voltages and source currents only, and both run. `ibis` needs KiCad's real cache folder and `q17` does not export. A `SIGSEGV` sent from outside is swallowed by Rust's handler and the run carries on, so the live crash test uses `SIGABRT`. `.tran 1n 10` now ends in the exit callback, not a segfault |
+| E89 | Two independent review rounds of the run path, each finding reproduced through the worker or the server | Fixed: model text in errors, engine warnings missing from complete results, a panic on a stray folder name, retention failures refusing good runs, the budget not covering the probe and exports, a halt lost before the engine thread starts, and paths passed through engine commands, which ngspice expands. `SPICE_SCRIPTS` over about 500 bytes overran a buffer, so it is now `.`. 26 odd folder names pass. `.ENDSUBCKT` and `.ends,f` close a block, as KiCad's own QA library needs |
 | E64 | Read `Cargo.toml`, `Cargo.lock`, and the `konnect` and `konnect-core` manifests | `dirs` and `sha2` already in `konnect-core`. `libc` 0.2.189 and `windows-sys` 0.61.2 are in the lock, not direct dependencies of `konnect` |
 | E65 | Ran both netlist formats on all 18 demos at tag 10.0.1: full copy, snapshot with `Sim.Library` rewrite, snapshot without | Snapshot matched byte for byte on 17; `laser_driver` had the same lines in a different order. Without the rewrite 15 exit 2 and still write a file, with `Simulation model library not found`. `Q17ng` exits 2 either way: KiCad's parser rejects `all_devices.lib` |
 | E66 | Ran the `ibis` demo repeatedly and after other projects' exports; read the cache cleanup in `netlist_exporter_spice.cpp` at the tag | Includes `~/Library/Caches/KiCad/10.0/ibis/U1.cache`. Present after its own exports; missing after later exports from other projects |

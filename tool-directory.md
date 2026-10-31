@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
+- **230 registered tools** + **7 always-visible meta-tools** = **237 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -481,7 +481,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Simulation
 
-### `simulation` · 1 tools
+### `simulation` · 2 tools
 
 **Purpose:** Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run.
 **Source:** [`crates/konnect-core/src/tools/simulation.rs`](crates/konnect-core/src/tools/simulation.rs)
@@ -489,6 +489,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `check_simulation_readiness` | Report whether a schematic can be simulated, and why not, without running a simulation. Works from the saved files on a private copy, so the project is not touched and unsaved editor changes are not seen. Also vets the deck: every include is inlined, and anything that could run commands is removed or refused. Then checks models, values, ground, net names and connectivity, including any testbench changes given. |
+| `run_simulation` | Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. |
 
 ## Appendix: Structural observations
 
