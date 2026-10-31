@@ -4,7 +4,8 @@ use super::{cli, get_path, sch_export, ToolContext, ToolDef};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
-use crate::simulation::kicad_netlist::{self, ElementEntry, NetEntry, SpiceNetlist};
+use crate::simulation::kicad_netlist::{self, ElementEntry, KiCadNetlist, NetEntry, SpiceNetlist};
+use crate::simulation::preflight::{self, Preflight};
 use crate::simulation::snapshot;
 use crate::simulation::worker_client::{probe_engine, EngineStatus};
 use crate::tool;
@@ -17,6 +18,7 @@ const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LIMIT: u64 = 25;
 const MAX_LIMIT: u64 = 200;
 const DETAIL_LIMIT: usize = 800;
+const MAX_SPICE_LINES: usize = 200;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![tool!(
@@ -26,6 +28,23 @@ pub fn tools() -> Vec<ToolDef> {
             "type": "object",
             "properties": {
                 "schematic": { "type": "string", "description": "Root .kicad_sch path" },
+                "testbench": {
+                    "type": "object",
+                    "description": "Changes to the deck for simulation only. The schematic is not touched",
+                    "properties": {
+                        "exclude_references": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "References to leave out, or prefix wildcards such as J*"
+                        },
+                        "spice_lines": {
+                            "type": "array",
+                            "maxItems": MAX_SPICE_LINES,
+                            "items": { "type": "string" },
+                            "description": "Elements, models and includes to add. Use spice_name values from this tool"
+                        }
+                    }
+                },
                 "net_filter": { "type": "string", "description": "Only list nets whose name contains this text" },
                 "limit": {
                     "type": "integer",
@@ -91,10 +110,78 @@ async fn handle_check_simulation_readiness(
         .get()
         .map(|runtime| runtime.model_dirs().to_vec())
         .unwrap_or_default();
-    let design = inspect_design(&ctx.config.kicad_cli, &schematic, &model_dirs).await;
+    let testbench = Testbench::from_args(&args["testbench"]);
+    let allow_digital_models = ctx
+        .simulation
+        .get()
+        .is_none_or(|runtime| runtime.allows_digital_models());
+    let inputs = DesignInputs {
+        model_dirs: &model_dirs,
+        testbench: &testbench,
+        allow_digital_models,
+        code_model_count: engine.code_model_count,
+    };
+    let design = inspect_design(&ctx.config.kicad_cli, &schematic, &inputs).await;
     Ok(CallToolResult::json(&readiness_report(
         &engine, &design, net_filter, limit,
     )))
+}
+
+#[derive(Default)]
+struct Testbench {
+    exclude_references: Vec<String>,
+    spice_lines: Vec<String>,
+}
+
+impl Testbench {
+    fn from_args(value: &Value) -> Self {
+        let strings = |field: &str| -> Vec<String> {
+            value[field]
+                .as_array()
+                .map(|items| {
+                    let text = items.iter().filter_map(Value::as_str);
+                    text.map(str::to_owned).collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            exclude_references: strings("exclude_references"),
+            spice_lines: strings("spice_lines"),
+        }
+    }
+}
+
+struct DesignInputs<'a> {
+    model_dirs: &'a [PathBuf],
+    testbench: &'a Testbench,
+    allow_digital_models: bool,
+    code_model_count: usize,
+}
+
+/// References each pattern selects, and the patterns that select nothing. A
+/// trailing `*` matches a prefix.
+fn excluded_references(kicad: &KiCadNetlist, patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut references = Vec::new();
+    let mut unmatched = Vec::new();
+    for pattern in patterns {
+        let matches = |reference: &str| match pattern.strip_suffix('*') {
+            Some(prefix) => reference.starts_with(prefix),
+            None => reference == pattern,
+        };
+        let selected: Vec<String> = kicad
+            .components
+            .iter()
+            .filter(|component| matches(&component.reference))
+            .map(|component| component.reference.clone())
+            .collect();
+        if selected.is_empty() {
+            unmatched.push(pattern.clone());
+        }
+        references.extend(selected);
+    }
+    references.sort();
+    references.dedup();
+    (references, unmatched)
 }
 
 /// The design as `kicad-cli` sees it, from a private copy of the saved files.
@@ -105,6 +192,8 @@ struct Design {
     compatibility: Compatibility,
     deck: Result<FlatDeck, Refusal>,
     ignored_model_dirs: Vec<String>,
+    excluded_references: Vec<String>,
+    preflight: Option<Preflight>,
 }
 
 /// KiCad wipes its per-user IBIS cache on every SPICE export, from any project,
@@ -142,7 +231,7 @@ fn allowed_roots(project_dir: &Path, model_dirs: &[PathBuf]) -> (Vec<PathBuf>, V
 async fn inspect_design(
     kicad_cli: &str,
     schematic: &Path,
-    model_dirs: &[PathBuf],
+    inputs: &DesignInputs<'_>,
 ) -> anyhow::Result<Design> {
     let scratch = tempfile::Builder::new()
         .prefix("konnect-sim-export-")
@@ -166,20 +255,46 @@ async fn inspect_design(
     .await?;
     let kicad = kicad_netlist::parse(&netlists.kicad)?;
     let spice = SpiceNetlist::parse(&netlists.spice);
-    let (allowed_roots, ignored_model_dirs) = allowed_roots(&project_dir, model_dirs);
+    let (allowed_roots, ignored_model_dirs) = allowed_roots(&project_dir, inputs.model_dirs);
+    let (excluded_references, unmatched_exclusions) =
+        excluded_references(&kicad, &inputs.testbench.exclude_references);
+    let nets = kicad_netlist::net_entries(&kicad, &spice);
+    let elements = kicad_netlist::element_entries(&kicad, &spice, &excluded_references);
+    let excluded_elements: Vec<String> = elements
+        .iter()
+        .filter(|element| element.excluded)
+        .filter_map(|element| element.element_name.as_deref())
+        .map(str::to_lowercase)
+        .collect();
     let deck = flatten::flatten(&DeckInputs {
         netlist: &netlists.spice,
-        testbench: &[],
+        testbench: &inputs.testbench.spice_lines,
         project_dir: &project_dir,
         allowed_roots: &allowed_roots,
         compatibility,
+        excluded_elements: &excluded_elements,
+    });
+    let preflight = deck.as_ref().ok().map(|deck| {
+        preflight::run(&preflight::Inputs {
+            deck,
+            compatibility,
+            kicad: &kicad,
+            nets: &nets,
+            elements: &elements,
+            allow_digital_models: inputs.allow_digital_models,
+            code_model_count: inputs.code_model_count,
+            unmatched_exclusions: &unmatched_exclusions,
+            has_testbench_lines: !inputs.testbench.spice_lines.is_empty(),
+        })
     });
     Ok(Design {
         compatibility,
         deck,
         ignored_model_dirs,
-        nets: kicad_netlist::net_entries(&kicad, &spice),
-        elements: kicad_netlist::element_entries(&kicad, &spice),
+        excluded_references,
+        preflight,
+        nets,
+        elements,
         locks_present: snapshot
             .locks_present
             .iter()
@@ -247,19 +362,31 @@ fn readiness_report(
             "reason": "The netlist could not be exported.",
         }),
     };
-    let checks = [
-        engine_check,
-        export_check,
-        deck_check,
-        json!({
+    let preflight = design
+        .as_ref()
+        .ok()
+        .and_then(|design| design.preflight.as_ref());
+    let mut checks = vec![engine_check, export_check, deck_check];
+    match preflight {
+        Some(preflight) => checks.extend(
+            preflight
+                .checks
+                .iter()
+                .map(|check| check_report(check, limit)),
+        ),
+        None => checks.push(json!({
             "name": "preflight",
             "ran": false,
-            "reason": "Preflight checks are not implemented in this build."
-        }),
-    ];
-    let deck_refused = matches!(design, Ok(design) if design.deck.is_err());
-    let failed = (engine_ran && !engine.available) || design.is_err() || deck_refused;
-    let ready = if failed { json!(false) } else { Value::Null };
+            "reason": "Preflight runs on a deck that passed vetting."
+        })),
+    }
+    let ready = if checks.iter().any(|check| check["passed"] == false) {
+        json!(false)
+    } else if checks.iter().any(|check| check["ran"] == false) {
+        Value::Null
+    } else {
+        json!(true)
+    };
 
     let mut report = json!({
         "ready": ready,
@@ -286,10 +413,54 @@ fn readiness_report(
                 "dropped_directives": deck.dropped_directives,
             });
         }
+        if let Some(preflight) = &design.preflight {
+            report["unmodelled_symbols"] = unmodelled_report(&preflight.unmodelled_symbols, limit);
+            let warnings = preflight.warnings.iter();
+            report["warnings"] = json!(warnings
+                .map(|warning| warning_report(warning, limit))
+                .collect::<Vec<_>>());
+        }
+        if !design.excluded_references.is_empty() {
+            report["excluded_references"] =
+                json!(listing(design.excluded_references.iter(), limit));
+        }
         report["source_evidence"] = json!({
             "excludes_unsaved_editor_state": true,
             "locks_present": design.locks_present,
         });
+    }
+    report
+}
+
+/// A check with its items cut to the limit and counted before the cut.
+fn check_report(check: &preflight::Check, limit: usize) -> Value {
+    let mut report = json!(check);
+    add_items(&mut report, &check.items, limit);
+    report
+}
+
+fn add_items(report: &mut Value, items: &[String], limit: usize) {
+    let shown: Vec<&String> = items.iter().take(limit).collect();
+    report["total"] = json!(items.len());
+    report["shown"] = json!(shown.len());
+    report["truncated"] = json!(shown.len() < items.len());
+    report["items"] = json!(shown);
+}
+
+fn warning_report(warning: &preflight::Warning, limit: usize) -> Value {
+    let mut report = json!(warning);
+    add_items(&mut report, &warning.items, limit);
+    report
+}
+
+/// Listed like the other lists, with each symbol's pins cut to the same limit.
+fn unmodelled_report(symbols: &[preflight::UnmodelledSymbol], limit: usize) -> Value {
+    let mut report = json!(listing(symbols.iter(), limit));
+    if let Some(items) = report["items"].as_array_mut() {
+        for (item, symbol) in items.iter_mut().zip(symbols) {
+            item["pin_total"] = json!(symbol.pins.len());
+            item["pins"] = json!(symbol.pins.iter().take(limit).collect::<Vec<_>>());
+        }
     }
     report
 }
@@ -328,16 +499,115 @@ mod tests {
         }
     }
 
+    static NO_TESTBENCH: Testbench = Testbench {
+        exclude_references: Vec::new(),
+        spice_lines: Vec::new(),
+    };
+
+    fn no_inputs() -> DesignInputs<'static> {
+        DesignInputs {
+            model_dirs: &[],
+            testbench: &NO_TESTBENCH,
+            allow_digital_models: true,
+            code_model_count: 1,
+        }
+    }
+
+    #[test]
+    fn exclusions_take_exact_references_and_prefix_wildcards() {
+        let kicad = kicad_netlist::parse(NET).unwrap();
+        let (references, unmatched) = excluded_references(
+            &kicad,
+            &["D1".to_string(), "R*".to_string(), "J*".to_string()],
+        );
+        assert_eq!(references, ["D1", "R1", "R2"]);
+        assert_eq!(unmatched, ["J*"]);
+    }
+
+    #[test]
+    fn a_symbol_with_many_pins_is_cut_to_the_limit() {
+        let pin = |number: usize| preflight::SymbolPin {
+            pin: number.to_string(),
+            pin_name: None,
+            pin_type: None,
+            net: "/a".to_string(),
+            spice_net: None,
+        };
+        let symbol = preflight::UnmodelledSymbol {
+            reference: "U1".to_string(),
+            value: String::new(),
+            lib_id: None,
+            pins: (0..5).map(pin).collect(),
+            suggested_fix: "exclude",
+        };
+        let report = unmodelled_report(&[symbol], 2);
+        assert_eq!(report["items"][0]["pin_total"], 5);
+        assert_eq!(report["items"][0]["pins"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_passing_design_is_ready_only_when_every_check_ran() {
+        let mut passing = design().unwrap();
+        passing.preflight = Some(Preflight {
+            checks: Vec::new(),
+            warnings: Vec::new(),
+            unmodelled_symbols: Vec::new(),
+        });
+        let report = readiness_report(&engine("ok", true), &Ok(passing), "", 25);
+        assert_eq!(report["ready"], true, "{report}");
+        let report = readiness_report(&engine("not_available", false), &design(), "", 25);
+        assert_eq!(report["ready"], Value::Null, "{report}");
+    }
+
+    #[test]
+    fn check_items_are_cut_to_the_limit_and_counted_first() {
+        let kicad = kicad_netlist::parse(NET).unwrap();
+        let mut design = design().unwrap();
+        design.preflight = Some(preflight::run(&preflight::Inputs {
+            deck: &flatten::flatten(&DeckInputs {
+                netlist: CIR,
+                testbench: &[],
+                project_dir: Path::new("/"),
+                allowed_roots: &[],
+                compatibility: Compatibility::DEFAULT,
+                excluded_elements: &[],
+            })
+            .unwrap(),
+            compatibility: Compatibility::DEFAULT,
+            kicad: &kicad,
+            nets: &design.nets,
+            elements: &design.elements,
+            allow_digital_models: true,
+            code_model_count: 1,
+            unmatched_exclusions: &[],
+            has_testbench_lines: false,
+        }));
+        let report = readiness_report(&engine("ok", true), &Ok(design), "", 1);
+        assert_eq!(report["ready"], false);
+        let coverage = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "model_coverage")
+            .unwrap();
+        assert_eq!(coverage["total"], 2, "{report}");
+        assert_eq!(coverage["items"].as_array().unwrap().len(), 1);
+        assert_eq!(report["unmodelled_symbols"]["total"], 2);
+        assert_eq!(report["unmodelled_symbols"]["truncated"], true);
+    }
+
     fn design() -> anyhow::Result<Design> {
         let kicad = kicad_netlist::parse(NET)?;
         let spice = SpiceNetlist::parse(CIR);
         Ok(Design {
             nets: kicad_netlist::net_entries(&kicad, &spice),
-            elements: kicad_netlist::element_entries(&kicad, &spice),
+            elements: kicad_netlist::element_entries(&kicad, &spice, &[]),
             locks_present: vec!["/p/~top.kicad_sch.lck".to_string()],
             compatibility: Compatibility::DEFAULT,
             deck: Ok(FlatDeck::default()),
             ignored_model_dirs: Vec::new(),
+            excluded_references: Vec::new(),
+            preflight: None,
         })
     }
 
@@ -564,7 +834,7 @@ mod tests {
             let root = project(project_dir.path());
             let fake = exporting_cli(tools.path());
 
-            let design = inspect_design(fake.to_str().unwrap(), &root, &[])
+            let design = inspect_design(fake.to_str().unwrap(), &root, &no_inputs())
                 .await
                 .unwrap();
             assert_eq!(design.elements.len(), 5);
@@ -584,7 +854,7 @@ mod tests {
             let read_only = std::fs::Permissions::from_mode(0o555);
             std::fs::set_permissions(project_dir.path(), read_only).unwrap();
 
-            let result = inspect_design(fake.to_str().unwrap(), &root, &[]).await;
+            let result = inspect_design(fake.to_str().unwrap(), &root, &no_inputs()).await;
 
             let writable = std::fs::Permissions::from_mode(0o755);
             std::fs::set_permissions(project_dir.path(), writable).unwrap();
@@ -608,7 +878,7 @@ mod tests {
                  exit 2\n",
                 "",
             );
-            let error = inspect_design(fake.to_str().unwrap(), &root, &[])
+            let error = inspect_design(fake.to_str().unwrap(), &root, &no_inputs())
                 .await
                 .err()
                 .unwrap();
@@ -632,7 +902,7 @@ mod tests {
                  done\n",
                 "",
             );
-            assert!(inspect_design(fake.to_str().unwrap(), &root, &[])
+            assert!(inspect_design(fake.to_str().unwrap(), &root, &no_inputs())
                 .await
                 .is_err());
         }

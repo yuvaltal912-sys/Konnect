@@ -235,7 +235,7 @@ fn a_real_project_is_read_from_a_snapshot_and_left_untouched() {
 
     assert_eq!(report["checks"][0]["passed"], true, "{report}");
     assert_eq!(report["checks"][1]["passed"], true, "{report}");
-    assert!(report["ready"].is_null(), "{report}");
+    assert_eq!(report["ready"], true, "{report}");
     assert_eq!(file_names(project.path()), before);
     let nets = report["nets"]["items"].as_array().unwrap();
     assert!(nets.iter().any(|net| net["kicad_name"] == "/rect_out"
@@ -326,6 +326,7 @@ fn every_simulation_demo_flattens_or_names_its_export_failure() {
     let kicad_cache = PathBuf::from(std::env::var_os("HOME").unwrap()).join("Library/Caches/KiCad");
     let model_dirs = format!("ngspice_model_dirs = [{:?}]\n", kicad_cache);
     let mut vetted = 0;
+    let mut failures: Vec<String> = Vec::new();
     for project_file in project_files(&demos().join("simulation")) {
         let source = project_file.parent().unwrap();
         let name = project_file.file_name().unwrap().to_owned();
@@ -338,16 +339,51 @@ fn every_simulation_demo_flattens_or_names_its_export_failure() {
             &model_dirs,
         );
         let demo = source.file_name().unwrap().to_string_lossy().into_owned();
-        eprintln!("{demo}: {} {}", report["checks"][2], report["deck"]);
+        eprintln!("{demo}: ready={} {}", report["ready"], report["checks"]);
         if report["checks"][1]["passed"] == false {
             assert_eq!(report["checks"][2]["ran"], false, "{demo}: {report}");
             continue;
         }
         assert_eq!(report["checks"][2]["passed"], true, "{demo}: {report}");
         assert!(report["deck"]["line_count"].as_u64().unwrap() > 0, "{demo}");
+        if report["ready"] != true {
+            failures.push(demo.clone());
+        }
         vetted += 1;
     }
     assert_eq!(vetted, 17, "Q17ng alone is expected to fail its export");
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_testbench_changes_what_readiness_sees_without_touching_the_project() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let before = std::fs::read(&schematic).unwrap();
+
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({
+            "schematic": schematic,
+            "testbench": { "exclude_references": ["V1"], "spice_lines": ["V9 /signal_inn 0 1"] }
+        }),
+    );
+
+    assert_eq!(
+        report["excluded_references"]["items"],
+        json!(["V1"]),
+        "{report}"
+    );
+    let checks = report["checks"].as_array().unwrap();
+    let testbench = checks
+        .iter()
+        .find(|c| c["name"] == "testbench_nodes")
+        .unwrap();
+    assert_eq!(testbench["code"], "unknown_testbench_node", "{report}");
+    assert_eq!(report["ready"], false);
+    assert_eq!(std::fs::read(&schematic).unwrap(), before);
 }
 
 #[test]

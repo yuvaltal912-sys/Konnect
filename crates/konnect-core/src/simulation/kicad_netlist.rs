@@ -15,6 +15,18 @@ pub(crate) struct Component {
     pub reference: String,
     pub value: String,
     pub lib_id: Option<String>,
+    /// Has `Sim.*` fields of its own. Without them KiCad infers a model from
+    /// the value, or leaves the part unmodelled.
+    pub has_sim_fields: bool,
+    pub sim_params: Option<String>,
+}
+
+/// What a library symbol carries, which a placed symbol may not have copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryPart {
+    pub lib_id: String,
+    pub has_sim_fields: bool,
+    pub sim_params: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,6 +49,7 @@ pub(crate) struct Net {
 pub(crate) struct KiCadNetlist {
     pub components: Vec<Component>,
     pub nets: Vec<Net>,
+    pub library_parts: Vec<LibraryPart>,
 }
 
 pub(crate) fn parse(source: &str) -> Result<KiCadNetlist> {
@@ -55,7 +68,47 @@ pub(crate) fn parse(source: &str) -> Result<KiCadNetlist> {
         .into_iter()
         .map(net)
         .collect::<Result<Vec<_>>>()?;
-    Ok(KiCadNetlist { components, nets })
+    let library_parts = root
+        .find("libparts")
+        .map(|parts| parts.find_all("libpart"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(library_part)
+        .collect();
+    Ok(KiCadNetlist {
+        components,
+        nets,
+        library_parts,
+    })
+}
+
+/// Whether any `Sim.*` field exists, and the value of `Sim.Params`.
+fn sim_fields(node: &SexpNode) -> (bool, Option<String>) {
+    let fields = node
+        .find("fields")
+        .map(|fields| fields.find_all("field"))
+        .unwrap_or_default();
+    let named = |field: &&SexpNode, name: &str| field.find_str("name") == Some(name);
+    // `Sim.Pins` alone says nothing about the model.
+    let has_sim_fields = fields.iter().any(|field| {
+        field
+            .find_str("name")
+            .is_some_and(|name| name.starts_with("Sim.") && name != "Sim.Pins")
+    });
+    let sim_params = fields
+        .iter()
+        .find(|field| named(field, "Sim.Params"))
+        .and_then(|field| field.children()?.last()?.as_str().map(str::to_owned));
+    (has_sim_fields, sim_params)
+}
+
+fn library_part(node: &SexpNode) -> Option<LibraryPart> {
+    let (has_sim_fields, sim_params) = sim_fields(node);
+    Some(LibraryPart {
+        lib_id: format!("{}:{}", node.find_str("lib")?, node.find_str("part")?),
+        has_sim_fields,
+        sim_params,
+    })
 }
 
 fn required(node: &SexpNode, tag: &str) -> Result<String> {
@@ -70,10 +123,13 @@ fn component(node: &SexpNode) -> Result<Component> {
         let part = source.find_str("part")?;
         Some(format!("{lib}:{part}"))
     });
+    let (has_sim_fields, sim_params) = sim_fields(node);
     Ok(Component {
         reference: required(node, "ref")?,
         value: node.find_str("value").unwrap_or_default().to_owned(),
         lib_id,
+        has_sim_fields,
+        sim_params,
     })
 }
 
@@ -162,6 +218,7 @@ pub(crate) struct ElementEntry {
     /// Null when the symbol has no line in the deck: excluded from simulation.
     pub element_name: Option<String>,
     pub modelled: bool,
+    pub excluded: bool,
 }
 
 pub(crate) fn net_entries(kicad: &KiCadNetlist, spice: &SpiceNetlist) -> Vec<NetEntry> {
@@ -184,16 +241,29 @@ pub(crate) fn net_entries(kicad: &KiCadNetlist, spice: &SpiceNetlist) -> Vec<Net
         .collect()
 }
 
-pub(crate) fn element_entries(kicad: &KiCadNetlist, spice: &SpiceNetlist) -> Vec<ElementEntry> {
+pub(crate) fn element_entries(
+    kicad: &KiCadNetlist,
+    spice: &SpiceNetlist,
+    excluded: &[String],
+) -> Vec<ElementEntry> {
+    let references: HashSet<&str> = kicad
+        .components
+        .iter()
+        .map(|component| component.reference.as_str())
+        .collect();
     kicad
         .components
         .iter()
         .map(|component| {
-            let element = spice.element_for(&component.reference);
+            // `VR7` may be `R7` with a device letter, or a symbol of its own.
+            let element = spice.element_for(&component.reference).filter(|tokens| {
+                tokens[0] == component.reference || !references.contains(tokens[0].as_str())
+            });
             ElementEntry {
                 reference: component.reference.clone(),
                 element_name: element.and_then(|tokens| tokens.first().cloned()),
                 modelled: element.is_some_and(|tokens| !is_unmodelled(tokens)),
+                excluded: excluded.contains(&component.reference),
             }
         })
         .collect()
@@ -245,7 +315,7 @@ mod tests {
     fn unmodelled_symbols_are_found_and_modelled_ones_are_not() {
         let kicad = parse(RECTIFIER_NET).unwrap();
         let spice = SpiceNetlist::parse(RECTIFIER_CIR);
-        let elements = element_entries(&kicad, &spice);
+        let elements = element_entries(&kicad, &spice, &[]);
         let modelled = |reference: &str| {
             elements
                 .iter()
@@ -303,6 +373,7 @@ mod tests {
                 name: "/isolated(1)".to_string(),
                 pins: Vec::new(),
             }],
+            library_parts: Vec::new(),
         };
         let nets = net_entries(&kicad, &SpiceNetlist::parse("R1 a b 1k\n"));
         assert!(!nets[0].in_deck);
@@ -318,16 +389,40 @@ mod tests {
     }
 
     #[test]
+    fn a_symbol_with_no_line_does_not_claim_another_symbols_line() {
+        let component = |reference: &str| Component {
+            reference: reference.to_string(),
+            value: String::new(),
+            lib_id: None,
+            has_sim_fields: false,
+            sim_params: None,
+        };
+        let kicad = KiCadNetlist {
+            components: vec![component("R7"), component("VR7"), component("BT1")],
+            nets: Vec::new(),
+            library_parts: Vec::new(),
+        };
+        let spice = SpiceNetlist::parse("VR7 a 0 10\nVBT1 a 0 1\n");
+        let elements = element_entries(&kicad, &spice, &[]);
+        assert_eq!(elements[0].element_name, None);
+        assert_eq!(elements[1].element_name.as_deref(), Some("VR7"));
+        assert_eq!(elements[2].element_name.as_deref(), Some("VBT1"));
+    }
+
+    #[test]
     fn a_symbol_with_no_line_is_not_modelled_and_has_no_element() {
         let kicad = KiCadNetlist {
             components: vec![Component {
                 reference: "H1".to_string(),
                 value: "Hole".to_string(),
                 lib_id: None,
+                has_sim_fields: false,
+                sim_params: None,
             }],
             nets: Vec::new(),
+            library_parts: Vec::new(),
         };
-        let elements = element_entries(&kicad, &SpiceNetlist::parse("R1 a b 1k\n"));
+        let elements = element_entries(&kicad, &SpiceNetlist::parse("R1 a b 1k\n"), &[]);
         assert_eq!(elements[0].element_name, None);
         assert!(!elements[0].modelled);
     }
@@ -340,6 +435,18 @@ mod tests {
         assert!(!is_unmodelled(&tokens("Q1 c b e __Q1")));
         assert!(!is_unmodelled(&tokens("Q2 __Q3")));
         assert!(!is_unmodelled(&tokens("R1 a b 1k")));
+    }
+
+    #[test]
+    fn a_pin_map_alone_is_not_a_model() {
+        let source = |field: &str| {
+            format!(
+                "(export (components (comp (ref \"D1\") (fields (field (name \"{field}\") \"x\")))))"
+            )
+        };
+        let has_fields = |field: &str| parse(&source(field)).unwrap().components[0].has_sim_fields;
+        assert!(!has_fields("Sim.Pins"));
+        assert!(has_fields("Sim.Device"));
     }
 
     #[test]
