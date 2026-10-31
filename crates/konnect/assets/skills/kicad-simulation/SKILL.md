@@ -67,10 +67,10 @@ Set `max_step_seconds` to about a hundredth of the fastest edge you care about. 
 | `value_at` | `at_seconds` | The value at that time |
 | `crossing` | `level`, optional `direction` | The first time the signal reaches the level |
 | `rise_time`, `fall_time` | | 10 to 90 percent |
-| `overshoot_percent` | | How far past the final value, as a share of the step |
+| `overshoot_percent` | | How far the signal goes past the final value, in the step's direction, as a share of the step |
 | `settling_time` | Optional `band_percent`, default 2 | Time from the window start until it stays in the band. The band is a share of the final value or the step, whichever is larger |
 
-All but `value_at` take `from_seconds` and `to_seconds`. The last four default to the window's first and last values as the step, so give a window that holds just one edge and let it run on until the signal has stopped. They return `start_value` and `final_value`: check them, because a window that ends on the wrong level gives a wrong number and no test catches every case. A signal still moving at the end, an edge in the last tenth of the window, or a signal that strays more than three steps from its start gives `final_value_needed`: narrow or extend the window, or give `final_value`. An inrush current has a small final value and a big peak, so it needs `final_value`, or use `peak_abs`.
+All but `value_at` take `from_seconds` and `to_seconds`. The last four take their step from the window: its first value, and the mean of its last tenth as the final value. So give a window that holds just one edge and let it run on until the signal has stopped. They return `start_value` and `final_value`: check them, because a window ending just past a crest gives a wrong number and no test catches every case. A signal still moving at the end, or an edge in the last tenth of the window, gives `final_value_needed`: narrow or extend the window, or give `final_value`. So does a rise, fall or overshoot whose signal strays more than three steps from its start, such as an inrush current, where `peak_abs` is the measurement you want. A sag that stays down reads as overshoot: use `min` for a droop.
 
 A `value` of `null` with a `finding` is an answer, not a failure.
 
@@ -84,7 +84,7 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 | `outside_data` | The window or time holds no data |
 | `non_finite_data` | The data, or the result, is not a finite number |
 
-**Initial conditions.** With `use_initial_conditions`, ngspice saves no point at time zero, so `analysis.first_point_seconds` is above 0 and `no_point_at_start` warns that a peak at that instant reads low and an integral misses the first step. Device probes would also lose a voltage set on a net by `.ic` or `.nodeset`, so with either card only node voltages and source currents are saved, `i(R1)` and `p(R1)` read `signal_not_found`, and a `.probe` card of your own is refused as `probe_loses_initial_conditions`. To keep device currents, use `IC=` on the device, which probes do not disturb.
+**Initial conditions.** With `use_initial_conditions`, ngspice saves no point at time zero, so `analysis.first_point_seconds` is above 0 and `no_point_at_start` warns that a peak at that instant reads low and an integral misses the first step. Device probes would also lose a voltage set on a net by `.ic` or `.nodeset`, so with either card only node voltages and source currents are saved, `i(R1)` and `p(R1)` read `signal_not_found`, as does `i()` of a current source, and a `.probe` card of your own is refused as `probe_loses_initial_conditions`. To keep device currents, use `IC=` on the device, which probes do not disturb.
 
 ## Fixing an Unmodelled Symbol
 
@@ -100,10 +100,10 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 
 - **`outcome.status`:** `complete` means the requested range was covered and every measurement found its signal. `partial` means the data is real but stops early or a signal was missing, and `stopped.reason` says why it stopped: `timeout`, `size_limit`, `no_convergence` or `incomplete_coverage`.
 - **`analysis.coverage_ratio`:** how much of the requested time ran. On a partial run every measurement and summary carries `window_truncated: true`, because it describes only the part that ran. Say so, and never report such a peak as the run's peak. On a complete run the same flag means that measurement's window reached past the saved data, such as before `start_save_seconds`, so its number leaves out that stretch.
-- **`finding: "signal_not_found"`:** the run does not hold that signal. Device currents are not saved in circuits with digital parts, or with `.ic` or `.nodeset` under `use_initial_conditions`, and `device_currents_not_saved` says which. Digital nets have no `v()`.
+- **`finding: "signal_not_found"`:** the run does not hold that signal. Only voltage sources keep their currents in circuits with digital parts, or with `.ic` or `.nodeset` under `use_initial_conditions`, and `device_currents_not_saved` says which. Digital nets have no `v()`.
 - **`simulated_circuit`:** `modified` means parts were excluded or added. Never present such a result as describing the schematic as drawn.
 - **`circuit.approximations`:** parts whose behaviour rests on an assumption. Say so when they matter.
-- **`warnings`:** read them. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means a digital circuit reports only voltages and source currents.
+- **`warnings`:** read them. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means only node voltages and voltage source currents were saved.
 - **`operating_point.rows`:** currents read positive into a device's first pin, so a delivering source reads negative.
 - **Full data:** `artifacts.table_path` holds every row, and `artifacts.deck_path` holds the deck that ran.
 

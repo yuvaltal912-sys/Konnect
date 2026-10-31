@@ -15,9 +15,10 @@ const WINDOW_TOLERANCE: f64 = 1e-9;
 /// is anything under the engine's own current tolerance.
 const NOISE_SHARE: f64 = 1e-9;
 const NOISE_FLOOR: f64 = 1e-12;
-/// With no `final_value`, the window's last value stands in for it. That holds
-/// only if the signal has stopped: this last share of the window must stay within
-/// `TAIL_STEADY_SHARE` of the step, its two halves must average within
+/// With no `final_value`, the mean of the window's last stretch stands in for it,
+/// so ripple does not shift the level with the phase the window ended on. That
+/// holds only if the signal has stopped: this last share of the window must stay
+/// within `TAIL_STEADY_SHARE` of the step, its two halves must average within
 /// `STILL_SHARE` of the step, so ripple does not count and a slow tail does, and
 /// the signal must stay within `MAX_EXCURSION` steps of its start, which a ring
 /// does and a pulse that came back does not. The result always shows the levels
@@ -29,6 +30,9 @@ const MAX_EXCURSION: f64 = 3.0;
 /// For settling, the end of the window may move this share of the band, which is
 /// what keeps the time it reports close to the true one.
 const BAND_STILL_SHARE: f64 = 0.05;
+/// A final value below this share of the swing is zero for the purpose of a band,
+/// so an inrush that dies away is banded on its swing.
+const ZERO_FINAL_SHARE: f64 = 1e-3;
 const RISE_LOW: f64 = 0.1;
 const RISE_HIGH: f64 = 0.9;
 const DEFAULT_BAND_PERCENT: f64 = 2.0;
@@ -455,7 +459,9 @@ impl Window {
     /// Between `final` and where the window starts, the step this window holds.
     fn step(&self, final_value: Option<f64>) -> (f64, f64) {
         let start = self.values[0];
-        let end = final_value.unwrap_or(self.values[self.values.len() - 1]);
+        let last = self.time[self.time.len() - 1];
+        let tail = self.duration() * TAIL_SHARE;
+        let end = final_value.unwrap_or_else(|| self.mean(last - tail, last));
         (start, end)
     }
 
@@ -580,23 +586,28 @@ impl Window {
 
     /// When the signal last enters the band and stays. The band is a share of
     /// the final value or of the step, whichever is larger: a rail has a large
-    /// final value and a small step, a discharge the reverse, and a share of a
-    /// final value of zero would be no band at all.
+    /// final value and a small step, a discharge the reverse. An inrush that dies
+    /// away to nothing has neither, so its band is a share of its swing.
     fn settling(&self, final_value: Option<f64>, band_percent: f64) -> Reading {
         let (start, end) = self.step(final_value);
         let step = (end - start).abs();
-        let band = end.abs().max(step) * band_percent / 100.0;
-        let noise = self.noise(end);
-        if final_value.is_some() {
-            if band <= noise {
-                return Reading::none("no_transition");
-            }
+        let excursion = self.excursion();
+        let reference = end.abs().max(step);
+        let reference = if reference < excursion * ZERO_FINAL_SHARE {
+            excursion
         } else {
-            if self.excursion() <= noise {
+            reference
+        };
+        let band = reference * band_percent / 100.0;
+        let noise = self.noise(end);
+        if band <= noise {
+            return Reading::none("no_transition");
+        }
+        if final_value.is_none() {
+            if excursion <= noise {
                 return Reading::none("no_transition");
             }
-            let allowed = (step * STILL_SHARE).max(band * BAND_STILL_SHARE);
-            if band <= noise || self.drift() > allowed {
+            if self.drift() > (step * STILL_SHARE).max(band * BAND_STILL_SHARE) {
                 return Reading::none("final_value_needed");
             }
         }
@@ -801,7 +812,6 @@ mod tests {
             .collect();
         let charge = |t: f64| 5.0 * (1.0 - (-t / tau).exp());
         let values: Vec<f64> = time.iter().map(|&t| charge(t)).collect();
-        let end = charge(stop);
 
         let settled = with(request("rise_time"), "final_value", json!(5.0));
         let rise = read(&settled, &time, &values).value.unwrap();
@@ -814,9 +824,10 @@ mod tests {
         let expected = 5.0 * (5.0 * tau - tau * (1.0 - (-5f64).exp()));
         close(read(&area, &time, &values).value.unwrap(), expected, 1e-9);
 
-        let settle = read(&request("settling_time"), &time, &values);
-        // |v - end| = 0.02 end means 5 e^(-t/tau) = 5 e^(-12) + 0.02 end.
-        let exact = -tau * ((5.0 * (-12f64).exp() + 0.02 * end) / 5.0).ln();
+        let settled = with(request("settling_time"), "final_value", json!(5.0));
+        let settle = read(&settled, &time, &values);
+        // 5 e^(-t/tau) = 0.02 times 5.
+        let exact = tau * 50f64.ln();
         close(settle.value.unwrap(), exact, 1e-8);
         close(settle.at.unwrap(), exact, 1e-8);
     }
@@ -1133,7 +1144,8 @@ mod tests {
         let settle = read(&request("settling_time"), &time, &values)
             .value
             .unwrap();
-        close(settle, 50f64.ln(), 3e-3);
+        // The tail's mean sits a little short of 1, so the band does too.
+        close(settle, 50f64.ln(), 5e-3);
     }
 
     #[test]
@@ -1201,6 +1213,60 @@ mod tests {
         // Five whole cycles in each half of the tail, so the means agree.
         let settled = read(&request("settling_time"), &time, &values);
         close(settled.value.unwrap(), 9.8, 1e-6);
+    }
+
+    /// A rail of 1 with a triangle ripple, reached by a ramp to `t` = 10.
+    fn rippling(to: f64) -> f64 {
+        let time: Vec<f64> = (0..=4000).map(|n| f64::from(n) * 0.025).collect();
+        let ripple = |t: f64| {
+            let phase = t.fract();
+            1.0 + 0.012 * (4.0 * (phase - 0.5).abs() - 1.0)
+        };
+        let values: Vec<f64> = time
+            .iter()
+            .map(|&t| if t < 10.0 { t / 10.0 } else { ripple(t) })
+            .collect();
+        let entry = with(request("settling_time"), "to_seconds", json!(to));
+        read(&entry, &time, &values).value.unwrap()
+    }
+
+    #[test]
+    fn settling_does_not_swing_with_the_ripple_phase_the_window_ended_on() {
+        // The window ends on a crest, a trough and between them. A last sample
+        // standing in for the final level would move the band by the ripple.
+        let settled = [
+            rippling(95.0),
+            rippling(95.25),
+            rippling(95.5),
+            rippling(95.75),
+        ];
+        for time in settled {
+            close(time, settled[0], 0.02);
+        }
+    }
+
+    #[test]
+    fn an_inrush_that_dies_away_settles_against_its_swing() {
+        let time: Vec<f64> = (0..=40_000).map(|n| f64::from(n) * 0.001).collect();
+        // From nothing, up at once, then away: no step from start to final.
+        let mut values: Vec<f64> = time.iter().map(|t| 12.0 * (-t).exp()).collect();
+        values[0] = 0.0;
+        let entry = with(request("settling_time"), "final_value", json!(0.0));
+        // Within 0.24 of nothing at ln(50).
+        close(
+            read(&entry, &time, &values).value.unwrap(),
+            50f64.ln(),
+            2e-3,
+        );
+        let loose = with(entry.clone(), "band_percent", json!(50));
+        close(read(&loose, &time, &values).value.unwrap(), 2f64.ln(), 2e-3);
+        close(
+            read(&request("settling_time"), &time, &values)
+                .value
+                .unwrap(),
+            50f64.ln(),
+            2e-3,
+        );
     }
 
     #[test]

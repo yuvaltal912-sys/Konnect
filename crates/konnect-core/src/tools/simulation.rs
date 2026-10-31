@@ -1241,9 +1241,10 @@ impl RunEnd<'_> {
             if first_point > 0.0 && saves_from_start {
                 warnings.push(json!({
                     "code": "no_point_at_start",
-                    "detail": "With use_initial_conditions ngspice saves no point at time zero, \
-                               so an event at that instant is cut short: a peak reads low, and \
-                               an integral misses the first step. See first_point_seconds.",
+                    "detail": "This run has no point at time zero, which is how ngspice saves \
+                               under use_initial_conditions, so an event at that instant is cut \
+                               short: a peak reads low, and an integral misses the first step. \
+                               See first_point_seconds.",
                 }));
             }
         }
@@ -1292,7 +1293,7 @@ impl RunEnd<'_> {
                 warnings.push(json!({
                     "code": "device_currents_not_saved",
                     "detail": "ngspice cannot probe device currents next to digital nodes, so \
-                               only analog node voltages and source currents are saved.",
+                               only analog node voltages and voltage source currents are saved.",
                 }));
             }
         }
@@ -1300,8 +1301,8 @@ impl RunEnd<'_> {
             warnings.push(json!({
                 "code": "device_currents_not_saved",
                 "detail": "Device probes would lose .ic and .nodeset voltages under \
-                           use_initial_conditions, so only node voltages and source currents are \
-                           saved.",
+                           use_initial_conditions, so only node voltages and voltage source \
+                           currents are saved.",
             }));
         }
         if !self.engine.code_models_failed.is_empty() {

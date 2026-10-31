@@ -1055,7 +1055,8 @@ fn check_options(card: &str) -> Result<(), String> {
         let name = name.to_lowercase();
         if !KNOWN_OPTIONS.contains(&name.as_str()) {
             return Err(format!(
-                "The option {} is not one Konnect allows, because some options set file paths.",
+                "The option {} is not one Konnect allows, because some options set file \
+                 paths or change what a run saves.",
                 shown_name(&name)
             ));
         }
