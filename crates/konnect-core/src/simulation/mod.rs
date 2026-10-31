@@ -7,6 +7,7 @@
 
 pub(crate) mod ac;
 pub(crate) mod element;
+pub(crate) mod export;
 pub(crate) mod flatten;
 pub(crate) mod kicad_netlist;
 pub(crate) mod measure;

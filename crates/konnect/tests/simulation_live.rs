@@ -2397,3 +2397,230 @@ fn a_peak_that_two_samples_straddle_evenly_is_refused_and_one_on_a_sample_is_rea
     );
     near(measured(&run(-1.0), "bw"), 125.0, 1.5);
 }
+
+/// One tool call in a server whose state folder is `home`, so a later call sees the
+/// runs of an earlier one.
+fn call_again(home: &Path, tool: &str, arguments: Value) -> Value {
+    call_in_home(home, tool, arguments, "")
+}
+
+fn run_folders(home: &Path) -> usize {
+    let Ok(projects) = std::fs::read_dir(home.join("simulation")) else {
+        return 0;
+    };
+    projects
+        .flatten()
+        .map(|project| std::fs::read_dir(project.path()).unwrap().count())
+        .sum()
+}
+
+fn csv_rows(path: &str) -> Vec<Vec<String>> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| line.split(',').map(str::to_owned).collect())
+        .collect()
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_stored_soft_start_is_measured_again_and_listed_without_simulating() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let sheet = project.path().join("rectifier.kicad_sch");
+    let home = tempfile::tempdir().unwrap();
+    let run = call_again(
+        home.path(),
+        "run_simulation",
+        json!({
+            "schematic": sheet,
+            "testbench": { "exclude_references": ["*"], "spice_lines": soft_start_lines() },
+            "analysis": { "kind": "transient", "stop_time_seconds": 0.14, "max_step_seconds": 5e-7 },
+            "signals": ["v(vout)"],
+            "measurements": [
+                { "name": "inrush_peak", "kind": "peak_abs", "signal": "i(VBAT)" },
+                { "name": "rail_low", "kind": "min", "signal": "v(vout)", "from_seconds": 60e-3 },
+            ],
+        }),
+    );
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run_folders(home.path()), 1);
+
+    // The CSV holds the raw file's points under the raw file's names.
+    let csv = csv_rows(run["artifacts"]["csv_path"].as_str().unwrap());
+    assert_eq!(csv[0][0], "time");
+    assert!(csv[0].iter().any(|name| name == "v(vout)"), "{:?}", csv[0]);
+    assert_eq!(
+        csv.len() - 1,
+        run["analysis"]["points"].as_u64().unwrap() as usize
+    );
+
+    let listed = call_again(
+        home.path(),
+        "list_simulation_runs",
+        json!({ "schematic": sheet }),
+    );
+    assert_eq!(listed["total"], 1, "{listed}");
+    let entry = &listed["runs"][0];
+    assert_eq!(entry["run_id"], run["run_id"]);
+    assert_eq!(entry["analysis_kind"], "transient");
+    assert_eq!(entry["run_status"], "complete");
+    assert_eq!(entry["simulated_circuit"], "modified");
+    assert_eq!(entry["coverage_ratio"], 1.0);
+    assert_eq!(entry["inputs_changed_since_run"], false, "{entry}");
+
+    // The same two measurements, and one the run never took, from the stored data.
+    let again = call_again(
+        home.path(),
+        "measure_simulation_run",
+        json!({
+            "run_id": run["run_id"],
+            "signals": ["v(vout)"],
+            "measurements": [
+                { "name": "inrush_peak", "kind": "peak_abs", "signal": "i(VBAT)" },
+                { "name": "rail_low", "kind": "min", "signal": "v(vout)", "from_seconds": 60e-3 },
+                { "name": "rail_before", "kind": "value_at", "signal": "v(vout)", "at_seconds": 59.9e-3 },
+            ],
+        }),
+    );
+    assert_eq!(again["outcome"]["status"], "complete", "{again}");
+    assert_eq!(again["measurements"][0], run["measurements"][0]);
+    assert_eq!(again["measurements"][1], run["measurements"][1]);
+    assert_eq!(again["signal_summaries"], run["signal_summaries"]);
+    // From `soft_start_reference.py`.
+    near(measured(&again, "rail_before"), 11.98087, 1e-4);
+    near(measured(&again, "inrush_peak"), -16.9040, 2e-3);
+    assert_eq!(again["inputs_changed_since_run"], false);
+    assert_eq!(run_folders(home.path()), 1, "no new run was made");
+
+    // Saving a different sheet makes the run read as made from other inputs.
+    let text = std::fs::read_to_string(&sheet).unwrap();
+    std::fs::write(&sheet, format!("{text}\n")).unwrap();
+    let after = call_again(
+        home.path(),
+        "list_simulation_runs",
+        json!({ "schematic": sheet }),
+    );
+    assert_eq!(
+        after["runs"][0]["inputs_changed_since_run"], true,
+        "{after}"
+    );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_stored_ac_loop_gives_the_same_margins_and_a_complex_csv() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let sheet = project.path().join("rectifier.kicad_sch");
+    let home = tempfile::tempdir().unwrap();
+    let measurements = json!([
+        { "name": "pm", "kind": "phase_margin", "signal": "v(out)" },
+        { "name": "gm", "kind": "gain_margin", "signal": "v(out)" },
+        { "name": "bw", "kind": "bandwidth_3db", "signal": "v(out)" },
+        { "name": "at_1k", "kind": "value_at", "signal": "v(out)", "at_hz": 1000.0 },
+    ]);
+    let run = call_again(
+        home.path(),
+        "run_simulation",
+        json!({
+            "schematic": sheet,
+            "testbench": { "exclude_references": ["*"], "spice_lines": ac_loop_lines() },
+            "analysis": { "kind": "ac", "start_hz": 1.0, "stop_hz": 1e6, "points": 200 },
+            "measurements": measurements,
+        }),
+    );
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    let again = call_again(
+        home.path(),
+        "measure_simulation_run",
+        json!({ "run_id": run["run_id"], "measurements": measurements }),
+    );
+    assert_eq!(again["analysis_kind"], "ac");
+    assert_eq!(again["measurements"], run["measurements"], "{again}");
+    near(measured(&again, "pm"), 3.485942, 2e-3);
+
+    let csv = csv_rows(run["artifacts"]["csv_path"].as_str().unwrap());
+    assert_eq!(csv[0][0], "frequency");
+    assert!(
+        csv[0].iter().any(|name| name == "v(out).real"),
+        "{:?}",
+        csv[0]
+    );
+    assert!(
+        csv[0].iter().any(|name| name == "v(out).imag"),
+        "{:?}",
+        csv[0]
+    );
+    assert_eq!(
+        csv.len() - 1,
+        run["analysis"]["points"].as_u64().unwrap() as usize
+    );
+    // The first frequency is the start, and every row has a cell for every column.
+    near(csv[1][0].parse().unwrap(), 1.0, 1e-12);
+    assert!(csv[1..].iter().all(|row| row.len() == csv[0].len()));
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_csv_of_two_sweeps_has_the_second_value_the_engine_does_not_save() {
+    let lines: Vec<String> = [
+        "VA a 0 DC 0",
+        "VB b 0 DC 0",
+        "R1 a c 1k",
+        "R2 b c 1k",
+        "R3 c 0 1k",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let sheet = project.path().join("rectifier.kicad_sch");
+    let home = tempfile::tempdir().unwrap();
+    let analysis = json!({ "kind": "dc_sweep", "sweeps": [
+        { "target": "VA", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+        { "target": "VB", "start_value": 1.0, "stop_value": 4.0, "step_value": 1.0 },
+    ] });
+    let run = call_again(
+        home.path(),
+        "run_simulation",
+        json!({
+            "schematic": sheet,
+            "testbench": { "exclude_references": ["*"], "spice_lines": lines },
+            "analysis": analysis,
+            "signals": ["v(c)"],
+        }),
+    );
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    let csv = csv_rows(run["artifacts"]["csv_path"].as_str().unwrap());
+    let column = |name: &str| csv[0].iter().position(|cell| cell == name).unwrap();
+    let (outer, inner) = (column("VB (V)"), column("VA (V)"));
+    assert!(outer < inner, "{:?}", csv[0]);
+    assert_eq!(csv.len() - 1, 12);
+    // The engine saves v(a) and v(b) as the circuit's own nodes, which the sweeps set,
+    // so they check the rebuilt columns against the engine's own.
+    let (a, b, c) = (column("v(a)"), column("v(b)"), column("v(c)"));
+    for row in &csv[1..] {
+        let number = |cell: usize| row[cell].parse::<f64>().unwrap();
+        near(number(inner), number(a), 1e-9);
+        near(number(outer), number(b), 1e-9);
+        near(number(c), (number(a) + number(b)) / 3.0, 1e-9);
+    }
+    near(csv[1][outer].parse().unwrap(), 1.0, 1e-12);
+    near(csv[12][outer].parse().unwrap(), 4.0, 1e-12);
+
+    // A stored run of two sweeps is listed, and takes no measurement.
+    let listed = call_again(
+        home.path(),
+        "list_simulation_runs",
+        json!({ "schematic": sheet }),
+    );
+    assert_eq!(listed["runs"][0]["analysis_kind"], "dc_sweep", "{listed}");
+    let refused = call_again(
+        home.path(),
+        "measure_simulation_run",
+        json!({ "run_id": run["run_id"],
+                "measurements": [{ "kind": "max", "signal": "v(c)" }] }),
+    );
+    assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused}");
+}

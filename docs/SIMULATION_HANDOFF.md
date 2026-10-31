@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 8 merged to `main` and PR 9 open.
+**Last updated:** 2026-10-31, with PR 1 to 9 merged to `main` (PR 9 as `2503cad`) and PR 10 open.
 
 ## Start here
 
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 8 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
+PRs 1 to 9 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -40,12 +40,24 @@ PRs 1 to 8 are merged to `main` on the `fork` remote, each as a merge commit. La
 | 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Merged |
 | 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
 | 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
-| 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Open, waiting for the owner |
-| 10 to 11 | Not opened | | Not started |
+| 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
+| 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Open, waiting for the owner |
+| 11 | Not opened | | Not started |
 
-## Now: PR 9 is open
+## Now: PR 10 is open
 
-PR 9 adds the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin and gain margin, per-kind summaries and coverage proof. Nothing is merged. Ask the owner before merging it, and before starting PR 10.
+PR 9 is merged. It added the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin, gain margin, per-kind summaries and coverage proof. PR 10 adds `list_simulation_runs`, `measure_simulation_run` and CSV export. Nothing is merged. Ask the owner before merging it, and before starting PR 11.
+
+### What PR 10 changed that the next PR needs to know
+
+- **A finished run keeps `run.json`.** It is what `list_simulation_runs` and `measure_simulation_run` read: the schematic path, the analysis as run (`Analysis::record`, with a DC sweep's element and unit), `run_status`, `stopped`, `simulated_circuit`, `coverage_ratio`, `inputs_hash`, the inlined model files, and the net and element tables that turn `v(/NET)` and `i(REF)` into the engine's names. Only runs with data are recorded. A failed run, and any run from PR 6 to 9, has none: it is counted as `without_record` and not listed, and `measure_simulation_run` says `run_not_found`. PR 11 should read the same record, through `runs::read_record`.
+- **A stored measurement is the live one.** `Evaluation` (in `tools/simulation.rs`) holds the signal lookup and the per-analysis gathering that `RunEnd` used to hold, and both a live run and a stored one go through it. `Wanted::for_analysis` is the argument check for a known analysis. A new analysis kind must add its arm in `Analysis::record`, `from_record` and `Evaluation`, or stored runs will not read it.
+- **`runs::locate` takes an id and nothing else.** It checks the exact shape first, builds `<state>/simulation/<first 12>/<id>` and refuses a link (`symlink_metadata`). `list` and `read_record` never follow a link either. PR 11 must reach a run only through `locate`.
+- **`inputs_changed_since_run`** is the hash of the saved sheets and `.kicad_pro` taken now (`CurrentSources`, a snapshot and `hash_sources`, no export) with the run's inlined model files, against the run's `inputs_hash`. `null` when the sheets cannot be copied. A model file that has gone is a change.
+- **`results.csv` is written for every run** (`export.rs`, 10 million values at most, then `csv_path: null` with a `csv_not_written` warning). The scale of a DC sweep is renamed for what it varies, and a second sweep gets a column of its own, rebuilt from the point number. Names that a spreadsheet would run as a formula get a leading `'`.
+- **Two sweeps: left out on purpose.** A slice per outer value would need a result shape of its own (one measurement list per outer step, an `outcome` that counts them, and a bound on how many a call may return), and PR 10's job was to make a stored run measurable. So a two-sweep run takes `signals` and no measurements, as before, and its whole grid is in `results.csv` with both sweeps' values, which a script can slice. If the owner wants slices, it is a later PR that adds an `outer_step` selection to `measure_simulation_run`.
+- **Runs made in one second** sort by their random end, so "newest first" is only exact to the second.
+- **`measure_simulation_run` needs no engine.** It works in a process with no worker, and with the engine gone.
 
 ### What PR 9 changed that the next PR needs to know
 
@@ -77,11 +89,10 @@ PR 9 adds the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus
 - **`i(l1)` appears twice** in the raw file, differing by rounding. `signals::vector` treats that as one signal, and real disagreement as none.
 - **`.options interp` is refused,** because it thins the saved samples (E95).
 
-## After PR 9
+## After PR 10
 
 | PR | Outcome |
 |---|---|
-| 10 | `list_simulation_runs`, `measure_simulation_run`, CSV |
 | 11 | `plot_simulation_run`, SVG |
 | Any | `fix(schematic): copy Sim fields on placement` |
 
@@ -98,7 +109,10 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect-core/src/simulation/flatten.rs` | One vetted deck. This is the security boundary |
 | `crates/konnect-core/src/simulation/element.rs`, `preflight.rs` | Deck reader and checks |
 | `crates/konnect-core/src/simulation/raw.rs` | Raw file parser |
+| `crates/konnect-core/src/simulation/runs.rs` | Run folders: create, prune, `locate` by id, `list`, and the `run.json` record |
+| `crates/konnect-core/src/simulation/export.rs` | The plot as CSV |
 | `crates/konnect-core/src/simulation/signals.rs`, `measure.rs`, `ac.rs` | Signal grammar and lookup (real and complex), measurements on any axis, and AC gain, phase and margins |
+| `crates/konnect-core/src/tools/simulation/stored.rs` | `list_simulation_runs` and `measure_simulation_run` |
 | `crates/konnect-core/src/tools/simulation/sweeps.rs` | The `ac` and `dc_sweep` analyses: arguments, deck line, target lookup, coverage |
 | `crates/konnect-core/src/simulation/worker_client.rs`, `protocol.rs` | Worker supervision and its contract |
 | `crates/konnect/src/sim_worker.rs` | The only FFI. `konnect-core` stays free of `unsafe` |
@@ -170,9 +184,10 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - A phase margin or gain margin is read from the first crossing only, and a loop gain with a low-frequency phase of exactly -180 degrees depends on the sign of rounding in the imaginary part. The result shows `start_phase_degrees` so the reader can see it. A gain margin from a start within 0.001 degree of -180 reads `starts_on_level`.
 - `no_ac_stimulus` counts any V or I source with a non-zero `AC` value, including one inside a subcircuit that nothing calls, so a circuit whose only AC source is in an uncalled subcircuit passes and reads zero.
 - **The undersampling tests are a best effort.** Four review rounds each found another edge of them. Left as limits: a deep notch below crossover is refused at sensible densities (a 50 dB notch at 300 Hz needed 800 points a decade), and an all-pass or long delay aliases unseen. The dependable control is two runs at double the density. If a later PR touches this, consider making `run_simulation` do that second run itself when a margin is asked for.
+- **Stored runs, limits left in PR 10:** a run that inlined an IBIS model reads `inputs_changed_since_run: true` for good once another project's export wipes KiCad's IBIS cache, since the cache file is one of its inputs. Runs from PR 6 to 9 have no record, so they are counted as `without_record` and cannot be measured. A stored measurement on a partial run counts as failed, as a live one does, though its number is exact. The prune-race branch of `measure_simulation_run` (`or_not_found`) is tested through the function and not through a real race. `list_simulation_runs` does not check that a run's raw file is still there.
 - A top-level element in a file that a testbench `.include`s is refused as `unknown_testbench_node`, though the plan says lines from such a file count. Found in PR 9's review, in PR 4's code, and not fixed.
 - A DC sweep of one point (start equals stop), or an AC sweep that holds one point, reads `complete` with `outside_data` for every window measurement. An AC sweep with under two points is refused; a DC one is not.
-- With two sweeps `signals` summarise the whole grid and measurements are refused. A slice per outer value would need a result shape of its own, and PR 10's stored runs are the place for it.
+- With two sweeps `signals` summarise the whole grid and measurements are refused, live and stored. A slice per outer value needs a result shape of its own, and PR 10 left it out (see above). `results.csv` has the grid.
 - A `bandwidth_3db` measured from the lowest frequency on a band-pass reads the first fall below that level, which can be far above the band. The result shows `reference_gain_db`, and `reference_level: "peak"` gives the band's own edges.
 - `bg_halt` stops an AC sweep at the size limit and at the budget: a 1 MB limit halted a 90,005-point sweep at 34,407 points. `.op` still has no pause test.
 - `.ic` inside a `.subckt` is refused by preflight as `unknown_testbench_node`, or warned as dropped, though ngspice applies it. A false refusal, from PR 4.

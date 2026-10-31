@@ -4,6 +4,9 @@
 //! may sit in synced folders. The id starts with the project hash, so finding a
 //! run later needs no scan.
 
+use super::kicad_netlist::{ElementEntry, NetEntry};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +16,17 @@ const HASH_CHARS: usize = 12;
 const STAMP_CHARS: usize = 15;
 const SUFFIX_CHARS: usize = 4;
 const CREATE_ATTEMPTS: usize = 8;
+/// What a finished run keeps beside its data, so a later call can measure it
+/// without the circuit.
+pub(crate) const RECORD_FILE: &str = "run.json";
+const RECORD_VERSION: u32 = 1;
+/// A folder with no record is a failed run, once it is this old. Younger, it may be
+/// a run another server has not finished.
+const FAILED_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Far above any real record, which holds the net and element names of one design.
+const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+/// The worker's `status.json` is a few hundred bytes.
+pub(crate) const MAX_STATUS_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunFolder {
@@ -75,6 +89,229 @@ pub(crate) fn is_valid_id(id: &str) -> bool {
         && hex(&bytes[stamp_end + 1..])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunState {
+    Complete,
+    Partial,
+}
+
+impl RunState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+/// Why a partial run stopped, as `run_simulation` reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Stopped {
+    pub reason: String,
+    pub at_point: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+/// What `run_simulation` knew about a finished run that its data files do not
+/// say. Only runs with data are recorded: a run that failed returned an error and
+/// has nothing to measure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RunRecord {
+    pub version: u32,
+    /// The canonical root sheet, so the inputs can be checked again.
+    pub schematic: PathBuf,
+    /// The analysis as `Analysis::record` writes it.
+    pub analysis: Value,
+    pub run_status: RunState,
+    pub stopped: Option<Stopped>,
+    pub simulated_circuit: String,
+    /// What was excluded, added and approximated, for a `modified` circuit.
+    #[serde(default)]
+    pub circuit: Value,
+    /// The `analysis` object the run returned: where it ended and how many points.
+    #[serde(default)]
+    pub result: Value,
+    pub coverage_ratio: f64,
+    pub inputs_hash: String,
+    /// Model files the deck inlined, which the hash covers.
+    pub inlined_files: Vec<PathBuf>,
+    /// Kept to resolve a net or reference to the engine's name.
+    pub nets: Vec<NetEntry>,
+    pub elements: Vec<ElementEntry>,
+    /// What the run said about itself that a later measurement is read with: the
+    /// engine's messages, a missing first point, a sweep that ended short.
+    #[serde(default)]
+    pub warnings: Vec<Value>,
+}
+
+impl RunRecord {
+    pub(crate) fn new(fields: RecordFields) -> Self {
+        Self {
+            version: RECORD_VERSION,
+            schematic: fields.schematic,
+            analysis: fields.analysis,
+            run_status: fields.run_status,
+            stopped: fields.stopped,
+            simulated_circuit: fields.simulated_circuit,
+            circuit: fields.circuit,
+            result: fields.result,
+            coverage_ratio: fields.coverage_ratio,
+            inputs_hash: fields.inputs_hash,
+            inlined_files: fields.inlined_files,
+            nets: fields.nets,
+            elements: fields.elements,
+            warnings: fields.warnings,
+        }
+    }
+
+    pub(crate) fn analysis_kind(&self) -> &str {
+        self.analysis["kind"].as_str().unwrap_or_default()
+    }
+}
+
+/// Everything a record holds apart from its version.
+pub(crate) struct RecordFields {
+    pub schematic: PathBuf,
+    pub analysis: Value,
+    pub run_status: RunState,
+    pub stopped: Option<Stopped>,
+    pub simulated_circuit: String,
+    pub circuit: Value,
+    pub result: Value,
+    pub coverage_ratio: f64,
+    pub inputs_hash: String,
+    pub inlined_files: Vec<PathBuf>,
+    pub nets: Vec<NetEntry>,
+    pub elements: Vec<ElementEntry>,
+    pub warnings: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RecordError {
+    #[error("the run folder holds no record")]
+    Missing,
+    #[error("the run record cannot be used: {0}")]
+    Unusable(String),
+}
+
+/// Write beside the final name and rename, so a reader never sees half a record.
+/// A name that is already there, such as a link, is replaced and not followed.
+pub(crate) fn write_record(dir: &Path, record: &RunRecord) -> std::io::Result<()> {
+    let partial = dir.join(format!("{RECORD_FILE}.partial"));
+    // Whatever stands at the temporary name, a link included, is removed and not
+    // written through.
+    std::fs::remove_file(&partial).ok();
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &serde_json::to_vec(record)?));
+    written
+        .and_then(|()| std::fs::rename(&partial, dir.join(RECORD_FILE)))
+        .inspect_err(|_| {
+            std::fs::remove_file(&partial).ok();
+        })
+}
+
+/// A file's bytes, if it is a plain file of at most `cap` bytes. A link, a device
+/// or a pipe in the store is never read: a record or a status file is only ever
+/// written there as a plain file.
+pub(crate) fn read_plain(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("it is not a plain file"));
+    }
+    if meta.len() > cap {
+        return Err(std::io::Error::other(format!("it is {} bytes", meta.len())));
+    }
+    std::fs::read(path)
+}
+
+pub(crate) fn read_record(dir: &Path) -> Result<RunRecord, RecordError> {
+    let bytes = match read_plain(&dir.join(RECORD_FILE), MAX_RECORD_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RecordError::Missing)
+        }
+        Err(error) => return Err(RecordError::Unusable(error.to_string())),
+    };
+    // The parser's own message can quote the text it choked on.
+    let record: RunRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        RecordError::Unusable(format!(
+            "it does not parse, at line {} column {}",
+            error.line(),
+            error.column()
+        ))
+    })?;
+    match record.version == RECORD_VERSION {
+        true => Ok(record),
+        false => Err(RecordError::Unusable(format!(
+            "it is version {}, and this server reads version {RECORD_VERSION}",
+            record.version
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocateError {
+    /// Not the shape of a run id. Nothing was looked up.
+    InvalidId,
+    NotFound,
+}
+
+/// The folder of a run, found from its id alone: the id starts with the project
+/// hash. The id is checked first, because it becomes two path components.
+pub(crate) fn locate(state_root: &Path, id: &str) -> Result<PathBuf, LocateError> {
+    if !is_valid_id(id) {
+        return Err(LocateError::InvalidId);
+    }
+    let dir = state_root
+        .join("simulation")
+        .join(&id[..HASH_CHARS])
+        .join(id);
+    // `symlink_metadata` does not follow a link, so a link in the store is no run.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => Ok(dir),
+        _ => Err(LocateError::NotFound),
+    }
+}
+
+/// The ids of a project's runs, newest first. Ids sort by their time stamp, and
+/// two made in one second by their random end.
+pub(crate) fn list(state_root: &Path, schematic: &Path) -> std::io::Result<Vec<String>> {
+    let project = state_root.join("simulation").join(project_hash(schematic)?);
+    let entries = match std::fs::read_dir(&project) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_valid_id(name))
+        .collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(ids)
+}
+
+/// `2026-10-30T13:35:12Z` from a valid id.
+pub(crate) fn created_at(id: &str) -> Option<String> {
+    let stamp = id.get(HASH_CHARS + 1..HASH_CHARS + 1 + STAMP_CHARS)?;
+    let (date, time) = stamp.split_once('T')?;
+    Some(format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        date.get(..4)?,
+        date.get(4..6)?,
+        date.get(6..8)?,
+        time.get(..2)?,
+        time.get(2..4)?,
+        time.get(4..6)?
+    ))
+}
+
 /// A new, empty folder for this run, after dropping the project's oldest.
 pub(crate) fn create(state_root: &Path, schematic: &Path) -> std::io::Result<RunFolder> {
     let hash = project_hash(schematic)?;
@@ -127,13 +364,35 @@ fn prune(project: &Path, current: &str) -> usize {
         .filter(|name| is_valid_id(name) && name != current)
         .collect();
     runs.sort();
-    let surplus = runs.len().saturating_sub(KEEP_RUNS - 1);
+    // A run that failed has no data to lose, so it goes before one that has some:
+    // twenty failed attempts must not push out the run whose response was lost.
+    let (failed, kept): (Vec<String>, Vec<String>) = runs
+        .into_iter()
+        .partition(|name| failed_long_ago(&project.join(name)));
+    let surplus = (failed.len() + kept.len()).saturating_sub(KEEP_RUNS - 1);
     let gone = |name: &&String| match std::fs::remove_dir_all(project.join(name)) {
         Ok(()) => false,
         // Another server pruned the same run first.
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
-    runs[..surplus].iter().filter(gone).count()
+    failed
+        .iter()
+        .chain(&kept)
+        .take(surplus)
+        .filter(gone)
+        .count()
+}
+
+/// A run folder that has held no record for an hour. Younger, it may be a run
+/// another server is still making. A link is not asked about at all.
+fn failed_long_ago(dir: &Path) -> bool {
+    let has_record = std::fs::symlink_metadata(dir.join(RECORD_FILE)).is_ok();
+    let old = std::fs::symlink_metadata(dir)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= FAILED_AFTER);
+    !has_record && old
 }
 
 #[cfg(test)]
@@ -266,5 +525,378 @@ mod tests {
         prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000");
         assert!(outside.path().join("precious").exists());
         assert!(link.symlink_metadata().is_ok());
+    }
+
+    const ID: &str = "3fa9c1d27b04-20261030T133512-7f3a";
+
+    fn record() -> RunRecord {
+        RunRecord::new(RecordFields {
+            schematic: PathBuf::from("/p/top.kicad_sch"),
+            analysis: serde_json::json!({ "kind": "transient", "stop_time_seconds": 1.0 }),
+            run_status: RunState::Partial,
+            stopped: Some(Stopped {
+                reason: "timeout".to_string(),
+                at_point: 7,
+                node: None,
+            }),
+            simulated_circuit: "modified".to_string(),
+            circuit: serde_json::json!({ "excluded_references": ["J1"] }),
+            result: serde_json::json!({ "kind": "transient", "points": 7 }),
+            coverage_ratio: 0.5,
+            inputs_hash: "abc".to_string(),
+            inlined_files: vec![PathBuf::from("/p/m.lib")],
+            nets: Vec::new(),
+            elements: Vec::new(),
+            warnings: vec![serde_json::json!({ "code": "engine_messages" })],
+        })
+    }
+
+    fn store_with(id: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("simulation").join(&id[..12]).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    #[test]
+    fn a_run_is_found_from_its_id_alone() {
+        let (root, dir) = store_with(ID);
+        assert_eq!(locate(root.path(), ID), Ok(dir));
+        assert_eq!(
+            locate(root.path(), "3fa9c1d27b04-20261030T133512-0000"),
+            Err(LocateError::NotFound)
+        );
+        // The same id under another project hash is not this run.
+        assert_eq!(
+            locate(root.path(), "aaaaaaaaaaaa-20261030T133512-7f3a"),
+            Err(LocateError::NotFound)
+        );
+    }
+
+    #[test]
+    fn nothing_but_an_exact_id_is_looked_up() {
+        let (root, _) = store_with(ID);
+        let outside = root.path().join("simulation").join("secret");
+        std::fs::create_dir_all(&outside).unwrap();
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../simulation",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "3fa9c1d27b04/../3fa9c1d27b04-20261030T133512-7f3a",
+            "3fa9c1d27b04-20261030T133512-7f3a/",
+            "3fa9c1d27b04-20261030T133512-7f3a/..",
+            "3fa9c1d27b04-20261030T133512-7f3a\0",
+            "3fa9c1d27b04-20261030T133512-7f3a ",
+            "..\\3fa9c1d27b04-20261030T133512-7f3a",
+        ] {
+            assert_eq!(
+                locate(root.path(), bad),
+                Err(LocateError::InvalidId),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_or_a_file_in_the_store_is_not_a_run() {
+        let (root, dir) = store_with(ID);
+        std::fs::remove_dir(&dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+        assert_eq!(locate(root.path(), ID), Err(LocateError::NotFound));
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::write(&dir, "").unwrap();
+        assert_eq!(locate(root.path(), ID), Err(LocateError::NotFound));
+    }
+
+    #[test]
+    fn runs_are_listed_newest_first_and_strays_are_left_out() {
+        let folder = tempfile::tempdir().unwrap();
+        let sheet = schematic(folder.path());
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(list(state.path(), &sheet).unwrap(), Vec::<String>::new());
+        let first = create(state.path(), &sheet).unwrap();
+        let project = first.dir.parent().unwrap().to_path_buf();
+        let hash = first.id[..HASH_CHARS].to_string();
+        for stamp in [
+            "20250101T000000-0001",
+            "20260101T000000-0000",
+            "20250101T000000-0002",
+        ] {
+            std::fs::create_dir(project.join(format!("{hash}-{stamp}"))).unwrap();
+        }
+        std::fs::create_dir(project.join("stray")).unwrap();
+        std::fs::write(project.join(format!("{hash}-20270101T000000-0000")), "").unwrap();
+        let listed = list(state.path(), &sheet).unwrap();
+        // The one made by `create` carries today's date, and is newest.
+        assert_eq!(listed[0], first.id);
+        assert_eq!(
+            &listed[1..],
+            [
+                format!("{hash}-20260101T000000-0000"),
+                format!("{hash}-20250101T000000-0002"),
+                format!("{hash}-20250101T000000-0001"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_record_comes_back_as_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_record_that_is_missing_or_cannot_be_trusted_says_which() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_record(dir.path()), Err(RecordError::Missing));
+        let path = dir.path().join(RECORD_FILE);
+        std::fs::write(&path, "{ nope").unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+        let mut wrong = serde_json::to_value(record()).unwrap();
+        wrong["version"] = serde_json::json!(RECORD_VERSION + 1);
+        std::fs::write(&path, wrong.to_string()).unwrap();
+        let Err(RecordError::Unusable(why)) = read_record(dir.path()) else {
+            panic!("a record of another version must not be read")
+        };
+        assert!(why.contains("version"), "{why}");
+        // A folder where the file belongs is not a record either.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_is_a_link_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_record(outside.path(), &record()).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join(RECORD_FILE),
+            dir.path().join(RECORD_FILE),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+    }
+
+    #[test]
+    fn a_record_past_the_size_limit_is_not_read() {
+        // Valid JSON padded with spaces, which would parse if it were read.
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = serde_json::to_string(&record()).unwrap();
+        text.push_str(&" ".repeat(MAX_RECORD_BYTES as usize));
+        std::fs::write(dir.path().join(RECORD_FILE), text).unwrap();
+        let Err(RecordError::Unusable(why)) = read_record(dir.path()) else {
+            panic!("a record past the limit must not be read")
+        };
+        assert!(why.contains("bytes"), "{why}");
+        // At the limit it is read.
+        let mut text = serde_json::to_string(&record()).unwrap();
+        let room = MAX_RECORD_BYTES as usize - text.len();
+        text.push_str(&" ".repeat(room));
+        std::fs::write(dir.path().join(RECORD_FILE), text).unwrap();
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_record_error_never_quotes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(RECORD_FILE),
+            "{\"version\": \"secret-text\"}",
+        )
+        .unwrap();
+        let Err(RecordError::Unusable(why)) = read_record(dir.path()) else {
+            panic!("not a record")
+        };
+        assert!(!why.contains("secret-text"), "{why}");
+        assert!(why.contains("line 1"), "{why}");
+    }
+
+    #[test]
+    fn only_a_small_plain_file_is_read_for_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("status.json");
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(read_plain(&file, 2).unwrap(), b"{}");
+        assert!(read_plain(&file, 1).is_err());
+        assert!(read_plain(dir.path(), 100).is_err(), "a folder");
+        assert!(read_plain(&dir.path().join("none"), 100).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_a_link_is_never_read_for_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Were the pipe read, the read would wait for a writer: give it one, so a
+        // missing guard fails the test and does not hang it.
+        let writer = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(writer);
+        });
+        assert!(read_plain(&fifo, 100).is_err());
+        let real = dir.path().join("real");
+        std::fs::write(&real, "{}").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_plain(&link, 100).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_never_written_through_a_link_at_its_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, "mine").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(format!("{RECORD_FILE}.partial")))
+            .unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_record_is_replaced_whole_and_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        let mut newer = record();
+        newer.coverage_ratio = 1.0;
+        write_record(dir.path(), &newer).unwrap();
+        assert_eq!(read_record(dir.path()), Ok(newer));
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [RECORD_FILE]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_does_not_follow_a_link_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, "mine").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(RECORD_FILE)).unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_stopped_node_that_is_unknown_is_left_out() {
+        let stopped = Stopped {
+            reason: "timeout".to_string(),
+            at_point: 3,
+            node: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&stopped).unwrap(),
+            serde_json::json!({ "reason": "timeout", "at_point": 3 })
+        );
+        let read: Stopped = serde_json::from_str(r#"{"reason":"timeout","at_point":3}"#).unwrap();
+        assert_eq!(read, stopped);
+    }
+
+    #[test]
+    fn the_time_in_an_id_reads_as_a_date() {
+        assert_eq!(created_at(ID).as_deref(), Some("2026-10-30T13:35:12Z"));
+        assert_eq!(created_at("short"), None);
+    }
+
+    #[cfg(unix)]
+    fn make_old(dir: &Path) {
+        let long_ago = SystemTime::now() - FAILED_AFTER - std::time::Duration::from_secs(60);
+        std::fs::File::open(dir)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_attempts_go_before_a_run_with_data() {
+        let folder = tempfile::tempdir().unwrap();
+        let recorded = |second: usize| format!("3fa9c1d27b04-20260101T0000{second:02}-0000");
+        let failed = |second: usize| format!("3fa9c1d27b04-20260102T0000{second:02}-0000");
+        // Nineteen runs with data, older than six failed attempts.
+        for second in 0..19 {
+            let dir = folder.path().join(recorded(second));
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
+        }
+        for second in 0..6 {
+            let dir = folder.path().join(failed(second));
+            std::fs::create_dir(&dir).unwrap();
+            make_old(&dir);
+        }
+        let current = "3fa9c1d27b04-20260103T000000-0000";
+        std::fs::create_dir(folder.path().join(current)).unwrap();
+        assert_eq!(prune(folder.path(), current), 0);
+        let left = |name: &String| folder.path().join(name).exists();
+        assert!(
+            (0..19).map(recorded).all(|name| left(&name)),
+            "a run with data went"
+        );
+        // Twenty folders stay, counting the current one: the six failed ones are out.
+        assert!((0..6).map(failed).all(|name| !left(&name)));
+    }
+
+    #[test]
+    fn a_folder_with_no_record_that_is_young_may_be_a_run_in_flight() {
+        let folder = tempfile::tempdir().unwrap();
+        for second in 0..20 {
+            let dir = folder
+                .path()
+                .join(format!("3fa9c1d27b04-20260101T0000{second:02}-0000"));
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
+        }
+        // Newer than all of them and not yet recorded, as another server's run is.
+        let young = "3fa9c1d27b04-20260102T000000-0000";
+        std::fs::create_dir(folder.path().join(young)).unwrap();
+        let current = "3fa9c1d27b04-20260103T000000-0000";
+        std::fs::create_dir(folder.path().join(current)).unwrap();
+        prune(folder.path(), current);
+        assert!(
+            folder.path().join(young).exists(),
+            "a run in flight was removed"
+        );
+        // The oldest two with data went to make room.
+        assert!(!folder
+            .path()
+            .join("3fa9c1d27b04-20260101T000000-0000")
+            .exists());
+        assert!(!folder
+            .path()
+            .join("3fa9c1d27b04-20260101T000001-0000")
+            .exists());
+        assert!(folder
+            .path()
+            .join("3fa9c1d27b04-20260101T000002-0000")
+            .exists());
     }
 }

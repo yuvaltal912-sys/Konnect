@@ -7,7 +7,7 @@
 use super::net_names;
 use anyhow::{Context, Result};
 use konnect_sexp::{parse_sexp, SexpNode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +202,7 @@ impl SpiceNetlist {
 }
 
 /// A net as the simulator will see it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NetEntry {
     pub kicad_name: String,
     pub spice_name: String,
@@ -212,7 +212,7 @@ pub(crate) struct NetEntry {
     pub pin_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ElementEntry {
     pub reference: String,
     /// Null when the symbol has no line in the deck: excluded from simulation.

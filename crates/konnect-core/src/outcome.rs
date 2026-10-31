@@ -18,6 +18,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "add_schematic_component",
     "annotate_schematic",
     "batch_place_components",
+    "measure_simulation_run",
     "run_design_review",
     "run_simulation",
 ];

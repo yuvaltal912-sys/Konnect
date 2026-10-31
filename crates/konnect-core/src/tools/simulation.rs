@@ -4,6 +4,7 @@ use super::{cli, get_path, sch_export, ToolContext, ToolDef};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::outcome::{self, OutcomeStatus};
+use crate::simulation::export::{self, Layout};
 use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
 use crate::simulation::kicad_netlist::{self, ElementEntry, KiCadNetlist, NetEntry, SpiceNetlist};
 use crate::simulation::measure::{self, AxisSpec, Measurement};
@@ -12,6 +13,7 @@ use crate::simulation::protocol::{
     RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION, RAW_FILE, REQUEST_FILE,
 };
 use crate::simulation::raw::Plot;
+use crate::simulation::runs::{RecordFields, RunRecord, RunState, Stopped};
 use crate::simulation::signals::{self, Names, NotFound, Signal};
 use crate::simulation::worker_client::{
     classify, probe_engine, read_results, run_worker, EngineStatus, SimulationRuntime, Verdict,
@@ -26,6 +28,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod stored;
 mod sweeps;
 use sweeps::{Ac, DcSweep};
 
@@ -68,6 +71,7 @@ const HALT_NOTICES: [&str; 2] = ["doAnalyses: pause requested", "run simulation 
 /// The engine's status variable, which ends the part of a log worth reading.
 const STATUS_NAME: &str = "sim_status";
 const OPERATING_POINT_FILE: &str = "operating_point.json";
+const CSV_FILE: &str = "results.csv";
 /// KiCad's own defaults for what to save. `.probe alli` stops the engine on any
 /// event-driven node, so it is left out of those circuits.
 const SAVE_ALL_VOLTAGES: &str = ".save all";
@@ -304,6 +308,59 @@ pub fn tools() -> Vec<ToolDef> {
             "required": ["schematic", "analysis"]
         }),
         |args, ctx| async move { handle_run_simulation(args, ctx).await }
+    ), tool!(
+        "list_simulation_runs",
+        "List the stored runs of a schematic, newest first, so a run is not lost with a response that never arrived. Each shows its analysis, whether it is complete or partial, whether it simulated the circuit as drawn, how much of the requested range it covered, and whether the saved schematic or its model files have changed since. The newest 20 runs of each project are kept.",
+        json!({
+            "type": "object",
+            "properties": {
+                "schematic": { "type": "string", "description": "Root .kicad_sch path" },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": stored::MAX_LISTED_RUNS,
+                    "default": stored::DEFAULT_LISTED_RUNS,
+                    "description": "Most runs to list; the total is always complete"
+                }
+            },
+            "required": ["schematic"]
+        }),
+        |args, ctx| async move { handle_list_simulation_runs(args, ctx).await }
+    ), tool!(
+        "measure_simulation_run",
+        "Work out more measurements and signal summaries on a stored run without simulating again. Measurements take the same kinds as run_simulation, and one that does not fit the run's analysis is refused. Read run_status and simulated_circuit: a measurement on a partial run covers only the data it has, and one on a modified circuit does not describe the schematic as drawn. inputs_changed_since_run says whether the saved schematic differs from what the run used. A dc_sweep with two sweeps takes no measurements.",
+        json!({
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{12}-[0-9]{8}T[0-9]{6}-[0-9a-f]{4}$",
+                    "description": "The run_id from run_simulation or list_simulation_runs"
+                },
+                "signals": {
+                    "type": "array",
+                    "maxItems": MAX_SIGNALS,
+                    "items": { "type": "string" },
+                    "description": "Signals to summarise: v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF), which only a run that asked for it has saved"
+                },
+                "measurements": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_MEASUREMENTS,
+                    "items": measurement_schema(),
+                    "description": "Values to work out from the run. A kind that does not fit the run's analysis is refused"
+                },
+                "envelope_points": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_ENVELOPE_POINTS,
+                    "default": 0,
+                    "description": "Transient runs only. Buckets of min and max to add to each summary"
+                }
+            },
+            "required": ["run_id", "measurements"]
+        }),
+        |args, ctx| async move { handle_measure_simulation_run(args, ctx).await }
     )]
 }
 
@@ -459,6 +516,40 @@ async fn handle_run_simulation(args: &Value, ctx: &ToolContext) -> anyhow::Resul
     })
 }
 
+async fn handle_list_simulation_runs(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let limit = args["limit"]
+        .as_u64()
+        .unwrap_or(stored::DEFAULT_LISTED_RUNS)
+        .clamp(1, stored::MAX_LISTED_RUNS) as usize;
+    Ok(stored::list(ctx, &schematic, limit).unwrap_or_else(|refusal| refusal))
+}
+
+async fn handle_measure_simulation_run(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let envelope_points = args["envelope_points"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(MAX_ENVELOPE_POINTS) as usize;
+    let question = stored::Question {
+        run_id: args["run_id"].as_str().unwrap_or_default(),
+        signals: &args["signals"],
+        measurements: &args["measurements"],
+        envelope_points,
+    };
+    Ok(match stored::measure(ctx, &question) {
+        Ok(result) => result,
+        Err((refusal, target)) => {
+            stored::failed_measure_outcome(refusal, &target, question.requested())
+        }
+    })
+}
+
 struct RunArguments<'a> {
     schematic: &'a Path,
     analysis: Analysis,
@@ -546,6 +637,17 @@ impl Transient {
         })
     }
 
+    /// The arguments again, for `Transient::from_args` to read back.
+    fn record(&self) -> Value {
+        json!({
+            "kind": "transient",
+            "stop_time_seconds": self.stop,
+            "max_step_seconds": self.max_step,
+            "start_save_seconds": self.start_save,
+            "use_initial_conditions": self.use_initial_conditions,
+        })
+    }
+
     /// Only numbers formatted here, never text from a caller.
     fn line(&self) -> String {
         let mut line = format!(".tran {:e} {:e}", self.stop / PRINT_STEPS, self.stop);
@@ -596,6 +698,28 @@ impl Analysis {
                 "analysis.kind",
                 format!("Unknown analysis kind: {other}"),
             )),
+        }
+    }
+
+    /// What a stored run keeps of the analysis. Numbers only, and for a sweep the
+    /// element as the deck spells it, so a later call needs no deck.
+    fn record(&self) -> Value {
+        match self {
+            Self::OperatingPoint => json!({ "kind": "operating_point" }),
+            Self::Transient(transient) => transient.record(),
+            Self::Ac(ac) => ac.record(),
+            Self::DcSweep(sweep) => sweep.record(),
+        }
+    }
+
+    /// The analysis of a stored run. None if the record does not hold one.
+    fn from_record(record: &Value) -> Option<Self> {
+        match record["kind"].as_str()? {
+            "operating_point" => Some(Self::OperatingPoint),
+            "transient" => Transient::from_args(record).ok().map(Self::Transient),
+            "ac" => Ac::from_args(record).ok().map(Self::Ac),
+            "dc_sweep" => DcSweep::restore(record).map(Self::DcSweep),
+            _ => None,
         }
     }
 
@@ -694,6 +818,17 @@ impl Wanted {
         envelope_points: usize,
     ) -> Result<(Analysis, Self), CallToolResult> {
         let analysis = Analysis::from_args(analysis)?;
+        let wanted = Self::for_analysis(&analysis, signals, measurements, envelope_points)?;
+        Ok((analysis, wanted))
+    }
+
+    /// What is asked of an analysis that is already known, as for a stored run.
+    fn for_analysis(
+        analysis: &Analysis,
+        signals: &Value,
+        measurements: &Value,
+        envelope_points: usize,
+    ) -> Result<Self, CallToolResult> {
         let no_items = Vec::new();
         let signals = signals.as_array().unwrap_or(&no_items);
         let measurements = measurements.as_array().unwrap_or(&no_items);
@@ -709,7 +844,7 @@ impl Wanted {
         let Some(axis) = analysis.axis() else {
             let fits = signals.is_empty() && measurements.is_empty() && envelope_points == 0;
             return match fits {
-                true => Ok((analysis, Self::default())),
+                true => Ok(Self::default()),
                 false => Err(invalid(
                     "measurements",
                     "signals, measurements and envelope_points need a transient, an ac or a \
@@ -728,12 +863,12 @@ impl Wanted {
         }
         // Along two sweeps a value has two places, and a window, a crossing or a
         // single value over the grid would not say which.
-        let grid = matches!(&analysis, Analysis::DcSweep(sweep) if sweep.sweeps.len() > 1);
+        let grid = matches!(analysis, Analysis::DcSweep(sweep) if sweep.sweeps.len() > 1);
         if grid && !measurements.is_empty() {
             return Err(invalid(
                 "measurements",
-                "A dc_sweep with two sweeps takes signals but no measurements: the data is in \
-                 the raw file. Use one sweep to measure.",
+                "A dc_sweep with two sweeps takes signals but no measurements: the whole grid is \
+                 in the raw file and in results.csv. Use one sweep to measure.",
             ));
         }
         let ac = matches!(analysis, Analysis::Ac(_));
@@ -759,14 +894,11 @@ impl Wanted {
                 measure::parse(entry, index, &axis).map_err(|bad| invalid(bad.field, bad.reason))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((
-            analysis,
-            Self {
-                signals,
-                measurements,
-                envelope_points,
-            },
-        ))
+        Ok(Self {
+            signals,
+            measurements,
+            envelope_points,
+        })
     }
 
     fn all_signals(&self) -> impl Iterator<Item = &Signal> {
@@ -1236,9 +1368,194 @@ struct Gathered {
     failed_measurements: usize,
 }
 
+/// What a run's signals and measurements come to. A stored run is read the same
+/// way as a fresh one, from the plot and the names that were kept with it.
+struct Evaluation<'a> {
+    names: Names<'a>,
+    wanted: &'a Wanted,
+}
+
+impl Evaluation<'_> {
+    /// Look up a measurement's signal. With a `reference_signal` it is the ratio of
+    /// the two, worked out as complex numbers.
+    fn effective_signal(
+        &self,
+        plot: &Plot,
+        request: &Measurement,
+    ) -> Result<signals::Resolved, NotFound> {
+        let mut found = signals::resolve(plot, &request.signal, self.names)?;
+        let Some((_, reference)) = &request.reference_signal else {
+            return Ok(found);
+        };
+        let other = signals::resolve(plot, reference, self.names)?;
+        let (real, imaginary) = ac::divide(
+            (&found.values, &found.imaginary),
+            (&other.values, &other.imaginary),
+        );
+        found.values = real;
+        found.imaginary = imaginary;
+        found.shared_nets.extend(other.shared_nets);
+        Ok(found)
+    }
+
+    /// Resolve every signal and measurement, and say what each analysis made of it.
+    fn gather(
+        &self,
+        plot: &Plot,
+        partial: bool,
+        measurements: &[Measurement],
+        summary: impl Fn(&str, &Signal, &signals::Resolved) -> Value,
+        measurement: impl Fn(&Measurement, &signals::Resolved) -> Value,
+    ) -> Gathered {
+        let mut gathered = Gathered::default();
+        for (text, signal) in &self.wanted.signals {
+            match signals::resolve(plot, signal, self.names) {
+                Ok(found) => {
+                    gathered
+                        .shared_nets
+                        .extend(found.shared_nets.iter().cloned());
+                    gathered.summaries.push(summary(text, signal, &found));
+                }
+                Err(not_found) => {
+                    gathered.signal_missing = true;
+                    let report = json!({ "signal": text, "finding": "signal_not_found" });
+                    gathered.summaries.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        for request in measurements {
+            match self.effective_signal(plot, request) {
+                Ok(found) => {
+                    gathered.failed_measurements += usize::from(partial);
+                    gathered
+                        .shared_nets
+                        .extend(found.shared_nets.iter().cloned());
+                    gathered.measurements.push(measurement(request, &found));
+                }
+                Err(not_found) => {
+                    gathered.failed_measurements += 1;
+                    let report = measure::missing_report(request, partial);
+                    gathered.measurements.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        gathered
+    }
+
+    /// Put what was gathered in the body, and count the outcome units that failed.
+    /// The "range covered" unit also stands for the signals asked for: `signals`
+    /// has no units of its own.
+    fn finish_body(&self, body: &mut Value, gathered: Gathered, partial: bool) -> usize {
+        let wanted = self.wanted;
+        if !wanted.measurements.is_empty() {
+            body["measurements"] = json!(gathered.measurements);
+        }
+        if !wanted.signals.is_empty() {
+            body["signal_summaries"] = json!(gathered.summaries);
+        }
+        if let Some(warnings) = body["warnings"].as_array_mut() {
+            if !gathered.shared_nets.is_empty() {
+                warnings.push(json!({
+                    "code": "nets_share_engine_node",
+                    "detail": "ngspice reads these nets as one node, so their signals are the same.",
+                    "items": gathered.shared_nets,
+                }));
+            }
+        }
+        usize::from(partial || gathered.signal_missing) + gathered.failed_measurements
+    }
+
+    fn transient(&self, plot: &Plot, partial: bool) -> Gathered {
+        let wanted = self.wanted;
+        let time: Vec<f64> = plot
+            .variable("time")
+            .map(|index| plot.real(index).collect())
+            .unwrap_or_default();
+        self.gather(
+            plot,
+            partial,
+            &wanted.measurements,
+            |text, signal, found| {
+                measure::summary(
+                    &time,
+                    &found.values,
+                    text,
+                    signal.unit(),
+                    wanted.envelope_points,
+                    partial,
+                )
+            },
+            |request, found| {
+                measure::measure(&time, &found.values, request).report(request, partial)
+            },
+        )
+    }
+
+    fn ac(&self, ac: &Ac, plot: &Plot, partial: bool) -> Gathered {
+        let freq: Vec<f64> = plot
+            .variable("frequency")
+            .map(|index| plot.real(index).collect())
+            .unwrap_or_default();
+        let logarithmic = ac.scale.is_logarithmic();
+        self.gather(
+            plot,
+            partial,
+            &self.wanted.measurements,
+            |text, _, found| ac::summary(&freq, &found.values, &found.imaginary, text, partial),
+            |request, found| match ac::Response::new(
+                &freq,
+                &found.values,
+                &found.imaginary,
+                logarithmic,
+            ) {
+                Some(response) => ac::measure(&response, request, partial),
+                None => measure::missing_report(request, partial),
+            },
+        )
+    }
+
+    fn sweep(&self, sweep: &DcSweep, plot: &Plot, partial: bool) -> Gathered {
+        let inner = sweep.inner();
+        // Falling sweeps are measured on a rising axis, and put back on the way out.
+        let direction = AxisSpec::sweep(inner.start, inner.stop, inner.unit).direction();
+        let axis: Vec<f64> = DcSweep::axis(plot).iter().map(|x| x * direction).collect();
+        let measurements: Vec<Measurement> = self
+            .wanted
+            .measurements
+            .iter()
+            .cloned()
+            .map(|mut request| {
+                request.axis.unit = inner.unit.to_string();
+                request
+            })
+            .collect();
+        self.gather(
+            plot,
+            partial,
+            &measurements,
+            |text, signal, found| {
+                measure::sweep_summary(&found.values, text, signal.unit(), partial)
+            },
+            |request, found| {
+                measure::measure(&axis, &found.values, request).report(request, partial)
+            },
+        )
+    }
+}
+
 impl RunEnd<'_> {
     fn path(&self, file: &str) -> String {
         self.run.dir.join(file).display().to_string()
+    }
+
+    fn evaluation(&self) -> Evaluation<'_> {
+        Evaluation {
+            names: Names {
+                nets: &self.design.nets,
+                elements: &self.design.elements,
+            },
+            wanted: &self.request.wanted,
+        }
     }
 
     fn status(&self) -> Option<&RunStatus> {
@@ -1289,7 +1606,7 @@ impl RunEnd<'_> {
         let Some(Ok(plot)) = &results else {
             return Err(self.failure("results_unreadable"));
         };
-        let (body, failed) = match self.analysis {
+        let (mut body, failed) = match self.analysis {
             Analysis::OperatingPoint => (
                 self.operating_point_body(plot, stopped),
                 usize::from(stopped.is_some()),
@@ -1298,6 +1615,8 @@ impl RunEnd<'_> {
             Analysis::Ac(ac) => self.ac_body(ac, plot, stopped),
             Analysis::DcSweep(sweep) => self.sweep_body(sweep, plot, stopped),
         };
+        self.add_table(&mut body, plot);
+        self.keep_record(&mut body, stopped.is_some());
         let requested = FIXED_OUTCOME_UNITS + self.request.wanted.measurements.len();
         let status = match failed {
             0 => OutcomeStatus::Complete,
@@ -1315,100 +1634,79 @@ impl RunEnd<'_> {
         Ok(outcome::attach(CallToolResult::json(&body), outcome))
     }
 
-    fn names(&self) -> Names<'_> {
-        Names {
-            nets: &self.design.nets,
-            elements: &self.design.elements,
+    /// How the plot is written as a table.
+    fn table_layout(&self, plot: &Plot) -> Layout {
+        match self.analysis {
+            Analysis::OperatingPoint => Layout::Table,
+            Analysis::DcSweep(sweep) => sweep.table_layout(plot),
+            Analysis::Transient(_) | Analysis::Ac(_) => Layout::Series,
         }
     }
 
-    /// Look up a measurement's signal. With a `reference_signal` it is the ratio of
-    /// the two, worked out as complex numbers.
-    fn effective_signal(
-        &self,
-        plot: &Plot,
-        request: &Measurement,
-    ) -> Result<signals::Resolved, NotFound> {
-        let mut found = signals::resolve(plot, &request.signal, self.names())?;
-        let Some((_, reference)) = &request.reference_signal else {
-            return Ok(found);
-        };
-        let other = signals::resolve(plot, reference, self.names())?;
-        let (real, imaginary) = ac::divide(
-            (&found.values, &found.imaginary),
-            (&other.values, &other.imaginary),
-        );
-        found.values = real;
-        found.imaginary = imaginary;
-        found.shared_nets.extend(other.shared_nets);
-        Ok(found)
-    }
-
-    /// Resolve every signal and measurement, and say what each analysis made of it.
-    fn gather(
-        &self,
-        plot: &Plot,
-        partial: bool,
-        measurements: &[Measurement],
-        summary: impl Fn(&str, &Signal, &signals::Resolved) -> Value,
-        measurement: impl Fn(&Measurement, &signals::Resolved) -> Value,
-    ) -> Gathered {
-        let mut gathered = Gathered::default();
-        for (text, signal) in &self.request.wanted.signals {
-            match signals::resolve(plot, signal, self.names()) {
-                Ok(found) => {
-                    gathered
-                        .shared_nets
-                        .extend(found.shared_nets.iter().cloned());
-                    gathered.summaries.push(summary(text, signal, &found));
+    /// Write the plot as CSV beside the raw file. A run is not lost by this failing,
+    /// so a refusal or an error is a warning and `csv_path` stays null.
+    fn add_table(&self, body: &mut Value, plot: &Plot) {
+        let path = self.run.dir.join(CSV_FILE);
+        let written = export::write(&path, plot, &self.table_layout(plot));
+        match table_problem(&written) {
+            None => {
+                body["artifacts"]["csv_path"] = json!(self.path(CSV_FILE));
+                if let Ok(export::Written::Bytes(bytes)) = written {
+                    body["artifacts"]["csv_bytes"] = json!(bytes);
                 }
-                Err(not_found) => {
-                    gathered.signal_missing = true;
-                    let report = json!({ "signal": text, "finding": "signal_not_found" });
-                    gathered.summaries.push(with_pins(report, &not_found));
+            }
+            Some(problem) => {
+                body["artifacts"]["csv_path"] = Value::Null;
+                if let Some(warnings) = body["warnings"].as_array_mut() {
+                    warnings.push(problem);
                 }
             }
         }
-        for request in measurements {
-            match self.effective_signal(plot, request) {
-                Ok(found) => {
-                    gathered.failed_measurements += usize::from(partial);
-                    gathered
-                        .shared_nets
-                        .extend(found.shared_nets.iter().cloned());
-                    gathered.measurements.push(measurement(request, &found));
-                }
-                Err(not_found) => {
-                    gathered.failed_measurements += 1;
-                    let report = measure::missing_report(request, partial);
-                    gathered.measurements.push(with_pins(report, &not_found));
-                }
-            }
-        }
-        gathered
     }
 
-    /// Put what was gathered in the body, and count the outcome units that failed.
-    /// The "range covered" unit also stands for the signals asked for: `signals`
-    /// has no units of its own.
-    fn finish_body(&self, body: &mut Value, gathered: Gathered, partial: bool) -> usize {
-        let wanted = &self.request.wanted;
-        if !wanted.measurements.is_empty() {
-            body["measurements"] = json!(gathered.measurements);
-        }
-        if !wanted.signals.is_empty() {
-            body["signal_summaries"] = json!(gathered.summaries);
-        }
-        if let Some(warnings) = body["warnings"].as_array_mut() {
-            if !gathered.shared_nets.is_empty() {
+    /// Save what a later `list_simulation_runs` or `measure_simulation_run` needs.
+    fn keep_record(&self, body: &mut Value, partial: bool) {
+        let stopped = body.get("stopped").map(|stopped| Stopped {
+            reason: stopped["reason"].as_str().unwrap_or_default().to_string(),
+            at_point: stopped["at_point"].as_u64().unwrap_or(0) as usize,
+            node: stopped["node"].as_str().map(str::to_owned),
+        });
+        let record = RunRecord::new(RecordFields {
+            schematic: self
+                .request
+                .schematic
+                .canonicalize()
+                .unwrap_or_else(|_| self.request.schematic.to_path_buf()),
+            analysis: self.analysis.record(),
+            run_status: if partial {
+                RunState::Partial
+            } else {
+                RunState::Complete
+            },
+            stopped,
+            simulated_circuit: body["simulated_circuit"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            circuit: body["circuit"].clone(),
+            result: body["analysis"].clone(),
+            coverage_ratio: body["analysis"]["coverage_ratio"].as_f64().unwrap_or(0.0),
+            inputs_hash: self.design.inputs_hash.clone(),
+            inlined_files: self.deck.inlined_files.clone(),
+            nets: self.design.nets.clone(),
+            elements: self.design.elements.clone(),
+            warnings: carried_warnings(body),
+        });
+        if let Err(error) = runs::write_record(&self.run.dir, &record) {
+            if let Some(warnings) = body["warnings"].as_array_mut() {
                 warnings.push(json!({
-                    "code": "nets_share_engine_node",
-                    "detail": "ngspice reads these nets as one node, so their signals are the same.",
-                    "items": gathered.shared_nets,
+                    "code": "run_record_not_saved",
+                    "detail": format!(
+                        "list_simulation_runs and measure_simulation_run cannot use this run: {error}"
+                    ),
                 }));
             }
         }
-        usize::from(partial || gathered.signal_missing) + gathered.failed_measurements
     }
 
     /// The body and how many outcome units failed.
@@ -1418,30 +1716,8 @@ impl RunEnd<'_> {
         plot: &Plot,
         stopped: Option<&'static str>,
     ) -> (Value, usize) {
-        let wanted = &self.request.wanted;
         let partial = stopped.is_some();
-        let time: Vec<f64> = plot
-            .variable("time")
-            .map(|index| plot.real(index).collect())
-            .unwrap_or_default();
-        let gathered = self.gather(
-            plot,
-            partial,
-            &wanted.measurements,
-            |text, signal, found| {
-                measure::summary(
-                    &time,
-                    &found.values,
-                    text,
-                    signal.unit(),
-                    wanted.envelope_points,
-                    partial,
-                )
-            },
-            |request, found| {
-                measure::measure(&time, &found.values, request).report(request, partial)
-            },
-        );
+        let gathered = self.evaluation().transient(plot, partial);
         let reached = Transient::reached(plot).unwrap_or(0.0);
         let first_point = Transient::first_point(plot).unwrap_or(0.0);
         let analysis = json!({
@@ -1466,33 +1742,13 @@ impl RunEnd<'_> {
                 }));
             }
         }
-        let failed = self.finish_body(&mut body, gathered, partial);
+        let failed = self.evaluation().finish_body(&mut body, gathered, partial);
         (body, failed)
     }
 
     fn ac_body(&self, ac: &Ac, plot: &Plot, stopped: Option<&'static str>) -> (Value, usize) {
-        let wanted = &self.request.wanted;
         let partial = stopped.is_some();
-        let freq: Vec<f64> = plot
-            .variable("frequency")
-            .map(|index| plot.real(index).collect())
-            .unwrap_or_default();
-        let logarithmic = ac.scale.is_logarithmic();
-        let gathered = self.gather(
-            plot,
-            partial,
-            &wanted.measurements,
-            |text, _, found| ac::summary(&freq, &found.values, &found.imaginary, text, partial),
-            |request, found| match ac::Response::new(
-                &freq,
-                &found.values,
-                &found.imaginary,
-                logarithmic,
-            ) {
-                Some(response) => ac::measure(&response, request, partial),
-                None => measure::missing_report(request, partial),
-            },
-        );
+        let gathered = self.evaluation().ac(ac, plot, partial);
         let mut body = self.result_body(plot, ac.describe(plot), stopped);
         let reached = Ac::reached(plot).unwrap_or(0.0);
         if let Some(warnings) = body["warnings"].as_array_mut() {
@@ -1504,7 +1760,7 @@ impl RunEnd<'_> {
                 }));
             }
         }
-        let failed = self.finish_body(&mut body, gathered, partial);
+        let failed = self.evaluation().finish_body(&mut body, gathered, partial);
         (body, failed)
     }
 
@@ -1514,32 +1770,8 @@ impl RunEnd<'_> {
         plot: &Plot,
         stopped: Option<&'static str>,
     ) -> (Value, usize) {
-        let wanted = &self.request.wanted;
         let partial = stopped.is_some();
-        let inner = sweep.inner();
-        // Falling sweeps are measured on a rising axis, and put back on the way out.
-        let direction = AxisSpec::sweep(inner.start, inner.stop, inner.unit).direction();
-        let axis: Vec<f64> = DcSweep::axis(plot).iter().map(|x| x * direction).collect();
-        let measurements: Vec<Measurement> = wanted
-            .measurements
-            .iter()
-            .cloned()
-            .map(|mut request| {
-                request.axis.unit = inner.unit.to_string();
-                request
-            })
-            .collect();
-        let gathered = self.gather(
-            plot,
-            partial,
-            &measurements,
-            |text, signal, found| {
-                measure::sweep_summary(&found.values, text, signal.unit(), partial)
-            },
-            |request, found| {
-                measure::measure(&axis, &found.values, request).report(request, partial)
-            },
-        );
+        let gathered = self.evaluation().sweep(sweep, plot, partial);
         let mut body = self.result_body(plot, sweep.describe(plot), stopped);
         if let Some(warnings) = body["warnings"].as_array_mut() {
             let short = sweep.shortfalls(plot);
@@ -1552,7 +1784,7 @@ impl RunEnd<'_> {
                 }));
             }
         }
-        let failed = self.finish_body(&mut body, gathered, partial);
+        let failed = self.evaluation().finish_body(&mut body, gathered, partial);
         (body, failed)
     }
 
@@ -1701,6 +1933,46 @@ impl RunEnd<'_> {
             }
         }
         body
+    }
+}
+
+/// What a run said about itself that a later measurement should be read with.
+/// Left out are what concerns this call alone: files it wrote, runs it pruned, and
+/// the nets that its own signals share, which a new measurement works out again.
+fn carried_warnings(body: &Value) -> Vec<Value> {
+    const THIS_CALL_ONLY: [&str; 4] = [
+        "old_runs_kept",
+        "csv_not_written",
+        "run_record_not_saved",
+        "nets_share_engine_node",
+    ];
+    let warnings = body["warnings"].as_array().into_iter().flatten();
+    warnings
+        .filter(|warning| {
+            warning["code"]
+                .as_str()
+                .is_some_and(|code| !THIS_CALL_ONLY.contains(&code))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The warning for a CSV that was not written, or none if it was.
+fn table_problem(written: &std::io::Result<export::Written>) -> Option<Value> {
+    match written {
+        Ok(export::Written::Bytes(_)) => None,
+        Ok(export::Written::TooLarge { cells }) => Some(json!({
+            "code": "csv_not_written",
+            "detail": format!(
+                "The data holds {cells} values, past the {} that results.csv takes. The raw \
+                 file has all of it.",
+                export::MAX_CELLS
+            ),
+        })),
+        Err(error) => Some(json!({
+            "code": "csv_not_written",
+            "detail": format!("results.csv could not be written: {error}"),
+        })),
     }
 }
 
@@ -1864,9 +2136,11 @@ async fn inspect_design(
         .tempdir()?;
     let source = scratch.path().join("src");
     std::fs::create_dir(&source)?;
+    // The copy is named for the file as the disk spells it, so the hash of the
+    // sheets does not depend on how the caller typed the path.
+    let schematic = &schematic.canonicalize()?;
     let snapshot = snapshot::take_snapshot(schematic, &source)?;
     let project_dir = schematic
-        .canonicalize()?
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
@@ -2873,6 +3147,77 @@ mod tests {
         assert!(with(".nodeset v(a)=5\n"));
         assert!(with(".NODESET V(a)=5\n"));
         assert!(!with(""));
+    }
+
+    #[test]
+    fn every_analysis_reads_back_from_its_stored_form() {
+        let transient = |args: Value| Analysis::Transient(Transient::from_args(&args).unwrap());
+        let analyses = [
+            Analysis::OperatingPoint,
+            transient(json!({ "kind": "transient", "stop_time_seconds": 0.5 })),
+            transient(json!({ "kind": "transient", "stop_time_seconds": 0.5,
+                              "max_step_seconds": 1e-5, "start_save_seconds": 0.1,
+                              "use_initial_conditions": true })),
+            Analysis::Ac(
+                Ac::from_args(&json!({ "kind": "ac", "start_hz": 10.0, "stop_hz": 1e5,
+                                       "scale": "octave", "points": 12 }))
+                .unwrap(),
+            ),
+        ];
+        for analysis in analyses {
+            let stored = analysis.record();
+            assert_eq!(Analysis::from_record(&stored), Some(analysis), "{stored}");
+        }
+        for broken in [
+            json!({}),
+            json!({ "kind": "noise" }),
+            json!({ "kind": "ac" }),
+            json!({ "kind": "transient" }),
+            json!({ "kind": "dc_sweep" }),
+        ] {
+            assert_eq!(Analysis::from_record(&broken), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn a_run_carries_what_it_reported_except_what_belongs_to_its_own_call() {
+        let body = json!({ "warnings": [
+            { "code": "engine_messages", "items": ["x"] },
+            { "code": "no_point_at_start" },
+            { "code": "old_runs_kept" },
+            { "code": "csv_not_written" },
+            { "code": "run_record_not_saved" },
+            { "code": "nets_share_engine_node" },
+            { "detail": "no code at all" },
+        ] });
+        let carried: Vec<&str> = carried_warnings(&body)
+            .iter()
+            .map(|warning| warning["code"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|code| match code.as_str() {
+                "engine_messages" => "engine_messages",
+                "no_point_at_start" => "no_point_at_start",
+                other => panic!("carried {other}"),
+            })
+            .collect();
+        assert_eq!(carried, ["engine_messages", "no_point_at_start"]);
+        assert!(carried_warnings(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_csv_left_unwritten_is_a_warning_that_says_why() {
+        assert_eq!(table_problem(&Ok(export::Written::Bytes(10))), None);
+        let large = table_problem(&Ok(export::Written::TooLarge { cells: 30_000_000 })).unwrap();
+        assert_eq!(large["code"], "csv_not_written");
+        let detail = large["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("30000000") && detail.contains("raw file"),
+            "{detail}"
+        );
+        let broken = table_problem(&Err(std::io::Error::other("disk full"))).unwrap();
+        assert_eq!(broken["code"], "csv_not_written");
+        assert!(broken["detail"].as_str().unwrap().contains("disk full"));
     }
 
     #[test]
@@ -4428,6 +4773,1001 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             assert!(gone, "the hung export is still running");
+        }
+
+        // --- stored runs -----------------------------------------------------
+
+        async fn listed(scene: &Scene, extra: Value) -> (bool, Value) {
+            let mut arguments = json!({ "schematic": scene.root });
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                arguments[key] = value.clone();
+            }
+            let result = handle_list_simulation_runs(&arguments, &scene.ctx)
+                .await
+                .unwrap();
+            read_body(result)
+        }
+
+        async fn measured(scene: &Scene, arguments: Value) -> (bool, Value) {
+            let result = handle_measure_simulation_run(&arguments, &scene.ctx)
+                .await
+                .unwrap();
+            read_body(result)
+        }
+
+        fn read_body(result: crate::mcp::protocol::CallToolResult) -> (bool, Value) {
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            (result.is_error, serde_json::from_str(text).unwrap())
+        }
+
+        fn id_of(body: &Value) -> String {
+            body["run_id"].as_str().unwrap().to_string()
+        }
+
+        fn transient_job() -> String {
+            format!("{}\n{}", copy_transient(), status_json("0", "null", true))
+        }
+
+        fn first_run_dir(scene: &Scene) -> PathBuf {
+            run_dirs(scene).remove(0)
+        }
+
+        #[tokio::test]
+        async fn a_run_is_recorded_and_listed_with_what_it_proved() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let (failed, list) = listed(&scene, json!({})).await;
+            assert!(!failed, "{list}");
+            assert_eq!(list["total"], 1);
+            assert_eq!(list["shown"], 1);
+            assert_eq!(list["truncated"], false);
+            assert_eq!(list["without_record"], 0);
+            let entry = &list["runs"][0];
+            assert_eq!(entry["run_id"], run["run_id"]);
+            assert_eq!(entry["analysis_kind"], "transient");
+            assert_eq!(entry["run_status"], "complete");
+            assert_eq!(entry["simulated_circuit"], "modified");
+            assert_eq!(entry["coverage_ratio"], 1.0);
+            assert_eq!(entry["inputs_changed_since_run"], false);
+            let created = entry["created_at"].as_str().unwrap();
+            assert!(created.ends_with('Z') && created.contains('T'), "{created}");
+            // The record keeps the names a later call needs to find a signal.
+            let record = runs::read_record(&first_run_dir(&scene)).unwrap();
+            assert!(record.nets.iter().any(|net| net.kicad_name == "/rect_out"));
+            assert!(record
+                .elements
+                .iter()
+                .any(|element| element.reference == "R2"));
+            assert_eq!(record.schematic, scene.root.canonicalize().unwrap());
+            assert_eq!(record.inputs_hash, run["source_evidence"]["inputs_hash"]);
+        }
+
+        #[tokio::test]
+        async fn a_new_measurement_needs_no_new_simulation() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            // With no worker left, any attempt to simulate again would fail loudly.
+            std::fs::remove_file(scene.tools.path().join("fake-worker")).unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({
+                    "run_id": run["run_id"],
+                    "signals": ["v(a)"],
+                    "measurements": [
+                        { "name": "bottom", "kind": "min", "signal": "v(a)" },
+                        { "name": "top", "kind": "max", "signal": "v(a)" },
+                    ],
+                }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(run_dirs(&scene).len(), 1);
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(
+                body["outcome"]["requested"], 3,
+                "two measurements and the summaries"
+            );
+            assert_eq!(body["outcome"]["completed"], 3);
+            assert_eq!(body["measurements"][0]["value"], 0.0);
+            assert_eq!(body["measurements"][1]["value"], 2.0);
+            assert_eq!(body["signal_summaries"][0]["final"], 2.0);
+            assert_eq!(body["run_id"], run["run_id"]);
+            assert_eq!(body["run_status"], "complete");
+            assert_eq!(body["simulated_circuit"], "modified");
+            assert_eq!(body["coverage_ratio"], 1.0);
+            assert_eq!(body["inputs_changed_since_run"], false);
+            assert_eq!(body["analysis_kind"], "transient");
+            // Where the run ended and what it left out come with its measurements.
+            assert_eq!(body["analysis"], run["analysis"], "{body}");
+            assert_eq!(body["circuit"], run["circuit"], "{body}");
+            assert_eq!(
+                body["circuit"]["excluded_references"],
+                json!(["D1", "R1", "V1"])
+            );
+            // The run's own answer and the stored one are the same measurement.
+            assert_eq!(
+                run["measurements"][0]["value"],
+                body["measurements"][1]["value"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_measurement_that_does_not_fit_the_stored_analysis_is_refused() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            for measurement in [
+                json!({ "kind": "bandwidth_3db", "signal": "v(a)" }),
+                json!({ "kind": "value_at", "signal": "v(a)", "at_hz": 5.0 }),
+                json!({ "kind": "max", "signal": "v(a)", "from_sweep": 1.0 }),
+            ] {
+                let (failed, body) = measured(
+                    &scene,
+                    json!({ "run_id": run["run_id"], "measurements": [measurement] }),
+                )
+                .await;
+                assert!(failed, "{body}");
+                assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+                assert_eq!(body["outcome"]["status"], "failed", "{body}");
+                assert_eq!(body["outcome"]["requested"], 1);
+                assert_eq!(body["outcome"]["failed"], 1);
+            }
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "measurements": [] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["field"], "measurements", "{body}");
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "envelope_points": 4,
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["field"], "envelope_points", "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_id_that_could_leave_the_store_is_refused_before_any_lookup() {
+            let scene = scene(&transient_job());
+            call(&scene, transient_args(&scene.root, 2.0)).await;
+            let state = scene.state.path().display().to_string();
+            let hostile = [
+                "../../../../etc/passwd".to_string(),
+                "..".to_string(),
+                String::new(),
+                "/etc/passwd".to_string(),
+                "3fa9c1d27b04-20261030T133512-7f3a/..".to_string(),
+                "3fa9c1d27b04-20261030T133512-7f3a\n".to_string(),
+                "3fa9c1d27b04-20261030T133512-7f3a/../../x".to_string(),
+                "..\\..\\3fa9c1d27b04-20261030T133512-7f3a".to_string(),
+                format!("{state}/simulation"),
+                "3fa9c1d27b04-20261030T133512-7F3A".to_string(),
+                "\u{5e9}fa9c1d27b04-20261030T133512-7f3a".to_string(),
+            ];
+            for id in hostile {
+                let (failed, body) = measured(
+                    &scene,
+                    json!({ "run_id": id, "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+                )
+                .await;
+                assert!(failed, "{id:?}: {body}");
+                assert_eq!(body["error"]["kind"], "invalid_argument", "{id:?}: {body}");
+                assert_eq!(body["error"]["field"], "run_id", "{id:?}: {body}");
+                assert_eq!(body["outcome"]["status"], "failed", "{id:?}: {body}");
+                assert_eq!(
+                    body["outcome"]["target"], "(not a run id)",
+                    "{id:?}: {body}"
+                );
+            }
+            // Not a string at all.
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": 7, "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["field"], "run_id", "{body}");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_link_in_the_store_is_no_run() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let id = id_of(&run);
+            let real = first_run_dir(&scene);
+            let outside = tempfile::tempdir().unwrap();
+            for entry in std::fs::read_dir(&real).unwrap().flatten() {
+                std::fs::copy(entry.path(), outside.path().join(entry.file_name())).ok();
+            }
+            std::fs::remove_dir_all(&real).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &real).unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": id, "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "run_not_found", "{body}");
+            // The linked folder is not listed either.
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["total"], 0, "{list}");
+        }
+
+        #[tokio::test]
+        async fn a_missing_run_and_a_damaged_one_have_their_own_reasons() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let dir = first_run_dir(&scene);
+            let reason = |body: &Value| body["error"]["reason"].as_str().unwrap().to_string();
+
+            let gone = json!({ "run_id": "3fa9c1d27b04-20261030T133512-7f3a",
+                               "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let (failed, body) = measured(&scene, gone).await;
+            assert!(failed);
+            assert_eq!(reason(&body), "run_not_found", "{body}");
+            assert_eq!(body["error"]["kind"], "simulation_failed");
+            assert_eq!(body["outcome"]["status"], "failed");
+
+            let raw = std::fs::read(dir.join(RAW_FILE)).unwrap();
+            std::fs::write(dir.join(RAW_FILE), b"not a raw file").unwrap();
+            let (failed, body) = measured(&scene, ask.clone()).await;
+            assert!(failed);
+            assert_eq!(reason(&body), "results_unreadable", "{body}");
+            assert_eq!(body["error"]["stage"], "results");
+            std::fs::remove_file(dir.join(RAW_FILE)).unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(reason(&body), "results_unreadable", "{body}");
+            std::fs::write(dir.join(RAW_FILE), &raw).unwrap();
+
+            std::fs::remove_file(dir.join(crate::simulation::protocol::STATUS_FILE)).unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(reason(&body), "results_unreadable", "{body}");
+
+            let record = std::fs::read(dir.join(runs::RECORD_FILE)).unwrap();
+            std::fs::write(dir.join(runs::RECORD_FILE), b"{ not json").unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(reason(&body), "results_unreadable", "{body}");
+            let mut wrong = serde_json::from_slice::<Value>(&record).unwrap();
+            wrong["version"] = json!(99);
+            std::fs::write(dir.join(runs::RECORD_FILE), wrong.to_string()).unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(reason(&body), "results_unreadable", "{body}");
+            let mut wrong = serde_json::from_slice::<Value>(&record).unwrap();
+            wrong["analysis"] = json!({ "kind": "transient" });
+            std::fs::write(dir.join(runs::RECORD_FILE), wrong.to_string()).unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(reason(&body), "results_unreadable", "{body}");
+
+            std::fs::remove_file(dir.join(runs::RECORD_FILE)).unwrap();
+            let (_, body) = measured(&scene, ask).await;
+            assert_eq!(reason(&body), "run_not_found", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_partial_run_stays_partial_when_it_is_measured_again() {
+            let job = format!(
+                "{}\n{}",
+                copy_transient(),
+                status_json("0", "\"timeout\"", true)
+            );
+            let scene = scene(&job);
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert_eq!(run["outcome"]["status"], "partial", "{run}");
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["run_status"], "partial", "{list}");
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["run_status"], "partial");
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["stopped"]["reason"], "timeout", "{body}");
+            assert_eq!(body["measurements"][0]["window_truncated"], true, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_changed_schematic_reads_as_changed_inputs() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let original = std::fs::read_to_string(&scene.root).unwrap();
+            std::fs::write(&scene.root, format!("{original} ")).unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["inputs_changed_since_run"], true, "{list}");
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+
+            std::fs::write(&scene.root, &original).unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], false, "{body}");
+
+            // The project file is an input too.
+            let project = scene.root.with_extension("kicad_pro");
+            std::fs::write(&project, "{\"a\":1}").unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+            std::fs::write(&project, "{}").unwrap();
+
+            // With the sheet gone, nothing can be said.
+            std::fs::remove_file(&scene.root).unwrap();
+            let (failed, body) = measured(&scene, ask).await;
+            assert!(!failed, "{body}");
+            assert!(body["inputs_changed_since_run"].is_null(), "{body}");
+            let (failed, list) = listed(&scene, json!({})).await;
+            assert!(failed);
+            assert_eq!(list["error"]["kind"], "file_not_found", "{list}");
+        }
+
+        #[tokio::test]
+        async fn a_model_file_the_deck_inlined_is_an_input_that_can_change() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let model = scene.project.path().join("part.lib");
+            std::fs::write(&model, ".model D1N dioc\n").unwrap();
+            let dir = first_run_dir(&scene);
+            let path = dir.join(runs::RECORD_FILE);
+            let mut record: RunRecord =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            // Pretend the deck inlined it, with the hash it had then.
+            let before = stored::CurrentSources::of(&scene.root);
+            record.inlined_files = vec![model.clone()];
+            record.inputs_hash =
+                inputs_hash(before.0.clone().unwrap(), &record.inlined_files).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], false, "{body}");
+            std::fs::write(&model, ".model D1N dioc2\n").unwrap();
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+            std::fs::remove_file(&model).unwrap();
+            let (_, body) = measured(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_signal_the_run_lacks_fails_alone_and_unsaved_power_says_so() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["p(R2)"],
+                        "measurements": [
+                            { "kind": "max", "signal": "v(a)" },
+                            { "kind": "max", "signal": "v(nowhere)" },
+                        ] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["measurements"][0]["value"], 2.0);
+            assert_eq!(
+                body["measurements"][1]["finding"], "signal_not_found",
+                "{body}"
+            );
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 3);
+            assert_eq!(body["outcome"]["completed"], 1);
+            assert_eq!(body["outcome"]["failed"], 2);
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("power_not_saved"), "{warnings}");
+            assert!(warnings.contains("p(R2)"), "{warnings}");
+        }
+
+        #[tokio::test]
+        async fn the_list_is_newest_first_cut_to_the_limit_and_counts_what_has_no_record() {
+            let scene = scene("exit 0");
+            let first = runs::create(scene.state.path(), &scene.root).unwrap();
+            let project = first.dir.parent().unwrap().to_path_buf();
+            let hash = first.id[..12].to_string();
+            let record = |circuit: &str| {
+                RunRecord::new(RecordFields {
+                    schematic: scene.root.clone(),
+                    analysis: json!({ "kind": "operating_point" }),
+                    run_status: RunState::Complete,
+                    stopped: None,
+                    simulated_circuit: circuit.to_string(),
+                    circuit: Value::Null,
+                    result: Value::Null,
+                    coverage_ratio: 1.0,
+                    inputs_hash: String::new(),
+                    inlined_files: Vec::new(),
+                    nets: Vec::new(),
+                    elements: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            };
+            let mut made = Vec::new();
+            for (stamp, circuit) in [
+                ("20250102T000000", "as_drawn"),
+                ("20250104T000000", "modified"),
+                ("20250103T000000", "as_drawn"),
+            ] {
+                let id = format!("{hash}-{stamp}-0000");
+                std::fs::create_dir(project.join(&id)).unwrap();
+                runs::write_record(&project.join(&id), &record(circuit)).unwrap();
+                made.push(id);
+            }
+            std::fs::create_dir(project.join("not-a-run")).unwrap();
+            std::fs::write(project.join(format!("{hash}-20250105T000000-0000")), "").unwrap();
+
+            let (failed, list) = listed(&scene, json!({})).await;
+            assert!(!failed, "{list}");
+            let ids: Vec<&str> = list["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|run| run["run_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, [made[1].as_str(), made[2].as_str(), made[0].as_str()]);
+            assert_eq!(list["total"], 3);
+            assert_eq!(list["without_record"], 1, "the empty folder made first");
+            assert_eq!(list["runs"][0]["simulated_circuit"], "modified");
+            assert_eq!(list["runs"][0]["analysis_kind"], "operating_point");
+            assert_eq!(list["runs"][0]["created_at"], "2025-01-04T00:00:00Z");
+
+            let (_, list) = listed(&scene, json!({ "limit": 2 })).await;
+            assert_eq!(list["shown"], 2);
+            assert_eq!(list["total"], 3);
+            assert_eq!(list["truncated"], true);
+            assert_eq!(list["runs"][1]["run_id"], made[2].as_str());
+        }
+
+        #[tokio::test]
+        async fn no_runs_is_an_empty_list_and_a_missing_sheet_is_refused() {
+            let scene = scene("exit 0");
+            let (failed, list) = listed(&scene, json!({})).await;
+            assert!(!failed, "{list}");
+            assert_eq!(list["total"], 0);
+            assert_eq!(list["runs"], json!([]));
+            let missing = scene.project.path().join("nope.kicad_sch");
+            let result = handle_list_simulation_runs(&json!({ "schematic": missing }), &scene.ctx)
+                .await
+                .unwrap();
+            let (failed, body) = read_body(result);
+            assert!(failed);
+            assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_failed_leaves_no_record_to_list_or_measure() {
+            let scene = scene("kill -ABRT $$");
+            let (failed, _) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert!(failed);
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["total"], 0, "{list}");
+            assert_eq!(list["without_record"], 1, "{list}");
+        }
+
+        #[tokio::test]
+        async fn the_csv_is_the_raw_data_as_text() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let path = run["artifacts"]["csv_path"].as_str().unwrap();
+            assert!(path.ends_with("results.csv"), "{path}");
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "time,v(a),i(m1:d)\n0e0,0e0,5e0\n1e0,1e0,5e0\n2e0,2e0,5e0\n"
+            );
+            assert_eq!(
+                run["artifacts"]["csv_bytes"],
+                std::fs::metadata(path).unwrap().len()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_operating_point_csv_reads_down_the_rows() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, run) = call(&scene, args(&scene.root)).await;
+            let text =
+                std::fs::read_to_string(run["artifacts"]["csv_path"].as_str().unwrap()).unwrap();
+            assert!(text.starts_with("signal,value\n"), "{text}");
+            assert_eq!(text.lines().count(), 4, "{text}");
+        }
+
+        #[tokio::test]
+        async fn an_ac_csv_has_a_real_scale_and_a_stored_ac_run_measures_like_the_run() {
+            let raw = copy_ac(&low_pass(&[
+                1.0, 2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0, 64.0, 100.0,
+            ]));
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let measurements = json!([
+                { "name": "gain", "kind": "value_at", "signal": "v(a)", "at_hz": 10.0 },
+                { "name": "corner", "kind": "bandwidth_3db", "signal": "v(a)" },
+            ]);
+            let mut arguments = ac_args(&scene.root, json!({ "points": 1, "scale": "decade" }));
+            arguments["measurements"] = measurements.clone();
+            let (_, run) = call(&scene, arguments).await;
+            let text =
+                std::fs::read_to_string(run["artifacts"]["csv_path"].as_str().unwrap()).unwrap();
+            let mut lines = text.lines();
+            assert_eq!(lines.next(), Some("frequency,v(a).real,v(a).imag"));
+            assert_eq!(lines.count(), 10);
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "measurements": measurements }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["analysis_kind"], "ac");
+            assert_eq!(body["measurements"], run["measurements"]);
+            assert_eq!(body["outcome"]["requested"], 2);
+        }
+
+        #[tokio::test]
+        async fn a_stored_dc_sweep_measures_like_the_run_and_its_csv_is_named_for_the_target() {
+            let points: Vec<(f64, f64)> = (0..=5)
+                .map(|n| (f64::from(n), 2.0 * f64::from(n)))
+                .collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let measurements = json!([
+                { "name": "cross", "kind": "crossing", "signal": "v(a)", "level": 5.0 },
+                { "name": "mid", "kind": "value_at", "signal": "v(a)", "at_sweep": 2.5 },
+                { "name": "late", "kind": "min", "signal": "v(a)", "from_sweep": 3.0 },
+            ]);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "vsrc", "start_value": 0.0, "stop_value": 5.0, "step_value": 1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["measurements"] = measurements.clone();
+            let (_, run) = call(&scene, arguments).await;
+            let text =
+                std::fs::read_to_string(run["artifacts"]["csv_path"].as_str().unwrap()).unwrap();
+            assert_eq!(text.lines().next(), Some("VSRC (V),v(a)"));
+            assert_eq!(text.lines().nth(3), Some("2e0,4e0"));
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "measurements": measurements }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["analysis_kind"], "dc_sweep");
+            assert_eq!(body["measurements"], run["measurements"]);
+        }
+
+        #[tokio::test]
+        async fn a_falling_stored_sweep_is_measured_in_the_order_it_ran() {
+            let points: Vec<(f64, f64)> = (0..=5)
+                .map(|n| (5.0 - f64::from(n), 2.0 * (5.0 - f64::from(n))))
+                .collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let measurements = json!([
+                { "kind": "crossing", "signal": "v(a)", "level": 5.0 },
+                { "kind": "value_at", "signal": "v(a)", "at_sweep": 2.5 },
+            ]);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "vsrc", "start_value": 5.0, "stop_value": 0.0, "step_value": -1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["measurements"] = measurements.clone();
+            let (_, run) = call(&scene, arguments).await;
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "measurements": measurements }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["measurements"], run["measurements"]);
+            assert_eq!(body["measurements"][1]["value"], 5.0, "{body}");
+        }
+
+        #[tokio::test]
+        async fn two_sweeps_are_exported_with_their_second_value_and_are_not_measured() {
+            let grid: Vec<(f64, f64)> = (0..9).map(|n| ((n % 3) as f64, n as f64)).collect();
+            let job = format!("{}\n{}", copy_dc(&grid), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                    { "target": "R2", "start_value": 1000.0, "stop_value": 3000.0, "step_value": 1000.0 },
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["signals"] = json!(["v(a)"]);
+            let (_, run) = call(&scene, arguments).await;
+            assert_eq!(run["outcome"]["status"], "complete", "{run}");
+            let text =
+                std::fs::read_to_string(run["artifacts"]["csv_path"].as_str().unwrap()).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines[0], "R2 (Ω),VSRC (V),v(a)");
+            assert_eq!(lines[1], "1e3,0e0,0e0");
+            assert_eq!(lines[3], "1e3,2e0,2e0");
+            assert_eq!(lines[4], "2e3,0e0,3e0");
+            assert_eq!(lines[9], "3e3,2e0,8e0");
+            assert_eq!(lines.len(), 10);
+
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "measurements", "{body}");
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["analysis_kind"], "dc_sweep");
+        }
+
+        #[tokio::test]
+        async fn a_csv_that_cannot_be_written_costs_the_run_nothing() {
+            let job = format!("mkdir results.csv\n{}", transient_job());
+            let scene = scene(&job);
+            let (failed, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert!(!failed, "{run}");
+            assert_eq!(run["outcome"]["status"], "complete", "{run}");
+            assert!(run["artifacts"]["csv_path"].is_null(), "{run}");
+            assert!(
+                run["warnings"].to_string().contains("csv_not_written"),
+                "{run}"
+            );
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["total"], 1);
+        }
+
+        #[tokio::test]
+        async fn a_record_that_cannot_be_written_is_a_warning_and_leaves_the_run_unlisted() {
+            let job = format!("mkdir run.json\n{}", transient_job());
+            let scene = scene(&job);
+            let (failed, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert!(!failed, "{run}");
+            assert_eq!(run["outcome"]["status"], "complete", "{run}");
+            assert!(
+                run["warnings"].to_string().contains("run_record_not_saved"),
+                "{run}"
+            );
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["total"], 0);
+            // A folder stands where the record belongs: there, and not usable.
+            assert_eq!(list["unreadable_record"], 1, "{list}");
+        }
+
+        #[tokio::test]
+        async fn a_stored_run_is_read_with_the_names_it_was_made_with() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            // Its data names the nets and parts as the engine does.
+            std::fs::write(
+                dir.join(RAW_FILE),
+                "Title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 3\n\
+                 No. Points: 2\nVariables:\n\t0\ttime\ttime\n\t1\tv(/out_x)\tvoltage\n\
+                 \t2\ti(vbt1)\tcurrent\nValues:\n0\t0.0\n\t1.0\n\t3.0\n1\t2.0\n\t4.0\n\t6.0\n\n",
+            )
+            .unwrap();
+            let path = dir.join(runs::RECORD_FILE);
+            let mut record: RunRecord =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record.nets = vec![crate::simulation::kicad_netlist::NetEntry {
+                kicad_name: "/Out".to_string(),
+                spice_name: "/out_x".to_string(),
+                in_deck: true,
+                pin_count: 2,
+            }];
+            record.elements = vec![crate::simulation::kicad_netlist::ElementEntry {
+                reference: "BT1".to_string(),
+                element_name: Some("VBT1".to_string()),
+                modelled: true,
+                excluded: false,
+            }];
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "measurements": [
+                    { "kind": "max", "signal": "v(/Out)" },
+                    { "kind": "max", "signal": "i(BT1)" },
+                ] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["measurements"][0]["value"], 4.0, "{body}");
+            assert_eq!(body["measurements"][1]["value"], 6.0, "{body}");
+        }
+
+        #[tokio::test]
+        async fn power_a_run_saved_is_measured_without_a_warning() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            std::fs::write(
+                dir.join(RAW_FILE),
+                "Title: t\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\n\
+                 No. Points: 2\nVariables:\n\t0\ttime\ttime\n\t1\tr2:power\tpower\n\
+                 Values:\n0\t0.0\n\t1.0\n1\t2.0\n\t9.0\n\n",
+            )
+            .unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["p(R2)"],
+                        "measurements": [{ "kind": "max", "signal": "p(R2)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["measurements"][0]["value"], 9.0, "{body}");
+            assert!(
+                !body["warnings"].to_string().contains("power_not_saved"),
+                "{body}"
+            );
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_summary_signal_the_run_lacks_makes_the_outcome_partial_alone() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(nowhere)"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["signal_summaries"][0]["finding"], "signal_not_found");
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["completed"], 1);
+            assert_eq!(body["outcome"]["failed"], 1);
+            assert!(
+                !body["warnings"].to_string().contains("power_not_saved"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_run_that_covered_half_its_range_lists_that_share() {
+            let scene = scene(&transient_job());
+            // Data to 2 s of a 4 s stop, from an engine that reported success.
+            let (_, run) = call(&scene, transient_args(&scene.root, 4.0)).await;
+            assert_eq!(run["outcome"]["status"], "partial", "{run}");
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["run_status"], "partial", "{list}");
+            assert_eq!(list["runs"][0]["coverage_ratio"], 0.5, "{list}");
+            let (_, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert_eq!(body["coverage_ratio"], 0.5, "{body}");
+            assert_eq!(body["stopped"]["reason"], "incomplete_coverage", "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_operating_point_run_is_listed_and_has_nothing_to_measure() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, run) = call(&scene, args(&scene.root)).await;
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(
+                list["runs"][0]["analysis_kind"], "operating_point",
+                "{list}"
+            );
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_model_file_the_run_inlined_is_an_input_that_can_change() {
+            let scene = scene(&transient_job());
+            let model = scene.project.path().join("part.lib");
+            std::fs::write(&model, ".model DX D(IS=1e-14)\n").unwrap();
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["testbench"]["spice_lines"] = json!([".include part.lib"]);
+            let (failed, run) = call(&scene, arguments).await;
+            assert!(!failed, "{run}");
+            let record = runs::read_record(&first_run_dir(&scene)).unwrap();
+            assert_eq!(record.inlined_files.len(), 1, "{record:?}");
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], false, "{body}");
+            std::fs::write(&model, ".model DX D(IS=2e-14)\n").unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["runs"][0]["inputs_changed_since_run"], true, "{list}");
+            let (_, body) = measured(&scene, ask.clone()).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+            std::fs::remove_file(&model).unwrap();
+            let (_, body) = measured(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+        }
+
+        #[tokio::test]
+        async fn what_the_run_warned_of_comes_with_a_later_measurement() {
+            // No point at time zero under uic: a peak at the start reads low.
+            let raw = "cat > results.raw <<'RAW'\nTitle: t\nPlotname: Transient Analysis\n\
+                Flags: real\nNo. Variables: 2\nNo. Points: 3\nVariables:\n\t0\ttime\ttime\n\
+                \t1\tv(a)\tvoltage\nValues:\n0\t5e-1\n\t1.0\n1\t1.0\n\t2.0\n2\t2.0\n\t3.0\n\nRAW";
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["analysis"]["use_initial_conditions"] = json!(true);
+            let (failed, run) = call(&scene, arguments).await;
+            assert!(!failed, "{run}");
+            assert!(
+                run["warnings"].to_string().contains("no_point_at_start"),
+                "{run}"
+            );
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("no_point_at_start"), "{warnings}");
+            // The warning points at a number, and the body has it.
+            assert_eq!(body["analysis"]["first_point_seconds"], 0.5, "{body}");
+            // What belonged to the run's own call is not carried.
+            assert!(!warnings.contains("csv_not_written"), "{warnings}");
+            assert!(!warnings.contains("old_runs_kept"), "{warnings}");
+        }
+
+        #[tokio::test]
+        async fn the_sheets_are_named_as_the_disk_spells_them_whatever_the_caller_typed() {
+            let scene = scene(&transient_job());
+            let shouted = scene.root.with_file_name("TOP.KICAD_SCH");
+            // A disk that tells the two apart has no such file, and nothing to test.
+            if !shouted.exists() {
+                return;
+            }
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["schematic"] = json!(shouted);
+            let (failed, run) = call(&scene, arguments).await;
+            assert!(!failed, "{run}");
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let (_, body) = measured(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], false, "{body}");
+            for schematic in [&scene.root, &shouted] {
+                let result =
+                    handle_list_simulation_runs(&json!({ "schematic": schematic }), &scene.ctx)
+                        .await
+                        .unwrap();
+                let (_, list) = read_body(result);
+                assert_eq!(list["total"], 1, "{list}");
+                assert_eq!(list["runs"][0]["inputs_changed_since_run"], false, "{list}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_status_file_or_raw_file_that_is_a_link_is_never_read() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"],
+                              "measurements": [{ "kind": "max", "signal": "v(a)" }] });
+            let dir = first_run_dir(&scene);
+            let outside = tempfile::tempdir().unwrap();
+            for name in [crate::simulation::protocol::STATUS_FILE, RAW_FILE] {
+                let file = dir.join(name);
+                let kept = outside.path().join(name);
+                std::fs::rename(&file, &kept).unwrap();
+                std::os::unix::fs::symlink(&kept, &file).unwrap();
+                let (failed, body) = measured(&scene, ask.clone()).await;
+                assert!(failed, "{name}: {body}");
+                assert_eq!(
+                    body["error"]["reason"], "results_unreadable",
+                    "{name}: {body}"
+                );
+                std::fs::remove_file(&file).unwrap();
+                std::fs::rename(&kept, &file).unwrap();
+            }
+            let (failed, body) = measured(&scene, ask).await;
+            assert!(!failed, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_status_file_past_its_limit_is_not_read() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            let status = dir.join(crate::simulation::protocol::STATUS_FILE);
+            let mut text = std::fs::read_to_string(&status).unwrap();
+            text.push_str(&" ".repeat(runs::MAX_STATUS_BYTES as usize));
+            std::fs::write(&status, text).unwrap();
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "results_unreadable", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_record_that_cannot_be_used_is_counted_apart_from_a_missing_one() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let record = first_run_dir(&scene).join(runs::RECORD_FILE);
+            std::fs::write(&record, "{ not json").unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["total"], 0, "{list}");
+            assert_eq!(list["unreadable_record"], 1, "{list}");
+            assert_eq!(list["without_record"], 0, "{list}");
+            std::fs::remove_file(&record).unwrap();
+            let (_, list) = listed(&scene, json!({})).await;
+            assert_eq!(list["unreadable_record"], 0, "{list}");
+            assert_eq!(list["without_record"], 1, "{list}");
+            let _ = run;
+        }
+
+        #[tokio::test]
+        async fn a_stored_two_sweep_run_says_why_it_takes_no_measurement_and_where_the_grid_is() {
+            let grid: Vec<(f64, f64)> = (0..9).map(|n| ((n % 3) as f64, n as f64)).collect();
+            let job = format!("{}\n{}", copy_dc(&grid), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                    { "target": "R2", "start_value": 1000.0, "stop_value": 3000.0, "step_value": 1000.0 },
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            let (_, run) = call(&scene, arguments).await;
+            let (failed, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"],
+                        "measurements": [{ "kind": "max", "signal": "v(a)" }] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            let message = body["error"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+                + body["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("results.csv"), "{body}");
+            assert!(!message.contains("takes signals but"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_power_signal_asked_twice_is_named_once() {
+            let scene = scene(&transient_job());
+            let (_, run) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            let (_, body) = measured(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["p(R2)"],
+                        "measurements": [{ "kind": "max", "signal": "p(R2)" }] }),
+            )
+            .await;
+            let warning = body["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|warning| warning["code"] == "power_not_saved")
+                .unwrap_or_else(|| panic!("{body}"));
+            assert_eq!(warning["items"], json!(["p(R2)"]), "{warning}");
         }
     }
 }
