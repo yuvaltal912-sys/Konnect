@@ -381,6 +381,13 @@ fn leading_number(token: &str) -> Option<f64> {
     token[..end].parse().ok()
 }
 
+/// A value with the bracket and spaces ngspice allows before it taken off.
+fn trim_bracket(value: &str) -> String {
+    value
+        .trim_start_matches(|c: char| c == '(' || c.is_whitespace())
+        .to_string()
+}
+
 /// The `AC` keyword of a source card, and the text of the value it gives, if any.
 /// ngspice reads `AC 1`, `AC=1`, `ac = 1` and `AC(1 0)` alike. The name and two
 /// nodes come first, so a node called `ac` is not the keyword.
@@ -389,15 +396,12 @@ fn ac_value(words: &[String]) -> Option<Option<String>> {
         let lower = word.to_ascii_lowercase();
         if lower == "ac" {
             // `AC (1 0)` has a space before the bracket.
-            let next = words
-                .get(at + 1)
-                .map(|value| value.trim_start_matches('(').to_string());
-            return Some(next);
+            return Some(words.get(at + 1).map(|value| trim_bracket(value)));
         }
         let rest = lower
             .strip_prefix("ac=")
             .or_else(|| lower.strip_prefix("ac("))?;
-        Some((!rest.is_empty()).then(|| rest.to_string()))
+        Some((!rest.is_empty()).then(|| trim_bracket(rest)))
     })
 }
 
@@ -989,6 +993,7 @@ mod tests {
             "V1 a 0 DC 0 ac=1 0",
             "V1 a 0 DC 0 AC(1 0)",
             "V1 a 0 AC (1 0)",
+            "V1 a 0 AC ( 1 0 )",
             "I1 0 a ac=1m",
             "V1 a 0 SIN(0 1 1k) ac = 1",
         ] {
@@ -1013,6 +1018,8 @@ mod tests {
             "V1 a 0 AC=0.0 90",
             "V1 a 0 DC 1 AC(0 0)",
             "V1 a 0 AC (0 0)",
+            "V1 a 0 AC ( 0 0 )",
+            "V1 a 0 ac=( 0 0 )",
         ] {
             assert!(!driven(card), "{card}");
         }

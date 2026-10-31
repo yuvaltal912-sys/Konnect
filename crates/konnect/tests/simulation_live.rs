@@ -2200,3 +2200,98 @@ fn a_sweep_that_lands_where_it_planned_says_nothing_about_its_end() {
     assert_eq!(result["analysis"]["points"], 501, "{result}");
     assert_eq!(result["warnings"], json!([]), "{result}");
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_linear_sweep_too_coarse_for_a_resonance_gives_no_margin_and_a_fine_one_gives_it() {
+    // The same two-stage Q = 50 loop on a linear grid: 100 Hz steps step over the
+    // resonance at 1 kHz, and 5001 points do not [verified: run E102].
+    let lines: Vec<String> = [
+        "V1 in 0 DC 0 AC 1",
+        "R1 in a 1.25663706144",
+        "L1 a b 0.01",
+        "C1 b 0 2.53302959106e-06",
+        "E1 c 0 b 0 1",
+        "R2 c d 1.25663706144",
+        "L2 d e 0.01",
+        "C2 e 0 2.53302959106e-06",
+        "E2 out 0 e 0 10",
+        "RO out 0 1meg",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let run = |points: u64| {
+        run_on_testbench(
+            &lines,
+            json!({
+                "analysis": { "kind": "ac", "start_hz": 50.0, "stop_hz": 10050.0, "scale": "linear", "points": points },
+                "measurements": [
+                    { "name": "pm", "kind": "phase_margin", "signal": "v(out)" },
+                    { "name": "gm", "kind": "gain_margin", "signal": "v(out)" },
+                ],
+            }),
+        )
+    };
+    let items = |result: &Value| result["measurements"].as_array().unwrap().clone();
+    for item in items(&run(101)) {
+        assert!(item["value"].is_null(), "{item}");
+        assert_eq!(item["finding"], "phase_unreliable", "{item}");
+    }
+    let fine = run(5001);
+    near(measured(&fine, "pm"), -178.52, 0.05);
+    near(measured(&fine, "gm"), -87.96, 0.1);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_pole_at_the_start_of_a_linear_sweep_is_not_mistaken_for_a_resonance() {
+    // One pole at 1 Hz on a sweep from 1 Hz by 10: the first step falls 20 dB, with a
+    // phase that is easy to follow. A gain of 1e4 puts unity gain near 10 kHz.
+    let lines: Vec<String> = [
+        "V1 in 0 DC 0 AC 1",
+        "R1 in out 1k",
+        "C1 out 0 159.15494309189535m",
+        "E1 o2 0 out 0 10000",
+        "RL o2 0 1meg",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": { "kind": "ac", "start_hz": 1.0, "stop_hz": 100001.0, "scale": "linear", "points": 10000 },
+            "measurements": [{ "name": "pm", "kind": "phase_margin", "signal": "v(o2)" }],
+        }),
+    );
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    near(measured(&result, "pm"), 90.007, 0.01);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_peak_bandwidth_is_refused_where_the_peak_falls_between_samples_and_read_where_it_does_not() {
+    // KiCad's amplifier-ac: a resonance at about 5 kHz. Its own `.ac dec 10` reads
+    // 380 Hz and the answer is 521.7 [verified: run E101, E102].
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/amplifier-ac"), project.path());
+    let run = |points: u64| {
+        call_over_stdio(
+            "run_simulation",
+            json!({
+                "schematic": project.path().join("amplifier-ac.kicad_sch"),
+                "analysis": { "kind": "ac", "start_hz": 1.0, "stop_hz": 1e6, "points": points },
+                "measurements": [{
+                    "name": "bw", "kind": "bandwidth_3db", "signal": "v(VOUT)", "reference_level": "peak"
+                }],
+            }),
+        )
+    };
+    for points in [10, 20] {
+        let item = &run(points)["measurements"][0].clone();
+        assert!(item["value"].is_null(), "{points}: {item}");
+        assert_eq!(item["finding"], "sweep_too_coarse", "{points}: {item}");
+    }
+    // 50 a decade is within half a percent; 1000 is the reference.
+    near(measured(&run(50), "bw"), 521.7, 3.0);
+    near(measured(&run(1000), "bw"), 521.7, 0.5);
+}

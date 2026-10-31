@@ -28,14 +28,19 @@ const MAX_PHASE_STEP_DEGREES: f64 = 120.0;
 /// same two samples, which a smooth roll-off never does: 60 dB a decade is 1.2 dB
 /// a point at 50 a decade.
 const MAX_GAIN_STEP_DB: f64 = 10.0;
-/// The log step of 50 points a decade, which `MAX_GAIN_STEP_DB` is meant for. On a
-/// linear sweep the steps are wide at low frequency and fine at high, so the limit
-/// grows with the step: a pole near the start falls 20 dB between 1 Hz and 11 Hz
-/// with a phase that is easy to follow.
-const REFERENCE_LOG_STEP: f64 = 0.046_051_701_859_880_91;
-/// A bandwidth is a 3 dB point, so a step of more than that between the two samples
-/// it lies between says the sweep was too coarse to place it.
-const MAX_EDGE_STEP_DB: f64 = HALF_POWER_DB;
+/// A jump over the limit counts only if it is larger than the one before it, which
+/// is a sweep closing on a feature. The first step of a sweep has none before it and
+/// is not judged: a linear sweep starts wide, and a pole at its start falls 20 dB
+/// between 1 Hz and 11 Hz with a phase that is easy to follow, and then by less.
+/// Scaling the limit with the step instead let an 18 dB jump at 900 Hz through.
+/// A bandwidth edge placed between two samples that differ by more than this is
+/// placed inside a step larger than most of the roll-off around it.
+const MAX_EDGE_STEP_DB: f64 = MAX_GAIN_STEP_DB;
+/// A peak is resolved when the samples either side of the highest one are within the
+/// half-power point of it. Further down than that, the peak lies between samples,
+/// and every edge is read from a level that is too low: `amplifier-ac` read 380 Hz
+/// at 10 a decade and 521.7 Hz at 1000.
+const MAX_PEAK_DROP_DB: f64 = HALF_POWER_DB;
 /// Relative slack on the ends of the sweep, for the rounding the engine leaves.
 const EDGE_TOLERANCE: f64 = 1e-9;
 
@@ -99,14 +104,10 @@ impl Response {
                     let step = principal - last_principal;
                     let turn = step - 360.0 * (step / 360.0).round();
                     let jump = (gain_db[index] - gain_db[index - 1]).abs();
-                    let allowed = match log_axis {
-                        true => MAX_GAIN_STEP_DB,
-                        false => {
-                            let wide = (freq[index] / freq[index - 1]).ln() / REFERENCE_LOG_STEP;
-                            MAX_GAIN_STEP_DB * wide.max(1.0)
-                        }
-                    };
-                    let too_sharp = turn.abs() > MAX_PHASE_STEP_DEGREES || jump > allowed;
+                    let closing =
+                        index > 1 && jump > (gain_db[index - 1] - gain_db[index - 2]).abs();
+                    let too_sharp =
+                        turn.abs() > MAX_PHASE_STEP_DEGREES || (jump > MAX_GAIN_STEP_DB && closing);
                     if too_sharp && doubtful_from.is_none() {
                         doubtful_from = Some(index);
                     }
@@ -196,7 +197,7 @@ impl Response {
         })
     }
 
-    /// The gain changes by more than 3 dB between this sample and the next.
+    /// The gain changes by more than `MAX_EDGE_STEP_DB` between this sample and the next.
     fn too_wide(&self, index: usize) -> bool {
         (self.gain_db[index] - self.gain_db[index + 1]).abs() > MAX_EDGE_STEP_DB
     }
@@ -369,11 +370,19 @@ fn band_edges(window: &Response) -> Found {
         .flatten();
     let lower = rise.map(|index| window.crossing(&window.gain_db, index, level));
     let upper = fall.map(|index| window.crossing(&window.gain_db, index, level));
-    // A peak the samples straddle reads low, and every edge with it.
-    let coarse = [rise, fall]
+    // A peak the samples straddle reads low, and every edge with it. A peak at an end
+    // of the sweep is an edge and has only one side.
+    let sides = [peak_at.checked_sub(1), Some(peak_at + 1)];
+    let straddled = sides
         .into_iter()
         .flatten()
-        .any(|index| window.too_wide(index));
+        .filter(|&side| peak_at > 0 && side < window.len())
+        .any(|side| peak - window.gain_db[side] > MAX_PEAK_DROP_DB);
+    let coarse = straddled
+        || [rise, fall]
+            .into_iter()
+            .flatten()
+            .any(|index| window.too_wide(index));
     let found = match (lower, upper) {
         _ if coarse => Found::none("sweep_too_coarse"),
         (Some(lower), Some(upper)) => Found::value(upper - lower),
@@ -903,7 +912,7 @@ mod tests {
         // 20 dB down in one step, with the phase still: the unity crossing is in the
         // jump, and a phase read there rests on a sweep that stepped over the detail.
         let freq = [1.0, 1.047, 1.096, 1.148];
-        let real = [2.0, 0.2, 0.1, 0.05];
+        let real = [2.0, 1.9, 0.19, 0.1];
         let response = Response::new(&freq, &real, &[0.0; 4], true).unwrap();
         let report = measure(&response, &request("phase_margin", json!({})), false);
         assert!(report["value"].is_null(), "{report}");
@@ -941,8 +950,8 @@ mod tests {
             "{report}"
         );
         // A jump of 15 dB between neighbours at 1 kHz is a sharp feature all the same.
-        let freq = [1000.0, 1001.0, 1002.0, 1003.0];
-        let response = Response::new(&freq, &[3.0, 0.5, 0.4, 0.3], &[0.0; 4], false).unwrap();
+        let freq = [1000.0, 1001.0, 1002.0, 1003.0, 1004.0];
+        let response = Response::new(&freq, &[3.0, 2.9, 0.5, 0.4, 0.3], &[0.0; 5], false).unwrap();
         let report = measure(&response, &request("phase_margin", json!({})), false);
         assert_eq!(report["finding"], "phase_unreliable", "{report}");
     }
@@ -982,5 +991,52 @@ mod tests {
         let report = measure(&response, &request("bandwidth_3db", json!({})), false);
         assert!(report["value"].is_null(), "{report}");
         assert_eq!(report["finding"], "sweep_too_coarse", "{report}");
+    }
+
+    #[test]
+    fn a_peak_between_samples_is_refused_on_its_own_neighbours_and_an_edge_on_its_step() {
+        // Q = 10 at 20 a decade: every edge step is under 10 dB, but the sample beside
+        // the highest one is more than 3 dB down, so the peak lies between samples.
+        let q = 10.0;
+        let freq = sweep(20, 300.0, 3000.0);
+        let (mut real, mut imaginary) = (Vec::new(), Vec::new());
+        for &f in &freq {
+            let x = f / 1000.0;
+            let (dr, di) = (1.0 - x * x, x / q);
+            let power = dr * dr + di * di;
+            real.push(((x / q) * di) / power);
+            imaginary.push(((x / q) * dr) / power);
+        }
+        let response = Response::new(&freq, &real, &imaginary, true).unwrap();
+        let peak = json!({ "reference_level": "peak" });
+        let report = measure(&response, &request("bandwidth_3db", peak), false);
+        assert_eq!(report["finding"], "sweep_too_coarse", "{report}");
+        let steps: Vec<f64> = (0..freq.len() - 1)
+            .map(|i| ((response.gain_db[i] - response.gain_db[i + 1]) as f64).abs())
+            .collect();
+        assert!(steps.iter().all(|step| *step < 10.0), "{steps:?}");
+
+        // A monotone edge in a step of 5 dB is placed: only 10 dB or more is refused.
+        let freq = [1.0, 2.0, 3.0, 4.0];
+        let real: Vec<f64> = [0.0, -1.0, -2.0, -7.0]
+            .iter()
+            .map(|db: &f64| 10f64.powf(db / 20.0))
+            .collect();
+        let response = Response::new(&freq, &real, &[0.0; 4], false).unwrap();
+        let report = measure(&response, &request("bandwidth_3db", json!({})), false);
+        assert!(
+            value_of(&report) > 3.0 && value_of(&report) < 4.0,
+            "{report}"
+        );
+
+        // A peak at the start of the sweep is an edge with one side, not a straddled peak.
+        let real: Vec<f64> = [0.0, -5.0, -9.0, -12.0]
+            .iter()
+            .map(|db: &f64| 10f64.powf(db / 20.0))
+            .collect();
+        let response = Response::new(&freq, &real, &[0.0; 4], false).unwrap();
+        let peak = json!({ "reference_level": "peak" });
+        let report = measure(&response, &request("bandwidth_3db", peak), false);
+        assert_eq!(report["finding"], "level_not_reached", "{report}");
     }
 }

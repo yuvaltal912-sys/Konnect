@@ -83,7 +83,7 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 |---|---|
 | `level_not_reached` | The signal never got there |
 | `phase_unreliable` | AC only: the sweep is too coarse to follow the phase past `phase_unreliable_from_hz`. Raise `points` |
-| `sweep_too_coarse` | AC only: the gain falls more than 3 dB between the two samples that hold a `bandwidth_3db` edge, so the edge cannot be placed. Raise `points` |
+| `sweep_too_coarse` | AC only: a `bandwidth_3db` edge cannot be placed, because the gain changes by over 10 dB between the two samples that hold it, or, with `reference_level: "peak"`, the peak lies between samples. Raise `points` |
 | `starts_on_level` | It was already on the level when the window began, and never crossed it |
 | `no_transition` | The signal is flat to within rounding, or the step runs the other way |
 | `final_value_needed` | The window's last value cannot stand in for the final value |
