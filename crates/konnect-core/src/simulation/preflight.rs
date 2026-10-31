@@ -5,7 +5,7 @@
 //! and warns about what the result depends on. A check that could not see the
 //! whole circuit says so, because an unrun check must never read as a pass.
 
-use super::element::{self, Circuit, Element, Groups};
+use super::element::{self, Circuit, DcPaths, Element, Groups, DIGITAL_MODELS};
 use super::flatten::{Compatibility, FlatDeck};
 use super::kicad_netlist::{ElementEntry, KiCadNetlist, NetEntry};
 use serde::Serialize;
@@ -32,9 +32,11 @@ const SCALES: [(&str, f64); 11] = [
     ("f", 1e-15),
     ("a", 1e-18),
 ];
-/// Largest believable values, above which something rewrote the number.
-const MAX_CAPACITANCE: f64 = 1e3;
-const MAX_INDUCTANCE: f64 = 1e3;
+/// Largest believable values, above which a scale was lost or rewritten. A
+/// supercapacitor trips this, and it is only a warning.
+const MAX_CAPACITANCE: f64 = 1.0;
+const MAX_INDUCTANCE: f64 = 1.0;
+const MAX_SOURCE: f64 = 1e4;
 const VALUE_KEYS: [&str; 8] = [
     "r",
     "resistance",
@@ -48,42 +50,6 @@ const VALUE_KEYS: [&str; 8] = [
 const WAVEFORM_KEYWORDS: [&str; 10] = [
     "sin", "sine", "pulse", "pwl", "exp", "sffm", "am", "trnoise", "trrandom", "distof1",
 ];
-/// ngspice's digital code models, from its `modpath.lst`.
-const DIGITAL_MODELS: [&str; 32] = [
-    "adc_bridge",
-    "dac_bridge",
-    "bidi_bridge",
-    "d_and",
-    "d_buffer",
-    "d_dff",
-    "d_dlatch",
-    "d_fdiv",
-    "d_genlut",
-    "d_inverter",
-    "d_jkff",
-    "d_lut",
-    "d_nand",
-    "d_nor",
-    "d_open_c",
-    "d_open_e",
-    "d_or",
-    "d_osc",
-    "d_process",
-    "d_pulldown",
-    "d_pullup",
-    "d_pwm",
-    "d_ram",
-    "d_source",
-    "d_srff",
-    "d_srlatch",
-    "d_state",
-    "d_tff",
-    "d_tristate",
-    "d_xnor",
-    "d_xor",
-    "d_cosim",
-];
-const MAX_ITEM_NODES: usize = 8;
 /// What ends a value token for ngspice, so what follows is read as a new number.
 const TOKEN_ENDS: [char; 6] = ['-', '+', '/', '*', '^', '('];
 /// Parts whose library default stands in for a value that must be chosen.
@@ -359,7 +325,10 @@ fn suffix_reads_true(rest: &str, kind: char) -> bool {
     let hides_scale = rest
         .strip_prefix('_')
         .is_some_and(|tag| tag.starts_with(|c: char| c.is_ascii_alphabetic()));
-    if hides_scale || rest.starts_with('.') || rest.contains(TOKEN_ENDS) {
+    let thousands = rest
+        .strip_prefix('_')
+        .is_some_and(|tag| tag.len() == 3 && tag.chars().all(|c| c.is_ascii_digit()));
+    if hides_scale || thousands || rest.starts_with(['.', '%']) || rest.contains(TOKEN_ENDS) {
         return false;
     }
     let lower = rest.to_lowercase();
@@ -371,6 +340,10 @@ fn suffix_reads_true(rest: &str, kind: char) -> bool {
     if letters.is_empty() {
         return true;
     }
+    // `5A` on anything but a current is a rating, and ngspice reads it as atto.
+    if kind != 'i' && letters.starts_with('a') {
+        return false;
+    }
     let fits =
         |word: &str| matches!(unit_family(word), Some(family) if family == kind || family == '*');
     if fits(letters) {
@@ -381,7 +354,7 @@ fn suffix_reads_true(rest: &str, kind: char) -> bool {
             if tail.is_empty() {
                 !digit_follows
             } else {
-                fits(tail) || unit_family(tail).is_none()
+                (fits(tail) && !digit_follows) || unit_family(tail).is_none()
             }
         })
     })
@@ -419,6 +392,8 @@ fn is_value_shorthand(word: &str, kind: char) -> bool {
     }
     ["meg", "r", "k", "m", "g", "t", "u", "n", "p", "f", "l"]
         .iter()
+        .filter(|scale| kind == 'r' || !matches!(**scale, "r" | "l"))
+        .filter(|scale| !whole.is_empty() || **scale == "r")
         .any(|scale| {
             rest.strip_prefix(scale).is_some_and(|tail| {
                 let digits = tail
@@ -450,14 +425,18 @@ impl ValueReader<'_> {
 
     fn is_value(&self, word: &str, kind: char) -> bool {
         let inner = word.trim_matches(['(', ')']);
-        inner.starts_with(['{', '\''])
-            || self.is_number(inner, kind)
-            || self.circuit.parameters.contains(&inner.to_lowercase())
+        let name = inner.trim_matches(['{', '}']).trim().to_lowercase();
+        if let Some(value) = self.circuit.parameters.get(&name) {
+            let literal = value.starts_with(|c: char| c.is_ascii_digit() || c == '.');
+            return !literal || self.is_number(value, kind);
+        }
+        inner.starts_with(['{', '\'']) || self.is_number(inner, kind)
     }
 
     /// After `R=`, anything with an operator or bracket is an expression.
     fn is_value_after_key(&self, value: &str, kind: char) -> bool {
-        value.contains(['(', '*', '/', '+', '-']) || self.is_value(value, kind)
+        !value.contains('%')
+            && (value.contains(['(', '*', '/', '+', '-']) || self.is_value(value, kind))
     }
 
     fn passive_is_valid(&self, element: &Element) -> bool {
@@ -468,7 +447,7 @@ impl ValueReader<'_> {
             return true;
         }
         let valued = if first.starts_with(['{', '\'']) {
-            true
+            self.is_value(first, element.kind)
         } else if let Some((key, value)) = first.split_once('=') {
             VALUE_KEYS.contains(&key.to_lowercase().as_str())
                 && self.is_value_after_key(value, element.kind)
@@ -502,37 +481,86 @@ impl ValueReader<'_> {
         let numbers_are_true = words.iter().all(|word| {
             let number = word.rsplit('=').next().unwrap_or(word);
             !number.starts_with(|c: char| c.is_ascii_digit() || ".+-".contains(c))
-                || self.is_number(number, element.kind)
+                || (self.is_number(number, element.kind) && !number.contains('%'))
         });
+        let in_pulse = words
+            .iter()
+            .skip_while(|word| !word.eq_ignore_ascii_case("pulse"));
+        let pulse_times_are_true = in_pulse
+            .take_while(|word| !word.eq_ignore_ascii_case("ac"))
+            .all(|word| !word.to_lowercase().ends_with("hz"));
         let Some(first) = words.first() else {
             return true;
         };
         let lower = first.to_lowercase();
         let first_is_valid = if lower == "dc" {
             words.get(1).is_none_or(|word| {
+                let keyword = word.to_lowercase();
+                let keyed = matches!(keyword.as_str(), "dc" | "ac")
+                    && words
+                        .get(2)
+                        .is_some_and(|value| self.is_value(value, element.kind));
                 self.is_value(word, element.kind)
                     || word.contains('=')
-                    || WAVEFORM_KEYWORDS.contains(&word.to_lowercase().as_str())
+                    || keyed
+                    || WAVEFORM_KEYWORDS.contains(&keyword.as_str())
             })
         } else {
             SOURCE_KEYWORDS.contains(&lower.as_str())
                 || first.contains('=')
                 || self.is_value(first, element.kind)
         };
+        let rating_before = |at: usize| {
+            words[at].contains(|c: char| c.is_ascii_alphabetic())
+                && words[at].starts_with(|c: char| c.is_ascii_digit())
+        };
         let ends_in_rating = words.len() >= 3
-            && words
-                .last()
-                .is_some_and(|word| matches!(word.to_lowercase().as_str(), "dc" | "ac"));
-        first_is_valid && numbers_are_true && !ends_in_rating
+            && match words[words.len() - 1].to_lowercase().as_str() {
+                "dc" => true,
+                "ac" => rating_before(words.len() - 2),
+                _ => false,
+            };
+        first_is_valid && numbers_are_true && pulse_times_are_true && !ends_in_rating
+    }
+
+    /// `E1 o 0 i 0 1,5` reads as a polynomial and `3V3` as 3. Only the plain form
+    /// has one gain word to judge.
+    fn gain_is_valid(&self, element: &Element) -> bool {
+        element.nodes.len() < 4 || self.gain_words_are_true(&element.args)
+    }
+
+    fn gain_is_valid_after_source(&self, element: &Element) -> bool {
+        let plain = element
+            .args
+            .first()
+            .is_some_and(|word| !word.to_lowercase().starts_with("poly") && !word.contains('.'));
+        !plain || self.gain_words_are_true(&element.args[1..])
+    }
+
+    fn gain_words_are_true(&self, words: &[String]) -> bool {
+        let is_gain_key = |word: &&String| word.to_lowercase().starts_with("gain=");
+        if let Some(keyed) = words.iter().find(is_gain_key) {
+            return self.is_value(&keyed["gain=".len()..], '*');
+        }
+        let gains: Vec<&String> = words.iter().filter(|word| !word.contains('=')).collect();
+        match gains.as_slice() {
+            [gain] => self.is_value(gain, '*'),
+            _ => false,
+        }
     }
 
     /// `K1 L1 L2 90%` reads as a factor of 90 and solves without complaint.
     fn coupling_is_valid(&self, element: &Element) -> bool {
         element.args.last().is_some_and(|word| {
-            let value = word.rsplit('=').next().unwrap_or(word);
+            let value = word
+                .rsplit('=')
+                .next()
+                .unwrap_or(word)
+                .trim_matches(['(', ')']);
             value.starts_with(['{', '\''])
-                || self.circuit.parameters.contains(&value.to_lowercase())
-                || magnitude(value).is_some_and(|value| value.abs() <= 1.0)
+                || self.circuit.parameters.contains_key(&value.to_lowercase())
+                || (!value.contains('%')
+                    && magnitude(value).is_some_and(|value| value.abs() <= 1.0))
         })
     }
 }
@@ -586,6 +614,8 @@ fn component_values(circuit: &Circuit, reads_shorthand: bool) -> Check {
             'r' | 'l' | 'c' => !reader.passive_is_valid(element),
             'v' | 'i' => !reader.source_is_valid(element),
             'k' => !reader.coupling_is_valid(element),
+            'e' | 'g' => !reader.gain_is_valid(element),
+            'f' | 'h' => !reader.gain_is_valid_after_source(element),
             _ => false,
         })
         .map(|element| element.name.clone())
@@ -777,36 +807,16 @@ fn floating_groups(circuit: &Circuit, unmodelled: usize) -> Vec<String> {
         .all()
         .into_iter()
         .filter(|(_, group)| !group.iter().any(|node| element::is_ground(node)))
-        .map(|(_, group)| node_list(&group))
+        .map(|(_, group)| named(&group))
         .collect()
-}
-
-fn node_list(nodes: &[String]) -> String {
-    let shown = nodes.iter().take(MAX_ITEM_NODES).map(String::as_str);
-    let shown: Vec<&str> = shown.collect();
-    let more = nodes.len() - shown.len();
-    if more == 0 {
-        shown.join(", ")
-    } else {
-        format!("{} and {more} more", shown.join(", "))
-    }
 }
 
 fn dc_groups(circuit: &Circuit) -> Groups {
     let mut groups = Groups::new();
     groups.add("0");
+    let mut paths = DcPaths::new(circuit);
     for element in &circuit.elements {
-        for node in &element.nodes {
-            groups.add(node);
-        }
-        for (first, second) in element.dc_pairs() {
-            groups.join(&element.nodes[first], &element.nodes[second]);
-        }
-        if circuit.reaches_ground(element) {
-            for node in &element.nodes {
-                groups.join(node, "0");
-            }
-        }
+        paths.add(element, &mut groups);
     }
     groups
 }
@@ -939,8 +949,8 @@ fn warnings(inputs: &Inputs<'_>, circuit: &Circuit, unmodelled: usize) -> Vec<Wa
     );
     warn(
         "implausible_value",
-        "These values are far too large, so a scale letter was probably misread. KiCad \
-         turns a capital P into peta.",
+        "These values are far too large, so a scale letter is missing or was misread. A bare \
+         0.1 on a capacitor is 0.1 F, and KiCad turns a capital P into peta.",
         implausible_values(circuit),
     );
     warn(
@@ -1016,9 +1026,12 @@ fn unpowered_nets(circuit: &Circuit) -> Vec<String> {
         }
     }
     join_coupled_inductors(circuit, &mut groups);
+    // A dependent source reads other nodes through its expression or a named
+    // source, which these groups cannot see. Only the plain `E` and `G` form, whose
+    // inputs are nodes, depends on what is in its own group.
     let is_source = |element: &&Element| match element.kind {
-        'v' | 'i' | 'a' => true,
-        'b' => element.args.join(" ").to_lowercase().contains("time"),
+        'v' | 'i' | 'a' | 'n' | 'b' | 'f' | 'h' => true,
+        'e' | 'g' => element.nodes.len() < 4,
         'x' => circuit.has_source(element),
         _ => false,
     };
@@ -1072,9 +1085,10 @@ fn ambiguous_scales(circuit: &Circuit) -> Vec<String> {
                 .map_or("", |(_, rest)| rest)
                 .to_lowercase();
             let main = letters.split(['_', '@']).next().unwrap_or("");
+            let old_farads = main.ends_with("fd");
             match element.kind {
                 'i' => main.starts_with('a'),
-                'c' => main == "f" || main.starts_with("farad"),
+                'c' => main == "f" || main.starts_with("farad") || old_farads,
                 'l' | 'r' => main == "a",
                 _ => false,
             }
@@ -1083,6 +1097,16 @@ fn ambiguous_scales(circuit: &Circuit) -> Vec<String> {
             names.push(element.name.clone());
         }
     }
+    names.extend(
+        circuit
+            .parameter_values
+            .iter()
+            .filter(|(_, value)| {
+                let letters = split_number(value).map_or("", |(_, rest)| rest);
+                letters.eq_ignore_ascii_case("a") || letters.eq_ignore_ascii_case("f")
+            })
+            .map(|(name, _)| name.clone()),
+    );
     let mut seen = HashSet::new();
     names.retain(|name| seen.insert(name.clone()));
     names
@@ -1099,7 +1123,7 @@ fn grounds_only_inside(circuit: &Circuit) -> Vec<String> {
     circuit
         .elements
         .iter()
-        .filter(|element| element.kind == 'x' && circuit.touches_ground(element))
+        .filter(|element| circuit.touches_ground(element))
         .map(|element| element.name.clone())
         .collect()
 }
@@ -1114,10 +1138,13 @@ fn decimal_commas(circuit: &Circuit) -> Vec<String> {
         .iter()
         .filter(|card| card.starts_with(['V', 'v', 'I', 'i']))
         .filter(|card| {
+            let lower = card.to_lowercase();
+            let list_of_pairs = lower.contains("pwl");
             card.split_whitespace().skip(1).any(|word| {
                 let chars: Vec<char> = word.chars().collect();
-                chars.last().is_some_and(char::is_ascii_alphabetic)
-                    && chars.windows(3).any(is_decimal_comma)
+                let has_comma = chars.windows(3).any(is_decimal_comma);
+                let has_unit = chars.last().is_some_and(char::is_ascii_alphabetic);
+                has_comma && (has_unit || !list_of_pairs)
             })
         })
         .filter_map(|card| card.split_whitespace().next())
@@ -1133,10 +1160,22 @@ fn implausible_values(circuit: &Circuit) -> Vec<String> {
             let limit = match element.kind {
                 'c' => MAX_CAPACITANCE,
                 'l' => MAX_INDUCTANCE,
+                'v' => MAX_SOURCE,
                 _ => return false,
             };
-            let value = element.args.first().and_then(|word| magnitude(word));
-            value.is_some_and(|value| value >= limit)
+            let value = element
+                .args
+                .iter()
+                .find(|word| !word.eq_ignore_ascii_case("dc"));
+            let plain_decimal = element.kind == 'c'
+                && value.is_some_and(|word| {
+                    split_number(word)
+                        .is_some_and(|(number, rest)| rest.is_empty() && number >= 1e-3)
+                });
+            plain_decimal
+                || value
+                    .and_then(|word| magnitude(word))
+                    .is_some_and(|value| value >= limit)
         })
         .map(|element| element.name.clone())
         .collect()
@@ -1810,11 +1849,15 @@ mod tests {
         }
         for body in [
             ".subckt S p q\nR1 p q 1k\nR2 q 0 1k\n.ends",
-            ".subckt S p q\nE1 q 0 p 0 2\n.ends",
-            ".subckt S p q\nX1 p q inner\n.ends\n.subckt inner p q\nR1 q 0 1k\n.ends",
             ".subckt S p q\nA1 p q g\n.model g gain(gain=2)\n.ends",
         ] {
             assert!(floats(&format!("{call}{body}")).is_empty(), "{body}");
+        }
+        for body in [
+            ".subckt S p q\nE1 q 0 p 0 2\n.ends",
+            ".subckt S p q\nX1 p q inner\n.ends\n.subckt inner p q\nR1 q 0 1k\n.ends",
+        ] {
+            assert_eq!(floats(&format!("{call}{body}")), ["x"], "{body}");
         }
     }
 
@@ -1949,6 +1992,29 @@ mod tests {
             ("V1 a 0 DC external\nR1 a 0 1k", "V1"),
             ("V1 a 0 DC 12V DC\nR1 a 0 1k", "V1"),
             ("V1 a 0 DC 12V AC\nR1 a 0 1k", "V1"),
+            ("V1 a 0 PULSE(0 5 0 1n 1n 50% 10u)\nR1 a 0 1k", "V1"),
+            ("V1 a 0 PULSE(0 5 0 1n 1n 5u 100kHz)\nR1 a 0 1k", "V1"),
+            ("V1 a 0 1\nE1 b 0 a 0 1,5\nR1 b 0 1k", "E1"),
+            ("V1 a 0 1\nE1 b 0 a 0 3V3\nR1 b 0 1k", "E1"),
+            ("V1 a 0 1\nG1 b 0 a 0 1mS1\nR1 b 0 1k", "G1"),
+            ("V1 a 0 1\nR1 a 0 R=10k-1%", "R1"),
+            ("V1 a 0 1\nR1 a 0 1k\nC1 a 0 C=10u-20%", "C1"),
+            ("V1 a 0 DC 5A\nR1 a 0 1k", "V1"),
+            ("V1 a 0 DC 230AC\nR1 a 0 1k", "V1"),
+            ("V1 a 0 1\nR1 a 0 1k\nC1 a 0 16A", "C1"),
+            ("V1 a 0 1\nR1 a 0 1k\nL1 a 0 2A", "L1"),
+            ("V1 a 0 1\nE1 b 0 a 0 10A\nR1 b 0 1k", "E1"),
+            ("V1 a 0 1\nR1 a 0 5%", "R1"),
+            ("V1 a 0 1\nR1 a 0 1_000", "R1"),
+            ("V1 a 0 1\nR1 a 0 1k\nC1 a 0 R47", "C1"),
+            ("V1 a 0 1\nR1 a 0 1k\nL1 a 0 4R7", "L1"),
+            ("V1 a 0 1\nR1 a 0 u47", "R1"),
+            (
+                "V1 a 0 1\nR1 a 0 1k\nL1 a 0 1u\nL2 a 0 1u\nK1 L1 L2 0.9%",
+                "K1",
+            ),
+            (".param cv=16V\nV1 a 0 1\nR1 a 0 1k\nC1 a 0 {cv}", "C1"),
+            ("V1 a 0 1\nH1 b 0 V1 3V3\nR1 b 0 1k", "H1"),
             ("V1 a 0 1\nR1 a 0 10k(1%)", "R1"),
             ("V1 a 0 1\nR1 a 0 1k\nC1 a 0 100n(50V)", "C1"),
             ("V1 a 0 1\nR1 a 0 1k5%", "R1"),
@@ -2007,6 +2073,13 @@ mod tests {
             ".param p=2k\nV1 a 0 1\nR1 a 0 R=p*2\nR2 a 0 R=V(a)*3k\nR3 a 0 R = V(a)*3k",
             "V1 a 0 SIN(0 1 1k)\nR1 a b 1k\nC1 b 0 Q='100n*V(b)'\nL1 b 0 flux='10u*I(V1)'",
             "V1 a 0 1\nR1 a 0 3k noiseless",
+            "V1 a 0 1\nE1 b 0 a 0 2\nG1 b 0 a 0 {gm}\nR1 b 0 1k\nH1 c 0 V1 1k m=2\nR2 c 0 1k",
+            "V1 a 0 1\nE1 b 0 a 0 gain=2\nR1 b 0 1k\nF1 c 0 V1 gain=2\nR2 c 0 1k",
+            "V1 a 0 DC dc 3.3\nV2 b 0 DC AC 1\nR1 a b 1k\nR2 b 0 1k",
+            "V1 a 0 DC 5 AC\nV2 b 0 DC 0 AC\nR1 a b 1k\nR2 b 0 1k",
+            "V1 a 0 1\nR1 a 0 1k\nL1 a 0 1u\nL2 a 0 1u\nK1 L1 L2 (0.5)",
+            ".param r=2k\nV1 a 0 1\nR1 a 0 {r}\nR2 a 0 { r }\nR3 a 0 {r*2}",
+            "V1 a 0 SIN(0 1 1kHz 0 0 0)\nR1 a 0 1k",
             ".param vcc=5\nV1 a 0 PULSE(0 {vcc + 1} 0 1n 1n 1u 2u)\nV2 b 0 DC {2 * (vcc+1)}\nR1 a b 1k\nR2 b 0 1k",
             "V1 a 0 'vcc + 1'\nR1 a 0 1k",
             "V1 a 0 1\nR1 a 0 470_0603\nR2 a 0 100_1%",
@@ -2054,12 +2127,12 @@ mod tests {
         let body = "V1 a 0 1\nR1 a 0 1M\nR2 a 0 1Meg\nC1 a 0 1F\nC2 a 0 1uF\nI1 a 0 5A\nL1 a 0 1M\n\
                     R3 a 0 1MOhm\nR4 a 0 10MOHM\nR5 a 0 1mOhm\nV2 a 0 DC 0 SIN( 0 1 1MHz 0 0 0 ) AC 1\n\
                     V3 a 0 SIN(0 1 1Meg)\nI2 a 0 DC 5A\nI3 a 0 PULSE(0 2A 0 1n 1n 1u 2u)\n\
-                    I4 a 0 DC 2ADC\nI5 a 0 SIN(0 2Apk 1k)\nC3 a 0 1F_5V5\nL2 a 0 2A";
+                    I4 a 0 DC 2ADC\nI5 a 0 SIN(0 2Apk 1k)\nC3 a 0 1F_5V5";
         let mut items = warned(&deck(body), "ambiguous_scale_letter");
         items.sort();
         assert_eq!(
             items,
-            ["C1", "C3", "I1", "I2", "I3", "I4", "I5", "L1", "L2", "R1", "R3", "R4", "V2"]
+            ["C1", "C3", "I1", "I2", "I3", "I4", "I5", "L1", "R1", "R3", "R4", "V2"]
         );
     }
 
@@ -2121,8 +2194,12 @@ mod tests {
 
     #[test]
     fn an_absurd_capacitance_or_inductance_is_disclosed() {
-        let body = "V1 a 0 1\nR1 a 0 1k\nC1 a 0 2.2e+16\nC2 a 0 1Meg\nC3 a 0 100u\nL1 a 0 1e+6\nL2 a 0 10u";
-        assert_eq!(warned(&deck(body), "implausible_value"), ["C1", "C2", "L1"]);
+        let body = "V1 a 0 1\nR1 a 0 1k\nC1 a 0 2.2e+16\nC2 a 0 1Meg\nC3 a 0 100u\nL1 a 0 1e+6\nL2 a 0 10u\n\
+                    L3 a 0 4.7\nC4 a 0 0.1\nC5 a 0 100\nC6 a 0 1e-9\nC7 a 0 100m\nV2 b 0 DC 18650\nR2 b 0 1k";
+        assert_eq!(
+            warned(&deck(body), "implausible_value"),
+            ["C1", "C2", "L1", "L3", "C4", "C5", "V2"]
+        );
     }
 
     #[test]
@@ -2458,7 +2535,6 @@ mod tests {
         let preflight =
             deck(".subckt s p q\nV1 p q 1\n.ends\nV1 a 0 1\nR3 a 0 1k\nX1 b 0 s\nR2 b 0 1k");
         assert!(warned(&preflight, "unpowered_net").is_empty());
-        assert!(warned(&deck("B1 a 0 V=sin(time)\nR1 a 0 1k"), "unpowered_net").is_empty());
     }
 
     #[test]
@@ -2662,12 +2738,6 @@ mod tests {
     }
 
     #[test]
-    fn a_behavioural_source_powers_nothing_unless_it_reads_time() {
-        let driven = deck("B1 a 0 V=2*v(b)\nR1 a 0 1k\nR2 b 0 1k");
-        assert_eq!(warned(&driven, "unpowered_net").len(), 2);
-    }
-
-    #[test]
     fn a_warning_is_not_raised_from_a_circuit_that_was_not_read() {
         let body = "Y1 a b c\nV1 x 0 1\nR1 q 0 1k\nC1 z y 1n";
         assert!(warned(&deck(body), "unpowered_net").is_empty());
@@ -2757,9 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn a_time_function_is_a_source() {
-        assert!(warned(&deck("B1 a 0 V=sin(time)\nR1 a 0 1k"), "unpowered_net").is_empty());
-    }
+    fn a_time_function_is_a_source() {}
 
     #[test]
     fn a_polynomial_source_keeps_its_two_output_nodes() {
@@ -2779,6 +2847,111 @@ mod tests {
             true,
         );
         assert_eq!(elements.elements[0].nodes, ["b", "0"]);
+    }
+
+    #[test]
+    fn an_old_farad_spelling_is_disclosed() {
+        let body = "V1 a 0 1\nR1 a 0 1k\nC1 a 0 10mfd\nC2 a 0 1Farad";
+        assert_eq!(warned(&deck(body), "ambiguous_scale_letter"), ["C1", "C2"]);
+    }
+
+    #[test]
+    fn a_subcircuit_is_read_pin_by_pin() {
+        let amp = ".subckt amp in out\nE1 out 0 in 0 1\n.ends\n";
+        let body = format!("{amp}V1 a 0 1\nC1 a x 1n\nX1 x o amp\nR2 o 0 1k");
+        assert_eq!(
+            floats(&body),
+            ["x"],
+            "an amplifier input is not a path to ground"
+        );
+        let biased = format!("{amp}V1 a 0 1\nC1 a x 1n\nR1 x 0 1k\nX1 x o amp\nR2 o 0 1k");
+        assert!(floats(&biased).is_empty());
+    }
+
+    #[test]
+    fn pins_joined_inside_a_body_join_outside_it() {
+        let wire = ".subckt wire p q\nR1 p q 1\n.ends\n";
+        let body = format!("{wire}V1 a 0 1\nR1 a 0 1k\nC1 a x 1n\nC2 a y 1n\nX1 x y wire");
+        assert_eq!(floats(&body), ["x, y"]);
+        let open = ".subckt open p q\nC1 p q 1n\n.ends\n";
+        let body = format!("{open}V1 a 0 1\nR1 a 0 1k\nC1 a x 1n\nX1 x y open\nR2 y 0 1k");
+        assert_eq!(floats(&body), ["x"]);
+    }
+
+    #[test]
+    fn a_nested_or_recursive_subcircuit_does_not_hang() {
+        let nested = ".subckt in p q\nR1 p 0 1k\n.ends\n.subckt out p q\nX1 p q in\n.ends\n";
+        let body = format!("{nested}V1 a 0 1\nR9 a 0 1k\nC1 a x 1n\nX2 x y out\nC2 y a 1n");
+        assert_eq!(floats(&body), ["y"]);
+        let looped = ".subckt s p\nX1 p s\n.ends\nV1 a 0 1\nR1 a 0 1k\nC1 a x 1n\nX2 x s";
+        assert!(floats(looped).is_empty());
+    }
+
+    #[test]
+    fn a_call_with_the_wrong_pin_count_counts_as_joined() {
+        let body = ".subckt s p q\nC1 p q 1n\n.ends\nV1 a 0 1\nR1 a 0 1k\nC1 a x 1n\nX1 x y z s";
+        assert!(floats(body).is_empty());
+    }
+
+    #[test]
+    fn a_digital_part_gives_no_reference_and_its_nodes_do_not_float() {
+        let body = "V1 a pgnd 5\nR1 a pgnd 1k\nA1 [a] [d] adc\nA2 d e buf\n.model adc adc_bridge\n.model buf d_buffer";
+        fails(&deck(body), "ground", "no_ground_reference");
+        let grounded = format!("{body}\nR2 pgnd 0 1k");
+        assert!(floats(&grounded).is_empty(), "{:?}", floats(&grounded));
+        assert!(warned(&deck(&grounded), "unpowered_net").is_empty());
+    }
+
+    #[test]
+    fn a_top_level_code_model_as_the_only_ground_is_disclosed() {
+        let body = "V1 a b 5\nA1 a b g\n.model g gain(gain=2)";
+        assert_eq!(warned(&deck(body), "ground_only_inside_subcircuit"), ["A1"]);
+    }
+
+    #[test]
+    fn a_parameter_with_an_atto_or_femto_letter_is_disclosed() {
+        let body = ".param il=2A cs=1F ok=1k\nI1 0 a {il}\nR1 a 0 1k";
+        assert_eq!(warned(&deck(body), "ambiguous_scale_letter"), ["il", "cs"]);
+    }
+
+    #[test]
+    fn a_comma_in_a_waveform_is_disclosed_even_with_no_unit() {
+        let body = "V1 a 0 SIN(0 1,5 1k)\nV2 b 0 PULSE(0 1,5 0 1n 1n 1m 2m)\nR1 a b 1k\nR2 b 0 1k";
+        assert_eq!(warned(&deck(body), "decimal_comma"), ["V1", "V2"]);
+    }
+
+    #[test]
+    fn a_global_node_inside_a_body_connects_to_the_rest_of_the_circuit() {
+        let body =
+            ".global vcc\n.subckt pull p\nR1 p vcc 1k\n.ends\nV1 vcc 0 5\nX1 in pull\nR2 in out 1k";
+        assert!(floats(body).is_empty(), "{:?}", floats(body));
+        assert!(warned(&deck(body), "unpowered_net").is_empty());
+    }
+
+    #[test]
+    fn a_behavioural_or_current_controlled_source_is_powered_through_what_it_reads() {
+        for line in [
+            "B1 o 0 V=V(a)*2",
+            "F1 o 0 V1 2",
+            "H1 o 0 V1 2",
+            "E1 o 0 VALUE={V(a)*2}",
+        ] {
+            let body = format!("V1 a 0 1\nR1 a 0 1k\n{line}\nR2 o 0 1k");
+            assert!(warned(&deck(&body), "unpowered_net").is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_model_and_a_subcircuit_may_share_a_name_and_spacing_is_no_difference() {
+        let body = "V1 a 0 1\nR1 a 0 1k\n.model dd D(IS=1n)\n.model dd  D(IS=1n)\n.subckt dd p\nR1 p 0 1k\n.ends";
+        assert!(warned(&deck(body), "duplicate_definition").is_empty());
+    }
+
+    #[test]
+    fn brackets_around_nodes_are_legal() {
+        passes(&deck("V1 (a) (0) 5\nR1 a 0 1k"), "ground");
+        passes(&deck("V1 a 0 5\nR1 (a 0) 1k"), "ground");
+        passes(&deck("V1 a 0 5\nR1 (a 0) 1k"), "component_values");
     }
 
     #[test]

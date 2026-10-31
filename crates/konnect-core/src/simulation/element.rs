@@ -7,13 +7,49 @@
 use super::flatten::{comment_start, directive, FlatDeck};
 use std::collections::{HashMap, HashSet};
 
+/// ngspice's digital code models, from its `modpath.lst`.
+pub(crate) const DIGITAL_MODELS: [&str; 32] = [
+    "adc_bridge",
+    "dac_bridge",
+    "bidi_bridge",
+    "d_and",
+    "d_buffer",
+    "d_dff",
+    "d_dlatch",
+    "d_fdiv",
+    "d_genlut",
+    "d_inverter",
+    "d_jkff",
+    "d_lut",
+    "d_nand",
+    "d_nor",
+    "d_open_c",
+    "d_open_e",
+    "d_or",
+    "d_osc",
+    "d_process",
+    "d_pulldown",
+    "d_pullup",
+    "d_pwm",
+    "d_ram",
+    "d_source",
+    "d_srff",
+    "d_srlatch",
+    "d_state",
+    "d_tff",
+    "d_tristate",
+    "d_xnor",
+    "d_xor",
+    "d_cosim",
+];
 const MAX_BIPOLAR_TOKENS: usize = 6;
 const MAX_MOS_TOKENS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Element {
     pub name: String,
-    /// The device letter, lowercase.
+    /// The device letter, lowercase. `p` is a potentiometer and `n` a digital
+    /// code model, both written as `A` lines in the deck.
     pub kind: char,
     /// Lowercase, as ngspice stores them, with ground written as `0`.
     pub nodes: Vec<String>,
@@ -25,11 +61,11 @@ pub(crate) struct Element {
 impl Element {
     /// Node index pairs joined at DC. A MOS gate, a controlled source's input
     /// and a switch's control carry no DC, and neither do capacitors or current
-    /// sources. Code models hold their own references, so they join nothing.
+    /// sources. Code models and subcircuits are read by [`DcPaths`].
     pub(crate) fn dc_pairs(&self) -> Vec<(usize, usize)> {
         let chain = |count: usize| (1..count).map(|at| (at - 1, at)).collect();
         match self.kind {
-            'c' | 'i' | 'g' | 'f' | 'k' | 'a' => Vec::new(),
+            'c' | 'i' | 'g' | 'f' | 'k' | 'a' | 'n' | 'x' => Vec::new(),
             'b' if self.is_behavioural_current() => Vec::new(),
             'm' => {
                 let mut pairs = vec![(0, 2)];
@@ -52,13 +88,140 @@ impl Element {
 /// What a subcircuit's body can do for the circuit around it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Subcircuit {
-    /// A conducting path from a pin to node `0`.
-    pub reaches_ground: bool,
     /// Any element on node `0`, which is a reference for AC and transient.
     pub touches_ground: bool,
     pub has_source: bool,
     calls: Vec<String>,
     code_models: Vec<String>,
+    pins: Vec<String>,
+    body: Vec<Element>,
+    /// Holds a line the reader could not place, so its paths are unknown.
+    unread: bool,
+}
+
+/// How a subcircuit's pins connect at DC: which share a path, by group number,
+/// and which reach ground.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinPaths {
+    groups: Vec<usize>,
+    grounded: Vec<bool>,
+    /// The `.global` nodes each pin reaches.
+    globals: Vec<Vec<String>>,
+}
+
+/// Adds elements to DC groups, looking inside each subcircuit once.
+pub(crate) struct DcPaths<'a> {
+    circuit: &'a Circuit,
+    solved: HashMap<String, Option<PinPaths>>,
+    open: Vec<String>,
+}
+
+impl<'a> DcPaths<'a> {
+    pub(crate) fn new(circuit: &'a Circuit) -> Self {
+        Self {
+            circuit,
+            solved: HashMap::new(),
+            open: Vec::new(),
+        }
+    }
+
+    pub(crate) fn add(&mut self, element: &Element, groups: &mut Groups) {
+        // Digital nodes are events, not voltages, so they float by design.
+        if element.kind == 'n' {
+            return;
+        }
+        for node in &element.nodes {
+            groups.add(node);
+        }
+        for (first, second) in element.dc_pairs() {
+            groups.join(&element.nodes[first], &element.nodes[second]);
+        }
+        match element.kind {
+            'a' => {
+                for node in &element.nodes {
+                    groups.join(node, "0");
+                }
+            }
+            'x' => self.add_call(element, groups),
+            _ => {}
+        }
+    }
+
+    /// A body the reader could not follow counts as joining and grounding every
+    /// pin. That can only silence a warning.
+    fn add_call(&mut self, element: &Element, groups: &mut Groups) {
+        let name = element.args.first().map(|name| name.to_lowercase());
+        let paths = name.and_then(|name| self.solve(&name));
+        let paths = paths.filter(|paths| paths.groups.len() == element.nodes.len());
+        let Some(paths) = paths else {
+            for node in &element.nodes {
+                groups.join(node, "0");
+            }
+            return;
+        };
+        for (at, node) in element.nodes.iter().enumerate() {
+            if paths.grounded[at] {
+                groups.join(node, "0");
+            }
+            let partner = paths.groups[..at]
+                .iter()
+                .position(|group| *group == paths.groups[at]);
+            if let Some(partner) = partner {
+                groups.join(node, &element.nodes[partner]);
+            }
+            for global in &paths.globals[at] {
+                groups.join(node, global);
+            }
+        }
+    }
+
+    fn solve(&mut self, name: &str) -> Option<PinPaths> {
+        if let Some(solved) = self.solved.get(name) {
+            return solved.clone();
+        }
+        let circuit = self.circuit;
+        let subcircuit = circuit.subcircuits.get(name)?;
+        if subcircuit.unread || self.open.iter().any(|open| open == name) {
+            return None;
+        }
+        self.open.push(name.to_string());
+        let mut groups = Groups::new();
+        groups.add("0");
+        for element in &subcircuit.body {
+            self.add(element, &mut groups);
+        }
+        self.open.pop();
+        let pins: Vec<String> = subcircuit
+            .pins
+            .iter()
+            .map(|pin| node_name(pin, false))
+            .collect();
+        // A pin named like ground is not this body's ground: see gnd_pin_subcircuits.
+        let pin_named_ground = pins.iter().any(|pin| is_ground(pin));
+        let ground = groups.group_of("0");
+        let group_ids: Vec<usize> = pins.iter().map(|pin| groups.group_of(pin)).collect();
+        let reachable: Vec<(usize, &String)> = circuit
+            .globals
+            .iter()
+            .map(|global| (groups.group_of(global), global))
+            .collect();
+        let paths = PinPaths {
+            grounded: group_ids
+                .iter()
+                .map(|id| *id == ground && !pin_named_ground)
+                .collect(),
+            globals: group_ids
+                .iter()
+                .map(|id| {
+                    let shared = reachable.iter().filter(|(group, _)| group == id);
+                    shared.map(|(_, global)| (*global).clone()).collect()
+                })
+                .collect(),
+            groups: group_ids,
+        };
+        self.solved.insert(name.to_string(), Some(paths.clone()));
+        Some(paths)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -69,9 +232,12 @@ pub(crate) struct Circuit {
     pub subcircuits: HashMap<String, Subcircuit>,
     /// Model names a reachable code-model element instantiates, lowercase.
     pub code_models_used: HashSet<String>,
-    pub parameters: HashSet<String>,
-    /// Each `.param` value as written, with its name.
+    /// Each top-level `.param`, by lowercase name, with its value as written.
+    pub parameters: HashMap<String, String>,
+    /// Each `.param` with its name as written, in order.
     pub parameter_values: Vec<(String, String)>,
+    /// Nodes named by `.global`, lowercase.
+    pub globals: HashSet<String>,
     /// Elements that were not understood, by name.
     pub unparsed: Vec<String>,
     pub has_conditionals: bool,
@@ -99,13 +265,6 @@ impl Circuit {
     pub(crate) fn cards_naming(&self, word: &str) -> usize {
         self.word_cards.get(word).copied().unwrap_or(0)
     }
-    pub(crate) fn reaches_ground(&self, element: &Element) -> bool {
-        element.kind == 'a'
-            || self
-                .definition(element)
-                .is_some_and(|sub| sub.reaches_ground)
-    }
-
     pub(crate) fn touches_ground(&self, element: &Element) -> bool {
         element.kind == 'a'
             || self
@@ -234,7 +393,7 @@ pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
         } else {
             match element(&words, card.from_testbench, &circuit) {
                 Some(element) => {
-                    if element.kind == 'a' {
+                    if matches!(element.kind, 'a' | 'n') {
                         let model = element.args.first().map(|name| name.to_lowercase());
                         circuit.code_models_used.extend(model);
                     }
@@ -269,15 +428,17 @@ fn note_definition(
         *open = name().map(|name| (name, card.text.to_lowercase()));
         None
     } else if word.contains("model") && word.starts_with('.') {
-        name().map(|name| (name, card.text.to_lowercase()))
+        name().map(|name| (format!(".model {name}"), card.text.to_lowercase()))
     } else {
         None
     };
     if let Some((name, text)) = finished {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let previous = circuit
             .definitions
             .entry(name.clone())
             .or_insert_with(|| text.clone());
+        let name = name.trim_start_matches(".model ").to_string();
         if *previous != text && !circuit.conflicting_definitions.contains(&name) {
             circuit.conflicting_definitions.push(name);
         }
@@ -302,19 +463,26 @@ fn read_definitions(card: &Card, depth: usize, circuit: &mut Circuit) {
         let name = words
             .get(1)
             .map_or(String::new(), |name| name.to_lowercase());
-        circuit.subcircuits.entry(name.clone()).or_default();
+        circuit.subcircuits.entry(name.clone()).or_default().pins = ordered_pins(&words);
         let pins = formal_pins(&words);
         if pins.contains("gnd") || pins.contains("0") {
             circuit.gnd_pin_subcircuits.push(name);
         }
+    } else if word == ".global" {
+        circuit
+            .globals
+            .extend(words.iter().skip(1).map(|word| word.to_lowercase()));
     } else if word == ".if" {
         circuit.has_conditionals = true;
     } else if word.starts_with(".para") && depth == 0 {
         for assignment in words.iter().skip(1) {
             if let Some((name, value)) = assignment.split_once('=') {
-                circuit.parameters.insert(name.to_lowercase());
-                let value = value.to_string();
-                circuit.parameter_values.push((name.to_string(), value));
+                circuit
+                    .parameters
+                    .insert(name.to_lowercase(), value.to_string());
+                circuit
+                    .parameter_values
+                    .push((name.to_string(), value.to_string()));
             }
         }
     } else if word.starts_with(".opt") {
@@ -339,6 +507,15 @@ fn formal_pins(words: &[String]) -> HashSet<String> {
         .skip(2)
         .take_while(|word| !is_parameter_word(word))
         .map(|word| word.to_lowercase())
+        .collect()
+}
+
+fn ordered_pins(words: &[String]) -> Vec<String> {
+    words
+        .iter()
+        .skip(2)
+        .take_while(|word| !is_parameter_word(word))
+        .cloned()
         .collect()
 }
 
@@ -382,20 +559,20 @@ fn read_body_element(
     circuit: &mut Circuit,
 ) {
     let parsed = element(words, false, circuit);
+    let globals = circuit.globals.clone();
     let Some(entry) = circuit.subcircuits.get_mut(&subcircuit) else {
         return;
     };
     let Some(element) = parsed else {
         // Unread, so assume the best: this only ever silences a warning.
-        entry.reaches_ground = true;
+        entry.unread = true;
         entry.touches_ground = true;
         entry.has_source = true;
         return;
     };
     match element.kind {
-        'a' => {
-            entry.reaches_ground = true;
-            entry.touches_ground = true;
+        'a' | 'n' => {
+            entry.touches_ground |= element.kind == 'a';
             entry.has_source = true;
             entry
                 .code_models
@@ -408,11 +585,10 @@ fn read_body_element(
         _ => {}
     }
     let pin_named_ground = pins.contains("0") || pins.contains("gnd");
-    let on_ground = |node: &String| is_ground(node) && !pin_named_ground;
-    entry.touches_ground |= element.nodes.iter().any(on_ground);
-    entry.reaches_ground |= element.dc_pairs().iter().any(|(first, second)| {
-        on_ground(&element.nodes[*first]) || on_ground(&element.nodes[*second])
-    });
+    let touches = element.nodes.iter().any(|node| is_ground(node));
+    entry.touches_ground |= !pin_named_ground && touches;
+    entry.has_source |= element.nodes.iter().any(|node| globals.contains(node));
+    entry.body.push(element);
 }
 
 /// Code models inside bodies the circuit really calls. A mixed vendor library
@@ -448,10 +624,8 @@ fn settle_nested_calls(circuit: &mut Circuit) {
                 let Some(callee) = snapshot.get(&called) else {
                     continue;
                 };
-                changed |= (callee.reaches_ground && !subcircuit.reaches_ground)
-                    || (callee.touches_ground && !subcircuit.touches_ground)
+                changed |= (callee.touches_ground && !subcircuit.touches_ground)
                     || (callee.has_source && !subcircuit.has_source);
-                subcircuit.reaches_ground |= callee.reaches_ground;
                 subcircuit.touches_ground |= callee.touches_ground;
                 subcircuit.has_source |= callee.has_source;
             }
@@ -483,7 +657,27 @@ fn model_type(words: &[String]) -> Option<String> {
     Some(lower.split('(').next()?.to_string())
 }
 
+/// `R1 (a 0) 1k` and `V1 (a) (0) 5` are legal: brackets around nodes vanish.
+fn without_node_brackets(words: &[String]) -> Vec<String> {
+    let mut plain = Vec::with_capacity(words.len());
+    for (at, word) in words.iter().enumerate() {
+        if at > 0 && word.starts_with('(') && word.ends_with(')') && !is_source_field(words, at) {
+            let inner = word.trim_matches(['(', ')']);
+            plain.extend(inner.split_whitespace().map(str::to_owned));
+        } else {
+            plain.push(word.clone());
+        }
+    }
+    plain
+}
+
+/// Past the second node a bracket is a value, as in `R1 a 0 (1k)`.
+fn is_source_field(words: &[String], at: usize) -> bool {
+    at > 1 && !words[1].starts_with('(') || at > 2
+}
+
 fn element(words: &[String], from_testbench: bool, circuit: &Circuit) -> Option<Element> {
+    let words = &without_node_brackets(words);
     let name = words.first()?;
     let kind = name.chars().next()?.to_ascii_lowercase();
     let is_model = |word: &String| circuit.models.contains_key(&word.to_lowercase());
@@ -587,7 +781,11 @@ fn code_model_call(words: &[String], from_testbench: bool, circuit: &Circuit) ->
         .collect();
     Some(Element {
         name: words[0].clone(),
-        kind: if kind == "potentiometer" { 'p' } else { 'a' },
+        kind: match kind.as_str() {
+            "potentiometer" => 'p',
+            digital if digital != "dac_bridge" && DIGITAL_MODELS.contains(&digital) => 'n',
+            _ => 'a',
+        },
         nodes,
         args: vec![model.clone()],
         from_testbench,
