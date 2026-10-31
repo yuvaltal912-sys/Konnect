@@ -1256,3 +1256,281 @@ fn a_bridge_file_in_the_project_never_reaches_the_engine() {
     write_bridges(read.dir.path());
     assert_eq!(read.finish().sim_status, None, "{}", read.log());
 }
+
+// Protection stand-ins. The decks are the ones the `kicad-simulation` skill shows,
+// and `protection/reference.py` works the expected values out with no SPICE engine.
+
+fn protection_deck(name: &str) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/simulation/protection")
+        .join(format!("{name}.sp"));
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines().map(str::to_owned).collect()
+}
+
+/// The same deck with one line changed, so a missing line fails the test.
+fn with_line_replaced(mut deck: Vec<String>, old: &str, new: &str) -> Vec<String> {
+    let line = deck
+        .iter_mut()
+        .find(|line| line.as_str() == old)
+        .unwrap_or_else(|| panic!("no line {old:?}"));
+    *line = new.to_string();
+    deck
+}
+
+fn transient(stop: f64, step: f64) -> Value {
+    json!({ "kind": "transient", "stop_time_seconds": stop, "max_step_seconds": step })
+}
+
+fn assert_clean_and_modified(result: &Value) {
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["simulated_circuit"], "modified", "{result}");
+    assert_eq!(result["warnings"], json!([]), "{result}");
+    assert_eq!(result["analysis"]["coverage_ratio"], 1.0, "{result}");
+}
+
+/// The time a `crossing` measurement returns on the analysis axis.
+fn at(result: &Value, name: &str) -> f64 {
+    measured(result, name)
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_output_short_draws_the_current_the_circuit_equation_gives() {
+    let result = run_on_testbench(
+        &protection_deck("short"),
+        json!({
+            "analysis": transient(10e-3, 1e-6),
+            "signals": ["v(out)"],
+            "measurements": [
+                { "name": "before", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 4e-3 },
+                { "name": "peak", "kind": "peak_abs", "signal": "i(VBAT)" },
+                { "name": "after", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 9.9e-3 },
+                { "name": "output", "kind": "value_at", "signal": "v(out)", "at_seconds": 9.9e-3 },
+            ],
+        }),
+    );
+
+    assert_clean_and_modified(&result);
+    // From `protection/reference.py`. A delivering source reads negative.
+    near(measured(&result, "before"), -0.9983361, 1e-6);
+    near(measured(&result, "peak"), -480.03999, 1e-3);
+    near(measured(&result, "after"), -480.03999, 1e-3);
+    near(measured(&result, "output"), 2.3992003, 1e-6);
+    // A smooth edge needs no more than a few points per microsecond of it.
+    let points = result["analysis"]["points"].as_u64().unwrap();
+    assert!(points < 20_000, "{points}");
+}
+
+fn fuse_run(deck: Vec<String>, stop: f64) -> Value {
+    run_on_testbench(
+        &deck,
+        json!({
+            "analysis": transient(stop, 1e-7),
+            "measurements": [
+                { "name": "before", "kind": "value_at", "signal": "i(VFZS)", "at_seconds": 4e-3 },
+                { "name": "peak", "kind": "peak_abs", "signal": "i(VFZS)" },
+                { "name": "open", "kind": "crossing", "signal": "i(VFZS)", "level": 100.0,
+                  "direction": "falling", "from_seconds": 5e-3 },
+                { "name": "let_through", "kind": "value_at", "signal": "v(fz_q)", "at_seconds": stop - 1e-4 },
+                { "name": "after", "kind": "value_at", "signal": "i(VFZS)", "at_seconds": stop - 1e-4 },
+            ],
+        }),
+    )
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_i2t_fuse_opens_when_the_integral_reaches_its_rating_and_stays_open() {
+    let result = fuse_run(protection_deck("fuse"), 10e-3);
+
+    assert_clean_and_modified(&result);
+    // From `protection/reference.py`, which integrates i squared by RK4: the fuse
+    // trips at 2.002 A2s, 5.020498 ms.
+    near(measured(&result, "before"), 0.9979210, 1e-6);
+    near(at(&result, "open"), 5.020498e-3, 5e-7);
+    // A step cannot stop the integral on the rating: it overshoots by at most
+    // one step of the prospective current squared, 400 A and 0.1 us.
+    let let_through = measured(&result, "let_through");
+    assert!(
+        (2.002..2.002 + 0.017).contains(&let_through),
+        "{let_through}"
+    );
+    near(measured(&result, "peak"), 399.5503, 0.05);
+    // 12 V through the open 1 Mohm, and it stays open for the rest of the run.
+    near(measured(&result, "after"), 1.2e-5, 1e-8);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_i2t_fuse_carrying_less_than_its_rating_does_not_open() {
+    let deck = with_line_replaced(
+        protection_deck("fuse"),
+        ".param fz_rated=2",
+        ".param fz_rated=3000",
+    );
+    let result = fuse_run(deck, 10e-3);
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    // The reference integrates 782.83 A2s by 9.9 ms, a quarter of the rating.
+    near(measured(&result, "let_through"), 782.83, 0.1);
+    near(measured(&result, "after"), 400.0278, 0.01);
+    assert!(result["measurements"][2]["value"].is_null(), "{result}");
+    assert_eq!(result["measurements"][2]["finding"], "level_not_reached");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_efuse_holds_its_limit_into_a_short_and_drops_only_its_resistance_below_it() {
+    let result = run_on_testbench(
+        &protection_deck("efuse"),
+        json!({
+            "analysis": transient(10e-3, 2e-7),
+            "signals": ["v(out)"],
+            "measurements": [
+                { "name": "load_current", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 4e-3 },
+                { "name": "load_output", "kind": "value_at", "signal": "v(out)", "at_seconds": 4e-3 },
+                { "name": "worst", "kind": "peak_abs", "signal": "i(VBAT)" },
+                { "name": "short_current", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 9.9e-3 },
+                { "name": "short_output", "kind": "value_at", "signal": "v(out)", "at_seconds": 9.9e-3 },
+            ],
+        }),
+    );
+
+    assert_clean_and_modified(&result);
+    // From `protection/reference.py`: 5 tanh(v / 0.1) against a 12 ohm load.
+    near(measured(&result, "load_current"), -0.99831349, 1e-6);
+    near(measured(&result, "load_output"), 11.9797619, 1e-5);
+    // Never above the limit, through the whole fall into the short.
+    let worst = measured(&result, "worst").abs();
+    assert!((5.0..5.0001).contains(&worst), "{worst}");
+    near(measured(&result, "short_current"), -5.0, 1e-6);
+    near(measured(&result, "short_output"), 0.0249896, 1e-6);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_undervoltage_lockout_closes_at_its_on_threshold_and_opens_at_its_off_threshold() {
+    let result = run_on_testbench(
+        &protection_deck("uvlo"),
+        json!({
+            "analysis": transient(28e-3, 1e-5),
+            "signals": ["v(out)"],
+            "measurements": [
+                { "name": "on", "kind": "crossing", "signal": "v(out)", "level": 5.0, "direction": "rising" },
+                { "name": "off", "kind": "crossing", "signal": "v(out)", "level": 5.0, "direction": "falling" },
+                { "name": "between_up", "kind": "value_at", "signal": "v(out)", "at_seconds": 9.5e-3 },
+                { "name": "between_down", "kind": "value_at", "signal": "v(out)", "at_seconds": 18.5e-3 },
+            ],
+        }),
+    );
+
+    assert_clean_and_modified(&result);
+    // The 1 V per ms ramp reaches 10 V at 10 ms and falls through 9 V at 19 ms,
+    // within one 10 us step each: 10 mV.
+    near(at(&result, "on"), 10e-3, 2e-5);
+    near(at(&result, "off"), 19e-3, 2e-5);
+    // At 9.5 V it is off on the way up and on on the way down: the hysteresis.
+    near(measured(&result, "between_up"), 1.14e-7, 1e-6);
+    near(measured(&result, "between_down"), 9.4920899, 1e-5);
+    let points = result["analysis"]["points"].as_u64().unwrap();
+    assert!(points < 5_000, "{points}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_reversed_battery_is_blocked_to_its_leakage_and_a_forward_one_drops_the_on_resistance() {
+    let result = run_on_testbench(
+        &protection_deck("reverse"),
+        json!({
+            "analysis": transient(24e-3, 1e-5),
+            "signals": ["v(out)"],
+            "measurements": [
+                { "name": "reverse_current", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 0.0 },
+                { "name": "reverse_worst", "kind": "peak_abs", "signal": "i(VBAT)", "to_seconds": 11e-3 },
+                { "name": "reverse_output", "kind": "min", "signal": "v(out)", "to_seconds": 11e-3 },
+                { "name": "forward_current", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 24e-3 },
+                { "name": "forward_output", "kind": "value_at", "signal": "v(out)", "at_seconds": 24e-3 },
+            ],
+        }),
+    );
+
+    assert_clean_and_modified(&result);
+    // From `protection/reference.py`: -12 V into 12 Mohm and 12 ohm, then +12 V
+    // through 30 mohm, the knee included. i(VBAT) is the current into the battery.
+    near(measured(&result, "reverse_current"), 9.99999e-7, 1e-10);
+    near(measured(&result, "reverse_worst"), 9.99999e-7, 1e-10);
+    near(measured(&result, "reverse_output"), -1.1999988e-5, 1e-9);
+    near(measured(&result, "forward_current"), -0.99750007, 1e-6);
+    near(measured(&result, "forward_output"), 11.9700008, 1e-5);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_stand_in_joins_a_real_schematic_by_the_net_name_kicad_shows() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let result = call_over_stdio(
+        "run_simulation",
+        json!({
+            "schematic": project.path().join("rectifier.kicad_sch"),
+            "analysis": transient(1e-3, 1e-5),
+            "testbench": {
+                "exclude_references": ["V1", "D1", "R1"],
+                "spice_lines": protection_deck("spliced"),
+            },
+            "measurements": [
+                { "name": "rail", "kind": "value_at", "signal": "v(/rect_out)", "at_seconds": 1e-3 },
+                { "name": "draw", "kind": "value_at", "signal": "i(VBAT)", "at_seconds": 1e-3 },
+            ],
+        }),
+    );
+
+    assert_clean_and_modified(&result);
+    // R2 is 100 kohm: 120 uA, and 0.1 ohm * atanh(24e-6) = 2.4 uV across the stand-in.
+    near(measured(&result, "rail"), 12.0 - 2.4e-6, 1e-7);
+    near(measured(&result, "draw"), -1.2e-4, 1e-8);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn every_stand_in_runs_under_initial_conditions_and_keeps_its_device_currents() {
+    // (deck, stop, step, signal, time, expected). Values are the ones above.
+    let cases: [(&str, f64, f64, &str, f64, f64); 5] = [
+        ("short", 10e-3, 1e-6, "i(VBAT)", 9.9e-3, -480.03999),
+        ("fuse", 10e-3, 1e-7, "i(VFZS)", 9.9e-3, 1.2e-5),
+        ("efuse", 10e-3, 2e-7, "i(VBAT)", 9.9e-3, -5.0),
+        ("uvlo", 28e-3, 1e-5, "v(out)", 16e-3, 11.990008),
+        ("reverse", 24e-3, 1e-5, "i(VBAT)", 24e-3, -0.99750007),
+    ];
+    for (name, stop, step, signal, time, expected) in cases {
+        let mut analysis = transient(stop, step);
+        analysis["use_initial_conditions"] = json!(true);
+        let result = run_on_testbench(
+            &protection_deck(name),
+            json!({
+                "analysis": analysis,
+                // A device current, which a `.ic` or a stand-in `.probe` would have cost.
+                "measurements": [
+                    { "name": "value", "kind": "value_at", "signal": signal, "at_seconds": time },
+                    { "name": "load", "kind": "value_at", "signal": "i(RLOAD)", "at_seconds": time },
+                ],
+            }),
+        );
+
+        assert_eq!(result["outcome"]["status"], "complete", "{name}: {result}");
+        assert_eq!(result["outcome"]["failed"], 0, "{name}: {result}");
+        let codes: Vec<&str> = result["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|warning| warning["code"].as_str())
+            .collect();
+        assert_eq!(codes, ["no_point_at_start"], "{name}: {result}");
+        near(
+            measured(&result, "value"),
+            expected,
+            expected.abs() * 1e-5 + 1e-8,
+        );
+    }
+}

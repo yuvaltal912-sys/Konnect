@@ -2813,6 +2813,59 @@ mod tests {
             assert!(!scene.state.path().join("simulation").exists());
         }
 
+        /// The protection stand-ins the skill shows, under their fixture names.
+        const PROTECTION_DECKS: [&str; 5] = ["short", "fuse", "efuse", "uvlo", "reverse"];
+
+        fn protection_lines(name: &str) -> Vec<String> {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/simulation/protection")
+                .join(format!("{name}.sp"));
+            let text = std::fs::read_to_string(path).unwrap();
+            text.lines().map(str::to_owned).collect()
+        }
+
+        fn protection_args(root: &Path, lines: &[String], uic: bool) -> Value {
+            let mut arguments = transient_args(root, 2.0);
+            arguments["analysis"]["use_initial_conditions"] = json!(uic);
+            arguments["testbench"] = json!({ "exclude_references": ["*"], "spice_lines": lines });
+            arguments
+        }
+
+        /// Hosted CI has no engine, so this is the part of the contract it can hold:
+        /// vetting keeps every line, preflight raises nothing, and no stand-in adds
+        /// a card PR 7 refuses. `protection/spliced.sp` needs the rectifier demo's own
+        /// parts, so only the live test runs it.
+        #[tokio::test]
+        async fn every_protection_stand_in_passes_vetting_and_preflight_untouched() {
+            for name in PROTECTION_DECKS {
+                for uic in [false, true] {
+                    let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+                    let scene = scene(&job);
+                    let lines = protection_lines(name);
+                    let (failed, body) =
+                        call(&scene, protection_args(&scene.root, &lines, uic)).await;
+                    assert!(!failed, "{name}: {body}");
+                    assert_eq!(body["simulated_circuit"], "modified", "{name}");
+                    assert_eq!(body["warnings"], json!([]), "{name}, uic {uic}");
+
+                    let dirs = run_dirs(&scene);
+                    let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+                    for line in lines.iter().filter(|line| !line.starts_with('*')) {
+                        assert!(
+                            deck.lines().any(|kept| kept == line),
+                            "{name} lost {line}\n{deck}"
+                        );
+                    }
+                    // The only probe is Konnect's own, and with no `.ic` it stays under uic.
+                    assert_eq!(deck.matches(".probe").count(), 1, "{name}: {deck}");
+                    assert!(deck.contains("\n.probe alli\n"), "{name}: {deck}");
+                    for refused in [".ic", ".nodeset", "\nk", ".options interp"] {
+                        assert!(!deck.to_lowercase().contains(refused), "{name}: {refused}");
+                    }
+                }
+            }
+        }
+
         #[tokio::test]
         async fn a_callers_probe_is_left_alone_without_a_condition_to_lose() {
             let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));

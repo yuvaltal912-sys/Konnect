@@ -4,7 +4,8 @@ description: |
   SPICE simulation workflow for KiCAD schematics via MCP tools. Triggers on: "simulate", "SPICE",
   "ngspice", "operating point", "bias point", "what voltage is on this net", "does this circuit work",
   "check the DC levels", "run a simulation", "transient", "inrush", "load step", "droop", "overshoot",
-  "settling time", "rise time", "soft start".
+  "settling time", "rise time", "soft start", "short circuit", "fuse", "eFuse", "current limit",
+  "undervoltage lockout", "UVLO", "reverse polarity", "reversed battery", "protection".
 argument-hint: "[circuit or question]"
 ---
 
@@ -86,13 +87,126 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 
 **Initial conditions.** With `use_initial_conditions`, ngspice saves no point at time zero, so `analysis.first_point_seconds` is above 0 and `no_point_at_start` warns that a peak at that instant reads low and an integral misses the first step. Device probes would also lose a voltage set on a net by `.ic` or `.nodeset`, so with either card only node voltages and source currents are saved, `i(R1)` and `p(R1)` read `signal_not_found`, as does `i()` of a current source, and a `.probe` card of your own is refused as `probe_loses_initial_conditions`. To keep device currents, use `IC=` on the device, which probes do not disturb.
 
+## Protection Scenarios
+
+Parts that protect a rail rarely have a usable model, so paste a stand-in into `testbench.spice_lines`, one array item per line. A stand-in is an approximation with the behaviour its parameters give and nothing else. It is not a model of a specific part and has no thermal behaviour: no heating, no thermal shutdown, no drift with temperature. The result reads `simulated_circuit: "modified"`. Say both things when you report it.
+
+Each block below ran through `run_simulation` and matched values worked out without SPICE. The first lines of a block (supply, load, and for the fuse its path resistor) are a bench harness that your schematic supplies instead. Swap the node names for yours, using the `spice_name` values from readiness, such as `/rect_out`. For a bench check, exclude everything with `exclude_references: ["*"]` and paste the block as it stands.
+
+Rules for all five:
+
+- **Keep transitions smooth, as written.** A stand-in that flips back and forth stops the run with `no_convergence`: a lockout whose hysteresis is narrower than the supply sag does. Set `max_step_seconds` as each block says.
+- **Add no `.probe`, `.ic`, `.nodeset`, `K` coupling or `.options interp`.** Konnect refuses some of them and they change the circuit in the rest. The capacitor in the fuse uses `IC=` on the device, which is safe, and every block also runs with `use_initial_conditions`.
+- **Rename what collides.** Nodes and elements carry the prefixes `sh_`, `fz_`, `ef_`, `uv_`, `rb_` and `RSHORT`, `VFZS` and so on. Change one that a part of your schematic already uses.
+- **Use `**` for powers.** `exp()` in a behavioural expression turns linear above an argument of 14, so `exp(ln(1G)*x)` quietly reads 9.3 Mohm for 1 Gohm.
+
+### Output short
+
+A resistor across the output that falls from 1 G to 5 mohm at `sh_t0`. It is the fault the next three blocks are tested against. `max_step_seconds` 1e-6 is plenty.
+
+```
+* Output short. Your circuit supplies the first three elements; the rest is the fault.
+VBAT vbat 0 DC 12
+RSRC vbat out 20m
+RLOAD out 0 12
+* Fault: a resistor across the output that falls from 1 G to 5 mohm around 5 ms.
+.param sh_t0=5m sh_tau=5u sh_ron=5m sh_roff=1G
+.func sh_s() {0.5*(1+tanh((time-sh_t0)/sh_tau))}
+RSHORT out 0 R='sh_roff**(1-sh_s())*sh_ron**sh_s()'
+```
+
+This harness gives 480.04 A and 2.399 V at the output, as 12 V over 20 mohm plus 5 mohm in parallel with 12 ohm.
+
+### I²t fuse
+
+Opens for good once the integral of the current squared reaches `fz_rated`, in A²s. `v(fz_q)` is that integral. The fuse must sit in series, with `VFZS` in the path to read the current. Add the short above to see it open.
+
+```
+* I2t fuse into a short. Your circuit supplies the supply, RSRC and the load.
+VBAT vbat 0 DC 12
+RSRC vbat fz_in 20m
+RLOAD out 0 12
+* Fault: the output short.
+.param sh_t0=5m sh_tau=5u sh_ron=5m sh_roff=1G
+.func sh_s() {0.5*(1+tanh((time-sh_t0)/sh_tau))}
+RSHORT out 0 R='sh_roff**(1-sh_s())*sh_ron**sh_s()'
+* Stand-in: a latching switch that opens once the integral of i^2 passes the rating.
+.param fz_rated=2
+VFZS fz_in fz_a 0
+BFZQ 0 fz_q I='time>0 ? 1u*i(VFZS)*i(VFZS) : 0'
+CFZQ fz_q 0 1u IC=0
+RFZQ fz_q 0 1e12
+BFZC fz_ctl 0 V='fz_rated-v(fz_q)'
+SFZ fz_a out fz_ctl 0 SWFZ
+.model SWFZ SW(Vt=0 Vh={fz_rated/1000} Ron=5m Roff=1Meg)
+```
+
+The step cannot land on the rating, so the integral overshoots the trip by up to the prospective current squared times `max_step_seconds`: 0.016 A²s at 400 A and 0.1 µs, and 0.004 A²s was seen. For a 1 percent error, use `max_step_seconds` of `0.01 * fz_rated / I²`, and narrow the run to the moments around the fault. The fuse never closes again and never cools: a long overload below the rating still builds the integral.
+
+### eFuse current limit
+
+Behaves as `ef_ron` below `ef_ilim` and holds `ef_ilim` above it, for as long as the fault lasts. There is no timer, no foldback and no thermal shutdown, so it never trips. It also conducts backwards, so pair it with the reversed battery block.
+
+```
+* eFuse current limit into a short. Your circuit supplies the supply and the load.
+VBAT vbat 0 DC 12
+RLOAD out 0 12
+* Fault: the output short.
+.param sh_t0=5m sh_tau=5u sh_ron=5m sh_roff=1G
+.func sh_s() {0.5*(1+tanh((time-sh_t0)/sh_tau))}
+RSHORT out 0 R='sh_roff**(1-sh_s())*sh_ron**sh_s()'
+* Stand-in: a pass element that is ef_ron below the limit and holds ef_ilim above it.
+.param ef_ilim=5 ef_ron=20m
+BEFZ vbat out I='ef_ilim*tanh(v(vbat,out)/(ef_ilim*ef_ron))'
+```
+
+### Undervoltage lockout
+
+A switch that closes when its own input rises above `uv_on` and opens when it falls below `uv_off`. Feed it a slow ramp, because the switch changes in one step. The threshold error is the ramp rate times `max_step_seconds`: 10 mV for 1 V per ms and 10 µs. The hysteresis must be wider than the sag when the load connects: with a 3 ohm source ahead of it, the 12 V load pulled the input from 10 V to 8 V, the stand-in chattered and the run stopped in `no_convergence`.
+
+```
+* Undervoltage lockout on a slow ramp. Your circuit supplies the input and the load.
+VIN vin 0 PWL(0 0 14m 14 28m 0)
+RLOAD out 0 12
+* Stand-in: a switch that closes above uv_on and opens below uv_off, on its own input.
+.param uv_on=10 uv_off=9
+SUV vin out vin 0 SWUV
+.model SWUV SW(Vt={(uv_on+uv_off)/2} Vh={(uv_on-uv_off)/2} Ron=10m Roff=1G)
+```
+
+### Reversed battery
+
+`dc_sweep` is not available yet, so ramp the battery with a slow transient, which `run_simulation` does. The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Use `max_step_seconds` 1e-5 on 24 ms. With no reactive part the ramp rate does not matter. With a capacitor on the output, ramp slower than its time constant. `i(VBAT)` reads positive when leakage flows back into the battery.
+
+```
+* Reversed battery on a slow ramp from -12 V to 12 V. Your circuit supplies the battery and the load.
+VBAT vbat 0 PWL(0 -12 24m 12)
+RLOAD out 0 12
+* Stand-in: a pass element that conducts forward at rb_ron and leaks backward through rb_roff.
+.param rb_ron=30m rb_roff=12Meg rb_knee=10m
+BRB vbat out I='v(vbat,out)*(1/rb_roff+(1/rb_ron-1/rb_roff)*0.5*(1+tanh(v(vbat,out)/rb_knee)))'
+```
+
+At -12 V this reads 1.0 µA of leakage and -12 µV at the output. At +12 V the output is 11.970 V.
+
+### In your own schematic
+
+This eFuse feeds the `/rect_out` net of the rectifier demo, with its own R2 and C1 as the load. Exclude V1, D1 and R1.
+
+```
+* eFuse into a net of the schematic. Exclude V1, D1 and R1 of the rectifier demo, and R2 and C1 are the load.
+VBAT vbat GND DC 12
+.param ef_ilim=5 ef_ron=20m
+BEFZ vbat /rect_out I='ef_ilim*tanh(v(vbat,/rect_out)/(ef_ilim*ef_ron))'
+```
+
 ## Fixing an Unmodelled Symbol
 
 | `suggested_fix` | What to do |
 |---|---|
 | `copy_library_sim_fields` | Copy the `Sim.*` fields from the library symbol with `edit_schematic_component` |
 | `exclude` | The part has no series role. Add it to `testbench.exclude_references` |
-| `replace_series_part` | Removing it would break the path. Add a stand-in through `testbench.spice_lines` |
+| `replace_series_part` | Removing it would break the path. Add a stand-in through `testbench.spice_lines`, such as the protection blocks above |
 
 Nothing in `testbench` touches the schematic. Use the `spice_name` values from readiness in `spice_lines`.
 
