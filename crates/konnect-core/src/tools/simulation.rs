@@ -1542,11 +1542,13 @@ impl RunEnd<'_> {
         );
         let mut body = self.result_body(plot, sweep.describe(plot), stopped);
         if let Some(warnings) = body["warnings"].as_array_mut() {
-            if !partial && sweep.ends_short(plot) {
+            let short = sweep.shortfalls(plot);
+            if !partial && !short.is_empty() {
                 warnings.push(json!({
                     "code": "sweep_ends_before_stop",
-                    "detail": "The engine adds its step each time and stopped one point short \
-                               of the stop, here simulated_to_value. Every point it plans was run.",
+                    "detail": "The engine adds its step each time, and rounding can cost a \
+                               sweep its last point. See simulated_to_value.",
+                    "items": short,
                 }));
             }
         }
@@ -3049,7 +3051,9 @@ mod tests {
 
         #[tokio::test]
         async fn a_finished_ac_sweep_gives_gain_in_db_and_tells_the_worker_its_data_is_complex() {
-            let raw = copy_ac(&low_pass(&[1.0, 10.0, 100.0]));
+            let raw = copy_ac(&low_pass(&[
+                1.0, 2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0, 64.0, 100.0,
+            ]));
             let job = format!("{raw}\n{}", status_json("0", "null", true));
             let scene = scene(&job);
             let mut arguments = ac_args(&scene.root, json!({ "points": 1, "scale": "decade" }));
@@ -3063,7 +3067,7 @@ mod tests {
             assert_eq!(body["outcome"]["status"], "complete", "{body}");
             assert_eq!(body["outcome"]["requested"], 4);
             assert_eq!(body["analysis"]["kind"], "ac");
-            assert_eq!(body["analysis"]["points"], 3);
+            assert_eq!(body["analysis"]["points"], 10);
             assert_eq!(body["analysis"]["simulated_to_hz"], 100.0);
             assert_eq!(body["analysis"]["coverage_ratio"], 1.0);
             // 20 log10(1/sqrt(2)) at the corner, and -45 degrees.
@@ -3351,6 +3355,7 @@ mod tests {
             assert_eq!(body["analysis"]["expected_points"], 6);
             let warnings = body["warnings"].to_string();
             assert!(warnings.contains("sweep_ends_before_stop"), "{warnings}");
+            assert!(warnings.contains("VSRC ran 5 of 6 points"), "{warnings}");
         }
 
         #[tokio::test]

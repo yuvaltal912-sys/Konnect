@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 /// The most points a DC sweep may ask for. A run that makes more would be stopped by
 /// its budget or size limit anyway, and this says so before the export. An AC sweep
-/// cannot reach it: ten thousand points a decade over the whole frequency range is
-/// 270,000.
+/// stays under it: 10,000 points an octave over the whole frequency range is
+/// about 900,000.
 pub(super) const MAX_SWEEP_POINTS: f64 = 1_000_000.0;
 /// The frequencies the engine was run at. Past them it loops at `inf` Hz, or stops
 /// for no reason in the circuit.
@@ -420,14 +420,32 @@ impl DcSweep {
             && (inner.stop - last).abs() <= inner.step.abs() * (1.0 + COUNT_TOLERANCE)
     }
 
-    /// The first sweep ended short of its stop, by more than rounding.
-    pub(super) fn ends_short(&self, plot: &Plot) -> bool {
-        let inner = self.inner();
-        let Some((run, _)) = self.shape(plot) else {
-            return false;
+    /// Where the engine ran fewer steps than planned, one line for each sweep. The
+    /// engine adds its step each time, so rounding can cost it the last point, and it
+    /// is the count that says so: a stop the grid never lands on is not a lost point.
+    /// Only the first sweep's value is saved, so the second is known by its rows.
+    pub(super) fn shortfalls(&self, plot: &Plot) -> Vec<String> {
+        let Some((run, rows)) = self.shape(plot) else {
+            return Vec::new();
         };
-        let last = Self::axis(plot)[run - 1];
-        (inner.stop - last) * inner.step.signum() > inner.step.abs() * COUNT_TOLERANCE
+        let mut lines = Vec::new();
+        let inner = self.inner();
+        if (run as u64) < inner.points {
+            let last = Self::axis(plot)[run - 1];
+            lines.push(format!(
+                "{} ran {run} of {} points and ended at {last}, short of {}",
+                inner.target, inner.points, inner.stop
+            ));
+        }
+        if let Some(outer) = self.sweeps.get(1) {
+            if (rows as u64) < outer.points {
+                lines.push(format!(
+                    "{} ran {rows} of {} steps",
+                    outer.target, outer.points
+                ));
+            }
+        }
+        lines
     }
 
     /// The axis the first sweep draws along, the one the engine saves.
@@ -944,8 +962,10 @@ mod tests {
         let slow: Vec<f64> = scale.iter().map(|value| value / 10.0).collect();
         assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &slow, 5)));
         let short = plot(false, ["v(v-sweep)", "v(a)"], &scale[..4], 4);
-        assert!(one.covered(&short) && one.ends_short(&short));
-        assert!(!one.ends_short(&plot(false, ["temp-sweep", "v(a)"], &scale, 5)));
+        assert!(one.covered(&short) && !one.shortfalls(&short).is_empty());
+        assert!(one
+            .shortfalls(&plot(false, ["temp-sweep", "v(a)"], &scale, 5))
+            .is_empty());
         assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale[..3], 3)));
         assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale[..1], 1)));
         assert!(!one.covered(&plot(
@@ -1030,5 +1050,38 @@ mod tests {
         ]))
         .unwrap();
         assert!(single.covered(&plot(false, names, &[1.0, 1.0, 1.0], 3)));
+    }
+
+    #[test]
+    fn a_short_end_is_a_missing_step_and_not_a_stop_the_grid_never_lands_on() {
+        let names = ["v(v-sweep)", "v(a)"];
+        // 0 to 1 by 0.3 plans four points and ends at 0.9, which loses nothing.
+        let off = dc(
+            json!([{ "target": "V1", "start_value": 0.0, "stop_value": 1.0, "step_value": 0.3 }]),
+        )
+        .unwrap();
+        let ran = plot(false, names, &[0.0, 0.3, 0.6, 0.9], 4);
+        assert!(off.covered(&ran) && off.shortfalls(&ran).is_empty());
+        // A stop on the grid that rounding cost the last point of.
+        let on = dc(
+            json!([{ "target": "V1", "start_value": 0.0, "stop_value": 1.5, "step_value": 0.003 }]),
+        )
+        .unwrap();
+        let all: Vec<f64> = (0..501).map(|n| f64::from(n) * 0.003).collect();
+        let whole = plot(false, names, &all[..501], 501);
+        assert!(on.shortfalls(&whole).is_empty());
+        // The count says what was lost, in either sweep.
+        let grid = dc(json!([
+            { "target": "V2", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 },
+            { "target": "TEMP", "start_value": 0.0, "stop_value": 100.0, "step_value": 25.0 }
+        ]))
+        .unwrap();
+        let rows = |count: usize| -> Vec<f64> { (0..count * 2).map(|n| (n % 2) as f64).collect() };
+        assert!(grid
+            .shortfalls(&plot(false, names, &rows(5), 10))
+            .is_empty());
+        let lost = grid.shortfalls(&plot(false, names, &rows(4), 8));
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert!(lost[0].contains("TEMP ran 4 of 5"), "{lost:?}");
     }
 }

@@ -2142,10 +2142,10 @@ fn a_source_written_as_ac_equals_or_ac_in_brackets_drives_a_sweep() {
 
 #[test]
 #[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
-fn the_reversed_battery_stand_in_latches_when_swept_downward_through_zero() {
+fn the_reversed_battery_stand_in_has_a_second_solution_near_zero_that_a_downward_sweep_lands_on() {
     // Between about -0.56 V and 0 the stand-in has two DC solutions, so which one the
-    // engine finds depends on where it came from. Swept up it blocks; swept down
-    // from 0 it stays on [verified: run E100].
+    // engine finds depends on where it came from and the step. Swept downward from 0
+    // it stays on; swept upward at the documented 0.05 V it blocks [verified: run E100].
     let lowest = |start: f64, stop: f64, step: f64| {
         let result = run_on_testbench(
             &protection_deck("reverse"),
@@ -2159,6 +2159,44 @@ fn the_reversed_battery_stand_in_latches_when_swept_downward_through_zero() {
         assert_eq!(result["outcome"]["status"], "complete", "{result}");
         result["signal_summaries"][0]["min"].as_f64().unwrap()
     };
-    assert!(lowest(-12.0, 0.0, 0.01) > -0.05);
+    assert!(lowest(-12.0, 0.0, 0.05) > -0.005);
     assert!(lowest(0.0, -12.0, -0.01) < -0.3);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_grid_that_loses_its_last_outer_row_says_so() {
+    let lines: Vec<String> = ["VS a 0 DC 10", "R1 a 0 1k"].map(str::to_owned).to_vec();
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": { "kind": "dc_sweep", "sweeps": [
+                { "target": "VS", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 },
+                { "target": "TEMP", "start_value": 0.0, "stop_value": 100.0, "step_value": 0.1 },
+            ] },
+            "signals": ["i(VS)"],
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["analysis"]["points"], 2000, "{result}");
+    assert_eq!(result["analysis"]["expected_points"], 2002);
+    let warnings = result["warnings"].to_string();
+    assert!(warnings.contains("sweep_ends_before_stop"), "{warnings}");
+    assert!(warnings.contains("TEMP ran 1000 of 1001"), "{warnings}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_sweep_that_lands_where_it_planned_says_nothing_about_its_end() {
+    // 0 to 1.5 by 0.003 runs every one of 501 points, and ends at 1.49999999999.
+    let lines: Vec<String> = ["VS a 0 DC 10", "R1 a 0 1k"].map(str::to_owned).to_vec();
+    let result = run_on_testbench(
+        &lines,
+        json!({ "analysis": { "kind": "dc_sweep", "sweeps": [
+            { "target": "TEMP", "start_value": 0.0, "stop_value": 1.5, "step_value": 0.003 }
+        ] } }),
+    );
+    assert_eq!(result["analysis"]["points"], 501, "{result}");
+    assert_eq!(result["warnings"], json!([]), "{result}");
 }

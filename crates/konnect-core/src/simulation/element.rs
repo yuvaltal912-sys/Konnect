@@ -388,7 +388,11 @@ fn ac_value(words: &[String]) -> Option<Option<String>> {
     words.iter().enumerate().skip(3).find_map(|(at, word)| {
         let lower = word.to_ascii_lowercase();
         if lower == "ac" {
-            return Some(words.get(at + 1).cloned());
+            // `AC (1 0)` has a space before the bracket.
+            let next = words
+                .get(at + 1)
+                .map(|value| value.trim_start_matches('(').to_string());
+            return Some(next);
         }
         let rest = lower
             .strip_prefix("ac=")
@@ -984,6 +988,7 @@ mod tests {
             "V1 a 0 AC=1",
             "V1 a 0 DC 0 ac=1 0",
             "V1 a 0 DC 0 AC(1 0)",
+            "V1 a 0 AC (1 0)",
             "I1 0 a ac=1m",
             "V1 a 0 SIN(0 1 1k) ac = 1",
         ] {
@@ -1007,6 +1012,7 @@ mod tests {
             "V1 a 0 ac=0",
             "V1 a 0 AC=0.0 90",
             "V1 a 0 DC 1 AC(0 0)",
+            "V1 a 0 AC (0 0)",
         ] {
             assert!(!driven(card), "{card}");
         }
