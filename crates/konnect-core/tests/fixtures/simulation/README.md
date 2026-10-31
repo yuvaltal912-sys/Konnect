@@ -24,5 +24,13 @@ A²s and 96 mV, this reads 16.90 A, 0.2447 A²s and 95.5 mV.
 0.1 µs on the same equations, and the live test compares `run_simulation` with what
 it prints. With `max_step_seconds` at 0.5 µs the two agree to every digit it prints.
 
+`protection/` holds the five protection stand-ins the `kicad-simulation` skill shows, as
+`.sp` decks, and `spliced.sp`, the eFuse joined to the rectifier demo's `/rect_out`.
+They are hand-written, not KiCad exports. The E56 decks were not kept, so these replace
+them. `protection/reference.py` works the expected values out with no SPICE engine:
+closed forms, bisection for the nonlinear loads, and RK4 at 1 ns for the fuse's
+integral. The live tests compare `run_simulation` with what it prints, and a test fails
+if a line of a deck is missing from the skill.
+
 KiCad-owned formats: do not hand-edit these. Regenerate them with the commands
 above if a KiCad version changes the output.

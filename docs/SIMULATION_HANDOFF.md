@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 7 open and PR 8 not started.
+**Last updated:** 2026-10-31, with PR 1 to 7 merged to `main` and PR 8 open.
 
 ## Start here
 
@@ -30,21 +30,28 @@ Decisions already made by the owner:
 
 ## PR stack
 
-Each PR is based on the one before it. None is merged.
+PRs 1 to 7 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
-| 1 to 3 | [#1](https://github.com/yuvaltal912-sys/Konnect/pull/1) | `feat/simulation` | Open |
-| 4 | [#2](https://github.com/yuvaltal912-sys/Konnect/pull/2) | `feat/simulation-preflight` | Open |
-| 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Open |
-| 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Open |
-| 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Open |
-| 8 | Not opened | | **Next, once the owner approves** |
+| 1 to 3 | [#1](https://github.com/yuvaltal912-sys/Konnect/pull/1) | `feat/simulation` | Merged |
+| 4 | [#2](https://github.com/yuvaltal912-sys/Konnect/pull/2) | `feat/simulation-preflight` | Merged |
+| 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Merged |
+| 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Merged |
+| 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
+| 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | **Open, awaiting the owner** |
 | 9 to 11 | Not opened | | Not started |
 
-## Now: nothing is running
+## Now: PR 8 is open
 
-PR 7 is done and open. Ask the owner before starting PR 8. A real transient runs through `run_simulation`: `soft_start.sp` matches a reference worked out with no SPICE engine to every digit it prints, at `max_step_seconds` 0.5 µs. A run that stops early reads `partial` with its data kept, for the budget, the size limit and lost convergence.
+PR 8 is done and open on `feat/simulation-protection`. Ask the owner before merging it, and before starting PR 9. It adds no tool surface: the skill shows five tested stand-ins (output short, I²t fuse, eFuse current limit, undervoltage lockout, reversed battery), and `run_simulation` runs each live against `protection/reference.py`, which works the expected values out with no SPICE engine. Reversed battery runs as a slow transient ramp, because `dc_sweep` does not exist yet: PR 9 re-runs it as a sweep and compares.
+
+### What PR 8 changed that the next PR needs to know
+
+- **The skill's decks are the tested decks.** They live in `crates/konnect-core/tests/fixtures/simulation/protection/*.sp`, and `crates/konnect/tests/protection_skill.rs` fails if a line is missing from the skill. Change a deck and the skill together.
+- **`exp()` in a behavioural expression is linear above 14.** `exp(15)` reads twice `exp(14)`. Write powers with `**` (E98).
+- **A latch is needed for a fuse.** Without one the fuse settles half open (E97). The integral overshoots its trip by up to the current squared times the step.
+- **PR 9's job on this:** run `reverse.sp` as a `dc_sweep` from -12 to 12 V and compare it with the ramp.
 
 ### What PR 7 changed that the next PR needs to know
 
@@ -55,12 +62,11 @@ PR 7 is done and open. Ask the owner before starting PR 8. A real transient runs
 - **`i(l1)` appears twice** in the raw file, differing by rounding. `signals::vector` treats that as one signal, and real disagreement as none.
 - **`.options interp` is refused,** because it thins the saved samples (E95).
 
-## After PR 7
+## After PR 8
 
 | PR | Outcome |
 |---|---|
-| 8 | Protection stand-ins in the skill: short, I²t fuse, eFuse limit, UVLO, reversed battery |
-| 9 | AC and DC sweeps, `no_ac_stimulus`, `sweep_target_not_found` |
+| 9 | AC and DC sweeps, `no_ac_stimulus`, `sweep_target_not_found`, and the reversed battery as a sweep |
 | 10 | `list_simulation_runs`, `measure_simulation_run`, CSV |
 | 11 | `plot_simulation_run`, SVG |
 | Any | `fix(schematic): copy Sim fields on placement` |
@@ -82,7 +88,8 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect-core/src/simulation/worker_client.rs`, `protocol.rs` | Worker supervision and its contract |
 | `crates/konnect/src/sim_worker.rs` | The only FFI. `konnect-core` stays free of `unsafe` |
 | `crates/konnect/tests/simulation_live.rs` | Ignored tests that need KiCad |
-| `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance. `soft_start.sp` and its reference script stand in for E31 |
+| `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance. `soft_start.sp` and its reference script stand in for E31, and `protection/` and its `reference.py` for E56 |
+| `crates/konnect/assets/skills/kicad-simulation/SKILL.md` | The skill, including the protection stand-ins |
 
 ## Graph
 
@@ -131,6 +138,8 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - A dangling symlink passes path checks, so test an interpreter by running it.
 - Editing Rust with a script breaks after `cargo fmt` reshapes the text. Check the file before rerunning a partly applied edit.
 - The default transient step is `stop / 2000`. On a 0.14 s run that is 70 µs: the values stay within 1 percent, but a peak on a flat top lands 0.6 ms early. A smaller step is not always a longer run: 2 µs took 1,019,783 points where 0.5 µs took 281,020.
+- `exp()` in a B source or behavioural `R=` is exact only up to an argument of 14, and linear above it, so `exp(ln(1G))` reads 9.3 million. Use `**` or `pow()`.
+- A hard-edged control did not run away in any rebuilt short (E98). E57's deck is gone, so do not claim the cause. The failure seen is a lockout chattering, which ends in `no_convergence`.
 - Under `uic`, ngspice saves no point at time zero, so `first_point_seconds` is above 0.
 - A reviewer's scratch `HOME` moves KiCad's IBIS cache path, so the `ibis` demo only runs from the real home.
 - `cargo xtask fix-doc-counts` scans every `.md` under the root, including the ignored `graphify-out/GRAPH_REPORT.md`, whose community count reads as a stale tool count, so it refuses here. Run it from a clean checkout. `docs_quote_the_registry_tool_counts` is the real gate.
@@ -149,6 +158,7 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - A real segfault inside libngspice has not been reproduced on 44.2. The crash path is proven with a fake worker and with `SIGABRT` on the real one.
 - `.op` has no pause test, so `bg_halt` cannot stop one. It ends at the worker's own deadline.
 - `class-d`, `laser_driver` and `v_i_sources` report `engine_messages`. `laser_driver` and `v_i_sources` are true positives. The `class-d` lines were not rechecked after progress notes were filtered out.
+- The protection stand-ins are approximations with known edges, all in the skill: the fuse opens in one step with no arc, so inductance ahead of it rings (E97); the reverse stand-in leaks near zero volts because of its 10 mV knee; the eFuse resistance rises near its limit. The independent review of PR 8 found these, not wrong numbers.
 - The hosted CI has never run on this fork. It needs the owner's click in the Actions tab.
 - Q17 is an accepted limit: `filesource`, `d_source`, `d_state` and table models read a numeric data file named in the deck.
 - Local scratch scripts for mutation runs and dogfooding were never committed. The recipes above replace them.
