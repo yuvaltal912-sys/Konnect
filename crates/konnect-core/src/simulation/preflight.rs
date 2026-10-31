@@ -2024,6 +2024,10 @@ mod tests {
                 "K1",
             ),
             (
+                "V1 a 0 1\nR1 a 0 1k\nL1 a 0 1u\nL2 a 0 1u\nK1 L1 L2 2",
+                "K1",
+            ),
+            (
                 "V1 a 0 1\nR1 a 0 1k\nL1 a 0 1u\nL2 a 0 1u\nK1 L1 L2 k",
                 "K1",
             ),
@@ -2918,6 +2922,13 @@ mod tests {
     fn a_comma_in_a_waveform_is_disclosed_even_with_no_unit() {
         let body = "V1 a 0 SIN(0 1,5 1k)\nV2 b 0 PULSE(0 1,5 0 1n 1n 1m 2m)\nR1 a b 1k\nR2 b 0 1k";
         assert_eq!(warned(&deck(body), "decimal_comma"), ["V1", "V2"]);
+    }
+
+    #[test]
+    fn a_source_or_ground_in_a_nested_subcircuit_counts() {
+        let body = ".subckt outer p\nX1 p inner\n.ends\n.subckt inner p\nV1 p 0 1\n.ends\nX2 a outer\nR1 a b 1k";
+        assert!(warned(&deck(body), "unpowered_net").is_empty());
+        passes(&deck(body), "ground");
     }
 
     #[test]
