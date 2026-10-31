@@ -1091,6 +1091,45 @@ mod reliability_contract_dispatch_tests {
         );
         assert_eq!(body["outcome"]["target"], schematic.display().to_string());
     }
+
+    #[tokio::test]
+    async fn a_simulation_refusal_keeps_its_outcome_through_the_served_dispatch() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("gone.kicad_sch");
+
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_simulation",
+                    "arguments": {
+                        "schematic": schematic.display().to_string(),
+                        "analysis": {"kind": "operating_point"}
+                    }
+                }
+            }))
+            .await
+            .expect("request returns a response");
+        let result = response.result.expect("successful JSON-RPC response");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().expect("JSON text");
+        let body: Value = serde_json::from_str(text).expect("tool body is JSON");
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["outcome"]["status"], "failed", "{body}");
+    }
 }
 
 #[cfg(test)]

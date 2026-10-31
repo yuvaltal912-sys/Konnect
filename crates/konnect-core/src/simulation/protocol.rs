@@ -57,6 +57,8 @@ pub struct RunStatus {
     pub code_models_failed: Vec<String>,
     /// The exit callback fired, with its status. The library is dead after this.
     pub exit_status: Option<i32>,
+    /// The analysis had started, so a fatal error came from the run, not the load.
+    pub run_started: bool,
     /// `$sim_status`. Absent if the circuit never parsed.
     pub sim_status: Option<i32>,
     pub halted_reason: Option<HaltReason>,

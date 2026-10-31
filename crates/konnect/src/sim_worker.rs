@@ -187,7 +187,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 fn run_probe(request: &Request) -> Result<()> {
     let report = if request.protocol == PROTOCOL_VERSION {
-        probe(&request)
+        probe(request)
     } else {
         empty_report(Some(format!(
             "worker speaks protocol {PROTOCOL_VERSION}, caller asked for {}",
@@ -238,6 +238,7 @@ fn empty_status(load_error: Option<String>) -> RunStatus {
         code_models_loaded: Vec::new(),
         code_models_failed: Vec::new(),
         exit_status: None,
+        run_started: false,
         sim_status: None,
         halted_reason: None,
         results_written: false,
@@ -315,6 +316,7 @@ fn prepare_and_simulate(run_dir: &Path) -> Result<RunStatus> {
         engine.load_circuit(lines);
     }
     if !EXIT_CALLED.load(Ordering::SeqCst) {
+        status.run_started = true;
         engine.run_command("bg_run")?;
         status.halted_reason = engine.wait_for_run(started + budget);
     }

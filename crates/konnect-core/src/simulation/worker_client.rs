@@ -337,7 +337,11 @@ pub(crate) fn classify(
         return Verdict::Failed("engine_load_failed");
     }
     if status.exit_status.is_some() {
-        return Verdict::Failed("load_failed");
+        return Verdict::Failed(if status.run_started {
+            "engine_crashed"
+        } else {
+            "load_failed"
+        });
     }
     let Some(sim_status) = status.sim_status else {
         return Verdict::Failed("circuit_not_parsed");
@@ -527,6 +531,7 @@ mod tests {
             code_models_loaded: Vec::new(),
             code_models_failed: Vec::new(),
             exit_status: None,
+            run_started: true,
             sim_status,
             halted_reason: None,
             results_written: true,
@@ -610,7 +615,18 @@ mod tests {
             exit_status: Some(1),
             ..status(Some(0))
         };
-        assert_eq!(verdict(exited, &good), Verdict::Failed("load_failed"));
+        assert_eq!(
+            verdict(exited.clone(), &good),
+            Verdict::Failed("engine_crashed")
+        );
+        let while_loading = RunStatus {
+            run_started: false,
+            ..exited
+        };
+        assert_eq!(
+            verdict(while_loading, &good),
+            Verdict::Failed("load_failed")
+        );
         let unloaded = RunStatus {
             load_error: Some("no library".to_string()),
             ..status(Some(0))

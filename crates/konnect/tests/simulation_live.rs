@@ -8,7 +8,11 @@
 //! ```
 
 use konnect_core::kicad_install::{find_code_models_dir, find_ngspice_library};
-use konnect_core::simulation::protocol::{ProbeReport, PROTOCOL_VERSION, WORKER_SUBCOMMAND};
+use konnect_core::simulation::protocol::{
+    HaltReason, ProbeReport, RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION,
+    RAW_FILE, REQUEST_FILE, STATUS_FILE, WORKER_SUBCOMMAND,
+};
+use konnect_core::simulation::raw;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -422,4 +426,278 @@ fn a_project_relative_include_in_schematic_text_is_read_from_the_project() {
     let report = call_over_stdio("check_simulation_readiness", json!({ "schematic": path }));
     assert_eq!(report["checks"][2]["passed"], true, "{report}");
     assert_eq!(report["deck"]["inlined_file_count"], 3, "{report}");
+}
+
+fn run_operating_point(project: &Path, sheet: &str) -> Value {
+    call_over_stdio(
+        "run_simulation",
+        json!({
+            "schematic": project.join(sheet),
+            "analysis": { "kind": "operating_point" },
+            "limit": 200,
+        }),
+    )
+}
+
+fn row<'a>(result: &'a Value, signal: &str) -> &'a Value {
+    let rows = result["operating_point"]["rows"].as_array().unwrap();
+    rows.iter()
+        .find(|row| row["signal"] == signal)
+        .unwrap_or_else(|| panic!("no {signal} in {result}"))
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_real_operating_point_runs_and_leaves_the_project_untouched() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/amplifier-ac"), project.path());
+    let before = file_names(project.path());
+
+    let result = run_operating_point(project.path(), "amplifier-ac.kicad_sch");
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["simulated_circuit"], "as_drawn");
+    assert_eq!(result["analysis"]["coverage_ratio"], 1.0);
+    assert_eq!(result["engine"]["version"], "44.2");
+    let supply = row(&result, "v(+12v)");
+    assert_eq!(supply["net"], "+12V", "{result}");
+    assert_eq!(supply["unit"], "V");
+    assert!((supply["value"].as_f64().unwrap() - 12.0).abs() < 1e-9);
+    assert_eq!(file_names(project.path()), before);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_dropped_control_block_is_reported_and_never_reaches_the_engine() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/sallen_key"), project.path());
+
+    let result = run_operating_point(project.path(), "sallen_key.kicad_sch");
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    let dropped = result["circuit"]["dropped_directives"].to_string();
+    assert!(dropped.contains(".control"), "{result}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_digital_circuit_runs_without_the_probe_that_would_stop_it() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/up-down-counter"), project.path());
+    let sheet = file_names(project.path())
+        .into_iter()
+        .find(|name| name.ends_with(".kicad_sch"))
+        .unwrap();
+
+    let result = run_operating_point(project.path(), &sheet);
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert!(result["warnings"]
+        .to_string()
+        .contains("device_currents_not_saved"));
+}
+
+/// The engine as readiness found it, so these tests need no paths of their own.
+fn engine_paths() -> (PathBuf, PathBuf) {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let report = call_over_stdio(
+        "check_simulation_readiness",
+        json!({ "schematic": project.path().join("rectifier.kicad_sch") }),
+    );
+    let engine = &report["engine"];
+    (
+        PathBuf::from(engine["library_path"].as_str().unwrap()),
+        PathBuf::from(engine["code_models_dir"].as_str().unwrap()),
+    )
+}
+
+struct WorkerRun {
+    dir: tempfile::TempDir,
+}
+
+impl WorkerRun {
+    /// A run folder as the server prepares one, with `deck` taken as vetted. This
+    /// is how a test reaches past deck vetting to the barriers behind it.
+    fn prepare(deck: &str, input_path: Option<&Path>, budget_ms: u64) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, code_models) = engine_paths();
+        let request = RunRequest {
+            protocol: PROTOCOL_VERSION,
+            library,
+            code_models: Some(code_models),
+            load_digital: true,
+            compatibility: Some("ltpsa".to_string()),
+            input_path: input_path.map(Path::to_path_buf),
+            budget_ms,
+        };
+        std::fs::write(dir.path().join(".spiceinit"), "").unwrap();
+        std::fs::write(dir.path().join(DECK_FILE), deck).unwrap();
+        std::fs::write(
+            dir.path().join(REQUEST_FILE),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        Self { dir }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        command
+            .args(["sim-worker", "--protocol", &PROTOCOL_VERSION.to_string()])
+            .arg("--run-dir")
+            .arg(self.dir.path())
+            .current_dir(self.dir.path())
+            .env_clear()
+            .env("SPICE_SCRIPTS", self.dir.path())
+            .env("SPICE_USERINIT_DIR", self.dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn status(&self) -> Option<RunStatus> {
+        let bytes = std::fs::read(self.dir.path().join(STATUS_FILE)).ok()?;
+        Some(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn finish(&self) -> RunStatus {
+        assert!(self.command().status().unwrap().success());
+        self.status().expect("a status file")
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join(LOG_FILE)).unwrap()
+    }
+
+    fn plot(&self) -> raw::Plot {
+        let path = self.dir.path().join(RAW_FILE);
+        raw::read(&path, u64::MAX).unwrap().remove(0)
+    }
+}
+
+const SLOW_DECK: &str =
+    ".title t\nV1 a 0 SIN(0 1 1k)\nR1 a b 1k\nC1 b 0 1u\n.tran 1n 1 0 1n\n.end\n";
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_run_past_its_budget_halts_softly_and_keeps_its_data() {
+    let run = WorkerRun::prepare(SLOW_DECK, None, 1_500);
+
+    let status = run.finish();
+
+    assert_eq!(status.halted_reason, Some(HaltReason::Timeout));
+    assert_eq!(status.sim_status, Some(0));
+    assert!(status.results_written);
+    let plot = run.plot();
+    assert!(plot.points > 1, "{}", plot.points);
+    let time = plot.variable("time").unwrap();
+    let reached = plot.real(time).last().unwrap();
+    assert!(reached > 0.0 && reached < 1.0, "{reached}");
+}
+
+/// Abort, because the engine can call it. A `SIGSEGV` sent from outside proves
+/// nothing: Rust's handler resets the signal and returns, and the run carries on.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_worker_killed_mid_run_leaves_no_report_to_misread() {
+    let run = WorkerRun::prepare(SLOW_DECK, None, 30_000);
+    let mut child = run.command().spawn().unwrap();
+    while !run.dir.path().join(LOG_FILE).is_file() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let pid = child.id().to_string();
+    assert!(Command::new("kill")
+        .args(["-ABRT", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let exit = child.wait().unwrap();
+
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&exit),
+        Some(6)
+    );
+    assert!(run.status().is_none());
+    assert!(!run.dir.path().join(RAW_FILE).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_engine_cannot_start_a_process_even_past_deck_vetting() {
+    let scratch = tempfile::tempdir().unwrap();
+    let marker = scratch.path().join("started");
+    let deck = format!(
+        ".title t\nV1 a 0 1\nR1 a 0 1k\n.control\necho KONNECT_BLOCK_RAN\nshell /usr/bin/touch {}\n\
+         .endc\n.op\n.end\n",
+        marker.display()
+    );
+    let run = WorkerRun::prepare(&deck, None, 5_000);
+
+    run.finish();
+
+    assert!(run.log().contains("KONNECT_BLOCK_RAN"), "{}", run.log());
+    assert!(!marker.exists(), "{}", run.log());
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_engine_names_a_hebrew_node_with_underscores() {
+    let deck = ".title t\nV1 /\u{5e9} 0 1\nR1 /\u{5e9} 0 1k\n.save all\n.op\n.end\n";
+    let run = WorkerRun::prepare(deck, None, 5_000);
+
+    let status = run.finish();
+
+    assert_eq!(status.sim_status, Some(0));
+    assert!(run.plot().variable("v(/__)").is_some());
+}
+
+const TABLE_DECK: &str = ".title t\nV1 a 0 1\nV2 b 0 1\nR1 c 0 1k\nA1 a b c tb\n\
+    .model tb table2d(offset=0 gain=1 order=2 file=\"data.table\")\n.save all\n.op\n.end\n";
+const TABLE: &str = "* table\n3\n3\n0 1 2\n0 1 2\n0 1 2\n0 1 2\n0 1 2\n";
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn code_models_read_relative_data_files_from_the_project() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("data.table"), TABLE).unwrap();
+
+    let found = WorkerRun::prepare(TABLE_DECK, Some(project.path()), 5_000);
+    assert_eq!(found.finish().sim_status, Some(0), "{}", found.log());
+
+    let lost = WorkerRun::prepare(TABLE_DECK, None, 5_000);
+    assert!(lost.finish().exit_status.is_some(), "{}", lost.log());
+}
+
+const BRIDGE_DECK: &str = ".title t\nV1 a 0 1\nR1 y 0 1k\nA1 a y inv\n\
+    .model inv d_inverter(family=\"kq\")\n.save all\n.op\n.end\n";
+const BRIDGE_FILES: [&str; 3] = [
+    "bridge_kq_d_in.subcir",
+    "bridge_kq_d_out.subcir",
+    "bridge_kq_d_inout.subcir",
+];
+
+fn write_bridges(dir: &Path) {
+    for name in BRIDGE_FILES {
+        std::fs::write(dir.join(name), "* not a bridge\n").unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_bridge_file_in_the_project_never_reaches_the_engine() {
+    let project = tempfile::tempdir().unwrap();
+    write_bridges(project.path());
+    let clean = WorkerRun::prepare(BRIDGE_DECK, Some(project.path()), 5_000);
+    assert_eq!(clean.finish().sim_status, Some(0), "{}", clean.log());
+
+    // The control: the same files in the run folder are read, and break the deck.
+    let read = WorkerRun::prepare(BRIDGE_DECK, None, 5_000);
+    write_bridges(read.dir.path());
+    assert_eq!(read.finish().sim_status, None, "{}", read.log());
 }

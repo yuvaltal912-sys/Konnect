@@ -561,7 +561,7 @@ fn engine_complaints(log: &str, deck: &FlatDeck) -> Vec<String> {
 
 fn failure_message(reason: &str) -> &'static str {
     match reason {
-        "engine_crashed" => "The simulator process died. The server is unaffected.",
+        "engine_crashed" => "The simulator stopped on a fatal error. The server is unaffected.",
         "engine_load_failed" => "The simulator could not start this run.",
         "load_failed" => "The simulator stopped on a fatal error while loading the circuit.",
         "circuit_not_parsed" => "The simulator could not parse the circuit.",
@@ -1600,7 +1600,7 @@ mod tests {
 
         const OP_FIXTURE: &str = "tests/fixtures/simulation/raw/op.ascii.raw";
         /// Good status fields, for a fake worker to write.
-        const GOOD: &str = r#""protocol":2,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#;
+        const GOOD: &str = r#""protocol":2,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null,"run_started":true"#;
 
         /// Answers a probe as a working engine, then does `job` in the run folder.
         fn fake_worker(dir: &Path, job: &str) -> PathBuf {
@@ -1776,6 +1776,15 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .ends_with("engine.log"));
+
+            let scene = scene("kill -SEGV $$");
+            let (failed, _) = call(&scene, args(&scene.root)).await;
+            assert!(failed);
+            let after =
+                handle_check_simulation_readiness(&json!({ "schematic": scene.root }), &scene.ctx)
+                    .await
+                    .unwrap();
+            assert!(!after.is_error, "the server must carry on after a crash");
         }
 
         #[tokio::test]
@@ -1789,12 +1798,11 @@ mod tests {
             let lost = status_json("0", "null", true);
             fails_with(&lost, "results_unreadable", "results").await;
             fails_with("exit 124", "timed_out", "run").await;
-            let exited = format!(
-                "cat > status.json <<'JSON'\n{{\"protocol\":2,\"load_error\":null,\
+            let exited = "cat > status.json <<'JSON'\n{\"protocol\":2,\"load_error\":null,\
                  \"engine_version\":null,\"code_models_loaded\":[],\"code_models_failed\":[],\
-                 \"exit_status\":1,\"sim_status\":null,\"halted_reason\":null,\
-                 \"results_written\":false}}\nJSON"
-            );
+                 \"exit_status\":1,\"run_started\":false,\"sim_status\":null,\
+                 \"halted_reason\":null,\"results_written\":false}\nJSON"
+                .to_string();
             fails_with(&exited, "load_failed", "run").await;
             let unloaded = exited.replace("\"load_error\":null", "\"load_error\":\"no\"");
             let body = fails_with(&unloaded, "engine_load_failed", "engine").await;
