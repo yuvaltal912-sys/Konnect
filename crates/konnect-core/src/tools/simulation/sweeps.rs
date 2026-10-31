@@ -175,6 +175,17 @@ impl Ac {
         }
     }
 
+    /// The arguments again, for `Ac::from_args` to read back.
+    pub(super) fn record(&self) -> Value {
+        json!({
+            "kind": "ac",
+            "start_hz": self.start,
+            "stop_hz": self.stop,
+            "scale": self.scale.name(),
+            "points": self.points,
+        })
+    }
+
     pub(super) fn line(&self) -> String {
         format!(
             ".ac {} {} {:e} {:e}",
@@ -377,8 +388,17 @@ impl DcSweep {
         if axis.is_empty() {
             return None;
         }
+        let run = self.run_length(&axis);
+        axis.len()
+            .is_multiple_of(run)
+            .then_some((run, axis.len() / run))
+    }
+
+    /// How many points one run of the first sweep took, read from where its value
+    /// turns back. A cut run gives the length it had when it was cut.
+    fn run_length(&self, axis: &[f64]) -> usize {
         let inner = self.inner();
-        let run = if self.sweeps.len() == 1 {
+        if self.sweeps.len() == 1 {
             axis.len()
         } else if inner.points == 1 {
             1
@@ -387,10 +407,24 @@ impl DcSweep {
             (1..axis.len())
                 .find(|&i| (axis[i] - axis[i - 1]) * direction < 0.0)
                 .unwrap_or(axis.len())
-        };
-        axis.len()
-            .is_multiple_of(run)
-            .then_some((run, axis.len() / run))
+        }
+    }
+
+    /// How the plot is written as a table: each sweep under what it varies, and the
+    /// second, which the engine does not save, rebuilt from the point number.
+    pub(super) fn table_layout(&self, plot: &Plot) -> crate::simulation::export::Layout {
+        use crate::simulation::export::{Layout, Outer};
+        let heading = |sweep: &Sweep| format!("{} ({})", sweep.name, sweep.unit);
+        let outer = self.sweeps.get(1).map(|sweep| Outer {
+            name: heading(sweep),
+            start: sweep.start,
+            step: sweep.step,
+            run: self.run_length(&Self::axis(plot)),
+        });
+        Layout::Sweep {
+            inner: heading(self.inner()),
+            outer,
+        }
     }
 
     /// The plot holds the grid asked for, in a plot whose first vector is a sweep's
@@ -523,6 +557,46 @@ impl DcSweep {
             ));
         }
         Ok(self)
+    }
+
+    /// The arguments again, with the deck's spelling of each target, for
+    /// `DcSweep::restore` to read back.
+    pub(super) fn record(&self) -> Value {
+        let sweeps: Vec<Value> = self
+            .sweeps
+            .iter()
+            .map(|sweep| {
+                json!({
+                    "target": sweep.target,
+                    "start_value": sweep.start,
+                    "stop_value": sweep.stop,
+                    "step_value": sweep.step,
+                    "element": sweep.name,
+                    "unit": sweep.unit,
+                })
+            })
+            .collect();
+        json!({ "kind": "dc_sweep", "sweeps": sweeps })
+    }
+
+    /// Read a record back: the arguments, then each sweep's element and unit as they
+    /// were found in the deck. None if the record does not say.
+    pub(super) fn restore(analysis: &Value) -> Option<Self> {
+        let mut sweep = Self::from_args(analysis).ok()?;
+        let entries = analysis["sweeps"].as_array()?;
+        for (sweep, entry) in sweep.sweeps.iter_mut().zip(entries) {
+            let name = entry["element"].as_str()?;
+            let named =
+                name == TEMPERATURE || name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if name.is_empty() || !named {
+                return None;
+            }
+            sweep.name = name.to_string();
+            sweep.unit = ["V", "A", "Ω", TEMPERATURE_UNIT]
+                .into_iter()
+                .find(|unit| Some(*unit) == entry["unit"].as_str())?;
+        }
+        Some(sweep)
     }
 
     pub(super) fn describe(&self, plot: &Plot) -> Value {
@@ -1085,5 +1159,87 @@ mod tests {
         let lost = grid.shortfalls(&plot(false, names, &rows(4), 8));
         assert_eq!(lost.len(), 1, "{lost:?}");
         assert!(lost[0].contains("TEMP ran 4 of 5"), "{lost:?}");
+    }
+
+    #[test]
+    fn a_stored_ac_sweep_reads_back_as_it_was() {
+        for scale in ["decade", "octave", "linear"] {
+            let ac = ac(json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 1e4,
+                                "scale": scale, "points": 7 }))
+            .unwrap();
+            assert_eq!(Ac::from_args(&ac.record()).unwrap(), ac, "{scale}");
+        }
+    }
+
+    #[test]
+    fn a_stored_dc_sweep_keeps_the_deck_spelling_and_the_unit() {
+        let elements = [entry("R2", Some("R2"), false)];
+        let sweep = dc(json!([
+            { "target": "r2", "start_value": 1.0, "stop_value": 3.0, "step_value": 1.0 },
+            { "target": "temp", "start_value": -40.0, "stop_value": 85.0, "step_value": 25.0 },
+        ]))
+        .unwrap()
+        .resolve(&["R2"], &elements)
+        .unwrap();
+        let restored = DcSweep::restore(&sweep.record()).unwrap();
+        assert_eq!(restored, sweep);
+        assert_eq!(restored.sweeps[0].name, "R2");
+        assert_eq!(restored.sweeps[0].unit, "Ω");
+        assert_eq!(restored.sweeps[1].unit, "°C");
+    }
+
+    #[test]
+    fn a_stored_sweep_that_was_altered_is_not_trusted() {
+        let elements = [entry("R2", Some("R2"), false)];
+        let record = dc(json!([
+            { "target": "R2", "start_value": 1.0, "stop_value": 3.0, "step_value": 1.0 },
+        ]))
+        .unwrap()
+        .resolve(&["R2"], &elements)
+        .unwrap()
+        .record();
+        for (field, value) in [
+            ("element", json!("R2; shell")),
+            ("element", json!("")),
+            ("element", json!(5)),
+            ("unit", json!("furlongs")),
+            ("unit", Value::Null),
+        ] {
+            let mut altered = record.clone();
+            altered["sweeps"][0][field] = value.clone();
+            assert!(DcSweep::restore(&altered).is_none(), "{field} {value}");
+        }
+        let mut no_element = record.clone();
+        no_element["sweeps"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("element");
+        assert!(DcSweep::restore(&no_element).is_none());
+        let mut no_step = record;
+        no_step["sweeps"][0]["step_value"] = json!(0.0);
+        assert!(DcSweep::restore(&no_step).is_none());
+    }
+
+    #[test]
+    fn the_second_sweep_steps_when_the_first_has_run() {
+        let elements = [
+            entry("R2", Some("R2"), false),
+            entry("V1", Some("V1"), false),
+        ];
+        let sweep = dc(json!([
+            { "target": "V1", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+            { "target": "R2", "start_value": 10.0, "stop_value": 30.0, "step_value": 10.0 },
+        ]))
+        .unwrap()
+        .resolve(&["V1", "R2"], &elements)
+        .unwrap();
+        let axis = [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0];
+        // A run cut inside the third row still has its first run's length.
+        assert_eq!(sweep.run_length(&axis), 3);
+        let one = dc(json!([
+            { "target": "V1", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+        ]))
+        .unwrap();
+        assert_eq!(one.run_length(&axis), 7);
     }
 }

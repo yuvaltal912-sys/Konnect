@@ -4,6 +4,9 @@
 //! may sit in synced folders. The id starts with the project hash, so finding a
 //! run later needs no scan.
 
+use super::kicad_netlist::{ElementEntry, NetEntry};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +16,12 @@ const HASH_CHARS: usize = 12;
 const STAMP_CHARS: usize = 15;
 const SUFFIX_CHARS: usize = 4;
 const CREATE_ATTEMPTS: usize = 8;
+/// What a finished run keeps beside its data, so a later call can measure it
+/// without the circuit.
+pub(crate) const RECORD_FILE: &str = "run.json";
+const RECORD_VERSION: u32 = 1;
+/// Far above any real record, which holds the net and element names of one design.
+const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunFolder {
@@ -73,6 +82,183 @@ pub(crate) fn is_valid_id(id: &str) -> bool {
         && digits(&bytes[HASH_CHARS + 10..stamp_end])
         && bytes[stamp_end] == b'-'
         && hex(&bytes[stamp_end + 1..])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunState {
+    Complete,
+    Partial,
+}
+
+impl RunState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+/// Why a partial run stopped, as `run_simulation` reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Stopped {
+    pub reason: String,
+    pub at_point: usize,
+    pub node: Option<String>,
+}
+
+/// What `run_simulation` knew about a finished run that its data files do not
+/// say. Only runs with data are recorded: a run that failed returned an error and
+/// has nothing to measure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RunRecord {
+    pub version: u32,
+    /// The canonical root sheet, so the inputs can be checked again.
+    pub schematic: PathBuf,
+    /// The analysis as `Analysis::record` writes it.
+    pub analysis: Value,
+    pub run_status: RunState,
+    pub stopped: Option<Stopped>,
+    pub simulated_circuit: String,
+    pub coverage_ratio: f64,
+    pub inputs_hash: String,
+    /// Model files the deck inlined, which the hash covers.
+    pub inlined_files: Vec<PathBuf>,
+    /// Kept to resolve a net or reference to the engine's name.
+    pub nets: Vec<NetEntry>,
+    pub elements: Vec<ElementEntry>,
+}
+
+impl RunRecord {
+    pub(crate) fn new(fields: RecordFields) -> Self {
+        Self {
+            version: RECORD_VERSION,
+            schematic: fields.schematic,
+            analysis: fields.analysis,
+            run_status: fields.run_status,
+            stopped: fields.stopped,
+            simulated_circuit: fields.simulated_circuit,
+            coverage_ratio: fields.coverage_ratio,
+            inputs_hash: fields.inputs_hash,
+            inlined_files: fields.inlined_files,
+            nets: fields.nets,
+            elements: fields.elements,
+        }
+    }
+
+    pub(crate) fn analysis_kind(&self) -> &str {
+        self.analysis["kind"].as_str().unwrap_or_default()
+    }
+}
+
+/// Everything a record holds apart from its version.
+pub(crate) struct RecordFields {
+    pub schematic: PathBuf,
+    pub analysis: Value,
+    pub run_status: RunState,
+    pub stopped: Option<Stopped>,
+    pub simulated_circuit: String,
+    pub coverage_ratio: f64,
+    pub inputs_hash: String,
+    pub inlined_files: Vec<PathBuf>,
+    pub nets: Vec<NetEntry>,
+    pub elements: Vec<ElementEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RecordError {
+    #[error("the run folder holds no record")]
+    Missing,
+    #[error("the run record cannot be used: {0}")]
+    Unusable(String),
+}
+
+pub(crate) fn write_record(dir: &Path, record: &RunRecord) -> std::io::Result<()> {
+    std::fs::write(dir.join(RECORD_FILE), serde_json::to_vec(record)?)
+}
+
+pub(crate) fn read_record(dir: &Path) -> Result<RunRecord, RecordError> {
+    let path = dir.join(RECORD_FILE);
+    let size = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return Err(RecordError::Unusable("it is not a plain file".to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RecordError::Missing)
+        }
+        Err(error) => return Err(RecordError::Unusable(error.to_string())),
+    };
+    if size > MAX_RECORD_BYTES {
+        return Err(RecordError::Unusable(format!("it is {size} bytes")));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| RecordError::Unusable(error.to_string()))?;
+    let record: RunRecord =
+        serde_json::from_slice(&bytes).map_err(|error| RecordError::Unusable(error.to_string()))?;
+    match record.version == RECORD_VERSION {
+        true => Ok(record),
+        false => Err(RecordError::Unusable(format!(
+            "it is version {}, and this server reads version {RECORD_VERSION}",
+            record.version
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocateError {
+    /// Not the shape of a run id. Nothing was looked up.
+    InvalidId,
+    NotFound,
+}
+
+/// The folder of a run, found from its id alone: the id starts with the project
+/// hash. The id is checked first, because it becomes two path components.
+pub(crate) fn locate(state_root: &Path, id: &str) -> Result<PathBuf, LocateError> {
+    if !is_valid_id(id) {
+        return Err(LocateError::InvalidId);
+    }
+    let dir = state_root
+        .join("simulation")
+        .join(&id[..HASH_CHARS])
+        .join(id);
+    // `symlink_metadata` does not follow a link, so a link in the store is no run.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => Ok(dir),
+        _ => Err(LocateError::NotFound),
+    }
+}
+
+/// The ids of a project's runs, newest first. Ids sort by their time stamp, and
+/// two made in one second by their random end.
+pub(crate) fn list(state_root: &Path, schematic: &Path) -> std::io::Result<Vec<String>> {
+    let project = state_root.join("simulation").join(project_hash(schematic)?);
+    let entries = match std::fs::read_dir(&project) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_valid_id(name))
+        .collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(ids)
+}
+
+/// `2026-10-30T13:35:12Z` from a valid id.
+pub(crate) fn created_at(id: &str) -> Option<String> {
+    let stamp = id.get(HASH_CHARS + 1..HASH_CHARS + 1 + STAMP_CHARS)?;
+    let (date, time) = stamp.split_once('T')?;
+    Some(format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        date.get(..4)?,
+        date.get(4..6)?,
+        date.get(6..8)?,
+        time.get(..2)?,
+        time.get(2..4)?,
+        time.get(4..6)?
+    ))
 }
 
 /// A new, empty folder for this run, after dropping the project's oldest.
@@ -266,5 +452,186 @@ mod tests {
         prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000");
         assert!(outside.path().join("precious").exists());
         assert!(link.symlink_metadata().is_ok());
+    }
+
+    const ID: &str = "3fa9c1d27b04-20261030T133512-7f3a";
+
+    fn record() -> RunRecord {
+        RunRecord::new(RecordFields {
+            schematic: PathBuf::from("/p/top.kicad_sch"),
+            analysis: serde_json::json!({ "kind": "transient", "stop_time_seconds": 1.0 }),
+            run_status: RunState::Partial,
+            stopped: Some(Stopped {
+                reason: "timeout".to_string(),
+                at_point: 7,
+                node: None,
+            }),
+            simulated_circuit: "modified".to_string(),
+            coverage_ratio: 0.5,
+            inputs_hash: "abc".to_string(),
+            inlined_files: vec![PathBuf::from("/p/m.lib")],
+            nets: Vec::new(),
+            elements: Vec::new(),
+        })
+    }
+
+    fn store_with(id: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("simulation").join(&id[..12]).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    #[test]
+    fn a_run_is_found_from_its_id_alone() {
+        let (root, dir) = store_with(ID);
+        assert_eq!(locate(root.path(), ID), Ok(dir));
+        assert_eq!(
+            locate(root.path(), "3fa9c1d27b04-20261030T133512-0000"),
+            Err(LocateError::NotFound)
+        );
+        // The same id under another project hash is not this run.
+        assert_eq!(
+            locate(root.path(), "aaaaaaaaaaaa-20261030T133512-7f3a"),
+            Err(LocateError::NotFound)
+        );
+    }
+
+    #[test]
+    fn nothing_but_an_exact_id_is_looked_up() {
+        let (root, _) = store_with(ID);
+        let outside = root.path().join("simulation").join("secret");
+        std::fs::create_dir_all(&outside).unwrap();
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../simulation",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "3fa9c1d27b04/../3fa9c1d27b04-20261030T133512-7f3a",
+            "3fa9c1d27b04-20261030T133512-7f3a/",
+            "3fa9c1d27b04-20261030T133512-7f3a/..",
+            "3fa9c1d27b04-20261030T133512-7f3a\0",
+            "3fa9c1d27b04-20261030T133512-7f3a ",
+            "..\\3fa9c1d27b04-20261030T133512-7f3a",
+        ] {
+            assert_eq!(
+                locate(root.path(), bad),
+                Err(LocateError::InvalidId),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_or_a_file_in_the_store_is_not_a_run() {
+        let (root, dir) = store_with(ID);
+        std::fs::remove_dir(&dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+        assert_eq!(locate(root.path(), ID), Err(LocateError::NotFound));
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::write(&dir, "").unwrap();
+        assert_eq!(locate(root.path(), ID), Err(LocateError::NotFound));
+    }
+
+    #[test]
+    fn runs_are_listed_newest_first_and_strays_are_left_out() {
+        let folder = tempfile::tempdir().unwrap();
+        let sheet = schematic(folder.path());
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(list(state.path(), &sheet).unwrap(), Vec::<String>::new());
+        let first = create(state.path(), &sheet).unwrap();
+        let project = first.dir.parent().unwrap().to_path_buf();
+        let hash = first.id[..HASH_CHARS].to_string();
+        for stamp in [
+            "20250101T000000-0001",
+            "20260101T000000-0000",
+            "20250101T000000-0002",
+        ] {
+            std::fs::create_dir(project.join(format!("{hash}-{stamp}"))).unwrap();
+        }
+        std::fs::create_dir(project.join("stray")).unwrap();
+        std::fs::write(project.join(format!("{hash}-20270101T000000-0000")), "").unwrap();
+        let listed = list(state.path(), &sheet).unwrap();
+        // The one made by `create` carries today's date, and is newest.
+        assert_eq!(listed[0], first.id);
+        assert_eq!(
+            &listed[1..],
+            [
+                format!("{hash}-20260101T000000-0000"),
+                format!("{hash}-20250101T000000-0002"),
+                format!("{hash}-20250101T000000-0001"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_record_comes_back_as_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), &record()).unwrap();
+        assert_eq!(read_record(dir.path()), Ok(record()));
+    }
+
+    #[test]
+    fn a_record_that_is_missing_or_cannot_be_trusted_says_which() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_record(dir.path()), Err(RecordError::Missing));
+        let path = dir.path().join(RECORD_FILE);
+        std::fs::write(&path, "{ nope").unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+        let mut wrong = serde_json::to_value(record()).unwrap();
+        wrong["version"] = serde_json::json!(RECORD_VERSION + 1);
+        std::fs::write(&path, wrong.to_string()).unwrap();
+        let Err(RecordError::Unusable(why)) = read_record(dir.path()) else {
+            panic!("a record of another version must not be read")
+        };
+        assert!(why.contains("version"), "{why}");
+        // A folder where the file belongs is not a record either.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_is_a_link_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_record(outside.path(), &record()).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join(RECORD_FILE),
+            dir.path().join(RECORD_FILE),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+    }
+
+    #[test]
+    fn a_record_past_the_size_limit_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join(RECORD_FILE)).unwrap();
+        file.set_len(MAX_RECORD_BYTES + 1).unwrap();
+        assert!(matches!(
+            read_record(dir.path()),
+            Err(RecordError::Unusable(_))
+        ));
+    }
+
+    #[test]
+    fn the_time_in_an_id_reads_as_a_date() {
+        assert_eq!(created_at(ID).as_deref(), Some("2026-10-30T13:35:12Z"));
+        assert_eq!(created_at("short"), None);
     }
 }
