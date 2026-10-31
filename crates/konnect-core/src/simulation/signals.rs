@@ -80,6 +80,18 @@ pub(crate) struct Resolved {
     pub shared_nets: Vec<String>,
 }
 
+/// Two vectors closer than this share of their peak are one signal. An inductor's
+/// branch and its current probe are separate unknowns, so they differ by rounding.
+const SAME_SIGNAL_SHARE: f64 = 1e-6;
+
+fn same_signal(first: &[f64], other: &[f64]) -> bool {
+    let peak = first
+        .iter()
+        .fold(0.0_f64, |peak, value| peak.max(value.abs()));
+    let limit = peak * SAME_SIGNAL_SHARE;
+    first.len() == other.len() && first.iter().zip(other).all(|(a, b)| (a - b).abs() <= limit)
+}
+
 /// The vector of this name. Two can share a name, and a device with a branch
 /// reports its current twice under one. The same data twice is one signal;
 /// different data is not ours to choose between.
@@ -91,7 +103,9 @@ fn vector(plot: &Plot, name: &str) -> Option<Vec<f64>> {
         .filter(|(_, variable)| variable.name.eq_ignore_ascii_case(name))
         .map(|(index, _)| plot.real(index).collect::<Vec<f64>>());
     let first = matches.next()?;
-    matches.all(|other| other == first).then_some(first)
+    matches
+        .all(|other| same_signal(&first, &other))
+        .then_some(first)
 }
 
 fn node_of(name: &str, nets: &[NetEntry]) -> String {
@@ -114,39 +128,42 @@ fn node_voltage(plot: &Plot, node: &str) -> Option<Vec<f64>> {
 }
 
 /// One node, or else two split at a comma. A whole name that is a net wins,
-/// because a net name may hold a comma.
+/// because a net name may hold a comma, and so does a split where both sides
+/// resolve.
 fn voltage(plot: &Plot, text: &str, nets: &[NetEntry]) -> Option<Resolved> {
     let known = |name: &str| nets.iter().any(|net| net.kicad_name == name);
-    let whole = node_of(text, nets);
     let shared = |node: &str| match nets_on(node, nets) {
         names if names.len() > 1 => names,
         _ => Vec::new(),
     };
     if known(text) || !text.contains(',') {
+        let whole = node_of(text, nets);
         return Some(Resolved {
             values: node_voltage(plot, &whole)?,
             shared_nets: shared(&whole),
         });
     }
-    let (first, second) = text.split_once(',')?;
-    let (first, second) = (node_of(first.trim(), nets), node_of(second.trim(), nets));
-    let plus = node_voltage(plot, &first)?;
-    let minus = node_voltage(plot, &second)?;
-    let values = plus.iter().zip(&minus).map(|(p, m)| p - m).collect();
-    let mut shared_nets = shared(&first);
-    shared_nets.extend(shared(&second));
-    Some(Resolved {
-        values,
-        shared_nets,
+    text.match_indices(',').find_map(|(comma, _)| {
+        let first = node_of(text[..comma].trim(), nets);
+        let second = node_of(text[comma + 1..].trim(), nets);
+        let plus = node_voltage(plot, &first)?;
+        let minus = node_voltage(plot, &second)?;
+        let mut shared_nets = shared(&first);
+        shared_nets.extend(shared(&second));
+        Some(Resolved {
+            values: plus.iter().zip(&minus).map(|(p, m)| p - m).collect(),
+            shared_nets,
+        })
     })
 }
 
 /// The deck's name for a part: `BT1` is the source `VBT1`. A testbench element
-/// has no reference, so its own name stands.
+/// has no reference, so its own name stands, even over an excluded part it
+/// replaces.
 fn element_name<'a>(reference: &'a str, elements: &'a [ElementEntry]) -> &'a str {
     elements
         .iter()
-        .find(|element| element.reference == reference)
+        .find(|element| element.reference == reference && !element.excluded)
         .and_then(|element| element.element_name.as_deref())
         .unwrap_or(reference)
 }
@@ -169,7 +186,7 @@ pub(crate) fn resolve(plot: &Plot, signal: &Signal, names: Names) -> Result<Reso
     let found = match signal {
         Signal::Voltage(text) => voltage(plot, text, names.nets),
         Signal::Current { reference, pin } => {
-            let element = element_name(reference, names.elements);
+            let element = preflight::engine_node(element_name(reference, names.elements));
             let name = match pin {
                 Some(pin) => format!("i({element}:{pin})"),
                 None => format!("i({element})"),
@@ -177,15 +194,16 @@ pub(crate) fn resolve(plot: &Plot, signal: &Signal, names: Names) -> Result<Reso
             plain(vector(plot, &name))
         }
         Signal::Power(reference) => {
-            let element = element_name(reference, names.elements);
+            let element = preflight::engine_node(element_name(reference, names.elements));
             plain(vector(plot, &format!("{element}:power")))
         }
     };
     found.ok_or_else(|| NotFound {
         pins: match signal {
-            Signal::Current { reference, .. } => {
-                pins_of(plot, element_name(reference, names.elements))
-            }
+            Signal::Current { reference, .. } => pins_of(
+                plot,
+                &preflight::engine_node(element_name(reference, names.elements)),
+            ),
             _ => Vec::new(),
         },
     })
@@ -194,8 +212,8 @@ pub(crate) fn resolve(plot: &Plot, signal: &Signal, names: Names) -> Result<Reso
 /// `.probe p(NAME)` for each part asked for. The name comes from the deck, so no
 /// caller text reaches the engine. `.probe` splices hidden sources into the
 /// circuit, so this runs only for parts someone asked about, as KiCad's own
-/// loop does for all of them. ngspice ignores code models here, so they get none
-/// and read as `signal_not_found`.
+/// loop does for all of them. ngspice ignores code models here, and a probe on a
+/// coupling stops the run, so neither gets one and they read as `signal_not_found`.
 pub(crate) fn power_probes<'a>(
     signals: impl Iterator<Item = &'a Signal>,
     names: Names,
@@ -222,8 +240,8 @@ pub(crate) fn power_probes<'a>(
 }
 
 fn probe_safe(name: &str) -> bool {
-    let code_model = name.starts_with(['a', 'A']);
-    !code_model && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let no_power = name.starts_with(['a', 'A', 'k', 'K']);
+    !no_power && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -416,6 +434,48 @@ mod tests {
     }
 
     #[test]
+    fn an_inductors_two_vectors_differ_by_rounding_and_are_one_signal() {
+        let plot = plot(
+            &["time", "i(l1)", "i(l1)"],
+            &[&[0.0, 1.0, 1.0 + 1e-10], &[1.0, 2.0, 2.0]],
+        );
+        assert_eq!(values(&plot, "i(L1)", NONE), Ok(vec![1.0, 2.0]));
+    }
+
+    #[test]
+    fn a_stand_in_for_an_excluded_part_answers_to_its_own_name() {
+        let elements = [ElementEntry {
+            excluded: true,
+            ..element("Q1", "MQ1")
+        }];
+        let names = Names {
+            nets: &[],
+            elements: &elements,
+        };
+        let plot = plot(&["time", "i(q1:c)", "i(mq1:d)"], &[&[0.0, 7.0, 9.0]]);
+        assert_eq!(values(&plot, "i(Q1:c)", names), Ok(vec![7.0]));
+        let asked = [Signal::Power("Q1".into())];
+        assert_eq!(power_probes(asked.iter(), names, &["Q1"]), [".probe p(Q1)"]);
+    }
+
+    #[test]
+    fn a_hebrew_reference_reads_the_name_the_engine_made_of_it() {
+        let plot = plot(&["time", "i(r__1)"], &[&[0.0, 4.0]]);
+        assert_eq!(values(&plot, "i(R\u{5d0}1)", NONE), Ok(vec![4.0]));
+    }
+
+    #[test]
+    fn a_difference_finds_the_comma_that_splits_two_real_nets() {
+        let nets = [net("/A,B", "/A_B")];
+        let names = Names {
+            nets: &nets,
+            elements: &[],
+        };
+        let plot = plot(&["time", "v(/a_b)", "v(c)"], &[&[0.0, 5.0, 2.0]]);
+        assert_eq!(values(&plot, "v(/A,B,c)", names), Ok(vec![3.0]));
+    }
+
+    #[test]
     fn a_signal_the_run_does_not_hold_is_not_found() {
         let plot = plot(&["time", "v(a)"], &[&[0.0, 1.0]]);
         for text in ["v(zzz)", "i(R9)", "p(R9)", "v(a,zzz)"] {
@@ -446,8 +506,12 @@ mod tests {
     }
 
     #[test]
-    fn a_code_model_gets_no_probe_and_a_strange_name_is_left_out() {
-        let asked = [Signal::Power("A1".into()), Signal::Power("r)1".into())];
-        assert!(power_probes(asked.iter(), NONE, &["A1", "r)1"]).is_empty());
+    fn a_code_model_or_coupling_gets_no_probe_and_a_strange_name_is_left_out() {
+        let asked = [
+            Signal::Power("A1".into()),
+            Signal::Power("K1".into()),
+            Signal::Power("r)1".into()),
+        ];
+        assert!(power_probes(asked.iter(), NONE, &["A1", "K1", "r)1"]).is_empty());
     }
 }

@@ -891,6 +891,133 @@ fn the_size_limit_counts_every_vector_the_engine_saves() {
     assert!((LIMIT..LIMIT + LIMIT / 2).contains(&bytes), "{bytes}");
 }
 
+fn lines(deck: &[&str]) -> Vec<String> {
+    deck.iter().map(|line| line.to_string()).collect()
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_initial_voltage_holds_whichever_way_round_the_part_is_drawn() {
+    for capacitor in ["C1 0 a 1u", "C1 a 0 1u"] {
+        let result = run_on_testbench(
+            &lines(&[capacitor, "R1 a 0 1k", ".ic v(a)=5"]),
+            json!({
+                "analysis": {
+                    "kind": "transient",
+                    "stop_time_seconds": 2e-3,
+                    "max_step_seconds": 1e-6,
+                    "use_initial_conditions": true,
+                },
+                "signals": ["p(R1)"],
+                "measurements": [
+                    { "name": "at_1ms", "kind": "value_at", "signal": "v(a)", "at_seconds": 1e-3 },
+                ],
+            }),
+        );
+
+        // 5 e^-1, from the RC time constant.
+        near(measured(&result, "at_1ms"), 1.8394, 2e-3);
+        assert!(result["warnings"]
+            .to_string()
+            .contains("device_currents_not_saved"));
+        assert_eq!(result["signal_summaries"][0]["finding"], "signal_not_found");
+    }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_initial_value_on_a_device_keeps_its_probes_and_says_the_run_has_no_start() {
+    let result = run_on_testbench(
+        &lines(&["C1 0 a 1u IC=-5", "R1 a 0 1k"]),
+        json!({
+            "analysis": {
+                "kind": "transient",
+                "stop_time_seconds": 2e-3,
+                "max_step_seconds": 1e-6,
+                "use_initial_conditions": true,
+            },
+            "measurements": [
+                { "name": "at_1ms", "kind": "value_at", "signal": "v(a)", "at_seconds": 1e-3 },
+                { "name": "current", "kind": "max", "signal": "i(R1)" },
+            ],
+        }),
+    );
+
+    near(measured(&result, "at_1ms"), 1.8394, 2e-3);
+    near(measured(&result, "current"), 5e-3, 1e-5);
+    assert!(result["analysis"]["first_point_seconds"].as_f64().unwrap() > 0.0);
+    assert!(result["warnings"].to_string().contains("no_point_at_start"));
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn every_inductor_current_is_found_though_the_engine_reports_it_twice() {
+    let result = run_on_testbench(
+        &lines(&[
+            "V1 a 0 PULSE(0 12 10u 1u 1u 5m 10m)",
+            "L1 a b 1m",
+            "R1 b c 1",
+            "L2 c d 1m",
+            "C1 d 0 10u",
+            "R2 d 0 2",
+        ]),
+        json!({
+            "analysis": { "kind": "transient", "stop_time_seconds": 1e-3 },
+            "signals": ["i(L1)", "i(L2)"],
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    let summaries = &result["signal_summaries"];
+    assert_eq!(summaries[0]["unit"], "A", "{result}");
+    near(
+        summaries[0]["max"].as_f64().unwrap(),
+        summaries[1]["max"].as_f64().unwrap(),
+        1e-6,
+    );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_probe_on_a_coupling_cannot_kill_the_run() {
+    let result = run_on_testbench(
+        &lines(&[
+            "V1 a 0 SIN(0 1 1k)",
+            "L1 a 0 1m",
+            "L2 b 0 1m",
+            "K1 L1 L2 .9",
+            "R1 b 0 1k",
+        ]),
+        json!({
+            "analysis": { "kind": "transient", "stop_time_seconds": 1e-3 },
+            "signals": ["p(K1)", "v(b)"],
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "partial", "{result}");
+    assert_eq!(result["signal_summaries"][0]["finding"], "signal_not_found");
+    assert!(result["signal_summaries"][1]["max"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_save_start_near_the_end_keeps_the_ordinary_step() {
+    let result = run_on_testbench(
+        &lines(&["V1 a 0 SIN(0 1 1k)", "R1 a 0 1k"]),
+        json!({
+            "analysis": {
+                "kind": "transient",
+                "stop_time_seconds": 1,
+                "start_save_seconds": 0.999999,
+            },
+            "signals": ["v(a)"],
+            "timeout_seconds": 10,
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+}
+
 const SLOW_DECK: &str =
     ".title t\nV1 a 0 SIN(0 1 1k)\nR1 a b 1k\nC1 b 0 1u\n.tran 1n 1 0 1n\n.end\n";
 

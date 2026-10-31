@@ -32,7 +32,7 @@ load_toolset('simulation')    # check_simulation_readiness, run_simulation
 
 ## Transient Runs
 
-Add `signals` for summaries and `measurements` for numbers. Neither enters the deck, and with neither you get no values back, only the proof that the run covered the range.
+Add `signals` for summaries and `measurements` for numbers. With neither you get no values back, only the proof that the run covered the range. Caller text never reaches the deck.
 
 ```json
 {
@@ -53,7 +53,7 @@ Add `signals` for summaries and `measurements` for numbers. Neither enters the d
 | `v(NET)`, `v(NET1,NET2)` | A net by the name KiCad shows, or the difference of two |
 | `i(REF)` | The current of a two-pin part or source, by reference |
 | `i(REF:PIN)` | A pin of a larger part, such as `i(M1:d)`. A wrong guess lists the real `pins` |
-| `p(REF)` | Power in a part. Code models (references the deck names with `A`) report none |
+| `p(REF)` | Power in a part. Code models and `K` couplings report none |
 
 A testbench element has no reference, so use the name it has in `spice_lines`.
 
@@ -70,9 +70,21 @@ Set `max_step_seconds` to about a hundredth of the fastest edge you care about. 
 | `overshoot_percent` | | How far past the final value, as a share of the step |
 | `settling_time` | Optional `band_percent`, default 2 | Time from the window start until it stays in the band. The band is a share of the final value or the step, whichever is larger |
 
-All but `value_at` take `from_seconds` and `to_seconds`. The last four default to the window's first and last values as the step, so give a window that holds just one edge, and give `final_value` when the signal has not finished moving by the end of it.
+All but `value_at` take `from_seconds` and `to_seconds`. The last four default to the window's first and last values as the step, so give a window that holds just one edge. If the window ends on something that is not the final value, because the signal is still moving or a pulse has come back, you get `final_value_needed` or `not_settled`: narrow the window or give `final_value`.
 
-A `value` of `null` with a `finding` is an answer, not a failure: `level_not_reached` means the signal never got there. Other findings are `no_transition`, `not_settled`, `outside_data` and `non_finite_data`.
+A `value` of `null` with a `finding` is an answer, not a failure.
+
+| Finding | Meaning |
+|---|---|
+| `level_not_reached` | The signal never got there |
+| `starts_on_level` | It was already on the level when the window began, and never crossed it |
+| `no_transition` | The signal is flat, or the step runs the other way |
+| `final_value_needed` | The window's last value cannot stand in for the final value |
+| `not_settled` | It is still outside the band at the end of the window |
+| `outside_data` | The window or time holds no data |
+| `non_finite_data` | The data, or the result, is not a finite number |
+
+**Initial conditions.** With `use_initial_conditions`, ngspice saves no point at time zero, so `analysis.first_point_seconds` is above 0 and `no_point_at_start` warns that a peak at that instant reads low and an integral misses the first step. Device probes would also lose a `.ic` on a net, so with a `.ic` card only node voltages and source currents are saved, and `i(R1)` or `p(R1)` read `signal_not_found`. An `IC=` value on the device has neither limit on probes. To keep device currents, use `IC=`.
 
 ## Fixing an Unmodelled Symbol
 
@@ -87,8 +99,8 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 ## Reading a Result
 
 - **`outcome.status`:** `complete` means the requested range was covered and every measurement found its signal. `partial` means the data is real but stops early or a signal was missing, and `stopped.reason` says why it stopped: `timeout`, `size_limit`, `no_convergence` or `incomplete_coverage`.
-- **`analysis.coverage_ratio`:** how much of the requested time ran. On a partial run every measurement carries `window_truncated: true`, because it describes only the part that ran. Say so, and never report such a peak as the run's peak.
-- **`finding: "signal_not_found"`:** the run does not hold that signal. Circuits with digital parts save only voltages and source currents.
+- **`analysis.coverage_ratio`:** how much of the requested time ran. On a partial run every measurement and summary carries `window_truncated: true`, because it describes only the part that ran. Say so, and never report such a peak as the run's peak. On a complete run the same flag means that measurement's window reached past the saved data, such as before `start_save_seconds`.
+- **`finding: "signal_not_found"`:** the run does not hold that signal. Circuits with digital parts save only analog node voltages and source currents.
 - **`simulated_circuit`:** `modified` means parts were excluded or added. Never present such a result as describing the schematic as drawn.
 - **`circuit.approximations`:** parts whose behaviour rests on an assumption. Say so when they matter.
 - **`warnings`:** read them. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means a digital circuit reports only voltages and source currents.

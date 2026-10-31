@@ -42,8 +42,9 @@ const MAX_ENVELOPE_POINTS: u64 = 64;
 /// The print step as a share of the stop time. Too small a share kills the engine
 /// outright, as `.tran 1n 10` does, because it sizes memory from this ratio.
 const PRINT_STEPS: f64 = 2000.0;
-/// The shortest and longest stop times run on the engine.
-const STOP_TIME_RANGE: std::ops::RangeInclusive<f64> = 1e-15..=1e12;
+/// The stop times that run on the engine. Far longer ones stop for no reason in
+/// the circuit: ngspice's smallest step is a fixed share of its largest.
+const STOP_TIME_RANGE: std::ops::RangeInclusive<f64> = 1e-15..=1e6;
 /// How close to the stop time a run must end to count as covering it.
 const COVERAGE_TOLERANCE: f64 = 1e-6;
 const SOURCE: &str = "saved_schematic_snapshot";
@@ -451,10 +452,11 @@ impl Transient {
             ));
         }
         let max_step = number("max_step_seconds")?;
-        if max_step.is_some_and(|step| step <= 0.0 || step < stop * f64::EPSILON) {
+        if max_step.is_some_and(|step| step < stop * f64::EPSILON || step > stop) {
             return Err(invalid(
                 "analysis.max_step_seconds",
-                "max_step_seconds must be above 0 and within reach of the stop time",
+                "max_step_seconds must be above 0, within reach of the stop time, and no \
+                 larger than it",
             ));
         }
         let start_save = number("start_save_seconds")?;
@@ -477,11 +479,12 @@ impl Transient {
     /// Only numbers formatted here, never text from a caller.
     fn line(&self) -> String {
         let mut line = format!(".tran {:e} {:e}", self.stop / PRINT_STEPS, self.stop);
+        // Left to itself, ngspice sizes the largest step from the saved stretch
+        // alone, so a late `start_save_seconds` would crawl through the whole run.
         if self.start_save.is_some() || self.max_step.is_some() {
-            line.push_str(&format!(" {:e}", self.start_save.unwrap_or(0.0)));
-        }
-        if let Some(step) = self.max_step {
-            line.push_str(&format!(" {step:e}"));
+            let step = self.max_step.unwrap_or(self.stop / PRINT_STEPS);
+            let start = self.start_save.unwrap_or(0.0);
+            line.push_str(&format!(" {start:e} {step:e}"));
         }
         if self.use_initial_conditions {
             line.push_str(" uic");
@@ -491,6 +494,10 @@ impl Transient {
 
     fn reached(plot: &Plot) -> Option<f64> {
         plot.real(plot.variable("time")?).last()
+    }
+
+    fn first_point(plot: &Plot) -> Option<f64> {
+        plot.real(plot.variable("time")?).next()
     }
 
     fn covered(&self, plot: &Plot) -> bool {
@@ -537,6 +544,10 @@ impl Analysis {
             Self::OperatingPoint => operating_point_covered(plot),
             Self::Transient(transient) => transient.covered(plot),
         }
+    }
+
+    fn uses_initial_conditions(&self) -> bool {
+        matches!(self, Self::Transient(run) if run.use_initial_conditions)
     }
 }
 
@@ -737,11 +748,19 @@ fn top_level_elements(deck: &FlatDeck) -> Vec<&str> {
     names
 }
 
+/// Whether the deck sets node voltages with `.ic`.
+fn sets_node_conditions(deck: &FlatDeck) -> bool {
+    deck.lines().any(|(text, _, _)| {
+        let first = text.split_whitespace().next().unwrap_or_default();
+        first.to_ascii_lowercase().starts_with(".ic")
+    })
+}
+
 /// Konnect's own lines after the vetted deck. They hold nothing from a caller:
 /// the analysis is numbers formatted here, and a probe names a deck element.
-fn own_lines(analysis: &Analysis, event_nodes: bool, probes: &[String]) -> Vec<String> {
+fn own_lines(analysis: &Analysis, save_currents: bool, probes: &[String]) -> Vec<String> {
     let mut lines = vec![SAVE_ALL_VOLTAGES.to_string()];
-    if !event_nodes {
+    if save_currents {
         lines.push(SAVE_ALL_CURRENTS.to_string());
     }
     lines.extend_from_slice(probes);
@@ -833,15 +852,21 @@ async fn run_analysis(
         .preflight
         .as_ref()
         .is_some_and(|preflight| preflight.event_nodes);
-    let probes = signals::power_probes(
-        request.wanted.all_signals(),
-        Names {
-            nets: &design.nets,
-            elements: &design.elements,
-        },
-        &top_level_elements(deck),
-    );
-    let own_lines = own_lines(&request.analysis, event_nodes, &probes);
+    // A probe moves a device's pin onto a hidden node, and under `uic` a device
+    // takes its start from its own pins: a `.ic` on the net would be lost.
+    let keep_conditions = request.analysis.uses_initial_conditions() && sets_node_conditions(deck);
+    let probes = match keep_conditions {
+        true => Vec::new(),
+        false => signals::power_probes(
+            request.wanted.all_signals(),
+            Names {
+                nets: &design.nets,
+                elements: &design.elements,
+            },
+            &top_level_elements(deck),
+        ),
+    };
+    let own_lines = own_lines(&request.analysis, !event_nodes && !keep_conditions, &probes);
     prepare_run(&run, deck, &own_lines, &worker_request)
         .map_err(|error| store_failure(format!("Failed to prepare the run: {error:#}")))?;
     let end = run_worker(runtime, &run.dir, &library, budget)
@@ -857,6 +882,7 @@ async fn run_analysis(
         })?;
 
     let finish = RunEnd {
+        keep_conditions,
         request,
         run: &run,
         design: &design,
@@ -869,6 +895,8 @@ async fn run_analysis(
 
 /// Everything known once the worker has gone.
 struct RunEnd<'a> {
+    /// Probes were left out so `.ic` voltages hold.
+    keep_conditions: bool,
     request: &'a RunArguments<'a>,
     run: &'a runs::RunFolder,
     design: &'a Design,
@@ -1115,6 +1143,7 @@ impl RunEnd<'_> {
                         text,
                         signal.unit(),
                         wanted.envelope_points,
+                        partial,
                     ));
                 }
                 Err(not_found) => {
@@ -1142,9 +1171,11 @@ impl RunEnd<'_> {
             }
         }
         let reached = Transient::reached(plot).unwrap_or(0.0);
+        let first_point = Transient::first_point(plot).unwrap_or(0.0);
         let analysis = json!({
             "kind": self.request.analysis.kind(),
             "stop_time_seconds": transient.stop,
+            "first_point_seconds": first_point,
             "simulated_to_seconds": reached,
             "coverage_ratio": (reached / transient.stop).min(1.0),
             "points": plot.points,
@@ -1156,12 +1187,20 @@ impl RunEnd<'_> {
         if !wanted.signals.is_empty() {
             body["signal_summaries"] = json!(summaries);
         }
-        if !shared_nets.is_empty() {
-            if let Some(warnings) = body["warnings"].as_array_mut() {
+        if let Some(warnings) = body["warnings"].as_array_mut() {
+            if !shared_nets.is_empty() {
                 warnings.push(json!({
                     "code": "nets_share_engine_node",
                     "detail": "ngspice reads these nets as one node, so their signals are the same.",
                     "items": shared_nets,
+                }));
+            }
+            if first_point > 0.0 && transient.start_save.is_none() {
+                warnings.push(json!({
+                    "code": "no_point_at_start",
+                    "detail": "With use_initial_conditions ngspice saves no point at time zero, \
+                               so an event at that instant is cut short: a peak reads low, and \
+                               an integral misses the first step. See first_point_seconds.",
                 }));
             }
         }
@@ -1210,9 +1249,16 @@ impl RunEnd<'_> {
                 warnings.push(json!({
                     "code": "device_currents_not_saved",
                     "detail": "ngspice cannot probe device currents next to digital nodes, so \
-                               only voltages and source currents are saved.",
+                               only analog node voltages and source currents are saved.",
                 }));
             }
+        }
+        if self.keep_conditions {
+            warnings.push(json!({
+                "code": "device_currents_not_saved",
+                "detail": "Device probes would lose .ic voltages under use_initial_conditions, \
+                           so only node voltages and source currents are saved.",
+            }));
         }
         if !self.engine.code_models_failed.is_empty() {
             warnings.push(json!({
@@ -2258,7 +2304,7 @@ mod tests {
         );
         assert_eq!(
             line(json!({ "stop_time_seconds": 1, "start_save_seconds": 0.5 })),
-            ".tran 5e-4 1e0 5e-1"
+            ".tran 5e-4 1e0 5e-1 5e-4"
         );
         assert_eq!(
             line(json!({
@@ -2287,7 +2333,7 @@ mod tests {
         refused(json!({ "stop_time_seconds": -1 }), stop);
         refused(json!({ "stop_time_seconds": "soon" }), stop);
         refused(json!({ "stop_time_seconds": 1e-16 }), stop);
-        refused(json!({ "stop_time_seconds": 1e13 }), stop);
+        refused(json!({ "stop_time_seconds": 1e7 }), stop);
         let step = "analysis.max_step_seconds";
         refused(
             json!({ "stop_time_seconds": 1, "max_step_seconds": 0 }),
@@ -2299,6 +2345,10 @@ mod tests {
         );
         refused(
             json!({ "stop_time_seconds": 1, "max_step_seconds": 1e-20 }),
+            step,
+        );
+        refused(
+            json!({ "stop_time_seconds": 1, "max_step_seconds": 2 }),
             step,
         );
         let start = "analysis.start_save_seconds";
@@ -2382,11 +2432,11 @@ mod tests {
         let run = Analysis::Transient(transient(json!({ "stop_time_seconds": 1 })).unwrap());
         let probes = [".probe p(R1)".to_string()];
         assert_eq!(
-            own_lines(&run, false, &probes),
+            own_lines(&run, true, &probes),
             [".save all", ".probe alli", ".probe p(R1)", ".tran 5e-4 1e0"]
         );
         assert_eq!(
-            own_lines(&Analysis::OperatingPoint, true, &[]),
+            own_lines(&Analysis::OperatingPoint, false, &[]),
             [".save all", ".op"]
         );
     }
@@ -2510,6 +2560,7 @@ mod tests {
                 assert_eq!(body["measurements"][0]["value"], 2.0, "{body}");
                 assert_eq!(body["measurements"][0]["window_truncated"], true);
                 assert_eq!(body["measurements"][1]["window_truncated"], true);
+                assert_eq!(body["signal_summaries"][0]["window_truncated"], true);
             }
         }
 
@@ -2556,6 +2607,16 @@ mod tests {
             assert_eq!(body["measurements"][1]["pins"], json!(["d"]));
             assert_eq!(body["signal_summaries"][0]["finding"], "signal_not_found");
             assert!(body.get("stopped").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_run_that_starts_at_zero_gives_no_start_warning() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let (_, body) = call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert_eq!(body["analysis"]["first_point_seconds"], 0.0, "{body}");
+            assert!(!body["warnings"].to_string().contains("no_point_at_start"));
+            assert_eq!(body["signal_summaries"][0]["window_truncated"], false);
         }
 
         #[tokio::test]
@@ -2608,6 +2669,61 @@ mod tests {
             assert_eq!(deck.matches(".probe p(").count(), 1, "{deck}");
             assert!(deck.contains("\n.probe p(RX)\n"), "{deck}");
             assert!(!deck.to_lowercase().contains("nope"), "{deck}");
+        }
+
+        fn with_initial_conditions(root: &Path, line: &str) -> Value {
+            let mut arguments = args(root);
+            arguments["analysis"] = json!({
+                "kind": "transient",
+                "stop_time_seconds": 2.0,
+                "use_initial_conditions": true,
+            });
+            arguments["signals"] = json!(["p(RX)"]);
+            arguments["testbench"]["spice_lines"] = json!(["VX a 0 1", "RX a 0 1k", line]);
+            arguments
+        }
+
+        #[tokio::test]
+        async fn a_node_condition_under_uic_keeps_every_probe_out_of_the_deck() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = with_initial_conditions(&scene.root, ".ic v(a)=5");
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            let deck = std::fs::read_to_string(run_dirs(&scene)[0].join(DECK_FILE)).unwrap();
+            assert!(!deck.contains(".probe"), "{deck}");
+            assert!(deck.contains("uic\n"), "{deck}");
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("device_currents_not_saved"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_device_condition_under_uic_keeps_its_probes() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = with_initial_conditions(&scene.root, "CX a 0 1u IC=1");
+            call(&scene, arguments).await;
+            let deck = std::fs::read_to_string(run_dirs(&scene)[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains(".probe alli"), "{deck}");
+            assert!(deck.contains(".probe p(RX)"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn a_run_with_no_point_at_zero_says_so() {
+            let job = format!(
+                "{}\nsed -i.bak 's/^0\\t0.0$/0\\t0.5/' results.raw\n{}",
+                copy_transient(),
+                status_json("0", "null", true)
+            );
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "transient", "stop_time_seconds": 2.0 });
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["analysis"]["first_point_seconds"], 0.5, "{body}");
+            assert!(
+                body["warnings"].to_string().contains("no_point_at_start"),
+                "{body}"
+            );
         }
 
         #[tokio::test]
