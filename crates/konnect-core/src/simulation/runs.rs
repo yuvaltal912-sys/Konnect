@@ -18,6 +18,8 @@ const CREATE_ATTEMPTS: usize = 8;
 pub(crate) struct RunFolder {
     pub id: String,
     pub dir: PathBuf,
+    /// Old runs that could not be removed. They cost disk, not this run.
+    pub old_runs_kept: usize,
 }
 
 fn project_hash(schematic: &Path) -> std::io::Result<String> {
@@ -56,24 +58,21 @@ fn stamp(seconds: u64) -> String {
 /// The schema enforces this shape too, and handlers check it again, because a
 /// run id becomes a folder name.
 pub(crate) fn is_valid_id(id: &str) -> bool {
-    let hex = |text: &str| {
-        text.bytes()
+    let hex = |text: &[u8]| {
+        text.iter()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     };
-    let parts: Vec<&str> = id.split('-').collect();
-    let [hash, stamp, suffix] = parts.as_slice() else {
-        return false;
-    };
-    let (date, clock) = stamp.split_at(stamp.len().min(9));
-    hash.len() == HASH_CHARS
-        && hex(hash)
-        && stamp.len() == STAMP_CHARS
-        && date
-            .strip_suffix('T')
-            .is_some_and(|date| date.bytes().all(|b| b.is_ascii_digit()))
-        && clock.bytes().all(|byte| byte.is_ascii_digit())
-        && suffix.len() == SUFFIX_CHARS
-        && hex(suffix)
+    let digits = |text: &[u8]| text.iter().all(u8::is_ascii_digit);
+    let bytes = id.as_bytes();
+    let stamp_end = HASH_CHARS + 1 + STAMP_CHARS;
+    bytes.len() == stamp_end + 1 + SUFFIX_CHARS
+        && hex(&bytes[..HASH_CHARS])
+        && bytes[HASH_CHARS] == b'-'
+        && digits(&bytes[HASH_CHARS + 1..HASH_CHARS + 9])
+        && bytes[HASH_CHARS + 9] == b'T'
+        && digits(&bytes[HASH_CHARS + 10..stamp_end])
+        && bytes[stamp_end] == b'-'
+        && hex(&bytes[stamp_end + 1..])
 }
 
 /// A new, empty folder for this run, after dropping the project's oldest.
@@ -96,8 +95,12 @@ pub(crate) fn create(state_root: &Path, schematic: &Path) -> std::io::Result<Run
         let dir = project.join(&id);
         match std::fs::create_dir(&dir) {
             Ok(()) => {
-                prune(&project, &id)?;
-                return Ok(RunFolder { id, dir });
+                let old_runs_kept = prune(&project, &id);
+                return Ok(RunFolder {
+                    id,
+                    dir,
+                    old_runs_kept,
+                });
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -110,10 +113,14 @@ pub(crate) fn create(state_root: &Path, schematic: &Path) -> std::io::Result<Run
     }
 }
 
-/// Keep the newest runs, counting the current one. Anything that is not a real
-/// run folder stays, so a stray file or link is never followed or deleted.
-fn prune(project: &Path, current: &str) -> std::io::Result<()> {
-    let mut runs: Vec<String> = std::fs::read_dir(project)?
+/// Keep the newest runs, counting the current one, and return how many old ones
+/// would not go. A failure here must never refuse a good run. Anything that is not
+/// a real run folder stays, so a stray file or link is never followed or deleted.
+fn prune(project: &Path, current: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(project) else {
+        return 0;
+    };
+    let mut runs: Vec<String> = entries
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| entry.file_name().into_string().ok())
@@ -121,10 +128,12 @@ fn prune(project: &Path, current: &str) -> std::io::Result<()> {
         .collect();
     runs.sort();
     let surplus = runs.len().saturating_sub(KEEP_RUNS - 1);
-    for name in &runs[..surplus] {
-        std::fs::remove_dir_all(project.join(name))?;
-    }
-    Ok(())
+    let gone = |name: &&String| match std::fs::remove_dir_all(project.join(name)) {
+        Ok(()) => false,
+        // Another server pruned the same run first.
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    runs[..surplus].iter().filter(gone).count()
 }
 
 #[cfg(test)]
@@ -174,6 +183,8 @@ mod tests {
             "3fa9c1d27b04-2026103aT133512-7f3a",
             "3fa9c1d27b04-20261030T13351a-7f3a",
             "3fa9c1d27b04-20261030T133512-7f3",
+            "3fa9c1d27b04-2026103\u{5e9}T1234-0000",
+            "\u{5e9}\u{5e9}\u{5e9}\u{5e9}\u{5e9}\u{5e9}-20261030T133512-7f3a",
         ] {
             assert!(!is_valid_id(bad), "{bad}");
         }
@@ -193,7 +204,7 @@ mod tests {
         let current = "3fa9c1d27b04-20200101T000000-0000";
         std::fs::create_dir(folder.path().join(current)).unwrap();
 
-        prune(folder.path(), current).unwrap();
+        assert_eq!(prune(folder.path(), current), 0);
 
         let mut left: Vec<String> = std::fs::read_dir(folder.path())
             .unwrap()
@@ -211,6 +222,35 @@ mod tests {
         assert_eq!(runs, KEEP_RUNS + stray_file);
     }
 
+    #[test]
+    fn a_stray_folder_name_cannot_stop_a_run() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = schematic(folder.path());
+        let first = create(folder.path(), &root).unwrap();
+        let project = first.dir.parent().unwrap();
+        let hash = first.id.split('-').next().unwrap();
+        std::fs::create_dir(project.join(format!("{hash}-20261030\u{5e9}T1234-0000"))).unwrap();
+        assert!(create(folder.path(), &root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_will_not_go_is_counted_and_stops_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let stuck = folder.path().join("3fa9c1d27b04-20000101T000000-0000");
+        std::fs::create_dir_all(stuck.join("inner/deep")).unwrap();
+        let inner = stuck.join("inner");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+        for second in 0..KEEP_RUNS {
+            let id = format!("3fa9c1d27b04-20261030T{second:06}-0000");
+            std::fs::create_dir(folder.path().join(id)).unwrap();
+        }
+        let kept = prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(kept, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_link_is_never_followed_or_removed() {
@@ -223,7 +263,7 @@ mod tests {
             let id = format!("3fa9c1d27b04-20261030T{second:06}-0000");
             std::fs::create_dir(folder.path().join(id)).unwrap();
         }
-        prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000").unwrap();
+        prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000");
         assert!(outside.path().join("precious").exists());
         assert!(link.symlink_metadata().is_ok());
     }

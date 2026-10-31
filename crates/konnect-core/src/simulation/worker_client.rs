@@ -12,7 +12,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::Command;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// After its budget the worker gets this long to stop by itself. It leaves on its
 /// own a little sooner, so this only catches a process that is truly stuck.
 const KILL_GRACE: Duration = Duration::from_secs(15);
@@ -122,6 +122,7 @@ impl EngineStatus {
 pub(crate) async fn probe_engine(
     runtime: Option<&SimulationRuntime>,
     kicad_cli: &str,
+    limit: Duration,
 ) -> EngineStatus {
     let Some(runtime) = runtime else {
         let mut status = EngineStatus::unavailable("not_available");
@@ -139,7 +140,7 @@ pub(crate) async fn probe_engine(
     };
     let code_models =
         kicad_install::find_code_models_dir(&runtime.settings.ngspice_code_models_dir, &library);
-    probe_library(runtime, &library, code_models.as_deref(), PROBE_TIMEOUT).await
+    probe_library(runtime, &library, code_models.as_deref(), limit).await
 }
 
 async fn probe_library(
@@ -216,8 +217,10 @@ fn worker_command(runtime: &SimulationRuntime, dir: &Path) -> Command {
         .args(["--protocol", &PROTOCOL_VERSION.to_string()])
         .current_dir(dir)
         .env_clear()
-        .env("SPICE_SCRIPTS", dir)
-        .env("SPICE_USERINIT_DIR", dir)
+        // Relative: ngspice copies these into fixed buffers, and a long state
+        // folder would overrun them.
+        .env("SPICE_SCRIPTS", ".")
+        .env("SPICE_USERINIT_DIR", ".")
         .stdin(Stdio::null())
         .kill_on_drop(true);
     command
@@ -337,11 +340,7 @@ pub(crate) fn classify(
         return Verdict::Failed("engine_load_failed");
     }
     if status.exit_status.is_some() {
-        return Verdict::Failed(if status.run_started {
-            "engine_crashed"
-        } else {
-            "load_failed"
-        });
+        return Verdict::Failed("engine_failed");
     }
     let Some(sim_status) = status.sim_status else {
         return Verdict::Failed("circuit_not_parsed");
@@ -531,7 +530,6 @@ mod tests {
             code_models_loaded: Vec::new(),
             code_models_failed: Vec::new(),
             exit_status: None,
-            run_started: true,
             sim_status,
             halted_reason: None,
             results_written: true,
@@ -615,18 +613,7 @@ mod tests {
             exit_status: Some(1),
             ..status(Some(0))
         };
-        assert_eq!(
-            verdict(exited.clone(), &good),
-            Verdict::Failed("engine_crashed")
-        );
-        let while_loading = RunStatus {
-            run_started: false,
-            ..exited
-        };
-        assert_eq!(
-            verdict(while_loading, &good),
-            Verdict::Failed("load_failed")
-        );
+        assert_eq!(verdict(exited, &good), Verdict::Failed("engine_failed"));
         let unloaded = RunStatus {
             load_error: Some("no library".to_string()),
             ..status(Some(0))
@@ -701,7 +688,7 @@ mod tests {
         let tools = tempfile::tempdir().unwrap();
         let body = format!(
             "test -f .spiceinit && test ! -s .spiceinit && test -z \"$HOME\" && \
-             test \"$SPICE_SCRIPTS\" = \"$PWD\" || exit 9\ncat > {STATUS_FILE} <<'JSON'\n{}\nJSON\n",
+             test \"$SPICE_SCRIPTS\" = . || exit 9\ncat > {STATUS_FILE} <<'JSON'\n{}\nJSON\n",
             serde_json::to_string(&status(Some(0))).unwrap()
         );
         let worker = write_script(tools.path(), "worker", &body, "");
@@ -719,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_process_without_the_worker_says_so() {
-        let status = probe_engine(None, "").await;
+        let status = probe_engine(None, "", PROBE_TIMEOUT).await;
         assert_eq!(status.probe_status, "not_available");
         assert!(!status.available);
     }
@@ -736,7 +723,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let status = probe_engine(Some(&runtime), "").await;
+        let status = probe_engine(Some(&runtime), "", PROBE_TIMEOUT).await;
         assert_eq!(status.probe_status, "not_found");
         assert_eq!(status.searched_locations, vec![display(&missing)]);
     }
@@ -804,7 +791,7 @@ mod tests {
         let body = format!(
             "{{ if read -r line; then echo stdin-open; else echo stdin-null; fi; \
              test -f .spiceinit && test ! -s .spiceinit && echo spiceinit-blank; \
-             test ! -e \"$SPICE_SCRIPTS/spinit\" && echo spinit-absent; \
+             test \"$SPICE_SCRIPTS\" = . && test ! -e spinit && echo spinit-absent; \
              /usr/bin/env; }} > '{}'\necho '{good}'\n",
             seen.display()
         );

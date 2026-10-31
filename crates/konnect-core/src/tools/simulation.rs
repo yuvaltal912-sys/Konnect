@@ -13,13 +13,14 @@ use crate::simulation::protocol::{
 use crate::simulation::raw::Plot;
 use crate::simulation::worker_client::{
     classify, probe_engine, read_results, run_worker, EngineStatus, SimulationRuntime, Verdict,
-    WorkerEnd,
+    WorkerEnd, PROBE_TIMEOUT,
 };
 use crate::simulation::{runs, snapshot};
 use crate::tool;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,9 @@ const MAX_LOG_ITEMS: usize = 12;
 const MAX_LOG_ITEM_CHARS: usize = 300;
 /// The worker runs with no init file on purpose, so this says nothing.
 const SPINIT_NOTICE: &str = "Warning: can't find the initialization file";
+const MODEL_LINE_NOTE: &str = "A line quoting a model file. See the log.";
+/// The engine's status variable, which ends the part of a log worth reading.
+const STATUS_NAME: &str = "sim_status";
 const OPERATING_POINT_FILE: &str = "operating_point.json";
 /// KiCad's own defaults for what to save. `.probe alli` stops the engine on any
 /// event-driven node, so it is left out of those circuits.
@@ -176,6 +180,7 @@ async fn handle_check_simulation_readiness(
     let engine = probe_engine(
         ctx.simulation.get().map(|r| r.as_ref()),
         &ctx.config.kicad_cli,
+        PROBE_TIMEOUT,
     )
     .await;
     let model_dirs = ctx
@@ -268,8 +273,9 @@ struct RunArguments<'a> {
 async fn usable_engine(
     runtime: &SimulationRuntime,
     kicad_cli: &str,
+    limit: Duration,
 ) -> Result<EngineStatus, CallToolResult> {
-    let engine = probe_engine(Some(runtime), kicad_cli).await;
+    let engine = probe_engine(Some(runtime), kicad_cli, limit).await;
     if engine.available {
         return Ok(engine);
     }
@@ -305,6 +311,16 @@ fn export_failure(error: &anyhow::Error) -> CallToolResult {
         "netlist_export_failed"
     };
     simulation_failure("export", reason, None, Vec::new(), message)
+}
+
+fn out_of_budget() -> CallToolResult {
+    simulation_failure(
+        "export",
+        "netlist_export_timed_out",
+        None,
+        Vec::new(),
+        "The time budget ran out before the simulator could start.",
+    )
 }
 
 fn deck_refusal(refusal: &Refusal) -> CallToolResult {
@@ -396,17 +412,25 @@ async fn run_analysis(
             "This process does not carry the simulation worker (embedded or library use).",
         ));
     };
-    let engine = usable_engine(runtime, &ctx.config.kicad_cli).await?;
+    let probe_limit = request.budget.min(PROBE_TIMEOUT);
+    let engine = usable_engine(runtime, &ctx.config.kicad_cli, probe_limit).await?;
+    let export_budget = request.budget.saturating_sub(started.elapsed());
     let inputs = DesignInputs {
         model_dirs: runtime.model_dirs(),
         testbench: request.testbench,
         allow_digital_models: runtime.allows_digital_models(),
         code_model_count: engine.code_model_count,
-        export_timeout: request.budget.min(EXPORT_TIMEOUT),
+        export_timeout: export_budget.min(EXPORT_TIMEOUT),
     };
-    let design = inspect_design(&ctx.config.kicad_cli, request.schematic, &inputs)
-        .await
-        .map_err(|error| export_failure(&error))?;
+    let inspected = tokio::time::timeout(
+        export_budget,
+        inspect_design(&ctx.config.kicad_cli, request.schematic, &inputs),
+    )
+    .await;
+    let design = match inspected {
+        Ok(design) => design.map_err(|error| export_failure(&error))?,
+        Err(_) => return Err(out_of_budget()),
+    };
     let deck = design.deck.as_ref().map_err(deck_refusal)?;
     if let Some(refusal) = design
         .preflight
@@ -420,23 +444,17 @@ async fn run_analysis(
         .checked_sub(started.elapsed())
         .filter(|budget| !budget.is_zero())
     else {
-        return Err(simulation_failure(
-            "export",
-            "netlist_export_timed_out",
-            None,
-            Vec::new(),
-            "The time budget ran out before the simulator could start.",
-        ));
+        return Err(out_of_budget());
     };
 
-    let internal =
-        |error: String| simulation_failure("run", "engine_load_failed", None, Vec::new(), error);
+    let store_failure =
+        |error: String| simulation_failure("run", "run_store_failed", None, Vec::new(), error);
     let library = PathBuf::from(engine.library_path.clone().unwrap_or_default());
     let run = runtime
         .state_root()
         .map_err(|error| error.to_string())
         .and_then(|root| runs::create(&root, request.schematic).map_err(|error| error.to_string()))
-        .map_err(|error| internal(format!("Failed to create a run folder: {error}")))?;
+        .map_err(|error| store_failure(format!("Failed to create a run folder: {error}")))?;
     let worker_request = RunRequest {
         protocol: PROTOCOL_VERSION,
         library: library.clone(),
@@ -451,10 +469,18 @@ async fn run_analysis(
         .as_ref()
         .is_some_and(|preflight| preflight.event_nodes);
     prepare_run(&run, deck, event_nodes, &worker_request)
-        .map_err(|error| internal(format!("Failed to prepare the run: {error:#}")))?;
+        .map_err(|error| store_failure(format!("Failed to prepare the run: {error:#}")))?;
     let end = run_worker(runtime, &run.dir, &library, budget)
         .await
-        .map_err(|error| internal(format!("{error:#}")))?;
+        .map_err(|error| {
+            simulation_failure(
+                "engine",
+                "engine_load_failed",
+                None,
+                Vec::new(),
+                format!("{error:#}"),
+            )
+        })?;
 
     let finish = RunEnd {
         request,
@@ -535,22 +561,35 @@ fn operating_point_covered(plot: &Plot) -> bool {
     plot.points == 1 && !plot.is_truncated() && !plot.variables.is_empty()
 }
 
-/// What the engine said went wrong. Its log can quote any deck line, and text
-/// from a model file is not ours to repeat, so those lines are named only.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// What the engine said went wrong. It rewrites deck lines and quotes pieces of
+/// them, and text from a model file is not ours to repeat, so a line is shown only
+/// if none of its words come from model files alone. A false match hides a line,
+/// which stays in the log.
 fn engine_complaints(log: &str, deck: &FlatDeck) -> Vec<String> {
-    let included: Vec<String> = deck
-        .lines()
-        .filter(|(_, _, included)| *included)
-        .map(|(text, _, _)| text.trim().to_lowercase())
-        .filter(|text| !text.is_empty())
-        .collect();
-    let ours = log.lines().take_while(|line| !line.contains("sim_status"));
+    let mut model_words = HashSet::new();
+    let mut own_words = HashSet::new();
+    for (text, _, included) in deck.lines() {
+        let target = if included {
+            &mut model_words
+        } else {
+            &mut own_words
+        };
+        target.extend(words(text));
+    }
+    let ours = log.lines().take_while(|line| !line.contains(STATUS_NAME));
     ours.filter_map(|line| line.strip_prefix("stderr "))
         .filter(|line| !line.starts_with(SPINIT_NOTICE))
         .map(|line| {
-            let lower = line.to_lowercase();
-            if included.iter().any(|text| lower.contains(text)) {
-                "A line from an included model file. See the log.".to_string()
+            let private =
+                words(line).any(|word| model_words.contains(&word) && !own_words.contains(&word));
+            if private {
+                MODEL_LINE_NOTE.to_string()
             } else {
                 line.chars().take(MAX_LOG_ITEM_CHARS).collect()
             }
@@ -561,9 +600,9 @@ fn engine_complaints(log: &str, deck: &FlatDeck) -> Vec<String> {
 
 fn failure_message(reason: &str) -> &'static str {
     match reason {
-        "engine_crashed" => "The simulator stopped on a fatal error. The server is unaffected.",
+        "engine_crashed" => "The simulator process died. The server is unaffected.",
+        "engine_failed" => "The simulator stopped on a fatal error. The server is unaffected.",
         "engine_load_failed" => "The simulator could not start this run.",
-        "load_failed" => "The simulator stopped on a fatal error while loading the circuit.",
         "circuit_not_parsed" => "The simulator could not parse the circuit.",
         "no_convergence" => "The analysis did not converge and left no data.",
         "timed_out" => "The time budget ran out before the simulator left any data.",
@@ -584,14 +623,17 @@ impl RunEnd<'_> {
         }
     }
 
+    fn engine_log(&self) -> String {
+        std::fs::read_to_string(self.run.dir.join(LOG_FILE)).unwrap_or_default()
+    }
+
     fn failure(&self, reason: &'static str) -> CallToolResult {
         let stage = match reason {
             "engine_load_failed" => "engine",
             "results_unreadable" => "results",
             _ => "run",
         };
-        let log = std::fs::read_to_string(self.run.dir.join(LOG_FILE)).unwrap_or_default();
-        let mut items = engine_complaints(&log, self.deck);
+        let mut items = engine_complaints(&self.engine_log(), self.deck);
         if let WorkerEnd::Died(how) = self.end {
             items.insert(0, how.clone());
         }
@@ -664,6 +706,22 @@ impl RunEnd<'_> {
             warnings.push(json!({
                 "code": "code_models_failed",
                 "items": self.engine.code_models_failed,
+            }));
+        }
+        // A run can finish after the engine ignored a parameter or changed a value.
+        let messages = engine_complaints(&self.engine_log(), self.deck);
+        if !messages.is_empty() {
+            warnings.push(json!({
+                "code": "engine_messages",
+                "detail": "The engine reported these and carried on. They can change the circuit.",
+                "items": messages,
+            }));
+        }
+        if self.run.old_runs_kept > 0 {
+            warnings.push(json!({
+                "code": "old_runs_kept",
+                "detail": "Old runs could not be removed, so they still use disk.",
+                "total": self.run.old_runs_kept,
             }));
         }
         warnings
@@ -1540,25 +1598,28 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path().canonicalize().unwrap();
         let model = root.join("private.lib");
-        std::fs::write(&model, ".model secret_vendor_part D(IS=1)\n").unwrap();
+        std::fs::write(&model, "R77 b 0 1k SECRETTOKEN=3\n.param secretparam=2\n").unwrap();
         let deck = flat(
-            ".title t\n.include \"INCLUDE\"\nR1 a 0 1k\n",
+            ".title t\n.include \"INCLUDE\"\nR1 own 0 1k\n",
             &model,
             std::slice::from_ref(&root),
         );
         let log = "stdout noise\n\
                    stderr Warning: can't find the initialization file spinit.\n\
-                   stderr .MODEL secret_vendor_part D(IS=1)\n\
-                   stderr r1 a 0 1k\n\
+                   stderr r77 b probe_int_0_r77 1k secrettoken=3\n\
+                   stderr unknown parameter (secrettoken)\n\
+                   stderr Expression err: secretparam*2}\n\
+                   stderr r1 own 0 1k\n\
                    stderr could not find a valid modelname\n\
                    stderr Error: sim_status: no such variable.\n\
                    stderr after the marker\n";
-        let complaints = engine_complaints(log, &deck);
         assert_eq!(
-            complaints,
+            engine_complaints(log, &deck),
             [
-                "A line from an included model file. See the log.",
-                "r1 a 0 1k",
+                MODEL_LINE_NOTE,
+                MODEL_LINE_NOTE,
+                MODEL_LINE_NOTE,
+                "r1 own 0 1k",
                 "could not find a valid modelname",
             ]
         );
@@ -1600,7 +1661,7 @@ mod tests {
 
         const OP_FIXTURE: &str = "tests/fixtures/simulation/raw/op.ascii.raw";
         /// Good status fields, for a fake worker to write.
-        const GOOD: &str = r#""protocol":2,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null,"run_started":true"#;
+        const GOOD: &str = r#""protocol":2,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#;
 
         /// Answers a probe as a working engine, then does `job` in the run folder.
         fn fake_worker(dir: &Path, job: &str) -> PathBuf {
@@ -1800,13 +1861,78 @@ mod tests {
             fails_with("exit 124", "timed_out", "run").await;
             let exited = "cat > status.json <<'JSON'\n{\"protocol\":2,\"load_error\":null,\
                  \"engine_version\":null,\"code_models_loaded\":[],\"code_models_failed\":[],\
-                 \"exit_status\":1,\"run_started\":false,\"sim_status\":null,\
+                 \"exit_status\":1,\"sim_status\":null,\
                  \"halted_reason\":null,\"results_written\":false}\nJSON"
                 .to_string();
-            fails_with(&exited, "load_failed", "run").await;
+            fails_with(&exited, "engine_failed", "run").await;
             let unloaded = exited.replace("\"load_error\":null", "\"load_error\":\"no\"");
             let body = fails_with(&unloaded, "engine_load_failed", "engine").await;
             assert_eq!(body["error"]["items"][0], "no");
+        }
+
+        #[tokio::test]
+        async fn what_the_engine_ignored_reaches_a_complete_result() {
+            let job = format!(
+                "echo 'stderr unrecognized parameter (bogus) - ignored' > engine.log\n{}\n{}",
+                copy_raw(),
+                status_json("0", "null", true)
+            );
+            let scene = scene(&job);
+            let (failed, body) = call(&scene, args(&scene.root)).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete");
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("engine_messages"), "{body}");
+            assert!(
+                warnings.contains("unrecognized parameter (bogus)"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_budget_covers_the_export() {
+            let scene = scene("touch worker-ran");
+            let slow = write_script(scene.tools.path(), "slow-cli", "exec /bin/sleep 20\n", "");
+            let ctx = context(slow.to_str().unwrap());
+            let runtime = scene.ctx.simulation.get().unwrap().clone();
+            ctx.simulation.set(runtime).ok();
+            let scene = Scene { ctx, ..scene };
+            let mut arguments = args(&scene.root);
+            arguments["timeout_seconds"] = json!(1);
+            let started = Instant::now();
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(
+                body["error"]["reason"], "netlist_export_timed_out",
+                "{body}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        #[tokio::test]
+        async fn a_file_the_worker_did_not_report_is_not_read() {
+            let job = format!("{}\n{}", copy_raw(), status_json("1", "null", false));
+            fails_with(&job, "no_convergence", "run").await;
+        }
+
+        #[tokio::test]
+        async fn a_digital_circuit_saves_no_device_currents_and_says_so() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["testbench"]["spice_lines"] = json!([
+                "A1 [/rect_out] [dout] inv",
+                ".model inv d_inverter",
+                "R9 dout 0 1k",
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert!(body["warnings"]
+                .to_string()
+                .contains("device_currents_not_saved"));
+            let deck = std::fs::read_to_string(run_dirs(&scene)[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains(".save all"), "{deck}");
+            assert!(!deck.contains(".probe alli"), "{deck}");
         }
 
         #[tokio::test]

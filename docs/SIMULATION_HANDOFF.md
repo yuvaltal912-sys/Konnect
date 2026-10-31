@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, at the start of PR 6.
+**Last updated:** 2026-10-31, with PR 6 built and under review.
 
 ## Start here
 
@@ -43,14 +43,14 @@ Each PR is based on the one before it. None is merged.
 
 Branch `feat/simulation-run`, from `feat/simulation-raw`. Plan sections: 2.2 (Worker, Limits, Classification, Reading results), 2.3 (`run_simulation`) and 4.
 
-- [ ] Worker run mode in `crates/konnect/src/sim_worker.rs`, with process rights dropped before the deck loads
-- [ ] Classification and supervision in `simulation/worker_client.rs`
-- [ ] Run store in `simulation/runs.rs`, with retention
-- [ ] `run_simulation`, `operating_point` arm only. Each PR declares only the parameters its handler reads
-- [ ] `ToolErrorKind::SimulationFailed` and the outcome envelope
-- [ ] Starter skill `kicad-simulation`
-- [ ] Live tests: a real operating point, a worker crash, process rights, and open questions Q18, Q19 and Q20
-- [ ] Gate, independent review, PR
+- [x] Worker run mode in `crates/konnect/src/sim_worker.rs`, with process rights dropped before the deck loads
+- [x] Classification and supervision in `simulation/worker_client.rs`
+- [x] Run store in `simulation/runs.rs`, with retention
+- [x] `run_simulation`, `operating_point` arm only. Each PR declares only the parameters its handler reads
+- [x] `ToolErrorKind::SimulationFailed` and the outcome envelope
+- [x] Starter skill `kicad-simulation`
+- [x] Live tests: a real operating point, a worker crash, process rights, and open questions Q18, Q19 and Q20
+- [ ] Negative controls, independent review, gate, PR
 
 **Done when:** a real operating point runs, and a worker crash leaves the server alive with a typed error.
 
@@ -112,6 +112,11 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - A halted run writes a complete-looking raw file. Only the worker's own record says it stopped.
 - `write` after a failed analysis falls back to the `constants` plot, and the parser refuses that.
 - The worker runs in the C locale, so ngspice turns every non-ASCII byte in a node name into `_`. Look signals up by the engine's name, such as `v(/__)`.
+- `.probe alli` is a fatal error next to any digital or event node. `run_simulation` leaves it out of those circuits and warns `device_currents_not_saved`. PR 7 needs the same rule.
+- A `SIGSEGV` sent from outside does not kill the worker: Rust's handler swallows it. Test crashes with `SIGABRT`.
+- ngspice expands `$`, `{` and backticks in commands, and copies `SPICE_SCRIPTS` into a fixed buffer. So `write` takes a relative name and `SPICE_SCRIPTS` is `.`. Never put a path in a command.
+- A `bg_halt` sent before the engine's thread starts is lost, so the worker repeats it.
+- ngspice rewrites deck lines in its messages, so matching whole lines cannot keep model text out of errors. `engine_complaints` compares words.
 - `ngSpice_nospinit` and `ngSpice_nospiceinit` crash on 44.2 if called before init. The worker shadows those files instead.
 - `ngSpice_Circ` stops at the first `.end`, and the first line sent is the title.
 - A dangling symlink passes path checks, so test an interpreter by running it.
@@ -121,6 +126,5 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 ## Known open items
 
 - The hosted CI has never run on this fork. It needs the owner's click in the Actions tab.
-- Q18 and Q19 in the plan need a live answer in PR 6: auto-bridge lookup, and `ngCM_Input_Path` for relative table files.
 - Q17 is an accepted limit: `filesource`, `d_source`, `d_state` and table models read a numeric data file named in the deck.
 - Local scratch scripts for mutation runs and dogfooding were never committed. The recipes above replace them.

@@ -42,7 +42,7 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 - **`outcome.status`:** `complete` means the requested range was covered. `partial` means the data is real but stops early, and `stopped.reason` says why.
 - **`simulated_circuit`:** `modified` means parts were excluded or added. Never present such a result as describing the schematic as drawn.
 - **`circuit.approximations`:** parts whose behaviour rests on an assumption. Say so when they matter.
-- **`warnings`:** read them. `device_currents_not_saved` means a digital circuit reports only voltages and source currents.
+- **`warnings`:** read them. `engine_messages` lists what ngspice ignored or changed, which can alter the circuit. `device_currents_not_saved` means a digital circuit reports only voltages and source currents.
 - **`operating_point.rows`:** currents read positive into a device's first pin, so a delivering source reads negative.
 - **Full data:** `artifacts.table_path` holds every row, and `artifacts.deck_path` holds the deck that ran.
 
@@ -59,7 +59,9 @@ Branch on `error.reason`, and show `error.items`.
 | `circuit_not_parsed` | ngspice rejected the deck | Read `error.items` and the log |
 | `no_convergence` | The analysis did not settle | Check for voltage loops and floating gates |
 | `timed_out` | The budget ran out | Raise `timeout_seconds`, up to the client's own limit |
-| `engine_crashed` | The simulator stopped on a fatal error | The server is unaffected. Read the log |
+| `engine_failed` | The simulator stopped on a fatal error | Read `error.items` and the log |
+| `engine_crashed` | The simulator process died | The server is unaffected. Read the log |
+| `unbalanced_deck_block` | A `.if` or `.subckt` is left open | Close it. Check `spice_lines` first |
 | `engine_not_found` | No libngspice was found | Set `ngspice_library`, using the listed locations |
 
 MCP clients often stop waiting at 60 seconds, which is why the default budget is 40.

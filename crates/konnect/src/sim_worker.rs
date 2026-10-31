@@ -47,6 +47,7 @@ const WORKER_GRACE: Duration = Duration::from_secs(10);
 const OUT_OF_TIME: i32 = 124;
 const STATUS_MARKER: &str = "KONNECT_SIM_STATUS=";
 const POLL: Duration = Duration::from_millis(5);
+const HALT_REPEAT: Duration = Duration::from_millis(250);
 /// A chatty deck must not fill the disk.
 const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Lines kept in memory, which only need to reach the banner and code models.
@@ -238,7 +239,6 @@ fn empty_status(load_error: Option<String>) -> RunStatus {
         code_models_loaded: Vec::new(),
         code_models_failed: Vec::new(),
         exit_status: None,
-        run_started: false,
         sim_status: None,
         halted_reason: None,
         results_written: false,
@@ -316,7 +316,6 @@ fn prepare_and_simulate(run_dir: &Path) -> Result<RunStatus> {
         engine.load_circuit(lines);
     }
     if !EXIT_CALLED.load(Ordering::SeqCst) {
-        status.run_started = true;
         engine.run_command("bg_run")?;
         status.halted_reason = engine.wait_for_run(started + budget);
     }
@@ -325,10 +324,11 @@ fn prepare_and_simulate(run_dir: &Path) -> Result<RunStatus> {
         return Ok(status);
     }
     status.sim_status = engine.sim_status();
-    let raw = run_dir.join(RAW_FILE);
-    if status.sim_status.is_some() && raw.to_str().is_some_and(|raw| !raw.contains('\'')) {
-        engine.run_command(&format!("write '{}'", raw.display()))?;
-        status.results_written = raw.is_file();
+    if status.sim_status.is_some() {
+        // Relative, because this process works in the run folder: ngspice expands
+        // `$`, `{` and backticks in a command, and the folder name is not ours.
+        engine.run_command(&format!("write {RAW_FILE}"))?;
+        status.results_written = run_dir.join(RAW_FILE).is_file();
     }
     if EXIT_CALLED.load(Ordering::SeqCst) {
         status.exit_status = Some(EXIT_STATUS.load(Ordering::SeqCst));
@@ -446,13 +446,16 @@ impl Engine {
         unsafe { (self.circuit)(pointers.as_mut_ptr()) };
     }
 
-    /// Wait for the run, halting it softly at the deadline. `bg_halt` is
-    /// cooperative, so a run that ignores it ends at the worker's own deadline.
+    /// Wait for the run, halting it softly at the deadline. A halt sent before
+    /// the engine's thread starts is lost, so it repeats. `bg_halt` is cooperative,
+    /// so a run that ignores it ends at the worker's own deadline.
     fn wait_for_run(&self, deadline: Instant) -> Option<HaltReason> {
         let mut halted = None;
+        let mut next_halt = deadline;
         while !RUN_FINISHED.load(Ordering::SeqCst) && !EXIT_CALLED.load(Ordering::SeqCst) {
-            if halted.is_none() && Instant::now() >= deadline {
+            if Instant::now() >= next_halt {
                 halted = Some(HaltReason::Timeout);
+                next_halt = Instant::now() + HALT_REPEAT;
                 let _ = self.run_command("bg_halt");
             }
             std::thread::sleep(POLL);
@@ -463,6 +466,7 @@ impl Engine {
     /// The library has no getter for this, so have the engine print it. An
     /// undefined variable comes back as its own name, which reads as none.
     fn sim_status(&self) -> Option<i32> {
+        *STATUS_LINE.lock().ok()? = None;
         self.run_command(&format!("echo {STATUS_MARKER}$sim_status"))
             .ok()?;
         let line = STATUS_LINE.lock().ok()?.clone()?;

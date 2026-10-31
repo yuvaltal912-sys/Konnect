@@ -159,6 +159,7 @@ pub(crate) fn run(inputs: &Inputs<'_>) -> Preflight {
     let reads_shorthand = inputs.compatibility.reads_value_shorthand();
     let mut checks = vec![
         model_coverage(&unmodelled_symbols),
+        deck_structure(inputs.deck),
         component_values(&circuit, reads_shorthand),
         ground(&circuit, inputs.nets),
         net_names(inputs),
@@ -839,6 +840,36 @@ fn dc_groups(circuit: &Circuit) -> Groups {
         paths.add(element, &mut groups);
     }
     groups
+}
+
+/// An open `.if` or `.subckt` swallows the analysis line Konnect adds after it,
+/// and the engine then reports a failure that says nothing of the cause.
+fn deck_structure(deck: &FlatDeck) -> Check {
+    let mut open_blocks = Vec::new();
+    let mut stray = Vec::new();
+    for (text, _, _) in deck.lines() {
+        let line = text.trim().to_lowercase();
+        let word = line.split(|c: char| c.is_whitespace() || c == '(').next();
+        match word.unwrap_or_default() {
+            ".if" => open_blocks.push(".if"),
+            ".subckt" => open_blocks.push(".subckt"),
+            ".endif" if open_blocks.last() == Some(&".if") => {
+                open_blocks.pop();
+            }
+            ".ends" if open_blocks.last() == Some(&".subckt") => {
+                open_blocks.pop();
+            }
+            word @ (".endif" | ".ends") => stray.push(word.to_string()),
+            _ => {}
+        }
+    }
+    let unclosed = open_blocks.iter().map(|block| format!("{block} left open"));
+    let items: Vec<String> = stray.into_iter().chain(unclosed).collect();
+    if items.is_empty() {
+        Check::passed("deck_structure")
+    } else {
+        Check::failed("deck_structure", "unbalanced_deck_block", items)
+    }
 }
 
 /// Digital parts, and the event-driven parts in `xtraevt`. A kind this misses
@@ -1769,6 +1800,38 @@ mod tests {
             },
         );
         passes(&preflight, "net_names");
+    }
+
+    #[test]
+    fn an_open_block_would_swallow_the_analysis() {
+        let circuit = "V1 a 0 1\nR1 a 0 1k";
+        passes(&deck(circuit), "deck_structure");
+        let balanced = format!("{circuit}\n.subckt x a b\nR2 a b 1k\n.if (1)\n.endif\n.ends x");
+        passes(&deck(&balanced), "deck_structure");
+        for (extra, item) in [
+            (".if (0)", ".if left open"),
+            (".IF(1)", ".if left open"),
+            (".subckt x a b", ".subckt left open"),
+            (".endif", ".endif"),
+            (".ends", ".ends"),
+        ] {
+            let items = fails(
+                &deck(&format!("{circuit}\n{extra}")),
+                "deck_structure",
+                "unbalanced_deck_block",
+            );
+            assert_eq!(items, [item]);
+        }
+    }
+
+    #[test]
+    fn event_nodes_come_from_digital_and_real_valued_parts() {
+        let analog = "V1 a 0 1\nR1 a 0 1k\nA1 a b amp\n.model amp gain(gain=2)\nR2 b 0 1k";
+        assert!(!deck(analog).event_nodes);
+        let digital = "V1 a 0 1\nR1 a 0 1k\nA1 [a] [b] inv\n.model inv d_inverter\nR2 b 0 1k";
+        assert!(deck(digital).event_nodes);
+        let real = "V1 a 0 1\nR1 a 0 1k\nA1 a b dly\n.model dly real_delay\nR2 b 0 1k";
+        assert!(deck(real).event_nodes);
     }
 
     #[test]

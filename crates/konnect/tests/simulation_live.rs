@@ -520,7 +520,11 @@ impl WorkerRun {
     /// A run folder as the server prepares one, with `deck` taken as vetted. This
     /// is how a test reaches past deck vetting to the barriers behind it.
     fn prepare(deck: &str, input_path: Option<&Path>, budget_ms: u64) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::prepare_in(&std::env::temp_dir(), deck, input_path, budget_ms)
+    }
+
+    fn prepare_in(parent: &Path, deck: &str, input_path: Option<&Path>, budget_ms: u64) -> Self {
+        let dir = tempfile::tempdir_in(parent).unwrap();
         let (library, code_models) = engine_paths();
         let request = RunRequest {
             protocol: PROTOCOL_VERSION,
@@ -549,8 +553,8 @@ impl WorkerRun {
             .arg(self.dir.path())
             .current_dir(self.dir.path())
             .env_clear()
-            .env("SPICE_SCRIPTS", self.dir.path())
-            .env("SPICE_USERINIT_DIR", self.dir.path())
+            .env("SPICE_SCRIPTS", ".")
+            .env("SPICE_USERINIT_DIR", ".")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -595,6 +599,41 @@ fn a_run_past_its_budget_halts_softly_and_keeps_its_data() {
     let time = plot.variable("time").unwrap();
     let reached = plot.real(time).last().unwrap();
     assert!(reached > 0.0 && reached < 1.0, "{reached}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_budget_that_ends_before_the_engine_starts_still_halts_softly() {
+    let run = WorkerRun::prepare(SLOW_DECK, None, 1);
+
+    let status = run.finish();
+
+    assert_eq!(
+        status.halted_reason,
+        Some(HaltReason::Timeout),
+        "{}",
+        run.log()
+    );
+    assert_eq!(status.sim_status, Some(0));
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_run_folder_name_never_reaches_the_engine_as_text() {
+    const DECK: &str = ".title t\nV1 a 0 1\nR1 a 0 1k\n.save all\n.op\n.end\n";
+    let scratch = tempfile::tempdir().unwrap();
+    let long = "n".repeat(200);
+    for name in ["it's", "a$b", "c{d}", "e`echo hi`f", "with space", &long] {
+        let mut parent = scratch.path().join(name);
+        if name == long {
+            parent = parent.join(&long).join(&long);
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        let run = WorkerRun::prepare_in(&parent, DECK, None, 5_000);
+        let status = run.finish();
+        assert!(status.results_written, "{name}: {}", run.log());
+        assert_eq!(run.plot().points, 1, "{name}");
+    }
 }
 
 /// Abort, because the engine can call it. A `SIGSEGV` sent from outside proves
