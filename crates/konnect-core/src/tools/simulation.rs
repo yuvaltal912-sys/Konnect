@@ -1646,6 +1646,40 @@ mod tests {
     }
 
     #[test]
+    fn a_non_ascii_model_word_is_recognised_after_the_engine_rewrites_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("hebrew.lib");
+        std::fs::write(&model, ".model dx D(AB\u{5e9}HIDDENPART=3)\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stderr unknown parameter (ab__hiddenpart)\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert!(shown.is_empty(), "{shown:?}");
+        assert_eq!(hidden, 1);
+    }
+
+    #[test]
+    fn a_word_the_schematic_also_uses_is_not_private() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("shared.lib");
+        std::fs::write(&model, ".param sharedname=1\n").unwrap();
+        let deck = flat(
+            ".title t\n.include \"INCLUDE\"\n.param sharedname=2\nR1 own 0 1k\n",
+            &model,
+            std::slice::from_ref(&root),
+        );
+        let log = "stderr unknown parameter (sharedname)\n";
+        let (shown, hidden) = engine_complaints(log, &deck);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
     fn a_short_model_word_does_not_hide_a_line_about_the_schematic() {
         let folder = tempfile::tempdir().unwrap();
         let root = folder.path().canonicalize().unwrap();

@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 6 built and under review.
+**Last updated:** 2026-10-31, with PR 6 open for the owner's review.
 
 ## Start here
 
@@ -36,10 +36,12 @@ Each PR is based on the one before it. None is merged.
 | 1 to 3 | [#1](https://github.com/yuvaltal912-sys/Konnect/pull/1) | `feat/simulation` | Open |
 | 4 | [#2](https://github.com/yuvaltal912-sys/Konnect/pull/2) | `feat/simulation-preflight` | Open |
 | 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Open |
-| 6 | Not opened | `feat/simulation-run` | **In progress** |
+| 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Open |
 | 7 to 11 | Not opened | | Not started |
 
-## Now: PR 6, an isolated operating point
+## Done last: PR 6, an isolated operating point
+
+**Next is PR 7, once the owner says so.** Branch it from `feat/simulation-run`.
 
 Branch `feat/simulation-run`, from `feat/simulation-raw`. Plan sections: 2.2 (Worker, Limits, Classification, Reading results), 2.3 (`run_simulation`) and 4.
 
@@ -50,7 +52,7 @@ Branch `feat/simulation-run`, from `feat/simulation-raw`. Plan sections: 2.2 (Wo
 - [x] `ToolErrorKind::SimulationFailed` and the outcome envelope
 - [x] Starter skill `kicad-simulation`
 - [x] Live tests: a real operating point, a worker crash, process rights, and open questions Q18, Q19 and Q20
-- [ ] Negative controls, independent review, gate, PR
+- [x] Negative controls, two independent review rounds, gate, PR
 
 **Done when:** a real operating point runs, and a worker crash leaves the server alive with a typed error.
 
@@ -125,6 +127,10 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 
 ## Known open items
 
+- A value computed from a model parameter can still appear in an engine message, because nothing can recognise it. Worth knowing, not worth more code.
+- A real segfault inside libngspice has not been reproduced on 44.2. The crash path is proven with a fake worker and with `SIGABRT` on the real one.
+- `.op` has no pause test, so `bg_halt` cannot stop one. It ends at the worker's own deadline.
+- `class-d`, `laser_driver` and `v_i_sources` report `engine_messages`. `laser_driver` and `v_i_sources` are true positives. The `class-d` lines were not rechecked after progress notes were filtered out.
 - The hosted CI has never run on this fork. It needs the owner's click in the Actions tab.
 - Q17 is an accepted limit: `filesource`, `d_source`, `d_state` and table models read a numeric data file named in the deck.
 - Local scratch scripts for mutation runs and dogfooding were never committed. The recipes above replace them.
