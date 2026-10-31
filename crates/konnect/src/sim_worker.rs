@@ -56,6 +56,7 @@ const MAX_ENGINE_LINES: usize = 10_000;
 static ENGINE_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static EXIT_CALLED: AtomicBool = AtomicBool::new(false);
 static EXIT_STATUS: AtomicI32 = AtomicI32::new(0);
+static RUN_STARTED: AtomicBool = AtomicBool::new(false);
 static RUN_FINISHED: AtomicBool = AtomicBool::new(false);
 static LOG: Mutex<Option<Log>> = Mutex::new(None);
 static STATUS_LINE: Mutex<Option<String>> = Mutex::new(None);
@@ -117,9 +118,12 @@ unsafe extern "C" fn on_background_running(
     _id: c_int,
     _user: *mut c_void,
 ) -> c_int {
-    if not_running {
-        RUN_FINISHED.store(true, Ordering::SeqCst);
-    }
+    let flag = if not_running {
+        &RUN_FINISHED
+    } else {
+        &RUN_STARTED
+    };
+    flag.store(true, Ordering::SeqCst);
     0
 }
 
@@ -447,13 +451,15 @@ impl Engine {
     }
 
     /// Wait for the run, halting it softly at the deadline. A halt sent before
-    /// the engine's thread starts is lost, so it repeats. `bg_halt` is cooperative,
-    /// so a run that ignores it ends at the worker's own deadline.
+    /// the engine's thread starts marks the engine as stopped, and every later one
+    /// finds nothing to stop, so none goes until the thread says it is running.
+    /// `bg_halt` is cooperative, so a run that ignores it ends at the worker's own
+    /// deadline.
     fn wait_for_run(&self, deadline: Instant) -> Option<HaltReason> {
         let mut halted = None;
         let mut next_halt = deadline;
         while !RUN_FINISHED.load(Ordering::SeqCst) && !EXIT_CALLED.load(Ordering::SeqCst) {
-            if Instant::now() >= next_halt {
+            if RUN_STARTED.load(Ordering::SeqCst) && Instant::now() >= next_halt {
                 halted = Some(HaltReason::Timeout);
                 next_halt = Instant::now() + HALT_REPEAT;
                 let _ = self.run_command("bg_halt");
