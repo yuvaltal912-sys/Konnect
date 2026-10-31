@@ -9,10 +9,10 @@ use super::raw::Plot;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Most values written. A power-board transient is a few million; past this the
-/// text would take minutes to write and gigabytes to keep, and the raw file holds
-/// the same data.
-pub(crate) const MAX_CELLS: usize = 20_000_000;
+/// Most values written. The soft-start transient at 0.5 µs is two million and wrote
+/// 67 MB in under half a second; past this the text would pass 250 MB, several
+/// times the raw file that holds the same data, for every one of the 20 runs kept.
+pub(crate) const MAX_CELLS: usize = 10_000_000;
 
 /// How the plot's first variable, its scale, is written.
 #[derive(Debug, Clone, PartialEq)]
