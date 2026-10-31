@@ -83,12 +83,14 @@ pub(crate) struct Resolved {
 /// Two vectors closer than this share of their peak are one signal. An inductor's
 /// branch and its current probe are separate unknowns, so they differ by rounding.
 const SAME_SIGNAL_SHARE: f64 = 1e-6;
+/// Below the engine's current tolerance, two vectors are both only rounding.
+const SAME_SIGNAL_FLOOR: f64 = 1e-12;
 
 fn same_signal(first: &[f64], other: &[f64]) -> bool {
     let peak = first
         .iter()
         .fold(0.0_f64, |peak, value| peak.max(value.abs()));
-    let limit = peak * SAME_SIGNAL_SHARE;
+    let limit = (peak * SAME_SIGNAL_SHARE).max(SAME_SIGNAL_FLOOR);
     first.len() == other.len() && first.iter().zip(other).all(|(a, b)| (a - b).abs() <= limit)
 }
 
@@ -440,6 +442,15 @@ mod tests {
             &[&[0.0, 1.0, 1.0 + 1e-10], &[1.0, 2.0, 2.0]],
         );
         assert_eq!(values(&plot, "i(L1)", NONE), Ok(vec![1.0, 2.0]));
+    }
+
+    #[test]
+    fn two_vectors_of_nothing_but_rounding_are_one_signal() {
+        let plot = plot(
+            &["time", "i(l1)", "i(l1)"],
+            &[&[0.0, 1e-15, -2e-15], &[1.0, 2e-15, 1e-15]],
+        );
+        assert_eq!(values(&plot, "i(L1)", NONE), Ok(vec![1e-15, 2e-15]));
     }
 
     #[test]

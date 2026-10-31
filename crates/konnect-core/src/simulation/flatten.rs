@@ -56,7 +56,7 @@ const KNOWN_DIRECTIVES: [&str; 26] = [
 ];
 /// Options that only tune the solver or the log. Other names set interpreter
 /// variables, and some of those are paths: `measoutfile` writes to one.
-const KNOWN_OPTIONS: [&str; 83] = [
+const KNOWN_OPTIONS: [&str; 82] = [
     "ingold",
     "maxstep",
     "measdgt",
@@ -87,7 +87,6 @@ const KNOWN_OPTIONS: [&str; 83] = [
     "gminsteps",
     "gshunt",
     "indverbosity",
-    "interp",
     "itl1",
     "itl2",
     "itl3",
@@ -1613,6 +1612,7 @@ mod tests {
     fn an_option_that_can_name_a_file_is_refused() {
         for line in [
             ".options measoutfile=out.txt",
+            ".options interp",
             ".option rawfile=out.raw",
             ".opt sourcepath=/x",
             ".options reltol=1m measoutfile=out.txt",

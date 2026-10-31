@@ -11,19 +11,24 @@ use serde_json::{json, Value};
 /// Relative slack on the end of a window: the engine stops within rounding of
 /// the stop time, not on it.
 const WINDOW_TOLERANCE: f64 = 1e-9;
-/// How far past `start_save_seconds` the first saved point can land, as a share of
-/// the run: two print steps.
-const FIRST_POINT_SLACK: f64 = 1.0 / 1000.0;
-/// A step smaller than this share of the signal's size is rounding noise.
+/// A step smaller than this share of the signal's size is rounding noise, and so
+/// is anything under the engine's own current tolerance.
 const NOISE_SHARE: f64 = 1e-9;
-/// With no `final_value`, the window's last value stands in for it, which holds
-/// only if this last share of the window is steady to within `TAIL_STEADY_SHARE`
-/// of the step, and the signal never strays `MAX_EXCURSION` steps from its start.
-/// A ramp, a sine or a pulse that came back fails, rather than give a number
-/// measured against whatever value the window happened to end on.
+const NOISE_FLOOR: f64 = 1e-12;
+/// With no `final_value`, the window's last value stands in for it. That holds
+/// only if the signal has stopped: this last share of the window must stay within
+/// `TAIL_STEADY_SHARE` of the step, its two halves must average within
+/// `STILL_SHARE` of the step, so ripple does not count and a slow tail does, and
+/// the signal must stay within `MAX_EXCURSION` steps of its start, which a ring
+/// does and a pulse that came back does not. The result always shows the levels
+/// it used, because no test can see every window that ends on the wrong value.
 const TAIL_SHARE: f64 = 0.1;
 const TAIL_STEADY_SHARE: f64 = 0.05;
-const MAX_EXCURSION: f64 = 10.0;
+const STILL_SHARE: f64 = 1e-3;
+const MAX_EXCURSION: f64 = 3.0;
+/// For settling, the end of the window may move this share of the band, which is
+/// what keeps the time it reports close to the true one.
+const BAND_STILL_SHARE: f64 = 0.05;
 const RISE_LOW: f64 = 0.1;
 const RISE_HIGH: f64 = 0.9;
 const DEFAULT_BAND_PERCENT: f64 = 2.0;
@@ -122,6 +127,8 @@ pub(crate) struct Measurement {
     pub direction: Direction,
     pub final_value: Option<f64>,
     pub band_percent: f64,
+    /// Where the run starts saving, so a window reaching before it can say so.
+    pub saved_from: f64,
 }
 
 /// A measurement that does not fit, naming the field.
@@ -146,7 +153,12 @@ fn finite(entry: &Value, key: &str, prefix: &str) -> Result<Option<f64>, BadMeas
 }
 
 /// Read one entry of `measurements`, and refuse what could not give an answer.
-pub(crate) fn parse(entry: &Value, index: usize, stop: f64) -> Result<Measurement, BadMeasurement> {
+pub(crate) fn parse(
+    entry: &Value,
+    index: usize,
+    stop: f64,
+    saved_from: f64,
+) -> Result<Measurement, BadMeasurement> {
     let prefix = format!("measurements[{index}]");
     let bad = |key: &str, reason: String| BadMeasurement {
         field: format!("{prefix}.{key}"),
@@ -246,6 +258,7 @@ pub(crate) fn parse(entry: &Value, index: usize, stop: f64) -> Result<Measuremen
         direction,
         final_value,
         band_percent: band_percent.unwrap_or(DEFAULT_BAND_PERCENT),
+        saved_from,
     })
 }
 
@@ -258,6 +271,8 @@ pub(crate) struct Reading {
     pub finding: Option<&'static str>,
     /// The window asked for reaches past the data.
     pub clipped: bool,
+    /// The start and final levels a step was measured between.
+    pub levels: Option<(f64, f64)>,
 }
 
 impl Reading {
@@ -267,6 +282,7 @@ impl Reading {
             at: None,
             finding: None,
             clipped: false,
+            levels: None,
         }
     }
 
@@ -283,6 +299,14 @@ impl Reading {
             at: None,
             finding: Some(finding),
             clipped: false,
+            levels: None,
+        }
+    }
+
+    fn between(self, start: f64, end: f64) -> Self {
+        Self {
+            levels: Some((start, end)),
+            ..self
         }
     }
 
@@ -301,6 +325,10 @@ impl Reading {
         }
         if let Some(finding) = self.finding {
             report["finding"] = json!(finding);
+        }
+        if let Some((start, end)) = self.levels {
+            report["start_value"] = json!(start);
+            report["final_value"] = json!(end);
         }
         report
     }
@@ -341,7 +369,13 @@ struct Window {
 }
 
 impl Window {
-    fn cut(time: &[f64], values: &[f64], from: Option<f64>, to: Option<f64>) -> Option<Self> {
+    fn cut(
+        time: &[f64],
+        values: &[f64],
+        from: Option<f64>,
+        to: Option<f64>,
+        saved_from: f64,
+    ) -> Option<Self> {
         let (&first, &last) = (time.first()?, time.last()?);
         let slack = last.abs().max(first.abs()) * WINDOW_TOLERANCE;
         let low = from.unwrap_or(first).max(first);
@@ -349,9 +383,10 @@ impl Window {
         if low >= high {
             return None;
         }
-        let early = slack + last.abs() * FIRST_POINT_SLACK;
-        let clipped =
-            from.is_some_and(|from| from < first - early) || to.is_some_and(|to| to > last + slack);
+        // The first saved point lands a little after `saved_from`, so a window from
+        // there has lost nothing.
+        let clipped = from.is_some_and(|from| from < first - slack && from < saved_from)
+            || to.is_some_and(|to| to > last + slack);
         let start = time.partition_point(|&sample| sample <= low);
         let end = time.partition_point(|&sample| sample < high);
         let inner = start..end.max(start);
@@ -433,15 +468,40 @@ impl Window {
         std::iter::once(first).chain(self.values[rest..].iter().copied())
     }
 
-    /// The step to measure, or the finding that says there is none to trust.
-    fn transition(&self, final_value: Option<f64>) -> Result<(f64, f64), &'static str> {
-        let (start, end) = self.step(final_value);
-        let step = (end - start).abs();
+    /// The time-weighted mean between two times in the window.
+    fn mean(&self, from: f64, to: f64) -> f64 {
+        let part = Self::cut(&self.time, &self.values, Some(from), Some(to), 0.0);
+        part.map_or(0.0, |part| part.integrate() / part.duration())
+    }
+
+    /// How far the level moved across the tail, half against half.
+    fn drift(&self) -> f64 {
+        let last = self.time[self.time.len() - 1];
+        let tail = self.duration() * TAIL_SHARE;
+        let middle = last - tail / 2.0;
+        (self.mean(last - tail, middle) - self.mean(middle, last)).abs()
+    }
+
+    fn noise(&self, end: f64) -> f64 {
         let size = self
             .values
             .iter()
             .fold(end.abs(), |size, y| size.max(y.abs()));
-        let noise = size * NOISE_SHARE;
+        (size * NOISE_SHARE).max(NOISE_FLOOR)
+    }
+
+    fn excursion(&self) -> f64 {
+        let start = self.values[0];
+        self.values
+            .iter()
+            .fold(0.0, |far: f64, y| far.max((y - start).abs()))
+    }
+
+    /// The step to measure, or the finding that says there is none to trust.
+    fn transition(&self, final_value: Option<f64>) -> Result<(f64, f64), &'static str> {
+        let (start, end) = self.step(final_value);
+        let step = (end - start).abs();
+        let noise = self.noise(end);
         if final_value.is_some() {
             return if step > noise {
                 Ok((start, end))
@@ -449,17 +509,14 @@ impl Window {
                 Err("no_transition")
             };
         }
-        let excursion = self
-            .values
-            .iter()
-            .fold(0.0, |far: f64, y| far.max((y - start).abs()));
+        let excursion = self.excursion();
         if excursion <= noise {
             return Err("no_transition");
         }
         let unsteady = self
             .tail()
             .any(|y| (y - end).abs() > step * TAIL_STEADY_SHARE);
-        if unsteady || excursion > step * MAX_EXCURSION {
+        if unsteady || self.drift() > step * STILL_SHARE || excursion > step * MAX_EXCURSION {
             return Err("final_value_needed");
         }
         Ok((start, end))
@@ -501,7 +558,7 @@ impl Window {
             progress[left],
             RISE_LOW,
         );
-        Reading::found_at(high_time - low_time, high_time)
+        Reading::found_at(high_time - low_time, high_time).between(start, end)
     }
 
     /// How far past the final value the signal goes, as a share of the step. A
@@ -518,7 +575,7 @@ impl Window {
             self.extreme(|value, best| value < best)
         };
         let beyond = if step > 0.0 { peak - end } else { end - peak };
-        Reading::found_at((beyond.max(0.0)) / step.abs() * 100.0, at)
+        Reading::found_at((beyond.max(0.0)) / step.abs() * 100.0, at).between(start, end)
     }
 
     /// When the signal last enters the band and stays. The band is a share of
@@ -527,9 +584,21 @@ impl Window {
     /// final value of zero would be no band at all.
     fn settling(&self, final_value: Option<f64>, band_percent: f64) -> Reading {
         let (start, end) = self.step(final_value);
-        let band = end.abs().max((end - start).abs()) * band_percent / 100.0;
-        if band == 0.0 {
-            return Reading::none("no_transition");
+        let step = (end - start).abs();
+        let band = end.abs().max(step) * band_percent / 100.0;
+        let noise = self.noise(end);
+        if final_value.is_some() {
+            if band <= noise {
+                return Reading::none("no_transition");
+            }
+        } else {
+            if self.excursion() <= noise {
+                return Reading::none("no_transition");
+            }
+            let allowed = (step * STILL_SHARE).max(band * BAND_STILL_SHARE);
+            if band <= noise || self.drift() > allowed {
+                return Reading::none("final_value_needed");
+            }
         }
         let outside = |value: f64| (value - end).abs() > band;
         // The last value is always inside a band around itself, so with no given
@@ -539,7 +608,7 @@ impl Window {
         }
         let last = self.values.iter().rposition(|&value| outside(value));
         let Some(last) = last else {
-            return Reading::found_at(0.0, self.time[0]);
+            return Reading::found_at(0.0, self.time[0]).between(start, end);
         };
         if last + 1 == self.values.len() {
             return Reading::none("not_settled");
@@ -547,7 +616,7 @@ impl Window {
         let (before, after) = (self.values[last], self.values[last + 1]);
         let edge = end + band.copysign(before - end);
         let time = time_of(self.time[last], before, self.time[last + 1], after, edge);
-        Reading::found_at(time - self.time[0], time)
+        Reading::found_at(time - self.time[0], time).between(start, end)
     }
 }
 
@@ -569,7 +638,8 @@ pub(crate) fn measure(time: &[f64], values: &[f64], request: &Measurement) -> Re
             false => Reading::none("non_finite_data"),
         };
     }
-    let Some(window) = Window::cut(time, values, request.from, request.to) else {
+    let Some(window) = Window::cut(time, values, request.from, request.to, request.saved_from)
+    else {
         return Reading::none("outside_data");
     };
     if !window.values.iter().all(|value| value.is_finite()) {
@@ -703,7 +773,7 @@ mod tests {
     }
 
     fn read(entry: &Value, time: &[f64], values: &[f64]) -> Reading {
-        measure(time, values, &parse(entry, 0, 1e9).unwrap())
+        measure(time, values, &parse(entry, 0, 1e9, 0.0).unwrap())
     }
 
     fn close(actual: f64, expected: f64, tolerance: f64) {
@@ -845,7 +915,8 @@ mod tests {
             Some(0.0)
         );
         // A signal decaying to zero has no band from its final value alone.
-        let decay = [10.0, 1.0, 0.1, 0.0];
+        let time = [0.0, 1.0, 2.0, 3.0, 20.0];
+        let decay = [10.0, 1.0, 0.1, 0.0, 0.0];
         let settled = read(&request("settling_time"), &time, &decay);
         // Inside 0.2 V after 1 s, between 1 V and 0.1 V.
         close(settled.value.unwrap(), 1.0 + 0.8 / 0.9, 1e-12);
@@ -1028,29 +1099,108 @@ mod tests {
         }
         assert_eq!(
             read(&request("settling_time"), &time, &ramp).finding,
-            Some("not_settled")
+            Some("final_value_needed")
         );
         let sine: Vec<f64> = time.iter().map(|t| (t * 0.5).sin()).collect();
+        assert_eq!(read(&request("settling_time"), &time, &sine).value, None);
+    }
+
+    /// An RC charging to 1 with time constant 1, cut off at `stop` of them.
+    fn charging(stop: f64) -> (Vec<f64>, Vec<f64>) {
+        let time: Vec<f64> = (0..=20_000)
+            .map(|n| stop * f64::from(n) / 20_000.0)
+            .collect();
+        let values = time.iter().map(|t| 1.0 - (-t).exp()).collect();
+        (time, values)
+    }
+
+    #[test]
+    fn a_charge_still_rising_at_the_end_of_the_window_gives_no_number() {
+        for stop in [1.5, 2.0, 3.0, 4.0, 5.0] {
+            let (time, values) = charging(stop);
+            for kind in ["rise_time", "settling_time"] {
+                let reading = read(&request(kind), &time, &values);
+                assert_eq!(reading.finding, Some("final_value_needed"), "{kind} {stop}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_charge_that_has_finished_gives_a_number_close_to_the_true_one() {
+        let (time, values) = charging(10.0);
+        let rise = read(&request("rise_time"), &time, &values).value.unwrap();
+        close(rise, 9f64.ln(), 1e-3);
+        let settle = read(&request("settling_time"), &time, &values)
+            .value
+            .unwrap();
+        close(settle, 50f64.ln(), 3e-3);
+    }
+
+    #[test]
+    fn a_ramp_on_a_rail_is_not_settled_for_being_small_against_the_rail() {
+        let time: Vec<f64> = (0..=1000).map(|n| f64::from(n) / 1000.0).collect();
+        let ramp: Vec<f64> = time.iter().map(|t| 12.0 + t).collect();
         assert_eq!(
-            read(&request("settling_time"), &time, &sine).finding,
-            Some("not_settled")
+            read(&request("settling_time"), &time, &ramp).finding,
+            Some("final_value_needed")
         );
     }
 
     #[test]
+    fn a_pulse_that_came_most_of_the_way_back_gives_no_number() {
+        let time = [0.0, 1.0, 5.0, 5.01, 10.0];
+        let values = [0.0, 5.0, 5.0, 1.0, 1.0];
+        let reading = read(&request("overshoot_percent"), &time, &values);
+        assert_eq!(reading.finding, Some("final_value_needed"));
+    }
+
+    #[test]
+    fn a_ring_passing_its_final_value_keeps_its_number() {
+        let (time, values) = second_order();
+        let reading = read(&request("overshoot_percent"), &time, &values);
+        close(reading.value.unwrap(), 52.66, 0.05);
+    }
+
+    #[test]
+    fn the_result_shows_the_levels_a_step_was_measured_between() {
+        let time = [0.0, 1.0, 2.0, 3.0, 40.0];
+        let values = [1.0, 2.0, 3.0, 3.0, 3.0];
+        for kind in ["rise_time", "overshoot_percent", "settling_time"] {
+            let reading = read(&request(kind), &time, &values);
+            assert_eq!(reading.levels, Some((1.0, 3.0)), "{kind}");
+        }
+        let parsed = parse(&request("rise_time"), 0, 100.0, 0.0).unwrap();
+        let report = measure(&time, &values, &parsed).report(&parsed, false);
+        assert_eq!(report["start_value"], 1.0);
+        assert_eq!(report["final_value"], 3.0);
+        let parsed = parse(&request("max"), 0, 100.0, 0.0).unwrap();
+        let report = measure(&time, &values, &parsed).report(&parsed, false);
+        assert!(report.get("final_value").is_none());
+    }
+
+    #[test]
+    fn a_settled_signal_moving_only_by_rounding_has_no_transition() {
+        let (time, values) = ([0.0, 1.0, 2.0], [1.8e-15, -1.8e-15, 1e-16]);
+        for kind in ["fall_time", "settling_time", "overshoot_percent"] {
+            assert_eq!(
+                read(&request(kind), &time, &values).finding,
+                Some("no_transition"),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
     fn a_ripple_inside_the_band_at_the_end_is_not_called_unsettled() {
-        let time: Vec<f64> = (0..=100).map(f64::from).collect();
-        let ripple = |t: f64| 1.0 + 0.01 * t.sin();
+        let time: Vec<f64> = (0..=2000).map(|n| f64::from(n) * 0.05).collect();
+        let ripple = |t: f64| 1.0 + 0.01 * (std::f64::consts::TAU * t).sin();
         let values: Vec<f64> = time
             .iter()
             .map(|&t| if t < 10.0 { t / 10.0 } else { ripple(t) })
             .collect();
-        // It enters the band on the last straight line of the ramp, from 0.9 at
-        // t = 9 to ripple(10) at t = 10.
-        let end = ripple(100.0);
-        let expected = 9.0 + (0.98 * end - 0.9) / (ripple(10.0) - 0.9);
+        // Five whole cycles in each half of the tail, so the means agree.
         let settled = read(&request("settling_time"), &time, &values);
-        close(settled.value.unwrap(), expected, 1e-9);
+        close(settled.value.unwrap(), 9.8, 1e-6);
     }
 
     #[test]
@@ -1089,11 +1239,16 @@ mod tests {
         assert_eq!(read(&entry, &time, &values).value, Some(2.0));
     }
 
+    fn from_saved(from: f64, saved_from: f64, time: &[f64], values: &[f64]) -> bool {
+        let entry = with(request("max"), "from_seconds", json!(from));
+        let parsed = parse(&entry, 0, 1e9, saved_from).unwrap();
+        measure(time, values, &parsed).clipped
+    }
+
     #[test]
     fn a_first_point_just_after_the_saved_start_is_not_a_clipped_window() {
         let (time, values) = ([1.0096e-4, 1e-3], [2.0, 4.0]);
-        let entry = with(request("max"), "from_seconds", json!(1e-4));
-        assert!(!read(&entry, &time, &values).clipped);
+        assert!(!from_saved(1e-4, 1e-4, &time, &values));
     }
 
     #[test]
@@ -1112,8 +1267,9 @@ mod tests {
     #[test]
     fn a_window_from_before_the_saved_data_is_flagged() {
         let (time, values) = ([1.0, 2.0], [2.0, 4.0]);
-        let entry = json!({ "kind": "max", "signal": "v(a)", "from_seconds": 0.0 });
-        assert!(read(&entry, &time, &values).clipped);
+        assert!(from_saved(0.0, 0.9, &time, &values));
+        let (time, values) = ([9e-4, 1.0], [2.0, 4.0]);
+        assert!(from_saved(0.0, 9e-4, &time, &values));
     }
 
     #[test]
@@ -1150,17 +1306,17 @@ mod tests {
     #[test]
     fn a_result_names_units_and_never_hides_a_null() {
         let entry = json!({ "kind": "i2t", "signal": "i(r1)", "name": "fuse" });
-        let parsed = parse(&entry, 0, 1.0).unwrap();
+        let parsed = parse(&entry, 0, 1.0, 0.0).unwrap();
         let report = measure(&[0.0, 1.0], &[2.0, 2.0], &parsed).report(&parsed, false);
         assert_eq!(report["name"], "fuse");
         assert_eq!(report["unit"], "A²s");
         assert_eq!(report["value"], 4.0);
         assert_eq!(report["window_truncated"], false);
 
-        let unnamed = parse(&request("crossing_x"), 0, 1.0).unwrap_err();
+        let unnamed = parse(&request("crossing_x"), 0, 1.0, 0.0).unwrap_err();
         assert_eq!(unnamed.field, "measurements[0].kind");
         let entry = with(request("crossing"), "level", json!(9.0));
-        let parsed = parse(&entry, 0, 1.0).unwrap();
+        let parsed = parse(&entry, 0, 1.0, 0.0).unwrap();
         assert_eq!(parsed.name, "crossing v(a)");
         let report = measure(&[0.0, 1.0], &[2.0, 2.0], &parsed).report(&parsed, true);
         assert!(report["value"].is_null(), "{report}");
@@ -1172,7 +1328,7 @@ mod tests {
     #[test]
     fn what_cannot_give_an_answer_is_refused_with_its_field() {
         let refused = |entry: Value, field: &str| {
-            let error = parse(&entry, 3, 1.0).unwrap_err();
+            let error = parse(&entry, 3, 1.0, 0.0).unwrap_err();
             assert_eq!(error.field, format!("measurements[3].{field}"), "{error:?}");
         };
         refused(json!({ "kind": "max", "signal": "x(a)" }), "signal");

@@ -926,6 +926,76 @@ fn an_initial_voltage_holds_whichever_way_round_the_part_is_drawn() {
 
 #[test]
 #[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_nodeset_under_uic_holds_as_an_initial_voltage_does() {
+    let result = run_on_testbench(
+        &lines(&["C1 0 a 1u", "R1 a 0 1k", ".nodeset v(a)=5"]),
+        json!({
+            "analysis": {
+                "kind": "transient",
+                "stop_time_seconds": 2e-3,
+                "max_step_seconds": 1e-6,
+                "use_initial_conditions": true,
+            },
+            "measurements": [
+                { "name": "at_1ms", "kind": "value_at", "signal": "v(a)", "at_seconds": 1e-3 },
+            ],
+        }),
+    );
+
+    near(measured(&result, "at_1ms"), 1.8394, 2e-3);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_engines_sample_thinning_option_cannot_reach_a_run() {
+    let result = run_on_testbench(
+        &lines(&["V1 a 0 1", "R1 a 0 1k", ".options interp"]),
+        json!({ "analysis": { "kind": "transient", "stop_time_seconds": 1e-3 } }),
+    );
+
+    assert_eq!(result["error"]["reason"], "unsafe_deck_content", "{result}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_step_cut_off_while_still_rising_gives_no_number_and_a_finished_one_does() {
+    let deck = lines(&[
+        "V1 in 0 PULSE(0 5 0 1n 1n 100 200)",
+        "R1 in a 1k",
+        "C1 a 0 1u",
+    ]);
+    let run = |stop: f64| {
+        run_on_testbench(
+            &deck,
+            json!({
+                "analysis": {
+                    "kind": "transient",
+                    "stop_time_seconds": stop,
+                    "max_step_seconds": 1e-6,
+                },
+                "measurements": [
+                    { "name": "rise", "kind": "rise_time", "signal": "v(a)" },
+                    { "name": "settle", "kind": "settling_time", "signal": "v(a)" },
+                ],
+            }),
+        )
+    };
+
+    let cut_off = run(3e-3);
+    assert_eq!(cut_off["measurements"][0]["finding"], "final_value_needed");
+    assert_eq!(cut_off["measurements"][1]["finding"], "final_value_needed");
+    let finished = run(12e-3);
+    near(measured(&finished, "rise"), 2.197e-3, 3e-6);
+    near(measured(&finished, "settle"), 3.912e-3, 3e-6);
+    near(
+        finished["measurements"][0]["final_value"].as_f64().unwrap(),
+        5.0,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
 fn an_initial_value_on_a_device_keeps_its_probes_and_says_the_run_has_no_start() {
     let result = run_on_testbench(
         &lines(&["C1 0 a 1u IC=-5", "R1 a 0 1k"]),

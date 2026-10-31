@@ -608,8 +608,13 @@ impl Wanted {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                measure::parse(entry, index, transient.stop)
-                    .map_err(|bad| invalid(bad.field, bad.reason))
+                measure::parse(
+                    entry,
+                    index,
+                    transient.stop,
+                    transient.start_save.unwrap_or(0.0),
+                )
+                .map_err(|bad| invalid(bad.field, bad.reason))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
@@ -748,11 +753,42 @@ fn top_level_elements(deck: &FlatDeck) -> Vec<&str> {
     names
 }
 
-/// Whether the deck sets node voltages with `.ic`.
+/// The text of every card that starts with `prefix`, in any case.
+fn cards_starting<'a>(deck: &'a FlatDeck, prefix: &'a str) -> impl Iterator<Item = &'a str> {
+    deck.lines().filter_map(move |(text, _, _)| {
+        let first = text.split_whitespace().next()?;
+        first
+            .to_ascii_lowercase()
+            .starts_with(prefix)
+            .then_some(text)
+    })
+}
+
+/// Whether the deck seeds node voltages. Under `uic` both cards do, through the
+/// same vector.
 fn sets_node_conditions(deck: &FlatDeck) -> bool {
-    deck.lines().any(|(text, _, _)| {
-        let first = text.split_whitespace().next().unwrap_or_default();
-        first.to_ascii_lowercase().starts_with(".ic")
+    [".ic", ".nodeset"]
+        .iter()
+        .any(|prefix| cards_starting(deck, prefix).next().is_some())
+}
+
+/// A caller's own `.probe` would lose the voltages that Konnect's are held back to
+/// keep, and it cannot be taken out of a deck that names it on purpose.
+fn probe_conflict(deck: &FlatDeck) -> Option<CallToolResult> {
+    let items: Vec<String> = cards_starting(deck, ".probe")
+        .take(MAX_ERROR_ITEMS)
+        .map(str::to_owned)
+        .collect();
+    (!items.is_empty()).then(|| {
+        simulation_failure(
+            "preflight",
+            "probe_loses_initial_conditions",
+            None,
+            items,
+            "A .probe card moves a device's pin onto a hidden node, so under \
+             use_initial_conditions a .ic or .nodeset voltage on that net would be lost. \
+             Remove the card, or use IC= on the device.",
+        )
     })
 }
 
@@ -822,6 +858,14 @@ async fn run_analysis(
     {
         return Err(refusal);
     }
+    // A probe moves a device's pin onto a hidden node, and under `uic` a device
+    // takes its start from its own pins: a voltage set on the net would be lost.
+    let keep_conditions = request.analysis.uses_initial_conditions() && sets_node_conditions(deck);
+    if keep_conditions {
+        if let Some(refusal) = probe_conflict(deck) {
+            return Err(refusal);
+        }
+    }
     let Some(budget) = request
         .budget
         .checked_sub(started.elapsed())
@@ -852,9 +896,6 @@ async fn run_analysis(
         .preflight
         .as_ref()
         .is_some_and(|preflight| preflight.event_nodes);
-    // A probe moves a device's pin onto a hidden node, and under `uic` a device
-    // takes its start from its own pins: a `.ic` on the net would be lost.
-    let keep_conditions = request.analysis.uses_initial_conditions() && sets_node_conditions(deck);
     let probes = match keep_conditions {
         true => Vec::new(),
         false => signals::power_probes(
@@ -1195,7 +1236,9 @@ impl RunEnd<'_> {
                     "items": shared_nets,
                 }));
             }
-            if first_point > 0.0 && transient.start_save.is_none() {
+            let saves_from_start =
+                transient.start_save.unwrap_or(0.0) < transient.stop / PRINT_STEPS;
+            if first_point > 0.0 && saves_from_start {
                 warnings.push(json!({
                     "code": "no_point_at_start",
                     "detail": "With use_initial_conditions ngspice saves no point at time zero, \
@@ -1256,8 +1299,9 @@ impl RunEnd<'_> {
         if self.keep_conditions {
             warnings.push(json!({
                 "code": "device_currents_not_saved",
-                "detail": "Device probes would lose .ic voltages under use_initial_conditions, \
-                           so only node voltages and source currents are saved.",
+                "detail": "Device probes would lose .ic and .nodeset voltages under \
+                           use_initial_conditions, so only node voltages and source currents are \
+                           saved.",
             }));
         }
         if !self.engine.code_models_failed.is_empty() {
@@ -2428,6 +2472,21 @@ mod tests {
     }
 
     #[test]
+    fn a_node_condition_is_seen_in_any_case_and_a_device_value_is_not_one() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = [root.path().to_path_buf()];
+        let with = |card: &str| {
+            let netlist = format!(".title t\nR1 a 0 1k\nC1 a 0 1u IC=1\n{card}.end\n");
+            sets_node_conditions(&flat(&netlist, root.path(), &roots))
+        };
+        assert!(with(".ic v(a)=5\n"));
+        assert!(with(".IC V(a)=5\n"));
+        assert!(with(".nodeset v(a)=5\n"));
+        assert!(with(".NODESET V(a)=5\n"));
+        assert!(!with(""));
+    }
+
+    #[test]
     fn a_probe_goes_ahead_of_the_analysis_and_after_the_saves() {
         let run = Analysis::Transient(transient(json!({ "stop_time_seconds": 1 })).unwrap());
         let probes = [".probe p(R1)".to_string()];
@@ -2609,6 +2668,44 @@ mod tests {
             assert!(body.get("stopped").is_none());
         }
 
+        fn run_from_half_a_second(start_save: f64) -> (String, Value) {
+            let job = format!(
+                "{}\nsed -i.bak 's/^0\\t0.0$/0\\t0.5/' results.raw\n{}",
+                copy_transient(),
+                status_json("0", "null", true)
+            );
+            (
+                job,
+                json!({
+                    "kind": "transient",
+                    "stop_time_seconds": 2.0,
+                    "start_save_seconds": start_save,
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_save_start_at_zero_does_not_silence_the_missing_point() {
+            let (job, analysis) = run_from_half_a_second(0.0);
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = analysis;
+            let (_, body) = call(&scene, arguments).await;
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("no_point_at_start"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_late_save_start_is_not_a_missing_point() {
+            let (job, analysis) = run_from_half_a_second(0.4);
+            let scene = scene(&job);
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = analysis;
+            let (_, body) = call(&scene, arguments).await;
+            let warnings = body["warnings"].to_string();
+            assert!(!warnings.contains("no_point_at_start"), "{body}");
+        }
+
         #[tokio::test]
         async fn a_run_that_starts_at_zero_gives_no_start_warning() {
             let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
@@ -2695,6 +2792,35 @@ mod tests {
             assert!(deck.contains("uic\n"), "{deck}");
             let warnings = body["warnings"].to_string();
             assert!(warnings.contains("device_currents_not_saved"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_callers_probe_that_would_lose_a_condition_is_refused() {
+            let scene = scene("touch worker-ran");
+            let mut arguments = with_initial_conditions(&scene.root, ".ic v(a)=5");
+            arguments["testbench"]["spice_lines"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(".probe alli"));
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(
+                body["error"]["reason"], "probe_loses_initial_conditions",
+                "{body}"
+            );
+            assert_eq!(body["error"]["items"][0], ".probe alli");
+            assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_callers_probe_is_left_alone_without_a_condition_to_lose() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = transient_args(&scene.root, 2.0);
+            arguments["testbench"]["spice_lines"] =
+                json!(["VX a 0 1", "RX a 0 1k", ".ic v(a)=5", ".probe alli"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
         }
 
         #[tokio::test]
