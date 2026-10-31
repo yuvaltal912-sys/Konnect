@@ -39,7 +39,7 @@ PRs 1 to 7 are merged to `main` on the `fork` remote, each as a merge commit. La
 | 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Merged |
 | 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Merged |
 | 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
-| 8 | Opened, see the PR list | `feat/simulation-protection` | **Open, awaiting the owner** |
+| 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | **Open, awaiting the owner** |
 | 9 to 11 | Not opened | | Not started |
 
 ## Now: PR 8 is open
