@@ -408,7 +408,7 @@ fn annotate(window: &Response, found: Found) -> Found {
 
 /// 180 degrees plus the phase where the gain first falls through 0 dB.
 fn phase_margin(window: &Response) -> Found {
-    let note = |found: Found| annotate(&window, found);
+    let note = |found: Found| annotate(window, found);
     if window.gain_db[0] == UNITY_DB {
         return note(Found::none("starts_on_level"));
     }
@@ -430,7 +430,7 @@ fn phase_margin(window: &Response) -> Found {
 
 /// The gain, negated, where the phase first falls through -180 degrees.
 fn gain_margin(window: &Response) -> Found {
-    let note = |found: Found| annotate(&window, found);
+    let note = |found: Found| annotate(window, found);
     if window.phase[0] <= INVERSION_DEGREES + START_TOLERANCE_DEGREES {
         return note(Found::none("starts_on_level"));
     }
@@ -753,7 +753,7 @@ mod tests {
         // Gain falls 1 dB per hertz: the -3.01 dB point is at 3.0103 Hz.
         let freq: Vec<f64> = (0..=10).map(f64::from).collect();
         let real: Vec<f64> = freq.iter().map(|f| 10f64.powf(-f / 20.0)).collect();
-        let response = Response::new(&freq[1..], &real[1..], &vec![0.0; 10], false).unwrap();
+        let response = Response::new(&freq[1..], &real[1..], &[0.0; 10], false).unwrap();
         let report = measure(&response, &request("bandwidth_3db", json!({})), false);
         // From the lowest frequency (1 Hz, -1 dB): the edge is -4.0103 dB, 4.0103 Hz.
         assert!((value_of(&report) - 4.0103).abs() < 1e-4, "{report}");
@@ -1012,7 +1012,7 @@ mod tests {
         let report = measure(&response, &request("bandwidth_3db", peak), false);
         assert_eq!(report["finding"], "sweep_too_coarse", "{report}");
         let steps: Vec<f64> = (0..freq.len() - 1)
-            .map(|i| ((response.gain_db[i] - response.gain_db[i + 1]) as f64).abs())
+            .map(|i| (response.gain_db[i] - response.gain_db[i + 1]).abs())
             .collect();
         assert!(steps.iter().all(|step| *step < 10.0), "{steps:?}");
 

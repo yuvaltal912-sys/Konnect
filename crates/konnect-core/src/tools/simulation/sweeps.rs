@@ -295,7 +295,7 @@ impl Sweep {
             ));
         }
         let ratio = (stop - start) / step;
-        if !(ratio * (1.0 + COUNT_TOLERANCE) < MAX_SWEEP_POINTS) {
+        if ratio.is_nan() || ratio * (1.0 + COUNT_TOLERANCE) >= MAX_SWEEP_POINTS {
             return Err(invalid(
                 format!("{path}.step_value"),
                 format!("This sweep would take more than {MAX_SWEEP_POINTS:.0} points"),
@@ -388,7 +388,9 @@ impl DcSweep {
                 .find(|&i| (axis[i] - axis[i - 1]) * direction < 0.0)
                 .unwrap_or(axis.len())
         };
-        (axis.len() % run == 0).then_some((run, axis.len() / run))
+        axis.len()
+            .is_multiple_of(run)
+            .then_some((run, axis.len() / run))
     }
 
     /// The plot holds the grid asked for, in a plot whose first vector is a sweep's

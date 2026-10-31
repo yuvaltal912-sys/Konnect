@@ -2814,7 +2814,7 @@ mod tests {
             let current = kind != "i2t";
             let entry = if current { kind } else { "min" };
             assert!(fits(&run, &[entry]), "transient {kind}");
-            assert_eq!(fits(&ac, &[kind]), false, "ac {kind}");
+            assert!(!fits(&ac, &[kind]), "ac {kind}");
         }
         for kind in ac_kinds {
             assert!(fits(&ac, &[kind]), "ac {kind}");
