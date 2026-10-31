@@ -159,8 +159,14 @@ fn call_over_stdio(tool: &str, arguments: Value) -> Value {
 /// IBIS models to the user's real cache. A test that needs them allows it here.
 fn call_with_config(tool: &str, arguments: Value, config: &str) -> Value {
     let home = tempfile::tempdir().unwrap();
+    call_in_home(home.path(), tool, arguments, config)
+}
+
+/// The same call with the server's `HOME` and state folder given, so a test can
+/// read the run it left behind.
+fn call_in_home(home: &Path, tool: &str, arguments: Value, config: &str) -> Value {
     for config_dir in [".config/konnect", "Library/Application Support/konnect"] {
-        let config_dir = home.path().join(config_dir);
+        let config_dir = home.join(config_dir);
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(config_dir.join("config.toml"), config).unwrap();
     }
@@ -174,8 +180,8 @@ fn call_with_config(tool: &str, arguments: Value, config: &str) -> Value {
             "name": tool, "arguments": arguments}}),
     ];
     let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
-        .env("HOME", home.path())
-        .env("KONNECT_STATE_DIR", home.path())
+        .env("HOME", home)
+        .env("KONNECT_STATE_DIR", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -535,6 +541,7 @@ impl WorkerRun {
             input_path: input_path.map(Path::to_path_buf),
             budget_ms,
             max_raw_bytes: 1 << 40,
+            complex_data: false,
         };
         std::fs::write(dir.path().join(".spiceinit"), "").unwrap();
         std::fs::write(dir.path().join(DECK_FILE), deck).unwrap();
@@ -551,6 +558,15 @@ impl WorkerRun {
         let mut request: RunRequest =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         request.max_raw_bytes = max_raw_bytes;
+        std::fs::write(path, serde_json::to_vec(&request).unwrap()).unwrap();
+    }
+
+    /// Tell the worker its data is complex, as the server does for an AC sweep.
+    fn make_complex(&mut self) {
+        let path = self.dir.path().join(REQUEST_FILE);
+        let mut request: RunRequest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        request.complex_data = true;
         std::fs::write(path, serde_json::to_vec(&request).unwrap()).unwrap();
     }
 
@@ -1588,4 +1604,416 @@ fn exp_in_an_expression_is_linear_above_an_argument_of_fourteen() {
     near(measured(&result, "exp"), 9.288032e6, 1.0);
     near(measured(&result, "pow"), 1e9, 1.0);
     near(measured(&result, "low"), 10f64.exp(), 1e-6);
+}
+
+const AC_DECK: &str = "title\nV1 a 0 DC 1 AC 1\nR1 a b 1k\nC1 b 0 1u\nR2 b 0 100\n.save all\n\
+                       .ac dec 10000 1 1G\n.end\n";
+
+/// The bytes of an AC plot, which holds a real and an imaginary double per value.
+fn complex_bytes(plot: &raw::Plot) -> u64 {
+    16 * plot.points as u64 * plot.variables.len() as u64
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_size_limit_counts_a_complex_value_as_two_doubles() {
+    const LIMIT: u64 = 1 << 20;
+    let mut run = WorkerRun::prepare(AC_DECK, None, 30_000);
+    run.limit_size(LIMIT);
+    run.make_complex();
+
+    let status = run.finish();
+
+    assert_eq!(status.halted_reason, Some(HaltReason::SizeLimit));
+    assert!(status.results_written);
+    let plot = run.plot();
+    assert!(plot.complex);
+    let bytes = complex_bytes(&plot);
+    assert!((LIMIT..LIMIT + LIMIT / 2).contains(&bytes), "{bytes}");
+
+    // Told nothing, the worker counts a real double and lets the data reach twice
+    // the limit: the reason the server sends the flag.
+    let mut real = WorkerRun::prepare(AC_DECK, None, 30_000);
+    real.limit_size(LIMIT);
+    let status = real.finish();
+    assert_eq!(status.halted_reason, Some(HaltReason::SizeLimit));
+    let bytes = complex_bytes(&real.plot());
+    assert!(bytes > LIMIT + LIMIT / 2, "{bytes}");
+}
+
+fn ac_loop_lines() -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/simulation/ac_loop.sp");
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines().map(str::to_owned).collect()
+}
+
+fn ac_loop(extra: Value) -> Value {
+    let mut arguments = json!({
+        "analysis": { "kind": "ac", "start_hz": 1.0, "stop_hz": 1e6, "points": 200 },
+        "signals": ["v(out)"],
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        arguments[key] = value.clone();
+    }
+    run_on_testbench(&ac_loop_lines(), arguments)
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_three_pole_loop_gives_the_margins_the_formula_does() {
+    let result = ac_loop(json!({
+        "measurements": [
+            { "name": "pm", "kind": "phase_margin", "signal": "v(out)" },
+            { "name": "gm", "kind": "gain_margin", "signal": "v(out)" },
+            { "name": "bw", "kind": "bandwidth_3db", "signal": "v(out)" },
+            { "name": "at_1k", "kind": "value_at", "signal": "v(out)", "at_hz": 1000.0 },
+        ],
+    }));
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["outcome"]["requested"], 6);
+    assert_eq!(result["simulated_circuit"], "modified");
+    assert_eq!(result["analysis"]["coverage_ratio"], 1.0, "{result}");
+    assert_eq!(result["warnings"], json!([]), "{result}");
+    // From `ac_loop_reference.py`, which solves the formulas with no SPICE engine.
+    near(measured(&result, "pm"), 3.485942, 2e-3);
+    near(measured(&result, "gm"), 1.742135, 2e-3);
+    near(measured(&result, "bw"), 99.014567, 0.05);
+    near(measured(&result, "at_1k"), 16.903273, 1e-3);
+    let items = result["measurements"].as_array().unwrap();
+    let find = |name: &str| items.iter().find(|item| item["name"] == name).unwrap();
+    near(find("pm")["crossover_hz"].as_f64().unwrap(), 3013.707, 0.5);
+    near(
+        find("gm")["phase_crossover_hz"].as_f64().unwrap(),
+        3331.666,
+        0.5,
+    );
+    near(
+        find("at_1k")["phase_degrees"].as_f64().unwrap(),
+        -135.0,
+        1e-3,
+    );
+    // A loop that starts at zero degrees, so the unwrapping began on the right side.
+    near(
+        find("pm")["start_phase_degrees"].as_f64().unwrap(),
+        -0.6359,
+        0.01,
+    );
+    let summary = &result["signal_summaries"][0];
+    near(
+        summary["low_frequency_gain_db"].as_f64().unwrap(),
+        40.0,
+        1e-3,
+    );
+    assert_eq!(summary["unit"], "dB");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_loop_gain_taken_as_a_ratio_of_two_nodes_gives_the_same_margins() {
+    let result = ac_loop(json!({
+        "measurements": [
+            { "name": "pm", "kind": "phase_margin", "signal": "v(out)", "reference_signal": "v(in)" },
+            { "name": "gm", "kind": "gain_margin", "signal": "v(out)", "reference_signal": "v(in)" },
+        ],
+    }));
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    near(measured(&result, "pm"), 3.485942, 2e-3);
+    near(measured(&result, "gm"), 1.742135, 2e-3);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn octave_and_linear_sweeps_cover_what_the_engine_plans() {
+    for (analysis, last) in [
+        // Ends on the last grid point at or below the stop, short of it.
+        (
+            json!({ "kind": "ac", "start_hz": 7.0, "stop_hz": 1000.0, "scale": "octave", "points": 3 }),
+            896.0,
+        ),
+        (
+            json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 5.0, "points": 10 }),
+            3.98107,
+        ),
+        (
+            json!({ "kind": "ac", "start_hz": 100.0, "stop_hz": 1100.0, "scale": "linear", "points": 11 }),
+            1100.0,
+        ),
+        (
+            json!({ "kind": "ac", "start_hz": 3.0, "stop_hz": 5500.0, "points": 7 }),
+            5500.0,
+        ),
+    ] {
+        let result = ac_loop(json!({ "analysis": analysis.clone() }));
+        assert_eq!(
+            result["outcome"]["status"], "complete",
+            "{analysis} {result}"
+        );
+        let reached = result["analysis"]["simulated_to_hz"].as_f64().unwrap();
+        assert!((reached / last - 1.0).abs() < 1e-4, "{analysis}: {reached}");
+        let short = analysis["stop_hz"].as_f64().unwrap() * 0.999 > reached;
+        assert_eq!(
+            result["warnings"]
+                .to_string()
+                .contains("sweep_ends_before_stop"),
+            short,
+            "{analysis} {result}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_real_filter_with_a_vendor_model_matches_its_formula() {
+    // KiCad's sallen_key demo: unity gain, R = 1 k and C = 100 n twice, on an
+    // AD8051 model. Equal parts give Q = 1/2, a double pole at 1/(2 pi R C), a gain
+    // of -6.02 dB there with -90 degrees, and a -3 dB edge at f0 sqrt(sqrt(2) - 1).
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/sallen_key"), project.path());
+    let before = file_names(project.path());
+    let f0 = 1.0 / (2.0 * std::f64::consts::PI * 1e3 * 100e-9);
+
+    let result = call_over_stdio(
+        "run_simulation",
+        json!({
+            "schematic": project.path().join("sallen_key.kicad_sch"),
+            "analysis": { "kind": "ac", "start_hz": 10.0, "stop_hz": 1e6, "points": 200 },
+            "measurements": [
+                { "name": "edge", "kind": "bandwidth_3db", "signal": "v(/lowpass)" },
+                { "name": "at_f0", "kind": "value_at", "signal": "v(/lowpass)", "at_hz": f0 },
+            ],
+        }),
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["simulated_circuit"], "as_drawn");
+    let dropped = result["circuit"]["dropped_directives"].to_string();
+    assert!(
+        dropped.contains(".ac") && dropped.contains(".control"),
+        "{dropped}"
+    );
+    near(
+        measured(&result, "edge") / f0,
+        (2f64.sqrt() - 1.0).sqrt(),
+        1e-4,
+    );
+    near(measured(&result, "at_f0"), -6.0206, 2e-3);
+    let phase = result["measurements"][1]["phase_degrees"].as_f64().unwrap();
+    near(phase, -90.0, 0.01);
+    assert_eq!(file_names(project.path()), before);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_ac_sweep_with_nothing_to_drive_it_is_refused_on_a_real_schematic() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(
+        &demos().join("simulation/analog-multiplier"),
+        project.path(),
+    );
+
+    let result = call_over_stdio(
+        "run_simulation",
+        json!({
+            "schematic": project.path().join("a-multi.kicad_sch"),
+            "analysis": { "kind": "ac", "start_hz": 10.0, "stop_hz": 1e4 },
+        }),
+    );
+
+    assert_eq!(result["error"]["reason"], "no_ac_stimulus", "{result}");
+    assert_eq!(result["outcome"]["status"], "failed");
+}
+
+fn ramp_and_sweep() -> (Value, Value) {
+    let ramp = run_on_testbench(
+        &protection_deck("reverse"),
+        json!({
+            "analysis": transient(24e-3, 5e-7),
+            "measurements": REVERSE_PLACES.iter().flat_map(|&volts| [
+                json!({ "name": format!("out {volts}"), "kind": "value_at", "signal": "v(out)",
+                        "at_seconds": (volts + 12.0) / 1000.0 }),
+                json!({ "name": format!("in {volts}"), "kind": "value_at", "signal": "i(VBAT)",
+                        "at_seconds": (volts + 12.0) / 1000.0 }),
+            ]).collect::<Vec<_>>(),
+        }),
+    );
+    let sweep = run_on_testbench(
+        &protection_deck("reverse"),
+        json!({
+            "analysis": { "kind": "dc_sweep", "sweeps": [
+                { "target": "VBAT", "start_value": -12.0, "stop_value": 12.0, "step_value": 0.05 }
+            ] },
+            "signals": ["v(out)", "i(VBAT)"],
+            "measurements": REVERSE_PLACES.iter().flat_map(|&volts| [
+                json!({ "name": format!("out {volts}"), "kind": "value_at", "signal": "v(out)",
+                        "at_sweep": volts }),
+                json!({ "name": format!("in {volts}"), "kind": "value_at", "signal": "i(VBAT)",
+                        "at_sweep": volts }),
+            ]).collect::<Vec<_>>(),
+        }),
+    );
+    (ramp, sweep)
+}
+
+const REVERSE_PLACES: [f64; 10] = [-12.0, -6.0, -1.0, -0.1, -0.05, 0.05, 0.1, 1.0, 6.0, 12.0];
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_reversed_battery_swept_from_minus_12_to_12_volts_agrees_with_its_ramp() {
+    let (ramp, sweep) = ramp_and_sweep();
+
+    assert_clean_and_modified(&ramp);
+    assert_clean_and_modified(&sweep);
+    assert_eq!(sweep["analysis"]["points"], 481, "{sweep}");
+    for volts in REVERSE_PLACES {
+        for signal in ["out", "in"] {
+            let name = format!("{signal} {volts}");
+            let (ramped, swept) = (measured(&ramp, &name), measured(&sweep, &name));
+            // The ramp is read between steps of 0.5 us, which is 0.5 mV of battery. The
+            // knee passes current in proportion to e^(V/5 mV), so a coarser step
+            // reads 25 percent off at -50 mV by interpolation alone.
+            near(swept, ramped, 1e-6 + 2e-3 * swept.abs());
+        }
+    }
+    // From `protection/reference.py`: the same leakage and drop as the ramp gives.
+    near(measured(&sweep, "out -12"), -1.1999988e-5, 1e-9);
+    near(measured(&sweep, "in -12"), 9.99999e-7, 1e-10);
+    near(measured(&sweep, "out 12"), 11.9700008, 1e-5);
+    near(measured(&sweep, "in 12"), -0.99750007, 1e-6);
+    let summary = &sweep["signal_summaries"][0];
+    // Over the whole sweep the lowest output is not the -12 V leakage: within 50 mV
+    // of zero the stand-in's 10 mV knee passes a little current backward, which the
+    // handoff names and the ramp's summary would show too.
+    near(summary["min"].as_f64().unwrap(), -1.108e-3, 2e-5);
+    near(summary["max"].as_f64().unwrap(), 11.9700008, 1e-5);
+    assert_eq!(sweep["analysis"]["sweeps"][0]["element"], "VBAT");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_falling_sweep_and_a_rising_one_give_the_same_curve() {
+    let lines = protection_deck("reverse");
+    let run = |start: f64, stop: f64, step: f64, positive: [f64; 2]| {
+        run_on_testbench(
+            &lines,
+            json!({
+                "analysis": { "kind": "dc_sweep", "sweeps": [
+                    { "target": "VBAT", "start_value": start, "stop_value": stop, "step_value": step }
+                ] },
+                "measurements": [
+                    { "name": "out", "kind": "value_at", "signal": "v(out)", "at_sweep": 6.0 },
+                    { "name": "turn_on", "kind": "crossing", "signal": "v(out)", "level": 5.0 },
+                    { "name": "high", "kind": "max", "signal": "v(out)", "from_sweep": positive[0], "to_sweep": positive[1] },
+                ],
+            }),
+        )
+    };
+    let (up, down) = (
+        run(-12.0, 12.0, 0.5, [0.0, 12.0]),
+        run(12.0, -12.0, -0.5, [12.0, 0.0]),
+    );
+
+    assert_eq!(up["outcome"]["status"], "complete", "{up}");
+    assert_eq!(down["outcome"]["status"], "complete", "{down}");
+    // The solver stops within a microvolt of the answer, from either side.
+    near(measured(&up, "out"), measured(&down, "out"), 5e-6);
+    // The crossing is where the output passes 5 V, going up one way and down the other.
+    near(measured(&up, "turn_on"), measured(&down, "turn_on"), 1e-4);
+    near(measured(&up, "high"), 11.9700008, 1e-5);
+    near(measured(&down, "high"), 11.9700008, 1e-5);
+    assert_eq!(down["analysis"]["points"], 49);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn two_dc_sweeps_run_the_whole_grid_with_the_first_sweeping_fastest() {
+    let lines: Vec<String> = [
+        "VA a 0 DC 0",
+        "VB b 0 DC 0",
+        "R1 a c 1k",
+        "R2 b c 1k",
+        "R3 c 0 1k",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let result = call_in_home(
+        home.path(),
+        "run_simulation",
+        json!({
+            "schematic": project.path().join("rectifier.kicad_sch"),
+            "testbench": { "exclude_references": ["*"], "spice_lines": lines },
+            "analysis": { "kind": "dc_sweep", "sweeps": [
+                { "target": "VA", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                { "target": "VB", "start_value": 0.0, "stop_value": 3.0, "step_value": 1.0 },
+            ] },
+            "signals": ["v(c)"],
+        }),
+        "",
+    );
+
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    assert_eq!(result["analysis"]["points"], 12);
+    assert_eq!(result["analysis"]["expected_points"], 12);
+    let summary = &result["signal_summaries"][0];
+    // v(c) = (VA + VB) / 3: nothing at the first point and (2 + 3) / 3 at the last.
+    assert_eq!(summary["at_start"], 0.0, "{summary}");
+    near(summary["at_stop"].as_f64().unwrap(), 5.0 / 3.0, 1e-9);
+    near(summary["max"].as_f64().unwrap(), 5.0 / 3.0, 1e-9);
+    // The raw file shows VA moving first: the third point has VA at 2 and VB at 0.
+    let raw_path = result["artifacts"]["raw_path"].as_str().unwrap();
+    let plots = raw::read(Path::new(raw_path), u64::MAX).unwrap();
+    let plot = &plots[0];
+    let a: Vec<f64> = plot.real(plot.variable("v(a)").unwrap()).collect();
+    let b: Vec<f64> = plot.real(plot.variable("v(b)").unwrap()).collect();
+    assert_eq!(&a[..6], [0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
+    assert_eq!(&b[..6], [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_resistor_and_the_temperature_can_be_swept() {
+    let lines: Vec<String> = ["VS a 0 DC 10", "R1 a b 1k", "R2 b 0 1k"]
+        .map(str::to_owned)
+        .to_vec();
+    let sweep = |target: &str, start: f64, stop: f64, step: f64| {
+        run_on_testbench(
+            &lines,
+            json!({
+                "analysis": { "kind": "dc_sweep", "sweeps": [
+                    { "target": target, "start_value": start, "stop_value": stop, "step_value": step }
+                ] },
+                "measurements": [{ "name": "last", "kind": "value_at", "signal": "v(b)", "at_sweep": stop }],
+            }),
+        )
+    };
+    let resistor = sweep("R2", 1000.0, 3000.0, 1000.0);
+    assert_eq!(resistor["outcome"]["status"], "complete", "{resistor}");
+    near(measured(&resistor, "last"), 7.5, 1e-9);
+    assert_eq!(resistor["analysis"]["sweeps"][0]["unit"], "Ω");
+    let temperature = sweep("TEMP", -40.0, 125.0, 55.0);
+    assert_eq!(
+        temperature["outcome"]["status"], "complete",
+        "{temperature}"
+    );
+    assert_eq!(temperature["analysis"]["points"], 4);
+    assert_eq!(temperature["analysis"]["sweeps"][0]["unit"], "°C");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_sweep_that_would_run_the_wrong_way_is_refused_where_the_engine_would_write_nothing() {
+    let lines: Vec<String> = ["VS a 0 DC 10", "R1 a 0 1k"].map(str::to_owned).to_vec();
+    let result = run_on_testbench(
+        &lines,
+        json!({ "analysis": { "kind": "dc_sweep", "sweeps": [
+            { "target": "VS", "start_value": 0.0, "stop_value": 5.0, "step_value": -1.0 }
+        ] } }),
+    );
+    assert_eq!(result["error"]["kind"], "invalid_argument", "{result}");
+    assert_eq!(result["error"]["field"], "analysis.sweeps[0].step_value");
 }

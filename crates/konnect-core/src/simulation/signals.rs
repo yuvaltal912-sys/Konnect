@@ -75,7 +75,10 @@ pub(crate) struct NotFound {
 /// A signal's values, and any nets that its node is shared with.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Resolved {
+    /// The real parts, or the values of a real plot.
     pub values: Vec<f64>,
+    /// The imaginary parts of an AC plot, and empty for a real one.
+    pub imaginary: Vec<f64>,
     /// KiCad names for one engine node, which ngspice cannot tell apart.
     pub shared_nets: Vec<String>,
 }
@@ -86,24 +89,68 @@ const SAME_SIGNAL_SHARE: f64 = 1e-6;
 /// Below the engine's current tolerance, two vectors are both only rounding.
 const SAME_SIGNAL_FLOOR: f64 = 1e-12;
 
-fn same_signal(first: &[f64], other: &[f64]) -> bool {
+/// A vector's real and imaginary parts. A real plot has no imaginary part, so
+/// that is empty and not a column of zeros.
+#[derive(Debug, Clone, PartialEq)]
+struct Parts {
+    real: Vec<f64>,
+    imaginary: Vec<f64>,
+}
+
+impl Parts {
+    fn zero(points: usize, complex: bool) -> Self {
+        Self {
+            real: vec![0.0; points],
+            imaginary: if complex {
+                vec![0.0; points]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// `self - other`, point by point.
+    fn minus(&self, other: &Self) -> Self {
+        let take = |first: &[f64], second: &[f64]| -> Vec<f64> {
+            first.iter().zip(second).map(|(a, b)| a - b).collect()
+        };
+        Self {
+            real: take(&self.real, &other.real),
+            imaginary: take(&self.imaginary, &other.imaginary),
+        }
+    }
+}
+
+fn same_signal(first: &Parts, other: &Parts) -> bool {
     let peak = first
+        .real
         .iter()
+        .chain(&first.imaginary)
         .fold(0.0_f64, |peak, value| peak.max(value.abs()));
     let limit = (peak * SAME_SIGNAL_SHARE).max(SAME_SIGNAL_FLOOR);
-    first.len() == other.len() && first.iter().zip(other).all(|(a, b)| (a - b).abs() <= limit)
+    let close = |a: &[f64], b: &[f64]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() <= limit)
+    };
+    close(&first.real, &other.real) && close(&first.imaginary, &other.imaginary)
 }
 
 /// The vector of this name. Two can share a name, and a device with a branch
 /// reports its current twice under one. The same data twice is one signal;
 /// different data is not ours to choose between.
-fn vector(plot: &Plot, name: &str) -> Option<Vec<f64>> {
+fn vector(plot: &Plot, name: &str) -> Option<Parts> {
     let mut matches = plot
         .variables
         .iter()
         .enumerate()
         .filter(|(_, variable)| variable.name.eq_ignore_ascii_case(name))
-        .map(|(index, _)| plot.real(index).collect::<Vec<f64>>());
+        .map(|(index, _)| Parts {
+            real: plot.real(index).collect(),
+            imaginary: if plot.complex {
+                plot.imaginary(index).collect()
+            } else {
+                Vec::new()
+            },
+        });
     let first = matches.next()?;
     matches
         .all(|other| same_signal(&first, &other))
@@ -122,9 +169,9 @@ fn nets_on(node: &str, nets: &[NetEntry]) -> Vec<String> {
         .collect()
 }
 
-fn node_voltage(plot: &Plot, node: &str) -> Option<Vec<f64>> {
+fn node_voltage(plot: &Plot, node: &str) -> Option<Parts> {
     if node == "0" {
-        return Some(vec![0.0; plot.points]);
+        return Some(Parts::zero(plot.points, plot.complex));
     }
     vector(plot, &format!("v({node})"))
 }
@@ -140,8 +187,10 @@ fn voltage(plot: &Plot, text: &str, nets: &[NetEntry]) -> Option<Resolved> {
     };
     if known(text) || !text.contains(',') {
         let whole = node_of(text, nets);
+        let parts = node_voltage(plot, &whole)?;
         return Some(Resolved {
-            values: node_voltage(plot, &whole)?,
+            values: parts.real,
+            imaginary: parts.imaginary,
             shared_nets: shared(&whole),
         });
     }
@@ -152,8 +201,10 @@ fn voltage(plot: &Plot, text: &str, nets: &[NetEntry]) -> Option<Resolved> {
         let minus = node_voltage(plot, &second)?;
         let mut shared_nets = shared(&first);
         shared_nets.extend(shared(&second));
+        let difference = plus.minus(&minus);
         Some(Resolved {
-            values: plus.iter().zip(&minus).map(|(p, m)| p - m).collect(),
+            values: difference.real,
+            imaginary: difference.imaginary,
             shared_nets,
         })
     })
@@ -179,9 +230,10 @@ fn pins_of(plot: &Plot, element: &str) -> Vec<String> {
 
 /// Find a signal in a finished run.
 pub(crate) fn resolve(plot: &Plot, signal: &Signal, names: Names) -> Result<Resolved, NotFound> {
-    let plain = |values: Option<Vec<f64>>| {
-        values.map(|values| Resolved {
-            values,
+    let plain = |parts: Option<Parts>| {
+        parts.map(|parts| Resolved {
+            values: parts.real,
+            imaginary: parts.imaginary,
             shared_nets: Vec::new(),
         })
     };
@@ -266,6 +318,28 @@ mod tests {
             text.push_str(&format!(" {point}"));
             for value in *row {
                 text.push_str(&format!("\t{value:e}\n"));
+            }
+        }
+        raw::parse(text.as_bytes()).unwrap().remove(0)
+    }
+
+    /// An AC plot: the first column is the frequency, the rest are `(re, im)`.
+    fn complex_plot(names: &[&str], rows: &[&[(f64, f64)]]) -> Plot {
+        let mut text = format!(
+            "Title: t\nPlotname: AC Analysis\nFlags: complex\nNo. Variables: {}\n\
+             No. Points: {}\nVariables:\n",
+            names.len() + 1,
+            rows.len()
+        );
+        text.push_str("\t0\tfrequency\tfrequency grid=3\n");
+        for (index, name) in names.iter().enumerate() {
+            text.push_str(&format!("\t{}\t{name}\tvoltage\n", index + 1));
+        }
+        text.push_str("Values:\n");
+        for (point, row) in rows.iter().enumerate() {
+            text.push_str(&format!(" {point}\t{:e},0\n", (point + 1) as f64));
+            for (re, im) in *row {
+                text.push_str(&format!("\t{re:e},{im:e}\n"));
             }
         }
         raw::parse(text.as_bytes()).unwrap().remove(0)
@@ -524,5 +598,53 @@ mod tests {
             Signal::Power("r)1".into()),
         ];
         assert!(power_probes(asked.iter(), NONE, &["A1", "K1", "r)1"]).is_empty());
+    }
+    #[test]
+    fn an_ac_signal_keeps_both_parts_and_a_difference_subtracts_both() {
+        let plot = complex_plot(
+            &["v(a)", "v(b)"],
+            &[&[(3.0, 4.0), (1.0, 1.0)], &[(5.0, -2.0), (0.5, 3.0)]],
+        );
+        let resolve_text =
+            |text: &str| resolve(&plot, &Signal::parse(text).unwrap(), NONE).unwrap();
+        let whole = resolve_text("v(a)");
+        assert_eq!(
+            (whole.values, whole.imaginary),
+            (vec![3.0, 5.0], vec![4.0, -2.0])
+        );
+        let difference = resolve_text("v(a,b)");
+        assert_eq!(difference.values, [2.0, 4.5]);
+        assert_eq!(difference.imaginary, [3.0, -5.0]);
+        // Ground is zero in both parts.
+        let ground = resolve_text("v(a,0)");
+        assert_eq!(ground.imaginary, [4.0, -2.0]);
+        let zero = resolve_text("v(0)");
+        assert_eq!(
+            (zero.values, zero.imaginary),
+            (vec![0.0, 0.0], vec![0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn a_real_plot_has_no_imaginary_part() {
+        let plot = plot(&["time", "v(a)"], &[&[0.0, 1.0], &[1.0, 2.0]]);
+        let resolved = resolve(&plot, &Signal::parse("v(a)").unwrap(), NONE).unwrap();
+        assert!(resolved.imaginary.is_empty());
+        let ground = resolve(&plot, &Signal::parse("v(0)").unwrap(), NONE).unwrap();
+        assert!(ground.imaginary.is_empty());
+    }
+
+    #[test]
+    fn two_vectors_that_differ_only_in_their_imaginary_part_are_not_one_signal() {
+        let same = complex_plot(
+            &["i(l1)", "i(l1)"],
+            &[&[(1.0, 2.0), (1.0, 2.0)], &[(3.0, 4.0), (3.0, 4.0)]],
+        );
+        assert!(resolve(&same, &Signal::parse("i(L1)").unwrap(), NONE).is_ok());
+        let apart = complex_plot(
+            &["i(l1)", "i(l1)"],
+            &[&[(1.0, 2.0), (1.0, 9.0)], &[(3.0, 4.0), (3.0, 4.0)]],
+        );
+        assert!(resolve(&apart, &Signal::parse("i(L1)").unwrap(), NONE).is_err());
     }
 }

@@ -6,7 +6,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::outcome::{self, OutcomeStatus};
 use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
 use crate::simulation::kicad_netlist::{self, ElementEntry, KiCadNetlist, NetEntry, SpiceNetlist};
-use crate::simulation::measure::{self, Measurement};
+use crate::simulation::measure::{self, AxisSpec, Measurement};
 use crate::simulation::preflight::{self, Preflight};
 use crate::simulation::protocol::{
     RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION, RAW_FILE, REQUEST_FILE,
@@ -17,7 +17,7 @@ use crate::simulation::worker_client::{
     classify, probe_engine, read_results, run_worker, EngineStatus, SimulationRuntime, Verdict,
     WorkerEnd, MAX_RAW_LIMIT, PROBE_TIMEOUT,
 };
-use crate::simulation::{runs, snapshot};
+use crate::simulation::{ac, element, runs, snapshot};
 use crate::tool;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -25,6 +25,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+mod sweeps;
+use sweeps::{Ac, DcSweep};
 
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LIMIT: u64 = 25;
@@ -119,6 +122,58 @@ fn analysis_schema() -> Value {
             "required": ["kind", "stop_time_seconds"]
         }, {
             "type": "object",
+            "properties": {
+                "kind": { "const": "ac" },
+                "start_hz": { "type": "number", "exclusiveMinimum": 0 },
+                "stop_hz": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Above start_hz. An octave sweep ends on the last point at or below it"
+                },
+                "scale": {
+                    "enum": ["decade", "octave", "linear"],
+                    "default": "decade"
+                },
+                "points": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000,
+                    "default": 50,
+                    "description": "Per decade or octave, or in all if linear (at least 2)"
+                }
+            },
+            "required": ["kind", "start_hz", "stop_hz"],
+            "description": "Small-signal sweep. Needs a source with an AC value, such as `AC 1`"
+        }, {
+            "type": "object",
+            "properties": {
+                "kind": { "const": "dc_sweep" },
+                "sweeps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "description": "The first sweep varies fastest",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target": {
+                                "type": "string",
+                                "description": "Reference of a voltage source, current source or resistor, or TEMP. Values use its unit: V, A, ohm or degrees C"
+                            },
+                            "start_value": { "type": "number" },
+                            "stop_value": { "type": "number" },
+                            "step_value": {
+                                "type": "number",
+                                "description": "Not 0. Negative to sweep down"
+                            }
+                        },
+                        "required": ["target", "start_value", "stop_value", "step_value"]
+                    }
+                }
+            },
+            "required": ["kind", "sweeps"]
+        }, {
+            "type": "object",
             "properties": { "kind": { "const": "operating_point" } },
             "required": ["kind"]
         }]
@@ -136,10 +191,25 @@ fn measurement_schema() -> Value {
                 "type": "string",
                 "description": "v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF)"
             },
-            "from_seconds": { "type": "number", "description": "Window start. Default is the first point" },
-            "to_seconds": { "type": "number", "description": "Window end. Default is the last point" },
-            "at_seconds": { "type": "number", "description": "For value_at" },
+            "reference_signal": {
+                "type": "string",
+                "description": "AC only: the measured signal is divided by this one, as in a loop gain taken between two nodes"
+            },
+            "from_seconds": { "type": "number", "description": "Transient window start. Default is the first point" },
+            "to_seconds": { "type": "number", "description": "Transient window end. Default is the last point" },
+            "at_seconds": { "type": "number", "description": "Transient value_at" },
+            "from_hz": { "type": "number", "description": "AC: only the points from here up are examined" },
+            "to_hz": { "type": "number", "description": "AC: only the points up to here are examined" },
+            "at_hz": { "type": "number", "description": "AC value_at: gain in dB, with phase" },
+            "from_sweep": { "type": "number", "description": "DC sweep window start, in the order of the sweep" },
+            "to_sweep": { "type": "number", "description": "DC sweep window end, in the order of the sweep" },
+            "at_sweep": { "type": "number", "description": "DC sweep value_at" },
             "level": { "type": "number", "description": "For crossing" },
+            "reference_level": {
+                "enum": ["low_frequency", "peak"],
+                "default": "low_frequency",
+                "description": "For bandwidth_3db: 3 dB below the lowest frequency's gain, or below the peak, which gives both edges"
+            },
             "direction": {
                 "enum": ["rising", "falling", "either"],
                 "default": "either",
@@ -183,7 +253,7 @@ pub fn tools() -> Vec<ToolDef> {
         |args, ctx| async move { handle_check_simulation_readiness(args, ctx).await }
     ), tool!(
         "run_simulation",
-        "Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point or a transient. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time.",
+        "Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point, a transient, an AC sweep or a DC sweep. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time. An AC sweep gives gain in dB, and bandwidth, phase margin and gain margin. A DC sweep varies a source, a resistor or the temperature, and takes extremes and crossings along it.",
         json!({
             "type": "object",
             "properties": {
@@ -194,20 +264,20 @@ pub fn tools() -> Vec<ToolDef> {
                     "type": "array",
                     "maxItems": MAX_SIGNALS,
                     "items": { "type": "string" },
-                    "description": "Signals to summarise: v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF). Transient only. Net names as KiCad shows them"
+                    "description": "Signals to summarise: v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF; not in an AC sweep). Net names as KiCad shows them. An AC summary is in dB, 20 log10 of the magnitude, which is the gain when the AC source is 1"
                 },
                 "measurements": {
                     "type": "array",
                     "maxItems": MAX_MEASUREMENTS,
                     "items": measurement_schema(),
-                    "description": "Values to work out from the run, with time weighting. Transient only"
+                    "description": "Values to work out from the run. Each analysis takes its own kinds, and a kind that does not fit it is refused: a transient takes all but the AC ones, an AC sweep takes bandwidth_3db, phase_margin, gain_margin and value_at, a DC sweep with one sweep takes min, max, peak_to_peak, peak_abs, value_at and crossing"
                 },
                 "envelope_points": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": MAX_ENVELOPE_POINTS,
                     "default": 0,
-                    "description": "Buckets of min and max to add to each summary"
+                    "description": "Transient only. Buckets of min and max to add to each summary"
                 },
                 "limit": {
                     "type": "integer",
@@ -507,10 +577,12 @@ impl Transient {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Analysis {
     OperatingPoint,
     Transient(Transient),
+    Ac(Ac),
+    DcSweep(DcSweep),
 }
 
 impl Analysis {
@@ -518,6 +590,8 @@ impl Analysis {
         match analysis["kind"].as_str().unwrap_or_default() {
             "operating_point" => Ok(Self::OperatingPoint),
             "transient" => Transient::from_args(analysis).map(Self::Transient),
+            "ac" => Ac::from_args(analysis).map(Self::Ac),
+            "dc_sweep" => DcSweep::from_args(analysis).map(Self::DcSweep),
             other => Err(invalid(
                 "analysis.kind",
                 format!("Unknown analysis kind: {other}"),
@@ -529,6 +603,8 @@ impl Analysis {
         match self {
             Self::OperatingPoint => "operating_point",
             Self::Transient(_) => "transient",
+            Self::Ac(_) => "ac",
+            Self::DcSweep(_) => "dc_sweep",
         }
     }
 
@@ -536,6 +612,8 @@ impl Analysis {
         match self {
             Self::OperatingPoint => OPERATING_POINT.to_string(),
             Self::Transient(transient) => transient.line(),
+            Self::Ac(ac) => ac.line(),
+            Self::DcSweep(sweep) => sweep.line(),
         }
     }
 
@@ -543,11 +621,59 @@ impl Analysis {
         match self {
             Self::OperatingPoint => operating_point_covered(plot),
             Self::Transient(transient) => transient.covered(plot),
+            Self::Ac(ac) => ac.covered(plot),
+            Self::DcSweep(sweep) => sweep.covered(plot),
         }
     }
 
     fn uses_initial_conditions(&self) -> bool {
         matches!(self, Self::Transient(run) if run.use_initial_conditions)
+    }
+
+    /// An AC sweep makes complex values, which take twice the room of a real one.
+    fn makes_complex_data(&self) -> bool {
+        matches!(self, Self::Ac(_))
+    }
+
+    /// What measurements are taken along. Not known for an operating point, and
+    /// not for a DC sweep until its target is read from the deck.
+    fn axis(&self) -> Option<AxisSpec> {
+        match self {
+            Self::OperatingPoint => None,
+            Self::Transient(run) => Some(AxisSpec::time(run.stop, run.start_save.unwrap_or(0.0))),
+            Self::Ac(ac) => Some(AxisSpec::frequency(ac.start, ac.stop)),
+            Self::DcSweep(sweep) => {
+                let inner = sweep.inner();
+                Some(AxisSpec::sweep(inner.start, inner.stop, ""))
+            }
+        }
+    }
+
+    /// Read what the deck holds that the analysis names. A refusal here stops the
+    /// run before the engine does.
+    fn prepared(
+        self,
+        deck: &FlatDeck,
+        compatibility: Compatibility,
+        elements: &[ElementEntry],
+    ) -> Result<Self, CallToolResult> {
+        match self {
+            Self::Ac(_) if !element::has_ac_stimulus(deck, compatibility.dollar_is_comment()) => {
+                Err(simulation_failure(
+                    "preflight",
+                    "no_ac_stimulus",
+                    None,
+                    Vec::new(),
+                    "No voltage or current source has an AC value, so every signal would read \
+                     zero. Give a source an AC value, such as `AC 1`, or add a source through \
+                     the testbench.",
+                ))
+            }
+            Self::DcSweep(sweep) => sweep
+                .resolve(&top_level_elements(deck), elements)
+                .map(Self::DcSweep),
+            other => Ok(other),
+        }
     }
 }
 
@@ -580,25 +706,47 @@ impl Wanted {
                 format!("At most {MAX_MEASUREMENTS} measurements"),
             ));
         }
-        let Analysis::Transient(transient) = analysis else {
+        let Some(axis) = analysis.axis() else {
             let fits = signals.is_empty() && measurements.is_empty() && envelope_points == 0;
             return match fits {
                 true => Ok((analysis, Self::default())),
                 false => Err(invalid(
                     "measurements",
-                    "signals, measurements and envelope_points need a transient",
+                    "signals, measurements and envelope_points need a transient, an ac or a \
+                     dc_sweep analysis",
                 )),
             };
         };
+        if envelope_points > 0 && !matches!(analysis, Analysis::Transient(_)) {
+            return Err(invalid(
+                "envelope_points",
+                "envelope_points applies to a transient",
+            ));
+        }
         if envelope_points > 0 && signals.is_empty() {
             return Err(invalid("envelope_points", "envelope_points needs signals"));
         }
+        // Along two sweeps a value has two places, and a window, a crossing or a
+        // single value over the grid would not say which.
+        let grid = matches!(&analysis, Analysis::DcSweep(sweep) if sweep.sweeps.len() > 1);
+        if grid && !measurements.is_empty() {
+            return Err(invalid(
+                "measurements",
+                "A dc_sweep with two sweeps takes signals but no measurements: the data is in \
+                 the raw file. Use one sweep to measure.",
+            ));
+        }
+        let ac = matches!(analysis, Analysis::Ac(_));
         let signals = signals
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 let text = entry.as_str().unwrap_or_default();
                 match Signal::parse(text) {
+                    Ok(Signal::Power(_)) if ac => Err(invalid(
+                        format!("signals[{index}]"),
+                        "p() has no value in an ac analysis",
+                    )),
                     Ok(signal) => Ok((text.to_string(), signal)),
                     Err(reason) => Err(invalid(format!("signals[{index}]"), reason)),
                 }
@@ -608,13 +756,7 @@ impl Wanted {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                measure::parse(
-                    entry,
-                    index,
-                    transient.stop,
-                    transient.start_save.unwrap_or(0.0),
-                )
-                .map_err(|bad| invalid(bad.field, bad.reason))
+                measure::parse(entry, index, &axis).map_err(|bad| invalid(bad.field, bad.reason))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
@@ -715,10 +857,12 @@ fn preflight_refusal(preflight: &Preflight, kind: &str) -> Option<CallToolResult
         });
         return Some(simulation_failure("preflight", code, None, items, message));
     }
+    // Both solve the circuit at DC, where an isolated group has no defined voltage.
+    let dc = matches!(kind, "operating_point" | "dc_sweep");
     let floating = preflight
         .warnings
         .iter()
-        .find(|warning| warning.code == "floating_subcircuit" && kind == "operating_point")?;
+        .find(|warning| warning.code == "floating_subcircuit" && dc)?;
     Some(simulation_failure(
         "preflight",
         floating.code,
@@ -858,9 +1002,14 @@ async fn run_analysis(
     {
         return Err(refusal);
     }
+    let analysis =
+        request
+            .analysis
+            .clone()
+            .prepared(deck, design.compatibility, &design.elements)?;
     // A probe moves a device's pin onto a hidden node, and under `uic` a device
     // takes its start from its own pins: a voltage set on the net would be lost.
-    let keep_conditions = request.analysis.uses_initial_conditions() && sets_node_conditions(deck);
+    let keep_conditions = analysis.uses_initial_conditions() && sets_node_conditions(deck);
     if keep_conditions {
         if let Some(refusal) = probe_conflict(deck) {
             return Err(refusal);
@@ -891,6 +1040,7 @@ async fn run_analysis(
         input_path: Some(design.project_dir.clone()),
         budget_ms: budget.as_millis() as u64,
         max_raw_bytes: request.max_raw_bytes,
+        complex_data: analysis.makes_complex_data(),
     };
     let event_nodes = design
         .preflight
@@ -907,7 +1057,7 @@ async fn run_analysis(
             &top_level_elements(deck),
         ),
     };
-    let own_lines = own_lines(&request.analysis, !event_nodes && !keep_conditions, &probes);
+    let own_lines = own_lines(&analysis, !event_nodes && !keep_conditions, &probes);
     prepare_run(&run, deck, &own_lines, &worker_request)
         .map_err(|error| store_failure(format!("Failed to prepare the run: {error:#}")))?;
     let end = run_worker(runtime, &run.dir, &library, budget)
@@ -924,6 +1074,7 @@ async fn run_analysis(
 
     let finish = RunEnd {
         keep_conditions,
+        analysis: &analysis,
         request,
         run: &run,
         design: &design,
@@ -938,6 +1089,8 @@ async fn run_analysis(
 struct RunEnd<'a> {
     /// Probes were left out so `.ic` voltages hold.
     keep_conditions: bool,
+    /// The analysis as it ran, with a sweep's targets read from the deck.
+    analysis: &'a Analysis,
     request: &'a RunArguments<'a>,
     run: &'a runs::RunFolder,
     design: &'a Design,
@@ -1073,6 +1226,16 @@ fn failure_message(reason: &str) -> &'static str {
     }
 }
 
+/// Signals and measurements read from a run.
+#[derive(Default)]
+struct Gathered {
+    summaries: Vec<Value>,
+    measurements: Vec<Value>,
+    shared_nets: BTreeSet<String>,
+    signal_missing: bool,
+    failed_measurements: usize,
+}
+
 impl RunEnd<'_> {
     fn path(&self, file: &str) -> String {
         self.run.dir.join(file).display().to_string()
@@ -1116,7 +1279,7 @@ impl RunEnd<'_> {
             .status()
             .map(|status| read_results(&self.run.dir, status));
         let verdict = classify(self.end, results.as_ref(), |plot| {
-            self.request.analysis.covered(plot)
+            self.analysis.covered(plot)
         });
         let stopped = match verdict {
             Verdict::Failed(reason) => return Err(self.failure(reason)),
@@ -1126,12 +1289,14 @@ impl RunEnd<'_> {
         let Some(Ok(plot)) = &results else {
             return Err(self.failure("results_unreadable"));
         };
-        let (body, failed) = match &self.request.analysis {
+        let (body, failed) = match self.analysis {
             Analysis::OperatingPoint => (
                 self.operating_point_body(plot, stopped),
                 usize::from(stopped.is_some()),
             ),
             Analysis::Transient(transient) => self.transient_body(transient, plot, stopped),
+            Analysis::Ac(ac) => self.ac_body(ac, plot, stopped),
+            Analysis::DcSweep(sweep) => self.sweep_body(sweep, plot, stopped),
         };
         let requested = FIXED_OUTCOME_UNITS + self.request.wanted.measurements.len();
         let status = match failed {
@@ -1157,8 +1322,96 @@ impl RunEnd<'_> {
         }
     }
 
-    /// The body and how many outcome units failed. The "range covered" unit also
-    /// stands for the signals asked for: `signals` has no units of its own.
+    /// Look up a measurement's signal. With a `reference_signal` it is the ratio of
+    /// the two, worked out as complex numbers.
+    fn effective_signal(
+        &self,
+        plot: &Plot,
+        request: &Measurement,
+    ) -> Result<signals::Resolved, NotFound> {
+        let mut found = signals::resolve(plot, &request.signal, self.names())?;
+        let Some((_, reference)) = &request.reference_signal else {
+            return Ok(found);
+        };
+        let other = signals::resolve(plot, reference, self.names())?;
+        let (real, imaginary) = ac::divide(
+            (&found.values, &found.imaginary),
+            (&other.values, &other.imaginary),
+        );
+        found.values = real;
+        found.imaginary = imaginary;
+        found.shared_nets.extend(other.shared_nets);
+        Ok(found)
+    }
+
+    /// Resolve every signal and measurement, and say what each analysis made of it.
+    fn gather(
+        &self,
+        plot: &Plot,
+        partial: bool,
+        measurements: &[Measurement],
+        summary: impl Fn(&str, &Signal, &signals::Resolved) -> Value,
+        measurement: impl Fn(&Measurement, &signals::Resolved) -> Value,
+    ) -> Gathered {
+        let mut gathered = Gathered::default();
+        for (text, signal) in &self.request.wanted.signals {
+            match signals::resolve(plot, signal, self.names()) {
+                Ok(found) => {
+                    gathered
+                        .shared_nets
+                        .extend(found.shared_nets.iter().cloned());
+                    gathered.summaries.push(summary(text, signal, &found));
+                }
+                Err(not_found) => {
+                    gathered.signal_missing = true;
+                    let report = json!({ "signal": text, "finding": "signal_not_found" });
+                    gathered.summaries.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        for request in measurements {
+            match self.effective_signal(plot, request) {
+                Ok(found) => {
+                    gathered.failed_measurements += usize::from(partial);
+                    gathered
+                        .shared_nets
+                        .extend(found.shared_nets.iter().cloned());
+                    gathered.measurements.push(measurement(request, &found));
+                }
+                Err(not_found) => {
+                    gathered.failed_measurements += 1;
+                    let report = measure::missing_report(request, partial);
+                    gathered.measurements.push(with_pins(report, &not_found));
+                }
+            }
+        }
+        gathered
+    }
+
+    /// Put what was gathered in the body, and count the outcome units that failed.
+    /// The "range covered" unit also stands for the signals asked for: `signals`
+    /// has no units of its own.
+    fn finish_body(&self, body: &mut Value, gathered: Gathered, partial: bool) -> usize {
+        let wanted = &self.request.wanted;
+        if !wanted.measurements.is_empty() {
+            body["measurements"] = json!(gathered.measurements);
+        }
+        if !wanted.signals.is_empty() {
+            body["signal_summaries"] = json!(gathered.summaries);
+        }
+        if let Some(warnings) = body["warnings"].as_array_mut() {
+            if !gathered.shared_nets.is_empty() {
+                warnings.push(json!({
+                    "code": "nets_share_engine_node",
+                    "detail": "ngspice reads these nets as one node, so their signals are the same.",
+                    "items": gathered.shared_nets,
+                }));
+            }
+        }
+        usize::from(partial || gathered.signal_missing) + gathered.failed_measurements
+    }
+
+    /// The body and how many outcome units failed.
     fn transient_body(
         &self,
         transient: &Transient,
@@ -1171,50 +1424,28 @@ impl RunEnd<'_> {
             .variable("time")
             .map(|index| plot.real(index).collect())
             .unwrap_or_default();
-        let mut shared_nets = BTreeSet::new();
-        let mut signal_missing = false;
-        let mut summaries = Vec::new();
-        for (text, signal) in &wanted.signals {
-            match signals::resolve(plot, signal, self.names()) {
-                Ok(found) => {
-                    shared_nets.extend(found.shared_nets);
-                    summaries.push(measure::summary(
-                        &time,
-                        &found.values,
-                        text,
-                        signal.unit(),
-                        wanted.envelope_points,
-                        partial,
-                    ));
-                }
-                Err(not_found) => {
-                    signal_missing = true;
-                    let report = json!({ "signal": text, "finding": "signal_not_found" });
-                    summaries.push(with_pins(report, &not_found));
-                }
-            }
-        }
-        let mut failed_measurements = 0;
-        let mut measurements = Vec::new();
-        for request in &wanted.measurements {
-            match signals::resolve(plot, &request.signal, self.names()) {
-                Ok(found) => {
-                    failed_measurements += usize::from(partial);
-                    shared_nets.extend(found.shared_nets);
-                    let reading = measure::measure(&time, &found.values, request);
-                    measurements.push(reading.report(request, partial));
-                }
-                Err(not_found) => {
-                    failed_measurements += 1;
-                    let report = measure::missing_report(request, partial);
-                    measurements.push(with_pins(report, &not_found));
-                }
-            }
-        }
+        let gathered = self.gather(
+            plot,
+            partial,
+            &wanted.measurements,
+            |text, signal, found| {
+                measure::summary(
+                    &time,
+                    &found.values,
+                    text,
+                    signal.unit(),
+                    wanted.envelope_points,
+                    partial,
+                )
+            },
+            |request, found| {
+                measure::measure(&time, &found.values, request).report(request, partial)
+            },
+        );
         let reached = Transient::reached(plot).unwrap_or(0.0);
         let first_point = Transient::first_point(plot).unwrap_or(0.0);
         let analysis = json!({
-            "kind": self.request.analysis.kind(),
+            "kind": self.analysis.kind(),
             "stop_time_seconds": transient.stop,
             "first_point_seconds": first_point,
             "simulated_to_seconds": reached,
@@ -1222,20 +1453,7 @@ impl RunEnd<'_> {
             "points": plot.points,
         });
         let mut body = self.result_body(plot, analysis, stopped);
-        if !wanted.measurements.is_empty() {
-            body["measurements"] = json!(measurements);
-        }
-        if !wanted.signals.is_empty() {
-            body["signal_summaries"] = json!(summaries);
-        }
         if let Some(warnings) = body["warnings"].as_array_mut() {
-            if !shared_nets.is_empty() {
-                warnings.push(json!({
-                    "code": "nets_share_engine_node",
-                    "detail": "ngspice reads these nets as one node, so their signals are the same.",
-                    "items": shared_nets,
-                }));
-            }
             let saves_from_start =
                 transient.start_save.unwrap_or(0.0) < transient.stop / PRINT_STEPS;
             if first_point > 0.0 && saves_from_start {
@@ -1248,7 +1466,82 @@ impl RunEnd<'_> {
                 }));
             }
         }
-        let failed = usize::from(partial || signal_missing) + failed_measurements;
+        let failed = self.finish_body(&mut body, gathered, partial);
+        (body, failed)
+    }
+
+    fn ac_body(&self, ac: &Ac, plot: &Plot, stopped: Option<&'static str>) -> (Value, usize) {
+        let wanted = &self.request.wanted;
+        let partial = stopped.is_some();
+        let freq: Vec<f64> = plot
+            .variable("frequency")
+            .map(|index| plot.real(index).collect())
+            .unwrap_or_default();
+        let logarithmic = ac.scale.is_logarithmic();
+        let gathered = self.gather(
+            plot,
+            partial,
+            &wanted.measurements,
+            |text, _, found| ac::summary(&freq, &found.values, &found.imaginary, text, partial),
+            |request, found| match ac::Response::new(
+                &freq,
+                &found.values,
+                &found.imaginary,
+                logarithmic,
+            ) {
+                Some(response) => ac::measure(&response, request, partial),
+                None => measure::missing_report(request, partial),
+            },
+        );
+        let mut body = self.result_body(plot, ac.describe(plot), stopped);
+        let reached = Ac::reached(plot).unwrap_or(0.0);
+        if let Some(warnings) = body["warnings"].as_array_mut() {
+            if !partial && ac.ends_short(reached) {
+                warnings.push(json!({
+                    "code": "sweep_ends_before_stop",
+                    "detail": "ngspice's frequency grid ends on its last point at or below \
+                               stop_hz, here simulated_to_hz. Every point it plans was run.",
+                }));
+            }
+        }
+        let failed = self.finish_body(&mut body, gathered, partial);
+        (body, failed)
+    }
+
+    fn sweep_body(
+        &self,
+        sweep: &DcSweep,
+        plot: &Plot,
+        stopped: Option<&'static str>,
+    ) -> (Value, usize) {
+        let wanted = &self.request.wanted;
+        let partial = stopped.is_some();
+        let inner = sweep.inner();
+        // Falling sweeps are measured on a rising axis, and put back on the way out.
+        let direction = AxisSpec::sweep(inner.start, inner.stop, inner.unit).direction();
+        let axis: Vec<f64> = DcSweep::axis(plot).iter().map(|x| x * direction).collect();
+        let measurements: Vec<Measurement> = wanted
+            .measurements
+            .iter()
+            .cloned()
+            .map(|mut request| {
+                request.axis.unit = inner.unit.to_string();
+                request
+            })
+            .collect();
+        let gathered = self.gather(
+            plot,
+            partial,
+            &measurements,
+            |text, signal, found| {
+                measure::sweep_summary(&found.values, text, signal.unit(), partial)
+            },
+            |request, found| {
+                measure::measure(&axis, &found.values, request).report(request, partial)
+            },
+        );
+        let mut body = self.result_body(plot, sweep.describe(plot), stopped);
+        let failed = self.finish_body(&mut body, gathered, partial);
         (body, failed)
     }
 
@@ -1265,7 +1558,7 @@ impl RunEnd<'_> {
             0.0
         };
         let analysis = json!({
-            "kind": self.request.analysis.kind(),
+            "kind": self.analysis.kind(),
             "coverage_ratio": coverage,
             "points": plot.points,
         });
@@ -2451,6 +2744,90 @@ mod tests {
     }
 
     #[test]
+    fn each_analysis_takes_the_measurements_that_fit_it() {
+        let ac = json!({ "kind": "ac", "start_hz": 1, "stop_hz": 100 });
+        let dc = json!({ "kind": "dc_sweep", "sweeps": [
+            { "target": "V1", "start_value": 0, "stop_value": 5, "step_value": 1 }
+        ] });
+        let run = json!({ "kind": "transient", "stop_time_seconds": 1 });
+        let none = Value::Null;
+        let kinds = |names: &[&str]| -> Value {
+            let items: Vec<Value> = names
+                .iter()
+                .map(|kind| {
+                    let mut entry = json!({ "kind": kind, "signal": "v(a)" });
+                    match *kind {
+                        "value_at" => entry["at_hz"] = json!(10),
+                        "crossing" => entry["level"] = json!(1),
+                        _ => {}
+                    }
+                    entry
+                })
+                .collect();
+            json!(items)
+        };
+        let fits = |analysis: &Value, names: &[&str]| {
+            let mut measurements = kinds(names);
+            // The point-in-axis field follows the analysis.
+            for entry in measurements.as_array_mut().unwrap() {
+                if entry["kind"] == "value_at" {
+                    entry.as_object_mut().unwrap().remove("at_hz");
+                    let key = match analysis["kind"].as_str() {
+                        Some("ac") => "at_hz",
+                        Some("dc_sweep") => "at_sweep",
+                        _ => "at_seconds",
+                    };
+                    entry[key] = json!(1);
+                }
+            }
+            Wanted::from_args(analysis, &none, &measurements, 0).is_ok()
+        };
+        let time_kinds = [
+            "min",
+            "max",
+            "peak_to_peak",
+            "peak_abs",
+            "average",
+            "rms",
+            "integral",
+            "i2t",
+            "crossing",
+            "rise_time",
+            "fall_time",
+            "overshoot_percent",
+            "settling_time",
+        ];
+        let ac_kinds = ["bandwidth_3db", "phase_margin", "gain_margin"];
+        let sweep_kinds = ["min", "max", "peak_to_peak", "peak_abs", "crossing"];
+        for kind in time_kinds {
+            let current = kind != "i2t";
+            let entry = if current { kind } else { "min" };
+            assert!(fits(&run, &[entry]), "transient {kind}");
+            assert_eq!(fits(&ac, &[kind]), false, "ac {kind}");
+        }
+        for kind in ac_kinds {
+            assert!(fits(&ac, &[kind]), "ac {kind}");
+            assert!(!fits(&run, &[kind]), "transient {kind}");
+            assert!(!fits(&dc, &[kind]), "dc {kind}");
+        }
+        for kind in sweep_kinds {
+            assert!(fits(&dc, &[kind]), "dc {kind}");
+        }
+        for kind in [
+            "average",
+            "rms",
+            "integral",
+            "rise_time",
+            "fall_time",
+            "overshoot_percent",
+            "settling_time",
+        ] {
+            assert!(!fits(&dc, &[kind]), "dc {kind}");
+        }
+        assert!(fits(&ac, &["value_at"]) && fits(&dc, &["value_at"]) && fits(&run, &["value_at"]));
+    }
+
+    #[test]
     fn an_envelope_with_no_signals_or_a_bad_signal_is_refused() {
         let run = json!({ "kind": "transient", "stop_time_seconds": 1 });
         let none = Value::Null;
@@ -2519,7 +2896,11 @@ mod tests {
 
         const OP_FIXTURE: &str = "tests/fixtures/simulation/raw/op.ascii.raw";
         /// Good status fields, for a fake worker to write.
-        const GOOD: &str = r#""protocol":3,"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#;
+        fn good() -> String {
+            format!(
+                r#""protocol":{PROTOCOL_VERSION},"load_error":null,"engine_version":"44.2","code_models_loaded":["analog"],"code_models_failed":[],"exit_status":null"#
+            )
+        }
 
         /// Answers a probe as a working engine, then does `job` in the run folder.
         fn fake_worker(dir: &Path, job: &str) -> PathBuf {
@@ -2534,8 +2915,9 @@ mod tests {
         }
 
         fn status_json(sim_status: &str, halted: &str, written: bool) -> String {
+            let good = good();
             format!(
-                "cat > status.json <<'JSON'\n{{{GOOD},\"sim_status\":{sim_status},\
+                "cat > status.json <<'JSON'\n{{{good},\"sim_status\":{sim_status},\
                  \"halted_reason\":{halted},\"results_written\":{written}}}\nJSON"
             )
         }
@@ -2588,6 +2970,522 @@ mod tests {
             let dirs = run_dirs(&scene);
             let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
             assert!(deck.contains("\n.tran 1e-3 2e0\n.end"), "{deck}");
+        }
+
+        /// An AC sweep of `v(a)`: each point is a frequency, then the real and
+        /// imaginary parts of the signal.
+        fn copy_ac(points: &[(f64, f64, f64)]) -> String {
+            let mut raw = format!(
+                "cat > results.raw <<'RAW'\nTitle: t\nPlotname: AC Analysis\nFlags: complex\n\
+                 No. Variables: 2\nNo. Points: {}\nVariables:\n\t0\tfrequency\tfrequency grid=3\n\
+                 \t1\tv(a)\tvoltage\nValues:\n",
+                points.len()
+            );
+            for (index, (frequency, real, imaginary)) in points.iter().enumerate() {
+                raw.push_str(&format!(
+                    "{index}\t{frequency:e},0\n\t{real:e},{imaginary:e}\n"
+                ));
+            }
+            raw.push_str("\nRAW");
+            raw
+        }
+
+        /// A DC sweep with `v(a)` as the one signal, after the sweep's own value.
+        fn copy_dc(points: &[(f64, f64)]) -> String {
+            let mut raw = format!(
+                "cat > results.raw <<'RAW'\nTitle: t\nPlotname: DC transfer characteristic\n\
+                 Flags: real\nNo. Variables: 2\nNo. Points: {}\nVariables:\n\
+                 \t0\tv(v-sweep)\tvoltage\n\t1\tv(a)\tvoltage\nValues:\n",
+                points.len()
+            );
+            for (index, (sweep, value)) in points.iter().enumerate() {
+                raw.push_str(&format!("{index}\t{sweep:e}\n\t{value:e}\n"));
+            }
+            raw.push_str("\nRAW");
+            raw
+        }
+
+        /// The rectifier fixture with its parts out and a source of ours in.
+        fn sweep_args(root: &Path, analysis: Value, source: &str) -> Value {
+            let mut arguments = args(root);
+            arguments["analysis"] = analysis;
+            arguments["testbench"]["spice_lines"] = json!([source]);
+            arguments
+        }
+
+        fn ac_args(root: &Path, analysis: Value) -> Value {
+            let ac = json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 100.0 });
+            let mut merged = ac;
+            for (key, value) in analysis.as_object().unwrap() {
+                merged[key] = value.clone();
+            }
+            sweep_args(root, merged, "VAC /signal_in 0 DC 0 AC 1")
+        }
+
+        /// A low-pass at 10 Hz: gain 1/sqrt(1 + (f/10)^2), phase -atan(f/10).
+        fn low_pass(frequencies: &[f64]) -> Vec<(f64, f64, f64)> {
+            frequencies
+                .iter()
+                .map(|&f| {
+                    let denominator = 1.0 + (f / 10.0).powi(2);
+                    (f, 1.0 / denominator, -(f / 10.0) / denominator)
+                })
+                .collect()
+        }
+
+        fn request_of(scene: &Scene) -> Value {
+            let dirs = run_dirs(scene);
+            serde_json::from_slice(&std::fs::read(dirs[0].join(REQUEST_FILE)).unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_finished_ac_sweep_gives_gain_in_db_and_tells_the_worker_its_data_is_complex() {
+            let raw = copy_ac(&low_pass(&[1.0, 10.0, 100.0]));
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = ac_args(&scene.root, json!({ "points": 1, "scale": "decade" }));
+            arguments["signals"] = json!(["v(a)"]);
+            arguments["measurements"] = json!([
+                { "name": "gain", "kind": "value_at", "signal": "v(a)", "at_hz": 10.0 },
+                { "name": "corner", "kind": "bandwidth_3db", "signal": "v(a)" },
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["outcome"]["requested"], 4);
+            assert_eq!(body["analysis"]["kind"], "ac");
+            assert_eq!(body["analysis"]["points"], 3);
+            assert_eq!(body["analysis"]["simulated_to_hz"], 100.0);
+            assert_eq!(body["analysis"]["coverage_ratio"], 1.0);
+            // 20 log10(1/sqrt(2)) at the corner, and -45 degrees.
+            let gain = &body["measurements"][0];
+            assert!(
+                (gain["value"].as_f64().unwrap() + 3.0103).abs() < 1e-3,
+                "{gain}"
+            );
+            assert!(
+                (gain["phase_degrees"].as_f64().unwrap() + 45.0).abs() < 1e-6,
+                "{gain}"
+            );
+            assert_eq!(gain["unit"], "dB");
+            assert_eq!(gain["at_hz"], 10.0);
+            // From -0.04 dB at 1 Hz, the edge is -3.05 dB, a little above the 10 Hz corner.
+            let corner = body["measurements"][1]["value"].as_f64().unwrap();
+            assert!(corner > 10.0 && corner < 10.5, "{body}");
+            let summary = &body["signal_summaries"][0];
+            assert_eq!(summary["unit"], "dB");
+            assert!(
+                summary["high_frequency_gain_db"].as_f64().unwrap() < -19.0,
+                "{summary}"
+            );
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains("\n.ac dec 1 1e0 1e2\n.end"), "{deck}");
+            assert!(!deck.contains(".probe p("), "{deck}");
+            assert_eq!(request_of(&scene)["complex_data"], true);
+        }
+
+        #[tokio::test]
+        async fn a_transient_and_a_dc_sweep_leave_the_data_real() {
+            let job = format!("{}\n{}", copy_transient(), status_json("0", "null", true));
+            let scene = scene(&job);
+            call(&scene, transient_args(&scene.root, 2.0)).await;
+            assert_eq!(request_of(&scene)["complex_data"], false);
+        }
+
+        #[tokio::test]
+        async fn an_ac_sweep_that_stops_early_is_partial_and_flagged() {
+            let raw = copy_ac(&low_pass(&[1.0, 10.0]));
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = ac_args(&scene.root, json!({ "points": 1 }));
+            arguments["measurements"] =
+                json!([{ "kind": "value_at", "signal": "v(a)", "at_hz": 5.0 }]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["stopped"]["reason"], "incomplete_coverage");
+            assert_eq!(body["measurements"][0]["window_truncated"], true);
+            assert!(body["analysis"]["coverage_ratio"].as_f64().unwrap() < 1.0);
+        }
+
+        #[tokio::test]
+        async fn an_octave_sweep_ending_one_step_short_is_complete_and_says_where_it_ended() {
+            // 1 to 100 Hz by octave: the grid ends at 64, as ngspice does.
+            let grid: Vec<f64> = (0..=6).map(|n| 2f64.powi(n)).collect();
+            let job = format!(
+                "{}\n{}",
+                copy_ac(&low_pass(&grid)),
+                status_json("0", "null", true)
+            );
+            let scene = scene(&job);
+            let arguments = ac_args(&scene.root, json!({ "scale": "octave", "points": 1 }));
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["analysis"]["simulated_to_hz"], 64.0);
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("sweep_ends_before_stop"), "{warnings}");
+            // Two steps short is not a finished sweep.
+            let job = format!(
+                "{}\n{}",
+                copy_ac(&low_pass(&grid[..5])),
+                status_json("0", "null", true)
+            );
+            let scene = self::scene(&job);
+            let arguments = ac_args(&scene.root, json!({ "scale": "octave", "points": 1 }));
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_ac_sweep_with_no_source_to_drive_it_is_refused_before_the_engine_starts() {
+            let scene = scene("exit 1");
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 10.0 });
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "no_ac_stimulus", "{body}");
+            assert_eq!(body["error"]["stage"], "preflight");
+            assert_eq!(body["outcome"]["status"], "failed");
+            assert!(run_dirs(&scene).is_empty());
+            // A source with only a DC value or a zero AC value drives nothing.
+            for line in ["VAC /signal_in 0 DC 5", "VAC /signal_in 0 AC 0"] {
+                let arguments = sweep_args(
+                    &scene.root,
+                    json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 10.0 }),
+                    line,
+                );
+                let (failed, body) = call(&scene, arguments).await;
+                assert!(failed, "{line}");
+                assert_eq!(body["error"]["reason"], "no_ac_stimulus", "{line}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_ratio_of_two_signals_is_the_loop_gain_a_margin_is_read_from() {
+            // v(a) is the loop's return and v(b) the injection: L = v(a)/v(b).
+            let mut raw = String::from(
+                "cat > results.raw <<'RAW'\nTitle: t\nPlotname: AC Analysis\nFlags: complex\n\
+                 No. Variables: 3\nNo. Points: 4\nVariables:\n\t0\tfrequency\tfrequency grid=3\n\
+                 \t1\tv(a)\tvoltage\n\t2\tv(b)\tvoltage\nValues:\n",
+            );
+            // v(b) is 2 (so the ratio halves it), and v(a) is 20, 10, 2, 0.2 at a
+            // phase that falls 45 degrees a point.
+            for (index, (f, magnitude, phase)) in [
+                (1.0, 20.0, -45.0_f64),
+                (10.0, 10.0, -90.0),
+                (100.0, 2.0, -135.0),
+                (1000.0, 0.2, -180.0),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let (re, im) = (
+                    magnitude * phase.to_radians().cos(),
+                    magnitude * phase.to_radians().sin(),
+                );
+                raw.push_str(&format!("{index}\t{f:e},0\n\t{re:e},{im:e}\n\t2e0,0e0\n"));
+            }
+            raw.push_str("\nRAW");
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = ac_args(
+                &scene.root,
+                json!({ "start_hz": 1.0, "stop_hz": 1000.0, "points": 1 }),
+            );
+            arguments["measurements"] = json!([
+                { "name": "pm", "kind": "phase_margin", "signal": "v(a)", "reference_signal": "v(b)" },
+                { "name": "gm", "kind": "gain_margin", "signal": "v(a)", "reference_signal": "v(b)" },
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            // L = 10, 5, 1, 0.1: it crosses unity at 100 Hz where the phase is -135.
+            let pm = &body["measurements"][0];
+            assert!((pm["value"].as_f64().unwrap() - 45.0).abs() < 1e-6, "{pm}");
+            assert_eq!(pm["reference_signal"], "v(b)");
+            assert!(
+                (pm["crossover_hz"].as_f64().unwrap() - 100.0).abs() < 1e-6,
+                "{pm}"
+            );
+            // The phase reaches -180 at 1 kHz, where L is 0.1, which is -20 dB.
+            let gm = &body["measurements"][1];
+            assert!((gm["value"].as_f64().unwrap() - 20.0).abs() < 1e-6, "{gm}");
+            assert!(
+                (gm["phase_crossover_hz"].as_f64().unwrap() - 1000.0).abs() < 1e-6,
+                "{gm}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_dc_sweep_reads_its_target_from_the_deck_and_measures_along_the_sweep() {
+            // v(a) = 2 x over 0 to 5 by 1 V.
+            let points: Vec<(f64, f64)> = (0..=5)
+                .map(|n| (f64::from(n), 2.0 * f64::from(n)))
+                .collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "vsrc", "start_value": 0.0, "stop_value": 5.0, "step_value": 1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["signals"] = json!(["v(a)"]);
+            arguments["measurements"] = json!([
+                { "name": "top", "kind": "max", "signal": "v(a)" },
+                { "name": "cross", "kind": "crossing", "signal": "v(a)", "level": 5.0 },
+                { "name": "mid", "kind": "value_at", "signal": "v(a)", "at_sweep": 2.5 },
+                { "name": "late", "kind": "min", "signal": "v(a)", "from_sweep": 3.0 },
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["outcome"]["requested"], 6);
+            assert_eq!(body["analysis"]["kind"], "dc_sweep");
+            assert_eq!(body["analysis"]["points"], 6);
+            assert_eq!(body["analysis"]["expected_points"], 6);
+            assert_eq!(body["analysis"]["sweeps"][0]["element"], "VSRC");
+            assert_eq!(body["analysis"]["sweeps"][0]["unit"], "V");
+            let measured = |name: &str| {
+                let items = body["measurements"].as_array().unwrap();
+                items
+                    .iter()
+                    .find(|item| item["name"] == name)
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(measured("top")["value"], 10.0);
+            assert_eq!(measured("top")["at_sweep"], 5.0);
+            assert_eq!(measured("cross")["value"], 2.5);
+            assert_eq!(measured("cross")["unit"], "V");
+            assert_eq!(measured("mid")["value"], 5.0);
+            assert_eq!(measured("late")["value"], 6.0);
+            let summary = &body["signal_summaries"][0];
+            assert_eq!(
+                (
+                    summary["min"].clone(),
+                    summary["max"].clone(),
+                    summary["at_start"].clone(),
+                    summary["at_stop"].clone()
+                ),
+                (json!(0.0), json!(10.0), json!(0.0), json!(10.0)),
+            );
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            // The deck's own spelling of the name, not the caller's.
+            assert!(deck.contains("\n.dc VSRC 0e0 5e0 1e0\n.end"), "{deck}");
+            assert!(deck.contains(".save all\n.probe alli"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn a_falling_dc_sweep_is_measured_in_the_order_it_ran() {
+            // 5 V down to 0: v(a) = 2 x, so it falls through 5 at x = 2.5.
+            let points: Vec<(f64, f64)> = (0..=5)
+                .map(|n| (5.0 - f64::from(n), 2.0 * (5.0 - f64::from(n))))
+                .collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 5.0, "stop_value": 0.0, "step_value": -1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["measurements"] = json!([
+                { "name": "falls", "kind": "crossing", "signal": "v(a)", "level": 5.0, "direction": "falling" },
+                { "name": "rises", "kind": "crossing", "signal": "v(a)", "level": 5.0, "direction": "rising" },
+                { "name": "low", "kind": "min", "signal": "v(a)", "from_sweep": 3.0, "to_sweep": 1.0 },
+                { "name": "mid", "kind": "value_at", "signal": "v(a)", "at_sweep": 4.5 },
+            ]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            let measured = |name: &str| {
+                let items = body["measurements"].as_array().unwrap();
+                items
+                    .iter()
+                    .find(|item| item["name"] == name)
+                    .unwrap()
+                    .clone()
+            };
+            // Going down the sweep, the signal falls, and the place is the caller's.
+            assert_eq!(measured("falls")["value"], 2.5);
+            assert!(measured("rises")["value"].is_null());
+            assert_eq!(measured("low")["value"], 2.0);
+            assert_eq!(measured("low")["at_sweep"], 1.0);
+            assert_eq!(measured("mid")["value"], 9.0);
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert!(deck.contains(".dc VSRC 5e0 0e0 -1e0\n"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn two_dc_sweeps_are_covered_only_by_the_whole_grid() {
+            let grid = |count: usize| -> Vec<(f64, f64)> {
+                (0..count).map(|n| ((n % 3) as f64, n as f64)).collect()
+            };
+            let analysis = json!({ "kind": "dc_sweep", "sweeps": [
+                { "target": "VSRC", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                { "target": "R2", "start_value": 1000.0, "stop_value": 3000.0, "step_value": 1000.0 },
+            ] });
+            let job = format!("{}\n{}", copy_dc(&grid(9)), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = sweep_args(&scene.root, analysis.clone(), "VSRC /rect_out 0 DC 0");
+            arguments["signals"] = json!(["v(a)"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["analysis"]["expected_points"], 9);
+            assert_eq!(body["analysis"]["sweeps"][1]["element"], "R2");
+            assert_eq!(body["analysis"]["sweeps"][1]["unit"], "Ω");
+            let dirs = run_dirs(&scene);
+            let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
+            assert!(
+                deck.contains(".dc VSRC 0e0 2e0 1e0 R2 1e3 3e3 1e3\n"),
+                "{deck}"
+            );
+            // Eight of nine points is a sweep that stopped.
+            let job = format!("{}\n{}", copy_dc(&grid(8)), status_json("0", "null", true));
+            let scene = self::scene(&job);
+            let arguments = sweep_args(&scene.root, analysis, "VSRC /rect_out 0 DC 0");
+            let (_, body) = call(&scene, arguments).await;
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["stopped"]["reason"], "incomplete_coverage");
+        }
+
+        #[tokio::test]
+        async fn a_dc_sweep_of_something_the_deck_lacks_never_starts_the_worker() {
+            let scene = scene("exit 1");
+            let arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VNOPE", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "sweep_target_not_found", "{body}");
+            assert_eq!(body["error"]["stage"], "preflight");
+            assert!(run_dirs(&scene).is_empty());
+            // A capacitor is in the deck but the engine cannot sweep it.
+            let arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "C1", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(body["error"]["field"], "analysis.sweeps[0].target");
+        }
+
+        #[tokio::test]
+        async fn what_a_sweep_cannot_give_is_refused_before_anything_runs() {
+            let scene = scene("exit 1");
+            let refused = |analysis: Value, signals: Value, measurements: Value, envelope: u64| {
+                let mut arguments = args(&scene.root);
+                arguments["analysis"] = analysis;
+                arguments["signals"] = signals;
+                arguments["measurements"] = measurements;
+                arguments["envelope_points"] = json!(envelope);
+                arguments
+            };
+            let ac = json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 10.0 });
+            let dc = |count: usize| {
+                let sweep = json!({ "target": "VSRC", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 });
+                json!({ "kind": "dc_sweep", "sweeps": vec![sweep; count] })
+            };
+            let max = json!([{ "kind": "max", "signal": "v(a)" }]);
+            let margin = json!([{ "kind": "phase_margin", "signal": "v(a)" }]);
+            let none = Value::Null;
+            for (arguments, field) in [
+                (
+                    refused(ac.clone(), json!(["p(R1)"]), none.clone(), 0),
+                    "signals[0]",
+                ),
+                (
+                    refused(ac.clone(), json!(["v(a)"]), none.clone(), 4),
+                    "envelope_points",
+                ),
+                (
+                    refused(ac.clone(), none.clone(), max.clone(), 0),
+                    "measurements[0].kind",
+                ),
+                (
+                    refused(dc(1), none.clone(), margin.clone(), 0),
+                    "measurements[0].kind",
+                ),
+                (
+                    refused(
+                        dc(1),
+                        none.clone(),
+                        json!([{ "kind": "average", "signal": "v(a)" }]),
+                        0,
+                    ),
+                    "measurements[0].kind",
+                ),
+                (
+                    refused(dc(1), json!(["v(a)"]), none.clone(), 4),
+                    "envelope_points",
+                ),
+                (refused(dc(2), none.clone(), max.clone(), 0), "measurements"),
+                (
+                    refused(
+                        ac.clone(),
+                        none.clone(),
+                        json!([{ "kind": "value_at", "signal": "v(a)", "at_seconds": 1.0 }]),
+                        0,
+                    ),
+                    "measurements[0].at_seconds",
+                ),
+                (
+                    refused(
+                        ac.clone(),
+                        none.clone(),
+                        json!([{ "kind": "value_at", "signal": "v(a)", "at_hz": 100.0 }]),
+                        0,
+                    ),
+                    "measurements[0].at_hz",
+                ),
+                (
+                    refused(
+                        dc(1),
+                        none.clone(),
+                        json!([{ "kind": "max", "signal": "v(a)", "from_hz": 1.0 }]),
+                        0,
+                    ),
+                    "measurements[0].from_hz",
+                ),
+                (
+                    refused(
+                        dc(1),
+                        none.clone(),
+                        json!([{ "kind": "max", "signal": "v(a)", "reference_signal": "v(b)" }]),
+                        0,
+                    ),
+                    "measurements[0].reference_signal",
+                ),
+                (
+                    refused(
+                        ac.clone(),
+                        none.clone(),
+                        json!([{ "kind": "phase_margin", "signal": "v(a)", "reference_level": "peak" }]),
+                        0,
+                    ),
+                    "measurements[0].reference_level",
+                ),
+            ] {
+                let (failed, body) = call(&scene, arguments.clone()).await;
+                assert!(failed, "{arguments}");
+                assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+                assert_eq!(body["error"]["field"], field, "{body}");
+            }
+            assert!(run_dirs(&scene).is_empty());
         }
 
         #[tokio::test]
@@ -2974,9 +3872,12 @@ mod tests {
         }
 
         fn run_dirs(scene: &Scene) -> Vec<PathBuf> {
+            // No folder at all means no run was ever made.
             let projects = scene.state.path().join("simulation");
-            std::fs::read_dir(projects)
-                .unwrap()
+            let Ok(projects) = std::fs::read_dir(projects) else {
+                return Vec::new();
+            };
+            projects
                 .flatten()
                 .flat_map(|project| std::fs::read_dir(project.path()).unwrap().flatten())
                 .map(|run| run.path())
@@ -3096,11 +3997,12 @@ mod tests {
             let lost = status_json("0", "null", true);
             fails_with(&lost, "results_unreadable", "results").await;
             fails_with("exit 124", "timed_out", "run").await;
-            let exited = "cat > status.json <<'JSON'\n{\"protocol\":3,\"load_error\":null,\
+            let exited = format!(
+                "cat > status.json <<'JSON'\n{{\"protocol\":{PROTOCOL_VERSION},\"load_error\":null,\
                  \"engine_version\":null,\"code_models_loaded\":[],\"code_models_failed\":[],\
                  \"exit_status\":1,\"sim_status\":null,\
-                 \"halted_reason\":null,\"results_written\":false}\nJSON"
-                .to_string();
+                 \"halted_reason\":null,\"results_written\":false}}\nJSON"
+            );
             fails_with(&exited, "engine_failed", "run").await;
             let unloaded = exited.replace("\"load_error\":null", "\"load_error\":\"no\"");
             let body = fails_with(&unloaded, "engine_load_failed", "engine").await;
@@ -3216,6 +4118,27 @@ mod tests {
             assert_eq!(body["error"]["items"], json!(["D1", "V1"]));
             assert_eq!(body["outcome"]["status"], "failed");
             assert!(!scene.state.path().join("simulation").exists());
+        }
+
+        #[tokio::test]
+        async fn a_floating_group_refuses_a_dc_sweep_but_not_an_ac_one() {
+            let sweep = json!({ "kind": "dc_sweep", "sweeps": [
+                { "target": "Vx", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 }
+            ] });
+            let scene = scene("touch worker-ran");
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = sweep;
+            arguments["testbench"]["spice_lines"] = json!(["Vx fl1 fl2 1", "Rx fl1 fl2 1k"]);
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "floating_subcircuit", "{body}");
+            assert!(!scene.state.path().join("simulation").exists());
+            // Series capacitors give a true AC answer, so only a DC solve refuses.
+            let mut arguments = args(&scene.root);
+            arguments["analysis"] = json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 10.0 });
+            arguments["testbench"]["spice_lines"] = json!(["Vx fl1 fl2 AC 1", "Rx fl1 fl2 1k"]);
+            let (_, body) = call(&scene, arguments).await;
+            assert_ne!(body["error"]["reason"], "floating_subcircuit", "{body}");
         }
 
         #[tokio::test]

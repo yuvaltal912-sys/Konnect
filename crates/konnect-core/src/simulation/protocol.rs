@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump when a worker argument or report field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The subcommand the worker answers to. Hidden from `--help`.
 pub const WORKER_SUBCOMMAND: &str = "sim-worker";
@@ -38,6 +38,11 @@ pub struct RunRequest {
     pub budget_ms: u64,
     /// When to halt the run softly because of the data it has made.
     pub max_raw_bytes: u64,
+    /// The analysis makes complex values, which take twice the room of a real one.
+    /// The size limit counts bytes, so a worker that assumed real data would let an
+    /// AC run reach twice the limit.
+    #[serde(default)]
+    pub complex_data: bool,
 }
 
 /// Why the worker stopped a run that was still going.
