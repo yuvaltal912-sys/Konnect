@@ -3178,6 +3178,32 @@ mod tests {
     }
 
     #[test]
+    fn a_run_carries_what_it_reported_except_what_belongs_to_its_own_call() {
+        let body = json!({ "warnings": [
+            { "code": "engine_messages", "items": ["x"] },
+            { "code": "no_point_at_start" },
+            { "code": "old_runs_kept" },
+            { "code": "csv_not_written" },
+            { "code": "run_record_not_saved" },
+            { "code": "nets_share_engine_node" },
+            { "detail": "no code at all" },
+        ] });
+        let carried: Vec<&str> = carried_warnings(&body)
+            .iter()
+            .map(|warning| warning["code"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|code| match code.as_str() {
+                "engine_messages" => "engine_messages",
+                "no_point_at_start" => "no_point_at_start",
+                other => panic!("carried {other}"),
+            })
+            .collect();
+        assert_eq!(carried, ["engine_messages", "no_point_at_start"]);
+        assert!(carried_warnings(&json!({})).is_empty());
+    }
+
+    #[test]
     fn a_csv_left_unwritten_is_a_warning_that_says_why() {
         assert_eq!(table_problem(&Ok(export::Written::Bytes(10))), None);
         let large = table_problem(&Ok(export::Written::TooLarge { cells: 30_000_000 })).unwrap();
