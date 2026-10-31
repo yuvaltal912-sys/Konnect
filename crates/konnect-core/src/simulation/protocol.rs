@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump when a worker argument or report field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The subcommand the worker answers to. Hidden from `--help`.
 pub const WORKER_SUBCOMMAND: &str = "sim-worker";
@@ -38,6 +38,11 @@ pub struct RunRequest {
     pub budget_ms: u64,
     /// When to halt the run softly because of the data it has made.
     pub max_raw_bytes: u64,
+    /// The analysis makes complex values, which take twice the room of a real one.
+    /// The size limit counts bytes, so a worker that assumed real data would let an
+    /// AC run reach twice the limit.
+    #[serde(default)]
+    pub complex_data: bool,
 }
 
 /// Why the worker stopped a run that was still going.
@@ -83,4 +88,16 @@ pub struct ProbeReport {
     pub code_models_failed: Vec<String>,
     /// The library called its exit callback, so it must be treated as dead.
     pub exit_callback: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_protocol_moved_with_the_complex_data_flag() {
+        // An older worker would count an AC sweep as real data and let it reach
+        // twice its size limit, so a mismatch must be reported and not guessed through.
+        const { assert!(PROTOCOL_VERSION >= 4) };
+    }
 }

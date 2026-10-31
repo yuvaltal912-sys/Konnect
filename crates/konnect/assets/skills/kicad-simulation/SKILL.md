@@ -5,7 +5,9 @@ description: |
   "ngspice", "operating point", "bias point", "what voltage is on this net", "does this circuit work",
   "check the DC levels", "run a simulation", "transient", "inrush", "load step", "droop", "overshoot",
   "settling time", "rise time", "soft start", "short circuit", "fuse", "eFuse", "current limit",
-  "undervoltage lockout", "UVLO", "reverse polarity", "reversed battery", "protection".
+  "undervoltage lockout", "UVLO", "reverse polarity", "reversed battery", "protection",
+  "AC analysis", "frequency response", "bode", "bandwidth", "phase margin", "gain margin",
+  "stability", "loop gain", "DC sweep", "transfer curve", "sweep".
 argument-hint: "[circuit or question]"
 ---
 
@@ -29,6 +31,8 @@ load_toolset('simulation')    # check_simulation_readiness, run_simulation
 4. Run `run_simulation` with one analysis:
    - `{ "kind": "operating_point" }` for DC levels.
    - `{ "kind": "transient", "stop_time_seconds": 0.14 }` for inrush, load steps and anything over time.
+   - `{ "kind": "ac", "start_hz": 10, "stop_hz": 1e6 }` for gain, bandwidth and stability margins.
+   - `{ "kind": "dc_sweep", "sweeps": [{ "target": "V1", "start_value": 0, "stop_value": 12, "step_value": 0.1 }] }` for a transfer curve or a polarity sweep.
 5. Report the results, and state `simulated_circuit` if it is `modified`.
 
 ## Transient Runs
@@ -78,6 +82,8 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 | Finding | Meaning |
 |---|---|
 | `level_not_reached` | The signal never got there |
+| `phase_unreliable` | AC only: the sweep is too coarse to follow the phase past `phase_unreliable_from_hz`. Raise `points` |
+| `sweep_too_coarse` | AC only: a `bandwidth_3db` edge cannot be placed, because the gain changes by over 10 dB between the two samples that hold it, or, with `reference_level: "peak"`, the peak lies between samples (a parabola through it and its neighbours rises over 0.15 dB). Raise `points` |
 | `starts_on_level` | It was already on the level when the window began, and never crossed it |
 | `no_transition` | The signal is flat to within rounding, or the step runs the other way |
 | `final_value_needed` | The window's last value cannot stand in for the final value |
@@ -86,6 +92,53 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 | `non_finite_data` | The data, or the result, is not a finite number |
 
 **Initial conditions.** With `use_initial_conditions`, ngspice saves no point at time zero, so `analysis.first_point_seconds` is above 0 and `no_point_at_start` warns that a peak at that instant reads low and an integral misses the first step. Device probes would also lose a voltage set on a net by `.ic` or `.nodeset`, so with either card only node voltages and source currents are saved, `i(R1)` and `p(R1)` read `signal_not_found`, as does `i()` of a current source, and a `.probe` card of your own is refused as `probe_loses_initial_conditions`. To keep device currents, use `IC=` on the device, which probes do not disturb.
+
+## AC Sweeps
+
+A small-signal sweep around the operating point. It needs a source with an `AC` value: a KiCad source with `ac=1` in its `Sim.Params` has one, and a testbench source can say `VIN in 0 DC 0 AC 1`. With none, every signal would read zero, so `run_simulation` refuses it as `no_ac_stimulus`. It reads the deck text: a source whose `AC` value is a parameter that is 0, or one inside a subcircuit nothing calls, passes and reads zero.
+
+```json
+{
+  "schematic": "filter.kicad_sch",
+  "analysis": { "kind": "ac", "start_hz": 10, "stop_hz": 1e6, "scale": "decade", "points": 100 },
+  "signals": ["v(/OUT)"],
+  "measurements": [
+    { "name": "edge", "kind": "bandwidth_3db", "signal": "v(/OUT)" },
+    { "name": "gain_1k", "kind": "value_at", "signal": "v(/OUT)", "at_hz": 1000 }
+  ]
+}
+```
+
+`points` is per decade or octave, or in all on a `linear` scale (at least 3). Frequencies run from 1e-9 to 1e18. A margin follows the phase from sample to sample, and a sweep too coarse to follow a sharp resonance would read an unstable loop as stable, so it gives `phase_unreliable` instead. That catches most of it, not all. It also refuses a loop with a deep notch below crossover at sensible densities. And a feature that turns the phase by more than half a revolution between two samples with the gain flat, such as an all-pass or a long delay, can read as a small turn and pass. **Run any margin that matters twice, at double the `points`. If it moves, the first sweep did not resolve it.** Use 100 points a decade or more. An octave sweep, and some decade ones, end on their last grid point at or below `stop_hz`, up to a step short of it: read `simulated_to_hz`, and `sweep_ends_before_stop` says so. Gain is 20 log10 of the magnitude, so it is the gain only if the AC source is 1. Say "dB re 1 V" otherwise. `p()` has no value here.
+
+| Measurement | Returns |
+|---|---|
+| `value_at` with `at_hz` | Gain in dB, and `phase_degrees` unwrapped from the lowest frequency. Where the sweep cannot follow the phase it keeps the gain, nulls the phase and says `phase_finding: "phase_unreliable"` |
+| `bandwidth_3db` | The first frequency 3.01 dB below the gain at the lowest frequency, shown as `reference_gain_db`. With `reference_level: "peak"` it measures from the peak and gives `lower_edge_hz`, `upper_edge_hz` and their difference as `value` |
+| `phase_margin` | 180 degrees plus the phase where the gain first falls through 0 dB, with `crossover_hz` |
+| `gain_margin` | The negative of the gain in dB where the phase first falls through -180 degrees, with `phase_crossover_hz` |
+
+**Stability margins need a loop gain, not a closed-loop response.** Break the loop at one point, drive it with an AC source, and take the loop gain between two nodes with `reference_signal`: `{ "kind": "phase_margin", "signal": "v(/RETURN)", "reference_signal": "v(/INJECT)" }`. The signal must be non-inverted: the result shows `start_phase_degrees`, and a loop that starts near 0 or at -90 is plausible while one that starts at 180 has the wrong sign. A margin is a first crossing: if the gain crosses 0 dB more than once, `from_hz` and `to_hz` pick which points are examined. A `null` value with `level_not_reached` means the curve never crossed, which for a gain margin means the phase never reaches -180.
+
+## DC Sweeps
+
+Varies up to two things and solves the circuit at each step: a voltage source, a current source, a resistor, or `TEMP` in degrees C. Give a part's reference (`BT1` finds `VBT1`), a testbench element's own name, or `TEMP`. A name the circuit does not have is `sweep_target_not_found`.
+
+```json
+{
+  "schematic": "power.kicad_sch",
+  "analysis": { "kind": "dc_sweep", "sweeps": [
+    { "target": "BT1", "start_value": -12, "stop_value": 12, "step_value": 0.05 }
+  ] },
+  "signals": ["v(/VOUT)"],
+  "measurements": [
+    { "name": "out_at_12", "kind": "value_at", "signal": "v(/VOUT)", "at_sweep": 12 },
+    { "name": "turn_on", "kind": "crossing", "signal": "v(/VOUT)", "level": 5, "direction": "rising" }
+  ]
+}
+```
+
+A negative `step_value` sweeps down, and its sign must point from the start toward the stop. Measurements and windows follow the order of the sweep: `from_sweep` 12 and `to_sweep` 0 on a sweep that falls from 12. One sweep takes `min`, `max`, `peak_to_peak`, `peak_abs`, `value_at` (`at_sweep`) and `crossing`, and a place on the sweep comes back in the sweep's unit. An average over a sweep has no meaning, so it is refused. With two sweeps the first varies fastest, `signals` cover the whole grid (`at_start` and `at_stop` are its first and last point), and measurements are refused: the data is in `artifacts.raw_path`.
 
 ## Protection Scenarios
 
@@ -176,7 +229,7 @@ SUV vin out vin 0 SWUV
 
 ### Reversed battery
 
-A DC sweep is not available yet, so ramp the battery with a slow transient, which `run_simulation` does. The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Use `max_step_seconds` 1e-5 on 24 ms. With no reactive part the ramp rate does not matter. With a capacitor on the output, ramp slower than its time constant. `i(VBAT)` reads positive when leakage flows back into the battery.
+The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Sweep it with `dc_sweep` on `VBAT` from -12 to 12 V in 0.05 V steps: the sweep replaces the `PWL` value, so the block runs as it stands. The ramp in the block gives the same curve as a transient on 24 ms with `max_step_seconds` 5e-7, within 0.2 percent at ten places from -12 to 12 V (a part in 10^9 from 6 V up), and a ramp is the way to go with a capacitor on the output (ramp slower than its time constant). A coarser ramp step reads the knee badly: 10 µs read 25 percent off at -50 mV. `i(VBAT)` reads positive when leakage flows back into the battery.
 
 ```
 * Reversed battery on a slow ramp from -12 V to 12 V. Your circuit supplies the battery and the load.
@@ -187,7 +240,7 @@ RLOAD out 0 12
 BRB vbat out I='v(vbat,out)*(1/rb_roff+(1/rb_ron-1/rb_roff)*0.5*(1+tanh(v(vbat,out)/rb_knee)))'
 ```
 
-At -12 V this reads 1.0 µA of leakage and -12 µV at the output. At +12 V the output is 11.970 V. The knee `rb_knee` of 10 mV limits both ends. `rb_ron` is the resistance only where its drop is well above about 30 mV: 5 mohm at 1 A dropped 6.4 mV and not 5.0. Blocking reaches `rb_roff` only beyond about 100 mV in reverse. Near zero volts it leaks, from the formula 45 mA at 5 mV, 75 µA at 50 mV and 83 nA at 1 V.
+At -12 V this reads 1.0 µA of leakage and -12 µV at the output. Between about -0.56 V and 0 the stand-in has a second, conducting solution, and which one the engine finds depends on the direction and the step: swept down from 0 it latches on (-0.55 V out, 45 mA); swept up at 0.05 V it blocks (lowest output -1.1 mV), but at 0.01 V it latched at -45 mV. So the region near zero is not a result. Sweep upward, and take the leakage and the forward drop from the ends. At +12 V the output is 11.970 V. The knee `rb_knee` of 10 mV limits both ends. `rb_ron` is the resistance only where its drop is well above about 30 mV: 5 mohm at 1 A dropped 6.4 mV and not 5.0. Blocking reaches `rb_roff` only beyond about 100 mV in reverse. Near zero volts it leaks, from the formula 45 mA at 5 mV, 75 µA at 50 mV and 83 nA at 1 V.
 
 ### In your own schematic
 
@@ -213,7 +266,7 @@ Nothing in `testbench` touches the schematic. Use the `spice_name` values from r
 ## Reading a Result
 
 - **`outcome.status`:** `complete` means the requested range was covered and every measurement found its signal. `partial` means the data is real but stops early or a signal was missing, and `stopped.reason` says why it stopped: `timeout`, `size_limit`, `no_convergence` or `incomplete_coverage`.
-- **`analysis.coverage_ratio`:** how much of the requested time ran. On a partial run every measurement and summary carries `window_truncated: true`, because it describes only the part that ran. Say so, and never report such a peak as the run's peak. On a complete run the same flag means that measurement's window reached past the saved data, such as before `start_save_seconds`, so its number leaves out that stretch.
+- **`analysis.coverage_ratio`:** how much of the requested time, frequency range or sweep ran. On a partial run every measurement and summary carries `window_truncated: true`, because it describes only the part that ran. Say so, and never report such a peak as the run's peak. On a complete run the same flag means that measurement's window reached past the saved data, such as before `start_save_seconds`, so its number leaves out that stretch.
 - **`finding: "signal_not_found"`:** the run does not hold that signal. Only voltage sources keep their currents in circuits with digital parts, or with `.ic` or `.nodeset` under `use_initial_conditions`, and `device_currents_not_saved` says which. Digital nets have no `v()`.
 - **`simulated_circuit`:** `modified` means parts were excluded or added. Never present such a result as describing the schematic as drawn.
 - **`circuit.approximations`:** parts whose behaviour rests on an assumption. Say so when they matter.
@@ -229,7 +282,9 @@ Branch on `error.reason`, and show `error.items`.
 |---|---|---|
 | `unmodelled_symbols` | Parts have no simulation model | Fix as above |
 | `no_ground_reference` | No element reaches node 0 | Add a ground to the schematic |
-| `floating_subcircuit` | Nodes have no DC path to ground, so their voltages are arbitrary | Add the missing path, or a large resistor through `spice_lines` |
+| `floating_subcircuit` | Nodes have no DC path to ground, so their voltages are arbitrary. Refused for an operating point and a DC sweep | Add the missing path, or a large resistor through `spice_lines` |
+| `no_ac_stimulus` | No source has an `AC` value, so an AC sweep would read zero | Set `ac=1` on a source, or add `VIN in 0 DC 0 AC 1` to `spice_lines` |
+| `sweep_target_not_found` | The DC sweep names something the circuit does not have | Use a V, I or R reference, a testbench element's name, or `TEMP` |
 | `net_name_collision` | Two nets become one node in the engine | Rename one. Non-ASCII labels of equal length collide |
 | `circuit_not_parsed` | ngspice rejected the deck | Read `error.items` and the log |
 | `no_convergence` | The analysis did not settle | Check for voltage loops and floating gates |

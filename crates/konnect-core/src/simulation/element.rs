@@ -350,6 +350,87 @@ fn tokens(card: &str) -> Vec<String> {
     words
 }
 
+/// The leading number of a value token, whatever scale letters follow it. ngspice
+/// reads `1meg` and `10k` this way, so only the sign and size matter here. An
+/// expression or a parameter name has none.
+fn leading_number(token: &str) -> Option<f64> {
+    let bytes = token.as_bytes();
+    let digits = |from: usize| {
+        bytes[from..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b'.')
+            .count()
+    };
+    let sign = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mantissa = sign + digits(sign);
+    if mantissa == sign {
+        return None;
+    }
+    // `1e3` is an exponent, and `1meg` or `5e` are not.
+    let mut end = mantissa;
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let after = end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+        let exponent = bytes[after.min(bytes.len())..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if exponent > 0 {
+            end = after + exponent;
+        }
+    }
+    token[..end].parse().ok()
+}
+
+/// A value with the bracket and spaces ngspice allows before it taken off.
+fn trim_bracket(value: &str) -> String {
+    value
+        .trim_start_matches(|c: char| c == '(' || c.is_whitespace())
+        .to_string()
+}
+
+/// Every `AC` keyword of a source card, with the text of the value it gives, if any.
+/// ngspice reads `AC 1`, `AC=1`, `ac = 1`, `AC(1 0)` and `ACMAG 1` alike, and a later
+/// `acmag` replaces an earlier `AC`. The name and two nodes come first, so a node
+/// called `ac` is not the keyword.
+fn ac_values(words: &[String]) -> Vec<Option<String>> {
+    words
+        .iter()
+        .enumerate()
+        .skip(3)
+        .filter_map(|(at, word)| {
+            let lower = word.to_ascii_lowercase();
+            if lower == "ac" || lower == "acmag" {
+                // `AC (1 0)` has a space before the bracket.
+                return Some(words.get(at + 1).map(|value| trim_bracket(value)));
+            }
+            let rest = lower
+                .strip_prefix("acmag=")
+                .or_else(|| lower.strip_prefix("ac="))
+                .or_else(|| lower.strip_prefix("ac("))?;
+            Some((!rest.is_empty()).then(|| trim_bracket(rest)))
+        })
+        .collect()
+}
+
+/// Whether any voltage or current source can drive an AC analysis: it carries an
+/// `AC` value that is not a plain zero. A source with only a DC value gives a
+/// sweep of zeros and `sim_status=0`, so the engine never says so [verified: E54].
+/// A source inside a subcircuit counts, because whether it is called is not followed.
+pub(crate) fn has_ac_stimulus(deck: &FlatDeck, dollar_is_comment: bool) -> bool {
+    cards(deck, dollar_is_comment).iter().any(|card| {
+        let words = tokens(&card.text);
+        let is_source = words
+            .first()
+            .is_some_and(|name| name.starts_with(['v', 'V', 'i', 'I']));
+        // `AC` alone means 1, and an expression is taken to be non-zero.
+        is_source
+            && ac_values(&words).iter().any(|value| match value {
+                None => true,
+                Some(value) => leading_number(value) != Some(0.0),
+            })
+    })
+}
+
 pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
     let cards = cards(deck, dollar_is_comment);
     let mut circuit = Circuit::default();
@@ -853,5 +934,113 @@ impl Groups {
         }
         groups.sort_by(|(_, a), (_, b)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         groups
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::flatten::{flatten, Compatibility, DeckInputs};
+    use std::path::Path;
+
+    fn deck(netlist: &str) -> FlatDeck {
+        flatten(&DeckInputs {
+            netlist,
+            testbench: &[],
+            project_dir: Path::new("/"),
+            allowed_roots: &[],
+            compatibility: Compatibility::DEFAULT,
+            excluded_elements: &[],
+        })
+        .unwrap()
+    }
+
+    fn driven(card: &str) -> bool {
+        let netlist = format!(".title t\n{card}\nR1 a 0 1k\n.end\n");
+        has_ac_stimulus(&deck(&netlist), false)
+    }
+
+    #[test]
+    fn a_value_is_read_as_ngspice_reads_it() {
+        for (text, expected) in [
+            ("1", Some(1.0)),
+            ("0", Some(0.0)),
+            ("-0.5", Some(-0.5)),
+            ("1meg", Some(1.0)),
+            ("10k", Some(10.0)),
+            ("2e3", Some(2000.0)),
+            ("1e-3x", Some(0.001)),
+            ("5e", Some(5.0)),
+            ("0m", Some(0.0)),
+            ("amp", None),
+            ("{amp}", None),
+            ("sin(0", None),
+            ("-", None),
+        ] {
+            assert_eq!(leading_number(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_source_with_an_ac_value_drives_an_ac_analysis() {
+        for card in [
+            "V1 a 0 DC 0 AC 1",
+            "v1 a 0 ac 1",
+            "V1 a 0 AC",
+            "V1 a 0 AC 0.5 90",
+            "V1 a 0 SIN(0 1 1k) AC 1",
+            "I1 0 a DC 1m AC 1m",
+            "V1 a 0 AC {amp}",
+            "V1 a 0 DC 5 AC 1meg",
+            "V1 a 0 dc=0 ac=1",
+            "V1 a 0 AC=1",
+            "V1 a 0 DC 0 ac=1 0",
+            "V1 a 0 DC 0 AC(1 0)",
+            "V1 a 0 AC (1 0)",
+            "V1 a 0 AC ( 1 0 )",
+            "V1 a 0 DC 0 acmag=1",
+            "V1 a 0 ACMAG 1",
+            "V1 a 0 AC 0 acmag=1",
+            "I1 0 a ac=1m",
+            "V1 a 0 SIN(0 1 1k) ac = 1",
+        ] {
+            assert!(driven(card), "{card}");
+        }
+    }
+
+    #[test]
+    fn a_source_with_no_ac_value_or_a_zero_one_drives_nothing() {
+        for card in [
+            "V1 a 0 DC 5",
+            "V1 a 0 5",
+            "V1 a 0 PULSE(0 5 0 1n 1n 1m 2m)",
+            "V1 a 0 AC 0",
+            "V1 a 0 DC 1 ac 0.0 90",
+            "I1 0 a AC 0m",
+            // The word is a node here, not the keyword.
+            "V1 ac 0 DC 5",
+            "R2 a b ac",
+            "C1 a b 1u ac 1",
+            "V1 a 0 ac=0",
+            "V1 a 0 AC=0.0 90",
+            "V1 a 0 DC 1 AC(0 0)",
+            "V1 a 0 AC (0 0)",
+            "V1 a 0 AC ( 0 0 )",
+            "V1 a 0 acmag=0",
+            "V1 a 0 ACMAG 0",
+        ] {
+            assert!(!driven(card), "{card}");
+        }
+    }
+
+    #[test]
+    fn a_source_in_a_subcircuit_counts_because_a_call_is_not_followed() {
+        let netlist = ".title t\n.subckt drive o\nV1 o 0 AC 1\n.ends\nR1 a 0 1k\n.end\n";
+        assert!(has_ac_stimulus(&deck(netlist), false));
+    }
+
+    #[test]
+    fn a_continued_source_line_is_read_whole() {
+        assert!(driven("V1 a 0 DC 0\n+ AC 1"));
     }
 }

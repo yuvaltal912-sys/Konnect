@@ -53,8 +53,10 @@ const POLL: Duration = Duration::from_millis(5);
 const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Lines kept in memory, which only need to reach the banner and code models.
 const MAX_ENGINE_LINES: usize = 10_000;
-/// Each value of each vector is one double in the raw file and in memory.
-const BYTES_PER_VALUE: u64 = 8;
+/// A real value is one double in the raw file and in memory, and an AC value is a
+/// pair of them.
+const REAL_VALUE_BYTES: u64 = 8;
+const COMPLEX_VALUE_BYTES: u64 = 16;
 
 static ENGINE_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static EXIT_CALLED: AtomicBool = AtomicBool::new(false);
@@ -64,6 +66,7 @@ static RUN_FINISHED: AtomicBool = AtomicBool::new(false);
 static LOG: Mutex<Option<Log>> = Mutex::new(None);
 static STATUS_LINE: Mutex<Option<String>> = Mutex::new(None);
 static DATA_BYTES: AtomicU64 = AtomicU64::new(0);
+static VALUE_BYTES: AtomicU64 = AtomicU64::new(REAL_VALUE_BYTES);
 
 /// The start of `vecvaluesall` in `sharedspice.h`.
 #[repr(C)]
@@ -125,7 +128,9 @@ unsafe extern "C" fn on_send_data(
 ) -> c_int {
     // SAFETY: ngspice passes its own struct, valid for this call, or NULL.
     if let Some(data) = unsafe { data.as_ref() } {
-        DATA_BYTES.store(data_bytes(data.vector_count, data.point), Ordering::Relaxed);
+        let value_bytes = VALUE_BYTES.load(Ordering::Relaxed);
+        let bytes = data_bytes(data.vector_count, data.point, value_bytes);
+        DATA_BYTES.store(bytes, Ordering::Relaxed);
     }
     0
 }
@@ -139,12 +144,19 @@ unsafe extern "C" fn on_send_init_data(
     0
 }
 
-fn data_bytes(vector_count: c_int, point: c_int) -> u64 {
+fn data_bytes(vector_count: c_int, point: c_int, value_bytes: u64) -> u64 {
     let vectors = u64::try_from(vector_count).unwrap_or(0);
     let points = u64::try_from(point).map_or(0, |point| point + 1);
-    vectors
-        .saturating_mul(points)
-        .saturating_mul(BYTES_PER_VALUE)
+    vectors.saturating_mul(points).saturating_mul(value_bytes)
+}
+
+/// What one value of one vector takes: the sweep of an AC analysis is complex.
+fn value_bytes(complex_data: bool) -> u64 {
+    if complex_data {
+        COMPLEX_VALUE_BYTES
+    } else {
+        REAL_VALUE_BYTES
+    }
 }
 
 /// Whether to stop a run now, and why. Too much data comes first: more time
@@ -373,6 +385,7 @@ fn prepare_and_simulate(run_dir: &Path) -> Result<RunStatus> {
     if let Some(behavior) = &request.compatibility {
         engine.run_command(&format!("set ngbehavior={behavior}"))?;
     }
+    VALUE_BYTES.store(value_bytes(request.complex_data), Ordering::Relaxed);
     if !EXIT_CALLED.load(Ordering::SeqCst) {
         drop_process_rights()?;
         engine.load_circuit(lines);
@@ -682,12 +695,19 @@ mod tests {
 
     #[test]
     fn data_is_counted_per_value_of_every_vector() {
-        assert_eq!(data_bytes(3, 9), 3 * 10 * 8);
-        assert_eq!(data_bytes(3, 0), 24);
-        assert_eq!(data_bytes(0, 9), 0);
-        assert_eq!(data_bytes(-1, 9), 0);
-        assert_eq!(data_bytes(3, -1), 0);
-        assert_eq!(data_bytes(i32::MAX, i32::MAX), u64::MAX);
+        assert_eq!(data_bytes(3, 9, 8), 3 * 10 * 8);
+        assert_eq!(data_bytes(3, 0, 8), 24);
+        assert_eq!(data_bytes(0, 9, 8), 0);
+        assert_eq!(data_bytes(-1, 9, 8), 0);
+        assert_eq!(data_bytes(3, -1, 8), 0);
+        assert_eq!(data_bytes(i32::MAX, i32::MAX, 8), u64::MAX);
+    }
+
+    #[test]
+    fn an_ac_value_counts_as_a_pair_of_doubles() {
+        assert_eq!(value_bytes(false), 8);
+        assert_eq!(value_bytes(true), 16);
+        assert_eq!(data_bytes(3, 9, value_bytes(true)), 3 * 10 * 16);
     }
 
     #[test]

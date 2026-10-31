@@ -53,10 +53,13 @@ pub(crate) enum Kind {
     FallTime,
     OvershootPercent,
     SettlingTime,
+    Bandwidth3db,
+    PhaseMargin,
+    GainMargin,
 }
 
 /// Every kind, as the schema and the result name it.
-pub(crate) const KINDS: [(&str, Kind); 14] = [
+pub(crate) const KINDS: [(&str, Kind); 17] = [
     ("min", Kind::Min),
     ("max", Kind::Max),
     ("peak_to_peak", Kind::PeakToPeak),
@@ -71,7 +74,95 @@ pub(crate) const KINDS: [(&str, Kind); 14] = [
     ("fall_time", Kind::FallTime),
     ("overshoot_percent", Kind::OvershootPercent),
     ("settling_time", Kind::SettlingTime),
+    ("bandwidth_3db", Kind::Bandwidth3db),
+    ("phase_margin", Kind::PhaseMargin),
+    ("gain_margin", Kind::GainMargin),
 ];
+
+/// What a measurement is taken along: the analysis decides which of the
+/// `_seconds`, `_hz` and `_sweep` fields a measurement may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Axis {
+    Time,
+    Frequency,
+    Sweep,
+}
+
+impl Axis {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Time => "seconds",
+            Self::Frequency => "hz",
+            Self::Sweep => "sweep",
+        }
+    }
+
+    /// How a refusal names the analysis.
+    fn analysis(self) -> &'static str {
+        match self {
+            Self::Time => "a transient",
+            Self::Frequency => "an ac analysis",
+            Self::Sweep => "a dc_sweep",
+        }
+    }
+}
+
+/// The axis a run was taken along, as the analysis states it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AxisSpec {
+    pub axis: Axis,
+    /// Where the axis starts and where it ends, in the order it is swept. A DC
+    /// sweep may run downward.
+    pub first: f64,
+    pub last: f64,
+    /// Where the run starts saving. Nothing before it was lost on purpose.
+    pub saved_from: f64,
+    /// The unit of a location on the axis.
+    pub unit: String,
+}
+
+impl AxisSpec {
+    pub(crate) fn time(stop: f64, saved_from: f64) -> Self {
+        Self {
+            axis: Axis::Time,
+            first: 0.0,
+            last: stop,
+            saved_from,
+            unit: "s".to_string(),
+        }
+    }
+
+    pub(crate) fn frequency(start: f64, stop: f64) -> Self {
+        Self {
+            axis: Axis::Frequency,
+            first: start,
+            last: stop,
+            saved_from: f64::NEG_INFINITY,
+            unit: "Hz".to_string(),
+        }
+    }
+
+    pub(crate) fn sweep(start: f64, stop: f64, unit: &str) -> Self {
+        Self {
+            axis: Axis::Sweep,
+            first: start,
+            last: stop,
+            saved_from: f64::NEG_INFINITY,
+            unit: unit.to_string(),
+        }
+    }
+
+    /// `1` for a sweep that rises or stands still and `-1` for one that falls.
+    /// Windows and searches run in sweep order, and the measuring code needs an
+    /// axis that rises, so a falling one is negated on the way in and out.
+    pub(crate) fn direction(&self) -> f64 {
+        if self.last >= self.first {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+}
 
 impl Kind {
     fn takes_level(self) -> bool {
@@ -85,16 +176,44 @@ impl Kind {
         )
     }
 
-    fn unit(self, signal_unit: &str) -> String {
+    fn unit(self, signal_unit: &str, axis: &AxisSpec) -> String {
         match self {
             Self::Integral => format!("{signal_unit}*s"),
             Self::I2t => "A²s".to_string(),
-            Self::Crossing | Self::RiseTime | Self::FallTime | Self::SettlingTime => {
-                "s".to_string()
-            }
+            Self::Crossing => axis.unit.clone(),
+            Self::RiseTime | Self::FallTime | Self::SettlingTime => "s".to_string(),
             Self::OvershootPercent => "%".to_string(),
+            Self::Bandwidth3db => "Hz".to_string(),
+            Self::PhaseMargin => "degrees".to_string(),
+            Self::GainMargin => "dB".to_string(),
+            Self::ValueAt if axis.axis == Axis::Frequency => "dB".to_string(),
             _ => signal_unit.to_string(),
         }
+    }
+
+    /// Whether this can be worked out along the axis. An average over a sweep has
+    /// no meaning, and a margin needs a frequency.
+    fn fits(self, axis: Axis) -> bool {
+        match axis {
+            Axis::Time => !self.is_ac_only(),
+            Axis::Frequency => self.is_ac_only() || self == Self::ValueAt,
+            Axis::Sweep => matches!(
+                self,
+                Self::Min
+                    | Self::Max
+                    | Self::PeakToPeak
+                    | Self::PeakAbs
+                    | Self::ValueAt
+                    | Self::Crossing
+            ),
+        }
+    }
+
+    pub(crate) fn is_ac_only(self) -> bool {
+        matches!(
+            self,
+            Self::Bandwidth3db | Self::PhaseMargin | Self::GainMargin
+        )
     }
 }
 
@@ -133,6 +252,26 @@ pub(crate) struct Measurement {
     pub band_percent: f64,
     /// Where the run starts saving, so a window reaching before it can say so.
     pub saved_from: f64,
+    pub axis: AxisSpec,
+    /// `1`, or `-1` for a DC sweep that falls. `from`, `to`, `at`, `level` and
+    /// `saved_from` are already in the rising order the measuring code needs.
+    pub sign: f64,
+    /// The second signal of an AC ratio: `signal / reference_signal`.
+    pub reference_signal: Option<(String, Signal)>,
+    /// For `bandwidth_3db`: measure from the peak and not from the lowest frequency.
+    pub peak_reference: bool,
+}
+
+impl Measurement {
+    /// The unit of the answer.
+    pub(crate) fn unit(&self) -> String {
+        self.kind.unit(self.signal.unit(), &self.axis)
+    }
+
+    /// A location on the axis, back in the order the caller gave.
+    pub(crate) fn place(&self, location: f64) -> f64 {
+        location * self.sign
+    }
 }
 
 /// A measurement that does not fit, naming the field.
@@ -160,8 +299,7 @@ fn finite(entry: &Value, key: &str, prefix: &str) -> Result<Option<f64>, BadMeas
 pub(crate) fn parse(
     entry: &Value,
     index: usize,
-    stop: f64,
-    saved_from: f64,
+    axis: &AxisSpec,
 ) -> Result<Measurement, BadMeasurement> {
     let prefix = format!("measurements[{index}]");
     let bad = |key: &str, reason: String| BadMeasurement {
@@ -175,31 +313,76 @@ pub(crate) fn parse(
             format!("Unknown measurement kind: {kind_name}"),
         ));
     };
+    if !kind.fits(axis.axis) {
+        return Err(bad(
+            "kind",
+            format!("{kind_name} is not defined for {}", axis.axis.analysis()),
+        ));
+    }
     let signal_text = entry["signal"].as_str().unwrap_or_default().to_string();
     let signal = Signal::parse(&signal_text).map_err(|reason| bad("signal", reason))?;
     if kind == Kind::I2t && !matches!(signal, Signal::Current { .. }) {
         return Err(bad("signal", "i2t needs a current".to_string()));
     }
-    let from = finite(entry, "from_seconds", &prefix)?;
-    let to = finite(entry, "to_seconds", &prefix)?;
-    let at = finite(entry, "at_seconds", &prefix)?;
+    let ac = axis.axis == Axis::Frequency;
+    // Power is a time average of a product, so a phasor has none to give.
+    let no_power = |key: &str, signal: &Signal| match (ac, signal) {
+        (true, Signal::Power(_)) => Err(bad(key, "p() has no value in an ac analysis".into())),
+        _ => Ok(()),
+    };
+    no_power("signal", &signal)?;
+
+    // The fields of the analysis this measurement belongs to. A field of another
+    // analysis would be ignored, so it is refused.
+    let key = |name: &str| format!("{name}_{}", axis.axis.suffix());
+    for other in [Axis::Time, Axis::Frequency, Axis::Sweep] {
+        for name in ["from", "to", "at"] {
+            let foreign = format!("{name}_{}", other.suffix());
+            if other != axis.axis && !entry[&foreign].is_null() {
+                return Err(bad(
+                    &foreign,
+                    format!(
+                        "{foreign} does not apply to {}. Use {}",
+                        axis.axis.analysis(),
+                        key(name)
+                    ),
+                ));
+            }
+        }
+    }
+    let from = finite(entry, &key("from"), &prefix)?;
+    let to = finite(entry, &key("to"), &prefix)?;
+    let at = finite(entry, &key("at"), &prefix)?;
     let level = finite(entry, "level", &prefix)?;
     let final_value = finite(entry, "final_value", &prefix)?;
     let band_percent = finite(entry, "band_percent", &prefix)?;
-    for (key, time) in [
-        ("from_seconds", from),
-        ("to_seconds", to),
-        ("at_seconds", at),
-    ] {
-        if time.is_some_and(|time| !(0.0..=stop).contains(&time)) {
-            return Err(bad(key, format!("{key} must fall within the analysis")));
+    let (low, high) = (axis.first.min(axis.last), axis.first.max(axis.last));
+    let slack = high.abs().max(low.abs()) * WINDOW_TOLERANCE;
+    for (name, value) in [("from", from), ("to", to), ("at", at)] {
+        if value.is_some_and(|value| value < low - slack || value > high + slack) {
+            return Err(bad(
+                &key(name),
+                format!("{} must fall within the analysis", key(name)),
+            ));
         }
     }
+    // A window runs in the order of the sweep, so a falling sweep goes from the
+    // larger value to the smaller.
+    let sign = axis.direction();
+    let (from, to, at) = (
+        from.map(|v| v * sign),
+        to.map(|v| v * sign),
+        at.map(|v| v * sign),
+    );
     if let (Some(from), Some(to)) = (from, to) {
         if from >= to {
             return Err(bad(
-                "to_seconds",
-                "to_seconds must follow from_seconds".into(),
+                &key("to"),
+                format!(
+                    "{} must follow {} in the order of the sweep",
+                    key("to"),
+                    key("from")
+                ),
             ));
         }
     }
@@ -224,13 +407,13 @@ pub(crate) fn parse(
         true => Err(bad(key, format!("{kind_name} does not use {key}"))),
         false => Ok(()),
     };
-    let point_in_time = kind == Kind::ValueAt;
-    if point_in_time {
-        needs(at.is_some(), "at_seconds")?;
-        unused(from.is_some(), "from_seconds")?;
-        unused(to.is_some(), "to_seconds")?;
+    let point_in_axis = kind == Kind::ValueAt;
+    if point_in_axis {
+        needs(at.is_some(), &key("at"))?;
+        unused(from.is_some(), &key("from"))?;
+        unused(to.is_some(), &key("to"))?;
     } else {
-        unused(at.is_some(), "at_seconds")?;
+        unused(at.is_some(), &key("at"))?;
     }
     if kind.takes_level() {
         needs(level.is_some(), "level")?;
@@ -245,9 +428,54 @@ pub(crate) fn parse(
         unused(band_percent.is_some(), "band_percent")?;
     }
 
+    let reference_signal = match entry["reference_signal"].as_str() {
+        None if entry["reference_signal"].is_null() => None,
+        None => {
+            return Err(bad(
+                "reference_signal",
+                "reference_signal must be text".into(),
+            ))
+        }
+        Some(_) if !ac => {
+            return Err(bad(
+                "reference_signal",
+                format!(
+                    "reference_signal applies to an ac analysis, not {}",
+                    axis.axis.analysis()
+                ),
+            ))
+        }
+        Some(text) => {
+            let parsed = Signal::parse(text).map_err(|reason| bad("reference_signal", reason))?;
+            no_power("reference_signal", &parsed)?;
+            Some((text.to_string(), parsed))
+        }
+    };
+    let peak_reference = match entry["reference_level"].as_str() {
+        None if entry["reference_level"].is_null() => false,
+        _ if kind != Kind::Bandwidth3db => {
+            return Err(bad(
+                "reference_level",
+                format!("{kind_name} does not use reference_level"),
+            ))
+        }
+        Some("low_frequency") => false,
+        Some("peak") => true,
+        _ => {
+            return Err(bad(
+                "reference_level",
+                "reference_level must be low_frequency or peak".into(),
+            ))
+        }
+    };
+
     let name = match entry["name"].as_str() {
         Some(name) => name.to_string(),
         None => format!("{kind_name} {signal_text}"),
+    };
+    let saved_from = match axis.saved_from.is_finite() {
+        true => axis.saved_from * sign,
+        false => f64::NEG_INFINITY,
     };
     Ok(Measurement {
         name,
@@ -263,6 +491,10 @@ pub(crate) fn parse(
         final_value,
         band_percent: band_percent.unwrap_or(DEFAULT_BAND_PERCENT),
         saved_from,
+        axis: axis.clone(),
+        sign,
+        reference_signal,
+        peak_reference,
     })
 }
 
@@ -316,16 +548,21 @@ impl Reading {
 
     /// One entry of `measurements` in a result.
     pub(crate) fn report(&self, request: &Measurement, window_truncated: bool) -> Value {
+        // A crossing is a place on the axis, so it is turned back with the others.
+        let value = match request.kind {
+            Kind::Crossing => self.value.map(|value| request.place(value)),
+            _ => self.value,
+        };
         let mut report = json!({
             "name": request.name,
             "kind": request.kind_name,
             "signal": request.signal_text,
-            "value": self.value,
-            "unit": request.kind.unit(request.signal.unit()),
+            "value": value,
+            "unit": request.unit(),
             "window_truncated": window_truncated || self.clipped,
         });
         if let Some(at) = self.at {
-            report["at_seconds"] = json!(at);
+            report[format!("at_{}", request.axis.axis.suffix())] = json!(request.place(at));
         }
         if let Some(finding) = self.finding {
             report["finding"] = json!(finding);
@@ -639,7 +876,8 @@ pub(crate) fn measure(time: &[f64], values: &[f64], request: &Measurement) -> Re
     if request.kind == Kind::ValueAt {
         let at = request.at.unwrap_or_default();
         let last = time[time.len() - 1];
-        let inside = at >= time[0] && at <= last + last.abs() * WINDOW_TOLERANCE;
+        let slack = last.abs().max(time[0].abs()) * WINDOW_TOLERANCE;
+        let inside = at >= time[0] - slack && at <= last + slack;
         if !inside {
             return Reading::none("outside_data");
         }
@@ -703,7 +941,10 @@ fn over_window(window: &Window, request: &Measurement) -> Reading {
         Kind::FallTime => window.edge(request.final_value, false),
         Kind::OvershootPercent => window.overshoot(request.final_value),
         Kind::SettlingTime => window.settling(request.final_value, request.band_percent),
-        Kind::ValueAt => Reading::none("outside_data"),
+        // Answered before a window is cut, or by the AC measurements.
+        Kind::ValueAt | Kind::Bandwidth3db | Kind::PhaseMargin | Kind::GainMargin => {
+            Reading::none("outside_data")
+        }
     }
 }
 
@@ -734,6 +975,32 @@ pub(crate) fn summary(
     }
     if envelope_points > 0 {
         report["envelope"] = envelope(time, values, envelope_points);
+    }
+    report
+}
+
+/// What a DC sweep holds: the lowest and highest value, and the value at each end.
+/// With two sweeps these cover the whole grid, and the ends are its first and last
+/// point. `at_stop` is the last point the run saved.
+pub(crate) fn sweep_summary(
+    values: &[f64],
+    signal_text: &str,
+    unit: &str,
+    window_truncated: bool,
+) -> Value {
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    let end = |value: Option<&f64>| value.copied().filter(|value| value.is_finite());
+    let mut report = json!({
+        "signal": signal_text,
+        "unit": unit,
+        "min": finite.iter().copied().reduce(f64::min),
+        "max": finite.iter().copied().reduce(f64::max),
+        "at_start": end(values.first()),
+        "at_stop": end(values.last()),
+        "window_truncated": window_truncated,
+    });
+    if finite.len() != values.len() {
+        report["finding"] = json!("non_finite_data");
     }
     report
 }
@@ -784,7 +1051,11 @@ mod tests {
     }
 
     fn read(entry: &Value, time: &[f64], values: &[f64]) -> Reading {
-        measure(time, values, &parse(entry, 0, 1e9, 0.0).unwrap())
+        measure(
+            time,
+            values,
+            &parse(entry, 0, &AxisSpec::time(1e9, 0.0)).unwrap(),
+        )
     }
 
     fn close(actual: f64, expected: f64, tolerance: f64) {
@@ -1181,11 +1452,11 @@ mod tests {
             let reading = read(&request(kind), &time, &values);
             assert_eq!(reading.levels, Some((1.0, 3.0)), "{kind}");
         }
-        let parsed = parse(&request("rise_time"), 0, 100.0, 0.0).unwrap();
+        let parsed = parse(&request("rise_time"), 0, &AxisSpec::time(100.0, 0.0)).unwrap();
         let report = measure(&time, &values, &parsed).report(&parsed, false);
         assert_eq!(report["start_value"], 1.0);
         assert_eq!(report["final_value"], 3.0);
-        let parsed = parse(&request("max"), 0, 100.0, 0.0).unwrap();
+        let parsed = parse(&request("max"), 0, &AxisSpec::time(100.0, 0.0)).unwrap();
         let report = measure(&time, &values, &parsed).report(&parsed, false);
         assert!(report.get("final_value").is_none());
     }
@@ -1305,9 +1576,23 @@ mod tests {
         assert_eq!(read(&entry, &time, &values).value, Some(2.0));
     }
 
+    #[test]
+    fn the_first_point_itself_has_a_value_despite_rounding() {
+        // A sweep from 5 V down to 3 V is measured on a negated axis, and the
+        // engine's first value lands a rounding error past the 5 the caller wrote.
+        let (axis, values) = ([-4.999999999999999, -4.0, -3.0], [0.0, 1.0, 2.0]);
+        let entry = json!({ "kind": "value_at", "signal": "v(a)", "at_sweep": 5.0 });
+        let parsed = parse(&entry, 0, &AxisSpec::sweep(5.0, 3.0, "V")).unwrap();
+        assert_eq!(parsed.at, Some(-5.0));
+        assert_eq!(measure(&axis, &values, &parsed).value, Some(0.0));
+        let last = json!({ "kind": "value_at", "signal": "v(a)", "at_sweep": 3.0 });
+        let parsed = parse(&last, 0, &AxisSpec::sweep(5.0, 3.0, "V")).unwrap();
+        assert_eq!(measure(&axis, &values, &parsed).value, Some(2.0));
+    }
+
     fn from_saved(from: f64, saved_from: f64, time: &[f64], values: &[f64]) -> bool {
         let entry = with(request("max"), "from_seconds", json!(from));
-        let parsed = parse(&entry, 0, 1e9, saved_from).unwrap();
+        let parsed = parse(&entry, 0, &AxisSpec::time(1e9, saved_from)).unwrap();
         measure(time, values, &parsed).clipped
     }
 
@@ -1372,17 +1657,17 @@ mod tests {
     #[test]
     fn a_result_names_units_and_never_hides_a_null() {
         let entry = json!({ "kind": "i2t", "signal": "i(r1)", "name": "fuse" });
-        let parsed = parse(&entry, 0, 1.0, 0.0).unwrap();
+        let parsed = parse(&entry, 0, &AxisSpec::time(1.0, 0.0)).unwrap();
         let report = measure(&[0.0, 1.0], &[2.0, 2.0], &parsed).report(&parsed, false);
         assert_eq!(report["name"], "fuse");
         assert_eq!(report["unit"], "A²s");
         assert_eq!(report["value"], 4.0);
         assert_eq!(report["window_truncated"], false);
 
-        let unnamed = parse(&request("crossing_x"), 0, 1.0, 0.0).unwrap_err();
+        let unnamed = parse(&request("crossing_x"), 0, &AxisSpec::time(1.0, 0.0)).unwrap_err();
         assert_eq!(unnamed.field, "measurements[0].kind");
         let entry = with(request("crossing"), "level", json!(9.0));
-        let parsed = parse(&entry, 0, 1.0, 0.0).unwrap();
+        let parsed = parse(&entry, 0, &AxisSpec::time(1.0, 0.0)).unwrap();
         assert_eq!(parsed.name, "crossing v(a)");
         let report = measure(&[0.0, 1.0], &[2.0, 2.0], &parsed).report(&parsed, true);
         assert!(report["value"].is_null(), "{report}");
@@ -1394,7 +1679,7 @@ mod tests {
     #[test]
     fn what_cannot_give_an_answer_is_refused_with_its_field() {
         let refused = |entry: Value, field: &str| {
-            let error = parse(&entry, 3, 1.0, 0.0).unwrap_err();
+            let error = parse(&entry, 3, &AxisSpec::time(1.0, 0.0)).unwrap_err();
             assert_eq!(error.field, format!("measurements[3].{field}"), "{error:?}");
         };
         refused(json!({ "kind": "max", "signal": "x(a)" }), "signal");
