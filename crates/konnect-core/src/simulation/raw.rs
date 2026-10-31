@@ -598,6 +598,13 @@ mod tests {
     }
 
     #[test]
+    fn a_length_of_several_dimensions_is_their_product() {
+        assert_eq!(own_length("voltage dims=3,2"), Some(6));
+        assert_eq!(own_length("voltage dims=3,x"), None);
+        assert_eq!(own_length("voltage grid=3"), None);
+    }
+
+    #[test]
     fn a_variable_past_the_end_has_no_values() {
         let plot = only(OP_TEXT);
         assert_eq!(plot.real(plot.variables.len()).count(), 0);
@@ -606,6 +613,8 @@ mod tests {
     #[test]
     fn a_constants_plot_is_not_a_result() {
         let text = with("Plotname: Operating Point", "Plotname: constants");
+        assert_eq!(parse(&text), Err(RawError::NoResults));
+        let text = with("Plotname: Operating Point", "Plotname: Constants");
         assert_eq!(parse(&text), Err(RawError::NoResults));
     }
 
