@@ -862,6 +862,18 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "upper_edge_hz",
         "unavailable",
         "ambiguous",
+        "analysis_kind",
+        "created_at",
+        "csv_not_written",
+        "csv_path",
+        "inputs_changed_since_run",
+        "invalid_argument",
+        "power_not_saved",
+        "results_unreadable",
+        "run_not_found",
+        "run_status",
+        "unreadable_record",
+        "without_record",
     ];
 
     let mut phantom = Vec::new();

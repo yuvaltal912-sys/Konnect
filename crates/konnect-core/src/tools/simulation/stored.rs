@@ -515,12 +515,22 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(made.success());
-            // A writer, so that a read would return and fail the test, not hang it.
+            // Writers, so that a read would return and fail the test, not hang it. The
+            // hash the run would have recorded is the hash of an empty file, so reading
+            // the pipe would read as unchanged.
             let writer = fifo.clone();
             std::thread::spawn(move || {
-                let _ = std::fs::OpenOptions::new().write(true).open(writer);
+                for _ in 0..3 {
+                    let _ = std::fs::OpenOptions::new().write(true).open(&writer);
+                }
             });
-            assert_eq!(sources.changed_since(&record(vec![fifo])), Some(true));
+            let unchanged = inputs_hash(Sha256::default(), std::slice::from_ref(&fifo)).unwrap();
+            let pipe_record = |hash: String| {
+                let mut record = record(vec![fifo.clone()]);
+                record.inputs_hash = hash;
+                record
+            };
+            assert_eq!(sources.changed_since(&pipe_record(unchanged)), Some(true));
         }
         let big = dir.path().join("big.lib");
         std::fs::File::create(&big)
