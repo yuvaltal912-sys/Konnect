@@ -7,9 +7,17 @@ use crate::simulation::kicad_netlist::ElementEntry;
 use crate::simulation::raw::Plot;
 use serde_json::{json, Value};
 
-/// The most points a sweep may ask for. A run that makes more would be stopped by
-/// its budget or size limit anyway, and this says so before the export.
+/// The most points a DC sweep may ask for. A run that makes more would be stopped by
+/// its budget or size limit anyway, and this says so before the export. An AC sweep
+/// cannot reach it: ten thousand points a decade over the whole frequency range is
+/// 270,000.
 pub(super) const MAX_SWEEP_POINTS: f64 = 1_000_000.0;
+/// The frequencies the engine was run at. Past them it loops at `inf` Hz, or stops
+/// for no reason in the circuit.
+const FREQUENCY_RANGE: std::ops::RangeInclusive<f64> = 1e-9..=1e18;
+/// A step smaller than this share of the values it steps between is lost in
+/// rounding, and the engine then runs far past the points counted [verified: run E100].
+const MIN_STEP_SHARE: f64 = 1e-9;
 const DEFAULT_AC_POINTS: u64 = 50;
 const MAX_AC_POINTS: u64 = 10_000;
 /// ngspice counts the points of a DC sweep with a little room for rounding, so
@@ -101,8 +109,17 @@ impl Ac {
     pub(super) fn from_args(analysis: &Value) -> Result<Self, CallToolResult> {
         let start = required(analysis, "start_hz", "analysis", "An ac analysis")?;
         let stop = required(analysis, "stop_hz", "analysis", "An ac analysis")?;
-        if start <= 0.0 {
-            return Err(invalid("analysis.start_hz", "start_hz must be above 0"));
+        for (field, value) in [("start_hz", start), ("stop_hz", stop)] {
+            if !FREQUENCY_RANGE.contains(&value) {
+                return Err(invalid(
+                    format!("analysis.{field}"),
+                    format!(
+                        "{field} must be from {:e} to {:e}",
+                        FREQUENCY_RANGE.start(),
+                        FREQUENCY_RANGE.end()
+                    ),
+                ));
+            }
         }
         if stop <= start {
             return Err(invalid(
@@ -126,11 +143,12 @@ impl Ac {
                     )
                 })?,
         };
-        if scale == Scale::Linear && points < 2 {
-            // One point is the start alone, and the sweep would never reach the stop.
+        if scale == Scale::Linear && points < 3 {
+            // ngspice gives the start alone for 2, and the sweep would never reach the
+            // stop [verified: run E100].
             return Err(invalid(
                 "analysis.points",
-                "A linear sweep needs at least 2 points to reach stop_hz",
+                "A linear sweep needs at least 3 points: ngspice gives the start alone for 2",
             ));
         }
         let ac = Self {
@@ -139,26 +157,22 @@ impl Ac {
             scale,
             points,
         };
-        let total = ac.estimated_points();
-        if !(total <= MAX_SWEEP_POINTS) {
+        if ac.steps() < 1.0 - COUNT_TOLERANCE {
             return Err(invalid(
                 "analysis.points",
-                format!(
-                    "This sweep would take about {total:.0} points. At most {MAX_SWEEP_POINTS:.0}"
-                ),
+                "This range holds fewer than two points at this density. Raise points or widen the range",
             ));
         }
         Ok(ac)
     }
 
-    /// A safe overestimate of the points, for the limit.
-    fn estimated_points(&self) -> f64 {
-        let steps = match self.scale {
+    /// How many steps the grid takes from the start to the stop.
+    fn steps(&self) -> f64 {
+        match self.scale {
             Scale::Decade => (self.stop / self.start).log10() * self.points as f64,
             Scale::Octave => (self.stop / self.start).log2() * self.points as f64,
-            Scale::Linear => return self.points as f64,
-        };
-        steps.ceil() + 1.0
+            Scale::Linear => (self.points - 1) as f64,
+        }
     }
 
     pub(super) fn line(&self) -> String {
@@ -271,6 +285,15 @@ impl Sweep {
                 "step_value must point from start_value toward stop_value: negative to sweep down",
             ));
         }
+        // Past this the step vanishes in rounding, and the engine runs on far beyond
+        // the stop while the count says a few points.
+        if step.abs() < start.abs().max(stop.abs()) * MIN_STEP_SHARE {
+            return Err(invalid(
+                format!("{path}.step_value"),
+                "step_value is too small against the values swept: the engine cannot tell \
+                 the points apart",
+            ));
+        }
         let ratio = (stop - start) / step;
         if !(ratio * (1.0 + COUNT_TOLERANCE) < MAX_SWEEP_POINTS) {
             return Err(invalid(
@@ -346,17 +369,65 @@ impl DcSweep {
         format!(".dc {}", sweeps.join(" "))
     }
 
-    /// Every point of the grid was saved, in a plot whose first vector is a sweep's
+    /// How many points one run of the first sweep took, and how many such runs the
+    /// plot holds. The engine saves only the first sweep's value, so the first run
+    /// ends where that value turns back.
+    fn shape(&self, plot: &Plot) -> Option<(usize, usize)> {
+        let axis = Self::axis(plot);
+        if axis.is_empty() {
+            return None;
+        }
+        let inner = self.inner();
+        let run = if self.sweeps.len() == 1 {
+            axis.len()
+        } else if inner.points == 1 {
+            1
+        } else {
+            let direction = inner.step.signum();
+            (1..axis.len())
+                .find(|&i| (axis[i] - axis[i - 1]) * direction < 0.0)
+                .unwrap_or(axis.len())
+        };
+        (axis.len() % run == 0).then_some((run, axis.len() / run))
+    }
+
+    /// The plot holds the grid asked for, in a plot whose first vector is a sweep's
     /// scale: `v-sweep`, `i-sweep`, `res-sweep` or `temp-sweep`, whatever the target
-    /// [verified: run E99]. A sweep the engine cut short, or one it counted
-    /// differently, is not covered.
+    /// [verified: run E99]. The engine adds its step and may stop one point short of
+    /// the stop (`TEMP` by 0.1 from 0 to 100 stops at 99.9), so a sweep one point
+    /// short in either direction is covered, and `ends_short` says so. Two or more
+    /// short, or past the stop, is not.
     pub(super) fn covered(&self, plot: &Plot) -> bool {
-        !plot.is_truncated()
-            && plot
-                .variables
-                .first()
-                .is_some_and(|scale| scale.name.contains(SWEEP_SCALE))
-            && plot.points as u64 == self.expected_points()
+        let scale_is_a_sweep = plot
+            .variables
+            .first()
+            .is_some_and(|scale| scale.name.contains(SWEEP_SCALE));
+        if plot.is_truncated() || !scale_is_a_sweep {
+            return false;
+        }
+        let Some((run, rows)) = self.shape(plot) else {
+            return false;
+        };
+        let within = |found: usize, planned: u64| {
+            let planned = planned as usize;
+            (planned.saturating_sub(1).max(1)..=planned).contains(&found)
+        };
+        let outer = self.sweeps.get(1).map_or(1, |sweep| sweep.points);
+        let inner = self.inner();
+        let last = Self::axis(plot)[run - 1];
+        within(run, inner.points)
+            && within(rows, outer)
+            && (inner.stop - last).abs() <= inner.step.abs() * (1.0 + COUNT_TOLERANCE)
+    }
+
+    /// The first sweep ended short of its stop, by more than rounding.
+    pub(super) fn ends_short(&self, plot: &Plot) -> bool {
+        let inner = self.inner();
+        let Some((run, _)) = self.shape(plot) else {
+            return false;
+        };
+        let last = Self::axis(plot)[run - 1];
+        (inner.stop - last) * inner.step.signum() > inner.step.abs() * COUNT_TOLERANCE
     }
 
     /// The axis the first sweep draws along, the one the engine saves.
@@ -456,6 +527,7 @@ impl DcSweep {
             "sweeps": sweeps,
             "points": plot.points,
             "expected_points": expected,
+            "simulated_to_value": Self::axis(plot).last(),
             "coverage_ratio": (plot.points as f64 / expected as f64).min(1.0),
         })
     }
@@ -565,6 +637,32 @@ mod tests {
             ),
             (
                 json!({ "start_hz": 1e-300, "stop_hz": 1e300, "points": 10000 }),
+                "analysis.start_hz",
+            ),
+            (
+                json!({ "start_hz": 1.0, "stop_hz": 1e308 }),
+                "analysis.stop_hz",
+            ),
+            (
+                json!({ "start_hz": 1.0, "stop_hz": 1.1e18 }),
+                "analysis.stop_hz",
+            ),
+            (
+                json!({ "start_hz": 1e-10, "stop_hz": 1.0 }),
+                "analysis.start_hz",
+            ),
+            // ngspice gives the start alone for two linear points.
+            (
+                json!({ "start_hz": 10.0, "stop_hz": 20.0, "scale": "linear", "points": 2 }),
+                "analysis.points",
+            ),
+            // One point per decade over less than a decade holds the start alone.
+            (
+                json!({ "start_hz": 1.0, "stop_hz": 5.0, "points": 1 }),
+                "analysis.points",
+            ),
+            (
+                json!({ "start_hz": 7.0, "stop_hz": 9.0, "scale": "octave", "points": 1 }),
                 "analysis.points",
             ),
         ] {
@@ -655,6 +753,11 @@ mod tests {
             ),
             (
                 json!([with("step_value", json!(1e-9))]),
+                "analysis.sweeps[0].step_value",
+            ),
+            // A step lost in rounding makes the engine run on far past the stop.
+            (
+                json!([{ "target": "V1", "start_value": 1e16, "stop_value": 1.000000000000001e16, "step_value": 1.0 }]),
                 "analysis.sweeps[0].step_value",
             ),
             (
@@ -835,7 +938,16 @@ mod tests {
         }
         // A cut file, a short grid, a long one, and a plot that is not a sweep's.
         assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale, 7)));
-        assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale[..4], 4)));
+        // One point short is how the engine ends a `TEMP` sweep by 0.1: covered, and
+        // it says where it ended. Two short is not.
+        // The right number of points that never got near the stop is not a sweep.
+        let slow: Vec<f64> = scale.iter().map(|value| value / 10.0).collect();
+        assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &slow, 5)));
+        let short = plot(false, ["v(v-sweep)", "v(a)"], &scale[..4], 4);
+        assert!(one.covered(&short) && one.ends_short(&short));
+        assert!(!one.ends_short(&plot(false, ["temp-sweep", "v(a)"], &scale, 5)));
+        assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale[..3], 3)));
+        assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale[..1], 1)));
         assert!(!one.covered(&plot(
             false,
             ["v(v-sweep)", "v(a)"],
@@ -885,5 +997,38 @@ mod tests {
         let elements = [entry("V1", Some("V1"), true)];
         let run = resolved("V1", &["V1"], &elements).unwrap();
         assert_eq!(run.sweeps[0].name, "V1");
+    }
+
+    #[test]
+    fn a_grid_is_read_by_where_the_first_sweeps_value_turns_back() {
+        let grid = dc(json!([
+            { "target": "V1", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+            { "target": "V2", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 }
+        ]))
+        .unwrap();
+        let names = ["v(v-sweep)", "v(a)"];
+        let rows = |count: usize| -> Vec<f64> { (0..count * 3).map(|n| (n % 3) as f64).collect() };
+        assert!(grid.covered(&plot(false, names, &rows(3), 9)));
+        // A row short is the outer sweep's last step lost, as an inner one can be.
+        assert!(grid.covered(&plot(false, names, &rows(2), 6)));
+        assert!(!grid.covered(&plot(false, names, &rows(1), 3)));
+        assert!(!grid.covered(&plot(false, names, &rows(4), 12)));
+        // A half-finished row is not a grid.
+        assert!(!grid.covered(&plot(false, names, &rows(3)[..8], 8)));
+        // A falling first sweep turns back upward.
+        let down = dc(json!([
+            { "target": "V1", "start_value": 2.0, "stop_value": 0.0, "step_value": -1.0 },
+            { "target": "V2", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 }
+        ]))
+        .unwrap();
+        let falling: Vec<f64> = [2.0, 1.0, 0.0, 2.0, 1.0, 0.0].to_vec();
+        assert!(down.covered(&plot(false, names, &falling, 6)));
+        // A first sweep of one point makes every point a row.
+        let single = dc(json!([
+            { "target": "V1", "start_value": 1.0, "stop_value": 1.0, "step_value": 1.0 },
+            { "target": "V2", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 }
+        ]))
+        .unwrap();
+        assert!(single.covered(&plot(false, names, &[1.0, 1.0, 1.0], 3)));
     }
 }

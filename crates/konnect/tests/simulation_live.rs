@@ -2017,3 +2017,148 @@ fn a_sweep_that_would_run_the_wrong_way_is_refused_where_the_engine_would_write_
     assert_eq!(result["error"]["kind"], "invalid_argument", "{result}");
     assert_eq!(result["error"]["field"], "analysis.sweeps[0].step_value");
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_temperature_sweep_that_ends_one_point_short_is_complete_and_says_so() {
+    // The engine adds 0.1 a thousand times and its last value is 99.90000000002, so it
+    // saves 1000 points and not 1001 [verified: run E100].
+    let lines: Vec<String> = ["VS a 0 DC 10", "R1 a 0 1k"].map(str::to_owned).to_vec();
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": { "kind": "dc_sweep", "sweeps": [
+                { "target": "TEMP", "start_value": 0.0, "stop_value": 100.0, "step_value": 0.1 }
+            ] },
+            "measurements": [
+                { "name": "last", "kind": "value_at", "signal": "i(VS)", "at_sweep": 99.9 },
+                { "name": "at_stop", "kind": "value_at", "signal": "i(VS)", "at_sweep": 100.0 },
+            ],
+        }),
+    );
+
+    assert_eq!(result["analysis"]["points"], 1000, "{result}");
+    assert_eq!(result["analysis"]["expected_points"], 1001);
+    near(
+        result["analysis"]["simulated_to_value"].as_f64().unwrap(),
+        99.9,
+        1e-6,
+    );
+    assert_eq!(result["outcome"]["status"], "complete", "{result}");
+    let warnings = result["warnings"].to_string();
+    assert!(warnings.contains("sweep_ends_before_stop"), "{warnings}");
+    let find = |name: &str| {
+        let items = result["measurements"].as_array().unwrap();
+        items
+            .iter()
+            .find(|item| item["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert!(find("last")["value"].as_f64().is_some());
+    // The engine never reached 100, and the result does not pretend it did.
+    assert_eq!(find("at_stop")["finding"], "outside_data");
+}
+
+/// Two buffered second-order low-passes at 1 kHz with Q = 50 and a gain of 10: the
+/// phase falls 360 degrees within a few percent of frequency.
+fn resonant_loop(points: u64) -> Value {
+    let lines: Vec<String> = [
+        "VIN in 0 DC 0 AC 1",
+        "R1 in a 3.183",
+        "L1 a b 25.33m",
+        "C1 b 0 1u",
+        "E1 c 0 b 0 1",
+        "R2 c d 3.183",
+        "L2 d e 25.33m",
+        "C2 e 0 1u",
+        "E2 out 0 e 0 10",
+        "RL out 0 1k",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    run_on_testbench(
+        &lines,
+        json!({
+            "analysis": { "kind": "ac", "start_hz": 1.1, "stop_hz": 1e5, "points": points },
+            "measurements": [
+                { "name": "pm", "kind": "phase_margin", "signal": "v(out)" },
+                { "name": "gm", "kind": "gain_margin", "signal": "v(out)" },
+            ],
+        }),
+    )
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_sweep_too_coarse_to_follow_the_phase_gives_no_margin_instead_of_a_stable_one() {
+    // The formulas give a gain margin of -88 dB and a phase margin of -178.5 degrees.
+    // At 50 points a decade the phase steps over its 360 degree turn, and an
+    // unwrapping that trusted it read +181 degrees and no gain margin.
+    let coarse = resonant_loop(50);
+    for name in ["pm", "gm"] {
+        let items = coarse["measurements"].as_array().unwrap();
+        let item = items.iter().find(|item| item["name"] == name).unwrap();
+        assert!(item["value"].is_null(), "{item}");
+        assert_eq!(item["finding"], "phase_unreliable", "{item}");
+        assert!(
+            item["phase_unreliable_from_hz"].as_f64().is_some(),
+            "{item}"
+        );
+    }
+    let fine = resonant_loop(1000);
+    near(measured(&fine, "pm"), -178.5, 0.1);
+    near(measured(&fine, "gm"), -88.0, 0.5);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_source_written_as_ac_equals_or_ac_in_brackets_drives_a_sweep() {
+    for source in [
+        "V1 in 0 dc=0 ac=1",
+        "V1 in 0 AC=1",
+        "V1 in 0 DC 0 ac=1 0",
+        "V1 in 0 DC 0 AC(1 0)",
+        "V1 in 0 SIN(0 1 1k) ac = 1",
+    ] {
+        let lines: Vec<String> = [source, "R1 in out 1k", "C1 out 0 1u"]
+            .map(str::to_owned)
+            .to_vec();
+        let result = run_on_testbench(
+            &lines,
+            json!({
+                "analysis": { "kind": "ac", "start_hz": 10.0, "stop_hz": 1000.0 },
+                "measurements": [{ "name": "g", "kind": "value_at", "signal": "v(out)", "at_hz": 10.0 }],
+            }),
+        );
+        assert_eq!(
+            result["outcome"]["status"], "complete",
+            "{source}: {result}"
+        );
+        // 1k and 1 uF: 159 Hz corner, so -0.017 dB at 10 Hz.
+        near(measured(&result, "g"), -0.0171, 1e-3);
+    }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn the_reversed_battery_stand_in_latches_when_swept_downward_through_zero() {
+    // Between about -0.56 V and 0 the stand-in has two DC solutions, so which one the
+    // engine finds depends on where it came from. Swept up it blocks; swept down
+    // from 0 it stays on [verified: run E100].
+    let lowest = |start: f64, stop: f64, step: f64| {
+        let result = run_on_testbench(
+            &protection_deck("reverse"),
+            json!({
+                "analysis": { "kind": "dc_sweep", "sweeps": [
+                    { "target": "VBAT", "start_value": start, "stop_value": stop, "step_value": step }
+                ] },
+                "signals": ["v(out)"],
+            }),
+        );
+        assert_eq!(result["outcome"]["status"], "complete", "{result}");
+        result["signal_summaries"][0]["min"].as_f64().unwrap()
+    };
+    assert!(lowest(-12.0, 0.0, 0.01) > -0.05);
+    assert!(lowest(0.0, -12.0, -0.01) < -0.3);
+}

@@ -128,7 +128,7 @@ fn analysis_schema() -> Value {
                 "stop_hz": {
                     "type": "number",
                     "exclusiveMinimum": 0,
-                    "description": "Above start_hz. An octave sweep ends on the last point at or below it"
+                    "description": "Above start_hz. Both from 1e-9 to 1e18. An octave sweep ends on the last point at or below it"
                 },
                 "scale": {
                     "enum": ["decade", "octave", "linear"],
@@ -139,7 +139,7 @@ fn analysis_schema() -> Value {
                     "minimum": 1,
                     "maximum": 10000,
                     "default": 50,
-                    "description": "Per decade or octave, or in all if linear (at least 2)"
+                    "description": "Per decade or octave, or in all if linear (at least 3). Phase margin and gain margin need enough points to follow the phase: use 100 a decade or more near a resonance"
                 }
             },
             "required": ["kind", "start_hz", "stop_hz"],
@@ -1541,6 +1541,15 @@ impl RunEnd<'_> {
             },
         );
         let mut body = self.result_body(plot, sweep.describe(plot), stopped);
+        if let Some(warnings) = body["warnings"].as_array_mut() {
+            if !partial && sweep.ends_short(plot) {
+                warnings.push(json!({
+                    "code": "sweep_ends_before_stop",
+                    "detail": "The engine adds its step each time and stopped one point short \
+                               of the stop, here simulated_to_value. Every point it plans was run.",
+                }));
+            }
+        }
         let failed = self.finish_body(&mut body, gathered, partial);
         (body, failed)
     }
@@ -3167,27 +3176,22 @@ mod tests {
 
         #[tokio::test]
         async fn a_ratio_of_two_signals_is_the_loop_gain_a_margin_is_read_from() {
-            // v(a) is the loop's return and v(b) the injection: L = v(a)/v(b).
-            let mut raw = String::from(
+            // v(a) is the loop's return and v(b) the injection, which is 2: L = v(a)/v(b).
+            // The loop's gain falls 10 dB a decade from 20 dB at 1 Hz, and its phase
+            // 67.5 degrees a decade. So unity gain is at 100 Hz with -135 degrees, and
+            // -180 degrees comes at 10^(8/3) Hz with a gain of -20/3 dB.
+            let points = 61;
+            let mut raw = format!(
                 "cat > results.raw <<'RAW'\nTitle: t\nPlotname: AC Analysis\nFlags: complex\n\
-                 No. Variables: 3\nNo. Points: 4\nVariables:\n\t0\tfrequency\tfrequency grid=3\n\
-                 \t1\tv(a)\tvoltage\n\t2\tv(b)\tvoltage\nValues:\n",
+                 No. Variables: 3\nNo. Points: {points}\nVariables:\n\t0\tfrequency\tfrequency grid=3\n\
+                 \t1\tv(a)\tvoltage\n\t2\tv(b)\tvoltage\nValues:\n"
             );
-            // v(b) is 2 (so the ratio halves it), and v(a) is 20, 10, 2, 0.2 at a
-            // phase that falls 45 degrees a point.
-            for (index, (f, magnitude, phase)) in [
-                (1.0, 20.0, -45.0_f64),
-                (10.0, 10.0, -90.0),
-                (100.0, 2.0, -135.0),
-                (1000.0, 0.2, -180.0),
-            ]
-            .iter()
-            .enumerate()
-            {
-                let (re, im) = (
-                    magnitude * phase.to_radians().cos(),
-                    magnitude * phase.to_radians().sin(),
-                );
+            for index in 0..points {
+                let u = index as f64 * 0.05;
+                let magnitude = 10f64.powf((20.0 - 10.0 * u) / 20.0);
+                let phase = (-67.5 * u).to_radians();
+                let (re, im) = (2.0 * magnitude * phase.cos(), 2.0 * magnitude * phase.sin());
+                let f = 10f64.powf(u);
                 raw.push_str(&format!("{index}\t{f:e},0\n\t{re:e},{im:e}\n\t2e0,0e0\n"));
             }
             raw.push_str("\nRAW");
@@ -3195,7 +3199,7 @@ mod tests {
             let scene = scene(&job);
             let mut arguments = ac_args(
                 &scene.root,
-                json!({ "start_hz": 1.0, "stop_hz": 1000.0, "points": 1 }),
+                json!({ "start_hz": 1.0, "stop_hz": 1000.0, "points": 20 }),
             );
             arguments["measurements"] = json!([
                 { "name": "pm", "kind": "phase_margin", "signal": "v(a)", "reference_signal": "v(b)" },
@@ -3203,19 +3207,21 @@ mod tests {
             ]);
             let (failed, body) = call(&scene, arguments).await;
             assert!(!failed, "{body}");
-            // L = 10, 5, 1, 0.1: it crosses unity at 100 Hz where the phase is -135.
             let pm = &body["measurements"][0];
             assert!((pm["value"].as_f64().unwrap() - 45.0).abs() < 1e-6, "{pm}");
             assert_eq!(pm["reference_signal"], "v(b)");
             assert!(
-                (pm["crossover_hz"].as_f64().unwrap() - 100.0).abs() < 1e-6,
+                (pm["crossover_hz"].as_f64().unwrap() / 100.0 - 1.0).abs() < 1e-6,
                 "{pm}"
             );
-            // The phase reaches -180 at 1 kHz, where L is 0.1, which is -20 dB.
             let gm = &body["measurements"][1];
-            assert!((gm["value"].as_f64().unwrap() - 20.0).abs() < 1e-6, "{gm}");
             assert!(
-                (gm["phase_crossover_hz"].as_f64().unwrap() - 1000.0).abs() < 1e-6,
+                (gm["value"].as_f64().unwrap() - 20.0 / 3.0).abs() < 1e-6,
+                "{gm}"
+            );
+            let f180 = 10f64.powf(8.0 / 3.0);
+            assert!(
+                (gm["phase_crossover_hz"].as_f64().unwrap() / f180 - 1.0).abs() < 1e-6,
                 "{gm}"
             );
         }
@@ -3322,6 +3328,29 @@ mod tests {
             let dirs = run_dirs(&scene);
             let deck = std::fs::read_to_string(dirs[0].join(DECK_FILE)).unwrap();
             assert!(deck.contains(".dc VSRC 5e0 0e0 -1e0\n"), "{deck}");
+        }
+
+        #[tokio::test]
+        async fn a_dc_sweep_one_point_short_is_complete_and_says_where_it_ended() {
+            // The engine adds its step, and a run of 0 to 5 can end at 4: one short.
+            let points: Vec<(f64, f64)> = (0..5).map(|n| (f64::from(n), f64::from(n))).collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": 5.0, "step_value": 1.0 }
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            let (failed, body) = call(&scene, arguments).await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["analysis"]["simulated_to_value"], 4.0);
+            assert_eq!(body["analysis"]["points"], 5);
+            assert_eq!(body["analysis"]["expected_points"], 6);
+            let warnings = body["warnings"].to_string();
+            assert!(warnings.contains("sweep_ends_before_stop"), "{warnings}");
         }
 
         #[tokio::test]

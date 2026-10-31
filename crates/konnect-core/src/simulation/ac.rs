@@ -17,6 +17,17 @@ const INVERSION_DEGREES: f64 = -180.0;
 /// A loop that starts this close to -180 degrees, or past it, has no first crossing
 /// to find: rounding in the engine decides which side of the line it begins on.
 const START_TOLERANCE_DEGREES: f64 = 1e-3;
+/// Phase is unwrapped by taking the smallest turn from one sample to the next. A
+/// turn near half a revolution could as well be the other way round, or a whole
+/// revolution more, and then nothing after it can be trusted. A resonance with a
+/// high Q turns the phase by nearly 180 degrees inside one coarse step.
+const MAX_PHASE_STEP_DEGREES: f64 = 120.0;
+/// A phase can turn by more than a whole revolution between two samples and read
+/// as a small step, so a turn below the limit above proves nothing by itself. A
+/// resonance sharp enough to do that also changes the gain by many dB between the
+/// same two samples, which a smooth roll-off never does: 60 dB a decade is 1.2 dB
+/// a point at 50 a decade.
+const MAX_GAIN_STEP_DB: f64 = 10.0;
 /// Relative slack on the ends of the sweep, for the rounding the engine leaves.
 const EDGE_TOLERANCE: f64 = 1e-9;
 
@@ -47,6 +58,9 @@ pub(crate) struct Response {
     phase: Vec<f64>,
     /// The sweep is spaced by ratio, so lines are drawn against `ln f`.
     log_axis: bool,
+    /// The first sample reached by a turn too large to trust. From there on the
+    /// unwrapped phase may be out by a multiple of 360 degrees.
+    doubtful_from: Option<usize>,
 }
 
 impl Response {
@@ -60,21 +74,28 @@ impl Response {
         if points == 0 || real.len() != points || imaginary.len() != points {
             return None;
         }
-        let gain_db = real
+        let gain_db: Vec<f64> = real
             .iter()
             .zip(imaginary)
             .map(|(re, im)| 20.0 * re.hypot(*im).log10())
             .collect();
         let mut phase: Vec<f64> = Vec::with_capacity(points);
         let mut last_principal = 0.0;
-        for (re, im) in real.iter().zip(imaginary) {
+        let mut doubtful_from = None;
+        for (index, (re, im)) in real.iter().zip(imaginary).enumerate() {
             let principal = degrees(*re, *im);
             phase.push(match phase.last() {
                 None => principal,
                 // The smallest turn from the last sample, to a multiple of 360.
                 Some(last) => {
                     let step = principal - last_principal;
-                    last + step - 360.0 * (step / 360.0).round()
+                    let turn = step - 360.0 * (step / 360.0).round();
+                    let jump = (gain_db[index] - gain_db[index - 1]).abs();
+                    let too_sharp = turn.abs() > MAX_PHASE_STEP_DEGREES || jump > MAX_GAIN_STEP_DB;
+                    if too_sharp && doubtful_from.is_none() {
+                        doubtful_from = Some(index);
+                    }
+                    last + turn
                 }
             });
             last_principal = principal;
@@ -84,7 +105,13 @@ impl Response {
             gain_db,
             phase,
             log_axis,
+            doubtful_from,
         })
+    }
+
+    /// The unwrapped phase of this sample may be out by whole turns.
+    fn doubtful(&self, sample: usize) -> bool {
+        self.doubtful_from.is_some_and(|from| sample >= from)
     }
 
     fn len(&self) -> usize {
@@ -148,6 +175,9 @@ impl Response {
             gain_db: picked.iter().map(|&i| self.gain_db[i]).collect(),
             phase: picked.iter().map(|&i| self.phase[i]).collect(),
             log_axis: self.log_axis,
+            doubtful_from: picked
+                .iter()
+                .position(|&i| self.doubtful_from.is_some_and(|from| i >= from)),
         })
     }
 
@@ -263,6 +293,17 @@ fn value_at(response: &Response, frequency: f64) -> Found {
     if !gain.is_finite() || !phase.is_finite() {
         return Found::none("non_finite_data");
     }
+    let upper = response
+        .freq
+        .partition_point(|&sample| sample < frequency)
+        .min(response.len() - 1);
+    if response.doubtful(upper) {
+        // The gain stands; the phase may be out by whole turns.
+        return Found::value(gain)
+            .at(frequency)
+            .with("phase_degrees", Value::Null)
+            .with("phase_finding", "phase_unreliable");
+    }
     Found::value(gain)
         .at(frequency)
         .with("phase_degrees", phase)
@@ -317,16 +358,29 @@ fn band_edges(window: &Response) -> Found {
         .with("peak_hz", window.freq[peak_at])
 }
 
+/// What every phase result shows beside its value: where the phase starts, and
+/// where it stops being trustworthy, because a margin read past that point can be
+/// out by 360 degrees and nothing else in the result would say so.
+fn annotate(window: &Response, found: Found) -> Found {
+    let found = found.with("start_phase_degrees", window.phase[0]);
+    match window.doubtful_from {
+        Some(from) => found.with("phase_unreliable_from_hz", window.freq[from]),
+        None => found,
+    }
+}
+
 /// 180 degrees plus the phase where the gain first falls through 0 dB.
 fn phase_margin(window: &Response) -> Found {
-    let start = window.phase[0];
-    let note = |found: Found| found.with("start_phase_degrees", start);
+    let note = |found: Found| annotate(&window, found);
     if window.gain_db[0] == UNITY_DB {
         return note(Found::none("starts_on_level"));
     }
     let Some(index) = window.first_fall(&window.gain_db, UNITY_DB, 0) else {
         return note(Found::none("level_not_reached"));
     };
+    if window.doubtful(index + 1) {
+        return note(Found::none("phase_unreliable"));
+    }
     let crossover = window.crossing(&window.gain_db, index, UNITY_DB);
     let phase = window.at(&window.phase, crossover);
     note(
@@ -339,15 +393,19 @@ fn phase_margin(window: &Response) -> Found {
 
 /// The gain, negated, where the phase first falls through -180 degrees.
 fn gain_margin(window: &Response) -> Found {
-    let start = window.phase[0];
-    let note = |found: Found| found.with("start_phase_degrees", start);
-    if start <= INVERSION_DEGREES + START_TOLERANCE_DEGREES {
+    let note = |found: Found| annotate(&window, found);
+    if window.phase[0] <= INVERSION_DEGREES + START_TOLERANCE_DEGREES {
         return note(Found::none("starts_on_level"));
     }
-    let Some(index) = (0..window.len() - 1)
+    // Only the stretch before the first doubtful turn can be searched.
+    let reliable = window.doubtful_from.unwrap_or(window.len());
+    let Some(index) = (0..reliable.saturating_sub(1))
         .find(|&i| window.phase[i] > INVERSION_DEGREES && window.phase[i + 1] <= INVERSION_DEGREES)
     else {
-        return note(Found::none("level_not_reached"));
+        return note(Found::none(match window.doubtful_from {
+            Some(_) => "phase_unreliable",
+            None => "level_not_reached",
+        }));
     };
     let crossover = window.crossing(&window.phase, index, INVERSION_DEGREES);
     let gain = window.at(&window.gain_db, crossover);
@@ -720,5 +778,124 @@ mod tests {
     fn mismatched_or_empty_data_is_no_response() {
         assert!(Response::new(&[], &[], &[], true).is_none());
         assert!(Response::new(&[1.0, 2.0], &[1.0], &[0.0], true).is_none());
+    }
+
+    /// Two stages of a second-order low-pass at 1 kHz with Q = 50, buffered, with a
+    /// gain of 10: the phase falls 360 degrees inside a few percent of frequency,
+    /// which a coarse sweep steps over. The loop is badly unstable: the formulas give
+    /// a gain margin of -88 dB and a phase margin of -178.5 degrees.
+    fn resonant_loop(per_decade: usize) -> Response {
+        let q = 50.0_f64;
+        let stage = |x: f64| {
+            // 1 / (1 - x^2 + j x / Q)
+            let (re, im) = (1.0 - x * x, x / q);
+            let power = re * re + im * im;
+            (re / power, -im / power)
+        };
+        let freq = sweep(per_decade, 1.1, 1e5);
+        let (mut real, mut imaginary) = (Vec::new(), Vec::new());
+        for &f in &freq {
+            let (re, im) = stage(f / 1000.0);
+            let (re, im) = (10.0 * (re * re - im * im), 10.0 * 2.0 * re * im);
+            real.push(re);
+            imaginary.push(im);
+        }
+        Response::new(&freq, &real, &imaginary, true).unwrap()
+    }
+
+    #[test]
+    fn a_sweep_too_coarse_to_follow_the_phase_gives_no_margin_and_says_why() {
+        let response = resonant_loop(50);
+        for kind in ["phase_margin", "gain_margin"] {
+            let report = measure(&response, &request(kind, json!({})), false);
+            assert!(report["value"].is_null(), "{kind}: {report}");
+            assert_eq!(report["finding"], "phase_unreliable", "{kind}: {report}");
+            let from = report["phase_unreliable_from_hz"].as_f64().unwrap();
+            assert!(from > 500.0 && from < 5000.0, "{from}");
+        }
+        // The gain stands where the phase does not.
+        let report = measure(
+            &response,
+            &request("value_at", json!({ "at_hz": 5000.0 })),
+            false,
+        );
+        assert!(report["value"].as_f64().is_some());
+        assert!(report["phase_degrees"].is_null(), "{report}");
+        assert_eq!(report["phase_finding"], "phase_unreliable");
+        let before = measure(
+            &response,
+            &request("value_at", json!({ "at_hz": 100.0 })),
+            false,
+        );
+        assert!(before["phase_degrees"].as_f64().is_some(), "{before}");
+        assert!(before.get("phase_finding").is_none());
+    }
+
+    #[test]
+    fn a_sweep_fine_enough_gives_the_margins_the_formulas_do() {
+        let response = resonant_loop(1000);
+        let report = measure(&response, &request("phase_margin", json!({})), false);
+        assert!(report.get("phase_unreliable_from_hz").is_none(), "{report}");
+        assert!((value_of(&report) + 178.5).abs() < 0.1, "{report}");
+        let report = measure(&response, &request("gain_margin", json!({})), false);
+        assert!((value_of(&report) + 88.0).abs() < 0.5, "{report}");
+    }
+
+    #[test]
+    fn a_crossing_before_the_first_doubtful_turn_is_still_read() {
+        // Unity gain is reached well below the resonances, where the phase is sound.
+        let response = resonant_loop(50);
+        let freq = [1.1_f64, 1.5, 2.0];
+        let _ = freq;
+        let report = measure(
+            &response,
+            &request("value_at", json!({ "at_hz": 1.5 })),
+            false,
+        );
+        assert!(report["phase_degrees"].as_f64().is_some(), "{report}");
+    }
+
+    #[test]
+    fn a_phase_that_turns_over_120_degrees_a_point_is_doubtful_whatever_the_gain_does() {
+        // A pure delay: flat gain, and 170 degrees of phase from one sample to the next.
+        // It crosses -180 inside that stretch, and the crossing cannot be believed.
+        let freq: Vec<f64> = (1..=6).map(f64::from).collect();
+        let phase = |n: f64| (-170.0 * n).to_radians();
+        let real: Vec<f64> = freq.iter().map(|&n| phase(n - 1.0).cos()).collect();
+        let imaginary: Vec<f64> = freq.iter().map(|&n| phase(n - 1.0).sin()).collect();
+        let response = Response::new(&freq, &real, &imaginary, false).unwrap();
+        let report = measure(&response, &request("gain_margin", json!({})), false);
+        assert!(report["value"].is_null(), "{report}");
+        assert_eq!(report["finding"], "phase_unreliable", "{report}");
+        assert_eq!(report["phase_unreliable_from_hz"], 2.0);
+    }
+
+    #[test]
+    fn a_gain_that_jumps_10_db_a_point_is_doubtful_whatever_the_phase_does() {
+        // 20 dB down in one step, with the phase still: the unity crossing is in the
+        // jump, and a phase read there rests on a sweep that stepped over the detail.
+        let freq = [1.0, 2.0, 3.0, 4.0];
+        let real = [2.0, 0.2, 0.1, 0.05];
+        let response = Response::new(&freq, &real, &[0.0; 4], false).unwrap();
+        let report = measure(&response, &request("phase_margin", json!({})), false);
+        assert!(report["value"].is_null(), "{report}");
+        assert_eq!(report["finding"], "phase_unreliable", "{report}");
+        // The same fall in steps of under 10 dB is read.
+        let real = [2.0, 1.3, 0.8, 0.5];
+        let response = Response::new(&freq, &real, &[0.0; 4], false).unwrap();
+        let report = measure(&response, &request("phase_margin", json!({})), false);
+        assert!(report["value"].as_f64().is_some(), "{report}");
+    }
+
+    #[test]
+    fn a_window_past_the_doubtful_turn_inherits_the_doubt() {
+        // The unwrapped phase up there is whatever the coarse step made of it.
+        let response = resonant_loop(50);
+        let from = json!({ "from_hz": 3000.0 });
+        let report = measure(&response, &request("gain_margin", from), false);
+        assert!(report["value"].is_null(), "{report}");
+        assert_eq!(report["finding"], "phase_unreliable", "{report}");
+        let from = report["phase_unreliable_from_hz"].as_f64().unwrap();
+        assert!(from >= 3000.0, "{report}");
     }
 }

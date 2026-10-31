@@ -381,10 +381,26 @@ fn leading_number(token: &str) -> Option<f64> {
     token[..end].parse().ok()
 }
 
+/// The `AC` keyword of a source card, and the text of the value it gives, if any.
+/// ngspice reads `AC 1`, `AC=1`, `ac = 1` and `AC(1 0)` alike. The name and two
+/// nodes come first, so a node called `ac` is not the keyword.
+fn ac_value(words: &[String]) -> Option<Option<String>> {
+    words.iter().enumerate().skip(3).find_map(|(at, word)| {
+        let lower = word.to_ascii_lowercase();
+        if lower == "ac" {
+            return Some(words.get(at + 1).cloned());
+        }
+        let rest = lower
+            .strip_prefix("ac=")
+            .or_else(|| lower.strip_prefix("ac("))?;
+        Some((!rest.is_empty()).then(|| rest.to_string()))
+    })
+}
+
 /// Whether any voltage or current source can drive an AC analysis: it carries an
 /// `AC` value that is not a plain zero. A source with only a DC value gives a
 /// sweep of zeros and `sim_status=0`, so the engine never says so [verified: E54].
-/// A source inside a subcircuit counts, because whether it is called is not known.
+/// A source inside a subcircuit counts, because whether it is called is not followed.
 pub(crate) fn has_ac_stimulus(deck: &FlatDeck, dollar_is_comment: bool) -> bool {
     cards(deck, dollar_is_comment).iter().any(|card| {
         let words = tokens(&card.text);
@@ -394,18 +410,12 @@ pub(crate) fn has_ac_stimulus(deck: &FlatDeck, dollar_is_comment: bool) -> bool 
         if !is_source {
             return false;
         }
-        // The name and two nodes come first.
-        let Some(at) = words
-            .iter()
-            .skip(3)
-            .position(|word| word.eq_ignore_ascii_case("ac"))
-        else {
-            return false;
-        };
-        let magnitude = words.get(at + 4).and_then(|word| leading_number(word));
         // `AC` alone means 1, and an expression is taken to be non-zero.
-        let next_is_value = words.get(at + 4).is_some();
-        !(next_is_value && magnitude == Some(0.0))
+        match ac_value(&words) {
+            None => false,
+            Some(None) => true,
+            Some(Some(value)) => leading_number(&value) != Some(0.0),
+        }
     })
 }
 
@@ -970,6 +980,12 @@ mod tests {
             "I1 0 a DC 1m AC 1m",
             "V1 a 0 AC {amp}",
             "V1 a 0 DC 5 AC 1meg",
+            "V1 a 0 dc=0 ac=1",
+            "V1 a 0 AC=1",
+            "V1 a 0 DC 0 ac=1 0",
+            "V1 a 0 DC 0 AC(1 0)",
+            "I1 0 a ac=1m",
+            "V1 a 0 SIN(0 1 1k) ac = 1",
         ] {
             assert!(driven(card), "{card}");
         }
@@ -988,6 +1004,9 @@ mod tests {
             "V1 ac 0 DC 5",
             "R2 a b ac",
             "C1 a b 1u ac 1",
+            "V1 a 0 ac=0",
+            "V1 a 0 AC=0.0 90",
+            "V1 a 0 DC 1 AC(0 0)",
         ] {
             assert!(!driven(card), "{card}");
         }

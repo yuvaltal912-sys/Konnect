@@ -82,6 +82,7 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 | Finding | Meaning |
 |---|---|
 | `level_not_reached` | The signal never got there |
+| `phase_unreliable` | AC only: the sweep is too coarse to follow the phase past `phase_unreliable_from_hz`. Raise `points` |
 | `starts_on_level` | It was already on the level when the window began, and never crossed it |
 | `no_transition` | The signal is flat to within rounding, or the step runs the other way |
 | `final_value_needed` | The window's last value cannot stand in for the final value |
@@ -107,7 +108,7 @@ A small-signal sweep around the operating point. It needs a source with an `AC` 
 }
 ```
 
-`points` is per decade or octave, or in all on a `linear` scale. An octave sweep, and some decade ones, end on their last grid point at or below `stop_hz`, up to a step short of it: read `simulated_to_hz`, and `sweep_ends_before_stop` says so. Gain is 20 log10 of the magnitude, so it is the gain only if the AC source is 1. Say "dB re 1 V" otherwise. `p()` has no value here.
+`points` is per decade or octave, or in all on a `linear` scale (at least 3). Frequencies run from 1e-9 to 1e18. A margin follows the phase from sample to sample, and a sweep too coarse to follow a sharp resonance would read an unstable loop as stable, so it gives `phase_unreliable` instead: use 100 points a decade or more for margins. An octave sweep, and some decade ones, end on their last grid point at or below `stop_hz`, up to a step short of it: read `simulated_to_hz`, and `sweep_ends_before_stop` says so. Gain is 20 log10 of the magnitude, so it is the gain only if the AC source is 1. Say "dB re 1 V" otherwise. `p()` has no value here.
 
 | Measurement | Returns |
 |---|---|
@@ -227,7 +228,7 @@ SUV vin out vin 0 SWUV
 
 ### Reversed battery
 
-The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Sweep it with `dc_sweep` on `VBAT` from -12 to 12 V in 0.05 V steps: the sweep replaces the `PWL` value, so the block runs as it stands. The ramp in the block gives the same curve as a transient on 24 ms with `max_step_seconds` 5e-7, within 0.2 percent at ten places from -12 to 12 V, and a ramp is the way to go with a capacitor on the output (ramp slower than its time constant). A coarser ramp step reads the knee badly: 10 µs read 25 percent off at -50 mV. `i(VBAT)` reads positive when leakage flows back into the battery.
+The stand-in conducts forward through `rb_ron` and leaks backward through `rb_roff`. Sweep it upward with `dc_sweep` on `VBAT` from -12 to 12 V in 0.05 V steps: the sweep replaces the `PWL` value, so the block runs as it stands. The ramp in the block gives the same curve as a transient on 24 ms with `max_step_seconds` 5e-7, within 0.2 percent at ten places from -12 to 12 V (a part in 10^9 from 6 V up), and a ramp is the way to go with a capacitor on the output (ramp slower than its time constant). A coarser ramp step reads the knee badly: 10 µs read 25 percent off at -50 mV. `i(VBAT)` reads positive when leakage flows back into the battery.
 
 ```
 * Reversed battery on a slow ramp from -12 V to 12 V. Your circuit supplies the battery and the load.
@@ -238,7 +239,7 @@ RLOAD out 0 12
 BRB vbat out I='v(vbat,out)*(1/rb_roff+(1/rb_ron-1/rb_roff)*0.5*(1+tanh(v(vbat,out)/rb_knee)))'
 ```
 
-At -12 V this reads 1.0 µA of leakage and -12 µV at the output. The lowest output of the whole sweep is -1.1 mV, within 50 mV of zero. At +12 V the output is 11.970 V. The knee `rb_knee` of 10 mV limits both ends. `rb_ron` is the resistance only where its drop is well above about 30 mV: 5 mohm at 1 A dropped 6.4 mV and not 5.0. Blocking reaches `rb_roff` only beyond about 100 mV in reverse. Near zero volts it leaks, from the formula 45 mA at 5 mV, 75 µA at 50 mV and 83 nA at 1 V.
+At -12 V this reads 1.0 µA of leakage and -12 µV at the output. **Sweep it upward.** Between about -0.56 V and 0 the stand-in has two solutions, so a sweep that runs downward through zero latches into conduction (-0.55 V out, 45 mA) where an upward one blocks, and the lowest output of an upward sweep depends on its step (-1.1 mV at 0.05 V, -40 mV at 0.01 V) because the knee leaks most within 50 mV of zero. Take the leakage from the ends. At +12 V the output is 11.970 V. The knee `rb_knee` of 10 mV limits both ends. `rb_ron` is the resistance only where its drop is well above about 30 mV: 5 mohm at 1 A dropped 6.4 mV and not 5.0. Blocking reaches `rb_roff` only beyond about 100 mV in reverse. Near zero volts it leaks, from the formula 45 mA at 5 mV, 75 µA at 50 mV and 83 nA at 1 V.
 
 ### In your own schematic
 
