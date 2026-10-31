@@ -458,6 +458,10 @@ run, so the default budget is 40. Raise it only as far as the client allows. If 
 client gave up first, the run still finished and its files are under Konnect's
 state folder, in `simulation/`.
 
+A run also stops at `max_raw_bytes`, 256 MiB by default, which reads as `partial` with
+`stopped.reason: size_limit` and keeps its data. A very small `max_step_seconds` is the
+usual cause. Shorten the run or raise the step before raising the limit.
+
 ## Tools don't appear after `load_toolset`
 
 After a successful `load_toolset` call the server sends a

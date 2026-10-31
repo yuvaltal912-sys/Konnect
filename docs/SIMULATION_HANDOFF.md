@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 6 open and PR 7 handed over.
+**Last updated:** 2026-10-31, with PR 1 to 7 open and PR 8 not started.
 
 ## Start here
 
@@ -38,70 +38,22 @@ Each PR is based on the one before it. None is merged.
 | 4 | [#2](https://github.com/yuvaltal912-sys/Konnect/pull/2) | `feat/simulation-preflight` | Open |
 | 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Open |
 | 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Open |
-| 7 | Not opened | `feat/simulation-transient` | **Next** |
-| 8 to 11 | Not opened | | Not started |
+| 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Open |
+| 8 | Not opened | | **Next, once the owner approves** |
+| 9 to 11 | Not opened | | Not started |
 
-## Now: PR 7, transient analysis and measurements
+## Now: nothing is running
 
-The owner has approved this PR. It is the first slice that answers inrush and load-step questions.
+PR 7 is done and open. Ask the owner before starting PR 8. A real transient runs through `run_simulation`: `soft_start.sp` matches a reference worked out with no SPICE engine to every digit it prints, at `max_step_seconds` 0.5 µs. A run that stops early reads `partial` with its data kept, for the budget, the size limit and lost convergence.
 
-**Branch:** create `feat/simulation-transient` from `feat/simulation-run`. Open the PR against `feat/simulation-run`, titled `feat(simulation): transient analysis and measurements`.
+### What PR 7 changed that the next PR needs to know
 
-**Plan sections to read first:** 2.2 (Limits, Classification, Reading results, Signals, Measurements), 2.3 (`run_simulation` schema, transient output, failure matrix) and 6.
-
-**Done when:** a real transient runs through `run_simulation` and returns correct inrush and load-step measurements, and a run that stops early reads as `partial` with its data kept.
-
-### Scope
-
-- [ ] `transient` arm in `analysis`: `stop_time_seconds`, `max_step_seconds`, `start_save_seconds`, `use_initial_conditions`. `operating_point` stays the last `oneOf` arm
-- [ ] New `run_simulation` parameters: `signals`, `measurements`, `envelope_points`, `max_raw_bytes`
-- [ ] Signal grammar: `v(NET)`, `v(NET1,NET2)`, `i(REF)`, `i(REF:PIN)`, `p(REF)`, resolved in Rust
-- [ ] New `simulation/measure.rs` with the transient measurements below
-- [ ] `signal_summaries`, with min, max, final and an optional envelope
-- [ ] Size limit: the worker halts softly at `max_raw_bytes`
-- [ ] Docs: plan, `kicad-simulation` skill, `tool-directory.md` and this file
-- [ ] Unit tests, live tests, negative controls, an independent review, gate, PR
-
-**Measurements in this PR:** `min`, `max`, `peak_to_peak`, `peak_abs`, `average`, `rms`, `integral`, `i2t`, `value_at`, `crossing`, `rise_time`, `fall_time`, `overshoot_percent`, `settling_time`.
-
-**Not in this PR:** the AC measurements and every `_hz` and `_sweep` field (PR 9), protection stand-ins (PR 8), and stored-run tools (PR 10). A tool declares only the parameters its handler reads.
-
-### Where PR 6 is hard-wired to an operating point
-
-| Place | Change |
-|---|---|
-| `run_analysis` in `tools/simulation.rs` | Refuses every kind but `operating_point` |
-| `prepare_run` | Picks the deck's own lines, and needs the analysis line |
-| `RunEnd::report` | Passes `operating_point_covered` to `classify`, and always builds rows |
-| `RunEnd::result_body` | `coverage_ratio` is 0 or 1, and `operating_point` is always present |
-| `HaltReason` in `protocol.rs` | Needs `SizeLimit` |
-| `classify` in `worker_client.rs` | Reads `let HaltReason::Timeout = reason`, and must name both reasons |
-| `RunRequest` in `protocol.rs` | Needs the size limit. Bump `PROTOCOL_VERSION`; the fake-worker JSON in `tools/simulation.rs` hard-codes `"protocol":2` |
-| `MAX_RAW_BYTES` in `worker_client.rs` | A fixed 1 GiB read limit, which must stay above `max_raw_bytes` |
-
-### Decided
-
-- **Measurements run in Rust, time-weighted.** Adaptive steps cluster on edges: naive RMS read 5.30 where the true value is 2.69 (E28). Never use `.meas`.
-- **Signals never enter the deck.** `render_with` lines carry no caller text. Only numbers, written by Konnect, go into the `.tran` line. Reject non-finite and non-positive values before the deck is built.
-- **No summaries unless `signals` is given.** This keeps the default result small.
-- **A value that does not exist is `null`, never 0,** with a `finding` such as `level_not_reached`. That is an engineering result, not a failed check.
-- **Outcome counts.** `requested` is 2 plus the measurement count. On a partial run each value carries `window_truncated: true` and counts as failed. A signal missing after the run is partial, with `signal_not_found`.
-- **Coverage.** A transient is proven when the last time reaches the stop time within tolerance. `coverage_ratio` becomes a real ratio.
-- **Non-ASCII nets.** Accept the name KiCad shows, and map it with `preflight::engine_node` before lookup. If two nets share an engine name, say so.
-
-### Check these first, because nothing here has proven them
-
-- **Reading vector length during a run.** The plan has the worker poll it with `ngGet_Vec_Info`. No run has tested that from the main thread while `bg_run` is going. If it is unsafe, read `SendStat` or another signal, and record what you find as E90.
-- **The `.tran` step argument.** The plan does not fix it. `.tran 1n 10` is fatal: it died with exit 139 in E10 and ended in `malloc: can't allocate` in E88. `.tran 5m 10 0 1n` survives (E10). Keep the print step a fixed fraction of the stop time, and test the extremes.
-- **`p(REF)`.** E30 shows `m1:power`, but which devices report it is not settled. KiCad adds one `.probe p(NAME)` per item and skips XSPICE parts (`eeschema/netlist_exporters/netlist_exporter_spice.cpp` near line 724). Do the same only for the references asked for.
-- **`.probe alli` during a transient.** It multiplies vectors, so check memory against the default 256 MiB limit. It stays out of circuits with `event_nodes`.
-- **Halting.** `bg_halt` was proven on a transient (E57 and the live tests), but only with the budget. Prove the size limit the same way.
-
-### Tests the plan asks for
-
-- **Unit, against values worked out independently of the code:** RC charge, RLC overshoot and settling, I²t against the analytic value, and the naive-against-weighted RMS regression. This settles Q12.
-- **Classification:** every row, including `size_limit`, with zero points and with some.
-- **Live:** soft-start inrush and a load step, compared with E31 (16.56 A peak, I²t 0.179, 96 mV droop), plus a soft halt on the budget and on the size limit. The E31 deck was not kept, so build a new one and record it in a fixture README.
+- **`max_raw_bytes` counts in `SendData`,** on the engine's own thread. Polling `ngGet_Vec_Info` from the main thread does not work (E90). `data_bytes` assumes real data, so PR 9 must double it for complex AC vectors.
+- **`measure.rs` is Rust-only and time-weighted.** A signal is straight lines between samples, and RMS and I²t use the exact integral of that line squared, not the trapezoid of the squares (E94).
+- **A step measurement with no `final_value` uses the mean of the window's last tenth,** behind stillness checks, and shows the `start_value` and `final_value` it used. The rules are in the plan under Measurements. They will never catch every window that ends on the wrong level: E96 names the known misses.
+- **`.probe` changes the circuit.** Under `uic`, it loses any voltage set by `.ic` or `.nodeset`, so Konnect leaves out its own probes and refuses a caller's. It also stops the run on a `K` coupling (E92, E94, E95). PR 8's stand-ins are added through `spice_lines`, so they must not add `.probe`.
+- **`i(l1)` appears twice** in the raw file, differing by rounding. `signals::vector` treats that as one signal, and real disagreement as none.
+- **`.options interp` is refused,** because it thins the saved samples (E95).
 
 ## After PR 7
 
@@ -126,10 +78,11 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect-core/src/simulation/flatten.rs` | One vetted deck. This is the security boundary |
 | `crates/konnect-core/src/simulation/element.rs`, `preflight.rs` | Deck reader and checks |
 | `crates/konnect-core/src/simulation/raw.rs` | Raw file parser |
+| `crates/konnect-core/src/simulation/signals.rs`, `measure.rs` | Signal grammar and lookup, and measurements |
 | `crates/konnect-core/src/simulation/worker_client.rs`, `protocol.rs` | Worker supervision and its contract |
 | `crates/konnect/src/sim_worker.rs` | The only FFI. `konnect-core` stays free of `unsafe` |
 | `crates/konnect/tests/simulation_live.rs` | Ignored tests that need KiCad |
-| `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance |
+| `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance. `soft_start.sp` and its reference script stand in for E31 |
 
 ## Graph
 
@@ -177,10 +130,21 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - `ngSpice_Circ` stops at the first `.end`, and the first line sent is the title.
 - A dangling symlink passes path checks, so test an interpreter by running it.
 - Editing Rust with a script breaks after `cargo fmt` reshapes the text. Check the file before rerunning a partly applied edit.
+- The default transient step is `stop / 2000`. On a 0.14 s run that is 70 µs: the values stay within 1 percent, but a peak on a flat top lands 0.6 ms early. A smaller step is not always a longer run: 2 µs took 1,019,783 points where 0.5 µs took 281,020.
+- Under `uic`, ngspice saves no point at time zero, so `first_point_seconds` is above 0.
+- A reviewer's scratch `HOME` moves KiCad's IBIS cache path, so the `ibis` demo only runs from the real home.
+- `cargo xtask fix-doc-counts` scans every `.md` under the root, including the ignored `graphify-out/GRAPH_REPORT.md`, whose community count reads as a stale tool count, so it refuses here. Run it from a clean checkout. `docs_quote_the_registry_tool_counts` is the real gate.
 - Tests that touch security use nonexistent paths. Engine tests use harmless `echo` and marker files only.
 
 ## Known open items
 
+- `.ic` inside a `.subckt` is refused by preflight as `unknown_testbench_node`, or warned as dropped, though ngspice applies it. A false refusal, from PR 4.
+- A `.ic` in a dead `.if` still drops device currents under `uic`. It fails loudly.
+- `p(REF)` on a subcircuit counts only the pins it shows, so a hidden ground or supply reads short.
+- A net named `time` or `frequency`, and `/out#branch`, read `signal_not_found`. No wrong number comes out.
+- A part with `Sim.Enable` off reads `as_drawn`. The first PR 7 review reported this from before PR 7, and it has not been rechecked.
+- On a partial run, a measurement wholly inside the data reads `window_truncated: true` and counts as failed, as the plan says, though its number is exact.
+- Code-model `ic=` under probes, and `bg_halt` when one step takes over a second, have not been tested.
 - A value computed from a model parameter can still appear in an engine message, because nothing can recognise it. Worth knowing, not worth more code.
 - A real segfault inside libngspice has not been reproduced on 44.2. The crash path is proven with a fake worker and with `SIGABRT` on the real one.
 - `.op` has no pause test, so `bg_halt` cannot stop one. It ends at the worker's own deadline.

@@ -14,7 +14,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -27,12 +27,14 @@ type SendChar = unsafe extern "C" fn(*mut c_char, c_int, *mut c_void) -> c_int;
 type SendStat = unsafe extern "C" fn(*mut c_char, c_int, *mut c_void) -> c_int;
 type ControlledExit = unsafe extern "C" fn(c_int, bool, bool, c_int, *mut c_void) -> c_int;
 type BackgroundRunning = unsafe extern "C" fn(bool, c_int, *mut c_void) -> c_int;
+type SendData = unsafe extern "C" fn(*mut VectorValues, c_int, c_int, *mut c_void) -> c_int;
+type SendInitData = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
 type NgSpiceInit = unsafe extern "C" fn(
     Option<SendChar>,
     Option<SendStat>,
     Option<ControlledExit>,
-    *mut c_void,
-    *mut c_void,
+    Option<SendData>,
+    Option<SendInitData>,
     Option<BackgroundRunning>,
     *mut c_void,
 ) -> c_int;
@@ -51,6 +53,8 @@ const POLL: Duration = Duration::from_millis(5);
 const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Lines kept in memory, which only need to reach the banner and code models.
 const MAX_ENGINE_LINES: usize = 10_000;
+/// Each value of each vector is one double in the raw file and in memory.
+const BYTES_PER_VALUE: u64 = 8;
 
 static ENGINE_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static EXIT_CALLED: AtomicBool = AtomicBool::new(false);
@@ -59,6 +63,16 @@ static RUN_STARTED: AtomicBool = AtomicBool::new(false);
 static RUN_FINISHED: AtomicBool = AtomicBool::new(false);
 static LOG: Mutex<Option<Log>> = Mutex::new(None);
 static STATUS_LINE: Mutex<Option<String>> = Mutex::new(None);
+static DATA_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The start of `vecvaluesall` in `sharedspice.h`.
+#[repr(C)]
+struct VectorValues {
+    vector_count: c_int,
+    /// Index of the point just stored.
+    point: c_int,
+    values: *mut c_void,
+}
 
 /// The engine's words, on disk as they arrive, so a crash leaves them behind.
 struct Log {
@@ -98,6 +112,51 @@ fn record_line(line: String) {
 
 unsafe extern "C" fn on_send_stat(_text: *mut c_char, _id: c_int, _user: *mut c_void) -> c_int {
     0
+}
+
+/// Runs on the engine's thread as each point lands, which is why the size limit
+/// reads this and not `ngGet_Vec_Info`: from the main thread that reports an error
+/// into the engine's log until the plot exists, and can starve the run's start.
+unsafe extern "C" fn on_send_data(
+    data: *mut VectorValues,
+    _count: c_int,
+    _id: c_int,
+    _user: *mut c_void,
+) -> c_int {
+    // SAFETY: ngspice passes its own struct, valid for this call, or NULL.
+    if let Some(data) = unsafe { data.as_ref() } {
+        DATA_BYTES.store(data_bytes(data.vector_count, data.point), Ordering::Relaxed);
+    }
+    0
+}
+
+/// ngspice sends no data at all unless this is set too.
+unsafe extern "C" fn on_send_init_data(
+    _vectors: *mut c_void,
+    _id: c_int,
+    _user: *mut c_void,
+) -> c_int {
+    0
+}
+
+fn data_bytes(vector_count: c_int, point: c_int) -> u64 {
+    let vectors = u64::try_from(vector_count).unwrap_or(0);
+    let points = u64::try_from(point).map_or(0, |point| point + 1);
+    vectors
+        .saturating_mul(points)
+        .saturating_mul(BYTES_PER_VALUE)
+}
+
+/// Whether to stop a run now, and why. Too much data comes first: more time
+/// would not help it.
+fn halt_reason(out_of_time: bool, data_bytes: u64, max_raw_bytes: u64) -> Option<HaltReason> {
+    if data_bytes >= max_raw_bytes {
+        Some(HaltReason::SizeLimit)
+    } else if out_of_time {
+        Some(HaltReason::Timeout)
+    } else {
+        None
+    }
 }
 
 unsafe extern "C" fn on_controlled_exit(
@@ -320,7 +379,7 @@ fn prepare_and_simulate(run_dir: &Path) -> Result<RunStatus> {
     }
     if !EXIT_CALLED.load(Ordering::SeqCst) {
         engine.run_command("bg_run")?;
-        status.halted_reason = engine.wait_for_run(started + budget);
+        status.halted_reason = engine.wait_for_run(started + budget, request.max_raw_bytes);
     }
     if EXIT_CALLED.load(Ordering::SeqCst) {
         status.exit_status = Some(EXIT_STATUS.load(Ordering::SeqCst));
@@ -403,8 +462,8 @@ fn load_and_init(path: &Path) -> Result<Engine> {
             Some(on_send_char),
             Some(on_send_stat),
             Some(on_controlled_exit),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            Some(on_send_data),
+            Some(on_send_init_data),
             Some(on_background_running),
             std::ptr::null_mut(),
         );
@@ -449,18 +508,21 @@ impl Engine {
         unsafe { (self.circuit)(pointers.as_mut_ptr()) };
     }
 
-    /// Wait for the run, halting it softly at the deadline. A halt sent before
-    /// the engine's thread starts marks the engine as stopped, and every later one
-    /// finds nothing to stop, so it waits until the thread says it is running. It
-    /// goes once: `bg_halt` is cooperative and leaves its flag set if the run does
-    /// not answer in time, so a run that ignores it ends at the worker's deadline.
-    fn wait_for_run(&self, deadline: Instant) -> Option<HaltReason> {
+    /// Wait for the run, halting it softly at the deadline or the size limit. A
+    /// halt sent before the engine's thread starts marks the engine as stopped, and
+    /// every later one finds nothing to stop, so it waits until the thread says it
+    /// is running. It goes once: `bg_halt` is cooperative and leaves its flag set
+    /// if the run does not answer in time, so a run that ignores it ends at the
+    /// worker's deadline.
+    fn wait_for_run(&self, deadline: Instant, max_raw_bytes: u64) -> Option<HaltReason> {
         let mut halted = None;
         while !RUN_FINISHED.load(Ordering::SeqCst) && !EXIT_CALLED.load(Ordering::SeqCst) {
-            if halted.is_none() && RUN_STARTED.load(Ordering::SeqCst) && Instant::now() >= deadline
-            {
-                halted = Some(HaltReason::Timeout);
-                let _ = self.run_command("bg_halt");
+            if halted.is_none() && RUN_STARTED.load(Ordering::SeqCst) {
+                let bytes = DATA_BYTES.load(Ordering::Relaxed);
+                halted = halt_reason(Instant::now() >= deadline, bytes, max_raw_bytes);
+                if halted.is_some() {
+                    let _ = self.run_command("bg_halt");
+                }
             }
             std::thread::sleep(POLL);
         }
@@ -616,6 +678,24 @@ mod tests {
             "/l",
         ];
         assert!(parse_args(&args(&both)).is_err());
+    }
+
+    #[test]
+    fn data_is_counted_per_value_of_every_vector() {
+        assert_eq!(data_bytes(3, 9), 3 * 10 * 8);
+        assert_eq!(data_bytes(3, 0), 24);
+        assert_eq!(data_bytes(0, 9), 0);
+        assert_eq!(data_bytes(-1, 9), 0);
+        assert_eq!(data_bytes(3, -1), 0);
+        assert_eq!(data_bytes(i32::MAX, i32::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn a_run_stops_at_its_size_limit_or_its_deadline_and_not_before() {
+        assert_eq!(halt_reason(false, 99, 100), None);
+        assert_eq!(halt_reason(false, 100, 100), Some(HaltReason::SizeLimit));
+        assert_eq!(halt_reason(true, 99, 100), Some(HaltReason::Timeout));
+        assert_eq!(halt_reason(true, 100, 100), Some(HaltReason::SizeLimit));
     }
 
     #[test]
