@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 9 merged to `main` (PR 9 as `2503cad`) and PR 10 in progress.
+**Last updated:** 2026-10-31, with PR 1 to 9 merged to `main` (PR 9 as `2503cad`) and PR 10 open.
 
 ## Start here
 
@@ -41,12 +41,12 @@ PRs 1 to 9 are merged to `main` on the `fork` remote, each as a merge commit. La
 | 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
 | 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
-| 10 | Not opened | `feat/simulation-stored-runs` | In progress |
+| 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Open, waiting for the owner |
 | 11 | Not opened | | Not started |
 
-## Now: PR 10 (stored runs)
+## Now: PR 10 is open
 
-PR 9 is merged. It added the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin, gain margin, per-kind summaries and coverage proof. PR 10 adds `list_simulation_runs`, `measure_simulation_run` and CSV export. Ask the owner before starting PR 11.
+PR 9 is merged. It added the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin, gain margin, per-kind summaries and coverage proof. PR 10 adds `list_simulation_runs`, `measure_simulation_run` and CSV export. Nothing is merged. Ask the owner before merging it, and before starting PR 11.
 
 ### What PR 10 changed that the next PR needs to know
 
