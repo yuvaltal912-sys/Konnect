@@ -3083,6 +3083,9 @@ mod tests {
             assert!(deck.contains("\n.ac dec 1 1e0 1e2\n.end"), "{deck}");
             assert!(!deck.contains(".probe p("), "{deck}");
             assert_eq!(request_of(&scene)["complex_data"], true);
+            // The grid ended on the stop, so there is nothing to warn about.
+            let warnings = body["warnings"].to_string();
+            assert!(!warnings.contains("sweep_ends_before_stop"), "{warnings}");
         }
 
         #[tokio::test]
@@ -3466,6 +3469,24 @@ mod tests {
                         dc(1),
                         none.clone(),
                         json!([{ "kind": "max", "signal": "v(a)", "reference_signal": "v(b)" }]),
+                        0,
+                    ),
+                    "measurements[0].reference_signal",
+                ),
+                (
+                    refused(
+                        ac.clone(),
+                        none.clone(),
+                        json!([{ "kind": "value_at", "signal": "p(R1)", "at_hz": 5.0 }]),
+                        0,
+                    ),
+                    "measurements[0].signal",
+                ),
+                (
+                    refused(
+                        ac.clone(),
+                        none.clone(),
+                        json!([{ "kind": "phase_margin", "signal": "v(a)", "reference_signal": "p(R1)" }]),
                         0,
                     ),
                     "measurements[0].reference_signal",

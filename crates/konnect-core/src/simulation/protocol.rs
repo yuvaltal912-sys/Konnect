@@ -89,3 +89,15 @@ pub struct ProbeReport {
     /// The library called its exit callback, so it must be treated as dead.
     pub exit_callback: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_protocol_moved_with_the_complex_data_flag() {
+        // An older worker would count an AC sweep as real data and let it reach
+        // twice its size limit, so a mismatch must be reported and not guessed through.
+        assert!(PROTOCOL_VERSION >= 4);
+    }
+}

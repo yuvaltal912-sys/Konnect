@@ -18,6 +18,8 @@ const COUNT_TOLERANCE: f64 = 1e-9;
 /// Longest target name repeated in a refusal.
 const MAX_TARGET_CHARS: usize = 40;
 const TEMPERATURE: &str = "temp";
+/// What the engine calls the scale of every DC sweep.
+const SWEEP_SCALE: &str = "-sweep";
 const TEMPERATURE_UNIT: &str = "°C";
 
 /// `field` as a finite number, or none if absent.
@@ -344,11 +346,16 @@ impl DcSweep {
         format!(".dc {}", sweeps.join(" "))
     }
 
-    /// Every point of the grid was saved. A sweep the engine cut short, or one it
-    /// counted differently, is not covered.
+    /// Every point of the grid was saved, in a plot whose first vector is a sweep's
+    /// scale: `v-sweep`, `i-sweep`, `res-sweep` or `temp-sweep`, whatever the target
+    /// [verified: run E99]. A sweep the engine cut short, or one it counted
+    /// differently, is not covered.
     pub(super) fn covered(&self, plot: &Plot) -> bool {
         !plot.is_truncated()
-            && !plot.variables.is_empty()
+            && plot
+                .variables
+                .first()
+                .is_some_and(|scale| scale.name.contains(SWEEP_SCALE))
             && plot.points as u64 == self.expected_points()
     }
 
@@ -752,5 +759,131 @@ mod tests {
         .unwrap();
         let refusal = run.resolve(&["V1"], &[]).unwrap_err();
         assert_eq!(field(refusal), "analysis.sweeps[1].target");
+    }
+    /// A plot of `scale` and one more vector, with every value its point number. The
+    /// header may claim more points than the file holds.
+    fn plot(complex: bool, names: [&str; 2], scale: &[f64], declared: usize) -> Plot {
+        let mut text = format!(
+            "Title: t\nPlotname: p\nFlags: {}\nNo. Variables: 2\nNo. Points: {declared}\n\
+             Variables:\n\t0\t{}\tfrequency\n\t1\t{}\tvoltage\nValues:\n",
+            if complex { "complex" } else { "real" },
+            names[0],
+            names[1],
+        );
+        for (index, value) in scale.iter().enumerate() {
+            let pair = |value: f64| {
+                if complex {
+                    format!("{value:e},0")
+                } else {
+                    format!("{value:e}")
+                }
+            };
+            text.push_str(&format!(
+                "{index}\t{}\n\t{}\n",
+                pair(*value),
+                pair(index as f64)
+            ));
+        }
+        crate::simulation::raw::parse(text.as_bytes())
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn an_ac_sweep_is_covered_only_by_a_whole_complex_plot_that_reached_its_grid() {
+        let decade = |points: u64| {
+            ac(json!({ "start_hz": 1.0, "stop_hz": 100.0, "points": points })).unwrap()
+        };
+        let names = ["frequency", "v(a)"];
+        let whole = plot(true, names, &[1.0, 10.0, 100.0], 3);
+        assert!(decade(1).covered(&whole));
+        // The file holds three of five points, as a cut file does.
+        assert!(!decade(1).covered(&plot(true, names, &[1.0, 10.0, 100.0], 5)));
+        // Real values are no AC sweep, and neither is a plot with no frequency.
+        assert!(!decade(1).covered(&plot(false, names, &[1.0, 10.0, 100.0], 3)));
+        assert!(!decade(1).covered(&plot(true, ["time", "v(a)"], &[1.0, 10.0, 100.0], 3)));
+        // Ending a step short where the next point is the stop: cut short.
+        assert!(!decade(1).covered(&plot(true, names, &[1.0, 10.0], 2)));
+        // Ending a step short where the next point is past the stop: the grid's end.
+        let octave =
+            ac(json!({ "start_hz": 1.0, "stop_hz": 100.0, "scale": "octave", "points": 1 }))
+                .unwrap();
+        let grid: Vec<f64> = (0..=6).map(|n| 2f64.powi(n)).collect();
+        assert!(octave.covered(&plot(true, names, &grid, 7)));
+        assert!(!octave.covered(&plot(true, names, &grid[..6], 6)));
+        // A linear sweep must reach the stop.
+        let linear =
+            ac(json!({ "start_hz": 100.0, "stop_hz": 1100.0, "scale": "linear", "points": 11 }))
+                .unwrap();
+        let line: Vec<f64> = (0..=10).map(|n| 100.0 + 100.0 * f64::from(n)).collect();
+        assert!(linear.covered(&plot(true, names, &line, 11)));
+        assert!(!linear.covered(&plot(true, names, &line[..10], 10)));
+    }
+
+    #[test]
+    fn a_dc_sweep_is_covered_only_by_the_whole_grid_in_a_sweep_plot() {
+        let one = dc(
+            json!([{ "target": "V1", "start_value": 0.0, "stop_value": 4.0, "step_value": 1.0 }]),
+        )
+        .unwrap();
+        let scale = [0.0, 1.0, 2.0, 3.0, 4.0];
+        for name in ["v(v-sweep)", "i(i-sweep)", "res-sweep", "temp-sweep"] {
+            assert!(
+                one.covered(&plot(false, [name, "v(a)"], &scale, 5)),
+                "{name}"
+            );
+        }
+        // A cut file, a short grid, a long one, and a plot that is not a sweep's.
+        assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale, 7)));
+        assert!(!one.covered(&plot(false, ["v(v-sweep)", "v(a)"], &scale[..4], 4)));
+        assert!(!one.covered(&plot(
+            false,
+            ["v(v-sweep)", "v(a)"],
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            6
+        )));
+        assert!(!one.covered(&plot(false, ["time", "v(a)"], &scale, 5)));
+        let grid = dc(json!([
+            { "target": "V1", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+            { "target": "V2", "start_value": 0.0, "stop_value": 1.0, "step_value": 1.0 }
+        ]))
+        .unwrap();
+        let six = [0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
+        assert!(grid.covered(&plot(false, ["v(v-sweep)", "v(a)"], &six, 6)));
+        assert!(!grid.covered(&plot(false, ["v(v-sweep)", "v(a)"], &six[..5], 5)));
+    }
+
+    #[test]
+    fn a_zero_step_is_refused_for_what_it_is_and_not_for_the_points_it_would_take() {
+        let refusal = dc(
+            json!([{ "target": "V1", "start_value": 0.0, "stop_value": 5.0, "step_value": 0.0 }]),
+        )
+        .unwrap_err();
+        assert_eq!(field(refusal.clone()), "analysis.sweeps[0].step_value");
+        assert!(body(&refusal)["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be 0"));
+        // Not even a sweep that stands still has a zero step.
+        let still = dc(
+            json!([{ "target": "V1", "start_value": 2.0, "stop_value": 2.0, "step_value": 0.0 }]),
+        )
+        .unwrap_err();
+        assert!(body(&still)["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be 0"));
+    }
+
+    #[test]
+    fn a_part_taken_out_of_the_deck_is_not_found_by_its_reference() {
+        // BT1 is excluded, and the testbench has its own VBT1: a reference to the
+        // excluded part must not find that element, as a signal would not.
+        let elements = [entry("BT1", Some("VBT1"), true)];
+        assert!(resolved("BT1", &["VBT1"], &elements).is_err());
+        // A stand-in the testbench gives the excluded part's own reference is found.
+        let elements = [entry("V1", Some("V1"), true)];
+        let run = resolved("V1", &["V1"], &elements).unwrap();
+        assert_eq!(run.sweeps[0].name, "V1");
     }
 }

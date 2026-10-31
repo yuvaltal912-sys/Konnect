@@ -1576,6 +1576,20 @@ mod tests {
         assert_eq!(read(&entry, &time, &values).value, Some(2.0));
     }
 
+    #[test]
+    fn the_first_point_itself_has_a_value_despite_rounding() {
+        // A sweep from 5 V down to 3 V is measured on a negated axis, and the
+        // engine's first value lands a rounding error past the 5 the caller wrote.
+        let (axis, values) = ([-4.999999999999999, -4.0, -3.0], [0.0, 1.0, 2.0]);
+        let entry = json!({ "kind": "value_at", "signal": "v(a)", "at_sweep": 5.0 });
+        let parsed = parse(&entry, 0, &AxisSpec::sweep(5.0, 3.0, "V")).unwrap();
+        assert_eq!(parsed.at, Some(-5.0));
+        assert_eq!(measure(&axis, &values, &parsed).value, Some(0.0));
+        let last = json!({ "kind": "value_at", "signal": "v(a)", "at_sweep": 3.0 });
+        let parsed = parse(&last, 0, &AxisSpec::sweep(5.0, 3.0, "V")).unwrap();
+        assert_eq!(measure(&axis, &values, &parsed).value, Some(2.0));
+    }
+
     fn from_saved(from: f64, saved_from: f64, time: &[f64], values: &[f64]) -> bool {
         let entry = with(request("max"), "from_seconds", json!(from));
         let parsed = parse(&entry, 0, &AxisSpec::time(1e9, saved_from)).unwrap();
