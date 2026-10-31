@@ -1,15 +1,26 @@
 //! Start and supervise the `konnect sim-worker` process.
 
-use super::protocol::{ProbeReport, PROTOCOL_VERSION, WORKER_SUBCOMMAND};
+use super::protocol::{
+    HaltReason, ProbeReport, RunStatus, PROTOCOL_VERSION, RAW_FILE, STATUS_FILE, WORKER_SUBCOMMAND,
+};
+use super::raw::{self, Plot};
 use crate::kicad_install;
 use anyhow::Context;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::Command;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// After its budget the worker gets this long to stop by itself. It leaves on its
+/// own a little sooner, so this only catches a process that is truly stuck.
+const KILL_GRACE: Duration = Duration::from_secs(15);
+/// The exit code of a worker that left at its own deadline.
+const OUT_OF_TIME_EXIT: i32 = 124;
+const WORKER_OUTPUT_FILE: &str = "worker.out";
+/// Far above any raw file the first analyses write.
+const MAX_RAW_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Simulation settings from the server configuration.
 #[derive(Debug, Clone, Default)]
@@ -31,6 +42,9 @@ pub struct SimulationSettings {
 pub struct SimulationRuntime {
     worker_exe: PathBuf,
     settings: SimulationSettings,
+    /// Where runs go, when a test must not use the shared state folder.
+    #[cfg(test)]
+    pub(crate) state_root: Option<PathBuf>,
 }
 
 impl SimulationRuntime {
@@ -38,7 +52,17 @@ impl SimulationRuntime {
         Self {
             worker_exe,
             settings,
+            #[cfg(test)]
+            state_root: None,
         }
+    }
+
+    pub(crate) fn state_root(&self) -> Result<PathBuf, konnect_sexp::SexpError> {
+        #[cfg(test)]
+        if let Some(root) = &self.state_root {
+            return Ok(root.clone());
+        }
+        konnect_sexp::writer::state_root()
     }
 
     pub(crate) fn model_dirs(&self) -> &[PathBuf] {
@@ -155,45 +179,22 @@ async fn run_probe(
     std::fs::write(scratch.path().join(".spiceinit"), "")
         .context("Failed to prepare the simulation worker's working directory")?;
 
-    let mut command = Command::new(&runtime.worker_exe);
+    let mut command = worker_command(runtime, scratch.path());
     command
-        .arg(WORKER_SUBCOMMAND)
-        .args(["--protocol", &PROTOCOL_VERSION.to_string()])
         .arg("--probe")
         .arg("--library")
         .arg(library)
-        .current_dir(scratch.path())
-        // A worker must not hold the MCP stdin; `SPICE_*` must not change results.
-        .env_clear()
-        .env("SPICE_SCRIPTS", scratch.path())
-        .env("SPICE_USERINIT_DIR", scratch.path())
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     if let Some(dir) = code_models {
         command.arg("--code-models").arg(dir);
     }
     if !runtime.settings.allow_digital_models {
         command.arg("--no-digital");
     }
-    // Windows resolves a DLL's own dependencies through PATH.
-    #[cfg(target_os = "windows")]
-    if let Some(dir) = library.parent() {
-        command.env("PATH", dir);
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            command.env("SystemRoot", root);
-        }
-    }
+    allow_dll_dependencies(&mut command, library);
 
-    #[cfg(test)]
-    let child = crate::tools::cli::test_support::spawn_cli(&mut command)
-        .context("Failed to start the simulation worker")?;
-    #[cfg(not(test))]
-    let child = command
-        .spawn()
-        .context("Failed to start the simulation worker")?;
-
+    let child = spawn_worker(&mut command)?;
     let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
         Ok(output) => output.context("Failed to read the simulation worker's output")?,
         Err(_) => return Ok(EngineStatus::unavailable("timed_out")),
@@ -204,6 +205,161 @@ async fn run_probe(
         return Ok(status);
     }
     Ok(interpret_probe_output(&output.stdout))
+}
+
+/// A command for the worker, working in `dir`. A worker must not hold the MCP
+/// stdin, and `SPICE_*` must not change results.
+fn worker_command(runtime: &SimulationRuntime, dir: &Path) -> Command {
+    let mut command = Command::new(&runtime.worker_exe);
+    command
+        .arg(WORKER_SUBCOMMAND)
+        .args(["--protocol", &PROTOCOL_VERSION.to_string()])
+        .current_dir(dir)
+        .env_clear()
+        .env("SPICE_SCRIPTS", dir)
+        .env("SPICE_USERINIT_DIR", dir)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+/// Windows resolves a DLL's own dependencies through PATH.
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn allow_dll_dependencies(command: &mut Command, library: &Path) {
+    #[cfg(target_os = "windows")]
+    if let Some(dir) = library.parent() {
+        command.env("PATH", dir);
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+    }
+}
+
+fn spawn_worker(command: &mut Command) -> anyhow::Result<tokio::process::Child> {
+    #[cfg(test)]
+    let child = crate::tools::cli::test_support::spawn_cli(command);
+    #[cfg(not(test))]
+    let child = command.spawn();
+    child.context("Failed to start the simulation worker")
+}
+
+/// How the worker process ended, before anything reads what it wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkerEnd {
+    Reported(RunStatus),
+    OutOfTime,
+    Died(String),
+}
+
+/// Run the worker on a prepared folder. Dropping this future kills the worker.
+pub(crate) async fn run_worker(
+    runtime: &SimulationRuntime,
+    run_dir: &Path,
+    library: &Path,
+    budget: Duration,
+) -> anyhow::Result<WorkerEnd> {
+    std::fs::write(run_dir.join(".spiceinit"), "")
+        .context("Failed to prepare the simulation worker's working directory")?;
+    let output = std::fs::File::create(run_dir.join(WORKER_OUTPUT_FILE))
+        .context("Failed to create the worker's output file")?;
+    let errors = output.try_clone()?;
+    let mut command = worker_command(runtime, run_dir);
+    command
+        .arg("--run-dir")
+        .arg(run_dir)
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(errors));
+    allow_dll_dependencies(&mut command, library);
+    let mut child = spawn_worker(&mut command)?;
+    let finished = tokio::time::timeout(budget + KILL_GRACE, child.wait()).await;
+    let exit = match finished {
+        Ok(exit) => exit.context("Failed to wait for the simulation worker")?,
+        Err(_) => {
+            child.kill().await.ok();
+            return Ok(WorkerEnd::OutOfTime);
+        }
+    };
+    Ok(read_end(run_dir, exit))
+}
+
+fn read_end(run_dir: &Path, exit: ExitStatus) -> WorkerEnd {
+    let report = std::fs::read(run_dir.join(STATUS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<RunStatus>(&bytes).ok());
+    match report {
+        Some(status) => WorkerEnd::Reported(status),
+        None if exit.code() == Some(OUT_OF_TIME_EXIT) => WorkerEnd::OutOfTime,
+        None => WorkerEnd::Died(describe_exit(exit)),
+    }
+}
+
+fn describe_exit(exit: ExitStatus) -> String {
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&exit) {
+        return format!("signal {signal}");
+    }
+    match exit.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code".to_string(),
+    }
+}
+
+/// What a run came to. Logs explain a result; they never decide it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Complete,
+    Partial(&'static str),
+    Failed(&'static str),
+}
+
+/// The last plot in the raw file, which is the one `write` saved.
+pub(crate) fn read_results(run_dir: &Path, status: &RunStatus) -> Result<Plot, raw::RawError> {
+    if !status.results_written {
+        return Err(raw::RawError::NoResults);
+    }
+    let mut plots = raw::read(&run_dir.join(RAW_FILE), MAX_RAW_BYTES)?;
+    plots.pop().ok_or(raw::RawError::NoResults)
+}
+
+/// Decide from the evidence alone. `covered` is the proof that the requested
+/// range was simulated; a run that reads success without it is only partial.
+pub(crate) fn classify(
+    end: &WorkerEnd,
+    results: Option<&Result<Plot, raw::RawError>>,
+    covered: impl Fn(&Plot) -> bool,
+) -> Verdict {
+    let status = match end {
+        WorkerEnd::OutOfTime => return Verdict::Failed("timed_out"),
+        WorkerEnd::Died(_) => return Verdict::Failed("engine_crashed"),
+        WorkerEnd::Reported(status) => status,
+    };
+    if status.protocol != PROTOCOL_VERSION || status.load_error.is_some() {
+        return Verdict::Failed("engine_load_failed");
+    }
+    if status.exit_status.is_some() {
+        return Verdict::Failed("load_failed");
+    }
+    let Some(sim_status) = status.sim_status else {
+        return Verdict::Failed("circuit_not_parsed");
+    };
+    let plot = results.and_then(|results| results.as_ref().ok());
+    let has_points = plot.is_some_and(|plot| plot.points > 0);
+    if let Some(reason) = status.halted_reason {
+        let HaltReason::Timeout = reason;
+        return match has_points {
+            true => Verdict::Partial("timeout"),
+            false => Verdict::Failed("timed_out"),
+        };
+    }
+    match (sim_status, has_points) {
+        (0, _) => match plot {
+            Some(plot) if covered(plot) => Verdict::Complete,
+            Some(_) => Verdict::Partial("incomplete_coverage"),
+            None => Verdict::Failed("results_unreadable"),
+        },
+        (_, true) => Verdict::Partial("no_convergence"),
+        (_, false) => Verdict::Failed("no_convergence"),
+    }
 }
 
 /// The report is the last stdout line: ngspice may print to stdout itself.
@@ -361,6 +517,188 @@ mod tests {
     fn a_diagnostic_tail_never_splits_a_character() {
         let text = "ש".repeat(400);
         assert!(diagnostic_tail(text.as_bytes()).chars().all(|c| c == 'ש'));
+    }
+
+    fn status(sim_status: Option<i32>) -> RunStatus {
+        RunStatus {
+            protocol: PROTOCOL_VERSION,
+            load_error: None,
+            engine_version: Some("44.2".to_string()),
+            code_models_loaded: Vec::new(),
+            code_models_failed: Vec::new(),
+            exit_status: None,
+            sim_status,
+            halted_reason: None,
+            results_written: true,
+        }
+    }
+
+    fn plot(text: &str) -> Result<Plot, raw::RawError> {
+        raw::parse(text.as_bytes()).map(|mut plots| plots.remove(0))
+    }
+
+    const ONE_POINT: &str = "Title: t\nPlotname: Operating Point\nFlags: real\n\
+        No. Variables: 1\nNo. Points: 1\nVariables:\n\t0\tv(a)\tvoltage\nValues:\n 0\t1.0\n\n";
+    const NO_POINTS: &str = "Title: t\nPlotname: Operating Point\nFlags: real\n\
+        No. Variables: 1\nNo. Points: 1\nVariables:\n\t0\tv(a)\tvoltage\nValues:\n";
+
+    fn verdict(status: RunStatus, results: &Result<Plot, raw::RawError>) -> Verdict {
+        classify(&WorkerEnd::Reported(status), Some(results), |_| true)
+    }
+
+    #[test]
+    fn every_row_of_the_classification_table() {
+        let good = plot(ONE_POINT);
+        let empty = plot(NO_POINTS);
+        let none = Err(raw::RawError::NoResults);
+        let halted = RunStatus {
+            halted_reason: Some(HaltReason::Timeout),
+            ..status(Some(0))
+        };
+
+        assert_eq!(verdict(status(Some(0)), &good), Verdict::Complete);
+        assert_eq!(
+            verdict(status(None), &none),
+            Verdict::Failed("circuit_not_parsed")
+        );
+        assert_eq!(
+            verdict(status(Some(1)), &none),
+            Verdict::Failed("no_convergence")
+        );
+        assert_eq!(
+            verdict(status(Some(1)), &empty),
+            Verdict::Failed("no_convergence")
+        );
+        assert_eq!(
+            verdict(status(Some(1)), &good),
+            Verdict::Partial("no_convergence")
+        );
+        assert_eq!(verdict(halted.clone(), &good), Verdict::Partial("timeout"));
+        assert_eq!(verdict(halted.clone(), &none), Verdict::Failed("timed_out"));
+        assert_eq!(verdict(halted, &empty), Verdict::Failed("timed_out"));
+        assert_eq!(
+            verdict(status(Some(0)), &none),
+            Verdict::Failed("results_unreadable")
+        );
+    }
+
+    #[test]
+    fn a_run_that_reads_success_without_coverage_is_only_partial() {
+        let good = plot(ONE_POINT);
+        let end = WorkerEnd::Reported(status(Some(0)));
+        assert_eq!(
+            classify(&end, Some(&good), |_| false),
+            Verdict::Partial("incomplete_coverage")
+        );
+    }
+
+    #[test]
+    fn a_worker_that_gave_no_report_never_reads_as_a_result() {
+        let good = plot(ONE_POINT);
+        let pass = |end: WorkerEnd| classify(&end, Some(&good), |_| true);
+        assert_eq!(
+            pass(WorkerEnd::Died("signal 11".to_string())),
+            Verdict::Failed("engine_crashed")
+        );
+        assert_eq!(pass(WorkerEnd::OutOfTime), Verdict::Failed("timed_out"));
+    }
+
+    #[test]
+    fn a_dead_library_outranks_whatever_else_it_left() {
+        let good = plot(ONE_POINT);
+        let exited = RunStatus {
+            exit_status: Some(1),
+            ..status(Some(0))
+        };
+        assert_eq!(verdict(exited, &good), Verdict::Failed("load_failed"));
+        let unloaded = RunStatus {
+            load_error: Some("no library".to_string()),
+            ..status(Some(0))
+        };
+        assert_eq!(
+            verdict(unloaded, &good),
+            Verdict::Failed("engine_load_failed")
+        );
+        let other_build = RunStatus {
+            protocol: PROTOCOL_VERSION + 1,
+            ..status(Some(0))
+        };
+        assert_eq!(
+            verdict(other_build, &good),
+            Verdict::Failed("engine_load_failed")
+        );
+    }
+
+    async fn end_of(body: &str) -> WorkerEnd {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let worker = write_script(tools.path(), "worker", body, "");
+        run_worker(
+            &runtime(worker),
+            dir.path(),
+            Path::new("/lib"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_is_reported_with_its_signal() {
+        let end = end_of("kill -SEGV $$\n").await;
+        assert_eq!(end, WorkerEnd::Died("signal 11".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_at_its_own_deadline_reads_as_out_of_time() {
+        assert_eq!(end_of("exit 124\n").await, WorkerEnd::OutOfTime);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn garbage_in_the_status_file_is_a_crash_not_a_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let worker = write_script(
+            tools.path(),
+            "worker",
+            "echo '{' > status.json\nexit 3\n",
+            "",
+        );
+        let end = run_worker(
+            &runtime(worker),
+            dir.path(),
+            Path::new("/lib"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(end, WorkerEnd::Died("exit code 3".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_is_read_and_the_worker_gets_a_clean_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let body = format!(
+            "test -f .spiceinit && test ! -s .spiceinit && test -z \"$HOME\" && \
+             test \"$SPICE_SCRIPTS\" = \"$PWD\" || exit 9\ncat > {STATUS_FILE} <<'JSON'\n{}\nJSON\n",
+            serde_json::to_string(&status(Some(0))).unwrap()
+        );
+        let worker = write_script(tools.path(), "worker", &body, "");
+        let dir_path = dir.path().canonicalize().unwrap();
+        let end = run_worker(
+            &runtime(worker),
+            &dir_path,
+            Path::new("/lib"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(end, WorkerEnd::Reported(status(Some(0))));
     }
 
     #[tokio::test]

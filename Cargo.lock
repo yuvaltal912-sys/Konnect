@@ -2615,6 +2615,7 @@ dependencies = [
  "konnect-core",
  "konnect-ipc",
  "konnect-sexp",
+ "libc",
  "libloading",
  "prost",
  "serde",

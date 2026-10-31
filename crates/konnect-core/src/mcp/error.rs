@@ -130,6 +130,15 @@ pub enum ToolErrorKind {
     /// over the user's own settings (#580). `reason` starts with
     /// `malformed_json:` or `unreadable:`.
     InvalidConfiguration { path: String, reason: String },
+    /// A simulation stopped before it gave a result. `reason` is a fixed code,
+    /// so clients can branch on it. `stage` names the step that stopped it, and
+    /// `items` holds bounded detail such as the parts a refusal names.
+    SimulationFailed {
+        stage: &'static str,
+        reason: &'static str,
+        log_path: Option<String>,
+        items: Vec<String>,
+    },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -172,6 +181,7 @@ impl ToolErrorKind {
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::InvalidConfiguration { .. } => "invalid_configuration",
+            Self::SimulationFailed { .. } => "simulation_failed",
             Self::HandlerError { .. } => "handler_error",
             Self::IpcOutcomeUnknown { .. } => "ipc_outcome_unknown",
             Self::IpcBatchRecovered { .. } => "ipc_batch_recovered",

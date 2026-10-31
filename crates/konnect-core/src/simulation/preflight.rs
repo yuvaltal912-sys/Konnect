@@ -136,6 +136,9 @@ pub(crate) struct Preflight {
     pub checks: Vec<Check>,
     pub warnings: Vec<Warning>,
     pub unmodelled_symbols: Vec<UnmodelledSymbol>,
+    /// The circuit has digital or other event-driven nodes. ngspice stops with a
+    /// fatal error if `.probe alli` meets one.
+    pub event_nodes: bool,
 }
 
 pub(crate) struct Inputs<'a> {
@@ -167,6 +170,7 @@ pub(crate) fn run(inputs: &Inputs<'_>) -> Preflight {
         checks.push(testbench_nodes(&circuit, inputs.nets));
     }
     Preflight {
+        event_nodes: has_event_nodes(&circuit),
         checks,
         warnings: warnings(inputs, &circuit, unmodelled_symbols.len()),
         unmodelled_symbols,
@@ -666,7 +670,7 @@ fn ground(circuit: &Circuit, nets: &[NetEntry]) -> Check {
 /// The node ngspice will really use. It lowers case, reads `gnd` as `0`, and
 /// replaces each byte it cannot print with `_`. The worker runs in the C locale,
 /// where that is every non-ASCII byte, so `/\u{5e9}` and `/\u{5ea}` are one node.
-fn engine_node(spice_name: &str) -> String {
+pub(crate) fn engine_node(spice_name: &str) -> String {
     let node: String = spice_name
         .bytes()
         .map(|byte| {
@@ -835,6 +839,16 @@ fn dc_groups(circuit: &Circuit) -> Groups {
         paths.add(element, &mut groups);
     }
     groups
+}
+
+/// Digital parts, and the event-driven parts in `xtraevt`. A kind this misses
+/// fails loudly in the engine, never silently.
+fn has_event_nodes(circuit: &Circuit) -> bool {
+    circuit.code_models_used.iter().any(|name| {
+        circuit.models.get(name).is_some_and(|kind| {
+            DIGITAL_MODELS.contains(&kind.as_str()) || kind.starts_with("real_")
+        })
+    })
 }
 
 fn code_models(circuit: &Circuit, allow_digital_models: bool) -> Check {
