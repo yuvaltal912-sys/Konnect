@@ -663,6 +663,27 @@ fn ground(circuit: &Circuit, nets: &[NetEntry]) -> Check {
     Check::failed("ground", "no_ground_reference", candidates)
 }
 
+/// The node ngspice will really use. It lowers case, reads `gnd` as `0`, and
+/// replaces each byte it cannot print with `_`. The worker runs in the C locale,
+/// where that is every non-ASCII byte, so `/\u{5e9}` and `/\u{5ea}` are one node.
+fn engine_node(spice_name: &str) -> String {
+    let node: String = spice_name
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii() {
+                char::from(byte.to_ascii_lowercase())
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if node == "gnd" {
+        "0".to_string()
+    } else {
+        node
+    }
+}
+
 /// Only nets the deck really uses can merge, so a net whose parts are all
 /// excluded or unmodelled does not count. `0` and `GND` are one node in ngspice.
 fn net_names(inputs: &Inputs<'_>) -> Check {
@@ -683,12 +704,7 @@ fn net_names(inputs: &Inputs<'_>) -> Check {
     };
     let mut by_spice_name: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for net in inputs.nets.iter().filter(|net| live_net(&net.kicad_name)) {
-        let spice_name = net.spice_name.to_lowercase();
-        let node = if spice_name == "gnd" {
-            "0".to_string()
-        } else {
-            spice_name
-        };
+        let node = engine_node(&net.spice_name);
         by_spice_name.entry(node).or_default().push(&net.kicad_name);
     }
     let mut collisions = Vec::new();
@@ -1739,6 +1755,35 @@ mod tests {
             },
         );
         passes(&preflight, "net_names");
+    }
+
+    #[test]
+    fn hebrew_nets_of_one_length_merge_in_the_engine() {
+        let kicad = KiCadNetlist {
+            components: vec![component("R1"), component("R2")],
+            nets: vec![
+                net("/\u{5e9}", &["R1"]),
+                net("/\u{5ea}", &["R2"]),
+                net("/a", &[]),
+            ],
+            library_parts: Vec::new(),
+        };
+        let netlist = ".title t\nV1 /a 0 1\nR1 /a /\u{5e9} 1k\nR2 /a /\u{5ea} 1k\n";
+        let preflight = check(
+            netlist,
+            Setup {
+                kicad,
+                ..Setup::default()
+            },
+        );
+        fails(&preflight, "net_names", "net_name_collision");
+    }
+
+    #[test]
+    fn hebrew_nets_of_different_lengths_stay_apart() {
+        assert_eq!(engine_node("/\u{5e9}"), "/__");
+        assert_eq!(engine_node("/\u{5e9}\u{5e8}"), "/____");
+        assert_eq!(engine_node("/Out"), "/out");
     }
 
     #[test]
