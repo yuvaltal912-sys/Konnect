@@ -83,7 +83,7 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 |---|---|
 | `level_not_reached` | The signal never got there |
 | `phase_unreliable` | AC only: the sweep is too coarse to follow the phase past `phase_unreliable_from_hz`. Raise `points` |
-| `sweep_too_coarse` | AC only: a `bandwidth_3db` edge cannot be placed, because the gain changes by over 10 dB between the two samples that hold it, or, with `reference_level: "peak"`, the peak lies between samples. Raise `points` |
+| `sweep_too_coarse` | AC only: a `bandwidth_3db` edge cannot be placed, because the gain changes by over 10 dB between the two samples that hold it, or, with `reference_level: "peak"`, the peak lies between samples (a parabola through it and its neighbours rises over 0.15 dB). Raise `points` |
 | `starts_on_level` | It was already on the level when the window began, and never crossed it |
 | `no_transition` | The signal is flat to within rounding, or the step runs the other way |
 | `final_value_needed` | The window's last value cannot stand in for the final value |
@@ -109,7 +109,7 @@ A small-signal sweep around the operating point. It needs a source with an `AC` 
 }
 ```
 
-`points` is per decade or octave, or in all on a `linear` scale (at least 3). Frequencies run from 1e-9 to 1e18. A margin follows the phase from sample to sample, and a sweep too coarse to follow a sharp resonance would read an unstable loop as stable, so it gives `phase_unreliable` instead. That catches most of it, not all: a feature that turns the phase by more than half a revolution between two samples with the gain flat, such as an all-pass or a long delay, can read as a small turn and pass. **Run any margin that matters twice, at double the `points`. If it moves, the first sweep did not resolve it.** Use 100 points a decade or more. An octave sweep, and some decade ones, end on their last grid point at or below `stop_hz`, up to a step short of it: read `simulated_to_hz`, and `sweep_ends_before_stop` says so. Gain is 20 log10 of the magnitude, so it is the gain only if the AC source is 1. Say "dB re 1 V" otherwise. `p()` has no value here.
+`points` is per decade or octave, or in all on a `linear` scale (at least 3). Frequencies run from 1e-9 to 1e18. A margin follows the phase from sample to sample, and a sweep too coarse to follow a sharp resonance would read an unstable loop as stable, so it gives `phase_unreliable` instead. That catches most of it, not all. It also refuses a loop with a deep notch below crossover at sensible densities. And a feature that turns the phase by more than half a revolution between two samples with the gain flat, such as an all-pass or a long delay, can read as a small turn and pass. **Run any margin that matters twice, at double the `points`. If it moves, the first sweep did not resolve it.** Use 100 points a decade or more. An octave sweep, and some decade ones, end on their last grid point at or below `stop_hz`, up to a step short of it: read `simulated_to_hz`, and `sweep_ends_before_stop` says so. Gain is 20 log10 of the magnitude, so it is the gain only if the AC source is 1. Say "dB re 1 V" otherwise. `p()` has no value here.
 
 | Measurement | Returns |
 |---|---|

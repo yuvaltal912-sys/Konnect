@@ -2295,3 +2295,105 @@ fn a_peak_bandwidth_is_refused_where_the_peak_falls_between_samples_and_read_whe
     near(measured(&run(50), "bw"), 521.7, 3.0);
     near(measured(&run(1000), "bw"), 521.7, 0.5);
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn linear_sweeps_that_step_over_a_resonance_or_a_steep_start_are_flagged_and_a_decade_sweep_reads_true(
+) {
+    // Review round 4 found both read as stable: the first step of a sweep is not
+    // judged on its gain, so the step after it must be [verified: run E103].
+    let two_stage: Vec<String> = [
+        "V1 in 0 DC 0 AC 1",
+        "R1 in a 1.25663706144",
+        "L1 a b 0.01",
+        "C1 b 0 2.53302959106e-06",
+        "E1 c 0 b 0 1",
+        "R2 c d 1.25663706144",
+        "L2 d e 0.01",
+        "C2 e 0 2.53302959106e-06",
+        "E2 out 0 e 0 10",
+        "RO out 0 1meg",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let four_poles: Vec<String> = [
+        "V1 in 0 DC 0 AC 1",
+        "R1 in a 1k",
+        "C1 a 0 15.915u",
+        "E1 b 0 a 0 1",
+        "R2 b c 1k",
+        "C2 c 0 15.915u",
+        "E2 d 0 c 0 1",
+        "R3 d e 1k",
+        "C3 e 0 15.915u",
+        "E3 f 0 e 0 1",
+        "R4 f g 1k",
+        "C4 g 0 15.915u",
+        "E4 out 0 g 0 6.25e6",
+        "RL out 0 1meg",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let measurements = json!([
+        { "name": "pm", "kind": "phase_margin", "signal": "v(out)" },
+        { "name": "gm", "kind": "gain_margin", "signal": "v(out)" },
+    ]);
+    let run = |lines: &[String], analysis: Value| {
+        run_on_testbench(
+            lines,
+            json!({ "analysis": analysis, "measurements": measurements }),
+        )
+    };
+    let flagged = |result: &Value| {
+        let items = result["measurements"].as_array().unwrap();
+        items
+            .iter()
+            .all(|item| item["value"].is_null() && item["finding"] == "phase_unreliable")
+    };
+    let linear = |start: f64, stop: f64, points: u64| json!({ "kind": "ac", "start_hz": start, "stop_hz": stop, "scale": "linear", "points": points });
+    assert!(flagged(&run(&two_stage, linear(880.0, 100_880.0, 1001))));
+    for points in [100, 200] {
+        assert!(
+            flagged(&run(&four_poles, linear(1.0, 1e4, points))),
+            "{points}"
+        );
+    }
+    let decade = run(
+        &four_poles,
+        json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 1e4, "points": 100 }),
+    );
+    near(measured(&decade, "pm"), -175.42, 0.1);
+    near(measured(&decade, "gm"), -123.9, 0.2);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_peak_that_two_samples_straddle_evenly_is_refused_and_one_on_a_sample_is_read() {
+    let lines: Vec<String> = [
+        "V1 in 0 DC 0 AC 1",
+        "L1 in a 10m",
+        "C1 a b 2.533u",
+        "R1 b out 7.854",
+        "RG out 0 1e-9",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let run = |offset: f64| {
+        run_on_testbench(
+            &lines,
+            json!({
+                "analysis": { "kind": "ac", "start_hz": 1000.0 * 10f64.powf(offset),
+                              "stop_hz": 1000.0 * 10f64.powf(offset + 2.0), "points": 50 },
+                "measurements": [{ "name": "bw", "kind": "bandwidth_3db", "signal": "v(out)",
+                                   "reference_level": "peak" }],
+            }),
+        )
+    };
+    // Q = 8: the width is 125 Hz, and an evenly straddled peak read 141 Hz.
+    let straddled = run(-1.01);
+    assert_eq!(
+        straddled["measurements"][0]["finding"], "sweep_too_coarse",
+        "{straddled}"
+    );
+    near(measured(&run(-1.0), "bw"), 125.0, 1.5);
+}

@@ -36,11 +36,13 @@ const MAX_GAIN_STEP_DB: f64 = 10.0;
 /// A bandwidth edge placed between two samples that differ by more than this is
 /// placed inside a step larger than most of the roll-off around it.
 const MAX_EDGE_STEP_DB: f64 = MAX_GAIN_STEP_DB;
-/// A peak is resolved when the samples either side of the highest one are within the
-/// half-power point of it. Further down than that, the peak lies between samples,
-/// and every edge is read from a level that is too low: `amplifier-ac` read 380 Hz
-/// at 10 a decade and 521.7 Hz at 1000.
-const MAX_PEAK_DROP_DB: f64 = HALF_POWER_DB;
+/// A peak is resolved when a parabola through the highest sample and the two beside
+/// it rises no more than this above the highest. The highest sample reads low by
+/// that much when the peak lies between samples, and every edge is read from a level
+/// that is too low, by about 23 percent of the width for each dB: `amplifier-ac` read
+/// 380 Hz at 10 a decade and 521.7 Hz at 1000. Judging the drop to the neighbours
+/// instead let an even straddle through, 13 percent wide.
+const MAX_PEAK_LOSS_DB: f64 = 0.15;
 /// Relative slack on the ends of the sweep, for the rounding the engine leaves.
 const EDGE_TOLERANCE: f64 = 1e-9;
 
@@ -104,8 +106,10 @@ impl Response {
                     let step = principal - last_principal;
                     let turn = step - 360.0 * (step / 360.0).round();
                     let jump = (gain_db[index] - gain_db[index - 1]).abs();
-                    let closing =
-                        index > 1 && jump > (gain_db[index - 1] - gain_db[index - 2]).abs();
+                    // The first step is not judged, so the second has nothing to be
+                    // larger than: a steep start must not hide the next jump.
+                    let closing = index == 2
+                        || (index > 2 && jump > (gain_db[index - 1] - gain_db[index - 2]).abs());
                     let too_sharp =
                         turn.abs() > MAX_PHASE_STEP_DEGREES || (jump > MAX_GAIN_STEP_DB && closing);
                     if too_sharp && doubtful_from.is_none() {
@@ -372,12 +376,12 @@ fn band_edges(window: &Response) -> Found {
     let upper = fall.map(|index| window.crossing(&window.gain_db, index, level));
     // A peak the samples straddle reads low, and every edge with it. A peak at an end
     // of the sweep is an edge and has only one side.
-    let sides = [peak_at.checked_sub(1), Some(peak_at + 1)];
-    let straddled = sides
-        .into_iter()
-        .flatten()
-        .filter(|&side| peak_at > 0 && side < window.len())
-        .any(|side| peak - window.gain_db[side] > MAX_PEAK_DROP_DB);
+    let interior = peak_at > 0 && peak_at + 1 < window.len();
+    let straddled = interior && {
+        let (before, after) = (window.gain_db[peak_at - 1], window.gain_db[peak_at + 1]);
+        let bend = 2.0 * peak - before - after;
+        bend > 1e-12 && (after - before).powi(2) / (8.0 * bend) > MAX_PEAK_LOSS_DB
+    };
     let coarse = straddled
         || [rise, fall]
             .into_iter()
@@ -1038,5 +1042,69 @@ mod tests {
         let peak = json!({ "reference_level": "peak" });
         let report = measure(&response, &request("bandwidth_3db", peak), false);
         assert_eq!(report["finding"], "level_not_reached", "{report}");
+    }
+
+    /// A series-resonant band-pass at 1 kHz, sampled where the caller says.
+    fn band_pass(q: f64, freq: &[f64]) -> Response {
+        let (mut real, mut imaginary) = (Vec::new(), Vec::new());
+        for &f in freq {
+            let x = f / 1000.0;
+            let (dr, di) = (1.0 - x * x, x / q);
+            let power = dr * dr + di * di;
+            real.push(((x / q) * di) / power);
+            imaginary.push(((x / q) * dr) / power);
+        }
+        Response::new(freq, &real, &imaginary, true).unwrap()
+    }
+
+    #[test]
+    fn a_peak_straddled_evenly_by_two_samples_is_refused_and_one_on_a_sample_is_read() {
+        // Q = 8 at 50 a decade, with samples a hundredth of a decade either side of
+        // 1 kHz: the highest reads 0.55 dB low, and a bandwidth of 141 Hz against 125.
+        let peak = json!({ "reference_level": "peak" });
+        let off = |start: f64| -> Vec<f64> {
+            (0..=100)
+                .map(|k| 1000.0 * 10f64.powf(start + 0.02 * f64::from(k)))
+                .collect()
+        };
+        let report = measure(
+            &band_pass(8.0, &off(-1.01)),
+            &request("bandwidth_3db", peak.clone()),
+            false,
+        );
+        assert_eq!(report["finding"], "sweep_too_coarse", "{report}");
+        // On a sample, the same circuit reads within 1 percent of f0 / Q.
+        let report = measure(
+            &band_pass(8.0, &off(-1.0)),
+            &request("bandwidth_3db", peak),
+            false,
+        );
+        assert!((value_of(&report) / 125.0 - 1.0).abs() < 0.01, "{report}");
+    }
+
+    #[test]
+    fn a_window_that_ends_on_the_peak_makes_it_an_edge_and_not_a_straddled_peak() {
+        let freq = sweep(20, 100.0, 10_000.0);
+        let response = band_pass(20.0, &freq);
+        let peak = json!({ "reference_level": "peak", "to_hz": 950.0 });
+        let report = measure(&response, &request("bandwidth_3db", peak), false);
+        assert_ne!(report["finding"], "sweep_too_coarse", "{report}");
+        let peak = json!({ "reference_level": "peak", "from_hz": 1050.0 });
+        let report = measure(&response, &request("bandwidth_3db", peak), false);
+        assert_ne!(report["finding"], "sweep_too_coarse", "{report}");
+    }
+
+    #[test]
+    fn a_steep_first_step_does_not_hide_the_jump_after_it() {
+        // 27 dB, then 21, then 15: none is larger than the step before it, but the
+        // first is not judged, so the second must be.
+        let freq = [880.0, 980.0, 1080.0, 1180.0];
+        let real: Vec<f64> = [40.0, 13.2, -7.8, -22.8]
+            .iter()
+            .map(|db: &f64| 10f64.powf(db / 20.0))
+            .collect();
+        let response = Response::new(&freq, &real, &[0.0; 4], false).unwrap();
+        let report = measure(&response, &request("phase_margin", json!({})), false);
+        assert_eq!(report["finding"], "phase_unreliable", "{report}");
     }
 }

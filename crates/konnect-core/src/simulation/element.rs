@@ -388,21 +388,28 @@ fn trim_bracket(value: &str) -> String {
         .to_string()
 }
 
-/// The `AC` keyword of a source card, and the text of the value it gives, if any.
-/// ngspice reads `AC 1`, `AC=1`, `ac = 1` and `AC(1 0)` alike. The name and two
-/// nodes come first, so a node called `ac` is not the keyword.
-fn ac_value(words: &[String]) -> Option<Option<String>> {
-    words.iter().enumerate().skip(3).find_map(|(at, word)| {
-        let lower = word.to_ascii_lowercase();
-        if lower == "ac" {
-            // `AC (1 0)` has a space before the bracket.
-            return Some(words.get(at + 1).map(|value| trim_bracket(value)));
-        }
-        let rest = lower
-            .strip_prefix("ac=")
-            .or_else(|| lower.strip_prefix("ac("))?;
-        Some((!rest.is_empty()).then(|| trim_bracket(rest)))
-    })
+/// Every `AC` keyword of a source card, with the text of the value it gives, if any.
+/// ngspice reads `AC 1`, `AC=1`, `ac = 1`, `AC(1 0)` and `ACMAG 1` alike, and a later
+/// `acmag` replaces an earlier `AC`. The name and two nodes come first, so a node
+/// called `ac` is not the keyword.
+fn ac_values(words: &[String]) -> Vec<Option<String>> {
+    words
+        .iter()
+        .enumerate()
+        .skip(3)
+        .filter_map(|(at, word)| {
+            let lower = word.to_ascii_lowercase();
+            if lower == "ac" || lower == "acmag" {
+                // `AC (1 0)` has a space before the bracket.
+                return Some(words.get(at + 1).map(|value| trim_bracket(value)));
+            }
+            let rest = lower
+                .strip_prefix("acmag=")
+                .or_else(|| lower.strip_prefix("ac="))
+                .or_else(|| lower.strip_prefix("ac("))?;
+            Some((!rest.is_empty()).then(|| trim_bracket(rest)))
+        })
+        .collect()
 }
 
 /// Whether any voltage or current source can drive an AC analysis: it carries an
@@ -415,15 +422,12 @@ pub(crate) fn has_ac_stimulus(deck: &FlatDeck, dollar_is_comment: bool) -> bool 
         let is_source = words
             .first()
             .is_some_and(|name| name.starts_with(['v', 'V', 'i', 'I']));
-        if !is_source {
-            return false;
-        }
         // `AC` alone means 1, and an expression is taken to be non-zero.
-        match ac_value(&words) {
-            None => false,
-            Some(None) => true,
-            Some(Some(value)) => leading_number(&value) != Some(0.0),
-        }
+        is_source
+            && ac_values(&words).iter().any(|value| match value {
+                None => true,
+                Some(value) => leading_number(value) != Some(0.0),
+            })
     })
 }
 
@@ -994,6 +998,9 @@ mod tests {
             "V1 a 0 DC 0 AC(1 0)",
             "V1 a 0 AC (1 0)",
             "V1 a 0 AC ( 1 0 )",
+            "V1 a 0 DC 0 acmag=1",
+            "V1 a 0 ACMAG 1",
+            "V1 a 0 AC 0 acmag=1",
             "I1 0 a ac=1m",
             "V1 a 0 SIN(0 1 1k) ac = 1",
         ] {
@@ -1019,7 +1026,8 @@ mod tests {
             "V1 a 0 DC 1 AC(0 0)",
             "V1 a 0 AC (0 0)",
             "V1 a 0 AC ( 0 0 )",
-            "V1 a 0 ac=( 0 0 )",
+            "V1 a 0 acmag=0",
+            "V1 a 0 ACMAG 0",
         ] {
             assert!(!driven(card), "{card}");
         }
