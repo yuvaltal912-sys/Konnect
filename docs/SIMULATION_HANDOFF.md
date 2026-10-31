@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 7 merged to `main` and PR 8 open.
+**Last updated:** 2026-10-31, with PR 1 to 8 merged to `main`.
 
 ## Start here
 
@@ -39,12 +39,12 @@ PRs 1 to 7 are merged to `main` on the `fork` remote, each as a merge commit. La
 | 5 | [#3](https://github.com/yuvaltal912-sys/Konnect/pull/3) | `feat/simulation-raw` | Merged |
 | 6 | [#4](https://github.com/yuvaltal912-sys/Konnect/pull/4) | `feat/simulation-run` | Merged |
 | 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
-| 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | **Open, awaiting the owner** |
+| 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
 | 9 to 11 | Not opened | | Not started |
 
-## Now: PR 8 is open
+## Now: nothing is running
 
-PR 8 is done and open on `feat/simulation-protection`. Ask the owner before merging it, and before starting PR 9. It adds no tool surface: the skill shows five tested stand-ins (output short, I²t fuse, eFuse current limit, undervoltage lockout, reversed battery), and `run_simulation` runs each live against `protection/reference.py`, which works the expected values out with no SPICE engine. Reversed battery runs as a slow transient ramp, because `dc_sweep` does not exist yet: PR 9 re-runs it as a sweep and compares.
+PR 8 is merged to `main`. Ask the owner before starting PR 9. It adds no tool surface: the skill shows five tested stand-ins (output short, I²t fuse, eFuse current limit, undervoltage lockout, reversed battery), and `run_simulation` runs each live against `protection/reference.py`, which works the expected values out with no SPICE engine. Reversed battery runs as a slow transient ramp, because `dc_sweep` does not exist yet: PR 9 re-runs it as a sweep and compares.
 
 ### What PR 8 changed that the next PR needs to know
 
@@ -142,7 +142,6 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - A hard-edged control did not run away in any rebuilt short (E98). E57's deck is gone, so do not claim the cause. The failure seen is a lockout chattering, which ends in `no_convergence`.
 - Under `uic`, ngspice saves no point at time zero, so `first_point_seconds` is above 0.
 - A reviewer's scratch `HOME` moves KiCad's IBIS cache path, so the `ibis` demo only runs from the real home.
-- `cargo xtask fix-doc-counts` scans every `.md` under the root, including the ignored `graphify-out/GRAPH_REPORT.md`, whose community count reads as a stale tool count, so it refuses here. Run it from a clean checkout. `docs_quote_the_registry_tool_counts` is the real gate.
 - Tests that touch security use nonexistent paths. Engine tests use harmless `echo` and marker files only.
 
 ## Known open items
