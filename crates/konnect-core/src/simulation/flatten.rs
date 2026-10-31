@@ -56,7 +56,12 @@ const KNOWN_DIRECTIVES: [&str; 26] = [
 ];
 /// Options that only tune the solver or the log. Other names set interpreter
 /// variables, and some of those are paths: `measoutfile` writes to one.
-const KNOWN_OPTIONS: [&str; 78] = [
+const KNOWN_OPTIONS: [&str; 83] = [
+    "ingold",
+    "maxstep",
+    "measdgt",
+    "plotwinsize",
+    "post",
     "abstol",
     "accept",
     "acct",
@@ -217,6 +222,16 @@ impl Compatibility {
         self.ngbehavior
             .is_some_and(|mode| mode.contains("lt") || mode.contains("ps"))
     }
+
+    /// Under `lt`, `4k7` means 4.7k. Elsewhere it is silently 4k.
+    pub(crate) fn reads_value_shorthand(self) -> bool {
+        self.ngbehavior.is_some_and(|mode| mode.contains("lt"))
+    }
+
+    /// In PSpice mode `$` is an ordinary character after the start of a line.
+    pub(crate) fn dollar_is_comment(self) -> bool {
+        !self.ngbehavior.is_some_and(|mode| mode.contains("ps"))
+    }
 }
 
 pub(crate) struct DeckInputs<'a> {
@@ -226,6 +241,8 @@ pub(crate) struct DeckInputs<'a> {
     /// Canonical folders an include may read from.
     pub allowed_roots: &'a [PathBuf],
     pub compatibility: Compatibility,
+    /// Top-level netlist elements to leave out, in lowercase.
+    pub excluded_elements: &'a [String],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +250,7 @@ struct DeckLine {
     text: String,
     origin: Arc<str>,
     line: usize,
+    from_testbench: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -246,6 +264,16 @@ pub(crate) struct FlatDeck {
 impl FlatDeck {
     pub(crate) fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Each deck line, whether a testbench added it, and whether it came from
+    /// an included file rather than what the schematic or testbench wrote.
+    pub(crate) fn lines(&self) -> impl Iterator<Item = (&str, bool, bool)> {
+        self.lines.iter().map(|line| {
+            let origin = line.origin.as_ref();
+            let included = origin != "netlist" && origin != "testbench";
+            (line.text.as_str(), line.from_testbench, included)
+        })
     }
 
     /// The deck the engine receives.
@@ -283,6 +311,7 @@ struct Flattener<'a> {
     dropping_continuation: bool,
     first_include_dir: Option<PathBuf>,
     last_include_dir: Option<PathBuf>,
+    reading_testbench: bool,
 }
 
 pub(crate) fn flatten(inputs: &DeckInputs<'_>) -> Result<FlatDeck, Refusal> {
@@ -293,6 +322,7 @@ pub(crate) fn flatten(inputs: &DeckInputs<'_>) -> Result<FlatDeck, Refusal> {
         dropping_continuation: false,
         first_include_dir: None,
         last_include_dir: None,
+        reading_testbench: false,
     };
     flattener.read(
         inputs.netlist.as_bytes(),
@@ -302,6 +332,7 @@ pub(crate) fn flatten(inputs: &DeckInputs<'_>) -> Result<FlatDeck, Refusal> {
         &mut Vec::new(),
     )?;
     let testbench = inputs.testbench.join("\n");
+    flattener.reading_testbench = true;
     flattener.read(
         testbench.as_bytes(),
         "testbench",
@@ -338,7 +369,7 @@ fn trimmed(mut line: &[u8]) -> &[u8] {
 
 /// Lowercased first token, read as ngspice reads a dot card: it also ends at
 /// these delimiters or a comment, so `.end,x` is an `.end`.
-fn directive(line: &str) -> String {
+pub(crate) fn directive(line: &str) -> String {
     let line = line.trim_start_matches('\u{feff}').trim_start();
     let line = &line[..comment_start(line.as_bytes(), true)];
     line.split(|c: char| c.is_whitespace() || "=(),+-*/^\"'".contains(c))
@@ -380,7 +411,7 @@ fn is_comment_line(line: &[u8]) -> bool {
 
 /// Where a trailing comment starts, skipping quoted text as ngspice does. `$`
 /// starts one only outside PSpice mode, and only after a space, comma or tab.
-fn comment_start(line: &[u8], dollar: bool) -> usize {
+pub(crate) fn comment_start(line: &[u8], dollar: bool) -> usize {
     let mut quote = None;
     for (at, byte) in line.iter().enumerate() {
         match quote {
@@ -442,6 +473,7 @@ impl Flattener<'_> {
         let mut control_start = None;
         let mut netlist_end = None;
         let mut title_seen = false;
+        let mut subcircuit_depth = 0usize;
         for (index, raw) in bytes.split(|byte| *byte == b'\n').enumerate() {
             let number = index + 1;
             let line = trimmed(raw);
@@ -556,6 +588,22 @@ impl Flattener<'_> {
             if line.starts_with(b"+") && self.dropping_continuation {
                 continue;
             }
+            if word.starts_with(".subckt") || word.starts_with(".macro") {
+                subcircuit_depth += 1;
+            } else if word.starts_with(".ends") || word == ".eom" {
+                subcircuit_depth = subcircuit_depth.saturating_sub(1);
+            }
+            let first_word = text.split_whitespace().next().unwrap_or("");
+            if source == Source::Netlist
+                && subcircuit_depth == 0
+                && self
+                    .inputs
+                    .excluded_elements
+                    .contains(&first_word.to_lowercase())
+            {
+                self.dropping_continuation = true;
+                continue;
+            }
             // An include line vanishes, so a drop carries on into the included file.
             let includes = word.starts_with(".inc") || word.starts_with(".lib");
             if !includes {
@@ -600,6 +648,7 @@ impl Flattener<'_> {
                 text: text.to_string(),
                 origin: shared_origin.clone(),
                 line: number,
+                from_testbench: self.reading_testbench,
             });
         }
         match control_start {
@@ -956,15 +1005,18 @@ fn function_names(lines: &[DeckLine]) -> Vec<String> {
         }
         let code = &line.text[..comment_start(line.text.as_bytes(), false)];
         let lower = code.to_lowercase();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
         for (at, _) in lower.match_indices('(') {
             let before = lower[..at].trim_end();
-            let is_word = |c: char| c.is_alphanumeric() || c == '_';
             let start = before
                 .char_indices()
                 .rev()
                 .find(|(_, c)| !is_word(*c))
                 .map_or(0, |(gap, c)| gap + c.len_utf8());
-            names.push(before[start..].to_string());
+            // `.param n=int(3.7)` calls a function, and only defining one counts.
+            if before[..start].ends_with(char::is_whitespace) {
+                names.push(before[start..].to_string());
+            }
         }
     }
     names
@@ -1086,6 +1138,7 @@ pub(crate) fn verify_deck(deck: &str) -> Result<(), Refusal> {
             text: text.to_string(),
             origin: origin.clone(),
             line: index + 2,
+            from_testbench: false,
         })
         .collect();
     verify_lines(&lines)
@@ -1128,6 +1181,7 @@ mod tests {
             project_dir: &root,
             allowed_roots: std::slice::from_ref(&root),
             compatibility: Compatibility::DEFAULT,
+            excluded_elements: &[],
         })
     }
 
@@ -1493,6 +1547,7 @@ mod tests {
             project_dir: &root,
             allowed_roots: &[],
             compatibility: Compatibility::DEFAULT,
+            excluded_elements: &[],
         };
         for netlist in [
             "R5 a 0 5k\nV1 a 0 1\n",
@@ -1628,6 +1683,29 @@ mod tests {
         ] {
             assert!(deck(line).is_ok(), "{line}");
         }
+    }
+
+    #[test]
+    fn an_excluded_element_leaves_with_its_continuation_lines() {
+        let root = PathBuf::from("/");
+        let excluded = ["j1".to_string()];
+        let flat = flatten(&DeckInputs {
+            netlist: ".title t\nR1 a 0 1k\nJ1 a __J1\n+ more\n.subckt f a b\nJ1 a b m\n.ends\n",
+            testbench: &[],
+            project_dir: &root,
+            allowed_roots: &[],
+            compatibility: Compatibility::DEFAULT,
+            excluded_elements: &excluded,
+        })
+        .unwrap();
+        let rendered = flat.render();
+        assert!(!rendered.contains("__J1") && !rendered.contains("more"));
+        assert!(rendered.contains("J1 a b m"), "{rendered}");
+    }
+
+    #[test]
+    fn calling_a_function_does_not_stop_a_model_of_that_name() {
+        assert!(deck(".param n=int(3.7)\n.model ii int(gain=1)").is_ok());
     }
 
     #[test]
@@ -2096,6 +2174,7 @@ mod tests {
             project_dir: &root,
             allowed_roots: std::slice::from_ref(&root),
             compatibility,
+            excluded_elements: &[],
         };
         assert!(flatten(&inputs(Compatibility::DEFAULT)).is_ok());
         let refused = flatten(&inputs(Compatibility { ngbehavior: None })).unwrap_err();
@@ -2328,6 +2407,7 @@ mod tests {
                         project_dir: &root,
                         allowed_roots: std::slice::from_ref(&root),
                         compatibility: Compatibility::DEFAULT,
+                        excluded_elements: &[],
                     });
                     if let Err(refusal) = result {
                         refusals.push(format!(

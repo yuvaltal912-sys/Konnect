@@ -181,11 +181,11 @@ This is hardening, not a sandbox. See R4.
 |---|---|---|---|
 | Child sheet | Root schematic only, as `run_erc` does | Refused | [verified: source E39] |
 | `unmodelled_symbols` | `REF __REF` with no nodes and no `.model` | Refused | [verified: run E2, source E4] |
-| `invalid_component_value` | V, I, R, L, C with a non-numeric value | Refused | [verified: run E3] |
-| `no_ground_reference` | No element uses node `0` or `GND`. List ground-like nets | Refused | [verified: run E16] |
-| `net_name_collision` | Distinct KiCad nets mapping to one lowercase SPICE name, such as `A(1)` and `A[1]` | Refused | [verified: run E17, E69] |
-| `floating_subcircuit` | A group of elements with no DC path to node 0. Capacitors and current sources are not DC paths; a subcircuit joins all its pins | Refused | [verified: run E16] |
-| `unknown_testbench_node` | A `spice_lines` node that is not a schematic net, not `0`, and used only once. A typo otherwise makes a new silent node: the run reports success with zero volts everywhere | Refused | [verified: run E63] |
+| `invalid_component_value` | A value ngspice would not read as written, judged the way it reads: a number, then scale letters, then it stops. Refused: a word; `3V3`; `10k-1%`, `10k(1%)` and `100_nF`, where the token ends early; a rating such as `16V` on a capacitor or `100n 50V`, where the last number wins; `ic=1` with no value; a waveform number of those shapes; `DC 12V DC`; `K1 L1 L2 90%`. Passing: suitable units, tags ngspice ignores such as `47R;1W` or `10k@0402`, expressions, `.param` names and models. `4k7` passes only in `lt` modes, because elsewhere ngspice silently reads 4k | Refused | [verified: run E3, E85] |
+| `no_ground_reference` | Nothing touches node `0` or `GND`, at top level, inside a called subcircuit, through a code model other than a potentiometer, or through a nonzero `rshunt`. `gshunt` adds no reference. List ground-like nets | Refused | [verified: run E16, E85] |
+| `net_name_collision` | Distinct KiCad nets holding live parts that map to one lowercase SPICE name, such as `A(1)` and `A[1]`, or `0` and `GND`. Also a net holding `=`, which ngspice cuts in two | Refused | [verified: run E17, E69, E85] |
+| `floating_subcircuit` | A group of nodes with no DC path to node 0. Capacitors, current sources, MOS gates and controlled-source inputs are not DC paths; a subcircuit joins its pins, and reaches ground only through a conducting path in its body | Warning here, because series capacitors and isolated windings give correct AC and transient results. `run_simulation` should refuse it for an operating point | [verified: run E16, E85] |
+| `unknown_testbench_node` | A testbench node, or `.ic` or `.nodeset` target, that is not a schematic net or `0`, and that no other card names. Lines from a file a testbench includes count. A typo otherwise makes a new silent node: the run reports success with zero volts everywhere | Refused | [verified: run E63, E85] |
 | `no_ac_stimulus` | Kind `ac` with no source carrying an AC value | Refused | [verified: run E54] |
 | `sweep_target_not_found` | `dc_sweep` target absent from the deck. Caught early, for a typed reason instead of a fatal engine message | Refused | [verified: run E63] |
 | `encrypted_model` | Model line starting `$CDNENCSTART` | Refused | [verified: run E32] |
@@ -193,15 +193,26 @@ This is hardening, not a sandbox. See R4.
 | `model_library_missing` | Unresolved include, or `kicad-cli` reported a missing library | Refused | [verified: run E12] |
 | `unsafe_deck_content` | Refused forms above, or a path outside the allowed roots, with file and line | Refused | [verified: run E18 to E20, E50 to E52] |
 | `code_models_missing` | No `.cm` files found. Decks needing them will fail to parse | Warning | [verified: run E34] |
-| `unpowered_net` | A group with no independent source | Warning | [verified: run E63] |
+| `unpowered_net` | A group with no independent source. Dependent sources do not count, and a subcircuit counts only if its body holds a source | Warning | [verified: run E63, E85] |
 | `inferred_from_value` | An R, L, C, V or I element whose `lib_id` is not a plain R, L, C or source symbol, such as an NTC named `RT1` | Warning, disclosed in the result | [verified: source E4] |
-| `generic_default_model` | A built-in part still at library defaults, such as a varistor at its 1 kV default threshold | Warning, disclosed in the result | [verified: source E62] |
-| `digital_models_disabled` | Deck uses a digital code model, such as `d_pwm` or `dac_bridge`, while `digital.cm` is off. Otherwise the engine gives only a parse error | Refused | [verified: run E72] |
+| `generic_default_model` | A varistor or potentiometer still at library defaults, such as a varistor's 1 kV threshold or a dual potentiometer's 1 ohm | Warning, disclosed in the result | [verified: source E62, run E85] |
+| `digital_models_disabled` | An element instantiates a digital code model while `digital.cm` is off. Otherwise the engine gives only a parse error | Refused | [verified: run E72, E85] |
 | `ground_like_local_net` | A net such as `/gnd` or `/0`. KiCad 10.0.1 keeps these as ordinary nodes; later 10.0 builds turn them into ground | Warning | [verified: run E69, E71] |
 | `net_map_mismatch` | A node in the SPICE netlist that the name port cannot explain. Readiness then returns `spice_net: null` for it, never a guess | Warning | [verified: run E69] |
 | `pulse_period_defaulted` | `PULSE` with fewer than 7 values, because the default changed at ngspice 46 | Warning | [verified: source E46] |
+| `duplicate_element` | Two top-level elements with one name, such as a netlist part repeated in `spice_lines` | Refused | [verified: run E85] |
+| `missing_referenced_element` | A `K`, `F` or `H` element whose partner is absent, which excluding a part can cause | Refused | [verified: run E85] |
+| `ambiguous_scale_letter` | A capital `M` that is not `Meg`, such as `1MOhm` or `1MHz`, in any R, L, C or source field or `.param`; `1F` on C; `5A` on I. ngspice reads these as milli, femto and atto | Warning | [verified: run E85] |
+| `implausible_value` | A capacitance or inductance of 1 kF or 1 kH or more, because KiCad turns `22P` into peta | Warning | [verified: run E85] |
+| `source_without_value` | A V or I source with no value, which reads as zero | Warning | [verified: run E85] |
+| `gnd_pin_in_subcircuit` | A subcircuit pin named `gnd` or `0`, which ngspice reads as global ground, so the net wired to it is not connected | Warning | [verified: run E85] |
+| `exclusion_matched_nothing` | An `exclude_references` entry that selects no symbol | Warning | |
+| `ground_only_inside_subcircuit` | No top-level element touches node 0, so the only reference is inside a subcircuit, and a ground net named `GNDA` floats | Warning | [verified: run E85] |
+| `decimal_comma` | `1,5V` or `0,5us` in a source, where every later waveform field moves along by one | Warning | [verified: run E85] |
+| `duplicate_definition` | One model or subcircuit name with two different bodies, where ngspice uses the first for both | Warning | [verified: run E85] |
+| `unknown_initial_node` | A schematic `.ic` or `.nodeset` on no net, which ngspice drops without saying so | Warning | [verified: run E85] |
 
-The element parser needs a node count per device letter. A device it cannot parse disables connectivity checks for that run and reports `connectivity_not_checked`, so an unrun check never reads as a pass.
+The element parser needs a node count per device letter. A device it cannot parse, or any `.if` block, stops the checks that need the whole circuit and reports `connectivity_not_checked`, `ground_not_checked` or `testbench_nodes_not_checked`, so an unrun check never reads as a pass. `no_ac_stimulus` and `sweep_target_not_found` need an analysis, so they arrive with those kinds in PR 9.
 
 **Classification.** Log text explains; it never decides.
 
@@ -297,27 +308,30 @@ Output:
   "checks": [
     { "name": "engine", "ran": true, "passed": true },
     { "name": "netlist_export", "ran": true, "passed": true },
-    { "name": "model_coverage", "ran": true, "passed": false, "count": 9 },
-    { "name": "ground", "ran": true, "passed": false, "candidates": ["PGND"] },
-    { "name": "connectivity", "ran": false, "reason": "unmodelled symbols present" }
+    { "name": "deck_vetting", "ran": true, "passed": true },
+    { "name": "model_coverage", "ran": true, "passed": false, "code": "unmodelled_symbols", "total": 9, "shown": 5, "truncated": true, "items": ["D1"] },
+    { "name": "component_values", "ran": true, "passed": true, "total": 0, "shown": 0, "truncated": false, "items": [] },
+    { "name": "ground", "ran": true, "passed": false, "code": "no_ground_reference", "total": 1, "shown": 1, "truncated": false, "items": ["PGND"] },
+    { "name": "connectivity", "ran": false, "code": "connectivity_not_checked", "reason": "Unmodelled symbols have no nodes in the deck yet.", "total": 0, "shown": 0, "truncated": false, "items": [] }
   ],
-  "engine": { "available": true, "version": "44.2", "library_path": "...", "code_model_count": 6, "compatibility": "ltpsa", "probe_status": "ok" },
-  "nets": { "total": 9, "shown": 5, "truncated": true, "items": [ { "kicad_name": "/VBAT", "spice_name": "/VBAT", "pin_count": 4 } ] },
-  "elements": { "total": 13, "shown": 5, "truncated": true, "items": [ { "reference": "BT1", "element_name": "VBT1", "modelled": true } ] },
+  "engine": { "available": true, "version": "44.2", "library_path": "...", "code_model_count": 5, "compatibility": "ltpsa", "probe_status": "ok" },
+  "nets": { "total": 9, "shown": 5, "truncated": true, "items": [ { "kicad_name": "/VBAT", "spice_name": "/VBAT", "in_deck": true, "pin_count": 4 } ] },
+  "elements": { "total": 13, "shown": 5, "truncated": true, "items": [ { "reference": "BT1", "element_name": "VBT1", "modelled": true, "excluded": false } ] },
+  "deck": { "line_count": 40, "inlined_file_count": 2, "dropped_directives": [".tran"] },
   "unmodelled_symbols": {
     "total": 9, "shown": 5, "truncated": true,
     "items": [ {
-      "reference": "F1", "value": "10A", "lib_id": "Device:Fuse",
+      "reference": "F1", "value": "10A", "lib_id": "Device:Fuse", "pin_total": 2,
       "pins": [ { "pin": "1", "pin_name": "~", "pin_type": "passive", "net": "/VBAT", "spice_net": "/VBAT" } ],
       "suggested_fix": "replace_series_part"
     } ]
   },
-  "warnings": [],
-  "report_path": "..."
+  "warnings": [ { "code": "floating_subcircuit", "detail": "...", "total": 1, "shown": 1, "truncated": false, "items": ["x, y"] } ],
+  "source_evidence": { "excludes_unsaved_editor_state": true, "locks_present": [] }
 }
 ```
 
-`ready` is `true` only if every check ran and passed, `false` if one failed, and `null` if a check could not run, with the missing evidence named. The `deck_vetting` check carries a `refusal` with `code`, `origin` and `line`, and a passing deck adds `deck` with its line count, inlined file count and `dropped_directives`. An `unmodelled_symbols` item suggests `exclude` only for parts with no series role, and `copy_library_sim_fields` when the embedded library symbol has `Sim.*` fields.
+`ready` is `true` only if every check ran and passed, `false` if one failed, and `null` if a check could not run, with the missing evidence named. The `deck_vetting` check carries a `refusal` with `code`, `origin` and `line`, and a passing deck adds `deck` with its line count, inlined file count and `dropped_directives`. An `unmodelled_symbols` item suggests `copy_library_sim_fields` when the library symbol has `Sim.*` fields and the placed one does not, `replace_series_part` when two or more pins on signal nets touch other parts, and `exclude` otherwise. `spice_net` is null for a net the deck does not name.
 
 | Case | Result |
 |---|---|
@@ -676,6 +690,7 @@ Recorded here so every implementation session follows them.
 | Q15 | Do real vendor sets with their own nested includes flatten correctly? Tested only on a real library split into nested files [verified: run E76] | Sample vendor libraries in PR 3 |
 | Q16 | Settled, by removing the dependency. String expressions can only reach a `.model` type or name field, and both must now be literal. Tested forms in E79, with a negative control for each | Closed in PR 3 |
 | Q17 | Decided for v1, as an accepted limit: `filesource`, `d_source`, `d_state`, `table2d` and `table3d` read a data file named in the deck. They run no code, and refusing them would break legal XSPICE stimulus. A deck can therefore read a numeric file it can name [verified: run E83]. Revisit with an OS sandbox | Accepted, R4 |
+| Q20 | A subcircuit with any internal ground counts all its pins as grounded, so `floating_subcircuit` can miss an input pin that a capacitor feeds. This is a warning that does not fire, not a wrong refusal. Per-pin paths would close it | With the transient PR, if it matters on real boards |
 | Q18 | XSPICE auto-bridging can read `bridge_<family>_*.subcir` after parsing, from the working folder or `sourcepath`, and that file reaches the engine unvetted [verified: run E83]. The worker's working folder holds only an empty `.spiceinit`, and `sourcepath` is refused as an option. Prove this with a live test | Live test, PR 6 |
 | Q19 | Does `ngCM_Input_Path` set to the project let code models find relative data files such as `test-3d-1.table`? From an empty working folder they fail loudly [verified: run E84] | Live test, PR 6 |
 | Q13 | Does FFT computed from a stored transient match KiCad's `linearize` and `fft` result? | FFT PR |
@@ -801,6 +816,7 @@ Recorded here so every implementation session follows them.
 | E82 | Independent review by three reviewers of the first flattener, each form run through KiCad's libngspice 44.2 with harmless markers and a nonexistent library path; read `inpcom.c`, `inpcompat.c`, `inpgtok.c`, `inp2dot.c`, `simulator_frame.cpp` | Bypassed it: `r#...` in an unused subcircuit under `ltpsa` (`comment_out_unused_subckt_models` writes `*` over the first character, after `pspice_compat` has already rewritten `*#`); `;#`, `=#`, `(#` and others in modes without `ps` (`inp_check_syntax`); a no-break space before `#` or `$`; `.model m;x D` then `+ {t}(...)`, where the comment hides the type; `"d_co""sim"` joining into a string. Wrong results: `.end,x` stopped the circuit silently; `.tran,1u,1m` and `.op;x` ran. False refusals on real libraries: `ako:` cards and `.model D9_Empty D;`. KiCad forces `LT_PSPICE` while the workbook name is empty. All are fixed or named as limits, each with a test |
 | E83 | Rounds two and three of the same review, each form run through libngspice 44.2 | Reached `d_cosim`: `.cmodel m {t}(...)`, `.model m mfg=x {t}(...)` in `lt` and `ps` modes, and `.model m g()(...)` with `.func g() {d_co sim}`. `.options measoutfile=<path>` wrote a file. Silent circuit differences: a `.end` before the last card, a `;` line inside a continuation, a first netlist line that ngspice reads as the title, include search order, and `\\` around comments, includes and dot-leading values. `\\` appears on 4 lines in 527 real files, so it is refused rather than imitated. Accepted as limits: Q17 and Q18 |
 | E84 | Round four: raw against flattened through libngspice 44.2 in modes 1, 4 and 5, on 4,120 generated decks, 363 ngspice example decks and 439 model and subcircuit instance decks | Two differences, both fixed: a form feed before a comment or `+` line in a model file, and `.incpslt` in `ltpsa`, where the PSpice pass runs twice. The reviewer for side effects stopped early on a provider safety filter, so the final version has had no complete independent side-effect review. A source search for `fopen` then found that CIDER models (`numd`, `numd2`, `numos`, `nbjt`, `nbjt2`) write state files to `rootfile`. A `numd` deck wrote them to the path it named, and vetting refuses that deck. Repeated on the final code: 3,669 generated cases and 793 example cases matched. The 17 example differences are all explained: Monte Carlo decks that also differ between two raw runs, one `.meas` log line number, a same-valued listing order, and `table3d` data files that fail loudly from an empty folder (Q19) |
+| E85 | Four independent review rounds of preflight, each case run through libngspice 44.2 or a real `kicad-cli` export on a scratch copy; `4k7`, `R47` and `4n7` run by mode | Wrong results it now catches: `100n 50V` read as 50 F, `3V3` as 3 V, `1MOhm` and `1MHz` as milli, `22P` exported as 2.2e+16, labels holding `=`, `.if(` read as live. Wrong refusals removed: series capacitors and isolated windings, which give correct AC and transient results; `.param` names as values; `47R`, `100n_X7R`, `5VDC`; `DC(5)` and `(1k)`; `R = (expr)`; `tc=a,b`. Also a panic on `\u00b0` before a bracket, and a cubic slowdown. A potentiometer counts as no reference. KiCad's 17 exportable demos all report ready. Known gaps left as they are: a bare `4.7` on an inductor or `100` on a capacitor is that many henries or farads, a gain of `1,5` on `E` is not read, and `tw=50%` in `PULSE` is 50 s |
 | E64 | Read `Cargo.toml`, `Cargo.lock`, and the `konnect` and `konnect-core` manifests | `dirs` and `sha2` already in `konnect-core`. `libc` 0.2.189 and `windows-sys` 0.61.2 are in the lock, not direct dependencies of `konnect` |
 | E65 | Ran both netlist formats on all 18 demos at tag 10.0.1: full copy, snapshot with `Sim.Library` rewrite, snapshot without | Snapshot matched byte for byte on 17; `laser_driver` had the same lines in a different order. Without the rewrite 15 exit 2 and still write a file, with `Simulation model library not found`. `Q17ng` exits 2 either way: KiCad's parser rejects `all_devices.lib` |
 | E66 | Ran the `ibis` demo repeatedly and after other projects' exports; read the cache cleanup in `netlist_exporter_spice.cpp` at the tag | Includes `~/Library/Caches/KiCad/10.0/ibis/U1.cache`. Present after its own exports; missing after later exports from other projects |

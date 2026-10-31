@@ -45,6 +45,10 @@ impl SimulationRuntime {
         &self.settings.model_dirs
     }
 
+    pub(crate) fn allows_digital_models(&self) -> bool {
+        self.settings.allow_digital_models
+    }
+
     /// The running executable as the worker. Only `main` calls this: in the
     /// plugin library `current_exe()` names the host.
     pub fn for_current_executable(settings: SimulationSettings) -> std::io::Result<Self> {
