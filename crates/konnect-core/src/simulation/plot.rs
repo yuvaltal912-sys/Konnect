@@ -1545,6 +1545,13 @@ mod tests {
             let frames: Vec<_> = rects.iter().filter(|r| r.0 == "#FFFFFF").collect();
             assert_eq!(banner.len(), 1);
             assert_eq!(frames.len(), 2);
+            // The x axis label is clear of the tick labels above it.
+            let last_frame = frames.iter().map(|r| r.4).fold(0.0, f64::max);
+            let x_label = boxes.iter().find(|b| b.0.starts_with("Time")).unwrap();
+            assert!(
+                x_label.3 - last_frame >= 17.0,
+                "{x_label:?} against {last_frame}"
+            );
             for (text, left, right, top, bottom) in &boxes {
                 let meets = |r: &&(String, f64, f64, f64, f64)| {
                     *left < r.2 && r.1 < *right && *top < r.4 && r.3 < *bottom
@@ -1556,7 +1563,7 @@ mod tests {
                 let in_banner = banner.iter().any(inside);
                 assert_eq!(in_banner, is_banner_line, "{text:?} at {width} px");
                 assert!(
-                    !(banner.iter().any(meets) && !in_banner),
+                    in_banner || !banner.iter().any(meets),
                     "{text:?} crosses the banner at {width} px"
                 );
                 assert!(
