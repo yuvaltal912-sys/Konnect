@@ -534,12 +534,12 @@ fn tick_text(value: f64, factor: f64, step: f64) -> String {
         return "0".to_string();
     }
     if scaled != 0.0 && (scaled.abs() >= 1e9 || unit_step < 1e-9) {
-        return format!("{scaled:.3e}");
+        return format!("{scaled:.2e}");
     }
     let places = (-unit_step.log10().floor()).clamp(0.0, 9.0) as usize;
     let text = format!("{scaled:.places$}");
     if text.chars().count() > MAX_TICK_CHARS {
-        return format!("{scaled:.3e}");
+        return format!("{scaled:.2e}");
     }
     match text
         .trim_start_matches('-')
@@ -584,9 +584,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         })
         .max()
         .unwrap_or(0);
-    let left = (28.0 + widest as f64 * 11.0 * CHAR_EM + 6.0)
-        .max(MARGIN_LEFT)
-        .min(w * 0.5);
+    let left = (28.0 + widest as f64 * 11.0 * CHAR_EM + 6.0).max(MARGIN_LEFT);
     let area = (w - left - MARGIN_RIGHT).max(40.0);
     let columns = area.floor() as usize;
     let mut body = String::new();
@@ -1458,6 +1456,11 @@ mod tests {
         // A value near the limit of what is plotted.
         assert!(tick_text(1e149, 1e9, 1e148).len() <= 10);
         assert_eq!(tick_text(-17.3, 1e-3, 5.0), "-17300");
+        // Past nine characters a label goes scientific rather than crowd the axis.
+        assert_eq!(tick_text(123_456.123, 1.0, 0.001), "1.23e5");
+        assert_eq!(tick_text(12_345.678, 1.0, 0.001), "12345.678");
+        assert_eq!(tick_text(12_345.6789, 1.0, 0.0001), "1.23e4");
+        assert_eq!(tick_text(1234.567, 1.0, 0.001), "1234.567");
         // Ordinary ticks keep their places.
         assert_eq!(tick_text(0.25, 1.0, 0.05), "0.25");
         assert_eq!(tick_text(2.0, 1.0, 1.0), "2");
@@ -1782,5 +1785,29 @@ mod tests {
             "{}",
             drawn.points_drawn
         );
+    }
+
+    #[test]
+    fn a_narrow_spike_in_every_one_of_many_stretches_survives_the_cut() {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for stretch in 0..700 {
+            for point in 0..1400 {
+                x.push(f64::from(stretch * 1400 + point));
+                y.push(if point == 701 { 10.0 } else { 0.0 });
+            }
+            x.push(f64::from(stretch * 1400 + 1400));
+            y.push(f64::NAN);
+        }
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        let document = Document::parse(&drawn.svg).unwrap();
+        let ys: Vec<f64> = document
+            .descendants()
+            .filter(|n| n.has_tag_name("polyline"))
+            .flat_map(|n| n.attribute("points").unwrap().split(' '))
+            .map(|p| p.split(',').nth(1).unwrap().parse().unwrap())
+            .collect();
+        let top = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+        let spikes = ys.iter().filter(|y| (**y - top).abs() < 0.2).count();
+        assert!(spikes >= 600, "{spikes} of 700 spikes kept");
     }
 }
