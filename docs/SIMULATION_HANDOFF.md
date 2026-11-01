@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 9 merged to `main` (PR 9 as `2503cad`) and PR 10 open.
+**Last updated:** 2026-11-01, with PR 1 to 10 merged to `main` (PR 9 as `2503cad`, PR 10 as `d6b5ea8`).
 
 ## Start here
 
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 9 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
+PRs 1 to 10 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -41,12 +41,12 @@ PRs 1 to 9 are merged to `main` on the `fork` remote, each as a merge commit. La
 | 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
 | 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
-| 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Open, waiting for the owner |
+| 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
 | 11 | Not opened | | Not started |
 
-## Now: PR 10 is open
+## Now: PR 10 is merged
 
-PR 9 is merged. It added the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin, gain margin, per-kind summaries and coverage proof. PR 10 adds `list_simulation_runs`, `measure_simulation_run` and CSV export. Nothing is merged. Ask the owner before merging it, and before starting PR 11.
+PR 9 added the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin, gain margin, per-kind summaries and coverage proof. PR 10 added `list_simulation_runs`, `measure_simulation_run` and CSV export, and merged as `d6b5ea8`. PR 11 (SVG plots) is next and is the last planned PR of v1. Ask the owner before starting any follow-up.
 
 ### What PR 10 changed that the next PR needs to know
 
