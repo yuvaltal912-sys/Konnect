@@ -6730,6 +6730,42 @@ mod tests {
         }
 
         #[test]
+        fn a_step_of_the_second_sweep_never_reads_past_the_end_of_a_short_variable() {
+            assert_eq!(plots::step_rows(0, 3, 10), 0..3);
+            assert_eq!(plots::step_rows(1, 3, 5), 3..5);
+            assert_eq!(plots::step_rows(2, 3, 5), 5..5);
+            assert_eq!(plots::step_rows(9, 3, 5), 5..5);
+            assert_eq!(plots::step_rows(0, 3, 0), 0..0);
+        }
+
+        #[tokio::test]
+        async fn a_second_sweep_of_temperature_names_its_curves_in_plain_degrees() {
+            let points: Vec<(f64, f64)> = (0..9).map(|n| ((n % 3) as f64, n as f64)).collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                    { "target": "TEMP", "start_value": 0.1, "stop_value": 0.3, "step_value": 0.1 },
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["signals"] = json!(["v(a)"]);
+            let run = run_of(&scene, arguments).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            for label in ["temp = 0.1 °C", "temp = 0.2 °C", "temp = 0.3 °C"] {
+                assert!(shown.iter().any(|t| t == label), "{label} in {shown:?}");
+            }
+        }
+
+        #[test]
         fn a_variable_shorter_than_the_plot_is_cut_to_pair_with_its_own_axis() {
             let (x, y) = plots::paired(&[0.0, 1.0, 2.0], &[5.0, 6.0]);
             assert_eq!((x, y), (vec![0.0, 1.0], vec![5.0, 6.0]));

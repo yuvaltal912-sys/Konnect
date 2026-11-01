@@ -296,6 +296,12 @@ fn chosen_steps(steps: usize) -> Vec<usize> {
         .collect()
 }
 
+/// The rows of one step of the second sweep, in a vector of `len` values. A variable
+/// the engine saved shorter than the plot is cut short and never read past its end.
+pub(super) fn step_rows(step: usize, run: usize, len: usize) -> std::ops::Range<usize> {
+    (step * run).min(len)..((step + 1) * run).min(len)
+}
+
 fn dc_grid(sweep: &DcSweep, plot: &Plot, found: &[Found]) -> Drawing {
     let (axis, x) = sweep_axis(sweep, plot);
     let outer = &sweep.sweeps[1];
@@ -312,15 +318,10 @@ fn dc_grid(sweep: &DcSweep, plot: &Plot, found: &[Found]) -> Drawing {
             let curves = chosen
                 .iter()
                 .enumerate()
-                .map(|(position, step)| {
-                    // A variable the engine saved shorter than the plot is cut short,
-                    // and never read past its end.
-                    let rows = |len: usize| (step * run).min(len)..((step + 1) * run).min(len);
-                    Series {
-                        color: ramp_at(position),
-                        x: axis[rows(axis.len())].to_vec(),
-                        y: found.real[rows(found.real.len())].to_vec(),
-                    }
+                .map(|(position, step)| Series {
+                    color: ramp_at(position),
+                    x: axis[step_rows(*step, run, axis.len())].to_vec(),
+                    y: found.real[step_rows(*step, run, found.real.len())].to_vec(),
                 })
                 .collect();
             Panel {

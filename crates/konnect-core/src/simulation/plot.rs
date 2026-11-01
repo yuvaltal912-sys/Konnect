@@ -1191,6 +1191,9 @@ mod tests {
             let drawn = render(&empty);
             assert!(!drawn.svg.contains("NaN") && !drawn.svg.contains("inf"));
             assert!(Document::parse(&drawn.svg).is_ok());
+            // An empty frame still has an axis to read: one decade.
+            let shown = texts(&drawn.svg);
+            assert!(shown.iter().any(|t| t == "10"), "{shown:?}");
         }
         // One frequency is a range of one: it gets a span of its own.
         let mut one = chart(vec![panel(vec![line(0, vec![10.0, 10.0], vec![1.0, 2.0])])]);
