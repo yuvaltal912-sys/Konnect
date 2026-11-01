@@ -2236,6 +2236,7 @@ async fn handle_add_power_symbol(
         true,
         centred,
     ));
+    super::sch_components::push_sim_fields(&mut sym, &placement_fields.sim_fields, x, y);
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the

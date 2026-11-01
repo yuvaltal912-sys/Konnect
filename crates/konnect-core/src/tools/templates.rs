@@ -739,6 +739,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_template_copies_library_sim_fields() {
+        let (_dir, schematic, _environment) = template_fixture();
+        // Give the fixture's embedded Device:R a Sim field, as a library
+        // part that simulates has.
+        let source = std::fs::read_to_string(&schematic).unwrap();
+        let marker = "(symbol \"Device:R\"";
+        let at = source.find(marker).expect("embedded Device:R") + marker.len();
+        let patched = format!(
+            "{}\n\t\t(property \"Sim.Device\" \"R\" (at 0 0 0) (hide yes))\n\t\t(property \"Sim.Pins\" \"1=+ 2=-\" (at 0 0 0) (hide yes)){}",
+            &source[..at],
+            &source[at..]
+        );
+        std::fs::write(&schematic, patched).unwrap();
+
+        let applied = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_one_resistor",
+                "position_x": 180.0,
+                "position_y": 100.0
+            }),
+            test_ctx(),
+        )
+        .await;
+        assert!(!applied.is_error, "{applied:?}");
+
+        let (sim, _) = crate::tools::sim_field_placement_tests::saved_sim_fields(&schematic, "R3");
+        assert_eq!(
+            sim,
+            crate::tools::sim_field_placement_tests::hidden(&[
+                ("Sim.Device", "R"),
+                ("Sim.Pins", "1=+ 2=-")
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn apply_template_uses_project_identity_and_leaves_batch_writes_usable() {
         let (_dir, schematic, _environment) = template_fixture();
         let ctx = test_ctx();

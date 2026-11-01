@@ -801,6 +801,7 @@ pub(crate) fn place_one_component(
         true,
         centred,
     ));
+    push_sim_fields(&mut sym, &fields.sim_fields, x, y);
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
@@ -818,10 +819,36 @@ pub(crate) fn place_one_component(
     })
 }
 
+/// Copy the library's `Sim.*` fields onto a placed instance, hidden at the
+/// origin like Footprint. KiCad's simulator reads the instance only, never the
+/// library symbol behind it, so a part placed without them exports as
+/// `D1 __D1` and does not simulate; eeschema copies them on placement.
+pub(crate) fn push_sim_fields(
+    sym: &mut cse::Symbol,
+    sim_fields: &[(String, String)],
+    x: f64,
+    y: f64,
+) {
+    for (name, value) in sim_fields {
+        sym.properties.push(crate::tools::positioned_property(
+            name,
+            value,
+            x,
+            y,
+            0.0,
+            true,
+            cse::library::FieldJustify::default(),
+        ));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlacementFields {
     pub(crate) value: String,
     pub(crate) footprint: String,
+    /// The library's `Sim.*` fields, copied as they stand: no tool argument
+    /// overrides them (`edit_schematic_component` does that afterwards).
+    pub(crate) sim_fields: Vec<(String, String)>,
 }
 
 impl PlacementFields {
@@ -843,6 +870,7 @@ impl PlacementFields {
         Self {
             value: value.unwrap_or(library_value).to_owned(),
             footprint: footprint.unwrap_or(&metadata.footprint).to_owned(),
+            sim_fields: metadata.sim_fields.clone(),
         }
     }
 }
@@ -902,7 +930,10 @@ impl ComponentTargetUnit {
                 ("Reference".to_owned(), reference.to_owned()),
                 ("Value".to_owned(), fields.value.clone()),
                 ("Footprint".to_owned(), fields.footprint.clone()),
-            ]),
+            ])
+            .into_iter()
+            .chain(fields.sim_fields.iter().cloned())
+            .collect(),
             instances,
         }
     }

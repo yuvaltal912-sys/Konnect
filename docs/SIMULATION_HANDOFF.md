@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-01, with PR 1 to 11 merged to `main` (PR 11 as `7bd17c1`) and the false-refusal fix open on `fix/simulation-false-refusals`.
+**Last updated:** 2026-11-01, with PR 1 to 11 and both follow-up fixes merged to `main`.
 
 ## Start here
 
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. The false-refusal fix (after PR 11, not a plan PR) is open against `main`.
+PRs 1 to 11 and the two fixes after them are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -43,11 +43,21 @@ PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. T
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
 | 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
 | 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
-| Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Open, waiting for the owner |
+| Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Merged as `d6f0d51` |
+| Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
 
-## Now: PR 1 to 11 are merged, and one small fix is open
+## Now: the plan's v1 is merged
 
-PR 11 added `plot_simulation_run`, the last tool of the plan's PR series, and is merged. The one open PR is `fix/simulation-false-refusals`, below. Ask the owner before merging it, and before starting any follow-up. The placement fix, still not started, is the only part of v1 left; the "After PR 11" table lists it and the rest.
+PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
+
+### What the placement fix changed that later work needs to know
+
+- **One helper does it.** `SymbolMetadata.sim_fields` (in `library.rs`) reads the embedded library symbol's direct `Sim.*` properties in library order, first of a repeated name. `PlacementFields.sim_fields` carries them, and `sch_components::push_sim_fields` writes them. `place_one_component` is the single writer for `add_schematic_component`, `batch_place_components` and `apply_template`; `add_power_symbol` builds its own symbol and calls the same helper. A new placer must call it too.
+- **The copy is exact and has no argument.** `ki_*` fields stay in the library. A caller changes a `Sim.*` value afterwards with `edit_schematic_component`.
+- **The post-write readback checks the copied fields** (they are in `ComponentTargetUnit.fields`), so a placement that loses one is reported, not passed.
+- **Not covered:** `replace_component` swaps `lib_id` and leaves the instance's fields as they were, so a diode replaced by a resistor keeps `Sim.Device=D` and simulates as a diode, and a part replaced into a symbol with Sim fields gets none. That is the worse of the two and it is silent; it is a separate PR. Parts placed before this fix still read `unmodelled_symbols` with `copy_library_sim_fields`.
+- **Limits left:** fields are read from the schematic's embedded library copy (as Footprint is), so a stale embedded copy places stale fields until `update_symbols_from_library`. KiCad also copies the library's `exclude_from_sim` attribute and the legacy `Spice_*` and `Sim_Library`/`Sim_Name` fields, which Konnect does not. The readback compares against the same list the writer used, so it proves the write and not the extraction; the extraction is tested on its own in `library.rs`.
+- **Tests:** `tools/sim_field_placement_tests.rs` (one test per path, with a quoted `Sim.Params` value), a template test in `templates.rs`, and two ignored live tests at the end of `simulation_live.rs`: a diode placed by `add_schematic_component` and another by `batch_place_components` simulate, and the same circuit with the instance `Sim.*` fields cut out is refused as `unmodelled_symbols`. Evidence is E110 and E111 in the plan. There is no "X4" in the plan (its open questions are Q1 to Q17); E45 and E74 are the evidence behind this row.
 
 ### What the false-refusal fix changed
 
@@ -114,11 +124,11 @@ PR 11 added `plot_simulation_run`, the last tool of the plan's PR series, and is
 
 ## After PR 11
 
-The plan's v1 is PR 1 to 11 and the placement fix. What is left:
+The plan's v1 is PR 1 to 11 and the placement fix, all merged. What is left after them:
 
 | Work | Outcome |
 |---|---|
-| `fix(schematic): copy Sim fields on placement` | Part of v1, not started |
+| `fix(schematic)`: Sim fields on `replace_component` | A replaced part keeps its old model without warning (see "Not covered" above) |
 | Two-sweep slices | An `outer_step` selection on `measure_simulation_run`, if the owner wants it |
 | PNG and inline images | Need a small vector font for labels, with its licence checked, and `outcome::attach` reading the JSON block first |
 | Margin runs at double density | `run_simulation` doing the second AC run itself |
