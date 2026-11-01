@@ -2978,3 +2978,181 @@ fn negative_control_the_same_circuit_without_the_copied_fields_does_not_simulate
     );
     assert_eq!(run["error"]["reason"], "unmodelled_symbols", "{run}");
 }
+
+/// V1 (5 V) - R1 (1k) - the part to ground, where the part is placed as `from_lib` and
+/// then swapped to `to_lib` with `replace_component` before it is wired. The
+/// pins are read back after the swap, so the ground lands on the new symbol's
+/// pin 1 whatever its geometry. Returns the schematic path.
+fn build_replaced_part_circuit(
+    home: &Path,
+    project: &Path,
+    reference: &str,
+    from_lib: &str,
+    to_lib: &str,
+) -> PathBuf {
+    let schematic = project.join("replaced.kicad_sch");
+    let sch = schematic.display().to_string();
+    let first = vec![
+        (
+            "create_project",
+            json!({"path": project, "name": "replaced"}),
+        ),
+        (
+            "add_schematic_component",
+            json!({"schematic": sch, "lib_id": "Simulation_SPICE:VDC", "reference": "V1",
+                   "x": 50.0, "y": 80.0, "value": "5"}),
+        ),
+        (
+            "add_schematic_component",
+            json!({"schematic": sch, "lib_id": "Device:R", "reference": "R1",
+                   "x": 100.0, "y": 60.0, "value": "1k"}),
+        ),
+        (
+            "add_schematic_component",
+            json!({"schematic": sch, "lib_id": from_lib, "reference": reference,
+                   "x": 140.0, "y": 80.0, "rotation": 270, "value": "1k"}),
+        ),
+        (
+            "replace_component",
+            json!({"schematic": sch, "reference": reference, "new_lib_id": to_lib}),
+        ),
+        (
+            "get_schematic_pin_locations",
+            json!({"schematic": sch, "reference": reference}),
+        ),
+    ];
+    let results = call_session(home, &first);
+    for (n, result) in results.iter().enumerate() {
+        assert!(
+            result.get("error").is_none(),
+            "{} failed: {result}",
+            first[n].0
+        );
+    }
+    let pin_one = results[5]["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pin| pin["number"] == "1")
+        .unwrap_or_else(|| panic!("no pin 1: {}", results[5]));
+    let (x, y) = (
+        pin_one["x"].as_f64().unwrap(),
+        pin_one["y"].as_f64().unwrap(),
+    );
+    let net = |reference: &str, pin: &str, net: &str| {
+        (
+            "connect_to_net",
+            json!({"schematic": sch, "reference": reference, "pin_number": pin, "net": net}),
+        )
+    };
+    let second = vec![
+        net("V1", "1", "IN"),
+        (
+            "add_power_symbol",
+            json!({"schematic": sch, "power_net": "GND", "x": 49.53, "y": 85.09}),
+        ),
+        net("R1", "1", "IN"),
+        net("R1", "2", "MID"),
+        net(reference, "2", "MID"),
+        (
+            "add_power_symbol",
+            json!({"schematic": sch, "power_net": "GND", "x": x, "y": y}),
+        ),
+    ];
+    for (n, result) in call_session(home, &second).iter().enumerate() {
+        assert!(
+            result.get("error").is_none(),
+            "{} failed: {result}",
+            second[n].0
+        );
+    }
+    schematic
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice and its symbol libraries"]
+fn a_diode_replaced_by_a_resistor_simulates_as_a_resistor() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let schematic =
+        build_replaced_part_circuit(home.path(), project.path(), "D1", "Device:D", "Device:R");
+
+    // The embedded library copy of Device:D keeps its fields; the instance must not.
+    let saved = std::fs::read_to_string(&schematic).unwrap();
+    let instances = &saved[saved.find("(symbol\n\t\t(lib_id").unwrap()..];
+    assert!(
+        !instances.contains("(property \"Sim.Device\" \"D\""),
+        "the diode's model stayed on the instance"
+    );
+
+    // The resistor has no model of its own and still reads D1, which KiCad
+    // cannot infer: the circuit refuses, where it used to run as a diode.
+    let (readiness, _) = operating_point(home.path(), &schematic);
+    assert_eq!(readiness["ready"], false, "{readiness}");
+    assert_eq!(
+        readiness["unmodelled_symbols"]["items"][0]["reference"], "D1",
+        "{readiness}"
+    );
+    // Renamed as a resistor is, KiCad infers it from the R prefix and the value.
+    let renamed = call_session(
+        home.path(),
+        &[(
+            "edit_schematic_component",
+            json!({"schematic": schematic, "reference": "D1", "new_reference": "R2"}),
+        )],
+    );
+    assert!(renamed[0].get("error").is_none(), "{}", renamed[0]);
+
+    let (readiness, run) = operating_point(home.path(), &schematic);
+    assert_eq!(readiness["ready"], true, "{readiness}");
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run["simulated_circuit"], "as_drawn", "{run}");
+    // 1k over 1k from 5 V: a diode would sit near 0.6 V.
+    let mid = row(&run, "v(/mid)")["value"].as_f64().unwrap();
+    assert!((mid - 2.5).abs() < 1e-6, "a divider, got {mid} V: {run}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice and its symbol libraries"]
+fn a_resistor_replaced_by_a_diode_simulates_as_a_diode() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let schematic =
+        build_replaced_part_circuit(home.path(), project.path(), "R2", "Device:R", "Device:D");
+
+    let (readiness, run) = operating_point(home.path(), &schematic);
+    assert_eq!(readiness["ready"], true, "{readiness}");
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    let mid = row(&run, "v(/mid)")["value"].as_f64().unwrap();
+    assert!(
+        (0.4..0.9).contains(&mid),
+        "a forward diode drop, got {mid} V: {run}"
+    );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice and its symbol libraries"]
+fn negative_control_a_replacement_that_keeps_the_old_fields_simulates_the_old_part() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let schematic =
+        build_replaced_part_circuit(home.path(), project.path(), "D1", "Device:D", "Device:R");
+    // What `replace_component` did before: the resistor keeps the diode's model.
+    let saved = std::fs::read_to_string(&schematic).unwrap();
+    // D1 is the last Device:R instance: V1 and R1 were placed before it.
+    let at = saved.rfind("(lib_id \"Device:R\")").unwrap();
+    let block_end = at + saved[at..].find("(instances").unwrap();
+    let mut old = saved.clone();
+    old.insert_str(
+        block_end,
+        "(property \"Sim.Device\" \"D\" (at 140 80 0) (hide yes))\n\t\t(property \"Sim.Pins\" \"1=K 2=A\" (at 140 80 0) (hide yes))\n\t\t",
+    );
+    std::fs::write(&schematic, old).unwrap();
+
+    let (_, run) = operating_point(home.path(), &schematic);
+    let mid = row(&run, "v(/mid)")["value"].as_f64().unwrap();
+    assert!(
+        (0.4..0.9).contains(&mid),
+        "the stale fields make the resistor a diode, got {mid} V: {run}"
+    );
+}

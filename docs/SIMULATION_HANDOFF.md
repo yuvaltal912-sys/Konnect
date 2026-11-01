@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-01, with PR 1 to 11 and both follow-up fixes merged to `main`.
+**Last updated:** 2026-11-01, with PR 1 to 11 and both follow-up fixes merged to `main`, and the `replace_component` fix open on `fix/replace-component-sim-fields`.
 
 ## Start here
 
@@ -45,19 +45,30 @@ PRs 1 to 11 and the two fixes after them are merged to `main` on the `fork` remo
 | 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
 | Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Merged as `d6f0d51` |
 | Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
+| Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Open, waiting for the owner |
 
 ## Now: the plan's v1 is merged
 
-PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
+PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. The `replace_component` fix is open as #13. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
 
 ### What the placement fix changed that later work needs to know
 
 - **One helper does it.** `SymbolMetadata.sim_fields` (in `library.rs`) reads the embedded library symbol's direct `Sim.*` properties in library order, first of a repeated name. `PlacementFields.sim_fields` carries them, and `sch_components::push_sim_fields` writes them. `place_one_component` is the single writer for `add_schematic_component`, `batch_place_components` and `apply_template`; `add_power_symbol` builds its own symbol and calls the same helper. A new placer must call it too.
 - **The copy is exact and has no argument.** `ki_*` fields stay in the library. A caller changes a `Sim.*` value afterwards with `edit_schematic_component`.
 - **The post-write readback checks the copied fields** (they are in `ComponentTargetUnit.fields`), so a placement that loses one is reported, not passed.
-- **Not covered:** `replace_component` swaps `lib_id` and leaves the instance's fields as they were, so a diode replaced by a resistor keeps `Sim.Device=D` and simulates as a diode, and a part replaced into a symbol with Sim fields gets none. That is the worse of the two and it is silent; it is a separate PR. Parts placed before this fix still read `unmodelled_symbols` with `copy_library_sim_fields`.
+- **`replace_component` is the other half, and has its own section below.** It is not a placement, so this fix left it alone; it keeps no old fields any more (see "What the `replace_component` fix changed"). Parts placed before the placement fix still read `unmodelled_symbols` with `copy_library_sim_fields`.
 - **Limits left:** fields are read from the schematic's embedded library copy (as Footprint is), so a stale embedded copy places stale fields until `update_symbols_from_library`. KiCad also copies the library's `exclude_from_sim` attribute and the legacy `Spice_*` and `Sim_Library`/`Sim_Name` fields, which Konnect does not. The readback compares against the same list the writer used, so it proves the write and not the extraction; the extraction is tested on its own in `library.rs`.
 - **Tests:** `tools/sim_field_placement_tests.rs` (one test per path, with a quoted `Sim.Params` value), a template test in `templates.rs`, and two ignored live tests at the end of `simulation_live.rs`: a diode placed by `add_schematic_component` and another by `batch_place_components` simulate, and the same circuit with the instance `Sim.*` fields cut out is refused as `unmodelled_symbols`. Evidence is E110 and E111 in the plan. There is no "X4" in the plan (its open questions are Q1 to Q17); E45 and E74 are the evidence behind this row.
+
+### What the `replace_component` fix changed
+
+- **`replace_component` swaps the instance's `Sim.*` fields with its `lib_id`.** After the new definition is embedded, `plan_sim_field_swap` (in `sch_components.rs`) takes `symbol_metadata(...).sim_fields` of the new symbol and, in every placed unit, deletes each `Sim.*` property and inserts the new ones, hidden, after the unit's last property. The text edits are applied before the junction pass and the write, like the `lib_id` edits.
+- **Decision: the old part's `Sim.*` go, hand-edited ones included.** A tuned `Sim.Params` describes the part that is leaving. The result lists `sim_fields_dropped` and `sim_fields_added` (`[{name, value}]`) so a caller can restore one. A field the new symbol repeats exactly is in neither list. Only names starting with `Sim.` count (`Simulation`, `sim.device` stay).
+- **Replacing a symbol with itself changes no Sim field.** Nothing is being swapped, so a hand edit survives. A unit that already carries exactly the new fields, in any layout, is left as it is.
+- **The readback checks both ways.** The bound intent (`ComponentTargetUnit.fields`) drops the old `Sim.*` and holds the new, so a missing new field is reported; `unit_with_stale_sim_field` reports an old one that survived.
+- **It does not rename the part, and it does not touch Value or Footprint.** A diode `D1` replaced by `Device:R` has no Sim fields (the library's `R` has none) and still reads `D1`, so KiCad cannot infer a model and readiness says `unmodelled_symbols`. That is loud, where it used to run as a diode. Renaming it to `R2` with `edit_schematic_component` makes KiCad infer a resistor from the prefix and the value.
+- **Limits left:** the new fields come from the schematic's embedded library copy, as in the placement fix. Legacy `Spice_*` / `Sim_Library` fields on the instance are not touched, and KiCad migrates them into `Sim.*` when it loads the sheet, which could overwrite the swapped fields on a sheet that still has them. `Sim.Enable` is a `Sim.*` field, so a part switched off in the simulation is switched back on by a replacement (it appears in `sim_fields_dropped`). The insert indent is whitespace only; a block written on one line gets the default.
+- **Tests:** 16 in `tools/sim_field_placement_tests.rs` (both directions, replacement rather than merge, a hand edit, the same symbol, CRLF and tabs, two units that disagree, lookalike names, a one-line block, identical fields in another layout, the stale-field check) and three ignored live tests at the end of `simulation_live.rs`. Evidence is E112 and E113 in the plan.
 
 ### What the false-refusal fix changed
 
@@ -128,7 +139,6 @@ The plan's v1 is PR 1 to 11 and the placement fix, all merged. What is left afte
 
 | Work | Outcome |
 |---|---|
-| `fix(schematic)`: Sim fields on `replace_component` | A replaced part keeps its old model without warning (see "Not covered" above) |
 | Two-sweep slices | An `outer_step` selection on `measure_simulation_run`, if the owner wants it |
 | PNG and inline images | Need a small vector font for labels, with its licence checked, and `outcome::attach` reading the JSON block first |
 | Margin runs at double density | `run_simulation` doing the second AC run itself |

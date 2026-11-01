@@ -3,6 +3,21 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `replace_component` swaps the instance's `Sim.*` fields (minor release)
+
+`replace_component` now removes the replaced instance's `Sim.*` fields from every
+placed unit and copies the new library symbol's, hidden, as a placement does. KiCad's
+simulator reads the instance's fields only, so before this a diode replaced by a
+resistor kept `Sim.Device=D` and simulated as a diode, and a part replaced into a
+symbol with Sim fields got none.
+
+Hand-edited `Sim.*` fields go with the old part. The result adds
+`sim_fields_dropped` and `sim_fields_added`, each a list of `{name, value}` that
+changed; restore a dropped value with `edit_schematic_component`. Replacing a symbol
+with itself leaves the fields alone. The reference, Value and Footprint still are not
+changed, so a replacement with no Sim fields of its own (such as `Device:R`) is
+inferred from its reference prefix: rename `D1` to `R1` to simulate it as a resistor.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

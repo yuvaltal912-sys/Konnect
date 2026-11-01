@@ -106,7 +106,7 @@ and Windows servers do not.
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
 | `group_components` | Add or update a group property across every placed unit of multiple components. |
-| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
+| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number, and swap its `Sim.*` fields for the new symbol's. |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
