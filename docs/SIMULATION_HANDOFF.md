@@ -43,7 +43,7 @@ PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. T
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
 | 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
 | 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
-| Fix | to be filled in | `fix/simulation-false-refusals` | Open, waiting for the owner |
+| Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Open, waiting for the owner |
 
 ## Now: PR 1 to 11 are merged, and one small fix is open
 
