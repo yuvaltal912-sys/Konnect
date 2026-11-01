@@ -2727,3 +2727,254 @@ fn a_real_transient_an_ac_sweep_and_two_dc_sweeps_are_plotted_to_a_small_svg() {
     }
     assert_eq!(svg.matches("<polyline").count(), 4);
 }
+
+// ---- Placement copies the library's Sim fields (fix/schematic-sim-fields) ----
+
+/// One server session that loads the toolsets a build-and-simulate test needs
+/// and makes the calls in order. Returns each call's JSON result. `HOME` is
+/// the server's own, so KiCad's user libraries are not the ones read.
+fn call_session(home: &Path, calls: &[(&str, Value)]) -> Vec<Value> {
+    let mut requests = vec![
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "live-test", "version": "0"}}}),
+    ];
+    for (n, toolset) in ["sch_components", "sch_wiring", "sch_batch", "simulation"]
+        .iter()
+        .enumerate()
+    {
+        requests.push(
+            json!({"jsonrpc": "2.0", "id": 10 + n, "method": "tools/call", "params": {
+            "name": "load_toolset", "arguments": {"name": toolset}}}),
+        );
+    }
+    for (n, (tool, arguments)) in calls.iter().enumerate() {
+        requests.push(
+            json!({"jsonrpc": "2.0", "id": 100 + n, "method": "tools/call", "params": {
+            "name": tool, "arguments": arguments}}),
+        );
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .env("HOME", home)
+        .env("KONNECT_STATE_DIR", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for request in &requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let responses: Vec<Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    (0..calls.len())
+        .map(|n| {
+            let response = responses
+                .iter()
+                .find(|message| message["id"] == 100 + n)
+                .unwrap_or_else(|| panic!("no response to {}", calls[n].0));
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }))
+        })
+        .collect()
+}
+
+/// Build V1 (5 V) - R1 (1k) - a diode to ground, entirely through placement
+/// tools. `D1` goes through `add_schematic_component`, `D2` in parallel with
+/// it through `batch_place_components`, and `D3` is a derived library symbol
+/// (`Diode:1N4148`, whose Sim fields come from its parent). Returns the
+/// schematic path.
+fn build_diode_circuit(home: &Path, project: &Path) -> PathBuf {
+    let schematic = project.join("diode.kicad_sch");
+    let sch = schematic.display().to_string();
+    let net = |reference: &str, pin: &str, net: &str| {
+        (
+            "connect_to_net",
+            json!({"schematic": sch, "reference": reference, "pin_number": pin, "net": net}),
+        )
+    };
+    // A GND symbol on the pin itself: a local label named 0 is an ordinary
+    // net on KiCad 10.0.1 (`ground_like_local_net`).
+    let ground = |x: f64, y: f64| {
+        (
+            "add_power_symbol",
+            json!({"schematic": sch, "power_net": "GND", "x": x, "y": y}),
+        )
+    };
+    let place = |lib_id: &str, reference: &str, x: f64, y: f64, extra: Value| {
+        let mut args = json!({"schematic": sch, "lib_id": lib_id, "reference": reference,
+                              "x": x, "y": y});
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        ("add_schematic_component", args)
+    };
+    let calls = vec![
+        ("create_project", json!({"path": project, "name": "diode"})),
+        place(
+            "Simulation_SPICE:VDC",
+            "V1",
+            50.0,
+            80.0,
+            json!({"value": "5"}),
+        ),
+        place("Device:R", "R1", 100.0, 60.0, json!({"value": "1k"})),
+        place("Device:D", "D1", 140.0, 80.0, json!({"rotation": 270})),
+        // Its Sim fields sit on the parent symbol (1N4001), not on this one.
+        place("Diode:1N4148", "D3", 200.0, 80.0, json!({"rotation": 270})),
+        (
+            "batch_place_components",
+            json!({"schematic": sch, "components": [
+                {"lib_id": "Device:D", "reference": "D2", "x": 170.0, "y": 80.0, "rotation": 270}]}),
+        ),
+        net("V1", "1", "IN"),
+        ground(49.53, 85.09),
+        net("R1", "1", "IN"),
+        net("R1", "2", "MID"),
+        net("D1", "2", "MID"),
+        ground(139.7, 76.2),
+        net("D2", "2", "MID"),
+        net("D3", "2", "MID"),
+        ground(170.18, 76.2),
+        ground(200.66, 76.2),
+    ];
+    for (n, result) in call_session(home, &calls).iter().enumerate() {
+        assert!(
+            result.get("error").is_none(),
+            "{} failed: {result}",
+            calls[n].0
+        );
+    }
+    schematic
+}
+
+fn operating_point(home: &Path, schematic: &Path) -> (Value, Value) {
+    let mut results = call_session(
+        home,
+        &[
+            (
+                "check_simulation_readiness",
+                json!({"schematic": schematic}),
+            ),
+            (
+                "run_simulation",
+                json!({"schematic": schematic, "analysis": {"kind": "operating_point"},
+                       "limit": 50}),
+            ),
+        ],
+    );
+    let run = results.pop().unwrap();
+    (results.pop().unwrap(), run)
+}
+
+/// Remove the instance-level `Sim.*` properties from `source`, leaving the
+/// library symbols alone: a part placed the way `main` placed it.
+fn strip_instance_sim_fields(source: &str) -> String {
+    let start = source.find("(lib_symbols").unwrap();
+    let mut depth = 0usize;
+    let mut end = start;
+    for (offset, ch) in source[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + offset + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let (head, mut tail) = source.split_at(end);
+    let mut out = head.to_owned();
+    while let Some(at) = tail.find("(property \"Sim.") {
+        out.push_str(&tail[..at]);
+        let mut depth = 0usize;
+        let mut close = at;
+        for (offset, ch) in tail[at..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = at + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        tail = &tail[close..];
+    }
+    out.push_str(tail);
+    out
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice and its symbol libraries"]
+fn a_part_placed_by_konnect_simulates_as_it_does_when_placed_in_kicad() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let schematic = build_diode_circuit(home.path(), project.path());
+
+    // Both placement paths, and a derived symbol, left the library's fields
+    // on the instance.
+    let saved = std::fs::read_to_string(&schematic).unwrap();
+    let instances = &saved[saved.find("(symbol\n\t\t(lib_id \"Device:D\")").unwrap()..];
+    assert_eq!(
+        instances.matches("(property \"Sim.Device\" \"D\"").count(),
+        3
+    );
+    assert_eq!(
+        instances
+            .matches("(property \"Sim.Pins\" \"1=K 2=A\"")
+            .count(),
+        3
+    );
+
+    let (readiness, run) = operating_point(home.path(), &schematic);
+    assert_eq!(readiness["ready"], true, "{readiness}");
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run["simulated_circuit"], "as_drawn", "{run}");
+    let mid = row(&run, "v(/mid)")["value"].as_f64().unwrap();
+    assert!(
+        (0.4..0.9).contains(&mid),
+        "a forward diode drop, got {mid} V: {run}"
+    );
+    assert!((row(&run, "v(/in)")["value"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice and its symbol libraries"]
+fn negative_control_the_same_circuit_without_the_copied_fields_does_not_simulate() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let schematic = build_diode_circuit(home.path(), project.path());
+    let saved = std::fs::read_to_string(&schematic).unwrap();
+    let stripped = strip_instance_sim_fields(&saved);
+    assert!(stripped.len() < saved.len(), "the control removed nothing");
+    std::fs::write(&schematic, stripped).unwrap();
+
+    let (readiness, run) = operating_point(home.path(), &schematic);
+    assert_eq!(readiness["ready"], false, "{readiness}");
+    let unmodelled: Vec<_> = readiness["unmodelled_symbols"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["reference"].as_str().unwrap())
+        .collect();
+    assert!(
+        unmodelled.contains(&"D1") && unmodelled.contains(&"D2"),
+        "{unmodelled:?}"
+    );
+    assert_eq!(run["error"]["reason"], "unmodelled_symbols", "{run}");
+}

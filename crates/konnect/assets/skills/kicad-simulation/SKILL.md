@@ -300,7 +300,7 @@ BEFZ vbat /rect_out I='ef_ilim*tanh(v(vbat,/rect_out)/(ef_ilim*ef_ron))'
 
 | `suggested_fix` | What to do |
 |---|---|
-| `copy_library_sim_fields` | Copy the `Sim.*` fields from the library symbol with `edit_schematic_component` |
+| `copy_library_sim_fields` | Copy the `Sim.*` fields from the library symbol with `edit_schematic_component`. Parts placed by Konnect now carry them already, so this is for parts placed earlier, by hand or by another tool |
 | `exclude` | The part has no series role. Add it to `testbench.exclude_references` |
 | `replace_series_part` | Removing it would break the path. Add a stand-in through `testbench.spice_lines`, such as the protection blocks above |
 

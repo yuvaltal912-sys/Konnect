@@ -429,6 +429,10 @@ pub struct SymbolMetadata {
     pub footprint: String,
     pub datasheet: String,
     pub description: String,
+    /// The library's `Sim.*` fields as `(name, value)`, in library order.
+    /// KiCad's simulator reads these from the placed instance only, so a
+    /// placement has to copy them (`Sim.Device`, `Sim.Pins`, `Sim.Params`, ...).
+    pub sim_fields: Vec<(String, String)>,
 }
 
 /// Read the metadata fields of `lib_id` from the schematic's embedded symbol.
@@ -448,12 +452,25 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
             .unwrap_or_default()
             .to_string()
     };
+    let mut sim_fields: Vec<(String, String)> = Vec::new();
+    for property in symbol.find_all("property") {
+        let (Some(name), Some(text)) = (
+            property.value(),
+            property.args().get(1).and_then(SexpNode::text),
+        ) else {
+            continue;
+        };
+        if name.starts_with("Sim.") && !sim_fields.iter().any(|(seen, _)| seen == name) {
+            sim_fields.push((name.to_string(), text.to_string()));
+        }
+    }
     SymbolMetadata {
         reference: value("Reference"),
         value: value("Value"),
         footprint: value("Footprint"),
         datasheet: value("Datasheet"),
         description: value("Description"),
+        sim_fields,
     }
 }
 
@@ -979,9 +996,25 @@ mod field_anchor_tests {
                 footprint: "Resistor_THT:R_Axial".to_string(),
                 datasheet: "~".to_string(),
                 description: "Resistor".to_string(),
+                sim_fields: Vec::new(),
             }
         );
         assert_eq!(symbol_metadata(&sch, "Device:C"), SymbolMetadata::default());
+    }
+
+    #[test]
+    fn reads_the_librarys_sim_fields_in_order_from_direct_properties_only() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:D\" (property \"Reference\" \"D\" (at 0 0 0)) (property \"Value\" \"D\" (at 0 0 0)) (property \"Sim.Device\" \"D\" (at 0 0 0) (hide yes)) (property \"Sim.Pins\" \"1=K 2=A\" (at 0 0 0)) (property \"Sim.Device\" \"again\" (at 0 0 0)) (property \"ki_keywords\" \"diode\" (at 0 0 0)) (symbol \"D_0_1\" (property \"Sim.Params\" \"nested\" (at 0 0 0))))",
+        );
+        assert_eq!(
+            symbol_metadata(&sch, "Device:D").sim_fields,
+            vec![
+                ("Sim.Device".to_string(), "D".to_string()),
+                ("Sim.Pins".to_string(), "1=K 2=A".to_string()),
+            ],
+            "library order, first of a repeated name, nothing from a unit sub-symbol or ki_*"
+        );
     }
 
     /// The anchor alone is not enough: `Regulator_Linear:AP2112K-3.3` puts
