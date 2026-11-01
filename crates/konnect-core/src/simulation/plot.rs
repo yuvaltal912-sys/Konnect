@@ -41,8 +41,9 @@ const CHAR_EM: f64 = 0.65;
 /// A span narrower than this share of the largest value is widened to it, so that
 /// noise on a large offset reads as the flat line it is, and its ticks stay apart.
 const MIN_RELATIVE_SPAN: f64 = 1e-6;
-/// Most characters of a tick label before it goes scientific.
-const MAX_TICK_CHARS: usize = 9;
+/// Most characters of a tick label before it goes scientific: a sign, three digits,
+/// the point, and the seven places that the narrowest span a plot allows needs.
+const MAX_TICK_CHARS: usize = 12;
 
 /// Colour-blind safe, after Okabe and Ito, with the pale yellow swapped for a
 /// purple that holds up on white.
@@ -372,10 +373,10 @@ fn widen(lo: f64, hi: f64, log: bool, share: f64) -> (f64, f64) {
     }
 }
 
-/// Cut a trace, already in pixels, to at most two points per pixel column: the
-/// lowest and the highest of each, in the order they occur. A trace that is short
-/// enough is kept whole.
-fn envelope(points: &[(f64, f64)], columns: usize) -> Vec<(f64, f64)> {
+/// Cut a trace, already in pixels, to at most two points per bucket `width` pixels
+/// wide, a pixel column for a width of 1: the lowest and the highest of each, in the
+/// order they occur. A trace that is short enough is kept whole.
+fn envelope(points: &[(f64, f64)], columns: usize, width: f64) -> Vec<(f64, f64)> {
     // A stretch is kept whole only if it is no denser than two points a column of
     // the width it spans, so that many short stretches cannot each pass as small.
     let (first, last) = points
@@ -383,7 +384,8 @@ fn envelope(points: &[(f64, f64)], columns: usize) -> Vec<(f64, f64)> {
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
             (lo.min(p.0), hi.max(p.0))
         });
-    let spanned = ((last - first).max(0.0).floor() as usize + 1).min(columns.max(1) + 1);
+    let spanned = (((last - first).max(0.0) / width).floor() as usize + 1)
+        .min((columns.max(1) as f64 / width) as usize + 1);
     if points.len() <= spanned * POINTS_PER_COLUMN {
         return points.to_vec();
     }
@@ -394,7 +396,7 @@ fn envelope(points: &[(f64, f64)], columns: usize) -> Vec<(f64, f64)> {
             out.push(points[low.max(high)]);
         }
     };
-    let column_of = |x: f64| x.floor() as i64;
+    let column_of = |x: f64| (x / width).floor() as i64;
     let mut column = column_of(points[0].0);
     let (mut low, mut high) = (0usize, 0usize);
     for (index, point) in points.iter().enumerate().skip(1) {
@@ -457,19 +459,21 @@ fn trace(
     }
     plotted.given = runs.iter().map(Vec::len).sum();
     let marked = plotted.given <= MARKED_UP_TO;
-    let mut stretches: Vec<Vec<(f64, f64)>> =
-        runs.iter().map(|run| envelope(run, columns)).collect();
-    // However the stretches fall, a trace holds at most four points a column.
-    let total: usize = stretches.iter().map(Vec::len).sum();
+    let cut = |width: f64| -> Vec<Vec<(f64, f64)>> {
+        runs.iter()
+            .map(|run| envelope(run, columns, width))
+            .collect()
+    };
+    let mut stretches = cut(1.0);
+    // However the stretches fall, a trace holds at most four points a column. If they
+    // are too many together, every stretch is cut again to wider buckets, which keeps
+    // the lowest and highest of each and so keeps a spike.
     let cap = columns.max(1) * POINTS_PER_COLUMN * 2;
-    if total > cap {
-        for kept in &mut stretches {
-            let share = (cap * kept.len() / total).max(2);
-            if kept.len() > share {
-                let step = kept.len().div_ceil(share);
-                *kept = kept.iter().copied().step_by(step).collect();
-            }
-        }
+    let mut width = 1.0;
+    while stretches.iter().map(Vec::len).sum::<usize>() > cap && width <= columns as f64 {
+        let total = stretches.iter().map(Vec::len).sum::<usize>();
+        width *= (total as f64 / cap as f64).ceil().max(2.0);
+        stretches = cut(width);
     }
     for kept in stretches {
         plotted.drawn += kept.len();
@@ -691,9 +695,27 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         (true, false) => prefix_for(x_lo.abs().max(x_hi.abs())),
         _ => (1.0, ""),
     };
+    let x_label_of = |tick: f64, step: f64| match log {
+        true => si(tick),
+        false => tick_text(tick, x_factor, step),
+    };
     let (x_ticks, x_step) = match log {
         true => (log_ticks(x_lo, x_hi, (area / 70.0) as usize), 1.0),
-        false => linear_ticks(x_lo, x_hi, ((area / 90.0) as usize).max(2)),
+        false => {
+            let mut wanted = ((area / 90.0) as usize).max(2);
+            let mut ticks = linear_ticks(x_lo, x_hi, wanted);
+            // Wide labels, such as nine digits on a hair of a span, need more room.
+            let widest = |(ticks, step): &(Vec<f64>, f64)| {
+                let width = |tick: &f64| x_label_of(*tick, *step).chars().count();
+                ticks.iter().map(width).max().unwrap_or(0) as f64 * 11.0 * CHAR_EM
+            };
+            let need = widest(&ticks) * 1.3;
+            if need > area / ticks.0.len().max(1) as f64 {
+                wanted = ((area / need) as usize).max(1);
+                ticks = linear_ticks(x_lo, x_hi, wanted);
+            }
+            ticks
+        }
     };
 
     let (mut points_drawn, mut points_in) = (0usize, 0usize);
@@ -755,16 +777,19 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
                 px(at),
                 px(bottom)
             ));
-            let label = match log {
-                true => si(*tick),
-                false => tick_text(*tick, x_factor, x_step),
+            let label = x_label_of(*tick, x_step);
+            // A label that would run off the right edge ends at it instead.
+            let half = label.chars().count() as f64 * 11.0 * CHAR_EM / 2.0;
+            let (anchor, place) = match at + half > w - 2.0 {
+                true => ("end", w - 2.0),
+                false => ("middle", at),
             };
             text(
                 &mut body,
-                at,
+                place,
                 bottom + 14.0,
                 11.0,
-                "middle",
+                anchor,
                 "normal",
                 &label,
             );
@@ -794,7 +819,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         // The label runs up the panel, so the panel's height is what it must fit.
         let unit = escape(&unit, 16);
         let room = (panel_height / (12.0 * CHAR_EM)) as usize;
-        let name = room.saturating_sub(unit.chars().count() + 3).clamp(4, 40);
+        let name = room.saturating_sub(unit.chars().count() + 4).clamp(4, 40);
         let label = format!("{} ({unit})", escape(&panel.y_label, name));
         let (cx, cy) = (14.0, top + panel_height / 2.0);
         body.push_str(&format!(
@@ -818,7 +843,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         true => escape(&chart.x.label, across.min(MAX_TEXT_CHARS)),
         false => {
             let unit = escape(&x_unit, 16);
-            let name = across.saturating_sub(unit.chars().count() + 3).clamp(4, 40);
+            let name = across.saturating_sub(unit.chars().count() + 4).clamp(4, 40);
             format!("{} ({unit})", escape(&chart.x.label, name))
         }
     };
@@ -1457,9 +1482,10 @@ mod tests {
         assert!(tick_text(1e149, 1e9, 1e148).len() <= 10);
         assert_eq!(tick_text(-17.3, 1e-3, 5.0), "-17300");
         // Past nine characters a label goes scientific rather than crowd the axis.
-        assert_eq!(tick_text(123_456.123, 1.0, 0.001), "1.23e5");
+        assert_eq!(tick_text(123_456.123, 1.0, 0.001), "123456.123");
+        assert_eq!(tick_text(123_456.123_456_7, 1.0, 1e-7), "1.23e5");
         assert_eq!(tick_text(12_345.678, 1.0, 0.001), "12345.678");
-        assert_eq!(tick_text(12_345.678_9, 1.0, 0.0001), "1.23e4");
+        assert_eq!(tick_text(12_345.678_9, 1.0, 0.0001), "12345.6789");
         assert_eq!(tick_text(1234.567, 1.0, 0.001), "1234.567");
         // Ordinary ticks keep their places.
         assert_eq!(tick_text(0.25, 1.0, 0.05), "0.25");
@@ -1809,5 +1835,115 @@ mod tests {
         let top = ys.iter().cloned().fold(f64::INFINITY, f64::min);
         let spikes = ys.iter().filter(|y| (**y - top).abs() < 0.2).count();
         assert!(spikes >= 600, "{spikes} of 700 spikes kept");
+    }
+
+    #[test]
+    fn sweeps_that_share_an_x_range_keep_their_spikes_when_the_trace_is_cut_to_fit() {
+        // Five curves over the same 20,000 samples, each with one narrow spike, apart by
+        // NaN: together far over four points a column.
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for sweep in 0..5 {
+            for point in 0..20_000 {
+                x.push(f64::from(point));
+                y.push(if point == 12_345 {
+                    10.0 + f64::from(sweep)
+                } else {
+                    0.0
+                });
+            }
+            x.push(0.0);
+            y.push(f64::NAN);
+        }
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        assert!(drawn.points_drawn <= 4 * 707, "{}", drawn.points_drawn);
+        let document = Document::parse(&drawn.svg).unwrap();
+        let lines: Vec<Vec<f64>> = document
+            .descendants()
+            .filter(|n| n.has_tag_name("polyline"))
+            .map(|n| {
+                n.attribute("points")
+                    .unwrap()
+                    .split(' ')
+                    .map(|p| p.split(',').nth(1).unwrap().parse().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(lines.len(), 5);
+        // The pixel row of the highest spike is the least y of any, and every
+        // curve's own spike stands out of its flat line by a good margin.
+        for (sweep, ys) in lines.iter().enumerate() {
+            let top = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+            let flat = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                flat - top > 20.0,
+                "curve {sweep} lost its spike: {top} {flat}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_values_near_the_span_floor_still_have_ticks_that_tell_apart() {
+        let y = vec![-3.3, -3.300004, -3.3, -3.300004];
+        let drawn = render(&chart(vec![panel(vec![line(
+            0,
+            vec![0.0, 1.0, 2.0, 3.0],
+            y,
+        )])]));
+        let labels: Vec<String> = texts(&drawn.svg)
+            .into_iter()
+            .filter(|t| t.starts_with("-3."))
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = labels.iter().collect();
+        assert!(
+            labels.len() >= 3 && distinct.len() == labels.len(),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn nine_digit_x_labels_on_a_hair_of_a_span_keep_clear_of_each_other_and_the_edge() {
+        for width in [MIN_WIDTH, 260, 320, 800] {
+            let mut hair = chart(vec![panel(vec![line(
+                0,
+                vec![1.2490828, 1.2490828 + 1e-9],
+                vec![0.0, 1.0],
+            )])]);
+            hair.width = width;
+            hair.x.unit = "s".into();
+            assert_laid_out(&render(&hair), &format!("width {width}"));
+        }
+    }
+
+    #[test]
+    fn a_label_up_a_panel_is_no_taller_than_the_panel() {
+        let mut long = chart(vec![
+            Panel {
+                y_label: "Y".repeat(80),
+                y_unit: "uV".into(),
+                ..panel(vec![sine(20)])
+            },
+            Panel {
+                y_label: "Z".repeat(80),
+                ..panel(vec![sine(20)])
+            },
+        ]);
+        long.width = 800;
+        let two = text_boxes(&render(&long).svg);
+        // Rotated texts are as wide as their font is high.
+        let rotated: Vec<_> = two
+            .iter()
+            .filter(|b| (b.2 - b.1 - 12.0).abs() < 0.01)
+            .collect();
+        assert_eq!(rotated.len(), 2);
+        for label in rotated {
+            assert!(label.4 - label.3 <= PANEL_HEIGHT, "{label:?}");
+        }
+        long.panels.truncate(1);
+        let one = text_boxes(&render(&long).svg);
+        let label = one
+            .iter()
+            .find(|b| (b.2 - b.1 - 12.0).abs() < 0.01)
+            .unwrap();
+        assert!(label.4 - label.3 <= SINGLE_PANEL_HEIGHT, "{label:?}");
     }
 }
