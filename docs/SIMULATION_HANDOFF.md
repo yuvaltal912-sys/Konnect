@@ -7,7 +7,7 @@ The current state of the simulation work. Anyone picking this up, human or agent
 ## Start here
 
 1. Read `AGENTS.md` for the rules.
-2. Create the branch under "Now".
+2. Create a branch from `main` for the work, unless "Now" names an open one to continue.
 3. Read the "Now" list, then the sections of `docs/SIMULATION_PLAN.md` it names.
 4. Run the gate before changing anything, so you know the baseline.
 5. If a step here cannot run in your environment, such as `gh`, a push or the KiCad library, say so. Never skip it silently.
@@ -45,16 +45,17 @@ PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. T
 | 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
 | Fix | to be filled in | `fix/simulation-false-refusals` | Open, waiting for the owner |
 
-## Now: PR 1 to 11 are merged, and the simulation toolset is complete
+## Now: PR 1 to 11 are merged, and one small fix is open
 
-PR 11 added `plot_simulation_run`, the last tool of the plan's v1, and is merged. One small PR is open: `fix/simulation-false-refusals`, below. Ask the owner before merging it, and before starting any follow-up. The "After PR 11" table lists what is left.
+PR 11 added `plot_simulation_run`, the last tool of the plan's PR series, and is merged. The one open PR is `fix/simulation-false-refusals`, below. Ask the owner before merging it, and before starting any follow-up. The placement fix, still not started, is the only part of v1 left; the "After PR 11" table lists it and the rest.
 
 ### What the false-refusal fix changed
 
-- **`.ic` and `.nodeset` inside a `.subckt` are no longer read as circuit nodes.** `read_definitions` in `element.rs` records initial-condition nodes only at depth 0, since a subcircuit's names are its own. Before, such a card was refused as `unknown_testbench_node` (testbench) or warned as `unknown_initial_node` (schematic). A top-level `.ic` is checked as before, including after a `.ends`.
-- **A file the testbench includes now counts through its top-level elements.** `Circuit::word_cards` also counts a depth-0 element card that came from the testbench's included file. A model line in that file, a subcircuit body and a library the schematic includes still do not, so a typo cannot be excused by a model parameter that shares its spelling. A typo inside the included file is still refused.
+- **`.ic` and `.nodeset` inside a `.subckt` or `.macro` are judged against that body, not against the circuit's nets.** `read_definitions` in `element.rs` records initial-condition nodes at depth 0 only. `read` records the others per subcircuit, and `Circuit::unknown_subcircuit_initial_nodes` accepts a node that is a pin, a body element's node, ground, a `.global`, or `xN.name`, and does not judge a body holding a line the reader could not place. A typo inside a subcircuit is still refused (testbench) or warned `unknown_initial_node` (schematic). Before, every such card was flagged, the correct ones too.
+- **A file the testbench includes now counts through the nodes of its top-level elements.** `read` adds each such element's nodes to `word_cards`. A value, a model name, a parameter, an element name, a model line, a subcircuit body, a library the schematic includes, and an element inside an `.if` block do not count. A typo inside the included file is still refused.
+- **Left as limits:** the testbench's own lines still count every word on a card (as before), and an included element inside an `.if` is never counted, so a circuit that needs one stays refused. The same file included twice passes `testbench_nodes`, and `element_names` reports the duplicate.
 - `flatten.rs` is unchanged. The flat deck is the same, so this is only a change in what preflight judges.
-- **Not tested against the engine:** that ngspice applies a `.ic` written inside a subcircuit is taken from the earlier finding, and no live run was made here.
+- **Run against the engine by the PR's reviewer, not by the tests:** libngspice 44.2 applies a `.ic` written inside a subcircuit (`v(x1.int)` read 1 with it, 0 without) and logs "IC on non-existent node" for a mistyped one.
 
 ### What PR 11 changed that later work needs to know
 

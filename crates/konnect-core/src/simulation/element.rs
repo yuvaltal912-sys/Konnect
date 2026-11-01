@@ -247,6 +247,10 @@ pub(crate) struct Circuit {
     pub testbench_initial_nodes: Vec<String>,
     /// The same from the schematic.
     pub netlist_initial_nodes: Vec<String>,
+    /// `.ic` and `.nodeset` nodes inside a subcircuit: its name, whether the
+    /// testbench wrote it, and the node. They are the body's own, so they are
+    /// judged against the body and not against the circuit's nets.
+    subcircuit_initial_nodes: Vec<(String, bool, String)>,
     /// Cards as the schematic or testbench wrote them, not from included files.
     pub netlist_cards: Vec<String>,
     /// KiCad's generated models that carry no parameters at all.
@@ -264,6 +268,34 @@ pub(crate) struct Circuit {
 impl Circuit {
     pub(crate) fn cards_naming(&self, word: &str) -> usize {
         self.word_cards.get(word).copied().unwrap_or(0)
+    }
+
+    /// Nodes that a `.ic` or `.nodeset` inside a subcircuit names, and that the
+    /// body, its pins, `.global` and ground do not. ngspice drops these without
+    /// saying so. A body with a line the reader could not place is not judged.
+    pub(crate) fn unknown_subcircuit_initial_nodes(&self, from_testbench: bool) -> Vec<String> {
+        self.subcircuit_initial_nodes
+            .iter()
+            .filter(|(_, written_by_testbench, _)| *written_by_testbench == from_testbench)
+            .filter(|(name, _, node)| {
+                let Some(body) = self.subcircuits.get(name) else {
+                    return false;
+                };
+                let inside = || {
+                    body.pins.iter().any(|pin| pin.eq_ignore_ascii_case(node))
+                        || body.body.iter().any(|element| element.nodes.contains(node))
+                };
+                let reaches_inner = node
+                    .split_once('.')
+                    .is_some_and(|(call, _)| call.starts_with('x'));
+                !(body.unread
+                    || is_ground(node)
+                    || self.globals.contains(node)
+                    || reaches_inner
+                    || inside())
+            })
+            .map(|(_, _, node)| node.clone())
+            .collect()
     }
     pub(crate) fn touches_ground(&self, element: &Element) -> bool {
         element.kind == 'a'
@@ -443,11 +475,7 @@ pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
         } else if word.starts_with(".ends") || word == ".eom" {
             depth = depth.saturating_sub(1);
         }
-        // A file the testbench includes counts through its elements. A library's
-        // models and the schematic's own includes do not, so a model parameter
-        // sharing a typo's spelling cannot make it look deliberate.
-        let names_nodes = !card.included || (card.from_testbench && !word.starts_with('.'));
-        if (names_nodes && depth == 0) || word == ".global" {
+        if (!card.included && depth == 0) || word == ".global" {
             count_words(&card.text, &mut circuit.word_cards);
         }
         if !card.included && !word.starts_with(".subckt") {
@@ -458,6 +486,7 @@ pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
     }
 
     let mut open: Vec<(String, HashSet<String>)> = Vec::new();
+    let mut if_depth = 0usize;
     for card in &cards {
         let words = tokens(&card.text);
         let Some(first) = words.first() else {
@@ -472,6 +501,21 @@ pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
         } else if word.starts_with(".ends") || word == ".eom" {
             open.pop();
         } else if word.starts_with('.') {
+            if word == ".if" {
+                if_depth += 1;
+            } else if word.starts_with(".endif") {
+                if_depth = if_depth.saturating_sub(1);
+            } else if word == ".ic" || word == ".nodeset" {
+                if let Some((name, _)) = open.last() {
+                    let mut nodes = Vec::new();
+                    read_initial_nodes(&card.text, &mut nodes);
+                    circuit.subcircuit_initial_nodes.extend(
+                        nodes
+                            .into_iter()
+                            .map(|node| (name.clone(), card.from_testbench, node)),
+                    );
+                }
+            }
             continue;
         } else if let Some((name, pins)) = open.last() {
             read_body_element(&words, name.clone(), &pins.clone(), &mut circuit);
@@ -481,6 +525,15 @@ pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
                     if matches!(element.kind, 'a' | 'n') {
                         let model = element.args.first().map(|name| name.to_lowercase());
                         circuit.code_models_used.extend(model);
+                    }
+                    // A file the testbench includes counts through the nodes of its
+                    // elements, as the testbench's own lines do. A value or a model
+                    // name does not name a node, and a branch the engine may not
+                    // take proves nothing.
+                    if card.included && card.from_testbench && if_depth == 0 {
+                        for node in element.nodes.iter().collect::<HashSet<_>>() {
+                            *circuit.word_cards.entry(node.clone()).or_default() += 1;
+                        }
                     }
                     circuit.elements.push(element);
                 }
