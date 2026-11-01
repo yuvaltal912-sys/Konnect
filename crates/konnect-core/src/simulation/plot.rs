@@ -665,7 +665,10 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
     let (mut points_drawn, mut points_in) = (0usize, 0usize);
     for (panel, axis) in chart.panels.iter().zip(&y_axes) {
         if !panel.title.is_empty() {
-            let fits = (((w - left) / 7.2) as usize).clamp(8, MAX_TEXT_CHARS);
+            // One character less, for the ellipsis a cut adds.
+            let fits = (((w - left) / 7.2) as usize)
+                .saturating_sub(1)
+                .clamp(8, MAX_TEXT_CHARS);
             let title = escape(&panel.title, fits);
             text(&mut body, left, y + 14.0, 12.0, "start", "bold", &title);
         }
@@ -1507,11 +1510,84 @@ mod tests {
             }
             for (i, a) in boxes.iter().enumerate() {
                 for b in &boxes[i + 1..] {
-                    let across = a.1 < b.2 - 0.5 && b.1 < a.2 - 0.5;
-                    let down = a.3 < b.4 - 0.5 && b.3 < a.4 - 0.5;
+                    let across = a.1 < b.2 - 0.05 && b.1 < a.2 - 0.05;
+                    let down = a.3 < b.4 - 0.05 && b.3 < a.4 - 0.05;
                     assert!(!(across && down), "{:?} overlaps {:?} at {width} px", a, b);
                 }
             }
+            // Text and boxes: the banner holds its own lines whole and nothing else, and no
+            // text is drawn inside a plot frame.
+            let document = Document::parse(&drawn.svg).unwrap();
+            let rects: Vec<(String, f64, f64, f64, f64)> = document
+                .descendants()
+                .filter(|node| node.has_tag_name("rect") && node.attribute("x").is_some())
+                .map(|node| {
+                    let n = |name: &str| node.attribute(name).unwrap().parse::<f64>().unwrap();
+                    let fill = node.attribute("fill").unwrap().to_string();
+                    (
+                        fill,
+                        n("x"),
+                        n("x") + n("width"),
+                        n("y"),
+                        n("y") + n("height"),
+                    )
+                })
+                .collect();
+            let banner_lines: Vec<String> = document
+                .descendants()
+                .filter(|node| {
+                    node.has_tag_name("text") && node.attribute("fill") == Some("#4A3000")
+                })
+                .map(|node| node.text().unwrap_or_default().to_string())
+                .collect();
+            assert!(banner_lines.len() >= 2, "{banner_lines:?}");
+            let banner: Vec<_> = rects.iter().filter(|r| r.0 == "#FFF3CD").collect();
+            let frames: Vec<_> = rects.iter().filter(|r| r.0 == "#FFFFFF").collect();
+            assert_eq!(banner.len(), 1);
+            assert_eq!(frames.len(), 2);
+            for (text, left, right, top, bottom) in &boxes {
+                let meets = |r: &&(String, f64, f64, f64, f64)| {
+                    *left < r.2 && r.1 < *right && *top < r.4 && r.3 < *bottom
+                };
+                let inside = |r: &&(String, f64, f64, f64, f64)| {
+                    *left >= r.1 && *right <= r.2 && *top >= r.3 && *bottom <= r.4
+                };
+                let is_banner_line = banner_lines.contains(text);
+                let in_banner = banner.iter().any(inside);
+                assert_eq!(in_banner, is_banner_line, "{text:?} at {width} px");
+                assert!(
+                    !(banner.iter().any(meets) && !in_banner),
+                    "{text:?} crosses the banner at {width} px"
+                );
+                assert!(
+                    !frames.iter().any(meets),
+                    "{text:?} is drawn inside a plot at {width} px"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn stretches_of_one_point_among_gaps_are_marks_and_a_title_fits_the_narrowest_picture() {
+        // Fifty single points, more than a line a column cannot be, and more than the
+        // forty a short trace gets marks for.
+        let x: Vec<f64> = (0..100).map(f64::from).collect();
+        let y: Vec<f64> = (0..100)
+            .map(|i| if i % 2 == 0 { f64::NAN } else { f64::from(i) })
+            .collect();
+        let lone = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        assert_eq!(lone.svg.matches("<circle").count(), 50);
+        // A panel title as long as a title may be, at the narrowest.
+        let mut narrow = chart(vec![
+            Panel {
+                title: "t".repeat(64),
+                ..panel(vec![sine(10)])
+            },
+            panel(vec![sine(10)]),
+        ]);
+        narrow.width = MIN_WIDTH;
+        let boxes = text_boxes(&render(&narrow).svg);
+        let title = boxes.iter().find(|b| b.0.starts_with("ttt")).unwrap();
+        assert!(title.2 <= f64::from(MIN_WIDTH), "{title:?}");
     }
 }

@@ -6916,6 +6916,24 @@ mod tests {
             assert!(!PathBuf::from(&half).exists());
         }
 
+        #[tokio::test]
+        async fn a_folder_that_cannot_be_listed_after_the_write_does_not_fail_the_plot() {
+            use std::os::unix::fs::PermissionsExt;
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            // Write and search, no read: the plot can be made and the folder not scanned.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!failed, "{body}");
+            assert!(PathBuf::from(body["path"].as_str().unwrap()).is_file());
+        }
+
         #[test]
         fn a_variable_shorter_than_the_plot_is_cut_to_pair_with_its_own_axis() {
             let (x, y) = plots::paired(&[0.0, 1.0, 2.0], &[5.0, 6.0]);
