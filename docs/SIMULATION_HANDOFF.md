@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-01, with PR 1 to 11 and both follow-up fixes merged to `main`, and the `replace_component` fix open on `fix/replace-component-sim-fields`.
+**Last updated:** 2026-11-01, with PR 1 to 11 and the three follow-up fixes merged to `main`.
 
 ## Start here
 
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11 and the two fixes after them are merged to `main` on the `fork` remote, each as a merge commit.
+PRs 1 to 11 and the three fixes after them are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -45,11 +45,11 @@ PRs 1 to 11 and the two fixes after them are merged to `main` on the `fork` remo
 | 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
 | Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Merged as `d6f0d51` |
 | Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
-| Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Open, waiting for the owner |
+| Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Merged as `5d5eeb5` |
 
 ## Now: the plan's v1 is merged
 
-PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. The `replace_component` fix is open as #13. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
+PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. The `replace_component` fix is merged too. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
 
 ### What the placement fix changed that later work needs to know
 
