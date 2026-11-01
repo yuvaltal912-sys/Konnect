@@ -1022,6 +1022,14 @@ mod tests {
             drawn.points_in, 4,
             "zero and negative frequency are dropped"
         );
+        assert!(!drawn.svg.contains("NaN") && !drawn.svg.contains("inf"));
+        // The axis starts at the first frequency that has a logarithm, at the left edge.
+        let first = drawn.svg.find("<polyline").unwrap();
+        assert!(
+            drawn.svg[first..].contains("points=\"76.0,"),
+            "{}",
+            &drawn.svg[first..]
+        );
         let shown = texts(&drawn.svg);
         for label in ["1", "10", "100", "1k", "Frequency (Hz)"] {
             assert!(shown.iter().any(|t| t == label), "{label} in {shown:?}");
