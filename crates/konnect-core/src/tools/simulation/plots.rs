@@ -183,6 +183,11 @@ fn transient(opened: &Opened, plot: &Plot, found: &[Found]) -> Result<Drawing, C
     })
 }
 
+/// The lower of the frequency so far, if any, and `at`.
+pub(super) fn earlier(so_far: Option<f64>, at: f64) -> Option<f64> {
+    Some(so_far.map_or(at, |first| first.min(at)))
+}
+
 fn bode(plot: &Plot, found: &[Found], ac: &super::sweeps::Ac) -> Result<Drawing, String> {
     let freq: Vec<f64> = plot
         .variable("frequency")
@@ -213,7 +218,7 @@ fn bode(plot: &Plot, found: &[Found], ac: &super::sweeps::Ac) -> Result<Drawing,
             y: degrees.to_vec(),
         });
         if let Some(from) = from {
-            doubtful = Some(doubtful.map_or(freq[from], |at| at.min(freq[from])));
+            doubtful = earlier(doubtful, freq[from]);
         }
     }
     let mut notes = vec![
@@ -428,7 +433,7 @@ fn kind_title(analysis: &Analysis) -> &'static str {
 
 /// The file's name: a short hash of what was asked, so asking again replaces the
 /// plot, and the folder cannot fill by repetition.
-fn file_name(signals: &[String], width: u32) -> String {
+pub(super) fn file_name(signals: &[String], width: u32) -> String {
     let mut hasher = Sha256::new();
     for signal in signals {
         hasher.update(signal.as_bytes());
@@ -443,7 +448,9 @@ fn file_name(signals: &[String], width: u32) -> String {
 fn is_plot_name(name: &str) -> bool {
     name.strip_prefix(PLOT_PREFIX)
         .and_then(|rest| rest.strip_suffix(PLOT_SUFFIX))
-        .is_some_and(|hex| hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .is_some_and(|hex| {
+            hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }
 
 /// Write the plot into the run's folder, replacing the same request's earlier file
@@ -461,13 +468,14 @@ fn write_plot(dir: &Path, name: &str, svg: &str) -> std::io::Result<u64> {
     let partial = dir.join(format!("{name}.partial"));
     if let Ok(meta) = std::fs::symlink_metadata(&partial) {
         // A recent half file is another call of the same request, writing now. An old
-        // one is a crash's, and nothing else is ever taken over.
+        // one is a crash's, and so is one dated in the future, which no call is writing.
+        // Nothing but a plain file is ever taken over.
         let old = meta.is_file()
             && meta
                 .modified()
                 .ok()
                 .and_then(|made| made.elapsed().ok())
-                .is_some_and(|age| age > STALE_PARTIAL);
+                .is_none_or(|age| age > STALE_PARTIAL);
         if !old {
             return Err(std::io::ErrorKind::AlreadyExists.into());
         }
@@ -485,7 +493,9 @@ fn write_plot(dir: &Path, name: &str, svg: &str) -> std::io::Result<u64> {
     }
     // The new plot is in place before an old one goes, and one another call already
     // removed is not an error.
-    let mut others: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)?
+    let mut others: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
         .flatten()
         .filter(|entry| entry.file_name().to_str().is_some_and(is_plot_name))
         .filter(|entry| entry.path() != target)

@@ -6766,6 +6766,157 @@ mod tests {
         }
 
         #[test]
+        fn the_file_name_tells_apart_signal_lists_that_join_to_the_same_text() {
+            let name = |signals: &[&str], width| {
+                let signals: Vec<String> = signals.iter().map(|s| s.to_string()).collect();
+                plots::file_name(&signals, width)
+            };
+            assert_ne!(name(&["ab", "c"], 800), name(&["a", "bc"], 800));
+            assert_ne!(name(&["v(a)"], 800), name(&["v(a)"], 801));
+            assert_eq!(name(&["v(a)"], 800), name(&["v(a)"], 800));
+            assert!(
+                name(&["v(a)"], 800).starts_with("plot-") && name(&["v(a)"], 800).ends_with(".svg")
+            );
+            // The lowest of the frequencies a phase turned too far at, across signals.
+            assert_eq!(plots::earlier(None, 50.0), Some(50.0));
+            assert_eq!(plots::earlier(Some(50.0), 10.0), Some(10.0));
+            assert_eq!(plots::earlier(Some(10.0), 50.0), Some(10.0));
+        }
+
+        #[tokio::test]
+        async fn every_signal_keeps_its_colour_in_the_legend_and_on_the_curve() {
+            let raw = copy_ac(&low_pass(&[
+                1.0, 2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0, 64.0, 100.0,
+            ]));
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                ac_args(&scene.root, json!({ "points": 1, "scale": "decade" })),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)", "v(a,0)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+            let strokes = |tag: &str| -> Vec<String> {
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name(tag))
+                    .filter(|node| tag != "line" || node.attribute("stroke-width") == Some("3"))
+                    .filter_map(|node| node.attribute("stroke").map(str::to_string))
+                    .collect()
+            };
+            // Two signals in a gain and a phase panel: the curves are in signal order
+            // in each, and the legend repeats the same two colours.
+            let curves = strokes("polyline");
+            assert_eq!(
+                curves,
+                [
+                    plot::CATEGORICAL[0],
+                    plot::CATEGORICAL[1],
+                    plot::CATEGORICAL[0],
+                    plot::CATEGORICAL[1]
+                ]
+            );
+            assert_eq!(
+                strokes("line"),
+                [plot::CATEGORICAL[0], plot::CATEGORICAL[1]]
+            );
+
+            // Two sweeps: the swatches are the colours of the curves they name.
+            let scene = self::scene(&grid_job(3, 3));
+            let run = run_of(&scene, grid_args(&scene.root, 3, 3)).await;
+            let (_, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            let svg = svg_of(&body);
+            let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+            let strokes = |tag: &str| -> Vec<String> {
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name(tag))
+                    .filter(|node| tag != "line" || node.attribute("stroke-width") == Some("3"))
+                    .filter_map(|node| node.attribute("stroke").map(str::to_string))
+                    .collect()
+            };
+            assert_eq!(strokes("line"), strokes("polyline"));
+        }
+
+        #[tokio::test]
+        async fn a_link_a_folder_and_a_capital_hex_name_in_the_run_folder_are_never_pruned() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let id = run["run_id"].clone();
+            let dir = first_run_dir(&scene);
+            let outside = scene.tools.path().join("precious");
+            std::fs::write(&outside, "keep").unwrap();
+            std::fs::create_dir(dir.join("plot-aaaaaaaaaaaa.svg")).unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("plot-bbbbbbbbbbbb.svg")).unwrap();
+            std::fs::write(dir.join("plot-ABCDEF012345.svg"), "mine").unwrap();
+            for width in 300..330 {
+                let (failed, body) = plotted(
+                    &scene,
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": width }),
+                )
+                .await;
+                assert!(!failed, "{body}");
+            }
+            assert!(dir.join("plot-aaaaaaaaaaaa.svg").is_dir());
+            assert!(dir.join("plot-bbbbbbbbbbbb.svg").is_symlink());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("plot-ABCDEF012345.svg")).unwrap(),
+                "mine"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_name_of_a_signal_that_is_not_there_is_cut_before_it_is_repeated() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let long = format!("v({})", "x".repeat(5000));
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": [long] }),
+            )
+            .await;
+            refused(failed, &body, "invalid_argument", "signals[0]");
+            assert!(
+                body["error"]["reason"].as_str().unwrap().len() < 200,
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_half_file_dated_in_the_future_is_treated_as_a_crashs() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"], "signals": ["v(a)"] });
+            let (_, first) = plotted(&scene, ask.clone()).await;
+            let path = PathBuf::from(first["path"].as_str().unwrap());
+            let mut half = path.clone().into_os_string();
+            half.push(".partial");
+            std::fs::write(&half, "junk").unwrap();
+            let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&half)
+                .unwrap()
+                .set_modified(future)
+                .unwrap();
+            let (failed, body) = plotted(&scene, ask).await;
+            assert!(!failed, "{body}");
+            assert!(!PathBuf::from(&half).exists());
+        }
+
+        #[test]
         fn a_variable_shorter_than_the_plot_is_cut_to_pair_with_its_own_axis() {
             let (x, y) = plots::paired(&[0.0, 1.0, 2.0], &[5.0, 6.0]);
             assert_eq!((x, y), (vec![0.0, 1.0], vec![5.0, 6.0]));

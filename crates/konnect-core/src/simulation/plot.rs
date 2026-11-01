@@ -430,6 +430,11 @@ fn trace(
     if !run.is_empty() {
         runs.push(run);
     }
+    // Data riddled with gaps would give a line for each stretch between them, and the
+    // file would grow with the gaps. Past a line for each column, the gaps are bridged.
+    if runs.len() > columns.max(1) {
+        runs = vec![runs.into_iter().flatten().collect()];
+    }
     plotted.given = runs.iter().map(Vec::len).sum();
     let marked = plotted.given <= MARKED_UP_TO;
     for run in runs {
@@ -446,7 +451,8 @@ fn trace(
                 list.join(" ")
             ));
         }
-        if marked {
+        // A stretch of one point has no line, and is still data.
+        if marked || kept.len() == 1 {
             for (x, y) in &kept {
                 svg.push_str(&format!(
                     "<circle cx=\"{}\" cy=\"{}\" r=\"2.5\" fill=\"{colour}\"/>\n",
@@ -459,10 +465,45 @@ fn trace(
     plotted
 }
 
+/// What a panel's y axis shows: its span, its prefix and its ticks.
+struct YAxis {
+    lo: f64,
+    hi: f64,
+    factor: f64,
+    prefix: &'static str,
+    ticks: Vec<f64>,
+    step: f64,
+}
+
+fn y_axis(panel: &Panel, panel_height: f64) -> YAxis {
+    let span = extent(panel.series.iter().flat_map(|s| s.y.iter().copied()), false);
+    let (lo, hi) = span.map_or((0.0, 1.0), |(lo, hi)| widen(lo, hi, false, 0.06));
+    let (factor, prefix) = match panel.y_si {
+        true => prefix_for(lo.abs().max(hi.abs())),
+        false => (1.0, ""),
+    };
+    let (ticks, step) = linear_ticks(lo, hi, ((panel_height / 40.0) as usize).max(2));
+    YAxis {
+        lo,
+        hi,
+        factor,
+        prefix,
+        ticks,
+        step,
+    }
+}
+
 fn tick_text(value: f64, factor: f64, step: f64) -> String {
     let scaled = value / factor;
     let unit_step = step / factor;
-    let places = (-unit_step.log10().floor()).clamp(0.0, 9.0) as usize;
+    // Ticks a hair apart, or past a billion, would be a dozen digits wide.
+    if scaled == 0.0 && unit_step < 1e-6 {
+        return "0".to_string();
+    }
+    if scaled != 0.0 && (scaled.abs() >= 1e9 || unit_step < 1e-6) {
+        return format!("{scaled:.3e}");
+    }
+    let places = (-unit_step.log10().floor()).clamp(0.0, 6.0) as usize;
     let text = format!("{scaled:.places$}");
     match text
         .trim_start_matches('-')
@@ -487,7 +528,29 @@ fn text(svg: &mut String, x: f64, y: f64, size: f64, anchor: &str, weight: &str,
 pub(crate) fn render(chart: &Chart) -> Rendered {
     let width = chart.width.clamp(MIN_WIDTH, MAX_WIDTH);
     let w = f64::from(width);
-    let left = MARGIN_LEFT.min(w * 0.3);
+    let panel_height = if chart.panels.len() == 1 {
+        SINGLE_PANEL_HEIGHT
+    } else {
+        PANEL_HEIGHT
+    };
+    let y_axes: Vec<YAxis> = chart
+        .panels
+        .iter()
+        .map(|panel| y_axis(panel, panel_height))
+        .collect();
+    // The left margin holds the y tick labels, however long they are, and the
+    // rotated axis label beyond them.
+    let widest = y_axes
+        .iter()
+        .flat_map(|axis| {
+            let label = |tick: &f64| tick_text(*tick, axis.factor, axis.step).chars().count();
+            axis.ticks.iter().map(label)
+        })
+        .max()
+        .unwrap_or(0);
+    let left = (28.0 + widest as f64 * 11.0 * 0.6 + 6.0)
+        .max(MARGIN_LEFT)
+        .min(w * 0.45);
     let area = (w - left - MARGIN_RIGHT).max(40.0);
     let columns = area.floor() as usize;
     let mut body = String::new();
@@ -599,22 +662,16 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         false => linear_ticks(x_lo, x_hi, ((area / 90.0) as usize).max(2)),
     };
 
-    let single = chart.panels.len() == 1;
-    let panel_height = if single {
-        SINGLE_PANEL_HEIGHT
-    } else {
-        PANEL_HEIGHT
-    };
     let (mut points_drawn, mut points_in) = (0usize, 0usize);
-    for panel in &chart.panels {
+    for (panel, axis) in chart.panels.iter().zip(&y_axes) {
         if !panel.title.is_empty() {
-            let title = escape(&panel.title, MAX_TEXT_CHARS);
+            let fits = (((w - left) / 7.2) as usize).clamp(8, MAX_TEXT_CHARS);
+            let title = escape(&panel.title, fits);
             text(&mut body, left, y + 14.0, 12.0, "start", "bold", &title);
         }
         let top = y + PANEL_TITLE;
         let bottom = top + panel_height;
-        let y_span = extent(panel.series.iter().flat_map(|s| s.y.iter().copied()), false);
-        let (y_lo, y_hi) = y_span.map_or((0.0, 1.0), |(lo, hi)| widen(lo, hi, false, 0.06));
+        let (y_lo, y_hi) = (axis.lo, axis.hi);
         let ys = Map {
             lo: y_lo,
             hi: y_hi,
@@ -622,11 +679,8 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
             from: bottom,
             to: top,
         };
-        let (y_factor, y_prefix) = match panel.y_si {
-            true => prefix_for(y_lo.abs().max(y_hi.abs())),
-            false => (1.0, ""),
-        };
-        let (y_ticks, y_step) = linear_ticks(y_lo, y_hi, ((panel_height / 40.0) as usize).max(2));
+        let (y_factor, y_prefix, y_step) = (axis.factor, axis.prefix, axis.step);
+        let y_ticks = &axis.ticks;
 
         body.push_str(&format!(
             "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#FFFFFF\" \
@@ -636,7 +690,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
             px(area),
             px(panel_height)
         ));
-        for tick in &y_ticks {
+        for tick in y_ticks {
             let at = ys.at(*tick);
             body.push_str(&format!(
                 "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#E2E2E2\"/>\n",
@@ -1311,5 +1365,153 @@ mod tests {
         assert_eq!(plain(100.0), "100");
         assert_eq!(plain(-2.25), "-2.25");
         assert_eq!(escape("a\u{061C}b", 64), "a b");
+    }
+
+    #[test]
+    fn data_riddled_with_gaps_is_still_bounded_and_every_stretch_still_shows() {
+        let n = 300_000;
+        let x: Vec<f64> = (0..n).map(f64::from).collect();
+        let every_third: Vec<f64> = (0..n)
+            .map(|i| {
+                if i % 3 == 0 {
+                    f64::NAN
+                } else {
+                    f64::from(i % 5)
+                }
+            })
+            .collect();
+        let drawn = render(&chart(vec![panel(vec![line(0, x.clone(), every_third)])]));
+        assert!(drawn.svg.len() < 200_000, "{} bytes", drawn.svg.len());
+        // Every other sample gone: a stretch of one point is data, and is drawn.
+        let every_second: Vec<f64> = (0..n)
+            .map(|i| if i % 2 == 0 { f64::NAN } else { 1.0 })
+            .collect();
+        let sparse = render(&chart(vec![panel(vec![line(0, x, every_second)])]));
+        assert!(sparse.svg.len() < 200_000, "{} bytes", sparse.svg.len());
+        assert!(sparse.svg.contains("<polyline"));
+        // A few isolated points are marks, since a line of one point is nothing.
+        let few = render(&chart(vec![panel(vec![line(
+            0,
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            vec![1.0, f64::NAN, 2.0, f64::NAN, 3.0],
+        )])]));
+        assert_eq!(few.svg.matches("<circle").count(), 3);
+    }
+
+    #[test]
+    fn a_tick_label_is_never_wider_than_a_few_characters_whatever_the_span() {
+        // A 5 V rail with a femtoamp of noise: ticks a hair apart.
+        assert!(tick_text(5.000000000000001, 1.0, 1e-15).len() <= 10);
+        assert_eq!(tick_text(0.0, 1.0, 1e-15), "0");
+        // A value near the limit of what is plotted.
+        assert!(tick_text(1e149, 1e9, 1e148).len() <= 10);
+        assert_eq!(tick_text(-17.3, 1e-3, 5.0), "-17300");
+        // Ordinary ticks keep their places.
+        assert_eq!(tick_text(0.25, 1.0, 0.05), "0.25");
+        assert_eq!(tick_text(2.0, 1.0, 1.0), "2");
+        let mut offset = chart(vec![panel(vec![line(
+            0,
+            vec![0.0, 1.0, 2.0],
+            vec![5.0, 5.0 + 1e-15, 5.0],
+        )])]);
+        offset.width = MIN_WIDTH;
+        let drawn = render(&offset);
+        assert!(
+            texts(&drawn.svg).iter().all(|t| t.len() < 40),
+            "{:?}",
+            texts(&drawn.svg)
+        );
+    }
+
+    /// Where a text sits, as a viewer would put it, with the width estimated at
+    /// 0.6 em a character: its left, right, top and bottom.
+    fn text_boxes(svg: &str) -> Vec<(String, f64, f64, f64, f64)> {
+        let document = Document::parse(svg).unwrap();
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name("text"))
+            .map(|node| {
+                let number = |name: &str| node.attribute(name).and_then(|v| v.parse::<f64>().ok());
+                let text = node.text().unwrap_or_default().to_string();
+                let (x, y, size) = (
+                    number("x").unwrap(),
+                    number("y").unwrap(),
+                    number("font-size").unwrap(),
+                );
+                let width = text.chars().count() as f64 * size * 0.6;
+                let rotated = node.attribute("transform").is_some();
+                let (w, h) = if rotated {
+                    (size, width)
+                } else {
+                    (width, size)
+                };
+                let left = match (node.attribute("text-anchor"), rotated) {
+                    (_, true) => x - w / 2.0,
+                    (Some("middle"), _) => x - w / 2.0,
+                    (Some("end"), _) => x - w,
+                    _ => x,
+                };
+                let top = if rotated { y - h / 2.0 } else { y - size * 0.8 };
+                (text, left, left + w, top, top + h)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nothing_the_picture_says_is_drawn_over_anything_else_at_any_width() {
+        for width in [MIN_WIDTH, 320, 480, 800, 1600] {
+            let mut full = chart(vec![
+                Panel {
+                    title: "Gain".into(),
+                    y_label: "Voltage".into(),
+                    y_unit: "V".into(),
+                    y_si: true,
+                    series: vec![
+                        sine(300),
+                        Series {
+                            color: 1,
+                            ..sine(300)
+                        },
+                    ],
+                },
+                Panel {
+                    title: "Phase".into(),
+                    y_label: "Current".into(),
+                    y_unit: "A".into(),
+                    y_si: true,
+                    series: vec![sine(300)],
+                },
+            ]);
+            full.width = width;
+            full.banner = vec![
+                "PARTIAL RUN: the simulation stopped early (timeout) and covers 12% of the range."
+                    .into(),
+                "MODIFIED CIRCUIT: this run simulated a modified circuit.".into(),
+            ];
+            full.title =
+                "Transient of board.kicad_sch, run 3fa9c1d27b04-20261030T133512-7f3a".into();
+            full.legend = vec![
+                (0, "v(/VOUT)".into()),
+                (1, "i(BT1)".into()),
+                (2, "p(M1)".into()),
+            ];
+            full.notes = vec!["Each trace is drawn as an envelope, the lowest and highest point of every pixel column.".into()];
+            let drawn = render(&full);
+            let boxes = text_boxes(&drawn.svg);
+            let (w, h) = (f64::from(drawn.width), f64::from(drawn.height));
+            for (text, left, right, top, bottom) in &boxes {
+                assert!(
+                    *left >= 0.0 && *right <= w + 1.0 && *top >= 0.0 && *bottom <= h,
+                    "{text:?} is outside {w}x{h} at {width}: {left} {right} {top} {bottom}"
+                );
+            }
+            for (i, a) in boxes.iter().enumerate() {
+                for b in &boxes[i + 1..] {
+                    let across = a.1 < b.2 - 0.5 && b.1 < a.2 - 0.5;
+                    let down = a.3 < b.4 - 0.5 && b.3 < a.4 - 0.5;
+                    assert!(!(across && down), "{:?} overlaps {:?} at {width} px", a, b);
+                }
+            }
+        }
     }
 }
