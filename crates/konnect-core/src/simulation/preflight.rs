@@ -950,6 +950,7 @@ fn testbench_nodes(circuit: &Circuit, nets: &[NetEntry]) -> Check {
             .filter(|node| !is_known(node) && !element_nodes.contains(*node))
             .cloned(),
     );
+    unknown.extend(circuit.unknown_subcircuit_initial_nodes(true));
     unknown.sort();
     unknown.dedup();
     if unknown.is_empty() {
@@ -1256,6 +1257,7 @@ fn unknown_initial_nodes(circuit: &Circuit, nets: &[NetEntry]) -> Vec<String> {
         .iter()
         .filter(|node| !element::is_ground(node) && !known.contains(*node) && !used.contains(*node))
         .cloned()
+        .chain(circuit.unknown_subcircuit_initial_nodes(false))
         .collect()
 }
 
@@ -1438,11 +1440,20 @@ mod tests {
 
     /// Runs a netlist through vetting first, as the tool does.
     fn check(netlist: &str, setup: Setup) -> Preflight {
+        check_in(netlist, setup, Path::new("/"), &[])
+    }
+
+    fn check_in(
+        netlist: &str,
+        setup: Setup,
+        project_dir: &Path,
+        allowed_roots: &[std::path::PathBuf],
+    ) -> Preflight {
         let deck = flatten(&DeckInputs {
             netlist,
             testbench: &setup.testbench,
-            project_dir: Path::new("/"),
-            allowed_roots: &[],
+            project_dir,
+            allowed_roots,
             compatibility: Compatibility::DEFAULT,
             excluded_elements: &[],
         })
@@ -2542,6 +2553,274 @@ mod tests {
             &[".ic v(/inn)=3"],
         );
         fails(&preflight, "testbench_nodes", "unknown_testbench_node");
+    }
+
+    /// A circuit whose nets are `/in` and `/out`, with the given files on disk
+    /// for `.include`, and the testbench and netlist lines as given.
+    fn with_files(netlist: &str, files: &[(&str, &str)], lines: &[&str]) -> Preflight {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for (name, text) in files {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let kicad = KiCadNetlist {
+            components: Vec::new(),
+            nets: ["/in", "/out"].map(|name| net(name, &[])).to_vec(),
+            library_parts: Vec::new(),
+        };
+        check_in(
+            netlist,
+            Setup {
+                kicad,
+                testbench: lines.iter().map(|line| line.to_string()).collect(),
+                ..Setup::default()
+            },
+            &root,
+            std::slice::from_ref(&root),
+        )
+    }
+
+    const TWO_NETS: &str = ".title t\nR1 /in /out 1k\nR2 /out 0 1k\n";
+
+    #[test]
+    fn a_top_level_element_in_a_file_the_testbench_includes_counts() {
+        let preflight = with_files(
+            TWO_NETS,
+            &[("load.sp", "R9 /out mid 1k\nC9 mid 0 1u\n")],
+            &["V1 /in 0 5", ".include \"load.sp\""],
+        );
+        passes(&preflight, "testbench_nodes");
+    }
+
+    #[test]
+    fn a_typo_inside_a_file_the_testbench_includes_is_still_refused() {
+        let preflight = with_files(
+            TWO_NETS,
+            &[("load.sp", "R9 /out mid 1k\nC9 midd 0 1u\n")],
+            &["V1 /in 0 5", ".include \"load.sp\""],
+        );
+        assert_eq!(
+            fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+            ["mid", "midd"]
+        );
+    }
+
+    #[test]
+    fn only_an_element_in_the_testbench_file_makes_a_node_look_deliberate() {
+        // A model line holding the word, and a library the schematic includes,
+        // are not a second card on the node.
+        for (netlist, files, lines) in [
+            (
+                TWO_NETS,
+                vec![("m.sp", ".model vv D(bv=5)\n")],
+                vec!["V1 /in 0 5", "R9 /in vv 1k", ".include \"m.sp\""],
+            ),
+            (
+                ".title t\n.include \"lib.sp\"\nR1 /in /out 1k\nR2 /out 0 1k\n",
+                vec![("lib.sp", "R8 vv 0 1k\n")],
+                vec!["V1 /in 0 5", "R9 /in vv 1k"],
+            ),
+        ] {
+            let preflight = with_files(netlist, &files, &lines);
+            assert_eq!(
+                fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+                ["vv"],
+                "{lines:?}"
+            );
+        }
+    }
+
+    const RC_WITH_IC: &str = ".subckt rc p q\nR1 p int 1k\nC1 int q 1u\n.ic v(int)=1\n.ends\n";
+
+    #[test]
+    fn an_initial_condition_inside_a_subcircuit_is_not_a_typo() {
+        let body = format!("V1 a 0 1\nR1 a 0 1k\n{RC_WITH_IC}X1 a 0 rc");
+        assert!(warned(&deck(&body), "unknown_initial_node").is_empty());
+        let lines = [".subckt rc p q", "R1 p int 1k", "C1 int q 1u"]
+            .into_iter()
+            .chain([".ic v(int)=1", ".ends", "X9 /out 0 rc", "V1 /in 0 5"]);
+        let lines: Vec<&str> = lines.collect();
+        passes(&with_files(TWO_NETS, &[], &lines), "testbench_nodes");
+    }
+
+    #[test]
+    fn an_initial_condition_after_a_subcircuit_is_still_checked() {
+        // The subcircuit's own node means nothing at the top level, and the
+        // check must not stay off once `.ends` has closed the block.
+        let body = format!("V1 a 0 1\nR1 a 0 1k\n{RC_WITH_IC}X1 a 0 rc\n.ic v(int)=1 v(typo)=2");
+        assert_eq!(
+            warned(&deck(&body), "unknown_initial_node"),
+            ["int", "typo"]
+        );
+        let lines = [
+            ".subckt rc p q",
+            "R1 p int 1k",
+            "C1 int q 1u",
+            ".ic v(int)=1",
+            ".ends",
+            "X9 /out 0 rc",
+            "V1 /in 0 5",
+            ".ic v(int)=2",
+        ];
+        assert_eq!(
+            fails(
+                &with_files(TWO_NETS, &[], &lines),
+                "testbench_nodes",
+                "unknown_testbench_node"
+            ),
+            ["int"]
+        );
+    }
+
+    #[test]
+    fn only_the_nodes_of_an_included_element_make_a_node_look_deliberate() {
+        // A value, a model name, a parameter and an element name are not nodes.
+        for (file, line, typo) in [
+            ("R8 /out 0 12", "V1 12 0 SIN(12 1 1k)", "12"),
+            (".model vv D\nD1 /out 0 vv", "R9 /in vv 1k", "vv"),
+            (".param rl=1k\nR8 /out 0 {rl}", "R9 /in rl 1k", "rl"),
+            ("R8 /out 0 1k", "R9 /in r8 1k", "r8"),
+            (".subckt amp p\nR8 p vv 1k\n.ends", "R9 /in vv 1k", "vv"),
+        ] {
+            let preflight = with_files(
+                TWO_NETS,
+                &[("f.sp", file)],
+                &["V2 /in 0 5", line, ".include \"f.sp\""],
+            );
+            assert_eq!(
+                fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+                [typo],
+                "{file:?} / {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_included_element_in_a_branch_the_engine_may_skip_proves_nothing() {
+        let included = |file: &str| {
+            with_files(
+                TWO_NETS,
+                &[("f.sp", file)],
+                &["V1 /in 0 5", "R9 /in typo 1k", ".include \"f.sp\""],
+            )
+        };
+        assert_eq!(
+            fails(
+                &included(".if (0)\nR8 /out typo 1k\n.endif"),
+                "testbench_nodes",
+                "unknown_testbench_node"
+            ),
+            ["typo"]
+        );
+        // The count comes back on once the block has closed.
+        passes(
+            &included(".if (1)\nR7 /out 0 1k\n.endif\nR8 /out typo 1k"),
+            "testbench_nodes",
+        );
+    }
+
+    #[test]
+    fn an_initial_condition_in_a_subcircuit_is_judged_against_its_body() {
+        let body = |ic: &str| format!(".subckt rc p q\nR1 p int 1k\nC1 int q 1u\n{ic}\n.ends\n");
+        let netlist = |ic: &str| format!("V1 a 0 1\nR1 a 0 1k\n{}X1 a 0 rc", body(ic));
+        // Its own nodes, its pins, an inner call's node, ground and a global.
+        let fine = ".ic v(int)=1 v(p)=1 v(x2.n)=0 v(0)=0 v(g)=1\n.nodeset v(int)=1";
+        let fine_body = format!(".global g\n{}", netlist(fine));
+        assert!(warned(&deck(&fine_body), "unknown_initial_node").is_empty());
+        for command in [".ic", ".nodeset"] {
+            let typo = format!("{command} v(intt)=1");
+            assert_eq!(
+                warned(&deck(&netlist(&typo)), "unknown_initial_node"),
+                ["intt"],
+                "{command}"
+            );
+            let mut lines = vec![".subckt rc p q", "R1 p int 1k", "C1 int q 1u"];
+            lines.extend([typo.as_str(), ".ends", "X9 /out 0 rc", "V1 /in 0 5"]);
+            assert_eq!(
+                fails(
+                    &with_files(TWO_NETS, &[], &lines),
+                    "testbench_nodes",
+                    "unknown_testbench_node"
+                ),
+                ["intt"],
+                "{command}"
+            );
+        }
+        // A pin no element of the body touches is still the body's own.
+        let pin =
+            "V1 a 0 1\nR1 a 0 1k\n.subckt dang P Q\nR1 P 0 1k\n.ic v(q)=1\n.ends\nX1 a 0 dang";
+        assert!(warned(&deck(pin), "unknown_initial_node").is_empty());
+        // A node that is only ever an element's later node is the body's too.
+        let later = "V1 a 0 1\nR1 a 0 1k\n.subckt two p q\nR1 p mid 1k\nR2 p mid 2k\nR3 q 0 1k\n.ic v(mid)=1\n.ends\nX1 a 0 two";
+        assert!(warned(&deck(later), "unknown_initial_node").is_empty());
+        // A correct node after `.nodeset` is no net either.
+        let mut lines = vec![".subckt rc p q", "R1 p int 1k", "C1 int q 1u"];
+        lines.extend([".nodeset v(int)=1", ".ends", "X9 /out 0 rc", "V1 /in 0 5"]);
+        passes(&with_files(TWO_NETS, &[], &lines), "testbench_nodes");
+        // A line the reader cannot place leaves the body unjudged.
+        let unread = ".subckt rc p q\nY1 p int 1k\n.ic v(whatever)=1\n.ends\n";
+        let body = format!("V1 a 0 1\nR1 a 0 1k\n{unread}X1 a 0 rc");
+        assert!(warned(&deck(&body), "unknown_initial_node").is_empty());
+    }
+
+    #[test]
+    fn a_schematic_typo_and_a_testbench_typo_are_kept_apart() {
+        let netlist =
+            format!("{TWO_NETS}.subckt sch p q\nR1 p q 1k\n.ic v(aa)=1\n.ends\nX1 /in /out sch\n");
+        let lines = [
+            ".subckt tb p q",
+            "R1 p q 1k",
+            ".ic v(bb)=1",
+            ".ends",
+            "X9 /out 0 tb",
+            "V1 /in 0 5",
+        ];
+        let preflight = with_files(&netlist, &[], &lines);
+        assert_eq!(
+            fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+            ["bb"]
+        );
+        assert_eq!(warned(&preflight, "unknown_initial_node"), ["aa"]);
+    }
+
+    #[test]
+    fn a_node_an_included_element_names_twice_is_one_card() {
+        let preflight = with_files(
+            TWO_NETS,
+            &[("f.sp", "R8 typo typo 1k")],
+            &["V1 /in 0 5", ".include \"f.sp\""],
+        );
+        assert_eq!(
+            fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+            ["typo"]
+        );
+    }
+
+    #[test]
+    fn an_initial_condition_inside_a_macro_is_its_own() {
+        let lines = [
+            ".macro foo a b",
+            "R1 a int 1k",
+            "C1 int b 1u",
+            ".ic v(int)=1",
+            ".eom",
+            "X9 /out 0 foo",
+            "V1 /in 0 5",
+        ];
+        passes(&with_files(TWO_NETS, &[], &lines), "testbench_nodes");
+    }
+
+    #[test]
+    fn an_initial_condition_after_an_unclosed_macro_is_still_checked() {
+        let lines = [".macro foo a b", "R1 a b 1k", ".ic v(typo)=1", "V1 /in 0 5"];
+        assert_eq!(
+            fails(
+                &with_files(TWO_NETS, &[], &lines),
+                "testbench_nodes",
+                "unknown_testbench_node"
+            ),
+            ["typo"]
+        );
     }
 
     #[test]

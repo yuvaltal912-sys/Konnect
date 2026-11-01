@@ -2,12 +2,12 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-01, with PR 1 to 10 merged to `main` (PR 9 as `2503cad`, PR 10 as `d6b5ea8`), PR 11 merged and the placement fix open.
+**Last updated:** 2026-11-01, with PR 1 to 11 and both follow-up fixes merged to `main`.
 
 ## Start here
 
 1. Read `AGENTS.md` for the rules.
-2. Create the branch under "Now".
+2. Create a branch from `main` for the work, unless "Now" names an open one to continue.
 3. Read the "Now" list, then the sections of `docs/SIMULATION_PLAN.md` it names.
 4. Run the gate before changing anything, so you know the baseline.
 5. If a step here cannot run in your environment, such as `gh`, a push or the KiCad library, say so. Never skip it silently.
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. The placement fix is open against `main`.
+PRs 1 to 11 and the two fixes after them are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -43,11 +43,12 @@ PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. T
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
 | 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
 | 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
-| Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Open, waiting for the owner |
+| Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Merged as `d6f0d51` |
+| Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
 
-## Now: the placement fix is open
+## Now: the plan's v1 is merged
 
-`add_schematic_component` and every other placement path now copy the library symbol's `Sim.*` fields onto the instance, hidden at the symbol's origin like Footprint. Nothing is merged. Ask the owner before merging it, and before starting any follow-up.
+PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
 
 ### What the placement fix changed that later work needs to know
 
@@ -58,9 +59,14 @@ PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. T
 - **Limits left:** fields are read from the schematic's embedded library copy (as Footprint is), so a stale embedded copy places stale fields until `update_symbols_from_library`. KiCad also copies the library's `exclude_from_sim` attribute and the legacy `Spice_*` and `Sim_Library`/`Sim_Name` fields, which Konnect does not. The readback compares against the same list the writer used, so it proves the write and not the extraction; the extraction is tested on its own in `library.rs`.
 - **Tests:** `tools/sim_field_placement_tests.rs` (one test per path, with a quoted `Sim.Params` value), a template test in `templates.rs`, and two ignored live tests at the end of `simulation_live.rs`: a diode placed by `add_schematic_component` and another by `batch_place_components` simulate, and the same circuit with the instance `Sim.*` fields cut out is refused as `unmodelled_symbols`. Evidence is E110 and E111 in the plan. There is no "X4" in the plan (its open questions are Q1 to Q17); E45 and E74 are the evidence behind this row.
 
-## Before that: PR 11 and v1
+### What the false-refusal fix changed
 
-PR 11 added `plot_simulation_run`, the last tool of the plan's v1, and is merged. With the placement fix v1 is done; the "After PR 11" table lists what is left.
+- **`.ic` and `.nodeset` inside a `.subckt` or `.macro` are judged against that body, not against the circuit's nets.** `read_definitions` in `element.rs` records initial-condition nodes at depth 0 only. `read` records the others per subcircuit, and `Circuit::unknown_subcircuit_initial_nodes` accepts a node that is a pin, a body element's node, ground, a `.global`, or `xN.name`, and does not judge a body holding a line the reader could not place. A typo inside a subcircuit is still refused (testbench) or warned `unknown_initial_node` (schematic). Before, every such card was flagged, the correct ones too.
+- **A file the testbench includes now counts through the nodes of its top-level elements.** `read` adds each such element's nodes to `word_cards`. A value, a model name, a parameter, an element name, a model line, a subcircuit body, a library the schematic includes, and an element inside an `.if` block do not count. A typo inside the included file is still refused.
+- **Left as limits:** the testbench's own lines still count every word on a card (as before), and an included element inside an `.if` is never counted, so a circuit that needs one stays refused. The same file included twice passes `testbench_nodes`, and `element_names` reports the duplicate.
+- **Left as limits, in the subcircuit `.ic` check** (every such card was flagged before, so these are no worse than before, but they are gaps): an element in a dead `.if` inside the body counts as a body node; two definitions of one subcircuit name are merged; and any `xN.name` is accepted without checking that the body has that instance, as at the top level.
+- `flatten.rs` is unchanged. The flat deck is the same, so this is only a change in what preflight judges.
+- **Run against the engine by the PR's reviewer, not by the tests:** libngspice 44.2 applies a `.ic` written inside a subcircuit (`v(x1.int)` read 1 with it, 0 without) and logs "IC on non-existent node" for a mistyped one.
 
 ### What PR 11 changed that later work needs to know
 
@@ -118,15 +124,14 @@ PR 11 added `plot_simulation_run`, the last tool of the plan's v1, and is merged
 
 ## After PR 11
 
-The plan's v1 is PR 1 to 11 and the placement fix. What is left after them:
+The plan's v1 is PR 1 to 11 and the placement fix, all merged. What is left after them:
 
 | Work | Outcome |
 |---|---|
-| `fix(schematic): copy Sim fields on placement` | Part of v1, open (see "Now") |
+| `fix(schematic)`: Sim fields on `replace_component` | A replaced part keeps its old model without warning (see "Not covered" above) |
 | Two-sweep slices | An `outer_step` selection on `measure_simulation_run`, if the owner wants it |
 | PNG and inline images | Need a small vector font for labels, with its licence checked, and `outcome::attach` reading the JSON block first |
 | Margin runs at double density | `run_simulation` doing the second AC run itself |
-| The two false refusals | The `.ic` inside `.subckt` refusal and the testbench `.include` refusal, both from PR 4 |
 
 Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets its live-test step then, and Q1, Q2, Q6 and Q7 are settled then.
 
@@ -221,12 +226,10 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - **Stored runs, limits left in PR 10:** a run that inlined an IBIS model reads `inputs_changed_since_run: true` for good once another project's export wipes KiCad's IBIS cache, since the cache file is one of its inputs. Runs from PR 6 to 9 have no record, so they are counted as `without_record` and cannot be measured. A stored measurement on a partial run counts as failed, as a live one does, though its number is exact. The prune-race branch of `measure_simulation_run` (`or_not_found`) is tested through the function and not through a real race. `list_simulation_runs` does not check that a run's raw file is still there.
 - **PR 11's review:** four rounds by independent agents, the last finding nothing serious, and 130 source breaks of which 123 failed the tests (E108, E109). The round 4 fixes were not reviewed again. Layout is checked by a geometry test that holds every text off every other text, off the banner's edge and out of the plot frames at widths from 200 to 1600, using an estimate of 0.65 em a character, not by pixels.
 - **Plots, limits left in PR 11:** text is placed by an estimate (0.6 em a character), so an unusually wide font could run a label past its margin, and nothing was checked in a viewer other than Chromium's. A linear AC sweep is drawn on a log axis and bunches at the high end. A two-sweep run whose first sweep has one point draws a mark for each step and no curve. A run's plots are not listed anywhere: `path` is the only way to find one. The picture was read by eye on one run of each analysis (E107) and by test for structure; no test compares pixels.
-- A top-level element in a file that a testbench `.include`s is refused as `unknown_testbench_node`, though the plan says lines from such a file count. Found in PR 9's review, in PR 4's code, and not fixed.
 - A DC sweep of one point (start equals stop), or an AC sweep that holds one point, reads `complete` with `outside_data` for every window measurement. An AC sweep with under two points is refused; a DC one is not.
 - With two sweeps `signals` summarise the whole grid and measurements are refused, live and stored. A slice per outer value needs a result shape of its own, and PR 10 left it out (see above). `results.csv` has the grid.
 - A `bandwidth_3db` measured from the lowest frequency on a band-pass reads the first fall below that level, which can be far above the band. The result shows `reference_gain_db`, and `reference_level: "peak"` gives the band's own edges.
 - `bg_halt` stops an AC sweep at the size limit and at the budget: a 1 MB limit halted a 90,005-point sweep at 34,407 points. `.op` still has no pause test.
-- `.ic` inside a `.subckt` is refused by preflight as `unknown_testbench_node`, or warned as dropped, though ngspice applies it. A false refusal, from PR 4.
 - A `.ic` in a dead `.if` still drops device currents under `uic`. It fails loudly.
 - `p(REF)` on a subcircuit counts only the pins it shows, so a hidden ground or supply reads short.
 - A net named `time` or `frequency`, and `/out#branch`, read `signal_not_found`. No wrong number comes out.
