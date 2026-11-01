@@ -339,7 +339,13 @@ pub fn tools() -> Vec<ToolDef> {
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag follows the same symbol UUID, unit, and pin number when that mapping is \
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
-             writing.",
+             writing. The simulator reads the instance's Sim.* fields only, so they are \
+             swapped too: every old Sim.* field is removed, hand-edited ones included, and \
+             the new symbol's are copied hidden. The result lists them as \
+             sim_fields_dropped and sim_fields_added (name and value). Replacing a symbol \
+             with itself leaves the fields alone. Value, Footprint and the reference are \
+             not changed, so a part with no Sim fields of its own is still inferred from \
+             its reference prefix.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2324,6 +2330,36 @@ fn property_insert_edit(
     value: &str,
 ) -> Result<SexpEdit, String> {
     let block = &content[start..end];
+    let (x, y, indent) = hidden_property_anchor(content, reference, start, end)?;
+    let prop = hidden_property_text(newline_of(content), &indent, name, value, x, y);
+
+    // Insert before the block's closing paren so the property stays inside it.
+    let close = block
+        .rfind(')')
+        .map(|offset| start + offset)
+        .ok_or_else(|| format!("symbol block for '{reference}' is malformed"))?;
+    Ok(SexpEdit::insert(close, prop))
+}
+
+fn newline_of(content: &str) -> &'static str {
+    if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Where a new hidden field goes in one placed unit: the unit's own `(at x y)`,
+/// and the indentation of its existing properties. Matching the block's
+/// indentation rather than assuming keeps an eeschema (tab) file from being
+/// rewritten wholesale.
+fn hidden_property_anchor(
+    content: &str,
+    reference: &str,
+    start: usize,
+    end: usize,
+) -> Result<(f64, f64, String), String> {
+    let block = &content[start..end];
 
     // The symbol's placement, to anchor the new property on.
     let (x, y) = block
@@ -2339,8 +2375,6 @@ fn property_insert_edit(
         })
         .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
 
-    // Match the block's own indentation rather than assuming: eeschema saves
-    // with tabs, this crate's writer uses two spaces.
     let indent = block
         .find("(property ")
         .map(|p| {
@@ -2348,15 +2382,22 @@ fn property_insert_edit(
             block[line_start..p].to_string()
         })
         .unwrap_or_else(|| "\t\t".to_string());
+    Ok((x, y, indent))
+}
 
+/// One hidden `(property …)` block, led by a line break so it can be inserted
+/// straight after another property or before a block's closing paren.
+fn hidden_property_text(
+    newline: &str,
+    indent: &str,
+    name: &str,
+    value: &str,
+    x: f64,
+    y: f64,
+) -> String {
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
-    let newline = if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let prop = format!(
+    format!(
         "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
          {indent}\t(at {x} {y} 0){newline}\
          {indent}\t(hide yes){newline}\
@@ -2366,14 +2407,7 @@ fn property_insert_edit(
          {indent}\t\t){newline}\
          {indent}\t){newline}\
          {indent})"
-    );
-
-    // Insert before the block's closing paren so the property stays inside it.
-    let close = block
-        .rfind(')')
-        .map(|offset| start + offset)
-        .ok_or_else(|| format!("symbol block for '{reference}' is malformed"))?;
-    Ok(SexpEdit::insert(close, prop))
+    )
 }
 
 /// Set one shared component property in every placed unit.
@@ -2429,6 +2463,118 @@ pub(crate) fn set_property_value(
         apply_edits(content.to_string(), edits),
         PropertyWriteCounts { updated, added },
     ))
+}
+
+/// `Sim.*` fields are the simulator's per-instance model assignment
+/// (`Sim.Device`, `Sim.Pins`, `Sim.Params`, ...): the set `symbol_metadata`
+/// copies on placement.
+fn is_sim_field(name: &str) -> bool {
+    name.starts_with("Sim.")
+}
+
+fn target_sim_field(target: &ComponentTarget, name: &str) -> bool {
+    target
+        .units
+        .iter()
+        .any(|unit| unit.fields.contains_key(name))
+}
+
+/// What `replace_component` does to an instance's `Sim.*` fields.
+#[derive(Debug, Default)]
+struct SimFieldSwap {
+    edits: Vec<SexpEdit>,
+    /// Old fields the new symbol does not reproduce exactly, `(name, value)`,
+    /// once each across the units.
+    dropped: Vec<(String, String)>,
+    /// New fields the old instance did not carry exactly.
+    added: Vec<(String, String)>,
+}
+
+/// Swap every placed unit's `Sim.*` fields for `new_fields`, the new library
+/// symbol's.
+///
+/// KiCad's simulator reads the instance only, so a replacement that kept the
+/// old fields would simulate the old part (a diode swapped for a resistor
+/// stays a diode), and one that added none would leave the new part
+/// unmodelled. The old fields go whether or not they were edited by hand: a
+/// tuned `Sim.Params` describes the part that is leaving. `dropped` carries
+/// their values so the caller can restore one. A unit already carrying exactly
+/// `new_fields` is left alone.
+///
+/// `content` must already hold the new definition and the new `lib_id`.
+fn plan_sim_field_swap(
+    content: &str,
+    reference: &str,
+    new_fields: &[(String, String)],
+) -> Result<SimFieldSwap, String> {
+    use konnect_sexp::writer::{find_balanced_block, find_block_starts};
+
+    let malformed = || format!("a property of '{reference}' is malformed");
+    let newline = newline_of(content);
+    let mut swap = SimFieldSwap::default();
+    for (start, end) in find_all_symbol_instance_blocks(content, reference) {
+        let block = &content[start..end];
+        let mut old_fields = Vec::new();
+        let mut removals = Vec::new();
+        let mut after_last_property = None;
+        for offset in find_block_starts(block, "property") {
+            let (from, to) = find_balanced_block(block, offset).ok_or_else(malformed)?;
+            after_last_property = Some(start + to);
+            let node = parse_sexp(&block[from..to]).map_err(|_| malformed())?;
+            let (Some(name), Some(value)) = (
+                node.get(1).and_then(|node| node.as_str()),
+                node.get(2).and_then(|node| node.as_str()),
+            ) else {
+                return Err(malformed());
+            };
+            if !is_sim_field(name) {
+                continue;
+            }
+            old_fields.push((name.to_owned(), value.to_owned()));
+            // Take the line break and indent before the property with it, so
+            // removing it leaves no blank line.
+            let bytes = content.as_bytes();
+            let mut first = start + from;
+            while first > start && matches!(bytes[first - 1], b' ' | b'\t') {
+                first -= 1;
+            }
+            if first > start && bytes[first - 1] == b'\n' {
+                first -= 1;
+                if first > start && bytes[first - 1] == b'\r' {
+                    first -= 1;
+                }
+            }
+            removals.push((first, start + to));
+        }
+        if old_fields == new_fields {
+            continue;
+        }
+        for field in &old_fields {
+            if !new_fields.contains(field) && !swap.dropped.contains(field) {
+                swap.dropped.push(field.clone());
+            }
+        }
+        for field in new_fields {
+            if !old_fields.contains(field) && !swap.added.contains(field) {
+                swap.added.push(field.clone());
+            }
+        }
+        swap.edits.extend(
+            removals
+                .into_iter()
+                .map(|(from, to)| SexpEdit::delete(from, to)),
+        );
+        if let (Some(after), false) = (after_last_property, new_fields.is_empty()) {
+            // Beside the unit's other fields, like a placement writes them.
+            let (x, y, indent) = hidden_property_anchor(content, reference, start, end)?;
+            let text: String = new_fields
+                .iter()
+                .map(|(name, value)| hidden_property_text(newline, &indent, name, value, x, y))
+                .collect();
+            swap.edits.push(SexpEdit::insert(after, text));
+        }
+    }
+    Ok(swap)
 }
 
 /// What `edit_schematic_component` may change about where a field's text sits.
@@ -4218,6 +4364,32 @@ async fn handle_replace_component(
         Some(content) => content,
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
+    // The simulator reads the instance's `Sim.*` fields, never the library's,
+    // so they travel with the symbol. Nothing is swapped when the symbol is not
+    // changing.
+    let sim_swap = if new_lib_id == old_lib_id {
+        SimFieldSwap::default()
+    } else {
+        let new_fields = match cse::Schematic::from_source(&sch_path, content.clone()) {
+            Ok(schematic) => cse::library::symbol_metadata(&schematic, &new_lib_id).sim_fields,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "Cannot read the new symbol's Sim fields: {error}"
+                )))
+            }
+        };
+        match plan_sim_field_swap(&content, &reference, &new_fields) {
+            Ok(swap) => {
+                for unit in &mut target.units {
+                    unit.fields.retain(|name, _| !is_sim_field(name));
+                    unit.fields.extend(new_fields.iter().cloned());
+                }
+                swap
+            }
+            Err(reason) => return Ok(CallToolResult::error(reason)),
+        }
+    };
+    let content = apply_edits(content, sim_swap.edits.clone());
     let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
@@ -4248,6 +4420,35 @@ async fn handle_replace_component(
             ));
         }
     };
+    // `verify_component_expectations` proves the new fields landed; this proves
+    // no old one survived, which a missing key in the intent cannot show.
+    if let Some(unit) = observed["units"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|unit| {
+            unit["fields"].as_object().is_some_and(|fields| {
+                fields
+                    .keys()
+                    .any(|name| is_sim_field(name) && !target_sim_field(&target, name))
+            })
+        })
+    {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "replace_component",
+            format!(
+                "unit {} still carries a Sim field of the old symbol",
+                unit["unit"]
+            ),
+        ));
+    }
+    let named = |fields: &[(String, String)]| {
+        fields
+            .iter()
+            .map(|(name, value)| json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>()
+    };
     let mut result = json!({
         "reference": observed["reference"],
         "old_lib_id": old_lib_id,
@@ -4257,7 +4458,9 @@ async fn handle_replace_component(
         "junctions_added_count": added,
         "junctions_pruned_count": pruned,
         "no_connects_moved_count": moved_markers.len(),
-        "no_connects_moved": moved_markers
+        "no_connects_moved": moved_markers,
+        "sim_fields_dropped": named(&sim_swap.dropped),
+        "sim_fields_added": named(&sim_swap.added)
     });
     copy_component_observation(&mut result, &observed);
     Ok(CallToolResult::json(&result))
