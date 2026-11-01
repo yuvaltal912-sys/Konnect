@@ -443,7 +443,11 @@ pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
         } else if word.starts_with(".ends") || word == ".eom" {
             depth = depth.saturating_sub(1);
         }
-        if (!card.included && depth == 0) || word == ".global" {
+        // A file the testbench includes counts through its elements. A library's
+        // models and the schematic's own includes do not, so a model parameter
+        // sharing a typo's spelling cannot make it look deliberate.
+        let names_nodes = !card.included || (card.from_testbench && !word.starts_with('.'));
+        if (names_nodes && depth == 0) || word == ".global" {
             count_words(&card.text, &mut circuit.word_cards);
         }
         if !card.included && !word.starts_with(".subckt") {
@@ -568,7 +572,8 @@ fn read_definitions(card: &Card, depth: usize, circuit: &mut Circuit) {
         }
     } else if word.starts_with(".opt") {
         circuit.shunted |= words.iter().any(|word| is_active_shunt(word));
-    } else if word == ".ic" || word == ".nodeset" {
+    } else if depth == 0 && (word == ".ic" || word == ".nodeset") {
+        // Inside a subcircuit the nodes are its own, not nets of the circuit.
         let nodes = if card.from_testbench {
             &mut circuit.testbench_initial_nodes
         } else {

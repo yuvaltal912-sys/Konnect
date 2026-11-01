@@ -1438,11 +1438,20 @@ mod tests {
 
     /// Runs a netlist through vetting first, as the tool does.
     fn check(netlist: &str, setup: Setup) -> Preflight {
+        check_in(netlist, setup, Path::new("/"), &[])
+    }
+
+    fn check_in(
+        netlist: &str,
+        setup: Setup,
+        project_dir: &Path,
+        allowed_roots: &[std::path::PathBuf],
+    ) -> Preflight {
         let deck = flatten(&DeckInputs {
             netlist,
             testbench: &setup.testbench,
-            project_dir: Path::new("/"),
-            allowed_roots: &[],
+            project_dir,
+            allowed_roots,
             compatibility: Compatibility::DEFAULT,
             excluded_elements: &[],
         })
@@ -2542,6 +2551,123 @@ mod tests {
             &[".ic v(/inn)=3"],
         );
         fails(&preflight, "testbench_nodes", "unknown_testbench_node");
+    }
+
+    /// A circuit whose nets are `/in` and `/out`, with the given files on disk
+    /// for `.include`, and the testbench and netlist lines as given.
+    fn with_files(netlist: &str, files: &[(&str, &str)], lines: &[&str]) -> Preflight {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for (name, text) in files {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let kicad = KiCadNetlist {
+            components: Vec::new(),
+            nets: ["/in", "/out"].map(|name| net(name, &[])).to_vec(),
+            library_parts: Vec::new(),
+        };
+        check_in(
+            netlist,
+            Setup {
+                kicad,
+                testbench: lines.iter().map(|line| line.to_string()).collect(),
+                ..Setup::default()
+            },
+            &root,
+            std::slice::from_ref(&root),
+        )
+    }
+
+    const TWO_NETS: &str = ".title t\nR1 /in /out 1k\nR2 /out 0 1k\n";
+
+    #[test]
+    fn a_top_level_element_in_a_file_the_testbench_includes_counts() {
+        let preflight = with_files(
+            TWO_NETS,
+            &[("load.sp", "R9 /out mid 1k\nC9 mid 0 1u\n")],
+            &["V1 /in 0 5", ".include \"load.sp\""],
+        );
+        passes(&preflight, "testbench_nodes");
+    }
+
+    #[test]
+    fn a_typo_inside_a_file_the_testbench_includes_is_still_refused() {
+        let preflight = with_files(
+            TWO_NETS,
+            &[("load.sp", "R9 /out mid 1k\nC9 midd 0 1u\n")],
+            &["V1 /in 0 5", ".include \"load.sp\""],
+        );
+        assert_eq!(
+            fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+            ["mid", "midd"]
+        );
+    }
+
+    #[test]
+    fn only_an_element_in_the_testbench_file_makes_a_node_look_deliberate() {
+        // A model line holding the word, and a library the schematic includes,
+        // are not a second card on the node.
+        for (netlist, files, lines) in [
+            (
+                TWO_NETS,
+                vec![("m.sp", ".model vv D(bv=5)\n")],
+                vec!["V1 /in 0 5", "R9 /in vv 1k", ".include \"m.sp\""],
+            ),
+            (
+                ".title t\n.include \"lib.sp\"\nR1 /in /out 1k\nR2 /out 0 1k\n",
+                vec![("lib.sp", "R8 vv 0 1k\n")],
+                vec!["V1 /in 0 5", "R9 /in vv 1k"],
+            ),
+        ] {
+            let preflight = with_files(netlist, &files, &lines);
+            assert_eq!(
+                fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+                ["vv"],
+                "{lines:?}"
+            );
+        }
+    }
+
+    const RC_WITH_IC: &str = ".subckt rc p q\nR1 p int 1k\nC1 int q 1u\n.ic v(int)=1\n.ends\n";
+
+    #[test]
+    fn an_initial_condition_inside_a_subcircuit_is_not_a_typo() {
+        let body = format!("V1 a 0 1\nR1 a 0 1k\n{RC_WITH_IC}X1 a 0 rc");
+        assert!(warned(&deck(&body), "unknown_initial_node").is_empty());
+        let lines = [".subckt rc p q", "R1 p int 1k", "C1 int q 1u"]
+            .into_iter()
+            .chain([".ic v(int)=1", ".ends", "X9 /out 0 rc", "V1 /in 0 5"]);
+        let lines: Vec<&str> = lines.collect();
+        passes(&with_files(TWO_NETS, &[], &lines), "testbench_nodes");
+    }
+
+    #[test]
+    fn an_initial_condition_after_a_subcircuit_is_still_checked() {
+        // The subcircuit's own node means nothing at the top level, and the
+        // check must not stay off once `.ends` has closed the block.
+        let body = format!("V1 a 0 1\nR1 a 0 1k\n{RC_WITH_IC}X1 a 0 rc\n.ic v(int)=1 v(typo)=2");
+        assert_eq!(
+            warned(&deck(&body), "unknown_initial_node"),
+            ["int", "typo"]
+        );
+        let lines = [
+            ".subckt rc p q",
+            "R1 p int 1k",
+            "C1 int q 1u",
+            ".ic v(int)=1",
+            ".ends",
+            "X9 /out 0 rc",
+            "V1 /in 0 5",
+            ".ic v(int)=2",
+        ];
+        assert_eq!(
+            fails(
+                &with_files(TWO_NETS, &[], &lines),
+                "testbench_nodes",
+                "unknown_testbench_node"
+            ),
+            ["int"]
+        );
     }
 
     #[test]

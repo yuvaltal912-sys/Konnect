@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-01, with PR 1 to 10 merged to `main` (PR 9 as `2503cad`, PR 10 as `d6b5ea8`) and PR 11 open.
+**Last updated:** 2026-11-01, with PR 1 to 11 merged to `main` (PR 11 as `7bd17c1`) and the false-refusal fix open on `fix/simulation-false-refusals`.
 
 ## Start here
 
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 10 are merged to `main` on the `fork` remote, each as a merge commit. PR 11 is open against `main`.
+PRs 1 to 11 are merged to `main` on the `fork` remote, each as a merge commit. The false-refusal fix (after PR 11, not a plan PR) is open against `main`.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -42,11 +42,19 @@ PRs 1 to 10 are merged to `main` on the `fork` remote, each as a merge commit. P
 | 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
 | 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
-| 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Open, waiting for the owner |
+| 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Merged as `7bd17c1` |
+| Fix | to be filled in | `fix/simulation-false-refusals` | Open, waiting for the owner |
 
-## Now: PR 11 is open, and v1 is complete
+## Now: PR 1 to 11 are merged, and the simulation toolset is complete
 
-PR 11 adds `plot_simulation_run`, the last tool of the plan's v1. Nothing is merged. Ask the owner before merging it, and before starting any follow-up. After it the plan's v1 is done apart from the placement fix; the "After PR 11" table lists what is left.
+PR 11 added `plot_simulation_run`, the last tool of the plan's v1, and is merged. One small PR is open: `fix/simulation-false-refusals`, below. Ask the owner before merging it, and before starting any follow-up. The "After PR 11" table lists what is left.
+
+### What the false-refusal fix changed
+
+- **`.ic` and `.nodeset` inside a `.subckt` are no longer read as circuit nodes.** `read_definitions` in `element.rs` records initial-condition nodes only at depth 0, since a subcircuit's names are its own. Before, such a card was refused as `unknown_testbench_node` (testbench) or warned as `unknown_initial_node` (schematic). A top-level `.ic` is checked as before, including after a `.ends`.
+- **A file the testbench includes now counts through its top-level elements.** `Circuit::word_cards` also counts a depth-0 element card that came from the testbench's included file. A model line in that file, a subcircuit body and a library the schematic includes still do not, so a typo cannot be excused by a model parameter that shares its spelling. A typo inside the included file is still refused.
+- `flatten.rs` is unchanged. The flat deck is the same, so this is only a change in what preflight judges.
+- **Not tested against the engine:** that ngspice applies a `.ic` written inside a subcircuit is taken from the earlier finding, and no live run was made here.
 
 ### What PR 11 changed that later work needs to know
 
@@ -112,7 +120,6 @@ The plan's v1 is PR 1 to 11 and the placement fix. What is left:
 | Two-sweep slices | An `outer_step` selection on `measure_simulation_run`, if the owner wants it |
 | PNG and inline images | Need a small vector font for labels, with its licence checked, and `outcome::attach` reading the JSON block first |
 | Margin runs at double density | `run_simulation` doing the second AC run itself |
-| The two false refusals | The `.ic` inside `.subckt` refusal and the testbench `.include` refusal, both from PR 4 |
 
 Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets its live-test step then, and Q1, Q2, Q6 and Q7 are settled then.
 
@@ -207,12 +214,10 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - **Stored runs, limits left in PR 10:** a run that inlined an IBIS model reads `inputs_changed_since_run: true` for good once another project's export wipes KiCad's IBIS cache, since the cache file is one of its inputs. Runs from PR 6 to 9 have no record, so they are counted as `without_record` and cannot be measured. A stored measurement on a partial run counts as failed, as a live one does, though its number is exact. The prune-race branch of `measure_simulation_run` (`or_not_found`) is tested through the function and not through a real race. `list_simulation_runs` does not check that a run's raw file is still there.
 - **PR 11's review:** four rounds by independent agents, the last finding nothing serious, and 130 source breaks of which 123 failed the tests (E108, E109). The round 4 fixes were not reviewed again. Layout is checked by a geometry test that holds every text off every other text, off the banner's edge and out of the plot frames at widths from 200 to 1600, using an estimate of 0.65 em a character, not by pixels.
 - **Plots, limits left in PR 11:** text is placed by an estimate (0.6 em a character), so an unusually wide font could run a label past its margin, and nothing was checked in a viewer other than Chromium's. A linear AC sweep is drawn on a log axis and bunches at the high end. A two-sweep run whose first sweep has one point draws a mark for each step and no curve. A run's plots are not listed anywhere: `path` is the only way to find one. The picture was read by eye on one run of each analysis (E107) and by test for structure; no test compares pixels.
-- A top-level element in a file that a testbench `.include`s is refused as `unknown_testbench_node`, though the plan says lines from such a file count. Found in PR 9's review, in PR 4's code, and not fixed.
 - A DC sweep of one point (start equals stop), or an AC sweep that holds one point, reads `complete` with `outside_data` for every window measurement. An AC sweep with under two points is refused; a DC one is not.
 - With two sweeps `signals` summarise the whole grid and measurements are refused, live and stored. A slice per outer value needs a result shape of its own, and PR 10 left it out (see above). `results.csv` has the grid.
 - A `bandwidth_3db` measured from the lowest frequency on a band-pass reads the first fall below that level, which can be far above the band. The result shows `reference_gain_db`, and `reference_level: "peak"` gives the band's own edges.
 - `bg_halt` stops an AC sweep at the size limit and at the budget: a 1 MB limit halted a 90,005-point sweep at 34,407 points. `.op` still has no pause test.
-- `.ic` inside a `.subckt` is refused by preflight as `unknown_testbench_node`, or warned as dropped, though ngspice applies it. A false refusal, from PR 4.
 - A `.ic` in a dead `.if` still drops device currents under `uic`. It fails loudly.
 - `p(REF)` on a subcircuit counts only the pins it shows, so a hidden ground or supply reads short.
 - A net named `time` or `frequency`, and `/out#branch`, read `signal_not_found`. No wrong number comes out.
