@@ -2748,8 +2748,11 @@ mod tests {
         }
         // A pin no element of the body touches is still the body's own.
         let pin =
-            "V1 a 0 1\nR1 a 0 1k\n.subckt dang p q\nR1 p 0 1k\n.ic v(q)=1\n.ends\nX1 a 0 dang";
+            "V1 a 0 1\nR1 a 0 1k\n.subckt dang P Q\nR1 P 0 1k\n.ic v(q)=1\n.ends\nX1 a 0 dang";
         assert!(warned(&deck(pin), "unknown_initial_node").is_empty());
+        // A node that is only ever an element's later node is the body's too.
+        let later = "V1 a 0 1\nR1 a 0 1k\n.subckt two p q\nR1 p mid 1k\nR2 p mid 2k\nR3 q 0 1k\n.ic v(mid)=1\n.ends\nX1 a 0 two";
+        assert!(warned(&deck(later), "unknown_initial_node").is_empty());
         // A correct node after `.nodeset` is no net either.
         let mut lines = vec![".subckt rc p q", "R1 p int 1k", "C1 int q 1u"];
         lines.extend([".nodeset v(int)=1", ".ends", "X9 /out 0 rc", "V1 /in 0 5"]);
@@ -2758,6 +2761,39 @@ mod tests {
         let unread = ".subckt rc p q\nY1 p int 1k\n.ic v(whatever)=1\n.ends\n";
         let body = format!("V1 a 0 1\nR1 a 0 1k\n{unread}X1 a 0 rc");
         assert!(warned(&deck(&body), "unknown_initial_node").is_empty());
+    }
+
+    #[test]
+    fn a_schematic_typo_and_a_testbench_typo_are_kept_apart() {
+        let netlist =
+            format!("{TWO_NETS}.subckt sch p q\nR1 p q 1k\n.ic v(aa)=1\n.ends\nX1 /in /out sch\n");
+        let lines = [
+            ".subckt tb p q",
+            "R1 p q 1k",
+            ".ic v(bb)=1",
+            ".ends",
+            "X9 /out 0 tb",
+            "V1 /in 0 5",
+        ];
+        let preflight = with_files(&netlist, &[], &lines);
+        assert_eq!(
+            fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+            ["bb"]
+        );
+        assert_eq!(warned(&preflight, "unknown_initial_node"), ["aa"]);
+    }
+
+    #[test]
+    fn a_node_an_included_element_names_twice_is_one_card() {
+        let preflight = with_files(
+            TWO_NETS,
+            &[("f.sp", "R8 typo typo 1k")],
+            &["V1 /in 0 5", ".include \"f.sp\""],
+        );
+        assert_eq!(
+            fails(&preflight, "testbench_nodes", "unknown_testbench_node"),
+            ["typo"]
+        );
     }
 
     #[test]
