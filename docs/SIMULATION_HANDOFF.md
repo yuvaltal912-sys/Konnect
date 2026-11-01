@@ -42,7 +42,7 @@ PRs 1 to 10 are merged to `main` on the `fork` remote, each as a merge commit. P
 | 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
 | 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
-| 11 | PR_LINK | `feat/simulation-plots` | Open, waiting for the owner |
+| 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Open, waiting for the owner |
 
 ## Now: PR 11 is open, and v1 is complete
 
