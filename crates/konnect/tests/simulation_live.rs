@@ -2624,3 +2624,106 @@ fn the_csv_of_two_sweeps_has_the_second_value_the_engine_does_not_save() {
     );
     assert_eq!(refused["error"]["kind"], "invalid_argument", "{refused}");
 }
+
+/// What a viewer would draw: the text of the file's `<text>` elements, read without
+/// a parser, which is enough because Konnect writes each on one line.
+fn svg_text_lines(svg: &str) -> Vec<String> {
+    svg.lines()
+        .filter(|line| line.starts_with("<text "))
+        .filter_map(|line| {
+            let start = line.find('>')? + 1;
+            Some(line[start..line.rfind("</text>")?].to_string())
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_real_transient_an_ac_sweep_and_two_dc_sweeps_are_plotted_to_a_small_svg() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let sheet = project.path().join("rectifier.kicad_sch");
+    let home = tempfile::tempdir().unwrap();
+    let run_on = |lines: Vec<String>, analysis: Value, signals: Value| {
+        let run = call_again(
+            home.path(),
+            "run_simulation",
+            json!({
+                "schematic": sheet,
+                "testbench": { "exclude_references": ["*"], "spice_lines": lines },
+                "analysis": analysis,
+                "signals": signals,
+            }),
+        );
+        assert_eq!(run["outcome"]["status"], "complete", "{run}");
+        run
+    };
+    let plot_of = |run: &Value, signals: Value| {
+        let plot = call_again(
+            home.path(),
+            "plot_simulation_run",
+            json!({ "run_id": run["run_id"], "signals": signals }),
+        );
+        assert_eq!(plot["outcome"]["status"], "complete", "{plot}");
+        let svg = std::fs::read_to_string(plot["path"].as_str().unwrap()).unwrap();
+        assert!(svg.starts_with("<?xml"), "{svg:.80}");
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert_eq!(plot["bytes"], svg.len());
+        (plot, svg)
+    };
+
+    // A transient of a million samples a signal, drawn as a few thousand points.
+    let tran = run_on(
+        soft_start_lines(),
+        json!({ "kind": "transient", "stop_time_seconds": 0.14, "max_step_seconds": 5e-7 }),
+        json!(["v(vout)", "i(VBAT)"]),
+    );
+    assert!(tran["analysis"]["points"].as_u64().unwrap() > 250_000);
+    let (plot, svg) = plot_of(&tran, json!(["v(vout)", "i(VBAT)"]));
+    assert_eq!(plot["points_in_run"], tran["analysis"]["points"]);
+    assert!(plot["points_drawn"].as_u64().unwrap() < 6000, "{plot}");
+    assert!(svg.len() < 100_000, "{} bytes", svg.len());
+    assert_eq!(plot["simulated_circuit"], "modified");
+    let text = svg_text_lines(&svg);
+    for label in ["Voltage (V)", "Current (A)", "Time (ms)"] {
+        assert!(text.iter().any(|t| t == label), "{label} in {text:?}");
+    }
+    assert!(text.iter().any(|t| t.starts_with("MODIFIED CIRCUIT")));
+
+    // The loop gain: 40 dB and no phase at the start, three poles in all.
+    let ac = run_on(
+        ac_loop_lines(),
+        json!({ "kind": "ac", "start_hz": 1.0, "stop_hz": 1e6, "points": 200 }),
+        json!(["v(out)"]),
+    );
+    let (plot, svg) = plot_of(&ac, json!(["v(out)"]));
+    assert_eq!(plot["analysis_kind"], "ac");
+    assert_eq!(plot["warnings"], json!([]), "{plot}");
+    let text = svg_text_lines(&svg);
+    for label in ["Gain (dB)", "Phase (°)", "Frequency (Hz)", "1k", "1M"] {
+        assert!(text.iter().any(|t| t == label), "{label} in {text:?}");
+    }
+
+    // Two sweeps: a curve for each step of the second, named for what it varies.
+    let lines = [
+        "VA a 0 DC 0",
+        "VB b 0 DC 0",
+        "R1 a c 1k",
+        "R2 b c 1k",
+        "R3 c 0 1k",
+    ];
+    let grid = run_on(
+        lines.map(str::to_owned).to_vec(),
+        json!({ "kind": "dc_sweep", "sweeps": [
+            { "target": "VA", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+            { "target": "VB", "start_value": 0.0, "stop_value": 3.0, "step_value": 1.0 },
+        ] }),
+        json!(["v(c)"]),
+    );
+    let (_, svg) = plot_of(&grid, json!(["v(c)"]));
+    let text = svg_text_lines(&svg);
+    for label in ["VB = 0 V", "VB = 3 V", "VA (V)", "v(c)"] {
+        assert!(text.iter().any(|t| t == label), "{label} in {text:?}");
+    }
+    assert_eq!(svg.matches("<polyline").count(), 4);
+}

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **232 registered tools** + **7 always-visible meta-tools** = **239 total**
+- **233 registered tools** + **7 always-visible meta-tools** = **240 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -481,7 +481,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Simulation
 
-### `simulation` · 4 tools
+### `simulation` · 5 tools
 
 **Purpose:** Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run.
 **Source:** [`crates/konnect-core/src/tools/simulation.rs`](crates/konnect-core/src/tools/simulation.rs)
@@ -492,6 +492,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `run_simulation` | Run one analysis on a schematic in an isolated simulator process and return compact results, with the full data on disk. Works from the saved files on a private copy. Read simulated_circuit: a result from a modified circuit does not describe the schematic as drawn. Runs an operating point, a transient, an AC sweep or a DC sweep. A transient can summarise signals and take time-weighted measurements such as inrush peak, I²t and settling time. An AC sweep gives gain in dB, and bandwidth, phase margin and gain margin. A DC sweep varies a source, a resistor or the temperature, and takes extremes and crossings along it. |
 | `list_simulation_runs` | List the stored runs of a schematic, newest first, so a run is not lost with a response that never arrived. Each shows its analysis, whether it is complete or partial, whether it simulated the circuit as drawn, how much of the requested range it covered, and whether the saved schematic or its model files have changed since. The newest 20 runs of each project are kept. |
 | `measure_simulation_run` | Work out more measurements and signal summaries on a stored run without simulating again. Measurements take the same kinds as run_simulation, and one that does not fit the run's analysis is refused. Read run_status and simulated_circuit: a measurement on a partial run covers only the data it has, and one on a modified circuit does not describe the schematic as drawn. inputs_changed_since_run says whether the saved schematic differs from what the run used. A dc_sweep with two sweeps takes no measurements. |
+| `plot_simulation_run` | Draw signals of a stored run as an SVG file and return its path, without simulating again. A transient, a dc_sweep with one sweep or an ac sweep is drawn against its own axis (an ac sweep as gain in dB and phase against log frequency); a dc_sweep with two sweeps draws up to eight steps of the second as curves, for up to four signals; an operating point is refused. Traces are cut to an envelope, so the file stays small however long the run. The picture carries a banner when the run was partial, simulated a modified circuit, or has changed inputs, and the result repeats run_status, simulated_circuit and inputs_changed_since_run: relay them. The file is a viewer or browser file, not an inline image. |
 
 ## Appendix: Structural observations
 

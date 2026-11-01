@@ -12,6 +12,7 @@ pub(crate) mod flatten;
 pub(crate) mod kicad_netlist;
 pub(crate) mod measure;
 pub(crate) mod net_names;
+pub(crate) mod plot;
 pub(crate) mod preflight;
 pub mod protocol;
 pub mod raw;

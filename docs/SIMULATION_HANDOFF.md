@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-10-31, with PR 1 to 9 merged to `main` (PR 9 as `2503cad`) and PR 10 open.
+**Last updated:** 2026-11-01, with PR 1 to 10 merged to `main` (PR 9 as `2503cad`, PR 10 as `d6b5ea8`) and PR 11 open.
 
 ## Start here
 
@@ -30,7 +30,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 9 are merged to `main` on the `fork` remote, each as a merge commit. Later PRs are based on `main`.
+PRs 1 to 10 are merged to `main` on the `fork` remote, each as a merge commit. PR 11 is open against `main`.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -41,12 +41,25 @@ PRs 1 to 9 are merged to `main` on the `fork` remote, each as a merge commit. La
 | 7 | [#5](https://github.com/yuvaltal912-sys/Konnect/pull/5) | `feat/simulation-transient` | Merged |
 | 8 | [#6](https://github.com/yuvaltal912-sys/Konnect/pull/6) | `feat/simulation-protection` | Merged |
 | 9 | [#8](https://github.com/yuvaltal912-sys/Konnect/pull/8) | `feat/simulation-sweeps` | Merged as `2503cad` |
-| 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Open, waiting for the owner |
-| 11 | Not opened | | Not started |
+| 10 | [#9](https://github.com/yuvaltal912-sys/Konnect/pull/9) | `feat/simulation-stored-runs` | Merged as `d6b5ea8` |
+| 11 | [#10](https://github.com/yuvaltal912-sys/Konnect/pull/10) | `feat/simulation-plots` | Open, waiting for the owner |
 
-## Now: PR 10 is open
+## Now: PR 11 is open, and v1 is complete
 
-PR 9 is merged. It added the `ac` and `dc_sweep` arms of `run_simulation`, with `no_ac_stimulus`, `sweep_target_not_found`, bandwidth, phase margin, gain margin, per-kind summaries and coverage proof. PR 10 adds `list_simulation_runs`, `measure_simulation_run` and CSV export. Nothing is merged. Ask the owner before merging it, and before starting PR 11.
+PR 11 adds `plot_simulation_run`, the last tool of the plan's v1. Nothing is merged. Ask the owner before merging it, and before starting any follow-up. After it the plan's v1 is done apart from the placement fix; the "After PR 11" table lists what is left.
+
+### What PR 11 changed that later work needs to know
+
+- **`plot_simulation_run` draws a stored run to `plot-<12 hex>.svg` in the run's folder.** `simulation/plot.rs` is the renderer (no plotting crate, no `unsafe`, nothing about runs), `tools/simulation/plots.rs` gathers each analysis's data and writes the file. A new analysis kind must add its arm there, as it must in `Analysis::record`, `from_record` and `Evaluation`.
+- **`stored::open` and `stored::read_plot` are the way to a stored run.** They were cut out of `measure_simulation_run`, which now uses them too, in the same order of checks. Reach a run only through them (`runs::locate`, then `runs::read_record`).
+- **What is drawn:** a panel for each unit for a transient or one DC sweep; a Bode plot (gain in dB, unwrapped phase) on a log frequency axis for AC; for two sweeps a panel for each signal (four at most) with a curve for each step of the second, eight at most, thinned evenly with the first and last kept. An operating point is refused. A partial run is drawn only as far as it got, because stretching the axis to the requested range made a run that covered 1 percent a blank plot.
+- **The banner is drawn first** and has a line each for `PARTIAL RUN`, `MODIFIED CIRCUIT` and `SCHEMATIC CHANGED` (`inputs_changed_since_run: true`). The last was not in the plan.
+- **Size is bounded by pixels, not by points.** At most two points a pixel column a trace, keeping the lowest and highest. 281,020 points on two signals is 25,710 bytes. A trace of 40 points or fewer also gets a mark at each sample.
+- **Text is untrusted.** Net names and the file name are escaped, cut to 64 characters and stripped of controls and reordering characters before they reach a text node. Never put one in an attribute. The tests parse the file with a strict XML parser (`usvg::roxmltree`, already a dependency).
+- **Files:** the same request replaces its file, at most 16 plots stay in a run folder, and only a plain file named exactly `plot-<12 hex>.svg` is ever replaced or removed. A link where the plot goes is `run_store_failed`.
+- **`signals_plotted` is a list** of the signals as written. The plan did not say whether it was a count.
+- **The SVG is not a PNG.** `konnect_render::svg_to_png` still refuses `<text>`, and the skill says the file is for a browser or an editor.
+- **Phase on the plot is the phase margins use,** so the same aliasing limits apply, and a `phase_unreliable` warning and a note in the picture say where it stops being trustworthy.
 
 ### What PR 10 changed that the next PR needs to know
 
@@ -89,12 +102,17 @@ PR 9 is merged. It added the `ac` and `dc_sweep` arms of `run_simulation`, with 
 - **`i(l1)` appears twice** in the raw file, differing by rounding. `signals::vector` treats that as one signal, and real disagreement as none.
 - **`.options interp` is refused,** because it thins the saved samples (E95).
 
-## After PR 10
+## After PR 11
 
-| PR | Outcome |
+The plan's v1 is PR 1 to 11 and the placement fix. What is left:
+
+| Work | Outcome |
 |---|---|
-| 11 | `plot_simulation_run`, SVG |
-| Any | `fix(schematic): copy Sim fields on placement` |
+| `fix(schematic): copy Sim fields on placement` | Part of v1, not started |
+| Two-sweep slices | An `outer_step` selection on `measure_simulation_run`, if the owner wants it |
+| PNG and inline images | Need a small vector font for labels, with its licence checked, and `outcome::attach` reading the JSON block first |
+| Margin runs at double density | `run_simulation` doing the second AC run itself |
+| The two false refusals | The `.ic` inside `.subckt` refusal and the testbench `.include` refusal, both from PR 4 |
 
 Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets its live-test step then, and Q1, Q2, Q6 and Q7 are settled then.
 
@@ -111,8 +129,10 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect-core/src/simulation/raw.rs` | Raw file parser |
 | `crates/konnect-core/src/simulation/runs.rs` | Run folders: create, prune, `locate` by id, `list`, and the `run.json` record |
 | `crates/konnect-core/src/simulation/export.rs` | The plot as CSV |
+| `crates/konnect-core/src/simulation/plot.rs` | The SVG renderer: layout, ticks, envelopes, escaping. Knows nothing of runs |
+| `crates/konnect-core/src/tools/simulation/plots.rs` | `plot_simulation_run`: what each analysis draws, the banner, the file |
 | `crates/konnect-core/src/simulation/signals.rs`, `measure.rs`, `ac.rs` | Signal grammar and lookup (real and complex), measurements on any axis, and AC gain, phase and margins |
-| `crates/konnect-core/src/tools/simulation/stored.rs` | `list_simulation_runs` and `measure_simulation_run` |
+| `crates/konnect-core/src/tools/simulation/stored.rs` | `list_simulation_runs` and `measure_simulation_run`, and `open` and `read_plot`, which every reader of a stored run goes through |
 | `crates/konnect-core/src/tools/simulation/sweeps.rs` | The `ac` and `dc_sweep` analyses: arguments, deck line, target lookup, coverage |
 | `crates/konnect-core/src/simulation/worker_client.rs`, `protocol.rs` | Worker supervision and its contract |
 | `crates/konnect/src/sim_worker.rs` | The only FFI. `konnect-core` stays free of `unsafe` |
@@ -185,6 +205,8 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - `no_ac_stimulus` counts any V or I source with a non-zero `AC` value, including one inside a subcircuit that nothing calls, so a circuit whose only AC source is in an uncalled subcircuit passes and reads zero.
 - **The undersampling tests are a best effort.** Four review rounds each found another edge of them. Left as limits: a deep notch below crossover is refused at sensible densities (a 50 dB notch at 300 Hz needed 800 points a decade), and an all-pass or long delay aliases unseen. The dependable control is two runs at double the density. If a later PR touches this, consider making `run_simulation` do that second run itself when a margin is asked for.
 - **Stored runs, limits left in PR 10:** a run that inlined an IBIS model reads `inputs_changed_since_run: true` for good once another project's export wipes KiCad's IBIS cache, since the cache file is one of its inputs. Runs from PR 6 to 9 have no record, so they are counted as `without_record` and cannot be measured. A stored measurement on a partial run counts as failed, as a live one does, though its number is exact. The prune-race branch of `measure_simulation_run` (`or_not_found`) is tested through the function and not through a real race. `list_simulation_runs` does not check that a run's raw file is still there.
+- **PR 11's review:** four rounds by independent agents, the last finding nothing serious, and 130 source breaks of which 123 failed the tests (E108, E109). The round 4 fixes were not reviewed again. Layout is checked by a geometry test that holds every text off every other text, off the banner's edge and out of the plot frames at widths from 200 to 1600, using an estimate of 0.65 em a character, not by pixels.
+- **Plots, limits left in PR 11:** text is placed by an estimate (0.6 em a character), so an unusually wide font could run a label past its margin, and nothing was checked in a viewer other than Chromium's. A linear AC sweep is drawn on a log axis and bunches at the high end. A two-sweep run whose first sweep has one point draws a mark for each step and no curve. A run's plots are not listed anywhere: `path` is the only way to find one. The picture was read by eye on one run of each analysis (E107) and by test for structure; no test compares pixels.
 - A top-level element in a file that a testbench `.include`s is refused as `unknown_testbench_node`, though the plan says lines from such a file count. Found in PR 9's review, in PR 4's code, and not fixed.
 - A DC sweep of one point (start equals stop), or an AC sweep that holds one point, reads `complete` with `outside_data` for every window measurement. An AC sweep with under two points is refused; a DC one is not.
 - With two sweeps `signals` summarise the whole grid and measurements are refused, live and stored. A slice per outer value needs a result shape of its own, and PR 10 left it out (see above). `results.csv` has the grid.

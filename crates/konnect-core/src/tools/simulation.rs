@@ -8,6 +8,7 @@ use crate::simulation::export::{self, Layout};
 use crate::simulation::flatten::{self, Compatibility, DeckInputs, FlatDeck, Refusal};
 use crate::simulation::kicad_netlist::{self, ElementEntry, KiCadNetlist, NetEntry, SpiceNetlist};
 use crate::simulation::measure::{self, AxisSpec, Measurement};
+use crate::simulation::plot;
 use crate::simulation::preflight::{self, Preflight};
 use crate::simulation::protocol::{
     RunRequest, RunStatus, DECK_FILE, LOG_FILE, PROTOCOL_VERSION, RAW_FILE, REQUEST_FILE,
@@ -28,6 +29,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod plots;
 mod stored;
 mod sweeps;
 use sweeps::{Ac, DcSweep};
@@ -361,6 +363,35 @@ pub fn tools() -> Vec<ToolDef> {
             "required": ["run_id", "measurements"]
         }),
         |args, ctx| async move { handle_measure_simulation_run(args, ctx).await }
+    ), tool!(
+        "plot_simulation_run",
+        "Draw signals of a stored run as an SVG file and return its path, without simulating again. A transient, a dc_sweep with one sweep or an ac sweep is drawn against its own axis (an ac sweep as gain in dB and phase against log frequency); a dc_sweep with two sweeps draws up to eight steps of the second as curves, for up to four signals; an operating point is refused. Traces are cut to an envelope, so the file stays small however long the run. The picture carries a banner when the run was partial, simulated a modified circuit, or has changed inputs, and the result repeats run_status, simulated_circuit and inputs_changed_since_run: relay them. The file is a viewer or browser file, not an inline image.",
+        json!({
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{12}-[0-9]{8}T[0-9]{6}-[0-9a-f]{4}$",
+                    "description": "The run_id from run_simulation or list_simulation_runs"
+                },
+                "signals": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": plots::MAX_PLOT_SIGNALS,
+                    "items": { "type": "string" },
+                    "description": "Signals to draw: v(NET), v(NET1,NET2), i(REF), i(REF:PIN) or p(REF), which only a run that asked for it has saved. One that the run does not hold is refused as invalid_argument"
+                },
+                "width_px": {
+                    "type": "integer",
+                    "minimum": plot::MIN_WIDTH,
+                    "maximum": plot::MAX_WIDTH,
+                    "default": plot::DEFAULT_WIDTH,
+                    "description": "Width of the picture in pixels; its height follows from what it holds"
+                }
+            },
+            "required": ["run_id", "signals"]
+        }),
+        |args, ctx| async move { handle_plot_simulation_run(args, ctx).await }
     )]
 }
 
@@ -547,6 +578,21 @@ async fn handle_measure_simulation_run(
         Err((refusal, target)) => {
             stored::failed_measure_outcome(refusal, &target, question.requested())
         }
+    })
+}
+
+async fn handle_plot_simulation_run(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let question = plots::Question {
+        run_id: args["run_id"].as_str().unwrap_or_default(),
+        signals: &args["signals"],
+        width_px: &args["width_px"],
+    };
+    Ok(match plots::plot(ctx, &question) {
+        Ok(result) => result,
+        Err((refusal, target)) => plots::failed_outcome(refusal, &target),
     })
 }
 
@@ -5768,6 +5814,1132 @@ mod tests {
                 .find(|warning| warning["code"] == "power_not_saved")
                 .unwrap_or_else(|| panic!("{body}"));
             assert_eq!(warning["items"], json!(["p(R2)"]), "{warning}");
+        }
+
+        // --- plots -----------------------------------------------------------
+
+        async fn plotted(scene: &Scene, arguments: Value) -> (bool, Value) {
+            let result = handle_plot_simulation_run(&arguments, &scene.ctx)
+                .await
+                .unwrap();
+            read_body(result)
+        }
+
+        fn svg_of(body: &Value) -> String {
+            std::fs::read_to_string(body["path"].as_str().unwrap()).unwrap()
+        }
+
+        fn svg_texts(svg: &str) -> Vec<String> {
+            let document = usvg::roxmltree::Document::parse(svg).expect("well-formed");
+            document
+                .descendants()
+                .filter(|node| node.has_tag_name("text"))
+                .map(|node| node.text().unwrap_or_default().to_string())
+                .collect()
+        }
+
+        /// The points of each polyline, in pixels.
+        fn svg_lines(svg: &str) -> Vec<Vec<(f64, f64)>> {
+            let document = usvg::roxmltree::Document::parse(svg).expect("well-formed");
+            document
+                .descendants()
+                .filter(|node| node.has_tag_name("polyline"))
+                .map(|node| {
+                    node.attribute("points")
+                        .unwrap()
+                        .split(' ')
+                        .map(|pair| {
+                            let (x, y) = pair.split_once(',').unwrap();
+                            (x.parse().unwrap(), y.parse().unwrap())
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+
+        fn plots_in(dir: &Path) -> Vec<PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("plot-"))
+                })
+                .collect()
+        }
+
+        async fn run_of(scene: &Scene, arguments: Value) -> Value {
+            let (failed, run) = call(scene, arguments).await;
+            assert!(!failed, "{run}");
+            run
+        }
+
+        fn refused(failed: bool, body: &Value, kind: &str, field: &str) {
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["kind"], kind, "{body}");
+            if !field.is_empty() {
+                assert_eq!(body["error"]["field"], field, "{body}");
+            }
+            assert_eq!(body["outcome"]["status"], "failed", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2, "{body}");
+            assert_eq!(body["outcome"]["failed"], 2, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_transient_is_drawn_with_a_panel_for_each_unit_and_a_banner_for_the_modified_circuit(
+        ) {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)", "i(m1:d)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let path = PathBuf::from(body["path"].as_str().unwrap());
+            assert!(path.starts_with(first_run_dir(&scene)), "{path:?}");
+            assert_eq!(path.extension().unwrap(), "svg");
+            let svg = svg_of(&body);
+            assert_eq!(body["bytes"], svg.len());
+            assert_eq!(body["width_px"], 800);
+            let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+            let height = document.root_element().attribute("height").unwrap();
+            assert_eq!(body["height_px"].to_string(), height);
+            assert_eq!(body["signals_plotted"], json!(["v(a)", "i(m1:d)"]));
+            assert_eq!(body["analysis_kind"], "transient");
+            assert_eq!(body["run_status"], "complete");
+            assert_eq!(body["simulated_circuit"], "modified");
+            assert_eq!(body["coverage_ratio"], 1.0);
+            assert_eq!(body["inputs_changed_since_run"], false);
+            assert_eq!(body["outcome"]["status"], "complete", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["completed"], 2);
+            let shown = svg_texts(&svg);
+            for label in ["Voltage (V)", "Current (A)", "Time (s)", "v(a)", "i(m1:d)"] {
+                assert!(shown.iter().any(|t| t == label), "{label} in {shown:?}");
+            }
+            assert!(
+                shown.iter().any(|t| t.starts_with("MODIFIED CIRCUIT")),
+                "{shown:?}"
+            );
+            assert!(!shown.iter().any(|t| t.starts_with("PARTIAL RUN")));
+            // Volts above amps.
+            let place = |label: &str| shown.iter().position(|t| t == label).unwrap();
+            assert!(place("Voltage (V)") < place("Current (A)"), "{shown:?}");
+            // v(a) climbs 0, 1, 2 and i(m1:d) holds 5: two lines.
+            let lines = svg_lines(&svg);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0][0].1 > lines[0][2].1, "v(a) rises");
+            assert_eq!(lines[1][0].1, lines[1][2].1, "the current is flat");
+        }
+
+        #[tokio::test]
+        async fn a_run_that_stopped_short_is_drawn_as_far_as_it_got_under_a_banner() {
+            let scene = scene(&transient_job());
+            // Data to 2 s of 5 s asked for.
+            let run = run_of(&scene, transient_args(&scene.root, 5.0)).await;
+            assert_eq!(run["outcome"]["status"], "partial");
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["run_status"], "partial");
+            assert_eq!(body["coverage_ratio"], 0.4);
+            assert_eq!(body["outcome"]["status"], "partial", "{body}");
+            assert_eq!(body["outcome"]["requested"], 2);
+            assert_eq!(body["outcome"]["completed"], 1);
+            assert_eq!(body["outcome"]["failed"], 1);
+            let svg = svg_of(&body);
+            let shown = svg_texts(&svg);
+            assert!(
+                shown
+                    .iter()
+                    .any(|t| t.starts_with("PARTIAL RUN") && t.contains("40%")),
+                "{shown:?}"
+            );
+            assert!(
+                shown.iter().any(|t| t.contains("incomplete_coverage")),
+                "{shown:?}"
+            );
+            // What was not simulated is not drawn: the data fill the axis, and the
+            // banner says how little of the range they are.
+            let line = &svg_lines(&svg)[0];
+            let (first, last) = (line[0].0, line[line.len() - 1].0);
+            let share = (last - first) / (800.0 - 76.0 - 18.0);
+            assert!(share > 0.99, "{share}");
+            assert!(!svg.contains("not simulated"));
+        }
+
+        #[tokio::test]
+        async fn an_ac_sweep_is_a_bode_plot_on_a_log_axis() {
+            let raw = copy_ac(&low_pass(&[
+                1.0, 2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0, 64.0, 100.0,
+            ]));
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                ac_args(&scene.root, json!({ "points": 1, "scale": "decade" })),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["analysis_kind"], "ac");
+            let svg = svg_of(&body);
+            let shown = svg_texts(&svg);
+            for label in ["Gain (dB)", "Phase (°)", "Frequency (Hz)", "1", "10", "100"] {
+                assert!(shown.iter().any(|t| t == label), "{label} in {shown:?}");
+            }
+            let lines = svg_lines(&svg);
+            assert_eq!(lines.len(), 2, "gain and phase");
+            // Log frequency: 1 to 10 Hz takes as much room as 10 to 100.
+            let gain = &lines[0];
+            let (x1, x10, x100) = (gain[0].0, gain[4].0, gain[9].0);
+            assert!(((x10 - x1) - (x100 - x10)).abs() < 0.5, "{x1} {x10} {x100}");
+            // Both fall: the pixel row grows. The gain is 3 dB down at the corner.
+            assert!(gain[9].1 > gain[4].1 && gain[4].1 > gain[0].1);
+            assert!(lines[1][9].1 > lines[1][0].1, "the phase falls");
+        }
+
+        #[tokio::test]
+        async fn a_dc_sweep_is_drawn_against_the_element_it_swept_and_a_falling_one_runs_leftward()
+        {
+            let rising: Vec<(f64, f64)> = (0..=5)
+                .map(|n| (f64::from(n), 2.0 * f64::from(n)))
+                .collect();
+            let sweep = |start: f64, stop: f64, step: f64| {
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "vsrc", "start_value": start, "stop_value": stop,
+                      "step_value": step }
+                ] })
+            };
+            let job = format!("{}\n{}", copy_dc(&rising), status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                sweep_args(&scene.root, sweep(0.0, 5.0, 1.0), "VSRC /rect_out 0 DC 0"),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            let shown = svg_texts(&svg);
+            assert!(shown.iter().any(|t| t == "VSRC (V)"), "{shown:?}");
+            let line = &svg_lines(&svg)[0];
+            assert!(line[0].0 < line[5].0 && line[0].1 > line[5].1);
+
+            let falling: Vec<(f64, f64)> = rising.iter().rev().copied().collect();
+            let job = format!("{}\n{}", copy_dc(&falling), status_json("0", "null", true));
+            let scene = self::scene(&job);
+            let run = run_of(
+                &scene,
+                sweep_args(&scene.root, sweep(5.0, 0.0, -1.0), "VSRC /rect_out 0 DC 0"),
+            )
+            .await;
+            let (_, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            let line = &svg_lines(&svg_of(&body))[0];
+            // It ran from 5 V down to 0 V: the line starts at the right, high.
+            assert!(line[0].0 > line[5].0 && line[0].1 < line[5].1, "{line:?}");
+        }
+
+        fn grid_job(inner: usize, outer: usize) -> String {
+            let points: Vec<(f64, f64)> = (0..inner * outer)
+                .map(|n| ((n % inner) as f64, n as f64))
+                .collect();
+            format!("{}\n{}", copy_dc(&points), status_json("0", "null", true))
+        }
+
+        fn grid_args(root: &Path, inner: usize, outer: usize) -> Value {
+            let mut arguments = sweep_args(
+                root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": (inner - 1) as f64,
+                      "step_value": 1.0 },
+                    { "target": "R2", "start_value": 1000.0,
+                      "stop_value": 1000.0 * outer as f64, "step_value": 1000.0 },
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["signals"] = json!(["v(a)"]);
+            arguments
+        }
+
+        #[tokio::test]
+        async fn two_dc_sweeps_draw_a_curve_for_each_step_of_the_second_found_from_the_point_number(
+        ) {
+            let scene = scene(&grid_job(3, 3));
+            let run = run_of(&scene, grid_args(&scene.root, 3, 3)).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            let shown = svg_texts(&svg);
+            for label in ["R2 = 1k Ω", "R2 = 2k Ω", "R2 = 3k Ω", "VSRC (V)", "v(a)"] {
+                assert!(shown.iter().any(|t| t == label), "{label} in {shown:?}");
+            }
+            let lines = svg_lines(&svg);
+            assert_eq!(lines.len(), 3);
+            // Step k holds values 3k to 3k + 2, so each curve starts above the last.
+            assert!(lines[0][0].1 > lines[1][0].1 && lines[1][0].1 > lines[2][0].1);
+            // Dark to light along the ramp.
+            let colour = |n: usize| {
+                let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name("polyline"))
+                    .nth(n)
+                    .and_then(|node| node.attribute("stroke").map(str::to_string))
+                    .unwrap()
+            };
+            assert_eq!(colour(0), plot::RAMP[0]);
+            assert_eq!(colour(2), plot::RAMP[7]);
+            assert_eq!(body["warnings"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn a_second_sweep_of_one_step_is_one_curve_in_the_first_colour() {
+            let scene = scene(&grid_job(3, 1));
+            let run = run_of(&scene, grid_args(&scene.root, 3, 1)).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            assert_eq!(svg_lines(&svg).len(), 1);
+            assert!(svg.contains(&format!("stroke=\"{}\"", plot::RAMP[0])));
+            assert!(!svg.contains(plot::RAMP[3]));
+            assert!(svg_texts(&svg).iter().any(|t| t == "R2 = 1k Ω"));
+        }
+
+        #[tokio::test]
+        async fn more_than_eight_steps_are_thinned_with_the_first_and_last_kept_and_said_so() {
+            let scene = scene(&grid_job(2, 12));
+            let run = run_of(&scene, grid_args(&scene.root, 2, 12)).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            assert_eq!(svg_lines(&svg).len(), 8);
+            let shown = svg_texts(&svg);
+            assert!(shown.iter().any(|t| t == "R2 = 1k Ω"), "{shown:?}");
+            assert!(shown.iter().any(|t| t == "R2 = 12k Ω"), "{shown:?}");
+            assert!(shown
+                .iter()
+                .any(|t| t.contains("Showing 8 of the 12 steps")));
+            let strokes: std::collections::BTreeSet<String> = {
+                let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name("polyline"))
+                    .filter_map(|node| node.attribute("stroke").map(str::to_string))
+                    .collect()
+            };
+            assert_eq!(strokes.len(), 8, "every curve has a colour of its own");
+            assert_eq!(body["warnings"][0]["code"], "curves_thinned");
+            assert_eq!(body["warnings"][0]["steps"], 12);
+        }
+
+        #[tokio::test]
+        async fn two_sweeps_take_four_signals_at_most() {
+            let scene = scene(&grid_job(3, 3));
+            let run = run_of(&scene, grid_args(&scene.root, 3, 3)).await;
+            let five = json!(["v(a)", "v(a)", "v(a)", "v(a)", "v(a)"]);
+            let (failed, body) =
+                plotted(&scene, json!({ "run_id": run["run_id"], "signals": five })).await;
+            refused(failed, &body, "invalid_argument", "signals");
+        }
+
+        #[tokio::test]
+        async fn an_operating_point_has_nothing_to_plot_and_says_where_its_table_is() {
+            let job = format!("{}\n{}", copy_raw(), status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(&scene, args(&scene.root)).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            refused(failed, &body, "invalid_argument", "run_id");
+            assert!(body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("results.csv"));
+            assert!(plots_in(&first_run_dir(&scene)).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_signal_the_run_lacks_refuses_the_plot_and_writes_nothing() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            for (signal, hint) in [
+                ("v(nowhere)", ""),
+                ("i(M1)", "pins: d"),
+                ("p(R2)", "asked for it"),
+            ] {
+                let (failed, body) = plotted(
+                    &scene,
+                    json!({ "run_id": run["run_id"], "signals": ["v(a)", signal] }),
+                )
+                .await;
+                refused(failed, &body, "invalid_argument", "signals[1]");
+                let reason = body["error"]["reason"].as_str().unwrap();
+                assert!(reason.contains("not in this run's data"), "{reason}");
+                assert!(reason.contains(hint), "{reason}");
+            }
+            assert!(plots_in(&first_run_dir(&scene)).is_empty());
+        }
+
+        #[tokio::test]
+        async fn arguments_out_of_range_are_refused_before_the_store_is_read() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let id = run["run_id"].clone();
+            let nine = json!(vec!["v(a)"; 9]);
+            let cases = [
+                (json!({ "run_id": id, "signals": [] }), "signals"),
+                (json!({ "run_id": id, "signals": nine }), "signals"),
+                (json!({ "run_id": id }), "signals"),
+                (
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": 199 }),
+                    "width_px",
+                ),
+                (
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": 1601 }),
+                    "width_px",
+                ),
+                (
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": 800.5 }),
+                    "width_px",
+                ),
+                (
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": "800" }),
+                    "width_px",
+                ),
+                (
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": -5 }),
+                    "width_px",
+                ),
+                (
+                    json!({ "run_id": "../../x", "signals": ["v(a)"] }),
+                    "run_id",
+                ),
+                (json!({ "signals": ["v(a)"] }), "run_id"),
+                (
+                    json!({ "run_id": id, "signals": ["nonsense"] }),
+                    "signals[0]",
+                ),
+                (json!({ "run_id": id, "signals": [7] }), "signals[0]"),
+            ];
+            for (arguments, field) in cases {
+                let (failed, body) = plotted(&scene, arguments.clone()).await;
+                refused(failed, &body, "invalid_argument", field);
+            }
+            assert!(plots_in(&first_run_dir(&scene)).is_empty());
+            // A well-formed id nobody made.
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": "000000000000-20260101T000000-0000", "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "run_not_found", "{body}");
+            assert_eq!(body["outcome"]["status"], "failed");
+            // The widest and narrowest are allowed.
+            for width in [200, 1600] {
+                let (failed, body) = plotted(
+                    &scene,
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": width }),
+                )
+                .await;
+                assert!(!failed, "{body}");
+                assert_eq!(body["width_px"], width);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_run_without_a_record_is_not_found() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            std::fs::remove_file(first_run_dir(&scene).join(runs::RECORD_FILE)).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "run_not_found", "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_run_whose_data_is_gone_is_unreadable_and_a_run_in_a_link_is_not_found() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            std::fs::remove_file(dir.join("results.raw")).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "results_unreadable", "{body}");
+            assert_eq!(body["outcome"]["status"], "failed");
+            // Replace the whole run folder by a link to another: `locate` refuses it.
+            let moved = dir.with_extension("moved");
+            std::fs::rename(&dir, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &dir).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed);
+            assert_eq!(body["error"]["reason"], "run_not_found", "{body}");
+            assert!(plots_in(&moved).is_empty());
+        }
+
+        #[tokio::test]
+        async fn the_same_request_replaces_its_plot_and_the_folder_keeps_sixteen() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let id = run["run_id"].clone();
+            let dir = first_run_dir(&scene);
+            let scene = &scene;
+            let ask = |width: u32| {
+                let arguments = json!({ "run_id": id, "signals": ["v(a)"], "width_px": width });
+                async move { plotted(scene, arguments).await }
+            };
+            let (_, first) = ask(300).await;
+            let (_, again) = ask(300).await;
+            assert_eq!(first["path"], again["path"]);
+            assert_eq!(plots_in(&dir).len(), 1);
+            for width in 301..=330 {
+                let (failed, body) = ask(width).await;
+                assert!(!failed, "{body}");
+                assert!(PathBuf::from(body["path"].as_str().unwrap()).is_file());
+            }
+            let left = plots_in(&dir);
+            assert_eq!(left.len(), 16, "{left:?}");
+            assert!(!PathBuf::from(first["path"].as_str().unwrap()).exists());
+            // Nothing but plots, the run's own files and no half-written file.
+            let strays = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+                .count();
+            assert_eq!(strays, 0);
+        }
+
+        #[tokio::test]
+        async fn a_link_where_the_plot_goes_is_never_written_through() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            let (_, first) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            let path = PathBuf::from(first["path"].as_str().unwrap());
+            let outside = scene.tools.path().join("precious.txt");
+            std::fs::write(&outside, "keep").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "run_store_failed", "{body}");
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+            assert!(dir.join(path.file_name().unwrap()).is_symlink());
+        }
+
+        #[tokio::test]
+        async fn net_names_with_markup_in_them_reach_the_file_as_plain_text() {
+            let name = "a<script>alert(1)</script>&amp;\"'";
+            let raw = format!(
+                "cat > results.raw <<'RAW'\nTitle: t\nPlotname: Transient Analysis\nFlags: real\n\
+                 No. Variables: 2\nNo. Points: 3\nVariables:\n\t0\ttime\ttime\n\
+                 \t1\tv({name})\tvoltage\nValues:\n0\t0.0\n\t0.0\n1\t1.0\n\t1.0\n2\t2.0\n\t2.0\n\nRAW"
+            );
+            let scene = scene(&format!("{raw}\n{}", status_json("0", "null", true)));
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let signal = format!("v({name})");
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": [signal] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            assert!(!svg.contains("<script"), "{svg}");
+            // The legend shows the name as it was written, cut to a length.
+            let shown = svg_texts(&svg);
+            assert!(
+                shown
+                    .iter()
+                    .any(|t| t.contains("<script>alert(1)</script>")),
+                "{shown:?}"
+            );
+        }
+
+        #[test]
+        fn the_banner_names_what_a_reader_must_know_and_is_empty_for_a_clean_run() {
+            let record = |status: RunState, circuit: &str| {
+                RunRecord::new(RecordFields {
+                    schematic: PathBuf::from("/p/board.kicad_sch"),
+                    analysis: json!({ "kind": "transient", "stop_time_seconds": 1.0 }),
+                    run_status: status,
+                    stopped: (status == RunState::Partial).then(|| Stopped {
+                        reason: "timeout".into(),
+                        at_point: 3,
+                        node: None,
+                    }),
+                    simulated_circuit: circuit.to_string(),
+                    circuit: Value::Null,
+                    result: Value::Null,
+                    coverage_ratio: 0.25,
+                    inputs_hash: String::new(),
+                    inlined_files: Vec::new(),
+                    nets: Vec::new(),
+                    elements: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            };
+            let clean = plots::banner(&record(RunState::Complete, "as_drawn"), Some(false));
+            assert!(clean.is_empty(), "{clean:?}");
+            assert!(plots::banner(&record(RunState::Complete, "as_drawn"), None).is_empty());
+            let partial = plots::banner(&record(RunState::Partial, "as_drawn"), Some(false));
+            assert_eq!(partial.len(), 1);
+            assert!(partial[0].starts_with("PARTIAL RUN") && partial[0].contains("25%"));
+            assert!(partial[0].contains("timeout"));
+            let modified = plots::banner(&record(RunState::Complete, "modified"), Some(false));
+            assert!(modified[0].starts_with("MODIFIED CIRCUIT"));
+            let changed = plots::banner(&record(RunState::Complete, "as_drawn"), Some(true));
+            assert!(changed[0].starts_with("SCHEMATIC CHANGED"));
+            let all = plots::banner(&record(RunState::Partial, "modified"), Some(true));
+            assert_eq!(all.len(), 3);
+        }
+
+        #[tokio::test]
+        async fn a_long_run_is_drawn_as_an_envelope_and_says_so() {
+            let mut raw = "cat > results.raw <<'RAW'\nTitle: t\nPlotname: Transient Analysis\n\
+                           Flags: real\nNo. Variables: 2\nNo. Points: 3001\nVariables:\n\
+                           \t0\ttime\ttime\n\t1\tv(a)\tvoltage\nValues:\n"
+                .to_string();
+            for i in 0..=3000 {
+                let t = f64::from(i) * 1e-3;
+                raw.push_str(&format!("{i}\t{t:e}\n\t{:e}\n", (t * 40.0).sin()));
+            }
+            raw.push_str("\nRAW");
+            let scene = scene(&format!("{raw}\n{}", status_json("0", "null", true)));
+            let run = run_of(&scene, transient_args(&scene.root, 3.0)).await;
+            assert_eq!(run["outcome"]["status"], "complete", "{run}");
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["points_in_run"], 3001);
+            let drawn = body["points_drawn"].as_u64().unwrap();
+            assert!(drawn <= 2 * 707 && drawn > 100, "{drawn}");
+            assert!(body["bytes"].as_u64().unwrap() < 60_000, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            assert!(
+                shown
+                    .iter()
+                    .any(|t| t.contains("envelope") && t.contains("3001")),
+                "{shown:?}"
+            );
+            // A short run says nothing of the kind.
+            let small = self::scene(&transient_job());
+            let run = run_of(&small, transient_args(&small.root, 2.0)).await;
+            let (_, body) = plotted(
+                &small,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!svg_texts(&svg_of(&body))
+                .iter()
+                .any(|t| t.contains("envelope")));
+        }
+
+        #[tokio::test]
+        async fn a_sample_that_turns_the_phase_too_far_is_noted_in_the_picture_and_the_result() {
+            // One decade a point: 1, 10 and 100 Hz, and the phase goes from 0 to 174
+            // degrees in one step.
+            let raw = copy_ac(&[(1.0, 1.0, 0.0), (10.0, -1.0, 0.1), (100.0, 0.5, -0.5)]);
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                ac_args(&scene.root, json!({ "points": 1, "scale": "decade" })),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(body["warnings"][0]["code"], "phase_unreliable", "{body}");
+            assert_eq!(body["warnings"][0]["from_hz"], 10.0);
+            let shown = svg_texts(&svg_of(&body));
+            assert!(
+                shown
+                    .iter()
+                    .any(|t| t.contains("Phase from 10 Hz on may be out by whole turns")),
+                "{shown:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn only_our_own_plots_are_ever_removed_and_a_stale_half_file_does_not_block() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let id = run["run_id"].clone();
+            let dir = first_run_dir(&scene);
+            let foreign = [
+                "plot-notes.svg",
+                "plot-zzzzzzzzzzzz.svg",
+                "plot-0123456789abc.svg",
+                "plot-0123456789ab.png",
+            ];
+            for name in foreign {
+                std::fs::write(dir.join(name), "mine").unwrap();
+            }
+            let scene = &scene;
+            let ask = |width: u32| {
+                let arguments = json!({ "run_id": id, "signals": ["v(a)"], "width_px": width });
+                async move { plotted(scene, arguments).await }
+            };
+            let mut paths = Vec::new();
+            for width in 300..320 {
+                let (failed, body) = ask(width).await;
+                assert!(!failed, "{body}");
+                paths.push(PathBuf::from(body["path"].as_str().unwrap()));
+            }
+            for name in foreign {
+                assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), "mine");
+            }
+            // Asking again for one that is still there costs no other plot.
+            let kept: Vec<&PathBuf> = paths.iter().filter(|p| p.exists()).collect();
+            assert_eq!(kept.len(), 16);
+            let (_, again) = ask(319).await;
+            assert_eq!(PathBuf::from(again["path"].as_str().unwrap()), paths[19]);
+            let (_, again) = ask(paths.len() as u32 + 296).await;
+            assert!(!again.is_null());
+            for path in &kept {
+                assert!(path.exists(), "{path:?} was removed by a repeat");
+            }
+            // A half file that is just made may be another call writing the same plot,
+            // and is not taken over.
+            let target = paths[19].clone();
+            let mut half = target.clone().into_os_string();
+            half.push(".partial");
+            std::fs::write(&half, "junk").unwrap();
+            let (failed, body) = ask(319).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "run_store_failed", "{body}");
+            assert_eq!(std::fs::read_to_string(&half).unwrap(), "junk");
+            // One left by a crash an hour ago does not stop the plot.
+            let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&half)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+            let (failed, body) = ask(319).await;
+            assert!(!failed, "{body}");
+            assert!(!PathBuf::from(&half).exists());
+            assert!(std::fs::read_to_string(&target)
+                .unwrap()
+                .ends_with("</svg>\n"));
+        }
+
+        #[tokio::test]
+        async fn nets_that_ngspice_reads_as_one_are_named_in_a_warning() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let record_path = first_run_dir(&scene).join(runs::RECORD_FILE);
+            let mut record: Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            let net = |name: &str| json!({ "kicad_name": name, "spice_name": "a", "in_deck": true, "pin_count": 2 });
+            record["nets"] = json!([net("NetOne"), net("NetTwo")]);
+            std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(NetOne)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            assert_eq!(
+                body["warnings"][0]["code"], "nets_share_engine_node",
+                "{body}"
+            );
+            assert_eq!(body["warnings"][0]["items"], json!(["NetOne", "NetTwo"]));
+        }
+
+        #[tokio::test]
+        async fn a_changed_schematic_shows_its_banner_in_the_picture() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"], "signals": ["v(a)"] });
+            let (_, body) = plotted(&scene, ask.clone()).await;
+            assert!(!svg_texts(&svg_of(&body))
+                .iter()
+                .any(|t| t.starts_with("SCHEMATIC CHANGED")));
+            let original = std::fs::read_to_string(&scene.root).unwrap();
+            std::fs::write(&scene.root, format!("{original} ")).unwrap();
+            let (_, body) = plotted(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            assert!(
+                shown.iter().any(|t| t.starts_with("SCHEMATIC CHANGED")),
+                "{shown:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_temperature_sweep_is_drawn_in_plain_degrees() {
+            let points: Vec<(f64, f64)> = (1..=5)
+                .map(|n| (f64::from(n) / 10.0, f64::from(n)))
+                .collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                sweep_args(
+                    &scene.root,
+                    json!({ "kind": "dc_sweep", "sweeps": [
+                        { "target": "TEMP", "start_value": 0.1, "stop_value": 0.5,
+                          "step_value": 0.1 }
+                    ] }),
+                    "VSRC /rect_out 0 DC 0",
+                ),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            assert!(shown.iter().any(|t| t == "temp (°C)"), "{shown:?}");
+        }
+
+        #[tokio::test]
+        async fn data_with_no_time_or_no_frequency_is_unreadable_and_not_a_blank_plot() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let raw = first_run_dir(&scene).join("results.raw");
+            let kept = std::fs::read_to_string(&raw).unwrap();
+            // The same data under a scale that is not time.
+            std::fs::write(&raw, kept.replace("\ttime\ttime", "\tseconds\ttime")).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "results_unreadable", "{body}");
+            assert!(body["message"].as_str().unwrap().contains("no time"));
+
+            let ac = copy_ac(&low_pass(&[1.0, 10.0, 100.0]));
+            let job = format!("{ac}\n{}", status_json("0", "null", true));
+            let scene = self::scene(&job);
+            let run = run_of(
+                &scene,
+                ac_args(&scene.root, json!({ "points": 1, "scale": "decade" })),
+            )
+            .await;
+            let raw = first_run_dir(&scene).join("results.raw");
+            let kept = std::fs::read_to_string(&raw).unwrap();
+            std::fs::write(
+                &raw,
+                kept.replace("\tfrequency\tfrequency", "\thz\tfrequency"),
+            )
+            .unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert!(body["message"].as_str().unwrap().contains("no frequency"));
+        }
+
+        #[test]
+        fn the_banner_never_rounds_a_short_run_up_to_the_whole_range() {
+            let record = |ratio: f64| {
+                RunRecord::new(RecordFields {
+                    schematic: PathBuf::from("/p/board.kicad_sch"),
+                    analysis: json!({ "kind": "transient", "stop_time_seconds": 1.0 }),
+                    run_status: RunState::Partial,
+                    stopped: Some(Stopped {
+                        reason: "x".repeat(500),
+                        at_point: 3,
+                        node: None,
+                    }),
+                    simulated_circuit: "as_drawn".into(),
+                    circuit: Value::Null,
+                    result: Value::Null,
+                    coverage_ratio: ratio,
+                    inputs_hash: String::new(),
+                    inlined_files: Vec::new(),
+                    nets: Vec::new(),
+                    elements: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            };
+            let says = |ratio: f64| plots::banner(&record(ratio), None).remove(0);
+            assert!(says(0.996).contains("covers 99% of"), "{}", says(0.996));
+            assert!(says(0.004).contains("covers under 1% of"));
+            assert!(says(0.5).contains("covers 50% of"));
+            // A reason from a damaged record is cut, not repeated whole.
+            assert!(says(0.5).len() < 300, "{}", says(0.5).len());
+        }
+
+        #[test]
+        fn a_step_of_the_second_sweep_never_reads_past_the_end_of_a_short_variable() {
+            assert_eq!(plots::step_rows(0, 3, 10), 0..3);
+            assert_eq!(plots::step_rows(1, 3, 5), 3..5);
+            assert_eq!(plots::step_rows(2, 3, 5), 5..5);
+            assert_eq!(plots::step_rows(9, 3, 5), 5..5);
+            assert_eq!(plots::step_rows(0, 3, 0), 0..0);
+        }
+
+        #[tokio::test]
+        async fn a_second_sweep_of_temperature_names_its_curves_in_plain_degrees() {
+            let points: Vec<(f64, f64)> = (0..9).map(|n| ((n % 3) as f64, n as f64)).collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let mut arguments = sweep_args(
+                &scene.root,
+                json!({ "kind": "dc_sweep", "sweeps": [
+                    { "target": "VSRC", "start_value": 0.0, "stop_value": 2.0, "step_value": 1.0 },
+                    { "target": "TEMP", "start_value": 0.1, "stop_value": 0.3, "step_value": 0.1 },
+                ] }),
+                "VSRC /rect_out 0 DC 0",
+            );
+            arguments["signals"] = json!(["v(a)"]);
+            let run = run_of(&scene, arguments).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            for label in ["temp = 0.1 °C", "temp = 0.2 °C", "temp = 0.3 °C"] {
+                assert!(shown.iter().any(|t| t == label), "{label} in {shown:?}");
+            }
+        }
+
+        #[test]
+        fn the_file_name_tells_apart_signal_lists_that_join_to_the_same_text() {
+            let name = |signals: &[&str], width| {
+                let signals: Vec<String> = signals.iter().map(|s| s.to_string()).collect();
+                plots::file_name(&signals, width)
+            };
+            assert_ne!(name(&["ab", "c"], 800), name(&["a", "bc"], 800));
+            assert_ne!(name(&["v(a)"], 800), name(&["v(a)"], 801));
+            assert_eq!(name(&["v(a)"], 800), name(&["v(a)"], 800));
+            assert!(
+                name(&["v(a)"], 800).starts_with("plot-") && name(&["v(a)"], 800).ends_with(".svg")
+            );
+            // The lowest of the frequencies a phase turned too far at, across signals.
+            assert_eq!(plots::earlier(None, 50.0), Some(50.0));
+            assert_eq!(plots::earlier(Some(50.0), 10.0), Some(10.0));
+            assert_eq!(plots::earlier(Some(10.0), 50.0), Some(10.0));
+        }
+
+        #[tokio::test]
+        async fn every_signal_keeps_its_colour_in_the_legend_and_on_the_curve() {
+            let raw = copy_ac(&low_pass(&[
+                1.0, 2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0, 64.0, 100.0,
+            ]));
+            let job = format!("{raw}\n{}", status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                ac_args(&scene.root, json!({ "points": 1, "scale": "decade" })),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)", "v(a,0)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+            let strokes = |tag: &str| -> Vec<String> {
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name(tag))
+                    .filter(|node| tag != "line" || node.attribute("stroke-width") == Some("3"))
+                    .filter_map(|node| node.attribute("stroke").map(str::to_string))
+                    .collect()
+            };
+            // Two signals in a gain and a phase panel: the curves are in signal order
+            // in each, and the legend repeats the same two colours.
+            let curves = strokes("polyline");
+            assert_eq!(
+                curves,
+                [
+                    plot::CATEGORICAL[0],
+                    plot::CATEGORICAL[1],
+                    plot::CATEGORICAL[0],
+                    plot::CATEGORICAL[1]
+                ]
+            );
+            assert_eq!(
+                strokes("line"),
+                [plot::CATEGORICAL[0], plot::CATEGORICAL[1]]
+            );
+
+            // Two sweeps: the swatches are the colours of the curves they name.
+            let scene = self::scene(&grid_job(3, 3));
+            let run = run_of(&scene, grid_args(&scene.root, 3, 3)).await;
+            let (_, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            let svg = svg_of(&body);
+            let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+            let strokes = |tag: &str| -> Vec<String> {
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name(tag))
+                    .filter(|node| tag != "line" || node.attribute("stroke-width") == Some("3"))
+                    .filter_map(|node| node.attribute("stroke").map(str::to_string))
+                    .collect()
+            };
+            assert_eq!(strokes("line"), strokes("polyline"));
+        }
+
+        #[tokio::test]
+        async fn a_link_a_folder_and_a_capital_hex_name_in_the_run_folder_are_never_pruned() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let id = run["run_id"].clone();
+            let dir = first_run_dir(&scene);
+            let outside = scene.tools.path().join("precious");
+            std::fs::write(&outside, "keep").unwrap();
+            std::fs::create_dir(dir.join("plot-aaaaaaaaaaaa.svg")).unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("plot-bbbbbbbbbbbb.svg")).unwrap();
+            std::fs::write(dir.join("plot-ABCDEF012345.svg"), "mine").unwrap();
+            for width in 300..330 {
+                let (failed, body) = plotted(
+                    &scene,
+                    json!({ "run_id": id, "signals": ["v(a)"], "width_px": width }),
+                )
+                .await;
+                assert!(!failed, "{body}");
+            }
+            assert!(dir.join("plot-aaaaaaaaaaaa.svg").is_dir());
+            assert!(dir.join("plot-bbbbbbbbbbbb.svg").is_symlink());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("plot-ABCDEF012345.svg")).unwrap(),
+                "mine"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_name_of_a_signal_that_is_not_there_is_cut_before_it_is_repeated() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let long = format!("v({})", "x".repeat(5000));
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": [long] }),
+            )
+            .await;
+            refused(failed, &body, "invalid_argument", "signals[0]");
+            assert!(
+                body["error"]["reason"].as_str().unwrap().len() < 200,
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_half_file_dated_in_the_future_is_treated_as_a_crashs() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"], "signals": ["v(a)"] });
+            let (_, first) = plotted(&scene, ask.clone()).await;
+            let path = PathBuf::from(first["path"].as_str().unwrap());
+            let mut half = path.clone().into_os_string();
+            half.push(".partial");
+            std::fs::write(&half, "junk").unwrap();
+            let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&half)
+                .unwrap()
+                .set_modified(future)
+                .unwrap();
+            let (failed, body) = plotted(&scene, ask).await;
+            assert!(!failed, "{body}");
+            assert!(!PathBuf::from(&half).exists());
+        }
+
+        #[tokio::test]
+        async fn a_folder_that_cannot_be_listed_after_the_write_does_not_fail_the_plot() {
+            use std::os::unix::fs::PermissionsExt;
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let dir = first_run_dir(&scene);
+            // Write and search, no read: the plot can be made and the folder not scanned.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!failed, "{body}");
+            assert!(PathBuf::from(body["path"].as_str().unwrap()).is_file());
+        }
+
+        #[test]
+        fn a_variable_shorter_than_the_plot_is_cut_to_pair_with_its_own_axis() {
+            let (x, y) = plots::paired(&[0.0, 1.0, 2.0], &[5.0, 6.0]);
+            assert_eq!((x, y), (vec![0.0, 1.0], vec![5.0, 6.0]));
+            let (x, y) = plots::paired(&[0.0], &[5.0, 6.0]);
+            assert_eq!((x, y), (vec![0.0], vec![5.0]));
         }
     }
 }
