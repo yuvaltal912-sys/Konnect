@@ -282,10 +282,19 @@ impl Map {
     }
 }
 
-/// The span of the finite values `values` gives, widened so it is never empty.
+/// A value that can be placed. Past this, the arithmetic of a span or a scale
+/// overflows to infinity and a coordinate comes out as `NaN`, and no circuit
+/// quantity is this large: a diverged run is.
+const MAX_MAGNITUDE: f64 = 1e150;
+
+fn plottable(value: f64) -> bool {
+    value.is_finite() && value.abs() <= MAX_MAGNITUDE
+}
+
+/// The span of the plottable values `values` gives.
 fn extent(values: impl Iterator<Item = f64>, log: bool) -> Option<(f64, f64)> {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for value in values.filter(|v| v.is_finite() && (!log || *v > 0.0)) {
+    for value in values.filter(|v| plottable(*v) && (!log || *v > 0.0)) {
         lo = lo.min(value);
         hi = hi.max(value);
     }
@@ -366,7 +375,7 @@ fn trace(
     let mut run: Vec<(f64, f64)> = Vec::new();
     let mut runs: Vec<Vec<(f64, f64)>> = Vec::new();
     for (&x, &y) in series.x.iter().zip(&series.y) {
-        let usable = x.is_finite() && y.is_finite() && (!xs.log || x > 0.0);
+        let usable = plottable(x) && plottable(y) && (!xs.log || x > 0.0);
         if usable {
             run.push((xs.at(x), ys.at(y)));
         } else if !run.is_empty() {
@@ -779,6 +788,7 @@ mod tests {
         // Reordering marks could make one net name read as another.
         assert_eq!(escape("v\u{202E}ba\u{2066}r", 64), "v ba r");
         assert_eq!(escape("a\u{2028}b\u{FFFF}c\u{FDD0}d", 64), "a b c d");
+        assert_eq!(escape("a\u{200E}b\u{200F}c", 64), "a b c");
         assert_eq!(escape("abcdef", 3), "abc…");
         assert_eq!(escape("abc", 3), "abc");
         // Cut by characters, never in the middle of one.
@@ -1091,5 +1101,24 @@ mod tests {
         assert_eq!(px(-0.0), "0.0");
         assert_eq!(px(12.34), "12.3");
         assert_eq!(px(-1.26), "-1.3");
+    }
+
+    #[test]
+    fn values_too_large_to_scale_are_left_out_and_never_make_a_coordinate_nan() {
+        let drawn = render(&chart(vec![panel(vec![line(
+            0,
+            vec![0.0, 1.0, 2.0, 3.0],
+            vec![0.0, 1e300, -1e308, 2.0],
+        )])]));
+        assert!(!drawn.svg.contains("NaN") && !drawn.svg.contains("inf"));
+        assert_eq!(drawn.points_in, 2);
+        // The axis is that of what remains: 0 to 2, not 1e300.
+        assert!(texts(&drawn.svg).iter().any(|t| t == "Voltage (V)"));
+        let wide = render(&chart(vec![panel(vec![line(
+            0,
+            vec![0.0, 1.0],
+            vec![1e149, -1e149],
+        )])]));
+        assert!(!wide.svg.contains("NaN") && wide.points_in == 2);
     }
 }

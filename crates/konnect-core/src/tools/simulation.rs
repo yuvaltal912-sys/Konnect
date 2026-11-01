@@ -6116,6 +6116,23 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_second_sweep_of_one_step_is_one_curve_in_the_first_colour() {
+            let scene = scene(&grid_job(3, 1));
+            let run = run_of(&scene, grid_args(&scene.root, 3, 1)).await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let svg = svg_of(&body);
+            assert_eq!(svg_lines(&svg).len(), 1);
+            assert!(svg.contains(&format!("stroke=\"{}\"", plot::RAMP[0])));
+            assert!(!svg.contains(plot::RAMP[3]));
+            assert!(svg_texts(&svg).iter().any(|t| t == "R2 = 1k Ω"));
+        }
+
+        #[tokio::test]
         async fn more_than_eight_steps_are_thinned_with_the_first_and_last_kept_and_said_so() {
             let scene = scene(&grid_job(2, 12));
             let run = run_of(&scene, grid_args(&scene.root, 2, 12)).await;

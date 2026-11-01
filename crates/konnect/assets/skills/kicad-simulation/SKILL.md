@@ -7,7 +7,8 @@ description: |
   "settling time", "rise time", "soft start", "short circuit", "fuse", "eFuse", "current limit",
   "undervoltage lockout", "UVLO", "reverse polarity", "reversed battery", "protection",
   "AC analysis", "frequency response", "bode", "bandwidth", "phase margin", "gain margin",
-  "stability", "loop gain", "DC sweep", "transfer curve", "sweep".
+  "stability", "loop gain", "DC sweep", "transfer curve", "sweep", "plot", "graph", "waveform",
+  "show me the curve".
 argument-hint: "[circuit or question]"
 ---
 
@@ -20,7 +21,7 @@ Simulation runs on the saved schematic, on a private copy, in a separate process
 ## Toolset Loading
 
 ```
-load_toolset('simulation')    # check_simulation_readiness, run_simulation, list_simulation_runs, measure_simulation_run
+load_toolset('simulation')    # check_simulation_readiness, run_simulation, list_simulation_runs, measure_simulation_run, plot_simulation_run
 ```
 
 ## Workflow
@@ -35,6 +36,7 @@ load_toolset('simulation')    # check_simulation_readiness, run_simulation, list
    - `{ "kind": "dc_sweep", "sweeps": [{ "target": "V1", "start_value": 0, "stop_value": 12, "step_value": 0.1 }] }` for a transfer curve or a polarity sweep.
 5. Report the results, and state `simulated_circuit` if it is `modified`.
 6. Want another number from the same run? Use `measure_simulation_run` with the `run_id`, and do not simulate again. Lost the response? `list_simulation_runs` finds the run.
+7. Want to see it? `plot_simulation_run` draws signals of a stored run to an SVG file. See Plots.
 
 ## Transient Runs
 
@@ -165,6 +167,21 @@ Every run that left data is kept: the newest 20 for each project. Nothing here s
 - **Only the newest 20 runs are kept.** An older id is `run_not_found`.
 
 Every run also writes `artifacts.csv_path`: the data as text for a spreadsheet or a script. A transient has `time` and one column a signal. An AC sweep has `frequency`, then `.real` and `.imag` columns for each signal. A DC sweep is headed by what it varies, such as `V1 (V)`. An operating point reads down the rows. A run too big for it has `csv_path: null` and a `csv_not_written` warning, and the raw file has the data.
+
+## Plots
+
+`plot_simulation_run` takes a `run_id` and one to eight `signals` (`v(NET)`, `v(NET1,NET2)`, `i(REF)`, `i(REF:PIN)`, `p(REF)`) and optionally `width_px` (200 to 1600, default 800). It writes an SVG into the run's folder and returns `path`, `width_px`, `height_px`, `bytes`, `signals_plotted`, `run_status`, `coverage_ratio`, `simulated_circuit` and `inputs_changed_since_run`. It does not simulate again.
+
+```json
+{ "run_id": "3fa9c1d27b04-20261030T133512-7f3a", "signals": ["v(/VOUT)", "i(BT1)"] }
+```
+
+- **Tell the owner the path.** The file is for a browser or a vector editor. It is not an inline image, and no PNG is made: the text in it is live text.
+- **Always relay `run_status`, `simulated_circuit` and `inputs_changed_since_run`.** The picture carries a yellow banner for each of them that is not clean (`PARTIAL RUN`, `MODIFIED CIRCUIT`, `SCHEMATIC CHANGED`), and the banner is the first thing drawn. A partial run is drawn as far as its data goes, so the axis ends where the run did: read the banner for how much of the range that was.
+- **What is drawn.** A transient and a one-sweep `dc_sweep` get a panel for each unit (volts, amps, watts), against time or against the quantity swept. An `ac` sweep gets a Bode plot, gain in dB over unwrapped phase, against frequency on a log axis whatever the sweep's spacing; a `phase_unreliable` warning, and a note in the picture, mean the phase may be out by whole turns from that frequency on. A `dc_sweep` with two sweeps gets a panel for each signal (four at most) with a curve for each step of the second sweep, dark to light. More than eight steps are thinned, evenly, always keeping the first and last, and `curves_thinned` says so. An `operating_point` has nothing to plot against and is `invalid_argument`: its table is `artifacts.table_path` and `results.csv`.
+- **Long runs are drawn as envelopes.** Each pixel column keeps its lowest and highest point, so a spike is never lost and a half-million point run is a file of tens of kilobytes. A note in the picture says so, and `points_in_run` and `points_drawn` give the counts.
+- **A signal the run does not hold is `invalid_argument`,** naming which one. `p(REF)` is only in a run that asked for it. Plot only what the run saved, or run again.
+- **The same request replaces its file.** At most 16 plots are kept for a run, and the oldest go first.
 
 ## Protection Scenarios
 
@@ -321,7 +338,7 @@ Branch on `error.reason`, and show `error.items`.
 | `engine_crashed` | The simulator process died | The server is unaffected. Read the log |
 | `unbalanced_deck_block` | A `.if` or `.subckt` is left open | Close it. Check `spice_lines` first |
 | `engine_not_found` | No libngspice was found | Set `ngspice_library`, using the listed locations |
-| `run_not_found` | `measure_simulation_run` has no run with that id: it was pruned, failed, or never existed | `list_simulation_runs` shows what is kept |
+| `run_not_found` | `measure_simulation_run` or `plot_simulation_run` has no run with that id: it was pruned, failed, or never existed | `list_simulation_runs` shows what is kept |
 | `results_unreadable` | The stored run's data or record cannot be read | Run again |
 
 A run that stops early with data is not an error. For `stopped.reason: "size_limit"`, raise `max_raw_bytes`, shorten the run or raise `max_step_seconds`. For `timeout`, do the same with `timeout_seconds`. For `no_convergence`, `stopped.node` names where it failed.
