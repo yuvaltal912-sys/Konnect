@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// A diode with the fields KiCad's Device library gives it (`Sim.Params`
 /// carries quotes, to prove they survive), a resistor with none, a
 /// `ki_keywords` that must stay in the library, and a `power:` symbol.
-pub(crate) const SIM_LIBRARY: &str = "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:D\"\n      (property \"Reference\" \"D\" (at 0 0 0))\n      (property \"Value\" \"D\" (at 0 0 0))\n      (property \"Sim.Device\" \"D\" (at 0 0 0) (hide yes))\n      (property \"Sim.Pins\" \"1=K 2=A\" (at 0 0 0) (hide yes))\n      (property \"Sim.Params\" \"m=\\\"x\\\" is=1n\" (at 0 0 0) (hide yes))\n      (property \"ki_keywords\" \"diode\" (at 0 0 0) (hide yes))\n    )\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 0 0 0))\n      (property \"Value\" \"R\" (at 0 0 0))\n    )\n    (symbol \"power:VSIM\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0))\n      (property \"Value\" \"VSIM\" (at 0 0 0))\n      (property \"Sim.Device\" \"V\" (at 0 0 0) (hide yes))\n    )\n  )\n)\n";
+pub(crate) const SIM_LIBRARY: &str = "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:D\"\n      (property \"Reference\" \"D\" (at 0 0 0))\n      (property \"Value\" \"D\" (at 0 0 0))\n      (property \"Sim.Device\" \"D\" (at 0 0 0) (hide yes))\n      (property \"Sim.Pins\" \"1=K 2=A\" (at 0 0 0) (hide yes))\n      (property \"Sim.Params\" \"m=\\\"x\\\" is=1n\" (at 0 0 0) (hide yes))\n      (property \"ki_keywords\" \"diode\" (at 0 0 0) (hide yes))\n    )\n    (symbol \"Device:DCOPY\"\n      (property \"Reference\" \"D\" (at 0 0 0))\n      (property \"Value\" \"DCOPY\" (at 0 0 0))\n      (property \"Sim.Device\" \"D\" (at 0 0 0) (hide yes))\n      (property \"Sim.Pins\" \"1=K 2=A\" (at 0 0 0) (hide yes))\n      (property \"Sim.Params\" \"m=\\\"x\\\" is=1n\" (at 0 0 0) (hide yes))\n    )\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 0 0 0))\n      (property \"Value\" \"R\" (at 0 0 0))\n    )\n    (symbol \"power:VSIM\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0))\n      (property \"Value\" \"VSIM\" (at 0 0 0))\n      (property \"Sim.Device\" \"V\" (at 0 0 0) (hide yes))\n    )\n  )\n)\n";
 
 /// What a placed `Device:D` must carry, in library order.
 pub(crate) const DIODE_SIM: [(&str, &str); 3] = [
@@ -298,7 +298,16 @@ async fn the_swap_writes_no_blank_line_and_keeps_a_crlf_tab_file_consistent() {
         saved.matches("\r\n").count(),
         "every line break stays CRLF"
     );
+    assert!(!saved.contains("\r\r"), "no stray carriage return");
     assert!(!saved.contains("\r\n\r\n"), "no blank line left behind");
+    let at = saved.find("(lib_id \"Device:D\")").unwrap();
+    let start = saved[..at].rfind("(symbol").unwrap();
+    let (_, end) = konnect_sexp::writer::find_balanced_block(&saved, start).unwrap();
+    assert!(
+        !saved[start..end].lines().any(|line| line.trim().is_empty()),
+        "no whitespace-only line in the instance:\n{}",
+        &saved[start..end]
+    );
     assert_eq!(saved_sim_fields(&path, "D1").0, hidden(&DIODE_SIM));
 }
 
@@ -370,5 +379,141 @@ async fn every_placed_unit_gets_the_swap() {
     assert_eq!(
         names(&result["sim_fields_dropped"]),
         pairs(&[("Sim.Device", "D"), ("Sim.Pins", "1=K 2=A")])
+    );
+}
+
+#[tokio::test]
+async fn only_sim_dot_fields_are_swapped_and_the_new_ones_land_after_the_last_property() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:D", "D1", 100.0).await;
+    call(
+        sch_components::tools(),
+        "edit_schematic_component",
+        json!({"schematic": path.display().to_string(), "reference": "D1",
+               "fields": {"Simulation": "keep", "sim.device": "keep", "SimX": "keep"}}),
+    )
+    .await;
+    replace(&path, "D1", "power:VSIM").await;
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let at = saved.find("(lib_id \"power:VSIM\")").unwrap();
+    let start = saved[..at].rfind("(symbol").unwrap();
+    let (_, end) = konnect_sexp::writer::find_balanced_block(&saved, start).unwrap();
+    let instance = &saved[start..end];
+    for name in ["Simulation", "sim.device", "SimX"] {
+        assert!(
+            instance.contains(&format!("(property \"{name}\" \"keep\"")),
+            "{name} is not a Sim.* field:\n{instance}"
+        );
+    }
+    let last = instance.rfind("(property \"").unwrap();
+    assert!(
+        instance[last..].starts_with("(property \"Sim.Device\" \"V\""),
+        "the new field follows the last property:\n{instance}"
+    );
+}
+
+#[tokio::test]
+async fn a_field_the_new_symbol_repeats_exactly_is_in_neither_list() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:D", "D1", 100.0).await;
+    // power:VSIM's Sim.Device is V; give the diode's the same value first.
+    call(
+        sch_components::tools(),
+        "edit_schematic_component",
+        json!({"schematic": path.display().to_string(), "reference": "D1",
+               "fields": {"Sim.Device": "V"}}),
+    )
+    .await;
+    let result = replace(&path, "D1", "power:VSIM").await;
+    assert_eq!(
+        names(&result["sim_fields_dropped"]),
+        pairs(&[("Sim.Pins", "1=K 2=A"), ("Sim.Params", "m=\"x\" is=1n")])
+    );
+    assert!(names(&result["sim_fields_added"]).is_empty(), "{result}");
+    assert_eq!(
+        saved_sim_fields(&path, "D1").0,
+        hidden(&[("Sim.Device", "V")])
+    );
+}
+
+#[tokio::test]
+async fn a_unit_already_carrying_the_new_fields_is_not_rewritten() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:R", "R1", 100.0).await;
+    place(&path, "Device:D", "D1", 120.0).await;
+    // A resistor replaced by a diode, and a diode by a diode, both through
+    // the swap; only the first changes the file's Sim text.
+    replace(&path, "R1", "Device:D").await;
+    let before = std::fs::read_to_string(&path).unwrap();
+    let result = replace(&path, "D1", "Device:D").await;
+    assert!(names(&result["sim_fields_dropped"]).is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn an_instance_block_written_on_one_line_is_not_corrupted() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:R", "R1", 100.0).await;
+    let saved = std::fs::read_to_string(&path).unwrap();
+    // Fold the placed instance onto one line.
+    let at = saved.find("(lib_id \"Device:R\")").unwrap();
+    let start = saved[..at].rfind("(symbol").unwrap();
+    let (_, end) = konnect_sexp::writer::find_balanced_block(&saved, start).unwrap();
+    let folded = saved[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        &path,
+        format!("{}{}{}", &saved[..start], folded, &saved[end..]),
+    )
+    .unwrap();
+    replace(&path, "R1", "Device:D").await;
+    assert_eq!(saved_sim_fields(&path, "R1").0, hidden(&DIODE_SIM));
+}
+
+#[test]
+fn the_readback_names_a_unit_still_carrying_an_old_sim_field() {
+    let expected = |name: &str| name == "Sim.Device";
+    let clean = json!({"units": [{"unit": 2, "fields": {"Sim.Device": "D", "Value": "x"}}]});
+    assert_eq!(
+        sch_components::unit_with_stale_sim_field(&clean, expected),
+        None
+    );
+    let stale = json!({"units": [{"unit": 2, "fields": {"Sim.Device": "D", "Sim.Pins": "1=K"}}]});
+    assert_eq!(
+        sch_components::unit_with_stale_sim_field(&stale, expected),
+        Some(json!(2))
+    );
+}
+
+#[tokio::test]
+async fn a_unit_already_carrying_the_new_fields_in_another_layout_is_left_alone() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:D", "D1", 100.0).await;
+    // The same three fields, each folded onto one line as a hand edit might.
+    let mut saved = std::fs::read_to_string(&path).unwrap();
+    let start = saved.rfind("(lib_id \"Device:D\")").unwrap();
+    for name in ["Sim.Device", "Sim.Pins", "Sim.Params"] {
+        let at = start
+            + saved[start..]
+                .find(&format!("(property \"{name}\""))
+                .unwrap();
+        let (_, end) = konnect_sexp::writer::find_balanced_block(&saved, at).unwrap();
+        let folded = saved[at..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        saved.replace_range(at..end, &folded);
+    }
+    std::fs::write(&path, &saved).unwrap();
+    // Device:DCOPY carries exactly the diode's fields.
+    let result = replace(&path, "D1", "Device:DCOPY").await;
+    assert!(names(&result["sim_fields_dropped"]).is_empty(), "{result}");
+    assert!(names(&result["sim_fields_added"]).is_empty(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        saved.replace("(lib_id \"Device:D\")", "(lib_id \"Device:DCOPY\")"),
+        "only the lib_id changes"
     );
 }

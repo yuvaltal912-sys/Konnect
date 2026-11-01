@@ -341,8 +341,9 @@ pub fn tools() -> Vec<ToolDef> {
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
              writing. The simulator reads the instance's Sim.* fields only, so they are \
              swapped too: every old Sim.* field is removed, hand-edited ones included, and \
-             the new symbol's are copied hidden. The result lists them as \
-             sim_fields_dropped and sim_fields_added (name and value). Replacing a symbol \
+             the new symbol's are copied hidden. The result lists the ones that \
+             changed as sim_fields_dropped and sim_fields_added (name and value); a field \
+             the new symbol repeats exactly is in neither. Replacing a symbol \
              with itself leaves the fields alone. Value, Footprint and the reference are \
              not changed, so a part with no Sim fields of its own is still inferred from \
              its reference prefix.",
@@ -2375,12 +2376,15 @@ fn hidden_property_anchor(
         })
         .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
 
+    // Only whitespace counts as indentation: a block written on one line has
+    // the symbol's own text before its first property.
     let indent = block
         .find("(property ")
         .map(|p| {
             let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
             block[line_start..p].to_string()
         })
+        .filter(|indent| indent.chars().all(|ch| ch == ' ' || ch == '\t'))
         .unwrap_or_else(|| "\t\t".to_string());
     Ok((x, y, indent))
 }
@@ -2472,11 +2476,24 @@ fn is_sim_field(name: &str) -> bool {
     name.starts_with("Sim.")
 }
 
-fn target_sim_field(target: &ComponentTarget, name: &str) -> bool {
-    target
-        .units
-        .iter()
-        .any(|unit| unit.fields.contains_key(name))
+/// The unit number of the first unit in the readback with a `Sim.*` field that
+/// `expected` does not name.
+pub(crate) fn unit_with_stale_sim_field(
+    observed: &serde_json::Value,
+    expected: impl Fn(&str) -> bool,
+) -> Option<serde_json::Value> {
+    observed["units"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|unit| {
+            unit["fields"].as_object().is_some_and(|fields| {
+                fields
+                    .keys()
+                    .any(|name| is_sim_field(name) && !expected(name))
+            })
+        })
+        .map(|unit| unit["unit"].clone())
 }
 
 /// What `replace_component` does to an instance's `Sim.*` fields.
@@ -4422,25 +4439,16 @@ async fn handle_replace_component(
     };
     // `verify_component_expectations` proves the new fields landed; this proves
     // no old one survived, which a missing key in the intent cannot show.
-    if let Some(unit) = observed["units"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|unit| {
-            unit["fields"].as_object().is_some_and(|fields| {
-                fields
-                    .keys()
-                    .any(|name| is_sim_field(name) && !target_sim_field(&target, name))
-            })
-        })
-    {
+    if let Some(unit) = unit_with_stale_sim_field(&observed, |name| {
+        target
+            .units
+            .iter()
+            .any(|bound| bound.fields.contains_key(name))
+    }) {
         return Ok(crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "replace_component",
-            format!(
-                "unit {} still carries a Sim field of the old symbol",
-                unit["unit"]
-            ),
+            format!("unit {unit} still carries a Sim field of the old symbol"),
         ));
     }
     let named = |fields: &[(String, String)]| {
