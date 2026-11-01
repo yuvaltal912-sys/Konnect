@@ -874,6 +874,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "run_status",
         "unreadable_record",
         "without_record",
+        // Result fields of `plot_simulation_run`, and its warning.
+        "curves_thinned",
+        "height_px",
+        "points_drawn",
+        "points_in_run",
+        "signals_plotted",
     ];
 
     let mut phantom = Vec::new();
