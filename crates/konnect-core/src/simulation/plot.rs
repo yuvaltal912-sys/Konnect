@@ -35,6 +35,14 @@ const POINTS_PER_COLUMN: usize = 2;
 /// A trace this short also gets a mark at each sample, so a single point shows.
 const MARKED_UP_TO: usize = 40;
 const TRACE_WIDTH: f64 = 1.5;
+/// How wide a character is, in em, for fitting text without a font to measure with.
+/// Capitals and bold run wider than the 0.55 of lower case, so this is generous.
+const CHAR_EM: f64 = 0.65;
+/// A span narrower than this share of the largest value is widened to it, so that
+/// noise on a large offset reads as the flat line it is, and its ticks stay apart.
+const MIN_RELATIVE_SPAN: f64 = 1e-6;
+/// Most characters of a tick label before it goes scientific.
+const MAX_TICK_CHARS: usize = 9;
 
 /// Colour-blind safe, after Okabe and Ito, with the pale yellow swapped for a
 /// purple that holds up on white.
@@ -141,13 +149,13 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 fn text_width(text: &str, size: f64) -> f64 {
-    text.chars().count() as f64 * size * 0.6
+    text.chars().count() as f64 * size * CHAR_EM
 }
 
 /// Break `text` at spaces so no line is much wider than `width`. A word longer
 /// than a line is cut.
 fn wrap(text: &str, size: f64, width: f64) -> Vec<String> {
-    let per_line = ((width / (size * 0.6)).floor() as usize).max(8);
+    let per_line = ((width / (size * CHAR_EM)).floor() as usize).max(8);
     let mut lines: Vec<String> = Vec::new();
     let mut line = String::new();
     let mut length = 0usize;
@@ -354,7 +362,11 @@ fn widen(lo: f64, hi: f64, log: bool, share: f64) -> (f64, f64) {
     match log {
         true => (lo, hi),
         false => {
-            let pad = (hi - lo) * share;
+            let floor = lo.abs().max(hi.abs()) * MIN_RELATIVE_SPAN;
+            let pad = match hi - lo < floor {
+                true => floor / 2.0,
+                false => (hi - lo) * share,
+            };
             (lo - pad, hi + pad)
         }
     }
@@ -364,7 +376,15 @@ fn widen(lo: f64, hi: f64, log: bool, share: f64) -> (f64, f64) {
 /// lowest and the highest of each, in the order they occur. A trace that is short
 /// enough is kept whole.
 fn envelope(points: &[(f64, f64)], columns: usize) -> Vec<(f64, f64)> {
-    if points.len() <= columns.max(1) * POINTS_PER_COLUMN {
+    // A stretch is kept whole only if it is no denser than two points a column of
+    // the width it spans, so that many short stretches cannot each pass as small.
+    let (first, last) = points
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            (lo.min(p.0), hi.max(p.0))
+        });
+    let spanned = ((last - first).max(0.0).floor() as usize + 1).min(columns.max(1) + 1);
+    if points.len() <= spanned * POINTS_PER_COLUMN {
         return points.to_vec();
     }
     let mut out: Vec<(f64, f64)> = Vec::new();
@@ -432,13 +452,26 @@ fn trace(
     }
     // Data riddled with gaps would give a line for each stretch between them, and the
     // file would grow with the gaps. Past a line for each column, the gaps are bridged.
-    if runs.len() > columns.max(1) {
+    if runs.len() > columns.max(1) / 2 {
         runs = vec![runs.into_iter().flatten().collect()];
     }
     plotted.given = runs.iter().map(Vec::len).sum();
     let marked = plotted.given <= MARKED_UP_TO;
-    for run in runs {
-        let kept = envelope(&run, columns);
+    let mut stretches: Vec<Vec<(f64, f64)>> =
+        runs.iter().map(|run| envelope(run, columns)).collect();
+    // However the stretches fall, a trace holds at most four points a column.
+    let total: usize = stretches.iter().map(Vec::len).sum();
+    let cap = columns.max(1) * POINTS_PER_COLUMN * 2;
+    if total > cap {
+        for kept in &mut stretches {
+            let share = (cap * kept.len() / total).max(2);
+            if kept.len() > share {
+                let step = kept.len().div_ceil(share);
+                *kept = kept.iter().copied().step_by(step).collect();
+            }
+        }
+    }
+    for kept in stretches {
         plotted.drawn += kept.len();
         if kept.len() > 1 {
             let list: Vec<String> = kept
@@ -497,14 +530,17 @@ fn tick_text(value: f64, factor: f64, step: f64) -> String {
     let scaled = value / factor;
     let unit_step = step / factor;
     // Ticks a hair apart, or past a billion, would be a dozen digits wide.
-    if scaled == 0.0 && unit_step < 1e-6 {
+    if scaled == 0.0 && unit_step < 1e-9 {
         return "0".to_string();
     }
-    if scaled != 0.0 && (scaled.abs() >= 1e9 || unit_step < 1e-6) {
+    if scaled != 0.0 && (scaled.abs() >= 1e9 || unit_step < 1e-9) {
         return format!("{scaled:.3e}");
     }
-    let places = (-unit_step.log10().floor()).clamp(0.0, 6.0) as usize;
+    let places = (-unit_step.log10().floor()).clamp(0.0, 9.0) as usize;
     let text = format!("{scaled:.places$}");
+    if text.chars().count() > MAX_TICK_CHARS {
+        return format!("{scaled:.3e}");
+    }
     match text
         .trim_start_matches('-')
         .chars()
@@ -548,9 +584,9 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         })
         .max()
         .unwrap_or(0);
-    let left = (28.0 + widest as f64 * 11.0 * 0.6 + 6.0)
+    let left = (28.0 + widest as f64 * 11.0 * CHAR_EM + 6.0)
         .max(MARGIN_LEFT)
-        .min(w * 0.45);
+        .min(w * 0.5);
     let area = (w - left - MARGIN_RIGHT).max(40.0);
     let columns = area.floor() as usize;
     let mut body = String::new();
@@ -603,7 +639,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
 
     // Legend, wrapped to the width, each entry short enough to fit one line.
     if !chart.legend.is_empty() {
-        let legend_chars = (((w - 50.0) / 7.2) as usize).clamp(8, MAX_TEXT_CHARS);
+        let legend_chars = (((w - 50.0) / (12.0 * CHAR_EM)) as usize).clamp(8, MAX_TEXT_CHARS);
         let (mut x, mut row) = (12.0, y);
         for (colour, label) in &chart.legend {
             let label = escape(&escape_plain(label), legend_chars);
@@ -666,7 +702,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
     for (panel, axis) in chart.panels.iter().zip(&y_axes) {
         if !panel.title.is_empty() {
             // One character less, for the ellipsis a cut adds.
-            let fits = (((w - left) / 7.2) as usize)
+            let fits = (((w - left) / (12.0 * CHAR_EM)) as usize)
                 .saturating_sub(1)
                 .clamp(8, MAX_TEXT_CHARS);
             let title = escape(&panel.title, fits);
@@ -757,7 +793,11 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
             points_in += plotted.given;
         }
         let unit = format!("{y_prefix}{}", panel.y_unit);
-        let label = format!("{} ({})", escape(&panel.y_label, 40), escape(&unit, 16));
+        // The label runs up the panel, so the panel's height is what it must fit.
+        let unit = escape(&unit, 16);
+        let room = (panel_height / (12.0 * CHAR_EM)) as usize;
+        let name = room.saturating_sub(unit.chars().count() + 3).clamp(4, 40);
+        let label = format!("{} ({unit})", escape(&panel.y_label, name));
         let (cx, cy) = (14.0, top + panel_height / 2.0);
         body.push_str(&format!(
             "<text x=\"{}\" y=\"{}\" font-size=\"12\" text-anchor=\"middle\" \
@@ -771,9 +811,18 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
     }
 
     let x_unit = format!("{x_prefix}{}", chart.x.unit);
+    // Under the plot the label must fit the picture.
+    // It is centred on the plot, so it has as much room as the nearer edge allows.
+    let centre = left + area / 2.0;
+    let half = centre.min(w - centre);
+    let across = (((2.0 * half - 8.0) / (12.0 * CHAR_EM)) as usize).clamp(8, MAX_TEXT_CHARS + 16);
     let x_label = match x_unit.is_empty() {
-        true => escape(&chart.x.label, MAX_TEXT_CHARS),
-        false => format!("{} ({})", escape(&chart.x.label, 40), escape(&x_unit, 16)),
+        true => escape(&chart.x.label, across.min(MAX_TEXT_CHARS)),
+        false => {
+            let unit = escape(&x_unit, 16);
+            let name = across.saturating_sub(unit.chars().count() + 3).clamp(4, 40);
+            format!("{} ({unit})", escape(&chart.x.label, name))
+        }
     };
     y += 4.0;
     text(
@@ -1196,7 +1245,7 @@ mod tests {
             12.0,
             100.0,
         );
-        let per_line = (100.0 / 7.2f64).floor() as usize;
+        let per_line = (100.0 / (12.0 * CHAR_EM)).floor() as usize;
         assert!(
             lines.iter().all(|l| l.chars().count() <= per_line),
             "{lines:?}"
@@ -1427,7 +1476,7 @@ mod tests {
     }
 
     /// Where a text sits, as a viewer would put it, with the width estimated at
-    /// 0.6 em a character: its left, right, top and bottom.
+    /// `CHAR_EM` a character: its left, right, top and bottom.
     fn text_boxes(svg: &str) -> Vec<(String, f64, f64, f64, f64)> {
         let document = Document::parse(svg).unwrap();
         document
@@ -1441,7 +1490,7 @@ mod tests {
                     number("y").unwrap(),
                     number("font-size").unwrap(),
                 );
-                let width = text.chars().count() as f64 * size * 0.6;
+                let width = text.chars().count() as f64 * size * CHAR_EM;
                 let rotated = node.attribute("transform").is_some();
                 let (w, h) = if rotated {
                     (size, width)
@@ -1596,5 +1645,142 @@ mod tests {
         let boxes = text_boxes(&render(&narrow).svg);
         let title = boxes.iter().find(|b| b.0.starts_with("ttt")).unwrap();
         assert!(title.2 <= f64::from(MIN_WIDTH), "{title:?}");
+    }
+
+    /// Every text inside the picture, and none over another.
+    fn assert_laid_out(drawn: &Rendered, what: &str) {
+        let boxes = text_boxes(&drawn.svg);
+        let (w, h) = (f64::from(drawn.width), f64::from(drawn.height));
+        for (text, left, right, top, bottom) in &boxes {
+            assert!(
+                *left >= 0.0 && *right <= w + 1.0 && *top >= 0.0 && *bottom <= h,
+                "{what}: {text:?} is outside {w}x{h}: {left} {right} {top} {bottom}"
+            );
+        }
+        for (i, a) in boxes.iter().enumerate() {
+            for b in &boxes[i + 1..] {
+                let across = a.1 < b.2 - 0.05 && b.1 < a.2 - 0.05;
+                let down = a.3 < b.4 - 0.05 && b.3 < a.4 - 0.05;
+                assert!(!(across && down), "{what}: {a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn labels_as_long_as_they_may_be_stay_in_the_picture_and_in_their_panel() {
+        for width in [MIN_WIDTH, 320, 800] {
+            let mut long = chart(vec![
+                Panel {
+                    title: "V(OUTPUT_FILTER_STAGE_2)".into(),
+                    y_label: "Y".repeat(80),
+                    y_unit: "V".into(),
+                    y_si: true,
+                    series: vec![sine(50)],
+                },
+                Panel {
+                    title: "W".repeat(64),
+                    y_label: "Z".repeat(80),
+                    y_unit: "A".into(),
+                    y_si: true,
+                    series: vec![sine(50)],
+                },
+            ]);
+            long.width = width;
+            long.x.label = "X".repeat(80);
+            long.x.unit = "Hz".into();
+            long.legend = vec![(0, "L".repeat(80)), (1, "M".repeat(80))];
+            assert_laid_out(&render(&long), &format!("width {width}"));
+        }
+    }
+
+    #[test]
+    fn noise_on_a_large_offset_reads_as_a_flat_line_with_ticks_that_tell_apart() {
+        // A 5 V rail with 1e-8 of noise: without a floor on the span, six ticks
+        // would read `5.000e0` alike.
+        let x: Vec<f64> = (0..50).map(f64::from).collect();
+        let y: Vec<f64> = (0..50).map(|i| 5.0 + 1e-8 * f64::from(i % 3)).collect();
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        let labels: Vec<String> = texts(&drawn.svg)
+            .into_iter()
+            .filter(|t| t.starts_with("5.") || t.starts_with("4."))
+            .collect();
+        assert!(labels.len() >= 3, "{labels:?}");
+        let distinct: std::collections::BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
+        assert!(
+            labels.iter().all(|l| l.chars().count() <= MAX_TICK_CHARS),
+            "{labels:?}"
+        );
+        // The same on the x axis: a hair of time.
+        let mut hair = chart(vec![panel(vec![line(
+            0,
+            vec![1.0, 1.0000002],
+            vec![0.0, 1.0],
+        )])]);
+        hair.x.si = false;
+        let labels: Vec<String> = texts(&render(&hair).svg)
+            .into_iter()
+            .filter(|t| t.starts_with("1.0"))
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = labels.iter().collect();
+        assert!(
+            labels.len() >= 2 && distinct.len() == labels.len(),
+            "{labels:?}"
+        );
+        // A span that is wide enough is left as it was.
+        assert_eq!(widen(0.0, 1.0, false, 0.06), (-0.06, 1.06));
+        let (lo, hi) = widen(5.0, 5.0 + 1e-12, false, 0.0);
+        assert!(hi - lo >= 5e-6 && hi - lo < 6e-6, "{lo} {hi}");
+    }
+
+    #[test]
+    fn many_stretches_that_are_each_small_still_add_up_to_a_bounded_file() {
+        // 700 stretches of 1,400 points, the cut a run's own width would let through:
+        // 980,000 points in one trace.
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for stretch in 0..700 {
+            for point in 0..1400 {
+                x.push(f64::from(stretch * 1400 + point));
+                y.push(f64::from(point % 9));
+            }
+            x.push(f64::from(stretch * 1400 + 1400));
+            y.push(f64::NAN);
+        }
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        assert!(drawn.svg.len() < 400_000, "{} bytes", drawn.svg.len());
+        // Fewer, longer stretches that stay apart: each cut by its own span, and all
+        // under the cap together.
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for stretch in 0..200 {
+            for point in 0..3000 {
+                x.push(f64::from(stretch * 3000 + point));
+                y.push(f64::from(point % 9));
+            }
+            x.push(f64::from(stretch * 3000 + 3000));
+            y.push(f64::NAN);
+        }
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        assert!(
+            drawn.points_drawn <= 4 * 707 + 400,
+            "{}",
+            drawn.points_drawn
+        );
+        assert!(drawn.svg.len() < 200_000, "{} bytes", drawn.svg.len());
+        // Stretches at the same place, over and over, are held by the cap.
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for _ in 0..150 {
+            for point in 0..2000 {
+                x.push(f64::from(point));
+                y.push(f64::from(point % 7));
+            }
+            x.push(0.0);
+            y.push(f64::NAN);
+        }
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        assert!(
+            drawn.points_drawn <= 4 * 707 + 300,
+            "{}",
+            drawn.points_drawn
+        );
     }
 }
