@@ -1459,7 +1459,7 @@ mod tests {
         // Past nine characters a label goes scientific rather than crowd the axis.
         assert_eq!(tick_text(123_456.123, 1.0, 0.001), "1.23e5");
         assert_eq!(tick_text(12_345.678, 1.0, 0.001), "12345.678");
-        assert_eq!(tick_text(12_345.6789, 1.0, 0.0001), "1.23e4");
+        assert_eq!(tick_text(12_345.678_9, 1.0, 0.0001), "1.23e4");
         assert_eq!(tick_text(1234.567, 1.0, 0.001), "1234.567");
         // Ordinary ticks keep their places.
         assert_eq!(tick_text(0.25, 1.0, 0.05), "0.25");
