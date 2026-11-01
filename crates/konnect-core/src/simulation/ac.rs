@@ -129,6 +129,12 @@ impl Response {
         })
     }
 
+    /// Gain in dB, the unwrapped phase in degrees, and the first sample whose phase
+    /// may be out by whole turns, for drawing.
+    pub(crate) fn bode(&self) -> (&[f64], &[f64], Option<usize>) {
+        (&self.gain_db, &self.phase, self.doubtful_from)
+    }
+
     /// The unwrapped phase of this sample may be out by whole turns.
     fn doubtful(&self, sample: usize) -> bool {
         self.doubtful_from.is_some_and(|from| sample >= from)

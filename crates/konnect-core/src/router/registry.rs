@@ -150,7 +150,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "simulation",
         description: "Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run",
         category: "simulation",
-        tool_count: 4,
+        tool_count: 5,
     },
 ];
 

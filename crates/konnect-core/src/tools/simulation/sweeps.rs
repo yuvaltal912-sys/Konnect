@@ -396,7 +396,7 @@ impl DcSweep {
 
     /// How many points one run of the first sweep took, read from where its value
     /// turns back. A cut run gives the length it had when it was cut.
-    fn run_length(&self, axis: &[f64]) -> usize {
+    pub(super) fn run_length(&self, axis: &[f64]) -> usize {
         let inner = self.inner();
         if self.sweeps.len() == 1 {
             axis.len()

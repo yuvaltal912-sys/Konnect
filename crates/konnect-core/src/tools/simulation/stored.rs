@@ -69,7 +69,7 @@ impl CurrentSources {
     /// Whether the run's inputs differ from what is saved now. A model file the
     /// run inlined that has gone counts as a change. Null when the sheets cannot
     /// be read, because nothing can then be said.
-    fn changed_since(&self, record: &RunRecord) -> Option<bool> {
+    pub(super) fn changed_since(&self, record: &RunRecord) -> Option<bool> {
         let hasher = self.0.clone()?;
         // The record names these files, and a store can be written by anyone who
         // can write the state folder, so only a plain file of a sane size is read.
@@ -100,7 +100,7 @@ fn run_not_found(run_id: &str, detail: &str) -> CallToolResult {
     )
 }
 
-fn unreadable(dir: &Path, detail: impl Into<String>) -> CallToolResult {
+pub(super) fn unreadable(dir: &Path, detail: impl Into<String>) -> CallToolResult {
     simulation_failure(
         "results",
         "results_unreadable",
@@ -240,33 +240,45 @@ impl Question<'_> {
     }
 }
 
-pub(super) fn measure(
-    ctx: &ToolContext,
-    question: &Question<'_>,
-) -> Result<CallToolResult, (CallToolResult, String)> {
-    // A client's text is not repeated unless it is an id.
-    let target = match runs::is_valid_id(question.run_id) {
-        true => question.run_id.to_string(),
+/// A stored run found and its record read, which is as far as the run's own files
+/// need to be: its data is read later, by whoever needs it.
+pub(super) struct Opened {
+    pub dir: PathBuf,
+    pub record: RunRecord,
+    pub analysis: Analysis,
+    /// The schematic the run was made from, which names the work in the outcome.
+    pub target: String,
+    root: PathBuf,
+}
+
+/// Find a run by its id and read its record. A refusal carries the target it
+/// should be reported under: the schematic once the record has named it, and until
+/// then the id, or a note that the text was not one, because a client's text is
+/// not repeated.
+pub(super) fn open(ctx: &ToolContext, run_id: &str) -> Result<Opened, (CallToolResult, String)> {
+    let target = match runs::is_valid_id(run_id) {
+        true => run_id.to_string(),
         false => "(not a run id)".to_string(),
     };
     let refuse = |result: CallToolResult| (result, target.clone());
-    question.check().map_err(refuse)?;
+    if !runs::is_valid_id(run_id) {
+        return Err(refuse(invalid("run_id", "run_id is not a run id")));
+    }
     let root = state_root(ctx).map_err(refuse)?;
     // A run that another server prunes while this one reads it loses its files one
     // by one, and what was lost last is not what to report.
-    let lost =
-        |otherwise: &dyn Fn() -> CallToolResult| or_not_found(&root, question.run_id, otherwise);
-    let dir = runs::locate(&root, question.run_id).map_err(|error| {
+    let lost = |otherwise: &dyn Fn() -> CallToolResult| or_not_found(&root, run_id, otherwise);
+    let dir = runs::locate(&root, run_id).map_err(|error| {
         refuse(match error {
             LocateError::InvalidId => invalid("run_id", "run_id is not a run id"),
-            LocateError::NotFound => run_not_found(question.run_id, "there is no such run"),
+            LocateError::NotFound => run_not_found(run_id, "there is no such run"),
         })
     })?;
     let record = runs::read_record(&dir).map_err(|error| {
         refuse(match error {
             RecordError::Missing => lost(&|| {
                 run_not_found(
-                    question.run_id,
+                    run_id,
                     "the run has no record: it failed, was made before records were kept, or \
                      its record could not be saved",
                 )
@@ -281,9 +293,58 @@ pub(super) fn measure(
     let refuse = |result: CallToolResult| (result, target.clone());
     let analysis = Analysis::from_record(&record.analysis)
         .ok_or_else(|| refuse(unreadable(&dir, "its record holds no analysis")))?;
+    Ok(Opened {
+        dir,
+        record,
+        analysis,
+        target,
+        root,
+    })
+}
+
+/// The run's data, as the worker left it. The raw parser reads whatever it is
+/// given, so a link or a pipe is stopped here.
+pub(super) fn read_plot(
+    opened: &Opened,
+    run_id: &str,
+) -> Result<crate::simulation::raw::Plot, (CallToolResult, String)> {
+    let dir = &opened.dir;
+    let refuse = |result: CallToolResult| (result, opened.target.clone());
+    let lost =
+        |otherwise: &dyn Fn() -> CallToolResult| or_not_found(&opened.root, run_id, otherwise);
+    let status: RunStatus = runs::read_plain(&dir.join(STATUS_FILE), runs::MAX_STATUS_BYTES)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| {
+            refuse(lost(&|| {
+                unreadable(dir, "its status file is missing or damaged")
+            }))
+        })?;
+    if !std::fs::symlink_metadata(dir.join(RAW_FILE)).is_ok_and(|meta| meta.is_file()) {
+        return Err(refuse(lost(&|| {
+            unreadable(dir, "its raw file is missing or not a plain file")
+        })));
+    }
+    read_results(dir, &status)
+        .map_err(|error| refuse(lost(&|| unreadable(dir, format!("its raw file: {error}")))))
+}
+
+pub(super) fn measure(
+    ctx: &ToolContext,
+    question: &Question<'_>,
+) -> Result<CallToolResult, (CallToolResult, String)> {
+    // A client's text is not repeated unless it is an id.
+    let target = match runs::is_valid_id(question.run_id) {
+        true => question.run_id.to_string(),
+        false => "(not a run id)".to_string(),
+    };
+    question.check().map_err(|result| (result, target))?;
+    let opened = open(ctx, question.run_id)?;
+    let (record, analysis, target) = (&opened.record, &opened.analysis, opened.target.clone());
+    let refuse = |result: CallToolResult| (result, target.clone());
     // The run's own message says "signals but no measurements", and a stored call
     // needs a measurement, so it would send the caller round in a circle.
-    if matches!(&analysis, Analysis::DcSweep(sweep) if sweep.sweeps.len() > 1) {
+    if matches!(analysis, Analysis::DcSweep(sweep) if sweep.sweeps.len() > 1) {
         return Err(refuse(invalid(
             "measurements",
             "A dc_sweep with two sweeps takes no measurements, live or stored: its whole \
@@ -291,28 +352,13 @@ pub(super) fn measure(
         )));
     }
     let wanted = Wanted::for_analysis(
-        &analysis,
+        analysis,
         question.signals,
         question.measurements,
         question.envelope_points,
     )
     .map_err(refuse)?;
-    let status: RunStatus = runs::read_plain(&dir.join(STATUS_FILE), runs::MAX_STATUS_BYTES)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| {
-            refuse(lost(&|| {
-                unreadable(&dir, "its status file is missing or damaged")
-            }))
-        })?;
-    // The raw parser reads whatever it is given, so a link or a pipe is stopped here.
-    if !std::fs::symlink_metadata(dir.join(RAW_FILE)).is_ok_and(|meta| meta.is_file()) {
-        return Err(refuse(lost(&|| {
-            unreadable(&dir, "its raw file is missing or not a plain file")
-        })));
-    }
-    let plot = read_results(&dir, &status)
-        .map_err(|error| refuse(lost(&|| unreadable(&dir, format!("its raw file: {error}")))))?;
+    let plot = read_plot(&opened, question.run_id)?;
 
     let partial = record.run_status == RunState::Partial;
     let evaluation = Evaluation {
@@ -322,7 +368,7 @@ pub(super) fn measure(
         },
         wanted: &wanted,
     };
-    let gathered = match &analysis {
+    let gathered = match analysis {
         Analysis::Transient(_) => evaluation.transient(&plot, partial),
         Analysis::Ac(ac) => evaluation.ac(ac, &plot, partial),
         Analysis::DcSweep(sweep) => evaluation.sweep(sweep, &plot, partial),
@@ -344,7 +390,7 @@ pub(super) fn measure(
         "simulated_circuit": record.simulated_circuit,
         "circuit": record.circuit,
         "coverage_ratio": record.coverage_ratio,
-        "inputs_changed_since_run": CurrentSources::of(&record.schematic).changed_since(&record),
+        "inputs_changed_since_run": CurrentSources::of(&record.schematic).changed_since(record),
         // What the run itself reported comes first: a peak that reads low there
         // reads low here.
         "warnings": record.warnings,
