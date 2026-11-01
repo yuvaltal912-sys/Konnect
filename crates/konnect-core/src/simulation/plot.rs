@@ -502,6 +502,15 @@ fn trace(
     plotted
 }
 
+/// Where a tick label centred on `at` and `half` wide goes: there, or, if that would
+/// run off a picture `w` wide, ending at its right edge instead.
+fn keep_inside(at: f64, half: f64, w: f64) -> (&'static str, f64) {
+    match at + half > w - 2.0 {
+        true => ("end", w - 2.0),
+        false => ("middle", at),
+    }
+}
+
 /// What a panel's y axis shows: its span, its prefix and its ticks.
 struct YAxis {
     lo: f64,
@@ -780,10 +789,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
             let label = x_label_of(*tick, x_step);
             // A label that would run off the right edge ends at it instead.
             let half = label.chars().count() as f64 * 11.0 * CHAR_EM / 2.0;
-            let (anchor, place) = match at + half > w - 2.0 {
-                true => ("end", w - 2.0),
-                false => ("middle", at),
-            };
+            let (anchor, place) = keep_inside(at, half, w);
             text(
                 &mut body,
                 place,
@@ -1945,5 +1951,13 @@ mod tests {
             .find(|b| (b.2 - b.1 - 12.0).abs() < 0.01)
             .unwrap();
         assert!(label.4 - label.3 <= SINGLE_PANEL_HEIGHT, "{label:?}");
+    }
+
+    #[test]
+    fn a_tick_label_that_would_run_off_the_right_edge_ends_at_it() {
+        assert_eq!(keep_inside(100.0, 30.0, 800.0), ("middle", 100.0));
+        assert_eq!(keep_inside(770.0, 30.0, 800.0), ("end", 798.0));
+        assert_eq!(keep_inside(768.0, 30.0, 800.0), ("middle", 768.0));
+        assert_eq!(keep_inside(768.5, 30.0, 800.0), ("end", 798.0));
     }
 }
