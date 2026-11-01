@@ -28,6 +28,8 @@ const LINE_HEIGHT: f64 = 16.0;
 const FONT: &str = "Helvetica, Arial, sans-serif";
 /// Most characters of any caller-derived text drawn in one piece.
 const MAX_TEXT_CHARS: usize = 64;
+/// Most characters of a title, a banner line or a note, which wrap over lines.
+const MAX_LONG_TEXT: usize = 400;
 /// A trace of this many points or fewer per pixel column is drawn whole.
 const POINTS_PER_COLUMN: usize = 2;
 /// A trace this short also gets a mark at each sample, so a single point shows.
@@ -40,8 +42,8 @@ pub(crate) const CATEGORICAL: [&str; 8] = [
     "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#B8860B", "#56B4E9", "#6A3D9A", "#555555",
 ];
 /// Dark to light, for the steps of an outer sweep.
-pub(crate) const RAMP: [&str; 7] = [
-    "#440154", "#443983", "#31688E", "#21908C", "#35B779", "#7AD151", "#B5C800",
+pub(crate) const RAMP: [&str; 8] = [
+    "#440154", "#46327E", "#365C8D", "#277F8E", "#1FA187", "#4AC16D", "#8FD744", "#BBC400",
 ];
 
 #[derive(Debug, Clone)]
@@ -124,7 +126,18 @@ fn unsafe_char(c: char) -> bool {
         || ('\u{202A}'..='\u{202E}').contains(&c)
         || ('\u{2066}'..='\u{2069}').contains(&c)
         || ('\u{200E}'..='\u{200F}').contains(&c)
+        || c == '\u{061C}'
         || ('\u{FDD0}'..='\u{FDEF}').contains(&c)
+}
+
+/// `text` cut to `max` characters, so nothing that came from the design can make a
+/// line, or the file, as long as it likes.
+fn clip(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().nth(max).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 fn text_width(text: &str, size: f64) -> f64 {
@@ -137,24 +150,29 @@ fn wrap(text: &str, size: f64, width: f64) -> Vec<String> {
     let per_line = ((width / (size * 0.6)).floor() as usize).max(8);
     let mut lines: Vec<String> = Vec::new();
     let mut line = String::new();
+    let mut length = 0usize;
     for word in text.split_whitespace() {
-        let mut word: String = word.to_string();
-        while word.chars().count() > per_line {
-            let head: String = word.chars().take(per_line).collect();
-            word = word.chars().skip(per_line).collect();
+        let characters: Vec<char> = word.chars().collect();
+        // A word longer than a line is cut into lines of its own.
+        let mut rest = characters.as_slice();
+        while rest.len() > per_line {
             if !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
+                length = 0;
             }
-            lines.push(head);
+            lines.push(rest[..per_line].iter().collect());
+            rest = &rest[per_line..];
         }
-        let joined = line.chars().count() + 1 + word.chars().count();
-        if !line.is_empty() && joined > per_line {
+        if length > 0 && length + 1 + rest.len() > per_line {
             lines.push(std::mem::take(&mut line));
+            length = 0;
         }
-        if !line.is_empty() {
+        if length > 0 {
             line.push(' ');
+            length += 1;
         }
-        line.push_str(&word);
+        line.extend(rest);
+        length += rest.len();
     }
     if !line.is_empty() {
         lines.push(line);
@@ -207,6 +225,16 @@ pub(crate) fn si(value: f64) -> String {
     format!("{trimmed}{prefix}")
 }
 
+/// A number as plain decimal text, such as `0.5`, for a unit that takes no prefix.
+pub(crate) fn plain(value: f64) -> String {
+    let text = format!("{value:.4}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    match trimmed {
+        "" | "-0" => "0".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn nice_step(raw: f64) -> f64 {
     let magnitude = 10f64.powf(raw.log10().floor());
     let norm = raw / magnitude;
@@ -238,27 +266,36 @@ fn linear_ticks(lo: f64, hi: f64, target: usize) -> (Vec<f64>, f64) {
 }
 
 fn log_ticks(lo: f64, hi: f64, room: usize) -> Vec<f64> {
-    let first = lo.log10().floor() as i32;
-    let last = hi.log10().ceil() as i32;
+    if !(lo > 0.0 && hi >= lo && hi.is_finite()) {
+        return Vec::new();
+    }
+    let first = lo.log10().floor() as i64;
+    let last = hi.log10().ceil() as i64;
     let decades = (last - first).max(1) as usize;
     let mut ticks = Vec::new();
     // Over a decade or two the 1, 2 and 5 of each decade read better than the
     // power alone, which would leave one or two labels.
-    let stride = decades.div_ceil(room.max(2) - 1).max(1) as i32;
+    let stride = decades.div_ceil(room.max(2) - 1).max(1) as i64;
     let mantissas: &[f64] = if decades <= 2 {
         &[1.0, 2.0, 5.0]
     } else {
         &[1.0]
     };
-    let mut power = first;
+    // From the first power inside the range, so that a stride never steps over it.
+    let mut power = lo.log10().ceil() as i64;
     while power <= last && ticks.len() < 40 {
         for mantissa in mantissas {
-            let value = mantissa * 10f64.powi(power);
+            let value = mantissa * 10f64.powi(power as i32);
             if value >= lo * (1.0 - 1e-9) && value <= hi * (1.0 + 1e-9) {
                 ticks.push(value);
             }
         }
         power += stride;
+    }
+    // A range between two powers of ten, such as 3 Hz to 300 Hz at a narrow
+    // width, still gets its ends.
+    if ticks.is_empty() {
+        ticks = if lo == hi { vec![lo] } else { vec![lo, hi] };
     }
     ticks
 }
@@ -355,6 +392,14 @@ fn envelope(points: &[(f64, f64)], columns: usize) -> Vec<(f64, f64)> {
         }
     }
     keep(low, high, &mut out);
+    // Real data has x moving one way, so each column is visited once. An x that
+    // goes back and forth would visit columns again and again, so the bound is
+    // held by thinning evenly.
+    let cap = columns.max(1) * POINTS_PER_COLUMN * 2;
+    if out.len() > cap {
+        let step = out.len().div_ceil(cap);
+        out = out.into_iter().step_by(step).collect();
+    }
     out
 }
 
@@ -453,7 +498,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         let lines: Vec<String> = chart
             .banner
             .iter()
-            .flat_map(|line| wrap(line, 12.0, w - 24.0))
+            .flat_map(|line| wrap(&clip(line, MAX_LONG_TEXT), 12.0, w - 24.0))
             .collect();
         let height = 12.0 + LINE_HEIGHT * lines.len() as f64;
         body.push_str(&format!(
@@ -474,7 +519,11 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         y += height + 6.0;
     }
 
-    let title_lines = wrap(&escape_plain(&chart.title), 14.0, w - 24.0);
+    let title_lines = wrap(
+        &escape_plain(&clip(&chart.title, MAX_LONG_TEXT)),
+        14.0,
+        w - 24.0,
+    );
     for line in &title_lines {
         y += 18.0;
         text(
@@ -489,11 +538,12 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
     }
     y += 6.0;
 
-    // Legend, wrapped to the width.
+    // Legend, wrapped to the width, each entry short enough to fit one line.
     if !chart.legend.is_empty() {
+        let legend_chars = (((w - 50.0) / 7.2) as usize).clamp(8, MAX_TEXT_CHARS);
         let (mut x, mut row) = (12.0, y);
         for (colour, label) in &chart.legend {
-            let label = escape(&escape_plain(label), MAX_TEXT_CHARS);
+            let label = escape(&escape_plain(label), legend_chars);
             let entry = 24.0 + text_width(&label, 12.0) + 14.0;
             if x + entry > w && x > 12.0 {
                 x = 12.0;
@@ -530,7 +580,8 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         .flat_map(|panel| &panel.series)
         .flat_map(|series| series.x.iter().copied());
     let x_span = extent(data_x, log);
-    let (x_lo, x_hi) = x_span.map_or((0.0, 1.0), |(lo, hi)| widen(lo, hi, log, 0.0));
+    let empty_span = if log { (1.0, 10.0) } else { (0.0, 1.0) };
+    let (x_lo, x_hi) = x_span.map_or(empty_span, |(lo, hi)| widen(lo, hi, log, 0.0));
     // Linear data fills the plot edge to edge, so a line meets its frame.
     let xs = Map {
         lo: x_lo,
@@ -649,7 +700,7 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
             points_in += plotted.given;
         }
         let unit = format!("{y_prefix}{}", panel.y_unit);
-        let label = escape(&format!("{} ({unit})", panel.y_label), MAX_TEXT_CHARS);
+        let label = format!("{} ({})", escape(&panel.y_label, 40), escape(&unit, 16));
         let (cx, cy) = (14.0, top + panel_height / 2.0);
         body.push_str(&format!(
             "<text x=\"{}\" y=\"{}\" font-size=\"12\" text-anchor=\"middle\" \
@@ -664,8 +715,8 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
 
     let x_unit = format!("{x_prefix}{}", chart.x.unit);
     let x_label = match x_unit.is_empty() {
-        true => chart.x.label.clone(),
-        false => format!("{} ({x_unit})", chart.x.label),
+        true => escape(&chart.x.label, MAX_TEXT_CHARS),
+        false => format!("{} ({})", escape(&chart.x.label, 40), escape(&x_unit, 16)),
     };
     y += 4.0;
     text(
@@ -675,11 +726,11 @@ pub(crate) fn render(chart: &Chart) -> Rendered {
         12.0,
         "middle",
         "normal",
-        &escape(&x_label, MAX_TEXT_CHARS),
+        &x_label,
     );
     y += 22.0;
     for note in &chart.notes {
-        for line in wrap(&escape_plain(note), 11.0, w - 24.0) {
+        for line in wrap(&escape_plain(&clip(note, MAX_LONG_TEXT)), 11.0, w - 24.0) {
             text(
                 &mut body,
                 12.0,
@@ -1128,5 +1179,134 @@ mod tests {
             vec![1e149, -1e149],
         )])]));
         assert!(!wide.svg.contains("NaN") && wide.points_in == 2);
+    }
+
+    #[test]
+    fn a_log_axis_with_nothing_to_place_draws_an_empty_frame_and_never_panics() {
+        for xs in [vec![], vec![0.0], vec![-3.0, -1.0], vec![f64::NAN]] {
+            let ys = vec![1.0; xs.len()];
+            let mut empty = chart(vec![panel(vec![line(0, xs, ys)])]);
+            empty.x.log = true;
+            empty.x.si = false;
+            let drawn = render(&empty);
+            assert!(!drawn.svg.contains("NaN") && !drawn.svg.contains("inf"));
+            assert!(Document::parse(&drawn.svg).is_ok());
+        }
+        // One frequency is a range of one: it gets a span of its own.
+        let mut one = chart(vec![panel(vec![line(0, vec![10.0, 10.0], vec![1.0, 2.0])])]);
+        one.x.log = true;
+        one.x.si = false;
+        let drawn = render(&one);
+        assert!(!drawn.svg.contains("NaN"));
+        assert!(
+            texts(&drawn.svg).iter().any(|t| t == "10"),
+            "{:?}",
+            texts(&drawn.svg)
+        );
+    }
+
+    #[test]
+    fn a_narrow_log_axis_between_two_powers_still_has_labels() {
+        let mut narrow = chart(vec![panel(vec![line(
+            0,
+            vec![3.16, 316_000.0],
+            vec![0.0, 1.0],
+        )])]);
+        narrow.width = MIN_WIDTH;
+        narrow.x.log = true;
+        narrow.x.si = false;
+        narrow.x.label = "Frequency".into();
+        narrow.x.unit = "Hz".into();
+        let shown = texts(&render(&narrow).svg);
+        let numbers = shown
+            .iter()
+            .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .count();
+        assert!(numbers >= 2, "{shown:?}");
+        // Ticks come from the first power inside the range and keep to it.
+        for tick in log_ticks(3.16, 316_000.0, 1) {
+            assert!((3.16..=316_000.0).contains(&tick), "{tick}");
+        }
+        assert_eq!(log_ticks(3.0, 300.0, 1), [10.0]);
+        assert_eq!(log_ticks(0.0, 10.0, 4), Vec::<f64>::new());
+        assert_eq!(log_ticks(5.0, 5.0, 4), [5.0]);
+    }
+
+    #[test]
+    fn a_long_label_keeps_its_unit_and_long_text_is_cut_to_a_length() {
+        let mut long = chart(vec![Panel {
+            title: String::new(),
+            y_label: "L".repeat(200),
+            y_unit: "V".into(),
+            y_si: false,
+            series: vec![sine(10)],
+        }]);
+        long.x.label = "T".repeat(200);
+        long.title = "N".repeat(100_000);
+        long.banner = vec!["B".repeat(100_000)];
+        long.notes = vec!["M".repeat(100_000)];
+        let drawn = render(&long);
+        assert!(drawn.svg.len() < 20_000, "{} bytes", drawn.svg.len());
+        let shown = texts(&drawn.svg);
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.starts_with("LLL") && t.ends_with("… (V)")),
+            "{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.starts_with("TTT") && t.ends_with("… (ms)")),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_legend_entry_is_cut_to_fit_the_narrowest_picture() {
+        let mut narrow = chart(vec![panel(vec![sine(10)])]);
+        narrow.width = MIN_WIDTH;
+        narrow.legend = vec![(0, "v".repeat(64))];
+        let shown = texts(&render(&narrow).svg);
+        let entry = shown.iter().find(|t| t.starts_with("vvv")).unwrap();
+        assert!(
+            24.0 + text_width(entry, 12.0) <= f64::from(MIN_WIDTH),
+            "{entry}"
+        );
+    }
+
+    #[test]
+    fn a_trace_whose_x_goes_back_and_forth_is_still_bounded() {
+        // Two columns, visited 100,000 times each.
+        let x: Vec<f64> = (0..200_000)
+            .map(|i| if i % 2 == 0 { 0.0 } else { 700.0 })
+            .collect();
+        let y: Vec<f64> = (0..200_000).map(|i| f64::from(i % 7)).collect();
+        let drawn = render(&chart(vec![panel(vec![line(0, x, y)])]));
+        assert!(drawn.points_drawn <= 4 * 707, "{}", drawn.points_drawn);
+        assert!(drawn.svg.len() < 100_000, "{} bytes", drawn.svg.len());
+    }
+
+    #[test]
+    fn wrapping_a_huge_word_takes_time_in_proportion_to_its_length() {
+        let started = std::time::Instant::now();
+        let lines = wrap(&"w".repeat(400_000), 12.0, 100.0);
+        assert!(lines.len() > 30_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_ramp_gives_each_of_its_eight_steps_a_colour_of_its_own() {
+        let distinct: std::collections::BTreeSet<&&str> = RAMP.iter().collect();
+        assert_eq!(distinct.len(), 8);
+        assert_eq!(plain(0.5), "0.5");
+        assert_eq!(plain(-0.0), "0");
+        assert_eq!(plain(100.0), "100");
+        assert_eq!(plain(-2.25), "-2.25");
+        assert_eq!(escape("a\u{061C}b", 64), "a b");
     }
 }

@@ -50,6 +50,8 @@ const MAX_CURVES: usize = 8;
 /// Plots kept in one run's folder. The run is pruned with the folder, and the name
 /// comes from the request, so asking again for the same plot replaces it.
 const KEEP_PLOTS: usize = 16;
+/// A `.partial` file older than this is left by a crash, not by a call still writing.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60);
 const PLOT_PREFIX: &str = "plot-";
 const PLOT_SUFFIX: &str = ".svg";
 
@@ -311,12 +313,13 @@ fn dc_grid(sweep: &DcSweep, plot: &Plot, found: &[Found]) -> Drawing {
                 .iter()
                 .enumerate()
                 .map(|(position, step)| {
-                    let rows = step * run..((step + 1) * run).min(axis.len());
-                    let values = found.real.get(rows.clone()).unwrap_or(&[]);
+                    // A variable the engine saved shorter than the plot is cut short,
+                    // and never read past its end.
+                    let rows = |len: usize| (step * run).min(len)..((step + 1) * run).min(len);
                     Series {
                         color: ramp_at(position),
-                        x: axis[rows.start..rows.end.min(axis.len())].to_vec(),
-                        y: values.to_vec(),
+                        x: axis[rows(axis.len())].to_vec(),
+                        y: found.real[rows(found.real.len())].to_vec(),
                     }
                 })
                 .collect();
@@ -339,7 +342,11 @@ fn dc_grid(sweep: &DcSweep, plot: &Plot, found: &[Found]) -> Drawing {
         .iter()
         .enumerate()
         .map(|(position, step)| {
-            let value = plot::si(value_of(*step));
+            // A temperature takes no prefix: 500 m°C would read as a milli-degree.
+            let value = match outer.unit {
+                "°C" => plot::plain(value_of(*step)),
+                _ => plot::si(value_of(*step)),
+            };
             (
                 ramp_at(position),
                 format!("{} = {value} {}", outer.name, outer.unit),
@@ -378,12 +385,17 @@ pub(super) fn banner(record: &RunRecord, changed: Option<bool>) -> Vec<String> {
         let why = record
             .stopped
             .as_ref()
-            .map(|stopped| format!(" ({})", stopped.reason))
+            .map(|stopped| format!(" ({})", stopped.reason.chars().take(40).collect::<String>()))
             .unwrap_or_default();
+        // Rounded down: 99.6 percent is not the whole range.
+        let share = record.coverage_ratio * 100.0;
+        let covers = match share < 1.0 {
+            true => "under 1%".to_string(),
+            false => format!("{:.0}%", (share + 1e-9).floor()),
+        };
         lines.push(format!(
-            "PARTIAL RUN: the simulation stopped early{why} and covers {:.0}% of the requested \
-             range. The traces end where the data ends.",
-            record.coverage_ratio * 100.0
+            "PARTIAL RUN: the simulation stopped early{why} and covers {covers} of the requested \
+             range. The traces end where the data ends."
         ));
     }
     if record.simulated_circuit != "as_drawn" {
@@ -438,26 +450,7 @@ fn is_plot_name(name: &str) -> bool {
 /// files of our own naming are touched, and the new file appears whole or not at
 /// all.
 fn write_plot(dir: &Path, name: &str, svg: &str) -> std::io::Result<u64> {
-    let mut plots: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)?
-        .flatten()
-        .filter(|entry| entry.file_name().to_str().is_some_and(is_plot_name))
-        .filter_map(|entry| {
-            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
-            meta.is_file().then(|| {
-                (
-                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    entry.path(),
-                )
-            })
-        })
-        .collect();
     let target = dir.join(name);
-    plots.retain(|(_, path)| *path != target);
-    plots.sort();
-    while plots.len() >= KEEP_PLOTS {
-        let (_, oldest) = plots.remove(0);
-        std::fs::remove_file(oldest)?;
-    }
     if let Ok(meta) = std::fs::symlink_metadata(&target) {
         // Never write through, or over, anything but our own earlier plot.
         if !meta.is_file() {
@@ -465,7 +458,18 @@ fn write_plot(dir: &Path, name: &str, svg: &str) -> std::io::Result<u64> {
         }
     }
     let partial = dir.join(format!("{name}.partial"));
-    if std::fs::symlink_metadata(&partial).is_ok() {
+    if let Ok(meta) = std::fs::symlink_metadata(&partial) {
+        // A recent half file is another call of the same request, writing now. An old
+        // one is a crash's, and nothing else is ever taken over.
+        let old = meta.is_file()
+            && meta
+                .modified()
+                .ok()
+                .and_then(|made| made.elapsed().ok())
+                .is_some_and(|age| age > STALE_PARTIAL);
+        if !old {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
         std::fs::remove_file(&partial)?;
     }
     let written = std::fs::OpenOptions::new()
@@ -477,6 +481,27 @@ fn write_plot(dir: &Path, name: &str, svg: &str) -> std::io::Result<u64> {
     if let Err(error) = written {
         std::fs::remove_file(&partial).ok();
         return Err(error);
+    }
+    // The new plot is in place before an old one goes, and one another call already
+    // removed is not an error.
+    let mut others: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)?
+        .flatten()
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_plot_name))
+        .filter(|entry| entry.path() != target)
+        .filter_map(|entry| {
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            meta.is_file().then(|| {
+                (
+                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    entry.path(),
+                )
+            })
+        })
+        .collect();
+    others.sort();
+    while others.len() + 1 > KEEP_PLOTS {
+        let (_, oldest) = others.remove(0);
+        std::fs::remove_file(oldest).ok();
     }
     Ok(svg.len() as u64)
 }

@@ -6111,7 +6111,7 @@ mod tests {
                     .unwrap()
             };
             assert_eq!(colour(0), plot::RAMP[0]);
-            assert_eq!(colour(2), plot::RAMP[6]);
+            assert_eq!(colour(2), plot::RAMP[7]);
             assert_eq!(body["warnings"], json!([]));
         }
 
@@ -6150,6 +6150,15 @@ mod tests {
             assert!(shown
                 .iter()
                 .any(|t| t.contains("Showing 8 of the 12 steps")));
+            let strokes: std::collections::BTreeSet<String> = {
+                let document = usvg::roxmltree::Document::parse(&svg).unwrap();
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name("polyline"))
+                    .filter_map(|node| node.attribute("stroke").map(str::to_string))
+                    .collect()
+            };
+            assert_eq!(strokes.len(), 8, "every curve has a colour of its own");
             assert_eq!(body["warnings"][0]["code"], "curves_thinned");
             assert_eq!(body["warnings"][0]["steps"], 12);
         }
@@ -6550,11 +6559,24 @@ mod tests {
             for path in &kept {
                 assert!(path.exists(), "{path:?} was removed by a repeat");
             }
-            // A half-written file left by a crash does not stop the plot.
+            // A half file that is just made may be another call writing the same plot,
+            // and is not taken over.
             let target = paths[19].clone();
             let mut half = target.clone().into_os_string();
             half.push(".partial");
             std::fs::write(&half, "junk").unwrap();
+            let (failed, body) = ask(319).await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "run_store_failed", "{body}");
+            assert_eq!(std::fs::read_to_string(&half).unwrap(), "junk");
+            // One left by a crash an hour ago does not stop the plot.
+            let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&half)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
             let (failed, body) = ask(319).await;
             assert!(!failed, "{body}");
             assert!(!PathBuf::from(&half).exists());
@@ -6584,6 +6606,127 @@ mod tests {
                 "{body}"
             );
             assert_eq!(body["warnings"][0]["items"], json!(["NetOne", "NetTwo"]));
+        }
+
+        #[tokio::test]
+        async fn a_changed_schematic_shows_its_banner_in_the_picture() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let ask = json!({ "run_id": run["run_id"], "signals": ["v(a)"] });
+            let (_, body) = plotted(&scene, ask.clone()).await;
+            assert!(!svg_texts(&svg_of(&body))
+                .iter()
+                .any(|t| t.starts_with("SCHEMATIC CHANGED")));
+            let original = std::fs::read_to_string(&scene.root).unwrap();
+            std::fs::write(&scene.root, format!("{original} ")).unwrap();
+            let (_, body) = plotted(&scene, ask).await;
+            assert_eq!(body["inputs_changed_since_run"], true, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            assert!(
+                shown.iter().any(|t| t.starts_with("SCHEMATIC CHANGED")),
+                "{shown:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_temperature_sweep_is_drawn_in_plain_degrees() {
+            let points: Vec<(f64, f64)> = (1..=5)
+                .map(|n| (f64::from(n) / 10.0, f64::from(n)))
+                .collect();
+            let job = format!("{}\n{}", copy_dc(&points), status_json("0", "null", true));
+            let scene = scene(&job);
+            let run = run_of(
+                &scene,
+                sweep_args(
+                    &scene.root,
+                    json!({ "kind": "dc_sweep", "sweeps": [
+                        { "target": "TEMP", "start_value": 0.1, "stop_value": 0.5,
+                          "step_value": 0.1 }
+                    ] }),
+                    "VSRC /rect_out 0 DC 0",
+                ),
+            )
+            .await;
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(!failed, "{body}");
+            let shown = svg_texts(&svg_of(&body));
+            assert!(shown.iter().any(|t| t == "temp (°C)"), "{shown:?}");
+        }
+
+        #[tokio::test]
+        async fn data_with_no_time_or_no_frequency_is_unreadable_and_not_a_blank_plot() {
+            let scene = scene(&transient_job());
+            let run = run_of(&scene, transient_args(&scene.root, 2.0)).await;
+            let raw = first_run_dir(&scene).join("results.raw");
+            let kept = std::fs::read_to_string(&raw).unwrap();
+            // The same data under a scale that is not time.
+            std::fs::write(&raw, kept.replace("\ttime\ttime", "\tseconds\ttime")).unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert_eq!(body["error"]["reason"], "results_unreadable", "{body}");
+            assert!(body["message"].as_str().unwrap().contains("no time"));
+
+            let ac = copy_ac(&low_pass(&[1.0, 10.0, 100.0]));
+            let job = format!("{ac}\n{}", status_json("0", "null", true));
+            let scene = self::scene(&job);
+            let run = run_of(
+                &scene,
+                ac_args(&scene.root, json!({ "points": 1, "scale": "decade" })),
+            )
+            .await;
+            let raw = first_run_dir(&scene).join("results.raw");
+            let kept = std::fs::read_to_string(&raw).unwrap();
+            std::fs::write(
+                &raw,
+                kept.replace("\tfrequency\tfrequency", "\thz\tfrequency"),
+            )
+            .unwrap();
+            let (failed, body) = plotted(
+                &scene,
+                json!({ "run_id": run["run_id"], "signals": ["v(a)"] }),
+            )
+            .await;
+            assert!(failed, "{body}");
+            assert!(body["message"].as_str().unwrap().contains("no frequency"));
+        }
+
+        #[test]
+        fn the_banner_never_rounds_a_short_run_up_to_the_whole_range() {
+            let record = |ratio: f64| {
+                RunRecord::new(RecordFields {
+                    schematic: PathBuf::from("/p/board.kicad_sch"),
+                    analysis: json!({ "kind": "transient", "stop_time_seconds": 1.0 }),
+                    run_status: RunState::Partial,
+                    stopped: Some(Stopped {
+                        reason: "x".repeat(500),
+                        at_point: 3,
+                        node: None,
+                    }),
+                    simulated_circuit: "as_drawn".into(),
+                    circuit: Value::Null,
+                    result: Value::Null,
+                    coverage_ratio: ratio,
+                    inputs_hash: String::new(),
+                    inlined_files: Vec::new(),
+                    nets: Vec::new(),
+                    elements: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            };
+            let says = |ratio: f64| plots::banner(&record(ratio), None).remove(0);
+            assert!(says(0.996).contains("covers 99% of"), "{}", says(0.996));
+            assert!(says(0.004).contains("covers under 1% of"));
+            assert!(says(0.5).contains("covers 50% of"));
+            // A reason from a damaged record is cut, not repeated whole.
+            assert!(says(0.5).len() < 300, "{}", says(0.5).len());
         }
 
         #[test]
