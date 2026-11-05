@@ -290,6 +290,19 @@ pub(crate) fn measure(response: &Response, request: &Measurement, window_truncat
     for (key, value) in found.extras {
         report[key] = value;
     }
+    if matches!(request.kind, Kind::PhaseMargin | Kind::GainMargin) && found.value.is_some() {
+        // Even perfectly smooth samples can hide complete phase revolutions.
+        // Keep the measured number, but never present the single-sweep heuristic
+        // as proof of adequate sampling or as a worst-crossing search.
+        report["sampling_validation"] = json!("unverified");
+        report["crossing_selection"] = json!("first");
+        report["warnings"] = json!([{
+            "code": "ac_margin_sampling_unverified",
+            "detail": "A single sampled sweep cannot exclude phase aliasing. Repeat the sweep \
+                       at higher point density and compare the margins. Agreement is supporting \
+                       evidence, not a guarantee against phase aliasing.",
+        }]);
+    }
     report
 }
 
@@ -602,6 +615,81 @@ mod tests {
         // A loop with small positive margins, so a wrong sign or a lost 360 shows.
         assert!(pm > 0.0 && pm < 20.0, "{pm}");
         assert!(gm > 0.0 && gm < 6.0, "{gm}");
+    }
+
+    #[test]
+    fn indistinguishable_delay_samples_do_not_claim_verified_margin_sampling() {
+        // H(f) = 2 / (1 + jf), with and without a one-second delay. At every
+        // integer-Hz sample the delay is an integer number of full turns, so
+        // both sweeps give the same complex samples. At the real unity crossing
+        // sqrt(3) Hz their phases differ by over 600 degrees. No test of the
+        // sampled curve alone can prove which circuit produced it.
+        let freq: Vec<f64> = (1..=12).map(f64::from).collect();
+        let mut plain_real = Vec::new();
+        let mut plain_imaginary = Vec::new();
+        let mut delayed_real = Vec::new();
+        let mut delayed_imaginary = Vec::new();
+        for &f in &freq {
+            let re = 2.0 / (1.0 + f * f);
+            let im = -f * re;
+            let turn = -std::f64::consts::TAU * f;
+            plain_real.push(re);
+            plain_imaginary.push(im);
+            delayed_real.push(re * turn.cos() - im * turn.sin());
+            delayed_imaginary.push(re * turn.sin() + im * turn.cos());
+        }
+        for (plain, delayed) in plain_real
+            .iter()
+            .chain(&plain_imaginary)
+            .zip(delayed_real.iter().chain(&delayed_imaginary))
+        {
+            assert!((plain - delayed).abs() < 1e-12);
+        }
+        let plain = Response::new(&freq, &plain_real, &plain_imaginary, false).unwrap();
+        let delayed = Response::new(&freq, &delayed_real, &delayed_imaginary, false).unwrap();
+        assert!(plain.doubtful_from.is_none());
+        assert!(delayed.doubtful_from.is_none());
+        let request = request("phase_margin", json!({}));
+        let plain_report = measure(&plain, &request, false);
+        let delayed_report = measure(&delayed, &request, false);
+        assert!((value_of(&plain_report) - value_of(&delayed_report)).abs() < 1e-10);
+        assert!(value_of(&delayed_report) > 100.0);
+        let true_delayed_phase = -3.0_f64.sqrt().atan().to_degrees() - 360.0 * 3.0_f64.sqrt();
+        assert!(180.0 + true_delayed_phase < -500.0);
+        for report in [plain_report, delayed_report] {
+            assert_eq!(report["sampling_validation"], "unverified", "{report}");
+            assert_eq!(report["crossing_selection"], "first", "{report}");
+            assert_eq!(
+                report["warnings"][0]["code"],
+                "ac_margin_sampling_unverified"
+            );
+        }
+    }
+
+    #[test]
+    fn both_margin_kinds_disclose_sampling_and_first_crossing_policy() {
+        let response = response_of(&sweep(200, 1.0, 1e6), true);
+        for kind in ["phase_margin", "gain_margin"] {
+            let report = measure(&response, &request(kind, json!({})), false);
+            assert!(report["value"].is_number(), "{report}");
+            assert_eq!(report["sampling_validation"], "unverified", "{report}");
+            assert_eq!(report["crossing_selection"], "first", "{report}");
+            let detail = report["warnings"][0]["detail"].as_str().unwrap();
+            assert!(detail.contains("higher point density"), "{detail}");
+            assert!(detail.contains("not a guarantee"), "{detail}");
+        }
+        // A refusal remains a refusal and does not grow a numeric-result warning.
+        let report = measure(
+            &response,
+            &request("phase_margin", json!({ "from_hz": 1.0, "to_hz": 2.0 })),
+            false,
+        );
+        assert!(report["value"].is_null());
+        assert_eq!(report["finding"], "level_not_reached");
+        assert!(report.get("warnings").is_none());
+        let bandwidth = measure(&response, &request("bandwidth_3db", json!({})), false);
+        assert!(bandwidth.get("sampling_validation").is_none());
+        assert!(bandwidth.get("crossing_selection").is_none());
     }
 
     #[test]

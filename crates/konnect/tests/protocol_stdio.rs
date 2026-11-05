@@ -15,18 +15,28 @@ struct McpProcess {
     next_id: i64,
     /// The handshake's `initialize` response.
     initialized: Value,
+    /// Keep the default process's config, logs and run records private until it exits.
+    _fixture: Option<tempfile::TempDir>,
 }
 
 impl McpProcess {
     fn spawn() -> Self {
-        Self::spawn_in_dir(None)
+        let fixture = tempfile::tempdir().unwrap();
+        // Select defaults before executable-relative or user config candidates.
+        std::fs::write(fixture.path().join("konnect.toml"), "").unwrap();
+        let mut process = Self::spawn_configured(Some(fixture.path()), true);
+        process._fixture = Some(fixture);
+        process
     }
 
     /// Spawn with the process working directory set to `dir`, so
     /// the config search's first path (`konnect.toml` in cwd) picks up
     /// a test config file placed there.
     fn spawn_in_dir(dir: Option<&std::path::Path>) -> Self {
-        Self::spawn_configured(dir, false)
+        match dir {
+            Some(dir) => Self::spawn_configured(Some(dir), true),
+            None => Self::spawn(),
+        }
     }
 
     /// Spawn with the working directory set to `dir` and, when `isolate_home`,
@@ -51,15 +61,24 @@ impl McpProcess {
         env: &[(&str, &str)],
     ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
-        for (key, value) in env {
-            command.env(key, value);
-        }
+        command.env_remove("KICAD_API_SOCKET");
+        command.env_remove("KICAD_API_TOKEN");
+        command.env_remove("KONNECT_STATE_DIR");
         if let Some(dir) = dir {
             command.current_dir(dir);
             if isolate_home {
                 command.env("HOME", dir);
                 command.env("APPDATA", dir);
+                command.env("USERPROFILE", dir);
+                command.env("KONNECT_STATE_DIR", dir.join("state"));
+                command.env("XDG_CONFIG_HOME", dir.join(".config"));
+                command.env("XDG_DATA_HOME", dir.join(".local/share"));
+                command.env("XDG_STATE_HOME", dir.join(".local/state"));
+                command.env("XDG_CACHE_HOME", dir.join(".cache"));
             }
+        }
+        for (key, value) in env {
+            command.env(key, value);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -75,6 +94,7 @@ impl McpProcess {
             reader,
             next_id: 1,
             initialized: Value::Null,
+            _fixture: None,
         };
         // MCP handshake
         let init = p.request(
@@ -169,6 +189,95 @@ impl Drop for McpProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn the_default_process_ignores_host_configuration_and_keeps_state_private() {
+    const CHILD: &str = "KONNECT_PROTOCOL_ISOLATION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let mut p = McpProcess::spawn();
+        let home = p._fixture.as_ref().unwrap().path().to_path_buf();
+        let info = McpProcess::tool_body(&p.call_tool("get_installation_info", json!({})));
+        assert_eq!(info["configuration"]["source"], "search_path");
+        assert_eq!(
+            info["configuration"]["selected_path"],
+            canonical(&home.join("konnect.toml"))
+        );
+        assert!(
+            !info.to_string().contains("host-test-socket.sock"),
+            "{info}"
+        );
+        let list = p.request("tools/list", json!({}));
+        let tools = list["result"]["tools"].as_array().unwrap().len();
+        assert!(
+            (10..30).contains(&tools),
+            "expected the starter kit, got {tools}"
+        );
+
+        let loaded = McpProcess::tool_body(&p.call_tool("load_user_config", json!({})));
+        assert_eq!(loaded["source"], "defaults", "{loaded}");
+        assert!(user_config_under(&home).is_file());
+        let created = p.call_tool(
+            "create_project",
+            json!({"name": "isolated", "path": home.join("isolated")}),
+        );
+        assert_ne!(created["isError"], json!(true), "{created}");
+        assert!(home.join("state").is_dir());
+        assert!(home.is_dir(), "the fixture must outlive the process");
+        drop(p);
+        assert!(
+            !home.exists(),
+            "the process must clean up its private fixture"
+        );
+        return;
+    }
+
+    // Exercise the normal helper in a subprocess so hostile host settings do
+    // not race other tests through process-global environment or cwd changes.
+    let host = tempfile::tempdir().unwrap();
+    let config = "eager_toolsets = true\nauto_load_toolsets = true\n";
+    for path in [
+        host.path().join("konnect.toml"),
+        host.path()
+            .join("Library/Application Support/konnect/config.toml"),
+        host.path().join(".config/konnect/config.toml"),
+        host.path().join("konnect/config.toml"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, config).unwrap();
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "the_default_process_ignores_host_configuration_and_keeps_state_private",
+            "--nocapture",
+        ])
+        .current_dir(host.path())
+        .env(CHILD, "1")
+        .env("HOME", host.path())
+        .env("APPDATA", host.path())
+        .env("USERPROFILE", host.path())
+        .env("KONNECT_STATE_DIR", host.path().join("state"))
+        .env("XDG_CONFIG_HOME", host.path())
+        .env("XDG_DATA_HOME", host.path())
+        .env("XDG_STATE_HOME", host.path())
+        .env("XDG_CACHE_HOME", host.path())
+        .env("KICAD_API_SOCKET", "ipc://host-test-socket.sock")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preferences = user_config_under(host.path());
+    assert!(!preferences.exists());
+    assert!(!host.path().join("state").exists());
+    for directory in ["logs", "run"] {
+        assert!(!preferences.parent().unwrap().join(directory).exists());
     }
 }
 

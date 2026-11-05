@@ -312,7 +312,7 @@ pub fn tools() -> Vec<ToolDef> {
         |args, ctx| async move { handle_run_simulation(args, ctx).await }
     ), tool!(
         "list_simulation_runs",
-        "List the stored runs of a schematic, newest first, so a run is not lost with a response that never arrived. Each shows its analysis, whether it is complete or partial, whether it simulated the circuit as drawn, how much of the requested range it covered, and whether the saved schematic or its model files have changed since. The newest 20 runs of each project are kept.",
+        "List the stored runs of a schematic, newest first. run_status and coverage describe the original run; result_files_present and result_files_error report whether its status and nonempty plain raw file are available now, without parsing the entire raw data. without_results counts runs missing that evidence. inputs_changed_since_run compares saved sources and original model files, or is null when provenance cannot be established. The newest 20 runs of each project are kept.",
         json!({
             "type": "object",
             "properties": {
@@ -1460,7 +1460,9 @@ impl Evaluation<'_> {
                     gathered
                         .shared_nets
                         .extend(found.shared_nets.iter().cloned());
-                    gathered.summaries.push(summary(text, signal, &found));
+                    let mut report = summary(text, signal, &found);
+                    signals::annotate_power_scope(signal, self.names, &mut report);
+                    gathered.summaries.push(report);
                 }
                 Err(not_found) => {
                     gathered.signal_missing = true;
@@ -1476,7 +1478,9 @@ impl Evaluation<'_> {
                     gathered
                         .shared_nets
                         .extend(found.shared_nets.iter().cloned());
-                    gathered.measurements.push(measurement(request, &found));
+                    let mut report = measurement(request, &found);
+                    signals::annotate_power_scope(&request.signal, self.names, &mut report);
+                    gathered.measurements.push(report);
                 }
                 Err(not_found) => {
                     gathered.failed_measurements += 1;
@@ -1493,6 +1497,13 @@ impl Evaluation<'_> {
     /// has no units of its own.
     fn finish_body(&self, body: &mut Value, gathered: Gathered, partial: bool) -> usize {
         let wanted = self.wanted;
+        append_result_warnings(
+            body,
+            gathered
+                .summaries
+                .iter()
+                .chain(gathered.measurements.iter()),
+        );
         if !wanted.measurements.is_empty() {
             body["measurements"] = json!(gathered.measurements);
         }
@@ -1717,7 +1728,7 @@ impl RunEnd<'_> {
             at_point: stopped["at_point"].as_u64().unwrap_or(0) as usize,
             node: stopped["node"].as_str().map(str::to_owned),
         });
-        let record = RunRecord::new(RecordFields {
+        let mut record = RunRecord::new(RecordFields {
             schematic: self
                 .request
                 .schematic
@@ -1743,6 +1754,7 @@ impl RunEnd<'_> {
             elements: self.design.elements.clone(),
             warnings: carried_warnings(body),
         });
+        record.input_provenance = self.design.input_provenance.clone();
         if let Err(error) = runs::write_record(&self.run.dir, &record) {
             if let Some(warnings) = body["warnings"].as_array_mut() {
                 warnings.push(json!({
@@ -1835,7 +1847,23 @@ impl RunEnd<'_> {
     }
 
     fn operating_point_body(&self, plot: &Plot, stopped: Option<&'static str>) -> Value {
-        let rows = operating_point_rows(plot, &self.design.nets);
+        let mut rows: Vec<Value> = operating_point_rows(plot, &self.design.nets)
+            .into_iter()
+            .map(|row| json!(row))
+            .collect();
+        for row in &mut rows {
+            if let Some(reference) = row["signal"]
+                .as_str()
+                .and_then(|signal| signal.strip_suffix(":power"))
+                .map(str::to_owned)
+            {
+                signals::annotate_power_scope(
+                    &Signal::Power(reference),
+                    self.evaluation().names,
+                    row,
+                );
+            }
+        }
         std::fs::write(
             self.run.dir.join(OPERATING_POINT_FILE),
             serde_json::to_vec_pretty(&rows).unwrap_or_default(),
@@ -1852,6 +1880,7 @@ impl RunEnd<'_> {
             "points": plot.points,
         });
         let mut body = self.result_body(plot, analysis, stopped);
+        append_result_warnings(&mut body, rows.iter());
         body["operating_point"] = json!({
             "total": rows.len(),
             "shown": rows.len().min(self.request.limit),
@@ -1982,15 +2011,35 @@ impl RunEnd<'_> {
     }
 }
 
+/// Surface result interpretation limits even when callers read only the top-level
+/// warnings. Repeated measurements share one warning per code.
+fn append_result_warnings<'a>(body: &mut Value, reports: impl Iterator<Item = &'a Value>) {
+    if let Some(warnings) = body["warnings"].as_array_mut() {
+        for warning in reports
+            .filter_map(|report| report["warnings"].as_array())
+            .flatten()
+        {
+            if !warnings
+                .iter()
+                .any(|existing| existing["code"] == warning["code"])
+            {
+                warnings.push(warning.clone());
+            }
+        }
+    }
+}
+
 /// What a run said about itself that a later measurement should be read with.
 /// Left out are what concerns this call alone: files it wrote, runs it pruned, and
 /// the nets that its own signals share, which a new measurement works out again.
 fn carried_warnings(body: &Value) -> Vec<Value> {
-    const THIS_CALL_ONLY: [&str; 4] = [
+    const THIS_CALL_ONLY: [&str; 6] = [
         "old_runs_kept",
         "csv_not_written",
         "run_record_not_saved",
         "nets_share_engine_node",
+        "ac_margin_sampling_unverified",
+        "subcircuit_power_boundary",
     ];
     let warnings = body["warnings"].as_array().into_iter().flatten();
     warnings
@@ -2100,6 +2149,7 @@ struct Design {
     preflight: Option<Preflight>,
     project_dir: PathBuf,
     inputs_hash: String,
+    input_provenance: Option<runs::InputProvenance>,
 }
 
 /// The copied sheets and project file, in a stable order. Taken before the
@@ -2138,6 +2188,22 @@ fn inputs_hash(mut hasher: Sha256, inlined_files: &[PathBuf]) -> std::io::Result
         hasher.update(std::fs::read(path)?);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// New runs fingerprint the exact model bytes the deck consumed. The old
+/// reopened-file hash above remains only for reading records without provenance.
+fn consumed_inputs_hash(mut hasher: Sha256, inlined_models: &[flatten::ModelInput]) -> String {
+    hasher.update(b"\0consumed-models-v1\0");
+    for model in inlined_models {
+        for path in [&model.path, &model.resolved] {
+            let name = path.to_string_lossy();
+            hasher.update((name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+        }
+        hasher.update(model.bytes.to_le_bytes());
+        hasher.update(model.sha256.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// KiCad wipes its per-user IBIS cache on every SPICE export, from any project,
@@ -2192,6 +2258,8 @@ async fn inspect_design(
         .unwrap_or_default();
     let compatibility = Compatibility::from_project_file(&schematic.with_extension("kicad_pro"));
     let sources_hash = hash_sources(&source)?;
+    let (original_roots, _) = allowed_roots(&project_dir, inputs.model_dirs);
+    let original_models = runs::OriginalModels::capture(&source, &project_dir, &original_roots);
     let _export_guard = EXPORT_LOCK.lock().await;
     let netlists = cli::export_simulation_netlists(
         kicad_cli,
@@ -2202,6 +2270,8 @@ async fn inspect_design(
     .await?;
     let kicad = kicad_netlist::parse(&netlists.kicad)?;
     let spice = SpiceNetlist::parse(&netlists.spice);
+    // A first export can create the IBIS cache directory. Resolve the allowed
+    // roots again after export so those newly created canonical paths are vetted.
     let (allowed_roots, ignored_model_dirs) = allowed_roots(&project_dir, inputs.model_dirs);
     let (excluded_references, unmatched_exclusions) =
         excluded_references(&kicad, &inputs.testbench.exclude_references);
@@ -2234,11 +2304,20 @@ async fn inspect_design(
             has_testbench_lines: !inputs.testbench.spice_lines.is_empty(),
         })
     });
-    let inlined = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_files);
-    let inputs_hash = inputs_hash(sources_hash, inlined)?;
+    let inlined_models = deck.as_ref().map_or(&[][..], |deck| &deck.inlined_models);
+    let input_provenance = Some(runs::InputProvenance::capture(
+        sources_hash.clone(),
+        &netlists.kicad,
+        inlined_models,
+        &project_dir,
+        &allowed_roots,
+        &original_models,
+    ));
+    let inputs_hash = consumed_inputs_hash(sources_hash, inlined_models);
     Ok(Design {
         compatibility,
         inputs_hash,
+        input_provenance,
         project_dir,
         deck,
         ignored_model_dirs,
@@ -2563,6 +2642,7 @@ mod tests {
             preflight: None,
             project_dir: PathBuf::new(),
             inputs_hash: String::new(),
+            input_provenance: None,
         })
     }
 
@@ -2957,6 +3037,32 @@ mod tests {
         assert_ne!(second, first);
         std::fs::write(&model, "n").unwrap();
         assert_ne!(hash(), second);
+    }
+
+    #[test]
+    fn new_input_hash_keeps_consumed_model_bytes_after_the_file_changes() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path().canonicalize().unwrap();
+        let model = root.join("model.lib");
+        std::fs::write(&model, "R1 out 0 1k\n").unwrap();
+        let read = || {
+            flat(
+                ".title hash\n.include \"INCLUDE\"\nV1 out 0 1\n",
+                &model,
+                std::slice::from_ref(&root),
+            )
+        };
+        let first = read();
+        let first_hash = consumed_inputs_hash(Sha256::new(), &first.inlined_models);
+        std::fs::write(&model, "R1 out 0 2k\n").unwrap();
+        assert_eq!(
+            consumed_inputs_hash(Sha256::new(), &first.inlined_models),
+            first_hash,
+        );
+        assert_ne!(
+            consumed_inputs_hash(Sha256::new(), &read().inlined_models),
+            first_hash,
+        );
     }
 
     fn transient(analysis: Value) -> Result<Transient, CallToolResult> {
@@ -5165,6 +5271,9 @@ mod tests {
             let path = dir.join(runs::RECORD_FILE);
             let mut record: RunRecord =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            // Exercise a legacy record: it carries the old combined input hash,
+            // without the optional original-model provenance used by new runs.
+            record.input_provenance = None;
             // Pretend the deck inlined it, with the hash it had then.
             let before = stored::CurrentSources::of(&scene.root);
             record.inlined_files = vec![model.clone()];

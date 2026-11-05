@@ -19,7 +19,7 @@
 use anyhow::Result;
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -73,15 +73,21 @@ async fn validate_origin(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+    if let Some(origin) = headers.get("origin") {
         let allowed = origin
-            .strip_prefix("http://")
-            .or_else(|| origin.strip_prefix("https://"))
-            .map(|rest| {
-                let host = rest.split(':').next().unwrap_or("");
-                host == "localhost" || host == "127.0.0.1" || host == "[::1]"
-            })
-            .unwrap_or(false);
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.parse::<Uri>().ok())
+            .is_some_and(|origin| {
+                matches!(origin.scheme_str(), Some("http" | "https"))
+                    && origin.authority().is_some_and(|authority| {
+                        !authority.as_str().contains('@')
+                            && matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]")
+                    })
+                    && origin
+                        .path_and_query()
+                        .is_none_or(|path| path.as_str() == "/")
+            });
         if !allowed {
             return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
         }

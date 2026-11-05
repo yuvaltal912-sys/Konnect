@@ -420,15 +420,14 @@ fn trim_bracket(value: &str) -> String {
         .to_string()
 }
 
-/// Every `AC` keyword of a source card, with the text of the value it gives, if any.
+/// Every `AC` keyword in a source's arguments, with its value text, if any.
 /// ngspice reads `AC 1`, `AC=1`, `ac = 1`, `AC(1 0)` and `ACMAG 1` alike, and a later
-/// `acmag` replaces an earlier `AC`. The name and two nodes come first, so a node
-/// called `ac` is not the keyword.
+/// `acmag` replaces an earlier `AC`. The parser has already separated the name
+/// and nodes, so a node called `ac` is not mistaken for the keyword.
 fn ac_values(words: &[String]) -> Vec<Option<String>> {
     words
         .iter()
         .enumerate()
-        .skip(3)
         .filter_map(|(at, word)| {
             let lower = word.to_ascii_lowercase();
             if lower == "ac" || lower == "acmag" {
@@ -444,23 +443,118 @@ fn ac_values(words: &[String]) -> Vec<Option<String>> {
         .collect()
 }
 
+/// Definitions have lexical scope: two vendor parts may each contain their own
+/// `driver` without sharing its sources. Keep this reachability view separate
+/// from the conservative, name-based connectivity summary used by preflight.
+#[derive(Default)]
+struct AcScope {
+    parent: Option<usize>,
+    definitions: HashMap<String, Vec<usize>>,
+    calls: Vec<String>,
+    has_stimulus: bool,
+    conditional: bool,
+}
+
+fn ac_scopes(deck: &FlatDeck, dollar_is_comment: bool) -> Vec<AcScope> {
+    let mut scopes = vec![AcScope::default()];
+    let mut current = 0;
+    let mut if_depth = 0usize;
+    for card in cards(deck, dollar_is_comment) {
+        let words = without_node_brackets(&tokens(&card.text));
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let word = directive(&card.text);
+        if word.starts_with(".subckt") || word.starts_with(".macro") {
+            let child = scopes.len();
+            let name = words
+                .get(1)
+                .map_or(String::new(), |name| name.to_lowercase());
+            // Same-scope alternatives stay candidates: choosing a conditional
+            // definition belongs to the engine. Different parents never share
+            // these candidates, even when their local names are identical.
+            scopes[current]
+                .definitions
+                .entry(name)
+                .or_default()
+                .push(child);
+            scopes.push(AcScope {
+                parent: Some(current),
+                conditional: if_depth > 0,
+                ..AcScope::default()
+            });
+            current = child;
+        } else if word.starts_with(".ends") || word == ".eom" {
+            current = scopes[current].parent.unwrap_or(0);
+        } else if word == ".if" {
+            if_depth += 1;
+        } else if word.starts_with(".endif") {
+            if_depth = if_depth.saturating_sub(1);
+        } else if first.starts_with(['v', 'V', 'i', 'I']) {
+            // Name and both nodes precede the arguments, including when the
+            // original card put parentheses around its nodes.
+            let arguments = words.get(3..).unwrap_or_default();
+            scopes[current].has_stimulus |=
+                ac_values(arguments)
+                    .last()
+                    .is_some_and(|value| match value {
+                        // `AC` alone means 1; parameters/expressions need engine evaluation.
+                        None => true,
+                        Some(value) => leading_number(value) != Some(0.0),
+                    });
+        } else if first.starts_with(['x', 'X']) {
+            if let Some(name) = subcircuit_fields(&words).last() {
+                scopes[current].calls.push(name.to_lowercase());
+            }
+        }
+    }
+    scopes
+}
+
+/// Find definitions visible from the calling body, then its parents and finally
+/// the top level. A conditional definition may be absent, leaving an outer one
+/// visible. An unconditional local definition always shadows the outer scopes.
+fn ac_definitions(scopes: &[AcScope], mut current: usize, name: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    loop {
+        if let Some(definitions) = scopes[current].definitions.get(name) {
+            found.extend(definitions);
+            if definitions.iter().any(|&id| !scopes[id].conditional) {
+                return found;
+            }
+        }
+        let Some(parent) = scopes[current].parent else {
+            return found;
+        };
+        current = parent;
+    }
+}
+
 /// Whether any voltage or current source can drive an AC analysis: it carries an
 /// `AC` value that is not a plain zero. A source with only a DC value gives a
 /// sweep of zeros and `sim_status=0`, so the engine never says so [verified: E54].
-/// A source inside a subcircuit counts, because whether it is called is not followed.
+/// Only sources in the top-level circuit or a reachable subcircuit count. An
+/// unused library definition supplies no stimulus. Expressions are still not
+/// evaluated here, and conditional branches are left to the engine.
 pub(crate) fn has_ac_stimulus(deck: &FlatDeck, dollar_is_comment: bool) -> bool {
-    cards(deck, dollar_is_comment).iter().any(|card| {
-        let words = tokens(&card.text);
-        let is_source = words
-            .first()
-            .is_some_and(|name| name.starts_with(['v', 'V', 'i', 'I']));
-        // `AC` alone means 1, and an expression is taken to be non-zero.
-        is_source
-            && ac_values(&words).iter().any(|value| match value {
-                None => true,
-                Some(value) => leading_number(value) != Some(0.0),
-            })
-    })
+    let scopes = ac_scopes(deck, dollar_is_comment);
+    let mut pending = vec![0];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if scopes[current].has_stimulus {
+            return true;
+        }
+        pending.extend(
+            scopes[current]
+                .calls
+                .iter()
+                .flat_map(|name| ac_definitions(&scopes, current, name)),
+        );
+    }
+    false
 }
 
 pub(crate) fn read(deck: &FlatDeck, dollar_is_comment: bool) -> Circuit {
@@ -881,12 +975,16 @@ fn controlled_source_nodes(words: &[String]) -> usize {
 }
 
 /// `X1 a b sub w=1`, with optional `params:` and PSpice's brackets around nodes.
-fn subcircuit_call(words: &[String], from_testbench: bool, circuit: &Circuit) -> Option<Element> {
-    let fields: Vec<&String> = words[1..]
+fn subcircuit_fields(words: &[String]) -> impl Iterator<Item = &String> {
+    words
         .iter()
+        .skip(1)
         .take_while(|word| !word.eq_ignore_ascii_case("params:"))
         .filter(|word| !word.contains('='))
-        .collect();
+}
+
+fn subcircuit_call(words: &[String], from_testbench: bool, circuit: &Circuit) -> Option<Element> {
+    let fields: Vec<&String> = subcircuit_fields(words).collect();
     let (definition, nodes) = fields.split_last()?;
     if !circuit.subcircuits.contains_key(&definition.to_lowercase()) {
         return None;
@@ -1092,9 +1190,137 @@ mod tests {
     }
 
     #[test]
-    fn a_source_in_a_subcircuit_counts_because_a_call_is_not_followed() {
+    fn an_unused_subcircuit_does_not_supply_ac_stimulus() {
         let netlist = ".title t\n.subckt drive o\nV1 o 0 AC 1\n.ends\nR1 a 0 1k\n.end\n";
+        assert!(!has_ac_stimulus(&deck(netlist), false));
+    }
+
+    #[test]
+    fn ac_stimulus_follows_only_reachable_subcircuit_calls() {
+        let definitions = ".subckt drive o\nV1 o 0 AC 1\n.ends\n\
+                           .subckt wrapper o\nXinner o drive\n.ends\n\
+                           .subckt passive o\nR1 o 0 1k\n.ends\n";
+        for (instance, expected) in [
+            ("X1 out drive", true),
+            ("x1 out WRAPPER params: unused=1", true),
+            ("X1 out passive", false),
+        ] {
+            let netlist = format!(".title t\n{definitions}{instance}\nRload out 0 1k\n.end\n");
+            assert_eq!(
+                has_ac_stimulus(&deck(&netlist), false),
+                expected,
+                "{instance}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac_stimulus_does_not_escape_an_unused_parents_local_definition() {
+        let active = ".subckt active out\n.subckt driver p\nVhidden p 0 DC 1\n\
+                      .ends driver\nXinner out driver\n.ends active\n";
+        let unused = ".subckt unused out\n.subckt driver p\nVac p 0 AC 1\n\
+                      .ends driver\nXinner out driver\n.ends unused\n";
+        for definitions in [format!("{active}{unused}"), format!("{unused}{active}")] {
+            let netlist = format!(".title t\n{definitions}Xtop out active\nRload out 0 1k\n.end\n");
+            assert!(!has_ac_stimulus(&deck(&netlist), false));
+            // The active parent's own source still counts when it supplies AC.
+            let driven = netlist.replace("Vhidden p 0 DC 1", "Vhidden p 0 AC 1");
+            assert!(has_ac_stimulus(&deck(&driven), false));
+        }
+    }
+
+    #[test]
+    fn ac_stimulus_resolves_local_then_parent_then_global_definitions() {
+        let netlist = ".title t\n\
+                       .subckt driver p\nVglobal p 0 AC 1\n.ends\n\
+                       .subckt outer out\n\
+                         .subckt driver p\nVparent p 0 DC 1\n.ends\n\
+                         .subckt inner p\nXdrive p DRIVER\n.ends\n\
+                         Xinner out inner\n\
+                       .ends\nXtop out outer\nRload out 0 1k\n.end\n";
+        assert!(!has_ac_stimulus(&deck(netlist), false));
+        let parent_drives = netlist.replace("Vparent p 0 DC 1", "Vparent p 0 AC 1");
+        assert!(has_ac_stimulus(&deck(&parent_drives), false));
+        let global_drives = netlist.replace(".subckt driver p\nVparent p 0 DC 1\n.ends\n", "");
+        assert!(has_ac_stimulus(&deck(&global_drives), false));
+        let local_shadows = parent_drives.replace(
+            ".subckt inner p\n",
+            ".subckt inner p\n.subckt driver q\nVlocal q 0 DC 1\n.ends\n",
+        );
+        assert!(!has_ac_stimulus(&deck(&local_shadows), false));
+    }
+
+    #[test]
+    fn ac_stimulus_visits_each_scoped_definition_even_when_names_match() {
+        let definitions = ".subckt passive out\n.subckt driver p\nVdc p 0 DC 1\n\
+                           .ends\nXinner out driver\n.ends\n\
+                           .subckt active out\n.subckt driver p\nVac p 0 AC 1\n\
+                           .ends\nXinner out driver\n.ends\n";
+        for instances in ["Xp a passive\nXa b active", "Xa b active\nXp a passive"] {
+            let netlist = format!(".title t\n{definitions}{instances}\n.end\n");
+            assert!(has_ac_stimulus(&deck(&netlist), false));
+        }
+    }
+
+    #[test]
+    fn ac_stimulus_resolves_a_helpers_calls_where_it_was_defined() {
+        let netlist = ".title t\n\
+                       .subckt driver p\nVglobal p 0 AC 1\n.ends\n\
+                       .subckt helper p\nXdrive p driver\n.ends\n\
+                       .subckt outer p\n\
+                         .subckt driver q\nVlocal q 0 DC 1\n.ends\n\
+                         Xhelper p helper\n\
+                       .ends\nXtop out outer\n.end\n";
         assert!(has_ac_stimulus(&deck(netlist), false));
+        // The caller's local source cannot drive a helper defined at the top level.
+        let only_local_drives = netlist
+            .replace("Vglobal p 0 AC 1", "Vglobal p 0 DC 1")
+            .replace("Vlocal q 0 DC 1", "Vlocal q 0 AC 1");
+        assert!(!has_ac_stimulus(&deck(&only_local_drives), false));
+    }
+
+    #[test]
+    fn ac_stimulus_handles_recursive_calls_with_lexical_shadowing() {
+        let netlist = ".title t\n\
+                       .subckt driver p\nVac p 0 AC 1\n.ends\n\
+                       .subckt outer out\n\
+                         .subckt driver p\nXnext p peer\n.ends\n\
+                         .subckt peer p\nXback p driver\n.ends\n\
+                         Xinner out driver\n\
+                       .ends\nXtop out outer\n.end\n";
+        assert!(!has_ac_stimulus(&deck(netlist), false));
+        let driven = netlist.replace("Xback p driver", "Xback p driver\nVlocal p 0 AC 1");
+        assert!(has_ac_stimulus(&deck(&driven), false));
+    }
+
+    #[test]
+    fn ac_stimulus_leaves_conditional_definition_selection_to_the_engine() {
+        let alternatives = ".title t\n.if (0)\n\
+                            .subckt driver p\nVdc p 0 DC 1\n.ends\n\
+                            .else\n.subckt driver p\nVac p 0 AC 1\n.ends\n\
+                            .endif\nXtop out driver\n.end\n";
+        assert!(has_ac_stimulus(&deck(alternatives), false));
+        let conditional_shadow = ".title t\n\
+                                  .subckt driver p\nVac p 0 AC 1\n.ends\n\
+                                  .subckt outer p\n.if (0)\n\
+                                    .subckt driver q\nVdc q 0 DC 1\n.ends\n\
+                                    .endif\nXinner p driver\n\
+                                  .ends\nXtop out outer\n.end\n";
+        assert!(has_ac_stimulus(&deck(conditional_shadow), false));
+    }
+
+    #[test]
+    fn recursive_calls_do_not_make_stimulus_search_loop() {
+        let netlist = ".title t\n.subckt a o\nXnext o b\n.ends\n\
+                       .subckt b o\nXnext o a\n.ends\nX1 out a\nR1 out 0 1k\n.end\n";
+        assert!(!has_ac_stimulus(&deck(netlist), false));
+    }
+
+    #[test]
+    fn the_last_ac_magnitude_assignment_is_the_effective_one() {
+        assert!(!driven("V1 a 0 AC 1 acmag=0"));
+        assert!(!driven("I1 0 a acmag=1 AC 0"));
+        assert!(driven("V1 a 0 AC 0 acmag=1"));
     }
 
     #[test]

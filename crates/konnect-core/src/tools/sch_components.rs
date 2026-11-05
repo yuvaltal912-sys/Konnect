@@ -339,9 +339,11 @@ pub fn tools() -> Vec<ToolDef> {
              reported as junctions_pruned_count and junctions_added_count. A no-connect \
              flag follows the same symbol UUID, unit, and pin number when that mapping is \
              one-to-one; removed, renumbered, or duplicated protected pins refuse before \
-             writing. The simulator reads the instance's Sim.* fields only, so they are \
-             swapped too: every old Sim.* field is removed, hand-edited ones included, and \
-             the new symbol's are copied hidden. The result lists the ones that \
+             writing. Simulation assignments are swapped too: every old Sim.* field \
+             and the exact legacy fields KiCad migrates (Spice_Primitive, Spice_Model, \
+             Spice_Node_Sequence, Spice_Netlist_Enabled, Spice_Lib_File, Sim_Type, \
+             Sim_Device, Sim_Pins, Sim_Params) are removed, hand-edited ones included, \
+             and the new symbol's Sim.* fields are copied hidden. The result lists those \
              changed as sim_fields_dropped and sim_fields_added (name and value); a field \
              the new symbol repeats exactly is in neither. Replacing a symbol \
              with itself leaves the fields alone. Value, Footprint and the reference are \
@@ -2469,15 +2471,30 @@ pub(crate) fn set_property_value(
     ))
 }
 
-/// `Sim.*` fields are the simulator's per-instance model assignment
-/// (`Sim.Device`, `Sim.Pins`, `Sim.Params`, ...): the set `symbol_metadata`
-/// copies on placement.
+/// Per-instance simulation assignments: the current `Sim.*` fields copied by
+/// `symbol_metadata`, and the exact legacy keys KiCad 10.0.1 migrates in
+/// `SIM_MODEL::MigrateSimModel` or consumes in the schematic parser. An old
+/// assignment must not remain available to revive the previous part's model.
+/// Keep this allowlist exact: arbitrary `Spice_*` and `Sim_*` names are user
+/// fields, not a second simulation namespace.
 fn is_sim_field(name: &str) -> bool {
     name.starts_with("Sim.")
+        || matches!(
+            name,
+            "Spice_Primitive"
+                | "Spice_Model"
+                | "Spice_Node_Sequence"
+                | "Spice_Netlist_Enabled"
+                | "Spice_Lib_File"
+                | "Sim_Type"
+                | "Sim_Device"
+                | "Sim_Pins"
+                | "Sim_Params"
+        )
 }
 
-/// The unit number of the first unit in the readback with a `Sim.*` field that
-/// `expected` does not name.
+/// The unit number of the first unit in the readback with a current or legacy
+/// simulation assignment that `expected` does not name.
 pub(crate) fn unit_with_stale_sim_field(
     observed: &serde_json::Value,
     expected: impl Fn(&str) -> bool,
@@ -2496,7 +2513,7 @@ pub(crate) fn unit_with_stale_sim_field(
         .map(|unit| unit["unit"].clone())
 }
 
-/// What `replace_component` does to an instance's `Sim.*` fields.
+/// What `replace_component` does to an instance's simulation assignments.
 #[derive(Debug, Default)]
 struct SimFieldSwap {
     edits: Vec<SexpEdit>,
@@ -2507,13 +2524,13 @@ struct SimFieldSwap {
     added: Vec<(String, String)>,
 }
 
-/// Swap every placed unit's `Sim.*` fields for `new_fields`, the new library
-/// symbol's.
+/// Swap every placed unit's current and recognized legacy simulation fields
+/// for `new_fields`, the new library symbol's modern `Sim.*` assignments.
 ///
 /// KiCad's simulator reads the instance only, so a replacement that kept the
-/// old fields would simulate the old part (a diode swapped for a resistor
-/// stays a diode), and one that added none would leave the new part
-/// unmodelled. The old fields go whether or not they were edited by hand: a
+/// old fields could simulate the old part. Legacy fields also have to go:
+/// KiCad can migrate them when a replacement has no modern model assignment.
+/// The old fields go whether or not they were edited by hand: a
 /// tuned `Sim.Params` describes the part that is leaving. `dropped` carries
 /// their values so the caller can restore one. A unit already carrying exactly
 /// `new_fields` is left alone.
@@ -4332,20 +4349,22 @@ async fn handle_replace_component(
     // Add the optional unit edits without a second source read. The multi-unit
     // guard above means this scan has at most one block.
     if let Some(unit) = new_unit {
+        use konnect_sexp::writer::{find_balanced_block, find_block_starts};
+
         let (start, end) = blocks[0];
         let block = &content[start..end];
-        let mut from = 0usize;
-        while let Some(relative) = block[from..].find("(unit ") {
-            let number_start = from + relative + "(unit ".len();
-            let Some(close) = block[number_start..].find(')') else {
-                break;
+        // These are the symbol's own unit and each hierarchical instance's
+        // unit. The string-aware scanner skips lookalikes in property names or
+        // values, including escaped quotes, before planning any file write.
+        for offset in find_block_starts(block, "unit") {
+            let Some((from, to)) = find_balanced_block(block, offset) else {
+                return Ok(CallToolResult::error("Malformed unit"));
             };
             edits.push(SexpEdit::replace(
-                start + number_start,
-                start + number_start + close,
-                unit.to_string(),
+                start + from,
+                start + to,
+                format!("(unit {unit})"),
             ));
-            from = number_start + close;
         }
     }
 
@@ -4381,9 +4400,8 @@ async fn handle_replace_component(
         Some(content) => content,
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
-    // The simulator reads the instance's `Sim.*` fields, never the library's,
-    // so they travel with the symbol. Nothing is swapped when the symbol is not
-    // changing.
+    // Current and recognized legacy simulation assignments travel with the
+    // symbol. Nothing is swapped when the symbol is not changing.
     let sim_swap = if new_lib_id == old_lib_id {
         SimFieldSwap::default()
     } else {
@@ -4448,7 +4466,7 @@ async fn handle_replace_component(
         return Ok(crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "replace_component",
-            format!("unit {unit} still carries a Sim field of the old symbol"),
+            format!("unit {unit} still carries a simulation field of the old symbol"),
         ));
     }
     let named = |fields: &[(String, String)]| {

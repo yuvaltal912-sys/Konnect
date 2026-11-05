@@ -70,13 +70,34 @@ impl CurrentSources {
     /// run inlined that has gone counts as a change. Null when the sheets cannot
     /// be read, because nothing can then be said.
     pub(super) fn changed_since(&self, record: &RunRecord) -> Option<bool> {
+        self.changed_since_with_cache(record, &mut runs::ModelHashCache::default())
+    }
+
+    fn changed_since_with_cache(
+        &self,
+        record: &RunRecord,
+        cache: &mut runs::ModelHashCache,
+    ) -> Option<bool> {
         let hasher = self.0.clone()?;
+        if let Some(provenance) = &record.input_provenance {
+            return provenance.changed_since_with_cache(hasher, cache);
+        }
         // The record names these files, and a store can be written by anyone who
         // can write the state folder, so only a plain file of a sane size is read.
         let readable = |path: &PathBuf| {
             std::fs::metadata(path)
                 .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_MODEL_BYTES)
         };
+        // Old records know only generated IBIS cache paths. Another export can
+        // delete or replace them; an original model can also change without an
+        // export. These records cannot prove the original inputs unchanged.
+        if record
+            .inlined_files
+            .iter()
+            .any(|path| runs::is_generated_ibis_cache(path))
+        {
+            return None;
+        }
         if !record.inlined_files.iter().all(readable) {
             return Some(true);
         }
@@ -143,25 +164,34 @@ pub(super) fn list(
     // records were kept. It has no data to offer, so it is counted and not listed.
     // One record is held at a time, whatever the store holds.
     let sources = std::cell::OnceCell::new();
+    let mut model_hashes = runs::ModelHashCache::default();
     let mut total = 0usize;
     let mut without_record = 0usize;
     let mut unreadable_record = 0usize;
+    let mut without_results = 0usize;
     let mut shown: Vec<Value> = Vec::new();
     for id in &ids {
-        let record = runs::locate(&root, id).map(|dir| runs::read_record(&dir));
-        let record = match record {
-            Ok(Ok(record)) => record,
+        let located = runs::locate(&root, id).map(|dir| {
+            let record = runs::read_record(&dir);
+            (dir, record)
+        });
+        let (dir, record) = match located {
+            Ok((dir, Ok(record))) => (dir, record),
             // The record exists and cannot be used: damaged, too big, or written by
             // another version. The run is there, so it is not "without a record".
-            Ok(Err(RecordError::Unusable(_))) => {
+            Ok((_, Err(RecordError::Unusable(_)))) => {
                 unreadable_record += 1;
                 continue;
             }
-            Ok(Err(RecordError::Missing)) | Err(_) => {
+            Ok((_, Err(RecordError::Missing))) | Err(_) => {
                 without_record += 1;
                 continue;
             }
         };
+        let result_files = result_files(&dir);
+        if result_files.is_err() {
+            without_results += 1;
+        }
         total += 1;
         if shown.len() < limit {
             let sources = sources.get_or_init(|| CurrentSources::of(schematic));
@@ -172,7 +202,11 @@ pub(super) fn list(
                 "run_status": record.run_status.as_str(),
                 "simulated_circuit": record.simulated_circuit,
                 "coverage_ratio": record.coverage_ratio,
-                "inputs_changed_since_run": sources.changed_since(&record),
+                "inputs_changed_since_run": sources.changed_since_with_cache(&record, &mut model_hashes),
+                // run_status is historical. File presence is checked now, without
+                // reading every potentially hundred-megabyte raw file in a list.
+                "result_files_present": result_files.is_ok(),
+                "result_files_error": result_files.err(),
             }));
         }
     }
@@ -182,6 +216,7 @@ pub(super) fn list(
         "truncated": shown.len() < total,
         "without_record": without_record,
         "unreadable_record": unreadable_record,
+        "without_results": without_results,
         "runs": shown,
     })))
 }
@@ -312,21 +347,27 @@ pub(super) fn read_plot(
     let refuse = |result: CallToolResult| (result, opened.target.clone());
     let lost =
         |otherwise: &dyn Fn() -> CallToolResult| or_not_found(&opened.root, run_id, otherwise);
+    let status = result_files(dir).map_err(|detail| refuse(lost(&|| unreadable(dir, detail))))?;
+    read_results(dir, &status)
+        .map_err(|error| refuse(lost(&|| unreadable(dir, format!("its raw file: {error}")))))
+}
+
+/// Check the small status record and raw-file presence. The raw parser still
+/// validates the content when a measurement or plot is requested.
+fn result_files(dir: &Path) -> Result<RunStatus, &'static str> {
     let status: RunStatus = runs::read_plain(&dir.join(STATUS_FILE), runs::MAX_STATUS_BYTES)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| {
-            refuse(lost(&|| {
-                unreadable(dir, "its status file is missing or damaged")
-            }))
-        })?;
-    if !std::fs::symlink_metadata(dir.join(RAW_FILE)).is_ok_and(|meta| meta.is_file()) {
-        return Err(refuse(lost(&|| {
-            unreadable(dir, "its raw file is missing or not a plain file")
-        })));
+        .ok_or("its status file is missing or damaged")?;
+    if !status.results_written {
+        return Err("its status says no results were written");
     }
-    read_results(dir, &status)
-        .map_err(|error| refuse(lost(&|| unreadable(dir, format!("its raw file: {error}")))))
+    if !std::fs::symlink_metadata(dir.join(RAW_FILE))
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    {
+        return Err("its raw file is missing, empty or not a plain file");
+    }
+    Ok(status)
 }
 
 pub(super) fn measure(
@@ -449,8 +490,163 @@ pub(super) fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const ID: &str = "3fa9c1d27b04-20261030T133512-7f3a";
+
+    fn basic_record(schematic: PathBuf) -> RunRecord {
+        RunRecord::new(runs::RecordFields {
+            schematic,
+            analysis: json!({ "kind": "operating_point" }),
+            run_status: RunState::Complete,
+            stopped: None,
+            simulated_circuit: "as_drawn".to_string(),
+            circuit: Value::Null,
+            result: Value::Null,
+            coverage_ratio: 1.0,
+            inputs_hash: String::new(),
+            inlined_files: Vec::new(),
+            nets: Vec::new(),
+            elements: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_listed_run_discloses_result_files_lost_after_completion() {
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let schematic = project.path().join("root.kicad_sch");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/batch_connect_facing_kicad10.kicad_sch"
+            ),
+            &schematic,
+        )
+        .unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let mut runtime = crate::simulation::SimulationRuntime::new(
+            PathBuf::from("unused-worker"),
+            Default::default(),
+        );
+        runtime.state_root = Some(state.path().to_path_buf());
+        ctx.simulation.set(Arc::new(runtime)).ok();
+        let run = runs::create(state.path(), &schematic).unwrap();
+        runs::write_record(&run.dir, &basic_record(schematic.clone())).unwrap();
+        let status = RunStatus {
+            protocol: crate::simulation::protocol::PROTOCOL_VERSION,
+            load_error: None,
+            engine_version: None,
+            code_models_loaded: Vec::new(),
+            code_models_failed: Vec::new(),
+            exit_status: None,
+            sim_status: Some(0),
+            halted_reason: None,
+            results_written: true,
+        };
+        std::fs::write(
+            run.dir.join(STATUS_FILE),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/simulation/raw/op.ascii.raw"
+            ),
+            run.dir.join(RAW_FILE),
+        )
+        .unwrap();
+        let listed = || {
+            let body = list(&ctx, &schematic, 10).unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &body.content[0] else {
+                panic!("text")
+            };
+            serde_json::from_str::<Value>(text).unwrap()
+        };
+        let available = listed();
+        std::fs::remove_file(run.dir.join(RAW_FILE)).unwrap();
+        let lost = listed();
+        assert_eq!(lost["runs"][0]["run_status"], "complete");
+        assert_eq!(lost["runs"][0]["result_files_present"], false, "{lost}");
+        assert_eq!(
+            available["runs"][0]["result_files_present"], true,
+            "{available}"
+        );
+        assert!(lost["runs"][0]["result_files_error"]
+            .as_str()
+            .unwrap()
+            .contains("raw"));
+        assert_eq!(lost["without_results"], 1, "{lost}");
+    }
+
+    #[test]
+    fn a_legacy_run_does_not_mistake_removed_ibis_cache_for_known_input_drift() {
+        let mut record = basic_record(PathBuf::new());
+        let cache = dirs::cache_dir()
+            .unwrap()
+            .join("KiCad/10.0/ibis")
+            .join(format!("nonexistent-{}.cache", uuid::Uuid::new_v4()));
+        record.inlined_files.push(cache);
+        let sources = CurrentSources(Some(Sha256::default()));
+        assert_eq!(sources.changed_since(&record), None);
+    }
+
+    #[test]
+    fn result_presence_checks_reject_broken_status_empty_raw_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = RunStatus {
+            protocol: crate::simulation::protocol::PROTOCOL_VERSION,
+            load_error: None,
+            engine_version: None,
+            code_models_loaded: Vec::new(),
+            code_models_failed: Vec::new(),
+            exit_status: None,
+            sim_status: Some(0),
+            halted_reason: None,
+            results_written: true,
+        };
+        let raw = dir.path().join(RAW_FILE);
+        let status_path = dir.path().join(STATUS_FILE);
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/simulation/raw/op.ascii.raw"
+            ),
+            &raw,
+        )
+        .unwrap();
+        assert!(result_files(dir.path()).unwrap_err().contains("status"));
+        std::fs::write(&status_path, b"broken JSON").unwrap();
+        assert!(result_files(dir.path()).unwrap_err().contains("status"));
+        std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+        assert!(result_files(dir.path()).is_ok());
+        let mut no_data = status.clone();
+        no_data.results_written = false;
+        std::fs::write(&status_path, serde_json::to_vec(&no_data).unwrap()).unwrap();
+        assert!(result_files(dir.path()).unwrap_err().contains("no results"));
+        std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+        std::fs::write(&raw, b"").unwrap();
+        assert!(result_files(dir.path()).unwrap_err().contains("raw"));
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("other.raw");
+            std::fs::rename(&raw, &target).unwrap();
+            std::fs::write(&target, b"nonempty").unwrap();
+            std::os::unix::fs::symlink(&target, &raw).unwrap();
+            assert!(result_files(dir.path()).unwrap_err().contains("raw"));
+            std::fs::remove_file(&raw).unwrap();
+            std::fs::rename(&target, &raw).unwrap();
+            let status_target = dir.path().join("other.json");
+            std::fs::rename(&status_path, &status_target).unwrap();
+            std::os::unix::fs::symlink(&status_target, &status_path).unwrap();
+            assert!(result_files(dir.path()).unwrap_err().contains("status"));
+        }
+    }
 
     fn refusal(result: &CallToolResult) -> (String, String) {
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {

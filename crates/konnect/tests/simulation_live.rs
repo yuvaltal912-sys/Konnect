@@ -1675,7 +1675,14 @@ fn a_three_pole_loop_gives_the_margins_the_formula_does() {
     assert_eq!(result["outcome"]["requested"], 6);
     assert_eq!(result["simulated_circuit"], "modified");
     assert_eq!(result["analysis"]["coverage_ratio"], 1.0, "{result}");
-    assert_eq!(result["warnings"], json!([]), "{result}");
+    let warnings = result["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{result}");
+    assert_eq!(warnings[0]["code"], "ac_margin_sampling_unverified");
+    assert_eq!(
+        result["measurements"][0]["sampling_validation"],
+        "unverified"
+    );
+    assert_eq!(result["measurements"][0]["crossing_selection"], "first");
     // From `ac_loop_reference.py`, which solves the formulas with no SPICE engine.
     near(measured(&result, "pm"), 3.485942, 2e-3);
     near(measured(&result, "gm"), 1.742135, 2e-3);
@@ -2990,9 +2997,26 @@ fn build_replaced_part_circuit(
     from_lib: &str,
     to_lib: &str,
 ) -> PathBuf {
+    build_replaced_part_circuit_with_legacy(home, project, reference, from_lib, to_lib, None)
+}
+
+fn build_replaced_part_circuit_with_legacy(
+    home: &Path,
+    project: &Path,
+    reference: &str,
+    from_lib: &str,
+    to_lib: &str,
+    legacy_fields: Option<Value>,
+) -> PathBuf {
     let schematic = project.join("replaced.kicad_sch");
     let sch = schematic.display().to_string();
-    let first = vec![
+    let legacy_names: Vec<String> = legacy_fields
+        .as_ref()
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|fields| fields.keys().cloned())
+        .collect();
+    let mut first = vec![
         (
             "create_project",
             json!({"path": project, "name": "replaced"}),
@@ -3021,7 +3045,32 @@ fn build_replaced_part_circuit(
             json!({"schematic": sch, "reference": reference}),
         ),
     ];
+    if let Some(fields) = legacy_fields {
+        first.insert(
+            4,
+            (
+                "edit_schematic_component",
+                json!({"schematic": sch, "reference": reference, "fields": fields}),
+            ),
+        );
+    }
     let results = call_session(home, &first);
+    if !legacy_names.is_empty() {
+        let replacement = first
+            .iter()
+            .position(|(tool, _)| *tool == "replace_component")
+            .unwrap();
+        let dropped = results[replacement]["sim_fields_dropped"]
+            .as_array()
+            .unwrap();
+        for name in legacy_names {
+            assert!(
+                dropped.iter().any(|field| field["name"] == name),
+                "{name}: {}",
+                results[replacement]
+            );
+        }
+    }
     for (n, result) in results.iter().enumerate() {
         assert!(
             result.get("error").is_none(),
@@ -3029,12 +3078,13 @@ fn build_replaced_part_circuit(
             first[n].0
         );
     }
-    let pin_one = results[5]["pins"]
+    let pins = results.last().unwrap();
+    let pin_one = pins["pins"]
         .as_array()
         .unwrap()
         .iter()
         .find(|pin| pin["number"] == "1")
-        .unwrap_or_else(|| panic!("no pin 1: {}", results[5]));
+        .unwrap_or_else(|| panic!("no pin 1: {pins}"));
     let (x, y) = (
         pin_one["x"].as_f64().unwrap(),
         pin_one["y"].as_f64().unwrap(),
@@ -3155,4 +3205,436 @@ fn negative_control_a_replacement_that_keeps_the_old_fields_simulates_the_old_pa
         (0.4..0.9).contains(&mid),
         "the stale fields make the resistor a diode, got {mid} V: {run}"
     );
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn an_uninstantiated_ac_source_is_refused_before_an_all_zero_sweep() {
+    let lines = [
+        ".subckt unused out",
+        "Vhidden out 0 AC 1",
+        ".ends unused",
+        "VDC out 0 DC 1",
+        "Rload out 0 1k",
+    ]
+    .map(str::to_owned);
+    let result = run_on_testbench(
+        &lines,
+        json!({
+            "analysis": { "kind": "ac", "start_hz": 1.0, "stop_hz": 1000.0, "points": 10 },
+            "signals": ["v(out)"]
+        }),
+    );
+    assert_eq!(result["error"]["reason"], "no_ac_stimulus", "{result}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice and its symbol libraries"]
+fn a_legacy_spice_model_is_removed_when_a_diode_becomes_a_resistor() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("legacy-diode.lib"),
+        ".model LEGACYD D(Is=1n)\n",
+    )
+    .unwrap();
+    let schematic = build_replaced_part_circuit_with_legacy(
+        home.path(),
+        project.path(),
+        "D1",
+        "Device:D",
+        "Device:R",
+        Some(json!({
+            "Spice_Primitive": "D", "Spice_Model": "LEGACYD",
+            "Spice_Node_Sequence": "2 1", "Spice_Lib_File": "legacy-diode.lib"
+        })),
+    );
+    let results = call_session(
+        home.path(),
+        &[(
+            "edit_schematic_component",
+            json!({"schematic": schematic, "reference": "D1", "new_reference": "R2"}),
+        )],
+    );
+    for result in &results {
+        assert!(result.get("error").is_none(), "{result}");
+    }
+    let (readiness, run) = operating_point(home.path(), &schematic);
+    assert_eq!(readiness["ready"], true, "{readiness}");
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    let mid = row(&run, "v(/mid)")["value"].as_f64().unwrap();
+    near(mid, 2.5, 1e-6);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn subcircuit_power_reports_the_exposed_pin_boundary_when_a_supply_is_hidden() {
+    for (hidden, expected_terminal_power) in [(true, 0.0), (false, 0.1)] {
+        let mut deck = vec!["VDD vdd 0 10", "Ranchor out 0 1meg"];
+        if hidden {
+            deck.extend([
+                ".global vdd",
+                ".subckt block out ground",
+                "Rload vdd ground 1000",
+                "Rout out ground 1000",
+                ".ends",
+                "X1 out 0 block",
+            ]);
+        } else {
+            deck.extend([
+                ".subckt block out supply ground",
+                "Rload supply ground 1000",
+                "Rout out ground 1000",
+                ".ends",
+                "X1 out vdd 0 block",
+            ]);
+        }
+        let result = run_on_testbench(
+            &lines(&deck),
+            json!({
+                "analysis": { "kind": "transient", "stop_time_seconds": 1e-3 },
+                "signals": ["p(X1)", "i(VDD)"],
+                "measurements": [{ "name": "power", "kind": "max", "signal": "p(X1)" }],
+            }),
+        );
+        assert_eq!(result["outcome"]["status"], "complete", "{result}");
+        near(measured(&result, "power"), expected_terminal_power, 1e-9);
+        let measurement = &result["measurements"][0];
+        assert_eq!(
+            measurement["power_scope"], "exposed_subcircuit_pins",
+            "{result}"
+        );
+        assert_eq!(
+            measurement["total_device_power_verified"], false,
+            "{result}"
+        );
+        let summaries = result["signal_summaries"].as_array().unwrap();
+        let power = summaries.iter().find(|v| v["signal"] == "p(X1)").unwrap();
+        assert_eq!(power["power_scope"], "exposed_subcircuit_pins", "{result}");
+        let supply = summaries.iter().find(|v| v["signal"] == "i(VDD)").unwrap();
+        // Both circuits consume 10 V * 10 mA = 0.1 W. Only the explicit supply
+        // terminal belongs to the boundary ngspice's subcircuit probe measures.
+        near(supply["final"].as_f64().unwrap(), -0.01, 1e-10);
+        assert!(supply.get("power_scope").is_none(), "{result}");
+        let warnings = result["warnings"].as_array().unwrap();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|v| v["code"] == "subcircuit_power_boundary")
+                .count(),
+            1,
+            "{result}"
+        );
+        let mut operating_deck = lines(&deck);
+        operating_deck.push(".probe p(X1)".to_string());
+        let operating = run_on_testbench(
+            &operating_deck,
+            json!({ "analysis": { "kind": "operating_point" } }),
+        );
+        assert_eq!(operating["outcome"]["status"], "complete", "{operating}");
+        let power_row = row(&operating, "x1:power");
+        near(
+            power_row["value"].as_f64().unwrap(),
+            expected_terminal_power,
+            1e-9,
+        );
+        assert_eq!(
+            power_row["power_scope"], "exposed_subcircuit_pins",
+            "{operating}"
+        );
+        assert_eq!(
+            power_row["total_device_power_verified"], false,
+            "{operating}"
+        );
+        assert!(
+            operating["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "subcircuit_power_boundary"),
+            "{operating}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn stored_subcircuit_power_recomputes_scope_for_measurement_and_plot() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let sheet = project.path().join("rectifier.kicad_sch");
+    let home = tempfile::tempdir().unwrap();
+    let mut arguments = json!({
+        "schematic": sheet,
+        "testbench": {
+            "exclude_references": ["*"],
+            "spice_lines": [
+                "VDD vdd 0 10",
+                "Ranchor out 0 1meg",
+                ".global vdd",
+                ".subckt block out ground",
+                "Rload vdd ground 1000",
+                "Rout out ground 1000",
+                ".ends",
+                "X1 out 0 block",
+                ".probe p(X1)"
+            ]
+        },
+        "analysis": { "kind": "transient", "stop_time_seconds": 1e-3 },
+        // Save the probe's data without asking for any power report yet.
+        // Stored readers must derive its scope rather than inherit a warning.
+        "signals": ["i(VDD)"]
+    });
+    let run = call_again(home.path(), "run_simulation", arguments.clone());
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    near(
+        run["signal_summaries"][0]["final"].as_f64().unwrap(),
+        -0.01,
+        1e-10,
+    );
+    assert!(
+        run["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| { warning["code"] != "subcircuit_power_boundary" }),
+        "{run}"
+    );
+    let again = call_again(
+        home.path(),
+        "measure_simulation_run",
+        json!({
+            "run_id": run["run_id"],
+            "signals": ["p(X1)"],
+            "measurements": [{ "name": "power", "kind": "max", "signal": "p(X1)" }]
+        }),
+    );
+    assert_eq!(again["outcome"]["status"], "complete", "{again}");
+    near(measured(&again, "power"), 0.0, 1e-10);
+    for report in [&again["signal_summaries"][0], &again["measurements"][0]] {
+        assert_eq!(report["power_scope"], "exposed_subcircuit_pins", "{again}");
+        assert_eq!(report["total_device_power_verified"], false, "{again}");
+    }
+    assert_eq!(
+        again["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "subcircuit_power_boundary")
+            .count(),
+        1,
+        "{again}"
+    );
+
+    let plotted = call_again(
+        home.path(),
+        "plot_simulation_run",
+        json!({ "run_id": run["run_id"], "signals": ["p(X1)"] }),
+    );
+    assert_eq!(plotted["outcome"]["status"], "complete", "{plotted}");
+    assert_eq!(
+        plotted["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "subcircuit_power_boundary")
+            .count(),
+        1,
+        "{plotted}"
+    );
+    let svg = std::fs::read_to_string(plotted["path"].as_str().unwrap()).unwrap();
+    let text = svg_text_lines(&svg).join(" ");
+    assert!(
+        text.contains("Subcircuit power covers exposed pins"),
+        "{text}"
+    );
+    assert!(text.contains("hidden supplies are excluded"), "{text}");
+    assert_eq!(
+        run_folders(home.path()),
+        1,
+        "stored readers must not make another run"
+    );
+
+    // A later voltage-only request does not inherit interpretation warnings
+    // from a power report made during the original run.
+    arguments["signals"] = json!(["p(X1)"]);
+    // This call asks Konnect to insert the power probe, so do not also insert
+    // the explicit probe used to save an unrequested vector in the first run.
+    arguments["testbench"]["spice_lines"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|line| line != ".probe p(X1)");
+    let power_run = call_again(home.path(), "run_simulation", arguments);
+    assert_eq!(power_run["outcome"]["status"], "complete", "{power_run}");
+    assert!(
+        power_run["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "subcircuit_power_boundary"),
+        "{power_run}"
+    );
+    let voltage_only = call_again(
+        home.path(),
+        "measure_simulation_run",
+        json!({
+            "run_id": power_run["run_id"],
+            "signals": ["v(out)"],
+            "measurements": [{ "name": "voltage", "kind": "max", "signal": "v(out)" }]
+        }),
+    );
+    assert_eq!(
+        voltage_only["outcome"]["status"], "complete",
+        "{voltage_only}"
+    );
+    assert!(
+        voltage_only["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning["code"] != "subcircuit_power_boundary"),
+        "{voltage_only}"
+    );
+    assert!(
+        voltage_only["signal_summaries"][0]
+            .get("power_scope")
+            .is_none(),
+        "{voltage_only}"
+    );
+    assert_eq!(
+        run_folders(home.path()),
+        2,
+        "measuring a stored run must not make a third run"
+    );
+}
+
+/// An explicit configuration and cache keep this regression away from every
+/// user's configuration, run store and KiCad-generated IBIS files.
+fn call_with_isolated_ibis_cache(
+    state: &Path,
+    cache: &Path,
+    tool: &str,
+    arguments: Value,
+) -> Value {
+    std::fs::create_dir_all(state).unwrap();
+    let cli = konnect_core::kicad_install::find_cli("kicad-cli").unwrap();
+    let config = state.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("kicad_cli = {}\ntransport = \"stdio\"\n", json!(cli)),
+    )
+    .unwrap();
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ibis-regression","version":"1"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"load_toolset","arguments":{"name":"simulation"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":tool,"arguments":arguments}}),
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .arg("--config")
+        .arg(config)
+        .env("HOME", state)
+        .env("KONNECT_STATE_DIR", state)
+        .env("KICAD_CACHE_HOME", cache)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for request in requests {
+        writeln!(child.stdin.as_mut().unwrap(), "{request}").unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let response = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|message| message["id"] == 3)
+        .expect("tool response");
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn stored_ibis_inputs_survive_unrelated_export_and_disclose_lost_results() {
+    fn cache_count(root: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                if entry.path().is_dir() {
+                    cache_count(&entry.path())
+                } else {
+                    usize::from(entry.path().extension().is_some_and(|ext| ext == "cache"))
+                }
+            })
+            .sum()
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let ibis = scratch.path().join("ibis");
+    let rectifier = scratch.path().join("rectifier");
+    let cache = scratch.path().join("cache");
+    let state = scratch.path().join("state");
+    copy_tree(&demos().join("simulation/ibis"), &ibis);
+    copy_tree(&demos().join("simulation/rectifier"), &rectifier);
+    let sheet = ibis.join("ibis.kicad_sch");
+    let call = |tool, arguments| call_with_isolated_ibis_cache(&state, &cache, tool, arguments);
+    let run = call(
+        "run_simulation",
+        json!({"schematic":sheet,"analysis":{"kind":"operating_point"}}),
+    );
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    let listed = call("list_simulation_runs", json!({"schematic":sheet}));
+    assert_eq!(
+        listed["runs"][0]["inputs_changed_since_run"], false,
+        "{listed}"
+    );
+    assert!(cache_count(&cache) > 0);
+    let export = Command::new(konnect_core::kicad_install::find_cli("kicad-cli").unwrap())
+        .args(["sch", "export", "netlist", "--format", "spice", "-o"])
+        .arg(scratch.path().join("rectifier.cir"))
+        .arg(rectifier.join("rectifier.kicad_sch"))
+        .env("KICAD_CACHE_HOME", &cache)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert_eq!(cache_count(&cache), 0);
+    let after_export = call("list_simulation_runs", json!({"schematic":sheet}));
+    assert_eq!(
+        after_export["runs"][0]["inputs_changed_since_run"], false,
+        "{after_export}"
+    );
+    let model = ibis.join("ibis_v1_1.ibs");
+    let old = std::fs::read_to_string(&model).unwrap();
+    let changed = old.replace("5.0V", "4.0V");
+    assert_ne!(old, changed);
+    std::fs::write(model, changed).unwrap();
+    let after_model = call("list_simulation_runs", json!({"schematic":sheet}));
+    assert_eq!(
+        after_model["runs"][0]["inputs_changed_since_run"], true,
+        "{after_model}"
+    );
+    assert_eq!(after_model["runs"][0]["result_files_present"], true);
+    std::fs::remove_file(run["artifacts"]["raw_path"].as_str().unwrap()).unwrap();
+    let after_raw = call("list_simulation_runs", json!({"schematic":sheet}));
+    assert_eq!(after_raw["runs"][0]["run_status"], "complete");
+    assert_eq!(
+        after_raw["runs"][0]["result_files_present"], false,
+        "{after_raw}"
+    );
+    assert_eq!(after_raw["without_results"], 1);
+    assert!(after_raw["runs"][0]["result_files_error"]
+        .as_str()
+        .unwrap()
+        .contains("raw"));
 }

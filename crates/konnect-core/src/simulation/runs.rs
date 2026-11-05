@@ -11,6 +11,9 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod inputs;
+pub(crate) use inputs::{is_generated_ibis_cache, InputProvenance, ModelHashCache, OriginalModels};
+
 const KEEP_RUNS: usize = 20;
 const HASH_CHARS: usize = 12;
 const STAMP_CHARS: usize = 15;
@@ -137,6 +140,10 @@ pub(crate) struct RunRecord {
     pub inputs_hash: String,
     /// Model files the deck inlined, which the hash covers.
     pub inlined_files: Vec<PathBuf>,
+    /// Original source/model inputs, independent of KiCad's disposable IBIS
+    /// cache. Absent on older records, whose original inputs may be unverifiable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_provenance: Option<InputProvenance>,
     /// Kept to resolve a net or reference to the engine's name.
     pub nets: Vec<NetEntry>,
     pub elements: Vec<ElementEntry>,
@@ -160,6 +167,7 @@ impl RunRecord {
             coverage_ratio: fields.coverage_ratio,
             inputs_hash: fields.inputs_hash,
             inlined_files: fields.inlined_files,
+            input_provenance: None,
             nets: fields.nets,
             elements: fields.elements,
             warnings: fields.warnings,
@@ -226,7 +234,30 @@ pub(crate) fn read_plain(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     if meta.len() > cap {
         return Err(std::io::Error::other(format!("it is {} bytes", meta.len())));
     }
-    std::fs::read(path)
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(std::io::Error::other("it is not a plain file"));
+    }
+    if opened.len() > cap {
+        return Err(std::io::Error::other(format!(
+            "it is {} bytes",
+            opened.len()
+        )));
+    }
+    read_bounded(file, cap)
+}
+
+/// A file can grow after its metadata check. Read only enough to detect that it
+/// exceeded the cap, rather than allocating for all of its newly appended data.
+fn read_bounded(reader: impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(std::io::Error::other(format!("it exceeds {cap} bytes")));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn read_record(dir: &Path) -> Result<RunRecord, RecordError> {
@@ -350,9 +381,10 @@ pub(crate) fn create(state_root: &Path, schematic: &Path) -> std::io::Result<Run
     }
 }
 
-/// Keep the newest runs, counting the current one, and return how many old ones
-/// would not go. A failure here must never refuse a good run. Anything that is not
-/// a real run folder stays, so a stray file or link is never followed or deleted.
+/// Keep the newest finished or expired runs, counting the current one, and return
+/// how many old ones would not go. Other young, record-less folders may still be
+/// running, so they stay outside the retention limit. A failure here must never
+/// refuse a good run. A stray file or link is never followed or deleted.
 fn prune(project: &Path, current: &str) -> usize {
     let Ok(entries) = std::fs::read_dir(project) else {
         return 0;
@@ -366,9 +398,16 @@ fn prune(project: &Path, current: &str) -> usize {
     runs.sort();
     // A run that failed has no data to lose, so it goes before one that has some:
     // twenty failed attempts must not push out the run whose response was lost.
-    let (failed, kept): (Vec<String>, Vec<String>) = runs
-        .into_iter()
-        .partition(|name| failed_long_ago(&project.join(name)));
+    let mut failed = Vec::new();
+    let mut kept = Vec::new();
+    for name in runs {
+        let dir = project.join(&name);
+        if std::fs::symlink_metadata(dir.join(RECORD_FILE)).is_ok() {
+            kept.push(name);
+        } else if failed_long_ago(&dir) {
+            failed.push(name);
+        }
+    }
     let surplus = (failed.len() + kept.len()).saturating_sub(KEEP_RUNS - 1);
     let gone = |name: &&String| match std::fs::remove_dir_all(project.join(name)) {
         Ok(()) => false,
@@ -455,7 +494,9 @@ mod tests {
         for index in 0..=4 {
             for second in 0..10 {
                 let id = format!("3fa9c1d27b04-2026103{index}T00000{second}-0000");
-                std::fs::create_dir(folder.path().join(id)).unwrap();
+                let dir = folder.path().join(id);
+                std::fs::create_dir(&dir).unwrap();
+                write_record(&dir, &record()).unwrap();
             }
         }
         std::fs::create_dir(folder.path().join("keep-me")).unwrap();
@@ -482,6 +523,92 @@ mod tests {
     }
 
     #[test]
+    fn a_young_recordless_run_survives_pruning_completed_runs() {
+        let folder = tempfile::tempdir().unwrap();
+        let active = folder.path().join("3fa9c1d27b04-20000101T000000-0000");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("deck.cir"), "running").unwrap();
+        for second in 0..KEEP_RUNS {
+            let dir = folder
+                .path()
+                .join(format!("3fa9c1d27b04-20261030T{second:06}-0000"));
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
+        }
+        let current = "3fa9c1d27b04-20261031T000000-0000";
+        std::fs::create_dir(folder.path().join(current)).unwrap();
+
+        assert!(!failed_long_ago(&active));
+        assert_eq!(prune(folder.path(), current), 0);
+        assert_eq!(
+            std::fs::read_to_string(active.join("deck.cir")).unwrap(),
+            "running"
+        );
+        assert!(folder.path().join(current).is_dir());
+        assert!(!folder
+            .path()
+            .join("3fa9c1d27b04-20261030T000000-0000")
+            .exists());
+        assert!(folder
+            .path()
+            .join("3fa9c1d27b04-20261030T000001-0000")
+            .is_dir());
+        // Nineteen completed runs, this call's current run, and the other active run.
+        assert_eq!(
+            std::fs::read_dir(folder.path()).unwrap().count(),
+            KEEP_RUNS + 1
+        );
+    }
+
+    #[test]
+    fn active_runs_can_temporarily_exceed_the_retention_limit() {
+        let folder = tempfile::tempdir().unwrap();
+        for second in 0..KEEP_RUNS + 2 {
+            std::fs::create_dir(
+                folder
+                    .path()
+                    .join(format!("3fa9c1d27b04-20261030T{second:06}-0000")),
+            )
+            .unwrap();
+        }
+        let current = "3fa9c1d27b04-20261030T000000-0000";
+        assert_eq!(prune(folder.path(), current), 0);
+        assert_eq!(
+            std::fs::read_dir(folder.path()).unwrap().count(),
+            KEEP_RUNS + 2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_recordless_run_is_pruned_before_completed_runs() {
+        let folder = tempfile::tempdir().unwrap();
+        // Its id sorts after every completed run, so age, not its name, must
+        // make it the first deletion candidate.
+        let expired = folder.path().join("3fa9c1d27b04-20990101T000000-0000");
+        std::fs::create_dir(&expired).unwrap();
+        make_old(&expired);
+        for second in 0..KEEP_RUNS - 1 {
+            let dir = folder
+                .path()
+                .join(format!("3fa9c1d27b04-20261030T{second:06}-0000"));
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
+        }
+        let current = "3fa9c1d27b04-20261031T000000-0000";
+        std::fs::create_dir(folder.path().join(current)).unwrap();
+
+        assert!(failed_long_ago(&expired));
+        assert_eq!(prune(folder.path(), current), 0);
+        assert!(!expired.exists());
+        assert!(folder
+            .path()
+            .join("3fa9c1d27b04-20261030T000000-0000")
+            .is_dir());
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), KEEP_RUNS);
+    }
+
+    #[test]
     fn a_stray_folder_name_cannot_stop_a_run() {
         let folder = tempfile::tempdir().unwrap();
         let root = schematic(folder.path());
@@ -499,11 +626,14 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let stuck = folder.path().join("3fa9c1d27b04-20000101T000000-0000");
         std::fs::create_dir_all(stuck.join("inner/deep")).unwrap();
+        write_record(&stuck, &record()).unwrap();
         let inner = stuck.join("inner");
         std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
         for second in 0..KEEP_RUNS {
             let id = format!("3fa9c1d27b04-20261030T{second:06}-0000");
-            std::fs::create_dir(folder.path().join(id)).unwrap();
+            let dir = folder.path().join(id);
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
         }
         let kept = prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000");
         std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -520,7 +650,9 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         for second in 0..KEEP_RUNS + 2 {
             let id = format!("3fa9c1d27b04-20261030T{second:06}-0000");
-            std::fs::create_dir(folder.path().join(id)).unwrap();
+            let dir = folder.path().join(id);
+            std::fs::create_dir(&dir).unwrap();
+            write_record(&dir, &record()).unwrap();
         }
         prune(folder.path(), "3fa9c1d27b04-20261030T000000-0000");
         assert!(outside.path().join("precious").exists());
@@ -739,6 +871,28 @@ mod tests {
         assert!(read_plain(&dir.path().join("none"), 100).is_err());
     }
 
+    #[test]
+    fn a_file_that_grows_after_its_size_check_is_read_only_to_the_cap() {
+        use std::io::{Seek, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let cap = file.metadata().unwrap().len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b' '; 4096])
+            .unwrap();
+
+        assert!(read_bounded(&mut file, cap).is_err());
+        assert_eq!(file.stream_position().unwrap(), cap + 1);
+        let mut exact = std::io::Cursor::new(b"{}");
+        assert_eq!(read_bounded(&mut exact, cap).unwrap(), b"{}");
+        assert_eq!(exact.position(), cap);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_pipe_or_a_link_is_never_read_for_the_store() {
@@ -885,12 +1039,13 @@ mod tests {
             folder.path().join(young).exists(),
             "a run in flight was removed"
         );
-        // The oldest two with data went to make room.
+        // Only the oldest completed run goes. The other active run stays
+        // outside the retention count until it finishes or expires.
         assert!(!folder
             .path()
             .join("3fa9c1d27b04-20260101T000000-0000")
             .exists());
-        assert!(!folder
+        assert!(folder
             .path()
             .join("3fa9c1d27b04-20260101T000001-0000")
             .exists());

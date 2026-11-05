@@ -298,6 +298,39 @@ fn probe_safe(name: &str) -> bool {
     !no_power && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Attach the boundary of an engine-reported subcircuit power value. The engine
+/// sums power through exposed pins; it cannot include a supply reached through
+/// a global net hidden inside the subcircuit. A stored plot has no information
+/// with which to prove that every supply was exposed, so label the boundary
+/// conservatively for every X element while retaining its useful measured value.
+pub(crate) fn annotate_power_scope(signal: &Signal, names: Names, report: &mut serde_json::Value) {
+    let Signal::Power(reference) = signal else {
+        return;
+    };
+    if !element_name(reference, names.elements).starts_with(['x', 'X']) {
+        return;
+    }
+    report["power_scope"] = serde_json::json!("exposed_subcircuit_pins");
+    report["total_device_power_verified"] = serde_json::json!(false);
+    let warnings = report
+        .as_object_mut()
+        .expect("a signal or measurement report is an object")
+        .entry("warnings")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(warnings) = warnings.as_array_mut() {
+        if !warnings
+            .iter()
+            .any(|warning| warning["code"] == "subcircuit_power_boundary")
+        {
+            warnings.push(serde_json::json!({
+                "code": "subcircuit_power_boundary",
+                "detail": "Power covers only exposed subcircuit pins. Hidden supply or ground \
+                           connections are not included, so total device power is not established.",
+            }));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +631,61 @@ mod tests {
             Signal::Power("r)1".into()),
         ];
         assert!(power_probes(asked.iter(), NONE, &["A1", "K1", "r)1"]).is_empty());
+    }
+
+    #[test]
+    fn subcircuit_power_discloses_its_terminal_boundary_without_changing_the_value() {
+        let elements = [element("U1", "XU1")];
+        let names = Names {
+            nets: &[],
+            elements: &elements,
+        };
+        let signal = Signal::Power("U1".into());
+        let mut report = serde_json::json!({
+            "signal": "p(U1)", "value": 0.0, "unit": "W",
+            "warnings": [{ "code": "existing_warning" }]
+        });
+        annotate_power_scope(&signal, names, &mut report);
+        annotate_power_scope(&signal, names, &mut report);
+        assert_eq!(report["value"], 0.0);
+        assert_eq!(report["power_scope"], "exposed_subcircuit_pins", "{report}");
+        assert_eq!(report["total_device_power_verified"], false, "{report}");
+        assert_eq!(report["warnings"][0]["code"], "existing_warning");
+        let warnings = report["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "{report}");
+        assert_eq!(warnings[1]["code"], "subcircuit_power_boundary");
+        assert!(warnings[1]["detail"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("hidden"));
+    }
+
+    #[test]
+    fn power_scope_uses_the_engine_element_name_and_does_not_warn_for_other_signals() {
+        let elements = [element("U1", "XU1"), element("XRES", "R1")];
+        let names = Names {
+            nets: &[],
+            elements: &elements,
+        };
+        for signal in [
+            Signal::Power("XRES".into()),
+            Signal::Power("R1".into()),
+            Signal::Voltage("XU1".into()),
+            Signal::Current {
+                reference: "U1".into(),
+                pin: Some("supply".into()),
+            },
+        ] {
+            let original = serde_json::json!({ "value": 0.1 });
+            let mut report = original.clone();
+            annotate_power_scope(&signal, names, &mut report);
+            assert_eq!(report, original, "{signal:?}");
+        }
+        // Testbench subcircuits can be addressed by their engine name directly.
+        let mut report = serde_json::json!({ "value": 0.1 });
+        annotate_power_scope(&Signal::Power("x1".into()), NONE, &mut report);
+        assert_eq!(report["power_scope"], "exposed_subcircuit_pins", "{report}");
     }
     #[test]
     fn an_ac_signal_keeps_both_parts_and_a_difference_subtracts_both() {

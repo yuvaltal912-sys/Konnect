@@ -11,7 +11,8 @@
 //!
 //! This is a filter, not a sandbox. The worker drops its own rights as well.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -268,8 +269,30 @@ struct DeckLine {
 pub(crate) struct FlatDeck {
     lines: Vec<DeckLine>,
     pub inlined_files: Vec<PathBuf>,
+    /// Fingerprints of the bytes actually consumed, retaining the include path
+    /// so later provenance checks also notice a retargeted symlink.
+    pub inlined_models: Vec<ModelInput>,
     /// Each kind once, however many lines it covered.
     pub dropped_directives: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ModelInput {
+    pub path: PathBuf,
+    pub resolved: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl ModelInput {
+    pub(crate) fn from_bytes(path: PathBuf, resolved: PathBuf, bytes: &[u8]) -> Self {
+        Self {
+            path,
+            resolved,
+            bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
 }
 
 impl FlatDeck {
@@ -723,7 +746,8 @@ impl Flattener<'_> {
                  project's compatibility mode.",
             ));
         }
-        let (path, directory) = self.resolve(&target, origin, number, search_dir)?;
+        let (path, written) = self.resolve(&target, origin, number, search_dir)?;
+        let directory = written.parent().unwrap_or(search_dir).to_path_buf();
         if stack.contains(&path) {
             return Err(Self::refuse(
                 RefusalCode::UnsafeDeckContent,
@@ -771,6 +795,10 @@ impl Flattener<'_> {
         if !self.deck.inlined_files.contains(&path) {
             self.deck.inlined_files.push(path.clone());
         }
+        let model = ModelInput::from_bytes(written, path.clone(), &bytes);
+        if !self.deck.inlined_models.contains(&model) {
+            self.deck.inlined_models.push(model);
+        }
         stack.push(path);
         let result = self.read(&bytes, &name, &directory, Source::ModelFile, stack);
         stack.pop();
@@ -797,8 +825,8 @@ impl Flattener<'_> {
             .collect()
     }
 
-    /// The real file, for checks, and the folder as written, because ngspice
-    /// resolves a nested include beside a symlink rather than beside its target.
+    /// The real file, for checks, and its path as written. ngspice resolves a
+    /// nested include beside a symlink rather than beside its target.
     fn resolve(
         &self,
         target: &str,
@@ -874,8 +902,7 @@ impl Flattener<'_> {
                 ),
             ));
         }
-        let directory = written.parent().unwrap_or(base).to_path_buf();
-        Ok((path, directory))
+        Ok((path, written))
     }
 }
 

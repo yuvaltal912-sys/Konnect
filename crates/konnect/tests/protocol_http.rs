@@ -205,6 +205,36 @@ fn streamable_http_conformance() {
 }
 
 #[test]
+fn loopback_origins_accept_ipv6_and_reject_non_origins() {
+    let server = HttpServer::spawn();
+    for (origin, expected) in [
+        ("http://[::1]:3000", 200),
+        ("https://[::1]", 200),
+        ("http://localhost:3000", 200),
+        ("http://127.0.0.1:3000", 200),
+        ("http://[::2]:3000", 403),
+        ("http://localhost.evil.example:3000", 403),
+        ("http://localhost:3000@evil.example", 403),
+        ("http://evil.example@localhost:3000", 403),
+        ("http://localhost:3000/path", 403),
+        ("http://localhost:3000?query", 403),
+        ("http://[::1", 403),
+        ("ftp://[::1]:3000", 403),
+        ("null", 403),
+    ] {
+        let (status, _, _) = server
+            .raw_request(
+                "POST",
+                "/mcp",
+                &[("Origin", origin)],
+                Some(r#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#),
+            )
+            .unwrap();
+        assert_eq!(status, expected, "Origin: {origin}");
+    }
+}
+
+#[test]
 fn sse_stream_delivers_tools_list_changed() {
     let server = HttpServer::spawn();
     let _ = server.post_mcp(&initialize_msg());

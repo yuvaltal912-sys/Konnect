@@ -193,6 +193,134 @@ fn pairs(fields: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+// KiCad 10.0.1's sim_model.h and SIM_MODEL::MigrateSimModel recognize these
+// exact historical spellings. The schematic parser also consumes the enable
+// field before model migration. Arbitrary Spice_* / Sim_* user fields do not
+// belong to this set.
+const LEGACY_SIM_ASSIGNMENTS: [(&str, &str); 9] = [
+    ("Spice_Primitive", "D"),
+    ("Spice_Model", "old_diode"),
+    ("Spice_Node_Sequence", "1 2"),
+    ("Spice_Netlist_Enabled", "N"),
+    ("Spice_Lib_File", "old-diode.lib"),
+    ("Sim_Type", "old_type"),
+    ("Sim_Device", "D"),
+    ("Sim_Pins", "1 2"),
+    ("Sim_Params", "is=5n"),
+];
+
+#[tokio::test]
+async fn replacing_a_part_removes_and_reports_recognized_legacy_simulation_assignments() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:D", "D1", 100.0).await;
+    let lookalikes = [
+        ("Spice_Notes", "keep"),
+        ("Spice_ModelSuffix", "keep"),
+        ("spice_model", "keep"),
+        ("Sim_DeviceNote", "keep"),
+        ("Sim_Library", "keep"),
+        ("Sim_Name", "keep"),
+    ];
+    let fields: serde_json::Map<String, serde_json::Value> = LEGACY_SIM_ASSIGNMENTS
+        .iter()
+        .chain(lookalikes.iter())
+        .map(|(name, value)| ((*name).into(), json!(value)))
+        .collect();
+    call(
+        sch_components::tools(),
+        "edit_schematic_component",
+        json!({"schematic": path, "reference": "D1", "fields": fields}),
+    )
+    .await;
+
+    let result = replace(&path, "D1", "Device:R").await;
+    let saved = konnect_schematic_editor::Schematic::load(&path).unwrap();
+    let symbol = saved
+        .symbols
+        .iter()
+        .find(|symbol| symbol.reference() == Some("D1"))
+        .unwrap();
+    let dropped = names(&result["sim_fields_dropped"]);
+    for (name, value) in LEGACY_SIM_ASSIGNMENTS {
+        assert!(
+            symbol.properties.iter().all(|field| field.name != name),
+            "{name} survived the swap and can resurrect the old model on KiCad load"
+        );
+        assert!(
+            dropped.contains(&(name.into(), value.into())),
+            "the caller must receive the removed {name} assignment: {result}"
+        );
+    }
+    for (name, value) in lookalikes {
+        assert!(
+            symbol
+                .properties
+                .iter()
+                .any(|field| field.name == name && field.value == value),
+            "unrecognized simulation-looking field {name} must be preserved"
+        );
+    }
+    assert!(saved_sim_fields(&path, "D1").0.is_empty());
+    assert!(names(&result["sim_fields_added"]).is_empty());
+}
+
+#[tokio::test]
+async fn same_symbol_replacement_preserves_legacy_simulation_assignments() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:D", "D1", 100.0).await;
+    let fields: serde_json::Map<String, serde_json::Value> = LEGACY_SIM_ASSIGNMENTS
+        .iter()
+        .map(|(name, value)| ((*name).into(), json!(value)))
+        .collect();
+    call(
+        sch_components::tools(),
+        "edit_schematic_component",
+        json!({"schematic": path, "reference": "D1", "fields": fields}),
+    )
+    .await;
+    let before = std::fs::read_to_string(&path).unwrap();
+    let result = replace(&path, "D1", "Device:D").await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    assert!(names(&result["sim_fields_dropped"]).is_empty());
+    assert!(names(&result["sim_fields_added"]).is_empty());
+}
+
+#[tokio::test]
+async fn identical_modern_fields_do_not_preserve_a_legacy_model_on_replacement() {
+    let (_dir, path) = seeded();
+    place(&path, "Device:D", "D1", 100.0).await;
+    call(
+        sch_components::tools(),
+        "edit_schematic_component",
+        json!({"schematic": path, "reference": "D1", "fields": {"Sim_Device": "D"}}),
+    )
+    .await;
+    let result = replace(&path, "D1", "Device:DCOPY").await;
+    assert_eq!(saved_sim_fields(&path, "D1").0, hidden(&DIODE_SIM));
+    assert_eq!(
+        names(&result["sim_fields_dropped"]),
+        pairs(&[("Sim_Device", "D")])
+    );
+    assert!(names(&result["sim_fields_added"]).is_empty());
+    let saved = konnect_schematic_editor::Schematic::load(&path).unwrap();
+    assert!(saved.symbols[0]
+        .properties
+        .iter()
+        .all(|field| field.name != "Sim_Device"));
+}
+
+#[test]
+fn readback_rejects_each_surviving_legacy_simulation_assignment() {
+    for (name, value) in LEGACY_SIM_ASSIGNMENTS {
+        let stale = json!({"units": [{"unit": 2, "fields": {name: value}}]});
+        assert_eq!(
+            sch_components::unit_with_stale_sim_field(&stale, |_| false),
+            Some(json!(2)),
+            "readback must reject surviving {name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn replacing_a_diode_with_a_resistor_drops_the_diode_model() {
     let (_dir, path) = seeded();
@@ -351,6 +479,62 @@ const TWO_UNITS: &str = r#"(kicad_sch
   (sheet_instances (path "/" (page "1")))
 )
 "#;
+
+#[tokio::test]
+async fn replacing_a_unit_preserves_unit_text_inside_quoted_fields() {
+    use konnect_sexp::writer::{apply_edits, find_direct_child_blocks, SexpEdit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi.kicad_sch");
+    // Keep one placement so the unit override is unambiguous, while retaining
+    // both units in the embedded library definition.
+    let (start, end) = find_direct_child_blocks(TWO_UNITS, "kicad_sch")
+        .into_iter()
+        .find(|&(start, end)| {
+            let node = konnect_sexp::parse_sexp(&TWO_UNITS[start..end]).unwrap();
+            node.head() == Some("symbol") && node.find_str("unit") == Some("2")
+        })
+        .unwrap();
+    std::fs::write(
+        &path,
+        apply_edits(TWO_UNITS.to_owned(), vec![SexpEdit::delete(start, end)]),
+    )
+    .unwrap();
+    let fields = json!({
+        "Note": "(unit 1)",
+        "Escaped": "quoted \"(unit 1)\" and a backslash \\ (unit 7)",
+        "(unit 1)": "a property name is also text",
+    });
+    call(
+        sch_components::tools(),
+        "edit_schematic_component",
+        json!({"schematic": path, "reference": "U1", "fields": fields}),
+    )
+    .await;
+
+    call(
+        sch_components::tools(),
+        "replace_component",
+        json!({"schematic": path, "reference": "U1", "new_lib_id": "Test:DUAL_NEW", "unit": 2}),
+    )
+    .await;
+
+    let saved = konnect_schematic_editor::Schematic::load(&path).unwrap();
+    let symbol = &saved.symbols[0];
+    assert_eq!(symbol.unit, 2);
+    assert_eq!(symbol.lib_id, "Test:DUAL_NEW");
+    let instances = symbol.instances();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].unit, Some(2));
+    for (name, value) in fields.as_object().unwrap() {
+        let property = symbol.properties.iter().find(|p| &p.name == name).unwrap();
+        assert_eq!(property.value, value.as_str().unwrap(), "{name}");
+    }
+    assert_eq!(
+        saved_sim_fields(&path, "U1").0,
+        hidden(&[("Sim.Device", "SUBCKT"), ("Sim.Name", "dual_new")])
+    );
+}
 
 #[tokio::test]
 async fn every_placed_unit_gets_the_swap() {
