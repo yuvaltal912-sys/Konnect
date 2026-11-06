@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes and the reliability repairs (PR #15) are merged. M1 of the datasheet-model series is PR #16 from `feat/simulation-datasheet-models`, against `main`, ready for review and not merged.
+**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 is next and not started; ask the owner before starting it.
 
 ## Start here
 
@@ -31,7 +31,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11, the three fixes after them and the reliability repairs are merged to `main` on the `fork` remote, each as a merge commit.
+PRs 1 to 11, the three fixes after them, the reliability repairs and M1 are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -48,11 +48,11 @@ PRs 1 to 11, the three fixes after them and the reliability repairs are merged t
 | Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
 | Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Merged as `5d5eeb5` |
 | Repairs | [#15](https://github.com/yuvaltal912-sys/Konnect/pull/15) | `fix/simulation-validation-and-results` | Merged as `15f7137` |
-| M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Open against `main`, ready for review |
+| M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Merged as `d10dbe1` |
 
 ## Current work: models fitted to datasheet values (M1)
 
-The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan, and M1 is on `feat/simulation-datasheet-models`:
+The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 is merged as PR #16, and M2 is next and not started:
 
 | PR | Delivers |
 |---|---|
@@ -77,7 +77,7 @@ What M1 built, and what later work must keep:
 
 Limits left in M1: one temperature per model, and no temperature check; no reverse recovery (no transient bench yet); a fuse never opens; capacitance and inductance are linear at their stated bias; a Zener's very soft knee is held at the largest `NBV` that keeps ngspice's knee above 30% of BV, and the knee then reads low; reused sheets are refused, not assigned. Disclosure rests on the marker, so a file whose marker line was deleted reads as an ordinary model. A commit that stops while recovering an earlier journal naming the same file answers `uncertain`, the cautious side, though this call wrote nothing. The KiCad dialog round trip and a run in KiCad's GUI simulator have not been checked: they are owner checks. The installed KiCad is 10.0.8 with ngspice 45.2, while the KiCad facts come from the 10.0.1 source; one live test still pins ngspice 44.2 and fails for that reason alone, a red baseline reported and not fixed here.
 
-Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignored), doctests, the live simulation tests (89 passed; the one failure is the ngspice 44.2 pin), Clippy, licence checks, documentation counts and the release build. The installed binary hash is unchanged. The repairs PR #15 merged on 2026-11-06, and M1, PR #16, now targets `main` with `main` merged in. It is ready for review and not merged; it waits for the owner.
+Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignored), doctests, the live simulation tests (89 passed; the one failure is the ngspice 44.2 pin), Clippy, licence checks, documentation counts and the release build. The installed binary hash is unchanged. The repairs PR #15 and then M1, PR #16, merged on 2026-11-06.
 
 ## Simulation validation and stored results (merged as PR #15)
 
