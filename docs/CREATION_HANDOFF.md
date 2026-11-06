@@ -39,7 +39,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
-| 7 | Board geometry layer: `query_board_region`, true outline containment | none | **Open**: PR_LINK_7 (not merged; run in parallel with PR 2b and #21 on the owner's say-so) |
+| 7 | Board geometry layer: `query_board_region`, true outline containment | none | **Open**: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25) (not merged; run in parallel with PR 2b and #21 on the owner's say-so) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Not started |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Not started |
@@ -100,7 +100,7 @@ Seven guards were broken one at a time and each broke a test (split, merged and 
 
 PR 2 should call `compare_netlist` with `reference_schematic` on a copy of the project taken before the wiring change. Edits to `connect_pins` and its siblings are in `tools/sch_wiring.rs`.
 
-## PR 7, the board geometry layer (open)
+## PR 7, the board geometry layer (open, #25)
 
 Research ranks 6 and 7 (C19, C17, A14's containment part). One model of the board, one outline, and four tools that read it.
 
