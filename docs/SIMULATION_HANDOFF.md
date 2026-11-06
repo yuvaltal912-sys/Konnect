@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-06. Simulation v1 and its three follow-up fixes are merged. The reliability repairs are PR #15 from `fix/simulation-validation-and-results`, and M1 of the datasheet-model series is draft PR #16 from `feat/simulation-datasheet-models`, stacked on #15. Neither is merged.
+**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes and the reliability repairs (PR #15) are merged. M1 of the datasheet-model series is PR #16 from `feat/simulation-datasheet-models`, against `main`, ready for review and not merged.
 
 ## Start here
 
@@ -31,7 +31,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11 and the three fixes after them are merged to `main` on the `fork` remote, each as a merge commit.
+PRs 1 to 11, the three fixes after them and the reliability repairs are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -47,6 +47,8 @@ PRs 1 to 11 and the three fixes after them are merged to `main` on the `fork` re
 | Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Merged as `d6f0d51` |
 | Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
 | Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Merged as `5d5eeb5` |
+| Repairs | [#15](https://github.com/yuvaltal912-sys/Konnect/pull/15) | `fix/simulation-validation-and-results` | Merged as `15f7137` |
+| M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Open against `main`, ready for review |
 
 ## Current work: models fitted to datasheet values (M1)
 
@@ -75,11 +77,11 @@ What M1 built, and what later work must keep:
 
 Limits left in M1: one temperature per model, and no temperature check; no reverse recovery (no transient bench yet); a fuse never opens; capacitance and inductance are linear at their stated bias; a Zener's very soft knee is held at the largest `NBV` that keeps ngspice's knee above 30% of BV, and the knee then reads low; reused sheets are refused, not assigned. Disclosure rests on the marker, so a file whose marker line was deleted reads as an ordinary model. A commit that stops while recovering an earlier journal naming the same file answers `uncertain`, the cautious side, though this call wrote nothing. The KiCad dialog round trip and a run in KiCad's GUI simulator have not been checked: they are owner checks. The installed KiCad is 10.0.8 with ngspice 45.2, while the KiCad facts come from the 10.0.1 source; one live test still pins ngspice 44.2 and fails for that reason alone, a red baseline reported and not fixed here.
 
-Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignored), doctests, the live simulation tests (89 passed; the one failure is the ngspice 44.2 pin), Clippy, licence checks, documentation counts and the release build. The installed binary hash is unchanged. M1 is draft PR #16, stacked on the repairs PR #15. Neither is merged, and both wait for the owner; after #15 merges, #16 is retargeted to `main`.
+Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignored), doctests, the live simulation tests (89 passed; the one failure is the ngspice 44.2 pin), Clippy, licence checks, documentation counts and the release build. The installed binary hash is unchanged. The repairs PR #15 merged on 2026-11-06, and M1, PR #16, now targets `main` with `main` merged in. It is ready for review and not merged; it waits for the owner.
 
-## Current follow-up: simulation validation and stored results
+## Simulation validation and stored results (merged as PR #15)
 
-The owner requested reproduction and repair of the known simulation issues. Work is on `fix/simulation-validation-and-results`, open as PR #15; it is not merged or installed. The original macOS baseline passed formatting, workspace tests, doctests, 79 live simulation tests, Clippy, license checks and the release build.
+The owner requested reproduction and repair of the known simulation issues. Work was on `fix/simulation-validation-and-results`, merged as PR #15 on 2026-11-06; it is not installed. The original macOS baseline passed formatting, workspace tests, doctests, 79 live simulation tests, Clippy, license checks and the release build.
 
 - **AC stimulus:** follow reachable subcircuit calls, with cycle protection. Unused definitions no longer satisfy `no_ac_stimulus`; the last AC magnitude assignment wins. Parameters and conditional branches still need engine evaluation.
 - **Legacy model replacement:** remove and read back KiCad's nine recognized legacy simulation fields as well as modern `Sim.*`, returning removed values in `sim_fields_dropped`. Same-symbol replacement and lookalike custom properties stay unchanged. A real baseline reproduction using `Spice_*` and an external diode model returned about 0.396828 V after a diode-to-resistor replacement; the corrected divider is 2.5 V.
@@ -91,7 +93,7 @@ Regression tests are in `simulation/element.rs`, `simulation/ac.rs`, `simulation
 
 ### Local code-review repairs
 
-The owner requested all six review fixes and both improvements on the same local branch, preserving the work above. On 2026-11-05 the owner had them committed on that branch, so the datasheet-model work can build on them. It is open as PR #15, not merged or installed.
+The owner requested all six review fixes and both improvements on the same local branch, preserving the work above. On 2026-11-05 the owner had them committed on that branch, so the datasheet-model work can build on them. It merged as PR #15 on 2026-11-06 and is not installed.
 
 - **Unit replacement:** edit actual `unit` nodes with the existing string-aware scanner. Quoted custom-property names and values containing `(unit ...)` remain unchanged; both the placed symbol and its hierarchical instance receive the new unit.
 - **Run retention:** young folders without `run.json` are potentially active and are excluded from deletion candidates. They may temporarily exceed the 20-run limit. Completed runs and abandoned record-less folders older than one hour remain eligible, with abandoned runs removed first.
