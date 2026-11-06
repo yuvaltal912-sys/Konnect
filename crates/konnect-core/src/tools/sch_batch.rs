@@ -429,7 +429,7 @@ fn batch_net_name(args: &serde_json::Value) -> Result<String, CallToolResult> {
     }
 }
 
-async fn handle_batch_connect_to_net(
+pub(crate) async fn handle_batch_connect_to_net(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -446,6 +446,14 @@ async fn handle_batch_connect_to_net(
     // a local label on the pin endpoint and no wire (#701).
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(0.0);
+    // The schema says so, but a direct call skips the schema: a negative stub
+    // would put the label somewhere the check never looked.
+    if !stub_length.is_finite() || stub_length < 0.0 {
+        return Ok(crate::tools::invalid_arg(
+            "stub_length",
+            "must be a length of 0 mm or more",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
     // Plain labels on the pin keep the string splice; anything else goes
     // through the editor model connect_to_net uses.
@@ -470,6 +478,8 @@ async fn handle_batch_connect_to_net(
         Vec::new()
     };
     let mut is_changed = false;
+    let sheet_wires = extract_wires(&tree);
+    let sheet_junctions = konnect_sexp::schematic::extract_junctions(&tree);
 
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
@@ -513,24 +523,40 @@ async fn handle_batch_connect_to_net(
         // skipped and reported, as a blocked route is.
         // The label alone is checked too (stub_length 0): it attaches to any
         // wire it lies on.
-        let current = match sch.as_ref() {
-            Some(sch) => sch.to_source(),
-            None => super::sch_wiring::insert_before_close(&content, &inserts),
-        };
-        let dir = match pick_stub_direction(
-            &current,
-            (px, py),
-            direction,
-            Some(pin_outward_direction(&pin, t)),
-            stub_length,
-            &net_name,
-            Endpoints::Pins,
-        )? {
-            Ok(dir) => dir,
-            Err(reasons) => {
-                errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
-                continue;
+        // Most pins need no full check. With no stub the label can join a foreign
+        // net only through a wire it lies inside with no junction there, and
+        // this call changes no wire in that case, so the wires read once at the
+        // start answer for every pin. The few that do get the full check, which
+        // parses the sheet as the call has built it so far.
+        let outward = Some(pin_outward_direction(&pin, t));
+        let needs_check = stub_length > 0.0
+            || crate::tools::sch_wiring::label_under_undotted_wire(
+                &sheet_wires,
+                &sheet_junctions,
+                (px, py),
+            );
+        let dir = if needs_check {
+            let current = match sch.as_ref() {
+                Some(sch) => sch.to_source(),
+                None => super::sch_wiring::insert_before_close(&content, &inserts),
+            };
+            match pick_stub_direction(
+                &current,
+                (px, py),
+                direction,
+                outward,
+                stub_length,
+                &net_name,
+                Endpoints::Pins,
+            )? {
+                Ok(dir) => dir,
+                Err(reasons) => {
+                    errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                    continue;
+                }
             }
+        } else {
+            crate::tools::stub_direction(direction, outward)
         };
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
@@ -613,7 +639,10 @@ async fn handle_batch_connect_to_net(
         body["label_type"] = json!(label_type);
     }
     body["nets_joined"] = joined;
-    Ok(CallToolResult::json(&body))
+    let mut result = CallToolResult::json(&body);
+    // Every pin skipped is a failed call, as in batch_connect_pins.
+    result.is_error = added.is_empty() && !errors.is_empty();
+    Ok(result)
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.

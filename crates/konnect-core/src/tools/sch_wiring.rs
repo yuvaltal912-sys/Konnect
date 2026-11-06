@@ -340,10 +340,12 @@ pub fn tools() -> Vec<ToolDef> {
              which are one net across all sheets and instances. The stub must join nothing \
              but the pin's own net: `auto` tries the other directions when the first would, \
              and a named direction that would is refused with plan_blocked. The same check \
-             covers a label placed on the pin (stub_length 0). A sheet with a placed symbol \
-             whose library pins cannot be read is refused too (plan_blocked, \"cannot check\"), \
-             because the check could not run. `nets_joined` lists the nets the call \
-             merged, including the named net itself.",
+             covers a label placed on the pin (stub_length 0). Coordinates that are a placed \
+             pin's end count as that pin; any other coordinate taps the wire it lies on. A \
+             sheet with a placed symbol whose library pins cannot be read is refused for a \
+             stub (plan_blocked, \"cannot check\"), because the check could not run; a label \
+             with no stub is judged on the wire under it. `nets_joined` lists the nets the \
+             call merged, including the named net itself.",
             json!({
                 "type": "object",
                 "properties": {
@@ -872,19 +874,102 @@ pub(crate) fn nets_joined(before: &str, after: &str) -> serde_json::Value {
     json!(joined)
 }
 
-/// Whether `at` lies strictly inside a wire that carries no junction there: a
-/// pin on that wire is not connected to it, and a label placed there would be.
-fn unjoined_wire_under(tree: &konnect_sexp::SexpNode, at: (f64, f64)) -> bool {
+/// Whether a label at `at` could attach to a wire that its pin is not already
+/// on: `at` lies strictly inside a wire and no junction dots it. Anything else
+/// a label at a pin touches is that pin's own net, so this is the only way a
+/// label alone can join a foreign one. Cheap: no parse, no graph.
+pub(crate) fn label_under_undotted_wire(
+    wires: &[konnect_sexp::schematic::Wire],
+    junctions: &[(f64, f64)],
+    at: (f64, f64),
+) -> bool {
     use konnect_sexp::geometry::{point_on_segment, points_coincident};
-    let dotted = konnect_sexp::schematic::extract_junctions(tree)
+    !junctions
         .iter()
-        .any(|&(x, y)| points_coincident(at.0, at.1, x, y, 0.01));
-    !dotted
-        && extract_wires(tree).iter().any(|w| {
+        .any(|&(x, y)| points_coincident(at.0, at.1, x, y, 0.01))
+        && wires.iter().any(|w| {
             point_on_segment(at.0, at.1, w.x1, w.y1, w.x2, w.y2, 0.01)
                 && !points_coincident(at.0, at.1, w.x1, w.y1, 0.01)
                 && !points_coincident(at.0, at.1, w.x2, w.y2, 0.01)
         })
+}
+
+/// The label check for a sheet whose symbols cannot all be read, so no
+/// [`RouteGuard`] exists. It needs no pin geometry: each wire the label point
+/// lies inside is fine when it is the pin's own net, already carries the name
+/// `net`, or the caller gave a coordinate to tap. Otherwise it is a join.
+fn label_join_without_pins(
+    tree: &konnect_sexp::SexpNode,
+    at: (f64, f64),
+    net: &str,
+    ends: Endpoints,
+) -> Option<String> {
+    use konnect_sexp::geometry::{point_on_segment, points_coincident};
+    if ends == Endpoints::Points {
+        return None;
+    }
+    let labels = konnect_sexp::schematic::extract_all_net_labels(tree);
+    let wires = extract_wires(tree);
+    let mut graph = crate::tools::sch_connectivity::net_graph_for(tree, &wires, &labels);
+    let own = graph.root_at(at.0, at.1);
+    wires
+        .iter()
+        .filter(|w| {
+            point_on_segment(at.0, at.1, w.x1, w.y1, w.x2, w.y2, 0.01)
+                && !points_coincident(at.0, at.1, w.x1, w.y1, 0.01)
+                && !points_coincident(at.0, at.1, w.x2, w.y2, 0.01)
+        })
+        .find_map(|w| {
+            let root = graph.root_at(w.x1, w.y1);
+            let named = graph.aliases_of_root(root).contains(net);
+            (root != own && !named).then(|| {
+                let on = graph
+                    .name_of_root(root)
+                    .map(|n| format!(" on net {n}"))
+                    .unwrap_or_default();
+                format!(
+                    "the label would join the wire it lies on mid-span at ({}, {}){on}",
+                    fmt_f64(at.0),
+                    fmt_f64(at.1)
+                )
+            })
+        })
+}
+
+/// Check what a tool is about to splice onto a pin (a wire, a bus entry, a
+/// label) against the sheet as it stands: it must join nothing but the pin's own
+/// net and what already carries the name `net`. `Ok(Err(..))` holds the reasons.
+pub(crate) fn check_additions(
+    before: &str,
+    pin: (f64, f64),
+    net: &str,
+    additions: &str,
+) -> anyhow::Result<Result<(), Vec<String>>> {
+    let tree = parse_sexp(before)?;
+    let Some(mut guard) = RouteGuard::new(&tree, pin, pin, Endpoints::Pins) else {
+        return Ok(Err(vec![format!(
+            "{UNCHECKED} what the wire would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]));
+    };
+    guard.allow_net_named(net);
+    let drawn = insert_before_close(before, additions);
+    let joined = guard.foreign_joins(&parse_sexp(&drawn)?);
+    Ok(if joined.is_empty() {
+        Ok(())
+    } else {
+        Err(vec![format!(
+            "the connection would join {}",
+            joined.join(", ")
+        )])
+    })
+}
+
+// How many full stub or label checks this thread has run, so a test can show
+// that a batch of ordinary pins runs none.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FULL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The directions a stub is tried in when `auto` finds its first choice blocked.
@@ -908,30 +993,26 @@ pub(crate) fn pick_stub_direction(
     net: &str,
     ends: Endpoints,
 ) -> anyhow::Result<Result<crate::tools::StubDirection, Vec<String>>> {
+    #[cfg(test)]
+    FULL_CHECKS.with(|count| count.set(count.get() + 1));
     let first = crate::tools::stub_direction(direction, outward);
     let tree = parse_sexp(before)?;
-    let Some(mut guard) = RouteGuard::new(&tree, pin, pin, ends) else {
-        // A label alone needs no pin geometry to be judged on the one thing it
-        // can join: a wire it lies on mid-span with no dot. Refusing every
-        // label because some unrelated symbol is unreadable would stop the
-        // default `batch_connect_to_net` on sheets it served before.
-        if stub_length <= 0.0 {
-            return Ok(match unjoined_wire_under(&tree, pin) {
-                true => Err(vec![
-                    "the label would join the wire it lies on mid-span, which has no junction there"
-                        .to_owned(),
-                ]),
-                false => Ok(first),
-            });
-        }
-        return Ok(Err(vec![format!(
-            "{UNCHECKED} what the stub would join: {}",
-            crate::tools::UNRESOLVED_PIN_GEOMETRY
-        )]));
-    };
-    guard.allow_net_named(net);
     if stub_length <= 0.0 {
-        // No wire, but the label still attaches to whatever wire it lies on.
+        // No wire, but the label attaches to whatever wire it lies inside.
+        if !label_under_undotted_wire(
+            &extract_wires(&tree),
+            &konnect_sexp::schematic::extract_junctions(&tree),
+            pin,
+        ) {
+            return Ok(Ok(first));
+        }
+        let Some(mut guard) = RouteGuard::new(&tree, pin, pin, ends) else {
+            return Ok(match label_join_without_pins(&tree, pin, net, ends) {
+                Some(reason) => Err(vec![reason]),
+                None => Ok(first),
+            });
+        };
+        guard.allow_net_named(net);
         let label = konnect_sexp::schematic::format_net_label(net, pin.0, pin.1, 0.0);
         let drawn = insert_before_close(before, &label);
         let joined = guard.foreign_joins(&parse_sexp(&drawn)?);
@@ -941,6 +1022,13 @@ pub(crate) fn pick_stub_direction(
             Err(vec![format!("the label would join {}", joined.join(", "))])
         });
     }
+    let Some(mut guard) = RouteGuard::new(&tree, pin, pin, ends) else {
+        return Ok(Err(vec![format!(
+            "{UNCHECKED} what the stub would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]));
+    };
+    guard.allow_net_named(net);
     let first_name = first.name;
     let mut candidates = vec![first];
     if direction == "auto" {
@@ -2922,12 +3010,6 @@ pub(crate) async fn handle_connect_to_net(
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (content, tree) = read_schematic(&sch_path)?;
-    // A named pin does not tap a wire it lies on; a coordinate does.
-    let ends = if args["reference"].is_string() {
-        Endpoints::Pins
-    } else {
-        Endpoints::Points
-    };
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
@@ -2976,6 +3058,17 @@ pub(crate) async fn handle_connect_to_net(
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
     let outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    // A named pin does not tap a wire it lies on, and neither does a coordinate
+    // that is a placed pin's end: it is that pin. Any other coordinate taps.
+    let ends = if args["reference"].is_string()
+        || crate::tools::all_pin_endpoints(&tree)
+            .iter()
+            .any(|&(x, y)| konnect_sexp::geometry::points_coincident(pin_x, pin_y, x, y, 0.01))
+    {
+        Endpoints::Pins
+    } else {
+        Endpoints::Points
+    };
     // The stub must join nothing but the pin's own net (#899): `auto` tries
     // the other directions, and a named direction that would join is refused.
     let dir = match pick_stub_direction(

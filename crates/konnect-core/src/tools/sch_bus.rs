@@ -379,16 +379,28 @@ async fn handle_connect_pins_to_bus(
 
         // Stub from the pin up to the entry's wire-side end. Zero-length when
         // the pin already sits there; KiCad rejects a degenerate wire.
+        let mut addition = String::new();
         if (sx - entry_x).abs() > 0.01 || (sy - entry_y).abs() > 0.01 {
-            inserts.push_str("\n  ");
-            inserts.push_str(&format_wire(sx, sy, entry_x, entry_y));
+            addition.push_str("\n  ");
+            addition.push_str(&format_wire(sx, sy, entry_x, entry_y));
         }
-        inserts.push_str("\n  ");
-        inserts.push_str(&format_bus_entry(entry_x, entry_y, entry_dir(dx, dy)));
+        addition.push_str("\n  ");
+        addition.push_str(&format_bus_entry(entry_x, entry_y, entry_dir(dx, dy)));
         // The label is what actually puts this stub on the bus.
         let rot = if horizontal { 90.0 } else { 0.0 };
-        inserts.push_str("\n  ");
-        inserts.push_str(&format_net_label(net, sx, sy, rot));
+        addition.push_str("\n  ");
+        addition.push_str(&format_net_label(net, sx, sy, rot));
+
+        // The stub and label must join nothing but the pin's own net and the
+        // bus member they name; the sheet as this call has built it so far.
+        let current = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+        match crate::tools::sch_wiring::check_additions(&current, (px, py), net, &addition)? {
+            Ok(()) => inserts.push_str(&addition),
+            Err(reasons) => {
+                errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                continue;
+            }
+        }
 
         added.push(json!({
             "reference": reference, "pin": pin_number, "net": net,

@@ -37,16 +37,25 @@ Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
   wire's net through the label. `connect_to_net` refuses it with `plan_blocked`;
   `batch_connect_to_net`, including its default label-only mode, skips the pin into
   `errors`. A negative `stub_length` is refused with `invalid_argument`.
-- **A pin is not a tap.** `connect_pins`, `batch_connect_pins` and `connect_to_net`
-  with `reference` + `pin_number` no longer allow the net of a wire their pin lies on
-  without a junction: the route's own T would join it, so they refuse. Coordinates
-  (`add_schematic_connection`, `connect_to_net` with `pin_x`/`pin_y`) still tap the
-  wire they lie on, as asked.
+- **A pin is not a tap.** `connect_pins`, `batch_connect_pins`, `connect_to_net` and
+  `batch_connect_to_net` (with or without a stub) no longer allow the net of a wire a
+  pin lies on without a junction: the route's, stub's or label's own T would join it,
+  so they refuse (the batch tools skip the pin into `errors`). `connect_to_net` with
+  `pin_x`/`pin_y` that are a placed pin's end counts as that pin. Any other
+  coordinate (`add_schematic_connection`, `connect_to_net` at a free point) still taps
+  the wire it lies on, as asked. `connect_pins_to_bus` checks each stub, bus entry
+  and label the same way and skips a pin that would join a foreign net into `errors`.
 - **Unreadable symbols.** The stub and route checks need every placed symbol's
-  library pins. When one cannot be read they refuse with `plan_blocked` and a reason
-  that begins "cannot check what the ... would join", because the check could not
-  run; no join was found. A label with no stub is still judged, on the one thing it
-  can join, a wire under it.
+  library pins. When one cannot be read, `connect_pins`, `add_schematic_connection`
+  and `connect_to_net` refuse with `plan_blocked` and a reason that begins "cannot
+  check what the ... would join", because the check could not run; no join was found.
+  `batch_connect_pins`, and `batch_connect_to_net` with a stub, skip each pin into
+  `errors` with the same reason. A label with no stub is still judged, on the one
+  thing it can join, a wire under it: it goes on unless that wire is another net,
+  does not already carry the name, and the point is not a free coordinate.
+- **Failed batches.** `batch_connect_to_net` sets `isError` when every pin was
+  skipped, as `batch_connect_pins` does. A direct call with a negative `stub_length`
+  is refused there too.
 - **Junction dots (#900).** `add_wire`, `batch_add_wire` and the stub wires dot only
   the T-junctions the new wire forms, not every dot-less T on the sheet. A sheet that
   had one used to gain a junction, and so a joined net, on any wire drawn anywhere.
