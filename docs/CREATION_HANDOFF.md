@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 1, 2, the PR 2 fixes, 2b and the first half of 9 are merged, and so is the ngspice test fix. PR 3 (#21) is open and being brought up to date. Ask the owner before starting anything else.
+**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). No PR is open and nothing is in progress. After the last merge, the combined `main` passed formatting, the workspace tests (3,401 passed, 0 failed), Clippy and the doc counts. The live suites were not rerun on it. The next PR to pick is under "Next", below the table.
 
 ## Start here
 
@@ -28,20 +28,22 @@ Owner decisions (2026-11-06, research §5):
 
 ## PR sequence
 
-One PR at a time, each on its own branch from `main`. Ask the owner before starting the next.
+One PR at a time, each on its own branch from `main`. Ask the owner before starting the next. The owner has sometimes approved two PRs in parallel when their code files do not overlap; that is their call, case by case.
 
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
 | 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | Merged: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19) |
 | 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: merged, [#22](https://github.com/yuvaltal912-sys/Konnect/pull/22) |
 | 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Merged: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
-| 3 | Response budget for ERC, DRC and list tools | none | **Open**: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21) |
+| 3 | Response budget for ERC, DRC and list tools | none | Merged: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21). Leftovers (C24 stale-fill field, A30's other long results) are open under rank 3 |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
-| 7 | Board geometry layer: `query_board_region`, true outline containment | none | **Open**: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25) (not merged; run in parallel with PR 2b and #21 on the owner's say-so) |
+| 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
-| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24). Footprint replace and routed-pad reassignment are the follow-up, PR 9b, not started |
+| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
+| 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Not started |
+| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Not started |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Not started |
@@ -49,7 +51,30 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
-## Now: PR 3, response budget
+## Next: what to pick
+
+**Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. If another row is "In progress", don't touch the code files it names.
+
+**Recommended order**, by research rank and what is unblocked:
+
+1. **PR 4**, inline renders as image blocks (rank 4, C5 first). `render_schematic_png` returns base64 inside JSON text, so the model never sees the image. `get_board_2d_view` already returns a real image block; copy that.
+2. **PR 5**, guidance in `crates/konnect/assets` (skills and agents). Its dependencies (1, 2, 2b) are merged, and the tools it should name now exist: `compare_netlist`, `query_board_region`, the Freerouting path with its limits, and paging.
+3. **PR 6** (mirror after placement, DNP and BOM flags, title block), **PR 8** (placement objective on PR 7's layer), **PR 10** (library correctness).
+4. Then 9b, 12, 13, 14, Q3, 11 and 15.
+
+**Checks still owed** (not blocking, but say so if your PR depends on them):
+
+- The real Freerouting run, `freerouting_routes_the_rounded_board` (ignored). Java 21 is now installed at `/opt/homebrew/opt/openjdk@21` (the system `java` is still 11). The owner deferred the live run; ask before running it.
+- PR 9 against a live KiCad: `crates/konnect/tests/live_kicad_tools.rs`, on a disposable board.
+- Windows and Linux for the whole series, at the end.
+
+**Known traps.**
+
+- `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
+- GitHub merge commits carry the owner's Gmail, because the account's email-privacy setting is off. Commits you make yourself use the noreply address from `AGENTS.md`.
+- Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
+
+## PR 3, response budget (merged, #21)
 
 The client refuses a tool result near 50,000 characters. Real use had 8 ERC/DRC results refused at 51 to 71 thousand, which sent the assistant to run `kicad-cli` itself. One helper, `tools/response_budget.rs`, now does the cutting:
 
@@ -62,7 +87,7 @@ Not done, and still open under rank 3: C24 (a `zone_fill_state` field on DRC, wh
 
 Proof: `response_budget_tests.rs` runs the real ERC handler against a stand-in `kicad-cli` that serves a 700-violation report (under the cap, counts of all 700, pages cover each violation once, `output` holds all of them), the DRC pager on 900 violations, and the list tools. Six guards were broken one at a time (the byte cap, the whole-list tally, truncation, paging order of `output`, argument checking, the summary) and each failed a test. Limits left: the cap counts characters of listed items only, so a response with very large non-list fields could still be large; the stand-in is not KiCad's own large report; the live KiCad was not asked.
 
-## Now: PR 2b, Freerouting on real boards
+## PR 2b, Freerouting on real boards (merged, #26)
 
 `export_specctra_dsn` refused any board with an arc in its outline, a rounded or oval pad, or a copper zone, so a real routing run was blocked and the AI hand-rolled a router. What changed (`specctra.rs`, `specctra_ses.rs`, `freerouting_setup.rs`, `check_freerouting`):
 
@@ -72,7 +97,7 @@ Proof: `response_budget_tests.rs` runs the real ERC handler against a stand-in `
 - **Setup:** `check_freerouting` asks the JAR which Java it needs (the class-file version of its main class), looks for one (`java_path`, `JAVA_HOME`, `PATH`, the usual JDK folders) and returns `setup` with the exact steps. `available` is false when the JAR cannot start. `route_specctra_dsn` refuses before starting anything when no Java fits. **Approach chosen: guidance, not a downloader.** Fetching and running a 60 MB program from the network is the owner's decision; the steps are the commands they would run.
 - **Native bridge:** KiCad writes rounded pads as polygons, which the differential check does not model, so `native_bridge_mode: prefer` falls back to the Rust DSN on such boards (a test pins this).
 
-**Freerouting could not be run here.** The machine has Java 11 and Freerouting 2.1.0 needs Java 21 (`UnsupportedClassVersionError`, class file 65). Installing a JDK was not done. So the DSN was not run through the real engine. What was run instead: Konnect's own DSN parser round trip, the planes and keepouts compared with KiCad 10.0.8's own export of the same board, and the import planner on a Freerouting-authored SES (from another board, adapted; see the fixture README). The real-engine test is `freerouting_routes_the_rounded_board` (ignored): with a Java 21 and `FREEROUTING_JAR` set it exports, routes and plans the import. That is the one check still owed.
+**Freerouting could not be run here.** When this was built, the machine had only Java 11, and Freerouting 2.1.0 needs Java 21 (`UnsupportedClassVersionError`, class file 65). Java 21 was installed afterwards, on 2026-11-07, but the live run was not done. So the DSN was not run through the real engine. What was run instead: Konnect's own DSN parser round trip, the planes and keepouts compared with KiCad 10.0.8's own export of the same board, and the import planner on a Freerouting-authored SES (from another board, adapted; see the fixture README). The real-engine test is `freerouting_routes_the_rounded_board` (ignored): with a Java 21 and `FREEROUTING_JAR` set it exports, routes and plans the import. That is the one check still owed.
 
 Limits left: more than two copper layers and back-side parts (rank 32); the router sees a pour's outline, not its fill; a rounded pad's corners are unavailable to the router; the rounded-pad polygon KiCad writes is not adopted.
 
@@ -142,7 +167,7 @@ Seven guards were broken one at a time and each broke a test (split, merged and 
 
 PR 2 should call `compare_netlist` with `reference_schematic` on a copy of the project taken before the wiring change. Edits to `connect_pins` and its siblings are in `tools/sch_wiring.rs`.
 
-## PR 7, the board geometry layer (open, #25)
+## PR 7, the board geometry layer (merged, #25)
 
 Research ranks 6 and 7 (C19, C17, A14's containment part). One model of the board, one outline, and four tools that read it.
 
