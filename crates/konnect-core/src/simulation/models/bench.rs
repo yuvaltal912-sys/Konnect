@@ -69,13 +69,39 @@ pub(crate) enum Probe {
     /// AC at `hz`: `Im(v(node)) / (2 pi hz)`, the inductance a unit AC current
     /// into `node` meets.
     NodeInductance { node: String, hz: f64 },
+    /// Transient: the charge a constant gate current `amps` has delivered by
+    /// the time `what` happens. Voltages are read times `sign`, so a P-channel
+    /// part reads as an N-channel one.
+    Charge {
+        gate: String,
+        drain: String,
+        amps: f64,
+        vds: f64,
+        sign: f64,
+        what: Charge,
+    },
+}
+
+/// Which charge a transient probe reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Charge {
+    /// Until the gate reaches `vgs`: the datasheet's total gate charge.
+    Total { vgs: f64 },
+    /// While the drain falls from 90 to 10 percent of `vds`: the charge the
+    /// drain's fall takes from the gate, the datasheet's gate-drain charge.
+    Miller,
 }
 
 impl Probe {
+    /// Whether the probe reads a transient run.
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Probe::Charge { .. })
+    }
+
     /// The frequency of an AC probe; none for an operating point.
     pub(crate) fn hz(&self) -> Option<f64> {
         match self {
-            Probe::Voltage { .. } | Probe::Current { .. } => None,
+            Probe::Voltage { .. } | Probe::Current { .. } | Probe::Charge { .. } => None,
             Probe::Capacitance { hz, .. }
             | Probe::Impedance { hz, .. }
             | Probe::Resistance { hz, .. }
@@ -93,6 +119,9 @@ pub(crate) struct Bench {
     pub dc: Vec<String>,
     /// For the AC runs: every AC run holds them all.
     pub ac: Vec<String>,
+    /// For the transient run, which lasts `tran_stop` seconds.
+    pub tran: Vec<String>,
+    pub tran_stop: f64,
     next: usize,
 }
 
@@ -138,7 +167,14 @@ pub(crate) fn ac_frequencies(checks: &[Check]) -> Vec<f64> {
 
 /// Whether any check reads the operating point.
 pub(crate) fn needs_operating_point(checks: &[Check]) -> bool {
-    checks.iter().any(|check| check.probe.hz().is_none())
+    checks
+        .iter()
+        .any(|check| check.probe.hz().is_none() && !check.probe.is_transient())
+}
+
+/// Whether any check reads the transient run.
+pub(crate) fn needs_transient(checks: &[Check]) -> bool {
+    checks.iter().any(|check| check.probe.is_transient())
 }
 
 const NO_NAMES: Names<'static> = Names {
@@ -169,7 +205,12 @@ fn current(plot: &Plot, source: &str) -> Option<(f64, f64)> {
 
 /// The value a check reads, from the operating point or from the AC run at its
 /// frequency. None when the run does not hold the signal.
-pub(crate) fn measure(check: &Check, dc: Option<&Plot>, ac: &[(f64, Plot)]) -> Option<f64> {
+pub(crate) fn measure(
+    check: &Check,
+    dc: Option<&Plot>,
+    ac: &[(f64, Plot)],
+    tran: Option<&Plot>,
+) -> Option<f64> {
     let tau = std::f64::consts::TAU;
     let at = |hz: f64| {
         ac.iter()
@@ -177,6 +218,14 @@ pub(crate) fn measure(check: &Check, dc: Option<&Plot>, ac: &[(f64, Plot)]) -> O
             .map(|(_, plot)| plot)
     };
     match &check.probe {
+        Probe::Charge {
+            gate,
+            drain,
+            amps,
+            vds,
+            sign,
+            what,
+        } => charge(tran?, gate, drain, *amps, *vds, *sign, *what),
         Probe::Voltage {
             node,
             scale,
@@ -199,6 +248,47 @@ pub(crate) fn measure(check: &Check, dc: Option<&Plot>, ac: &[(f64, Plot)]) -> O
         Probe::SeriesCapacitance { source, hz } => impedance(at(*hz)?, source)
             .filter(|(_, imaginary)| *imaginary < 0.0)
             .map(|(_, imaginary)| -1.0 / (tau * hz * imaginary)),
+    }
+}
+
+/// The first time a falling or rising trace crosses `level`, by straight lines
+/// between samples.
+fn crossing(times: &[f64], values: &[f64], level: f64, rising: bool) -> Option<f64> {
+    times.windows(2).zip(values.windows(2)).find_map(|(t, v)| {
+        let crosses = if rising {
+            v[0] < level && v[1] >= level
+        } else {
+            v[0] > level && v[1] <= level
+        };
+        crosses.then(|| t[0] + (t[1] - t[0]) * (level - v[0]) / (v[1] - v[0]))
+    })
+}
+
+fn charge(
+    plot: &Plot,
+    gate: &str,
+    drain: &str,
+    amps: f64,
+    vds: f64,
+    sign: f64,
+    what: Charge,
+) -> Option<f64> {
+    let times: Vec<f64> = plot.real(plot.variable("time")?).collect();
+    let trace = |node: &str| -> Option<Vec<f64>> {
+        let resolved = signals::resolve(plot, &Signal::Voltage(node.to_string()), NO_NAMES).ok()?;
+        Some(resolved.values.iter().map(|v| v * sign).collect())
+    };
+    match what {
+        Charge::Total { vgs } => {
+            let gate = trace(gate)?;
+            crossing(&times, &gate, vgs, true).map(|t| amps * t)
+        }
+        Charge::Miller => {
+            let drain = trace(drain)?;
+            let high = crossing(&times, &drain, 0.9 * vds, false)?;
+            let low = crossing(&times, &drain, 0.1 * vds, false)?;
+            Some(amps * (low - high))
+        }
     }
 }
 
@@ -237,6 +327,36 @@ mod tests {
             Bench::voltage(&id, "b1k", 25.0, true),
             "Vb1 b1k 0 DC 2.500000e1 AC 1"
         );
+    }
+
+    #[test]
+    fn crossings_interpolate_between_samples() {
+        let times = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(
+            crossing(&times, &[0.0, 2.0, 4.0, 6.0], 3.0, true),
+            Some(1.5)
+        );
+        assert_eq!(
+            crossing(&times, &[6.0, 4.0, 2.0, 0.0], 3.0, false),
+            Some(1.5)
+        );
+        assert_eq!(crossing(&times, &[0.0, 1.0, 2.0, 2.5], 3.0, true), None);
+    }
+
+    #[test]
+    fn a_charge_probe_reads_only_a_transient_run() {
+        let probe = Probe::Charge {
+            gate: "g".into(),
+            drain: "d".into(),
+            amps: 0.1,
+            vds: 10.0,
+            sign: 1.0,
+            what: Charge::Miller,
+        };
+        assert!(probe.is_transient() && probe.hz().is_none());
+        let checks = [check(probe)];
+        assert!(needs_transient(&checks));
+        assert!(!needs_operating_point(&checks));
     }
 
     #[test]

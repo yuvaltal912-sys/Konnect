@@ -124,6 +124,11 @@ impl Kind {
                 (DrainCurrent, 2, 16),
                 (GateResistance, 0, 1),
                 (ForwardVoltage, 0, 16),
+                (InputCapacitance, 0, 16),
+                (OutputCapacitance, 0, 16),
+                (ReverseTransferCapacitance, 0, 16),
+                (GateCharge, 0, 1),
+                (GateDrainCharge, 0, 1),
             ],
             Kind::Resistance => &[(Resistance, 1, 1), (SeriesInductance, 0, 1)],
             Kind::Capacitor => &[
@@ -153,6 +158,11 @@ pub(crate) enum Quantity {
     OnResistance,
     DrainCurrent,
     GateResistance,
+    InputCapacitance,
+    OutputCapacitance,
+    ReverseTransferCapacitance,
+    GateCharge,
+    GateDrainCharge,
     ZenerVoltage,
     DynamicImpedance,
     JunctionCapacitance,
@@ -180,7 +190,7 @@ pub(crate) const DC_BIAS: &str = "dc_bias_volts";
 pub(crate) const DC_CURRENT: &str = "dc_current_amps";
 
 impl Quantity {
-    pub(crate) const ALL: [Quantity; 20] = [
+    pub(crate) const ALL: [Quantity; 25] = [
         Quantity::ForwardVoltage,
         Quantity::ReverseCurrent,
         Quantity::BreakdownVoltage,
@@ -189,6 +199,11 @@ impl Quantity {
         Quantity::OnResistance,
         Quantity::DrainCurrent,
         Quantity::GateResistance,
+        Quantity::InputCapacitance,
+        Quantity::OutputCapacitance,
+        Quantity::ReverseTransferCapacitance,
+        Quantity::GateCharge,
+        Quantity::GateDrainCharge,
         Quantity::ZenerVoltage,
         Quantity::DynamicImpedance,
         Quantity::JunctionCapacitance,
@@ -213,6 +228,11 @@ impl Quantity {
             Quantity::OnResistance => "on_resistance",
             Quantity::DrainCurrent => "drain_current",
             Quantity::GateResistance => "gate_resistance",
+            Quantity::InputCapacitance => "input_capacitance",
+            Quantity::OutputCapacitance => "output_capacitance",
+            Quantity::ReverseTransferCapacitance => "reverse_transfer_capacitance",
+            Quantity::GateCharge => "gate_charge",
+            Quantity::GateDrainCharge => "gate_drain_charge",
             Quantity::ZenerVoltage => "zener_voltage",
             Quantity::DynamicImpedance => "dynamic_impedance",
             Quantity::JunctionCapacitance => "junction_capacitance",
@@ -242,11 +262,16 @@ impl Quantity {
             | Quantity::OnResistance
             | Quantity::GateResistance
             | Quantity::DcResistance => "ohm",
-            Quantity::JunctionCapacitance | Quantity::Capacitance => "F",
+            Quantity::JunctionCapacitance
+            | Quantity::Capacitance
+            | Quantity::InputCapacitance
+            | Quantity::OutputCapacitance
+            | Quantity::ReverseTransferCapacitance => "F",
             Quantity::SeriesInductance
             | Quantity::EquivalentSeriesInductance
             | Quantity::Inductance => "H",
             Quantity::SelfResonantFrequency => "Hz",
+            Quantity::GateCharge | Quantity::GateDrainCharge => "C",
         }
     }
 
@@ -261,6 +286,14 @@ impl Quantity {
             Quantity::OnResistance => (&[GATE_SOURCE_VOLTAGE, DRAIN_CURRENT], &[]),
             Quantity::DrainCurrent => (&[GATE_SOURCE_VOLTAGE, DRAIN_SOURCE_VOLTAGE], &[]),
             Quantity::GateResistance => (&[], &[FREQUENCY]),
+            Quantity::InputCapacitance
+            | Quantity::OutputCapacitance
+            | Quantity::ReverseTransferCapacitance => (&[DRAIN_SOURCE_VOLTAGE], &[FREQUENCY]),
+            Quantity::GateCharge => (
+                &[DRAIN_SOURCE_VOLTAGE, DRAIN_CURRENT, GATE_SOURCE_VOLTAGE],
+                &[],
+            ),
+            Quantity::GateDrainCharge => (&[DRAIN_SOURCE_VOLTAGE, DRAIN_CURRENT], &[]),
             Quantity::DynamicImpedance => (&[REVERSE_CURRENT], &[FREQUENCY]),
             Quantity::JunctionCapacitance => (&[REVERSE_VOLTAGE], &[FREQUENCY]),
             Quantity::LeakageCurrent => (&[VOLTAGE], &[]),

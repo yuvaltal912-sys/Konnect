@@ -15,10 +15,10 @@
 //! a negative `VTO` (ngspice mirrors the card around it) and bench sources of
 //! the opposite sign.
 
-use super::bench::{Bench, Check, Probe, Role};
-use super::diode::{fit_forward, forward_points, hold_out, Point, SILICON};
+use super::bench::{Bench, Charge, Check, Probe, Role};
+use super::diode::{fit_capacitance, fit_forward, forward_points, hold_out, Point, SILICON};
 use super::fit::{least_squares, root, thermal_voltage};
-use super::text::vdmos_card;
+use super::text::{number, vdmos_card};
 use super::{
     of, Characteristic, Element, Fitted, Invalid, Kind, Model, Quantity, DRAIN_CURRENT,
     DRAIN_SOURCE_VOLTAGE, FREQUENCY, GATE_SOURCE_VOLTAGE,
@@ -28,6 +28,10 @@ use super::{
 const KSUB: f64 = 0.1;
 /// The gate resistance is read at this frequency, unless the caller names one.
 const GATE_RESISTANCE_HZ: f64 = 1e6;
+/// Small-signal tests, unless a characteristic names its own frequency.
+const CAPACITANCE_HZ: f64 = 1e6;
+/// A body diode's junction potential, when the capacitance points cannot fix it.
+const BODY_VJ: f64 = 0.8;
 /// Rounds of fitting the channel, then the drain resistance, each on the last.
 const ROUNDS: usize = 3;
 const LAW_POINTS: usize = 3;
@@ -79,6 +83,60 @@ impl Law {
         let inside = root(|vds| self.inner(vgs, vds) - current, 0.0, vgst)?;
         Some(inside + current * self.rd)
     }
+}
+
+/// ngspice's gate-drain capacitance at a gate-drain voltage `vgd` at or below
+/// zero: `s atan(a vgd) + y`, with `s = (max - min) / (1 + pi / 2)` and
+/// `y = max - s`, so it runs from `max - s` at zero to `min` far below.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GateDrain {
+    pub max: f64,
+    pub min: f64,
+    pub a: f64,
+}
+
+impl GateDrain {
+    pub(crate) fn at_vds(&self, vds: f64) -> f64 {
+        let s = (self.max - self.min) / (1.0 + std::f64::consts::FRAC_PI_2);
+        let y = self.max - s;
+        s * (-self.a * vds).atan() + y
+    }
+}
+
+/// `max`, `min` and `a` for Crss values `(Vds, capacitance)`, by least squares
+/// on the log of the capacitance.
+fn fit_gate_drain(points: &[(f64, f64)]) -> GateDrain {
+    let highest = points.iter().map(|p| p.1).fold(0.0, f64::max);
+    let lowest = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let middle = points.iter().map(|p| p.0).sum::<f64>() / points.len() as f64;
+    let law = |x: &[f64]| {
+        let max = x[0].exp();
+        GateDrain {
+            max,
+            min: max * (-x[1]).exp(),
+            a: x[2].exp(),
+        }
+    };
+    let found = least_squares(
+        |x| {
+            let law = law(x);
+            points
+                .iter()
+                .map(|(vds, c)| (law.at_vds(*vds).max(1e-300) / c).ln())
+                .collect()
+        },
+        &[
+            (2.0 * highest).ln(),
+            (2.0 * highest / lowest).ln().max(0.5),
+            (1.0 / middle).ln(),
+        ],
+        |x| {
+            x[0] = x[0].clamp((highest * 1.0001).ln(), (highest * 100.0).ln());
+            x[1] = x[1].clamp(0.01, 12.0);
+            x[2] = x[2].clamp(-7.0, 7.0);
+        },
+    );
+    law(&found)
 }
 
 /// One transfer value: the drain current at a gate and drain voltage.
@@ -262,9 +320,17 @@ pub(crate) fn build(
          resistance is in rd, and the saturation current does not rise with drain voltage"
             .into(),
     );
+    let capacitances = capacitance_side(&mut model, characteristics)?;
+    if capacitances.parameters.is_empty() {
+        model.assumed.push(
+            "no capacitance values: the gate and drain capacitances are ngspice's defaults, so \
+             switching speed is not the part's"
+                .into(),
+        );
+    }
     model.assumed.push(
-        "no capacitance, charge or reverse-recovery values are fitted: the gate and drain \
-         capacitances are ngspice's defaults, so switching speed is not the part's"
+        "no gate-charge or reverse-recovery values are fitted: the body diode has no transit \
+         time"
             .into(),
     );
 
@@ -280,6 +346,7 @@ pub(crate) fn build(
     if let Some(gate) = of(characteristics, Quantity::GateResistance).first() {
         parameters.push(("RG", gate.value));
     }
+    parameters.extend(capacitances.parameters.iter().copied());
 
     // The body diode, from its forward voltages.
     let body = forward_points(characteristics);
@@ -334,8 +401,344 @@ pub(crate) fn build(
     if let Some(gate) = of(characteristics, Quantity::GateResistance).first() {
         check_gate_resistance(&mut model, &mut bench, gate);
     }
+    for cap in &capacitances.crss_fit {
+        check_capacitance(
+            &mut model,
+            &mut bench,
+            Which::ReverseTransfer,
+            cap,
+            Role::Fit,
+            sign,
+        );
+    }
+    if let Some(cap) = &capacitances.crss_held {
+        check_capacitance(
+            &mut model,
+            &mut bench,
+            Which::ReverseTransfer,
+            cap,
+            Role::HeldOut,
+            sign,
+        );
+    }
+    for cap in &capacitances.ciss {
+        check_capacitance(&mut model, &mut bench, Which::Input, cap, Role::Fit, sign);
+    }
+    for cap in &capacitances.coss {
+        check_capacitance(&mut model, &mut bench, Which::Output, cap, Role::Fit, sign);
+    }
+    check_charges(&mut model, &mut bench, characteristics, sign);
     model.bench = bench;
     Ok(model)
+}
+
+/// The time a gate-charge bench gives the gate current to deliver its charge,
+/// and the time it runs.
+const CHARGE_SECONDS: f64 = 250e-9;
+const CHARGE_RUN_SECONDS: f64 = 1.0e-6;
+const CHARGE_DELAY: &str = "1.000000e-8";
+const CHARGE_TOLERANCES: &str = ".options reltol=1e-3 vntol=1e-6 abstol=1e-12";
+
+/// Gate charge and gate-drain charge, as a clamped inductive turn-on: a
+/// current source Id from the supply into the drain with a diode back to the
+/// supply, and a constant current into the gate. They are checked, not fitted:
+/// the charges follow from the capacitances, and a datasheet's figure can sit
+/// well off the curve its capacitances draw.
+fn check_charges(
+    model: &mut Model,
+    bench: &mut Bench,
+    characteristics: &[Characteristic],
+    sign: f64,
+) {
+    let total = of(characteristics, Quantity::GateCharge).first().copied();
+    let miller = of(characteristics, Quantity::GateDrainCharge)
+        .first()
+        .copied();
+    let Some(sizing) = total.map(|c| c.value).or(miller.map(|c| 4.0 * c.value)) else {
+        return;
+    };
+    let gate_current = sizing / CHARGE_SECONDS;
+    let clamp_volts = total
+        .and_then(|c| c.condition(GATE_SOURCE_VOLTAGE))
+        .unwrap_or(10.0);
+    bench.tran_stop = CHARGE_RUN_SECONDS;
+    // The bench's tight tolerances, made for a breakdown, stall a transient at
+    // the gate current's first edge (a timestep of 1e-21 s).
+    bench.tran.push(CHARGE_TOLERANCES.to_string());
+    for (c, miller) in total
+        .map(|c| (c, false))
+        .into_iter()
+        .chain(miller.map(|c| (c, true)))
+    {
+        let id = bench.id();
+        let (supply, drain, gate) = (format!("{id}v"), format!("{id}d"), format!("{id}g"));
+        let vds = c.condition(DRAIN_SOURCE_VOLTAGE).unwrap_or_default();
+        let load = c.condition(DRAIN_CURRENT).unwrap_or_default();
+        bench
+            .tran
+            .push(Bench::voltage(&id, &supply, sign * vds, false));
+        bench.tran.push(format!(
+            "I{id}l {supply} {drain} DC {}",
+            number(sign * load)
+        ));
+        let (anode, cathode) = if sign > 0.0 {
+            (&drain, &supply)
+        } else {
+            (&supply, &drain)
+        };
+        bench.tran.push(format!("D{id}c {anode} {cathode} {id}dm"));
+        bench.tran.push(format!(".model {id}dm D"));
+        bench.tran.push(format!(
+            "I{id}g 0 {gate} PULSE(0 {} {CHARGE_DELAY} {CHARGE_DELAY} {CHARGE_DELAY} 1 2)",
+            number(sign * gate_current)
+        ));
+        // Beside a clamp diode, whose leakage is gmin, a 1 Tohm shunt would
+        // halve the gate's DC level: the shunt must be far below it.
+        bench.tran.push(format!("R{id}g {gate} 0 1.000000e6"));
+        // The gate current goes on after the charge is read. Clamping the gate
+        // above the final gate voltage keeps it from charging to hundreds of
+        // volts, where the body diode's solve fails.
+        let clamp = format!("{id}k");
+        bench.tran.push(Bench::voltage(
+            &format!("{id}k"),
+            &clamp,
+            sign * (clamp_volts + 2.0),
+            false,
+        ));
+        let (anode, cathode) = if sign > 0.0 {
+            (&gate, &clamp)
+        } else {
+            (&clamp, &gate)
+        };
+        bench.tran.push(format!("D{id}k {anode} {cathode} {id}dm"));
+        bench.tran.push(model.instance(&id, &[&drain, &gate, "0"]));
+        let what = if miller {
+            Charge::Miller
+        } else {
+            Charge::Total {
+                vgs: c.condition(GATE_SOURCE_VOLTAGE).unwrap_or_default(),
+            }
+        };
+        model.checks.push(Check {
+            characteristic: c.index,
+            role: Role::CheckOnly,
+            expected: c.value,
+            probe: Probe::Charge {
+                gate,
+                drain,
+                amps: gate_current,
+                vds,
+                sign,
+                what,
+            },
+        });
+    }
+}
+
+/// A capacitance value at a drain voltage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Cap {
+    vds: f64,
+    value: f64,
+    hz: f64,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Input,
+    Output,
+    ReverseTransfer,
+}
+
+#[derive(Debug, Default)]
+struct Capacitances {
+    parameters: Vec<(&'static str, f64)>,
+    crss_fit: Vec<Cap>,
+    crss_held: Option<Cap>,
+    ciss: Vec<Cap>,
+    coss: Vec<Cap>,
+}
+
+fn caps_of(characteristics: &[Characteristic], quantity: Quantity) -> Vec<Cap> {
+    let mut caps: Vec<Cap> = of(characteristics, quantity)
+        .into_iter()
+        .map(|c| Cap {
+            vds: c.condition(DRAIN_SOURCE_VOLTAGE).unwrap_or_default(),
+            value: c.value,
+            hz: c.condition(FREQUENCY).unwrap_or(CAPACITANCE_HZ),
+            index: c.index,
+        })
+        .collect();
+    caps.sort_by(|a, b| a.vds.total_cmp(&b.vds));
+    caps
+}
+
+/// `CGDMAX`, `CGDMIN` and `A` from Crss, then `CGS` from Ciss and the body
+/// diode's junction from Coss, each less the gate-drain capacitance they hold.
+fn capacitance_side(model: &mut Model, characteristics: &[Characteristic]) -> Fitted<Capacitances> {
+    let crss = caps_of(characteristics, Quantity::ReverseTransferCapacitance);
+    let ciss = caps_of(characteristics, Quantity::InputCapacitance);
+    let coss = caps_of(characteristics, Quantity::OutputCapacitance);
+    let field = |quantity: Quantity| {
+        of(characteristics, quantity)
+            .first()
+            .map_or("characteristics".to_string(), |c| c.field("value"))
+    };
+    if crss.is_empty() {
+        if let Some(quantity) = [
+            (Quantity::InputCapacitance, !ciss.is_empty()),
+            (Quantity::OutputCapacitance, !coss.is_empty()),
+        ]
+        .iter()
+        .find_map(|(quantity, given)| given.then_some(*quantity))
+        {
+            return Err(Invalid::new(
+                field(quantity),
+                "input and output capacitance need reverse_transfer_capacitance values too, \
+                 because the gate-drain capacitance is part of both",
+            ));
+        }
+        return Ok(Capacitances::default());
+    }
+    if crss.len() < 3 {
+        return Err(Invalid::new(
+            field(Quantity::ReverseTransferCapacitance),
+            "give at least three reverse_transfer_capacitance values off the capacitance \
+             curve, or none",
+        ));
+    }
+    for quantity in [
+        Quantity::ReverseTransferCapacitance,
+        Quantity::InputCapacitance,
+        Quantity::OutputCapacitance,
+    ] {
+        let caps = caps_of(characteristics, quantity);
+        if caps.windows(2).any(|pair| pair[0].vds == pair[1].vds) {
+            return Err(Invalid::new(
+                field(quantity),
+                "two values share one drain voltage",
+            ));
+        }
+    }
+    let sorted: Vec<((f64, f64), usize)> =
+        crss.iter().map(|c| ((c.vds, c.value), c.index)).collect();
+    let (fit_points, held) = hold_out(&sorted);
+    let values: Vec<(f64, f64)> = fit_points.iter().map(|(point, _)| *point).collect();
+    let gate_drain = fit_gate_drain(&values);
+    model.fitted.push(format!(
+        "cgdmax, cgdmin and a from {} reverse transfer capacitance values",
+        values.len()
+    ));
+    let mut parameters = vec![
+        ("CGDMAX", gate_drain.max),
+        ("CGDMIN", gate_drain.min),
+        ("A", gate_drain.a),
+    ];
+    if !ciss.is_empty() {
+        let mut total = 0.0;
+        for cap in &ciss {
+            let gate_source = cap.value - gate_drain.at_vds(cap.vds);
+            if gate_source <= 0.0 {
+                return Err(Invalid::new(
+                    format!("characteristics[{}].value", cap.index),
+                    "the input capacitance is not above the gate-drain capacitance at the same \
+                     drain voltage",
+                ));
+            }
+            total += gate_source;
+        }
+        parameters.push(("CGS", total / ciss.len() as f64));
+        model
+            .fitted
+            .push("cgs from the input capacitance less the gate-drain capacitance".into());
+    }
+    if !coss.is_empty() {
+        let mut junction = Vec::new();
+        for cap in &coss {
+            let drain_source = cap.value - gate_drain.at_vds(cap.vds);
+            if drain_source <= 0.0 {
+                return Err(Invalid::new(
+                    format!("characteristics[{}].value", cap.index),
+                    "the output capacitance is not above the gate-drain capacitance at the same \
+                     drain voltage",
+                ));
+            }
+            junction.push((cap.vds, drain_source));
+        }
+        let (cjo, vj, m, assumed) =
+            fit_capacitance(&junction, BODY_VJ, &field(Quantity::OutputCapacitance))?;
+        model.assumed.extend(assumed);
+        model
+            .fitted
+            .push("cjo, vj and m of the body diode from the output capacitance less the gate-drain capacitance".into());
+        parameters.extend([("CJO", cjo), ("VJ", vj), ("M", m)]);
+    }
+    let cap_at = |(point, index): ((f64, f64), usize)| {
+        let source = &crss.iter().find(|c| c.index == index).copied();
+        Cap {
+            vds: point.0,
+            value: point.1,
+            hz: source.map_or(CAPACITANCE_HZ, |c| c.hz),
+            index,
+        }
+    };
+    Ok(Capacitances {
+        parameters,
+        crss_fit: fit_points.into_iter().map(cap_at).collect(),
+        crss_held: held.map(cap_at),
+        ciss,
+        coss,
+    })
+}
+
+/// One capacitance, measured the way a datasheet's meter does: with the gate
+/// at 0 V, the drain biased at `Vds`, and the pins the quantity names tied at
+/// AC.
+fn check_capacitance(
+    model: &mut Model,
+    bench: &mut Bench,
+    which: Which,
+    cap: &Cap,
+    role: Role,
+    sign: f64,
+) {
+    let (drain_id, gate_id) = (bench.id(), bench.id());
+    let (drain, gate) = (format!("{drain_id}d"), format!("{gate_id}g"));
+    let ac_drain = which != Which::Input;
+    bench
+        .ac
+        .push(Bench::voltage(&drain_id, &drain, sign * cap.vds, ac_drain));
+    bench
+        .ac
+        .push(Bench::voltage(&gate_id, &gate, 0.0, !ac_drain));
+    bench
+        .ac
+        .push(model.instance(&drain_id, &[&drain, &gate, "0"]));
+    let probe = match which {
+        // The gate's source drives Ciss through RG, which a series capacitance
+        // ignores.
+        Which::Input => Probe::SeriesCapacitance {
+            source: format!("V{gate_id}"),
+            hz: cap.hz,
+        },
+        // The drain's source drives Cds + Cgd.
+        Which::Output => Probe::Capacitance {
+            source: format!("V{drain_id}"),
+            hz: cap.hz,
+        },
+        // The gate, held at AC ground, carries only the Cgd current.
+        Which::ReverseTransfer => Probe::Capacitance {
+            source: format!("V{gate_id}"),
+            hz: cap.hz,
+        },
+    };
+    model.checks.push(Check {
+        characteristic: cap.index,
+        role,
+        expected: cap.value,
+        probe,
+    });
 }
 
 /// The gate voltage at the threshold current, with the drain tied to the gate.
@@ -627,5 +1030,136 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.field, "characteristics");
+    }
+
+    fn capacitance(quantity: &str, vds: f64, farads: f64) -> Value {
+        json!({
+            "quantity": quantity, "value": farads,
+            "conditions": { "drain_source_voltage_volts": vds }, "statistic": "typical"
+        })
+    }
+
+    fn crss_curve() -> Vec<Value> {
+        [
+            (1.0, 1.6861e-9),
+            (5.0, 1.1205e-9),
+            (10.0, 7.3245e-10),
+            (25.0, 3.5803e-10),
+            (50.0, 2.1159e-10),
+        ]
+        .into_iter()
+        .map(|(v, c)| capacitance("reverse_transfer_capacitance", v, c))
+        .collect()
+    }
+
+    #[test]
+    fn crss_values_recover_the_gate_drain_law_that_made_them() {
+        let truth = GateDrain {
+            max: 3e-9,
+            min: 6e-11,
+            a: 0.15,
+        };
+        let points: Vec<(f64, f64)> = [1.0, 5.0, 10.0, 25.0, 50.0]
+            .into_iter()
+            .map(|v| (v, truth.at_vds(v)))
+            .collect();
+        let found = fit_gate_drain(&points);
+        for (v, c) in &points {
+            assert!(
+                (found.at_vds(*v) - c).abs() <= 0.01 * c,
+                "{v}: {} against {c}",
+                found.at_vds(*v)
+            );
+        }
+    }
+
+    #[test]
+    fn capacitances_add_their_cards_and_checks() {
+        let mut extra = crss_curve();
+        extra.push(capacitance("input_capacitance", 10.0, 2.7324e-9));
+        extra.push(capacitance("output_capacitance", 10.0, 1.059e-9));
+        let model = build_model(Kind::NMosfet, "irf_fit", &datasheet(extra), 25.0).unwrap();
+        for key in ["CGDMAX", "CGDMIN", "A", "CGS", "CJO", "VJ", "M"] {
+            fitted(&model, &format!("vdmos.{key}"));
+        }
+        assert!((fitted(&model, "vdmos.CGS") - 2.0e-9).abs() < 0.1e-9);
+        assert!(text::check_fitted(model.file().as_bytes()).is_ok());
+        // Crss holds its middle value out; Ciss and Coss are each one check.
+        assert_eq!(
+            model
+                .checks
+                .iter()
+                .filter(|c| c.role == Role::HeldOut)
+                .count(),
+            1
+        );
+        assert!(!model
+            .assumed
+            .iter()
+            .any(|note| note.contains("no capacitance values")));
+    }
+
+    #[test]
+    fn gate_charges_are_checked_not_fitted_on_a_clamped_inductive_turn_on() {
+        let mut extra = crss_curve();
+        extra.push(json!({
+            "quantity": "gate_charge", "value": 6.6e-8,
+            "conditions": { "drain_source_voltage_volts": 25.0, "drain_current_amps": 20.0, "gate_source_voltage_volts": 10.0 },
+            "statistic": "typical"
+        }));
+        extra.push(json!({
+            "quantity": "gate_drain_charge", "value": 2.1e-8,
+            "conditions": { "drain_source_voltage_volts": 25.0, "drain_current_amps": 20.0 },
+            "statistic": "typical"
+        }));
+        let model = build_model(Kind::NMosfet, "irf_fit", &datasheet(extra), 25.0).unwrap();
+        let charges: Vec<_> = model
+            .checks
+            .iter()
+            .filter(|c| c.role == Role::CheckOnly)
+            .collect();
+        assert_eq!(charges.len(), 2);
+        assert!(model.bench.tran_stop > 0.0);
+        assert!(model.bench.tran[0].starts_with(".options reltol=1e-3"));
+        // The load pushes into the drain and a diode returns it to the supply.
+        assert!(model
+            .bench
+            .tran
+            .iter()
+            .any(|l| l.starts_with("Ib") && l.contains("l b")));
+        assert!(model.bench.tran.iter().any(|l| l.contains("PULSE(0 2.64")));
+        // A part with no charges has no transient run.
+        let none = build_model(Kind::NMosfet, "irf_fit", &datasheet(vec![]), 25.0).unwrap();
+        assert!(none.bench.tran.is_empty() && none.bench.tran_stop == 0.0);
+    }
+
+    #[test]
+    fn without_capacitances_the_result_says_the_defaults_stand() {
+        let model = build_model(Kind::NMosfet, "irf_fit", &datasheet(vec![]), 25.0).unwrap();
+        assert!(model
+            .assumed
+            .iter()
+            .any(|note| note.contains("no capacitance values")));
+    }
+
+    #[test]
+    fn crss_needs_a_curve_and_ciss_and_coss_need_crss() {
+        let two = datasheet(crss_curve().into_iter().take(2).collect());
+        let error = build_model(Kind::NMosfet, "irf_fit", &two, 25.0).unwrap_err();
+        assert!(error.reason.contains("at least three"), "{error:?}");
+        let alone = datasheet(vec![capacitance("input_capacitance", 10.0, 2.7e-9)]);
+        let error = build_model(Kind::NMosfet, "irf_fit", &alone, 25.0).unwrap_err();
+        assert!(
+            error.reason.contains("need reverse_transfer_capacitance"),
+            "{error:?}"
+        );
+        // An input capacitance below the gate-drain capacitance at its voltage.
+        let mut low = crss_curve();
+        low.push(capacitance("input_capacitance", 10.0, 1e-10));
+        let error = build_model(Kind::NMosfet, "irf_fit", &datasheet(low), 25.0).unwrap_err();
+        assert!(
+            error.reason.contains("not above the gate-drain"),
+            "{error:?}"
+        );
     }
 }

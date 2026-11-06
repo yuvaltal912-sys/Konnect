@@ -53,9 +53,9 @@ fn characteristic_schema() -> Value {
                 "properties": {
                     "forward_current_amps": positive("For forward_voltage"),
                     "reverse_current_amps": positive("For breakdown_voltage, zener_voltage and dynamic_impedance"),
-                    "gate_source_voltage_volts": positive("For on_resistance and drain_current, as a magnitude"),
-                    "drain_source_voltage_volts": positive("For drain_current, as a magnitude"),
-                    "drain_current_amps": positive("For gate_threshold_voltage (usually 250 uA) and on_resistance"),
+                    "gate_source_voltage_volts": positive("For on_resistance, drain_current and gate_charge (the gate voltage the charge runs to), as a magnitude"),
+                    "drain_source_voltage_volts": positive("For drain_current, input_capacitance, output_capacitance, reverse_transfer_capacitance, gate_charge and gate_drain_charge, as a magnitude"),
+                    "drain_current_amps": positive("For gate_threshold_voltage (usually 250 uA), on_resistance, gate_charge and gate_drain_charge"),
                     "peak_pulse_current_amps": positive("For clamping_voltage: the peak pulse current the clamping voltage is stated at"),
                     "reverse_voltage_volts": non_negative("For reverse_current, above 0, and junction_capacitance, where 0 gives the zero-bias CJO"),
                     "voltage_volts": positive("For leakage_current"),
@@ -79,7 +79,7 @@ pub fn tools() -> Vec<ToolDef> {
     let kinds: Vec<&str> = Kind::ALL.iter().map(|kind| kind.name()).collect();
     vec![tool!(
         "create_simulation_model",
-        "Fit a SPICE model to datasheet values you read, check it on the simulator, and write it to the project's simulation_models folder only if every fitted value comes back within tolerance. Konnect never reads the datasheet: it fits and checks the numbers given. Kinds: diode, schottky_diode, led and zener need at least two forward_voltage values (a zener needs zener_voltage and dynamic_impedance instead); n_mosfet and p_mosfet (power MOSFETs, as a three-pin subcircuit) need a gate_threshold_voltage, an on_resistance and at least two drain_current values read off the transfer curve, all as magnitudes, with optional forward_voltage values for the body diode and a gate_resistance; tvs and tvs_bidirectional need a breakdown_voltage at its test current and a clamping_voltage at its peak pulse current (a bidirectional part takes no forward or capacitance values); resistance (a fuse's cold resistance, a jumper, a shunt), capacitor (capacitance with ESR, ESL and leakage) and inductor (inductance with DC resistance and self-resonance) are exact. Writes the model file and a .konnect.json sidecar, and touches no schematic: attach the model with assign_simulation_model.",
+        "Fit a SPICE model to datasheet values you read, check it on the simulator, and write it to the project's simulation_models folder only if every fitted value comes back within tolerance. Konnect never reads the datasheet: it fits and checks the numbers given. Kinds: diode, schottky_diode, led and zener need at least two forward_voltage values (a zener needs zener_voltage and dynamic_impedance instead); n_mosfet and p_mosfet (power MOSFETs, as a three-pin subcircuit) need a gate_threshold_voltage, an on_resistance and at least two drain_current values read off the transfer curve, all as magnitudes, with optional forward_voltage values for the body diode, a gate_resistance, a capacitance curve (three or more reverse_transfer_capacitance values, plus input_capacitance and output_capacitance at the same drain voltages) and gate_charge and gate_drain_charge, which are checked on a switching bench and never fitted; tvs and tvs_bidirectional need a breakdown_voltage at its test current and a clamping_voltage at its peak pulse current (a bidirectional part takes no forward or capacitance values); resistance (a fuse's cold resistance, a jumper, a shunt), capacitor (capacitance with ESR, ESL and leakage) and inductor (inductance with DC resistance and self-resonance) are exact. Writes the model file and a .konnect.json sidecar, and touches no schematic: attach the model with assign_simulation_model.",
         json!({
             "type": "object",
             "properties": {

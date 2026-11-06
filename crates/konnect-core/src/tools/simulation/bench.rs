@@ -30,6 +30,9 @@ const BENCH_RAW_BYTES: u64 = 16 * 1024 * 1024;
 /// little above it because a sweep needs room.
 const AC_SPAN: f64 = 1.001;
 const MAX_COMPLAINTS: usize = 8;
+/// A transient bench takes at most this many steps, so a charge is read to a
+/// part in a thousand of the run.
+const TRAN_STEPS: f64 = 2000.0;
 /// The engine's usual tolerances stop a breakdown solution up to 30 mV short
 /// at 30 V. A bench measures, so it solves to a part in a million.
 const BENCH_OPTIONS: &str = ".options reltol=1e-6 vntol=1e-9 abstol=1e-14";
@@ -159,9 +162,38 @@ pub(crate) async fn measure(
         .await?;
         ac_plots.push((hz, plot));
     }
+    let mut transient = None;
+    if model_bench::needs_transient(checks) {
+        let stop = model.bench.tran_stop;
+        let analysis = Analysis::from_args(&json!({
+            "kind": "transient",
+            "stop_time_seconds": stop,
+            "max_step_seconds": stop / TRAN_STEPS,
+        }))?;
+        let plot = run(
+            runtime,
+            &engine,
+            &staging_dir,
+            &file,
+            &model.bench.tran,
+            temperature,
+            &analysis,
+            project.compatibility,
+            budget.saturating_sub(started.elapsed()),
+        )
+        .await?;
+        transient = Some(plot);
+    }
     let values = checks
         .iter()
-        .map(|check| model_bench::measure(check, operating_point.as_ref(), &ac_plots))
+        .map(|check| {
+            model_bench::measure(
+                check,
+                operating_point.as_ref(),
+                &ac_plots,
+                transient.as_ref(),
+            )
+        })
         .collect();
     Ok(Measured {
         engine_version: engine.version.clone(),

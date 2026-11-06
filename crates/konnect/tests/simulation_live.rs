@@ -4080,6 +4080,12 @@ fn both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_
             "statistic": "typical"
         })
     };
+    let capacitance = |quantity: &str, vds: f64, farads: f64| {
+        json!({
+            "quantity": quantity, "value": farads,
+            "conditions": { "drain_source_voltage_volts": vds }, "statistic": "typical"
+        })
+    };
     let values = json!([
         { "quantity": "gate_threshold_voltage", "value": 2.7029, "conditions": { "drain_current_amps": 2.5e-4 }, "statistic": "typical" },
         { "quantity": "on_resistance", "value": 0.02478, "conditions": { "gate_source_voltage_volts": 10.0, "drain_current_amps": 20.0 }, "statistic": "typical" },
@@ -4089,7 +4095,19 @@ fn both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_
         transfer(8.0, 10.0, 200.0),
         { "quantity": "forward_voltage", "value": 0.8, "conditions": { "forward_current_amps": 1.0 }, "statistic": "typical" },
         { "quantity": "forward_voltage", "value": 1.0, "conditions": { "forward_current_amps": 20.0 }, "statistic": "typical" },
-        { "quantity": "gate_resistance", "value": 1.5, "conditions": { "frequency_hz": 1e6 }, "statistic": "typical" }
+        { "quantity": "gate_resistance", "value": 1.5, "conditions": { "frequency_hz": 1e6 }, "statistic": "typical" },
+        capacitance("reverse_transfer_capacitance", 1.0, 1.6861e-9),
+        capacitance("reverse_transfer_capacitance", 5.0, 1.1205e-9),
+        capacitance("reverse_transfer_capacitance", 10.0, 7.3245e-10),
+        capacitance("reverse_transfer_capacitance", 25.0, 3.5803e-10),
+        capacitance("reverse_transfer_capacitance", 50.0, 2.1159e-10),
+        capacitance("input_capacitance", 1.0, 3.6861e-9),
+        capacitance("input_capacitance", 50.0, 2.2116e-9),
+        capacitance("output_capacitance", 1.0, 2.4861e-9),
+        capacitance("output_capacitance", 10.0, 1.059e-9),
+        capacitance("output_capacitance", 50.0, 3.6218e-10),
+        { "quantity": "gate_charge", "value": 6.6e-8, "conditions": { "drain_source_voltage_volts": 25.0, "drain_current_amps": 20.0, "gate_source_voltage_volts": 10.0 }, "statistic": "typical" },
+        { "quantity": "gate_drain_charge", "value": 2.1e-8, "conditions": { "drain_source_voltage_volts": 25.0, "drain_current_amps": 20.0 }, "statistic": "typical" }
     ]);
     let results = call_session(
         home.path(),
@@ -4106,6 +4124,18 @@ fn both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_
     );
     for created in &results[..2] {
         assert_eq!(created["verification"]["status"], "passed", "{created}");
+        // The gate charges are read from a transient run: the engine's values
+        // sit within tolerance of the ones the capacitances imply.
+        for quantity in ["gate_charge", "gate_drain_charge"] {
+            let row = created["verification"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["quantity"] == quantity)
+                .unwrap_or_else(|| panic!("no {quantity} row in {created}"));
+            assert_eq!(row["role"], "check_only", "{row}");
+            assert_eq!(row["within_tolerance"], true, "{row}");
+        }
     }
     assert_eq!(
         results[2]["outcome"]["status"], "complete",
