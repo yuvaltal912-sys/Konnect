@@ -3,6 +3,47 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `update_pcb_from_schematic` copies symbol fields and can delete orphan footprints (minor release)
+
+Creation PR 9 (`docs/CREATION_HANDOFF.md`). Two additions to the sync; both are
+visible in the response, and the second is off unless asked for.
+
+- **Fields are copied.** The sync used to copy only Reference, Value, the footprint
+  ID, DNP and pad nets. It now also sets the footprint's Datasheet, Description and
+  every user field to the symbol's value, as KiCad's Update PCB does. A user field
+  the footprint lacks is created hidden on the fabrication layer at the footprint's
+  origin; one the symbol leaves empty is not created. A footprint field the symbol
+  does not have is left alone. **A board that was `noop` can now be `ready`** when a
+  footprint's Datasheet or Description differs from the schematic's, so a dry run
+  that used to report nothing may list field changes. Each `update` change gains
+  `field_changes: [{name, from, to}]` (only the fields that differ), each `add` gains
+  `fields`, and `coverage` gains `fields_updated: {planned, applied}`. `applied` is
+  the number of fields the board read back with the symbol's value, and a field that
+  did not land is a `field_readback_differs` diagnostic.
+- **Orphans are listed always and deleted on request.** A board footprint tied to a
+  symbol that is no longer in the saved schematic is listed under
+  `orphan_footprints` (`kiid`, `reference`, `value`, `footprint_id`, `symbol_path`,
+  `locked`, `outcome`, `attached_copper_count`, and the first 25 `attached_copper`
+  items). Nothing is deleted by default. `delete_orphan_footprints: true` plans a
+  `delete` change for each one and the apply deletes exactly those. Pass the same
+  value to the dry run and the apply: the plan revision covers the deletions, so a
+  plan reviewed without the flag cannot be applied with it. Never deleted: a locked
+  footprint (`kept_locked`), a footprint with no schematic identity, a board-only
+  footprint, and the footprint of a symbol that is only excluded from the BOM.
+- **Copper on an orphan.** A track, arc or via on the same net as one of the orphan's
+  pads, with an end inside the circle that holds the pad, counts as attached. With
+  `delete_orphan_footprints` alone that makes the plan a `conflict`
+  (`orphan_footprint_has_tracks`, outcome `refused_copper_attached`) that changes
+  nothing and lists the copper. `delete_orphans_with_tracks: true` (valid only with
+  `delete_orphan_footprints`, else `invalid_argument`) deletes the footprint and
+  leaves the copper on the board.
+- **Applied counts come from readback.** `coverage.orphans_deleted` is
+  `{planned, applied}` and `deleted_footprints` lists the footprints the board no
+  longer lists after the commit. A footprint KiCad still lists is an
+  `orphan_footprint_still_present` diagnostic and is not counted. The deletions are
+  in the same single undo entry as the rest of the apply.
+- `board_only_preserved` no longer counts a footprint that is planned for deletion.
+
 ## Unreleased: `replace_component` swaps the instance's `Sim.*` fields (minor release)
 
 `replace_component` now removes the replaced instance's `Sim.*` fields from every
@@ -42,6 +83,40 @@ now stop at 40,000 characters of listed items, even before `limit`, and say so.
   of its whole description. Pass `detail: "full"` for the old text. `tools/list` is
   unchanged. An unknown `detail` is refused.
 
+## Unreleased: Freerouting on boards with rounded outlines, rounded pads and pours (minor release)
+
+Creation PR 2b. `export_specctra_dsn` used to refuse any board with an arc in its
+outline (including the rounded outline `add_board_outline` draws), a rounded-rectangle
+or oval pad, or a copper zone. It now exports them; the other refusals stand.
+
+- **Outlines.** One closed loop of `gr_line`, `gr_arc`, `gr_rect`, `gr_circle` and
+  `gr_poly` on `Edge.Cuts`. The DSN writer has no arc, so arcs and circles become
+  chords whose middle strays at most 5 um from the true curve; the manifest says so.
+  Bezier curves (`gr_curve`), arcs in the pre-KiCad-7 centre-and-angle form, two
+  loops and loops enclosing no area are refused.
+- **Pads.** `roundrect` is written as its bounding rectangle: the router never sees
+  copper that is not there, and may not use the corners. `oval` is written as a
+  stadium (a path as wide as the short side); an oval with equal sides is a circle.
+  Trapezoid and custom pads are still refused.
+- **Zones.** A copper pour becomes a Specctra `plane` of its net on each of its copper
+  layers, which is how KiCad's own DSN export writes one. A rule area that forbids
+  tracks or vias becomes a keepout (tracks only, vias only, or both). Both come from the
+  zone's outline, not its fill: thermal reliefs and clearance gaps are not modelled, so
+  run DRC after a refill. A pour with no net, a pour on a net no pad is on, and a zone
+  with more than one outline are refused. The manifest gains `zone_plane_count` and
+  `zone_keepout_count`. The SES import adds tracks and vias only and refuses a board or
+  manifest whose zone inventory differs from the export's; it never edits a zone.
+- **Native bridge.** With `native_bridge_mode` `prefer`, KiCad's own DSN for a board with
+  rounded pads is no longer adopted (KiCad writes them as polygons, which the differential
+  check does not model), and the Rust DSN is used. `require` refuses.
+- **Freerouting setup.** `check_freerouting` reads the Java version the JAR needs from the
+  JAR itself and looks for a Java that meets it (`java_path`, `JAVA_HOME`, `PATH`, the
+  usual JDK folders). It returns `setup` with the exact steps when the JAR or the Java is
+  missing, and `available` is now false when the JAR cannot be started (it was true
+  whenever any Java started). `route_specctra_dsn` takes `java_path` and refuses before
+  starting anything when no Java meets the requirement. Konnect downloads and installs
+  nothing: that is your decision, and the steps are the commands you would run.
+
 ## Unreleased: wiring tools report the nets they join, and stubs and wires stop joining others (patch release)
 
 Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
@@ -53,8 +128,33 @@ Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
   would join is refused by `connect_to_net` with `plan_blocked` (one reason per
   direction tried) and skipped by `batch_connect_to_net`, which adds
   `"<ref>.<pin>: <reason>"` to `errors`. Reaching something already named by the
-  stub's own net is not a join. The chosen `direction` can differ from before when
-  the outward one was blocked.
+  stub's own net is not a join, whichever name that net carries (a power symbol's
+  name outranks a local label's, and the label still names it). The chosen
+  `direction` can differ from before when the outward one was blocked.
+- **Labels with no stub.** A label attaches to any wire it lies on, so `stub_length` 0
+  is checked too: a pin that sits mid-span on a wire with no junction would join that
+  wire's net through the label. `connect_to_net` refuses it with `plan_blocked`;
+  `batch_connect_to_net`, including its default label-only mode, skips the pin into
+  `errors`. A negative `stub_length` is refused with `invalid_argument`.
+- **A pin is not a tap.** `connect_pins`, `batch_connect_pins`, `connect_to_net` and
+  `batch_connect_to_net` (with or without a stub) no longer allow the net of a wire a
+  pin lies on without a junction: the route's, stub's or label's own T would join it,
+  so they refuse (the batch tools skip the pin into `errors`). `connect_to_net` with
+  `pin_x`/`pin_y` that are a placed pin's end counts as that pin. Any other
+  coordinate (`add_schematic_connection`, `connect_to_net` at a free point) still taps
+  the wire it lies on, as asked. `connect_pins_to_bus` checks each stub, bus entry
+  and label the same way and skips a pin that would join a foreign net into `errors`.
+- **Unreadable symbols.** The stub and route checks need every placed symbol's
+  library pins. When one cannot be read, `connect_pins`, `add_schematic_connection`
+  and `connect_to_net` refuse with `plan_blocked` and a reason that begins "cannot
+  check what the ... would join", because the check could not run; no join was found.
+  `batch_connect_pins`, and `batch_connect_to_net` with a stub, skip each pin into
+  `errors` with the same reason. A label with no stub is still judged, on the one
+  thing it can join, a wire under it: it goes on unless that wire is another net,
+  does not already carry the name, and the point is not a free coordinate.
+- **Failed batches.** `batch_connect_to_net` sets `isError` when every pin was
+  skipped, as `batch_connect_pins` does. A direct call with a negative `stub_length`
+  is refused there too.
 - **Junction dots (#900).** `add_wire`, `batch_add_wire` and the stub wires dot only
   the T-junctions the new wire forms, not every dot-less T on the sheet. A sheet that
   had one used to gain a junction, and so a joined net, on any wire drawn anywhere.
@@ -64,7 +164,8 @@ Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
   net that now holds two or more nets the sheet had before, named by label or, when
   nothing names a net, as `unnamed net with R1 pin 2`. It is `[]` when nothing was
   merged and `null` when a placed symbol's pins cannot be resolved. A net of bare
-  wires is not listed. `add_wire` and `batch_add_wire` take coordinates, so they draw
+  wires is not listed. `batch_connect_to_net` reports it in every mode, the default
+  label-only one included, where two labels of one name merge their nets. `add_wire` and `batch_add_wire` take coordinates, so they draw
   what they are given and only report. Check the result against intent with
   `compare_netlist`.
 

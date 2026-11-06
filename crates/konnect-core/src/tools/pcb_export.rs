@@ -254,12 +254,16 @@ pub fn tools() -> Vec<ToolDef> {
              editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. The first \
-             supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
-             and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
-             custom DRC rules, or incomplete effective routing rules instead of approximating \
-             them, and writes a \
+             is used. The supported \
+             profile is narrow: two copper layers, front-side SMD or through-hole footprints, \
+             circle, rectangle, rounded-rectangle and oval pads (a rounded rectangle is written \
+             as its bounding rectangle, never smaller than the copper), and one closed outline \
+             of lines, arcs, a rectangle, a circle or a polygon, where arcs and circles become \
+             chords within 5 um. Copper pours become fixed planes of their net and rule areas \
+             that forbid tracks or vias become keepouts, taken from the zone outline (not the \
+             fill), so check DRC after a refill. Locked straight tracks and vias are fixed wiring; \
+             unlocked routing, routed arcs, other pad shapes, curves, custom DRC rules and \
+             incomplete effective routing rules are refused instead of approximated. It writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
             json!({
                 "type": "object",

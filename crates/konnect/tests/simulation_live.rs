@@ -464,7 +464,20 @@ fn a_real_operating_point_runs_and_leaves_the_project_untouched() {
     assert_eq!(result["outcome"]["status"], "complete", "{result}");
     assert_eq!(result["simulated_circuit"], "as_drawn");
     assert_eq!(result["analysis"]["coverage_ratio"], 1.0);
-    assert_eq!(result["engine"]["version"], "44.2");
+    // KiCad ships its own libngspice, so the version follows the KiCad
+    // install (44.2 in 10.0.1, 45.2 in 10.0.8). Check that one is reported.
+    let version = result["engine"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no engine version in {result}"));
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or_else(|| panic!("engine version {version:?} is not MAJOR.MINOR"));
+    assert!(
+        major >= 44,
+        "KiCad 10 ships ngspice 44 or later, got {version}"
+    );
     let supply = row(&result, "v(+12v)");
     assert_eq!(supply["net"], "+12V", "{result}");
     assert_eq!(supply["unit"], "V");
