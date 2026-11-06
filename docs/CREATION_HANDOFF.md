@@ -33,7 +33,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
 | 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | **Open**: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19), branch `feat/creation-netlist-compare` |
-| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | **Open**, stacked on `feat/creation-netlist-compare`; branch `feat/schematic-route-safety` |
+| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | **Open**: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20), stacked on `feat/creation-netlist-compare`; branch `feat/schematic-route-safety` |
 | 3 | Response budget for ERC, DRC and list tools | none | Not started |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented | 1, 2 | Not started |
