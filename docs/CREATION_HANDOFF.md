@@ -32,7 +32,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
-| 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | **Open** (branch `feat/creation-netlist-compare`) |
+| 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | **Open**: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19), branch `feat/creation-netlist-compare` |
 | 2 | Route safety: port upstream #901, report `nets_joined`; PR 1 proves no net changed | 1 | Not started |
 | 3 | Response budget for ERC, DRC and list tools | none | Not started |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
