@@ -41,7 +41,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Not started |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
-| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | **Open**, first half: field copy and orphan delete (PR link below). Footprint replace and routed-pad reassignment are the follow-up, PR 9b, not started |
+| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | **Open**, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24). Footprint replace and routed-pad reassignment are the follow-up, PR 9b, not started |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Not started |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Not started |
@@ -64,7 +64,7 @@ A four-lens review of PR 20, each finding checked by two verifiers, confirmed te
 
 Seven guards were broken one at a time and each failed a test. Limits as before; the check still sees only pins, labels and sheet pins.
 
-## PR 9, sync completion, first half (open)
+## PR 9, sync completion, first half (open, #24)
 
 Branch `feat/creation-sync-completion`; all in `tools/pcb_sync.rs`, plus the two new arguments in the schema in `sch_export.rs`.
 
