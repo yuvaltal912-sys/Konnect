@@ -116,6 +116,8 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 
 Formatting, workspace tests (3,226 passed, 139 ignored), doctests (9 passed, 2 ignored), the live simulation tests (92 passed; the one failure is the ngspice 44.2 pin, a red baseline reported and not fixed), Clippy with warnings denied, `cargo deny check licenses`, documentation counts and the release build. The installed binary hash is unchanged. Not run: the dogfood run by pipe, hosted CI, Windows and Linux, and the KiCad dialog round trip, which stays an owner check.
 
+**The ngspice 44.2 pin is fixed (branch `fix/live-test-ngspice-version`).** `a_real_operating_point_runs_and_leaves_the_project_untouched` pinned the engine version to `44.2`, but KiCad ships its own libngspice, and 10.0.8 ships 45.2. The test now checks that a `MAJOR.MINOR` version of 44 or later is reported. With this fix the live suite has no red baseline.
+
 ## Simulation validation and stored results (merged as PR #15)
 
 The owner requested reproduction and repair of the known simulation issues. Work was on `fix/simulation-validation-and-results`, merged as PR #15 on 2026-11-06; it is not installed. The original macOS baseline passed formatting, workspace tests, doctests, 79 live simulation tests, Clippy, license checks and the release build.
