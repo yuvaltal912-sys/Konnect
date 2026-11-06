@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-06. The research is done. PR 1 (#19, 243d9c7) and PR 2 (#20, 65b6fc2) are merged. A review of PR 2 found ten defects; the fix PR is open and not merged. PR 3 (#21) is open and waits behind it and PR 2b. Ask the owner before starting anything else.
+**Last updated:** 2026-11-07. PRs 1, 2 and the PR 2 fixes are merged, and so is the ngspice test fix. PR 2b is open and not merged. PR 3 (#21) is open and waits behind it. Ask the owner before starting anything else.
 
 ## Start here
 
@@ -34,14 +34,14 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 |---|---|---|---|
 | 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | Merged: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19) |
 | 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: **open**, [#22](https://github.com/yuvaltal912-sys/Konnect/pull/22) |
-| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Not started (decided 2026-11-06, goes before PR 3) |
+| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | **Open**: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
 | 3 | Response budget for ERC, DRC and list tools | none | **Open**: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21), waits behind the PR 2 fixes and PR 2b |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | **Open**: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25) (not merged; run in parallel with PR 2b and #21 on the owner's say-so) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
-| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Not started |
+| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | **Open**, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24). Footprint replace and routed-pad reassignment are the follow-up, PR 9b, not started |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Not started |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Not started |
@@ -49,7 +49,23 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
-## Now: fixes from the review of PR 2
+## Now: PR 2b, Freerouting on real boards
+
+`export_specctra_dsn` refused any board with an arc in its outline, a rounded or oval pad, or a copper zone, so a real routing run was blocked and the AI hand-rolled a router. What changed (`specctra.rs`, `specctra_ses.rs`, `freerouting_setup.rs`, `check_freerouting`):
+
+- **Outline:** one closed loop of lines, arcs, a rectangle, a circle or a polygon. Specctra has no arc here, so arcs and circles are chords whose middle strays at most 5 um (`ARC_TOLERANCE_MM`); the manifest says so. Curves, old-form arcs, two loops and zero area are refused.
+- **Pads:** `roundrect` as its bounding rectangle (never smaller than the copper), `oval` as a stadium path, equal-sided oval as a circle. Trapezoid and custom are still refused.
+- **Zones:** a pour becomes a `plane` of its net per copper layer, a rule area that forbids tracks or vias becomes a keepout, both from the zone outline, as KiCad's own DSN does (the fixture carries KiCad's export for comparison). Thermal reliefs are not modelled: run DRC after a refill. The SES import still adds tracks and vias only; it now checks the board's zone inventory against the manifest and refuses a mismatch.
+- **Setup:** `check_freerouting` asks the JAR which Java it needs (the class-file version of its main class), looks for one (`java_path`, `JAVA_HOME`, `PATH`, the usual JDK folders) and returns `setup` with the exact steps. `available` is false when the JAR cannot start. `route_specctra_dsn` refuses before starting anything when no Java fits. **Approach chosen: guidance, not a downloader.** Fetching and running a 60 MB program from the network is the owner's decision; the steps are the commands they would run.
+- **Native bridge:** KiCad writes rounded pads as polygons, which the differential check does not model, so `native_bridge_mode: prefer` falls back to the Rust DSN on such boards (a test pins this).
+
+**Freerouting could not be run here.** The machine has Java 11 and Freerouting 2.1.0 needs Java 21 (`UnsupportedClassVersionError`, class file 65). Installing a JDK was not done. So the DSN was not run through the real engine. What was run instead: Konnect's own DSN parser round trip, the planes and keepouts compared with KiCad 10.0.8's own export of the same board, and the import planner on a Freerouting-authored SES (from another board, adapted; see the fixture README). The real-engine test is `freerouting_routes_the_rounded_board` (ignored): with a Java 21 and `FREEROUTING_JAR` set it exports, routes and plans the import. That is the one check still owed.
+
+Limits left: more than two copper layers and back-side parts (rank 32); the router sees a pour's outline, not its fill; a rounded pad's corners are unavailable to the router; the rounded-pad polygon KiCad writes is not adopted.
+
+## PR 2 fixes (merged)
+
+Review fixes for PR 2, now merged. In brief:
 
 A four-lens review of PR 20, each finding checked by two verifiers, confirmed ten defects in the merged code. All are fixed on `fix/route-safety-review`:
 
@@ -63,6 +79,19 @@ A four-lens review of PR 20, each finding checked by two verifiers, confirmed te
 - **Tests** for each of the above, the unreadable-symbol branch and `nets_joined: null`, and for the names a label-made merge reports. The ignored KiCad test also checks that the refused pin cases leave the circuit unchanged.
 
 Seven guards were broken one at a time and each failed a test. Limits as before; the check still sees only pins, labels and sheet pins.
+
+## PR 9, sync completion, first half (open, #24)
+
+Branch `feat/creation-sync-completion`; all in `tools/pcb_sync.rs`, plus the two new arguments in the schema in `sch_export.rs`.
+
+- **Field copy.** The netlist's `(fields …)` is read into `DesignComponent.fields` (everything but Reference, Value, Footprint and Component Class, as KiCad's updater skips them). A matched footprint's Datasheet, Description and user fields are compared by name; each difference is a `field_changes` entry (`name`, `from`, `to`) on the `update` change, and an added footprint carries `fields`. The write goes through `apply_footprint_fields`, the same path as reference and value. A user field the footprint lacks is created hidden on `F.Fab`/`B.Fab` at the footprint origin, as KiCad does; one the symbol leaves empty is not created. A footprint field the symbol lacks is left alone (KiCad removes it only under its "remove extra fields" option; Konnect has no such option yet). A board that was `noop` can now be `ready`.
+- **Orphans.** A footprint is an orphan when it has a schematic identity, is not board-only, matches no symbol, and its symbol is not merely excluded from the BOM (`ExportedDesign.bom_excluded` is new, because the flag reader used to drop those symbols without a trace, which would have orphaned their footprints). Always listed under `orphan_footprints`. `delete_orphan_footprints` plans a `delete` change for each and the apply deletes exactly those KIIDs, first in the commit. A locked orphan is kept (`kept_locked`). A conflicted plan deletes nothing (`kept_plan_conflict`).
+- **Attached copper.** Tracks, arcs and vias are now read with their geometry (`BoardState.copper`). Copper is attached to an orphan when it is on one of its pads' nets and an end lies inside the circle that holds that pad (half the diagonal of the largest layer size, plus half the track width; a via counts as 1 mm wide; any layer). It is deliberately wide: it can name copper that merely passes close and cannot miss connected copper. With `delete_orphan_footprints` alone, such an orphan makes the plan a conflict (`orphan_footprint_has_tracks`) that lists the copper. `delete_orphans_with_tracks` allows it; the copper stays. That flag without the first is `invalid_argument`.
+- **Readback.** `orphans_deleted.applied`, `deleted_footprints` and `fields_updated.applied` come from reading the footprints back after the commit. A footprint KiCad still lists is `orphan_footprint_still_present`; a field that did not land is `field_readback_differs`. The plan revision now covers footprint fields, locked and board-only flags and the copper KIIDs, and the deletions are in `changes`, so a plan reviewed without the flag cannot be applied with it.
+- **Proof.** Unit tests on the planner and on the served `tools/call` path against the protobuf mock board (changed field, idempotent second run, field already right, added footprint, orphan kept by default, unrouted orphan deleted, orphan with copper refused and then allowed, copper that does not touch, locked/unlinked/board-only/BOM-excluded never deleted, stale revision, a KiCad that ignores deletes or updates, flag misuse, conflicted plan). Sixteen guards were broken one at a time and each failed a test: copper never found, copper net or distance not compared, locked, board-only, unlinked and BOM-excluded footprints deleted, deletion on by default, a conflict that still deletes, deletion counted from the request, fields never compared, field readback skipped, the second flag accepted alone, new field visible, deletion never sent, Footprint field leaking into the field list.
+- **Not verified.** Nothing ran against a live KiCad: the field create/update and `DeleteItems` of a footprint are exercised only against the protobuf mock, shaped from KiCad 10.0.1's `footprint.cpp`/`pcb_field.cpp`. The live test is `crates/konnect/tests/live_kicad_tools.rs` (needs a disposable board). Windows and Linux were not run.
+- **Known limit.** Replacing a symbol under the same reference (delete R5, add a new R5) is still a `reference_identity_conflict`, and a conflict deletes nothing, so the old R5 has to go first (`delete_component`, or KiCad). Resolving that inside one plan belongs with PR 9b.
+- **PR 9b, next.** In-place footprint replacement (`footprint_id_changed`, now a conflict) and routed-pad net reassignment (`routed_pad_net_change`, now a conflict) need to keep position, rotation, side, locked state, pad nets and the tracks attached to the old pads. Ask the owner before starting.
 
 ## PR 2, route safety (merged, #20)
 

@@ -103,7 +103,13 @@ Follow this sequence for a clean PCB workflow:
    cannot be placed (custom-shape pads are not supported), assign those parts a
    footprint without them; when the schematic connects a pad the footprint does not
    have, fix the symbol or the footprint choice. A successful apply is one KiCad
-   undo entry, so Ctrl-Z reverses the whole update.
+   undo entry, so Ctrl-Z reverses the whole update. The sync also copies each
+   symbol's Datasheet, Description and user fields to its footprint (each change is
+   listed in the dry run). A footprint whose symbol is gone is listed in the dry run
+   and left alone; pass `delete_orphan_footprints: true` to the
+   dry run and the apply to delete it. One with tracks on its pads is refused unless
+   `delete_orphans_with_tracks: true` is also set, and then the tracks stay. A
+   changed footprint ID still needs KiCad's Update PCB (Replace footprints).
 3. **Refresh changed libraries** — when a linked footprint library changed, use
    `update_footprints_from_library`, the MCP equivalent of KiCad **Tools → Update
    Footprints from Library**. This is distinct from `update_pcb_from_schematic`:

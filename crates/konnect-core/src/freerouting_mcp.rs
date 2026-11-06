@@ -58,6 +58,8 @@ pub(crate) struct RouteSettings {
     pub job_timeout_seconds: Option<u64>,
     pub poll_interval: Duration,
     pub overall_timeout: Duration,
+    /// The Java to run the JAR with; `java` on `PATH` when unset.
+    pub java: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,8 +84,8 @@ pub(crate) struct BridgeProbe {
     pub error: Option<String>,
 }
 
-pub(crate) async fn probe_local(jar: &Path) -> BridgeProbe {
-    let mut client = match LocalMcpClient::start(jar).await {
+pub(crate) async fn probe_local(jar: &Path, java: Option<&Path>) -> BridgeProbe {
+    let mut client = match LocalMcpClient::start(jar, java).await {
         Ok(client) => client,
         Err(error) => {
             return BridgeProbe {
@@ -158,7 +160,7 @@ pub(crate) async fn route_local(
         );
     }
 
-    let mut client = LocalMcpClient::start(jar).await?;
+    let mut client = LocalMcpClient::start(jar, settings.java.as_deref()).await?;
     let started = Instant::now();
     let route_result = match timeout(
         settings.overall_timeout,
@@ -456,8 +458,8 @@ struct LocalMcpClient {
 }
 
 impl LocalMcpClient {
-    async fn start(jar: &Path) -> Result<Self> {
-        let mut client = Self::spawn(jar)?;
+    async fn start(jar: &Path, java: Option<&Path>) -> Result<Self> {
+        let mut client = Self::spawn(jar, java)?;
         if let Err(error) = client.initialize().await {
             let diagnostics = client.close().await;
             return if diagnostics.is_empty() {
@@ -469,8 +471,8 @@ impl LocalMcpClient {
         Ok(client)
     }
 
-    fn spawn(jar: &Path) -> Result<Self> {
-        let mut command = Command::new("java");
+    fn spawn(jar: &Path, java: Option<&Path>) -> Result<Self> {
+        let mut command = Command::new(java.unwrap_or_else(|| Path::new("java")));
         command
             .arg("-jar")
             .arg(jar)
@@ -920,6 +922,7 @@ mod tests {
                 job_timeout_seconds: Some(300),
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
+                java: None,
             },
         )
         .await
@@ -954,6 +957,7 @@ mod tests {
                     job_timeout_seconds: Some(300),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
+                    java: None,
                 },
             )
             .await
@@ -1001,6 +1005,7 @@ mod tests {
                     job_timeout_seconds: Some(300),
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
+                    java: None,
                 },
             )
             .await

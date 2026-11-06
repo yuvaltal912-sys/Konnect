@@ -1,6 +1,7 @@
 pub mod config_resolution;
 pub mod design_hash;
 pub(crate) mod freerouting_mcp;
+pub(crate) mod freerouting_setup;
 pub mod gates;
 pub mod guidance;
 pub mod kicad_install;

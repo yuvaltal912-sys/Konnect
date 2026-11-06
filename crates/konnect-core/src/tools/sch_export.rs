@@ -193,14 +193,20 @@ pub fn tools() -> Vec<ToolDef> {
              run a conflict whose diagnostics name the footprint and every part that needs it. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
-             is never reported as complete or empty.",
+             is never reported as complete or empty. Every symbol field (Datasheet, \
+             Description, user fields) is copied to its footprint, and the changes are listed \
+             per footprint. A footprint whose symbol is gone is listed under \
+             `orphan_footprints`; `delete_orphan_footprints` deletes them, and refuses one \
+             with tracks attached unless `delete_orphans_with_tracks` is also set.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
                     "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
-                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
+                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
+                    "delete_orphan_footprints": { "type": "boolean", "description": "Delete board footprints whose symbol is no longer in the saved schematic. Board-only, unlinked and locked footprints are never deleted. Pass the same value to the dry run and the apply", "default": false },
+                    "delete_orphans_with_tracks": { "type": "boolean", "description": "Also delete an orphan footprint that has tracks, arcs or vias on its pads. The copper stays on the board. Needs delete_orphan_footprints", "default": false }
                 },
                 "required": ["schematic", "board"]
             }),
