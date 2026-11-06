@@ -52,7 +52,7 @@ Execute in this order — do not skip steps:
 **Phase 2: Formal Rule Checks**
 - Run `run_erc` — review every error and warning
 - Run `get_drc_violations` if a PCB exists — review every violation
-- Check net connectivity matches intent
+- Check net connectivity matches intent: `compare_netlist` against the intended `{net: ["REF.PIN"]}`, or against a reference design
 - Mark an unavailable or structurally incomplete required check `BLOCKED`; the
   overall verdict is then `INCOMPLETE`
 

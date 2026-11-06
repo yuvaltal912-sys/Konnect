@@ -26,7 +26,7 @@ use super::sch_connectivity::net_graph_for;
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "export_schematic_svg",
             "Export a schematic sheet to an SVG file using kicad-cli. The result doubles as a              machine-readable geometry source: kicad-cli writes every string twice — visibly as              stroke paths, and again as an invisible <text opacity=\"0\"> element carrying x, y,              textLength, font-size and text-anchor — so text content, position and width are              checkable without rendering a pixel.",
@@ -209,7 +209,9 @@ pub fn tools() -> Vec<ToolDef> {
             }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
-    ]
+    ];
+    tools.extend(super::sch_netlist::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -1648,7 +1650,7 @@ mod tests {
         assert!(names.contains(&"render_schematic_png"), "{names:?}");
         assert!(names.contains(&"set_visual_baseline"), "{names:?}");
         assert!(names.contains(&"compare_visual_baseline"), "{names:?}");
-        assert_eq!(names.len(), 10, "sch_export tool count");
+        assert_eq!(names.len(), 12, "sch_export tool count");
     }
 
     #[tokio::test]

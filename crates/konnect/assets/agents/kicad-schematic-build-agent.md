@@ -65,6 +65,7 @@ load_toolset("templates")
 - Run `validate_wire_connections` and `validate_component_connections`
 - Run `find_shorted_nets`; reconcile every result against intended connectivity
 - Run `run_erc`; classify every violation and preserve any explicit waiver
+- Final connectivity check: run `compare_netlist` with the intended `{net: ["REF.PIN"]}` (`get_schematic_netlist` reads the whole hierarchy). A `fail` or `incomplete` verdict is not done
 - Run `render_schematic_png` with inline output and inspect the image
 - Confirm functional blocks are visually grouped, labels and symbols do not
   overlap, and all content remains inside the page boundaries
