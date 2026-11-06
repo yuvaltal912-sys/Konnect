@@ -4010,3 +4010,201 @@ fn a_model_that_leaves_a_wired_pin_unmapped_is_refused_and_writes_nothing() {
     assert_eq!(refused["outcome"]["status"], "failed");
     assert_eq!(std::fs::read_to_string(&schematic).unwrap(), before);
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn both_fitted_tvs_kinds_are_read_by_kicad_and_clamp_on_the_engine() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let tvs = json!([
+        { "quantity": "breakdown_voltage", "value": 15.0, "conditions": { "reverse_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "clamping_voltage", "value": 24.0, "conditions": { "peak_pulse_current_amps": 20.0 }, "statistic": "maximum" },
+        { "quantity": "reverse_current", "value": 1e-6, "conditions": { "reverse_voltage_volts": 12.0 }, "statistic": "maximum" },
+        { "quantity": "forward_voltage", "value": 1.0, "conditions": { "forward_current_amps": 1.0 }, "statistic": "maximum" }
+    ]);
+    let bidirectional = json!([
+        { "quantity": "breakdown_voltage", "value": 15.0, "conditions": { "reverse_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "clamping_voltage", "value": 24.0, "conditions": { "peak_pulse_current_amps": 20.0 }, "statistic": "maximum" },
+        { "quantity": "reverse_current", "value": 1e-6, "conditions": { "reverse_voltage_volts": 12.0 }, "statistic": "maximum" }
+    ]);
+    let readiness = || {
+        (
+            "check_simulation_readiness",
+            json!({ "schematic": schematic }),
+        )
+    };
+    let pins = json!({ "1": "K", "2": "A" });
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "tvs", "smbj15_fit", tvs),
+            create_model(
+                &schematic,
+                "tvs_bidirectional",
+                "smbj15ca_fit",
+                bidirectional,
+            ),
+            assign_model(&schematic, &["D1"], "smbj15_fit", pins.clone()),
+            readiness(),
+            assign_model(&schematic, &["D1"], "smbj15ca_fit", pins),
+            readiness(),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+    }
+    for at in [2, 4] {
+        assert_eq!(
+            results[at]["outcome"]["status"], "complete",
+            "{}",
+            results[at]
+        );
+        assert_eq!(results[at + 1]["ready"], true, "{}", results[at + 1]);
+        assert_eq!(results[at]["parts"][0]["element"], "XD1", "{}", results[at]);
+    }
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/class-d"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("Class-D.kicad_sch");
+    let transfer = |vgs: f64, vds: f64, amps: f64| {
+        json!({
+            "quantity": "drain_current", "value": amps,
+            "conditions": { "gate_source_voltage_volts": vgs, "drain_source_voltage_volts": vds },
+            "statistic": "typical"
+        })
+    };
+    let capacitance = |quantity: &str, vds: f64, farads: f64| {
+        json!({
+            "quantity": quantity, "value": farads,
+            "conditions": { "drain_source_voltage_volts": vds }, "statistic": "typical"
+        })
+    };
+    let values = json!([
+        { "quantity": "gate_threshold_voltage", "value": 2.7029, "conditions": { "drain_current_amps": 2.5e-4 }, "statistic": "typical" },
+        { "quantity": "on_resistance", "value": 0.02478, "conditions": { "gate_source_voltage_volts": 10.0, "drain_current_amps": 20.0 }, "statistic": "typical" },
+        transfer(3.5, 10.0, 2.446),
+        transfer(4.5, 10.0, 20.93),
+        transfer(6.0, 10.0, 78.261),
+        transfer(8.0, 10.0, 200.0),
+        { "quantity": "forward_voltage", "value": 0.8, "conditions": { "forward_current_amps": 1.0 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 1.0, "conditions": { "forward_current_amps": 20.0 }, "statistic": "typical" },
+        { "quantity": "gate_resistance", "value": 1.5, "conditions": { "frequency_hz": 1e6 }, "statistic": "typical" },
+        capacitance("reverse_transfer_capacitance", 1.0, 1.6861e-9),
+        capacitance("reverse_transfer_capacitance", 5.0, 1.1205e-9),
+        capacitance("reverse_transfer_capacitance", 10.0, 7.3245e-10),
+        capacitance("reverse_transfer_capacitance", 25.0, 3.5803e-10),
+        capacitance("reverse_transfer_capacitance", 50.0, 2.1159e-10),
+        capacitance("input_capacitance", 1.0, 3.6861e-9),
+        capacitance("input_capacitance", 50.0, 2.2116e-9),
+        capacitance("output_capacitance", 1.0, 2.4861e-9),
+        capacitance("output_capacitance", 10.0, 1.059e-9),
+        capacitance("output_capacitance", 50.0, 3.6218e-10),
+        { "quantity": "gate_charge", "value": 6.6e-8, "conditions": { "drain_source_voltage_volts": 25.0, "drain_current_amps": 20.0, "gate_source_voltage_volts": 10.0 }, "statistic": "typical" },
+        { "quantity": "gate_drain_charge", "value": 2.1e-8, "conditions": { "drain_source_voltage_volts": 25.0, "drain_current_amps": 20.0 }, "statistic": "typical" }
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "n_mosfet", "nfet_fit", values.clone()),
+            create_model(&schematic, "p_mosfet", "pfet_fit", values),
+            assign_model(
+                &schematic,
+                &["Q2"],
+                "nfet_fit",
+                json!({ "1": "D", "2": "G", "3": "S" }),
+            ),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+        // The gate charges are read from a transient run: the engine's values
+        // sit within tolerance of the ones the capacitances imply.
+        for quantity in ["gate_charge", "gate_drain_charge"] {
+            let row = created["verification"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["quantity"] == quantity)
+                .unwrap_or_else(|| panic!("no {quantity} row in {created}"));
+            assert_eq!(row["role"], "check_only", "{row}");
+            assert_eq!(row["within_tolerance"], true, "{row}");
+        }
+    }
+    assert_eq!(
+        results[2]["outcome"]["status"], "complete",
+        "{}",
+        results[2]
+    );
+    assert_eq!(results[2]["parts"][0]["element"], "XQ2", "{}", results[2]);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn both_fitted_bipolar_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/amplifier-ac"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("amplifier-ac.kicad_sch");
+    let gain = |ic: f64, hfe: f64| {
+        json!({
+            "quantity": "current_gain", "value": hfe,
+            "conditions": { "collector_current_amps": ic, "collector_emitter_voltage_volts": 5.0 },
+            "statistic": "typical"
+        })
+    };
+    let vbe = |ic: f64, volts: f64| {
+        json!({
+            "quantity": "base_emitter_voltage", "value": volts,
+            "conditions": { "collector_current_amps": ic, "collector_emitter_voltage_volts": 5.0 },
+            "statistic": "typical"
+        })
+    };
+    let junction = |quantity: &str, volts: f64, farads: f64| {
+        json!({
+            "quantity": quantity, "value": farads,
+            "conditions": { "reverse_voltage_volts": volts }, "statistic": "typical"
+        })
+    };
+    let values = json!([
+        gain(1e-4, 70.001),
+        gain(1e-3, 107.243),
+        gain(1e-2, 140.32),
+        gain(1e-1, 141.878),
+        vbe(1e-3, 0.6508),
+        vbe(1e-1, 0.77376),
+        { "quantity": "collector_emitter_saturation_voltage", "value": 0.05491, "conditions": { "collector_current_amps": 0.1, "base_current_amps": 0.01 }, "statistic": "typical" },
+        junction("collector_base_capacitance", 1.0, 3.0243e-12),
+        junction("collector_base_capacitance", 10.0, 1.6614e-12),
+        junction("emitter_base_capacitance", 0.5, 1.0138e-11),
+        { "quantity": "transition_frequency", "value": 3e8, "conditions": { "collector_current_amps": 0.01, "collector_emitter_voltage_volts": 5.0 }, "statistic": "typical" }
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "npn", "npn_fit", values.clone()),
+            create_model(&schematic, "pnp", "pnp_fit", values),
+            assign_model(
+                &schematic,
+                &["Q2"],
+                "npn_fit",
+                json!({ "1": "C", "2": "B", "3": "E" }),
+            ),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+    }
+    assert_eq!(
+        results[2]["outcome"]["status"], "complete",
+        "{}",
+        results[2]
+    );
+    assert_eq!(results[2]["parts"][0]["element"], "XQ2", "{}", results[2]);
+}

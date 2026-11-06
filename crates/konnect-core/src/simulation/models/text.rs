@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 /// Starts the first line of every fitted file.
 pub(crate) const MARKER_PREFIX: &str = "* konnect-fitted-model v1 ";
 pub(crate) const MAX_NAME: usize = 32;
+/// The longest kind name a marker carries (`tvs_bidirectional` is 17).
+const MAX_KIND: usize = 24;
 /// Every fitted model's name ends so, so it never reads as a vendor's model in
 /// KiCad, a BOM or a deck.
 pub(crate) const NAME_SUFFIX: &str = "_fit";
@@ -26,6 +28,19 @@ const MAX_LINES: usize = 400;
 pub(crate) const DIODE_PARAMETERS: [&str; 12] = [
     "IS", "N", "RS", "BV", "IBV", "NBV", "CJO", "VJ", "M", "EG", "XTI", "TNOM",
 ];
+
+/// Parameters a fitted VDMOS card may set. The channel type goes on a line of
+/// its own as a bare `NCHAN` or `PCHAN`.
+pub(crate) const MOSFET_PARAMETERS: [&str; 22] = [
+    "VTO", "KP", "THETA", "RD", "RS", "RG", "RB", "IS", "N", "EG", "XTI", "TNOM", "CGS", "CGDMIN",
+    "CGDMAX", "A", "CJO", "VJ", "M", "BV", "IBV", "NBV",
+];
+/// Parameters a fitted bipolar card may set.
+pub(crate) const BJT_PARAMETERS: [&str; 17] = [
+    "IS", "NF", "BF", "IKF", "ISE", "NE", "BR", "RC", "CJE", "VJE", "MJE", "CJC", "VJC", "MJC",
+    "TF", "TNOM", "NR",
+];
+const CHANNEL_FLAGS: [&str; 2] = ["NCHAN", "PCHAN"];
 
 /// A model name every parser reads alike, that says it was fitted.
 pub(crate) fn check_name(name: &str) -> Result<(), String> {
@@ -77,6 +92,42 @@ fn is_number(token: &str) -> bool {
 /// `.model NAME D` with its parameters on continuation lines.
 pub(crate) fn diode_card(name: &str, parameters: &[(&'static str, f64)]) -> String {
     let mut card = format!(".model {name} D\n");
+    for chunk in parameters.chunks(PARAMETERS_PER_LINE) {
+        let line: Vec<String> = chunk
+            .iter()
+            .map(|(key, value)| format!("{key}={}", number(*value)))
+            .collect();
+        card.push_str("+ ");
+        card.push_str(&line.join(" "));
+        card.push('\n');
+    }
+    card
+}
+
+/// `.model NAME VDMOS` with its channel type on a line of its own, then its
+/// parameters on continuation lines.
+pub(crate) fn vdmos_card(
+    name: &str,
+    p_channel: bool,
+    parameters: &[(&'static str, f64)],
+) -> String {
+    let mut card = format!(".model {name} VDMOS\n");
+    card.push_str(if p_channel { "+ PCHAN\n" } else { "+ NCHAN\n" });
+    for chunk in parameters.chunks(PARAMETERS_PER_LINE) {
+        let line: Vec<String> = chunk
+            .iter()
+            .map(|(key, value)| format!("{key}={}", number(*value)))
+            .collect();
+        card.push_str("+ ");
+        card.push_str(&line.join(" "));
+        card.push('\n');
+    }
+    card
+}
+
+/// `.model NAME NPN` or `PNP`, with its parameters on continuation lines.
+pub(crate) fn bjt_card(name: &str, pnp: bool, parameters: &[(&'static str, f64)]) -> String {
+    let mut card = format!(".model {name} {}\n", if pnp { "PNP" } else { "NPN" });
     for chunk in parameters.chunks(PARAMETERS_PER_LINE) {
         let line: Vec<String> = chunk
             .iter()
@@ -264,7 +315,7 @@ pub(crate) fn check_fitted(bytes: &[u8]) -> Result<Fitted, String> {
         field("body-sha256")?,
         field("verdict")?,
     );
-    if fields.split(' ').count() != 4 || verdict != "pass" || !is_identifier(kind, 16) {
+    if fields.split(' ').count() != 4 || verdict != "pass" || !is_identifier(kind, MAX_KIND) {
         return Err("the marker is not one Konnect writes".to_string());
     }
     check_name(name)?;
@@ -291,7 +342,7 @@ fn check_cards(body: &str, name: &str) -> Result<Card, String> {
     let first: Vec<&str> = lines[0].split(' ').collect();
     match first.as_slice() {
         [".model", card_name, "D"] if *card_name == name => {
-            let parameter_lines = check_continuations(&lines[1..], 0)?;
+            let parameter_lines = check_continuations(&lines[1..], 0, &DIODE_PARAMETERS, false)?;
             if 1 + parameter_lines != lines.len() {
                 return Err(format!(
                     "line {} follows the diode card, where Konnect writes nothing",
@@ -321,13 +372,23 @@ fn check_cards(body: &str, name: &str) -> Result<Card, String> {
     }
 }
 
-/// `+ KEY=number` lines after a `.model` card, from line `start` on.
-fn check_continuations(lines: &[&str], start: usize) -> Result<usize, String> {
+/// `+ KEY=number` lines after a `.model` card, from line `start` on. With
+/// `flag`, the first line may instead be a bare channel type.
+fn check_continuations(
+    lines: &[&str],
+    start: usize,
+    allowed: &[&str],
+    flag: bool,
+) -> Result<usize, String> {
     let mut count = 0;
     for line in lines {
         let Some(rest) = line.strip_prefix("+ ") else {
             break;
         };
+        if flag && count == 0 && CHANNEL_FLAGS.contains(&rest) {
+            count += 1;
+            continue;
+        }
         let pairs: Vec<&str> = rest.split(' ').collect();
         if pairs.is_empty() || pairs.len() > PARAMETERS_PER_LINE {
             return Err(format!(
@@ -338,17 +399,23 @@ fn check_continuations(lines: &[&str], start: usize) -> Result<usize, String> {
         for pair in pairs {
             let ok = pair
                 .split_once('=')
-                .is_some_and(|(key, value)| DIODE_PARAMETERS.contains(&key) && is_number(value));
+                .is_some_and(|(key, value)| allowed.contains(&key) && is_number(value));
             if !ok {
                 return Err(format!(
-                    "line {} sets something a fitted diode does not",
+                    "line {} sets something a fitted model does not",
                     start + count + 2
                 ));
             }
         }
         count += 1;
     }
-    if count == 0 {
+    if count == 0
+        || (flag
+            && count == 1
+            && lines[0]
+                .strip_prefix("+ ")
+                .is_some_and(|r| CHANNEL_FLAGS.contains(&r)))
+    {
         return Err("a model card has no parameters".to_string());
     }
     Ok(count)
@@ -361,6 +428,21 @@ fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
         .filter_map(|rest| rest.strip_suffix(" D"))
         .map(str::to_string)
         .collect();
+    let bjt_models: Vec<String> = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix(".model "))
+        .filter_map(|rest| {
+            rest.strip_suffix(" NPN")
+                .or_else(|| rest.strip_suffix(" PNP"))
+        })
+        .map(str::to_string)
+        .collect();
+    let mos_models: Vec<String> = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix(".model "))
+        .filter_map(|rest| rest.strip_suffix(" VDMOS"))
+        .map(str::to_string)
+        .collect();
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
@@ -369,20 +451,37 @@ fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
         let ok = match tokens.first().copied() {
             Some(".model") => {
                 let model = tokens.get(1).copied().unwrap_or_default();
-                let named = model
-                    .strip_prefix(name)
-                    .is_some_and(|rest| matches!(rest, "_f" | "_b"));
-                if !(tokens.len() == 3 && tokens[2] == "D" && named) {
-                    return Err(format!("line {} is not a model Konnect writes", index + 2));
-                }
-                index += 1 + check_continuations(&lines[index + 1..], index + 1)?;
+                let suffix = model.strip_prefix(name).unwrap_or_default();
+                let (allowed, flag): (&[&str], bool) = match (tokens.get(2).copied(), suffix) {
+                    (Some("D"), "_f" | "_b") if tokens.len() == 3 => (&DIODE_PARAMETERS, false),
+                    (Some("VDMOS"), "_m") if tokens.len() == 3 => (&MOSFET_PARAMETERS, true),
+                    (Some("NPN" | "PNP"), "_q") if tokens.len() == 3 => (&BJT_PARAMETERS, false),
+                    _ => {
+                        return Err(format!("line {} is not a model Konnect writes", index + 2));
+                    }
+                };
+                index += 1 + check_continuations(&lines[index + 1..], index + 1, allowed, flag)?;
                 continue;
+            }
+            Some("Q1") => {
+                matches!(
+                    tokens.as_slice(),
+                    [_, c, b, e, model] if is_node(c) && is_node(b) && is_node(e)
+                        && bjt_models.iter().any(|m| m == model)
+                )
+            }
+            Some("M1") => {
+                matches!(
+                    tokens.as_slice(),
+                    [_, d, g, s, model] if is_node(d) && is_node(g) && is_node(s)
+                        && mos_models.iter().any(|m| m == model)
+                )
             }
             Some("VKONNECT") => {
                 matches!(tokens.as_slice(), [_, a, b, "0"] if is_node(a) && is_node(b))
             }
             Some("R1" | "R2" | "RL" | "L1" | "C1") => number_line(&tokens),
-            Some("DF" | "DB") => matches!(
+            Some("DF" | "DB" | "DG" | "DH") => matches!(
                 tokens.as_slice(),
                 [_, a, b, model] if is_node(a) && is_node(b) && inner_models.iter().any(|m| m == model)
             ),
