@@ -1126,15 +1126,17 @@ fn own_lines(analysis: &Analysis, save_currents: bool, probes: &[String]) -> Vec
     lines
 }
 
+/// Write the deck and the worker's request into a run folder. Any folder will
+/// do: a stored run's, or a bench's temporary one.
 fn prepare_run(
-    run: &runs::RunFolder,
+    dir: &Path,
     deck: &FlatDeck,
     own_lines: &[String],
     request: &RunRequest,
 ) -> anyhow::Result<()> {
     let own_lines: Vec<&str> = own_lines.iter().map(String::as_str).collect();
-    std::fs::write(run.dir.join(DECK_FILE), deck.render_with(&own_lines))?;
-    std::fs::write(run.dir.join(REQUEST_FILE), serde_json::to_vec(request)?)?;
+    std::fs::write(dir.join(DECK_FILE), deck.render_with(&own_lines))?;
+    std::fs::write(dir.join(REQUEST_FILE), serde_json::to_vec(request)?)?;
     Ok(())
 }
 
@@ -1236,7 +1238,7 @@ async fn run_analysis(
         ),
     };
     let own_lines = own_lines(&analysis, !event_nodes && !keep_conditions, &probes);
-    prepare_run(&run, deck, &own_lines, &worker_request)
+    prepare_run(&run.dir, deck, &own_lines, &worker_request)
         .map_err(|error| store_failure(format!("Failed to prepare the run: {error:#}")))?;
     let end = run_worker(runtime, &run.dir, &library, budget)
         .await
