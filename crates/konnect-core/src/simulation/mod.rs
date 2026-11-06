@@ -11,6 +11,7 @@ pub(crate) mod export;
 pub(crate) mod flatten;
 pub(crate) mod kicad_netlist;
 pub(crate) mod measure;
+pub(crate) mod models;
 pub(crate) mod net_names;
 pub(crate) mod plot;
 pub(crate) mod preflight;

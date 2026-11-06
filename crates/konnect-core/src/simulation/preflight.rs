@@ -1036,6 +1036,28 @@ fn warnings(inputs: &Inputs<'_>, circuit: &Circuit, unmodelled: usize) -> Vec<Wa
             .chain(circuit.default_models.iter().cloned())
             .collect(),
     );
+    let fitted = fitted_models(inputs, circuit);
+    warn(
+        "fitted_model",
+        "These parts use a model Konnect fitted to datasheet values the caller gave, or a \
+         subcircuit that calls one. The model reproduces those values on the engine at the datasheet's temperature, not the part's \
+         full behaviour, and a run is at 27 C unless the circuit sets another. Under \
+         use_initial_conditions a .ic on a fitted passive's pin does not set the charge inside \
+         it. The model's .konnect.json says what it was fitted to.",
+        fitted.fitted,
+    );
+    warn(
+        "fitted_model_overridden",
+        "These parts use a fitted model whose parameters were changed in KiCad's Simulation \
+         Model dialog, so the values it was checked against may no longer hold.",
+        fitted.overridden,
+    );
+    warn(
+        "fitted_model_unverified",
+        "These parts use a fitted model that was edited after Konnect wrote it, or shares a \
+         name with another model, so the values it was checked against may not hold.",
+        fitted.unverified,
+    );
     warn(
         "unknown_initial_node",
         "These .ic or .nodeset nodes match no net, and ngspice drops them without saying so.",
@@ -1068,6 +1090,107 @@ fn warnings(inputs: &Inputs<'_>, circuit: &Circuit, unmodelled: usize) -> Vec<Wa
         inputs.unmatched_exclusions.to_vec(),
     );
     warnings
+}
+
+/// Parts on Konnect-fitted models, found from the files the deck consumed.
+#[derive(Debug, Default)]
+struct FittedModels {
+    /// References of parts whose model is a verified fitted one.
+    fitted: Vec<String>,
+    /// References of parts on KiCad's regenerated `REF.name` card of one.
+    overridden: Vec<String>,
+    /// References of parts on a fitted model that was edited after Konnect
+    /// wrote it, or whose name another model shares.
+    unverified: Vec<String>,
+}
+
+fn fitted_models(inputs: &Inputs<'_>, circuit: &Circuit) -> FittedModels {
+    let mut found = FittedModels::default();
+    let mut names: Vec<String> = Vec::new();
+    let mut doubtful: Vec<String> = Vec::new();
+    for input in &inputs.deck.fitted_inputs {
+        let shared = input
+            .name
+            .as_ref()
+            .is_some_and(|name| circuit.conflicting_definitions.contains(name));
+        match &input.name {
+            Some(name) if input.verified && !shared => names.push(name.clone()),
+            // An edited file is read for what it defines, since its marker
+            // may no longer name it.
+            _ => doubtful.extend(input.defines.iter().cloned()),
+        }
+    }
+    // A name both verified and doubtful, as when a copy was edited, is doubtful.
+    names.retain(|name| !doubtful.contains(name));
+    if names.is_empty() && doubtful.is_empty() {
+        return found;
+    }
+    let reference_of = |element: &str| {
+        inputs
+            .elements
+            .iter()
+            .find(|entry| {
+                entry
+                    .element_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(element))
+                    && !entry.excluded
+            })
+            .map_or_else(|| element.to_string(), |entry| entry.reference.clone())
+    };
+    let base_of = |model: &str| model.split_once('.').map(|(_, base)| base.to_string());
+    // What each subcircuit reaches, as (any doubtful, any verified), read once.
+    let mut reached: std::collections::HashMap<String, (bool, bool)> =
+        std::collections::HashMap::new();
+    for element in circuit
+        .elements
+        .iter()
+        .filter(|element| !element.from_testbench)
+    {
+        if !matches!(element.kind, 'd' | 'x') {
+            continue;
+        }
+        let Some(model) = element.args.first().map(|model| model.to_lowercase()) else {
+            continue;
+        };
+        let known = |name: &String| names.contains(name) || doubtful.contains(name);
+        // KiCad's dialog writes a diode's instance parameters, such as m=2 or
+        // area, on its element line and no card of its own.
+        let instance_parameters = element.kind == 'd' && element.args.len() > 1;
+        let reference = || reference_of(&element.name);
+        if known(&model) && instance_parameters {
+            found.overridden.push(reference());
+        } else if names.contains(&model) {
+            found.fitted.push(reference());
+        } else if doubtful.contains(&model) {
+            found.unverified.push(reference());
+        } else if base_of(&model).is_some_and(|base| known(&base)) {
+            found.overridden.push(reference());
+        } else if element.kind == 'x' {
+            // A hand-written subcircuit that calls a fitted model rests on it.
+            let (any_doubtful, any_verified) = *reached.entry(model.clone()).or_insert_with(|| {
+                let models = circuit.models_reached_by(&model);
+                (
+                    models.iter().any(|name| doubtful.contains(name)),
+                    models.iter().any(|name| names.contains(name)),
+                )
+            });
+            if any_doubtful {
+                found.unverified.push(reference());
+            } else if any_verified {
+                found.fitted.push(reference());
+            }
+        }
+    }
+    for list in [
+        &mut found.fitted,
+        &mut found.overridden,
+        &mut found.unverified,
+    ] {
+        list.sort();
+        list.dedup();
+    }
+    found
 }
 
 /// Groups joined by any element at all, with ground not counted as a connection
@@ -1657,6 +1780,7 @@ mod tests {
             lib_id: None,
             has_sim_fields: false,
             sim_params: None,
+            ..Default::default()
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -1777,6 +1901,7 @@ mod tests {
             lib_id: None,
             has_sim_fields: false,
             sim_params: None,
+            ..Default::default()
         }
     }
 
@@ -2944,6 +3069,71 @@ mod tests {
     }
 
     #[test]
+    fn a_fitted_passive_and_its_sense_source_power_nothing() {
+        let fitted = ".subckt c_fit 1 2\nVKONNECT 1 n1 0\nC1 n1 2 1e-6\n.ends c_fit";
+        let preflight = deck(&format!(
+            "{fitted}\nV1 a 0 1\nR3 a 0 1k\nX1 b 0 c_fit\nR2 b 0 1k"
+        ));
+        assert_eq!(warned(&preflight, "unpowered_net"), ["b"]);
+        let sourced = ".subckt s p q\nVKONNECT p n1 1\nR1 n1 q 1k\n.ends s";
+        let preflight = deck(&format!(
+            "{sourced}\nV1 a 0 1\nR3 a 0 1k\nX1 b 0 s\nR2 b 0 1k"
+        ));
+        assert!(warned(&preflight, "unpowered_net").is_empty());
+    }
+
+    #[test]
+    fn parts_on_fitted_models_are_named_and_an_edited_model_is_named_by_part() {
+        use crate::simulation::models::text;
+        let card = |name: &str, is: &str| format!(".model {name} D\n+ IS={is} N=1.800000e0\n");
+        let good = text::file("diode", "good_fit", &card("good_fit", "1.000000e-9"));
+        let edited = text::file("diode", "edit_fit", &card("edit_fit", "1.000000e-9"))
+            .replace("IS=1.000000e-9", "IS=2.000000e-9");
+        let renamed = text::file("diode", "lost_fit", &card("lost_fit", "1.000000e-9"))
+            .replace("name=lost_fit", "name=Lost");
+        // A note added above the marker is an edit too.
+        let noted = format!(
+            "* measured on the bench\n{}",
+            text::file("diode", "note_fit", &card("note_fit", "1.000000e-9"))
+        );
+        let netlist = ".title t\n.include \"good.lib\"\n.include \"edit.lib\"\n\
+                       .include \"lost.lib\"\n.include \"note.lib\"\n\
+                       .subckt clamp io g\nD1 io g good_fit\n.ends clamp\n\
+                       V1 /in 0 5\nD1 /in /out good_fit\n\
+                       D2 /out 0 edit_fit\nD3 /out 0 lost_fit\nD4 /out 0 good_fit\n\
+                       D5 /out 0 good_fit m=2\nD6 /out 0 note_fit\nXU1 /out 0 clamp\n\
+                       R1 /out 0 1k\n.end\n";
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for (name, text) in [
+            ("good.lib", &good),
+            ("edit.lib", &edited),
+            ("lost.lib", &renamed),
+            ("note.lib", &noted),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let kicad = KiCadNetlist {
+            components: ["D1", "D2", "D3", "D4", "D5", "D6", "U1"]
+                .map(component)
+                .to_vec(),
+            nets: ["/in", "/out"].map(|name| net(name, &[])).to_vec(),
+            library_parts: Vec::new(),
+        };
+        let setup = Setup {
+            kicad,
+            ..Setup::default()
+        };
+        let preflight = check_in(netlist, setup, &root, std::slice::from_ref(&root));
+        assert_eq!(warned(&preflight, "fitted_model"), ["D1", "D4", "U1"]);
+        assert_eq!(
+            warned(&preflight, "fitted_model_unverified"),
+            ["D2", "D3", "D6"]
+        );
+        assert_eq!(warned(&preflight, "fitted_model_overridden"), ["D5"]);
+    }
+
+    #[test]
     fn a_dependent_source_or_a_passive_subcircuit_powers_nothing() {
         let preflight = deck("V1 a 0 1\nR3 a 0 1k\nR1 c 0 1k\nE1 b 0 c 0 2\nR2 b 0 1k");
         assert_eq!(warned(&preflight, "unpowered_net"), ["b", "c"]);
@@ -3010,6 +3200,7 @@ mod tests {
             lib_id: Some(format!("Device:{part}")),
             has_sim_fields,
             sim_params: None,
+            ..Default::default()
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -3041,6 +3232,7 @@ mod tests {
             lib_id: Some("Device:Varistor".to_string()),
             has_sim_fields: true,
             sim_params,
+            ..Default::default()
         };
         let kicad = KiCadNetlist {
             components: vec![
@@ -3052,6 +3244,7 @@ mod tests {
                 lib_id: "Device:Varistor".to_string(),
                 has_sim_fields: true,
                 sim_params: params,
+                ..Default::default()
             }],
         };
         let netlist = ".title t\nV1 a 0 1\nR1 a 0 1k\n";

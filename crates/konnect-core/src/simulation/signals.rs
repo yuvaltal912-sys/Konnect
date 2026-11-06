@@ -245,7 +245,15 @@ pub(crate) fn resolve(plot: &Plot, signal: &Signal, names: Names) -> Result<Reso
                 Some(pin) => format!("i({element}:{pin})"),
                 None => format!("i({element})"),
             };
-            plain(vector(plot, &name))
+            // A Konnect-fitted passive carries a 0 V source at port 1, whose
+            // current the engine keeps when it keeps no device currents.
+            let sensed = || {
+                let sense = crate::simulation::models::SENSE_SOURCE.to_ascii_lowercase();
+                (pin.is_none() && element.starts_with('x'))
+                    .then(|| vector(plot, &format!("i(v.{element}.{sense})")))
+                    .flatten()
+            };
+            plain(vector(plot, &name).or_else(sensed))
         }
         Signal::Power(reference) => {
             let element = preflight::engine_node(element_name(reference, names.elements));
@@ -405,6 +413,28 @@ mod tests {
         nets: &[],
         elements: &[],
     };
+
+    #[test]
+    fn a_fitted_passive_reads_its_current_from_its_sense_source() {
+        let sensed = plot(
+            &["time", "i(v.xf1.vkonnect)", "i(v.xu1.vsense)"],
+            &[&[0.0, 2.5, 9.0]],
+        );
+        let elements = [element("F1", "XF1"), element("U1", "XU1")];
+        let names = Names {
+            nets: &[],
+            elements: &elements,
+        };
+        assert_eq!(values(&sensed, "i(F1)", names).unwrap(), [2.5]);
+        // Another subcircuit's own sense source is not read as its current.
+        assert!(values(&sensed, "i(U1)", names).is_err());
+        // The device current wins where the run kept it.
+        let probed = plot(
+            &["time", "i(xf1)", "i(v.xf1.vkonnect)"],
+            &[&[0.0, 1.0, 2.5]],
+        );
+        assert_eq!(values(&probed, "i(F1)", names).unwrap(), [1.0]);
+    }
 
     #[test]
     fn the_grammar_takes_every_form_and_keeps_a_net_name_whole() {

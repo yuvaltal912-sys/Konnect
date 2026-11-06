@@ -270,6 +270,31 @@ impl Circuit {
         self.word_cards.get(word).copied().unwrap_or(0)
     }
 
+    /// The models that the diodes and calls inside a subcircuit name, and
+    /// those of every body it calls in turn, lowercase. Each body is read once.
+    pub(crate) fn models_reached_by(&self, subcircuit: &str) -> Vec<String> {
+        let mut pending = vec![subcircuit.to_lowercase()];
+        let mut seen = HashSet::new();
+        let mut models = Vec::new();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(body) = self.subcircuits.get(&name) else {
+                continue;
+            };
+            pending.extend(body.calls.iter().cloned());
+            let named = body
+                .body
+                .iter()
+                .filter(|element| matches!(element.kind, 'd' | 'x'))
+                .filter_map(|element| element.args.first())
+                .map(|model| model.to_lowercase());
+            models.extend(named);
+        }
+        models
+    }
+
     /// Nodes that a `.ic` or `.nodeset` inside a subcircuit names, and that the
     /// body, its pins, `.global` and ground do not. ngspice drops these without
     /// saying so. A body with a line the reader could not place is not judged.
@@ -814,6 +839,13 @@ fn read_body_element(
         'x' => entry
             .calls
             .extend(element.args.first().map(|name| name.to_lowercase())),
+        // Konnect's 0 V sense source in a fitted passive measures a current
+        // and powers nothing.
+        'v' if element
+            .name
+            .eq_ignore_ascii_case(crate::simulation::models::SENSE_SOURCE)
+            && element.args.len() == 1
+            && element.args[0] == "0" => {}
         'v' | 'i' => entry.has_source = true,
         _ => {}
     }

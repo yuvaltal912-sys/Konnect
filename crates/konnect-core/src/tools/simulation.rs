@@ -29,6 +29,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub(crate) mod assignment;
+pub(crate) mod bench;
+mod parts;
 mod plots;
 mod stored;
 mod sweeps;
@@ -79,8 +82,55 @@ const CSV_FILE: &str = "results.csv";
 const SAVE_ALL_VOLTAGES: &str = ".save all";
 const SAVE_ALL_CURRENTS: &str = ".probe alli";
 const OPERATING_POINT: &str = ".op";
+/// The fitted-model codes among those, which the plot banner counts.
+const FITTED_APPROXIMATIONS: [&str; 3] = [
+    "fitted_model",
+    "fitted_model_overridden",
+    "fitted_model_unverified",
+];
+
+/// The approximation codes a stored run's circuit lists, for a listing.
+fn approximation_codes(circuit: &Value) -> Vec<String> {
+    circuit["approximations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["code"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// How many parts rest on Konnect-fitted models in a stored run, and how many
+/// of those may no longer match the values the model was checked against:
+/// changed in KiCad's dialog, edited, or sharing a name. Every fitted code
+/// lists parts.
+fn fitted_parts(circuit: &Value) -> (usize, usize) {
+    let count = |codes: &[&str]| -> usize {
+        circuit["approximations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry["code"]
+                    .as_str()
+                    .is_some_and(|code| codes.contains(&code))
+            })
+            .map(|entry| entry["items"].as_array().map_or(0, Vec::len))
+            .sum()
+    };
+    (
+        count(&FITTED_APPROXIMATIONS),
+        count(&["fitted_model_overridden", "fitted_model_unverified"]),
+    )
+}
+
 /// Warnings that mean the result rests on an assumption about a part.
-const APPROXIMATIONS: [&str; 2] = ["inferred_from_value", "generic_default_model"];
+const APPROXIMATIONS: [&str; 5] = [
+    "inferred_from_value",
+    "generic_default_model",
+    "fitted_model",
+    "fitted_model_overridden",
+    "fitted_model_unverified",
+];
 
 fn testbench_schema() -> Value {
     json!({
@@ -393,6 +443,9 @@ pub fn tools() -> Vec<ToolDef> {
         }),
         |args, ctx| async move { handle_plot_simulation_run(args, ctx).await }
     )]
+    .into_iter()
+    .chain(super::simulation_models::tools())
+    .collect()
 }
 
 /// Refuse a path that is missing, or a sheet inside another project.
@@ -2152,6 +2205,10 @@ struct Design {
     project_dir: PathBuf,
     inputs_hash: String,
     input_provenance: Option<runs::InputProvenance>,
+    /// The KiCad netlist's components and library parts, for the context of
+    /// the parts that need a model.
+    components: Vec<kicad_netlist::Component>,
+    library_parts: Vec<kicad_netlist::LibraryPart>,
 }
 
 /// The copied sheets and project file, in a stable order. Taken before the
@@ -2317,6 +2374,8 @@ async fn inspect_design(
     ));
     let inputs_hash = consumed_inputs_hash(sources_hash, inlined_models);
     Ok(Design {
+        components: kicad.components.clone(),
+        library_parts: kicad.library_parts.clone(),
         compatibility,
         inputs_hash,
         input_provenance,
@@ -2447,6 +2506,7 @@ fn readiness_report(
         }
         if let Some(preflight) = &design.preflight {
             report["unmodelled_symbols"] = unmodelled_report(&preflight.unmodelled_symbols, limit);
+            report["parts_needing_models"] = parts::report(design, preflight, limit);
             let warnings = preflight.warnings.iter();
             report["warnings"] = json!(warnings
                 .map(|warning| warning_report(warning, limit))
@@ -2544,6 +2604,18 @@ mod tests {
             code_model_count: 1,
             export_timeout: EXPORT_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn fitted_parts_counts_every_fitted_code_and_changed_models_apart() {
+        let circuit = json!({ "approximations": [
+            { "code": "fitted_model", "items": ["D1", "D4"] },
+            { "code": "fitted_model_overridden", "items": ["D5"] },
+            { "code": "fitted_model_unverified", "items": ["D2", "D3"] },
+            { "code": "testbench_stand_in", "items": ["U1"] },
+        ] });
+        assert_eq!(fitted_parts(&circuit), (5, 3));
+        assert_eq!(fitted_parts(&json!({})), (0, 0));
     }
 
     #[test]
@@ -2645,6 +2717,8 @@ mod tests {
             project_dir: PathBuf::new(),
             inputs_hash: String::new(),
             input_provenance: None,
+            components: kicad.components.clone(),
+            library_parts: kicad.library_parts.clone(),
         })
     }
 

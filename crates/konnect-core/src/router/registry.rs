@@ -148,9 +148,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "simulation",
-        description: "Simulate a schematic with KiCad's SPICE engine and check whether it is ready to run",
+        description: "Simulate a schematic with KiCad's SPICE engine, check whether it is ready to run, and fit models to datasheet values for parts that have none",
         category: "simulation",
-        tool_count: 5,
+        tool_count: 7,
     },
 ];
 

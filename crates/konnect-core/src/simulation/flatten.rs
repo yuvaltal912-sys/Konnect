@@ -274,6 +274,9 @@ pub(crate) struct FlatDeck {
     pub inlined_models: Vec<ModelInput>,
     /// Each kind once, however many lines it covered.
     pub dropped_directives: Vec<String>,
+    /// Consumed files that carry Konnect's fitted-model marker, judged from
+    /// the same bytes as the fingerprints.
+    pub fitted_inputs: Vec<crate::simulation::models::text::FittedInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,6 +801,11 @@ impl Flattener<'_> {
         let model = ModelInput::from_bytes(written, path.clone(), &bytes);
         if !self.deck.inlined_models.contains(&model) {
             self.deck.inlined_models.push(model);
+        }
+        if let Some(fitted) = crate::simulation::models::text::fitted_input(&path, &bytes) {
+            if !self.deck.fitted_inputs.contains(&fitted) {
+                self.deck.fitted_inputs.push(fitted);
+            }
         }
         stack.push(path);
         let result = self.read(&bytes, &name, &directory, Source::ModelFile, stack);

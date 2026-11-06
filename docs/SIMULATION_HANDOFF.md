@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-05. Simulation v1 and its three follow-up fixes are merged; the reliability repairs below are committed on `fix/simulation-validation-and-results`, not pushed or merged.
+**Last updated:** 2026-11-06. Simulation v1 and its three follow-up fixes are merged. The reliability repairs are committed on `fix/simulation-validation-and-results`, and M1 of the datasheet-model series stacks on them on `feat/simulation-datasheet-models`. Neither is pushed or merged.
 
 ## Start here
 
@@ -25,6 +25,7 @@ Decisions already made by the owner:
 | D1 | This lives in the owner's AGPL-3.0 fork, `yuvaltal912-sys/Konnect` |
 | D2 | Digital XSPICE models are on. Vetting refuses `d_process` and `d_cosim` |
 | D3 | Marked behavioural stand-ins are accepted. Such a result always reads `simulated_circuit: "modified"` |
+| D4 | (2026-11-05) Models fitted to datasheet values live in the project's `simulation_models/` folder and attach through `Sim.*` fields. Their results read `as_drawn`, and disclose the parts as `fitted_model` in `circuit.approximations`, the plot banner and the listing. D3 still governs testbench stand-ins and exclusions |
 | Scope | The first version simulates schematics only |
 | Platforms | macOS first. Windows and Linux are validated at the end of the series |
 
@@ -46,6 +47,35 @@ PRs 1 to 11 and the three fixes after them are merged to `main` on the `fork` re
 | Fix | [#11](https://github.com/yuvaltal912-sys/Konnect/pull/11) | `fix/simulation-false-refusals` | Merged as `d6f0d51` |
 | Fix | [#12](https://github.com/yuvaltal912-sys/Konnect/pull/12) | `fix/schematic-sim-fields` | Merged |
 | Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Merged as `5d5eeb5` |
+
+## Current work: models fitted to datasheet values (M1)
+
+The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan, and M1 is on `feat/simulation-datasheet-models`:
+
+| PR | Delivers |
+|---|---|
+| M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
+| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT |
+| M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
+| M4 | A standalone SPICE netlist in place of a schematic |
+| M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
+
+What M1 built, and what later work must keep:
+
+- **Konnect never reads a datasheet.** The caller gives `characteristics`: `{quantity, value, conditions, statistic}` in SI base units, so no scale letter can enter. Each kind has a closed list of quantities. A curve with more points than its fit needs holds its middle point out as an independent check.
+- **The fits** (`simulation/models/`) are the diode law by least squares on the voltage, the junction capacitance law, ngspice's breakdown for a Zener (a forward and a breakdown diode, each with its own series resistance), and exact closed forms for the passives. Two traps were found on the engine: the solver's default tolerances stop a breakdown 30 mV short at 30 V, so a bench solves at `reltol=1e-6`; and with a Schottky's large IS ngspice's current at BV falls short by `IS (BV / Vt - 1)`, which `breakdown_ibv` adds back. A golden-section search that ends at zero series resistance returns a sliver, and a sliver makes ngspice's matrix singular, so a negligible one is written as none.
+- **Nothing is written unless the engine reproduces every fitted and held-out value within `tolerance_percent`.** A bench is staged in a private folder, which is its only include root, and runs at `.temp` equal to the datasheet temperature with `TNOM` written to match. A blocked engine or a failed row writes nothing. A `check_only` row, such as a typical reverse current, is reported and never stops the write; a datasheet limit there passes on its own side.
+- **A fitted file holds no caller text.** KiCad's GUI includes a model file straight into ngspice, where a `*#` line runs as a command. So the file is one marker line, with a hash of the body, then cards in a narrow grammar of numbers Konnect formats; `text::check_fitted` accepts that grammar and nothing else. The values and the datasheet reference go in a `.konnect.json` sidecar. Publishing is one `commit_file_transaction`, and a file is replaced only if it still passes the check and keeps its pins.
+- **`assign_simulation_model` takes only Konnect-fitted files.** It writes `Sim.Library` as `${KIPRJMOD}/simulation_models/<name>.lib` (KiCad tries a bare relative path against its working folder first), `Sim.Name`, `Sim.Device` and `Sim.Pins`, through `plan_sim_field_swap`. Before any write, a private copy of the project is exported with `kicad-cli`, and each part must come out as an element of the model with every model pin on its mapped pin's net. It refuses: a lock on any sheet (Eeschema saves every sheet it holds); a connected pin left unmapped, unless it is stacked on a mapped pin's net; a pin map that contradicts the symbol's A/K names; an open jumper; a coupled inductor; and an excluded or legacy-enabled part. All sheets go in one transaction, then each part is read back.
+- **Disclosure.** `flatten` records Konnect's marker on each consumed file (`FlatDeck.fitted_inputs`), with the names the file defines, read loosely so an edited file still names its cards; a marker below an added line still marks the file, as edited. Preflight names the parts on those models as `fitted_model`, including a hand-written subcircuit that calls one. It names those that KiCad's dialog changed (a regenerated `REF.name` card, or a diode's `m` or `area` on its element line) as `fitted_model_overridden`, and those on an edited or name-sharing file as `fitted_model_unverified`. All three list part references and are approximations. Plots draw a FITTED MODELS banner line that counts the parts and how many may no longer match their check, and listings carry the codes.
+- **A fitted passive is a subcircuit** with a 0 V source, `VKONNECT`, at port 1. `i(REF)` reads `i(xref)` where probes ran, and `i(v.xref.vkonnect)` where they did not, as under `use_initial_conditions` with a `.ic`.
+- **Readiness** adds `parts_needing_models`, one entry per kind of part: references, sheet files, datasheet (a URL, a plain file inside the project, or raw text), allowlisted part-number fields, library pins with bare names, and the library's `Sim.Pins`. It covers parts KiCad runs on a default model too (`kicad_default_model`).
+- **Review repairs.** Three adversarial reviews of M1 confirmed 26 findings, and all are fixed. An inductor is checked with a current, because a voltage source across it is a loop at DC, and a low-Q inductor with a winding capacitance fits on either side of its reading. A capacitor near its resonance fits below it. A zero bias is accepted where a datasheet prints one, such as CJO at 0 V. An identical rewrite writes nothing and reports `unchanged`. Assign scans KiCad's locks again just before its commit. After a failed commit each file is read back: this call's text, or a journal that can still finish the write, reports `uncertain`; another writer's change is a conflict with a safe retry; otherwise nothing was written. A Konnect sidecar left without its model is replaced, and a foreign one never is. `unpowered_net` ignores a fitted passive's 0 V sense source.
+- **Tests:** units in `simulation/models/*`, `simulation/preflight.rs`, `tools/simulation/parts.rs`, `tools/simulation_models.rs` (refusals that write nothing), `signals.rs`, and six live tests at the end of `simulation_live.rs`.
+
+Limits left in M1: one temperature per model, and no temperature check; no reverse recovery (no transient bench yet); a fuse never opens; capacitance and inductance are linear at their stated bias; a Zener's very soft knee is held at the largest `NBV` that keeps ngspice's knee above 30% of BV, and the knee then reads low; reused sheets are refused, not assigned. Disclosure rests on the marker, so a file whose marker line was deleted reads as an ordinary model. A commit that stops while recovering an earlier journal naming the same file answers `uncertain`, the cautious side, though this call wrote nothing. The KiCad dialog round trip and a run in KiCad's GUI simulator have not been checked: they are owner checks. The installed KiCad is 10.0.8 with ngspice 45.2, while the KiCad facts come from the 10.0.1 source; one live test still pins ngspice 44.2 and fails for that reason alone, a red baseline reported and not fixed here.
+
+Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignored), doctests, the live simulation tests (89 passed; the one failure is the ngspice 44.2 pin), Clippy, licence checks, documentation counts and the release build. The installed binary hash is unchanged. M1 is committed on its branch and not pushed; it stacks on the repair branch, and both PRs wait for the owner.
 
 ## Current follow-up: simulation validation and stored results
 
@@ -193,7 +223,10 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect/src/sim_worker.rs` | The only FFI. `konnect-core` stays free of `unsafe` |
 | `crates/konnect/tests/simulation_live.rs` | Ignored tests that need KiCad |
 | `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance. `soft_start.sp` and its reference script stand in for E31, `protection/` and its `reference.py` for E56, and `ac_loop.sp` and its reference script for E29 |
-| `crates/konnect/assets/skills/kicad-simulation/SKILL.md` | The skill, including the protection stand-ins |
+| `crates/konnect/assets/skills/kicad-simulation/SKILL.md` | The skill, including the protection stand-ins and modelling parts from datasheets |
+| `crates/konnect-core/src/simulation/models/` | Fits to datasheet values (`diode.rs`, `passive.rs`), the fitted-file grammar and its strict check (`text.rs`), and bench fixtures and probes (`bench.rs`) |
+| `crates/konnect-core/src/tools/simulation_models.rs` | `create_simulation_model` and `assign_simulation_model` |
+| `crates/konnect-core/src/tools/simulation/bench.rs`, `assignment.rs`, `parts.rs` | The engine bench, the export check before an assignment, and readiness's `parts_needing_models` |
 
 ## Graph
 

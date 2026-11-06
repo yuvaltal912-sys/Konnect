@@ -201,6 +201,7 @@ pub(super) fn list(
                 "analysis_kind": record.analysis_kind(),
                 "run_status": record.run_status.as_str(),
                 "simulated_circuit": record.simulated_circuit,
+                "approximations": super::approximation_codes(&record.circuit),
                 "coverage_ratio": record.coverage_ratio,
                 "inputs_changed_since_run": sources.changed_since_with_cache(&record, &mut model_hashes),
                 // run_status is historical. File presence is checked now, without

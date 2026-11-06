@@ -2513,6 +2513,142 @@ pub(crate) fn unit_with_stale_sim_field(
         .map(|unit| unit["unit"].clone())
 }
 
+/// One part's planned simulation fields, bound to its units for the readback.
+pub(crate) struct SimAssignment {
+    pub reference: String,
+    target: ComponentTarget,
+    /// Old fields the new set does not repeat exactly, once each.
+    pub dropped: Vec<(String, String)>,
+    pub unit_count: usize,
+}
+
+/// Plan the `Sim.*` fields of each of `references` on one sheet. Every unit's
+/// current and recognized legacy simulation fields go, and `fields` go in,
+/// hidden, as KiCad's Simulation Model dialog writes them. A part KiCad would
+/// leave out of the simulation is refused: dropping a legacy enable field could
+/// change that, and a model on an excluded part never runs. Returns the edited
+/// sheet text.
+pub(crate) fn plan_sim_assignment(
+    sheet: &std::path::Path,
+    content: &str,
+    references: &[String],
+    fields: &[(String, String)],
+) -> Result<(String, Vec<SimAssignment>), CallToolResult> {
+    use konnect_sexp::writer::{find_balanced_block, find_block_starts};
+
+    let refuse = |reason: String| {
+        CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "references".to_string(),
+                reason: reason.clone(),
+            },
+            reason,
+        )
+    };
+    let mut content = content.to_string();
+    let mut planned = Vec::new();
+    for reference in references {
+        let mut target = component_target_from_source(sheet, &content, reference)
+            .map_err(ComponentDeleteTargetError::into_result)?;
+        for (start, end) in find_all_symbol_instance_blocks(&content, reference) {
+            let block = &content[start..end];
+            if block.contains("(exclude_from_sim yes)") {
+                return Err(refuse(format!(
+                    "{reference} is excluded from simulation in the schematic, so a model on it \
+                     would never run. Include it in KiCad first, or leave it out with \
+                     testbench.exclude_references"
+                )));
+            }
+            for offset in find_block_starts(block, "property") {
+                let Some((from, to)) = find_balanced_block(block, offset) else {
+                    continue;
+                };
+                let name = parse_sexp(&block[from..to]).ok().and_then(|node| {
+                    node.get(1)
+                        .and_then(|node| node.as_str())
+                        .map(str::to_owned)
+                });
+                if matches!(
+                    name.as_deref(),
+                    Some("Sim.Enable" | "Spice_Netlist_Enabled")
+                ) {
+                    return Err(refuse(format!(
+                        "{reference} carries KiCad's legacy simulation enable field, which a new \
+                         model would remove. Open and save the sheet in KiCad 10 first"
+                    )));
+                }
+            }
+        }
+        let swap = plan_sim_field_swap(&content, reference, fields).map_err(refuse)?;
+        content = apply_edits(content, swap.edits);
+        for unit in &mut target.units {
+            unit.fields.retain(|name, _| !is_sim_field(name));
+            unit.fields.extend(fields.iter().cloned());
+        }
+        planned.push(SimAssignment {
+            reference: reference.clone(),
+            unit_count: target.units.len(),
+            target,
+            dropped: swap.dropped,
+        });
+    }
+    Ok((content, planned))
+}
+
+/// Every pin of a placed part, across its units: number and bare name.
+pub(crate) fn symbol_pins(
+    content: &str,
+    reference: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let tree = parse_sexp(content).map_err(|error| format!("the sheet does not parse: {error}"))?;
+    let placed = super::placed_pins_by_reference(&tree);
+    let units: Vec<_> = placed
+        .iter()
+        .filter(|(instance, _)| instance.reference == reference)
+        .collect();
+    let blocks = find_all_symbol_instance_blocks(content, reference).len();
+    if units.is_empty() || units.len() != blocks {
+        return Err(format!(
+            "the library symbol of {reference} is not embedded in its sheet"
+        ));
+    }
+    let mut pins: Vec<(String, Option<String>)> = Vec::new();
+    for (_, unit_pins) in units {
+        for (pin, _) in unit_pins {
+            if !pins.iter().any(|(number, _)| *number == pin.number) {
+                let name = Some(pin.name.clone()).filter(|name| !name.is_empty() && name != "~");
+                pins.push((pin.number.clone(), name));
+            }
+        }
+    }
+    Ok(pins)
+}
+
+/// The written part, read back: every planned field present, no old one left.
+pub(crate) fn read_back_sim_assignment(
+    sheet: &std::path::Path,
+    assignment: &SimAssignment,
+    fields: &[(String, String)],
+) -> Result<serde_json::Value, CallToolResult> {
+    let uncertain = |reason: String| {
+        crate::tools::mutation_outcome_uncertain(sheet, "assign_simulation_model", reason)
+    };
+    let observed = match load_component_mutation_readback(sheet, &assignment.target) {
+        Ok(Ok(observed)) => observed,
+        Ok(Err(error)) => return Err(uncertain(tool_error_summary(&error))),
+        Err(error) => return Err(uncertain(format!("the sheet cannot be read back: {error}"))),
+    };
+    if let Some(unit) = unit_with_stale_sim_field(&observed, |name| {
+        fields.iter().any(|(field, _)| field == name)
+    }) {
+        return Err(uncertain(format!(
+            "unit {unit} of {} still carries an old simulation field",
+            assignment.reference
+        )));
+    }
+    Ok(observed)
+}
+
 /// What `replace_component` does to an instance's simulation assignments.
 #[derive(Debug, Default)]
 struct SimFieldSwap {
