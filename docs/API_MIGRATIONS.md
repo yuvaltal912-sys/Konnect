@@ -3,6 +3,47 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `update_pcb_from_schematic` copies symbol fields and can delete orphan footprints (minor release)
+
+Creation PR 9 (`docs/CREATION_HANDOFF.md`). Two additions to the sync; both are
+visible in the response, and the second is off unless asked for.
+
+- **Fields are copied.** The sync used to copy only Reference, Value, the footprint
+  ID, DNP and pad nets. It now also sets the footprint's Datasheet, Description and
+  every user field to the symbol's value, as KiCad's Update PCB does. A user field
+  the footprint lacks is created hidden on the fabrication layer at the footprint's
+  origin; one the symbol leaves empty is not created. A footprint field the symbol
+  does not have is left alone. **A board that was `noop` can now be `ready`** when a
+  footprint's Datasheet or Description differs from the schematic's, so a dry run
+  that used to report nothing may list field changes. Each `update` change gains
+  `field_changes: [{name, from, to}]` (only the fields that differ), each `add` gains
+  `fields`, and `coverage` gains `fields_updated: {planned, applied}`. `applied` is
+  the number of fields the board read back with the symbol's value, and a field that
+  did not land is a `field_readback_differs` diagnostic.
+- **Orphans are listed always and deleted on request.** A board footprint tied to a
+  symbol that is no longer in the saved schematic is listed under
+  `orphan_footprints` (`kiid`, `reference`, `value`, `footprint_id`, `symbol_path`,
+  `locked`, `outcome`, `attached_copper_count`, and the first 25 `attached_copper`
+  items). Nothing is deleted by default. `delete_orphan_footprints: true` plans a
+  `delete` change for each one and the apply deletes exactly those. Pass the same
+  value to the dry run and the apply: the plan revision covers the deletions, so a
+  plan reviewed without the flag cannot be applied with it. Never deleted: a locked
+  footprint (`kept_locked`), a footprint with no schematic identity, a board-only
+  footprint, and the footprint of a symbol that is only excluded from the BOM.
+- **Copper on an orphan.** A track, arc or via on the same net as one of the orphan's
+  pads, with an end inside the circle that holds the pad, counts as attached. With
+  `delete_orphan_footprints` alone that makes the plan a `conflict`
+  (`orphan_footprint_has_tracks`, outcome `refused_copper_attached`) that changes
+  nothing and lists the copper. `delete_orphans_with_tracks: true` (valid only with
+  `delete_orphan_footprints`, else `invalid_argument`) deletes the footprint and
+  leaves the copper on the board.
+- **Applied counts come from readback.** `coverage.orphans_deleted` is
+  `{planned, applied}` and `deleted_footprints` lists the footprints the board no
+  longer lists after the commit. A footprint KiCad still lists is an
+  `orphan_footprint_still_present` diagnostic and is not counted. The deletions are
+  in the same single undo entry as the rest of the apply.
+- `board_only_preserved` no longer counts a footprint that is planned for deletion.
+
 ## Unreleased: `replace_component` swaps the instance's `Sim.*` fields (minor release)
 
 `replace_component` now removes the replaced instance's `Sim.*` fields from every

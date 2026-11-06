@@ -40,6 +40,10 @@ struct ExportedDesign {
     /// `Footprint` property is empty. Nothing can be placed for them, so they
     /// are reported rather than planned — and never fatal (#507).
     unassigned: Vec<UnassignedComponent>,
+    /// Components left out of the sync because the symbol is excluded from the
+    /// bill of materials. They are not planned, but they are still in the
+    /// schematic, so their board footprints are not orphans.
+    bom_excluded: Vec<SkippedComponent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +89,10 @@ struct DesignComponent {
     symbol_path: String,
     dnp: bool,
     pad_nets: BTreeMap<String, String>,
+    /// Every symbol field the netlist carries except Reference, Value and
+    /// Footprint, which have their own handling. KiCad's Update PCB copies
+    /// them all (Datasheet, Description and the user fields).
+    fields: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -112,6 +120,11 @@ struct BoardFootprint {
     /// Every pad the live footprint has, netted or not. `pad_nets` holds only
     /// pads that carry a net, so it cannot answer whether a pad exists.
     pad_numbers: BTreeSet<String>,
+    /// Where each netted pad sits on the board, for finding the copper that
+    /// is attached to a footprint that is about to be deleted.
+    pads: Vec<BoardPad>,
+    /// Datasheet, Description and the user fields, by name.
+    fields: BTreeMap<String, String>,
     position: Point,
     rotation: f64,
     layer: String,
@@ -120,12 +133,37 @@ struct BoardFootprint {
     not_in_schematic: bool,
 }
 
+/// One netted pad as it lies on the board.
+#[derive(Debug, Clone, PartialEq)]
+struct BoardPad {
+    number: String,
+    net: String,
+    position: Point,
+    /// A circle around the pad centre that holds the whole pad, whatever its
+    /// shape and rotation.
+    radius: f64,
+}
+
+/// A track, arc or via, with the points where it can touch a pad.
+#[derive(Debug, Clone, PartialEq)]
+struct CopperItem {
+    kiid: String,
+    kind: &'static str,
+    net: String,
+    layer: String,
+    ends: Vec<Point>,
+    half_width: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct BoardState {
     footprints: Vec<BoardFootprint>,
     /// Net name to the number of routed copper objects (tracks, arcs, vias,
     /// and zones) carrying the net.
     routed_nets: BTreeMap<String, usize>,
+    /// Tracks, arcs and vias with their geometry. Zones are not here: a zone
+    /// is filled, not attached to a pad.
+    copper: Vec<CopperItem>,
     bounds: Bounds,
 }
 
@@ -153,6 +191,12 @@ struct SyncCounts {
     /// Schematic components with no footprint assigned: reported, never
     /// planned, never fatal (#507).
     unassigned_footprint: CountPair,
+    /// Footprint fields (Datasheet, Description, user fields) that are set to
+    /// the symbol's value. One per field, not per footprint.
+    fields_updated: CountPair,
+    /// Orphan footprints deleted. `applied` is what the board read back as
+    /// gone, not what was requested.
+    orphans_deleted: CountPair,
     conflicts: CountPair,
 }
 
@@ -164,6 +208,27 @@ struct PreservedBoardState {
     locked: bool,
 }
 
+/// One footprint field the sync would set to the symbol's value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FieldChange {
+    name: String,
+    /// What the board footprint holds now; empty when it has no such field.
+    from: String,
+    to: String,
+}
+
+/// A track, arc or via that touches a pad of a footprint the sync would delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AttachedCopper {
+    kiid: String,
+    kind: &'static str,
+    net: String,
+    layer: String,
+}
+
+/// Longest list of attached copper one orphan reports. The count is exact.
+const ATTACHED_COPPER_LISTED: usize = 25;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PlannedChange {
@@ -174,6 +239,8 @@ enum PlannedChange {
         symbol_path: String,
         dnp: bool,
         pad_nets: BTreeMap<String, String>,
+        /// Datasheet, Description and user fields from the symbol.
+        fields: BTreeMap<String, String>,
         position: Point,
     },
     Update {
@@ -183,8 +250,74 @@ enum PlannedChange {
         symbol_path: String,
         dnp: bool,
         pad_nets: BTreeMap<String, String>,
+        /// Only the fields whose value differs from the symbol's.
+        field_changes: Vec<FieldChange>,
         preserve: PreservedBoardState,
     },
+    /// An orphan footprint: its symbol is gone from the saved schematic.
+    /// Only planned when the caller asked for orphans to be deleted.
+    Delete {
+        kiid: String,
+        reference: String,
+        symbol_path: String,
+        footprint_id: String,
+        /// Copper that stays behind, unconnected. Empty unless the caller
+        /// allowed deleting a footprint that has copper attached.
+        attached_copper: Vec<AttachedCopper>,
+    },
+}
+
+/// Why a footprint with no symbol is, or is not, in the plan for deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OrphanOutcome {
+    /// Planned for deletion.
+    Delete,
+    /// Left alone: `delete_orphan_footprints` was not set.
+    KeptNotRequested,
+    /// Left alone: the footprint is locked.
+    KeptLocked,
+    /// Deleting it was requested, but copper is attached to its pads and
+    /// `delete_orphans_with_tracks` was not set. Makes the plan a conflict.
+    RefusedCopperAttached,
+    /// Left alone: the plan is a conflict, and a conflicted plan changes
+    /// nothing.
+    KeptPlanConflict,
+}
+
+/// A board footprint whose symbol is no longer in the saved schematic. Listed
+/// whether or not deletion was asked for, so the dry run always shows them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct OrphanFootprint {
+    kiid: String,
+    reference: String,
+    value: String,
+    footprint_id: String,
+    symbol_path: String,
+    locked: bool,
+    outcome: OrphanOutcome,
+    /// Exact number of tracks, arcs and vias touching its pads.
+    attached_copper_count: usize,
+    /// The first `ATTACHED_COPPER_LISTED` of them.
+    attached_copper: Vec<AttachedCopper>,
+}
+
+/// A footprint the apply deleted, confirmed absent when the board was read
+/// back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DeletedFootprint {
+    kiid: String,
+    reference: String,
+    symbol_path: String,
+}
+
+/// What the caller asked the sync to do beyond the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SyncOptions {
+    /// Delete board footprints whose symbol is gone.
+    delete_orphan_footprints: bool,
+    /// Also delete an orphan that has copper attached (the copper stays).
+    delete_orphans_with_tracks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -212,6 +345,13 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    /// Footprints whose symbol is gone, with what the plan does about each.
+    /// Survives a conflict, like `unassigned`.
+    orphans: Vec<OrphanFootprint>,
+    /// Footprints the board no longer lists after the apply, by what KiCad
+    /// read back. Empty for a dry run.
+    #[serde(skip)]
+    deleted: Vec<DeletedFootprint>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -300,6 +440,21 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let schematic = crate::tools::get_path(args, "schematic")?;
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let options = SyncOptions {
+        delete_orphan_footprints: args["delete_orphan_footprints"].as_bool().unwrap_or(false),
+        delete_orphans_with_tracks: args["delete_orphans_with_tracks"]
+            .as_bool()
+            .unwrap_or(false),
+    };
+    if options.delete_orphans_with_tracks && !options.delete_orphan_footprints {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "delete_orphans_with_tracks".to_string(),
+                reason: "only applies together with delete_orphan_footprints".to_string(),
+            },
+            "delete_orphans_with_tracks does nothing on its own; set delete_orphan_footprints too.",
+        ));
+    }
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -376,7 +531,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut plan = plan_sync_with(&netlist_source, &design, &snapshot.state, options);
             plan.staging = Some(snapshot.staging.clone());
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
@@ -419,14 +574,28 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false));
             }
 
-            let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
+            let Mutations {
+                creates,
+                updates,
+                deletes,
+            } = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
+                // Deletions go first, so a deleted footprint never sits
+                // beside the footprint that replaces its reference.
+                client.delete_items_in(snapshot.document.clone(), deletes.clone())?;
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
             })?;
+            // Counts for these come from reading the board back, not from
+            // the plan.
+            let readback = client.get_items_in(
+                snapshot.document.clone(),
+                konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )?;
+            record_applied_orphans_and_fields(&mut plan, &readback);
             for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
             {
                 plan.diagnostics.push(conflict(
@@ -500,9 +669,17 @@ fn sync_response(
             "board_only_preserved": plan.counts.board_only_preserved,
             "skipped_by_flag": plan.counts.skipped_by_flag,
             "unassigned_footprint": plan.counts.unassigned_footprint,
+            "fields_updated": plan.counts.fields_updated,
+            "orphans_deleted": plan.counts.orphans_deleted,
             "conflicts": plan.counts.conflicts
         },
         "changes": plan.changes,
+        // Footprints whose symbol is gone, with what the plan does about
+        // each. Listed on every run; deleted only with
+        // `delete_orphan_footprints`.
+        "orphan_footprints": plan.orphans,
+        // What the board read back as gone after an apply. Empty otherwise.
+        "deleted_footprints": plan.deleted,
         "diagnostics": plan.diagnostics,
         // Schematic components with no footprint: reported per part with what
         // the board holds for them, never planned and never fatal (#507). A
@@ -533,6 +710,8 @@ fn conflict_result(message: String) -> CallToolResult {
             "board_only_preserved": CountPair::default(),
             "skipped_by_flag": CountPair::default(),
             "unassigned_footprint": CountPair::default(),
+            "fields_updated": CountPair::default(),
+            "orphans_deleted": CountPair::default(),
             "conflicts": CountPair { planned: 1, applied: 0 }
         },
         "diagnostics": [conflict("preflight_conflict", message, None)]
@@ -545,7 +724,17 @@ fn conflict_result(message: String) -> CallToolResult {
     }
 }
 
+#[cfg(test)]
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+    plan_sync_with(netlist_source, design, board, SyncOptions::default())
+}
+
+fn plan_sync_with(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    options: SyncOptions,
+) -> SyncPlan {
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
@@ -765,6 +954,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
                 pad_nets: component.pad_nets.clone(),
+                fields: component.fields.clone(),
                 position,
             });
             counts.added.planned += 1;
@@ -850,12 +1040,15 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             }
         }
 
+        let field_changes = field_changes(&component.fields, &footprint.fields);
         let needs_update = footprint.reference != component.reference
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
-            || changed_pads > 0;
+            || changed_pads > 0
+            || !field_changes.is_empty();
         if needs_update {
+            counts.fields_updated.planned += field_changes.len();
             changes.push(PlannedChange::Update {
                 kiid: footprint.kiid.clone(),
                 reference: component.reference.clone(),
@@ -863,6 +1056,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
                 pad_nets: component.pad_nets.clone(),
+                field_changes,
                 preserve: PreservedBoardState {
                     position: footprint.position,
                     rotation: footprint.rotation,
@@ -875,13 +1069,113 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
     }
 
-    counts.board_only_preserved.planned = board.footprints.len() - matched.len();
+    // Footprints whose symbol is gone. Reported always; deleted only when
+    // asked, and never when the plan is already a conflict.
+    let bom_excluded_paths = design
+        .bom_excluded
+        .iter()
+        .map(|excluded| excluded.symbol_path.as_str())
+        .collect::<HashSet<_>>();
+    let bom_excluded_references = design
+        .bom_excluded
+        .iter()
+        .map(|excluded| excluded.reference.as_str())
+        .collect::<HashSet<_>>();
+    let mut orphans = Vec::new();
+    for (index, footprint) in board.footprints.iter().enumerate() {
+        if matched.contains(&index) {
+            continue;
+        }
+        // Only a footprint that was once tied to a symbol can be an orphan.
+        // One with no schematic identity is a logo, a fiducial or a hand-made
+        // part, and one flagged board-only is meant to have no symbol.
+        let Some(symbol_path) = footprint.symbol_path.as_deref() else {
+            continue;
+        };
+        if footprint.not_in_schematic {
+            continue;
+        }
+        // Left out of the bill of materials is not gone from the schematic.
+        if bom_excluded_paths.contains(symbol_path)
+            || bom_excluded_references.contains(footprint.reference.as_str())
+        {
+            continue;
+        }
+        let attached = attached_copper(footprint, &board.copper);
+        let outcome = if !options.delete_orphan_footprints {
+            OrphanOutcome::KeptNotRequested
+        } else if footprint.locked {
+            OrphanOutcome::KeptLocked
+        } else if !attached.is_empty() && !options.delete_orphans_with_tracks {
+            OrphanOutcome::RefusedCopperAttached
+        } else {
+            OrphanOutcome::Delete
+        };
+        let attached_copper_count = attached.len();
+        let listed_copper = attached
+            .into_iter()
+            .take(ATTACHED_COPPER_LISTED)
+            .collect::<Vec<_>>();
+        match outcome {
+            OrphanOutcome::Delete => changes.push(PlannedChange::Delete {
+                kiid: footprint.kiid.clone(),
+                reference: footprint.reference.clone(),
+                symbol_path: symbol_path.to_string(),
+                footprint_id: footprint.footprint_id.clone(),
+                attached_copper: listed_copper.clone(),
+            }),
+            OrphanOutcome::RefusedCopperAttached => diagnostics.push(conflict(
+                "orphan_footprint_has_tracks",
+                format!(
+                    "{} ({}) has no symbol in the schematic, but {} track(s), arc(s) or via(s) \
+                     touch its pads (nets {}). Deleting it leaves that copper unconnected. \
+                     Remove the copper first, or pass delete_orphans_with_tracks=true to \
+                     delete the footprint and keep the copper.",
+                    footprint.reference,
+                    footprint.kiid,
+                    attached_copper_count,
+                    attached_nets(&listed_copper)
+                ),
+                Some(&footprint.reference),
+            )),
+            OrphanOutcome::KeptNotRequested
+            | OrphanOutcome::KeptLocked
+            | OrphanOutcome::KeptPlanConflict => {}
+        }
+        orphans.push(OrphanFootprint {
+            kiid: footprint.kiid.clone(),
+            reference: footprint.reference.clone(),
+            value: footprint.value.clone(),
+            footprint_id: footprint.footprint_id.clone(),
+            symbol_path: symbol_path.to_string(),
+            locked: footprint.locked,
+            outcome,
+            attached_copper_count,
+            attached_copper: listed_copper,
+        });
+    }
+
+    counts.orphans_deleted.planned = orphans
+        .iter()
+        .filter(|orphan| orphan.outcome == OrphanOutcome::Delete)
+        .count();
+    counts.board_only_preserved.planned =
+        board.footprints.len() - matched.len() - counts.orphans_deleted.planned;
     counts.conflicts.planned = diagnostics.len();
     if !diagnostics.is_empty() {
         changes.clear();
         counts.added.planned = 0;
         counts.updated.planned = 0;
         counts.pads_reassigned.planned = 0;
+        counts.fields_updated.planned = 0;
+        counts.orphans_deleted.planned = 0;
+        // Nothing is deleted from a conflicted plan; the footprint stays.
+        counts.board_only_preserved.planned = board.footprints.len() - matched.len();
+        for orphan in &mut orphans {
+            if orphan.outcome == OrphanOutcome::Delete {
+                orphan.outcome = OrphanOutcome::KeptPlanConflict;
+            }
+        }
     }
     let status = if !diagnostics.is_empty() {
         PlanStatus::Conflict
@@ -898,6 +1192,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         changes,
         diagnostics,
         unassigned,
+        orphans,
+        deleted: Vec::new(),
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
     }
@@ -963,6 +1259,75 @@ fn pad_missing_conflict(reference: &str, footprint_id: &str, missing: &[&str]) -
         footprint_id,
         vec![reference.to_string()],
     )
+}
+
+/// The fields the symbol sets that the footprint holds differently. KiCad's
+/// Update PCB copies every symbol field to the footprint: Datasheet and
+/// Description always, a user field by name. A user field the footprint lacks
+/// and the symbol leaves empty is not created. A footprint field the symbol
+/// does not have is left alone, as Update PCB does unless its "remove extra
+/// fields" option is on.
+fn field_changes(
+    wanted: &BTreeMap<String, String>,
+    board: &BTreeMap<String, String>,
+) -> Vec<FieldChange> {
+    wanted
+        .iter()
+        .filter_map(|(name, to)| {
+            let from = board.get(name);
+            let unchanged = match from {
+                Some(from) => from == to,
+                // The mandatory fields always exist on the board; a custom
+                // one that does not, and has nothing to say, is no change.
+                None => to.is_empty(),
+            };
+            (!unchanged).then(|| FieldChange {
+                name: name.clone(),
+                from: from.cloned().unwrap_or_default(),
+                to: to.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Tracks, arcs and vias that touch a pad of `footprint`.
+///
+/// A deliberately wide net: the copper must carry the pad's own net and have
+/// an end within the circle that holds the pad, on any layer. It can name
+/// copper that merely passes close; it cannot miss copper that is connected.
+/// The caller reads a hit as "do not delete without being told".
+fn attached_copper(footprint: &BoardFootprint, copper: &[CopperItem]) -> Vec<AttachedCopper> {
+    // Two nanometres of slack for rounding between millimetres and nanometres.
+    const SLACK_MM: f64 = 2e-6;
+    copper
+        .iter()
+        .filter(|item| {
+            footprint.pads.iter().any(|pad| {
+                pad.net == item.net
+                    && item.ends.iter().any(|end| {
+                        let distance = (end.x - pad.position.x).hypot(end.y - pad.position.y);
+                        distance <= pad.radius + item.half_width + SLACK_MM
+                    })
+            })
+        })
+        .map(|item| AttachedCopper {
+            kiid: item.kiid.clone(),
+            kind: item.kind,
+            net: item.net.clone(),
+            layer: item.layer.clone(),
+        })
+        .collect()
+}
+
+/// The distinct nets of some copper, for a message.
+fn attached_nets(copper: &[AttachedCopper]) -> String {
+    copper
+        .iter()
+        .map(|item| item.net.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Pad numbers the schematic connects that `available` does not contain.
@@ -1052,6 +1417,22 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
             hasher.update(pad.as_bytes());
             hasher.update(net.as_bytes());
         }
+        // What the plan compares against the symbol's fields, and the flags
+        // that decide whether an orphan may be deleted.
+        for (name, value) in &footprint.fields {
+            hasher.update(name.as_bytes());
+            hasher.update(value.as_bytes());
+        }
+        hasher.update([footprint.locked as u8, footprint.not_in_schematic as u8]);
+    }
+    let mut copper = board
+        .copper
+        .iter()
+        .map(|item| item.kiid.as_str())
+        .collect::<Vec<_>>();
+    copper.sort_unstable();
+    for kiid in copper {
+        hasher.update(kiid.as_bytes());
     }
     for (net, count) in &board.routed_nets {
         hasher.update(net.as_bytes());
@@ -1107,6 +1488,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
         });
 
         let value = required_value(component_node, "value")?;
+        let fields = netlist_fields(component_node);
         // kicad-cli writes no `(footprint …)` node at all for a symbol whose
         // Footprint property is empty — only a bare `(field (name
         // "Footprint"))`. That is a legitimate state (a generic `Device:R`
@@ -1142,6 +1524,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             symbol_path,
             dnp,
             pad_nets: BTreeMap::new(),
+            fields,
         });
     }
 
@@ -1179,7 +1562,36 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
         components,
         skipped: Vec::new(),
         unassigned,
+        bom_excluded: Vec::new(),
     })
+}
+
+/// A symbol's fields as the netlist lists them, `(field (name "X") "value")`,
+/// without the three the sync sets from their own data. A field with no value
+/// is listed as `(field (name "X"))` and reads as empty.
+///
+/// KiCad's Update PCB skips the same names: Reference and Value are handled
+/// beside the footprint, Footprint is the footprint itself, and a component
+/// class is not editable on the board.
+fn netlist_fields(component: &SexpNode) -> BTreeMap<String, String> {
+    let Some(fields) = component.find("fields") else {
+        return BTreeMap::new();
+    };
+    fields
+        .find_all("field")
+        .into_iter()
+        .filter_map(|field| {
+            let name = field.find_str("name")?;
+            if matches!(
+                name,
+                "Reference" | "Value" | "Footprint" | "Component Class"
+            ) {
+                return None;
+            }
+            let value = field.get(2).and_then(SexpNode::as_str).unwrap_or("");
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
@@ -1203,6 +1615,7 @@ fn update_footprint_item(
         symbol_path,
         dnp,
         pad_nets,
+        field_changes,
         ..
     } = change
     else {
@@ -1214,6 +1627,10 @@ fn update_footprint_item(
         bail!("planned footprint {kiid} no longer matches the live board item");
     }
 
+    let fields = field_changes
+        .iter()
+        .map(|change| (change.name.clone(), change.to.clone()))
+        .collect::<BTreeMap<_, _>>();
     apply_footprint_fields(
         &mut footprint,
         reference,
@@ -1221,6 +1638,7 @@ fn update_footprint_item(
         symbol_path,
         *dnp,
         pad_nets,
+        &fields,
         net_codes,
     )?;
 
@@ -1238,6 +1656,7 @@ fn apply_footprint_fields(
     symbol_path: &str,
     dnp: bool,
     pad_nets: &BTreeMap<String, String>,
+    fields: &BTreeMap<String, String>,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<()> {
     use konnect_ipc::gen::kiapi;
@@ -1309,6 +1728,95 @@ fn apply_footprint_fields(
         }
     }
 
+    write_symbol_fields(footprint, fields)
+}
+
+/// Set the symbol's fields on a footprint the way KiCad's Update PCB does:
+/// Datasheet and Description are the footprint's own fields; any other name is
+/// a user field, set if the footprint has it and otherwise created hidden on
+/// the fabrication layer at the footprint's origin. A user field with nothing
+/// to say is not created.
+fn write_symbol_fields(
+    footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    fields: &BTreeMap<String, String>,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+
+    for (name, value) in fields {
+        match name.as_str() {
+            "Datasheet" => {
+                set_field_text(&mut footprint.datasheet_field, "Datasheet", value);
+                if let Some(definition) = footprint.definition.as_mut() {
+                    set_field_text(&mut definition.datasheet_field, "Datasheet", value);
+                }
+            }
+            "Description" => {
+                set_field_text(&mut footprint.description_field, "Description", value);
+                if let Some(definition) = footprint.definition.as_mut() {
+                    set_field_text(&mut definition.description_field, "Description", value);
+                }
+            }
+            custom => {
+                let layer = if footprint.layer == kiapi::board::types::BoardLayer::BlBCu as i32 {
+                    kiapi::board::types::BoardLayer::BlBFab
+                } else {
+                    kiapi::board::types::BoardLayer::BlFFab
+                };
+                let position = footprint.position.unwrap_or_default();
+                let angle = footprint.orientation.unwrap_or_default();
+                let definition = footprint
+                    .definition
+                    .as_mut()
+                    .context("board footprint has no library definition")?;
+                let mut found = false;
+                for child in &mut definition.items {
+                    if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Field") {
+                        continue;
+                    }
+                    let mut field = kiapi::board::types::Field::decode(child.value.as_slice())
+                        .with_context(|| format!("footprint field {custom} cannot be read"))?;
+                    if field.name != custom {
+                        continue;
+                    }
+                    let board_text = field.text.get_or_insert_with(Default::default);
+                    board_text.text.get_or_insert_with(Default::default).text = value.clone();
+                    *child = konnect_ipc::builders::pack_any(&field, "kiapi.board.types.Field");
+                    found = true;
+                }
+                if !found && !value.is_empty() {
+                    let field = kiapi::board::types::Field {
+                        id: None,
+                        name: custom.to_string(),
+                        visible: false,
+                        text: Some(kiapi::board::types::BoardText {
+                            layer: layer as i32,
+                            text: Some(kiapi::common::types::Text {
+                                position: Some(position),
+                                text: value.clone(),
+                                attributes: Some(kiapi::common::types::TextAttributes {
+                                    angle: Some(angle),
+                                    size: Some(kiapi::common::types::Vector2 {
+                                        x_nm: 1_000_000,
+                                        y_nm: 1_000_000,
+                                    }),
+                                    stroke_width: Some(kiapi::common::types::Distance {
+                                        value_nm: 150_000,
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    };
+                    definition.items.insert(
+                        0,
+                        konnect_ipc::builders::pack_any(&field, "kiapi.board.types.Field"),
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1658,6 +2166,10 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             return true;
         };
         if !entry.in_bom {
+            design.bom_excluded.push(SkippedComponent {
+                reference: entry.reference.clone(),
+                symbol_path: entry.symbol_path.clone(),
+            });
             return false;
         }
         if !entry.on_board {
@@ -1686,6 +2198,10 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             return true;
         };
         if !entry.in_bom {
+            design.bom_excluded.push(SkippedComponent {
+                reference: entry.reference.clone(),
+                symbol_path: entry.symbol_path.clone(),
+            });
             return false;
         }
         if !entry.on_board {
@@ -1739,19 +2255,47 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
+    let mut copper = Vec::new();
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
         if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, track.net.as_ref());
+            copper.extend(copper_item(
+                "track",
+                track.id.as_ref(),
+                track.net.as_ref(),
+                track.layer,
+                [track.start.as_ref(), track.end.as_ref()],
+                track.width.as_ref().map(|width| width.value_nm),
+            ));
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
         if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, arc.net.as_ref());
+            copper.extend(copper_item(
+                "arc",
+                arc.id.as_ref(),
+                arc.net.as_ref(),
+                arc.layer,
+                [arc.start.as_ref(), arc.end.as_ref()],
+                arc.width.as_ref().map(|width| width.value_nm),
+            ));
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
         if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, via.net.as_ref());
+            // A via is a point here. Its drill and annular ring are not read,
+            // so it is given a 1 mm width, which reaches 0.5 mm beyond its
+            // centre: wider than any ordinary via.
+            copper.extend(copper_item(
+                "via",
+                via.id.as_ref(),
+                via.net.as_ref(),
+                0,
+                [via.position.as_ref(), None],
+                Some(1_000_000),
+            ));
         }
     }
     if !client
@@ -1778,6 +2322,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         state: BoardState {
             footprints,
             routed_nets,
+            copper,
             bounds: Bounds {
                 min_x: extents.min.x,
                 min_y: extents.min.y,
@@ -1814,7 +2359,26 @@ fn board_footprint_from_instance(
         .context("KiCad returned a footprint without a definition")?;
     let mut pad_nets = BTreeMap::new();
     let mut pad_numbers = BTreeSet::new();
+    let mut pads = Vec::new();
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "Datasheet".to_string(),
+        field_text(&footprint.datasheet_field),
+    );
+    fields.insert(
+        "Description".to_string(),
+        field_text(&footprint.description_field),
+    );
     for child in &definition.items {
+        // A user field is a `Field` item beside the pads and drawings.
+        if konnect_ipc::builders::any_is(child, "kiapi.board.types.Field") {
+            let field = kiapi::board::types::Field::decode(child.value.as_slice())
+                .context("KiCad returned a footprint field Konnect cannot read")?;
+            if !field.name.is_empty() {
+                fields.insert(field.name.clone(), field_text(&Some(field)));
+            }
+            continue;
+        }
         // Same discriminator as `apply_footprint_fields`, for the same
         // reason: a graphic can decode as an empty pad.
         //
@@ -1834,7 +2398,17 @@ fn board_footprint_from_instance(
             continue;
         };
         pad_numbers.insert(pad.number.clone());
-        if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
+        if let Some(net) = pad.net.clone().filter(|net| !net.name.is_empty()) {
+            pads.push(BoardPad {
+                number: pad.number.clone(),
+                net: net.name.clone(),
+                position: pad
+                    .position
+                    .as_ref()
+                    .map(point_mm)
+                    .unwrap_or(Point { x: 0.0, y: 0.0 }),
+                radius: pad_radius_mm(&pad),
+            });
             pad_nets.insert(pad.number, net.name);
         }
     }
@@ -1851,6 +2425,8 @@ fn board_footprint_from_instance(
         symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
         pad_nets,
         pad_numbers,
+        pads,
+        fields,
         position: Point {
             x: position
                 .map(|point| konnect_ipc::builders::nm_to_mm(point.x_nm))
@@ -1877,6 +2453,41 @@ fn board_footprint_from_instance(
             .map(|attributes| attributes.not_in_schematic)
             .unwrap_or(false),
     })
+}
+
+fn point_mm(vector: &konnect_ipc::gen::kiapi::common::types::Vector2) -> Point {
+    Point {
+        x: konnect_ipc::builders::nm_to_mm(vector.x_nm),
+        y: konnect_ipc::builders::nm_to_mm(vector.y_nm),
+    }
+}
+
+/// Radius of a circle around a pad's centre that holds all of its copper, in
+/// millimetres: half the diagonal of the largest layer size, so the shape and
+/// rotation do not matter. A pad whose size KiCad did not send, or one with a
+/// custom shape (its size is only the anchor), gets a generous default
+/// instead of zero.
+fn pad_radius_mm(pad: &konnect_ipc::gen::kiapi::board::types::Pad) -> f64 {
+    use konnect_ipc::gen::kiapi::board::types::PadStackShape;
+    const UNKNOWN_SIZE_MM: f64 = 3.0;
+    let Some(stack) = pad.pad_stack.as_ref() else {
+        return UNKNOWN_SIZE_MM;
+    };
+    let mut radius: f64 = 0.0;
+    for layer in &stack.copper_layers {
+        if layer.shape() == PadStackShape::PssCustom {
+            radius = radius.max(UNKNOWN_SIZE_MM);
+        }
+        if let Some(size) = layer.size.as_ref() {
+            let size = point_mm(size);
+            radius = radius.max(size.x.hypot(size.y) / 2.0);
+        }
+    }
+    if radius > 0.0 {
+        radius
+    } else {
+        UNKNOWN_SIZE_MM
+    }
 }
 
 fn field_text(field: &Option<konnect_ipc::gen::kiapi::board::types::Field>) -> String {
@@ -1933,6 +2544,30 @@ fn board_layer_name(layer: i32) -> String {
         Some(layer) => layer.as_str_name().to_string(),
         None => format!("layer_{layer}"),
     }
+}
+
+/// One track, arc or via as the planner sees it. `None` when KiCad sent it
+/// without a net or an identity: such copper is attached to nothing.
+fn copper_item<'a>(
+    kind: &'static str,
+    id: Option<&konnect_ipc::gen::kiapi::common::types::Kiid>,
+    net: Option<&konnect_ipc::gen::kiapi::board::types::Net>,
+    layer: i32,
+    ends: impl IntoIterator<Item = Option<&'a konnect_ipc::gen::kiapi::common::types::Vector2>>,
+    width_nm: Option<i64>,
+) -> Option<CopperItem> {
+    let kiid = id.map(|id| id.value.clone()).filter(|id| !id.is_empty())?;
+    let net = net
+        .map(|net| net.name.clone())
+        .filter(|name| !name.is_empty())?;
+    Some(CopperItem {
+        kiid,
+        kind,
+        net,
+        layer: board_layer_name(layer),
+        ends: ends.into_iter().flatten().map(point_mm).collect(),
+        half_width: width_nm.map(konnect_ipc::builders::nm_to_mm).unwrap_or(0.0) / 2.0,
+    })
 }
 
 fn record_routed_net(
@@ -2139,6 +2774,97 @@ fn refuse_plan(plan: &mut SyncPlan, diagnostics: Vec<SyncDiagnostic>) {
     plan.changes.clear();
 }
 
+/// Fill the applied counts for deletions and field writes from the footprints
+/// KiCad lists after the commit. A deletion counts only when the KIID is gone;
+/// a field counts only when the footprint now holds the symbol's value. What
+/// did not land is a diagnostic, not a silent shortfall.
+fn record_applied_orphans_and_fields(plan: &mut SyncPlan, readback: &[prost_types::Any]) {
+    use konnect_ipc::gen::kiapi::board::types::FootprintInstance;
+
+    let present = readback
+        .iter()
+        .filter_map(|item| FootprintInstance::decode(item.value.as_slice()).ok())
+        .filter_map(|instance| board_footprint_from_instance(&instance).ok())
+        .map(|footprint| (footprint.kiid.clone(), footprint))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut deleted = Vec::new();
+    let mut fields_applied = 0usize;
+    let mut diagnostics = Vec::new();
+    for change in &plan.changes {
+        match change {
+            PlannedChange::Delete {
+                kiid,
+                reference,
+                symbol_path,
+                ..
+            } => {
+                if present.contains_key(kiid) {
+                    diagnostics.push(conflict(
+                        "orphan_footprint_still_present",
+                        format!(
+                            "{reference} ({kiid}) was sent for deletion but KiCad still lists it"
+                        ),
+                        Some(reference),
+                    ));
+                } else {
+                    deleted.push(DeletedFootprint {
+                        kiid: kiid.clone(),
+                        reference: reference.clone(),
+                        symbol_path: symbol_path.clone(),
+                    });
+                }
+            }
+            PlannedChange::Update {
+                kiid,
+                reference,
+                field_changes,
+                ..
+            } => {
+                let Some(footprint) = present.get(kiid) else {
+                    if !field_changes.is_empty() {
+                        diagnostics.push(conflict(
+                            "field_readback_differs",
+                            format!(
+                                "{reference} ({kiid}) is not on the board after the update, so \
+                                 its fields could not be checked"
+                            ),
+                            Some(reference),
+                        ));
+                    }
+                    continue;
+                };
+                for field in field_changes {
+                    let held = footprint.fields.get(&field.name);
+                    let landed = match held {
+                        Some(held) => *held == field.to,
+                        None => field.to.is_empty(),
+                    };
+                    if landed {
+                        fields_applied += 1;
+                    } else {
+                        diagnostics.push(conflict(
+                            "field_readback_differs",
+                            format!(
+                                "{reference} field {} was set to '{}' but the board now holds '{}'",
+                                field.name,
+                                field.to,
+                                held.map(String::as_str).unwrap_or("")
+                            ),
+                            Some(reference),
+                        ));
+                    }
+                }
+            }
+            PlannedChange::Add { .. } => {}
+        }
+    }
+    plan.counts.orphans_deleted.applied = deleted.len();
+    plan.counts.fields_updated.applied = fields_applied;
+    plan.deleted = deleted;
+    plan.diagnostics.extend(diagnostics);
+}
+
 fn footprint_dimensions(
     pads: &[konnect_ipc::IpcPadDefinition],
     graphics: &[konnect_ipc::IpcGraphicDefinition],
@@ -2233,6 +2959,7 @@ fn build_added_footprint(
         symbol_path,
         dnp,
         pad_nets,
+        fields,
         position,
     } = change
     else {
@@ -2260,6 +2987,7 @@ fn build_added_footprint(
         symbol_path,
         *dnp,
         pad_nets,
+        fields,
         net_codes,
     )?;
     Ok(konnect_ipc::builders::pack_any(
@@ -2268,13 +2996,22 @@ fn build_added_footprint(
     ))
 }
 
+/// What a plan sends to KiCad: footprints to create, footprints to update, and
+/// the KIIDs of footprints to delete.
+struct Mutations {
+    creates: Vec<prost_types::Any>,
+    updates: Vec<prost_types::Any>,
+    deletes: Vec<String>,
+}
+
 fn build_mutation_items(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
-) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
+) -> Result<Mutations> {
     let mut creates = Vec::new();
     let mut updates = Vec::new();
+    let mut deletes = Vec::new();
     for change in &plan.changes {
         match change {
             PlannedChange::Add { footprint_id, .. } => {
@@ -2290,9 +3027,19 @@ fn build_mutation_items(
                     .with_context(|| format!("planned footprint {kiid} disappeared"))?;
                 updates.push(update_footprint_item(item, change, &snapshot.net_codes)?);
             }
+            PlannedChange::Delete { kiid, .. } => {
+                if !snapshot.items.contains_key(kiid) {
+                    bail!("planned deletion {kiid} disappeared from the live board");
+                }
+                deletes.push(kiid.clone());
+            }
         }
     }
-    Ok((creates, updates))
+    Ok(Mutations {
+        creates,
+        updates,
+        deletes,
+    })
 }
 
 #[cfg(test)]
@@ -2921,6 +3668,7 @@ mod tests {
 
     fn resistor(reference: &str, symbol_path: &str) -> DesignComponent {
         DesignComponent {
+            fields: BTreeMap::new(),
             reference: reference.to_string(),
             value: "10k".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
@@ -2935,6 +3683,8 @@ mod tests {
 
     fn board_resistor(reference: &str, symbol_path: Option<&str>) -> BoardFootprint {
         BoardFootprint {
+            pads: Vec::new(),
+            fields: BTreeMap::new(),
             kiid: format!("{reference}-kiid"),
             reference: reference.to_string(),
             value: "10k".to_string(),
@@ -2956,6 +3706,7 @@ mod tests {
 
     fn board_with(footprints: Vec<BoardFootprint>) -> BoardState {
         BoardState {
+            copper: Vec::new(),
             footprints,
             routed_nets: BTreeMap::new(),
             bounds: Bounds {
@@ -2970,6 +3721,7 @@ mod tests {
     #[test]
     fn planner_matches_identity_preserves_pose_and_stages_new_parts_deterministically() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![
                 resistor("R2", "/sheet/existing"),
                 resistor("R3", "/sheet/new"),
@@ -2978,8 +3730,11 @@ mod tests {
             unassigned: Vec::new(),
         };
         let board = BoardState {
+            copper: Vec::new(),
             footprints: vec![
                 BoardFootprint {
+                    pads: Vec::new(),
+                    fields: BTreeMap::new(),
                     kiid: "existing-kiid".to_string(),
                     reference: "R1".to_string(),
                     value: "1k".to_string(),
@@ -2998,6 +3753,8 @@ mod tests {
                     not_in_schematic: false,
                 },
                 BoardFootprint {
+                    pads: Vec::new(),
+                    fields: BTreeMap::new(),
                     kiid: "board-only".to_string(),
                     reference: "MH1".to_string(),
                     value: "MountingHole".to_string(),
@@ -3171,6 +3928,7 @@ mod tests {
         assert_eq!(before.get("kiapi.board.types.BoardText"), Some(&1));
 
         let change = PlannedChange::Update {
+            field_changes: Vec::new(),
             kiid: "u1-kiid".to_string(),
             reference: "U1".to_string(),
             value: "NE555".to_string(),
@@ -3228,6 +3986,7 @@ mod tests {
             "/root/u2",
             false,
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
+            &BTreeMap::new(),
             &BTreeMap::from([("VCC".to_string(), 3)]),
         )
         .unwrap();
@@ -3319,6 +4078,7 @@ mod tests {
             false,
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .expect_err("an unreadable pad must not pass silently");
         let text = format!("{error:#}");
@@ -3369,6 +4129,7 @@ mod tests {
         let item =
             konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
         let change = PlannedChange::Update {
+            field_changes: Vec::new(),
             kiid: "keep-kiid".to_string(),
             reference: "R2".to_string(),
             value: "10k".to_string(),
@@ -3410,7 +4171,9 @@ mod tests {
     #[test]
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![DesignComponent {
+                fields: BTreeMap::new(),
                 pad_nets: BTreeMap::new(),
                 ..resistor("R1", "/sheet/existing")
             }],
@@ -3418,7 +4181,10 @@ mod tests {
             unassigned: Vec::new(),
         };
         let board = BoardState {
+            copper: Vec::new(),
             footprints: vec![BoardFootprint {
+                pads: Vec::new(),
+                fields: BTreeMap::new(),
                 kiid: "existing-kiid".to_string(),
                 reference: "R1".to_string(),
                 value: "10k".to_string(),
@@ -3455,6 +4221,7 @@ mod tests {
     #[test]
     fn already_synchronized_design_is_noop() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3473,6 +4240,7 @@ mod tests {
     #[test]
     fn footprint_swap_conflicts_but_an_unrouted_net_change_is_planned() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3498,6 +4266,7 @@ mod tests {
     #[test]
     fn on_board_no_skips_absent_but_conflicts_when_present() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: Vec::new(),
             skipped: vec![SkippedComponent {
                 reference: "R1".to_string(),
@@ -3524,6 +4293,7 @@ mod tests {
     #[test]
     fn reference_only_possible_rename_is_a_conflict() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R2", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3567,6 +4337,7 @@ mod tests {
     #[test]
     fn plan_revision_changes_when_reviewed_board_bounds_change() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/new")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3606,6 +4377,7 @@ mod tests {
             )
         };
         let board = BoardState {
+            copper: Vec::new(),
             footprints: Vec::new(),
             routed_nets: BTreeMap::new(),
             bounds: Bounds {
@@ -3807,6 +4579,7 @@ mod tests {
             board_footprint_from_instance(&board_only_instance("fiducial-kiid", "FID1")).unwrap(),
         ]);
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3863,6 +4636,7 @@ mod tests {
     #[test]
     fn issue_452_an_unlinked_footprint_the_schematic_names_is_adopted_not_refused() {
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3904,6 +4678,7 @@ mod tests {
         // The board carries a footprint with no schematic identity whose
         // library id and value match a component the schematic has just gained.
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R5", "/sheet/new")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3941,6 +4716,7 @@ mod tests {
             board_footprint_from_instance(&ref_star_instance("second-kiid")).unwrap(),
         ]);
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -3979,6 +4755,7 @@ mod tests {
             board_footprint_from_instance(&ref_star_instance("second-kiid")).unwrap(),
         ]);
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -4019,6 +4796,7 @@ mod tests {
             board_footprint_from_instance(&unlinked_instance("second-kiid", "R1")).unwrap(),
         ]);
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -4056,6 +4834,7 @@ mod tests {
             board_footprint_from_instance(&unlinked_instance("second-kiid", "R9")).unwrap(),
         ]);
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: vec![SkippedComponent {
                 reference: "R9".to_string(),
@@ -4098,6 +4877,7 @@ mod tests {
             board_footprint_from_instance(&ref_star_instance("loose-kiid")).unwrap(),
         ]);
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -4512,6 +5292,7 @@ mod tests {
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
                 .collect(),
+            fields: BTreeMap::new(),
             position: Point { x: 0.0, y: 0.0 },
         }
     }
@@ -4530,6 +5311,8 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            orphans: Vec::new(),
+            deleted: Vec::new(),
             staging: None,
         }
     }
@@ -4670,6 +5453,7 @@ mod tests {
             .pad_nets
             .insert("3".to_string(), "SENSE".to_string());
         let design = ExportedDesign {
+            bom_excluded: Vec::new(),
             components: vec![component],
             skipped: Vec::new(),
             unassigned: Vec::new(),
@@ -4766,6 +5550,31 @@ mod tests {
         board: PathBuf,
         exported: PathBuf,
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        /// The footprints the mock board holds now: the seed, plus what was
+        /// created, with updates applied and deletions removed.
+        held: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        /// The KIIDs `DeleteItems` received, in order.
+        deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// What the mock board holds before the sync runs.
+    #[derive(Default)]
+    struct Seed {
+        footprints: Vec<prost_types::Any>,
+        tracks: Vec<prost_types::Any>,
+        /// A KiCad that answers `DeleteItems` with OK and deletes nothing.
+        ignore_deletes: bool,
+        /// A KiCad that answers `UpdateItems` with OK and changes nothing.
+        ignore_updates: bool,
+    }
+
+    fn footprint_kiid(item: &prost_types::Any) -> String {
+        use konnect_ipc::gen::kiapi::board::types::FootprintInstance;
+        FootprintInstance::decode(item.value.as_slice())
+            .expect("a footprint")
+            .id
+            .expect("a KIID")
+            .value
     }
 
     /// What the mock's board holds after `CreateItems`.
@@ -4789,7 +5598,7 @@ mod tests {
         /// As [`Self::new`], with KiCad also holding one board graphic whose
         /// box is `outline`, `(x, y, width, height)` in mm.
         async fn holding_outline(outline: Option<(f64, f64, f64, f64)>) -> Self {
-            Self::build(outline, Vec::new(), Readback::AsSent).await
+            Self::build(outline, Vec::new(), Readback::AsSent, Seed::default()).await
         }
 
         /// As [`Self::holding_outline`], with KiCad refusing to list each class
@@ -4798,25 +5607,39 @@ mod tests {
             outline: Option<(f64, f64, f64, f64)>,
             refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
         ) -> Self {
-            Self::build(outline, refused, Readback::AsSent).await
+            Self::build(outline, refused, Readback::AsSent, Seed::default()).await
         }
 
         /// As [`Self::new`], with the board read back as `readback` says.
         async fn reading_back(readback: Readback) -> Self {
-            Self::build(None, Vec::new(), readback).await
+            Self::build(None, Vec::new(), readback, Seed::default()).await
+        }
+
+        /// As [`Self::new`], with the board already holding `seed`.
+        async fn holding(seed: Seed) -> Self {
+            Self::build(None, Vec::new(), Readback::AsSent, seed).await
         }
 
         async fn build(
             outline: Option<(f64, f64, f64, f64)>,
             refused: Vec<konnect_ipc::gen::kiapi::common::types::KiCadObjectType>,
             readback: Readback,
+            seed: Seed,
         ) -> Self {
             use crate::tools::cli::test_support::write_script;
             use konnect_ipc::gen::kiapi;
 
             let created =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
-            let board_items = created.clone();
+            let held = std::sync::Arc::new(std::sync::Mutex::new(seed.footprints.clone()));
+            let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let board_items = held.clone();
+            let created_log = created.clone();
+            let deleted_log = deleted.clone();
+            let tracks = seed.tracks.clone();
+            let has_seed = !seed.footprints.is_empty() || !seed.tracks.is_empty();
+            let ignore_deletes = seed.ignore_deletes;
+            let ignore_updates = seed.ignore_updates;
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -4849,6 +5672,7 @@ mod tests {
                         let shapes = kiapi::common::types::KiCadObjectType::KotPcbShape as i32;
                         let footprints =
                             kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
+                        let traces = kiapi::common::types::KiCadObjectType::KotPcbTrace as i32;
                         let items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
                                 vec![crate::tools::pcb_board::board_mock::listed_item(
@@ -4856,6 +5680,7 @@ mod tests {
                                     "outline",
                                 )]
                             }
+                            _ if request.types.contains(&traces) => tracks.clone(),
                             _ if request.types.contains(&footprints) => board_items
                                 .lock()
                                 .unwrap()
@@ -4883,6 +5708,11 @@ mod tests {
                         return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
                             command,
                             |kiid| {
+                                // A seeded board lists its own items, which
+                                // KiCad measures too.
+                                if has_seed && kiid != "outline" {
+                                    return (0.0, 0.0, 60.0, 60.0);
+                                }
                                 assert_eq!(kiid, "outline", "only the outline is listed");
                                 outline.expect("an outline to measure")
                             },
@@ -4924,6 +5754,10 @@ mod tests {
                             .lock()
                             .unwrap()
                             .extend(request.items.iter().cloned());
+                        created_log
+                            .lock()
+                            .unwrap()
+                            .extend(request.items.iter().cloned());
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::CreateItemsResponse {
                                 header: None,
@@ -4948,6 +5782,17 @@ mod tests {
                         let request =
                             kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
                                 .expect("UpdateItems request");
+                        if !ignore_updates {
+                            let mut board = board_items.lock().unwrap();
+                            for update in &request.items {
+                                let kiid = footprint_kiid(update);
+                                if let Some(slot) =
+                                    board.iter_mut().find(|held| footprint_kiid(held) == kiid)
+                                {
+                                    *slot = update.clone();
+                                }
+                            }
+                        }
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::UpdateItemsResponse {
                                 header: None,
@@ -4966,6 +5811,31 @@ mod tests {
                                     .collect(),
                             },
                             "kiapi.common.commands.UpdateItemsResponse",
+                        ));
+                    }
+                    if command.type_url.ends_with("DeleteItems") {
+                        let request =
+                            kiapi::common::commands::DeleteItems::decode(command.value.as_slice())
+                                .expect("DeleteItems request");
+                        let ids = request
+                            .item_ids
+                            .iter()
+                            .map(|id| id.value.clone())
+                            .collect::<Vec<_>>();
+                        deleted_log.lock().unwrap().extend(ids.iter().cloned());
+                        if !ignore_deletes {
+                            board_items
+                                .lock()
+                                .unwrap()
+                                .retain(|held| !ids.contains(&footprint_kiid(held)));
+                        }
+                        return Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::DeleteItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                deleted_items: Vec::new(),
+                            },
+                            "kiapi.common.commands.DeleteItemsResponse",
                         ));
                     }
                     if command.type_url.ends_with("EndCommit") {
@@ -4996,6 +5866,8 @@ mod tests {
                 board,
                 exported,
                 created,
+                held,
+                deleted,
             }
         }
 
@@ -5543,6 +6415,7 @@ mod tests {
             symbol_path: "/c1-uuid".into(),
             dnp,
             pad_nets: BTreeMap::new(),
+            fields: BTreeMap::new(),
             position: Point { x: 10.0, y: 10.0 },
         };
         let built_dnp = |part: &PreparedFootprint, dnp: bool| {
@@ -5582,6 +6455,839 @@ mod tests {
             refusal.1.contains("3D model clause 'origin'"),
             "{}",
             refusal.1
+        );
+    }
+
+    // ---- PR 9: field copy and orphan deletion --------------------------------
+
+    use konnect_ipc::gen::kiapi as api;
+
+    /// One board footprint for the mock board, built the way KiCad lists it.
+    struct SeedFootprint {
+        reference: &'static str,
+        /// `None` is a footprint tied to no symbol.
+        symbol: Option<&'static str>,
+        at: (f64, f64),
+        /// Pad number, net, and where the pad sits on the board, in mm.
+        pads: Vec<(&'static str, &'static str, (f64, f64))>,
+        datasheet: &'static str,
+        description: &'static str,
+        locked: bool,
+        board_only: bool,
+    }
+
+    impl SeedFootprint {
+        /// A resistor-like part whose symbol is `<reference>-uuid`, the
+        /// identity `fielded_netlist` gives the schematic's part.
+        fn linked(reference: &'static str) -> Self {
+            Self {
+                reference,
+                symbol: Some(reference),
+                at: (10.0, 10.0),
+                pads: Vec::new(),
+                datasheet: "",
+                description: "",
+                locked: false,
+                board_only: false,
+            }
+        }
+
+        fn build(&self) -> prost_types::Any {
+            let kiid = format!("kiid-{}", self.reference);
+            let pad = |number: &str, net: &str, at: (f64, f64)| {
+                let pad = api::board::types::Pad {
+                    number: number.to_string(),
+                    net: (!net.is_empty()).then(|| api::board::types::Net {
+                        code: None,
+                        name: net.to_string(),
+                    }),
+                    position: Some(api::common::types::Vector2 {
+                        x_nm: konnect_ipc::builders::mm_to_nm(at.0),
+                        y_nm: konnect_ipc::builders::mm_to_nm(at.1),
+                    }),
+                    pad_stack: Some(api::board::types::PadStack {
+                        copper_layers: vec![api::board::types::PadStackLayer {
+                            size: Some(api::common::types::Vector2 {
+                                x_nm: 1_000_000,
+                                y_nm: 1_000_000,
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad")
+            };
+            let mut items = self
+                .pads
+                .iter()
+                .map(|(number, net, at)| pad(number, net, *at))
+                .collect::<Vec<_>>();
+            // Pads the schematic connects must exist, even when unnetted here.
+            for number in ["1", "2"] {
+                if !self.pads.iter().any(|(held, _, _)| *held == number) {
+                    items.push(pad(number, "", self.at));
+                }
+            }
+            let mut footprint = api::board::types::FootprintInstance {
+                id: Some(api::common::types::Kiid { value: kiid }),
+                position: Some(api::common::types::Vector2 {
+                    x_nm: konnect_ipc::builders::mm_to_nm(self.at.0),
+                    y_nm: konnect_ipc::builders::mm_to_nm(self.at.1),
+                }),
+                layer: api::board::types::BoardLayer::BlFCu as i32,
+                locked: if self.locked {
+                    api::common::types::LockedState::LsLocked as i32
+                } else {
+                    api::common::types::LockedState::LsUnlocked as i32
+                },
+                symbol_path: self.symbol.map(|symbol| api::common::types::SheetPath {
+                    path: vec![api::common::types::Kiid {
+                        value: format!("{symbol}-uuid"),
+                    }],
+                    path_human_readable: String::new(),
+                }),
+                attributes: Some(api::board::types::FootprintAttributes {
+                    not_in_schematic: self.board_only,
+                    ..Default::default()
+                }),
+                definition: Some(api::board::types::Footprint {
+                    id: Some(api::common::types::LibraryIdentifier {
+                        library_nickname: "Capacitor_SMD".to_string(),
+                        entry_name: "C_0603_1608Metric".to_string(),
+                    }),
+                    items,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            set_field_text(&mut footprint.reference_field, "Reference", self.reference);
+            set_field_text(&mut footprint.value_field, "Value", "part");
+            set_field_text(&mut footprint.datasheet_field, "Datasheet", self.datasheet);
+            set_field_text(
+                &mut footprint.description_field,
+                "Description",
+                self.description,
+            );
+            konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+        }
+    }
+
+    /// A track on `net` from `start` to `end`, in mm.
+    fn seeded_track(kiid: &str, net: &str, start: (f64, f64), end: (f64, f64)) -> prost_types::Any {
+        let point = |at: (f64, f64)| api::common::types::Vector2 {
+            x_nm: konnect_ipc::builders::mm_to_nm(at.0),
+            y_nm: konnect_ipc::builders::mm_to_nm(at.1),
+        };
+        konnect_ipc::builders::pack_any(
+            &api::board::types::Track {
+                id: Some(api::common::types::Kiid {
+                    value: kiid.to_string(),
+                }),
+                start: Some(point(start)),
+                end: Some(point(end)),
+                width: Some(api::common::types::Distance { value_nm: 250_000 }),
+                layer: api::board::types::BoardLayer::BlFCu as i32,
+                net: Some(api::board::types::Net {
+                    code: None,
+                    name: net.to_string(),
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Track",
+        )
+    }
+
+    /// A netlist of parts whose pins 1 and 2 sit on `<ref>-1` and `<ref>-2`,
+    /// each with the symbol fields listed, as `kicad-cli` writes them.
+    fn fielded_netlist(parts: &[(&str, &[(&str, &str)])]) -> String {
+        let mut components = String::new();
+        let mut nets = String::new();
+        let mut code = 0;
+        for (reference, fields) in parts {
+            let listed = fields
+                .iter()
+                .map(|(name, value)| {
+                    if value.is_empty() {
+                        format!("(field (name \"{name}\"))")
+                    } else {
+                        format!("(field (name \"{name}\") \"{value}\")")
+                    }
+                })
+                .collect::<String>();
+            components.push_str(&format!(
+                "    (comp\n      (ref \"{reference}\")\n      (value \"part\")\n      (footprint \"{STOCK_0603}\")\n      (fields {listed})\n      (sheetpath (names \"/\") (tstamps \"/\"))\n      (tstamps \"{reference}-uuid\")\n      (units (unit (name \"A\") (pins (pin (num \"1\")) (pin (num \"2\"))))))\n"
+            ));
+            for pin in ["1", "2"] {
+                code += 1;
+                nets.push_str(&format!(
+                    "    (net (code \"{code}\") (name \"{reference}-{pin}\") (class \"Default\")\n      (node (ref \"{reference}\") (pin \"{pin}\") (pintype \"passive\")))\n"
+                ));
+            }
+        }
+        format!("(export\n  (components\n{components}  )\n  (nets\n{nets}  ))\n")
+    }
+
+    /// A seeded part that already matches `fielded_netlist` for `reference`.
+    fn seeded_in_sync(reference: &'static str) -> SeedFootprint {
+        let mut part = SeedFootprint::linked(reference);
+        part.pads = vec![
+            (
+                "1",
+                Box::leak(format!("{reference}-1").into_boxed_str()),
+                part.at,
+            ),
+            (
+                "2",
+                Box::leak(format!("{reference}-2").into_boxed_str()),
+                part.at,
+            ),
+        ];
+        part
+    }
+
+    impl ServedSync {
+        /// One run through `tools/call` with `extra` arguments added.
+        async fn run(&self, netlist: &str, extra: serde_json::Value) -> (bool, serde_json::Value) {
+            std::fs::write(&self.exported, netlist).unwrap();
+            let mut arguments = serde_json::json!({
+                "schematic": self.schematic.to_string_lossy(),
+                "board": self.board.to_string_lossy(),
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            self.call(arguments).await
+        }
+
+        /// A dry run with `flags`, then an apply of exactly that plan.
+        async fn plan_then_apply(
+            &self,
+            netlist: &str,
+            flags: serde_json::Value,
+        ) -> (serde_json::Value, serde_json::Value) {
+            let (is_error, plan) = self.run(netlist, flags.clone()).await;
+            assert!(!is_error, "{plan:#}");
+            assert_eq!(plan["status"], "ready", "{plan:#}");
+            let mut apply = flags;
+            apply["dry_run"] = serde_json::json!(false);
+            apply["expected_plan_revision"] = plan["plan_revision"].clone();
+            let (is_error, applied) = self.run(netlist, apply).await;
+            assert!(!is_error, "{applied:#}");
+            (plan, applied)
+        }
+
+        fn held_footprints(&self) -> Vec<api::board::types::FootprintInstance> {
+            self.held
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    api::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
+                })
+                .collect()
+        }
+
+        fn held_references(&self) -> Vec<String> {
+            let mut references = self
+                .held_footprints()
+                .iter()
+                .map(|footprint| field_text(&footprint.reference_field))
+                .collect::<Vec<_>>();
+            references.sort();
+            references
+        }
+    }
+
+    /// The user fields of a footprint as KiCad would read them back: name,
+    /// text, visibility and layer.
+    fn custom_fields(
+        footprint: &api::board::types::FootprintInstance,
+    ) -> Vec<(String, String, bool, i32)> {
+        footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Field"))
+            .map(|item| {
+                let field = api::board::types::Field::decode(item.value.as_slice()).unwrap();
+                let text = field.text.clone().unwrap();
+                (
+                    field.name,
+                    text.text.unwrap().text,
+                    field.visible,
+                    text.layer,
+                )
+            })
+            .collect()
+    }
+
+    /// Footprint fields: Datasheet, Description and a user field the symbol
+    /// carries are copied to a footprint that holds other values, the dry run
+    /// lists each one, and the apply writes exactly what was listed.
+    #[tokio::test]
+    async fn symbol_fields_are_copied_to_the_footprint_and_listed_in_the_plan() {
+        let mut part = seeded_in_sync("R1");
+        part.description = "old description";
+        let served = ServedSync::holding(Seed {
+            footprints: vec![part.build()],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[(
+            "R1",
+            &[
+                ("Datasheet", "https://example.test/r.pdf"),
+                ("Description", "10k resistor"),
+                ("MPN", "RC0603FR-0710KL"),
+            ],
+        )]);
+
+        let (plan, applied) = served
+            .plan_then_apply(&netlist, serde_json::json!({}))
+            .await;
+
+        let change = &plan["changes"][0];
+        assert_eq!(change["kind"], "update");
+        let listed = change["field_changes"].as_array().unwrap();
+        let by_name = |name: &str| {
+            listed
+                .iter()
+                .find(|field| field["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is listed: {listed:?}"))
+        };
+        assert_eq!(by_name("Datasheet")["from"], "");
+        assert_eq!(by_name("Datasheet")["to"], "https://example.test/r.pdf");
+        assert_eq!(by_name("Description")["from"], "old description");
+        assert_eq!(by_name("Description")["to"], "10k resistor");
+        assert_eq!(by_name("MPN")["from"], "");
+        assert_eq!(by_name("MPN")["to"], "RC0603FR-0710KL");
+        assert_eq!(plan["coverage"]["fields_updated"]["planned"], 3);
+
+        // The dry run and the apply are the same plan, and the apply's counts
+        // are what the board read back.
+        assert_eq!(plan["changes"], applied["changes"]);
+        assert_eq!(applied["coverage"]["fields_updated"]["applied"], 3);
+
+        let board = served.held_footprints();
+        let footprint = &board[0];
+        assert_eq!(
+            field_text(&footprint.datasheet_field),
+            "https://example.test/r.pdf"
+        );
+        assert_eq!(field_text(&footprint.description_field), "10k resistor");
+        // A new user field is created hidden, on the front fabrication layer.
+        assert_eq!(
+            custom_fields(footprint),
+            vec![(
+                "MPN".to_string(),
+                "RC0603FR-0710KL".to_string(),
+                false,
+                api::board::types::BoardLayer::BlFFab as i32
+            )]
+        );
+
+        // Nothing is left to do: the same schematic is now a no-op.
+        let (_, again) = served.run(&netlist, serde_json::json!({})).await;
+        assert_eq!(again["status"], "noop", "{again:#}");
+    }
+
+    /// A user field that is empty in the symbol and absent on the board is not
+    /// created, and a field the footprint already holds correctly is not
+    /// listed.
+    #[tokio::test]
+    async fn a_field_already_right_or_empty_and_absent_is_no_change() {
+        let mut part = seeded_in_sync("R1");
+        part.datasheet = "https://example.test/r.pdf";
+        let served = ServedSync::holding(Seed {
+            footprints: vec![part.build()],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[(
+            "R1",
+            &[
+                ("Datasheet", "https://example.test/r.pdf"),
+                ("Description", ""),
+                ("MPN", ""),
+            ],
+        )]);
+
+        let (is_error, plan) = served.run(&netlist, serde_json::json!({})).await;
+
+        assert!(!is_error, "{plan:#}");
+        assert_eq!(plan["status"], "noop", "{plan:#}");
+        assert_eq!(plan["coverage"]["fields_updated"]["planned"], 0);
+    }
+
+    /// A footprint added by the sync carries the symbol's fields too.
+    #[tokio::test]
+    async fn an_added_footprint_gets_the_symbol_fields() {
+        let served = ServedSync::new().await;
+        let netlist = fielded_netlist(&[(
+            "C1",
+            &[
+                ("Datasheet", "https://example.test/c.pdf"),
+                ("Description", "100n"),
+                ("Tolerance", "10%"),
+            ],
+        )]);
+
+        let (plan, _applied) = served
+            .plan_then_apply(&netlist, serde_json::json!({}))
+            .await;
+
+        assert_eq!(plan["changes"][0]["kind"], "add");
+        assert_eq!(plan["changes"][0]["fields"]["Tolerance"], "10%");
+        let sent = served.sent_footprints();
+        assert_eq!(
+            field_text(&sent[0].datasheet_field),
+            "https://example.test/c.pdf"
+        );
+        assert_eq!(field_text(&sent[0].description_field), "100n");
+        assert_eq!(custom_fields(&sent[0])[0].0, "Tolerance");
+        assert_eq!(custom_fields(&sent[0])[0].1, "10%");
+    }
+
+    /// An orphan is always listed, and never deleted unless asked: without the
+    /// flag the plan is a no-op and the footprint stays.
+    #[tokio::test]
+    async fn an_orphan_is_listed_and_kept_unless_deletion_is_requested() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("R1").build(), seeded_in_sync("R9").build()],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[])]);
+
+        let (is_error, plan) = served.run(&netlist, serde_json::json!({})).await;
+
+        assert!(!is_error, "{plan:#}");
+        assert_eq!(plan["status"], "noop", "{plan:#}");
+        let orphans = plan["orphan_footprints"].as_array().unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0]["reference"], "R9");
+        assert_eq!(orphans[0]["kiid"], "kiid-R9");
+        assert_eq!(orphans[0]["outcome"], "kept_not_requested");
+        assert_eq!(plan["coverage"]["orphans_deleted"]["planned"], 0);
+        assert_eq!(served.held_references(), ["R1", "R9"]);
+    }
+
+    /// An unrouted orphan is deleted on request: the dry run names it by
+    /// reference and KIID, the apply sends exactly that KIID, and the response
+    /// reports the deletion from the board read back.
+    #[tokio::test]
+    async fn an_unrouted_orphan_is_deleted_exactly_and_reported_from_readback() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("R1").build(), seeded_in_sync("R9").build()],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[])]);
+        let flags = serde_json::json!({ "delete_orphan_footprints": true });
+
+        let (plan, applied) = served.plan_then_apply(&netlist, flags).await;
+
+        let delete = &plan["changes"][0];
+        assert_eq!(delete["kind"], "delete");
+        assert_eq!(delete["reference"], "R9");
+        assert_eq!(delete["kiid"], "kiid-R9");
+        assert_eq!(plan["orphan_footprints"][0]["outcome"], "delete");
+        assert_eq!(plan["coverage"]["orphans_deleted"]["planned"], 1);
+        // Dry run equals apply.
+        assert_eq!(plan["changes"], applied["changes"]);
+        assert_eq!(plan["orphan_footprints"], applied["orphan_footprints"]);
+
+        assert_eq!(*served.deleted.lock().unwrap(), ["kiid-R9"]);
+        assert_eq!(served.held_references(), ["R1"]);
+        assert_eq!(applied["coverage"]["orphans_deleted"]["applied"], 1);
+        assert_eq!(
+            applied["deleted_footprints"],
+            serde_json::json!([{
+                "kiid": "kiid-R9",
+                "reference": "R9",
+                "symbol_path": "/R9-uuid"
+            }])
+        );
+        // The deletion is part of the one commit, so Ctrl-Z reverses it.
+        assert!(applied["undo"].is_string());
+    }
+
+    /// The count of deleted footprints comes from the board, not the request:
+    /// a KiCad that answers OK and deletes nothing is reported as such.
+    #[tokio::test]
+    async fn a_deletion_kicad_did_not_make_is_not_reported_as_made() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("R1").build(), seeded_in_sync("R9").build()],
+            ignore_deletes: true,
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[])]);
+        let flags = serde_json::json!({ "delete_orphan_footprints": true });
+
+        let (plan, applied) = served.plan_then_apply(&netlist, flags).await;
+
+        assert_eq!(plan["coverage"]["orphans_deleted"]["planned"], 1);
+        assert_eq!(applied["coverage"]["orphans_deleted"]["applied"], 0);
+        assert_eq!(applied["deleted_footprints"], serde_json::json!([]));
+        let codes = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            codes.contains(&"orphan_footprint_still_present".to_string()),
+            "{codes:?}"
+        );
+    }
+
+    /// The applied count of fields is what the board holds afterwards: a KiCad
+    /// that accepts the update and keeps the old text is reported as such.
+    #[tokio::test]
+    async fn a_field_kicad_did_not_keep_is_not_reported_as_written() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("R1").build()],
+            ignore_updates: true,
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[("Description", "10k resistor")])]);
+
+        let (plan, applied) = served
+            .plan_then_apply(&netlist, serde_json::json!({}))
+            .await;
+
+        assert_eq!(plan["coverage"]["fields_updated"]["planned"], 1);
+        assert_eq!(applied["coverage"]["fields_updated"]["applied"], 0);
+        let codes = applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            codes.contains(&"field_readback_differs".to_string()),
+            "{codes:?}"
+        );
+    }
+
+    /// An orphan with copper on its pads is refused by default, with the
+    /// copper listed; the refusal changes nothing and blocks the whole plan.
+    /// The second flag allows it, and then only the footprint is deleted.
+    #[tokio::test]
+    async fn an_orphan_with_tracks_is_refused_unless_the_second_flag_allows_it() {
+        let mut orphan = SeedFootprint::linked("R9");
+        orphan.at = (50.0, 50.0);
+        orphan.pads = vec![("1", "SIG", (50.0, 50.0)), ("2", "R9-2", (51.0, 50.0))];
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("R1").build(), orphan.build()],
+            // Ends 0.3 mm from the pad centre: on the pad.
+            tracks: vec![seeded_track(
+                "track-on-pad",
+                "SIG",
+                (50.3, 50.0),
+                (60.0, 50.0),
+            )],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[])]);
+
+        // Deletion requested, copper attached: a conflict that names the copper.
+        let flags = serde_json::json!({ "delete_orphan_footprints": true });
+        let (_, refused) = served.run(&netlist, flags.clone()).await;
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        let diagnostic = &refused["diagnostics"][0];
+        assert_eq!(diagnostic["code"], "orphan_footprint_has_tracks");
+        assert_eq!(diagnostic["reference"], "R9");
+        let orphan_report = &refused["orphan_footprints"][0];
+        assert_eq!(orphan_report["outcome"], "refused_copper_attached");
+        assert_eq!(orphan_report["attached_copper_count"], 1);
+        assert_eq!(orphan_report["attached_copper"][0]["kiid"], "track-on-pad");
+        assert_eq!(orphan_report["attached_copper"][0]["net"], "SIG");
+        assert_eq!(refused["changes"], serde_json::json!([]));
+
+        // An apply with the refused plan's revision changes nothing.
+        let mut apply = flags;
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = refused["plan_revision"].clone();
+        let (_, still_refused) = served.run(&netlist, apply).await;
+        assert_eq!(still_refused["status"], "conflict", "{still_refused:#}");
+        assert!(served.deleted.lock().unwrap().is_empty());
+        assert_eq!(served.held_references(), ["R1", "R9"]);
+
+        // Without deletion asked for, the orphan is only listed, with its copper.
+        let (_, listed) = served.run(&netlist, serde_json::json!({})).await;
+        assert_eq!(listed["status"], "noop");
+        assert_eq!(
+            listed["orphan_footprints"][0]["outcome"],
+            "kept_not_requested"
+        );
+        assert_eq!(listed["orphan_footprints"][0]["attached_copper_count"], 1);
+
+        // Both flags: the footprint goes and the track is left alone.
+        let both = serde_json::json!({
+            "delete_orphan_footprints": true,
+            "delete_orphans_with_tracks": true
+        });
+        let (plan, applied) = served.plan_then_apply(&netlist, both).await;
+        assert_eq!(plan["changes"][0]["kind"], "delete");
+        assert_eq!(
+            plan["changes"][0]["attached_copper"][0]["kiid"],
+            "track-on-pad"
+        );
+        assert_eq!(plan["changes"], applied["changes"]);
+        assert_eq!(*served.deleted.lock().unwrap(), ["kiid-R9"]);
+        assert_eq!(served.held_references(), ["R1"]);
+    }
+
+    /// Copper that is on the pad's net but far from it, or touching the pad on
+    /// another net, is not attached.
+    #[tokio::test]
+    async fn copper_that_does_not_touch_the_orphans_pads_does_not_block_it() {
+        let mut orphan = SeedFootprint::linked("R9");
+        orphan.at = (50.0, 50.0);
+        orphan.pads = vec![("1", "SIG", (50.0, 50.0)), ("2", "R9-2", (51.0, 50.0))];
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("R1").build(), orphan.build()],
+            tracks: vec![
+                // Same net, 30 mm away.
+                seeded_track("far", "SIG", (80.0, 50.0), (90.0, 50.0)),
+                // On the pad, but another net.
+                seeded_track("other-net", "OTHER", (50.2, 50.0), (60.0, 50.0)),
+            ],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[])]);
+
+        let (plan, _applied) = served
+            .plan_then_apply(
+                &netlist,
+                serde_json::json!({ "delete_orphan_footprints": true }),
+            )
+            .await;
+
+        assert_eq!(plan["orphan_footprints"][0]["attached_copper_count"], 0);
+        assert_eq!(served.held_references(), ["R1"]);
+    }
+
+    /// Only a footprint that lost its symbol is an orphan. A locked one, one
+    /// with no schematic identity, and a board-only one are listed or ignored
+    /// and never deleted.
+    #[tokio::test]
+    async fn locked_unlinked_and_board_only_footprints_are_never_deleted() {
+        let mut locked = SeedFootprint::linked("R5");
+        locked.locked = true;
+        let mut unlinked = SeedFootprint::linked("LOGO1");
+        unlinked.symbol = None;
+        let mut board_only = SeedFootprint::linked("H1");
+        board_only.board_only = true;
+        let served = ServedSync::holding(Seed {
+            footprints: vec![
+                seeded_in_sync("R1").build(),
+                locked.build(),
+                unlinked.build(),
+                board_only.build(),
+            ],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[])]);
+
+        let (is_error, plan) = served
+            .run(
+                &netlist,
+                serde_json::json!({ "delete_orphan_footprints": true }),
+            )
+            .await;
+
+        assert!(!is_error, "{plan:#}");
+        assert_eq!(plan["status"], "noop", "{plan:#}");
+        let orphans = plan["orphan_footprints"].as_array().unwrap();
+        assert_eq!(orphans.len(), 1, "only the locked one is an orphan");
+        assert_eq!(orphans[0]["reference"], "R5");
+        assert_eq!(orphans[0]["outcome"], "kept_locked");
+        assert_eq!(plan["coverage"]["orphans_deleted"]["planned"], 0);
+        assert!(served.deleted.lock().unwrap().is_empty());
+    }
+
+    /// The deletion flag is part of what the revision binds: a plan reviewed
+    /// without it cannot be applied with it.
+    #[tokio::test]
+    async fn a_plan_reviewed_without_the_flag_cannot_be_applied_with_it() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![
+                seeded_in_sync("R1").build(),
+                seeded_in_sync("R9").build(),
+                // Something else to do, so the unflagged plan has a revision
+                // worth applying.
+            ],
+            ..Seed::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("R1", &[("MPN", "X1")])]);
+        let (_, reviewed) = served.run(&netlist, serde_json::json!({})).await;
+        assert_eq!(reviewed["status"], "ready", "{reviewed:#}");
+
+        let (_, applied) = served
+            .run(
+                &netlist,
+                serde_json::json!({
+                    "dry_run": false,
+                    "delete_orphan_footprints": true,
+                    "expected_plan_revision": reviewed["plan_revision"]
+                }),
+            )
+            .await;
+
+        assert_eq!(applied["status"], "conflict", "{applied:#}");
+        assert_eq!(applied["diagnostics"][0]["code"], "stale_plan_revision");
+        assert!(served.deleted.lock().unwrap().is_empty());
+    }
+
+    /// The second flag means nothing alone, so it is refused rather than
+    /// silently ignored.
+    #[tokio::test]
+    async fn the_tracks_flag_without_the_deletion_flag_is_refused() {
+        let served = ServedSync::new().await;
+        let (is_error, result) = served
+            .run(
+                &fielded_netlist(&[("R1", &[])]),
+                serde_json::json!({ "delete_orphans_with_tracks": true }),
+            )
+            .await;
+        assert!(is_error);
+        let text = result.to_string();
+        assert!(text.contains("delete_orphans_with_tracks"), "{text}");
+    }
+
+    // ---- the planner on its own ----------------------------------------------
+
+    fn orphan_board(footprints: Vec<BoardFootprint>, copper: Vec<CopperItem>) -> BoardState {
+        BoardState {
+            footprints,
+            routed_nets: BTreeMap::new(),
+            copper,
+            bounds: Bounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+            },
+        }
+    }
+
+    fn design_of(components: Vec<DesignComponent>) -> ExportedDesign {
+        ExportedDesign {
+            components,
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+            bom_excluded: Vec::new(),
+        }
+    }
+
+    fn delete_everything() -> SyncOptions {
+        SyncOptions {
+            delete_orphan_footprints: true,
+            delete_orphans_with_tracks: false,
+        }
+    }
+
+    /// A conflicted plan deletes nothing, and says why the orphan stayed.
+    #[test]
+    fn a_conflicted_plan_deletes_no_orphan() {
+        let mut swapped = board_resistor("R1", Some("/sheet/r1"));
+        swapped.footprint_id = "Resistor_SMD:R_0805".to_string();
+        let orphan = board_resistor("R9", Some("/sheet/r9"));
+        let board = orphan_board(vec![swapped, orphan], Vec::new());
+        let design = design_of(vec![resistor("R1", "/sheet/r1")]);
+
+        let plan = plan_sync_with("netlist", &design, &board, delete_everything());
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.orphans_deleted.planned, 0);
+        assert_eq!(plan.orphans[0].reference, "R9");
+        assert_eq!(plan.orphans[0].outcome, OrphanOutcome::KeptPlanConflict);
+    }
+
+    /// A symbol left out of the bill of materials is still in the schematic:
+    /// its footprint is not an orphan.
+    #[test]
+    fn a_symbol_excluded_from_the_bom_does_not_orphan_its_footprint() {
+        let board = orphan_board(
+            vec![
+                board_resistor("R1", Some("/sheet/r1")),
+                board_resistor("R7", Some("/sheet/r7")),
+            ],
+            Vec::new(),
+        );
+        let mut design = design_of(vec![resistor("R1", "/sheet/r1")]);
+        design.bom_excluded.push(SkippedComponent {
+            reference: "R7".to_string(),
+            symbol_path: "/sheet/r7".to_string(),
+        });
+
+        let plan = plan_sync_with("netlist", &design, &board, delete_everything());
+
+        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
+        assert!(plan.changes.is_empty());
+    }
+
+    /// The saved-schematic reader records a BOM-excluded symbol instead of
+    /// dropping it without a trace.
+    #[test]
+    fn the_saved_flags_reader_records_bom_excluded_symbols() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("root.kicad_sch");
+        std::fs::write(
+            &file,
+            r#"(kicad_sch (version 20250114) (uuid "root-uuid")
+  (symbol (lib_id "Device:R") (at 10 10 0) (in_bom no) (on_board yes) (dnp no)
+    (uuid "r7-uuid")
+    (instances (project "p" (path "/root-uuid" (reference "R7") (unit 1))))))
+"#,
+        )
+        .unwrap();
+        let mut design = design_of(vec![resistor("R7", "/root-uuid/r7-uuid")]);
+
+        apply_saved_symbol_flags(&[file], &mut design).unwrap();
+
+        assert!(design.components.is_empty());
+        assert_eq!(
+            design.bom_excluded,
+            vec![SkippedComponent {
+                reference: "R7".to_string(),
+                symbol_path: "/root-uuid/r7-uuid".to_string(),
+            }]
+        );
+    }
+
+    /// Fields come from the netlist's `(fields …)`, without the three the sync
+    /// sets itself.
+    #[test]
+    fn the_netlist_reader_keeps_every_symbol_field_but_the_three_it_sets_itself() {
+        let design = parse_exported_netlist(UNASSIGNED).expect("a real export parses");
+        let c1 = design
+            .components
+            .iter()
+            .find(|component| component.reference == "C1")
+            .unwrap();
+        assert_eq!(
+            c1.fields,
+            BTreeMap::from([
+                ("Datasheet".to_string(), String::new()),
+                (
+                    "Description".to_string(),
+                    "Unpolarized capacitor".to_string()
+                ),
+            ])
         );
     }
 }
