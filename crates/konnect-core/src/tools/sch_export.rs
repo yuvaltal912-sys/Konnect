@@ -47,15 +47,22 @@ pub fn tools() -> Vec<ToolDef> {
             "Render a schematic sheet to PNG: kicad-cli SVG export rasterized in-process \
              (deterministic stroke-font rendering, no system fonts consulted). Returns the \
              PNG path and its actual pixel dimensions; with 'inline' true the response also \
-             carries the image as base64 so the caller can inspect its own output. Width is \
-             capped at 4096 px.",
+             carries an MCP image block so the caller can inspect its own output. An optional \
+             region in page millimetres renders a close-up at the requested width. Width is \
+             capped at 4096 px; region height at 8192 px and area at 16,777,216 pixels.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output PNG path (default: alongside the schematic)" },
-                    "width_px":  { "type": "integer", "description": "Output width in pixels", "default": 1600, "maximum": 4096 },
-                    "inline":    { "type": "boolean", "description": "Also return the PNG as base64 content", "default": false },
+                    "width_px":  { "type": "integer", "description": "Output width in pixels (of the region, when given)", "default": 1600, "maximum": 4096 },
+                    "inline":    { "type": "boolean", "description": "Also return the PNG as an MCP image block alongside JSON metadata", "default": false },
+                    "region": { "type": "object", "description": "Rectangle in mm from the page's top-left; must fit inside the page. Baselines always use the full sheet.", "properties": {
+                        "x": { "type": "number", "minimum": 0 },
+                        "y": { "type": "number", "minimum": 0 },
+                        "width": { "type": "number", "exclusiveMinimum": 0 },
+                        "height": { "type": "number", "exclusiveMinimum": 0 }
+                    }, "required": ["x", "y", "width", "height"] },
                     "monochrome": { "type": "boolean", "description": "Render in black and white", "default": false }
                 },
                 "required": ["schematic"]
@@ -89,7 +96,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "inline_diff": { "type": "boolean", "description": "Also return the current render as base64 for inspection", "default": false }
+                    "inline_diff": { "type": "boolean", "description": "Also return the current sheet render as an MCP image block for inspection (not a difference heatmap)", "default": false }
                 },
                 "required": ["schematic"]
             }),
@@ -267,6 +274,10 @@ async fn handle_render_png(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let region = match render_region(args) {
+        Ok(region) => region,
+        Err(error) => return Ok(error),
+    };
     let width_px = match args.get("width_px") {
         None => 1600,
         Some(v) => match v.as_u64() {
@@ -302,7 +313,11 @@ async fn handle_render_png(
             .await?;
     let svg_bytes = std::fs::read(&svg_path)?;
 
-    let rendered = match konnect_render::svg_to_png(&svg_bytes, width_px) {
+    let rendered = match region {
+        Some(region) => konnect_render::svg_region_to_png(&svg_bytes, width_px, region),
+        None => konnect_render::svg_to_png(&svg_bytes, width_px),
+    };
+    let rendered = match rendered {
         Ok(rendered) => rendered,
         Err(error) => {
             return Ok(CallToolResult::error(format!(
@@ -317,7 +332,7 @@ async fn handle_render_png(
     std::fs::write(&output_path, &rendered.png)?;
 
     // Dimensions come from the produced image, never echoed from the request.
-    let mut response = json!({
+    let response = json!({
         "rendered": output_path.display().to_string(),
         "width_px": rendered.width_px,
         "height_px": rendered.height_px,
@@ -325,11 +340,39 @@ async fn handle_render_png(
         "monochrome": monochrome
     });
     if inline {
-        use base64::Engine as _;
-        response["png_base64"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(&rendered.png));
+        return Ok(CallToolResult::json_with_png(&response, &rendered.png));
     }
     Ok(CallToolResult::json(&response))
+}
+
+fn render_region(
+    args: &serde_json::Value,
+) -> Result<Option<konnect_render::Region>, CallToolResult> {
+    let Some(value) = args.get("region") else {
+        return Ok(None);
+    };
+    let values: Option<Vec<f64>> = ["x", "y", "width", "height"]
+        .iter()
+        .map(|key| value.get(key)?.as_f64())
+        .collect();
+    if let Some(v) = values {
+        if v.iter().all(|n| n.is_finite()) && v[0] >= 0.0 && v[1] >= 0.0 && v[2] > 0.0 && v[3] > 0.0
+        {
+            return Ok(Some(konnect_render::Region {
+                x_mm: v[0],
+                y_mm: v[1],
+                width_mm: v[2],
+                height_mm: v[3],
+            }));
+        }
+    }
+    Err(CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "region".into(),
+            reason: "requires finite x, y >= 0 and width, height > 0 in page mm".into(),
+        },
+        "Argument 'region' requires finite x, y >= 0 and width, height > 0 in page mm",
+    ))
 }
 
 /// Baseline storage for a sheet: `<project>/.konnect/baselines/<stem>.png`
@@ -488,7 +531,7 @@ async fn handle_baseline_compare(
     } else {
         "PASS"
     };
-    let mut response = json!({
+    let response = json!({
         "status": status,
         "changed_pct_of_content": diff.changed_pct_of_content,
         "content_pixels": diff.content_pixels,
@@ -504,9 +547,7 @@ async fn handle_baseline_compare(
         "warnings": warnings,
     });
     if inline_diff {
-        use base64::Engine as _;
-        response["current_png_base64"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(&rendered.png));
+        return Ok(CallToolResult::json_with_png(&response, &rendered.png));
     }
     Ok(CallToolResult::json(&response))
 }
@@ -1669,6 +1710,203 @@ mod tests {
             crate::tools::ServerConfig::default(),
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )
+    }
+
+    #[test]
+    fn render_region_rejects_malformed_or_nonpositive_rectangles() {
+        for region in [
+            json!(null),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!({"x": "0", "y": 0, "width": 10, "height": 10}),
+            json!({"x": -1, "y": 0, "width": 10, "height": 10}),
+            json!({"x": 0, "y": -1, "width": 10, "height": 10}),
+            json!({"x": 0, "y": 0, "width": 0, "height": 10}),
+            json!({"x": 0, "y": 0, "width": 10, "height": -1}),
+        ] {
+            let result = render_region(&json!({"region": region})).unwrap_err();
+            assert!(result.is_error);
+            assert!(serde_json::to_string(&result)
+                .unwrap()
+                .contains("invalid_argument"));
+        }
+        assert!(render_region(&json!({})).unwrap().is_none());
+        assert!(
+            render_region(&json!({"region": {"x": 0, "y": 1, "width": 2, "height": 3}}))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn render_region_schema_requires_a_complete_positive_rectangle() {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t.name == "render_schematic_png")
+            .unwrap();
+        let region = &tool.input_schema["properties"]["region"];
+        assert_eq!(region["type"], "object");
+        assert_eq!(region["required"], json!(["x", "y", "width", "height"]));
+        for key in ["x", "y"] {
+            assert_eq!(region["properties"][key]["minimum"], 0);
+        }
+        for key in ["width", "height"] {
+            assert_eq!(region["properties"][key]["exclusiveMinimum"], 0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn render_scene() -> (TempDir, PathBuf, ToolContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("render.kicad_sch");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/power_rail.kicad_sch"),
+            &schematic,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("source.svg"),
+            include_bytes!("../../../konnect-render/tests/fixtures/placement_fixture.svg"),
+        )
+        .unwrap();
+        let cli = super::cli::test_support::write_script(
+            dir.path(),
+            "render-cli",
+            r##"#!/bin/sh
+scene_dir=$(dirname "$0")
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    shift
+    cp "$scene_dir/source.svg" "$1/render.svg"
+    exit $?
+  fi
+  shift
+done
+exit 1
+"##,
+            "",
+        );
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: cli.to_str().unwrap().into(),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        (dir, schematic, ctx)
+    }
+
+    #[cfg(unix)]
+    fn render_metadata(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected metadata")
+        };
+        assert!(text.len() < 2000, "PNG must not be embedded in JSON text");
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(value.get("png_base64").is_none());
+        assert!(value.get("current_png_base64").is_none());
+        value
+    }
+
+    #[cfg(unix)]
+    fn inline_png(result: &CallToolResult) -> Vec<u8> {
+        use base64::Engine as _;
+        assert_eq!(result.content.len(), 2);
+        let crate::mcp::protocol::ToolContent::Image { data, mime_type } = &result.content[1]
+        else {
+            panic!("expected image block")
+        };
+        assert_eq!(mime_type, "image/png");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(
+            konnect_render::diff_pngs(&png, &png)
+                .unwrap()
+                .changed_pixels,
+            0
+        );
+        png
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_render_is_an_image_block_and_preserves_file_metadata() {
+        let (_dir, schematic, ctx) = render_scene();
+        let args = json!({"schematic": schematic, "width_px": 320, "inline": true});
+        let inline = handle_render_png(&args, &ctx).await.unwrap();
+        let metadata = render_metadata(&inline);
+        let png = inline_png(&inline);
+        assert_eq!(metadata["width_px"], 320);
+        assert_eq!(metadata["png_bytes"], png.len());
+        assert_eq!(
+            std::fs::read(metadata["rendered"].as_str().unwrap()).unwrap(),
+            png
+        );
+        let file_only = handle_render_png(&json!({"schematic": schematic, "width_px": 320}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(file_only.content.len(), 1);
+        assert_eq!(render_metadata(&file_only), metadata);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn render_region_reaches_the_rasterizer_as_a_close_up() {
+        let (_dir, schematic, ctx) = render_scene();
+        let region = json!({"x": 40, "y": 40, "width": 80, "height": 30});
+        let result = handle_render_png(
+            &json!({"schematic": schematic, "width_px": 320, "inline": true, "region": region}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let metadata = render_metadata(&result);
+        assert_eq!(metadata["width_px"], 320);
+        assert_eq!(metadata["height_px"], 120);
+        let expected = konnect_render::svg_region_to_png(
+            include_bytes!("../../../konnect-render/tests/fixtures/placement_fixture.svg"),
+            320,
+            konnect_render::Region {
+                x_mm: 40.0,
+                y_mm: 40.0,
+                width_mm: 80.0,
+                height_mm: 30.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(inline_png(&result), expected.png);
+        let refused = handle_render_png(&json!({"schematic": schematic, "region": {"x": 290, "y": 0, "width": 80, "height": 30}}), &ctx).await.unwrap();
+        assert!(refused.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_baseline_compare_keeps_drift_metadata_and_shows_current_render() {
+        let (_dir, schematic, ctx) = render_scene();
+        let stored = handle_baseline_set(&json!({"schematic": schematic, "width_px": 320}), &ctx)
+            .await
+            .unwrap();
+        let stored_metadata = render_metadata(&stored);
+        let inline =
+            handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
+                .await
+                .unwrap();
+        let metadata = render_metadata(&inline);
+        assert_eq!(metadata["status"], "PASS");
+        assert_eq!(metadata["changed_pixels"], 0);
+        assert_eq!(metadata["source_changed_since_baseline"], false);
+        assert_eq!(
+            inline_png(&inline),
+            std::fs::read(stored_metadata["baseline_png"].as_str().unwrap()).unwrap()
+        );
+        let text_only = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(text_only.content.len(), 1);
+        assert_eq!(render_metadata(&text_only), metadata);
     }
 
     #[tokio::test]

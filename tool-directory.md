@@ -197,9 +197,9 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
-| `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
+| `render_schematic_png` | Render a sheet or `region: {x, y, width, height}` in page mm to PNG at `width_px`, using deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds a real MCP PNG image block alongside JSON metadata. Region output is capped at 8192 pixels high and 16,777,216 pixels total. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
-| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
+| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged. `inline_diff` adds the current full-sheet render as an MCP PNG image block alongside the metrics (not a difference heatmap). |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
@@ -279,7 +279,7 @@ and Windows servers do not.
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
-| `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
+| `get_board_2d_view` | Render the saved board with kicad-cli and return a PNG image block. Accepts `side` (`top` or `bottom`, default `top`) and positive `zoom` (default 1); width/height retain their 100–4000 pixel clamps. This is an orthographic 3D render; use `export_svg` for layer-aware 2D output. |
 
 ### `pcb_routing` · 15 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.

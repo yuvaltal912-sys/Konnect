@@ -193,6 +193,18 @@ impl CallToolResult {
             is_error: false,
         }
     }
+
+    /// Keep machine-readable facts in text and the PNG in an MCP image block,
+    /// where image-capable clients can inspect it without parsing base64 text.
+    pub fn json_with_png(metadata: &impl Serialize, png: &[u8]) -> Self {
+        use base64::Engine as _;
+        let mut result = Self::json(metadata);
+        result.content.push(ToolContent::Image {
+            data: base64::engine::general_purpose::STANDARD.encode(png),
+            mime_type: "image/png".into(),
+        });
+        result
+    }
 }
 
 // ─── MCP Notifications ───────────────────────────────────────────────────────
@@ -215,6 +227,29 @@ mod tests {
                 "isError": false,
             })
         );
+    }
+
+    #[test]
+    fn json_with_png_keeps_metadata_and_image_in_separate_blocks() {
+        let value = serde_json::to_value(CallToolResult::json_with_png(
+            &serde_json::json!({"width_px": 23}),
+            b"PNG bytes",
+        ))
+        .unwrap();
+        assert_eq!(value["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["content"][0],
+            serde_json::json!({
+                "type": "text", "text": "{\"width_px\":23}"
+            })
+        );
+        assert_eq!(
+            value["content"][1],
+            serde_json::json!({
+                "type": "image", "data": "UE5HIGJ5dGVz", "mimeType": "image/png"
+            })
+        );
+        assert_eq!(value["isError"], false);
     }
 
     #[test]

@@ -1982,7 +1982,7 @@ pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) ->
     export_schematic_svg(cli, schematic, output_dir, &SchematicSvgOptions::default()).await
 }
 
-/// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
+/// KiCAD 10: `pcb render --output <path> --width <w> --height <h> --side <side> --zoom <zoom> <input>`
 ///
 /// `pcb render` is the 3-D renderer and takes **no** `--layers`: passing it
 /// makes kicad-cli exit non-zero with `Unknown argument: --layers`, which is
@@ -1995,9 +1995,12 @@ pub async fn render_pcb_png(
     output: &Path,
     width: u32,
     height: u32,
+    side: &str,
+    zoom: f64,
 ) -> Result<()> {
     let width_str = width.to_string();
     let height_str = height.to_string();
+    let zoom_str = zoom.to_string();
     let args = vec![
         "pcb",
         "render",
@@ -2007,6 +2010,10 @@ pub async fn render_pcb_png(
         &width_str,
         "--height",
         &height_str,
+        "--side",
+        side,
+        "--zoom",
+        &zoom_str,
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;

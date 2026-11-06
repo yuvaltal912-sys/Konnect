@@ -26,6 +26,111 @@ pub struct Rendered {
     pub height_px: u32,
 }
 
+/// A schematic viewport in millimetres from the page's top-left corner.
+#[derive(Clone, Copy, Debug)]
+pub struct Region {
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub width_mm: f64,
+    pub height_mm: f64,
+}
+
+/// Rasterize a region of a KiCad schematic SVG without losing close-up detail.
+///
+/// KiCad exports the physical page width and height in `mm`. Those attributes
+/// map page coordinates to the parsed SVG viewport; any SVG `viewBox` origin
+/// and transform remain the renderer's responsibility. SVGs without explicit
+/// millimetre page dimensions are refused rather than guessed at.
+///
+/// The output width is 1..=8192, height at most 8192, and area at most 16 Mi
+/// pixels. A region must be finite, positive and entirely inside the page.
+/// The full-sheet renderer remains separate so existing visual baselines keep
+/// exactly the same rasterization path.
+pub fn svg_region_to_png(svg: &[u8], width_px: u32, region: Region) -> Result<Rendered> {
+    if width_px == 0 || width_px > 8192 {
+        bail!("width_px must be 1..=8192, got {width_px}");
+    }
+    if ![region.x_mm, region.y_mm, region.width_mm, region.height_mm]
+        .iter()
+        .all(|value| value.is_finite())
+        || region.x_mm < 0.0
+        || region.y_mm < 0.0
+        || region.width_mm <= 0.0
+        || region.height_mm <= 0.0
+    {
+        bail!("region must have finite nonnegative x_mm/y_mm and positive width_mm/height_mm");
+    }
+
+    let source = std::str::from_utf8(svg).context("SVG is not UTF-8")?;
+    // KiCad includes an external DOCTYPE declaration. roxmltree does not
+    // fetch external resources; allowing the declaration lets real exports
+    // be inspected in the same way as they are parsed by usvg.
+    let document = usvg::roxmltree::Document::parse_with_options(
+        source,
+        usvg::roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .context("SVG did not parse")?;
+    let root = document.root_element();
+    let page_mm = |attribute: &str| -> Result<f64> {
+        root.attribute(attribute)
+            .and_then(|value| value.trim().strip_suffix("mm"))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .with_context(|| format!("region rendering requires a positive SVG {attribute} in mm"))
+    };
+    let page_width_mm = page_mm("width")?;
+    let page_height_mm = page_mm("height")?;
+    if region.x_mm + region.width_mm > page_width_mm
+        || region.y_mm + region.height_mm > page_height_mm
+    {
+        bail!("region lies outside the SVG page ({page_width_mm} x {page_height_mm} mm)");
+    }
+
+    let height = (f64::from(width_px) * region.height_mm / region.width_mm)
+        .round()
+        .max(1.0);
+    if !height.is_finite() || height > 8192.0 {
+        bail!("region output height exceeds 8192 pixels; reduce width_px or widen the region");
+    }
+    let height_px = height as u32;
+    if u64::from(width_px) * u64::from(height_px) > 16 * 1024 * 1024 {
+        bail!("region output exceeds 16777216 pixels; reduce width_px");
+    }
+
+    // Apply the same font policy as full-sheet renders.
+    if svg_contains_visible_text(svg) {
+        bail!("SVG contains visible <text> elements; region rendering requires stroke-font paths");
+    }
+    let tree =
+        usvg::Tree::from_data(svg, &usvg::Options::default()).context("SVG did not parse")?;
+    let pixels_per_mm = f64::from(width_px) / region.width_mm;
+    let transform = tiny_skia::Transform::from_row(
+        (pixels_per_mm * page_width_mm / f64::from(tree.size().width())) as f32,
+        0.0,
+        0.0,
+        (pixels_per_mm * page_height_mm / f64::from(tree.size().height())) as f32,
+        (-region.x_mm * pixels_per_mm) as f32,
+        (-region.y_mm * pixels_per_mm) as f32,
+    );
+    if !transform.is_finite() {
+        bail!("region is too small for the renderer's coordinate precision");
+    }
+
+    let mut pixmap =
+        tiny_skia::Pixmap::new(width_px, height_px).context("could not allocate pixmap")?;
+    pixmap.fill(tiny_skia::Color::WHITE);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let png = pixmap.encode_png().context("PNG encoding failed")?;
+    Ok(Rendered {
+        png,
+        width_px,
+        height_px,
+    })
+}
+
 /// Rasterize SVG bytes to a PNG at the given pixel width (height follows the
 /// SVG's aspect ratio).
 ///
@@ -219,6 +324,184 @@ mod tests {
     use super::*;
 
     const RECT_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect x="10" y="10" width="30" height="20" fill="#112233"/></svg>"##;
+    const MM_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="10 20 200 100"><rect x="70" y="40" width="20" height="20" fill="#112233"/><rect x="110" y="40" width="20" height="20" fill="#ff0000"/></svg>"##;
+
+    fn region() -> Region {
+        Region {
+            x_mm: 30.0,
+            y_mm: 10.0,
+            width_mm: 10.0,
+            height_mm: 10.0,
+        }
+    }
+
+    #[test]
+    fn region_uses_page_mm_with_a_nonzero_svg_origin_and_keeps_closeup_detail() {
+        let out = svg_region_to_png(MM_SVG, 200, region()).unwrap();
+        assert_eq!((out.width_px, out.height_px), (200, 200));
+        let img = image::load_from_memory(&out.png).unwrap().to_rgba8();
+        for (x, y) in [(2, 2), (100, 100), (197, 197)] {
+            assert_eq!(img.get_pixel(x, y).0, [0x11, 0x22, 0x33, 255]);
+        }
+        assert!(!img.pixels().any(|pixel| pixel.0 == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn region_of_a_real_kicad_export_renders_stroke_text() {
+        let svg = include_bytes!("../tests/fixtures/placement_fixture.svg");
+        let out = svg_region_to_png(
+            svg,
+            600,
+            Region {
+                x_mm: 170.0,
+                y_mm: 160.0,
+                width_mm: 120.0,
+                height_mm: 40.0,
+            },
+        )
+        .unwrap();
+        assert_eq!((out.width_px, out.height_px), (600, 200));
+        let img = image::load_from_memory(&out.png).unwrap().to_rgba8();
+        let background = [0xf5, 0xf4, 0xef, 255];
+        assert_eq!(img.get_pixel(0, 0).0, background);
+        assert!(
+            img.pixels().filter(|pixel| pixel.0 != background).count() > 1000,
+            "the title block contains borders and stroke-font text"
+        );
+    }
+
+    #[test]
+    fn region_refuses_invalid_output_width() {
+        for width in [0, 8193] {
+            let err = svg_region_to_png(MM_SVG, width, region()).unwrap_err();
+            assert!(err.to_string().contains("width_px"), "{err}");
+        }
+    }
+
+    #[test]
+    fn region_refuses_nonfinite_negative_and_empty_rectangles() {
+        let valid = region();
+        for invalid in [
+            Region {
+                x_mm: f64::NAN,
+                ..valid
+            },
+            Region {
+                y_mm: f64::INFINITY,
+                ..valid
+            },
+            Region {
+                width_mm: f64::NAN,
+                ..valid
+            },
+            Region {
+                height_mm: f64::INFINITY,
+                ..valid
+            },
+            Region {
+                x_mm: -1.0,
+                ..valid
+            },
+            Region {
+                y_mm: -1.0,
+                ..valid
+            },
+            Region {
+                width_mm: 0.0,
+                ..valid
+            },
+            Region {
+                height_mm: -1.0,
+                ..valid
+            },
+        ] {
+            let err = svg_region_to_png(MM_SVG, 100, invalid).unwrap_err();
+            assert!(
+                err.to_string().contains("region must have"),
+                "{invalid:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_refuses_missing_or_invalid_physical_page_dimensions() {
+        for (width, height) in [
+            ("100", "50mm"),
+            ("100mm", "50px"),
+            ("0mm", "50mm"),
+            ("100mm", "-50mm"),
+            ("NaNmm", "50mm"),
+            ("100mm", "infmm"),
+        ] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"/>"#
+            );
+            let err = svg_region_to_png(svg.as_bytes(), 100, region()).unwrap_err();
+            assert!(
+                err.to_string().contains("positive SVG"),
+                "{width} {height}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_refuses_bounds_outside_either_page_axis() {
+        for invalid in [
+            Region {
+                x_mm: 95.0,
+                ..region()
+            },
+            Region {
+                y_mm: 45.0,
+                ..region()
+            },
+        ] {
+            let err = svg_region_to_png(MM_SVG, 100, invalid).unwrap_err();
+            assert!(err.to_string().contains("outside the SVG page"), "{err}");
+        }
+    }
+
+    #[test]
+    fn region_refuses_excessive_height_before_allocating() {
+        let err = svg_region_to_png(
+            MM_SVG,
+            100,
+            Region {
+                width_mm: 0.01,
+                ..region()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("height exceeds"), "{err}");
+    }
+
+    #[test]
+    fn region_refuses_excessive_pixel_area_before_allocating() {
+        let err = svg_region_to_png(MM_SVG, 5000, region()).unwrap_err();
+        assert!(err.to_string().contains("16777216 pixels"), "{err}");
+    }
+
+    #[test]
+    fn region_refuses_visible_text_instead_of_omitting_it() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm"><text x="30" y="20">hi</text></svg>"#;
+        let err = svg_region_to_png(svg, 100, region()).unwrap_err();
+        assert!(err.to_string().contains("visible <text>"), "{err}");
+    }
+
+    #[test]
+    fn region_refuses_an_unrepresentable_transform() {
+        let err = svg_region_to_png(
+            MM_SVG,
+            100,
+            Region {
+                width_mm: 1e-100,
+                height_mm: 1e-100,
+                ..region()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("coordinate precision"), "{err}");
+    }
 
     #[test]
     fn renders_a_rect_at_requested_width() {

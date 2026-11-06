@@ -2163,13 +2163,15 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_board_2d_view",
-            "Render the board with kicad-cli and return it as a base64 PNG. Note this is              kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is              no layer selection. Use export_svg for layer-aware 2-D output.",
+            "Render the saved board with kicad-cli and return a PNG image block. This is              kicad-cli's orthographic 3-D board render, viewed from the top or bottom with              optional camera zoom. There is no layer selection; use export_svg for layer-aware 2-D output.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":  { "type": "string" },
                     "width":  { "type": "integer", "default": 800, "description": "Render width in pixels, clamped to 100-4000 (kept small since the image lands in LLM context, raise it when detail matters)" },
-                    "height": { "type": "integer", "default": 600, "description": "Render height in pixels, clamped to 100-4000" }
+                    "height": { "type": "integer", "default": 600, "description": "Render height in pixels, clamped to 100-4000" },
+                    "side":   { "type": "string", "enum": ["top", "bottom"], "default": "top", "description": "Board side facing the camera" },
+                    "zoom":   { "type": "number", "exclusiveMinimum": 0, "default": 1.0, "description": "Positive camera zoom; 1 fits the board, larger values show a close-up" }
                 },
                 "required": ["board"]
             }),
@@ -3929,15 +3931,48 @@ async fn handle_get_board_2d_view(
     let board_path = get_path(args, "board")?;
     let width = args["width"].as_u64().unwrap_or(800).clamp(100, 4000) as u32;
     let height = args["height"].as_u64().unwrap_or(600).clamp(100, 4000) as u32;
+    let side = match args.get("side") {
+        None => "top",
+        Some(value) => match value.as_str() {
+            Some(side @ ("top" | "bottom")) => side,
+            _ => return Ok(super::invalid_arg("side", "must be top or bottom")),
+        },
+    };
+    let zoom = match args.get("zoom") {
+        None => 1.0,
+        Some(_) => match require_f64(args, "zoom") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        },
+    };
+    if !zoom.is_finite() || zoom <= 0.0 {
+        return Ok(super::invalid_arg(
+            "zoom",
+            "must be finite and greater than zero",
+        ));
+    }
 
-    let tmp = board_path.with_extension("render.png");
-    super::cli::render_pcb_png(&ctx.config.kicad_cli, &board_path, &tmp, width, height).await?;
+    let render_dir = tempfile::tempdir().context("could not create board render directory")?;
+    let tmp = render_dir.path().join("board.png");
+    super::cli::render_pcb_png(
+        &ctx.config.kicad_cli,
+        &board_path,
+        &tmp,
+        width,
+        height,
+        side,
+        zoom,
+    )
+    .await?;
     let bytes = tokio::fs::read(&tmp).await?;
-    let _ = tokio::fs::remove_file(&tmp).await;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(CallToolResult::image(b64, "image/png"))
 }
+
+#[cfg(test)]
+#[path = "board_render_tests.rs"]
+mod board_render_tests;
 
 #[cfg(test)]
 mod tests {
