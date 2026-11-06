@@ -569,10 +569,21 @@ pub(super) fn plot(
     };
 
     let mut found = Vec::new();
+    let mut power_scope_warnings: Vec<Value> = Vec::new();
     let mut shared: BTreeSet<String> = BTreeSet::new();
     for (index, (text, signal)) in wanted.signals.iter().enumerate() {
         match signals::resolve(&plot, signal, names) {
             Ok(values) => {
+                let mut scope = json!({});
+                signals::annotate_power_scope(signal, names, &mut scope);
+                for warning in scope["warnings"].as_array().into_iter().flatten() {
+                    if !power_scope_warnings
+                        .iter()
+                        .any(|existing| existing["code"] == warning["code"])
+                    {
+                        power_scope_warnings.push(warning.clone());
+                    }
+                }
                 shared.extend(values.shared_nets.iter().cloned());
                 found.push(Found {
                     text: text.clone(),
@@ -604,6 +615,13 @@ pub(super) fn plot(
             "detail": "ngspice reads these nets as one node, so their signals are the same.",
             "items": shared,
         }));
+    }
+
+    if !power_scope_warnings.is_empty() {
+        drawing.warnings.extend(power_scope_warnings);
+        drawing.notes.push(
+            "Subcircuit power covers exposed pins; hidden supplies are excluded.".to_string(),
+        );
     }
 
     let changed = CurrentSources::of(&record.schematic).changed_since(record);

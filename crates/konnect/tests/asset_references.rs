@@ -874,6 +874,17 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "run_status",
         "unreadable_record",
         "without_record",
+        // Simulation interpretation and stored-artifact evidence fields/codes.
+        "power_scope",
+        "exposed_subcircuit_pins",
+        "total_device_power_verified",
+        "subcircuit_power_boundary",
+        "sampling_validation",
+        "crossing_selection",
+        "ac_margin_sampling_unverified",
+        "result_files_present",
+        "result_files_error",
+        "without_results",
         // Result fields of `plot_simulation_run`, and its warning.
         "curves_thinned",
         "height_px",

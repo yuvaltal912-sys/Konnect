@@ -63,6 +63,8 @@ Add `signals` for summaries and `measurements` for numbers. With neither you get
 | `i(REF:PIN)` | A pin of a larger part, such as `i(M1:d)`. A wrong guess lists the real `pins` |
 | `p(REF)` | Power in a part, counting the pins it shows. A subcircuit with a hidden ground or supply reads short. Code models and `K` couplings report none |
 
+Subcircuit power results carry `power_scope: "exposed_subcircuit_pins"`, `total_device_power_verified: false`, and `subcircuit_power_boundary`. Relay that scope: hidden supplies can make terminal power much smaller than total device power. The same warning is returned for power plots and appears in the SVG notes.
+
 A testbench element has no reference, so use the name it has in `spice_lines`.
 
 Set `max_step_seconds` to about a hundredth of the fastest edge you care about. The default step is `stop_time_seconds / 2000`: on a 0.14 s run that is 70 µs, which got a 750 µs inrush within 1% but put its peak 0.6 ms early. A smaller step costs points, so narrow the run first.
@@ -98,7 +100,7 @@ A `value` of `null` with a `finding` is an answer, not a failure.
 
 ## AC Sweeps
 
-A small-signal sweep around the operating point. It needs a source with an `AC` value: a KiCad source with `ac=1` in its `Sim.Params` has one, and a testbench source can say `VIN in 0 DC 0 AC 1`. With none, every signal would read zero, so `run_simulation` refuses it as `no_ac_stimulus`. It reads the deck text: a source whose `AC` value is a parameter that is 0, or one inside a subcircuit nothing calls, passes and reads zero.
+A small-signal sweep around the operating point. It needs a source with an `AC` value: a KiCad source with `ac=1` in its `Sim.Params` has one, and a testbench source can say `VIN in 0 DC 0 AC 1`. With none, every signal would read zero, so `run_simulation` refuses it as `no_ac_stimulus`. Only top-level sources and reachable subcircuits count, and the last AC magnitude assignment wins. Parameters and conditional branches are not evaluated by this structural check, so a parameter that evaluates to zero can still pass it.
 
 ```json
 {
@@ -120,6 +122,8 @@ A small-signal sweep around the operating point. It needs a source with an `AC` 
 | `bandwidth_3db` | The first frequency 3.01 dB below the gain at the lowest frequency, shown as `reference_gain_db`. With `reference_level: "peak"` it measures from the peak and gives `lower_edge_hz`, `upper_edge_hz` and their difference as `value` |
 | `phase_margin` | 180 degrees plus the phase where the gain first falls through 0 dB, with `crossover_hz` |
 | `gain_margin` | The negative of the gain in dB where the phase first falls through -180 degrees, with `phase_crossover_hz` |
+
+Numeric phase/gain margins include `sampling_validation: "unverified"`, `crossing_selection: "first"`, and `ac_margin_sampling_unverified`. Always relay the warning. Comparing denser sweeps can expose undersampling; agreement does not prove that arbitrary phase aliasing is absent.
 
 **Stability margins need a loop gain, not a closed-loop response.** Break the loop at one point, drive it with an AC source, and take the loop gain between two nodes with `reference_signal`: `{ "kind": "phase_margin", "signal": "v(/RETURN)", "reference_signal": "v(/INJECT)" }`. The signal must be non-inverted: the result shows `start_phase_degrees`, and a loop that starts near 0 or at -90 is plausible while one that starts at 180 has the wrong sign. A margin is a first crossing: if the gain crosses 0 dB more than once, `from_hz` and `to_hz` pick which points are examined. A `null` value with `level_not_reached` means the curve never crossed, which for a gain margin means the phase never reaches -180.
 
@@ -147,7 +151,7 @@ A negative `step_value` sweeps down, and its sign must point from the start towa
 
 Every run that left data is kept: the newest 20 for each project. Nothing here simulates again.
 
-`list_simulation_runs` takes the schematic and lists its runs, newest first: `run_id`, `created_at`, `analysis_kind`, `run_status` (`complete` or `partial`), `simulated_circuit`, `coverage_ratio` and `inputs_changed_since_run`. `without_record` counts folders with no record, such as a run that failed, and `unreadable_record` those whose record is damaged.
+`list_simulation_runs` takes the schematic and lists its runs, newest first: `run_id`, `created_at`, `analysis_kind`, `run_status` (`complete` or `partial`), `simulated_circuit`, `coverage_ratio` and `inputs_changed_since_run`. `without_record` counts folders with no record, such as a run that failed, and `unreadable_record` those whose record is damaged. `run_status` describes the original run. Check `result_files_present` and `result_files_error` for current status/raw-file availability; `without_results` counts runs missing that evidence. Presence does not guarantee that the complete raw payload parses or remains available after the listing.
 
 `measure_simulation_run` takes a `run_id` and `measurements`, with optional `signals` and `envelope_points`, and works them out from the stored data. It takes the same kinds as `run_simulation`, and a kind the run's analysis cannot take is refused, so `bandwidth_3db` on a transient is `invalid_argument`.
 
@@ -161,7 +165,7 @@ Every run that left data is kept: the newest 20 for each project. Nothing here s
 ```
 
 - **Always relay `run_status` and `simulated_circuit`.** A measurement on a `partial` run covers only the data it has, so the result is `partial` too, with `stopped` saying why. A `modified` run does not describe the schematic as drawn, and `circuit` says what was excluded and added.
-- **`inputs_changed_since_run: true`** means the saved schematic, the project file or a model file differs from what the run used. The numbers still describe the old circuit. Say so, and run again if the answer matters. `null` means the sheets could not be read.
+- **`inputs_changed_since_run: true`** means the saved schematic, the project file or a model file differs from what the run used. The numbers still describe the old circuit. Say so, and run again if the answer matters. `null` means the sheets or original model provenance could not be established. New IBIS runs track proven original `.ibs` files, so unrelated KiCad cache cleanup does not itself mean the circuit changed. Legacy IBIS records can report unknown because they recorded only generated-cache paths.
 - **`p(REF)` only exists if the run asked for it.** Otherwise the signal is `signal_not_found` with a `power_not_saved` warning: run again with it in `signals` or `measurements`.
 - **A `dc_sweep` with two sweeps takes no measurements.** The whole grid is in `artifacts.csv_path`, with the second sweep's value in its own column.
 - **Only the newest 20 runs are kept.** An older id is `run_not_found`.

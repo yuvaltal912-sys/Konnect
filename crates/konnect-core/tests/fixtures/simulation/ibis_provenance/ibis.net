@@ -1,0 +1,1913 @@
+(export
+	(version "E")
+	(design
+		(source "ibis.kicad_sch")
+		(date "2026-11-04T14:42:28")
+		(tool "Eeschema 10.0.1")
+		(sheet
+			(number "1")
+			(name "/")
+			(tstamps "/")
+			(title_block
+				(title "KiCad IBIS Demo")
+				(company)
+				(rev)
+				(date)
+				(source "ibis.kicad_sch")
+				(comment
+					(number "1")
+					(value "")
+				)
+				(comment
+					(number "2")
+					(value "")
+				)
+				(comment
+					(number "3")
+					(value "")
+				)
+				(comment
+					(number "4")
+					(value "")
+				)
+				(comment
+					(number "5")
+					(value "")
+				)
+				(comment
+					(number "6")
+					(value "")
+				)
+				(comment
+					(number "7")
+					(value "")
+				)
+				(comment
+					(number "8")
+					(value "")
+				)
+				(comment
+					(number "9")
+					(value "")
+				)
+			)
+		)
+	)
+	(components
+		(comp
+			(ref "R1")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "1f645c34-b20f-4af8-9a69-5a1a53640a29")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R2")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "4f0e8ec3-b113-4b56-9464-7a2e9d5637a8")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R3")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "80fc8795-d4f7-41d3-9a56-4c1da6d57839")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R4")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b964312f-768e-4f43-ac5e-b40a5673d6cc")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R5")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "e67b05d2-ec05-4a3a-83c4-a6706eef09a5")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R6")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b321f617-a2c4-4631-95fc-6c7ce2f37c42")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R7")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "05e37c01-7d60-4635-8f57-cb101e059c7b")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R8")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b1c52766-1645-4c8f-8aa9-f0a295bec8b9")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R9")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "fc9a2045-75d7-4791-be83-c23d6a49f208")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R10")
+			(value "10k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "0e042f99-b13d-4924-a829-6289b06306a3")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R11")
+			(value "50k")
+			(fields
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(property
+				(name "ki_fp_filters")
+				(value "R_*")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "94193a55-cda8-4875-a07c-badbcd351427")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U1")
+			(value "IBIS_DRIVER")
+			(datasheet "https://ibis.org")
+			(fields
+				(field
+					(name "Sim_Name")
+				)
+				(field
+					(name "Sim_Library")
+				)
+				(field
+					(name "Sim.Name") "Virtual")
+				(field
+					(name "Sim.Library") "ibis_v1_1.ibs")
+				(field
+					(name "Sim.Ibis.Pin") "4")
+				(field
+					(name "Sim.Ibis.Model") "Output")
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "DCDRIVER")
+				(field
+					(name "Sim.Pins") "1=GND 2=IN/OUT")
+				(field
+					(name "Sim.Params") "dc=high")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "IBIS_DRIVER_1")
+				(description "Driver model for IBIS files.")
+			)
+			(property
+				(name "Sim_Name")
+				(value "")
+			)
+			(property
+				(name "Sim_Library")
+				(value "")
+			)
+			(property
+				(name "Sim.Name")
+				(value "Virtual")
+			)
+			(property
+				(name "Sim.Library")
+				(value "ibis_v1_1.ibs")
+			)
+			(property
+				(name "Sim.Ibis.Pin")
+				(value "4")
+			)
+			(property
+				(name "Sim.Ibis.Model")
+				(value "Output")
+			)
+			(property
+				(name "Sim.Device")
+				(value "IBIS")
+			)
+			(property
+				(name "Sim.Type")
+				(value "DCDRIVER")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=GND 2=IN/OUT")
+			)
+			(property
+				(name "Sim.Params")
+				(value "dc=high")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "Simulation IBIS")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "e08c34f2-1465-43ee-ad70-c397498f4df0")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U2")
+			(value "IBIS_DRIVER")
+			(datasheet "https://ibis.org")
+			(fields
+				(field
+					(name "Sim_Name")
+				)
+				(field
+					(name "Sim_Library")
+				)
+				(field
+					(name "Sim.Name") "Virtual")
+				(field
+					(name "Sim.Library") "ibis_v1_1.ibs")
+				(field
+					(name "Sim.Ibis.Pin") "4")
+				(field
+					(name "Sim.Ibis.Model") "Output")
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "DCDRIVER")
+				(field
+					(name "Sim.Pins") "1=GND 2=IN/OUT")
+				(field
+					(name "Sim.Params") "dc=low")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "IBIS_DRIVER_1")
+				(description "Driver model for IBIS files.")
+			)
+			(property
+				(name "Sim_Name")
+				(value "")
+			)
+			(property
+				(name "Sim_Library")
+				(value "")
+			)
+			(property
+				(name "Sim.Name")
+				(value "Virtual")
+			)
+			(property
+				(name "Sim.Library")
+				(value "ibis_v1_1.ibs")
+			)
+			(property
+				(name "Sim.Ibis.Pin")
+				(value "4")
+			)
+			(property
+				(name "Sim.Ibis.Model")
+				(value "Output")
+			)
+			(property
+				(name "Sim.Device")
+				(value "IBIS")
+			)
+			(property
+				(name "Sim.Type")
+				(value "DCDRIVER")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=GND 2=IN/OUT")
+			)
+			(property
+				(name "Sim.Params")
+				(value "dc=low")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "Simulation IBIS")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "fbeaad01-8f88-49cc-bda1-bb5c8e6d07d8")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U3")
+			(value "IBIS_DRIVER")
+			(datasheet "https://ibis.org")
+			(fields
+				(field
+					(name "Sim_Name")
+				)
+				(field
+					(name "Sim_Library")
+				)
+				(field
+					(name "Sim.Name") "Virtual")
+				(field
+					(name "Sim.Library") "ibis_v1_1.ibs")
+				(field
+					(name "Sim.Ibis.Pin") "4")
+				(field
+					(name "Sim.Ibis.Model") "Output")
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "DCDRIVER")
+				(field
+					(name "Sim.Pins") "1=GND 2=IN/OUT")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "IBIS_DRIVER_1")
+				(description "Driver model for IBIS files.")
+			)
+			(property
+				(name "Sim_Name")
+				(value "")
+			)
+			(property
+				(name "Sim_Library")
+				(value "")
+			)
+			(property
+				(name "Sim.Name")
+				(value "Virtual")
+			)
+			(property
+				(name "Sim.Library")
+				(value "ibis_v1_1.ibs")
+			)
+			(property
+				(name "Sim.Ibis.Pin")
+				(value "4")
+			)
+			(property
+				(name "Sim.Ibis.Model")
+				(value "Output")
+			)
+			(property
+				(name "Sim.Device")
+				(value "IBIS")
+			)
+			(property
+				(name "Sim.Type")
+				(value "DCDRIVER")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=GND 2=IN/OUT")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "Simulation IBIS")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "66081c26-c5e2-450a-b83e-5ad655e69bea")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U4")
+			(value "IBIS_DRIVER")
+			(datasheet "https://ibis.org")
+			(fields
+				(field
+					(name "Sim_Name")
+				)
+				(field
+					(name "Sim_Library")
+				)
+				(field
+					(name "Ibis_Pin")
+				)
+				(field
+					(name "Ibis_Model")
+				)
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "RECTDRIVER")
+				(field
+					(name "Sim.Pins") "1=GND 2=IN/OUT")
+				(field
+					(name "Sim.Name") "Virtual")
+				(field
+					(name "Sim.Library") "ibis_v1_1.ibs")
+				(field
+					(name "Sim.Ibis.Pin") "4")
+				(field
+					(name "Sim.Ibis.Model") "Output")
+				(field
+					(name "Sim.Params") "ton=100n toff=100n td=0 n=50")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "IBIS_DRIVER_1")
+				(description "Driver model for IBIS files.")
+			)
+			(property
+				(name "Sim_Name")
+				(value "")
+			)
+			(property
+				(name "Sim_Library")
+				(value "")
+			)
+			(property
+				(name "Ibis_Pin")
+				(value "")
+			)
+			(property
+				(name "Ibis_Model")
+				(value "")
+			)
+			(property
+				(name "Sim.Device")
+				(value "IBIS")
+			)
+			(property
+				(name "Sim.Type")
+				(value "RECTDRIVER")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=GND 2=IN/OUT")
+			)
+			(property
+				(name "Sim.Name")
+				(value "Virtual")
+			)
+			(property
+				(name "Sim.Library")
+				(value "ibis_v1_1.ibs")
+			)
+			(property
+				(name "Sim.Ibis.Pin")
+				(value "4")
+			)
+			(property
+				(name "Sim.Ibis.Model")
+				(value "Output")
+			)
+			(property
+				(name "Sim.Params")
+				(value "ton=100n toff=100n td=0 n=50")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "Simulation IBIS")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "0f9d5c8c-16a8-4cb5-86cd-7945cd8957f0")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U5")
+			(value "IBIS_DRIVER")
+			(datasheet "https://ibis.org")
+			(fields
+				(field
+					(name "Sim_Name")
+				)
+				(field
+					(name "Sim_Library")
+				)
+				(field
+					(name "Sim.Name") "Virtual")
+				(field
+					(name "Sim.Library") "ibis_v1_1.ibs")
+				(field
+					(name "Sim.Ibis.Pin") "4")
+				(field
+					(name "Sim.Ibis.Model") "Output")
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "PRBSDRIVER")
+				(field
+					(name "Sim.Pins") "1=GND 2=IN/OUT")
+				(field
+					(name "Sim.Params") "f0=10M n=20")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "IBIS_DRIVER_1")
+				(description "Driver model for IBIS files.")
+			)
+			(property
+				(name "Sim_Name")
+				(value "")
+			)
+			(property
+				(name "Sim_Library")
+				(value "")
+			)
+			(property
+				(name "Sim.Name")
+				(value "Virtual")
+			)
+			(property
+				(name "Sim.Library")
+				(value "ibis_v1_1.ibs")
+			)
+			(property
+				(name "Sim.Ibis.Pin")
+				(value "4")
+			)
+			(property
+				(name "Sim.Ibis.Model")
+				(value "Output")
+			)
+			(property
+				(name "Sim.Device")
+				(value "IBIS")
+			)
+			(property
+				(name "Sim.Type")
+				(value "PRBSDRIVER")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=GND 2=IN/OUT")
+			)
+			(property
+				(name "Sim.Params")
+				(value "f0=10M n=20")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "Simulation IBIS")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "811f111d-28bf-4a98-8b21-d85226e41d6a")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U6")
+			(value "IBIS_DEVICE")
+			(datasheet "https://ibis.org")
+			(fields
+				(field
+					(name "Sim.Name") "Virtual")
+				(field
+					(name "Sim.Library") "ibis_v1_1.ibs")
+				(field
+					(name "Sim.Ibis.Pin") "3")
+				(field
+					(name "Sim.Ibis.Model") "Input")
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "DEVICE")
+				(field
+					(name "Sim.Pins") "1=GND 2=IN/OUT")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "Simulation_SPICE")
+				(part "IBIS_DEVICE")
+				(description "Device model for IBIS files. Pin 3 can be used to monitor the die potential")
+			)
+			(property
+				(name "Sim.Name")
+				(value "Virtual")
+			)
+			(property
+				(name "Sim.Library")
+				(value "ibis_v1_1.ibs")
+			)
+			(property
+				(name "Sim.Ibis.Pin")
+				(value "3")
+			)
+			(property
+				(name "Sim.Ibis.Model")
+				(value "Input")
+			)
+			(property
+				(name "Sim.Device")
+				(value "IBIS")
+			)
+			(property
+				(name "Sim.Type")
+				(value "DEVICE")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=GND 2=IN/OUT")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "Simulation IBIS")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "ab2b2fff-aabc-47d0-824a-d48cb9f69295")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "2")
+						)
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "V1")
+			(value "5")
+			(fields
+				(field
+					(name "Sim.Pins") "1=+ 2=-")
+				(field
+					(name "Sim.Type") "DC")
+				(field
+					(name "Sim.Device") "V")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "VDC_1")
+				(description "Voltage source, DC")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=+ 2=-")
+			)
+			(property
+				(name "Sim.Type")
+				(value "DC")
+			)
+			(property
+				(name "Sim.Device")
+				(value "V")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "simulation")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b1f3dad6-3ca1-4f66-8a30-0f262dbc710e")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "V2")
+			(value "VPULSE")
+			(fields
+				(field
+					(name "Sim.Pins") "1=+ 2=-")
+				(field
+					(name "Sim.Type") "PULSE")
+				(field
+					(name "Sim.Device") "V")
+				(field
+					(name "Sim.Params") "y2=5 tr=20n tf=20n tw=90n per=180n")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description")
+				)
+			)
+			(libsource
+				(lib "")
+				(part "VPULSE_1")
+				(description "Voltage source, pulse")
+			)
+			(property
+				(name "Sim.Pins")
+				(value "1=+ 2=-")
+			)
+			(property
+				(name "Sim.Type")
+				(value "PULSE")
+			)
+			(property
+				(name "Sim.Device")
+				(value "V")
+			)
+			(property
+				(name "Sim.Params")
+				(value "y2=5 tr=20n tf=20n tw=90n per=180n")
+			)
+			(property
+				(name "Sheetname")
+				(value "")
+			)
+			(property
+				(name "Sheetfile")
+				(value "ibis.kicad_sch")
+			)
+			(property
+				(name "ki_keywords")
+				(value "simulation")
+			)
+			(sheetpath
+				(names "/")
+				(tstamps "/")
+			)
+			(tstamps "b8e17a2a-7446-4247-a06f-ebcc0bd8a891")
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+	)
+	(groups)
+	(variants)
+	(libparts
+		(libpart
+			(lib "")
+			(part "IBIS_DRIVER_1")
+			(description "Driver model for IBIS files.")
+			(docs "https://ibis.org")
+			(fields
+				(field
+					(name "Reference") "U?")
+				(field
+					(name "Value") "IBIS_DRIVER")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description") "Driver model for IBIS files.")
+				(field
+					(name "Sim_Name")
+				)
+				(field
+					(name "Sim_Library")
+				)
+				(field
+					(name "Ibis_Pin")
+				)
+				(field
+					(name "Ibis_Model")
+				)
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "IBISDRIVERDC")
+				(field
+					(name "Sim.Pins") "1=1 2=2")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "REF")
+					(type "power_in")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "bidirectional")
+				)
+			)
+		)
+		(libpart
+			(lib "")
+			(part "VDC_1")
+			(description "Voltage source, DC")
+			(fields
+				(field
+					(name "Reference") "V")
+				(field
+					(name "Value") "1")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Voltage source, DC")
+				(field
+					(name "Sim.Pins") "1=+ 2=-")
+				(field
+					(name "Sim.Type") "DC")
+				(field
+					(name "Sim.Device") "V")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "")
+			(part "VPULSE_1")
+			(description "Voltage source, pulse")
+			(fields
+				(field
+					(name "Reference") "V")
+				(field
+					(name "Value") "VPULSE")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Voltage source, pulse")
+				(field
+					(name "Sim.Pins") "1=+ 2=-")
+				(field
+					(name "Sim.Type") "PULSE")
+				(field
+					(name "Sim.Device") "V")
+				(field
+					(name "Sim.Params") "y1=0 y2=1 td=2n tr=2n tf=2n tw=50n per=100n")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "Device")
+			(part "R")
+			(description "Resistor")
+			(footprints
+				(fp "R_*")
+			)
+			(fields
+				(field
+					(name "Reference") "R")
+				(field
+					(name "Value") "R")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet")
+				)
+				(field
+					(name "Description") "Resistor")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "Simulation_SPICE")
+			(part "IBIS_DEVICE")
+			(description "Device model for IBIS files. Pin 3 can be used to monitor the die potential")
+			(docs "https://ibis.org")
+			(fields
+				(field
+					(name "Reference") "U?")
+				(field
+					(name "Value") "IBIS_DEVICE")
+				(field
+					(name "Footprint")
+				)
+				(field
+					(name "Datasheet") "https://ibis.org")
+				(field
+					(name "Description") "Device model for IBIS files. Pin 3 can be used to monitor the die potential")
+				(field
+					(name "Ibis_Pin")
+				)
+				(field
+					(name "Ibis_Model")
+				)
+				(field
+					(name "Sim.Device") "IBIS")
+				(field
+					(name "Sim.Type") "IBISDEVICE")
+				(field
+					(name "Sim.Pins") "1=1 2=2")
+			)
+			(pins
+				(pin
+					(num "1")
+					(name "REF")
+					(type "power_in")
+				)
+				(pin
+					(num "2")
+					(name "")
+					(type "input")
+				)
+			)
+		)
+	)
+	(libraries
+		(library
+			(logical "Device")
+			(uri "${KICAD10_SYMBOL_DIR}/Device.kicad_sym")
+		)
+		(library
+			(logical "Simulation_SPICE")
+			(uri "${KICAD10_SYMBOL_DIR}/Simulation_SPICE.kicad_sym")
+		)
+	)
+	(nets
+		(net
+			(code "1")
+			(name "GND")
+			(class "Default")
+			(node
+				(ref "R10")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R2")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R4")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R6")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R8")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "1")
+				(pinfunction "REF_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U2")
+				(pin "1")
+				(pinfunction "REF_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U3")
+				(pin "1")
+				(pinfunction "REF_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U4")
+				(pin "1")
+				(pinfunction "REF_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U5")
+				(pin "1")
+				(pinfunction "REF_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "U6")
+				(pin "1")
+				(pinfunction "REF_1")
+				(pintype "power_in")
+			)
+			(node
+				(ref "V1")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "V2")
+				(pin "2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "2")
+			(name "HIGHZ_OUTPUT")
+			(class "Default")
+			(node
+				(ref "R5")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R6")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U3")
+				(pin "2")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "3")
+			(name "HIGH_OUTPUT")
+			(class "Default")
+			(node
+				(ref "R1")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R2")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U1")
+				(pin "2")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "4")
+			(name "LOW_OUTPUT")
+			(class "Default")
+			(node
+				(ref "R3")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R4")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U2")
+				(pin "2")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "5")
+			(name "Net-(R11-Pad1)")
+			(class "Default")
+			(node
+				(ref "R11")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "V2")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "6")
+			(name "PRBS_OUTPUT")
+			(class "Default")
+			(node
+				(ref "R10")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R9")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "U5")
+				(pin "2")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "7")
+			(name "PULSE_INPUT")
+			(class "Default")
+			(node
+				(ref "R11")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "U6")
+				(pin "2")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "8")
+			(name "RECT_OUTPUT")
+			(class "Default")
+			(node
+				(ref "R7")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R8")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U4")
+				(pin "2")
+				(pintype "bidirectional")
+			)
+		)
+		(net
+			(code "9")
+			(name "VDD")
+			(class "Default")
+			(node
+				(ref "R1")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R3")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R5")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R7")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R9")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "V1")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+	)
+)
