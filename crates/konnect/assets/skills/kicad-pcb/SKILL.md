@@ -215,11 +215,23 @@ an unproved outline is not completion evidence.
   scorer deliberately did not guess about. `interface_filter_caps` lists caps
   within their family limit of a connector carrying every one of their nets;
   do not drag those cable-filtering parts toward an IC.
-- Outside-outline and connector-edge evidence applies only to a provably
-  axis-aligned rectangular outline (`outline_shape: "rectangular"`). Treat
-  `outline_unproven` like `outline_missing`, not like `pass`; validate a
-  non-rectangular board's real fit with KiCad DRC and report `BLOCKED` for the
-  unavailable containment proof.
+- Outside-outline and connector-edge evidence is judged against the true
+  Edge.Cuts outline, rounded corners and cut-outs included, and every
+  `outside_outline` failure carries its `overhang_mm`. An outline that does not
+  close, or has an unreadable graphic, is `outline_unproven`: treat it like
+  `outline_missing`, not like `pass`, and report `BLOCKED` for the unavailable
+  containment proof. Pass `edge_mount_references` for parts that are meant to
+  sit on the edge. `run_design_review`, `audit_manufacturing` and
+  `validate_for_manufacturing` run the same containment check on courtyards,
+  pads and silkscreen text.
+- `place_decoupling_caps`, `auto_place_from_schematic` and
+  `refine_placement_force_directed` still refuse any outline that is not a
+  provable rectangle; on a rounded or notched board place parts with small
+  explicit moves and confirm with `score_placement`.
+- `query_board_region` (placement toolset) answers "what is near this pad":
+  name a `bbox`, a footprint or pad to look `around`, or a `point` and radius.
+  Use it, and `query_traces` with `touching_pad`, instead of a script that
+  parses the board file.
 - `auto_place_from_schematic` returns a deterministic net-clustered starting
   plan for diagnosis. It never writes: `dry_run: false` returns structured
   **plan_blocked**.

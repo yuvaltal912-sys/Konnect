@@ -1,11 +1,14 @@
 pub mod board;
+pub mod board_geometry;
 pub mod bounds;
 pub mod command;
 pub mod error;
 pub mod geometry;
 pub mod layers;
 pub mod net;
+pub mod outline;
 pub mod parser;
+pub mod planar;
 pub mod schematic;
 pub mod transaction;
 pub mod writer;

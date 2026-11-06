@@ -746,6 +746,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "outline_shape",
         "outline_unproven",
         "outline_missing",
+        // Structured outline-containment response fields (creation PR 7), not
+        // callable tools.
+        "outside_outline",
+        "overhang_mm",
         // Shared placement-plan response fields, not callable tools.
         "plan_status",
         "blocking_reasons",

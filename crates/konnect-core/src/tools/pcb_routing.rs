@@ -182,14 +182,27 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "query_traces",
-            "List trace segments on the board, optionally filtered by net and/or layer. \
-             Each result includes the track's UUID, which delete_trace takes.",
+            "List trace segments on the board, optionally filtered by net, layer, or the pad \
+             they touch. Each result includes the track's UUID, which delete_trace takes. At \
+             most 'limit' segments (default 200) come back; 'total_matches' and 'truncated' \
+             say when that cut the list, so a busy board no longer returns tens of kilobytes. \
+             For everything else near a point (pads, vias, zones), use query_board_region.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":    { "type": "string" },
                     "net_name": { "type": "string", "description": "Filter by net (optional)" },
-                    "layer":    { "type": "string", "description": "Filter by layer (optional)" }
+                    "layer":    { "type": "string", "description": "Filter by layer (optional)" },
+                    "touching_pad": {
+                        "type": "object",
+                        "description": "Only segments whose copper touches this pad, on a layer the pad has copper on",
+                        "properties": {
+                            "reference": { "type": "string", "description": "Footprint reference, e.g. U1" },
+                            "pad": { "type": "string", "description": "Pad number, e.g. 3" }
+                        },
+                        "required": ["reference", "pad"]
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Most segments to return" }
                 },
                 "required": ["board"]
             }),
@@ -1072,6 +1085,132 @@ async fn handle_delete_trace(
     })))
 }
 
+/// `query_traces`: the `limit` cut and the `touching_pad` filter, against a
+/// mocked KiCad that holds the board-geometry fixture.
+#[cfg(test)]
+mod query_traces_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    const FIXTURE: &str =
+        include_str!("../../../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb");
+
+    /// The fixture's three segments, as KiCad would list them:
+    /// VCC (10,8)-(10,12) and GND (14,8)-(14,12) on F.Cu, VCC (10,12)-(14,12)
+    /// on B.Cu. U1 pad 1 sits at (10, 8), pad 2 at (14, 8).
+    async fn run(extra: serde_json::Value) -> (bool, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, FIXTURE).unwrap();
+        let tracks: Vec<prost_types::Any> = [
+            ("VCC", "F.Cu", (10.0, 8.0, 10.0, 12.0), "t-vcc-f"),
+            ("GND", "F.Cu", (14.0, 8.0, 14.0, 12.0), "t-gnd-f"),
+            ("VCC", "B.Cu", (10.0, 12.0, 14.0, 12.0), "t-vcc-b"),
+        ]
+        .into_iter()
+        .map(|(net, layer, (x1, y1, x2, y2), id)| {
+            let mut t = konnect_ipc::builders::build_track(net, 1, layer, 0.25, x1, y1, x2, y2);
+            t.id = Some(kiapi::common::types::Kiid {
+                value: id.to_string(),
+            });
+            konnect_ipc::builders::pack_any(&t, "kiapi.board.types.Track")
+        })
+        .collect();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: tracks.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("SaveDocumentToString") {
+                let request =
+                    kiapi::common::commands::SaveDocumentToString::decode(command.value.as_slice())
+                        .unwrap();
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::SavedDocumentResponse {
+                        document: request.document,
+                        contents: FIXTURE.into(),
+                    },
+                    "kiapi.common.commands.SavedDocumentResponse",
+                ));
+            }
+            None
+        });
+        let mut args = json!({ "board": board.to_string_lossy() });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        let result = handle_query_traces(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        (
+            result.is_error,
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })),
+        )
+    }
+
+    #[tokio::test]
+    async fn without_filters_every_segment_comes_back_untruncated() {
+        let (err, body) = run(json!({})).await;
+        assert!(!err, "{body}");
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["total_matches"], 3);
+        assert_eq!(body["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn a_limit_cuts_the_list_and_keeps_the_true_total() {
+        let (err, body) = run(json!({ "limit": 2 })).await;
+        assert!(!err, "{body}");
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["total_matches"], 3);
+        assert_eq!(body["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn touching_a_pad_keeps_only_the_segments_on_its_copper() {
+        // Pad 1 of U1 is at (10, 8): only the VCC F.Cu segment starting there
+        // touches it. The GND segment is 4 mm away (it ends on pad 2), and the
+        // B.Cu segment is on a layer an SMD pad has no copper on.
+        let (err, body) = run(json!({ "touching_pad": { "reference": "U1", "pad": "1" } })).await;
+        assert!(!err, "{body}");
+        assert_eq!(body["total_matches"], 1, "{body}");
+        assert_eq!(body["traces"][0]["uuid"], "t-vcc-f");
+
+        let (_, pad2) = run(json!({ "touching_pad": { "reference": "U1", "pad": "2" } })).await;
+        assert_eq!(pad2["traces"][0]["uuid"], "t-gnd-f", "{pad2}");
+        assert_eq!(pad2["total_matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn touching_filters_combine_with_the_net_filter_and_an_unknown_pad_is_an_error() {
+        let (_, none) =
+            run(json!({ "touching_pad": { "reference": "U1", "pad": "1" }, "net_name": "GND" }))
+                .await;
+        // The mock ignores the net filter (KiCad applies it); the pad filter
+        // alone decides here, so this only proves the arguments coexist.
+        assert!(none["total_matches"].is_number(), "{none}");
+
+        let (err, body) = run(json!({ "touching_pad": { "reference": "U1", "pad": "99" } })).await;
+        assert!(err, "{body}");
+        let (err, body) = run(json!({ "touching_pad": { "reference": "U1" } })).await;
+        assert!(err, "{body}");
+        let (err, body) = run(json!({ "limit": 0 })).await;
+        assert!(err, "{body}");
+    }
+}
+
 #[cfg(test)]
 mod delete_trace_tests {
     use super::*;
@@ -1199,6 +1338,10 @@ mod delete_trace_tests {
     }
 }
 
+/// Segments returned by `query_traces` when the caller names no limit.
+const QUERY_TRACES_DEFAULT_LIMIT: usize = 200;
+const QUERY_TRACES_MAX_LIMIT: usize = 1000;
+
 async fn handle_query_traces(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1206,12 +1349,84 @@ async fn handle_query_traces(
     let net = args["net_name"].as_str().map(String::from);
     let layer = args["layer"].as_str().map(String::from);
 
-    let tracks = ipc!(ctx, args, |c| {
-        c.get_tracks(net.as_deref(), layer.as_deref())
+    let limit = match args.get("limit") {
+        None | Some(serde_json::Value::Null) => QUERY_TRACES_DEFAULT_LIMIT,
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=QUERY_TRACES_MAX_LIMIT as u64).contains(&n) => n as usize,
+            _ => {
+                return Ok(crate::tools::invalid_arg(
+                    "limit",
+                    &format!("must be an integer from 1 to {QUERY_TRACES_MAX_LIMIT}"),
+                ))
+            }
+        },
+    };
+    let touching = match args.get("touching_pad") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let field = |key: &str| {
+                v.get(key)
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+            };
+            match (field("reference"), field("pad")) {
+                (Some(r), Some(p)) => Some((r.to_string(), p.to_string())),
+                _ => {
+                    return Ok(crate::tools::invalid_arg(
+                        "touching_pad",
+                        "needs a 'reference' and a 'pad', both strings",
+                    ))
+                }
+            }
+        }
+    };
+
+    // The pad's copper comes from the same board KiCad holds, read in the same
+    // call as the tracks, so the two cannot disagree about where the pad is.
+    let want_board = touching.is_some();
+    let (tracks, board_text) = ipc!(ctx, args, |c, doc| {
+        let tracks = c.get_tracks_in(doc.clone(), net.as_deref(), layer.as_deref())?;
+        let text = if want_board {
+            Some(c.save_document_to_string_in(doc)?)
+        } else {
+            None
+        };
+        Ok((tracks, text))
     });
 
-    let items: Vec<serde_json::Value> = tracks
+    let pad = match (&touching, board_text) {
+        (Some((reference, number)), Some(text)) => {
+            let tree = konnect_sexp::parse_sexp(&text)?;
+            let geometry = konnect_sexp::board_geometry::BoardGeometry::from_tree(&tree);
+            match geometry.pad(reference, number) {
+                Some(p) => Some(p.clone()),
+                None => {
+                    return Ok(CallToolResult::error(format!(
+                        "No pad '{number}' on footprint '{reference}', so there is nothing for a trace to touch."
+                    )))
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let matching: Vec<&_> = tracks
         .iter()
+        .filter(|t| {
+            pad.as_ref().is_none_or(|p| {
+                p.touches_track(
+                    &t.layer,
+                    (t.start.x, t.start.y),
+                    (t.end.x, t.end.y),
+                    t.width,
+                )
+            })
+        })
+        .collect();
+    let total = matching.len();
+    let items: Vec<serde_json::Value> = matching
+        .into_iter()
+        .take(limit)
         .map(|t| {
             json!({
                 "uuid": t.uuid,
@@ -1222,9 +1437,12 @@ async fn handle_query_traces(
         })
         .collect();
 
-    Ok(CallToolResult::json(
-        &json!({ "count": items.len(), "traces": items }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "count": items.len(),
+        "total_matches": total,
+        "truncated": total > items.len(),
+        "traces": items
+    })))
 }
 
 async fn handle_get_nets_list(
