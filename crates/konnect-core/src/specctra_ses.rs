@@ -86,6 +86,10 @@ struct SupportedProfile {
     #[serde(default)]
     locked_via_count: usize,
     copper_zones: bool,
+    #[serde(default)]
+    zone_plane_count: usize,
+    #[serde(default)]
+    zone_keepout_count: usize,
     custom_rules: bool,
     outline: String,
 }
@@ -229,7 +233,6 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     }
     if manifest.supported_profile.copper_layers != 2
         || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.copper_zones
         || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
@@ -243,6 +246,16 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
         || manifest.supported_profile.locked_via_count != locked_via_count
     {
         bail!("manifest locked-routing inventory does not match the live board snapshot");
+    }
+    // Zones stay as they were: the import adds tracks and vias and never
+    // touches a pour or a rule area, so the board must still hold the ones the
+    // export was told about.
+    let (planes, keepouts) = crate::specctra::zone_counts(board_source)?;
+    if manifest.supported_profile.copper_zones != (planes + keepouts > 0)
+        || manifest.supported_profile.zone_plane_count != planes
+        || manifest.supported_profile.zone_keepout_count != keepouts
+    {
+        bail!("manifest zone inventory does not match the live board snapshot");
     }
     let requested = canonical_existing(board_path)?;
     let recorded = canonical_existing(Path::new(&manifest.board_path))?;

@@ -59,6 +59,40 @@ with itself leaves the fields alone. The reference, Value and Footprint still ar
 changed, so a replacement with no Sim fields of its own (such as `Device:R`) is
 inferred from its reference prefix: rename `D1` to `R1` to simulate it as a resistor.
 
+## Unreleased: Freerouting on boards with rounded outlines, rounded pads and pours (minor release)
+
+Creation PR 2b. `export_specctra_dsn` used to refuse any board with an arc in its
+outline (including the rounded outline `add_board_outline` draws), a rounded-rectangle
+or oval pad, or a copper zone. It now exports them; the other refusals stand.
+
+- **Outlines.** One closed loop of `gr_line`, `gr_arc`, `gr_rect`, `gr_circle` and
+  `gr_poly` on `Edge.Cuts`. The DSN writer has no arc, so arcs and circles become
+  chords whose middle strays at most 5 um from the true curve; the manifest says so.
+  Bezier curves (`gr_curve`), arcs in the pre-KiCad-7 centre-and-angle form, two
+  loops and loops enclosing no area are refused.
+- **Pads.** `roundrect` is written as its bounding rectangle: the router never sees
+  copper that is not there, and may not use the corners. `oval` is written as a
+  stadium (a path as wide as the short side); an oval with equal sides is a circle.
+  Trapezoid and custom pads are still refused.
+- **Zones.** A copper pour becomes a Specctra `plane` of its net on each of its copper
+  layers, which is how KiCad's own DSN export writes one. A rule area that forbids
+  tracks or vias becomes a keepout (tracks only, vias only, or both). Both come from the
+  zone's outline, not its fill: thermal reliefs and clearance gaps are not modelled, so
+  run DRC after a refill. A pour with no net, a pour on a net no pad is on, and a zone
+  with more than one outline are refused. The manifest gains `zone_plane_count` and
+  `zone_keepout_count`. The SES import adds tracks and vias only and refuses a board or
+  manifest whose zone inventory differs from the export's; it never edits a zone.
+- **Native bridge.** With `native_bridge_mode` `prefer`, KiCad's own DSN for a board with
+  rounded pads is no longer adopted (KiCad writes them as polygons, which the differential
+  check does not model), and the Rust DSN is used. `require` refuses.
+- **Freerouting setup.** `check_freerouting` reads the Java version the JAR needs from the
+  JAR itself and looks for a Java that meets it (`java_path`, `JAVA_HOME`, `PATH`, the
+  usual JDK folders). It returns `setup` with the exact steps when the JAR or the Java is
+  missing, and `available` is now false when the JAR cannot be started (it was true
+  whenever any Java started). `route_specctra_dsn` takes `java_path` and refuses before
+  starting anything when no Java meets the requirement. Konnect downloads and installs
+  nothing: that is your decision, and the steps are the commands you would run.
+
 ## Unreleased: wiring tools report the nets they join, and stubs and wires stop joining others (patch release)
 
 Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
