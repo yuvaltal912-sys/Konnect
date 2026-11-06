@@ -109,7 +109,7 @@ pub enum ErcCoordinateStatus {
 /// path only — ERC has no board to index — and every one of them serialises
 /// away when it was never set, so the ERC response and any caller that ignores
 /// them see exactly the shape they saw before (#413).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReportItem {
     pub description: String,
     pub pos: Option<ReportPos>,

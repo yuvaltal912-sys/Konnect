@@ -403,7 +403,9 @@ pub fn tools() -> Vec<ToolDef> {
              Provided in `pcb_export` because the output is handy to bundle alongside \
              Gerbers when preparing a build package. For interactive / iterative DRC \
              work, prefer `run_drc` (verification toolset) — same kicad-cli check, \
-             cleaner summary with error/warning counts.",
+             cleaner summary with error/warning counts. The list is paged (`limit`, `offset`) \
+             and stops at a size cap; `truncated` and `next_offset` say what is left, \
+             and `output` writes the full report.",
             json!({
                 "type": "object",
                 "properties": {
@@ -415,6 +417,14 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 10000, "default": 50,
+                        "description": "Maximum number of violations to list (a page also stops at a size cap)"
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "default": 0,
+                        "description": "Violations to skip, in KiCad's report order"
                     }
                 },
                 "required": ["board"]
@@ -1060,13 +1070,17 @@ async fn handle_refill_zones(
     }
 }
 
-async fn handle_get_drc_violations(
+pub(crate) async fn handle_get_drc_violations(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
+    let (offset, limit) = match super::response_budget::window(args, 50) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -1091,7 +1105,7 @@ async fn handle_get_drc_violations(
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .collect();
 
-    let summary = json!({
+    let mut summary = json!({
         "total": report.all().count(),
         "source": provenance.source,
         "live_board_synced": provenance.live_board_synced,
@@ -1104,14 +1118,10 @@ async fn handle_get_drc_violations(
         "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
-        "violations": filtered.iter().map(|v| json!({
-            "severity": v.severity,
-            "rule": v.rule,
-            "description": v.description,
-            "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
-            "items": v.items
-        })).collect::<Vec<_>>()
     });
+    if let Some(object) = summary.as_object_mut() {
+        object.extend(super::drc::violations_page(&filtered, offset, limit));
+    }
 
     Ok(CallToolResult::text(
         serde_json::to_string(&summary).unwrap(),

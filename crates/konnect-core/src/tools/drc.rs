@@ -26,6 +26,35 @@ pub(crate) async fn write_report(output: &str, contents: &str) -> anyhow::Result
     .await?
 }
 
+/// The violations of a DRC result as one page, with the fields that say what the
+/// page is and a tally of every violation by rule. Both CLI DRC tools use it, so
+/// a large board cannot overflow the client in either (#C3).
+pub(crate) fn violations_page(
+    filtered: &[&cli::DrcViolation],
+    offset: usize,
+    limit: usize,
+) -> serde_json::Map<String, Value> {
+    use super::response_budget as budget;
+    let all: Vec<Value> = filtered
+        .iter()
+        .map(|v| {
+            json!({
+                "severity": v.severity,
+                "rule": v.rule,
+                "description": v.description,
+                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                "items": v.items
+            })
+        })
+        .collect();
+    let page = budget::page(&all, offset, limit, budget::BYTE_BUDGET);
+    let mut fields = serde_json::Map::new();
+    page.describe(&mut fields);
+    fields.insert("by_rule".into(), json!(budget::tally(&all, "rule")));
+    fields.insert("violations".into(), json!(page.items));
+    fields
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct DrcSourceEvidence {
     pub source: &'static str,

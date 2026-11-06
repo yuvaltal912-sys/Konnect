@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-06. The research is done. PR 1 (#19) and PR 2 are open and not merged; PR 2 is stacked on PR 1's branch. PR 3 is next and not started; ask the owner before starting it.
+**Last updated:** 2026-11-06. The research is done. PR 1 (#19) and PR 2 (#20) are merged. PR 3 is open and not merged. PR 4 is next and not started; ask the owner before starting it.
 
 ## Start here
 
@@ -32,9 +32,9 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
-| 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | **Open**: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19), branch `feat/creation-netlist-compare` |
-| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | **Open**: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20), stacked on `feat/creation-netlist-compare`; branch `feat/schematic-route-safety` |
-| 3 | Response budget for ERC, DRC and list tools | none | Not started |
+| 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | Merged: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19) |
+| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20) |
+| 3 | Response budget for ERC, DRC and list tools | none | **Open**, branch `feat/response-budget` |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented | 1, 2 | Not started |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
@@ -48,9 +48,22 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
-## Now: PR 2, route safety
+## Now: PR 3, response budget
 
-Stacked on PR 1's branch, so its base is `feat/creation-netlist-compare`; retarget it to `main` once PR 1 merges. Two commits:
+The client refuses a tool result near 50,000 characters. Real use had 8 ERC/DRC results refused at 51 to 71 thousand, which sent the assistant to run `kicad-cli` itself. One helper, `tools/response_budget.rs`, now does the cutting:
+
+- `window(args, default)` reads `limit` (1 to 10,000) and `offset`; a present value it cannot read is refused, not replaced by the default.
+- `page(items, offset, limit, budget)` stops at `limit` or at 40,000 characters of items, whichever comes first, and always returns one item when any remain. `describe` adds `shown`, `offset`, `limit`, `truncated` and, when truncated, `next_offset`, `byte_capped` and a `hint`. `tally` counts every item by rule and severity, not just the page. `list_response` is the same for plain lists.
+- Applied to `run_erc` (new `limit` default 100, `offset`, `by_rule`), `run_drc` and `get_drc_violations` (shared `drc::violations_page`; the latter had no limit at all), `list_schematic_components`, `list_symbol_libraries` and `list_footprint_libraries`. `output` still writes the full, unpaged report, which is the "full report on disk" part.
+- `load_toolset` returns each tool's first sentence (110 characters at most) by default; `detail: "full"` returns the old text. `tools/list` is unchanged. This was 20% of the bytes returned in real use.
+
+Not done, and still open under rank 3: C24 (a `zone_fill_state` field on DRC, which depends on this), and A30's other long results (`batch_place_components`, `update_pcb_from_schematic`, `validate_for_manufacturing`, the batch wiring tools), `get_component_list` and `query_traces`. They can reuse the helper. A caller that read every violation in one `get_drc_violations` or `run_erc` call must now follow `next_offset` or pass `output`; `docs/API_MIGRATIONS.md` says so.
+
+Proof: `response_budget_tests.rs` runs the real ERC handler against a stand-in `kicad-cli` that serves a 700-violation report (under the cap, counts of all 700, pages cover each violation once, `output` holds all of them), the DRC pager on 900 violations, and the list tools. Six guards were broken one at a time (the byte cap, the whole-list tally, truncation, paging order of `output`, argument checking, the summary) and each failed a test. Limits left: the cap counts characters of listed items only, so a response with very large non-list fields could still be large; the stand-in is not KiCad's own large report; the live KiCad was not asked.
+
+## PR 2, route safety (merged, #20)
+
+Two commits:
 
 - **#901 ported as it stands** (author Paulius Zaleckas, cherry-picked with `-x`): `connect_pins`, `batch_connect_pins` and `add_schematic_connection` try the other L-bend and refuse with `plan_blocked` when both would join another net. One conflict, in `docs/API_MIGRATIONS.md`, kept both entries.
 - **#899 and #900, which #901 touches the same path as.** A stub from `connect_to_net` or `batch_connect_to_net` is checked the same way (`pick_stub_direction`): `auto` tries the other directions, a named direction that would join is refused or, in the batch, skipped into `errors`. Reaching what already carries the stub's own net name is not a join, because the label joins it anyway (an existing test needs this). `add_wire`, `batch_add_wire` and the stub wires dot only the T's the new wire forms (`t_junctions_on`). `add_wire` takes coordinates, so it draws what it is given and only reports.
@@ -64,7 +77,7 @@ cargo test -p konnect-core --lib route_safety -- --ignored
 
 Guards were broken one at a time (the join check, the T filter, the stub check, the report); each failed fast tests and the live one. Limits left: the check sees pins, labels and sheet pins, so two bare-wire nets with nothing on them can still touch unreported; labels or power symbols that merge nets by name are out of its sight until `compare_netlist` runs; `add_power_symbol`, `add_junction`, the bus tools and the `move_*` tools were not looked at, and `add_wire` / `batch_add_wire` only report.
 
-## PR 1, the netlist read and compare (open, #19)
+## PR 1, the netlist read and compare (merged, #19)
 
 Two tools in the `sch_export` toolset (`tools/sch_netlist.rs`, tests in `tools/sch_netlist_tests.rs`).
 

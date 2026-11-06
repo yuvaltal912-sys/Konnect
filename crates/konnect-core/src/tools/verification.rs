@@ -23,7 +23,10 @@ pub fn tools() -> Vec<ToolDef> {
              with separate error and warning counts in the summary. Prefer this over \
              `get_drc_violations` (pcb_export toolset) — they run the same underlying \
              kicad-cli check, but `run_drc` returns a cleaner breakdown. KiCad runs the \
-             complete configured DRC ruleset; kicad-cli has no per-test selector.",
+             complete configured DRC ruleset; kicad-cli has no per-test selector. The list is \
+             paged (`limit`, `offset`) and stops at a size cap: `filtered_count`, \
+             `errors`, `warnings` and `by_rule` count every violation, `truncated` and \
+             `next_offset` say what is left, and `output` writes the full report.",
             json!({
                 "type": "object",
                 "properties": {
@@ -37,9 +40,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "default": "warning"
                     },
                     "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of violations to return",
-                        "default": 50
+                        "type": "integer", "minimum": 1, "maximum": 10000, "default": 50,
+                        "description": "Maximum number of violations to list (a page also stops at a size cap)"
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "default": 0,
+                        "description": "Violations to skip, in KiCad's report order"
                     }
                 },
                 "required": ["board"]
@@ -243,14 +249,17 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
-async fn handle_run_drc(
+pub(crate) async fn handle_run_drc(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let (offset, limit) = match super::response_budget::window(args, 50) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -275,12 +284,9 @@ async fn handle_run_drc(
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
-    let shown = filtered.len().min(limit);
-    let truncated = filtered.len() > limit;
     let missing = report.missing_categories();
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
+    let mut body = json!({
             "total_violations": report.all().count(),
             "source": provenance.source,
             "live_board_synced": provenance.live_board_synced,
@@ -300,18 +306,11 @@ async fn handle_run_drc(
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
-            "shown": shown,
-            "truncated": truncated,
-            "violations": filtered.iter().take(limit).map(|v| json!({
-                "severity": v.severity,
-                "rule": v.rule,
-                "description": v.description,
-                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
-                "items": v.items
-            })).collect::<Vec<_>>()
-        }))
-        .unwrap(),
-    ))
+    });
+    if let Some(object) = body.as_object_mut() {
+        object.extend(super::drc::violations_page(&filtered, offset, limit));
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 /// Write a report, creating the directory the caller named.

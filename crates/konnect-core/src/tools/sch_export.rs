@@ -150,7 +150,11 @@ pub fn tools() -> Vec<ToolDef> {
              object says whether they were corrected for the KiCad versions that \
              report them 100x too small, passed through, or withheld because the \
              KiCad version could not be classified. A report that is not in \
-             kicad-cli's ERC shape is an error, never zero violations.",
+             kicad-cli's ERC shape is an error, never zero violations. The list is \
+             paged (`limit`, `offset`) and stops at a size cap, so a large sheet \
+             cannot overflow the client: `total`, `errors`, `warnings` and `by_rule` \
+             count every violation, `truncated` and `next_offset` say what is left, \
+             and `output` writes the full response to a file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -160,6 +164,14 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Minimum severity to report: 'error', 'warning', 'info'",
                         "default": "warning"
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 10000, "default": 100,
+                        "description": "Most violations to list (a page also stops at a size cap)"
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "default": 0,
+                        "description": "Violations to skip, in KiCad's report order"
                     }
                 },
                 "required": ["schematic"]
@@ -704,12 +716,16 @@ fn erc_response(report: &cli::ErcReport, min_severity: &str) -> serde_json::Valu
     })
 }
 
-async fn handle_run_erc(
+pub(crate) async fn handle_run_erc(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let min_severity = args["severity"].as_str().unwrap_or("warning");
+    let (offset, limit) = match crate::tools::response_budget::window(args, 100) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let owning_root = match owning_project_root(&sch_path) {
         Ok(root) => root,
@@ -750,7 +766,27 @@ async fn handle_run_erc(
         std::fs::write(out_path, serde_json::to_string_pretty(&response)?)?;
     }
 
-    Ok(CallToolResult::json(&response))
+    Ok(CallToolResult::json(&budgeted_erc(response, offset, limit)))
+}
+
+/// The ERC response cut to one page. `total`, `errors`, `warnings` and
+/// `by_rule` stay counts of every violation, so a short page never reads as a
+/// clean sheet.
+fn budgeted_erc(mut response: serde_json::Value, offset: usize, limit: usize) -> serde_json::Value {
+    use crate::tools::response_budget as budget;
+    let all = response["violations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let page = budget::page(&all, offset, limit, budget::BYTE_BUDGET);
+    let mut fields = serde_json::Map::new();
+    page.describe(&mut fields);
+    response["by_rule"] = json!(budget::tally(&all, "rule"));
+    response["violations"] = json!(page.items);
+    if let Some(object) = response.as_object_mut() {
+        object.extend(fields);
+    }
+    response
 }
 
 async fn handle_fix_connectivity(

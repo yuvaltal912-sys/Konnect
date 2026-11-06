@@ -212,9 +212,10 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             name: "load_toolset".to_string(),
             description:
                 "Load a toolset by name so its tools appear in tools/list and can be called. \
-                 Returns the list of tools that were added. Use list_toolboxes() first to \
-                 see valid names. Pass an array to load several toolsets in one call -- \
-                 cheaper, one tools/list refresh."
+                 Returns the tools that were added, each with a one-line summary; pass \
+                 detail \"full\" for whole descriptions (tools/list always has them). Use \
+                 list_toolboxes() first to see valid names. Pass an array to load several \
+                 toolsets in one call -- cheaper, one tools/list refresh."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -225,6 +226,12 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
                             {"type": "array", "items": {"type": "string"}}
                         ],
                         "description": "Toolset name (e.g. 'sch_components', 'pcb_routing'), or an array of names"
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "full"],
+                        "default": "summary",
+                        "description": "How much of each tool's description to return: a one-line summary (default) or all of it"
                     }
                 },
                 "required": ["name"]
@@ -541,27 +548,62 @@ async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolRes
     }))
 }
 
+/// A tool's description as `load_toolset` echoes it: all of it, or its first
+/// sentence in at most [`SUMMARY_CHARS`] characters. `tools/list` keeps the
+/// whole text either way, so nothing is lost by the short form.
+fn describe(description: &str, full: bool) -> String {
+    if full {
+        return description.to_owned();
+    }
+    let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = flat.find(". ").map_or(flat.as_str(), |end| &flat[..=end]);
+    if sentence.chars().count() <= SUMMARY_CHARS {
+        return sentence.to_owned();
+    }
+    let cut: String = sentence.chars().take(SUMMARY_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+const SUMMARY_CHARS: usize = 110;
+
 async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
+    let full = match args["detail"].as_str() {
+        None if args["detail"].is_null() => false,
+        Some("summary") => false,
+        Some("full") => true,
+        _ => {
+            return CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "detail".to_string(),
+                    reason: "must be \"summary\" or \"full\"".to_string(),
+                },
+                "Argument 'detail' is invalid: must be \"summary\" or \"full\"",
+            )
+        }
+    };
     match &args["name"] {
         // Legacy single-name form: result shape is byte-identical to the
-        // pre-batch behavior (`loaded` is a string, `tools` echoes descriptions).
-        Value::String(name) => match ctx.router.load(name).await {
-            Some(tools) => {
-                let tool_list: Vec<Value> = tools
+        // pre-batch behavior (`loaded` is a string, `tools` echoes descriptions,
+        // now one line each unless `detail` is `full`).
+        Value::String(name) => {
+            match ctx.router.load(name).await {
+                Some(tools) => {
+                    let tool_list: Vec<Value> = tools
                     .iter()
-                    .map(|t| json!({ "name": t.name, "description": t.description }))
+                    .map(|t| json!({ "name": t.name, "description": describe(t.description, full) }))
                     .collect();
-                CallToolResult::json(&json!({
-                    "loaded": name,
-                    "tools_added": tools.len(),
-                    "tools": tool_list
-                }))
+                    CallToolResult::json(&json!({
+                        "loaded": name,
+                        "tools_added": tools.len(),
+                        "tools": tool_list
+                    }))
+                }
+                None => CallToolResult::error(format!(
+                    "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
+                    name
+                )),
             }
-            None => CallToolResult::error(format!(
-                "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-                name
-            )),
-        },
+        }
         // New array form: one load, one tools/list_changed notification.
         Value::Array(arr) => {
             let mut names: Vec<String> =
@@ -583,11 +625,9 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
                     Some(tools) => {
                         loaded.push(name.clone());
                         tools_added += tools.len();
-                        tool_list.extend(
-                            tools
-                                .iter()
-                                .map(|t| json!({ "name": t.name, "description": t.description })),
-                        );
+                        tool_list.extend(tools.iter().map(
+                            |t| json!({ "name": t.name, "description": describe(t.description, full) }),
+                        ));
                     }
                     None => errors.push(format!(
                         "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
@@ -961,6 +1001,89 @@ mod reload_tests {
         assert!(
             child.wait().unwrap().success(),
             "child failed:\n{output:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_toolset_detail_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+
+    fn context() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    async fn load(args: Value) -> (bool, Value) {
+        let result = handle_meta_tool("load_toolset", &args, &context())
+            .await
+            .expect("load_toolset is a meta tool");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        (result.is_error, serde_json::from_str(text).unwrap())
+    }
+
+    #[test]
+    fn a_summary_is_the_first_sentence_in_one_line_and_never_longer_than_the_limit() {
+        assert_eq!(describe("Move a part.  Then more.", false), "Move a part.");
+        assert_eq!(describe("No full stop here", false), "No full stop here");
+        // Source line continuations leave runs of spaces and breaks.
+        assert_eq!(describe("Export\n        to   SVG", false), "Export to SVG");
+        let long = format!("{} end.", "word ".repeat(60));
+        let summary = describe(&long, false);
+        assert!(summary.chars().count() <= SUMMARY_CHARS, "{summary}");
+        assert!(summary.ends_with('…'));
+        // Full is the text as written.
+        assert_eq!(describe("A  b.\n c", true), "A  b.\n c");
+    }
+
+    #[tokio::test]
+    async fn load_toolset_echoes_one_line_per_tool_unless_asked_for_full() {
+        for name in [json!("sch_export"), json!(["sch_export"])] {
+            let (is_error, short) = load(json!({ "name": name })).await;
+            assert!(!is_error, "{short}");
+            let (_, full) = load(json!({ "name": name, "detail": "full" })).await;
+            let short_tools = short["tools"].as_array().unwrap();
+            let full_tools = full["tools"].as_array().unwrap();
+            assert_eq!(short_tools.len(), full_tools.len());
+            assert_eq!(short["tools_added"], full["tools_added"]);
+            let bytes = |tools: &[Value]| tools.iter().map(|t| t.to_string().len()).sum::<usize>();
+            assert!(
+                bytes(short_tools) * 2 < bytes(full_tools),
+                "{} vs {}",
+                bytes(short_tools),
+                bytes(full_tools)
+            );
+            for (short, full) in short_tools.iter().zip(full_tools) {
+                assert_eq!(short["name"], full["name"]);
+                let line = short["description"].as_str().unwrap();
+                assert!(
+                    line.chars().count() <= SUMMARY_CHARS && !line.contains('\n'),
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_detail_is_refused_and_loads_nothing() {
+        let ctx = context();
+        let result = handle_meta_tool(
+            "load_toolset",
+            &json!({ "name": "sch_export", "detail": "everything" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(
+            ctx.router.get_tool("run_erc").await.is_none(),
+            "nothing was loaded"
         );
     }
 }
