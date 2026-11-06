@@ -34,7 +34,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 |---|---|---|---|
 | 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | Merged: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19) |
 | 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: **open**, [#22](https://github.com/yuvaltal912-sys/Konnect/pull/22) |
-| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | **Open**, branch `feat/freerouting-real-boards` |
+| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | **Open**: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
 | 3 | Response budget for ERC, DRC and list tools | none | **Open**: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21), waits behind the PR 2 fixes and PR 2b |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
