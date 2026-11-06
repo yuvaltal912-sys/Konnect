@@ -137,11 +137,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_freerouting",
-            "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available.",
+            "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that a Java it can run on is available. Reads the Java version the JAR needs from the JAR itself, finds a Java that meets it, and, when something is missing, returns `setup` with the exact steps (where to get the JAR and which Java to install). Nothing is downloaded or installed for you.",
             json!({
                 "type": "object",
                 "properties": {
-                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() }
+                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
+                    "java_path": { "type": "string", "description": "Path to a Java executable to use (optional). When omitted, Konnect tries JAVA_HOME, java on PATH, then the usual JDK install folders, and picks the first that meets the JAR's requirement." }
                 },
                 "required": []
             }),
@@ -156,6 +157,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
+                    "java_path": { "type": "string", "description": "Path to a Java executable to use (optional); see check_freerouting." },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
@@ -2259,58 +2261,75 @@ async fn handle_check_freerouting(
                      https://github.com/freerouting/freerouting/releases), or pass jar_path."
         }))),
         FreeroutingJar::Found(jar_path) => {
-            let mut java_command = tokio::process::Command::new("java");
-            java_command.arg("-version");
-            let java = match run_java_command(&mut java_command).await {
-                Ok(output) => output,
-                Err(error) => {
-                    return Ok(CallToolResult::json(&json!({
-                        "available": false,
-                        "engine_found": true,
-                        "native_mcp_available": false,
-                        "bridge_available": false,
-                        "jar_path": jar_path,
-                        "java_available": false,
-                        "note": error
-                    })));
-                }
-            };
-            if !java.status.success() {
+            let requirement = crate::freerouting_setup::jar_requirement(&jar_path);
+            let java_path = args["java_path"].as_str().map(PathBuf::from);
+            let found = crate::freerouting_setup::discover_java(java_path.as_deref()).await;
+            let setup =
+                crate::freerouting_setup::guidance(Some(&jar_path), Some(&requirement), &found);
+            let Some(java) =
+                crate::freerouting_setup::pick(&found, requirement.required_java_major)
+            else {
+                // A Java is there, or none is, but not one this JAR can start on.
+                let seen = if found.is_empty() {
+                    "no Java was found".to_string()
+                } else {
+                    format!("found Java {}", {
+                        let mut majors: Vec<u32> =
+                            found.iter().filter_map(|java| java.major).collect();
+                        majors.sort_unstable();
+                        majors.dedup();
+                        majors
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                };
                 return Ok(CallToolResult::json(&json!({
                     "available": false,
                     "engine_found": true,
                     "native_mcp_available": false,
                     "bridge_available": false,
                     "jar_path": jar_path,
-                    "java_available": false,
-                    "java_output": command_output(&java),
-                    "note": "Freerouting was found, but Java did not start successfully"
+                    "java_available": !found.is_empty(),
+                    "java_sufficient": false,
+                    "java_output": found.first().map(|java| java.version_output.clone()),
+                    "required_java_major": requirement.required_java_major,
+                    "note": format!(
+                        "Freerouting was found, but it needs Java {} or newer ({}); {seen}. The steps are in `setup`.",
+                        requirement.required_java_major, requirement.basis
+                    ),
+                    "setup": setup
                 })));
-            }
+            };
 
-            let mut freerouting_command = tokio::process::Command::new("java");
+            let mut freerouting_command = tokio::process::Command::new(&java.command);
             freerouting_command.args(["-jar", jar_path.to_str().unwrap_or(""), "--version"]);
             let freerouting = run_java_command(&mut freerouting_command).await;
             let (version_checked, version_output) = match freerouting {
                 Ok(output) => (output.status.success(), command_output(&output)),
                 Err(error) => (false, error),
             };
-
-            let bridge = crate::freerouting_mcp::probe_local(&jar_path).await;
+            let bridge = crate::freerouting_mcp::probe_local(&jar_path, Some(&java.command)).await;
             Ok(CallToolResult::json(&json!({
-                "available": true,
+                "available": version_checked,
                 "engine_found": true,
                 "native_mcp_available": bridge.native_mcp_available,
                 "bridge_available": bridge.bridge_available,
                 "jar_path": jar_path,
                 "java_available": true,
-                "java_output": command_output(&java),
+                "java_sufficient": true,
+                "java_command": java.command,
+                "java_major": java.major,
+                "required_java_major": requirement.required_java_major,
+                "java_output": java.version_output,
                 "version_checked": version_checked,
                 "version_output": version_output,
                 "server_protocol_version": bridge.server_protocol_version,
                 "native_mcp_tool_count": bridge.tool_count,
                 "native_mcp_diagnostics": bridge.diagnostics,
-                "bridge_error": bridge.error
+                "bridge_error": bridge.error,
+                "setup": setup
             })))
         }
     }
@@ -2340,6 +2359,29 @@ async fn handle_route_specctra_dsn(
             )));
         }
     };
+    // The JAR names the Java it needs; refuse before starting anything that
+    // would fail with a class-loading error that names no fix.
+    let requirement = crate::freerouting_setup::jar_requirement(&jar);
+    let java_path = args["java_path"].as_str().map(PathBuf::from);
+    let found = crate::freerouting_setup::discover_java(java_path.as_deref()).await;
+    let Some(java) = crate::freerouting_setup::pick(&found, requirement.required_java_major) else {
+        let setup = crate::freerouting_setup::guidance(Some(&jar), Some(&requirement), &found);
+        let reason = format!(
+            "Freerouting needs Java {} or newer ({}), and none was found that meets it. Nothing was routed. Run check_freerouting for the exact steps.",
+            requirement.required_java_major, requirement.basis
+        );
+        let mut result = CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: reason.clone(),
+            },
+            reason,
+        );
+        if let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first_mut() {
+            text.push_str(&format!("\nsetup: {setup}"));
+        }
+        return Ok(result);
+    };
+    let java = java.command.clone();
     let max_passes = args["max_passes"]
         .as_u64()
         .map(u32::try_from)
@@ -2353,6 +2395,7 @@ async fn handle_route_specctra_dsn(
         job_timeout_seconds,
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
+        java: Some(java),
     };
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
@@ -3805,5 +3848,163 @@ mod suggest_alternatives_tests {
         .await;
         assert!(is_error, "{body}");
         assert_eq!(body["error"]["field"], "value");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod freerouting_setup_tests {
+    use super::*;
+    use crate::freerouting_setup::{tests::fake_jar, ONLY_EXPLICIT};
+    use crate::tools::cli::test_support::write_script;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("not JSON: {text}"))
+    }
+
+    /// A `java` that reports `major`, and answers `-jar <jar> --version`.
+    fn fake_java(dir: &Path, name: &str, major: u32) -> PathBuf {
+        write_script(
+            dir,
+            name,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"{major}.0.1\" 2026-01-01' >&2; exit 0; fi\n\
+                 echo 'Freerouting 2.1.0'; exit 0\n"
+            ),
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn too_old_a_java_is_reported_with_the_steps_to_fix_it() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.1.0.jar", 65);
+        let java = fake_java(dir.path(), "java11", 11);
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let body = body(&result);
+        assert_eq!(body["available"], false, "{body}");
+        assert_eq!(body["engine_found"], true);
+        assert_eq!(body["java_available"], true);
+        assert_eq!(body["java_sufficient"], false);
+        assert_eq!(body["required_java_major"], 21);
+        assert_eq!(body["setup"]["status"], "needs_java");
+        let steps = body["setup"]["steps"].to_string();
+        assert!(
+            steps.contains("brew install openjdk@21") && steps.contains("found Java 11"),
+            "{steps}"
+        );
+        assert!(
+            body["note"].as_str().unwrap().contains("needs Java 21"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_java_that_meets_the_jar_is_chosen_over_one_that_does_not() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.1.0.jar", 65);
+        let java = fake_java(dir.path(), "java21", 21);
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let body = body(&result);
+        assert_eq!(body["java_sufficient"], true, "{body}");
+        assert_eq!(body["java_command"], json!(java), "{body}");
+        assert_eq!(body["version_checked"], true, "{body}");
+        assert_eq!(body["available"], true, "{body}");
+        assert_eq!(body["setup"]["status"], "ready");
+        // A JAR for an older Java is happy with the old one.
+        let old_jar = fake_jar(dir.path(), "freerouting-1.9.0.jar", 61);
+        let java17 = fake_java(dir.path(), "java17", 17);
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": old_jar, "java_path": java17 }), &ctx())
+                .await
+                .unwrap();
+        let body = body_of(&result);
+        assert_eq!(body["required_java_major"], 17, "{body}");
+        assert_eq!(body["java_sufficient"], true, "{body}");
+    }
+
+    fn body_of(result: &CallToolResult) -> serde_json::Value {
+        body(result)
+    }
+
+    #[tokio::test]
+    async fn a_java_that_cannot_start_the_jar_does_not_make_it_available() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.1.0.jar", 65);
+        // Reports Java 21, but the JAR itself fails to start.
+        let java = write_script(
+            dir.path(),
+            "java21-broken-jar",
+            "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\n\
+             echo 'Error: could not open the jar' >&2; exit 1\n",
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let body = body(&result);
+        assert_eq!(body["java_sufficient"], true, "{body}");
+        assert_eq!(body["version_checked"], false, "{body}");
+        assert_eq!(body["available"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn routing_with_a_java_that_is_too_old_is_refused_before_anything_starts() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.1.0.jar", 65);
+        let java = fake_java(dir.path(), "java11", 11);
+        let dsn = dir.path().join("board.dsn");
+        std::fs::write(&dsn, "(pcb x)").unwrap();
+        let ses = dir.path().join("board.ses");
+        let result = handle_route_specctra_dsn(
+            &json!({ "dsn_path": dsn, "ses_output_path": ses, "jar_path": jar, "java_path": java }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("needs Java 21 or newer"), "{text}");
+        assert!(text.contains("brew install openjdk@21"), "{text}");
+        assert!(text.contains("Nothing was routed"), "{text}");
+        assert!(!ses.exists(), "no output was created");
+    }
+
+    #[tokio::test]
+    async fn without_a_jar_the_guidance_says_where_to_get_one() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_check_freerouting(
+            &json!({ "jar_path": dir.path().join("missing.jar") }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let body = body(&result);
+        // A jar_path that is not a file keeps its own answer.
+        assert_eq!(body["available"], false);
+        assert!(body["note"].as_str().unwrap().contains("not a file"));
     }
 }

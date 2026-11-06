@@ -19,6 +19,14 @@ use std::path::Path;
 
 const UM_PER_MM: f64 = 1_000.0;
 const DSN_RESOLUTION: f32 = 10.0;
+/// The most an arc or circle may stray from its chord approximation, in mm.
+/// Specctra has no arc in the shapes the DSN writer offers, so board outlines,
+/// circles and zone-outline arcs are written as chords. 5 um is far under the
+/// rounding of the micrometre grid the DSN is written on, and under any edge
+/// clearance a fab allows.
+const ARC_TOLERANCE_MM: f64 = 0.005;
+/// The most chords one arc or circle may be cut into.
+const MAX_ARC_SEGMENTS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExportBundle {
@@ -36,6 +44,11 @@ pub(crate) struct ExportBundle {
 enum PadShape {
     Circle,
     Rect,
+    /// Written as its bounding rectangle, which is never smaller than the pad.
+    #[serde(rename = "roundrect")]
+    RoundRect,
+    /// Written as a stadium: a path of the short dimension's width.
+    Oval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +101,27 @@ struct LockedViaModel {
     net: String,
 }
 
+/// What a copper zone or rule area means to the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoneKind {
+    /// A net's copper pour: fixed copper of that net, a Specctra `plane`.
+    Plane,
+    /// No tracks or vias.
+    KeepoutAll,
+    /// No tracks.
+    KeepoutTracks,
+    /// No vias.
+    KeepoutVias,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ZoneModel {
+    kind: ZoneKind,
+    layer: String,
+    net: Option<String>,
+    outline: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct LockedRouting {
     tracks: Vec<LockedTrackModel>,
@@ -130,6 +164,12 @@ struct SupportedProfile {
     #[serde(default)]
     locked_via_count: usize,
     copper_zones: bool,
+    /// Copper pours written as fixed planes, one per pour and layer.
+    #[serde(default)]
+    zone_plane_count: usize,
+    /// Rule areas that forbid tracks or vias, one per area and layer.
+    #[serde(default)]
+    zone_keepout_count: usize,
     custom_rules: bool,
     outline: String,
 }
@@ -194,6 +234,7 @@ pub(crate) fn export_dsn(
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
     let footprints = footprints(&tree, &net_table)?;
+    let zones = zones(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
     }
@@ -215,6 +256,16 @@ pub(crate) fn export_dsn(
     for pins in net_pins.values_mut() {
         pins.sort();
         pins.dedup();
+    }
+
+    for zone in &zones {
+        if let Some(net) = &zone.net {
+            if !net_pins.contains_key(net) {
+                bail!(
+                    "unsupported first routing profile: the copper zone on net '{net}' has no pad on that net, so the router cannot know what it connects"
+                );
+            }
+        }
     }
 
     let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules)?;
@@ -249,6 +300,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
+        &zones,
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
@@ -262,6 +314,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
+        &zones,
     )?;
 
     Ok(ExportBundle {
@@ -765,12 +818,6 @@ fn locked_routing(
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
 ) -> Result<LockedRouting> {
-    let zone_count = tree.find_all("zone").len();
-    if zone_count > 0 {
-        bail!(
-            "unsupported first routing profile: board contains {zone_count} copper zone or rule area(s)"
-        );
-    }
     let arc_count = tree.find_all("arc").len();
     if arc_count > 0 {
         let locked = tree
@@ -917,8 +964,108 @@ fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
     Ok(copper)
 }
 
+/// One open Edge.Cuts piece: a line or an arc, with the chord points between
+/// its ends for an arc.
+struct OutlineEdge {
+    start: (i64, i64),
+    end: (i64, i64),
+    /// Points strictly between `start` and `end`, in that order.
+    inner: Vec<(i64, i64)>,
+}
+
+/// A KiCad `(x y)` pair in millimetres, as KiCad writes it (Y grows downward).
+fn xy_mm(node: &SexpNode, tag: &str) -> Result<(f64, f64)> {
+    let point = node.find(tag).with_context(|| format!("missing '{tag}'"))?;
+    Ok((
+        finite_number(point.get_f64(1), tag)?,
+        finite_number(point.get_f64(2), tag)?,
+    ))
+}
+
+/// Millimetres in KiCad's orientation to the DSN's micrometres, Y up.
+fn to_dsn(point: (f64, f64)) -> Result<(i64, i64)> {
+    Ok((
+        finite_um(Some(point.0), "outline x")?,
+        -finite_um(Some(point.1), "outline y")?,
+    ))
+}
+
+/// The points strictly between `start` and `end` of the arc through `mid`,
+/// on the arc, close enough that no chord strays more than
+/// [`ARC_TOLERANCE_MM`] from it. Three collinear points are a straight line.
+fn arc_inner_points(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+) -> Result<Vec<(f64, f64)>> {
+    let (ax, ay) = start;
+    let (bx, by) = mid;
+    let (cx, cy) = end;
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if d.abs() < 1e-9 {
+        return Ok(Vec::new());
+    }
+    let (a2, b2, c2) = (ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy);
+    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let radius = ((ax - ux).powi(2) + (ay - uy).powi(2)).sqrt();
+    if !radius.is_finite() || radius <= 0.0 {
+        bail!("unsupported outline: an Edge.Cuts arc has no usable radius");
+    }
+    let angle = |(x, y): (f64, f64)| (y - uy).atan2(x - ux);
+    let tau = std::f64::consts::TAU;
+    // The side the middle point is on says which way round the arc goes.
+    let counter_clockwise = (bx - ax) * (cy - by) - (by - ay) * (cx - bx) > 0.0;
+    let from = angle(start);
+    let to = angle(end);
+    let sweep = if counter_clockwise {
+        (to - from).rem_euclid(tau)
+    } else {
+        -((from - to).rem_euclid(tau))
+    };
+    chord_points(from, sweep, (ux, uy), radius)
+}
+
+/// `count - 1` points at equal angles along a sweep from `from`, on the circle.
+fn chord_points(from: f64, sweep: f64, centre: (f64, f64), radius: f64) -> Result<Vec<(f64, f64)>> {
+    let step = if ARC_TOLERANCE_MM >= radius {
+        std::f64::consts::PI
+    } else {
+        2.0 * (1.0 - ARC_TOLERANCE_MM / radius).acos()
+    };
+    let segments = (sweep.abs() / step).ceil().max(1.0);
+    if segments > MAX_ARC_SEGMENTS as f64 {
+        bail!(
+            "unsupported outline: an arc or circle would need more than {MAX_ARC_SEGMENTS} chords"
+        );
+    }
+    let segments = segments as usize;
+    Ok((1..segments)
+        .map(|i| {
+            let theta = from + sweep * i as f64 / segments as f64;
+            (
+                centre.0 + radius * theta.cos(),
+                centre.1 + radius * theta.sin(),
+            )
+        })
+        .collect())
+}
+
+/// The points of a full circle, `radius` mm round `centre`, as a closed loop's
+/// distinct vertices.
+fn circle_points(centre: (f64, f64), radius: f64) -> Result<Vec<(f64, f64)>> {
+    if !(radius.is_finite() && radius > 0.0) {
+        bail!("unsupported outline: an Edge.Cuts circle has no radius");
+    }
+    let mut points = vec![(centre.0 + radius, centre.1)];
+    points.extend(chord_points(0.0, std::f64::consts::TAU, centre, radius)?);
+    Ok(points)
+}
+
 fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
-    let mut edges = Vec::new();
+    let mut edges: Vec<OutlineEdge> = Vec::new();
+    // Shapes that close themselves: a rectangle, a circle, a polygon.
+    let mut closed: Vec<Vec<(i64, i64)>> = Vec::new();
     for node in tree.children().unwrap_or(&[]) {
         if node.find_str("layer") != Some("Edge.Cuts") {
             continue;
@@ -930,62 +1077,320 @@ fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
                 if start == end {
                     bail!("unsupported outline: zero-length Edge.Cuts line");
                 }
-                edges.push((start, end));
+                edges.push(OutlineEdge {
+                    start,
+                    end,
+                    inner: Vec::new(),
+                });
+            }
+            Some("gr_arc") => {
+                if node.find("mid").is_none() {
+                    bail!(
+                        "unsupported outline: an Edge.Cuts arc is in the old centre-and-angle form; open and save the board in KiCad 10 first"
+                    );
+                }
+                let (start, mid, end) = (
+                    xy_mm(node, "start")?,
+                    xy_mm(node, "mid")?,
+                    xy_mm(node, "end")?,
+                );
+                let (start_um, end_um) = (to_dsn(start)?, to_dsn(end)?);
+                if start_um == end_um {
+                    bail!("unsupported outline: an Edge.Cuts arc starts and ends at one point");
+                }
+                let inner = arc_inner_points(start, mid, end)?
+                    .into_iter()
+                    .map(to_dsn)
+                    .collect::<Result<Vec<_>>>()?;
+                edges.push(OutlineEdge {
+                    start: start_um,
+                    end: end_um,
+                    inner,
+                });
+            }
+            Some("gr_rect") => {
+                let (a, b) = (xy_mm(node, "start")?, xy_mm(node, "end")?);
+                if a.0 == b.0 || a.1 == b.1 {
+                    bail!("unsupported outline: zero-area Edge.Cuts rectangle");
+                }
+                closed.push(
+                    [a, (b.0, a.1), b, (a.0, b.1)]
+                        .into_iter()
+                        .map(to_dsn)
+                        .collect::<Result<_>>()?,
+                );
+            }
+            Some("gr_circle") => {
+                let centre = xy_mm(node, "center")?;
+                let edge = xy_mm(node, "end")?;
+                let radius = ((edge.0 - centre.0).powi(2) + (edge.1 - centre.1).powi(2)).sqrt();
+                closed.push(
+                    circle_points(centre, radius)?
+                        .into_iter()
+                        .map(to_dsn)
+                        .collect::<Result<_>>()?,
+                );
+            }
+            Some("gr_poly") => {
+                let points = node
+                    .find("pts")
+                    .context("Edge.Cuts polygon has no points")?
+                    .find_all("xy")
+                    .into_iter()
+                    .map(|xy| {
+                        to_dsn((
+                            finite_number(xy.get_f64(1), "outline x")?,
+                            finite_number(xy.get_f64(2), "outline y")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                closed.push(points);
             }
             Some(tag) if tag.starts_with("gr_") => {
-                bail!("unsupported first routing profile: Edge.Cuts '{tag}' is not a straight line")
+                bail!(
+                    "unsupported first routing profile: Edge.Cuts '{tag}' is not a line, arc, rectangle, circle or polygon"
+                )
             }
             _ => {}
         }
     }
-    if edges.len() < 3 {
+
+    let ordered = if let Some(shape) = closed.pop() {
+        if !closed.is_empty() || !edges.is_empty() {
+            bail!("unsupported outline: Edge.Cuts contains more than one loop");
+        }
+        let mut shape = shape;
+        shape.dedup();
+        if shape.first() == shape.last() && shape.len() > 1 {
+            shape.pop();
+        }
+        if shape.len() < 3 {
+            bail!("unsupported outline: need at least three Edge.Cuts vertices");
+        }
+        let first = shape[0];
+        shape.push(first);
+        shape
+    } else {
+        chain_edges(&edges)?
+    };
+    // A loop that folds back on itself has no area for the router to use.
+    let doubled_area: i128 = ordered
+        .windows(2)
+        .map(|pair| {
+            i128::from(pair[0].0) * i128::from(pair[1].1)
+                - i128::from(pair[1].0) * i128::from(pair[0].1)
+        })
+        .sum();
+    if doubled_area == 0 {
+        bail!("unsupported outline: Edge.Cuts encloses no area");
+    }
+    Ok(ordered)
+}
+
+/// Join open pieces end to end into one closed loop of points, the first point
+/// repeated at the end.
+fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
+    if edges.len() < 2 {
         bail!("unsupported outline: need at least three Edge.Cuts lines");
     }
-
-    let mut adjacency: BTreeMap<(i64, i64), Vec<(i64, i64)>> = BTreeMap::new();
-    for (start, end) in &edges {
-        adjacency.entry(*start).or_default().push(*end);
-        adjacency.entry(*end).or_default().push(*start);
+    let mut at: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
+    for (index, edge) in edges.iter().enumerate() {
+        at.entry(edge.start).or_default().push(index);
+        at.entry(edge.end).or_default().push(index);
     }
-    for (point, neighbours) in &mut adjacency {
-        neighbours.sort();
-        neighbours.dedup();
-        if neighbours.len() != 2 {
+    for (point, ends) in &at {
+        if ends.len() != 2 {
             bail!(
                 "unsupported outline: vertex ({}, {}) has degree {}, expected 2",
                 point.0,
                 point.1,
-                neighbours.len()
+                ends.len()
             );
         }
     }
 
-    let start = *adjacency.keys().next().context("outline has no vertices")?;
-    let mut ordered = vec![start];
-    let mut previous = None;
-    let mut current = start;
+    let origin = edges[0].start;
+    let mut ordered = vec![origin];
+    let mut used = vec![false; edges.len()];
+    let mut current = origin;
+    let mut edge_index = 0;
     loop {
-        let neighbours = &adjacency[&current];
-        let next = match previous {
-            None => neighbours[0],
-            Some(previous) if neighbours[0] == previous => neighbours[1],
-            Some(_) => neighbours[0],
+        used[edge_index] = true;
+        let edge = &edges[edge_index];
+        // Walk the piece from the end we stand on.
+        let (to, inner): (_, Vec<_>) = if edge.start == current {
+            (edge.end, edge.inner.clone())
+        } else {
+            (edge.start, edge.inner.iter().rev().copied().collect())
         };
-        if next == start {
-            ordered.push(start);
+        ordered.extend(inner);
+        ordered.push(to);
+        current = to;
+        if current == origin {
             break;
         }
-        if ordered.contains(&next) {
-            bail!("unsupported outline: Edge.Cuts contains more than one loop");
+        match at[&current].iter().find(|index| !used[**index]) {
+            Some(next) => edge_index = *next,
+            None => bail!("unsupported outline: Edge.Cuts is not one closed loop"),
         }
-        ordered.push(next);
-        previous = Some(current);
-        current = next;
     }
-    if ordered.len() != edges.len() + 1 {
-        bail!("unsupported outline: Edge.Cuts is not one closed loop");
+    if used.iter().any(|used| !used) {
+        bail!("unsupported outline: Edge.Cuts contains more than one loop");
     }
     Ok(ordered)
+}
+
+/// The board's copper zones and rule areas as the router sees them.
+///
+/// A pour with a net is fixed copper of that net (a Specctra `plane`, which is
+/// how KiCad's own DSN export writes one). A rule area that forbids tracks or
+/// vias is a keepout. The zone's outline is used, not its fill, so thermal
+/// reliefs and clearance gaps are not modelled: copper the fill will not reach
+/// can still look connected to the router, which is why DRC after a refill is
+/// the check. Anything else is refused rather than guessed at.
+pub(crate) fn zones(
+    tree: &SexpNode,
+    net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
+) -> Result<Vec<ZoneModel>> {
+    let mut out = Vec::new();
+    for zone in tree.find_all("zone") {
+        let name = zone.find_str("name").unwrap_or("unnamed");
+        let mut layers: Vec<String> = Vec::new();
+        if let Some(single) = zone.find_str("layer") {
+            layers.push(single.to_string());
+        }
+        if let Some(list) = zone.find("layers") {
+            layers.extend(
+                list.children()
+                    .unwrap_or(&[])
+                    .iter()
+                    .skip(1)
+                    .filter_map(SexpNode::as_str)
+                    .map(str::to_string),
+            );
+        }
+        let mut copper: Vec<String> = Vec::new();
+        for layer in &layers {
+            if layer == "*.Cu" {
+                copper.extend(copper_layers.iter().cloned());
+            } else if copper_layers.contains(layer) {
+                copper.push(layer.clone());
+            }
+        }
+        copper.sort();
+        copper.dedup();
+
+        let kind = match zone.find("keepout") {
+            Some(keepout) => {
+                let blocked = |tag: &str| keepout.find_str(tag) == Some("not_allowed");
+                match (blocked("tracks"), blocked("vias")) {
+                    (true, true) => ZoneKind::KeepoutAll,
+                    (true, false) => ZoneKind::KeepoutTracks,
+                    (false, true) => ZoneKind::KeepoutVias,
+                    // Forbids pours, pads or footprints only: nothing a router places.
+                    (false, false) => continue,
+                }
+            }
+            None => ZoneKind::Plane,
+        };
+        if copper.is_empty() {
+            continue;
+        }
+        let net = match kind {
+            ZoneKind::Plane => Some(
+                zone.find("net")
+                    .and_then(|node| resolve_net(node, net_table))
+                    .with_context(|| {
+                        format!(
+                            "unsupported first routing profile: copper zone '{name}' has no net, so the router cannot tell what it connects"
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        let outline = zone_outline(zone)
+            .with_context(|| format!("unsupported first routing profile: zone '{name}'"))?;
+        for layer in copper {
+            out.push(ZoneModel {
+                kind,
+                layer,
+                net: net.clone(),
+                outline: outline.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A zone's outline, closed, in DSN micrometres. Arcs in it are written as chords.
+fn zone_outline(zone: &SexpNode) -> Result<Vec<(i64, i64)>> {
+    let polygons = zone.find_all("polygon");
+    let [polygon] = polygons.as_slice() else {
+        bail!("expected one outline polygon, found {}", polygons.len());
+    };
+    let pts = polygon.find("pts").context("outline has no points")?;
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for item in pts.children().unwrap_or(&[]).iter().skip(1) {
+        match item.head() {
+            Some("xy") => points.push((
+                finite_number(item.get_f64(1), "zone x")?,
+                finite_number(item.get_f64(2), "zone y")?,
+            )),
+            Some("arc") => {
+                let (start, mid, end) = (
+                    xy_mm(item, "start")?,
+                    xy_mm(item, "mid")?,
+                    xy_mm(item, "end")?,
+                );
+                if points.last() != Some(&start) {
+                    points.push(start);
+                }
+                points.extend(arc_inner_points(start, mid, end)?);
+                points.push(end);
+            }
+            Some(other) => bail!("outline holds an unsupported '{other}'"),
+            None => {}
+        }
+    }
+    let mut outline = points.into_iter().map(to_dsn).collect::<Result<Vec<_>>>()?;
+    outline.dedup();
+    if outline.first() == outline.last() && outline.len() > 1 {
+        outline.pop();
+    }
+    if outline.len() < 3 {
+        bail!("outline has fewer than three corners");
+    }
+    let first = outline[0];
+    outline.push(first);
+    Ok(outline)
+}
+
+fn zone_polygon(zone: &ZoneModel) -> dsn::Polygon {
+    dsn::Polygon {
+        layer: zone.layer.clone(),
+        width: 0.0,
+        coords: zone
+            .outline
+            .iter()
+            .map(|(x, y)| dsn::Point {
+                x: *x as f64,
+                y: *y as f64,
+            })
+            .collect(),
+    }
+}
+
+/// How many pours and how many keepouts a board source holds, counted as the
+/// export counts them, for the importer to check against its manifest.
+pub(crate) fn zone_counts(board_source: &str) -> Result<(usize, usize)> {
+    let tree = parse_sexp(board_source).context("parse KiCad board for zone inventory")?;
+    let copper = copper_layers(&tree)?;
+    let zones = zones(&tree, &top_level_net_table(&tree), &copper)?;
+    Ok((
+        zones.iter().filter(|z| z.kind == ZoneKind::Plane).count(),
+        zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
+    ))
 }
 
 fn footprints(
@@ -1045,6 +1450,8 @@ fn footprints(
             let shape = match pad.get(3).and_then(SexpNode::as_str) {
                 Some("circle") => PadShape::Circle,
                 Some("rect") => PadShape::Rect,
+                Some("roundrect") => PadShape::RoundRect,
+                Some("oval") => PadShape::Oval,
                 Some(other) => bail!(
                     "unsupported first routing profile: pad {reference}-{number} has shape '{other}'"
                 ),
@@ -1060,6 +1467,12 @@ fn footprints(
             if shape == PadShape::Circle && size_x_um != size_y_um {
                 bail!("circle pad {reference}-{number} does not have equal X/Y size");
             }
+            // An oval of equal sides is a circle.
+            let shape = if shape == PadShape::Oval && size_x_um == size_y_um {
+                PadShape::Circle
+            } else {
+                shape
+            };
             if pad.find("clearance").is_some() {
                 bail!(
                     "unsupported first routing profile: pad {reference}-{number} has a local clearance override"
@@ -1203,6 +1616,7 @@ fn build_pcb(
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
+    zones: &[ZoneModel],
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
@@ -1393,8 +1807,31 @@ fn build_pcb(
             layers,
             boundary,
             place_boundary: None,
-            planes: Vec::new(),
-            keepouts: dsn::Keepouts(Vec::new()),
+            planes: zones
+                .iter()
+                .filter(|zone| zone.kind == ZoneKind::Plane)
+                .map(|zone| dsn::Plane {
+                    net: zone.net.clone().unwrap_or_default(),
+                    polygon: zone_polygon(zone),
+                })
+                .collect(),
+            keepouts: dsn::Keepouts(
+                zones
+                    .iter()
+                    .filter(|zone| zone.kind != ZoneKind::Plane)
+                    .map(|zone| dsn::Keepout {
+                        kind: match zone.kind {
+                            ZoneKind::KeepoutTracks => dsn::KeepoutKind::Wire,
+                            ZoneKind::KeepoutVias => dsn::KeepoutKind::Via,
+                            _ => dsn::KeepoutKind::Normal,
+                        },
+                        id_: String::new(),
+                        sequence_number: None,
+                        shape: dsn::Shape::Polygon(zone_polygon(zone)),
+                        rule: None,
+                    })
+                    .collect(),
+            ),
             via: dsn::ViaNames {
                 names: via_names.values().cloned().collect(),
             },
@@ -1427,13 +1864,29 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
                 diameter: key.size_x_um as f64,
                 offset: None,
             }),
-            PadShape::Rect => dsn::Shape::Rect(dsn::Rect {
+            // A rounded rectangle is written as its bounding rectangle: the router
+            // may not use the corners, and never sees copper it does not have.
+            PadShape::Rect | PadShape::RoundRect => dsn::Shape::Rect(dsn::Rect {
                 layer: layer.clone(),
                 x1: -(key.size_x_um as f64) / 2.0,
                 y1: -(key.size_y_um as f64) / 2.0,
                 x2: key.size_x_um as f64 / 2.0,
                 y2: key.size_y_um as f64 / 2.0,
             }),
+            // A stadium: a path along the long axis as wide as the short one.
+            PadShape::Oval => {
+                let half = (key.size_x_um - key.size_y_um).abs() as f64 / 2.0;
+                let (x, y) = if key.size_x_um >= key.size_y_um {
+                    (half, 0.0)
+                } else {
+                    (0.0, half)
+                };
+                dsn::Shape::Path(dsn::Path {
+                    layer: layer.clone(),
+                    width: key.size_x_um.min(key.size_y_um) as f64,
+                    coords: vec![dsn::Point { x: -x, y: -y }, dsn::Point { x, y }],
+                })
+            }
         })
         .collect();
     dsn::Padstack {
@@ -1475,6 +1928,7 @@ fn build_manifest(
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
+    zones: &[ZoneModel],
 ) -> Result<String> {
     let components = footprints
         .iter()
@@ -1538,13 +1992,19 @@ fn build_manifest(
         supported_profile: SupportedProfile {
             copper_layers: 2,
             component_side: "front".to_string(),
-            pad_shapes: vec!["circle".to_string(), "rect".to_string()],
+            pad_shapes: ["circle", "rect", "roundrect", "oval"]
+                .map(str::to_string)
+                .to_vec(),
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
-            copper_zones: false,
+            copper_zones: !zones.is_empty(),
+            zone_plane_count: zones.iter().filter(|z| z.kind == ZoneKind::Plane).count(),
+            zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
-            outline: "one closed loop of straight Edge.Cuts lines".to_string(),
+            outline: "one closed loop of Edge.Cuts lines, arcs, a rectangle, a circle or a \
+                      polygon, with arcs and circles as chords within 5 um"
+                .to_string(),
         },
         layers: copper_layers
             .iter()
@@ -1908,5 +2368,449 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("shape offset"), "{error}");
+    }
+
+    // ─── Creation PR 2b: rounded outlines, more pad shapes, zones ────────────
+
+    const ROUNDED: &str = include_str!("../tests/fixtures/specctra_rounded_board.kicad_pcb");
+
+    fn parse_dsn(text: &str) -> dsn::DsnFile {
+        let mut tokenizer = ListTokenizer::new(BufReader::new(Cursor::new(text.as_bytes())));
+        dsn::DsnFile::read_dsn(&mut tokenizer).expect("the DSN parses")
+    }
+
+    fn export_rounded(source: &str) -> Result<ExportBundle> {
+        export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+    }
+
+    fn boundary_points(export: &ExportBundle) -> Vec<(f64, f64)> {
+        match parse_dsn(&export.dsn).pcb.structure.boundary {
+            dsn::Boundary::Path(path) => path.coords.iter().map(|p| (p.x, p.y)).collect(),
+            other => panic!("unexpected boundary {other:?}"),
+        }
+    }
+
+    /// Distance of a DSN point (um, Y up) from the board's true outline: a
+    /// 50 x 40 mm rectangle from (80, 30) with 3 mm corner radius, in KiCad mm.
+    fn distance_from_rounded_rectangle_mm(point: (f64, f64)) -> f64 {
+        let (x, y) = (point.0 / 1000.0, -point.1 / 1000.0);
+        let (x0, y0, x1, y1, r): (f64, f64, f64, f64, f64) = (80.0, 30.0, 130.0, 70.0, 3.0);
+        // The rectangle shrunk by r is where the corner centres live; the outline
+        // is every point r from it.
+        let (cx, cy) = (x.clamp(x0 + r, x1 - r), y.clamp(y0 + r, y1 - r));
+        (((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r).abs()
+    }
+
+    #[test]
+    fn a_rounded_outline_is_exported_as_chords_within_the_stated_tolerance() {
+        let export = export_rounded(ROUNDED).unwrap();
+        let points = boundary_points(&export);
+        // Four straight sides and four quarter arcs of 3 mm, each cut into
+        // several chords: far more corners than a rectangle.
+        assert!(points.len() > 40, "{} points", points.len());
+        assert_eq!(points.first(), points.last(), "the loop is closed");
+        // Every vertex is on the real outline (1 um for the micrometre grid).
+        for point in &points {
+            let off = distance_from_rounded_rectangle_mm(*point);
+            assert!(off < 0.0011, "{point:?} is {off} mm off the outline");
+        }
+        // And no chord strays further than the tolerance: its middle is inside
+        // by the sagitta, which must stay within ARC_TOLERANCE_MM (plus grid).
+        let worst = points
+            .windows(2)
+            .map(|pair| {
+                let mid = ((pair[0].0 + pair[1].0) / 2.0, (pair[0].1 + pair[1].1) / 2.0);
+                distance_from_rounded_rectangle_mm(mid)
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(worst <= ARC_TOLERANCE_MM + 0.0011, "worst chord {worst} mm");
+        // It really is rounded: no vertex at the sharp corner.
+        assert!(!points.contains(&(80_000.0, -30_000.0)));
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert!(manifest["supported_profile"]["outline"]
+            .as_str()
+            .unwrap()
+            .contains("within 5 um"));
+    }
+
+    #[test]
+    fn the_same_outline_in_the_opposite_direction_gives_the_same_loop() {
+        let forward = boundary_points(&export_rounded(ROUNDED).unwrap());
+        // Swap every Edge.Cuts line and arc's ends; the loop must still close,
+        // visiting the same vertices.
+        let mut reversed = ROUNDED.to_string();
+        for tag in ["gr_line", "gr_arc"] {
+            let mut out = String::new();
+            let mut rest = reversed.as_str();
+            while let Some(at) = rest.find(&format!("({tag}\n")) {
+                out.push_str(&rest[..at]);
+                let block_end = rest[at..].find("(layer \"Edge.Cuts\")").unwrap() + at;
+                let block = &rest[at..block_end];
+                let swapped = block
+                    .replace("(start ", "(@@ ")
+                    .replace("(end ", "(start ")
+                    .replace("(@@ ", "(end ");
+                out.push_str(&swapped);
+                rest = &rest[block_end..];
+            }
+            out.push_str(rest);
+            reversed = out;
+        }
+        assert_ne!(reversed, ROUNDED);
+        let backward = boundary_points(&export_rounded(&reversed).unwrap());
+        let sorted = |mut v: Vec<(f64, f64)>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v.dedup();
+            v
+        };
+        assert_eq!(sorted(forward), sorted(backward));
+    }
+
+    fn replace_outline(source: &str, outline: &str) -> String {
+        let start = source
+            .find("\t(gr_arc")
+            .unwrap_or_else(|| source.find("\t(gr_line").unwrap());
+        let first = source.find("\t(gr_line").map_or(start, |l| l.min(start));
+        let end = source.rfind("\t(embedded_fonts no)\n)").unwrap();
+        // Drop every Edge.Cuts item, keeping the zones that follow them.
+        let zones_at = source[first..end]
+            .find("\t(zone")
+            .map_or(end, |z| first + z);
+        format!("{}{}{}", &source[..first], outline, &source[zones_at..])
+    }
+
+    const STROKE: &str = "(stroke (width 0.05) (type default)) (layer \"Edge.Cuts\") (uuid \"55555555-5555-4555-8555-555555555555\")";
+
+    #[test]
+    fn a_circle_and_a_rectangle_and_a_polygon_outline_are_accepted() {
+        let circle = replace_outline(
+            ROUNDED,
+            &format!("\t(gr_circle (center 105 50) (end 125 50) {STROKE})\n"),
+        );
+        let points = boundary_points(&export_rounded(&circle).unwrap());
+        assert!(points.len() > 50);
+        for (x, y) in &points {
+            let radius = ((x / 1000.0 - 105.0).powi(2) + (-y / 1000.0 - 50.0).powi(2)).sqrt();
+            assert!((radius - 20.0).abs() < 0.0011, "{radius}");
+        }
+        let rectangle = replace_outline(
+            ROUNDED,
+            &format!("\t(gr_rect (start 80 30) (end 130 70) {STROKE})\n"),
+        );
+        let points = boundary_points(&export_rounded(&rectangle).unwrap());
+        assert_eq!(points.len(), 5, "four corners and the closing one");
+        let polygon = replace_outline(
+            ROUNDED,
+            &format!("\t(gr_poly (pts (xy 80 30) (xy 130 30) (xy 130 70) (xy 100 75) (xy 80 70)) {STROKE})\n"),
+        );
+        assert_eq!(boundary_points(&export_rounded(&polygon).unwrap()).len(), 6);
+    }
+
+    #[test]
+    fn outlines_the_exporter_cannot_follow_are_still_refused() {
+        // A Bezier curve has no chord form here.
+        let curve = replace_outline(
+            ROUNDED,
+            &format!("\t(gr_curve (pts (xy 80 30) (xy 90 20) (xy 120 20) (xy 130 30)) {STROKE})\n"),
+        );
+        let error = export_rounded(&curve).unwrap_err().to_string();
+        assert!(
+            error.contains("gr_curve") && error.contains("not a line, arc"),
+            "{error}"
+        );
+        // A circle beside a rectangle is two loops.
+        let two = replace_outline(
+            ROUNDED,
+            &format!("\t(gr_circle (center 105 50) (end 110 50) {STROKE})\n\t(gr_rect (start 80 30) (end 130 70) {STROKE})\n"),
+        );
+        let error = export_rounded(&two).unwrap_err().to_string();
+        assert!(error.contains("more than one loop"), "{error}");
+        // An arc in KiCad 6's centre-and-angle form.
+        let old = replace_outline(
+            ROUNDED,
+            &format!("\t(gr_arc (start 100 50) (end 120 50) (angle 90) {STROKE})\n"),
+        );
+        let error = export_rounded(&old).unwrap_err().to_string();
+        assert!(error.contains("old centre-and-angle form"), "{error}");
+        // An open chain of arcs and lines.
+        let open = ROUNDED.replacen(
+            "\t(gr_line\n\t\t(start 80 67)",
+            "\t(gr_line\n\t\t(start 80 66)",
+            1,
+        );
+        assert_ne!(open, ROUNDED);
+        let error = export_rounded(&open).unwrap_err().to_string();
+        assert!(error.contains("degree"), "{error}");
+    }
+
+    fn padstacks(export: &ExportBundle) -> Vec<dsn::Padstack> {
+        parse_dsn(&export.dsn)
+            .pcb
+            .library
+            .padstacks
+            .into_iter()
+            .filter(|p| p.name.starts_with("konnect_pad_"))
+            .collect()
+    }
+
+    #[test]
+    fn a_roundrect_pad_is_written_as_its_bounding_rectangle() {
+        let export = export_rounded(ROUNDED).unwrap();
+        let stacks = padstacks(&export);
+        assert_eq!(stacks.len(), 1);
+        match &stacks[0].shapes[..] {
+            [dsn::Shape::Rect(rect)] => {
+                // 0.6 x 0.5 mm, never smaller than the copper.
+                assert_eq!((rect.x2 - rect.x1, rect.y2 - rect.y1), (600.0, 500.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["padstacks"][0]["shape"], "roundrect");
+        assert!(manifest["supported_profile"]["pad_shapes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|shape| shape == "roundrect"));
+    }
+
+    #[test]
+    fn an_oval_pad_is_a_stadium_and_an_equal_sided_oval_is_a_circle() {
+        let oval = ROUNDED.replace("smd roundrect", "smd oval");
+        let stacks = padstacks(&export_rounded(&oval).unwrap());
+        match &stacks[0].shapes[..] {
+            [dsn::Shape::Path(path)] => {
+                // 0.6 x 0.5: a 0.5 mm wide path 0.1 mm long along X.
+                assert_eq!(path.width, 500.0);
+                let xs: Vec<f64> = path.coords.iter().map(|p| p.x).collect();
+                assert_eq!(xs, [-50.0, 50.0]);
+                assert!(path.coords.iter().all(|p| p.y == 0.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        let tall = oval.replace("(size 0.6 0.5)", "(size 0.5 0.6)");
+        let stacks = padstacks(&export_rounded(&tall).unwrap());
+        match &stacks[0].shapes[..] {
+            [dsn::Shape::Path(path)] => {
+                assert_eq!(path.width, 500.0);
+                assert!(path.coords.iter().all(|p| p.x == 0.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        let round = oval.replace("(size 0.6 0.5)", "(size 0.5 0.5)");
+        let stacks = padstacks(&export_rounded(&round).unwrap());
+        assert!(matches!(stacks[0].shapes[..], [dsn::Shape::Circle(_)]));
+        // Shapes with no cheap exact form are still refused.
+        let trapezoid = ROUNDED.replace("smd roundrect", "smd trapezoid");
+        let error = export_rounded(&trapezoid).unwrap_err().to_string();
+        assert!(error.contains("trapezoid"), "{error}");
+    }
+
+    #[test]
+    fn a_pour_and_a_keepout_are_exported_as_a_plane_and_a_keepout() {
+        let export = export_rounded(ROUNDED).unwrap();
+        let structure = parse_dsn(&export.dsn).pcb.structure;
+        assert_eq!(structure.planes.len(), 1);
+        let plane = &structure.planes[0];
+        assert_eq!(
+            (plane.net.as_str(), plane.polygon.layer.as_str()),
+            ("GND", "B.Cu")
+        );
+        // The outline, closed, in DSN micrometres with Y up.
+        let corners: Vec<(f64, f64)> = plane.polygon.coords.iter().map(|p| (p.x, p.y)).collect();
+        assert_eq!(
+            corners,
+            [
+                (85_000.0, -35_000.0),
+                (125_000.0, -35_000.0),
+                (125_000.0, -65_000.0),
+                (85_000.0, -65_000.0),
+                (85_000.0, -35_000.0)
+            ]
+        );
+        assert_eq!(structure.keepouts.0.len(), 1);
+        let keepout = &structure.keepouts.0[0];
+        assert_eq!(keepout.kind, dsn::KeepoutKind::Normal);
+        assert!(matches!(&keepout.shape, dsn::Shape::Polygon(p) if p.layer == "F.Cu"));
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        let profile = &manifest["supported_profile"];
+        assert_eq!(profile["copper_zones"], true);
+        assert_eq!(profile["zone_plane_count"], 1);
+        assert_eq!(profile["zone_keepout_count"], 1);
+        // KiCad's own export of this board writes the same two things.
+        let native = include_str!("../tests/fixtures/specctra_rounded_board.native-kicad-10.dsn");
+        let native = parse_dsn(native).pcb.structure;
+        assert_eq!(native.planes.len(), 1);
+        assert_eq!(native.planes[0].net, "GND");
+        assert_eq!(native.planes[0].polygon.layer, "B.Cu");
+        assert_eq!(native.keepouts.0.len(), 1);
+    }
+
+    #[test]
+    fn keepouts_forbid_exactly_what_the_rule_area_forbids() {
+        let tracks_only = ROUNDED.replace("(vias not_allowed)", "(vias allowed)");
+        let structure = parse_dsn(&export_rounded(&tracks_only).unwrap().dsn)
+            .pcb
+            .structure;
+        assert_eq!(structure.keepouts.0[0].kind, dsn::KeepoutKind::Wire);
+        let vias_only = ROUNDED.replace("(tracks not_allowed)", "(tracks allowed)");
+        let structure = parse_dsn(&export_rounded(&vias_only).unwrap().dsn)
+            .pcb
+            .structure;
+        assert_eq!(structure.keepouts.0[0].kind, dsn::KeepoutKind::Via);
+        // A rule area that forbids neither is nothing a router places.
+        let neither = vias_only.replace("(vias not_allowed)", "(vias allowed)");
+        let export = export_rounded(&neither).unwrap();
+        assert!(parse_dsn(&export.dsn).pcb.structure.keepouts.0.is_empty());
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["zone_keepout_count"], 0);
+    }
+
+    #[test]
+    fn a_pour_on_both_layers_is_one_plane_each_and_a_corner_arc_is_chorded() {
+        let both = ROUNDED.replace(
+            "(net \"GND\")\n\t\t(layer \"B.Cu\")",
+            "(net \"GND\")\n\t\t(layers \"F.Cu\" \"B.Cu\")",
+        );
+        assert_ne!(both, ROUNDED);
+        let structure = parse_dsn(&export_rounded(&both).unwrap().dsn).pcb.structure;
+        assert_eq!(structure.planes.len(), 2);
+        // A rounded corner in the zone outline.
+        let rounded = ROUNDED.replace(
+            "(xy 85 35) (xy 125 35) (xy 125 65) (xy 85 65)",
+            "(xy 85 35) (xy 122 35) (arc (start 122 35) (mid 124.12132 35.87868) (end 125 38)) (xy 125 65) (xy 85 65)",
+        );
+        assert_ne!(rounded, ROUNDED);
+        let structure = parse_dsn(&export_rounded(&rounded).unwrap().dsn)
+            .pcb
+            .structure;
+        assert!(structure.planes[0].polygon.coords.len() > 8);
+    }
+
+    #[test]
+    fn zones_the_router_cannot_place_are_refused_not_guessed_at() {
+        // A copper zone with no net.
+        let no_net = ROUNDED.replacen("(net \"GND\")\n\t\t(layer \"B.Cu\")", "(layer \"B.Cu\")", 1);
+        let error = format!("{:#}", export_rounded(&no_net).unwrap_err());
+        assert!(error.contains("has no net"), "{error}");
+        // A pour on a net no pad is on.
+        let orphan = ROUNDED.replacen(
+            "(net \"GND\")\n\t\t(layer \"B.Cu\")",
+            "(net \"AGND\")\n\t\t(layer \"B.Cu\")",
+            1,
+        );
+        let error = export_rounded(&orphan).unwrap_err().to_string();
+        assert!(error.contains("no pad on that net"), "{error}");
+        // Two outlines in one zone.
+        let two = ROUNDED.replacen(
+            "(polygon\n\t\t\t(pts\n\t\t\t\t(xy 85 35)",
+            "(polygon\n\t\t\t(pts\n\t\t\t\t(xy 1 1) (xy 2 2) (xy 3 1)\n\t\t\t)\n\t\t)\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 85 35)",
+            1,
+        );
+        assert_ne!(two, ROUNDED);
+        let error = format!("{:#}", export_rounded(&two).unwrap_err());
+        assert!(error.contains("expected one outline polygon"), "{error}");
+    }
+
+    #[test]
+    fn a_board_with_zones_still_round_trips_through_the_import_plan_and_leaves_them_alone() {
+        let ses = include_str!("../tests/fixtures/specctra_rounded_board.freerouting-2.3.0.ses");
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("specctra_rounded_board.kicad_pcb");
+        std::fs::write(&board_path, ROUNDED).unwrap();
+        let export = export_dsn(&board_path, ROUNDED, &native_fixture_rules()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["zone_plane_count"], 1);
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board_path, ROUNDED, &export.manifest, ses)
+                .unwrap();
+        // The plan adds tracks and vias; a zone is not among its items.
+        assert!(!plan.tracks.is_empty());
+        assert!(!format!("{plan:?}").to_lowercase().contains("zone"));
+        let adopted = export.clone();
+
+        // The importer refuses a board whose zones are not the ones exported.
+        let moved = ROUNDED.replace("(xy 85 35) (xy 125 35)", "(xy 86 35) (xy 125 35)");
+        assert_ne!(moved, ROUNDED);
+        let error =
+            crate::specctra_ses::parse_import_plan(&board_path, &moved, &adopted.manifest, ses)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("revision") || error.contains("zone"),
+            "{error}"
+        );
+        // A manifest that misstates the zone inventory is refused.
+        let mut lie: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        lie["supported_profile"]["zone_plane_count"] = serde_json::json!(0);
+        let error =
+            crate::specctra_ses::parse_import_plan(&board_path, ROUNDED, &lie.to_string(), ses)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("zone inventory"), "{error}");
+        let mut flag: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        flag["supported_profile"]["copper_zones"] = serde_json::json!(false);
+        let error =
+            crate::specctra_ses::parse_import_plan(&board_path, ROUNDED, &flag.to_string(), ses)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("zone inventory"), "{error}");
+    }
+
+    #[test]
+    fn kicads_own_export_of_roundrect_pads_is_not_adopted_and_says_why() {
+        // KiCad writes a rounded pad as a polygon, which the native-bridge
+        // differential check does not model. Adoption refuses it, so the
+        // exporter keeps its own DSN (the caller reports the diagnostic).
+        let native = include_str!("../tests/fixtures/specctra_rounded_board.native-kicad-10.dsn");
+        let baseline = export_dsn(
+            Path::new("board.kicad_pcb"),
+            ROUNDED,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        let error = format!(
+            "{:#}",
+            adopt_native_dsn(baseline, native.to_string()).unwrap_err()
+        );
+        assert!(error.contains("unsupported shape"), "{error}");
+    }
+
+    /// Real-engine proof for the rounded board. Needs Java 21 or later and a
+    /// Freerouting 2.x JAR: `FREEROUTING_JAR=... cargo test -p konnect-core
+    /// freerouting_routes_the_rounded_board -- --ignored`.
+    #[test]
+    #[ignore = "requires Java 21+ and FREEROUTING_JAR"]
+    fn freerouting_routes_the_rounded_board() {
+        let jar = std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let board_path = temp.path().join("board.kicad_pcb");
+        let dsn_path = temp.path().join("board.dsn");
+        let ses_path = temp.path().join("board.ses");
+        std::fs::write(&board_path, ROUNDED).unwrap();
+        let export = export_dsn(&board_path, ROUNDED, &rules()).unwrap();
+        std::fs::write(&dsn_path, &export.dsn).unwrap();
+        let output = std::process::Command::new("java")
+            .arg("-jar")
+            .arg(jar)
+            .arg("-de")
+            .arg(&dsn_path)
+            .arg("-do")
+            .arg(&ses_path)
+            .arg("-mp")
+            .arg("2")
+            .output()
+            .expect("launch Freerouting");
+        assert!(
+            output.status.success(),
+            "Freerouting refused the DSN:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ses = std::fs::read_to_string(&ses_path).expect("Freerouting wrote an SES");
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board_path, ROUNDED, &export.manifest, &ses)
+                .expect("the SES passes Konnect's strict import planner");
+        assert!(!plan.tracks.is_empty());
     }
 }
