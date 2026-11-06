@@ -96,7 +96,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "audit_manufacturing",
             "DFM checks for the configured fab house: component spacing, silkscreen overlap, \
-             via-in-pad, acid traps, board outline issues.",
+             via-in-pad, acid traps, board outline issues. The outline check reads the true \
+             Edge.Cuts outline (rounded corners and cut-outs included) and reports each \
+             footprint whose courtyard, pads or silkscreen field text cross or sit outside it, \
+             with the overhang in mm; parts in 'edge_mount_references' are listed as intentional.",
             json!({
                 "type": "object",
                 "properties": {
@@ -105,7 +108,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Target manufacturer: 'jlcpcb' (default), 'pcbway', 'oshpark'",
                         "default": "jlcpcb"
-                    }
+                    },
+                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
                 },
                 "required": ["board"]
             }),
@@ -129,7 +133,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
-                    }
+                    },
+                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
                 },
                 "required": ["schematic"]
             }),
@@ -517,18 +522,26 @@ async fn handle_audit_manufacturing(
         _ => (0.15, 0.15, 0.3, 0.13),
     };
 
-    // Check board outline exists
-    let has_edge_cuts = content.contains("Edge.Cuts");
-    if !has_edge_cuts {
-        findings.push(AuditFinding {
-            severity: "error",
-            category: "dfm",
-            component: None,
-            issue: "No board outline found (Edge.Cuts layer is empty)".to_string(),
-            recommendation: "Add a board outline on the Edge.Cuts layer using add_board_outline"
-                .to_string(),
-        });
-    }
+    // The board outline: does it exist and close, and does everything sit
+    // inside it? This used to test for the string "Edge.Cuts", which every
+    // KiCad 6+ board contains in its layer table, so it could never fire.
+    let edge_mount = match crate::tools::board_geometry::parse_allowlist(args) {
+        Ok(list) => list,
+        Err(refusal) => return Ok(refusal),
+    };
+    let geometry = konnect_sexp::board_geometry::BoardGeometry::from_tree(&tree);
+    let outline_check = geometry.outline_check(&edge_mount);
+    findings.extend(
+        crate::tools::board_geometry::outline_issues(&outline_check)
+            .into_iter()
+            .map(|i| AuditFinding {
+                severity: i.severity,
+                category: "dfm",
+                component: i.component,
+                issue: i.issue,
+                recommendation: i.fix,
+            }),
+    );
 
     // Check for footprints on both sides (assembly complexity)
     let fps = tree.find_all("footprint");
@@ -593,6 +606,7 @@ async fn handle_audit_manufacturing(
             "audit": "manufacturing",
             "fab_house": fab_house,
             "components": { "front": front_count, "back": back_count },
+            "outline": crate::tools::board_geometry::outline_check_json(&outline_check, &geometry.outline),
             "findings": findings,
             "summary": format!("{} DFM issues found for {}.", findings.len(), fab_house)
         }))
@@ -2965,5 +2979,197 @@ mod net_resolution_tests {
                 (3, vec!["4".into(), "5".into(), "9".into()]),
             ]
         );
+    }
+}
+
+/// The outline checks in `audit_manufacturing`. They used to test whether the
+/// string "Edge.Cuts" occurred in the file, which every KiCad 6+ board does
+/// through its layer table, so no board could ever report a missing outline
+/// and no part could ever be found outside one.
+#[cfg(test)]
+mod outline_audit_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 40 × 30 mm board with rounded corners and a circular cut-out, plus the
+    /// parts described in the fixture's README.
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+    );
+
+    async fn audit(board_text: &str, extra: serde_json::Value) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        let mut args = json!({ "board": board.to_str().unwrap() });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        let result = handle_audit_manufacturing(&args, &test_ctx())
+            .await
+            .unwrap();
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn finding<'a>(report: &'a serde_json::Value, component: &str) -> &'a serde_json::Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["component"] == component)
+            .unwrap_or_else(|| panic!("no finding for {component}: {report}"))
+    }
+
+    #[tokio::test]
+    async fn each_part_crossing_the_outline_is_named_with_its_overhang() {
+        let report = audit(&std::fs::read_to_string(FIXTURE).unwrap(), json!({})).await;
+
+        // R9 is wholly outside, J1 has a pad over the edge: errors.
+        let r9 = finding(&report, "R9");
+        assert_eq!(r9["severity"], "error");
+        assert!(
+            r9["issue"]
+                .as_str()
+                .unwrap()
+                .contains("outside the board outline"),
+            "{r9}"
+        );
+        assert!(r9["issue"].as_str().unwrap().contains("21.00 mm"), "{r9}");
+        let j1 = finding(&report, "J1");
+        assert_eq!(j1["severity"], "error");
+        assert!(
+            j1["issue"].as_str().unwrap().contains("courtyard 3.00 mm"),
+            "{j1}"
+        );
+        assert!(
+            j1["issue"]
+                .as_str()
+                .unwrap()
+                .contains("worst pad 2 at 1.50 mm"),
+            "{j1}"
+        );
+        // C1 sits in a rounded corner: inside the bbox, caught by the true outline.
+        let c1 = finding(&report, "C1");
+        assert_eq!(c1["severity"], "error");
+        assert!(
+            c1["issue"].as_str().unwrap().contains("courtyard 0.66 mm"),
+            "{c1}"
+        );
+        // Q2 has only its courtyard over the cut-out: a warning, not an error.
+        assert_eq!(finding(&report, "Q2")["severity"], "warning");
+        // TP1 has only silkscreen text over the edge: a warning about an estimate.
+        let tp1 = finding(&report, "TP1");
+        assert_eq!(tp1["severity"], "warning");
+        assert!(
+            tp1["issue"].as_str().unwrap().contains("estimated"),
+            "{tp1}"
+        );
+        // U1 and Q1 are well inside and must not be named.
+        for inside in ["U1", "Q1"] {
+            assert!(
+                report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|f| f["component"] != inside),
+                "{inside} is inside the outline: {report}"
+            );
+        }
+        assert_eq!(report["outline"]["status"], "closed");
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_edge_mount_part_is_reported_as_intentional_not_dropped() {
+        let report = audit(
+            &std::fs::read_to_string(FIXTURE).unwrap(),
+            json!({ "edge_mount_references": ["J1"] }),
+        )
+        .await;
+        let j1 = finding(&report, "J1");
+        assert_eq!(j1["severity"], "info");
+        assert!(
+            j1["issue"]
+                .as_str()
+                .unwrap()
+                .contains("intentional edge-mount"),
+            "{j1}"
+        );
+        assert_eq!(
+            report["outline"]["intentional_edge_mount"][0]["reference"],
+            "J1"
+        );
+        // The others are still findings.
+        assert_eq!(finding(&report, "R9")["severity"], "error");
+    }
+
+    #[tokio::test]
+    async fn a_board_whose_layer_table_names_edge_cuts_but_draws_nothing_has_no_outline() {
+        let text = std::fs::read_to_string(FIXTURE)
+            .unwrap()
+            .replace("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")");
+        assert!(
+            text.contains("\"Edge.Cuts\""),
+            "the layer table still names it"
+        );
+        let report = audit(&text, json!({})).await;
+        let missing = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["issue"].as_str().unwrap().contains("No board outline"))
+            .unwrap_or_else(|| panic!("expected a missing-outline error: {report}"));
+        assert_eq!(missing["severity"], "error");
+        assert_eq!(report["outline"]["checked"], false);
+        // No verdict about parts without an outline to judge them by.
+        assert!(report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["component"] != "R9"));
+    }
+
+    #[tokio::test]
+    async fn an_outline_with_a_gap_is_an_error_and_no_part_is_judged() {
+        let text = std::fs::read_to_string(FIXTURE).unwrap().replacen(
+            "(layer \"Edge.Cuts\")",
+            "(layer \"Dwgs.User\")",
+            1,
+        );
+        let report = audit(&text, json!({})).await;
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["severity"] == "error"
+                    && f["issue"].as_str().unwrap().contains("does not close")),
+            "{report}"
+        );
+        assert_eq!(report["outline"]["status"], "open");
+        assert!(report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["component"] != "R9"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_allowlist_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, std::fs::read_to_string(FIXTURE).unwrap()).unwrap();
+        let result = handle_audit_manufacturing(
+            &json!({ "board": board.to_str().unwrap(), "edge_mount_references": "J1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
     }
 }

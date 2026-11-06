@@ -82,7 +82,10 @@ pub fn tools() -> Vec<ToolDef> {
             "validate_for_manufacturing",
             "Pre-flight check before ordering: verifies the design is ready for the target \
              fab house. Runs KiCad's DRC and checks board outline, design rules, footprints, \
-             and routing evidence. Returns NOT READY — never READY — if \
+             and routing evidence. The outline check reads the true Edge.Cuts outline and \
+             reports each footprint whose courtyard, pads or silkscreen text cross or sit \
+             outside it, with the overhang in mm; parts in 'edge_mount_references' are listed \
+             as intentional. Returns NOT READY — never READY — if \
              DRC reports errors or could not be run, so a READY verdict always rests on \
              evidence rather than on an absence of findings.",
             json!({
@@ -93,7 +96,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Target manufacturer: 'jlcpcb', 'pcbway', 'oshpark'",
                         "default": "jlcpcb"
-                    }
+                    },
+                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
                 },
                 "required": ["board"]
             }),
@@ -1017,14 +1021,21 @@ async fn handle_validate_for_manufacturing(
 
     let mut issues = Vec::new();
 
-    // Check board outline
-    let has_outline = content.contains("Edge.Cuts");
-    if !has_outline {
-        issues.push(json!({
-            "severity": "error",
-            "issue": "No board outline found on Edge.Cuts layer",
-            "fix": "Add a board outline using add_board_outline before ordering"
-        }));
+    // Check the board outline: it must exist, close, and contain the parts.
+    // The old test was for the string "Edge.Cuts", which every KiCad 6+ board
+    // carries in its layer table, so it could never report a missing outline.
+    let edge_mount = match crate::tools::board_geometry::parse_allowlist(args) {
+        Ok(list) => list,
+        Err(refusal) => return Ok(refusal),
+    };
+    let geometry = konnect_sexp::board_geometry::BoardGeometry::from_tree(&tree);
+    let outline_check = geometry.outline_check(&edge_mount);
+    for i in crate::tools::board_geometry::outline_issues(&outline_check) {
+        let mut issue = json!({ "severity": i.severity, "issue": i.issue, "fix": i.fix });
+        if let Some(component) = i.component {
+            issue["component"] = json!(component);
+        }
+        issues.push(issue);
     }
 
     // Check that footprints exist
@@ -1133,7 +1144,9 @@ async fn handle_validate_for_manufacturing(
 
     let verdict = if issues.iter().any(|i| i["severity"] == "error") {
         "NOT READY"
-    } else if !issues.is_empty() {
+    } else if issues.iter().any(|i| i["severity"] != "info") {
+        // An `info` line (an allowlisted edge-mount part) is disclosure, not
+        // something left to review.
         "NEEDS REVIEW"
     } else {
         "READY"
@@ -1159,6 +1172,7 @@ async fn handle_validate_for_manufacturing(
             // zeroed-out object: this tool must not be able to imply a clean
             // board it never checked.
             "drc": drc_summary,
+            "outline": crate::tools::board_geometry::outline_check_json(&outline_check, &geometry.outline),
             "issues": issues,
             "summary": format!(
                 "{}: {} issues found. {} footprints, {} copper layers.",
@@ -2289,5 +2303,94 @@ mod copper_layer_count_tests {
 
         let control = validate(TWO_LAYER).await;
         assert_eq!(control["board_info"]["copper_layers"], 2);
+    }
+}
+
+#[cfg(test)]
+mod outline_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+    );
+
+    async fn validate(board_text: &str, extra: serde_json::Value) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        let mut args = json!({ "board": board.to_str().unwrap() });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_validate_for_manufacturing(&args, &ctx)
+            .await
+            .unwrap();
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn issue<'a>(report: &'a serde_json::Value, component: &str) -> &'a serde_json::Value {
+        report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["component"] == component)
+            .unwrap_or_else(|| panic!("no issue for {component}: {report}"))
+    }
+
+    #[tokio::test]
+    async fn parts_across_the_true_outline_make_the_board_not_ready() {
+        let report = validate(&std::fs::read_to_string(FIXTURE).unwrap(), json!({})).await;
+        assert_eq!(report["verdict"], "NOT READY");
+        let r9 = issue(&report, "R9");
+        assert_eq!(r9["severity"], "error");
+        assert!(r9["issue"].as_str().unwrap().contains("21.00 mm"), "{r9}");
+        // C1 is in the rounded corner, inside the bounding box.
+        assert_eq!(issue(&report, "C1")["severity"], "error");
+        assert_eq!(report["outline"]["crossing"].as_array().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn allowlisted_parts_are_info_and_do_not_by_themselves_block() {
+        let report = validate(
+            &std::fs::read_to_string(FIXTURE).unwrap(),
+            json!({ "edge_mount_references": ["J1"] }),
+        )
+        .await;
+        assert_eq!(issue(&report, "J1")["severity"], "info");
+        assert_eq!(
+            report["outline"]["intentional_edge_mount"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_layer_table_naming_edge_cuts_is_not_an_outline() {
+        let text = std::fs::read_to_string(FIXTURE)
+            .unwrap()
+            .replace("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")");
+        let report = validate(&text, json!({})).await;
+        assert!(
+            report["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["severity"] == "error"
+                    && i["issue"].as_str().unwrap().contains("No board outline")),
+            "{report}"
+        );
     }
 }

@@ -1,0 +1,612 @@
+(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(general
+		(thickness 1.6)
+		(legacy_teardrops no)
+	)
+	(paper "A4")
+	(layers
+		(0 "F.Cu" signal)
+		(2 "B.Cu" signal)
+		(9 "F.Adhes" user "F.Adhesive")
+		(11 "B.Adhes" user "B.Adhesive")
+		(13 "F.Paste" user)
+		(15 "B.Paste" user)
+		(5 "F.SilkS" user "F.Silkscreen")
+		(7 "B.SilkS" user "B.Silkscreen")
+		(1 "F.Mask" user)
+		(3 "B.Mask" user)
+		(25 "Edge.Cuts" user)
+		(27 "Margin" user)
+		(31 "F.CrtYd" user "F.Courtyard")
+		(29 "B.CrtYd" user "B.Courtyard")
+		(35 "F.Fab" user)
+		(33 "B.Fab" user)
+	)
+	(setup
+		(pad_to_mask_clearance 0)
+		(pcbplotparams
+			(layerselection 0x00000000_00000000_55555555_5755f5ff)
+		)
+	)
+	(gr_line
+		(start 5 0)
+		(end 35 0)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000001")
+	)
+	(gr_line
+		(start 40 5)
+		(end 40 25)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000002")
+	)
+	(gr_line
+		(start 35 30)
+		(end 5 30)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000003")
+	)
+	(gr_line
+		(start 0 25)
+		(end 0 5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000004")
+	)
+	(gr_arc
+		(start 35 0)
+		(mid 38.535534 1.464466)
+		(end 40 5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000005")
+	)
+	(gr_arc
+		(start 40 25)
+		(mid 38.535534 28.535534)
+		(end 35 30)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000006")
+	)
+	(gr_arc
+		(start 5 30)
+		(mid 1.464466 28.535534)
+		(end 0 25)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000007")
+	)
+	(gr_arc
+		(start 0 5)
+		(mid 1.464466 1.464466)
+		(end 5 0)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000008")
+	)
+	(gr_circle
+		(center 20 15)
+		(end 23 15)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(fill no)
+		(layer "Edge.Cuts")
+		(uuid "00000000-0000-4000-8000-000000000009")
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000010")
+		(at 12 8 0)
+		(property "Reference" "U1"
+			(at 0 -3 0)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000011")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 0)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000012")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -3 -2)
+			(end 3 2)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000013")
+		)
+		(pad "1" smd rect
+			(at -2 0 0)
+			(size 1 1.5)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "VCC")
+			(uuid "00000000-0000-4000-8000-000000000014")
+		)
+		(pad "2" smd rect
+			(at 2 0 0)
+			(size 1 1.5)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "GND")
+			(uuid "00000000-0000-4000-8000-000000000015")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000016")
+		(at 40 15 0)
+		(property "Reference" "J1"
+			(at -6 0 0)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000017")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 0)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000018")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -3 -2)
+			(end 3 2)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000019")
+		)
+		(pad "1" smd rect
+			(at -1.5 0 0)
+			(size 1 1.5)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "VCC")
+			(uuid "00000000-0000-4000-8000-000000000020")
+		)
+		(pad "2" smd rect
+			(at 0.5 0 0)
+			(size 2 1.5)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "SIG")
+			(uuid "00000000-0000-4000-8000-000000000021")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000022")
+		(at 60 15 0)
+		(property "Reference" "R9"
+			(at 0 2 0)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000023")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 0)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000024")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -1 -0.5)
+			(end 1 0.5)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000025")
+		)
+		(pad "1" smd rect
+			(at -0.6 0 0)
+			(size 0.6 0.8)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "SIG")
+			(uuid "00000000-0000-4000-8000-000000000026")
+		)
+		(pad "2" smd rect
+			(at 0.6 0 0)
+			(size 0.6 0.8)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "GND")
+			(uuid "00000000-0000-4000-8000-000000000027")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000028")
+		(at 3 3 0)
+		(property "Reference" "C1"
+			(at 0 -3 0)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000029")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 0)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000030")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -2 -2)
+			(end 2 2)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000031")
+		)
+		(pad "1" smd rect
+			(at -1 0 0)
+			(size 1 1)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "GND")
+			(uuid "00000000-0000-4000-8000-000000000032")
+		)
+		(pad "2" smd rect
+			(at 1 0 0)
+			(size 1 1)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "VCC")
+			(uuid "00000000-0000-4000-8000-000000000033")
+		)
+		(pad "3" smd rect
+			(at -2 -2 0)
+			(size 1 1)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "GND")
+			(uuid "00000000-0000-4000-8000-000000000034")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000035")
+		(at 22.5 15 0)
+		(property "Reference" "C2"
+			(at 0 4 0)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000036")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 0)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000037")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -2 -2)
+			(end 2 2)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000038")
+		)
+		(pad "1" smd rect
+			(at -1 0 0)
+			(size 0.6 0.6)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "GND")
+			(uuid "00000000-0000-4000-8000-000000000039")
+		)
+		(pad "2" smd rect
+			(at 1 0 0)
+			(size 0.6 0.6)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "VCC")
+			(uuid "00000000-0000-4000-8000-000000000040")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000041")
+		(at 30 22 90)
+		(property "Reference" "Q1"
+			(at 0 2.5 90)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000042")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 90)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000043")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -2 -1)
+			(end 2 1)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000044")
+		)
+		(pad "1" smd rect
+			(at -1.5 0 90)
+			(size 0.8 1.6)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "SIG")
+			(uuid "00000000-0000-4000-8000-000000000045")
+		)
+		(pad "2" smd rect
+			(at 1.5 0 90)
+			(size 0.8 1.6)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "GND")
+			(uuid "00000000-0000-4000-8000-000000000046")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000047")
+		(at 20 18.5 90)
+		(property "Reference" "Q2"
+			(at 0 6 90)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000048")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 90)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000049")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -1 -0.5)
+			(end 1 0.5)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000050")
+		)
+		(pad "1" smd rect
+			(at -0.7 0 90)
+			(size 0.8 1.6)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "SIG")
+			(uuid "00000000-0000-4000-8000-000000000051")
+		)
+	)
+	(footprint "Fixture:Part"
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000052")
+		(at 20 27 0)
+		(property "Reference" "TP1"
+			(at 0 3 0)
+			(layer "F.SilkS")
+			(uuid "00000000-0000-4000-8000-000000000053")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(property "Value" "part"
+			(at 0 0 0)
+			(layer "F.Fab")
+			(hide yes)
+			(uuid "00000000-0000-4000-8000-000000000054")
+			(effects
+				(font
+					(size 1 1)
+					(thickness 0.15)
+				)
+			)
+		)
+		(fp_rect
+			(start -0.5 -0.5)
+			(end 0.5 0.5)
+			(stroke
+				(width 0.05)
+				(type solid)
+			)
+			(fill no)
+			(layer "F.CrtYd")
+			(uuid "00000000-0000-4000-8000-000000000055")
+		)
+		(pad "1" smd rect
+			(at 0 0 0)
+			(size 0.6 0.6)
+			(layers "F.Cu" "F.Mask" "F.Paste")
+			(net "SIG")
+			(uuid "00000000-0000-4000-8000-000000000056")
+		)
+	)
+	(segment
+		(start 10 8)
+		(end 10 12)
+		(width 0.25)
+		(layer "F.Cu")
+		(net "VCC")
+		(uuid "00000000-0000-4000-8000-000000000057")
+	)
+	(segment
+		(start 14 8)
+		(end 14 12)
+		(width 0.25)
+		(layer "F.Cu")
+		(net "GND")
+		(uuid "00000000-0000-4000-8000-000000000058")
+	)
+	(segment
+		(start 10 12)
+		(end 14 12)
+		(width 0.25)
+		(layer "B.Cu")
+		(net "VCC")
+		(uuid "00000000-0000-4000-8000-000000000059")
+	)
+	(via
+		(at 10 12)
+		(size 0.6)
+		(drill 0.3)
+		(layers "F.Cu" "B.Cu")
+		(net "VCC")
+		(uuid "00000000-0000-4000-8000-000000000060")
+	)
+	(zone
+		(net "GND")
+		(net_name "GND")
+		(layer "F.Cu")
+		(uuid "00000000-0000-4000-8000-000000000061")
+		(name "gnd_pour")
+		(hatch edge 0.5)
+		(connect_pads
+			(clearance 0.2)
+		)
+		(min_thickness 0.2)
+		(fill yes
+			(thermal_gap 0.5)
+			(thermal_bridge_width 0.5)
+		)
+		(polygon
+			(pts
+				(xy 33 24)
+				(xy 37 24)
+				(xy 37 27)
+				(xy 33 27)
+			)
+		)
+	)
+	(gr_line
+		(start 8 12)
+		(end 16 12)
+		(stroke
+			(width 0.15)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "00000000-0000-4000-8000-000000000062")
+	)
+)

@@ -598,13 +598,13 @@ fn pts_bbox(node: &SexpNode) -> Option<(f64, f64, f64, f64)> {
 
 /// `(tag x y)` as a finite coordinate pair, or `None` — never a zero-filled
 /// stand-in (see the module docs).
-fn coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
+pub(crate) fn coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
     let (x, y) = (node.get_f64(1)?, node.get_f64(2)?);
     (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 
 /// A coordinate pair with no omitted or trailing fields.
-fn exact_coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
+pub(crate) fn exact_coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
     (node.children()?.len() == 3)
         .then(|| coordinate_pair(node))
         .flatten()
@@ -613,7 +613,7 @@ fn exact_coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
 /// An arc with exactly one complete `start`, `mid`, and `end` child and no
 /// additional data. This keeps the lossless scanner from accepting a prefix
 /// while silently dropping duplicate tags or unknown trailing fields.
-fn exact_outline_arc(node: &SexpNode) -> Option<ZoneOutlineElement> {
+pub(crate) fn exact_outline_arc(node: &SexpNode) -> Option<ZoneOutlineElement> {
     if node.children()?.len() != 4 {
         return None;
     }
@@ -630,13 +630,13 @@ fn exact_outline_arc(node: &SexpNode) -> Option<ZoneOutlineElement> {
     })
 }
 
-fn point(node: &SexpNode, tag: &str) -> Option<(f64, f64)> {
+pub(crate) fn point(node: &SexpNode, tag: &str) -> Option<(f64, f64)> {
     coordinate_pair(node.find(tag)?)
 }
 
 /// The board's top-level net table (`(net N "NAME")` direct children), which
 /// only KiCad ≤ 9 writes. Keys are the numeric ids as written.
-fn top_level_net_table(tree: &SexpNode) -> HashMap<String, String> {
+pub(crate) fn top_level_net_table(tree: &SexpNode) -> HashMap<String, String> {
     tree.find_all("net")
         .into_iter()
         .filter_map(|n| Some((net::net_id(n)?.to_string(), net::net_name(n)?.to_string())))
@@ -648,7 +648,7 @@ fn top_level_net_table(tree: &SexpNode) -> HashMap<String, String> {
 /// no net node at all. A numeric reference the table cannot resolve keeps the
 /// id digits as its key: that is real identity from the file (the same
 /// fallback [`net::collect_net_keys`] uses), unlike a fabricated name.
-fn resolve_net(item: &SexpNode, table: &HashMap<String, String>) -> Option<String> {
+pub(crate) fn resolve_net(item: &SexpNode, table: &HashMap<String, String>) -> Option<String> {
     let node = item.find("net")?;
     if let Some(name) = net::net_name(node) {
         return (!name.is_empty()).then(|| name.to_string());
@@ -831,7 +831,7 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
 /// times across the installed demo boards, almost all of it on pads and
 /// graphics, so a text scan or a recursive search would report nearly every
 /// footprint as locked. Only a direct child describes the footprint itself.
-fn footprint_locked(fp: &SexpNode) -> bool {
+pub(crate) fn footprint_locked(fp: &SexpNode) -> bool {
     for child in fp.children().unwrap_or(&[]) {
         match child {
             // Legacy inline form: a bare `locked` token among the children.
@@ -848,7 +848,7 @@ fn footprint_locked(fp: &SexpNode) -> bool {
 
 /// The footprint's root `(at x y [rot])`. The rotation defaults to 0 when
 /// absent — that is the file's own convention — but x/y are load-bearing.
-fn footprint_root_at(fp: &SexpNode) -> Option<(f64, f64, f64)> {
+pub(crate) fn footprint_root_at(fp: &SexpNode) -> Option<(f64, f64, f64)> {
     let at = fp.find("at")?;
     let (x, y) = (at.get_f64(1)?, at.get_f64(2)?);
     let rot = at.get_f64(3).unwrap_or(0.0);
@@ -858,7 +858,7 @@ fn footprint_root_at(fp: &SexpNode) -> Option<(f64, f64, f64)> {
 /// Which side the footprint's own `(layer …)` puts it on. A footprint layer
 /// is always `F.Cu` or `B.Cu` in KiCAD-authored files; anything else is
 /// malformed rather than a third side.
-fn footprint_side(fp: &SexpNode) -> Option<Side> {
+pub(crate) fn footprint_side(fp: &SexpNode) -> Option<Side> {
     match fp.find_str("layer")? {
         "F.Cu" => Some(Side::Front),
         "B.Cu" => Some(Side::Back),
@@ -868,7 +868,7 @@ fn footprint_side(fp: &SexpNode) -> Option<Side> {
 
 /// The reference designator: `(property "Reference" "R1" …)` in current
 /// formats, `(fp_text reference "R1" …)` in legacy ones.
-fn footprint_reference(fp: &SexpNode) -> Option<String> {
+pub(crate) fn footprint_reference(fp: &SexpNode) -> Option<String> {
     for prop in fp.find_all("property") {
         if prop.get(1).and_then(|n| n.as_str()) == Some("Reference") {
             return prop.get(2).and_then(|n| n.as_str()).map(str::to_string);
@@ -885,7 +885,7 @@ fn footprint_reference(fp: &SexpNode) -> Option<String> {
 /// Local (footprint-frame) bbox of one `fp_*` graphic; `None` when a
 /// load-bearing coordinate is missing or non-finite. Centerline geometry —
 /// stroke width is not expanded, matching what the courtyard outline means.
-fn fp_shape_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
+pub(crate) fn fp_shape_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
     match head {
         "fp_line" | "fp_rect" => {
             let (x1, y1) = point(node, "start")?;
@@ -920,7 +920,10 @@ fn fp_shape_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
     }
 }
 
-fn merge_bbox(acc: Option<(f64, f64, f64, f64)>, bb: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+pub(crate) fn merge_bbox(
+    acc: Option<(f64, f64, f64, f64)>,
+    bb: (f64, f64, f64, f64),
+) -> (f64, f64, f64, f64) {
     match acc {
         None => bb,
         Some((x0, y0, x1, y1)) => (x0.min(bb.0), y0.min(bb.1), x1.max(bb.2), y1.max(bb.3)),

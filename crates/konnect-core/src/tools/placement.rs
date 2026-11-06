@@ -50,6 +50,7 @@ use konnect_sexp::board::{
     board_outline_shape, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
     OutlineShape, PcbConnectivityIndex, Side,
 };
+use konnect_sexp::outline::{Outline, OutlineStatus};
 use konnect_sexp::parser::SexpNode;
 use plan_status::PlanApplicability;
 use serde_json::json;
@@ -58,22 +59,25 @@ use std::collections::{BTreeSet, HashMap};
 // ─── Tool definitions ────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "score_placement",
             "Score a board's footprint placement: scores 0-100 and explains every deduction, \
          naming the components behind each one. Hard failures (courtyard overlaps, parts \
          outside the outline) decide the verdict regardless of the numeric score, and a \
          board without an Edge.Cuts outline can never pass — its verdict is \
-         'outline_missing'. Outside-outline and connector-edge evidence only applies against \
-         a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
-         or multi-boundary outline cannot prove containment from its bbox, so those checks \
-         are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
-         response) rather than a silent pass.",
+         'outline_missing'. Containment is judged against the true Edge.Cuts outline — \
+         rounded corners, notches, polygons and cut-outs included — and each part outside \
+         it is reported with its overhang in mm. Only an outline that does not close into a \
+         ring (or has an unreadable graphic) cannot prove containment: those checks are \
+         skipped and the verdict is 'outline_unproven' (see 'outline_shape' and 'outline' \
+         in the response) rather than a silent pass. Parts named in \
+         'edge_mount_references' may sit on the edge on purpose; they are listed, not failed.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
                 },
                 "required": ["board"]
             }),
@@ -185,7 +189,9 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_force_directed(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
-    ]
+    ];
+    tools.extend(crate::tools::board_geometry::tools());
+    tools
 }
 
 // ─── Scoring constants ───────────────────────────────────────────────────────
@@ -234,6 +240,10 @@ async fn handle_score_placement(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    let edge_mount = match crate::tools::board_geometry::parse_allowlist(args) {
+        Ok(list) => list,
+        Err(refusal) => return Ok(refusal),
+    };
 
     // The exact board open live in KiCad, when it is this one, is the truthful
     // source: a saved-file read here would silently score a stale snapshot
@@ -274,15 +284,15 @@ async fn handle_score_placement(
 
     let scan = footprint_courtyards(&tree);
     let outline_shape = board_outline_shape(&tree);
-    // Containment evidence is authoritative only against a proven-rectangular
-    // outline (#594): an `Unproven` shape (concave, notched, rounded,
-    // rotated, or multi-boundary) still surfaces its bbox for advisory
-    // display, but the outside-outline and connector-edge checks below only
-    // run as pass/fail evidence for `Rectangular`.
-    let outline = match outline_shape {
-        OutlineShape::Rectangular { bbox } => Some(bbox),
-        OutlineShape::Unproven { .. } | OutlineShape::Missing => None,
-    };
+    // Containment is judged against the true Edge.Cuts outline: its lines,
+    // arcs, circles and polygons joined into rings, cut-outs included. That
+    // replaces the #594 rule that only a provably axis-aligned rectangle could
+    // be checked. The outline is usable when it closes; an open or unreadable
+    // one proves nothing and the verdict says so instead of passing.
+    let true_outline = Outline::from_tree(&tree);
+    let outline_status = true_outline.status();
+    let outline_closed = outline_status == OutlineStatus::Closed;
+    let threshold = true_outline.containment_threshold_mm();
     let index = PcbConnectivityIndex::build(&tree);
     let values = footprint_values(&tree);
 
@@ -322,25 +332,39 @@ async fn handle_score_placement(
     }
 
     // ── Hard failure (b): parts outside the board outline ───────────────────
-    // No outline means this check is blocked, not passed: the response carries
-    // `outline_missing: true` and the verdict can never be "pass".
+    // No usable outline means this check is blocked, not passed: the response
+    // carries `outline_missing` or `outline_unproven` and the verdict can never
+    // be "pass". A part named in `edge_mount_references` is reported, not
+    // failed.
     let mut outside_refs: Vec<String> = Vec::new();
-    if let Some((ox0, oy0, ox1, oy1)) = outline {
+    let mut edge_mount_listed: Vec<serde_json::Value> = Vec::new();
+    if outline_closed {
         for c in &scan.items {
             let (x0, y0, x1, y1) = c.bbox;
-            if x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1 {
-                let reference = courtyard_reference(c);
-                outside_refs.push(reference.to_string());
-                hard_failures.push(json!({
-                    "kind": "outside_outline",
-                    "references": [reference],
-                    "detail": format!(
-                        "{reference} courtyard bbox ({}, {})..({}, {}) is not fully inside \
-                         the board outline ({ox0}, {oy0})..({ox1}, {oy1})",
-                        round3(x0), round3(y0), round3(x1), round3(y1),
-                    ),
-                }));
+            let over = true_outline.overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]);
+            if over.depth_mm <= threshold {
+                continue;
             }
+            let reference = courtyard_reference(c);
+            if edge_mount.allows(reference) {
+                edge_mount_listed.push(json!({
+                    "reference": reference,
+                    "overhang_mm": round3(over.depth_mm),
+                }));
+                continue;
+            }
+            outside_refs.push(reference.to_string());
+            hard_failures.push(json!({
+                "kind": "outside_outline",
+                "references": [reference],
+                "overhang_mm": round3(over.depth_mm),
+                "relation": if over.touches_board { "straddles" } else { "outside" },
+                "detail": format!(
+                    "{reference} courtyard bbox ({}, {})..({}, {}) is not fully inside \
+                     the board outline: it overhangs it by {} mm",
+                    round3(x0), round3(y0), round3(x1), round3(y1), round3(over.depth_mm),
+                ),
+            }));
         }
     }
 
@@ -350,7 +374,7 @@ async fn handle_score_placement(
     // without an outline, like the outside check.
     let mut connector_edges: Vec<serde_json::Value> = Vec::new();
     let mut connector_violations: Vec<(String, f64)> = Vec::new();
-    if let Some((ox0, oy0, ox1, oy1)) = outline {
+    if outline_closed {
         for c in &scan.items {
             let Some(reference) = c.reference.as_deref() else {
                 continue;
@@ -358,8 +382,14 @@ async fn handle_score_placement(
             if ref_prefix(reference) != "J" {
                 continue;
             }
-            let (cx, cy) = bbox_center(c.bbox);
-            let edge_distance = (cx - ox0).min(ox1 - cx).min(cy - oy0).min(oy1 - cy);
+            let centre = bbox_center(c.bbox);
+            // Distance to the nearest edge of the true outline (a cut-out's
+            // edge counts), negative when the centre is off the board.
+            let edge_distance = if true_outline.contains(centre) {
+                true_outline.boundary_distance(centre)
+            } else {
+                -true_outline.boundary_distance(centre)
+            };
             connector_edges.push(json!({
                 "reference": reference,
                 "edge_distance_mm": round3(edge_distance),
@@ -454,9 +484,9 @@ async fn handle_score_placement(
     // outline_missing → outline_unproven → pass.
     let verdict = if !hard_failures.is_empty() {
         "hard_fail"
-    } else if matches!(outline_shape, OutlineShape::Missing) {
+    } else if outline_status == OutlineStatus::Missing {
         "outline_missing"
-    } else if matches!(outline_shape, OutlineShape::Unproven { .. }) {
+    } else if !outline_closed {
         "outline_unproven"
     } else {
         "pass"
@@ -465,13 +495,16 @@ async fn handle_score_placement(
     Ok(CallToolResult::json(&json!({
         "verdict": verdict,
         "score": score,
-        "outline_missing": matches!(outline_shape, OutlineShape::Missing),
-        "outline_unproven": matches!(outline_shape, OutlineShape::Unproven { .. }),
-        "outline_shape": match outline_shape {
-            OutlineShape::Rectangular { .. } => "rectangular",
-            OutlineShape::Unproven { .. } => "unproven",
-            OutlineShape::Missing => "missing",
+        "outline_missing": outline_status == OutlineStatus::Missing,
+        "outline_unproven": !outline_closed && outline_status != OutlineStatus::Missing,
+        "outline_shape": match (outline_status, outline_shape) {
+            (OutlineStatus::Missing, _) => "missing",
+            (OutlineStatus::Closed, OutlineShape::Rectangular { .. }) => "rectangular",
+            (OutlineStatus::Closed, _) => "closed",
+            _ => "unproven",
         },
+        "outline": crate::tools::board_geometry::outline_json(&true_outline),
+        "edge_mount_listed": edge_mount_listed,
         "hard_failures": hard_failures,
         "deductions": deductions,
         "connector_edges": connector_edges,
@@ -2815,23 +2848,26 @@ mod tests {
     /// manufactured by string surgery. It has no footprints, so this exercises
     /// `score_placement`'s public path purely for outline recognition: the
     /// board must not be treated as outline-missing (gr_poly recognition
-    /// from #593 stands), but its concave shape is not a provable rectangle,
-    /// so containment is unproven (#594) — it must never reach a silent
-    /// "pass".
+    /// from #593 stands). Its concave shape is not a rectangle, which #594
+    /// treated as unprovable; the true-outline containment check proves it, so
+    /// the verdict now rests on the parts (this fixture has none).
     const GR_POLY_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../konnect-sexp/tests/fixtures/gr_poly_outline.kicad_pcb"
     );
 
     #[tokio::test]
-    async fn gr_poly_outline_is_recognized_but_unproven_through_the_public_scoring_path() {
+    async fn gr_poly_outline_is_recognized_and_proven_through_the_public_scoring_path() {
+        // #594 skipped containment on this concave 12-vertex polygon because a
+        // bbox cannot prove it. The true outline can: it is a closed ring.
         let response = score(std::path::Path::new(GR_POLY_FIXTURE)).await;
 
         assert_eq!(response["outline_missing"], false, "{response}");
-        assert_eq!(response["outline_unproven"], true, "{response}");
-        assert_eq!(response["outline_shape"], "unproven", "{response}");
-        assert_eq!(response["verdict"], "outline_unproven", "{response}");
-        assert_ne!(response["verdict"], "pass");
+        assert_eq!(response["outline_unproven"], false, "{response}");
+        assert_eq!(response["outline_shape"], "closed", "{response}");
+        assert_eq!(response["outline"]["status"], "closed", "{response}");
+        assert_eq!(response["outline"]["rings"], 1, "{response}");
+        assert_eq!(response["verdict"], "pass", "{response}");
         assert_eq!(response["score"], 100);
         assert_eq!(response["footprints_scored"], 0);
         assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
@@ -2847,11 +2883,11 @@ mod tests {
         );
     }
 
-    /// Served `tools/call` coverage (not a direct handler call) for #594's
-    /// `outline_unproven` verdict, over the same real-KiCad concave `gr_poly`
-    /// fixture used above.
+    /// Served `tools/call` coverage (not a direct handler call) for the same
+    /// real-KiCad concave `gr_poly` fixture: a closed non-rectangular outline
+    /// is proven, not "unproven".
     #[tokio::test]
-    async fn served_score_placement_reports_outline_unproven_for_a_non_rectangular_board() {
+    async fn served_score_placement_proves_a_non_rectangular_closed_board() {
         let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
             kicad_cli: String::new(),
             kicad_binary: String::new(),
@@ -2883,10 +2919,138 @@ mod tests {
 
         assert_eq!(response["isError"], json!(false), "{body}");
         assert_eq!(body["outline_missing"], false, "{body}");
-        assert_eq!(body["outline_unproven"], true, "{body}");
-        assert_eq!(body["outline_shape"], "unproven", "{body}");
-        assert_eq!(body["verdict"], "outline_unproven", "{body}");
-        assert_ne!(body["verdict"], "pass");
+        assert_eq!(body["outline_unproven"], false, "{body}");
+        assert_eq!(body["outline_shape"], "closed", "{body}");
+        assert_eq!(body["verdict"], "pass", "{body}");
+    }
+
+    /// What `outline_unproven` means now: the Edge.Cuts graphics do not close
+    /// into a ring. One side of the fixture's rectangle is retagged off
+    /// Edge.Cuts, so the outline has a gap and proves nothing.
+    #[tokio::test]
+    async fn an_outline_with_a_gap_is_unproven_and_never_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("gap.kicad_pcb");
+        let content = std::fs::read_to_string(FIXTURE).unwrap().replacen(
+            "(layer \"Edge.Cuts\")",
+            "(layer \"Dwgs.User\")",
+            1,
+        );
+        std::fs::write(&board, content).unwrap();
+        let response = score(&board).await;
+
+        assert_eq!(response["outline_unproven"], true, "{response}");
+        assert_eq!(response["outline_missing"], false, "{response}");
+        assert_eq!(response["outline_shape"], "unproven", "{response}");
+        assert_eq!(response["outline"]["status"], "open", "{response}");
+        assert_eq!(response["verdict"], "outline_unproven", "{response}");
+        assert_eq!(
+            response["hard_failures"].as_array().unwrap().len(),
+            0,
+            "{response}"
+        );
+    }
+
+    /// The rounded-and-cut-out board from the board-geometry fixtures: the
+    /// outline `add_board_outline` draws (arc corners) plus a circular cut-out.
+    /// Containment is now judged against it, with the overhang in mm. Expected
+    /// overhangs are hand-computed in the fixture's README.
+    const GEOMETRY_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+    );
+
+    fn outside_failure<'a>(
+        response: &'a serde_json::Value,
+        reference: &str,
+    ) -> &'a serde_json::Value {
+        response["hard_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["kind"] == "outside_outline" && f["references"][0] == reference)
+            .unwrap_or_else(|| panic!("{reference} should be outside the outline: {response}"))
+    }
+
+    #[tokio::test]
+    async fn a_rounded_outline_with_a_cutout_is_provable_and_names_each_overhang() {
+        let response = score(std::path::Path::new(GEOMETRY_FIXTURE)).await;
+
+        assert_eq!(response["outline_shape"], "closed", "{response}");
+        assert_eq!(response["outline_unproven"], false, "{response}");
+        assert_eq!(response["outline"]["cutouts"], 1, "{response}");
+        assert_eq!(response["verdict"], "hard_fail", "{response}");
+
+        let outside: std::collections::BTreeSet<&str> = response["hard_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["kind"] == "outside_outline")
+            .map(|f| f["references"][0].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            outside.into_iter().collect::<Vec<_>>(),
+            ["C1", "C2", "J1", "Q2", "R9"],
+            "U1, Q1 and TP1 are inside: {response}"
+        );
+
+        // C1 sits in a rounded corner: inside the outline's bounding box, so a
+        // rectangle test passes it, but its courtyard corner (1, 1) is
+        // 5.657 − 5 = 0.657 mm outside the corner arc (centre (5, 5), r 5).
+        let c1 = outside_failure(&response, "C1");
+        assert!(
+            (c1["overhang_mm"].as_f64().unwrap() - 0.657).abs() < 0.01,
+            "{c1}"
+        );
+        assert_eq!(c1["relation"], "straddles");
+        // R9 is 20 mm past the right edge; its far courtyard corner is 21 mm out.
+        let r9 = outside_failure(&response, "R9");
+        assert!(
+            (r9["overhang_mm"].as_f64().unwrap() - 21.0).abs() < 0.01,
+            "{r9}"
+        );
+        assert_eq!(r9["relation"], "outside");
+        // C2 courtyard x 20.5..24.5 against the radius-3 cut-out about (20, 15):
+        // the left edge midpoint is 2.5 mm into the hole.
+        let c2 = outside_failure(&response, "C2");
+        assert!(
+            (c2["overhang_mm"].as_f64().unwrap() - 2.5).abs() < 0.01,
+            "{c2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_mount_references_are_listed_not_failed() {
+        let result = handle_score_placement(
+            &json!({ "board": GEOMETRY_FIXTURE, "edge_mount_references": ["J*"] }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let response = text_of(&result).await;
+
+        assert!(
+            response["hard_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["references"][0] != "J1"),
+            "{response}"
+        );
+        assert_eq!(
+            response["edge_mount_listed"][0]["reference"], "J1",
+            "{response}"
+        );
+        assert!(
+            (response["edge_mount_listed"][0]["overhang_mm"]
+                .as_f64()
+                .unwrap()
+                - 3.0)
+                .abs()
+                < 0.01
+        );
+        // The others still fail.
+        assert_eq!(response["verdict"], "hard_fail", "{response}");
     }
 
     /// Move ONE footprint's root anchor by string surgery on the
@@ -3477,7 +3641,11 @@ mod tests {
                 serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
             if dry_run {
                 assert_eq!(response["isError"], false, "{body}");
-                assert_eq!(body["verdict_after_plan"], "outline_unproven", "{body}");
+                // The planner still refuses a non-rectangular outline (its
+                // containment rule is PR 8's). The score it reports is now
+                // truthful about that outline: the fixture's parts, at x 20 to
+                // 30, are nowhere near this polygon (x 103 to 154).
+                assert_eq!(body["verdict_after_plan"], "hard_fail", "{body}");
                 assert_eq!(body["plan_status"], "blocked", "{body}");
                 assert!(
                     body["blocking_reasons"]
