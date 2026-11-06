@@ -32,7 +32,8 @@ use super::sch_components::{
     plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, pick_stub_direction, resolve_pin_endpoint, resolve_placed_pin,
+    route_between,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -43,8 +44,9 @@ pub fn tools() -> Vec<ToolDef> {
             "batch_connect_to_net",
             "Connect multiple component pins to a named net. By default it adds a net label \
              at each pin endpoint with no wire. Pass stub_length, direction and label_type \
-             for connect_to_net's placement, applied to every pin in the call. \
-             Single file read → all edits → single file write. \
+             for connect_to_net's placement, applied to every pin in the call; a stub that \
+             would join another net is skipped and listed in `errors`, as connect_to_net \
+             refuses it. Single file read → all edits → single file write. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
@@ -128,7 +130,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle.",
+             file read/write cycle. Routes as connect_pins does; a pair whose route would \
+             join another net is skipped and listed in errors.",
             json!({
                 "type": "object",
                 "properties": {
@@ -504,7 +507,28 @@ async fn handle_batch_connect_to_net(
         let (px, py) = pin_endpoint(&pin, t);
         // `auto` is pin_label_rotation's direction, so the default rotation
         // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        // A stub must join nothing but the pin's own net (#899). Checked
+        // against the sheet as this call has drawn it so far; a blocked pin is
+        // skipped and reported, as a blocked route is.
+        let dir = match sch.as_ref() {
+            Some(sch) if stub_length > 0.0 => {
+                match pick_stub_direction(
+                    &sch.to_source(),
+                    (px, py),
+                    direction,
+                    Some(pin_outward_direction(&pin, t)),
+                    stub_length,
+                    &net_name,
+                )? {
+                    Ok(dir) => dir,
+                    Err(reasons) => {
+                        errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                        continue;
+                    }
+                }
+            }
+            _ => crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t))),
+        };
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
 
@@ -553,6 +577,9 @@ async fn handle_batch_connect_to_net(
         added.push(entry);
     }
 
+    let joined = sch
+        .as_ref()
+        .map(|sch| super::sch_wiring::nets_joined(&content, &sch.to_source()));
     if is_changed {
         match sch {
             // Revision-checked against `content`: a concurrent edit refuses
@@ -578,6 +605,9 @@ async fn handle_batch_connect_to_net(
     if !is_legacy_placement {
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
+    }
+    if let Some(joined) = joined {
+        body["nets_joined"] = joined;
     }
     Ok(CallToolResult::json(&body))
 }
@@ -855,7 +885,7 @@ async fn handle_batch_connect_pins(
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
     // this is safe to do up front instead of re-resolving per connection.
-    let mut resolved: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let mut resolved: Vec<(String, f64, f64, f64, f64)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for conn in &connections {
         let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
@@ -871,26 +901,40 @@ async fn handle_batch_connect_pins(
             resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
             resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
         ) {
-            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
+            (Ok((x1, y1)), Ok((x2, y2))) => {
+                resolved.push((format!("{ref1}.{pin1} -> {ref2}.{pin2}"), x1, y1, x2, y2))
+            }
             (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
         }
     }
 
-    // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
+    // ponytail: re-parses content and rebuilds net graphs per wire; incremental tree
+    // edits if batches get huge.
+    // A route that would join another net is skipped and reported; the rest
+    // still land, as an unresolved pin's do.
+    let before = content.clone();
     let mut new_content = content;
-    for (x1, y1, x2, y2) in &resolved {
-        new_content = route_between(new_content, *x1, *y1, *x2, *y2);
+    let mut connected = 0;
+    for (pair, x1, y1, x2, y2) in &resolved {
+        match route_between(&new_content, *x1, *y1, *x2, *y2)? {
+            Ok(routed) => {
+                new_content = routed.content;
+                connected += 1;
+            }
+            Err(reasons) => errors.push(format!("{pair}: {}", reasons.join("; "))),
+        }
     }
 
-    if !resolved.is_empty() {
+    if connected > 0 {
         write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
     let mut result = CallToolResult::json(&json!({
-        "connected_count": resolved.len(),
-        "errors": errors
+        "connected_count": connected,
+        "errors": errors,
+        "nets_joined": super::sch_wiring::nets_joined(&before, &new_content)
     }));
-    result.is_error = resolved.is_empty() && !errors.is_empty();
+    result.is_error = connected == 0 && !errors.is_empty();
     Ok(result)
 }
 
@@ -2470,6 +2514,8 @@ mod batch_place_and_connect_tests {
 
     /// Six single-pin instances of a synthetic part, positioned so that
     /// connecting them by pin pairs produces a T-junction on the second pair.
+    /// R4's pin lies on the R1-R2 route, so a label `N` on R1 and R4 puts it on
+    /// R1's net already: without it, that route would join R4 (#887).
     fn multi_point_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
         let pin_def = "\t\t\t(pin passive line (at 0 0 0) (length 0)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n";
         let lib_sym = format!("\t\t(symbol \"Test:PT\"\n{pin_def}\t\t)\n");
@@ -2478,13 +2524,16 @@ mod batch_place_and_connect_tests {
                 "\t(symbol\n\t\t(lib_id \"Test:PT\")\n\t\t(at {x} {y} 0)\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t)\n"
             )
         };
+        let label = |x: f64, y: f64| format!("\t(label \"N\"\n\t\t(at {x} {y} 0)\n\t)\n");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("points.kicad_sch");
         std::fs::write(
             &path,
             format!(
-                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{}{}{}{}{})\n",
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{}{}{}{}{}{}{})\n",
                 lib_sym,
+                label(100.0, 100.0),
+                label(110.0, 100.0),
                 inst("R1", 100.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000001"),
                 inst("R2", 120.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000002"),
                 inst("R3", 110.0, 80.0, "aaaaaaaa-0000-0000-0000-000000000003"),

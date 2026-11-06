@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-06. The research is done and PR 1 of 15 is open, not merged. PR 2 is next and not started; ask the owner before starting it.
+**Last updated:** 2026-11-06. The research is done. PR 1 (#19) and PR 2 are open and not merged; PR 2 is stacked on PR 1's branch. PR 3 is next and not started; ask the owner before starting it.
 
 ## Start here
 
@@ -33,7 +33,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
 | 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | **Open**: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19), branch `feat/creation-netlist-compare` |
-| 2 | Route safety: port upstream #901, report `nets_joined`; PR 1 proves no net changed | 1 | Not started |
+| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | **Open**: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20), stacked on `feat/creation-netlist-compare`; branch `feat/schematic-route-safety` |
 | 3 | Response budget for ERC, DRC and list tools | none | Not started |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented | 1, 2 | Not started |
@@ -48,7 +48,23 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
-## Now: PR 1, the netlist read and compare
+## Now: PR 2, route safety
+
+Stacked on PR 1's branch, so its base is `feat/creation-netlist-compare`; retarget it to `main` once PR 1 merges. Two commits:
+
+- **#901 ported as it stands** (author Paulius Zaleckas, cherry-picked with `-x`): `connect_pins`, `batch_connect_pins` and `add_schematic_connection` try the other L-bend and refuse with `plan_blocked` when both would join another net. One conflict, in `docs/API_MIGRATIONS.md`, kept both entries.
+- **#899 and #900, which #901 touches the same path as.** A stub from `connect_to_net` or `batch_connect_to_net` is checked the same way (`pick_stub_direction`): `auto` tries the other directions, a named direction that would join is refused or, in the batch, skipped into `errors`. Reaching what already carries the stub's own net name is not a join, because the label joins it anyway (an existing test needs this). `add_wire`, `batch_add_wire` and the stub wires dot only the T's the new wire forms (`t_junctions_on`). `add_wire` takes coordinates, so it draws what it is given and only reports.
+- **`nets_joined`** (`sch_wiring::nets_joined`) on all seven wiring tools: `[{nets: [...]}]` for each net that now holds two or more nets the sheet had before; `[]` for none; `null` when pins cannot be resolved. A net of bare wires is not listed.
+
+Proof: `route_safety_tests.rs`. The fast tests read the file. One ignored test asks the real KiCad, through `compare_netlist`, that the result connects what was meant on the #901 fixture (a far wire changes nothing, a refused route changes nothing, the avoided pin stays alone, the stub leaves the tee alone):
+
+```bash
+cargo test -p konnect-core --lib route_safety -- --ignored
+```
+
+Guards were broken one at a time (the join check, the T filter, the stub check, the report); each failed fast tests and the live one. Limits left: the check sees pins, labels and sheet pins, so two bare-wire nets with nothing on them can still touch unreported; labels or power symbols that merge nets by name are out of its sight until `compare_netlist` runs; `add_power_symbol`, `add_junction`, the bus tools and the `move_*` tools were not looked at, and `add_wire` / `batch_add_wire` only report.
+
+## PR 1, the netlist read and compare (open, #19)
 
 Two tools in the `sch_export` toolset (`tools/sch_netlist.rs`, tests in `tools/sch_netlist_tests.rs`).
 
