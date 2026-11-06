@@ -316,7 +316,8 @@ Konnect never reads a datasheet. You read it, Konnect fits a model to the number
 | Inductor, ferrite bead | Fit it: kind `inductor`. A bead is its DC resistance and inductance |
 | Connector, test point, mounting hole, open jumper | Leave it out with `testbench.exclude_references`. The run reads `modified` and lists them |
 | TVS diode | Fit it: kind `tvs`, or `tvs_bidirectional` for a pair. Give `breakdown_voltage` at its test current and `clamping_voltage` at its peak pulse current (`peak_pulse_current_amps`); `reverse_current` at the stand-off voltage is checked, not fitted. A bidirectional part takes no forward or capacitance values |
-| MOSFET, BJT, IC | Not fitted yet: a vendor model through KiCad, or a stand-in from Protection Scenarios |
+| Power MOSFET | Fit it: kind `n_mosfet` or `p_mosfet`. Give every value as a magnitude: `gate_threshold_voltage` (at 250 µA, usually), `on_resistance` at its gate voltage and current, and two or more `drain_current` values off the transfer curve (`gate_source_voltage_volts`, `drain_source_voltage_volts`); `forward_voltage` values fit the body diode. The result is a three-pin subcircuit (D, G, S) with ngspice's default capacitances, so it is right for DC and slow switching, not for switching speed, until capacitances are fitted |
+| BJT, IC | Not fitted yet: a vendor model through KiCad, or a stand-in from Protection Scenarios |
 
 4. Call `create_simulation_model`. Values are plain numbers in SI base units: 0.45 for 450 mV, 1e-6 for 1 µA. `statistic` is the datasheet column; never enter an absolute maximum rating. A diode needs two `forward_voltage` values at least, so read three or more off the forward curve with `read_from: "figure"`; with more than the fit needs, the middle one is held out as a check.
 

@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 is in progress on `feat/simulation-datasheet-models-m2` (not pushed): the TVS slice is done, the MOSFET and the BJT are not.
+**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 is in progress on `feat/simulation-datasheet-models-m2` (not pushed): the TVS slice and the MOSFET's DC fit are done; the MOSFET's capacitances and gate-charge check, and the BJT, are not.
 
 ## Start here
 
@@ -57,7 +57,7 @@ The owner asked for a design and its parts' datasheets to be enough to simulate.
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
-| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **TVS done** (kinds `tvs`, `tvs_bidirectional`); MOSFET and BJT next |
+| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **TVS done** (kinds `tvs`, `tvs_bidirectional`); **MOSFET DC fit done** (`n_mosfet`, `p_mosfet`); MOSFET capacitances and gate charge, then BJT, next |
 | M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
@@ -87,6 +87,17 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 - **Shared code.** `diode.rs` now holds `breakdown_card`, which `zener` and `tvs` both call, and `check_voltage_at_current`. The grammar checker accepts `DG`/`DH`, and a marker `kind` of up to 24 characters.
 - **Tests:** four in `tvs.rs`, one live test (`both_fitted_tvs_kinds_are_read_by_kicad_and_clamp_on_the_engine`) at the end of `simulation_live.rs`. Negative control: zeroing the series resistance in the card fails the live test with the clamp reading 15.25 V against 24 V.
 - **Limits:** the breakdown voltage does not follow temperature; no pulse-width or thermal behaviour, so a long pulse clamps as a short one; a bidirectional part's capacitance is not modelled.
+
+### M2 progress: MOSFET DC fit (done), capacitances and gate charge (not done)
+
+- **Kinds `n_mosfet`, `p_mosfet`** (`simulation/models/mosfet.rs`). Every value is a magnitude. Inputs: `gate_threshold_voltage` at a drain current, `on_resistance` at a gate voltage and current, two or more `drain_current` values (`gate_source_voltage_volts`, `drain_source_voltage_volts`), optional `forward_voltage` (the body diode) and `gate_resistance`.
+- **The model** is a three-pin subcircuit `D G S` holding one `M1` and one `.model ... VDMOS` card, so KiCad's export never adds thermal nodes. The channel type is a bare `NCHAN` or `PCHAN` continuation line.
+- **The law was checked against the engine, not assumed.** A scratch run of libngspice 45.2 matched `vgst = ksub ln(1 + exp((Vgs - VTO) / ksub))`, `beta = KP / (1 + THETA max(Vgs - VTO, 0))`, triode `beta Vds (vgst - Vds / 2)`, saturation `beta vgst^2 / 2`, to six digits, with `RD` in series. So the fit runs on the law (`Law` in `mosfet.rs`) and needs no engine round trip. The memory note's `(1 + lambda Vds)` term and `RS` are not used: lambda is 0 and all series resistance is `RD`.
+- **A P-channel card needs a negative `VTO`.** With `PCHAN` and a positive `VTO` ngspice reads 393 A where the mirror of the N-channel part reads 78 A. The fit writes `-VTO` for `p_mosfet`, and the bench uses sources of the opposite sign.
+- **The fit.** `fit::least_squares` (Levenberg-Marquardt, numeric Jacobian) fits `VTO`, `KP` and `THETA` to the log of the current at the threshold point and every transfer point; `RD` then follows from the on-resistance by inverting the law; three rounds. With more than three transfer values the middle one is held out. An on-resistance below the channel alone gives `RD = 0` and an `assumed` note; a current the channel cannot carry at the on-resistance's gate voltage is refused on that field.
+- **Grammar.** `text.rs` accepts `M1 D G S <name>_m` and a `.model <name>_m VDMOS` card whose parameters come from `MOSFET_PARAMETERS`.
+- **Tests:** eight in `mosfet.rs` (law against engine values, inversion, recovery, hold-out, P-channel mirror, grammar, two refusals), one in `fit.rs`, and `both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part` in `simulation_live.rs`, which fits both kinds and assigns the N-channel one to `Q2` of the `class-d` demo. Negative controls: dropping the P-channel `VTO` sign, and not writing `RD`, each fail the live test (the second with 60.5 percent worst error).
+- **Left for the rest of M2:** `Ciss`/`Coss`/`Crss` fits (`CGS`, `CGDMIN`, `CGDMAX`, `A`, `CJO`), the transient gate-charge check (`Qg`, `Qgd`), `BV` for avalanche, and temperature. Until then the capacitances are ngspice's defaults and the result says so in `fit.assumed`, so the model is right for DC and slow switching only.
 
 ## Simulation validation and stored results (merged as PR #15)
 

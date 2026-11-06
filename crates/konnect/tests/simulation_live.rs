@@ -4065,3 +4065,52 @@ fn both_fitted_tvs_kinds_are_read_by_kicad_and_clamp_on_the_engine() {
         assert_eq!(results[at]["parts"][0]["element"], "XD1", "{}", results[at]);
     }
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/class-d"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("Class-D.kicad_sch");
+    let transfer = |vgs: f64, vds: f64, amps: f64| {
+        json!({
+            "quantity": "drain_current", "value": amps,
+            "conditions": { "gate_source_voltage_volts": vgs, "drain_source_voltage_volts": vds },
+            "statistic": "typical"
+        })
+    };
+    let values = json!([
+        { "quantity": "gate_threshold_voltage", "value": 2.7029, "conditions": { "drain_current_amps": 2.5e-4 }, "statistic": "typical" },
+        { "quantity": "on_resistance", "value": 0.02478, "conditions": { "gate_source_voltage_volts": 10.0, "drain_current_amps": 20.0 }, "statistic": "typical" },
+        transfer(3.5, 10.0, 2.446),
+        transfer(4.5, 10.0, 20.93),
+        transfer(6.0, 10.0, 78.261),
+        transfer(8.0, 10.0, 200.0),
+        { "quantity": "forward_voltage", "value": 0.8, "conditions": { "forward_current_amps": 1.0 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 1.0, "conditions": { "forward_current_amps": 20.0 }, "statistic": "typical" },
+        { "quantity": "gate_resistance", "value": 1.5, "conditions": { "frequency_hz": 1e6 }, "statistic": "typical" }
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "n_mosfet", "nfet_fit", values.clone()),
+            create_model(&schematic, "p_mosfet", "pfet_fit", values),
+            assign_model(
+                &schematic,
+                &["Q2"],
+                "nfet_fit",
+                json!({ "1": "D", "2": "G", "3": "S" }),
+            ),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+    }
+    assert_eq!(
+        results[2]["outcome"]["status"], "complete",
+        "{}",
+        results[2]
+    );
+    assert_eq!(results[2]["parts"][0]["element"], "XQ2", "{}", results[2]);
+}
