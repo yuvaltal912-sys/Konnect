@@ -31,7 +31,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_wire",
             "Add a wire segment between two points. The wire must be horizontal or vertical. \
-             T-junctions are automatically detected and junction dots inserted.",
+             Junction dots are inserted for the T-junctions this wire forms and the pins it \
+             passes over, and only those. The coordinates are yours, so nothing is refused; \
+             `nets_joined` lists the nets the wire merged.",
             json!({
                 "type": "object",
                 "properties": {
@@ -45,7 +47,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_add_wire",
-            "Add multiple wire segments in a single file read/write cycle.",
+            "Add multiple wire segments in a single file read/write cycle. Dots only the \
+             T-junctions the new wires form; `nets_joined` lists the nets they merged.",
             json!({
                 "type": "object",
                 "properties": {
@@ -334,7 +337,10 @@ pub fn tools() -> Vec<ToolDef> {
              Name the pin with reference + pin_number, or give its coordinates directly. \
              The label is sheet-local: a sheet instanced N times gets N independent nets. \
              A rail shared by every instance needs add_power_symbol or a global_label, \
-             which are one net across all sheets and instances.",
+             which are one net across all sheets and instances. The stub must join nothing \
+             but the pin's own net: `auto` tries the other directions when the first would, \
+             and a named direction that would is refused with plan_blocked. `nets_joined` \
+             lists the nets the call merged, including the named net itself.",
             json!({
                 "type": "object",
                 "properties": {
@@ -475,6 +481,19 @@ fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> 
                 && !konnect_sexp::geometry::points_coincident(px, py, x1, y1, tol)
                 && !konnect_sexp::geometry::points_coincident(px, py, x2, y2, tol)
         })
+        .collect()
+}
+
+/// The T-junctions that lie on the wire from `a` to `b`, among those
+/// `find_t_junctions` reports for `wires` (which already holds that wire).
+fn t_junctions_on(
+    wires: &[konnect_sexp::schematic::Wire],
+    a: (f64, f64),
+    b: (f64, f64),
+) -> Vec<(f64, f64)> {
+    find_t_junctions(wires, 0.01)
+        .into_iter()
+        .filter(|&(x, y)| konnect_sexp::geometry::point_on_segment(x, y, a.0, a.1, b.0, b.1, 0.01))
         .collect()
 }
 
@@ -646,56 +665,67 @@ struct Terminal {
     net: String,
 }
 
+/// Every pin, label and sheet pin on the sheet with the net it is on, in sheet
+/// order. `None` when a placed symbol's pins cannot be resolved: they would be
+/// invisible, and a wire over them would join them unchecked.
+fn sheet_terminals(
+    before: &konnect_sexp::SexpNode,
+    graph: &mut crate::tools::sch_connectivity::NetGraph,
+    labels: &[konnect_sexp::schematic::Label],
+) -> Option<Vec<Terminal>> {
+    use crate::tools::sch_connectivity::pt_key;
+    use konnect_sexp::schematic::{extract_sheet_pins, LabelKind};
+    let mut terminals: Vec<Terminal> = Vec::new();
+    let mut index: std::collections::HashMap<(i64, i64), usize> = Default::default();
+    let mut push = |at: (f64, f64), desc: String| match index.get(&pt_key(at.0, at.1)) {
+        Some(&i) => terminals[i].descs.push(desc),
+        None => {
+            let root = graph.root_at(at.0, at.1);
+            let net = graph
+                .name_of_root(root)
+                .map(|n| format!(" on net {n}"))
+                .unwrap_or_default();
+            index.insert(pt_key(at.0, at.1), terminals.len());
+            terminals.push(Terminal {
+                at,
+                descs: vec![desc],
+                root,
+                net,
+            });
+        }
+    };
+    for (inst, pins) in crate::tools::resolved_placed_pins_by_reference(before)? {
+        for (pin, t) in pins {
+            push(
+                pin_endpoint(&pin, t),
+                format!("{} pin {}", inst.reference, pin.number),
+            );
+        }
+    }
+    for label in labels {
+        let kind = match label.kind {
+            LabelKind::NetLabel => "label",
+            LabelKind::GlobalLabel => "global label",
+            LabelKind::HierarchicalLabel => "hierarchical label",
+            LabelKind::PowerSymbol => "power symbol",
+        };
+        push((label.x, label.y), format!("{kind} {}", label.net));
+    }
+    for at in extract_sheet_pins(before) {
+        push(at, "a sheet pin".into());
+    }
+    Some(terminals)
+}
+
 impl RouteGuard {
     /// `None` when a placed symbol's pins cannot be resolved: the guard would
     /// not see them, and a route over them would join them unchecked.
     fn new(before: &konnect_sexp::SexpNode, a: (f64, f64), b: (f64, f64)) -> Option<Self> {
-        use crate::tools::sch_connectivity::pt_key;
         use konnect_sexp::geometry::point_on_segment;
-        use konnect_sexp::schematic::{extract_sheet_pins, LabelKind};
         let labels = konnect_sexp::schematic::extract_all_net_labels(before);
         let wires = extract_wires(before);
         let mut graph = crate::tools::sch_connectivity::net_graph_for(before, &wires, &labels);
-
-        let mut terminals: Vec<Terminal> = Vec::new();
-        let mut index: std::collections::HashMap<(i64, i64), usize> = Default::default();
-        let mut push = |at: (f64, f64), desc: String| match index.get(&pt_key(at.0, at.1)) {
-            Some(&i) => terminals[i].descs.push(desc),
-            None => {
-                let root = graph.root_at(at.0, at.1);
-                let net = graph
-                    .name_of_root(root)
-                    .map(|n| format!(" on net {n}"))
-                    .unwrap_or_default();
-                index.insert(pt_key(at.0, at.1), terminals.len());
-                terminals.push(Terminal {
-                    at,
-                    descs: vec![desc],
-                    root,
-                    net,
-                });
-            }
-        };
-        for (inst, pins) in crate::tools::resolved_placed_pins_by_reference(before)? {
-            for (pin, t) in pins {
-                push(
-                    pin_endpoint(&pin, t),
-                    format!("{} pin {}", inst.reference, pin.number),
-                );
-            }
-        }
-        for label in &labels {
-            let kind = match label.kind {
-                LabelKind::NetLabel => "label",
-                LabelKind::GlobalLabel => "global label",
-                LabelKind::HierarchicalLabel => "hierarchical label",
-                LabelKind::PowerSymbol => "power symbol",
-            };
-            push((label.x, label.y), format!("{kind} {}", label.net));
-        }
-        for at in extract_sheet_pins(before) {
-            push(at, "a sheet pin".into());
-        }
+        let terminals = sheet_terminals(before, &mut graph, &labels)?;
 
         let mut allowed = vec![graph.root_at(a.0, a.1), graph.root_at(b.0, b.1)];
         for w in &wires {
@@ -711,6 +741,19 @@ impl RouteGuard {
             a,
             terminals,
         })
+    }
+
+    /// Also allow whatever already carries the name `net`: a label of that name
+    /// joins it anyway, so a wire reaching it joins nothing new.
+    fn allow_net_named(&mut self, net: &str) {
+        let tag = format!(" on net {net}");
+        let named: Vec<_> = self
+            .terminals
+            .iter()
+            .filter(|t| t.net == tag)
+            .map(|t| t.root)
+            .collect();
+        self.allowed.extend(named);
     }
 
     /// Each point whose items `after` puts on `a`'s net although they were on
@@ -734,6 +777,117 @@ impl RouteGuard {
             })
             .collect()
     }
+}
+
+/// Which nets a change joined: each net the sheet had before that now shares
+/// one net with another. A net is told apart by what it carries (pins, labels,
+/// sheet pins), so a net of bare wires is never reported. Returns `null` when a
+/// placed symbol's pins cannot be resolved and the answer cannot be given.
+///
+/// This is the report a caller reads to see what a wire did to the netlist;
+/// `compare_netlist` is the check against intent.
+pub(crate) fn nets_joined(before: &str, after: &str) -> serde_json::Value {
+    let (Ok(before), Ok(after)) = (parse_sexp(before), parse_sexp(after)) else {
+        return serde_json::Value::Null;
+    };
+    let labels = konnect_sexp::schematic::extract_all_net_labels(&before);
+    let mut graph =
+        crate::tools::sch_connectivity::net_graph_for(&before, &extract_wires(&before), &labels);
+    let Some(terminals) = sheet_terminals(&before, &mut graph, &labels) else {
+        return serde_json::Value::Null;
+    };
+    let after_labels = konnect_sexp::schematic::extract_all_net_labels(&after);
+    let mut after_graph = crate::tools::sch_connectivity::net_graph_for(
+        &after,
+        &extract_wires(&after),
+        &after_labels,
+    );
+    // After-net -> the before-nets it now holds, in sheet order.
+    let mut groups: Vec<(crate::tools::sch_connectivity::NetRoot, Vec<&Terminal>)> = Vec::new();
+    for terminal in &terminals {
+        let root = after_graph.root_at(terminal.at.0, terminal.at.1);
+        match groups.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, members)) => members.push(terminal),
+            None => groups.push((root, vec![terminal])),
+        }
+    }
+    let joined: Vec<serde_json::Value> = groups
+        .into_iter()
+        .filter_map(|(_, members)| {
+            let mut roots: Vec<crate::tools::sch_connectivity::NetRoot> = Vec::new();
+            let mut nets: Vec<String> = Vec::new();
+            for terminal in members {
+                if roots.contains(&terminal.root) {
+                    continue;
+                }
+                roots.push(terminal.root);
+                nets.push(match terminal.net.strip_prefix(" on net ") {
+                    Some(name) => name.to_owned(),
+                    None => format!("unnamed net with {}", terminal.descs.join(" and ")),
+                });
+            }
+            (roots.len() > 1).then(|| json!({ "nets": nets }))
+        })
+        .collect();
+    json!(joined)
+}
+
+/// The directions a stub is tried in when `auto` finds its first choice blocked.
+const STUB_FALLBACKS: [&str; 4] = ["right", "up", "left", "down"];
+
+/// Pick a stub direction for `pin` whose wire joins nothing but the pin's own
+/// net (#899). A named direction is checked as it stands; `auto` takes the
+/// pin's outward direction first and then each other direction. The stub's
+/// label will name the pin's net `net`, so reaching what already carries that
+/// name is not a join the caller did not ask for. `Ok(Err(..))` holds one
+/// reason per direction tried. `before` is the sheet as it stands,
+/// including stubs drawn earlier in the same call.
+pub(crate) fn pick_stub_direction(
+    before: &str,
+    pin: (f64, f64),
+    direction: &str,
+    outward: Option<f64>,
+    stub_length: f64,
+    net: &str,
+) -> anyhow::Result<Result<crate::tools::StubDirection, Vec<String>>> {
+    let first = crate::tools::stub_direction(direction, outward);
+    // No wire is drawn, so nothing can be joined by one.
+    if stub_length <= 0.0 {
+        return Ok(Ok(first));
+    }
+    let tree = parse_sexp(before)?;
+    let Some(mut guard) = RouteGuard::new(&tree, pin, pin) else {
+        return Ok(Err(vec![format!(
+            "cannot check what the stub would join: {}",
+            crate::tools::UNRESOLVED_PIN_GEOMETRY
+        )]));
+    };
+    guard.allow_net_named(net);
+    let first_name = first.name;
+    let mut candidates = vec![first];
+    if direction == "auto" {
+        candidates.extend(
+            STUB_FALLBACKS
+                .iter()
+                .filter(|name| **name != first_name)
+                .map(|name| crate::tools::stub_direction(name, None)),
+        );
+    }
+    let mut refused = Vec::new();
+    for candidate in candidates {
+        let end = candidate.end(pin, stub_length);
+        let drawn = insert_wire_with_junctions(before.to_owned(), pin.0, pin.1, end.0, end.1);
+        let joined = guard.foreign_joins(&parse_sexp(&drawn)?);
+        if joined.is_empty() {
+            return Ok(Ok(candidate));
+        }
+        refused.push(format!(
+            "the {} stub would join {}",
+            candidate.name,
+            joined.join(", ")
+        ));
+    }
+    Ok(Err(refused))
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -774,19 +928,24 @@ async fn handle_add_wire(
         y2,
         uuid: None,
     });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    // Only the T's the new wire forms: a dot-less T elsewhere is two nets to
+    // KiCad, and dotting it would join them unasked (#900).
+    let junctions = t_junctions_on(&existing_wires, (x1, y1), (x2, y2));
 
+    let before = sch.to_source();
     sch.add_wire(x1, y1, x2, y2);
     add_missing_junctions(&mut sch, &junctions);
     // Pins the new wire passes over mid-segment also need junction dots.
     let (_, tree) = read_schematic(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
     add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
+    let joined = nets_joined(&before, &sch.to_source());
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(
-        &json!({ "added_wire": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 } }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "added_wire": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 },
+        "nets_joined": joined
+    })))
 }
 
 async fn handle_batch_add_wire(
@@ -816,6 +975,7 @@ async fn handle_batch_add_wire(
     }
 
     let mut sch = cse::Schematic::load(&sch_path)?;
+    let before = sch.to_source();
     let mut added = 0usize;
 
     // Pin endpoints are fixed for the whole batch (only wires change below).
@@ -840,7 +1000,7 @@ async fn handle_batch_add_wire(
             y2,
             uuid: None,
         });
-        let junctions = find_t_junctions(&existing_wires, 0.01);
+        let junctions = t_junctions_on(&existing_wires, (x1, y1), (x2, y2));
 
         sch.add_wire(x1, y1, x2, y2);
         add_missing_junctions(&mut sch, &junctions);
@@ -849,8 +1009,11 @@ async fn handle_batch_add_wire(
         added += 1;
     }
 
+    let joined = nets_joined(&before, &sch.to_source());
     sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({ "added_wires": added })))
+    Ok(CallToolResult::json(
+        &json!({ "added_wires": added, "nets_joined": joined }),
+    ))
 }
 
 async fn handle_delete_wire(
@@ -2674,7 +2837,7 @@ async fn handle_connect_to_net(
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
-    let (_, tree) = read_schematic(&sch_path)?;
+    let (content, tree) = read_schematic(&sch_path)?;
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
@@ -2722,9 +2885,19 @@ async fn handle_connect_to_net(
 
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
-    let dir = match outward {
-        Some(d) => crate::tools::stub_direction(direction, Some(d)),
-        None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
+    let outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    // The stub must join nothing but the pin's own net (#899): `auto` tries
+    // the other directions, and a named direction that would join is refused.
+    let dir = match pick_stub_direction(
+        &content,
+        (pin_x, pin_y),
+        direction,
+        outward,
+        stub_length,
+        &net,
+    )? {
+        Ok(dir) => dir,
+        Err(reasons) => return Ok(route_blocked("connect_to_net", reasons)),
     };
     let mut sch = cse::Schematic::load(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
@@ -2738,13 +2911,15 @@ async fn handle_connect_to_net(
         &net,
     );
 
+    let joined = nets_joined(&content, &sch.to_source());
     sch.overwrite()?;
 
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
         "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
-        "label": { "x": label_x, "y": label_y, "rotation": label_rot }
+        "label": { "x": label_x, "y": label_y, "rotation": label_rot },
+        "nets_joined": joined
     })))
 }
 
@@ -2783,7 +2958,7 @@ pub(crate) fn add_stub_wire(
         y2,
         uuid: None,
     });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    let junctions = t_junctions_on(&existing_wires, (x1, y1), (x2, y2));
 
     sch.add_wire(x1, y1, x2, y2);
     add_missing_junctions(sch, &junctions);
@@ -2863,7 +3038,8 @@ async fn handle_connect_pins(
             "from": { "ref": ref1, "pin": pin1, "x": x1, "y": y1 },
             "to":   { "ref": ref2, "pin": pin2, "x": x2, "y": y2 }
         },
-        "path": routed.path
+        "path": routed.path,
+        "nets_joined": nets_joined(&content, &routed.content)
     })))
 }
 
@@ -2971,7 +3147,8 @@ async fn handle_add_schematic_connection(
     write_atomic_if_unchanged(&sch_path, &content, &routed.content)?;
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] },
-        "path": routed.path
+        "path": routed.path,
+        "nets_joined": nets_joined(&content, &routed.content)
     })))
 }
 

@@ -32,7 +32,8 @@ use super::sch_components::{
     plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, pick_stub_direction, resolve_pin_endpoint, resolve_placed_pin,
+    route_between,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -43,8 +44,9 @@ pub fn tools() -> Vec<ToolDef> {
             "batch_connect_to_net",
             "Connect multiple component pins to a named net. By default it adds a net label \
              at each pin endpoint with no wire. Pass stub_length, direction and label_type \
-             for connect_to_net's placement, applied to every pin in the call. \
-             Single file read → all edits → single file write. \
+             for connect_to_net's placement, applied to every pin in the call; a stub that \
+             would join another net is skipped and listed in `errors`, as connect_to_net \
+             refuses it. Single file read → all edits → single file write. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
@@ -505,7 +507,28 @@ async fn handle_batch_connect_to_net(
         let (px, py) = pin_endpoint(&pin, t);
         // `auto` is pin_label_rotation's direction, so the default rotation
         // is unchanged.
-        let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
+        // A stub must join nothing but the pin's own net (#899). Checked
+        // against the sheet as this call has drawn it so far; a blocked pin is
+        // skipped and reported, as a blocked route is.
+        let dir = match sch.as_ref() {
+            Some(sch) if stub_length > 0.0 => {
+                match pick_stub_direction(
+                    &sch.to_source(),
+                    (px, py),
+                    direction,
+                    Some(pin_outward_direction(&pin, t)),
+                    stub_length,
+                    &net_name,
+                )? {
+                    Ok(dir) => dir,
+                    Err(reasons) => {
+                        errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                        continue;
+                    }
+                }
+            }
+            _ => crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t))),
+        };
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
 
@@ -554,6 +577,9 @@ async fn handle_batch_connect_to_net(
         added.push(entry);
     }
 
+    let joined = sch
+        .as_ref()
+        .map(|sch| super::sch_wiring::nets_joined(&content, &sch.to_source()));
     if is_changed {
         match sch {
             // Revision-checked against `content`: a concurrent edit refuses
@@ -579,6 +605,9 @@ async fn handle_batch_connect_to_net(
     if !is_legacy_placement {
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
+    }
+    if let Some(joined) = joined {
+        body["nets_joined"] = joined;
     }
     Ok(CallToolResult::json(&body))
 }
@@ -883,6 +912,7 @@ async fn handle_batch_connect_pins(
     // edits if batches get huge.
     // A route that would join another net is skipped and reported; the rest
     // still land, as an unresolved pin's do.
+    let before = content.clone();
     let mut new_content = content;
     let mut connected = 0;
     for (pair, x1, y1, x2, y2) in &resolved {
@@ -901,7 +931,8 @@ async fn handle_batch_connect_pins(
 
     let mut result = CallToolResult::json(&json!({
         "connected_count": connected,
-        "errors": errors
+        "errors": errors,
+        "nets_joined": super::sch_wiring::nets_joined(&before, &new_content)
     }));
     result.is_error = connected == 0 && !errors.is_empty();
     Ok(result)

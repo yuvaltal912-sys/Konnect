@@ -18,6 +18,32 @@ with itself leaves the fields alone. The reference, Value and Footprint still ar
 changed, so a replacement with no Sim fields of its own (such as `Device:R`) is
 inferred from its reference prefix: rename `D1` to `R1` to simulate it as a resistor.
 
+## Unreleased: wiring tools report the nets they join, and stubs and wires stop joining others (patch release)
+
+Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
+
+- **Stubs (#899).** `connect_to_net` and `batch_connect_to_net` with a `stub_length`
+  above zero now check the stub the way a route is checked. With `direction` `auto`
+  they take the pin's outward direction first and then each other direction, and keep
+  the first whose wire joins nothing but the pin's own net. A named `direction` that
+  would join is refused by `connect_to_net` with `plan_blocked` (one reason per
+  direction tried) and skipped by `batch_connect_to_net`, which adds
+  `"<ref>.<pin>: <reason>"` to `errors`. Reaching something already named by the
+  stub's own net is not a join. The chosen `direction` can differ from before when
+  the outward one was blocked.
+- **Junction dots (#900).** `add_wire`, `batch_add_wire` and the stub wires dot only
+  the T-junctions the new wire forms, not every dot-less T on the sheet. A sheet that
+  had one used to gain a junction, and so a joined net, on any wire drawn anywhere.
+- **`nets_joined`.** `add_wire`, `batch_add_wire`, `connect_pins`,
+  `batch_connect_pins`, `add_schematic_connection`, `connect_to_net` and
+  `batch_connect_to_net` add `nets_joined`: a list of `{"nets": [...]}`, one entry per
+  net that now holds two or more nets the sheet had before, named by label or, when
+  nothing names a net, as `unnamed net with R1 pin 2`. It is `[]` when nothing was
+  merged and `null` when a placed symbol's pins cannot be resolved. A net of bare
+  wires is not listed. `add_wire` and `batch_add_wire` take coordinates, so they draw
+  what they are given and only report. Check the result against intent with
+  `compare_netlist`.
+
 ## Unreleased: routed connections refuse to join another net (patch release)
 
 `connect_pins`, `batch_connect_pins` and `add_schematic_connection` route an
