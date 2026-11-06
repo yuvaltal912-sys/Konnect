@@ -411,6 +411,27 @@ pub(super) fn banner(record: &RunRecord, changed: Option<bool>) -> Vec<String> {
                 .to_string(),
         );
     }
+    let (fitted, edited) = super::fitted_parts(&record.circuit);
+    if fitted > 0 {
+        let parts = if fitted == 1 {
+            "part uses a model"
+        } else {
+            "parts use models"
+        };
+        let edited = match edited {
+            0 => String::new(),
+            1 => " One of them may no longer match the values it was checked against.".to_string(),
+            count => {
+                format!(
+                    " {count} of them may no longer match the values they were checked against."
+                )
+            }
+        };
+        lines.push(format!(
+            "FITTED MODELS: {fitted} {parts} Konnect fitted to datasheet values, not vendor \
+             models.{edited}"
+        ));
+    }
     if changed == Some(true) {
         lines.push(
             "SCHEMATIC CHANGED: the saved schematic or its model files differ from what this \

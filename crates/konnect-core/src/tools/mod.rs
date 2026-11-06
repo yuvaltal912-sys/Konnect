@@ -50,6 +50,7 @@ mod schematic_placement_tests;
 #[cfg(test)]
 mod sim_field_placement_tests;
 pub mod simulation;
+pub(crate) mod simulation_models;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;

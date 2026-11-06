@@ -10,7 +10,17 @@ use konnect_sexp::{parse_sexp, SexpNode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Part-number fields read from a component, by name ignoring case. Anything
+/// else a project adds is left out: it is project text, and unbounded.
+pub(crate) const PART_FIELDS: [&str; 5] = [
+    "MPN",
+    "Manufacturer",
+    "Manufacturer Part Number",
+    "LCSC",
+    "LCSC Part",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Component {
     pub reference: String,
     pub value: String,
@@ -19,14 +29,33 @@ pub(crate) struct Component {
     /// the value, or leaves the part unmodelled.
     pub has_sim_fields: bool,
     pub sim_params: Option<String>,
+    /// What the project says about the part, as written. Untrusted text.
+    pub datasheet: Option<String>,
+    pub description: Option<String>,
+    pub keywords: Option<String>,
+    pub part_fields: Vec<(String, String)>,
+    pub sheet_file: Option<String>,
 }
 
 /// What a library symbol carries, which a placed symbol may not have copied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct LibraryPart {
     pub lib_id: String,
     pub has_sim_fields: bool,
     pub sim_params: Option<String>,
+    /// The library's own `Sim.Pins`, such as `1=K 2=A`.
+    pub sim_pins: Option<String>,
+    pub pins: Vec<LibraryPin>,
+}
+
+/// A pin as the library defines it, with its bare name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LibraryPin {
+    pub number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,12 +131,49 @@ fn sim_fields(node: &SexpNode) -> (bool, Option<String>) {
     (has_sim_fields, sim_params)
 }
 
+/// The value of a `(fields (field (name ..) value))` entry, if it has one.
+fn field_value(node: &SexpNode, wanted: &str) -> Option<String> {
+    node.find("fields")?
+        .find_all("field")
+        .into_iter()
+        .find(|field| field.find_str("name") == Some(wanted))
+        .and_then(|field| field.children()?.last()?.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
+}
+
+/// The value of a `(property (name ..) (value ..))` entry.
+fn property_value(node: &SexpNode, wanted: &str) -> Option<String> {
+    node.find_all("property")
+        .into_iter()
+        .find(|property| property.find_str("name") == Some(wanted))
+        .and_then(|property| property.find_str("value").map(str::to_owned))
+        .filter(|value| !value.is_empty())
+}
+
 fn library_part(node: &SexpNode) -> Option<LibraryPart> {
     let (has_sim_fields, sim_params) = sim_fields(node);
+    let pins = node
+        .find("pins")
+        .map(|pins| pins.find_all("pin"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|pin| {
+            Some(LibraryPin {
+                number: pin.find_str("num")?.to_owned(),
+                name: pin
+                    .find_str("name")
+                    .filter(|name| !name.is_empty() && *name != "~")
+                    .map(str::to_owned),
+                kind: pin.find_str("type").map(str::to_owned),
+            })
+        })
+        .collect();
     Some(LibraryPart {
         lib_id: format!("{}:{}", node.find_str("lib")?, node.find_str("part")?),
         has_sim_fields,
         sim_params,
+        sim_pins: field_value(node, "Sim.Pins"),
+        pins,
     })
 }
 
@@ -124,12 +190,37 @@ fn component(node: &SexpNode) -> Result<Component> {
         Some(format!("{lib}:{part}"))
     });
     let (has_sim_fields, sim_params) = sim_fields(node);
+    let datasheet = node
+        .find_str("datasheet")
+        .map(str::to_owned)
+        .or_else(|| field_value(node, "Datasheet"))
+        .filter(|datasheet| !datasheet.is_empty() && datasheet != "~");
+    let part_fields = node
+        .find("fields")
+        .map(|fields| fields.find_all("field"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|field| {
+            let name = field.find_str("name")?;
+            let known = PART_FIELDS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name));
+            let value = field.children()?.last()?.as_str()?;
+            (known && !value.is_empty() && value != name)
+                .then(|| (name.to_owned(), value.to_owned()))
+        })
+        .collect();
     Ok(Component {
         reference: required(node, "ref")?,
         value: node.find_str("value").unwrap_or_default().to_owned(),
         lib_id,
         has_sim_fields,
         sim_params,
+        datasheet,
+        description: node.find_str("description").map(str::to_owned),
+        keywords: property_value(node, "ki_keywords"),
+        part_fields,
+        sheet_file: property_value(node, "Sheetfile"),
     })
 }
 
@@ -183,7 +274,7 @@ impl SpiceNetlist {
 
     /// KiCad prepends the device letter when a reference does not start with
     /// it, so `BT1` can be `VBT1` and `U1` can be `XU1`. An exact match wins.
-    fn element_for(&self, reference: &str) -> Option<&[String]> {
+    pub(crate) fn element_for(&self, reference: &str) -> Option<&[String]> {
         let matches_name = |tokens: &&Vec<String>, name: &dyn Fn(&str) -> bool| {
             tokens.first().is_some_and(|first| name(first))
         };
@@ -396,6 +487,7 @@ mod tests {
             lib_id: None,
             has_sim_fields: false,
             sim_params: None,
+            ..Default::default()
         };
         let kicad = KiCadNetlist {
             components: vec![component("R7"), component("VR7"), component("BT1")],
@@ -418,6 +510,7 @@ mod tests {
                 lib_id: None,
                 has_sim_fields: false,
                 sim_params: None,
+                ..Default::default()
             }],
             nets: Vec::new(),
             library_parts: Vec::new(),

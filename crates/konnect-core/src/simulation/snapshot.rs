@@ -82,7 +82,7 @@ pub(crate) fn take_snapshot(root: &Path, into: &Path) -> Result<Snapshot> {
     })
 }
 
-fn hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
     fn visit(
         path: &Path,
         seen: &mut HashSet<PathBuf>,
@@ -121,7 +121,7 @@ fn hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// Rewrite project-relative `Sim.Library` values to live absolute paths, so
 /// KiCad's resolver finds model files the snapshot does not carry. 15 of
 /// KiCad's 18 simulation demos exit 2 without this.
-fn absolute_sim_libraries(source: &str, project_dir: &Path) -> String {
+pub(crate) fn absolute_sim_libraries(source: &str, project_dir: &Path) -> String {
     let mut out = String::with_capacity(source.len());
     let mut rest = source;
     while let Some(start) = rest.find(SIM_LIBRARY_PROPERTY) {

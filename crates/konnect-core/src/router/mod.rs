@@ -201,7 +201,8 @@ mod tests {
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
-                        "apply_template/properties/net_mappings"
+                        "apply_template/properties/net_mappings" |
+                        "assign_simulation_model/properties/pin_map"
                     ),
                         "unreviewed open input record: {path}"
                     );

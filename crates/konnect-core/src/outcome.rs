@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "add_schematic_component",
     "annotate_schematic",
+    "assign_simulation_model",
     "batch_place_components",
+    "create_simulation_model",
     "measure_simulation_run",
     "plot_simulation_run",
     "run_design_review",

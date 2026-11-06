@@ -3638,3 +3638,375 @@ fn stored_ibis_inputs_survive_unrelated_export_and_disclose_lost_results() {
         .unwrap()
         .contains("raw"));
 }
+
+/// A Schottky's forward curve as a datasheet figure gives it, with a breakdown
+/// and a capacitance from its table.
+fn schottky_characteristics() -> Value {
+    json!([
+        { "quantity": "forward_voltage", "value": 0.24, "conditions": { "forward_current_amps": 1e-4 }, "statistic": "typical", "read_from": "figure" },
+        { "quantity": "forward_voltage", "value": 0.32, "conditions": { "forward_current_amps": 1e-3 }, "statistic": "typical", "read_from": "figure" },
+        { "quantity": "forward_voltage", "value": 0.40, "conditions": { "forward_current_amps": 1e-2 }, "statistic": "typical", "read_from": "figure" },
+        { "quantity": "forward_voltage", "value": 0.50, "conditions": { "forward_current_amps": 3e-2 }, "statistic": "typical", "read_from": "figure" },
+        { "quantity": "forward_voltage", "value": 0.80, "conditions": { "forward_current_amps": 0.1 }, "statistic": "typical", "read_from": "figure" },
+        { "quantity": "breakdown_voltage", "value": 30.0, "conditions": { "reverse_current_amps": 1e-4 }, "statistic": "minimum" },
+        { "quantity": "reverse_current", "value": 2e-6, "conditions": { "reverse_voltage_volts": 25.0 }, "statistic": "maximum" },
+        { "quantity": "junction_capacitance", "value": 10e-12, "conditions": { "reverse_voltage_volts": 1.0 }, "statistic": "maximum" }
+    ])
+}
+
+fn create_model(
+    schematic: &Path,
+    kind: &str,
+    name: &str,
+    characteristics: Value,
+) -> (&'static str, Value) {
+    (
+        "create_simulation_model",
+        json!({ "schematic": schematic, "kind": kind, "model_name": name, "characteristics": characteristics }),
+    )
+}
+
+fn assign_model(
+    schematic: &Path,
+    references: &[&str],
+    name: &str,
+    pin_map: Value,
+) -> (&'static str, Value) {
+    (
+        "assign_simulation_model",
+        json!({
+            "schematic": schematic,
+            "references": references,
+            "library_path": format!("simulation_models/{name}.lib"),
+            "model_name": name,
+            "pin_map": pin_map,
+        }),
+    )
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn fitted_models_attach_simulate_as_drawn_and_are_disclosed_everywhere() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let resistance = json!([{ "quantity": "resistance", "value": 1000.0, "statistic": "typical" }]);
+    let capacitor = json!([
+        { "quantity": "capacitance", "value": 100e-6, "conditions": { "frequency_hz": 120.0 }, "statistic": "typical" },
+        { "quantity": "equivalent_series_resistance", "value": 0.08, "conditions": { "frequency_hz": 1e5 }, "statistic": "maximum" },
+        { "quantity": "equivalent_series_inductance", "value": 12e-9, "statistic": "typical" }
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(
+                &schematic,
+                "schottky_diode",
+                "bat54_fit",
+                schottky_characteristics(),
+            ),
+            create_model(&schematic, "resistance", "r1k_fit", resistance),
+            create_model(&schematic, "capacitor", "c100u_fit", capacitor),
+            assign_model(
+                &schematic,
+                &["D1"],
+                "bat54_fit",
+                json!({ "1": "K", "2": "A" }),
+            ),
+            assign_model(
+                &schematic,
+                &["R1", "R2"],
+                "r1k_fit",
+                json!({ "1": "1", "2": "2" }),
+            ),
+            assign_model(
+                &schematic,
+                &["C1"],
+                "c100u_fit",
+                json!({ "1": "1", "2": "2" }),
+            ),
+            (
+                "check_simulation_readiness",
+                json!({ "schematic": schematic }),
+            ),
+            (
+                "run_simulation",
+                json!({
+                    "schematic": schematic,
+                    "analysis": { "kind": "transient", "stop_time_seconds": 0.002 },
+                    "measurements": [
+                        { "name": "diode", "kind": "peak_abs", "signal": "i(D1)" },
+                        { "name": "load", "kind": "peak_abs", "signal": "i(R2)" }
+                    ]
+                }),
+            ),
+            ("list_simulation_runs", json!({ "schematic": schematic })),
+        ],
+    );
+    for created in &results[..3] {
+        assert_eq!(created["written"], true, "{created}");
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+        assert_eq!(created["outcome"]["status"], "complete");
+    }
+    let lib =
+        std::fs::read_to_string(project.path().join("simulation_models/bat54_fit.lib")).unwrap();
+    assert!(lib.starts_with("* konnect-fitted-model v1 kind=schottky_diode name=bat54_fit "));
+    assert!(project
+        .path()
+        .join("simulation_models/bat54_fit.konnect.json")
+        .is_file());
+    for assigned in &results[3..6] {
+        assert_eq!(assigned["outcome"]["status"], "complete", "{assigned}");
+    }
+    assert_eq!(results[4]["assigned"], 2);
+    assert_eq!(
+        results[3]["sim_fields"]["Sim.Library"],
+        "${KIPRJMOD}/simulation_models/bat54_fit.lib"
+    );
+    let readiness = &results[6];
+    assert_eq!(readiness["ready"], true, "{readiness}");
+    let fitted = readiness["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "fitted_model")
+        .unwrap_or_else(|| panic!("no fitted_model warning in {readiness}"));
+    assert_eq!(fitted["items"], json!(["C1", "D1", "R1", "R2"]));
+    let run = &results[7];
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run["simulated_circuit"], "as_drawn");
+    assert_eq!(
+        run["circuit"]["approximations"],
+        json!([{ "code": "fitted_model", "items": ["C1", "D1", "R1", "R2"] }])
+    );
+    for measurement in run["measurements"].as_array().unwrap() {
+        assert!(
+            measurement["value"].as_f64().unwrap().abs() > 0.0,
+            "{measurement}"
+        );
+    }
+    let listed = &results[8]["runs"][0];
+    assert_eq!(
+        listed["approximations"],
+        json!(["fitted_model"]),
+        "{listed}"
+    );
+    let plot = call_session(
+        home.path(),
+        &[(
+            "plot_simulation_run",
+            json!({ "run_id": run["run_id"], "signals": ["v(/rect_out)"] }),
+        )],
+    );
+    let svg = std::fs::read_to_string(plot[0]["path"].as_str().unwrap()).unwrap();
+    assert!(svg.contains("FITTED MODELS: 4 parts"), "{}", &plot[0]);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn every_fitted_diode_kind_is_read_by_kicad_and_the_engine() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let led = json!([
+        { "quantity": "forward_voltage", "value": 1.8, "conditions": { "forward_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 2.0, "conditions": { "forward_current_amps": 2e-2 }, "statistic": "typical" }
+    ]);
+    let zener = json!([
+        { "quantity": "zener_voltage", "value": 5.1, "conditions": { "reverse_current_amps": 5e-3 }, "statistic": "typical" },
+        { "quantity": "dynamic_impedance", "value": 30.0, "conditions": { "reverse_current_amps": 5e-3 }, "statistic": "maximum" },
+        { "quantity": "dynamic_impedance", "value": 480.0, "conditions": { "reverse_current_amps": 2.5e-4 }, "statistic": "maximum" },
+        { "quantity": "forward_voltage", "value": 0.9, "conditions": { "forward_current_amps": 1e-2 }, "statistic": "maximum" }
+    ]);
+    let diode = json!([
+        { "quantity": "forward_voltage", "value": 0.62, "conditions": { "forward_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 0.72, "conditions": { "forward_current_amps": 1e-2 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 0.85, "conditions": { "forward_current_amps": 0.1 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 1.0, "conditions": { "forward_current_amps": 0.3 }, "statistic": "typical" },
+        // The zero-bias CJO most datasheets print passes the tool's schema.
+        { "quantity": "junction_capacitance", "value": 4e-12, "conditions": { "reverse_voltage_volts": 0.0, "frequency_hz": 1e6 }, "statistic": "typical" }
+    ]);
+    let readiness = || {
+        (
+            "check_simulation_readiness",
+            json!({ "schematic": schematic }),
+        )
+    };
+    let diode_pins = json!({ "1": "K", "2": "A" });
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "led", "red_led_fit", led),
+            create_model(&schematic, "zener", "bzx84c5v1_fit", zener),
+            create_model(&schematic, "diode", "sw4148_fit", diode),
+            assign_model(&schematic, &["D1"], "red_led_fit", diode_pins.clone()),
+            readiness(),
+            assign_model(&schematic, &["D1"], "bzx84c5v1_fit", diode_pins.clone()),
+            readiness(),
+            assign_model(&schematic, &["D1"], "sw4148_fit", diode_pins),
+            readiness(),
+        ],
+    );
+    for created in &results[..3] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+    }
+    for at in [3, 5, 7] {
+        assert_eq!(
+            results[at]["outcome"]["status"], "complete",
+            "{}",
+            results[at]
+        );
+        assert_eq!(results[at + 1]["ready"], true, "{}", results[at + 1]);
+    }
+    // The Zener is a subcircuit, so its element is an X line.
+    assert_eq!(results[5]["parts"][0]["element"], "XD1", "{}", results[5]);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_fitted_passive_reads_its_current_when_device_currents_are_not_saved() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let resistance = json!([{ "quantity": "resistance", "value": 1000.0, "statistic": "typical" }]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "resistance", "r1k_fit", resistance),
+            assign_model(
+                &schematic,
+                &["R1"],
+                "r1k_fit",
+                json!({ "1": "1", "2": "2" }),
+            ),
+            (
+                "run_simulation",
+                json!({
+                    "schematic": schematic,
+                    // A .ic under use_initial_conditions keeps Konnect's probes
+                    // out, so only voltage-source currents are saved.
+                    "analysis": { "kind": "transient", "stop_time_seconds": 0.002, "use_initial_conditions": true },
+                    "testbench": { "spice_lines": [".ic v(/rect_out)=0"] },
+                    "measurements": [{ "name": "series", "kind": "peak_abs", "signal": "i(R1)" }]
+                }),
+            ),
+        ],
+    );
+    let run = &results[2];
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    let warnings = run["warnings"].to_string();
+    assert!(warnings.contains("device_currents_not_saved"), "{run}");
+    let value = run["measurements"][0]["value"].as_f64();
+    assert!(value.is_some_and(|value| value.abs() > 0.0), "{run}");
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn inductive_parts_fit_on_the_engine_and_an_identical_rewrite_writes_nothing() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("rectifier.kicad_sch");
+    // An inductor is a 0 V branch at DC, so a check driven by a voltage would
+    // put a source loop across it.
+    let inductor = json!([
+        { "quantity": "inductance", "value": 10e-6, "conditions": { "frequency_hz": 1e5 }, "statistic": "typical" }
+    ]);
+    let choke = json!([
+        { "quantity": "inductance", "value": 22e-6, "statistic": "typical" },
+        { "quantity": "dc_resistance", "value": 0.05, "statistic": "maximum" },
+        { "quantity": "self_resonant_frequency", "value": 3e7, "statistic": "typical" }
+    ]);
+    let shunt = json!([
+        { "quantity": "resistance", "value": 0.01, "statistic": "typical" },
+        { "quantity": "series_inductance", "value": 1e-9, "statistic": "typical" }
+    ]);
+    let mut again = create_model(&schematic, "inductor", "l10u_fit", inductor.clone());
+    again.1["overwrite_existing"] = json!(true);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "inductor", "l10u_fit", inductor),
+            create_model(&schematic, "inductor", "choke_fit", choke),
+            create_model(&schematic, "resistance", "shunt_fit", shunt),
+            again,
+        ],
+    );
+    for created in &results[..3] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+        assert_eq!(created["written"], true, "{created}");
+    }
+    let library = project.path().join("simulation_models/l10u_fit.lib");
+    let sidecar = project
+        .path()
+        .join("simulation_models/l10u_fit.konnect.json");
+    let rewrite = &results[3];
+    assert_eq!(rewrite["outcome"]["status"], "complete", "{rewrite}");
+    assert_eq!(rewrite["written"], false, "{rewrite}");
+    assert_eq!(rewrite["unchanged"], true, "{rewrite}");
+    assert_eq!(results[0]["file"], rewrite["file"], "{rewrite}");
+    assert!(library.is_file() && sidecar.is_file());
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_model_that_misses_its_values_is_never_written() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let schematic = project.path().join("rectifier.kicad_sch");
+    // A kink no diode law follows: the held-out middle point misses.
+    let kinked = json!([
+        { "quantity": "forward_voltage", "value": 0.30, "conditions": { "forward_current_amps": 1e-4 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 0.35, "conditions": { "forward_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 0.70, "conditions": { "forward_current_amps": 1e-2 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 0.75, "conditions": { "forward_current_amps": 1e-1 }, "statistic": "typical" },
+        { "quantity": "forward_voltage", "value": 0.80, "conditions": { "forward_current_amps": 1.0 }, "statistic": "typical" }
+    ]);
+    let result = call_over_stdio(
+        "create_simulation_model",
+        json!({ "schematic": schematic, "kind": "diode", "model_name": "kinked_fit", "characteristics": kinked, "tolerance_percent": 2 }),
+    );
+    assert_eq!(result["written"], false, "{result}");
+    assert_eq!(result["reason"], "fit_out_of_tolerance");
+    assert_eq!(result["outcome"]["status"], "failed");
+    assert!(!project.path().join("simulation_models").exists());
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn a_model_that_leaves_a_wired_pin_unmapped_is_refused_and_writes_nothing() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/amplifier-ac"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("amplifier-ac.kicad_sch");
+    let before = std::fs::read_to_string(&schematic).unwrap();
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(
+                &schematic,
+                "schottky_diode",
+                "bat54_fit",
+                schottky_characteristics(),
+            ),
+            // A two-pin diode on a three-pin transistor: the emitter is wired
+            // to the circuit, and KiCad would drop it without a word.
+            assign_model(
+                &schematic,
+                &["Q1"],
+                "bat54_fit",
+                json!({ "1": "K", "2": "A" }),
+            ),
+        ],
+    );
+    let refused = &results[1];
+    assert_eq!(
+        refused["error"]["reason"], "unmapped_pin_connected",
+        "{refused}"
+    );
+    assert_eq!(refused["outcome"]["status"], "failed");
+    assert_eq!(std::fs::read_to_string(&schematic).unwrap(), before);
+}
