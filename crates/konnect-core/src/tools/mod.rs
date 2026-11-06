@@ -36,6 +36,9 @@ pub mod placement;
 pub mod project;
 #[cfg(test)]
 mod project_file_writer_tests;
+pub(crate) mod response_budget;
+#[cfg(test)]
+mod response_budget_tests;
 #[cfg(test)]
 mod route_obstacle_tests;
 #[cfg(test)]

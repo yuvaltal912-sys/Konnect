@@ -99,6 +99,30 @@ with itself leaves the fields alone. The reference, Value and Footprint still ar
 changed, so a replacement with no Sim fields of its own (such as `Device:R`) is
 inferred from its reference prefix: rename `D1` to `R1` to simulate it as a resistor.
 
+## Unreleased: long results are paged and capped in size (minor release)
+
+Creation PR 3. The client refuses a tool result near 50,000 characters, and `run_erc`
+and `run_drc` results of 51 to 71 thousand were refused in real use. The tools below
+now stop at 40,000 characters of listed items, even before `limit`, and say so.
+
+- **`run_erc`** gains `limit` (default 100, 1 to 10,000) and `offset`. It used to
+  return every violation. `total`, `errors`, `warnings` and the new `by_rule`
+  (`[{rule, severity, count}]`, most first) still count every violation; `shown`,
+  `offset`, `limit`, `truncated`, and, when truncated, `next_offset`, `byte_capped`
+  and `hint` describe the page. `output` still writes the full, unpaged response.
+- **`run_drc`** keeps `limit` (default 50) and gains `offset`, `by_rule`, `next_offset`,
+  `byte_capped` and `hint`. A `limit` that is not a whole number from 1 to 10,000 was
+  silently replaced by 50; it is now refused with `invalid_argument`.
+- **`get_drc_violations`** returned every violation. It now takes `limit` (default 50)
+  and `offset` and returns the same paging fields as `run_drc`. A caller that read the
+  whole list in one call must follow `next_offset` or pass `output`.
+- **`list_schematic_components`** (`limit` 200), **`list_symbol_libraries`** and
+  **`list_footprint_libraries`** (`limit` 100) take `limit` and `offset`. `count` is
+  still the whole list. Their key (`components`, `libraries`) holds one page.
+- **`load_toolset`** returns each tool's first sentence, at most 110 characters, instead
+  of its whole description. Pass `detail: "full"` for the old text. `tools/list` is
+  unchanged. An unknown `detail` is refused.
+
 ## Unreleased: Freerouting on boards with rounded outlines, rounded pads and pours (minor release)
 
 Creation PR 2b. `export_specctra_dsn` used to refuse any board with an arc in its

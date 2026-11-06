@@ -205,7 +205,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "list_footprint_libraries",
-            "List all registered footprint libraries (global and optionally project-level).",
+            "List the registered footprint libraries (global and optionally project-level). Paged (`limit`, `offset`) and capped in size: `count` is every library, `truncated` and `next_offset` say what is left.",
             json!({
                 "type": "object",
                 "properties": {
@@ -214,6 +214,14 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Scope: 'global', 'project', or 'all'",
                         "default": "all"
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 10000, "default": 100,
+                        "description": "Most libraries to list (a page also stops at a size cap)"
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "default": 0,
+                        "description": "Libraries to skip, in table order"
                     }
                 },
                 "required": []
@@ -337,7 +345,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "list_symbol_libraries",
-            "List all registered symbol libraries (global and optionally project-level).",
+            "List the registered symbol libraries (global and optionally project-level). Paged (`limit`, `offset`) and capped in size: `count` is every library, `truncated` and `next_offset` say what is left.",
             json!({
                 "type": "object",
                 "properties": {
@@ -346,6 +354,14 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Scope: 'global', 'project', or 'all'",
                         "default": "all"
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 10000, "default": 100,
+                        "description": "Most libraries to list (a page also stops at a size cap)"
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "default": 0,
+                        "description": "Libraries to skip, in table order"
                     }
                 },
                 "required": []
@@ -1956,6 +1972,10 @@ async fn handle_list_footprint_libraries(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let (offset, limit) = match crate::tools::response_budget::window(args, 100) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
     let scope = args["scope"].as_str().unwrap_or("all");
     let mut all_libs = Vec::new();
 
@@ -1986,12 +2006,8 @@ async fn handle_list_footprint_libraries(
         all_libs.extend(libs);
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "count": all_libs.len(),
-            "libraries": all_libs
-        }))
-        .unwrap(),
+    Ok(CallToolResult::json(
+        &crate::tools::response_budget::list_response("libraries", &all_libs, offset, limit),
     ))
 }
 
@@ -2228,10 +2244,14 @@ async fn handle_register_symbol_library(
     ))
 }
 
-async fn handle_list_symbol_libraries(
+pub(crate) async fn handle_list_symbol_libraries(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let (offset, limit) = match crate::tools::response_budget::window(args, 100) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
     let scope = args["scope"].as_str().unwrap_or("all");
     let mut all_libs = Vec::new();
 
@@ -2264,12 +2284,8 @@ async fn handle_list_symbol_libraries(
         all_libs.extend(libs);
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "count": all_libs.len(),
-            "libraries": all_libs
-        }))
-        .unwrap(),
+    Ok(CallToolResult::json(
+        &crate::tools::response_budget::list_response("libraries", &all_libs, offset, limit),
     ))
 }
 

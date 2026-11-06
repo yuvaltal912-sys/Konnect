@@ -130,12 +130,21 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "list_schematic_components",
-            "List all symbol instances in a schematic with their positions, values, \
-             footprints, and properties.",
+            "List the symbol instances in a schematic with their positions, values, \
+             footprints, and properties. Paged (`limit`, `offset`) and capped in size: \
+             `count` is every instance, `truncated` and `next_offset` say what is left.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string" }
+                    "schematic": { "type": "string" },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 10000, "default": 200,
+                        "description": "Most instances to list (a page also stops at a size cap)"
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "default": 0,
+                        "description": "Instances to skip, in file order"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -3387,11 +3396,15 @@ async fn handle_get_schematic_component(
     })))
 }
 
-async fn handle_list_schematic_components(
+pub(crate) async fn handle_list_schematic_components(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let (offset, limit) = match crate::tools::response_budget::window(args, 200) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
     let sch = cse::Schematic::load(&sch_path)?;
 
     let items: Vec<serde_json::Value> = sch
@@ -3416,10 +3429,9 @@ async fn handle_list_schematic_components(
         })
         .collect();
 
-    Ok(CallToolResult::json(&json!({
-        "count": items.len(),
-        "components": items
-    })))
+    Ok(CallToolResult::json(
+        &crate::tools::response_budget::list_response("components", &items, offset, limit),
+    ))
 }
 
 async fn handle_move_schematic_component(

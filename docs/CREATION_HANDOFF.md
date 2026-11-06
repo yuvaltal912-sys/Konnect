@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 1, 2 and the PR 2 fixes are merged, and so is the ngspice test fix. PR 2b is open and not merged. PR 3 (#21) is open and waits behind it. Ask the owner before starting anything else.
+**Last updated:** 2026-11-07. PRs 1, 2, the PR 2 fixes, 2b and the first half of 9 are merged, and so is the ngspice test fix. PR 3 (#21) is open and being brought up to date. Ask the owner before starting anything else.
 
 ## Start here
 
@@ -33,21 +33,34 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
 | 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | Merged: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19) |
-| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: **open**, [#22](https://github.com/yuvaltal912-sys/Konnect/pull/22) |
-| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | **Open**: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
-| 3 | Response budget for ERC, DRC and list tools | none | **Open**: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21), waits behind the PR 2 fixes and PR 2b |
+| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: merged, [#22](https://github.com/yuvaltal912-sys/Konnect/pull/22) |
+| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Merged: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
+| 3 | Response budget for ERC, DRC and list tools | none | **Open**: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21) |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | **Open**: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25) (not merged; run in parallel with PR 2b and #21 on the owner's say-so) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
-| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | **Open**, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24). Footprint replace and routed-pad reassignment are the follow-up, PR 9b, not started |
+| 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24). Footprint replace and routed-pad reassignment are the follow-up, PR 9b, not started |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Not started |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Not started |
 | 13 | DRC rule writer | none | Not started |
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
+
+## Now: PR 3, response budget
+
+The client refuses a tool result near 50,000 characters. Real use had 8 ERC/DRC results refused at 51 to 71 thousand, which sent the assistant to run `kicad-cli` itself. One helper, `tools/response_budget.rs`, now does the cutting:
+
+- `window(args, default)` reads `limit` (1 to 10,000) and `offset`; a present value it cannot read is refused, not replaced by the default.
+- `page(items, offset, limit, budget)` stops at `limit` or at 40,000 characters of items, whichever comes first, and always returns one item when any remain. `describe` adds `shown`, `offset`, `limit`, `truncated` and, when truncated, `next_offset`, `byte_capped` and a `hint`. `tally` counts every item by rule and severity, not just the page. `list_response` is the same for plain lists.
+- Applied to `run_erc` (new `limit` default 100, `offset`, `by_rule`), `run_drc` and `get_drc_violations` (shared `drc::violations_page`; the latter had no limit at all), `list_schematic_components`, `list_symbol_libraries` and `list_footprint_libraries`. `output` still writes the full, unpaged report, which is the "full report on disk" part.
+- `load_toolset` returns each tool's first sentence (110 characters at most) by default; `detail: "full"` returns the old text. `tools/list` is unchanged. This was 20% of the bytes returned in real use.
+
+Not done, and still open under rank 3: C24 (a `zone_fill_state` field on DRC, which depends on this), and A30's other long results (`batch_place_components`, `update_pcb_from_schematic`, `validate_for_manufacturing`, the batch wiring tools), `get_component_list` and `query_traces`. They can reuse the helper. A caller that read every violation in one `get_drc_violations` or `run_erc` call must now follow `next_offset` or pass `output`; `docs/API_MIGRATIONS.md` says so.
+
+Proof: `response_budget_tests.rs` runs the real ERC handler against a stand-in `kicad-cli` that serves a 700-violation report (under the cap, counts of all 700, pages cover each violation once, `output` holds all of them), the DRC pager on 900 violations, and the list tools. Six guards were broken one at a time (the byte cap, the whole-list tally, truncation, paging order of `output`, argument checking, the summary) and each failed a test. Limits left: the cap counts characters of listed items only, so a response with very large non-list fields could still be large; the stand-in is not KiCad's own large report; the live KiCad was not asked.
 
 ## Now: PR 2b, Freerouting on real boards
 
@@ -80,7 +93,7 @@ A four-lens review of PR 20, each finding checked by two verifiers, confirmed te
 
 Seven guards were broken one at a time and each failed a test. Limits as before; the check still sees only pins, labels and sheet pins.
 
-## PR 9, sync completion, first half (open, #24)
+## PR 9, sync completion, first half (merged, #24)
 
 Branch `feat/creation-sync-completion`; all in `tools/pcb_sync.rs`, plus the two new arguments in the schema in `sch_export.rs`.
 

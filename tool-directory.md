@@ -29,7 +29,7 @@ and Windows servers do not.
 | Tool | Purpose |
 |------|---------|
 | `list_toolboxes` | List all 22 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
-| `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
+| `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. Each tool comes back with a one-line summary; `detail: "full"` returns whole descriptions (`tools/list` always has them). |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
 
@@ -96,7 +96,7 @@ and Windows servers do not.
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
 | `edit_schematic_component` | Update shared fields consistently across every placed unit of a component, and move or hide any field's text. |
 | `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
-| `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. |
+| `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `count` is every instance. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. Does NOT adjust connected wires; junction dots are re-judged where the pins turned, and a no-connect flag travels with the pin it protects. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
@@ -205,7 +205,7 @@ and Windows servers do not.
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `get_schematic_netlist` | Read a whole hierarchy's connectivity as `{net: ["REF.PIN", ...]}` from kicad-cli's netlist export of a private copy of the saved sheets. Includes KiCad-named nets such as `Net-(R1-Pad2)`; resolves power symbols and hierarchical names across sheets. Paged by `limit`/`offset` with `truncated` and `next_offset`; warns on duplicate references. |
 | `compare_netlist` | Check the drawn circuit against an intended `{net: ["REF.PIN"]}`, a second schematic, or a `.net` file, by pin sets rather than net names. Reports `missing`, `split`, `merged` and `extra` findings and a verdict of `pass`, `fail` or `incomplete` (duplicate references make a clean pass unprovable). |
-| `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
+| `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `total`, `errors`, `warnings` and `by_rule` count every violation; `output` writes the full response. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. Every symbol field (Datasheet, Description, user fields) is copied to its footprint and listed per footprint. A footprint whose symbol is gone is listed under `orphan_footprints`; `delete_orphan_footprints` deletes them, and refuses one with tracks attached unless `delete_orphans_with_tracks` is also set. |
 
@@ -337,7 +337,7 @@ and Windows servers do not.
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
 | `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
-| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. |
+| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `by_rule` counts every violation; `output` writes the full report. |
 
 ---
 
@@ -355,12 +355,12 @@ and Windows servers do not.
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
-| `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
+| `list_footprint_libraries` | List all registered footprint libraries (global and/or project). Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `count` is every library. |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
-| `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
+| `list_symbol_libraries` | List all registered symbol libraries (global and/or project). Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `count` is every library. |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
@@ -402,7 +402,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `filtered_count`, `errors`, `warnings` and `by_rule` count every violation; `output` writes the full report. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
