@@ -271,8 +271,9 @@ async fn connect_to_net_auto_refuses_with_one_reason_per_direction_when_all_join
 #[tokio::test]
 async fn a_stub_that_reaches_the_net_it_names_is_not_a_foreign_join() {
     let (_dir, path) = fixture();
-    // OTHER is the net on R13.1; naming R12.1's stub OTHER and reaching R13.1
-    // is what the label does anyway. R13.1 is at (114.3, 54.61).
+    // OTHER is the net on R13.1; naming R11.2's stub OTHER and reaching R13.1
+    // is what the label does anyway. R11.2 is at (101.6, 54.61), R13.1 at
+    // (114.3, 54.61).
     let (is_error, body) = call(
         &path,
         "connect_to_net",
@@ -282,6 +283,12 @@ async fn a_stub_that_reaches_the_net_it_names_is_not_a_foreign_join() {
     .await;
     assert!(!is_error, "{body}");
     assert_eq!(body["direction"], "right");
+    // The merge made by the label's name is reported, with the named net itself.
+    assert_eq!(
+        joined(&body),
+        [["unnamed net with R11 pin 2", "OTHER"]],
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -358,6 +365,335 @@ async fn batch_connect_pins_and_add_schematic_connection_report_nets_joined() {
     )
     .await;
     assert_eq!(joined(&body).len(), 1, "{body}");
+}
+
+// ─── Review of PR 20 ─────────────────────────────────────────────────────────
+
+/// The fixture with R60 placed so its pin 1 sits mid-span on R51's wire, at
+/// (196.85, 156.21), with no junction: KiCad reads the pin as unconnected.
+/// `add_schematic_component` dots such a pin, so the dot is taken out again.
+async fn midspan_pin_scene() -> (tempfile::TempDir, PathBuf) {
+    let (dir, path) = fixture();
+    let text = std::fs::read_to_string(&path).unwrap();
+    // R53's block, moved: the same KiCad-authored symbol, another reference,
+    // place and set of ids.
+    let reference = text.find("(property \"Reference\" \"R53\"").expect("R53");
+    let start = text[..reference].rfind("(symbol").expect("its symbol");
+    let mut depth = 0usize;
+    let mut end = start;
+    for (i, c) in text[start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut block = text[start..end]
+        .replace("R53", "R60")
+        .replace("(at 190.5 139.7 0)", "(at 196.85 160.02 0)");
+    let mut n = 0;
+    while let Some(at) = block.find("(uuid \"") {
+        let close = block[at..].find("\")").unwrap() + at;
+        block.replace_range(
+            at..=close + 1,
+            &format!("(uuid_new \"00000000-0000-0000-0000-{n:012}\")"),
+        );
+        n += 1;
+    }
+    let block = block.replace("(uuid_new", "(uuid");
+    let at = text.rfind(')').unwrap();
+    std::fs::write(&path, format!("{}\t{block}\n{}", &text[..at], &text[at..])).unwrap();
+    assert!(
+        !junctions(&path).contains(&(196.85, 156.21)),
+        "the scene needs a pin on a wire with no dot"
+    );
+    (dir, path)
+}
+
+#[tokio::test]
+async fn a_pin_mid_span_on_a_foreign_wire_does_not_get_that_net_by_connect_pins() {
+    let (_dir, path) = midspan_pin_scene().await;
+    let before = std::fs::read_to_string(&path).unwrap();
+    let (is_error, body) = call(
+        &path,
+        "connect_pins",
+        json!({ "ref1": "R60", "pin1": "1", "ref2": "R21", "pin2": "2" }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+    assert!(
+        body["error"]["reasons"].to_string().contains("R51 pin 2"),
+        "{body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        before,
+        "nothing written"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_mid_span_on_a_foreign_wire_does_not_get_that_net_by_a_stub() {
+    let (_dir, path) = midspan_pin_scene().await;
+    let before = std::fs::read_to_string(&path).unwrap();
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "reference": "R60", "pin_number": "1", "net": "SIG" }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+    assert_eq!(
+        body["error"]["reasons"].as_array().unwrap().len(),
+        4,
+        "every direction: {body}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+    // A coordinate, unlike a pin, taps the wire it lies on: that is the ask.
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "pin_x": 196.85, "pin_y": 156.21, "net": "SIG" }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+}
+
+#[tokio::test]
+async fn a_label_on_a_pin_mid_span_is_refused_with_or_without_a_stub() {
+    let (_dir, path) = midspan_pin_scene().await;
+    let before = std::fs::read_to_string(&path).unwrap();
+    // connect_to_net, stub_length 0.
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "reference": "R60", "pin_number": "1", "net": "EN", "stub_length": 0 }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+    assert!(body["error"]["reasons"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("the label would join"));
+    // batch_connect_to_net's default, a label spliced onto the pin: skipped and reported.
+    let (is_error, body) = call(
+        &path,
+        "batch_connect_to_net",
+        json!({ "net": "EN", "pins": [{ "reference": "R60", "pin_number": "1" }] }),
+    )
+    .await;
+    assert!(!is_error || body["added_count"] == 0, "{body}");
+    assert_eq!(body["added_count"], 0, "{body}");
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("R60.1: the label would join"),
+        "{body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        before,
+        "nothing written"
+    );
+}
+
+#[tokio::test]
+async fn the_default_batch_reports_nets_joined_even_for_a_label_only_splice() {
+    let (_dir, path) = fixture();
+    let (is_error, body) = call(
+        &path,
+        "batch_connect_to_net",
+        json!({ "net": "N", "pins": [
+            { "reference": "R21", "pin_number": "2" },
+            { "reference": "R22", "pin_number": "1" } ] }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["added_count"], 2, "{body}");
+    // Two nets that had nothing in common are now one, by name.
+    assert_eq!(
+        joined(&body),
+        [["unnamed net with R21 pin 2", "unnamed net with R22 pin 1"]],
+        "{body}"
+    );
+    // A label that joins nothing reports an empty list, not a missing key.
+    let (_dir, path) = fixture();
+    let (_, body) = call(
+        &path,
+        "batch_connect_to_net",
+        json!({ "net": "N", "pins": [{ "reference": "R21", "pin_number": "2" }] }),
+    )
+    .await;
+    assert_eq!(joined(&body), Vec::<Vec<String>>::new(), "{body}");
+}
+
+#[tokio::test]
+async fn a_stub_to_a_net_that_has_the_requested_name_as_a_losing_alias_is_not_refused() {
+    let (_dir, path) = fixture();
+    // A wire at R54.2's left stub end, carrying two local labels. The winner
+    // is the alphabetically first, AAA; the stub asks for SIG.
+    for (net, x, y) in [("AAA", 171.45, 139.7), ("SIG", 171.45, 137.16)] {
+        let (e, b) = call(
+            &path,
+            "add_schematic_net_label",
+            json!({ "net": net, "x": x, "y": y }),
+        )
+        .await;
+        assert!(!e, "{b}");
+    }
+    let (e, b) = call(
+        &path,
+        "add_wire",
+        json!({ "x1": 171.45, "y1": 143.51, "x2": 171.45, "y2": 135.89 }),
+    )
+    .await;
+    assert!(!e, "{b}");
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "reference": "R54", "pin_number": "2", "net": "SIG",
+                "direction": "left", "stub_length": STUB }),
+    )
+    .await;
+    assert!(
+        !is_error,
+        "the SIG label joins that net by name anyway: {body}"
+    );
+    assert_eq!(body["direction"], "left");
+}
+
+/// R54 has a library symbol that does not exist, so the sheet's pins cannot all be read.
+fn break_one_symbol(path: &Path) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let reference = text.find("(property \"Reference\" \"R54\"").expect("R54");
+    let lib_id = text[..reference]
+        .rfind("(lib_id \"Device:R\")")
+        .expect("its lib_id");
+    let broken = format!(
+        "{}(lib_id \"Device:NoSuchSymbol\"){}",
+        &text[..lib_id],
+        &text[lib_id + "(lib_id \"Device:R\")".len()..]
+    );
+    std::fs::write(path, broken).unwrap();
+}
+
+#[tokio::test]
+async fn an_unreadable_symbol_makes_a_stub_unchecked_and_says_so() {
+    let (_dir, path) = fixture();
+    break_one_symbol(&path);
+    let before = std::fs::read_to_string(&path).unwrap();
+    // connect_to_net: refused, as "cannot check", not as a join.
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "reference": "R21", "pin_number": "1", "net": "N" }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "plan_blocked", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("cannot check what the wire would join"),
+        "{message}"
+    );
+    assert!(!message.contains("joins another net"), "{message}");
+    // batch_connect_to_net with a stub: every pin skipped and explained.
+    let (_, body) = call(
+        &path,
+        "batch_connect_to_net",
+        json!({ "net": "N", "stub_length": 2.54, "pins": [{ "reference": "R21", "pin_number": "1" }] }),
+    )
+    .await;
+    assert_eq!(body["added_count"], 0, "{body}");
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("cannot check what the stub would join"),
+        "{body}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        before,
+        "nothing written"
+    );
+}
+
+#[tokio::test]
+async fn with_an_unreadable_symbol_a_plain_label_still_goes_on_and_nets_joined_is_null() {
+    let (_dir, path) = fixture();
+    break_one_symbol(&path);
+    // The label-only default does not need pin geometry to be judged.
+    let (is_error, body) = call(
+        &path,
+        "batch_connect_to_net",
+        json!({ "net": "N", "pins": [{ "reference": "R21", "pin_number": "1" }] }),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["added_count"], 1, "{body}");
+    assert!(
+        body["nets_joined"].is_null(),
+        "cannot tell, and says so: {body}"
+    );
+    // add_wire and batch_add_wire say null too.
+    let (_, body) = call(
+        &path,
+        "add_wire",
+        json!({ "x1": 20.32, "y1": 20.32, "x2": 30.48, "y2": 20.32 }),
+    )
+    .await;
+    assert!(body["nets_joined"].is_null(), "{body}");
+    let (_, body) = call(
+        &path,
+        "batch_add_wire",
+        json!({ "wires": [{ "x1": 20.32, "y1": 25.4, "x2": 30.48, "y2": 25.4 }] }),
+    )
+    .await;
+    assert!(body["nets_joined"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn a_negative_stub_length_is_refused_before_anything_is_drawn() {
+    let (_dir, path) = fixture();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let (is_error, body) = call(
+        &path,
+        "connect_to_net",
+        json!({ "reference": "R54", "pin_number": "2", "net": "N",
+                "direction": "up", "stub_length": -7.62 }),
+    )
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+    assert_eq!(body["error"]["field"], "stub_length");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+    // Called directly, past the schema: the handler refuses it too.
+    let ctx = crate::tools::ToolContext::new(
+        ServerConfig::default(),
+        std::sync::Arc::new(crate::router::ToolRouter::new()),
+    );
+    let result = crate::tools::sch_wiring::handle_connect_to_net(
+        &json!({ "schematic": path.display().to_string(), "reference": "R54",
+                 "pin_number": "2", "net": "N", "direction": "up", "stub_length": -7.62 }),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(result.is_error);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 }
 
 // ─── Real KiCad: compare_netlist proves no unintended net changed ────────────
@@ -441,6 +777,26 @@ async fn kicad_agrees_no_tool_changed_a_net_it_was_not_asked_to() {
                 "TEE": ["R51.2", "R52.1"], "R53": ["R53.2"] }),
     )
     .await;
+
+    // A pin sitting on a wire with no dot: refused, so the circuit is unchanged.
+    let (_d, path) = midspan_pin_scene().await;
+    let (_before, reference) = snapshot_of(&path);
+    let (is_error, _) = call(
+        &path,
+        "connect_pins",
+        json!({ "ref1": "R60", "pin1": "1", "ref2": "R21", "pin2": "2" }),
+    )
+    .await;
+    assert!(is_error);
+    assert_same_circuit(&path, &reference).await;
+    let (is_error, _) = call(
+        &path,
+        "batch_connect_to_net",
+        json!({ "net": "EN", "pins": [{ "reference": "R60", "pin_number": "1" }] }),
+    )
+    .await;
+    assert!(!is_error);
+    assert_same_circuit(&path, &reference).await;
 
     // The stub, auto direction: N holds R54.2 alone and the tee is untouched.
     let (_d, path) = fixture();

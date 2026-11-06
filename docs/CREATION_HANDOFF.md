@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-06. The research is done. PR 1 (#19) and PR 2 are open and not merged; PR 2 is stacked on PR 1's branch. PR 3 is next and not started; ask the owner before starting it.
+**Last updated:** 2026-11-06. The research is done. PR 1 (#19, 243d9c7) and PR 2 (#20, 65b6fc2) are merged. A review of PR 2 found ten defects; the fix PR is open and not merged. PR 3 (#21) is open and waits behind it and PR 2b. Ask the owner before starting anything else.
 
 ## Start here
 
@@ -21,7 +21,7 @@ Owner decisions (2026-11-06, research §5):
 | ID | Decision |
 |---|---|
 | Q1 | Konnect-owned placement and routing planners are allowed as a second opinion, never as the author. A planner returns a read-only plan; the AI compares it with its own result and adopts what is good through the normal editing tools. Planners start only after PRs 1, 7 and 8 provide the metrics |
-| Q2 | Freerouting is the route path, after the core PRs (1 to 15). Widen the DSN profile (rank 32) first. Until then PR 5 documents it with its limits |
+| Q2 | Freerouting is the route path, after the core PRs (1 to 15). Widen the DSN profile (rank 32) first. Until then PR 5 documents it with its limits. **Amended 2026-11-06:** a focused part of rank 32 moves up as PR 2b, between PR 2 and PR 3, after a routing run on a real board went badly: the DSN export refused a rounded outline, Freerouting was not installed, and the AI hand-rolled its own router and left ground connections unrouted. PR 2b makes the DSN export accept rounded and arc outlines and roundrect pads, keep existing zones and pours as fixed copper, and gives an install path or clear setup guidance for Freerouting. More layers and back-side parts stay in rank 32 for later |
 | Q3 | One design-intent record per project (rails, currents, interfaces, fab target). Ranks 12, 29 and 38 read from it. It gets its own PR before PR 11; PR 11 may take a per-call currents argument as an interim |
 | Q4 | KiCad 10 variants and jobsets stay parked (`ROADMAP.md`) |
 | Scope | macOS first. Windows and Linux are validated at the end of the series |
@@ -32,11 +32,12 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 | PR | Delivers | Depends on | State |
 |---|---|---|---|
-| 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | **Open**: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19), branch `feat/creation-netlist-compare` |
-| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | **Open**: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20), stacked on `feat/creation-netlist-compare`; branch `feat/schematic-route-safety` |
-| 3 | Response budget for ERC, DRC and list tools | none | Not started |
+| 1 | Netlist read and intent compare: `get_schematic_netlist`, `compare_netlist` | none | Merged: [#19](https://github.com/yuvaltal912-sys/Konnect/pull/19) |
+| 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: **open**, branch `fix/route-safety-review` |
+| 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Not started (decided 2026-11-06, goes before PR 3) |
+| 3 | Response budget for ERC, DRC and list tools | none | **Open**: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21), waits behind the PR 2 fixes and PR 2b |
 | 4 | Inline renders as image blocks; region and side options | none | Not started |
-| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented | 1, 2 | Not started |
+| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Not started |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
@@ -48,9 +49,23 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
-## Now: PR 2, route safety
+## Now: fixes from the review of PR 2
 
-Stacked on PR 1's branch, so its base is `feat/creation-netlist-compare`; retarget it to `main` once PR 1 merges. Two commits:
+A four-lens review of PR 20, each finding checked by two verifiers, confirmed ten defects in the merged code. All are fixed on `fix/route-safety-review`:
+
+- **A pin is not a tap.** `RouteGuard` allowed the net of any wire an endpoint lay on, so a pin sitting mid-span on a foreign wire with no dot made `connect_pins` and `connect_to_net` join that net silently (the route's own T dots it). Only coordinates (`Endpoints::Points`) tap now; pins (`Endpoints::Pins`) do not.
+- **A label alone is checked.** `stub_length` 0 skipped the guard, but a label attaches to any wire it lies on. `pick_stub_direction` now checks the label; `batch_connect_to_net`'s default label-only path checks each pin against the labels spliced so far. When the sheet's pins cannot all be read, a label is judged on the one thing it can join, a wire under it with no junction.
+- **`nets_joined` in every mode.** The default `batch_connect_to_net` returned no such key. It reports always now.
+- **Aliases.** The allow-by-name rule matched only a net's winning name, so a stub to a net that carried the requested name as a lower-ranked alias was refused. It matches any name on the net.
+- **A negative `stub_length`** is refused (`invalid_argument`, schema minimum 0, and in the handler).
+- **An unreadable symbol** is refused as "cannot check what the wire would join", not as a join, and the docs say so.
+- **Tests** for each of the above, the unreadable-symbol branch and `nets_joined: null`, and for the names a label-made merge reports. The ignored KiCad test also checks that the refused pin cases leave the circuit unchanged.
+
+Seven guards were broken one at a time and each failed a test. Limits as before; the check still sees only pins, labels and sheet pins.
+
+## PR 2, route safety (merged, #20)
+
+Two commits:
 
 - **#901 ported as it stands** (author Paulius Zaleckas, cherry-picked with `-x`): `connect_pins`, `batch_connect_pins` and `add_schematic_connection` try the other L-bend and refuse with `plan_blocked` when both would join another net. One conflict, in `docs/API_MIGRATIONS.md`, kept both entries.
 - **#899 and #900, which #901 touches the same path as.** A stub from `connect_to_net` or `batch_connect_to_net` is checked the same way (`pick_stub_direction`): `auto` tries the other directions, a named direction that would join is refused or, in the batch, skipped into `errors`. Reaching what already carries the stub's own net name is not a join, because the label joins it anyway (an existing test needs this). `add_wire`, `batch_add_wire` and the stub wires dot only the T's the new wire forms (`t_junctions_on`). `add_wire` takes coordinates, so it draws what it is given and only reports.
@@ -64,7 +79,7 @@ cargo test -p konnect-core --lib route_safety -- --ignored
 
 Guards were broken one at a time (the join check, the T filter, the stub check, the report); each failed fast tests and the live one. Limits left: the check sees pins, labels and sheet pins, so two bare-wire nets with nothing on them can still touch unreported; labels or power symbols that merge nets by name are out of its sight until `compare_netlist` runs; `add_power_symbol`, `add_junction`, the bus tools and the `move_*` tools were not looked at, and `add_wire` / `batch_add_wire` only report.
 
-## PR 1, the netlist read and compare (open, #19)
+## PR 1, the netlist read and compare (merged, #19)
 
 Two tools in the `sch_export` toolset (`tools/sch_netlist.rs`, tests in `tools/sch_netlist_tests.rs`).
 

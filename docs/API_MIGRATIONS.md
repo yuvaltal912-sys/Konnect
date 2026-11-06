@@ -29,8 +29,24 @@ Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
   would join is refused by `connect_to_net` with `plan_blocked` (one reason per
   direction tried) and skipped by `batch_connect_to_net`, which adds
   `"<ref>.<pin>: <reason>"` to `errors`. Reaching something already named by the
-  stub's own net is not a join. The chosen `direction` can differ from before when
-  the outward one was blocked.
+  stub's own net is not a join, whichever name that net carries (a power symbol's
+  name outranks a local label's, and the label still names it). The chosen
+  `direction` can differ from before when the outward one was blocked.
+- **Labels with no stub.** A label attaches to any wire it lies on, so `stub_length` 0
+  is checked too: a pin that sits mid-span on a wire with no junction would join that
+  wire's net through the label. `connect_to_net` refuses it with `plan_blocked`;
+  `batch_connect_to_net`, including its default label-only mode, skips the pin into
+  `errors`. A negative `stub_length` is refused with `invalid_argument`.
+- **A pin is not a tap.** `connect_pins`, `batch_connect_pins` and `connect_to_net`
+  with `reference` + `pin_number` no longer allow the net of a wire their pin lies on
+  without a junction: the route's own T would join it, so they refuse. Coordinates
+  (`add_schematic_connection`, `connect_to_net` with `pin_x`/`pin_y`) still tap the
+  wire they lie on, as asked.
+- **Unreadable symbols.** The stub and route checks need every placed symbol's
+  library pins. When one cannot be read they refuse with `plan_blocked` and a reason
+  that begins "cannot check what the ... would join", because the check could not
+  run; no join was found. A label with no stub is still judged, on the one thing it
+  can join, a wire under it.
 - **Junction dots (#900).** `add_wire`, `batch_add_wire` and the stub wires dot only
   the T-junctions the new wire forms, not every dot-less T on the sheet. A sheet that
   had one used to gain a junction, and so a joined net, on any wire drawn anywhere.
@@ -40,7 +56,8 @@ Creation PR 2 (`docs/CREATION_HANDOFF.md`), on top of the route check above.
   net that now holds two or more nets the sheet had before, named by label or, when
   nothing names a net, as `unnamed net with R1 pin 2`. It is `[]` when nothing was
   merged and `null` when a placed symbol's pins cannot be resolved. A net of bare
-  wires is not listed. `add_wire` and `batch_add_wire` take coordinates, so they draw
+  wires is not listed. `batch_connect_to_net` reports it in every mode, the default
+  label-only one included, where two labels of one name merge their nets. `add_wire` and `batch_add_wire` take coordinates, so they draw
   what they are given and only report. Check the result against intent with
   `compare_netlist`.
 
