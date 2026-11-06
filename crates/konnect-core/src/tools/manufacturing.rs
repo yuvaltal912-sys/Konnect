@@ -1003,6 +1003,19 @@ fn invalid_manufacturing_argument(field: &str, reason: impl Into<String>) -> Cal
     )
 }
 
+/// The verdict an issue list supports. An `info` line (an allowlisted
+/// edge-mount part) is disclosure, not something left to review, so it alone
+/// does not stop a board being READY.
+fn readiness_verdict(issues: &[serde_json::Value]) -> &'static str {
+    if issues.iter().any(|i| i["severity"] == "error") {
+        "NOT READY"
+    } else if issues.iter().any(|i| i["severity"] != "info") {
+        "NEEDS REVIEW"
+    } else {
+        "READY"
+    }
+}
+
 async fn handle_validate_for_manufacturing(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1142,15 +1155,7 @@ async fn handle_validate_for_manufacturing(
         }
     };
 
-    let verdict = if issues.iter().any(|i| i["severity"] == "error") {
-        "NOT READY"
-    } else if issues.iter().any(|i| i["severity"] != "info") {
-        // An `info` line (an allowlisted edge-mount part) is disclosure, not
-        // something left to review.
-        "NEEDS REVIEW"
-    } else {
-        "READY"
-    };
+    let verdict = readiness_verdict(&issues);
 
     info!(
         verdict = verdict,
@@ -2374,6 +2379,25 @@ mod outline_validation_tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn only_errors_and_non_info_findings_move_the_verdict() {
+        let issue = |severity: &str| json!({ "severity": severity });
+        assert_eq!(readiness_verdict(&[]), "READY");
+        assert_eq!(
+            readiness_verdict(&[issue("info")]),
+            "READY",
+            "disclosure is not a to-do"
+        );
+        assert_eq!(
+            readiness_verdict(&[issue("info"), issue("warning")]),
+            "NEEDS REVIEW"
+        );
+        assert_eq!(
+            readiness_verdict(&[issue("warning"), issue("error")]),
+            "NOT READY"
         );
     }
 
