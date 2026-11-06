@@ -8,6 +8,7 @@
 //! the caller's numbers is listed as assumed.
 
 pub(crate) mod bench;
+pub(crate) mod bjt;
 pub(crate) mod diode;
 pub(crate) mod fit;
 pub(crate) mod mosfet;
@@ -40,13 +41,15 @@ pub(crate) enum Kind {
     TvsBidirectional,
     NMosfet,
     PMosfet,
+    Npn,
+    Pnp,
     Resistance,
     Capacitor,
     Inductor,
 }
 
 impl Kind {
-    pub(crate) const ALL: [Kind; 11] = [
+    pub(crate) const ALL: [Kind; 13] = [
         Kind::Diode,
         Kind::SchottkyDiode,
         Kind::Led,
@@ -55,6 +58,8 @@ impl Kind {
         Kind::TvsBidirectional,
         Kind::NMosfet,
         Kind::PMosfet,
+        Kind::Npn,
+        Kind::Pnp,
         Kind::Resistance,
         Kind::Capacitor,
         Kind::Inductor,
@@ -70,6 +75,8 @@ impl Kind {
             Kind::TvsBidirectional => "tvs_bidirectional",
             Kind::NMosfet => "n_mosfet",
             Kind::PMosfet => "p_mosfet",
+            Kind::Npn => "npn",
+            Kind::Pnp => "pnp",
             Kind::Resistance => "resistance",
             Kind::Capacitor => "capacitor",
             Kind::Inductor => "inductor",
@@ -130,6 +137,15 @@ impl Kind {
                 (GateCharge, 0, 1),
                 (GateDrainCharge, 0, 1),
             ],
+            // Values are magnitudes, so a PNP reads as an NPN.
+            Kind::Npn | Kind::Pnp => &[
+                (CurrentGain, 3, 16),
+                (BaseEmitterVoltage, 1, 16),
+                (CollectorEmitterSaturationVoltage, 0, 1),
+                (CollectorBaseCapacitance, 0, 16),
+                (EmitterBaseCapacitance, 0, 16),
+                (TransitionFrequency, 0, 1),
+            ],
             Kind::Resistance => &[(Resistance, 1, 1), (SeriesInductance, 0, 1)],
             Kind::Capacitor => &[
                 (Capacitance, 1, 1),
@@ -163,6 +179,12 @@ pub(crate) enum Quantity {
     ReverseTransferCapacitance,
     GateCharge,
     GateDrainCharge,
+    CurrentGain,
+    BaseEmitterVoltage,
+    CollectorEmitterSaturationVoltage,
+    CollectorBaseCapacitance,
+    EmitterBaseCapacitance,
+    TransitionFrequency,
     ZenerVoltage,
     DynamicImpedance,
     JunctionCapacitance,
@@ -184,13 +206,16 @@ pub(crate) const PEAK_PULSE_CURRENT: &str = "peak_pulse_current_amps";
 pub(crate) const GATE_SOURCE_VOLTAGE: &str = "gate_source_voltage_volts";
 pub(crate) const DRAIN_SOURCE_VOLTAGE: &str = "drain_source_voltage_volts";
 pub(crate) const DRAIN_CURRENT: &str = "drain_current_amps";
+pub(crate) const COLLECTOR_CURRENT: &str = "collector_current_amps";
+pub(crate) const COLLECTOR_EMITTER_VOLTAGE: &str = "collector_emitter_voltage_volts";
+pub(crate) const BASE_CURRENT: &str = "base_current_amps";
 pub(crate) const VOLTAGE: &str = "voltage_volts";
 pub(crate) const FREQUENCY: &str = "frequency_hz";
 pub(crate) const DC_BIAS: &str = "dc_bias_volts";
 pub(crate) const DC_CURRENT: &str = "dc_current_amps";
 
 impl Quantity {
-    pub(crate) const ALL: [Quantity; 25] = [
+    pub(crate) const ALL: [Quantity; 31] = [
         Quantity::ForwardVoltage,
         Quantity::ReverseCurrent,
         Quantity::BreakdownVoltage,
@@ -204,6 +229,12 @@ impl Quantity {
         Quantity::ReverseTransferCapacitance,
         Quantity::GateCharge,
         Quantity::GateDrainCharge,
+        Quantity::CurrentGain,
+        Quantity::BaseEmitterVoltage,
+        Quantity::CollectorEmitterSaturationVoltage,
+        Quantity::CollectorBaseCapacitance,
+        Quantity::EmitterBaseCapacitance,
+        Quantity::TransitionFrequency,
         Quantity::ZenerVoltage,
         Quantity::DynamicImpedance,
         Quantity::JunctionCapacitance,
@@ -233,6 +264,12 @@ impl Quantity {
             Quantity::ReverseTransferCapacitance => "reverse_transfer_capacitance",
             Quantity::GateCharge => "gate_charge",
             Quantity::GateDrainCharge => "gate_drain_charge",
+            Quantity::CurrentGain => "current_gain",
+            Quantity::BaseEmitterVoltage => "base_emitter_voltage",
+            Quantity::CollectorEmitterSaturationVoltage => "collector_emitter_saturation_voltage",
+            Quantity::CollectorBaseCapacitance => "collector_base_capacitance",
+            Quantity::EmitterBaseCapacitance => "emitter_base_capacitance",
+            Quantity::TransitionFrequency => "transition_frequency",
             Quantity::ZenerVoltage => "zener_voltage",
             Quantity::DynamicImpedance => "dynamic_impedance",
             Quantity::JunctionCapacitance => "junction_capacitance",
@@ -253,6 +290,8 @@ impl Quantity {
             Quantity::ForwardVoltage
             | Quantity::BreakdownVoltage
             | Quantity::ClampingVoltage
+            | Quantity::BaseEmitterVoltage
+            | Quantity::CollectorEmitterSaturationVoltage
             | Quantity::GateThresholdVoltage
             | Quantity::ZenerVoltage => "V",
             Quantity::ReverseCurrent | Quantity::LeakageCurrent | Quantity::DrainCurrent => "A",
@@ -266,11 +305,14 @@ impl Quantity {
             | Quantity::Capacitance
             | Quantity::InputCapacitance
             | Quantity::OutputCapacitance
+            | Quantity::CollectorBaseCapacitance
+            | Quantity::EmitterBaseCapacitance
             | Quantity::ReverseTransferCapacitance => "F",
             Quantity::SeriesInductance
             | Quantity::EquivalentSeriesInductance
             | Quantity::Inductance => "H",
-            Quantity::SelfResonantFrequency => "Hz",
+            Quantity::SelfResonantFrequency | Quantity::TransitionFrequency => "Hz",
+            Quantity::CurrentGain => "ratio",
             Quantity::GateCharge | Quantity::GateDrainCharge => "C",
         }
     }
@@ -294,6 +336,19 @@ impl Quantity {
                 &[],
             ),
             Quantity::GateDrainCharge => (&[DRAIN_SOURCE_VOLTAGE, DRAIN_CURRENT], &[]),
+            Quantity::CurrentGain | Quantity::BaseEmitterVoltage => {
+                (&[COLLECTOR_CURRENT, COLLECTOR_EMITTER_VOLTAGE], &[])
+            }
+            Quantity::CollectorEmitterSaturationVoltage => {
+                (&[COLLECTOR_CURRENT, BASE_CURRENT], &[])
+            }
+            Quantity::CollectorBaseCapacitance | Quantity::EmitterBaseCapacitance => {
+                (&[REVERSE_VOLTAGE], &[FREQUENCY])
+            }
+            Quantity::TransitionFrequency => (
+                &[COLLECTOR_CURRENT, COLLECTOR_EMITTER_VOLTAGE],
+                &[FREQUENCY],
+            ),
             Quantity::DynamicImpedance => (&[REVERSE_CURRENT], &[FREQUENCY]),
             Quantity::JunctionCapacitance => (&[REVERSE_VOLTAGE], &[FREQUENCY]),
             Quantity::LeakageCurrent => (&[VOLTAGE], &[]),
@@ -663,6 +718,7 @@ pub(crate) fn build(
         Kind::Zener => diode::zener(name, characteristics, temperature)?,
         Kind::Tvs | Kind::TvsBidirectional => tvs::build(kind, name, characteristics, temperature)?,
         Kind::NMosfet | Kind::PMosfet => mosfet::build(kind, name, characteristics, temperature)?,
+        Kind::Npn | Kind::Pnp => bjt::build(kind, name, characteristics, temperature)?,
         Kind::Resistance | Kind::Capacitor | Kind::Inductor => {
             passive::build(kind, name, characteristics)?
         }

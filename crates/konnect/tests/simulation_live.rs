@@ -4144,3 +4144,67 @@ fn both_fitted_mosfet_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_
     );
     assert_eq!(results[2]["parts"][0]["element"], "XQ2", "{}", results[2]);
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn both_fitted_bipolar_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/amplifier-ac"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("amplifier-ac.kicad_sch");
+    let gain = |ic: f64, hfe: f64| {
+        json!({
+            "quantity": "current_gain", "value": hfe,
+            "conditions": { "collector_current_amps": ic, "collector_emitter_voltage_volts": 5.0 },
+            "statistic": "typical"
+        })
+    };
+    let vbe = |ic: f64, volts: f64| {
+        json!({
+            "quantity": "base_emitter_voltage", "value": volts,
+            "conditions": { "collector_current_amps": ic, "collector_emitter_voltage_volts": 5.0 },
+            "statistic": "typical"
+        })
+    };
+    let junction = |quantity: &str, volts: f64, farads: f64| {
+        json!({
+            "quantity": quantity, "value": farads,
+            "conditions": { "reverse_voltage_volts": volts }, "statistic": "typical"
+        })
+    };
+    let values = json!([
+        gain(1e-4, 70.001),
+        gain(1e-3, 107.243),
+        gain(1e-2, 140.32),
+        gain(1e-1, 141.878),
+        vbe(1e-3, 0.6508),
+        vbe(1e-1, 0.77376),
+        { "quantity": "collector_emitter_saturation_voltage", "value": 0.05491, "conditions": { "collector_current_amps": 0.1, "base_current_amps": 0.01 }, "statistic": "typical" },
+        junction("collector_base_capacitance", 1.0, 3.0243e-12),
+        junction("collector_base_capacitance", 10.0, 1.6614e-12),
+        junction("emitter_base_capacitance", 0.5, 1.0138e-11),
+        { "quantity": "transition_frequency", "value": 3e8, "conditions": { "collector_current_amps": 0.01, "collector_emitter_voltage_volts": 5.0 }, "statistic": "typical" }
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "npn", "npn_fit", values.clone()),
+            create_model(&schematic, "pnp", "pnp_fit", values),
+            assign_model(
+                &schematic,
+                &["Q2"],
+                "npn_fit",
+                json!({ "1": "C", "2": "B", "3": "E" }),
+            ),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+    }
+    assert_eq!(
+        results[2]["outcome"]["status"], "complete",
+        "{}",
+        results[2]
+    );
+    assert_eq!(results[2]["parts"][0]["element"], "XQ2", "{}", results[2]);
+}

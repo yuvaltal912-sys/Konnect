@@ -69,6 +69,9 @@ pub(crate) enum Probe {
     /// AC at `hz`: `Im(v(node)) / (2 pi hz)`, the inductance a unit AC current
     /// into `node` meets.
     NodeInductance { node: String, hz: f64 },
+    /// AC at `hz`: `scale * |i(source)|`, the current a unit AC drive makes
+    /// `source` carry. With `scale = hz` it reads a transition frequency.
+    CurrentMagnitude { source: String, scale: f64, hz: f64 },
     /// Transient: the charge a constant gate current `amps` has delivered by
     /// the time `what` happens. Voltages are read times `sign`, so a P-channel
     /// part reads as an N-channel one.
@@ -107,7 +110,8 @@ impl Probe {
             | Probe::Resistance { hz, .. }
             | Probe::Inductance { hz, .. }
             | Probe::SeriesCapacitance { hz, .. }
-            | Probe::NodeInductance { hz, .. } => Some(*hz),
+            | Probe::NodeInductance { hz, .. }
+            | Probe::CurrentMagnitude { hz, .. } => Some(*hz),
         }
     }
 }
@@ -232,6 +236,9 @@ pub(crate) fn measure(
             divide_by,
         } => voltage(dc?, node).map(|(value, _)| scale * value / divide_by),
         Probe::Current { source, scale } => current(dc?, source).map(|(value, _)| scale * value),
+        Probe::CurrentMagnitude { source, scale, hz } => {
+            current(at(*hz)?, source).map(|(real, imaginary)| scale * real.hypot(imaginary))
+        }
         Probe::Capacitance { source, hz } => {
             current(at(*hz)?, source).map(|(_, imaginary)| imaginary.abs() / (tau * hz))
         }

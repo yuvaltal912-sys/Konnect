@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 is in progress on `feat/simulation-datasheet-models-m2` (not pushed): the TVS and the whole MOSFET (DC, capacitances, gate charge) are done; the BJT is not.
+**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 (TVS, MOSFET, BJT) is complete on `feat/simulation-datasheet-models-m2`, committed locally and not pushed, with no PR yet. M3 is next; ask the owner before starting it.
 
 ## Start here
 
@@ -57,7 +57,7 @@ The owner asked for a design and its parts' datasheets to be enough to simulate.
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
-| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **TVS done** (kinds `tvs`, `tvs_bidirectional`); **MOSFET done** (`n_mosfet`, `p_mosfet`: DC, capacitances, gate-charge check); BJT next |
+| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **TVS done** (kinds `tvs`, `tvs_bidirectional`); **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); not pushed, no PR yet |
 | M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
@@ -101,7 +101,20 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 - **Gate charge is checked, never fitted.** `gate_charge` (to a gate voltage) and `gate_drain_charge` run on a transient bench, `Probe::Charge` in `bench.rs`: a current source `Id` from the supply into the drain, a diode back to the supply, and a constant gate current sized to deliver the charge in 250 ns. Qg is the current times the time the gate reaches the stated `Vgs`; Qgd is the current times the time the drain takes to fall from 90 to 10 percent of `Vds`. Rows are `check_only`. Three traps, each hit and fixed: the bench's `reltol=1e-6` stalls a transient at the gate current's first edge (timestep 1e-21 s), so the fixture relaxes it (`.options reltol=1e-3 ...`); an unclamped gate charges to hundreds of volts and the body diode's solve then fails, so a diode clamps it two volts above the stated `Vgs`; and a 1 Tohm gate shunt beside that clamp diode (leakage `gmin`, also 1 Tohm) halves the gate's DC level, so the shunt is 1 Mohm. A hand integral of the fitted Cgd over the drain swing agreed with the engine's Qgd (21 nC).
 - **Tests:** 14 in `mosfet.rs`, 2 in `bench.rs`, 1 in `fit.rs`, and the live test above, which now also fits the full capacitance curve and both charges for both polarities and asserts the two charge rows. Negative controls, each failing the live test: dropping the P-channel `VTO` sign, not writing `RD`, halving `CGS` (the Ciss rows fail), and halving the Qg probe (-49.9 percent).
 - **Limits:** no avalanche (`BV`, `IBV`, `NBV` are in the grammar but never written, so a drain can rise above any rating), no temperature behaviour (one temperature, `TNOM` written), no reverse recovery (body diode `TT` is 0), `lambda` is 0 so the saturation current does not rise with drain voltage, and a value read at a different gate voltage than 0 V for the capacitances is not supported. Quasi-saturation (`RQ`, `VQ`) and `RS` are unused.
-- **Left for M2:** the BJT.
+- **Left for M2:** nothing; see the BJT section below.
+
+### M2 progress: BJT (done)
+
+- **Kinds `npn`, `pnp`** (`simulation/models/bjt.rs`), every value a magnitude, a three-pin subcircuit `C B E` around one `Q1` and one Gummel-Poon card (`.model <name>_q NPN|PNP`; the grammar takes `BJT_PARAMETERS`).
+- **The law was checked against the engine** (libngspice 45.2, scratch harness): with no Early voltage, `RB = RE = 0` and `NR = 1`, `Ic = (IF - IR)/qb - IR/BR` and `Ib = IF/BF + ISE(e^(Vbe/NE Vt) - 1) + IR/BR`, `qb = (1 + sqrt(1 + 4 IF/IKF))/2`, matched to 0.05 percent (the gap was a rounded Vt). So the fit runs on the law.
+- **Inputs.** Three or more `current_gain` values (a curve; with four or more the middle one is held out) and one or more `base_emitter_voltage` at a collector current and voltage give `IS`, `NF`, `BF`, `IKF`, `ISE` by `fit::least_squares` (`NE` is fixed at 1.5; with one Vbe value `NF` is 1 and the result says so). Optional: `collector_emitter_saturation_voltage` at a collector and base current gives `BR` by bisection, or `RC` when it is above what `BR = 0.05` gives, or `BR = 200` and a note when it is below what the model reaches; `collector_base_capacitance` and `emitter_base_capacitance` at reverse voltages give `CJC/VJC/MJC` and `CJE/VJE/MJE` by `fit_capacitance`; `transition_frequency` gives `TF` from `1/(2 pi fT)` less the depletion capacitances over `gm` (ngspice's forward-bias linearisation at `FC = 0.5`).
+- **Bench.** Gain: a base current of `Ic/hFE` is forced and `Ic/Ib` read, so it is the gain at that base current. Vbe: the base is grounded and the emitter current forced, so the emitter sits at `-Vbe`. Saturation: both currents forced, the collector voltage read. Cobo and Cibo: a reverse bias with an AC drive, the far pin open through 1 Gohm, `Probe::Capacitance`. fT: a unit AC base current at the biased point and `Probe::CurrentMagnitude` times the test frequency (a third of fT unless the caller gives one).
+- **Tests:** eight in `bjt.rs` (the law against engine values, inverses, recovery, hold-out, saturation, grammar for both polarities, capacitances and fT, a duplicate), and `both_fitted_bipolar_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part` in `simulation_live.rs`, which fits both polarities and assigns the NPN to `Q2` of the `amplifier-ac` demo. Negative controls, each failing the live test in the expected row: `TF` not written (fT), `BR` not written (saturation), the PNP junction bias unmirrored (all three capacitances).
+- **Limits:** no Early voltage (the collector current does not rise with collector voltage), no base or emitter resistance, no temperature behaviour, the gain is checked at the base current the datasheet gain implies and not at exactly the datasheet collector current, fT is a small-signal estimate that ignores `RB`, and `ITF`/`XTF` are unused.
+
+### M2 gate (macOS, 2026-11-06)
+
+Formatting, workspace tests (3,226 passed, 139 ignored), doctests (9 passed, 2 ignored), the live simulation tests (92 passed; the one failure is the ngspice 44.2 pin, a red baseline reported and not fixed), Clippy with warnings denied, `cargo deny check licenses`, documentation counts and the release build. The installed binary hash is unchanged. Not run: the dogfood run by pipe, hosted CI, Windows and Linux, and the KiCad dialog round trip, which stays an owner check.
 
 ## Simulation validation and stored results (merged as PR #15)
 

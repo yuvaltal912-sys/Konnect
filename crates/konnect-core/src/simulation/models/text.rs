@@ -35,6 +35,11 @@ pub(crate) const MOSFET_PARAMETERS: [&str; 22] = [
     "VTO", "KP", "THETA", "RD", "RS", "RG", "RB", "IS", "N", "EG", "XTI", "TNOM", "CGS", "CGDMIN",
     "CGDMAX", "A", "CJO", "VJ", "M", "BV", "IBV", "NBV",
 ];
+/// Parameters a fitted bipolar card may set.
+pub(crate) const BJT_PARAMETERS: [&str; 17] = [
+    "IS", "NF", "BF", "IKF", "ISE", "NE", "BR", "RC", "CJE", "VJE", "MJE", "CJC", "VJC", "MJC",
+    "TF", "TNOM", "NR",
+];
 const CHANNEL_FLAGS: [&str; 2] = ["NCHAN", "PCHAN"];
 
 /// A model name every parser reads alike, that says it was fitted.
@@ -108,6 +113,21 @@ pub(crate) fn vdmos_card(
 ) -> String {
     let mut card = format!(".model {name} VDMOS\n");
     card.push_str(if p_channel { "+ PCHAN\n" } else { "+ NCHAN\n" });
+    for chunk in parameters.chunks(PARAMETERS_PER_LINE) {
+        let line: Vec<String> = chunk
+            .iter()
+            .map(|(key, value)| format!("{key}={}", number(*value)))
+            .collect();
+        card.push_str("+ ");
+        card.push_str(&line.join(" "));
+        card.push('\n');
+    }
+    card
+}
+
+/// `.model NAME NPN` or `PNP`, with its parameters on continuation lines.
+pub(crate) fn bjt_card(name: &str, pnp: bool, parameters: &[(&'static str, f64)]) -> String {
+    let mut card = format!(".model {name} {}\n", if pnp { "PNP" } else { "NPN" });
     for chunk in parameters.chunks(PARAMETERS_PER_LINE) {
         let line: Vec<String> = chunk
             .iter()
@@ -408,6 +428,15 @@ fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
         .filter_map(|rest| rest.strip_suffix(" D"))
         .map(str::to_string)
         .collect();
+    let bjt_models: Vec<String> = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix(".model "))
+        .filter_map(|rest| {
+            rest.strip_suffix(" NPN")
+                .or_else(|| rest.strip_suffix(" PNP"))
+        })
+        .map(str::to_string)
+        .collect();
     let mos_models: Vec<String> = lines
         .iter()
         .filter_map(|line| line.strip_prefix(".model "))
@@ -426,12 +455,20 @@ fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
                 let (allowed, flag): (&[&str], bool) = match (tokens.get(2).copied(), suffix) {
                     (Some("D"), "_f" | "_b") if tokens.len() == 3 => (&DIODE_PARAMETERS, false),
                     (Some("VDMOS"), "_m") if tokens.len() == 3 => (&MOSFET_PARAMETERS, true),
+                    (Some("NPN" | "PNP"), "_q") if tokens.len() == 3 => (&BJT_PARAMETERS, false),
                     _ => {
                         return Err(format!("line {} is not a model Konnect writes", index + 2));
                     }
                 };
                 index += 1 + check_continuations(&lines[index + 1..], index + 1, allowed, flag)?;
                 continue;
+            }
+            Some("Q1") => {
+                matches!(
+                    tokens.as_slice(),
+                    [_, c, b, e, model] if is_node(c) && is_node(b) && is_node(e)
+                        && bjt_models.iter().any(|m| m == model)
+                )
             }
             Some("M1") => {
                 matches!(
