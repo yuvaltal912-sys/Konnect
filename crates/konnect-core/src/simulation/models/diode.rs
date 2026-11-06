@@ -23,8 +23,8 @@ const IMPEDANCE_HZ: f64 = 1e3;
 const BREAKDOWN_IS_RANGE: (f64, f64) = (1e-20, 1e-12);
 const BREAKDOWN_N: f64 = 4.0;
 /// A Zener with no forward values gets a plain silicon junction.
-const GENERIC_IS: f64 = 1e-14;
-const GENERIC_N: f64 = 1.0;
+pub(super) const GENERIC_IS: f64 = 1e-14;
+pub(super) const GENERIC_N: f64 = 1.0;
 const DEFAULT_M: f64 = 0.5;
 const N_RANGE: std::ops::RangeInclusive<f64> = 0.5..=12.0;
 /// A series resistance that drops less than this at the highest current is
@@ -43,16 +43,16 @@ const LAW_PARAMETERS: usize = 3;
 const PLAUSIBLE_N_SHARE: f64 = 1.25;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Technology {
+pub(super) struct Technology {
     name: &'static str,
     /// The emission coefficient taken when two points cannot fix it.
-    assumed_n: f64,
-    eg: f64,
-    xti: f64,
-    vj: f64,
+    pub assumed_n: f64,
+    pub eg: f64,
+    pub xti: f64,
+    pub vj: f64,
 }
 
-const SILICON: Technology = Technology {
+pub(super) const SILICON: Technology = Technology {
     name: "silicon",
     assumed_n: 1.8,
     eg: 1.11,
@@ -295,11 +295,11 @@ pub(crate) fn fit_capacitance(
 
 /// Points with their places in the caller's list: those to fit, and the one
 /// held out.
-type Split<T> = (Vec<(T, usize)>, Option<(T, usize)>);
+pub(super) type Split<T> = (Vec<(T, usize)>, Option<(T, usize)>);
 
 /// Split a curve into the points to fit and the one to hold out: the middle
 /// one, when there are more points than a three-parameter law needs.
-fn hold_out<T: Copy>(sorted: &[(T, usize)]) -> Split<T> {
+pub(super) fn hold_out<T: Copy>(sorted: &[(T, usize)]) -> Split<T> {
     if sorted.len() <= LAW_PARAMETERS {
         return (sorted.to_vec(), None);
     }
@@ -309,7 +309,7 @@ fn hold_out<T: Copy>(sorted: &[(T, usize)]) -> Split<T> {
     (fit, Some(held))
 }
 
-fn forward_points(characteristics: &[Characteristic]) -> Vec<(Point, usize)> {
+pub(super) fn forward_points(characteristics: &[Characteristic]) -> Vec<(Point, usize)> {
     let mut points: Vec<(Point, usize)> = of(characteristics, Quantity::ForwardVoltage)
         .into_iter()
         .map(|c| {
@@ -338,14 +338,19 @@ fn capacitance_points(characteristics: &[Characteristic]) -> Vec<((f64, f64), us
     points
 }
 
-fn field_of(characteristics: &[Characteristic], quantity: Quantity) -> String {
+pub(super) fn field_of(characteristics: &[Characteristic], quantity: Quantity) -> String {
     of(characteristics, quantity)
         .first()
         .map_or("characteristics".to_string(), |c| c.field("value"))
 }
 
 /// Forward points: each pushes its current into the anode.
-fn check_forward(model: &mut Model, bench: &mut Bench, points: &[(Point, usize)], role: Role) {
+pub(super) fn check_forward(
+    model: &mut Model,
+    bench: &mut Bench,
+    points: &[(Point, usize)],
+    role: Role,
+) {
     for (point, index) in points {
         let id = bench.id();
         let node = format!("{id}a");
@@ -369,11 +374,22 @@ fn check_forward(model: &mut Model, bench: &mut Bench, points: &[(Point, usize)]
 /// A reverse current pushed into the cathode, whose voltage is then the
 /// reverse voltage at that current.
 fn check_reverse_voltage(model: &mut Model, bench: &mut Bench, characteristic: &Characteristic) {
-    let id = bench.id();
-    let node = format!("{id}k");
     let current = characteristic
         .condition(REVERSE_CURRENT)
         .unwrap_or_default();
+    check_voltage_at_current(model, bench, characteristic, current);
+}
+
+/// A current pushed into the cathode, whose voltage is then the value the
+/// characteristic states at that current.
+pub(super) fn check_voltage_at_current(
+    model: &mut Model,
+    bench: &mut Bench,
+    characteristic: &Characteristic,
+    current: f64,
+) {
+    let id = bench.id();
+    let node = format!("{id}k");
     bench.dc.push(Bench::current_into(&id, &node, current));
     bench.dc.push(model.instance(&id, &["0", &node]));
     model.checks.push(Check {
@@ -390,7 +406,7 @@ fn check_reverse_voltage(model: &mut Model, bench: &mut Bench, characteristic: &
 
 /// The reverse current at a reverse voltage. The source delivers it, so its
 /// own current reads negative.
-fn check_leakage(model: &mut Model, bench: &mut Bench, characteristic: &Characteristic) {
+pub(super) fn check_leakage(model: &mut Model, bench: &mut Bench, characteristic: &Characteristic) {
     let id = bench.id();
     let node = format!("{id}k");
     let voltage = characteristic
@@ -409,7 +425,7 @@ fn check_leakage(model: &mut Model, bench: &mut Bench, characteristic: &Characte
     });
 }
 
-fn check_capacitance(
+pub(super) fn check_capacitance(
     model: &mut Model,
     bench: &mut Bench,
     characteristics: &[Characteristic],
@@ -456,10 +472,10 @@ fn check_impedance(model: &mut Model, bench: &mut Bench, characteristic: &Charac
 }
 
 /// The junction-capacitance card parameters, and the points behind them.
-type CapacitanceFit = (Vec<(&'static str, f64)>, Split<(f64, f64)>);
+pub(super) type CapacitanceFit = (Vec<(&'static str, f64)>, Split<(f64, f64)>);
 
 /// The junction-capacitance parameters, fitted on all but a held-out point.
-fn capacitance_parameters(
+pub(super) fn capacitance_parameters(
     model: &mut Model,
     characteristics: &[Characteristic],
     vj: f64,
@@ -648,30 +664,40 @@ fn breakdown_slope(
     Ok((impedance * current / vt, 0.0))
 }
 
-/// A Zener: a forward diode and a breakdown diode, each with its own series
-/// resistance.
-pub(crate) fn zener(
-    name: &str,
-    characteristics: &[Characteristic],
-    temperature: f64,
-) -> Fitted<Model> {
-    let vt = thermal_voltage(temperature);
-    let mut model = Model::new(Kind::Zener, name, Element::Subcircuit, vec!["A", "K"]);
-    let zener_voltage = of(characteristics, Quantity::ZenerVoltage)[0];
-    let impedances = of(characteristics, Quantity::DynamicImpedance);
-    let (nbv, rz) = breakdown_slope(&impedances, vt, &mut model)?;
-    let test_current = zener_voltage.condition(REVERSE_CURRENT).unwrap_or_default();
+/// The breakdown diode of a Zener or a TVS, as its card holds it.
+pub(super) struct Breakdown {
+    pub is: f64,
+    pub nbv: f64,
+    pub rz: f64,
+    pub bv: f64,
+    pub ibv: f64,
+}
+
+/// The breakdown card for a junction that must read `voltage` at
+/// `test_current`, given the slope `(nbv, rz)` its data asks for and the
+/// `(current, impedance)` points behind it. `field` names the value to blame if
+/// the series resistance's drop leaves no breakdown voltage.
+pub(super) fn breakdown_card(
+    model: &mut Model,
+    field: &str,
+    voltage: f64,
+    test_current: f64,
+    slope: (f64, f64),
+    slope_points: &[(f64, f64)],
+    vt: f64,
+) -> Fitted<Breakdown> {
+    let (nbv, rz) = slope;
     // A soft knee asks for a large NBV, which pulls ngspice's knee down. A
     // larger IS for the breakdown diode keeps the knee in place; past the top
     // of its range, NBV is held and the rest of the slope is resistance.
-    let span = (1.0 - KNEE_FLOOR) * zener_voltage.value;
+    let span = (1.0 - KNEE_FLOOR) * voltage;
     let breakdown_is = (test_current * (-span / (nbv * vt)).exp())
         .clamp(BREAKDOWN_IS_RANGE.0, BREAKDOWN_IS_RANGE.1);
     let ceiling = span / (vt * (test_current / breakdown_is).ln());
     let (nbv, rz) = if nbv > ceiling * (1.0 + 1e-9) {
-        let (current, impedance) = impedances
+        let (current, impedance) = slope_points
             .iter()
-            .map(|c| (c.condition(REVERSE_CURRENT).unwrap_or_default(), c.value))
+            .copied()
             .fold(
                 (0.0, 0.0),
                 |best, point| if point.0 > best.0 { point } else { best },
@@ -686,26 +712,67 @@ pub(crate) fn zener(
     };
     // A slope the law alone explains leaves a rounding sliver of resistance,
     // which ngspice reads as a near-infinite conductance.
-    let highest = impedances
+    let highest = slope_points
         .iter()
-        .filter_map(|c| c.condition(REVERSE_CURRENT))
+        .map(|point| point.0)
         .fold(test_current, f64::max);
     let rz = if rz * highest < NEGLIGIBLE_DROP {
         0.0
     } else {
         rz
     };
-    let bv = zener_voltage.value - test_current * rz;
-    let ibv = breakdown_ibv(test_current, bv, breakdown_is, vt);
+    let bv = voltage - test_current * rz;
     if bv <= 0.0 {
         return Err(Invalid::new(
-            zener_voltage.field("value"),
-            "the Zener voltage is below the series resistance's drop at its current",
+            field,
+            "the voltage is below the series resistance's drop at its current",
         ));
     }
+    let ibv = breakdown_ibv(test_current, bv, breakdown_is, vt);
     model
         .fitted
-        .push("bv and ibv from the Zener voltage at its test current".into());
+        .push("bv and ibv from the breakdown voltage at its test current".into());
+    Ok(Breakdown {
+        is: breakdown_is,
+        nbv,
+        rz,
+        bv,
+        ibv,
+    })
+}
+
+/// A Zener: a forward diode and a breakdown diode, each with its own series
+/// resistance.
+pub(crate) fn zener(
+    name: &str,
+    characteristics: &[Characteristic],
+    temperature: f64,
+) -> Fitted<Model> {
+    let vt = thermal_voltage(temperature);
+    let mut model = Model::new(Kind::Zener, name, Element::Subcircuit, vec!["A", "K"]);
+    let zener_voltage = of(characteristics, Quantity::ZenerVoltage)[0];
+    let impedances = of(characteristics, Quantity::DynamicImpedance);
+    let (nbv, rz) = breakdown_slope(&impedances, vt, &mut model)?;
+    let test_current = zener_voltage.condition(REVERSE_CURRENT).unwrap_or_default();
+    let slope_points: Vec<(f64, f64)> = impedances
+        .iter()
+        .map(|c| (c.condition(REVERSE_CURRENT).unwrap_or_default(), c.value))
+        .collect();
+    let Breakdown {
+        is: breakdown_is,
+        nbv,
+        rz,
+        bv,
+        ibv,
+    } = breakdown_card(
+        &mut model,
+        &zener_voltage.field("value"),
+        zener_voltage.value,
+        test_current,
+        (nbv, rz),
+        &slope_points,
+        vt,
+    )?;
 
     let points = forward_points(characteristics);
     let (fit_points, held) = hold_out(&points);

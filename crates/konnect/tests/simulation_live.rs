@@ -4010,3 +4010,58 @@ fn a_model_that_leaves_a_wired_pin_unmapped_is_refused_and_writes_nothing() {
     assert_eq!(refused["outcome"]["status"], "failed");
     assert_eq!(std::fs::read_to_string(&schematic).unwrap(), before);
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn both_fitted_tvs_kinds_are_read_by_kicad_and_clamp_on_the_engine() {
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/rectifier"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("rectifier.kicad_sch");
+    let tvs = json!([
+        { "quantity": "breakdown_voltage", "value": 15.0, "conditions": { "reverse_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "clamping_voltage", "value": 24.0, "conditions": { "peak_pulse_current_amps": 20.0 }, "statistic": "maximum" },
+        { "quantity": "reverse_current", "value": 1e-6, "conditions": { "reverse_voltage_volts": 12.0 }, "statistic": "maximum" },
+        { "quantity": "forward_voltage", "value": 1.0, "conditions": { "forward_current_amps": 1.0 }, "statistic": "maximum" }
+    ]);
+    let bidirectional = json!([
+        { "quantity": "breakdown_voltage", "value": 15.0, "conditions": { "reverse_current_amps": 1e-3 }, "statistic": "typical" },
+        { "quantity": "clamping_voltage", "value": 24.0, "conditions": { "peak_pulse_current_amps": 20.0 }, "statistic": "maximum" },
+        { "quantity": "reverse_current", "value": 1e-6, "conditions": { "reverse_voltage_volts": 12.0 }, "statistic": "maximum" }
+    ]);
+    let readiness = || {
+        (
+            "check_simulation_readiness",
+            json!({ "schematic": schematic }),
+        )
+    };
+    let pins = json!({ "1": "K", "2": "A" });
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "tvs", "smbj15_fit", tvs),
+            create_model(
+                &schematic,
+                "tvs_bidirectional",
+                "smbj15ca_fit",
+                bidirectional,
+            ),
+            assign_model(&schematic, &["D1"], "smbj15_fit", pins.clone()),
+            readiness(),
+            assign_model(&schematic, &["D1"], "smbj15ca_fit", pins),
+            readiness(),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+    }
+    for at in [2, 4] {
+        assert_eq!(
+            results[at]["outcome"]["status"], "complete",
+            "{}",
+            results[at]
+        );
+        assert_eq!(results[at + 1]["ready"], true, "{}", results[at + 1]);
+        assert_eq!(results[at]["parts"][0]["element"], "XD1", "{}", results[at]);
+    }
+}

@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 /// Starts the first line of every fitted file.
 pub(crate) const MARKER_PREFIX: &str = "* konnect-fitted-model v1 ";
 pub(crate) const MAX_NAME: usize = 32;
+/// The longest kind name a marker carries (`tvs_bidirectional` is 17).
+const MAX_KIND: usize = 24;
 /// Every fitted model's name ends so, so it never reads as a vendor's model in
 /// KiCad, a BOM or a deck.
 pub(crate) const NAME_SUFFIX: &str = "_fit";
@@ -264,7 +266,7 @@ pub(crate) fn check_fitted(bytes: &[u8]) -> Result<Fitted, String> {
         field("body-sha256")?,
         field("verdict")?,
     );
-    if fields.split(' ').count() != 4 || verdict != "pass" || !is_identifier(kind, 16) {
+    if fields.split(' ').count() != 4 || verdict != "pass" || !is_identifier(kind, MAX_KIND) {
         return Err("the marker is not one Konnect writes".to_string());
     }
     check_name(name)?;
@@ -382,7 +384,7 @@ fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
                 matches!(tokens.as_slice(), [_, a, b, "0"] if is_node(a) && is_node(b))
             }
             Some("R1" | "R2" | "RL" | "L1" | "C1") => number_line(&tokens),
-            Some("DF" | "DB") => matches!(
+            Some("DF" | "DB" | "DG" | "DH") => matches!(
                 tokens.as_slice(),
                 [_, a, b, model] if is_node(a) && is_node(b) && inner_models.iter().any(|m| m == model)
             ),

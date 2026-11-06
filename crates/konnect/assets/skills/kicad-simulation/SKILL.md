@@ -315,7 +315,8 @@ Konnect never reads a datasheet. You read it, Konnect fits a model to the number
 | Capacitor | Fit it: kind `capacitor`. Give an MLCC's capacitance at its working DC bias, with `dc_bias_volts` |
 | Inductor, ferrite bead | Fit it: kind `inductor`. A bead is its DC resistance and inductance |
 | Connector, test point, mounting hole, open jumper | Leave it out with `testbench.exclude_references`. The run reads `modified` and lists them |
-| MOSFET, BJT, TVS, IC | Not fitted yet: a vendor model through KiCad, or a stand-in from Protection Scenarios |
+| TVS diode | Fit it: kind `tvs`, or `tvs_bidirectional` for a pair. Give `breakdown_voltage` at its test current and `clamping_voltage` at its peak pulse current (`peak_pulse_current_amps`); `reverse_current` at the stand-off voltage is checked, not fitted. A bidirectional part takes no forward or capacitance values |
+| MOSFET, BJT, IC | Not fitted yet: a vendor model through KiCad, or a stand-in from Protection Scenarios |
 
 4. Call `create_simulation_model`. Values are plain numbers in SI base units: 0.45 for 450 mV, 1e-6 for 1 µA. `statistic` is the datasheet column; never enter an absolute maximum rating. A diode needs two `forward_voltage` values at least, so read three or more off the forward curve with `read_from: "figure"`; with more than the fit needs, the middle one is held out as a check.
 

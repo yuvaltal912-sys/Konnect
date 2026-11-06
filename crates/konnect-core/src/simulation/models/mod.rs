@@ -12,6 +12,7 @@ pub(crate) mod diode;
 pub(crate) mod fit;
 pub(crate) mod passive;
 pub(crate) mod text;
+pub(crate) mod tvs;
 
 use serde_json::Value;
 
@@ -34,17 +35,21 @@ pub(crate) enum Kind {
     SchottkyDiode,
     Led,
     Zener,
+    Tvs,
+    TvsBidirectional,
     Resistance,
     Capacitor,
     Inductor,
 }
 
 impl Kind {
-    pub(crate) const ALL: [Kind; 7] = [
+    pub(crate) const ALL: [Kind; 9] = [
         Kind::Diode,
         Kind::SchottkyDiode,
         Kind::Led,
         Kind::Zener,
+        Kind::Tvs,
+        Kind::TvsBidirectional,
         Kind::Resistance,
         Kind::Capacitor,
         Kind::Inductor,
@@ -56,6 +61,8 @@ impl Kind {
             Kind::SchottkyDiode => "schottky_diode",
             Kind::Led => "led",
             Kind::Zener => "zener",
+            Kind::Tvs => "tvs",
+            Kind::TvsBidirectional => "tvs_bidirectional",
             Kind::Resistance => "resistance",
             Kind::Capacitor => "capacitor",
             Kind::Inductor => "inductor",
@@ -88,6 +95,20 @@ impl Kind {
                 (ReverseCurrent, 0, 4),
                 (JunctionCapacitance, 0, 16),
             ],
+            Kind::Tvs => &[
+                (BreakdownVoltage, 1, 1),
+                (ClampingVoltage, 1, 1),
+                (ReverseCurrent, 0, 4),
+                (ForwardVoltage, 0, 16),
+                (JunctionCapacitance, 0, 16),
+            ],
+            // Both directions are the same, so a forward voltage or a junction
+            // capacitance has no one meaning for the pair.
+            Kind::TvsBidirectional => &[
+                (BreakdownVoltage, 1, 1),
+                (ClampingVoltage, 1, 1),
+                (ReverseCurrent, 0, 4),
+            ],
             Kind::Resistance => &[(Resistance, 1, 1), (SeriesInductance, 0, 1)],
             Kind::Capacitor => &[
                 (Capacitance, 1, 1),
@@ -111,6 +132,7 @@ pub(crate) enum Quantity {
     ForwardVoltage,
     ReverseCurrent,
     BreakdownVoltage,
+    ClampingVoltage,
     ZenerVoltage,
     DynamicImpedance,
     JunctionCapacitance,
@@ -128,16 +150,18 @@ pub(crate) enum Quantity {
 pub(crate) const FORWARD_CURRENT: &str = "forward_current_amps";
 pub(crate) const REVERSE_CURRENT: &str = "reverse_current_amps";
 pub(crate) const REVERSE_VOLTAGE: &str = "reverse_voltage_volts";
+pub(crate) const PEAK_PULSE_CURRENT: &str = "peak_pulse_current_amps";
 pub(crate) const VOLTAGE: &str = "voltage_volts";
 pub(crate) const FREQUENCY: &str = "frequency_hz";
 pub(crate) const DC_BIAS: &str = "dc_bias_volts";
 pub(crate) const DC_CURRENT: &str = "dc_current_amps";
 
 impl Quantity {
-    pub(crate) const ALL: [Quantity; 15] = [
+    pub(crate) const ALL: [Quantity; 16] = [
         Quantity::ForwardVoltage,
         Quantity::ReverseCurrent,
         Quantity::BreakdownVoltage,
+        Quantity::ClampingVoltage,
         Quantity::ZenerVoltage,
         Quantity::DynamicImpedance,
         Quantity::JunctionCapacitance,
@@ -157,6 +181,7 @@ impl Quantity {
             Quantity::ForwardVoltage => "forward_voltage",
             Quantity::ReverseCurrent => "reverse_current",
             Quantity::BreakdownVoltage => "breakdown_voltage",
+            Quantity::ClampingVoltage => "clamping_voltage",
             Quantity::ZenerVoltage => "zener_voltage",
             Quantity::DynamicImpedance => "dynamic_impedance",
             Quantity::JunctionCapacitance => "junction_capacitance",
@@ -174,7 +199,10 @@ impl Quantity {
 
     pub(crate) fn unit(self) -> &'static str {
         match self {
-            Quantity::ForwardVoltage | Quantity::BreakdownVoltage | Quantity::ZenerVoltage => "V",
+            Quantity::ForwardVoltage
+            | Quantity::BreakdownVoltage
+            | Quantity::ClampingVoltage
+            | Quantity::ZenerVoltage => "V",
             Quantity::ReverseCurrent | Quantity::LeakageCurrent => "A",
             Quantity::DynamicImpedance
             | Quantity::Resistance
@@ -194,6 +222,7 @@ impl Quantity {
             Quantity::ForwardVoltage => (&[FORWARD_CURRENT], &[]),
             Quantity::ReverseCurrent => (&[REVERSE_VOLTAGE], &[]),
             Quantity::BreakdownVoltage | Quantity::ZenerVoltage => (&[REVERSE_CURRENT], &[]),
+            Quantity::ClampingVoltage => (&[PEAK_PULSE_CURRENT], &[]),
             Quantity::DynamicImpedance => (&[REVERSE_CURRENT], &[FREQUENCY]),
             Quantity::JunctionCapacitance => (&[REVERSE_VOLTAGE], &[FREQUENCY]),
             Quantity::LeakageCurrent => (&[VOLTAGE], &[]),
@@ -561,6 +590,7 @@ pub(crate) fn build(
             diode::plain(kind, name, characteristics, temperature)?
         }
         Kind::Zener => diode::zener(name, characteristics, temperature)?,
+        Kind::Tvs | Kind::TvsBidirectional => tvs::build(kind, name, characteristics, temperature)?,
         Kind::Resistance | Kind::Capacitor | Kind::Inductor => {
             passive::build(kind, name, characteristics)?
         }

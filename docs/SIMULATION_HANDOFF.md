@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 is next and not started; ask the owner before starting it.
+**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 is in progress on `feat/simulation-datasheet-models-m2` (not pushed): the TVS slice is done, the MOSFET and the BJT are not.
 
 ## Start here
 
@@ -57,7 +57,7 @@ The owner asked for a design and its parts' datasheets to be enough to simulate.
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
-| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT |
+| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **TVS done** (kinds `tvs`, `tvs_bidirectional`); MOSFET and BJT next |
 | M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
@@ -78,6 +78,15 @@ What M1 built, and what later work must keep:
 Limits left in M1: one temperature per model, and no temperature check; no reverse recovery (no transient bench yet); a fuse never opens; capacitance and inductance are linear at their stated bias; a Zener's very soft knee is held at the largest `NBV` that keeps ngspice's knee above 30% of BV, and the knee then reads low; reused sheets are refused, not assigned. Disclosure rests on the marker, so a file whose marker line was deleted reads as an ordinary model. A commit that stops while recovering an earlier journal naming the same file answers `uncertain`, the cautious side, though this call wrote nothing. The KiCad dialog round trip and a run in KiCad's GUI simulator have not been checked: they are owner checks. The installed KiCad is 10.0.8 with ngspice 45.2, while the KiCad facts come from the 10.0.1 source; one live test still pins ngspice 44.2 and fails for that reason alone, a red baseline reported and not fixed here.
 
 Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignored), doctests, the live simulation tests (89 passed; the one failure is the ngspice 44.2 pin), Clippy, licence checks, documentation counts and the release build. The installed binary hash is unchanged. The repairs PR #15 and then M1, PR #16, merged on 2026-11-06.
+
+### M2 progress: TVS (done)
+
+- **Kinds `tvs` and `tvs_bidirectional`** (`simulation/models/tvs.rs`). Inputs: `breakdown_voltage` at its test current, `clamping_voltage` at `peak_pulse_current_amps` (a new quantity and condition), optional `reverse_current` (checked, not fitted). A unidirectional part also takes `forward_voltage` and `junction_capacitance`; a bidirectional one takes neither.
+- **The fit.** Two voltages fix the slope between them, not the knee, so `NBV = 1` and the series resistance carries the rest of the rise. If the clamp sits below the junction law, the resistance is zero and `NBV` takes the rise. Both cases are listed in `fit.assumed`.
+- **Bidirectional** is two Zener-style cells in series through an internal node `M` (`DF A M`, `DB A M`, `DG K M`, `DH K M`). Each datasheet voltage is the breakdown cell's plus the other cell's forward drop, which is a plain silicon junction and is listed as assumed.
+- **Shared code.** `diode.rs` now holds `breakdown_card`, which `zener` and `tvs` both call, and `check_voltage_at_current`. The grammar checker accepts `DG`/`DH`, and a marker `kind` of up to 24 characters.
+- **Tests:** four in `tvs.rs`, one live test (`both_fitted_tvs_kinds_are_read_by_kicad_and_clamp_on_the_engine`) at the end of `simulation_live.rs`. Negative control: zeroing the series resistance in the card fails the live test with the clamp reading 15.25 V against 24 V.
+- **Limits:** the breakdown voltage does not follow temperature; no pulse-width or thermal behaviour, so a long pulse clamps as a short one; a bidirectional part's capacitance is not modelled.
 
 ## Simulation validation and stored results (merged as PR #15)
 
