@@ -286,7 +286,8 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 5. Run `find_orphan_items` as a heuristic and corroborate its findings.
 6. Run direct KiCad ERC with `run_erc` and classify every violation.
 7. Run `render_schematic_png` with inline output and inspect the actual image.
-8. Fix findings and repeat every check invalidated by the edits.
+8. Final check: run `compare_netlist` with the intended `{net: ["REF.PIN"]}`. It compares pin sets across the whole hierarchy, so net names do not matter. Anything under `missing`, `split`, `merged` or `extra`, or a verdict of `incomplete`, is a connection you did not intend or could not prove.
+9. Fix findings and repeat every check invalidated by the edits.
 
 ---
 

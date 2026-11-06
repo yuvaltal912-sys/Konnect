@@ -88,3 +88,15 @@ as above.)
 |---|---|---|
 | `#PWR002` | `(at 50.8 167.64 0)` | `(at 45.72 167.64 0)` |
 | `R8` | `(at 59.69 139.7 90)` | `(at 54.61 139.7 90)` |
+
+## `single_pin_nets.net`
+
+KiCad's own netlist for this pair, kept so `get_schematic_netlist` and
+`compare_netlist` (`tools/sch_netlist_tests.rs`) have an oracle that needs no
+KiCad install. It is the output of the command above (kicadsexpr format, KiCad
+10.0.8), with one edit: the `(source …)` path was cut to the file name, because
+the export wrote an absolute path from the machine that ran it. The ignored test
+`real_kicad_reads_the_hierarchy_and_compares_edited_copies` re-exports the real
+hierarchy and requires the same nets, then edits copies of the root sheet (takes a
+label off `/TWO_PIN`, off `/SPLIT`, or renames one `/SPLIT` label to `TWO_PIN`)
+to produce an unnamed net, a split net and a merged net.

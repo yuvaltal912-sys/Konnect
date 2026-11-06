@@ -1463,6 +1463,35 @@ pub(crate) struct SimulationNetlists {
     pub kicad: String,
 }
 
+/// Export a private snapshot's KiCad-format netlist into `directory` and read it.
+///
+/// Only for a copy Konnect owns: the child is killed on timeout, which on a
+/// live project would strand KiCad's project lock. Any nonzero exit fails, as
+/// in [`export_simulation_netlists`].
+pub(crate) async fn export_kicad_netlist_text(
+    cli: &str,
+    schematic: &Path,
+    directory: &Path,
+    timeout_dur: Duration,
+) -> Result<String> {
+    let output = directory.join("netlist.net");
+    let output_arg = output.to_string_lossy();
+    let schematic_arg = schematic.to_string_lossy();
+    let args = [
+        "sch",
+        "export",
+        "netlist",
+        "--output",
+        &output_arg,
+        "--format",
+        "kicadsexpr",
+        &schematic_arg,
+    ];
+    run_cli_owned(cli, &args, timeout_dur, true).await?;
+    verify_nonempty_file(&output, "Netlist").await?;
+    Ok(tokio::fs::read_to_string(&output).await?)
+}
+
 /// Export a snapshot's KiCad-format and SPICE netlists into `directory`.
 ///
 /// Any nonzero exit fails: KiCad exits 2 after a library problem but still

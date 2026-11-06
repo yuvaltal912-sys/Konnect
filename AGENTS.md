@@ -1,11 +1,14 @@
 # Agent notes
 
-Start with `docs/SIMULATION_HANDOFF.md`. It says where the work stands, what comes next, and how to verify it. `docs/SIMULATION_PLAN.md` holds the full design and its evidence.
+Two tracks, two state files. Start with the one for your task; each says where the work stands, what comes next, and how to verify it.
+
+- Simulation: `docs/SIMULATION_HANDOFF.md`. `docs/SIMULATION_PLAN.md` holds the full design and its evidence.
+- Creation (schematic, PCB, library): `docs/CREATION_HANDOFF.md`. `docs/CREATION_RESEARCH.md` holds the ranked backlog and the 15-PR sequence.
 
 ## Rules
 
 - Reply in the language the owner last used. Keep it short, with one clear recommendation.
-- Update `docs/SIMULATION_HANDOFF.md` in the same commit that changes where the work stands.
+- Update the track's handoff file (`docs/SIMULATION_HANDOFF.md` or `docs/CREATION_HANDOFF.md`) in the same commit that changes where the work stands.
 - Work on one PR at a time, and ask before starting the next one.
 - Commit only on a feature branch, and push only to the `fork` remote. `origin` is the archived upstream and is read-only.
 - Do not merge a PR, enable CI or Actions, or turn on auto-merge unless the owner asks.
