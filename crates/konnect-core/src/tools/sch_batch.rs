@@ -33,7 +33,7 @@ use super::sch_components::{
 };
 use super::sch_wiring::{
     add_stub_label, add_stub_wire, pick_stub_direction, resolve_pin_endpoint, resolve_placed_pin,
-    route_between,
+    route_between, Endpoints,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -46,7 +46,8 @@ pub fn tools() -> Vec<ToolDef> {
              at each pin endpoint with no wire. Pass stub_length, direction and label_type \
              for connect_to_net's placement, applied to every pin in the call; a stub that \
              would join another net is skipped and listed in `errors`, as connect_to_net \
-             refuses it. Single file read → all edits → single file write. \
+             refuses it; so is a label on a pin that sits mid-span on a wire with no \
+             junction. `nets_joined` lists the nets the call merged. Single file read → all edits → single file write. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
@@ -428,7 +429,7 @@ fn batch_net_name(args: &serde_json::Value) -> Result<String, CallToolResult> {
     }
 }
 
-async fn handle_batch_connect_to_net(
+pub(crate) async fn handle_batch_connect_to_net(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -445,6 +446,14 @@ async fn handle_batch_connect_to_net(
     // a local label on the pin endpoint and no wire (#701).
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(0.0);
+    // The schema says so, but a direct call skips the schema: a negative stub
+    // would put the label somewhere the check never looked.
+    if !stub_length.is_finite() || stub_length < 0.0 {
+        return Ok(crate::tools::invalid_arg(
+            "stub_length",
+            "must be a length of 0 mm or more",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
     // Plain labels on the pin keep the string splice; anything else goes
     // through the editor model connect_to_net uses.
@@ -469,6 +478,8 @@ async fn handle_batch_connect_to_net(
         Vec::new()
     };
     let mut is_changed = false;
+    let sheet_wires = extract_wires(&tree);
+    let sheet_junctions = konnect_sexp::schematic::extract_junctions(&tree);
 
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
@@ -510,24 +521,42 @@ async fn handle_batch_connect_to_net(
         // A stub must join nothing but the pin's own net (#899). Checked
         // against the sheet as this call has drawn it so far; a blocked pin is
         // skipped and reported, as a blocked route is.
-        let dir = match sch.as_ref() {
-            Some(sch) if stub_length > 0.0 => {
-                match pick_stub_direction(
-                    &sch.to_source(),
-                    (px, py),
-                    direction,
-                    Some(pin_outward_direction(&pin, t)),
-                    stub_length,
-                    &net_name,
-                )? {
-                    Ok(dir) => dir,
-                    Err(reasons) => {
-                        errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
-                        continue;
-                    }
+        // The label alone is checked too (stub_length 0): it attaches to any
+        // wire it lies on.
+        // Most pins need no full check. With no stub the label can join a foreign
+        // net only through a wire it lies inside with no junction there, and
+        // this call changes no wire in that case, so the wires read once at the
+        // start answer for every pin. The few that do get the full check, which
+        // parses the sheet as the call has built it so far.
+        let outward = Some(pin_outward_direction(&pin, t));
+        let needs_check = stub_length > 0.0
+            || crate::tools::sch_wiring::label_under_undotted_wire(
+                &sheet_wires,
+                &sheet_junctions,
+                (px, py),
+            );
+        let dir = if needs_check {
+            let current = match sch.as_ref() {
+                Some(sch) => sch.to_source(),
+                None => super::sch_wiring::insert_before_close(&content, &inserts),
+            };
+            match pick_stub_direction(
+                &current,
+                (px, py),
+                direction,
+                outward,
+                stub_length,
+                &net_name,
+                Endpoints::Pins,
+            )? {
+                Ok(dir) => dir,
+                Err(reasons) => {
+                    errors.push(format!("{reference}.{pin_number}: {}", reasons.join("; ")));
+                    continue;
                 }
             }
-            _ => crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t))),
+        } else {
+            crate::tools::stub_direction(direction, outward)
         };
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
@@ -577,9 +606,12 @@ async fn handle_batch_connect_to_net(
         added.push(entry);
     }
 
-    let joined = sch
-        .as_ref()
-        .map(|sch| super::sch_wiring::nets_joined(&content, &sch.to_source()));
+    // Every mode reports: the label-only splice merges nets too, by name.
+    let after = match sch.as_ref() {
+        Some(sch) => sch.to_source(),
+        None => super::sch_wiring::insert_before_close(&content, &inserts),
+    };
+    let joined = super::sch_wiring::nets_joined(&content, &after);
     if is_changed {
         match sch {
             // Revision-checked against `content`: a concurrent edit refuses
@@ -606,10 +638,11 @@ async fn handle_batch_connect_to_net(
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
     }
-    if let Some(joined) = joined {
-        body["nets_joined"] = joined;
-    }
-    Ok(CallToolResult::json(&body))
+    body["nets_joined"] = joined;
+    let mut result = CallToolResult::json(&body);
+    // Every pin skipped is a failed call, as in batch_connect_pins.
+    result.is_error = added.is_empty() && !errors.is_empty();
+    Ok(result)
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
@@ -916,7 +949,7 @@ async fn handle_batch_connect_pins(
     let mut new_content = content;
     let mut connected = 0;
     for (pair, x1, y1, x2, y2) in &resolved {
-        match route_between(&new_content, *x1, *y1, *x2, *y2)? {
+        match route_between(&new_content, *x1, *y1, *x2, *y2, Endpoints::Pins)? {
             Ok(routed) => {
                 new_content = routed.content;
                 connected += 1;
@@ -4512,7 +4545,7 @@ mod batch_connect_options_tests {
 
     /// Omitting every new option, or passing its default, writes what `main`
     /// wrote: a local label on each pin endpoint, no wire, and the same
-    /// response keys.
+    /// response keys, plus `nets_joined`, which every wiring tool now reports.
     #[tokio::test]
     async fn defaults_keep_the_legacy_output() {
         // (x, y, rotation) of each pin's label, as main wrote them.
@@ -4533,7 +4566,7 @@ mod batch_connect_options_tests {
             let body = body(&result);
             assert_eq!(
                 keys(&body),
-                BTreeSet::from(["net", "added", "added_count", "errors"]),
+                BTreeSet::from(["net", "added", "added_count", "errors", "nets_joined"]),
                 "{options}"
             );
             for (entry, (x, y, rot)) in body["added"].as_array().unwrap().iter().zip(promised) {
