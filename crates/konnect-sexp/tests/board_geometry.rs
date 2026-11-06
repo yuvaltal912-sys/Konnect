@@ -1,4 +1,4 @@
-//! The board-geometry layer against `board_geometry_cases.kicad_pcb`.
+//! The board-geometry layer against `board_geometry/cases.kicad_pcb`.
 //!
 //! The fixture is a 40 × 30 mm board with 5 mm rounded corners (arcs, the way
 //! `add_board_outline` draws them) and a 3 mm circular cut-out at its centre,
@@ -19,7 +19,7 @@ fn load(name: &str) -> String {
 }
 
 fn geometry() -> BoardGeometry {
-    BoardGeometry::from_tree(&parse_sexp(&load("board_geometry_cases.kicad_pcb")).unwrap())
+    BoardGeometry::from_tree(&parse_sexp(&load("board_geometry/cases.kicad_pcb")).unwrap())
 }
 
 fn close(a: f64, b: f64, tol: f64) -> bool {
@@ -234,7 +234,7 @@ fn the_allowlist_excuses_a_part_but_still_reports_it() {
 
 #[test]
 fn nothing_is_judged_against_an_open_or_missing_outline() {
-    let text = load("board_geometry_cases.kicad_pcb");
+    let text = load("board_geometry/cases.kicad_pcb");
     // Move the first outline line to another layer: the ring no longer closes.
     let open = text.replacen("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")", 1);
     let g = BoardGeometry::from_tree(&parse_sexp(&open).unwrap());

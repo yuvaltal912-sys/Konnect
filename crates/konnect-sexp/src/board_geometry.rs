@@ -1241,17 +1241,15 @@ impl BoardGeometry {
             out.footprints_checked += 1;
             let part = |kind: &'static str, label: String, shape: &Shape| {
                 let o = self.outline.overhang(&shape.pts);
-                (o.depth_mm > threshold).then(|| {
-                    (
-                        PartOverhang {
-                            part: kind,
-                            label,
-                            overhang_mm: o.depth_mm,
-                            at: o.at,
-                        },
-                        o.touches_board,
-                    )
-                })
+                (o.depth_mm > threshold).then_some((
+                    PartOverhang {
+                        part: kind,
+                        label,
+                        overhang_mm: o.depth_mm,
+                        at: o.at,
+                    },
+                    o.touches_board,
+                ))
             };
             let courtyard = f
                 .courtyard

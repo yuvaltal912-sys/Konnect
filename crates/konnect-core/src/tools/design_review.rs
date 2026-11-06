@@ -2995,7 +2995,7 @@ mod outline_audit_tests {
     /// parts described in the fixture's README.
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+        "/../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb"
     );
 
     async fn audit(board_text: &str, extra: serde_json::Value) -> serde_json::Value {

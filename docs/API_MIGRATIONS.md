@@ -3,6 +3,46 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: board geometry: `query_board_region`, true outline containment (minor release)
+
+Creation PR 7 (`docs/CREATION_HANDOFF.md`).
+
+- **New tool `query_board_region`** (placement toolset, read-only). Name exactly one
+  of `bbox`, `around` (`reference`, optional `pad`, `margin_mm`) or `point`
+  (`x`, `y`, `radius_mm`); optional `kinds`, `layer`, `net`, `limit` (default 50, at
+  most 200) and `board_source`. It returns the items in the area nearest first, with
+  `total_matches`, `counts` and `truncated`.
+- **`score_placement` judges containment against the true Edge.Cuts outline.** A
+  rounded, notched, polygon or cut-out outline no longer gives `outline_unproven`; it
+  gives `outline_shape: "closed"` and the checks run. `outline_unproven` now means the
+  outline does not close or has an unreadable graphic. Each `outside_outline` hard
+  failure adds `overhang_mm` and `relation`; the response adds `outline` and
+  `edge_mount_listed`. A rectangular outline scores as before. A board that used to
+  return `outline_unproven` can now return `pass` or `hard_fail`, so a caller that
+  treated `outline_unproven` as the only reason to fall back to DRC should keep doing
+  so for open outlines only.
+- **`place_decoupling_caps`, `auto_place_from_schematic` and
+  `refine_placement_force_directed` are unchanged**: they still refuse a non-rectangular
+  outline. The score they report for such a board is now the truthful one, so
+  `place_decoupling_caps`'s `verdict_after_plan` can read `hard_fail` where it read
+  `outline_unproven`.
+- **`audit_manufacturing`, `validate_for_manufacturing` and `run_design_review`** check
+  the outline for real. They used to test for the string `Edge.Cuts`, which every KiCad 6+
+  board holds in its layer table, so a board with no outline passed and no part could be
+  found outside one. They now report a missing outline, an outline that does not close, and
+  each footprint whose courtyard, pads or silkscreen field text cross or sit outside it,
+  with the overhang in mm (`audit_manufacturing` and `validate_for_manufacturing` add an
+  `outline` object). A pad over the edge or a part wholly outside is an error; a courtyard
+  alone or estimated field text is a warning. The new argument `edge_mount_references`
+  (exact references, or a prefix ending in `*`) lists parts that may sit on the edge on
+  purpose; they are reported as `info`, and `validate_for_manufacturing` does not count
+  them against `READY`. A board that passed these tools only because the check could not
+  fire can now be `NOT READY`.
+- **`query_traces`** takes `limit` (default 200, at most 1000) and `touching_pad`
+  (`reference`, `pad`). Its response adds `total_matches` and `truncated`; `count` is now
+  the number returned, so a board with more than 200 segments needs `limit` raised to get
+  them all in one call.
+
 ## Unreleased: `replace_component` swaps the instance's `Sim.*` fields (minor release)
 
 `replace_component` now removes the replaced instance's `Sim.*` fields from every

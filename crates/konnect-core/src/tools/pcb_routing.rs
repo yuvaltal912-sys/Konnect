@@ -1095,7 +1095,7 @@ mod query_traces_tests {
     use prost::Message;
 
     const FIXTURE: &str =
-        include_str!("../../../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb");
+        include_str!("../../../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb");
 
     /// The fixture's three segments, as KiCad would list them:
     /// VCC (10,8)-(10,12) and GND (14,8)-(14,12) on F.Cu, VCC (10,12)-(14,12)

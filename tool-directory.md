@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **237 registered tools** + **7 always-visible meta-tools** = **244 total**
+- **238 registered tools** + **7 always-visible meta-tools** = **245 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -295,7 +295,7 @@ and Windows servers do not.
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
-| `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
+| `query_traces` | List trace segments on the board, optionally filtered by net, layer, or the pad they touch (`touching_pad`). At most `limit` (default 200) come back; `total_matches` and `truncated` say when that cut the list. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
@@ -303,13 +303,14 @@ and Windows servers do not.
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `placement` · 5 tools
+### `placement` · 6 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
 **Source:** [`crates/konnect-core/src/tools/placement.rs`](crates/konnect-core/src/tools/placement.rs)
 
 | Tool | Description |
 |------|-------------|
-| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. Off-board and connector-edge checks only count against a provably axis-aligned rectangular outline; any other Edge.Cuts shape (concave, notched, rounded, rotated, multi-boundary) skips them and gets the `outline_unproven` verdict instead of a pass, reported in `outline_shape` (`rectangular` / `unproven` / `missing`) and `outline_unproven`. A decoupling deduction requires the capacitor and IC to share a non-ground net with bounded fanout; `decoupling_associations` reports the qualifying evidence and `unproven_decoupling_caps` explains capacitors that cannot be associated conservatively. A cap sitting on a connector's own pins for cable filtering is judged against that connector instead of the nearest IC, and every such waiver is listed in `interface_filter_caps` — evidence that the check ran and was answered, not a separate score. |
+| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. Containment is judged against the true Edge.Cuts outline — rounded corners, notches, polygons and cut-outs included — and each part outside it is a hard failure with its `overhang_mm`; parts named in `edge_mount_references` are listed in `edge_mount_listed`, not failed. Only an outline that does not close (or has an unreadable graphic) skips the check and gets the `outline_unproven` verdict instead of a pass, reported in `outline_shape` (`rectangular` / `closed` / `unproven` / `missing`), `outline_unproven` and `outline`. A decoupling deduction requires the capacitor and IC to share a non-ground net with bounded fanout; `decoupling_associations` reports the qualifying evidence and `unproven_decoupling_caps` explains capacitors that cannot be associated conservatively. A cap sitting on a connector's own pins for cable filtering is judged against that connector instead of the nearest IC, and every such waiver is listed in `interface_filter_caps` — evidence that the check ran and was answered, not a separate score. |
+| `query_board_region` | Read-only: list what is in an area of the board (a `bbox`, `around` a footprint or pad, or a `point` and radius) — footprints, pads (real polygons, rotation included), tracks, vias, zones, graphics and the Edge.Cuts outline — nearest first, with nets, layers and UUIDs. Reads the board KiCad holds open where it can (`board_source`). `total_matches` and `truncated` report what `limit` cut. |
 | `place_decoupling_caps` | Plan (dry-run default) or apply a row of decoupling caps beside an IC, from `capacitor_references` the caller supplies — never discovered by shared nets, since GND alone pairs a cap with nearly every IC on the board. Reports a blocked plan status naming why it can't apply (a target outside the board outline, or no score improvement) before anything is written. |
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | **Deprecated:** diagnostic planning only. It can return a deterministic net-clustered starting plan and before/after scores, but autonomous whole-board mutation is retired. `dry_run: false` returns structured `plan_blocked` without writing; apply bounded, explicit `move_component` operations instead. |
@@ -443,7 +444,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
+| `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. The outline check reads the true Edge.Cuts outline and names each footprint whose courtyard, pads or silkscreen text cross or sit outside it, with the overhang in mm; `edge_mount_references` lists parts that may sit on the edge on purpose. |
 | `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
 | `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 
@@ -476,7 +477,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
-| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
+| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline (existence, closure, and every footprint's courtyard, pads and silkscreen text against it, with overhang in mm; `edge_mount_references` excuses intentional edge parts), design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
 ---

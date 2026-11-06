@@ -2318,7 +2318,7 @@ mod outline_validation_tests {
 
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+        "/../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb"
     );
 
     async fn validate(board_text: &str, extra: serde_json::Value) -> serde_json::Value {

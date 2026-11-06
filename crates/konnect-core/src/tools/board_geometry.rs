@@ -616,7 +616,7 @@ mod tests {
 
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+        "/../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb"
     );
 
     fn ctx() -> ToolContext {

@@ -2957,7 +2957,7 @@ mod tests {
     /// overhangs are hand-computed in the fixture's README.
     const GEOMETRY_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../konnect-sexp/tests/fixtures/board_geometry_cases.kicad_pcb"
+        "/../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb"
     );
 
     fn outside_failure<'a>(
