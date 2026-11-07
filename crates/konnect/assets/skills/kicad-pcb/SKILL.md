@@ -162,6 +162,7 @@ changes the design. Refill after routing and check the resulting copper.
 | `set_placed_footprint_models` | Inspect or edit exact indexed 3D-model entries on a live placed footprint |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
+| `get_board_2d_view`       | Image of the saved board; `side` top/bottom, `zoom` above 1 for a close-up |
 
 ### Bounded AI-directed placement loop
 

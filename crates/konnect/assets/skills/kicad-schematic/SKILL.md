@@ -337,8 +337,11 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 
 The agent can see its own schematic. After meaningful edits:
 
-1. `render_schematic_png` — rasterize the sheet (pass `inline` true to get
-   the image back as base64 and actually look at it).
+1. `render_schematic_png` — rasterize the sheet. Pass `inline` true to get
+   the PNG back as an image block and actually look at it. For a close-up,
+   add `region: {x, y, width, height}` in mm from the page's top-left; it is
+   rendered at `width_px`, so small text stays legible. Baselines always use
+   the full sheet.
 2. `set_visual_baseline` — capture the known-good render before a batch of
    edits (stored under the project's own state directory with the source
    hash and renderer identity).

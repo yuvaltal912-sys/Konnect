@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). PR 4 is implemented in draft [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28), awaiting review. The owner explicitly approved starting the next independent PR on 2026-11-07: PR 5 is implemented on `docs/creation-workflow-guidance`, branched from `main`, draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29). PR 4's code files are outside this work. The pre-change macOS gate passed formatting, 3,401 workspace tests, doctests, all 93 live simulation tests, Clippy, licenses, doc counts and the release build. The final gate and exact-build checks are recorded on #29 after its implementation commit. The installed binary's hash is unchanged. No later PR is authorized yet.
+**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). PR 4 is merged as [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). The owner explicitly approved starting the next independent PR on 2026-11-07: PR 5 is implemented on `docs/creation-workflow-guidance`, branched from `main`, draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29). PR 4's code files are outside this work. The pre-change macOS gate passed formatting, 3,401 workspace tests, doctests, all 93 live simulation tests, Clippy, licenses, doc counts and the release build. The final gate and exact-build checks are recorded on #29 after its implementation commit. The installed binary's hash is unchanged. No later PR is authorized yet.
 
 ## Start here
 
@@ -36,7 +36,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 2 | Route safety: port upstream #901, stubs (#899) and `add_wire` T-dots (#900), report `nets_joined`; PR 1 proves no net changed | 1 | Merged: [#20](https://github.com/yuvaltal912-sys/Konnect/pull/20). Review fixes: merged, [#22](https://github.com/yuvaltal912-sys/Konnect/pull/22) |
 | 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Merged: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
 | 3 | Response budget for ERC, DRC and list tools | none | Merged: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21). Leftovers (C24 stale-fill field, A30's other long results) are open under rank 3 |
-| 4 | Inline renders as image blocks; region and side options | none | In progress (branch `feat/inline-render-images`), draft [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28); implemented, awaiting review |
+| 4 | Inline renders as image blocks; region and side options | none | Merged: [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). Follow-ups: inline layer and library-item renders (rank 25), a generated difference image for `inline_diff` |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | In progress (branch `docs/creation-workflow-guidance`), draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29); implemented, awaiting review |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
@@ -57,8 +57,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Recommended order**, by research rank and what is unblocked:
 
-1. **PR 4** is already claimed and implemented in draft #28: inline image blocks, schematic region crops, board side/zoom.
-2. **PR 5** is already claimed and implemented in draft #29: guidance in `crates/konnect/assets` (skills and agents). Its dependencies (1, 2, 2b) are merged. Review these two drafts before claiming further work unless the owner explicitly approves another independent PR.
+1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
+2. **PR 5** is claimed and implemented in draft #29, rebased on PR 4; its skills now name PR 4's render options: guidance in `crates/konnect/assets` (skills and agents). Its dependencies (1, 2, 2b) are merged. Review this draft before claiming further work unless the owner explicitly approves another independent PR.
 3. **PR 6** (mirror after placement, DNP and BOM flags, title block), **PR 8** (placement objective on PR 7's layer), **PR 10** (library correctness).
 4. Then 9b, 12, 13, 14, Q3, 11 and 15.
 
@@ -103,8 +103,8 @@ The claim commit landed before code changes and the draft was opened against `ma
 
 ## PR 5, shipped creation guidance (draft, #29)
 
-The claim commit and draft preceded implementation. This branch starts from
-`main`, independently of PR 4; no runtime tools, schemas or API response shapes
+The claim commit and draft preceded implementation. This branch is rebased on
+`main` after PR 4 merged; the schematic and PCB skills name its `region` crop and board `side`/`zoom`; no runtime tools, schemas or API response shapes
 change, so `API_MIGRATIONS.md` and `tool-directory.md` need no new entries here.
 
 - Schematic guidance loads library/hierarchy/bus tools, distinguishes placed IC
