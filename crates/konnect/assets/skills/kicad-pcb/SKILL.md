@@ -595,3 +595,19 @@ refuse. Use `modify_trace` for partial in-place edits and `query_vias` /
 `delete_via` for observed via identities. A successful edit still needs the
 relevant clearance/connectivity checks; an uncertain result needs live-board
 inspection before retrying.
+
+### Saved custom rules and routing
+
+Use `create_custom_drc_rule`, `edit_custom_drc_rule` and `delete_custom_drc_rule`
+to preview saved custom-rule changes before applying the returned revision.
+Close the board and its root schematic before writing rules. General KiCad rule
+statements are compiled on scratch copies; a successful edit does not establish
+that the board passes DRC.
+
+Custom-rule DSN export supports unconditional numeric clearance and track-width
+minima. Other custom-rule forms return a blocker. Re-export after any project,
+rule or live netclass change. Keep exactly one PCB open for export/import.
+`plan_specctra_ses_import` does not run DRC. Application verifies the committed
+copper against private copies of the captured settings; inspect the result and
+its source/coverage. If restoration is uncertain, inspect the live board before
+retrying. No save, refill or schematic-parity check is implicit.

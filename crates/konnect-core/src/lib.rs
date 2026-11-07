@@ -1,4 +1,5 @@
 pub mod config_resolution;
+pub(crate) mod custom_rules;
 pub mod design_hash;
 pub(crate) mod freerouting_mcp;
 pub(crate) mod freerouting_setup;
@@ -10,6 +11,7 @@ pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod outcome;
 pub mod router;
+pub(crate) mod routing_context;
 pub(crate) mod runtime_info;
 pub mod simulation;
 pub(crate) mod specctra;

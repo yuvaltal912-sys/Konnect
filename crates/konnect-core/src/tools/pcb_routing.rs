@@ -21,8 +21,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use super::cli;
-
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {
         ipc!($ctx, $args, |$c, _| $body)
@@ -130,7 +128,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "plan_specctra_ses_import",
-            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
+            "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Binds saved project/rule files and live netclasses. Requires exactly one PCB open. Returns every track, arc and via; does not run DRC, mutate or save the board.",
             json!({
                 "type": "object",
                 "properties": {
@@ -145,7 +143,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, verifies routing identities/counts, then runs DRC on a private copy with captured project/rules after the live commit. A non-clean or incomplete custom-rule check triggers compensating deletion. Unproven restoration is uncertain; inspect before retrying. No save or zone refill is requested.",
             json!({
                 "type": "object",
                 "properties": {
@@ -522,6 +520,7 @@ async fn handle_plan_specctra_ses_import(
         .with_context(|| format!("resolve board {}", board.display()))?;
     let board_for_ipc = board.clone();
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        crate::routing_context::require_single_board(client)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
@@ -529,6 +528,12 @@ async fn handle_plan_specctra_ses_import(
             &manifest_source,
             &ses_source,
         )?;
+        let snapshot=crate::routing_context::Snapshot::read(&board_for_ipc)?;
+        if plan.routing_context.is_some() {
+            let effective=client.get_effective_routing_rules_in(document.clone())?;
+            snapshot.verify_live(plan.routing_context.as_ref(),&effective)?;
+        } else { snapshot.verify_saved(None)?; }
+        snapshot.ensure_unchanged(&board_for_ipc)?;
         let after = client.save_document_to_string_in(document)?;
         if before != after {
             anyhow::bail!("KiCad board changed while the SES import was planned; retry from a stable editor revision");
@@ -553,7 +558,7 @@ async fn handle_plan_specctra_ses_import(
             "tracks": plan.tracks,
             "arcs": plan.arcs,
             "vias": plan.vias,
-            "mutated": false
+            "routing_context":plan.routing_context,"drc":"not_run_by_plan","mutated": false
         }))),
         Err(failure) => {
             let reason = failure.message().to_string();
@@ -577,9 +582,13 @@ struct ApplyEvidence {
     created_count: usize,
     preserved_locked_track_count: usize,
     preserved_locked_via_count: usize,
+    drc_complete: bool,
+    project_source: &'static str,
+    custom_rules_checked: bool,
     drc_violations: usize,
     unconnected_items: usize,
-    schematic_parity_violations: usize,
+    drc_ignored_check_keys: serde_json::Value,
+    drc_included_severities: serde_json::Value,
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -666,19 +675,10 @@ async fn handle_apply_specctra_ses(
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
 
+    let mutation_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attempted_for_ipc = mutation_attempted.clone();
     let result = with_board_ipc_classified(ctx, &board, move |client, document| {
-        let open_boards = client.get_open_board_paths()?;
-        if open_boards.len() != 1 {
-            anyhow::bail!(
-                "atomic SES import requires exactly one PCB open in KiCad, got {} ({})",
-                open_boards.len(),
-                open_boards
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+        crate::routing_context::require_single_board(client)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
             &board_for_ipc,
@@ -686,6 +686,16 @@ async fn handle_apply_specctra_ses(
             &manifest_source,
             &ses_source,
         )?;
+
+        let snapshot=crate::routing_context::Snapshot::read(&board_for_ipc)?;
+        if plan.routing_context.is_some() {
+            let effective=client.get_effective_routing_rules_in(document.clone())?;
+            snapshot.verify_live(plan.routing_context.as_ref(),&effective)?;
+        } else { snapshot.verify_saved(None)?; }
+        if let Some(rules)=&snapshot.rules {
+            runtime.block_on(crate::tools::verification::drc_rule_writer::validate(&cli_path,rules))?;
+        }
+        snapshot.ensure_unchanged(&board_for_ipc)?;
 
         use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
         let existing_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
@@ -704,6 +714,7 @@ async fn handle_apply_specctra_ses(
                 existing_vias.len()
             );
         }
+        let original_ids=created_route_item_ids(&existing_tracks.iter().chain(existing_arcs.iter()).chain(existing_vias.iter()).cloned().collect::<Vec<_>>())?.into_iter().collect::<HashSet<_>>();
         let net_codes = client
             .get_nets_in(document.clone())?
             .into_iter()
@@ -763,7 +774,13 @@ async fn handle_apply_specctra_ses(
         if stable != before {
             anyhow::bail!("KiCad board changed while route items were prepared; retry from a stable editor revision");
         }
+        snapshot.ensure_unchanged(&board_for_ipc)?;
+        if plan.routing_context.is_some() {
+            let effective=client.get_effective_routing_rules_in(document.clone())?;
+            snapshot.verify_live(plan.routing_context.as_ref(),&effective)?;
+        }
         let expected_count = items.len();
+        attempted_for_ipc.store(true,std::sync::atomic::Ordering::SeqCst);
         let created_ids = client.run_commit("Import Freerouting SES", |client| {
             let created = client.create_items_in_returning(document.clone(), items)?;
             if created.len() != expected_count {
@@ -773,7 +790,9 @@ async fn handle_apply_specctra_ses(
                     expected_count
                 );
             }
-            created_route_item_ids(&created)
+            let ids=created_route_item_ids(&created)?;
+            if ids.iter().any(|id|original_ids.contains(id)){anyhow::bail!("created route receipt reused an original copper identity");}
+            Ok(ids)
         })?;
 
         // KiCad 10 publishes neither GetItems nor SaveDocumentToString changes
@@ -798,12 +817,29 @@ async fn handle_apply_specctra_ses(
                     read_tracks.len(), read_arcs.len(), read_vias.len()
                 );
             }
+            let observed_ids=created_route_item_ids(&read_tracks.iter().chain(read_arcs.iter()).chain(read_vias.iter()).cloned().collect::<Vec<_>>())?.into_iter().collect::<HashSet<_>>();
+            let expected_ids=original_ids.iter().chain(created_ids.iter()).cloned().collect::<HashSet<_>>();
+            if observed_ids!=expected_ids {anyhow::bail!("post-commit routing identity inventory differs from receipts");}
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             konnect_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
-            let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
+            let drc = runtime.block_on(crate::routing_context::candidate_drc(&cli_path, &candidate_source, &snapshot))?;
+            snapshot.ensure_unchanged(&board_for_ipc)?;
+            if plan.routing_context.is_some() {
+                let effective=client.get_effective_routing_rules_in(document.clone())?;
+                snapshot.verify_live(plan.routing_context.as_ref(),&effective)?;
+            }
+            if client.save_document_to_string_in(document.clone())? != candidate_source {
+                anyhow::bail!("live board changed during candidate DRC");
+            }
+            let complete = true;
+            if snapshot.rules.is_some() && (!complete || drc.violations != 0 || drc.unconnected_items != 0) {
+                anyhow::bail!("custom-rule candidate DRC is incomplete or non-clean: {} violations; inspect the source board before rerouting",drc.violations);
+            }
             Ok(ApplyEvidence {
+                drc_complete:complete,
+                project_source:if snapshot.project.is_some(){"captured_saved_project"}else{"synthetic_default_project"},
+                custom_rules_checked:snapshot.rules.is_some(),
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
                 track_count: plan.tracks.len(),
@@ -812,9 +848,10 @@ async fn handle_apply_specctra_ses(
                 created_count: created_ids.len(),
                 preserved_locked_track_count: plan.locked_track_count,
                 preserved_locked_via_count: plan.locked_via_count,
-                drc_violations: drc.violations.len(),
-                unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
-                schematic_parity_violations: parity_count,
+                drc_violations: drc.violations,
+                unconnected_items: drc.unconnected_items,
+                drc_ignored_check_keys:drc.ignored_check_keys,
+                drc_included_severities:drc.included_severities,
             })
         })();
         match operation {
@@ -834,6 +871,7 @@ async fn handle_apply_specctra_ses(
                         "SES import failed ({error}); compensating deletion completed but the live board did not return to its exact pre-import serialization"
                     );
                 }
+                attempted_for_ipc.store(false,std::sync::atomic::Ordering::SeqCst);
                 if candidate_for_ipc.exists() {
                     std::fs::remove_file(&candidate_for_ipc).with_context(|| {
                         format!(
@@ -858,34 +896,47 @@ async fn handle_apply_specctra_ses(
 
     match result {
         Ok(evidence) => Ok(CallToolResult::json(&json!({
-            "success": true,
-            "method": "strict_atomic_kicad_ipc_import",
-            "board": board,
-            "candidate_output_path": candidate,
-            "source_overwritten": false,
-            "undo_description": "Import Freerouting SES",
-            "source_sha256": evidence.source_sha256,
-            "session_id": evidence.session_id,
-            "track_count": evidence.track_count,
-            "arc_count": evidence.arc_count,
-            "via_count": evidence.via_count,
-            "created_count": evidence.created_count,
-            "preserved_locked_routing": {
-                "tracks": evidence.preserved_locked_track_count,
-                "vias": evidence.preserved_locked_via_count
-            },
-            "ipc_readback": "exact_count_match",
-            "drc": {
-                "clean": evidence.drc_violations == 0
-                    && evidence.unconnected_items == 0
-                    && evidence.schematic_parity_violations == 0,
-                "violations": evidence.drc_violations,
-                "unconnected_items": evidence.unconnected_items,
-                "schematic_parity_violations": evidence.schematic_parity_violations
-            }
-        }))),
+                    "success": true,
+                    "method": "strict_atomic_kicad_ipc_import",
+                    "board": board,
+                    "candidate_output_path": candidate,
+                    "source_overwritten": false,
+                    "undo_description": "Import Freerouting SES",
+                    "source_sha256": evidence.source_sha256,
+                    "session_id": evidence.session_id,
+                    "track_count": evidence.track_count,
+                    "arc_count": evidence.arc_count,
+                    "via_count": evidence.via_count,
+                    "created_count": evidence.created_count,
+                    "preserved_locked_routing": {
+                        "tracks": evidence.preserved_locked_track_count,
+                        "vias": evidence.preserved_locked_via_count
+                    },
+                    "ipc_readback": "exact_identity_and_count_match",
+                    "drc": {
+                        "source":"private_copy_of_live_candidate",
+                        "project_source":evidence.project_source,
+                        "custom_rules_checked":evidence.custom_rules_checked,
+                        "external_libraries":"not_copied",
+                        "schematic_parity":"not_requested",
+                        "zones_refilled":false,
+                        "categories_complete":evidence.drc_complete,
+                        "clean": evidence.drc_complete && evidence.drc_violations == 0
+                            && evidence.unconnected_items == 0
+        ,
+                        "violations": evidence.drc_violations,
+                        "unconnected_items": evidence.unconnected_items,
+                        "schematic_parity_violations":null,
+                        "scope":"configured_pcb_rules_and_unconnected_items",
+                        "ignored_check_keys":evidence.drc_ignored_check_keys,
+                        "included_severities":evidence.drc_included_severities
+                    }
+                }))),
         Err(failure) => {
             let reason = failure.message().to_string();
+            if mutation_attempted.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(CallToolResult::error_kind(ToolErrorKind::MutationOutcomeUncertain{operation:"apply_specctra_ses".into(),path:board.display().to_string(),reason:reason.clone()},format!("SES import may have changed the live board and restoration was not proven: {reason}. Inspect the live board before retrying.")));
+            }
             Ok(CallToolResult::error_kind(
                 ToolErrorKind::HandlerError {
                     reason: reason.clone(),
@@ -2102,7 +2153,9 @@ mod specctra_live_undo_test {
         let rules = client
             .get_effective_routing_rules_in(document.clone())
             .expect("capture routing rules");
-        let export = crate::specctra::export_dsn(&board, &before, &rules)
+        let snapshot =
+            crate::routing_context::Snapshot::read(&board).expect("capture routing context");
+        let export = crate::specctra::export_dsn_with_context(&board, &before, &rules, &snapshot)
             .expect("export locked-routing fixture");
 
         let temp = tempfile::tempdir().expect("create output directory");
@@ -3255,3 +3308,7 @@ mod zone_net_format_tests {
         assert!(zone.contains("(connect_pads no (clearance"), "{zone}");
     }
 }
+
+#[cfg(test)]
+#[path = "specctra_rule_tests.rs"]
+mod custom_rule_tests;

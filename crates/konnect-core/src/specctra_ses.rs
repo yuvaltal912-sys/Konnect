@@ -15,6 +15,8 @@ const UM_PER_MM: f64 = 1_000.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct SesImportPlan {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_context: Option<crate::routing_context::RoutingContext>,
     pub board_path: String,
     pub source_sha256: String,
     pub session_id: String,
@@ -62,6 +64,8 @@ pub(crate) struct SesVia {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    #[serde(default)]
+    routing_context: Option<crate::routing_context::RoutingContext>,
     schema_version: u32,
     board_path: String,
     source_sha256: String,
@@ -152,7 +156,7 @@ pub(crate) fn parse_import_plan(
 ) -> Result<SesImportPlan> {
     let manifest: Manifest =
         serde_json::from_str(manifest_source).context("parse Specctra reverse manifest")?;
-    validate_manifest(board_path, board_source, &manifest)?;
+    let snapshot = validate_manifest(board_path, board_source, &manifest)?;
 
     let root = parse_sexp(ses_source).context("parse Specctra SES")?;
     require_head(&root, "session")?;
@@ -201,11 +205,24 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
+    snapshot.ensure_unchanged(board_path)?;
+    if let Some(rules) = &snapshot.rules {
+        let minimum = crate::custom_rules::routing_bounds(rules)?.width_mm;
+        if tracks
+            .iter()
+            .map(|t| t.width_mm)
+            .chain(arcs.iter().map(|t| t.width_mm))
+            .any(|width| width < minimum)
+        {
+            bail!("SES width is below the exported custom-rule minimum");
+        }
+    }
     if tracks.is_empty() && arcs.is_empty() && vias.is_empty() {
         bail!("SES contains no route primitives");
     }
 
     Ok(SesImportPlan {
+        routing_context: manifest.routing_context,
         board_path: manifest.board_path,
         source_sha256: manifest.source_sha256,
         session_id,
@@ -217,7 +234,11 @@ pub(crate) fn parse_import_plan(
     })
 }
 
-fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest) -> Result<()> {
+fn validate_manifest(
+    board_path: &Path,
+    board_source: &str,
+    manifest: &Manifest,
+) -> Result<crate::routing_context::Snapshot> {
     if manifest.schema_version != 1 {
         bail!(
             "unsupported Specctra manifest schema {}",
@@ -233,7 +254,6 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     }
     if manifest.supported_profile.copper_layers != 2
         || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
     {
@@ -266,6 +286,11 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             requested.display()
         );
     }
+    let context = crate::routing_context::Snapshot::read(&requested)?;
+    context.verify_saved(manifest.routing_context.as_ref())?;
+    if manifest.supported_profile.custom_rules != context.rules.is_some() {
+        bail!("manifest custom-rule profile disagrees with the saved rules");
+    }
     let actual_hash = sha256_hex(board_source.as_bytes());
     if actual_hash != manifest.source_sha256 {
         bail!(
@@ -274,7 +299,8 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             actual_hash
         );
     }
-    validate_manifest_relations(manifest)
+    validate_manifest_relations(manifest)?;
+    Ok(context)
 }
 
 fn locked_routing_counts(board_source: &str) -> Result<(usize, usize)> {
@@ -920,6 +946,54 @@ mod tests {
         (dir, board, source, export.manifest)
     }
 
+    #[test]
+    fn custom_minima_export_round_trip_binds_saved_files_and_enforces_width() {
+        let (_dir, board, source, _) = fixture();
+        std::fs::write(board.with_extension("kicad_pro"), "{}\n").unwrap();
+        let custom="(version 1)(rule \"Minimums\" (constraint clearance (min 0.200001mm)) (constraint track_width (min 0.300001mm)))";
+        std::fs::write(board.with_extension("kicad_dru"), custom).unwrap();
+        let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
+        let export =
+            crate::specctra::export_dsn_with_context(&board, &source, &rules(), &snapshot).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(body["supported_profile"]["custom_rules"], true);
+        assert!(body["routing_context"]["project_sha256"].is_string());
+        assert!(parse_import_plan(&board, &source, &export.manifest, sample_ses()).is_err());
+        let session = sample_ses().replace("F.Cu 2500", "F.Cu 3010");
+        let plan = parse_import_plan(&board, &source, &export.manifest, &session).unwrap();
+        assert_eq!(plan.tracks[0].width_mm, 0.301);
+        assert!(plan.routing_context.is_some());
+        let native = crate::specctra::adopt_native_dsn(export.clone(), export.dsn.clone()).unwrap();
+        let native_body: serde_json::Value = serde_json::from_str(&native.manifest).unwrap();
+        assert_eq!(native_body["routing_context"], body["routing_context"]);
+        std::fs::write(board.with_extension("kicad_pro"), "{\"changed\":true}").unwrap();
+        assert!(parse_import_plan(&board, &source, &export.manifest, &session).is_err());
+        std::fs::write(board.with_extension("kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            board.with_extension("kicad_dru"),
+            custom.replace("0.300001", "0.400001"),
+        )
+        .unwrap();
+        assert!(parse_import_plan(&board, &source, &export.manifest, &session).is_err());
+        std::fs::remove_file(board.with_extension("kicad_dru")).unwrap();
+        assert!(parse_import_plan(&board, &source, &export.manifest, &session).is_err());
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+    #[test]
+    fn legacy_or_forged_manifest_cannot_hide_a_rule_file() {
+        let (_dir, board, source, legacy) = fixture();
+        std::fs::write(board.with_extension("kicad_dru"), "(version 1)").unwrap();
+        assert!(parse_import_plan(&board, &source, &legacy, sample_ses()).is_err());
+        let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
+        let export =
+            crate::specctra::export_dsn_with_context(&board, &source, &rules(), &snapshot).unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        body["supported_profile"]["custom_rules"] = serde_json::json!(false);
+        assert!(parse_import_plan(&board, &source, &body.to_string(), sample_ses()).is_err());
+        body["supported_profile"]["custom_rules"] = serde_json::json!(true);
+        body.as_object_mut().unwrap().remove("routing_context");
+        assert!(parse_import_plan(&board, &source, &body.to_string(), sample_ses()).is_err());
+    }
     #[test]
     fn valid_session_lowers_to_kicad_coordinates() {
         let (_dir, board, source, manifest) = fixture();

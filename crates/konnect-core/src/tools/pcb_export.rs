@@ -254,7 +254,7 @@ pub fn tools() -> Vec<ToolDef> {
              editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. The supported \
+             is used. Saved project/rule files and live class preferences are revision-bound. Exactly one PCB must be open. Unconditional numeric clearance/track-width minima use a conservative Rust projection; other custom rule forms refuse export. Native require mode refuses custom rules. The supported \
              profile is narrow: two copper layers, front-side SMD or through-hole footprints, \
              circle, rectangle, rounded-rectangle and oval pads (a rounded rectangle is written \
              as its bounding rectangle, never smaller than the copper), and one closed outline \
@@ -262,7 +262,7 @@ pub fn tools() -> Vec<ToolDef> {
              chords within 5 um. Copper pours become fixed planes of their net and rule areas \
              that forbid tracks or vias become keepouts, taken from the zone outline (not the \
              fill), so check DRC after a refill. Locked straight tracks and vias are fixed wiring; \
-             unlocked routing, routed arcs, other pad shapes, curves, custom DRC rules and \
+             unlocked routing, routed arcs, other pad shapes, curves, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
             json!({
@@ -762,34 +762,42 @@ async fn handle_export_specctra_dsn(
     let board_path = board_path
         .canonicalize()
         .with_context(|| format!("resolve board {}", board_path.display()))?;
-    let custom_rules_path = board_path.with_extension("kicad_dru");
-    if custom_rules_path.is_file() {
-        return Ok(CallToolResult::error_kind(
-            ToolErrorKind::HandlerError {
-                reason: format!(
-                    "custom DRC rules are outside the first supported routing profile: {}",
-                    custom_rules_path.display()
-                ),
-            },
-            format!(
-                "Specctra export refused: custom DRC rules are outside the first supported routing profile ({})",
-                custom_rules_path.display()
-            ),
-        ));
+    let snapshot = match crate::routing_context::Snapshot::read(&board_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(CallToolResult::error(format!(
+                "custom DRC rules/project could not be captured: {e:#}"
+            )))
+        }
+    };
+    if let Some(source) = &snapshot.rules {
+        if let Err(e) = crate::custom_rules::routing_bounds(source) {
+            return Ok(CallToolResult::error(format!(
+                "custom DRC rules cannot be translated to DSN: {e:#}"
+            )));
+        }
+        if native_bridge_mode == "require" {
+            return Ok(CallToolResult::error("native Specctra export cannot prove the custom-rule projection; use prefer or disable"));
+        }
     }
+    let snapshot_for_ipc = snapshot.clone();
     let board_for_ipc = board_path.clone();
     let addr = ctx.config.ipc_address.clone();
     let export = with_ipc(addr, move |client| {
         let document = client.find_open_board(&board_for_ipc)?;
+        crate::routing_context::require_single_board(client)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let rules = client.get_effective_routing_rules_in(document.clone())?;
-        let after = client.save_document_to_string_in(document)?;
+        let after = client.save_document_to_string_in(document.clone())?;
         if before != after {
             anyhow::bail!(
                 "KiCad board changed while routing rules were captured; retry from a stable editor revision"
             );
         }
-        let export = crate::specctra::export_dsn(&board_for_ipc, &before, &rules)?;
+        let rules_after=client.get_effective_routing_rules_in(document)?;
+        if rules!=rules_after {anyhow::bail!("live routing classes changed during export");}
+        snapshot_for_ipc.ensure_unchanged(&board_for_ipc)?;
+        let export = crate::specctra::export_dsn_with_context(&board_for_ipc, &before, &rules, &snapshot_for_ipc)?;
         Ok((export, before))
     })
     .await?;
@@ -810,7 +818,7 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let export = if native_bridge_mode == "disable" {
+    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() {
         baseline
     } else {
         let attempt = crate::native_specctra_bridge::try_export(&board_path).await;
@@ -871,6 +879,7 @@ async fn handle_export_specctra_dsn(
         }
     };
 
+    snapshot.ensure_unchanged(&board_path)?;
     let output_for_write = output_path.clone();
     let manifest_for_write = manifest_output_path.clone();
     let dsn_for_write = export.dsn.clone();
@@ -891,6 +900,8 @@ async fn handle_export_specctra_dsn(
             "success": true,
             "method": method,
             "native_bridge_mode": native_bridge_mode,
+            "custom_rule_projection":if snapshot.rules.is_some(){"conservative_global_minima"}else{"none"},
+            "routing_context":serde_json::from_str::<serde_json::Value>(&export.manifest)?["routing_context"].clone(),
             "native_bridge_pid": bridge_pid,
             "native_bridge_protocol_version": bridge_protocol_version,
             "native_bridge_diagnostics": bridge_diagnostics,
@@ -904,10 +915,10 @@ async fn handle_export_specctra_dsn(
             "routing_class_count": export.class_count,
             "capabilities": {
                 "dsn_export_available": true,
-                "ses_import_available": false,
+                "ses_import_available": true,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+                "supported_profile": "two_layer_front_side_locked_routing_zones_and_conservative_custom_minima"
             }
         })
         .to_string(),

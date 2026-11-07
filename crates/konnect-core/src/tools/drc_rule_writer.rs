@@ -1,14 +1,26 @@
-//! Narrow, validated creation of unconditional custom rules.
+//! Named custom rules: native compilation, revision-bound edits and saved readback.
 use super::*;
 use anyhow::{ensure, Context, Result};
 use konnect_sexp::writer::{read_consistent, write_atomic_if_unchanged, write_new_atomic};
 use sha2::{Digest, Sha256};
 
-const PROBE: &str = "__konnect_rule_validation_probe__";
+const PROBE: &str = crate::custom_rules::PROBE;
 const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
 
-pub(super) fn tool() -> ToolDef {
-    tool!("create_custom_drc_rule", "Preview or create one unconditional clearance or track-width minimum in the sibling .kicad_dru. KiCad must demonstrate that the candidate rule file loads on an isolated fixture, then DRC runs on a scratch copy of the saved target board and project. Apply requires the preview revision. A live-board clearance pass is not implied.", json!({"type":"object","properties":{"board":{"type":"string"},"name":{"type":"string"},"constraint":{"type":"string","enum":["clearance","track_width"]},"minimum_mm":{"type":"number"},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","name","constraint","minimum_mm"],"additionalProperties":false}), |args,ctx| async move {handle_create_custom_drc_rule(args,ctx).await})
+pub(super) fn tools() -> Vec<ToolDef> {
+    let mut schema = json!({"type":"object","properties":{"board":{"type":"string"},"name":{"type":"string"},"constraint":{"type":"string","enum":["clearance","track_width"]},"minimum_mm":{"type":"number"},"rule":{"type":"string","description":"One complete KiCad (rule ...) statement, with the same name. Conditions, assertions and numeric expressions are compiled by KiCad."},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","name"],"additionalProperties":false});
+    schema["oneOf"] = json!([{"required":["rule"],"not":{"anyOf":[{"required":["constraint"]},{"required":["minimum_mm"]}]}},{"required":["constraint","minimum_mm"],"not":{"required":["rule"]}}]);
+    let create=tool!("create_custom_drc_rule", "Preview or create a named custom DRC rule. Supply one complete KiCad rule or the clearance/track-width minimum shorthand. KiCad compiles the complete candidate and every expression on a private fixture, then DRC runs on a scratch copy of the saved board and project. Apply requires its exact preview revision.", schema, |args,ctx|async move{handle_create_custom_drc_rule(args,ctx).await});
+    let edit_schema = json!({"type":"object","properties":{"board":{"type":"string"},"name":{"type":"string"},"rule":{"type":"string"},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","name","rule"],"additionalProperties":false});
+    let mut delete_schema = edit_schema.clone();
+    delete_schema["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rule");
+    delete_schema["required"] = json!(["board", "name"]);
+    vec![create,
+    tool!("edit_custom_drc_rule","Preview or replace exactly one named custom DRC rule in place, preserving other rules, comments and order. Requires native scratch validation and the preview revision before writing.",edit_schema,|args,ctx|async move{handle_rule_change(args,ctx,crate::custom_rules::Operation::Edit).await}),
+    tool!("delete_custom_drc_rule","Preview or delete exactly one named custom DRC rule, preserving other rules and comments. Validates the remaining rules and runs scratch DRC; apply requires the preview revision.",delete_schema,|args,ctx|async move{handle_rule_change(args,ctx,crate::custom_rules::Operation::Delete).await})]
 }
 
 fn candidate(source: &str, name: &str, constraint: &str, minimum: f64) -> Result<String> {
@@ -33,76 +45,17 @@ fn candidate(source: &str, name: &str, constraint: &str, minimum: f64) -> Result
         (minimum * 1_000_000.0 - (minimum * 1_000_000.0).round()).abs() < 0.000001,
         "minimum must be an exact number of nanometers"
     );
-    let mut lines = source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    ensure!(
-        lines.next() == Some("(version 1)"),
-        "rule file must begin with version 1"
-    );
-    let mut seen = std::collections::BTreeSet::new();
-    for line in lines {
-        let node = konnect_sexp::parse_sexp(line).context("unsupported existing rule syntax")?;
-        let existing_name = node
-            .get(1)
-            .and_then(|n| n.as_str())
-            .context("existing rule has no name")?;
-        ensure!(
-            !existing_name.is_empty()
-                && existing_name.len() <= 80
-                && existing_name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
-            "unsupported existing rule name"
-        );
-        ensure!(
-            seen.insert(existing_name.to_owned()),
-            "duplicate existing rule name"
-        );
-        let clause = node.get(2).context("missing existing constraint")?;
-        let kind = clause
-            .get(1)
-            .and_then(|n| n.as_str())
-            .context("missing existing constraint name")?;
-        ensure!(
-            matches!(kind, "clearance" | "track_width"),
-            "unsupported existing constraint name"
-        );
-        let min = clause.get(2).context("missing existing minimum")?;
-        let raw = min
-            .get(1)
-            .and_then(|n| n.as_str())
-            .and_then(|n| n.strip_suffix("mm"))
-            .context("existing minimum must use millimeters")?;
-        let value: f64 = raw.parse().context("invalid existing minimum")?;
-        ensure!(
-            value.is_finite()
-                && (0.000001..=100.0).contains(&value)
-                && (value * 1_000_000.0 - (value * 1_000_000.0).round()).abs() < 0.000001,
-            "invalid existing minimum value"
-        );
-        ensure!(
-            line == format!(
-                "(rule \"{}\" (constraint {} (min {:.9}mm)))",
-                existing_name, kind, value
-            ),
-            "existing rule has unsupported formatting or extra content"
-        );
-    }
-    ensure!(
-        !source.contains(PROBE),
-        "reserved validation probe name already exists"
-    );
-    ensure!(
-        !source.contains(&format!("\"{name}\"")),
-        "name already appears in the rule file"
-    );
-    Ok(format!(
-        "{}\n(rule \"{}\" (constraint {} (min {:.9}mm)))\n",
-        source, name, constraint, minimum
-    ))
+    crate::custom_rules::change(
+        source,
+        name,
+        Some(&format!(
+            "(rule \"{}\" (constraint {} (min {:.9}mm)))",
+            name, constraint, minimum
+        )),
+        crate::custom_rules::Operation::Create,
+    )
 }
+
 fn revision(board: &Path, original: Option<&str>, result: &str) -> String {
     let mut h = Sha256::new();
     for part in [
@@ -152,12 +105,12 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 fn read_project(path: &Path) -> Result<Option<String>> {
     let source = read_optional(path)?;
     if let Some(source) = &source {
-        let value: Value = serde_json::from_str(source).context("saved project is not JSON")?;
-        ensure!(value.is_object(), "saved project root must be an object");
+        super::project_json_guard::parse(source)
+            .context("saved project is not unambiguous JSON")?;
     }
     Ok(source)
 }
-async fn target_drc(
+pub(crate) async fn target_drc(
     cli: &str,
     board_source: &str,
     project: Option<&str>,
@@ -190,10 +143,17 @@ async fn target_drc_with_timeout(
     .await?;
     tokio::fs::write(temp.path().join("target.kicad_dru"), rules).await?;
     let mut cmd = tokio::process::Command::new(crate::tools::cli::resolve_cli_executable(cli));
-    cmd.args(["pcb", "drc", "--format", "json", "--output"])
-        .arg(&output)
-        .arg(&board)
-        .kill_on_drop(true);
+    cmd.args([
+        "pcb",
+        "drc",
+        "--severity-all",
+        "--format",
+        "json",
+        "--output",
+    ])
+    .arg(&output)
+    .arg(&board)
+    .kill_on_drop(true);
     let run = tokio::time::timeout(timeout, cmd.output())
         .await
         .context("target DRC timed out")??;
@@ -227,7 +187,7 @@ fn target_summary(report: &Value, has_project: bool) -> Result<Value> {
         }
     }
     Ok(
-        json!({"status":"checked","source":"scratch_copy_of_saved_board","project_source":if has_project{"copied_saved_project"}else{"synthetic_default_project"},"violations":violations.len(),"error_violations":errors,"warning_violations":warnings,"other_severity_violations":other,"severity_coverage":if other==0{"complete"}else{"incomplete"},"unconnected_items":unconnected.len(),"ignored_checks_count":report["ignored_checks"].as_array().map(|v|v.len()),"ignored_check_keys":report["ignored_checks"].as_array().map(|items|items.iter().map(|item|item["key"].as_str()).collect::<Vec<_>>()),"schematic_parity":"not_requested","zones_refilled":false,"external_libraries":"not_copied"}),
+        json!({"status":"checked","source":"scratch_copy_of_saved_board","project_source":if has_project{"copied_saved_project"}else{"synthetic_default_project"},"violations":violations.len(),"error_violations":errors,"warning_violations":warnings,"other_severity_violations":other,"severity_coverage":if other==0{"complete"}else{"incomplete"},"unconnected_items":unconnected.len(),"included_severities":report["included_severities"].clone(),"ignored_checks_count":report["ignored_checks"].as_array().map(|v|v.len()),"ignored_check_keys":report["ignored_checks"].as_array().map(|items|items.iter().map(|item|item["key"].as_str()).collect::<Vec<_>>()),"schematic_parity":"not_requested","zones_refilled":false,"external_libraries":"not_copied"}),
     )
 }
 fn witness(report: &serde_json::Value) -> bool {
@@ -240,7 +200,7 @@ fn witness(report: &serde_json::Value) -> bool {
         })
     })
 }
-async fn validate(cli: &str, content: &str) -> Result<()> {
+pub(crate) async fn validate(cli: &str, content: &str) -> Result<()> {
     validate_with_timeout(cli, content, std::time::Duration::from_secs(60)).await
 }
 async fn validate_with_timeout(
@@ -253,13 +213,23 @@ async fn validate_with_timeout(
     let output = temp.path().join("report.json");
     tokio::fs::write(&board, FIXTURE).await?;
     tokio::fs::write(temp.path().join("probe.kicad_pro"), "{}\n").await?;
-    let rules = format!("{content}\n(rule \"{PROBE}\" (constraint clearance (min 50mm)))\n");
+    let condition = crate::custom_rules::quote(&crate::custom_rules::probe_condition(content)?);
+    let rules = format!(
+        "{content}\n(rule \"{PROBE}\" (condition {condition}) (constraint clearance (min 50mm)))\n"
+    );
     tokio::fs::write(temp.path().join("probe.kicad_dru"), rules).await?;
     let mut cmd = tokio::process::Command::new(crate::tools::cli::resolve_cli_executable(cli));
-    cmd.args(["pcb", "drc", "--format", "json", "--output"])
-        .arg(&output)
-        .arg(&board)
-        .kill_on_drop(true);
+    cmd.args([
+        "pcb",
+        "drc",
+        "--severity-all",
+        "--format",
+        "json",
+        "--output",
+    ])
+    .arg(&output)
+    .arg(&board)
+    .kill_on_drop(true);
     let result = tokio::time::timeout(timeout, cmd.output())
         .await
         .context("KiCad validation timed out")??;
@@ -280,19 +250,23 @@ async fn validate_with_timeout(
     Ok(())
 }
 async fn handle_create_custom_drc_rule(args: &Value, ctx: &ToolContext) -> Result<CallToolResult> {
+    handle_rule_change(args, ctx, crate::custom_rules::Operation::Create).await
+}
+async fn handle_rule_change(
+    args: &Value,
+    ctx: &ToolContext,
+    operation: crate::custom_rules::Operation,
+) -> Result<CallToolResult> {
+    use crate::custom_rules::Operation;
     let board = get_path(args, "board")?;
-    let (name, constraint, minimum) = match (
-        args["name"].as_str(),
-        args["constraint"].as_str(),
-        args["minimum_mm"].as_f64(),
-    ) {
-        (Some(n), Some(c), Some(m)) => (n, c, m),
-        _ => {
-            return Ok(CallToolResult::error(
-                "name, constraint and minimum_mm are required",
-            ))
-        }
+    let name = args["name"].as_str().context("name is required")?;
+    let operation_name = match operation {
+        Operation::Create => "create_custom_drc_rule",
+        Operation::Edit => "edit_custom_drc_rule",
+        Operation::Delete => "delete_custom_drc_rule",
     };
+    let minimum = args["minimum_mm"].as_f64();
+    let constraint = args["constraint"].as_str();
     let dry = match args.get("dry_run") {
         None => true,
         Some(Value::Bool(v)) => *v,
@@ -301,6 +275,9 @@ async fn handle_create_custom_drc_rule(args: &Value, ctx: &ToolContext) -> Resul
     let board = board.canonicalize()?;
     if let Some(refusal) = board_lock_refusal(&board) {
         return Ok(refusal);
+    }
+    if let Some(r) = super::project_json_guard::schematic_lock_refusal(&board) {
+        return Ok(r);
     }
     if let Some(r) =
         crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "custom DRC rule")
@@ -325,15 +302,31 @@ async fn handle_create_custom_drc_rule(args: &Value, ctx: &ToolContext) -> Resul
     let project = read_project(&project_path)?;
     let path = board.with_extension("kicad_dru");
     let original = read_optional(&path)?;
-    let proposed = match candidate(
-        original.as_deref().unwrap_or("(version 1)\n"),
-        name,
-        constraint,
-        minimum,
-    ) {
+    let source = original.as_deref().unwrap_or("(version 1)\n");
+    let proposed = match (|| -> Result<String> {
+        if matches!(operation, Operation::Create) && args.get("rule").is_none() {
+            return candidate(
+                source,
+                name,
+                constraint.context("constraint is required")?,
+                minimum.context("minimum_mm is required")?,
+            );
+        }
+        ensure!(
+            args.get("constraint").is_none() && args.get("minimum_mm").is_none(),
+            "raw rules cannot be combined with minimum shorthand"
+        );
+        let raw = if matches!(operation, Operation::Delete) {
+            None
+        } else {
+            Some(args["rule"].as_str().context("rule must be text")?)
+        };
+        crate::custom_rules::change(source, name, raw, operation)
+    })() {
         Ok(s) => s,
         Err(e) => return Ok(CallToolResult::error(e.to_string())),
     };
+    let changed = proposed != source;
     let plan = target_revision(
         &revision(&board, original.as_deref(), &proposed),
         &board_source,
@@ -374,31 +367,47 @@ async fn handle_create_custom_drc_rule(args: &Value, ctx: &ToolContext) -> Resul
         if let Some(refusal) = board_lock_refusal(&board) {
             return Ok(refusal);
         }
+        if let Some(r) = super::project_json_guard::schematic_lock_refusal(&board) {
+            return Ok(r);
+        }
         if read_consistent(&board)? != board_source || read_project(&project_path)? != project {
             return Ok(CallToolResult::error(
                 "saved board or project changed during validation; run a fresh preview",
             ));
         }
         regular_target(&path)?;
-        let result = match &original {
-            Some(before) => write_atomic_if_unchanged(&path, before, &proposed),
-            None => write_new_atomic(&path, &proposed),
-        };
-        if let Err(error) = result {
-            return Ok(uncertain(
-                &path,
-                format!("write could not be verified: {error}"),
-            ));
-        }
-        if !saved_matches(&path, &proposed) {
-            return Ok(uncertain(
-                &path,
-                "saved rule file differs from the validated candidate".into(),
-            ));
+        if !changed {
+            if read_optional(&path)? != original {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::Conflict {
+                        paths: vec![path.display().to_string()],
+                    },
+                    "saved rule file changed during no-op validation; preview again",
+                ));
+            }
+        } else {
+            let result = match &original {
+                Some(before) => write_atomic_if_unchanged(&path, before, &proposed),
+                None => write_new_atomic(&path, &proposed),
+            };
+            if let Err(error) = result {
+                return Ok(uncertain(
+                    &path,
+                    operation_name,
+                    format!("write could not be verified: {error}"),
+                ));
+            }
+            if !saved_matches(&path, &proposed) {
+                return Ok(uncertain(
+                    &path,
+                    operation_name,
+                    "saved rule file differs from the validated candidate".into(),
+                ));
+            }
         }
     }
     Ok(CallToolResult::json(
-        &json!({"status":if dry {"ready"}else{"applied"},"plan_revision":plan,"rules_file":path.to_string_lossy(),"rules_file_lossy":path.to_str().is_none(),"validation":"scratch_kicad_drc_probe","target_board_drc":target_report,"rule":{"name":name,"constraint":constraint,"minimum_mm":(minimum*1_000_000.0).round()/1_000_000.0}}),
+        &json!({"status":if !changed {"noop"}else if dry {"ready"}else{"applied"},"plan_revision":plan,"rules_file":path.to_string_lossy(),"rules_file_lossy":path.to_str().is_none(),"operation":operation_name,"unrelated_rules_preserved":true,"readback":if dry{"not_written"}else{"saved_bytes_match_candidate"},"validation":"scratch_kicad_drc_probe","target_board_drc":target_report,"rule":{"name":name,"constraint":constraint,"minimum_mm":minimum.map(|m|(m*1_000_000.0).round()/1_000_000.0)}}),
     ))
 }
 
@@ -427,8 +436,8 @@ pub(super) fn board_lock_refusal(board: &Path) -> Option<CallToolResult> {
     board_lock_refusal_with(board, |path| std::fs::symlink_metadata(path))
 }
 
-fn uncertain(path: &Path, reason: String) -> CallToolResult {
-    CallToolResult::error_kind(crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {operation:"create_custom_drc_rule".into(),path:path.display().to_string(),reason:reason.clone()},format!("The rule-file write could not be verified: {reason}. Inspect the saved file before retrying."))
+fn uncertain(path: &Path, operation: &str, reason: String) -> CallToolResult {
+    CallToolResult::error_kind(crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {operation:operation.into(),path:path.display().to_string(),reason:reason.clone()},format!("The rule-file write could not be verified: {reason}. Inspect the saved file before retrying."))
 }
 
 #[cfg(test)]
@@ -453,29 +462,10 @@ mod tests {
         assert!(candidate("(version 1)\n)", "new", "clearance", 0.2).is_err());
         let duplicated="(version 1)\n(rule \"old\" (constraint clearance (min 0.200000000mm)))\n(rule \"old\" (constraint clearance (min 0.200000000mm)))\n";
         assert!(candidate(duplicated, "new", "clearance", 0.2).is_err());
-        let long = format!(
-            "(version 1)\n(rule \"{}\" (constraint clearance (min 0.200000000mm)))",
-            "a".repeat(81)
-        );
-        assert!(candidate(&long, "new", "clearance", 0.2).is_err());
-        for source in [
-            "(version 1)\n(rule \"x\" (constraint clearance (min 0.2mm)))",
-            "(version 1)\n(rule \"x$\" (constraint clearance (min 0.200000000mm)))",
-            "(version 1)\n(rule \"x\" (constraint invalid_type (min 0.200000000mm)))",
-            "(version 1)\n(rule \"x\" (constraint clearance (min 0.000000000mm)))",
-            "(version 1)\n(rule \"__konnect_rule_validation_probe__\" (constraint clearance (min 0.200000000mm)))",
-        ] { assert!(candidate(source,"new","clearance",0.2).is_err()); }
-
+        assert!(candidate("# header\n(version 1)\n(rule \"existing label\" (condition \"A.NetName == 'VCC'\") (constraint clearance (min 0.2mm)))", "new", "clearance", 0.2).is_ok());
         assert!(candidate("(version 1)\n", PROBE, "clearance", 0.2).is_err());
         assert!(candidate(src, "old", "clearance", 0.2).is_err());
         assert!(candidate(src, "new", "unknown", 0.2).is_err());
-        assert!(candidate(
-            "(version 1)\n(rule \"x\" (condition \"bad\") (constraint clearance (min 0.2mm)))",
-            "new",
-            "clearance",
-            0.2
-        )
-        .is_err());
         assert!(candidate("(version 1)\n", "new", "clearance", 0.0000011).is_err());
         for n in [0.0, -1.0, 101.0, f64::NAN] {
             assert!(candidate(src, "new", "clearance", n).is_err());
@@ -863,7 +853,7 @@ mod tests {
         .unwrap();
         assert!(bad.is_error);
         let rules = board.with_extension("kicad_dru");
-        let existing="(version 1)\n(rule \"existing\" (condition \"A.NetName == 'VCC'\") (constraint clearance (min 0.2mm)))\n";
+        let existing="(version 1)\n(rule \"existing\" (condition \"A.NetName == 'VCC'\") (condition \"A.NetName == 'GND'\") (constraint clearance (min 0.2mm)))\n";
         std::fs::write(&rules, existing).unwrap();
         let refused = handle_create_custom_drc_rule(
             &json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2}),
@@ -929,7 +919,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("bad.kicad_pro");
         assert!(read_project(&p).unwrap().is_none());
-        for source in ["not-json", "[]", "null"] {
+        for source in ["not-json", "[]", "null", "{\"board\":{},\"board\":{}}"] {
             std::fs::write(&p, source).unwrap();
             assert!(read_project(&p).is_err());
         }
@@ -1237,6 +1227,56 @@ mod tests {
     }
     #[tokio::test]
     #[ignore = "requires real KiCad CLI"]
+    async fn native_expressions_reject_invalid_assertions_even_when_the_global_probe_would_pass() {
+        let cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli";
+        for rule in [
+            "(rule \"X\" (condition \"A.NetName == 'VCC'\") (constraint clearance (min 0.1mm + 0.1mm)))",
+            "(rule \"X\" (constraint assertion \"A.NetName == 'VCC'\"))",
+        ] {validate(cli,&format!("(version 1)\n{rule}")).await.unwrap();}
+        for rule in [
+            "(rule \"X\" (constraint assertion \"A.NoSuchProperty == 1\"))",
+            "(rule \"X\" (condition \"A.NoSuchProperty == 1\") (constraint clearance (min 0.2mm)))",
+            "(rule \"X\" (constraint clearance (min garbage)))",
+            "(rule \"X\" (layer \"NoSuchLayer\") (constraint clearance (min 0.2mm)))",
+        ] {
+            assert!(
+                validate(cli, &format!("(version 1)\n{rule}"))
+                    .await
+                    .is_err(),
+                "{rule}"
+            );
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires real KiCad CLI"]
+    async fn native_rule_edit_and_delete_round_trip_preserves_other_bytes() {
+        use crate::custom_rules::Operation;
+        let d = tempfile::tempdir().unwrap();
+        let board = d.path().join("board.kicad_pcb");
+        let path = board.with_extension("kicad_dru");
+        std::fs::write(&board, FIXTURE).unwrap();
+        let original = "# preserve header\r\n(version 1)\r\n# preserve unrelated comment\r\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".into(),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        for (operation,rule) in [(Operation::Create,Some("(rule \"general rule\" (condition \"A.NetName == 'VCC'\") (constraint clearance (min 0.1mm + 0.1mm)))")),(Operation::Edit,Some("(rule \"general rule\" (constraint track_width (min 0.3mm)))")),(Operation::Delete,None)] {
+            let mut args=json!({"board":board,"name":"general rule"});if let Some(rule)=rule{args["rule"]=json!(rule);}
+            let before=std::fs::read(&path).unwrap();let preview=handle_rule_change(&args,&ctx,operation).await.unwrap();assert!(!preview.is_error,"{preview:?}");assert_eq!(std::fs::read(&path).unwrap(),before);
+            let crate::mcp::protocol::ToolContent::Text{text}=&preview.content[0] else{panic!()};let body:Value=serde_json::from_str(text).unwrap();args["dry_run"]=json!(false);
+            assert!(handle_rule_change(&args,&ctx,operation).await.unwrap().is_error);
+            args["expected_plan_revision"]=body["plan_revision"].clone();let result=handle_rule_change(&args,&ctx,operation).await.unwrap();assert!(!result.is_error,"{result:?}");
+            let saved=std::fs::read_to_string(&path).unwrap();assert!(saved.starts_with(original));assert_eq!(crate::custom_rules::parse(&saved).unwrap().len(),if matches!(operation,Operation::Delete){0}else{1});
+        }
+        assert_eq!(std::fs::read(&board).unwrap(), FIXTURE);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real KiCad CLI"]
     async fn native_target_drc_uses_the_saved_project_and_requested_board() {
         let cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli";
         let board = std::str::from_utf8(FIXTURE).unwrap();
@@ -1262,3 +1302,7 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "drc_rule_edit_tests.rs"]
+mod edit_tests;

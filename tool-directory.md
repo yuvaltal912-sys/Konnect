@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **247 registered tools** + **7 always-visible meta-tools** = **254 total**
+- **249 registered tools** + **7 always-visible meta-tools** = **256 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -402,7 +402,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 13 tools
+### `verification` · 15 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
@@ -417,7 +417,9 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
-| `create_custom_drc_rule` | Preview or create an unconditional clearance or track-width minimum. Requires a scratch KiCad DRC witness and matching preview revision; reports DRC on a saved-board copy and refuses unsupported existing rules. |
+| `create_custom_drc_rule` | Preview or create a named complete KiCad rule, or use the clearance/track-width minimum shorthand. Native scratch compilation includes conditions/assertions; apply requires the exact preview revision and saved readback. |
+| `edit_custom_drc_rule` | Preview or replace one uniquely named rule in place, preserving unrelated bytes and rule order. Requires native validation and the preview revision. |
+| `delete_custom_drc_rule` | Preview or remove one uniquely named rule, retaining other rules, comments and the version header. Validates the remaining rules and requires the preview revision. |
 | `set_netclass_diff_pair` | Preview or apply differential-pair width, gap and via gap to a saved project netclass with a revision check. |
 | `delete_netclass` | Preview or delete a saved project netclass with no saved pattern or assignment references; does not inspect schematic connectivity. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |

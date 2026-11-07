@@ -141,6 +141,8 @@ type NetClassNames = BTreeMap<String, String>;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing_context: Option<crate::routing_context::RoutingContext>,
     schema_version: u32,
     board_path: String,
     source_sha256: String,
@@ -329,6 +331,22 @@ pub(crate) fn export_dsn(
         net_count: net_pins.len(),
         class_count: class_nets.len(),
     })
+}
+
+/// Production export binds saved sidecars and the original live class values.
+pub(crate) fn export_dsn_with_context(
+    board: &Path,
+    source: &str,
+    rules: &IpcEffectiveRoutingRules,
+    snapshot: &crate::routing_context::Snapshot,
+) -> Result<ExportBundle> {
+    let adjusted = snapshot.project_rules(rules)?;
+    let mut bundle = export_dsn(board, source, &adjusted)?;
+    let mut manifest: Manifest = serde_json::from_str(&bundle.manifest)?;
+    manifest.routing_context = Some(snapshot.seal(rules)?);
+    manifest.supported_profile.custom_rules = snapshot.rules.is_some();
+    bundle.manifest = serde_json::to_string_pretty(&manifest)?;
+    Ok(bundle)
 }
 
 /// Replace Konnect's deterministic DSN with a KiCad-native DSN while keeping
@@ -1984,6 +2002,7 @@ fn build_manifest(
     padstacks.sort_by(|left, right| left.name.cmp(&right.name));
 
     serde_json::to_string_pretty(&Manifest {
+        routing_context: None,
         schema_version: 1,
         board_path: board_path.display().to_string(),
         source_sha256: source_sha256.to_string(),

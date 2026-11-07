@@ -43,11 +43,11 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Integrated from [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31) in the creation alignment PR |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
-| Q3 | One design-intent record per project (rails, currents, interfaces, fab target). Ranks 12, 29 and 38 read from it. It gets its own PR before PR 11; PR 11 may take a per-call currents argument as an interim |
+| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | In progress (branch `feat/creation-design-intent`, Claude); must land before PR 11 |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
-| 13 | DRC rule writer | none | In progress: continuation on `codex/pr13-rules-completion` (custom_rules.rs, drc_rule_writer.rs, verification.rs, specctra.rs, specctra_ses.rs, pcb_export.rs, pcb_routing.rs); initial slice merged as #35 |
+| 13 | DRC rule writer | none | In progress: continuation on `codex/pr13-rules-completion` (custom_rules.rs, routing_context.rs, drc_rule_writer.rs, project_json_guard.rs, verification.rs, specctra.rs, specctra_ses.rs, pcb_export.rs, pcb_routing.rs); initial slice merged as #35; continuation draft [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38) |
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
@@ -432,3 +432,31 @@ project, reporting counts and disclosing missing external libraries, parity and
 zone refill. It never runs DRC directly on the original. Real KiCad scratch tests cover preview,
 apply, an observed target-rule violation and malformed-rule rejection. PR 13
 now also adds three project minima and independent preview/apply tools for differential-pair settings and deletion of netclasses unreferenced in saved project data. Project writes reject duplicate keys and linked files, check editor locks and verify conditional writes. Schematic connectivity and live netclass validation are not inspected. General rule expressions/edit/delete and safe DSN handling remain open. In particular, PR #34's SES import does not yet validate a scratch candidate with the source custom rules, so custom-rule export/import remains blocked. PR #34's routing code is included in this integration; a later PR 13 continuation must still preserve its routing contracts and prove custom-rule import safety before lifting the refusal.
+
+## PR 13 continuation (in progress, draft #38)
+
+The claim-only commit and draft preceded implementation, from main d0880ac.
+Work is isolated in `Konnect-pr13-rules` on `codex/pr13-rules-completion`;
+Q3's separate config/design-intent work is outside these files.
+
+The continuation adds full-statement rule creation, named edit/delete, strict
+whole-file framing and semantic inventory preservation, native compilation of
+conditions and assertions, and project/schematic-lock/revision checks. A trailing
+replacement comment cannot hide another rule, and stale no-op edits refuse.
+
+DSN export now translates the explicit unconditional numeric clearance/width
+minimum subset conservatively, preserving larger live preferences. Other rule
+semantics refuse export. The manifest seals saved project/rule bytes and live
+classes; SES planning/apply recheck them. Legacy manifests with saved sidecars
+require re-export. Native require mode refuses custom files; prefer uses Rust.
+
+SES verification runs DRC only in a private copy with the captured sidecars.
+Custom-rule candidates require complete, clean PCB/unconnected-item evidence, all severities
+and enabled required checks. Failed verification compensates only verified new
+identities; exact restored serialization proves rollback, otherwise the outcome
+is uncertain. No save, refill or schematic-parity check is requested. Coverage,
+ignored checks and source are explicit. The final gate, guard-break controls and
+release probes are recorded on #38 after the implementation commit.
+
+Real KiCad GUI/undo, the owner-deferred Freerouting run, hosted CI and Windows/
+Linux are not established by the mock IPC tests or native scratch CLI tests.
