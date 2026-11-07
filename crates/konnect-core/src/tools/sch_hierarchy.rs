@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::schematic_metadata::tool(),
         tool!(
             "create_schematic",
             "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
