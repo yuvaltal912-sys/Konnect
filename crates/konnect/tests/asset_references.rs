@@ -657,6 +657,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // Placement PR 8 response fields, not callable tool names.
+        "score_incomplete",
+        "routing_metrics",
+        "decoupling_coverage",
         // Creation response fields / scope values verified in response_budget,
         // sch_netlist, board_geometry, drc and Freerouting handlers (PR 5).
         "next_offset",
