@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **247 registered tools** + **7 always-visible meta-tools** = **254 total**
+- **251 registered tools** + **7 always-visible meta-tools** = **258 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -56,9 +56,9 @@ and Windows servers do not.
 
 ## Project
 
-### `project` · 7 tools
-**Purpose:** Create, open, save, rename, snapshot KiCAD projects, and launch the live schematic viewer.
-**Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
+### `project` · 11 tools
+**Purpose:** Create, open, save, rename, snapshot KiCAD projects, restorable checkpoints, the edit-readiness report, and the live schematic viewer.
+**Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs), [`crates/konnect-core/src/tools/checkpoints.rs`](crates/konnect-core/src/tools/checkpoints.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -67,7 +67,11 @@ and Windows servers do not.
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified time, project-file format version, and the generator versions recorded by the sibling design files. |
 | `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
-| `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
+| `snapshot_project` | Export the schematic and PCB to PDF as a timestamped visual record. Not restorable; use `create_checkpoint` for that. |
+| `create_checkpoint` | Save a verified, restorable copy of the saved design files under `<project_dir>/.konnect/checkpoints/<id>/`. Names open KiCad documents, whose unsaved changes are not captured. |
+| `list_checkpoints` | List checkpoints newest first, with how each differs from the saved files now. Reports unreadable checkpoints. |
+| `restore_checkpoint` | Preview, then apply with the preview's `revision`. Refused while KiCad owns a target or the project, or a write journal is pending. Takes a `pre_restore` checkpoint first (`undo_checkpoint`), reads every file back, and never deletes files added later. Optional `paths` subset. |
+| `get_edit_readiness` | Per design file: KiCad lock, open in KiCad over IPC, seen live this session, pending journals, and `edit_route` (`file`, `live` or `blocked`). Says once whether KiCad answers over IPC. Read-only. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
 ### `editor_navigation` · 5 tools

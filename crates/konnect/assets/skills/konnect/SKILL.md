@@ -47,9 +47,11 @@ does not establish that a missing server-side check ran.
 1. **Identify the project** — locate the `.kicad_pro` file
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
 3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available
-4. **Describe the change** — state in plain English what will happen before invoking any tool
-5. **Execute** — use Konnect MCP tools only
-6. **Verify** — re-query the design to confirm the change landed correctly
+4. **Check who owns the files** — before writing, call `get_edit_readiness` once. Its `edit_route` per file says whether to edit the saved file, edit live through KiCad, or stop because KiCad holds it. If it says KiCad is not answering over IPC, do not keep retrying live-only tools. Never delete a KiCad lock file to get past a refusal; ask the user to save and close the document
+5. **Checkpoint risky work** — before a multi-step or hard-to-reverse edit, call `create_checkpoint`. To undo, `restore_checkpoint` (preview first, then apply with its `revision`). Copying or zipping project files by hand is not a substitute: a checkpoint is verified and its restore is refused while KiCad owns a file
+6. **Describe the change** — state in plain English what will happen before invoking any tool
+7. **Execute** — use Konnect MCP tools only
+8. **Verify** — re-query the design to confirm the change landed correctly
 
 ## Decision Tree
 
