@@ -60,6 +60,7 @@ load_toolset('pcb_board')        # board outline, layers, setup, stackup
 load_toolset('pcb_components')   # place, refresh, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
+load_toolset('project')          # save the open PCB with save_project
 ```
 
 Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
@@ -69,6 +70,9 @@ Load additional toolsets as needed:
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
 load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
+load_toolset('placement')        # score_placement and read-only query_board_region
+load_toolset('pcb_export')       # export_specctra_dsn and refill_zones
+load_toolset('integration')      # check_freerouting and local route_specctra_dsn
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -121,12 +125,14 @@ Follow this sequence for a clean PCB workflow:
    apply is one undo entry, and unsupported or stale content returns a non-mutating
    conflict instead of silently dropping it.
 4. **Place components** — position all footprints
-5. **Route traces** — connect all nets
+5. **Route traces** — use the supported Freerouting round trip below; verify all nets
 6. **Copper pour** — add ground/power zones last
-7. **DRC** — run design rule check
-8. **Save** — `save_project`
+7. **Refill, save, and DRC** — synchronize the live board once as described below
+8. **Report** — state the result, remaining unrouted nets, and blockers
 
 Do NOT add copper pours before routing is complete — they interfere with interactive routing.
+Preserve existing zones: the DSN exporter supports their outlines, and removing them
+changes the design. Refill after routing and check the resulting copper.
 
 ---
 
@@ -151,10 +157,12 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `update_footprints_from_library` | Refresh placed definitions from linked libraries |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
+| `set_component_placements` | Set explicit positions and rotations in one atomic batch |
 | `flip_component`          | Set F.Cu/B.Cu via native IPC (KiCad 10.0.6+) or safe file fallback |
 | `set_placed_footprint_models` | Inspect or edit exact indexed 3D-model entries on a live placed footprint |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
+| `get_board_2d_view`       | Image of the saved board; `side` top/bottom, `zoom` above 1 for a close-up |
 
 ### Bounded AI-directed placement loop
 
@@ -174,16 +182,21 @@ board now has the intended placement:
    known current. `get_component_list` does not expose lock state, so if neither
    current saved evidence nor the caller establishes the KiCad-locked references,
    report `BLOCKED` and ask the caller to confirm them. Never send a held
-   reference to `move_component` or `rotate_component`.
+   reference to any placement, rotation, or flip call, including a batch.
 3. **Plan a small explicit batch.** Prefer one functional group and the fewest
    references needed to test the improvement. `auto_place_from_schematic` is a
    deprecated diagnostic planner only: its plan is always blocked from apply.
    `refine_placement_force_directed` is also deprecated; do not weaken its gates
    or apply a score tie. Make a justified score-neutral change with explicit
    moves instead.
-4. **Apply only the named moves.** Use `move_component` and
-   `rotate_component`; do not turn a diagnostic whole-board plan into an
-   autonomous bulk mutation.
+4. **Apply only the named moves.** Prefer
+   `set_component_placements(board, placements=[{reference, x, y, rotation}, ...])`
+   for a small explicit batch. Every entry requires absolute X/Y in mm and an
+   absolute rotation in degrees; it is one live IPC update and one undo step, or
+   one guarded closed-board write. Single moves may use `move_component` and
+   `rotate_component`. Use `flip_component(board, reference, layer='B.Cu')` to
+   change side; a layer rename does not mirror footprint geometry. Do not turn
+   a diagnostic whole-board plan into an autonomous bulk mutation.
 5. **Read back the exact requested live board.** After every batch, call
    `get_component_list` for that board and verify each requested reference's
    observed position, rotation, and layer. Call `get_board_info` and require
@@ -262,6 +275,67 @@ rotation, shape, size, drill, and per-copper-layer geometry; do not estimate
 copper extent from package family or a different pad in the footprint. A null
 geometry field is unavailable evidence, not a zero-size pad.
 
+For nearby geometry, use the read-only `query_board_region` from `placement`:
+
+```
+query_board_region(board, around={reference:'U1', pad:'1', margin_mm:2}, limit=50)
+```
+
+Use exactly one of `around`, `bbox`, or `point`. Read `sources`, `source_evidence`, `counts`,
+`total_matches`, and `truncated`; narrow the region or filters if it is cut.
+Zone results describe authored outlines, not filled copper, and footprint
+graphics/text are excluded. Use `query_traces(board, touching_pad={reference, pad}, ...)`
+when only segments touching the pad's copper matter. Do not replace these reads with a
+script that parses `.kicad_pcb`.
+
+### Freerouting round trip
+
+For a supported board, use the local Freerouting path. Load `pcb_export`,
+`integration`, `pcb_routing`, and `verification` before starting:
+
+1. Run `check_freerouting(jar_path?, java_path?)`. Inspect `available`,
+   `native_mcp_available`, and `bridge_available`, plus `note` or `setup` when
+   unavailable. The tool locates the JAR and a compatible Java; it does not
+   install either. If unavailable, stop and report the returned setup steps;
+   continue only after the installation or capability blocker is resolved.
+2. With the exact named board open over IPC and placement/rules settled, call
+   `export_specctra_dsn(board, output='new-job.dsn')`. Keep the returned DSN and
+   reverse manifest together. Rust export is the default
+   (`native_bridge_mode: 'disable'`); no native plugin is required. Existing
+   output files are refused. Do not change the board while routing this revision.
+3. Call `route_specctra_dsn(dsn_path, ses_output_path='new-result.ses',
+   jar_path?, java_path?)`. It runs the local JAR's native headless MCP server
+   and writes a new SES; creating that file does not prove every net was routed.
+4. Review `plan_specctra_ses_import(board, ses_path, manifest_path)`. It is
+   read-only and checks the SES against the revision-bound manifest and live
+   board. A stale revision needs a new export and routing job.
+5. Apply with `apply_specctra_ses(board, ses_path, manifest_path,
+   candidate_output_path='new-candidate.kicad_pcb')`. It imports tracks/vias in
+   one undo transaction, checks IPC readback, and writes/checks a new candidate
+   without overwriting the source. Inspect its `drc` result: a successful apply
+   can still report violations or unconnected items.
+6. Finish with the synchronized refill/DRC procedure below. The import's
+   candidate check does not establish that existing zone fills are current.
+
+**Current limits:** two copper layers and front-side SMD or through-hole
+footprints; circle, rectangle, rounded-rectangle, and oval pads; one closed
+outline made from supported lines/arcs, rectangle, circle, or polygon. Outline
+arcs/circles become chords within 5 um, and rounded pads use their bounding
+rectangles. Existing pours become fixed planes and track/via-blocking rule areas
+become keepouts from zone outlines, not their fills; thermal reliefs are not
+modelled. Locked straight tracks/vias are preserved. Unlocked routing, routed
+arcs, other pad shapes, curves, custom DRC rules, incomplete routing rules,
+back-side footprints, and more copper layers are refused. `flip_component`
+supports back-side placement, but that does not widen this DSN profile.
+
+If DSN export, Freerouting, or SES import fails, stop and report the exact
+blocker. Do not hand-roll a router or direct-edit the board as a fallback. If
+the tool cannot handle the requested board, explain the unsupported feature and
+have the user finish that routing in KiCad PCB Editor, refill zones, and run its
+Design Rules Checker. State every known unrouted net and unavailable check;
+report routing as `INCOMPLETE` while a blocker, unrouted connection, or missing
+routing-completion evidence remains. Never describe partial routing as finished.
+
 ### Routing Tools
 
 | Tool                      | Use Case                                    |
@@ -274,8 +348,9 @@ geometry field is unavailable evidence, not a zero-size pad.
 
 ### route_pad_to_pad
 
-The primary routing tool. Looks up both pad positions on the board and lays an
-L-shaped trace between them.
+For an explicitly planned individual connection. Looks up both pad positions on
+the board and lays an L-shaped trace between them; it is not an obstacle-aware
+replacement for Freerouting.
 
 ```
 route_pad_to_pad(board, net_name, ref1, pad1, ref2, pad2, layer?, width?)
@@ -296,7 +371,7 @@ the path yourself.
 route_trace(board, net_name, layer, x1, y1, x2, y2, width?)
 ```
 
-- Use when auto-routing creates suboptimal paths
+- Use for an explicitly planned segment or a targeted correction, then verify it
 - There is no waypoint list: call it once per segment to build a polyline
 - Coordinates are board-space mm
 
@@ -382,13 +457,15 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
 
 ### refill_zones
 
-**Must call `refill_zones` after any change that affects copper pour:**
+Refill after any change that affects copper pour:
 - After adding/moving components
 - After routing new traces
 - After modifying zone outlines
 - After changing design rules
 
 Zones do not auto-update — stale fills cause DRC errors.
+Use `refill_zones(board)` for a standalone live refill, or combine refill, save,
+and DRC with the procedure below. Do not refill twice for the same unchanged board.
 
 ### Zone Tips
 
@@ -429,11 +506,26 @@ Zones do not auto-update — stale fills cause DRC errors.
 
 ## Design Rule Check
 
-After completing layout:
+After finishing mutations and when ready to save the live board, refill and
+synchronize it once before checking:
 
 ```
-run_drc()
+run_drc(board, sync_live_board=true, refill_zones=true, output='full-drc.json')
 ```
+
+This refills over IPC, saves the named board, and checks its persisted snapshot.
+Verify `live_board_synced`, `zones_refilled`, `zone_refill_source`, and `source`.
+For an intentionally saved-only check, omit synchronization and identify it as
+saved-file evidence; it excludes unsaved live edits.
+
+`errors`, `warnings`, `by_rule`, and `unconnected_items` cover more than the shown
+page. Read every page using `next_offset` while `truncated` is true, or inspect
+the full `output` report. For follow-up pages keep the same board and filters,
+leave `sync_live_board` and `refill_zones` off, and make no edits. If the board
+changes, restart the evidence from the new revision. `categories_not_reported`
+and null counts mean unavailable checks, not zero findings. Completion needs
+resolved DRC findings and proven routing completion; report every outstanding
+unconnected item or the reason it could not be checked.
 
 Common DRC errors and fixes:
 - **Clearance violation**: move trace or component further apart
@@ -468,7 +560,8 @@ geometry is the board outline or a cutout the footprint carries itself.
 2. **Always verify placement after moves** — components may snap to unexpected positions
 3. **Board outline first** — define the physical boundary before placing anything
 4. **Refill zones after changes** — stale zone fills cause phantom DRC errors
-5. **Check DRC before finishing** — run `run_drc()` and resolve all errors
+5. **Check DRC before finishing** — use the synchronized procedure above, read
+   the full result, and report unresolved findings or unrouted nets
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
 7. **KiCAD normally must be running** — use guarded closed-board paths only when a
    tool explicitly offers them. Treat `unsafe_file_fallback` as a human recovery
@@ -476,3 +569,5 @@ geometry is the board outline or a cutout the footprint carries itself.
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 10. **Copper pour last** — add zones only after routing is substantially complete
+11. **Stop on routing failure** — report the DSN/Freerouting/import blocker;
+    never substitute a handwritten router or hide remaining unrouted nets

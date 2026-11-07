@@ -29,9 +29,20 @@ load_toolset("sch_wiring")
 load_toolset("sch_batch")
 load_toolset("sch_analysis")
 load_toolset("sch_export")
-load_toolset("project")
+load_toolset("library")
 load_toolset("templates")
 ```
+
+Load `sch_hierarchy` when the design spans sheets and `sch_bus` when it uses
+buses. Use `import_sheet_pins` and `validate_sheet_pins` for parent/child
+interfaces, and `add_bus` plus `connect_pins_to_bus` for named bus members.
+Load `project` only when project creation or other project operations are needed;
+its `save_project` tool saves the live PCB, not schematics.
+
+For a large build, work in functional-block passes. Before handing back an
+unfinished pass, give the caller the saved paths, intended net table, completed
+blocks, checks still owed and next action. A finished block is not a completed
+circuit.
 
 ### Build Workflow
 
@@ -40,6 +51,8 @@ load_toolset("templates")
 - Identify exact manufacturer parts, package suffixes, and authoritative datasheets
 - Identify key ICs and their support circuitry
 - Determine sheet hierarchy if the design is complex
+- Prepare the intended `{net: ["REF.PIN"]}` table from requirements before
+  wiring; use it for acceptance rather than copying the resulting netlist
 
 **Step 2: Search Templates First**
 - Check if a template exists for this circuit type (power supply, amplifier, MCU breakout)
@@ -48,33 +61,55 @@ load_toolset("templates")
 **Step 3: Place Components**
 - Group logically: power section, signal conditioning, MCU, connectors
 - Follow placement rules (see below)
-- Place power symbols (VCC, GND, +3V3) for every rail
+- Resolve symbols with `search_symbols` and `get_symbol_info`; verify actual
+  placed pins with `get_schematic_pin_locations`. For a multi-unit IC, place
+  every required unit, including its separate power unit, using the same
+  `reference` and the resolved `unit` number. Library-wide pin information is
+  not evidence that the power unit was placed
+- Place power symbols (VCC, GND, +3V3) for shared rails; keep intentionally
+  local rails separate in repeated sheet instances
 - Place decoupling caps immediately when placing each IC
 
 **Step 4: Wire the Circuit**
-- Use `connect_to_net` for power connections (cleaner than explicit wires)
+- Use `add_power_symbol` on the queried pin endpoints for shared power rails.
+  A rail that must remain separate in each repeated sheet instance instead
+  uses a local label through `connect_to_net`; power symbols are global
 - Use `connect_pins` for direct point-to-point signals
-- Use net labels for signals that span groups or sheets
+- Use local net labels within a sheet; use hierarchical labels and imported
+  sheet pins for parent/child interfaces, or global labels for signals shared
+  across all sheets and instances
 - Wire power first, then signals, then low-priority connections
 
-**Step 5: Annotate and save**
-- Run `annotate_schematic`; an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you) before saving
-- Run `save_project` so formal checks inspect the current saved design
+**Step 5: Annotate and confirm saved state**
+- Run `annotate_schematic`; an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you) before formal checks
+- Schematic tools already write their edits. Inspect their outcomes and query
+  the saved design back. If the owner has unsaved schematic editor changes,
+  have them save in KiCad before checking the saved files
 
 **Step 6: Collect direct evidence**
 - Run `validate_wire_connections` and `validate_component_connections`
 - Run `find_shorted_nets`; reconcile every result against intended connectivity
-- Run `run_erc`; classify every violation and preserve any explicit waiver
-- Final connectivity check: run `compare_netlist` with the intended `{net: ["REF.PIN"]}` (`get_schematic_netlist` reads the whole hierarchy). A `fail` or `incomplete` verdict is not done
+- Run `run_erc` on the root schematic; follow `next_offset` while `truncated`
+  is true, classify every violation and preserve any explicit waiver. Totals
+  describe the full report; `output` writes the full unpaged ERC report to disk
 - Run `render_schematic_png` with inline output and inspect the image
 - Confirm functional blocks are visually grouped, labels and symbols do not
   overlap, and all content remains inside the page boundaries
+- Final connectivity check: run `compare_netlist` on the root sheet with the
+  prepared `intended` table and `scope: "complete"`. Require `result: "pass"`,
+  `passed: true` and zero `counts` for `missing`, `split`, `merged` and `extra`.
+  The default `listed_pins` scope proves only a subset; `fail` or `incomplete`
+  is not done. `get_schematic_netlist` helps inspect the saved hierarchy;
+  follow its pages and check `pins_truncated` before claiming full coverage
 
 **Step 7: Fix and re-check**
 - Address failures, add justified no-connect flags, and clarify signal intent
 - Re-run every failed or invalidated check after the last edit
 - If a required check cannot run or its coverage is structurally impossible,
   report `INCOMPLETE` and identify the blocked evidence
+- If a needed edit has no supported tool, report the tool gap and concrete
+  KiCad GUI steps, then await the saved result for verification. Do not replace
+  the missing operation with source-file edits
 
 ### Placement Rules
 
@@ -100,6 +135,7 @@ Do not declare the circuit complete until:
 - Every required signal and power connection is present or intentionally marked
   with a documented reason
 - Direct short detection and ERC have no unexplained failures
+- The full intended net table passes `compare_netlist` with `scope: "complete"`
 - The saved render shows coherent functional groups, no visible symbol or label
   overlaps, and no content outside the page
 - All component references and values are resolved
@@ -107,7 +143,7 @@ Do not declare the circuit complete until:
 
 ### Output Format
 
-When the circuit is complete, provide:
+For a complete circuit or an incomplete handoff, provide:
 
 ```markdown
 # Circuit Build Summary
@@ -132,6 +168,7 @@ When the circuit is complete, provide:
 - ERC: [PASS/FAIL/BLOCKED, violation count and source]
 - Shorted nets: [PASS/FAIL/BLOCKED, findings]
 - Connection validators: [PASS/FAIL/BLOCKED, findings]
+- Intended connectivity: [result, scope, counts and source from `compare_netlist`]
 - Rendered inspection: [PASS/FAIL/BLOCKED, grouping/overlap/page evidence]
 - Overall evidence status: [COMPLETE/INCOMPLETE]
 

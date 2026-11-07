@@ -277,9 +277,9 @@ fn manufacturing_guidance_is_contract_bound_and_fail_closed() {
     let trace_width = include_str!("../assets/skills/kicad-pcb/references/trace-width-table.md");
 
     for marker in [
-        "presence of at least one `Edge.Cuts` item",
+        "true Edge.Cuts outline closure and footprint containment",
         "`verdict`, `issues`, and `drc`",
-        "does not prove outline closure",
+        "does not prove copper on every pad",
         "`warnings` and `files_generated`",
         "current invocation",
         "regular, non-empty file",
@@ -657,6 +657,21 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // Creation response fields / scope values verified in response_budget,
+        // sch_netlist, board_geometry, drc and Freerouting handlers (PR 5).
+        "next_offset",
+        "source_evidence",
+        "listed_pins",
+        "pins_truncated",
+        "total_matches",
+        "native_mcp_available",
+        "bridge_available",
+        "live_board_synced",
+        "zones_refilled",
+        "zone_refill_source",
+        "by_rule",
+        "unconnected_items",
+        "categories_not_reported",
         // Parameters and a net in the kicad-simulation protection stand-ins, which
         // `protection_skill.rs` ties to the decks the live tests run.
         "sh_t0",
