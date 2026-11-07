@@ -15,6 +15,13 @@ use serde_json::{json, Value};
 /// success, refusal, partial and post-mutation failure paths need evidence
 /// before it belongs here.
 pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
+    "route_trace",
+    "route_pad_to_pad",
+    "add_via",
+    "modify_trace",
+    "route_batch",
+    "query_vias",
+    "delete_via",
     "add_schematic_component",
     "annotate_schematic",
     "assign_simulation_model",

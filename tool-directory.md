@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **240 registered tools** + **7 always-visible meta-tools** = **247 total**
+- **241 registered tools** + **7 always-visible meta-tools** = **248 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -282,23 +282,26 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the saved board with kicad-cli and return a PNG image block. Accepts `side` (`top` or `bottom`, default `top`) and positive `zoom` (default 1); width/height retain their 100–4000 pixel clamps. This is an orthographic 3D render; use `export_svg` for layer-aware 2D output. |
 
-### `pcb_routing` · 15 tools
+### `pcb_routing` · 18 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
 | Tool | Description |
 |------|-------------|
 | `add_net` | Idempotently add a net to a pre-KiCad-10 board's top-level net table (S-expression insert, no IPC required). Existing names return their observed ID without writing. KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
-| `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
-| `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
-| `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
+| `route_trace` | Create one explicit segment with live net/layer/netclass-width checks, one undo commit and readback KIID/geometry. No clearance or save proof. |
+| `route_pad_to_pad` | Create a horizontal-then-vertical L-bend using live unique pad anchors, verified net/layer membership and readback IDs. No obstacle avoidance. |
+| `add_via` | Create a through via using live netclass defaults, rounded drill/diameter checks and verified readback KIID. |
 | `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
 | `query_traces` | List trace segments on the board, optionally filtered by net, layer, or the pad they touch (`touching_pad`). At most `limit` (default 200) come back; `total_matches` and `truncated` say when that cut the list. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
-| `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
+| `modify_trace` | Partially update an observed unlocked straight trace in place, preserving its KIID and omitted fields; verify actual geometry and net. |
+| `route_batch` | Create explicit polyline segments and through vias together (max 200 objects), with complete preflight, one live undo commit and verified readback IDs. |
+| `query_vias` | List live vias by net with KIIDs, positions, span and dimensions; paged and byte-bounded. |
+| `delete_via` | Delete an observed unlocked via by KIID and verify absence while preserving other routing objects. |
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |

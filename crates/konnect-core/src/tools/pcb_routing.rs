@@ -3,6 +3,9 @@
 //! Routing operations use the KiCAD IPC API; `add_net`, `create_netclass`, and
 //! `add_copper_pour` use S-expression file manipulation.
 
+#[path = "pcb_routing_batch.rs"]
+mod batch;
+
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -51,7 +54,7 @@ macro_rules! ipc {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "add_net",
             "Idempotently add a net to the top-level net table of a pre-KiCad-10 board \
@@ -80,7 +83,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "layer":    { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
-                    "width": { "type": "number", "default": 0.25 }
+                    "width": { "type": "number", "description":"Defaults to live effective netclass preferred width" }
                 },
                 "required": ["board", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
@@ -117,8 +120,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "net_name":  { "type": "string" },
                     "x":         { "type": "number" },
                     "y":         { "type": "number" },
-                    "drill":     { "type": "number", "description": "Drill diameter in mm", "default": 0.4 },
-                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "drill":     { "type": "number", "description": "Omitted uses the live effective netclass drill" },
+                    "pad_size":  { "type": "number", "description": "Omitted uses the live effective netclass diameter" }
                 },
                 "required": ["board", "net_name", "x", "y"]
             }),
@@ -224,7 +227,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
-            "Modify a trace segment by deleting and re-adding it with new parameters.",
+            "Partially modify an observed unlocked straight trace in place, preserving its KIID and omitted fields. Checks live routing rules and verifies readback in one undo commit.",
             json!({
                 "type": "object",
                 "properties": {
@@ -234,9 +237,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "layer":     { "type": "string" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" },
-                    "width":     { "type": "number", "default": 0.25 }
+                    "width":     { "type": "number" }
                 },
-                "required": ["board", "uuid", "net_name", "layer", "x1", "y1", "x2", "y2"]
+                "required": ["board", "uuid"]
             }),
             |args, ctx| async move { handle_modify_trace(args, ctx).await }
         )
@@ -265,7 +268,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "clearance":    { "type": "number", "description": "Clearance in mm", "default": 0.2 },
                     "trace_width":  { "type": "number", "description": "Default trace width in mm", "default": 0.25 },
                     "via_drill":    { "type": "number", "description": "Via drill diameter in mm", "default": 0.4 },
-                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "via_diameter": { "type": "number", "default": 0.8 }
                 },
                 "required": ["board", "name"]
             }),
@@ -340,7 +343,9 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_route_diff_pair(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
-    ]
+    ];
+    tools.extend(batch::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -442,152 +447,21 @@ async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let x1 = match require_f64(args, "x1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y1 = match require_f64(args, "y1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let x2 = match require_f64(args, "x2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y2 = match require_f64(args, "y2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let width = args["width"].as_f64().unwrap_or(0.25);
-
-    let net_ipc = net_name.clone();
-    let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| c
-        .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
-    Ok(CallToolResult::json(&json!({
-        "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
-    })))
+    batch::handle("route_trace", args, ctx).await
 }
 
 async fn handle_route_pad_to_pad(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let ref1 = match require_str(args, "ref1") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let pad1 = match require_str(args, "pad1") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let ref2 = match require_str(args, "ref2") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let pad2 = match require_str(args, "pad2") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
-    let width = args["width"].as_f64().unwrap_or(0.25);
-
-    // Both pads come from the board open in KiCad, the one the tracks are
-    // written to. The saved file lags any unsaved move, including
-    // move_component's own, and routing to it left a dangling track (#700).
-    let (net_ipc, layer_ipc) = (net_name.clone(), layer.clone());
-    let ends = [(ref1.clone(), pad1.clone()), (ref2.clone(), pad2.clone())];
-    let routed = ipc!(ctx, args, |c, document| {
-        let [(ref1, pad1), (ref2, pad2)] = &ends;
-        let (x1, y1) = match get_live_pad(c, &document, ref1, pad1)? {
-            Ok(at) => at,
-            Err(message) => return Ok(Err(message)),
-        };
-        let (x2, y2) = match get_live_pad(c, &document, ref2, pad2)? {
-            Ok(at) => at,
-            Err(message) => return Ok(Err(message)),
-        };
-        let segments: &[_] = if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-            // Already axis-aligned: single segment
-            &[(x1, y1, x2, y2)]
-        } else {
-            // L-bend: horizontal then vertical
-            &[(x1, y1, x2, y1), (x2, y1, x2, y2)]
-        };
-        c.add_tracks_in(document, &net_ipc, &layer_ipc, width, segments)?;
-        Ok(Ok(((x1, y1), (x2, y2))))
-    });
-    let ((x1, y1), (x2, y2)) = match routed {
-        Ok(ends) => ends,
-        Err(message) => return Ok(CallToolResult::error(message)),
-    };
-
-    Ok(CallToolResult::json(&json!({
-        "routed": true,
-        "net": net_name, "layer": layer, "width": width,
-        "from": { "ref": ref1, "pad": pad1, "x": x1, "y": y1 },
-        "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 },
-        "source": "ipc"
-    })))
-}
-
-/// A pad's board position on the live board, or the tool error naming what
-/// is missing from it.
-fn get_live_pad(
-    c: &konnect_ipc::client::KiCadIpcClient,
-    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
-    reference: &str,
-    pad: &str,
-) -> anyhow::Result<Result<(f64, f64), String>> {
-    let Some(pads) = c.get_footprint_pads_in(document.clone(), reference)? else {
-        return Ok(Err(format!(
-            "Footprint '{reference}' not found on the board open in KiCad"
-        )));
-    };
-    Ok(pads
-        .iter()
-        .find(|p| p.number == pad)
-        .map(|p| (p.x, p.y))
-        .ok_or_else(|| format!("Pad '{pad}' not found on '{reference}'")))
+    batch::handle("route_pad_to_pad", args, ctx).await
 }
 
 async fn handle_add_via(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let x = match require_f64(args, "x") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y = match require_f64(args, "y") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let drill = args["drill"].as_f64().unwrap_or(0.4);
-    let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
-
-    let net_ipc = net_name.clone();
-    ipc!(ctx, args, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
-    Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
-    ))
+    batch::handle("add_via", args, ctx).await
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {
@@ -1463,48 +1337,7 @@ async fn handle_modify_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let uuid = match require_str(args, "uuid") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let x1 = match require_f64(args, "x1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y1 = match require_f64(args, "y1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let x2 = match require_f64(args, "x2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y2 = match require_f64(args, "y2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let width = args["width"].as_f64().unwrap_or(0.25);
-
-    let uuid_ipc = uuid.clone();
-    let net_ipc = net_name.clone();
-    let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| {
-        c.delete_track(&uuid_ipc)?;
-        c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
-    });
-    Ok(CallToolResult::json(&json!({
-        "modified_uuid": uuid,
-        "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
-    })))
+    batch::handle("modify_trace", args, ctx).await
 }
 
 /// The sibling `<project>.kicad_pro`, which is where KiCad ≥ 7 keeps net
@@ -3420,263 +3253,5 @@ mod zone_net_format_tests {
         assert!(zone.contains("(name \"pour\")"), "{zone}");
         assert!(zone.contains("(priority 1)"), "{zone}");
         assert!(zone.contains("(connect_pads no (clearance"), "{zone}");
-    }
-}
-
-/// `route_pad_to_pad` writes to the live board, so its pad positions must come
-/// from there too (#700). The saved board is KiCad's own two-resistor fixture;
-/// the mock KiCad holds the same board with R1 moved 10 mm and not saved.
-#[cfg(test)]
-mod route_pad_to_pad_tests {
-    use super::*;
-    use crate::tools::pcb_board::board_mock::{
-        board_document, ctx_talking_to, spawn_kicad_holding_board,
-    };
-    use kiapi::common::types::DocumentSpecifier;
-    use konnect_ipc::gen::kiapi;
-    use std::sync::{Arc, Mutex};
-
-    const SAVED: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
-
-    /// Each board command the mock served, with the document it named.
-    type Named = Arc<Mutex<Vec<(&'static str, Option<DocumentSpecifier>)>>>;
-    /// The (start, end) of every track KiCad was asked to create.
-    type Tracks = Arc<Mutex<Vec<((f64, f64), (f64, f64))>>>;
-
-    fn footprint(reference: &str, at: (f64, f64), pads: &[(&str, f64, f64)]) -> prost_types::Any {
-        let items = pads
-            .iter()
-            .map(|(number, x, y)| {
-                konnect_ipc::builders::pack_any(
-                    &kiapi::board::types::Pad {
-                        number: number.to_string(),
-                        position: Some(konnect_ipc::builders::vec2(*x, *y)),
-                        ..Default::default()
-                    },
-                    "kiapi.board.types.Pad",
-                )
-            })
-            .collect();
-        konnect_ipc::builders::pack_any(
-            &kiapi::board::types::FootprintInstance {
-                position: Some(konnect_ipc::builders::vec2(at.0, at.1)),
-                reference_field: Some(kiapi::board::types::Field {
-                    name: "Reference".to_string(),
-                    text: Some(kiapi::board::types::BoardText {
-                        text: Some(kiapi::common::types::Text {
-                            text: reference.to_string(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                definition: Some(kiapi::board::types::Footprint {
-                    items,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            "kiapi.board.types.FootprintInstance",
-        )
-    }
-
-    fn result_text(result: &CallToolResult) -> &str {
-        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
-            panic!("expected text");
-        };
-        text
-    }
-
-    fn point_mm(v: &kiapi::common::types::Vector2) -> (f64, f64) {
-        use konnect_ipc::builders::nm_to_mm;
-        (nm_to_mm(v.x_nm), nm_to_mm(v.y_nm))
-    }
-
-    /// A KiCad holding the board at `board_path` with `footprints` on it, recording the
-    /// document each board command names and every track it creates.
-    fn spawn_live_board(
-        board_path: &Path,
-        footprints: Vec<prost_types::Any>,
-        named: Named,
-        tracks: Tracks,
-    ) -> crate::test_support::MockIpcServer {
-        spawn_kicad_holding_board(board_path, move |command| {
-            let bytes = command.value.as_slice();
-            if command.type_url.ends_with("GetItems") {
-                let request = kiapi::common::commands::GetItems::decode(bytes).unwrap();
-                named
-                    .lock()
-                    .unwrap()
-                    .push(("GetItems", request.header.and_then(|h| h.document)));
-                return Some(konnect_ipc::builders::pack_any(
-                    &kiapi::common::commands::GetItemsResponse {
-                        header: None,
-                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                        items: footprints.clone(),
-                    },
-                    "kiapi.common.commands.GetItemsResponse",
-                ));
-            }
-            if command.type_url.ends_with("GetNets") {
-                let request = kiapi::board::commands::GetNets::decode(bytes).unwrap();
-                named.lock().unwrap().push(("GetNets", request.board));
-                return Some(konnect_ipc::builders::pack_any(
-                    &kiapi::board::commands::NetsResponse {
-                        nets: vec![konnect_ipc::builders::net("VCC", 1)],
-                    },
-                    "kiapi.board.commands.NetsResponse",
-                ));
-            }
-            if command.type_url.ends_with("CreateItems") {
-                let request = kiapi::common::commands::CreateItems::decode(bytes).unwrap();
-                named
-                    .lock()
-                    .unwrap()
-                    .push(("CreateItems", request.header.and_then(|h| h.document)));
-                for item in &request.items {
-                    let track = kiapi::board::types::Track::decode(item.value.as_slice()).unwrap();
-                    tracks.lock().unwrap().push((
-                        point_mm(track.start.as_ref().unwrap()),
-                        point_mm(track.end.as_ref().unwrap()),
-                    ));
-                }
-                return Some(konnect_ipc::builders::pack_any(
-                    &kiapi::common::commands::CreateItemsResponse {
-                        header: None,
-                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                        created_items: request
-                            .items
-                            .into_iter()
-                            .map(|item| kiapi::common::commands::ItemCreationResult {
-                                status: Some(kiapi::common::commands::ItemStatus {
-                                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
-                                    error_message: String::new(),
-                                }),
-                                item: Some(item),
-                            })
-                            .collect(),
-                    },
-                    "kiapi.common.commands.CreateItemsResponse",
-                ));
-            }
-            None
-        })
-    }
-
-    /// R1 at (100, 60) live, R2 where the file has it. Pad positions are the
-    /// file's local offsets (-0.5 / +0.5) added to each live anchor.
-    fn moved_r1() -> Vec<prost_types::Any> {
-        vec![
-            footprint(
-                "R1",
-                (100.0, 60.0),
-                &[("1", 99.5, 60.0), ("2", 100.5, 60.0)],
-            ),
-            footprint(
-                "R2",
-                (110.0, 50.0),
-                &[("1", 109.5, 50.0), ("2", 110.5, 50.0)],
-            ),
-        ]
-    }
-
-    fn route_args(board_path: &Path, pad1: &str) -> serde_json::Value {
-        json!({
-            "board": board_path, "net_name": "VCC",
-            "ref1": "R1", "pad1": pad1, "ref2": "R2", "pad2": "2"
-        })
-    }
-
-    fn saved_board() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let board_path = dir.path().join("specctra_two_resistors.kicad_pcb");
-        std::fs::write(&board_path, SAVED).unwrap();
-        (dir, board_path)
-    }
-
-    #[tokio::test]
-    async fn routes_between_the_live_pads_not_the_saved_ones() {
-        let (_dir, board_path) = saved_board();
-        let (named, tracks) = (Named::default(), Tracks::default());
-        let server = spawn_live_board(&board_path, moved_r1(), named.clone(), tracks.clone());
-        let ctx = ctx_talking_to(server.address().to_string());
-
-        let result = handle_route_pad_to_pad(&route_args(&board_path, "1"), &ctx)
-            .await
-            .unwrap();
-
-        assert!(!result.is_error, "{:?}", result.content);
-        // The L-bend the issue's save-then-route control produced on KiCad
-        // 10.0.6: (99.5, 60) → (110.5, 60) → (110.5, 50). Without the save,
-        // the start was the saved (99.5, 50), 10 mm from the live pad.
-        assert_eq!(
-            *tracks.lock().unwrap(),
-            [
-                ((99.5, 60.0), (110.5, 60.0)),
-                ((110.5, 60.0), (110.5, 50.0))
-            ]
-        );
-        let body: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
-        assert_eq!(body["source"], "ipc");
-        assert_eq!(body["from"]["x"], 99.5);
-        assert_eq!(body["from"]["y"], 60.0);
-        assert_eq!(body["to"]["x"], 110.5);
-        assert_eq!(body["to"]["y"], 50.0);
-
-        // Both pads are read from, and both tracks written to, the document
-        // KiCad resolved for this board, not a blank or re-selected one.
-        let resolved = Some(board_document(&board_path.to_string_lossy()));
-        assert_eq!(
-            *named.lock().unwrap(),
-            [
-                ("GetItems", resolved.clone()),
-                ("GetItems", resolved.clone()),
-                ("GetNets", resolved.clone()),
-                ("CreateItems", resolved),
-            ]
-        );
-        assert_eq!(std::fs::read_to_string(&board_path).unwrap(), SAVED);
-    }
-
-    #[tokio::test]
-    async fn a_footprint_only_in_the_saved_file_is_refused_without_copper() {
-        let (_dir, board_path) = saved_board();
-        let tracks = Tracks::default();
-        let live = vec![footprint("R2", (110.0, 50.0), &[("2", 110.5, 50.0)])];
-        let server = spawn_live_board(&board_path, live, Named::default(), tracks.clone());
-        let ctx = ctx_talking_to(server.address().to_string());
-
-        let result = handle_route_pad_to_pad(&route_args(&board_path, "1"), &ctx)
-            .await
-            .unwrap();
-
-        assert!(result.is_error);
-        assert!(
-            result_text(&result).contains("Footprint 'R1' not found on the board open in KiCad"),
-            "{:?}",
-            result.content
-        );
-        assert!(tracks.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_missing_live_pad_is_refused_without_copper() {
-        let (_dir, board_path) = saved_board();
-        let tracks = Tracks::default();
-        let server = spawn_live_board(&board_path, moved_r1(), Named::default(), tracks.clone());
-        let ctx = ctx_talking_to(server.address().to_string());
-
-        let result = handle_route_pad_to_pad(&route_args(&board_path, "9"), &ctx)
-            .await
-            .unwrap();
-
-        assert!(result.is_error);
-        assert!(
-            result_text(&result).contains("Pad '9' not found on 'R1'"),
-            "{:?}",
-            result.content
-        );
-        assert!(tracks.lock().unwrap().is_empty());
     }
 }

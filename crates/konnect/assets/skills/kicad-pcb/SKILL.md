@@ -583,3 +583,15 @@ geometry is the board outline or a cutout the footprint carries itself.
 10. **Copper pour last** — add zones only after routing is substantially complete
 11. **Stop on routing failure** — report the DSN/Freerouting/import blocker;
     never substitute a handwritten router or hide remaining unrouted nets
+
+
+### Explicit routing batches
+
+Use `route_batch` for an explicit, reviewed set of polyline segments and through
+vias. It is not an autorouter and does not replace the Freerouting failure rule.
+Inspect readback IDs and the outcome before continuing. Live netclasses supply
+omitted widths and via dimensions; narrower widths and ambiguous pad routes
+refuse. Use `modify_trace` for partial in-place edits and `query_vias` /
+`delete_via` for observed via identities. A successful edit still needs the
+relevant clearance/connectivity checks; an uncertain result needs live-board
+inspection before retrying.
