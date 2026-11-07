@@ -52,7 +52,7 @@ PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are 
 | M2 | [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) | `feat/simulation-datasheet-models-m2` | Merged as `d228d5f` |
 | Version check | [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23) | `fix/live-test-ngspice-version` | Merged as `bdafc67` |
 
-## Current work: models fitted to datasheet values (M1)
+## Datasheet models: M1 and M2 merged
 
 The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3 is next and has not started:
 

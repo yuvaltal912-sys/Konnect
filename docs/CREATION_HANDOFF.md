@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. The integration PR records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
+**Last updated:** 2026-11-07. The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
 
 ## Start here
 
