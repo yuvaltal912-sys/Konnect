@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 4 (#28) and 5 (#29) are merged. PR 6 (#30), PR 8 (#31) and PR 10 (#32) are implemented in drafts awaiting review. PR 10 was claimed before implementation on `feat/library-correctness`, branched from main ca5a3ba. Its baseline passed all nine macOS checks (3,430 workspace tests, 9 doctests, 93 live simulation tests). See the PR 10 section for scope and verification. Existing PR detail sections and limits remain intact.
+**Last updated:** 2026-11-07. PRs 6 (#30), 8 (#31), 10 (#32) and 9b (#33) are implemented in drafts awaiting review. PR 9b was claimed before implementation on `codex/sync-replacement`, branched from main ca5a3ba. All nine baseline checks passed (3,430 workspace tests, 9 doctests, 93 live simulation tests). The PR 9b section records scope and remaining limits; final verification is recorded in the PR.
 
 ## Start here
 
@@ -42,7 +42,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | In progress (branch `feat/placement-objectives`), draft [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31); implemented, awaiting review |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
-| 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Not started |
+| 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | In progress (branch `codex/sync-replacement`; pcb_sync.rs, pcb_sync_completion.rs, pcb_footprint_update.rs, sch_export.rs), draft [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33); implemented, awaiting review |
 | Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs), draft [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32); implemented, awaiting review |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
@@ -60,7 +60,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
 2. **PR 5** is merged (#29): shipped creation guidance. **PR 6** is implemented in draft #30, awaiting review.
 3. **PR 8** is implemented in draft #31: wirelength/crossing terms, fanout filtering and pad-level decoupling. **PR 10** is implemented in draft #32 (library correctness).
-4. Then 9b, 12, 13, 14, Q3, 11 and 15.
+4. **PR 9b** is implemented in draft #33 with the conservative limits below. Then 12, 13, 14, Q3, 11 and 15, after owner approval.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
 
@@ -227,8 +227,8 @@ Branch `feat/creation-sync-completion`; all in `tools/pcb_sync.rs`, plus the two
 - **Readback.** `orphans_deleted.applied`, `deleted_footprints` and `fields_updated.applied` come from reading the footprints back after the commit. A footprint KiCad still lists is `orphan_footprint_still_present`; a field that did not land is `field_readback_differs`. The plan revision now covers footprint fields, locked and board-only flags and the copper KIIDs, and the deletions are in `changes`, so a plan reviewed without the flag cannot be applied with it.
 - **Proof.** Unit tests on the planner and on the served `tools/call` path against the protobuf mock board (changed field, idempotent second run, field already right, added footprint, orphan kept by default, unrouted orphan deleted, orphan with copper refused and then allowed, copper that does not touch, locked/unlinked/board-only/BOM-excluded never deleted, stale revision, a KiCad that ignores deletes or updates, flag misuse, conflicted plan). Sixteen guards were broken one at a time and each failed a test: copper never found, copper net or distance not compared, locked, board-only, unlinked and BOM-excluded footprints deleted, deletion on by default, a conflict that still deletes, deletion counted from the request, fields never compared, field readback skipped, the second flag accepted alone, new field visible, deletion never sent, Footprint field leaking into the field list.
 - **Not verified.** Nothing ran against a live KiCad: the field create/update and `DeleteItems` of a footprint are exercised only against the protobuf mock, shaped from KiCad 10.0.1's `footprint.cpp`/`pcb_field.cpp`. The live test is `crates/konnect/tests/live_kicad_tools.rs` (needs a disposable board). Windows and Linux were not run.
-- **Known limit.** Replacing a symbol under the same reference (delete R5, add a new R5) is still a `reference_identity_conflict`, and a conflict deletes nothing, so the old R5 has to go first (`delete_component`, or KiCad). Resolving that inside one plan belongs with PR 9b.
-- **PR 9b, next.** In-place footprint replacement (`footprint_id_changed`, now a conflict) and routed-pad net reassignment (`routed_pad_net_change`, now a conflict) need to keep position, rotation, side, locked state, pad nets and the tracks attached to the old pads. Ask the owner before starting.
+- **Known limit.** Replacing a symbol under the same reference (delete R5, add a new R5) is still a `reference_identity_conflict`, and a conflict deletes nothing, so the old R5 has to go first (`delete_component`, or KiCad). PR 9b retains this refusal: a different schematic identity still needs explicit repair, rather than an inferred reference-only replacement.
+- **PR 9b** is implemented in draft #33: in-place replacement and whole-net copper reassignment, preserving instance state and refusing routed-pad geometry changes. See its section below.
 
 ## PR 2, route safety (merged, #20)
 
@@ -309,3 +309,38 @@ in `tools/library_correctness.rs`.
   their results are reported in the PR. No live project or installed binary is
   used for mutation. Windows/Linux, GUI library refresh and physical pin-map
   validation remain unverified.
+
+## PR 9b, sync replacement and routed nets (draft, #33)
+
+The claim commit and draft preceded implementation. No new tools or arguments.
+`pcb_sync_completion.rs` holds the new preparation, revision and readback helpers;
+`pcb_sync.rs` integrates them, and `pcb_footprint_update.rs` exposes a narrow
+adapter to its existing instance-preserving rebuild.
+
+- Changed footprint IDs are previewed as updates with `replace_with`. Library
+  preparation and symbol-field application happen before mutation. KIID,
+  position, angle, side, lock, identity and overrides survive. Connected pads
+  cannot disappear; routed-pad geometry cannot change, so existing copper stays
+  attached rather than being moved by an implicit router. With unresolved copper,
+  every pad's geometry is held fixed, including pads without assigned nets.
+- Whole-net reassignment requires unanimous saved intent for all old terminals
+  and complete known copper coverage. Tracks, arcs and vias retain geometry and
+  KIIDs. Splits, skipped/board-only terminals, zones, unnetted copper and
+  ambiguous/malformed live pad data refuse safely.
+- Preview revisions cover raw live objects and exact prepared library bytes.
+  Completion counters come from readback. Differences after commit are
+  `applied_with_differences`; an unavailable verification is an explicit uncertain
+  outcome, not a preflight refusal. Inspect the live board before retrying.
+- Verification includes KiCad-authored library fixtures, front/back and rotated
+  instance preservation, served MCP preview/apply/no-op, unsafe-pad refusal,
+  whole-net changes, stale revisions, ignored writes and post-commit failures.
+  All 35 isolated guard-break controls caused actual test failures and were
+  restored. The focused suite has 94 passing tests (16 new), plus the ignored
+  release stdio probe. The full after-commit gate is required at closeout;
+  exact results are recorded in the PR. The release stdio dogfood uses mock IPC
+  and a netlist-export stand-in, not a live GUI.
+- Still unverified: real KiCad IPC replacement/reassignment, GUI/undo behavior,
+  Windows/Linux and physical DRC/connectivity after a real-board operation.
+  Arbitrary partial net splits, routed-pad relocation and reference reuse under
+  a different schematic identity remain explicit follow-ups. Saving the board
+  and refilling zones are not part of this sync.
