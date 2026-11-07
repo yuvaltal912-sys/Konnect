@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). PR 4 is merged as [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). The owner explicitly approved starting the next independent PR on 2026-11-07: PR 5 is implemented on `docs/creation-workflow-guidance`, branched from `main`, draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29). PR 4's code files are outside this work. The pre-change macOS gate passed formatting, 3,401 workspace tests, doctests, all 93 live simulation tests, Clippy, licenses, doc counts and the release build. The final gate and exact-build checks are recorded on #29 after its implementation commit. The installed binary's hash is unchanged. No later PR is authorized yet.
+**Last updated:** 2026-11-07. PRs 4 (#28) and 5 (#29) are merged. PR 6 (#30) and PR 8 (#31) are implemented and await review. The owner authorized continuing: PR 10 is claimed on `feat/library-correctness`, branched from main ca5a3ba. Its draft is being opened before implementation. The pre-change macOS gate passed all nine checks (3,430 workspace tests, 9 doctests, 93 live simulation tests). The installed binary hash is unchanged. Existing PR detail sections and limits below remain intact.
 
 ## Start here
 
@@ -37,14 +37,14 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Merged: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
 | 3 | Response budget for ERC, DRC and list tools | none | Merged: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21). Leftovers (C24 stale-fill field, A30's other long results) are open under rank 3 |
 | 4 | Inline renders as image blocks; region and side options | none | Merged: [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). Follow-ups: inline layer and library-item renders (rank 25), a generated difference image for `inline_diff` |
-| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | In progress (branch `docs/creation-workflow-guidance`), draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29); implemented, awaiting review |
-| 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
+| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Merged: [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29) |
+| 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | In progress (branch `feat/schematic-small-edits`), draft [#30](https://github.com/yuvaltal912-sys/Konnect/pull/30); implemented, awaiting review |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
-| 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
+| 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | In progress (branch `feat/placement-objectives`), draft [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31); implemented, awaiting review |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Not started |
 | Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
-| 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Not started |
+| 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs) |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Not started |
 | 13 | DRC rule writer | none | Not started |
@@ -58,8 +58,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 **Recommended order**, by research rank and what is unblocked:
 
 1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
-2. **PR 5** is claimed and implemented in draft #29, rebased on PR 4; its skills now name PR 4's render options: guidance in `crates/konnect/assets` (skills and agents). Its dependencies (1, 2, 2b) are merged. Review this draft before claiming further work unless the owner explicitly approves another independent PR.
-3. **PR 6** (mirror after placement, DNP and BOM flags, title block), **PR 8** (placement objective on PR 7's layer), **PR 10** (library correctness).
+2. **PR 5** is merged (#29): shipped creation guidance. **PR 6** is implemented in draft #30, awaiting review.
+3. **PR 8** is implemented in draft #31: wirelength/crossing terms, fanout filtering and pad-level decoupling. Then **PR 10** (library correctness), after owner approval.
 4. Then 9b, 12, 13, 14, Q3, 11 and 15.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
@@ -73,6 +73,45 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - GitHub merge commits carry the owner's Gmail, because the account's email-privacy setting is off. Commits you make yourself use the noreply address from `AGENTS.md`.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
+
+## PR 8, placement objectives (draft, #31)
+
+The claim-only commit and draft preceded implementation. This PR is independent
+of PR 6 and adds no new tools; it upgrades the existing scorer on PR 7's layer.
+
+- Routing proxies use deterministic per-net Euclidean pad-site MST length and
+  strict interior crossings between different nets. `max_net_references`
+  (2–256, default8) bounds distinct-reference fanout. Counts, raw values,
+  exclusions, fixed work limits and bounded diagnostic samples are explicit.
+  These are planar straight-airwire estimates, not actual routed/unrouted
+  copper, shorts, DRC or a layer-aware routing plan.
+- New advisory deductions use mean MST edge length / board diagonal, scaled
+  by20 and rounded up (cap20), and crossings times2 (cap20). Geometry/outline
+  hard verdicts retain precedence. Missing data/normalization, ambiguous
+  identities, exceeded work budgets or unproven associations set
+  `score_incomplete`; unavailable routing aggregates are null, not zero.
+- Decoupling now uses matching non-ground pad anchors. Pad-adjacent caps may
+  qualify on larger rails; farther associations need bounded fanout. Return
+  values identify the pads/positions and basis. Connector waivers check every
+  named terminal net using worst nearest-pair distance and existing mounting-
+  side/through-stack evidence. This remains a proximity heuristic, not a proof
+  of pin role, datasheet intent, arbitrary pad layers or routed current loops.
+- New witness arrays share byte/item budgets while exact counts/distances
+  remain evaluated. Scalar identifiers and legacy result lists are not a
+  whole-response size guarantee; wider response budgeting remains rank3 work.
+- Legacy row/refinement planners retain their existing geometry and retirement
+  limits. A bbox-oriented row may correctly stop improving under the better
+  judge. Incomplete before/after scores block application without hiding the
+  diagnostic plan; applied replies disclose post-write score completeness too.
+- Focused verification passed111 placement tests, including48 new tests and
+  hand-calculated native-fixture expectations. All75 removal controls failed
+  their intended tests and sources were restored:32 objective,28 decoupling,
+  15 handler/schema/integration. QA identified and closed the new witness-array
+  byte-budget gap. API migrations, tool directory and PCB guidance are updated.
+  The final gate and release/scratch checks are recorded on #31.
+- No live-project or installed-binary edit, real Freerouting job, autonomous
+  placement/routing or Claude runtime was used. Client GUI behavior,
+  Windows/Linux and hosted CI remain unverified.
 
 ## PR 4, render images and focused views (merged, #28)
 
@@ -101,7 +140,7 @@ The claim commit landed before code changes and the draft was opened against `ma
   mutations were restored. The final macOS gate is listed on #28. No live editor IPC is needed for these tools;
   Windows, Linux and display in an actual MCP client remain unverified.
 
-## PR 5, shipped creation guidance (draft, #29)
+## PR 5, shipped creation guidance (merged, #29)
 
 The claim commit and draft preceded implementation. This branch is rebased on
 `main` after PR 4 merged; the schematic and PCB skills name its `region` crop and board `side`/`zoom`; no runtime tools, schemas or API response shapes
