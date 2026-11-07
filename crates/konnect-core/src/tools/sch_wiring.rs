@@ -2669,8 +2669,7 @@ async fn handle_add_power_symbol(
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
-    sym.in_bom = true;
-    sym.on_board = true;
+    super::sch_components::apply_symbol_flags(&mut sym, placement_fields.flags);
     sym.uuid = uuid::Uuid::new_v4().to_string();
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.

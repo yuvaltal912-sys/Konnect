@@ -947,7 +947,7 @@ fn symbol_flags(symbol: &cse::Symbol) -> SymbolFlags {
     }
 }
 
-fn apply_symbol_flags(symbol: &mut cse::Symbol, flags: SymbolFlags) {
+pub(crate) fn apply_symbol_flags(symbol: &mut cse::Symbol, flags: SymbolFlags) {
     symbol.dnp = flags.dnp;
     symbol.in_bom = flags.in_bom;
     symbol.on_board = flags.on_board;

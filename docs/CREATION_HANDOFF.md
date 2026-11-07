@@ -98,12 +98,15 @@ The claim-only commit and draft preceded implementation, from merged `main`.
   followed by independent saved verification; failure then reports uncertainty.
 - API migrations, tool directory and schematic guidance describe the changes.
   `cargo xtask fix-doc-counts` updates generated counts for the one added tool.
-- Focused verification: 12 new component tests, 16 normal title-block tests and
+- Focused verification: 13 new component tests, 16 normal title-block tests and
   the ignored real KiCad SVG oracle passed, as did the existing library suite.
-  All 56 removal controls caused actual failures and were restored: 25 title,
-  31 component/library/schema, including one explicitly structural assertion of
+  All 57 removal controls caused actual failures and were restored: 25 title,
+  32 component/library/schema, including one explicitly structural assertion of
   the redundant published mirror-type metadata. These are not model-behavior
-  tests. The final workspace gate and release/stdio checks are recorded on #30.
+  tests. The first full gate exposed the separate power-symbol constructor's
+  missing flag copy and two exact served-response expectations; these were
+  fixed, with a served power regression and its removal control. The corrected
+  final workspace gate and release/stdio checks are recorded on #30.
 - No installed-binary update, live-project edit, variant support or Claude
   runtime was used. Client GUI behavior, Windows/Linux and hosted CI remain
   unverified. CodeRabbit's prior-PR review is still blocked by authentication.

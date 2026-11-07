@@ -653,3 +653,78 @@ async fn post_commit_readback_failure_reports_uncertainty_for_flags_and_mirror()
             }));
     }
 }
+
+#[tokio::test]
+async fn served_power_placement_copies_all_resolved_library_flags() {
+    let (_dir, path, ctx) = scene(MULTI);
+    let mut schematic = cse::Schematic::load(&path).unwrap();
+    // Use KiCad's own GND drawing from the committed ECC83 sheet. Vary only
+    // its typed inclusion attributes so every copied flag has an observable
+    // non-default value, without relying on an installed symbol library.
+    let mut definition = embedded_mut(&mut schematic, "ecc83-pp:GND").clone();
+    let cse::sexp::SexpNode::List(children) = &mut definition else {
+        unreachable!()
+    };
+    children[1] = cse::sexp::qstr("power:GND");
+    children.retain(|node| {
+        !matches!(
+            node.tag(),
+            Some("dnp" | "in_bom" | "on_board" | "exclude_from_sim")
+        )
+    });
+    for (key, value) in [
+        ("dnp", "yes"),
+        ("in_bom", "no"),
+        ("on_board", "no"),
+        ("exclude_from_sim", "yes"),
+    ] {
+        children.push(cse::sexp::tagged(key, vec![cse::sexp::atom(value)]));
+    }
+    let lib = schematic
+        .raw_other
+        .iter_mut()
+        .find(|node| node.tag() == Some("lib_symbols"))
+        .unwrap();
+    let cse::sexp::SexpNode::List(children) = lib else {
+        unreachable!()
+    };
+    children.push(definition);
+    schematic.overwrite().unwrap();
+    let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+        eager_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let response=handler.handle_message(json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"add_power_symbol","arguments":{"schematic":path,"power_net":"GND","x":25.4,"y":25.4}}})).await.unwrap();
+    let result = response.result.unwrap();
+    assert_ne!(result["isError"], true, "{result}");
+    let added: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let expected = json!({"dnp":true,"in_bom":false,"on_board":false,"exclude_from_sim":true});
+    assert_eq!(added["flags"], expected);
+    let saved = cse::Schematic::load(&path).unwrap();
+    let symbol = saved
+        .symbols
+        .iter()
+        .find(|symbol| Some(symbol.uuid.as_str()) == added["uuid"].as_str())
+        .unwrap();
+    assert_eq!(
+        symbol_flags(symbol),
+        SymbolFlags {
+            dnp: true,
+            in_bom: false,
+            on_board: false,
+            exclude_from_sim: Some(true)
+        }
+    );
+    let queried = body(
+        handle_get_schematic_component(
+            &json!({"schematic":path,"reference":added["reference"]}),
+            &ctx,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(queried["flags"], expected);
+}
