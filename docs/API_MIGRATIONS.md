@@ -3,6 +3,38 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: render images and focused views (minor release)
+
+Creation PR 4 (`docs/CREATION_HANDOFF.md`).
+
+- **`render_schematic_png` with `inline: true`** now returns two MCP content
+  blocks: JSON text with the existing path, actual dimensions and byte count,
+  followed by an `image` block (`mimeType: "image/png"`). The `png_base64` JSON
+  field is removed. Read the image block's `data` when consuming bytes; an
+  image-capable client can display it directly. Without `inline`, the response
+  remains JSON text and the PNG is still written to disk.
+- **`compare_visual_baseline` with `inline_diff: true`** uses the same pair of
+  blocks, preserving drift metrics and warnings and removing the
+  `current_png_base64` JSON field. Despite the option's historical name, the
+  image is the current full-sheet render, not a difference heatmap. Baseline
+  capture, comparison width and drift thresholds are unchanged.
+- **`render_schematic_png` accepts `region: {x, y, width, height}`**, in mm
+  measured from the page's top-left. All four values are required; coordinates
+  must be finite and nonnegative, dimensions finite and positive, and the
+  rectangle must fit inside the exported page. `width_px` is the cropped image's
+  width, so the region is rasterized directly at that resolution. Region output
+  is bounded to 8192 pixels high and 16,777,216 pixels in total; reduce
+  `width_px` or widen the region when refused. Crops require explicit mm page
+  dimensions in the SVG, as KiCad exports them. Full-sheet rendering and stored
+  baselines keep their existing rasterization path.
+- **`get_board_2d_view` accepts `side: "top" | "bottom"`** (default `"top"`)
+  and positive finite `zoom` (default `1.0`; larger values zoom in). Invalid
+  values are refused before starting KiCad. It still returns one PNG image
+  block, uses the saved board, and preserves the existing width/height defaults
+  and 100–4000 pixel clamps. Its temporary PNG now lives in a private directory,
+  so an existing neighbouring `<board>.render.png` is preserved. This is KiCad's
+  orthographic 3D renderer; use `export_svg` for selected-layer 2D plots.
+
 ## Unreleased: board geometry: `query_board_region`, true outline containment (minor release)
 
 Creation PR 7 (`docs/CREATION_HANDOFF.md`).
