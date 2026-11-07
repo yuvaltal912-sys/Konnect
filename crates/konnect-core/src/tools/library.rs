@@ -3,6 +3,9 @@
 //! Operations are file-based (S-expression manipulation + directory scanning).
 //! No IPC or kicad-cli is required for most tools.
 
+#[path = "library_correctness.rs"]
+mod correctness;
+
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -247,6 +250,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
                     "datasheet": { "type": "string", "description": "Datasheet URL or path (default empty). A '~' is written as an empty string — carrying it fails ERC's library-match check." },
+                    "keywords": {"type":"string"},
+                    "description": {"type":"string"},
+                    "footprint": {"type":"string"},
                     "glyph": {
                         "type": "string",
                         "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
@@ -375,7 +381,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword match)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
+                    "limit": { "type": "integer", "description": "Maximum number of ranked results", "default": 50, "minimum":1, "maximum":10000 },
+                    "offset": {"type":"integer","minimum":0},
                     "project_dir": { "type": "string", "description": "Project directory whose sym-lib-table is also searched. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
@@ -418,7 +425,9 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 }
+                    "project_dir": {"type":"string","description":"Project whose fp-lib-table is searched"},
+                    "limit": { "type": "integer", "description": "Maximum number of ranked results", "default": 50, "minimum":1, "maximum":10000 },
+                    "offset": {"type":"integer","minimum":0}
                 },
                 "required": ["query"]
             }),
@@ -457,6 +466,7 @@ pub fn tools() -> Vec<ToolDef> {
     {
         tools.insert(after_create_footprint + offset, tool);
     }
+    tools.extend(correctness::tools());
     tools
 }
 
@@ -4208,17 +4218,30 @@ async fn handle_create_symbol(
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
     // Schema-required. Defaulting them appended `(symbol "Symbol" …)` with
-    // reference `U` to the library — and there is no duplicate-name guard, so
-    // repeated calls stacked identically-named entries in one file (#218).
+    // reference `U` to the library; repeated calls used to stack identically-
+    // named entries in one file (#218).
     let name = match require_str(args, "name") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let original_name = name.to_owned();
+    if name.is_empty() || name.contains('\0') {
+        return Ok(invalid_library_argument(
+            "name",
+            "must be nonempty without NUL",
+        ));
+    }
+    let extra_fields = match correctness::metadata(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let escaped_name = escape_library_string(name);
+    let name = escaped_name.as_str();
     let ref_prefix = match require_str(args, "reference_prefix") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let value_str = args["value"].as_str().unwrap_or(name);
+    let value_str = args["value"].as_str().unwrap_or(original_name.as_str());
     // `~` is KiCAD's legacy "no datasheet" placeholder. Its library loader
     // normalises it to the empty string and its schematic lib_symbols loader
     // does not, so a symbol carrying `~` never matches its own library copy in
@@ -4486,6 +4509,8 @@ async fn handle_create_symbol(
         )
     };
     let visible_property = |name: &str, value: &str, y: f64| {
+        let escaped = escape_library_string(value);
+        let value = escaped.as_str();
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 {y:.4} 0) \
              (show_name no) (do_not_autoplace no) \
@@ -4493,6 +4518,8 @@ async fn handle_create_symbol(
         )
     };
     let hidden_property = |name: &str, value: &str| {
+        let escaped = escape_library_string(value);
+        let value = escaped.as_str();
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
              (show_name no) (do_not_autoplace no) (hide yes) \
@@ -4513,9 +4540,24 @@ async fn handle_create_symbol(
         units_sexp
     );
 
+    let original = if lib_path.exists() {
+        Some(read_consistent(&lib_path)?)
+    } else {
+        None
+    };
+    if let Some(source) = &original {
+        let root = correctness::library(source)?;
+        if root
+            .find_all("symbol")
+            .iter()
+            .any(|n| n.get(1).and_then(SexpNode::as_str) == Some(original_name.as_str()))
+        {
+            return Ok(invalid_library_argument("name", "symbol already exists"));
+        }
+    }
     // If file doesn't exist, create scaffold
-    let content = if lib_path.exists() {
-        let mut content = tokio::fs::read_to_string(&lib_path).await?;
+    let content = if let Some(source) = &original {
+        let mut content = source.clone();
         content = content.replace("(version 20240108)", "(version 20251024)");
         if !content.contains("(generator_version ") {
             if let Some(position) = content.find("(generator \"") {
@@ -4539,11 +4581,28 @@ async fn handle_create_symbol(
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    write_atomic(&lib_path, &new_content)?;
+    let new_content = correctness::prepare(&new_content, &original_name, &extra_fields)?;
+    if let Some(source) = original {
+        write_atomic_if_unchanged(&lib_path, &source, &new_content)?;
+    } else {
+        write_new_atomic(&lib_path, &new_content)?;
+    }
 
+    let saved_properties =
+        match correctness::saved_metadata(&lib_path, &original_name, &extra_fields) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(crate::tools::mutation_outcome_uncertain(
+                    &lib_path,
+                    "create_symbol",
+                    e.to_string(),
+                ))
+            }
+        };
     let mut result = json!({
+        "properties": saved_properties,
         "success": true,
-        "symbol": name,
+        "symbol": original_name,
         "library": lib_path.to_str().unwrap_or(""),
         "unit_count": unit_count,
         "power_pin_count": power_pin_count
@@ -4568,42 +4627,12 @@ async fn handle_delete_symbol(
         Err(e) => return Ok(e),
     };
 
-    let content = tokio::fs::read_to_string(&lib_path).await?;
-
-    // Find `  (symbol "NAME"` block
-    let pat = format!(r#"  (symbol "{}""#, symbol_name);
-    let start = content
-        .find(&pat)
-        .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
-
-    // Walk back to find preceding newline
-    let block_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-
-    // Walk forward to find end of block (depth count)
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    // Skip trailing newline
-    let end = if content[end..].starts_with('\n') {
-        end + 1
-    } else {
-        end
+    let content = read_consistent(&lib_path)?;
+    let candidate = match correctness::delete(&content, symbol_name) {
+        Ok(v) => v,
+        Err(e) => return Ok(CallToolResult::error(e.to_string())),
     };
-
-    let new_content = format!("{}{}", &content[..block_start], &content[end..]);
-    write_atomic(&lib_path, &new_content)?;
+    write_atomic_if_unchanged(&lib_path, &content, &candidate)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -4720,6 +4749,7 @@ fn resolve_symbol_pins<'a>(root: &'a SexpNode, sym_node: &'a SexpNode) -> Vec<&'
 
 /// Search one library body for top-level symbols whose name contains `query`
 /// (case-insensitive), returning result objects shaped like `search_symbols`.
+#[cfg(test)]
 fn search_lib_symbols(nickname: &str, content: &str, query: &str) -> Vec<serde_json::Value> {
     let Ok(names) = top_level_symbol_names(content) else {
         return Vec::new();
@@ -4763,62 +4793,7 @@ async fn handle_search_symbols(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let query = match require_str(args, "query") {
-        Ok(v) => v.to_lowercase(),
-        Err(e) => return Ok(e),
-    };
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-
-    let project_dir = args["project_dir"]
-        .as_str()
-        .map(PathBuf::from)
-        .or_else(|| ctx.config.project_dir.clone());
-
-    // Gather (nickname, path) entries from the global sym-lib-table and, when a
-    // project dir is supplied, the project's own sym-lib-table too — this is
-    // what makes project-attached libraries searchable. Nested `(type "Table")`
-    // references are followed and `${KICAD*_DIR}` URIs expanded, so the
-    // libraries KiCad ships are included.
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut tables = vec![global_sym_lib_table()];
-    if let Some(pd) = &project_dir {
-        tables.push(pd.join("sym-lib-table"));
-    }
-    for table in &tables {
-        for lib in read_flat_lib_table(table) {
-            if let (Some(nick), Some(path)) = (lib["nickname"].as_str(), lib["path"].as_str()) {
-                entries.push((nick.to_string(), path.to_string()));
-            }
-        }
-    }
-
-    let mut results = Vec::new();
-    // `entries` holds resolved filesystem paths, not the raw uris they came
-    // from — read_flat_lib_table does that expansion now.
-    'outer: for (nickname, resolved) in entries {
-        let lib_path = PathBuf::from(&resolved);
-        if !lib_path.exists() {
-            continue;
-        }
-        let Ok(lib_content) = tokio::fs::read_to_string(&lib_path).await else {
-            continue;
-        };
-        for hit in search_lib_symbols(&nickname, &lib_content, &query) {
-            results.push(hit);
-            if results.len() >= limit {
-                break 'outer;
-            }
-        }
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": query,
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    correctness::search(args, ctx, false).await
 }
 
 async fn handle_list_library_footprints(
@@ -4994,57 +4969,10 @@ async fn handle_get_footprint_info(
 
 async fn handle_search_footprints(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let query = match require_str(args, "query") {
-        Ok(v) => v.to_lowercase(),
-        Err(e) => return Ok(e),
-    };
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-
-    // Walk global fp-lib-table
-    let fp_lib_table_path = super::kicad_config_dir().join("fp-lib-table");
-
-    let mut results = Vec::new();
-
-    'outer: for lib in read_flat_lib_table(&fp_lib_table_path) {
-        let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
-        let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
-            continue;
-        };
-        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let fname = entry.file_name();
-            let fname_str = fname.to_string_lossy();
-            let Some(fp_name) = fname_str.strip_suffix(".kicad_mod") else {
-                continue;
-            };
-            if fp_name.to_lowercase().contains(&query) {
-                results.push(json!({
-                    "library": nickname,
-                    "name": fp_name,
-                    "id": format!("{}:{}", nickname, fp_name)
-                }));
-                if results.len() >= limit {
-                    break 'outer;
-                }
-            }
-        }
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": args["query"].as_str().unwrap_or(""),
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    correctness::search(args, ctx, true).await
 }
-
-// ─── get_symbol_info (moved from verification toolset) ───────────────────────
 
 async fn handle_get_symbol_info(
     args: &serde_json::Value,
