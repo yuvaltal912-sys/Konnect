@@ -413,7 +413,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "load_user_config",
             "Load the user's global Konnect preferences. Call this at the start of every session \
@@ -533,7 +533,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_list_design_rules(args, ctx).await }
         ),
-    ]
+    ];
+    tools.extend(super::design_intent::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -797,7 +799,10 @@ async fn handle_list_design_rules(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn resolve_project_dir(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_project_dir(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<PathBuf> {
     if let Some(dir) = args["project_dir"].as_str() {
         return Ok(PathBuf::from(dir));
     }

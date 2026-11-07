@@ -126,7 +126,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "config",
         description: "User preferences, project rules, design rules, fab constraints — call load_user_config at session start",
         category: "config",
-        tool_count: 7,
+        tool_count: 9,
     },
     ToolsetMeta {
         name: "design_review",

@@ -231,6 +231,11 @@ regulator output capacitors. It does not establish current capacity, voltage
 compatibility or sequencing. Verify those separately from datasheets, design
 loads and suitable calculations or measurements; report missing evidence.
 
+Read the project's recorded intent with `get_design_intent` before judging
+currents, rails, interfaces or fab limits. Its `missing_sections` say what was
+never recorded: name those as missing evidence rather than assuming values. When
+the owner states intent during the review, record it with `set_design_intent`.
+
 ### Manufacturing Audit
 
 ```
