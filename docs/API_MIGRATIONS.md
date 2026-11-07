@@ -17,7 +17,9 @@ Replacement preparation runs during preview. Missing/unsupported libraries,
 missing connected pads, or changed geometry of any pad whose net has routed
 copper are conflicts (`footprint_replacement_unsafe` for rebuild/geometry
 failures). Konnect does not move tracks to fit different pad locations. A
-replacement with unchanged routed-pad geometry keeps its copper intact.
+replacement with unchanged routed-pad geometry keeps its copper intact. With
+unresolved copper, all pad geometry must stay unchanged, including pads without
+assigned nets.
 
 Routed pad-net changes can now proceed when every existing pad on the old net
 maps to the same nonempty destination in the saved schematic. All tracks, arcs

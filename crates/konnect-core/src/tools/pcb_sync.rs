@@ -7893,6 +7893,33 @@ mod tests {
         assert!(plan["copper_changes"].as_array().unwrap().is_empty());
         let netlist = install_completion_target(&served, COMPLETION_SOURCE);
         assert_eq!(served.dry_run(&netlist).await["status"], "conflict");
+
+        // Unnetted copper can touch pads that have no assigned net either.
+        let mut instance = api::board::types::FootprintInstance::decode(
+            completion_native_item(false).value.as_slice(),
+        )
+        .unwrap();
+        for item in &mut instance.definition.as_mut().unwrap().items {
+            if konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+                let mut pad = api::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.net = None;
+                *item = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        let unnetted = ServedSync::holding(Seed {
+            footprints: vec![konnect_ipc::builders::pack_any(
+                &instance,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            tracks: vec![seeded_track("unnetted-all", "", (1.0, 2.0), (3.0, 4.0))],
+            ..Default::default()
+        })
+        .await;
+        let changed = COMPLETION_SOURCE.replacen("(at -0.775 0)", "(at -1.775 0)", 1);
+        install_completion_target(&unnetted, &changed);
+        let empty_intent = exported_netlist(&[("C1", STOCK_0603, &[])])
+            .replace(STOCK_0603, "Capacitor_SMD:CompletionSwap");
+        assert_eq!(unnetted.dry_run(&empty_intent).await["status"], "conflict");
     }
     #[tokio::test]
     async fn completion_malformed_live_copper_names_the_decode_failure() {
@@ -7997,13 +8024,53 @@ mod tests {
         let home = repo.join("target/dogfood-home");
         std::fs::create_dir_all(&home).unwrap();
         let state = tempfile::tempdir_in(&home).unwrap();
+        // The normal mock uses inproc://, which cannot cross process boundaries.
+        // Own a private IPC endpoint and forward raw messages inside this process.
+        use nng::options::Options;
+        let address = format!("ipc://{}", state.path().join("fork.sock").display());
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        socket.listen(&address).unwrap();
+        let control = socket.clone();
+        let upstream = served._kicad.address().to_string();
+        let worker = std::thread::spawn(move || {
+            let forward = nng::Socket::new(nng::Protocol::Req0).unwrap();
+            forward
+                .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(60)))
+                .unwrap();
+            forward.dial(&upstream).unwrap();
+            while let Ok(message) = socket.recv() {
+                if forward.send(message).is_err() {
+                    break;
+                }
+                let Ok(response) = forward.recv() else { break };
+                if socket.send(response).is_err() {
+                    break;
+                }
+            }
+        });
+        struct Bridge {
+            control: nng::Socket,
+            worker: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Bridge {
+            fn drop(&mut self) {
+                self.control.close();
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+        let _bridge = Bridge {
+            control,
+            worker: Some(worker),
+        };
         let config = state.path().join("config.toml");
         std::fs::write(
             &config,
             format!(
                 "kicad_cli = {}\nipc_address = {}\neager_toolsets = true\n",
                 serde_json::to_string(&served.cli.to_string_lossy()).unwrap(),
-                serde_json::to_string(served._kicad.address()).unwrap()
+                serde_json::to_string(&address).unwrap()
             ),
         )
         .unwrap();

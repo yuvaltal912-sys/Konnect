@@ -170,6 +170,9 @@ pub(super) fn prepare_replacements(
             let updated = pack_any(&instance, "kiapi.board.types.FootprintInstance");
             let old_pads = pads(old)?;
             let new_pads = pads(&updated)?;
+            if snapshot.state.unresolved_copper && old_pads != new_pads {
+                bail!("replacement changes pads while copper connectivity is unresolved");
+            }
             let before = snapshot
                 .state
                 .footprints

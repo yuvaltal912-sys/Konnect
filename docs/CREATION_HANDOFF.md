@@ -321,7 +321,8 @@ adapter to its existing instance-preserving rebuild.
   preparation and symbol-field application happen before mutation. KIID,
   position, angle, side, lock, identity and overrides survive. Connected pads
   cannot disappear; routed-pad geometry cannot change, so existing copper stays
-  attached rather than being moved by an implicit router.
+  attached rather than being moved by an implicit router. With unresolved copper,
+  every pad's geometry is held fixed, including pads without assigned nets.
 - Whole-net reassignment requires unanimous saved intent for all old terminals
   and complete known copper coverage. Tracks, arcs and vias retain geometry and
   KIIDs. Splits, skipped/board-only terminals, zones, unnetted copper and
@@ -333,7 +334,7 @@ adapter to its existing instance-preserving rebuild.
 - Verification includes KiCad-authored library fixtures, front/back and rotated
   instance preservation, served MCP preview/apply/no-op, unsafe-pad refusal,
   whole-net changes, stale revisions, ignored writes and post-commit failures.
-  All 34 isolated guard-break controls caused actual test failures and were
+  All 35 isolated guard-break controls caused actual test failures and were
   restored. The focused suite has 94 passing tests (16 new), plus the ignored
   release stdio probe. The full after-commit gate is required at closeout;
   exact results are recorded in the PR. The release stdio dogfood uses mock IPC
