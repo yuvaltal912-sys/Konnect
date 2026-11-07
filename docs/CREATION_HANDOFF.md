@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. Q3 (design-intent record) is implemented on [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37), in parallel with the PR 13 continuation. Before that, 2026-11-07: The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
+**Last updated:** 2026-11-08. Q3 (design-intent record) is merged: [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). The PR 13 continuation ([#38](https://github.com/yuvaltal912-sys/Konnect/pull/38)) and PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) are open on their own branches. Before that, 2026-11-07: The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
 
 ## Start here
 
@@ -43,7 +43,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Integrated from [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31) in the creation alignment PR |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
-| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Implemented on `feat/creation-design-intent`, [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37), awaiting review; must land before PR 11 |
+| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Merged: [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). PR 11 is unblocked |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
@@ -59,7 +59,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. Finish **PR 13**: general rule expressions and rule editing/deletion, then safe custom-rule DSN/SES handling. The integrated initial slice does not complete that scope.
 2. **PR 14**: checkpoints and readiness report.
-3. **PR 11**, once Q3 ([#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)) is merged: honest review and current audit, reading `get_design_intent`.
+3. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
 4. **PR 15**: ERC/DRC baselines.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
@@ -74,7 +74,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 - Use the noreply identity from `AGENTS.md`, including integration merge commits. A previous GitHub merge attempt rejected this identity; do not silently substitute a personal email.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
 
-## Q3, the design-intent record (#37)
+## Q3, the design-intent record (merged, #37)
 
 One record per project at `<project_dir>/.konnect/design_intent.json`, in `tools/design_intent.rs`, served by two `config` tools (starter kit, so they are listed without `load_toolset`):
 
