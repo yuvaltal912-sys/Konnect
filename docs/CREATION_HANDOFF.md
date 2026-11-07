@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 6 (#30), 8 (#31), 10 (#32), 9b (#33) and 12 (#34) are implemented in drafts awaiting review. PR 13 is claimed on `codex/drc-rule-writer`, based on main ca5a3ba. All nine baseline macOS checks passed (3,430 workspace tests, 9 doctests, 93 live simulation tests). The draft precedes implementation.
+**Last updated:** 2026-11-07. PRs 6 (#30), 8 (#31), 10 (#32), 9b (#33) and 12 (#34) are implemented in drafts awaiting review. PR 13 is claimed on `codex/drc-rule-writer`, based on main ca5a3ba. All nine baseline macOS checks passed (3,430 workspace tests, 9 doctests, 93 live simulation tests). The draft precedes implementation. A narrow rule writer, scratch KiCad validation, project minima and independent netclass operations are in progress; PR 13 is not complete.
 
 ## Start here
 
@@ -47,7 +47,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs), draft [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32); implemented, awaiting review |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | In progress (branch `codex/routing-batch-readback`; pcb_routing.rs, pcb_routing_batch.rs and its tests, outcome.rs), draft [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34); implemented, awaiting review |
-| 13 | DRC rule writer | none | In progress (branch `codex/drc-rule-writer`; verification.rs, drc_rule_writer.rs, pcb_export.rs, specctra.rs) |
+| 13 | DRC rule writer | none | In progress (branch `codex/drc-rule-writer`; verification.rs, drc_rule_writer.rs, drc_project_rules.rs, project_json_guard.rs), draft [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35); initial rule-writer slice in progress |
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
@@ -376,3 +376,23 @@ in `pcb_routing_batch.rs` serves three new tools and four upgraded tools.
   or save. Real KiCad GUI IPC/undo and Windows/Linux remain unverified. The
   release probe uses a private IPC bridge to a protobuf mock and scratch files.
   Differential-pair routing, delete_trace and Specctra keep their own contracts.
+
+## PR 13, initial rule-writer slice (in progress, draft #35)
+
+`create_custom_drc_rule` is a deliberately narrow first step: it previews or
+creates one unconditional clearance or track-width minimum, and refuses an
+existing rules file unless every rule is in its canonical single-line format.
+This preserves unsupported files unchanged while general rule editing is open.
+The preview revision binds board path, saved board and project bytes, existing
+rule-file bytes and the candidate.
+Apply rechecks the canonical board lock, writes atomically and verifies saved
+bytes. Lock inspection failures refuse rather than imply absence.
+
+Validation runs KiCad DRC on a private copy of a KiCad-authored board, with the
+candidate and a temporary probe clearance. A violation naming the probe proves
+that the scratch rules loaded; the command's exit status alone does not. It also runs DRC on a separate scratch copy of the saved target board and
+project, reporting counts and disclosing missing external libraries, parity and
+zone refill. It never runs DRC directly on the original. Real KiCad scratch tests cover preview,
+apply, an observed target-rule violation and malformed-rule rejection. PR 13
+now also adds three project minima and independent preview/apply tools for differential-pair settings and deletion of netclasses unreferenced in saved project data. Project writes reject duplicate keys and linked files, check editor locks and verify conditional writes. Schematic connectivity and live netclass validation are not inspected. General rule expressions/edit/delete and safe DSN handling remain open. In particular, PR #34's SES import does not yet validate a scratch candidate with the source custom rules, so custom-rule export/import remains blocked. The netclass code in
+`pcb_routing.rs` is claimed by PR #34 and must not be touched while it is open.

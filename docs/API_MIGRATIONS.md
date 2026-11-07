@@ -3,6 +3,45 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: initial custom DRC rule writer
+
+Creation PR 13 is in progress. `create_custom_drc_rule` previews by default and
+can create a named unconditional `clearance` or `track_width` minimum. Apply
+requires `dry_run: false` and the exact `expected_plan_revision` returned by the
+preview, including the saved board and project bytes. Names are limited to ASCII letters, digits, dot, hyphen and underscore;
+minimums are 1 nm–100 mm in whole nanometers. Duplicate names are refused.
+
+Existing `.kicad_dru` files must contain only version 1 and the writer's canonical
+single-line unconditional minimum format. Other rule syntax, formatting and
+comments are refused unchanged; this initial tool does not edit or delete rules.
+It checks KiCad IPC ownership and the canonical board lock (including when
+addressed through an alias), runs KiCad DRC on an isolated,
+KiCad-authored fixture with a probe rule, and requires a reported violation from
+that probe before writing. KiCad's exit code alone is not sufficient: an invalid
+rule can be ignored while DRC exits successfully. Rule and project paths must be regular files or absent; symlinks and directories
+are refused. The validated candidate is written with a revision check and read back. An uncertain write requires inspecting
+the saved rule file before retrying. This validates the narrow rule syntax; it
+also runs DRC on a private copy of the saved target board and project, with
+candidate rules, and reports violation and unconnected-item counts. External
+libraries are not copied, schematic parity is not requested and zones are not
+refilled. Missing project files use a synthetic default project and are labelled.
+The result is a snapshot, not a claim that the live board is clear.
+
+`set_design_rules` and `get_design_rules` now support `min_copper_edge_clearance`,
+`min_silk_clearance` and `min_via_annular_width` in millimeters. Project writes
+reject duplicate JSON keys and linked or non-regular project files, check board
+and root schematic locks, and use a conditional write with saved-byte readback.
+A board alias resolves to its physical project's path when setting rules.
+
+The verification toolset also provides `set_netclass_diff_pair` and
+`delete_netclass` on saved project data. Both preview by default and require the
+returned `expected_plan_revision` to apply. Deletion refuses Default, ambiguous
+names and classes referenced by saved patterns or assignments; it does not
+inspect schematic connectivity. These tools do not validate live netclasses.
+
+General rule expressions, rule editing/deletion and safe DSN custom-rule
+handling remain open. PR #34's routing files are intentionally separate.
+
 ## Unreleased: render images and focused views (minor release)
 
 Creation PR 4 (`docs/CREATION_HANDOFF.md`).
