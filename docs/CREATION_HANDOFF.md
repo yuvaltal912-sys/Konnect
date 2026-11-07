@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). PR 4 is merged as [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). The owner explicitly approved starting the next independent PR on 2026-11-07: PR 5 is implemented on `docs/creation-workflow-guidance`, branched from `main`, draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29). PR 4's code files are outside this work. The pre-change macOS gate passed formatting, 3,401 workspace tests, doctests, all 93 live simulation tests, Clippy, licenses, doc counts and the release build. The final gate and exact-build checks are recorded on #29 after its implementation commit. The installed binary's hash is unchanged. No later PR is authorized yet.
+**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 4 (#28), 5 (#29), 7, the first half of 9, and the ngspice test fix (#23). The owner authorized review of #28/#29 followed by PR 6. PR 6 is implemented on `feat/schematic-small-edits`, draft [#30](https://github.com/yuvaltal912-sys/Konnect/pull/30), awaiting review. The pre-change macOS gate on `ca5a3ba` passed formatting, 3,430 workspace tests, 9 doctests, all 93 live simulation tests, Clippy, licenses, doc counts and release build. The final gate and exact-build scratch checks are recorded on #30 after its implementation commit. The installed binary's hash is unchanged. The requested CodeRabbit review of #28/#29 could not authenticate its session/Git-provider access, including after browser sign-in; no review results were produced. This is unavailable evidence, not a pass; the CLI requests `coderabbit auth login` in a user-controlled terminal.
 
 ## Start here
 
@@ -37,8 +37,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Merged: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
 | 3 | Response budget for ERC, DRC and list tools | none | Merged: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21). Leftovers (C24 stale-fill field, A30's other long results) are open under rank 3 |
 | 4 | Inline renders as image blocks; region and side options | none | Merged: [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). Follow-ups: inline layer and library-item renders (rank 25), a generated difference image for `inline_diff` |
-| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | In progress (branch `docs/creation-workflow-guidance`), draft [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29); implemented, awaiting review |
-| 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
+| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Merged: [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29) |
+| 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | In progress (branch `feat/schematic-small-edits`), draft [#30](https://github.com/yuvaltal912-sys/Konnect/pull/30); implemented, awaiting review |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
@@ -58,8 +58,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 **Recommended order**, by research rank and what is unblocked:
 
 1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
-2. **PR 5** is claimed and implemented in draft #29, rebased on PR 4; its skills now name PR 4's render options: guidance in `crates/konnect/assets` (skills and agents). Its dependencies (1, 2, 2b) are merged. Review this draft before claiming further work unless the owner explicitly approves another independent PR.
-3. **PR 6** (mirror after placement, DNP and BOM flags, title block), **PR 8** (placement objective on PR 7's layer), **PR 10** (library correctness).
+2. **PR 5** is merged (#29): shipped guidance, including PR 4's render options.
+3. **PR 6** is implemented in draft #30 (mirror after placement, DNP and BOM flags, title block). Then **PR 8** (placement objective on PR 7's layer), **PR 10** (library correctness), after owner approval.
 4. Then 9b, 12, 13, 14, Q3, 11 and 15.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
@@ -73,6 +73,43 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - GitHub merge commits carry the owner's Gmail, because the account's email-privacy setting is off. Commits you make yourself use the noreply address from `AGENTS.md`.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
+
+## PR 6, small schematic edits (draft, #30)
+
+The claim-only commit and draft preceded implementation, from merged `main`.
+
+- `rotate_schematic_component` accepts `rotation` and/or absolute `mirror`
+  (`x`, `y`, `none`). Omitted transforms are preserved across every resolved
+  placed unit. Field text and no-connects follow the transform, junctions are
+  reconciled, and prospective and saved state are checked. Connected wires do
+  not move; pin-aligning replacement and wire stretching remain separate work.
+- `edit_schematic_component` accepts DNP/BOM/board/simulation inclusion booleans
+  for all resolved units. Component mutation/get/list observations expose saved
+  nested `flags`. Unrequested legacy simulation-token absence is preserved.
+  New components copy resolved library defaults, including inheritance; an
+  additional unit keeps consistent package choices. Missing and explicit-false
+  simulation exclusion are equivalent for that check, while untouched units
+  keep their existing token representation.
+- New `set_schematic_title_block` in `sch_hierarchy` partially updates one saved
+  sheet's title/date/revision/company/comments1–9. Targeted edits preserve other
+  bytes, omitted values, unknown list children, indentation and CRLF. Invalid or
+  ambiguous metadata, malformed child shapes, unsupported comment lines and
+  implicit/multiple roots are refused. A revision/lock-protected write is
+  followed by independent saved verification; failure then reports uncertainty.
+- API migrations, tool directory and schematic guidance describe the changes.
+  `cargo xtask fix-doc-counts` updates generated counts for the one added tool.
+- Focused verification: 13 new component tests, 16 normal title-block tests and
+  the ignored real KiCad SVG oracle passed, as did the existing library suite.
+  All 57 removal controls caused actual failures and were restored: 25 title,
+  32 component/library/schema, including one explicitly structural assertion of
+  the redundant published mirror-type metadata. These are not model-behavior
+  tests. The first full gate exposed the separate power-symbol constructor's
+  missing flag copy and two exact served-response expectations; these were
+  fixed, with a served power regression and its removal control. The corrected
+  final workspace gate and release/stdio checks are recorded on #30.
+- No installed-binary update, live-project edit, variant support or Claude
+  runtime was used. Client GUI behavior, Windows/Linux and hosted CI remain
+  unverified. CodeRabbit's prior-PR review is still blocked by authentication.
 
 ## PR 4, render images and focused views (merged, #28)
 
@@ -101,7 +138,7 @@ The claim commit landed before code changes and the draft was opened against `ma
   mutations were restored. The final macOS gate is listed on #28. No live editor IPC is needed for these tools;
   Windows, Linux and display in an actual MCP client remain unverified.
 
-## PR 5, shipped creation guidance (draft, #29)
+## PR 5, shipped creation guidance (merged, #29)
 
 The claim commit and draft preceded implementation. This branch is rebased on
 `main` after PR 4 merged; the schematic and PCB skills name its `region` crop and board `side`/`zoom`; no runtime tools, schemas or API response shapes

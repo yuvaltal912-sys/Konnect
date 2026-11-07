@@ -54,6 +54,7 @@ pub mod sch_hierarchy;
 pub(crate) mod sch_netlist;
 pub mod sch_wiring;
 pub mod schematic_builder;
+mod schematic_metadata;
 #[cfg(test)]
 mod schematic_placement_tests;
 #[cfg(test)]

@@ -96,7 +96,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Place multiple symbols from KiCAD libraries in one write with committed-file \
              readback. Preserves every saved hierarchy instance and preflights stale metadata \
              before any placement. Copies each library Value and Footprint unless that entry \
-             explicitly overrides it. Pins that land mid-segment on an existing wire gain the \
+             explicitly overrides it. New components use resolved library inclusion flags; \
+             additional units retain consistent existing package flags. Pins that land mid-segment on an existing wire gain the \
              required junction in the same atomic write; the response reports \
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
