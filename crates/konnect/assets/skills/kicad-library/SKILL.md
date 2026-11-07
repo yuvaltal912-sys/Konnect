@@ -28,6 +28,16 @@ load_toolset('pcb_components') # update_footprints_from_library for placed insta
 
 Always call `get_active_toolsets()` first to see what is already loaded.
 
+Before layout, use `check_symbol_footprint` with the symbol library path,
+symbol name and footprint path. Inspect `result`, `missing_pads` and
+`extra_pads`; unresolved inheritance is incomplete evidence. An identifier-set
+match does not replace the accepted physical datasheet pin map below.
+
+Use `edit_symbol` for metadata-only changes; it preserves pin/graphic geometry
+and existing field positioning. Refresh placed definitions separately. Search
+results are ranked and paged: follow `next_offset` when truncated and inspect
+skipped-library diagnostics before claiming the search was exhaustive.
+
 ---
 
 ## Refresh Placed Footprints

@@ -97,6 +97,36 @@ and reads one exact live snapshot or its disclosed saved-file fallback.
   planners. Their before/after comparisons use the default fanout policy of 8;
   do not compare those scalar scores with a custom-policy scoring call.
 
+## Unreleased: library correctness (minor release)
+
+Creation PR 10. New `edit_symbol` edits metadata only in an explicit
+`library_path` / `symbol_name`, preserving geometry and property positioning.
+Optional `value`, `reference_prefix`, `footprint`, `description`, `datasheet`
+and `keywords` are strings; omitted entries remain unchanged. Empty strings
+clear fields, except a reference prefix must remain nonempty. Existing file
+writes are revision-checked and independently read back. Placed symbols still
+need `update_symbols_from_library` to refresh their embedded definitions.
+
+`create_symbol` adds `footprint`, `description`, `keywords`, escapes metadata,
+refuses duplicate names and checks existing library structure before append.
+`delete_symbol` uses direct-child spans (tabs, quotes and CRLF supported), and
+refuses deleting a definition used as an inheritance base.
+
+New `check_symbol_footprint` compares the effective symbol's pin identifiers
+against an explicit footprint file. Missing and extra pads yield `fail`;
+unresolved inheritance or absent/unreadable identifiers yield `incomplete`.
+Repeated pin/pad numbers are sets, and unnumbered mechanical pads are ignored.
+A match proves identifier compatibility only, not a physical datasheet pin map.
+
+Both library searches now rank exact names, prefixes, substrings, then metadata
+matches. Symbol descriptions/keywords and footprint descriptions/tags participate;
+all query words must match. Footprint search adds `project_dir` like symbol search.
+Project nicknames override global nicknames. `limit`/`offset` paging reports full
+`total_matches`, `truncated` and `next_offset`; `count` is now all matches rather
+than only returned items. `skipped_libraries`, `skipped_library_count` and
+`search_complete` disclose unreadable discovered entries. This does not certify
+that a missing or invalid library table registered all intended libraries.
+
 ## Unreleased: render images and focused views (minor release)
 
 Creation PR 4 (`docs/CREATION_HANDOFF.md`).
