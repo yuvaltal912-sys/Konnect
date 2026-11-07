@@ -3,6 +3,39 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: schematic-to-PCB replacement and copper sync (minor release)
+
+Creation PR 9b. `update_pcb_from_schematic` still defaults to a live-board dry
+run and requires its exact `expected_plan_revision` to apply in one undo commit.
+A changed footprint ID now plans an `update` with `replace_with`, rather than
+always producing `footprint_id_changed`. The typed library refresh path rebuilds
+library-owned content while preserving footprint KIID, position, angle, side,
+lock, schematic identity and instance overrides. Schematic fields override the
+new library's defaults even when they matched the old board already.
+
+Replacement preparation runs during preview. Missing/unsupported libraries,
+missing connected pads, or changed geometry of any pad whose net has routed
+copper are conflicts (`footprint_replacement_unsafe` for rebuild/geometry
+failures). Konnect does not move tracks to fit different pad locations. A
+replacement with unchanged routed-pad geometry keeps its copper intact.
+
+Routed pad-net changes can now proceed when every existing pad on the old net
+maps to the same nonempty destination in the saved schematic. All tracks, arcs
+and vias on that old net receive the new name, preserving their KIIDs and every
+geometry field. `copper_changes` previews each KIID, kind, old name and new name.
+Partial splits, skipped/board-only terminals, zones (whose nets KiCad 10 IPC
+cannot expose), unnetted copper and ambiguous repeated pads remain conflicts.
+This is net reassignment, not a routing or clearance check.
+
+Plan revisions now cover raw live footprint/copper objects and prepared library
+bytes. Moving copper under the same KIID or editing a library after preview
+invalidates apply. `coverage.footprints_replaced` and `coverage.copper_reassigned`
+are new planned/applied counters. Updated-footprint, reassigned-pad and new
+completion counts use readback. A completed commit with verification differences
+returns `applied_with_differences` and diagnostics; a verification failure returns
+`mutation_outcome_uncertain`, requiring inspection of the open board before
+retrying. Neither means that the board was rolled back or saved.
+
 ## Unreleased: render images and focused views (minor release)
 
 Creation PR 4 (`docs/CREATION_HANDOFF.md`).

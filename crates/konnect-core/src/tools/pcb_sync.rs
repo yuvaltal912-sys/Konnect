@@ -4,6 +4,9 @@
 //! This module owns the deep planning interface: turn a KiCad-exported
 //! flattened netlist plus a board snapshot into a complete, immutable plan.
 
+#[path = "pcb_sync_completion.rs"]
+mod completion;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -157,6 +160,7 @@ struct CopperItem {
 
 #[derive(Debug, Clone, PartialEq)]
 struct BoardState {
+    unresolved_copper: bool,
     footprints: Vec<BoardFootprint>,
     /// Net name to the number of routed copper objects (tracks, arcs, vias,
     /// and zones) carrying the net.
@@ -197,6 +201,8 @@ struct SyncCounts {
     /// Orphan footprints deleted. `applied` is what the board read back as
     /// gone, not what was requested.
     orphans_deleted: CountPair,
+    footprints_replaced: CountPair,
+    copper_reassigned: CountPair,
     conflicts: CountPair,
 }
 
@@ -245,6 +251,8 @@ enum PlannedChange {
     },
     Update {
         kiid: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replace_with: Option<String>,
         reference: String,
         value: String,
         symbol_path: String,
@@ -341,6 +349,9 @@ struct SyncPlan {
     plan_revision: String,
     counts: SyncCounts,
     changes: Vec<PlannedChange>,
+    copper_changes: Vec<completion::CopperChange>,
+    #[serde(skip)]
+    replacements: BTreeMap<String, prost_types::Any>,
     diagnostics: Vec<SyncDiagnostic>,
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
@@ -420,6 +431,7 @@ struct LiveSnapshot {
 
 #[derive(Debug)]
 struct PreparedFootprint {
+    source: String,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     fields: konnect_ipc::IpcFieldPlacement,
@@ -543,12 +555,14 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 .map(UnpreparedFootprint::into_diagnostic)
                 .collect::<Vec<_>>();
             preflight.extend(additions_missing_pads(&plan, &prepared));
+            preflight.extend(completion::prepare_replacements(&mut plan, &prepared, &snapshot, &design));
             if !preflight.is_empty() {
                 refuse_plan(&mut plan, preflight);
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
+            completion::seal_revision(&mut plan, &snapshot, &prepared);
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -591,31 +605,42 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             })?;
             // Counts for these come from reading the board back, not from
             // the plan.
-            let readback = client.get_items_in(
-                snapshot.document.clone(),
-                konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-            )?;
-            record_applied_orphans_and_fields(&mut plan, &readback);
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
-            {
-                plan.diagnostics.push(conflict(
-                    "board_readback_differs",
-                    format!(
-                        "the board KiCad wrote differs from what was sent — {detail}. \
-                         No pad was invented, so this is reported rather than \
-                         refused; check the footprint before relying on it."
-                    ),
-                    None,
+            let verification = (|| -> Result<()> {
+                let readback = client.get_items_in(
+                    snapshot.document.clone(),
+                    konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+                )?;
+                record_applied_orphans_and_fields(&mut plan, &readback);
+                for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
+                {
+                    plan.diagnostics.push(conflict(
+                        "board_readback_differs",
+                        format!(
+                            "the board KiCad wrote differs from what was sent — {detail}. \
+                             No pad was invented, so this is reported rather than \
+                             refused; check the footprint before relying on it."
+                        ),
+                        None,
+                    ));
+                }
+                plan.counts.added.applied = plan.counts.added.planned;
+                completion::record_readback(&mut plan, &snapshot, &readback, client)?;
+                Ok(())
+            })();
+            if let Err(error) = verification {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+                        operation: "update_pcb_from_schematic".into(), path: ipc_board.display().to_string(), reason: format!("commit completed but verification failed: {error:#}"),
+                    },
+                    format!("KiCad committed the sync but live-board verification failed: {error:#}. Inspect the open board before retrying; saving was not requested."),
                 ));
             }
-            plan.counts.added.applied = plan.counts.added.planned;
-            plan.counts.updated.applied = plan.counts.updated.planned;
-            plan.counts.pads_reassigned.applied = plan.counts.pads_reassigned.planned;
             plan.counts.board_only_preserved.applied =
                 plan.counts.board_only_preserved.planned;
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
             plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
-            Ok(sync_response(&plan, "applied", hierarchy.len(), true))
+            let status = if plan.diagnostics.is_empty() { "applied" } else { "applied_with_differences" };
+            Ok(sync_response(&plan, status, hierarchy.len(), true))
         },
     )
     .await?;
@@ -671,9 +696,12 @@ fn sync_response(
             "unassigned_footprint": plan.counts.unassigned_footprint,
             "fields_updated": plan.counts.fields_updated,
             "orphans_deleted": plan.counts.orphans_deleted,
+            "footprints_replaced": plan.counts.footprints_replaced,
+            "copper_reassigned": plan.counts.copper_reassigned,
             "conflicts": plan.counts.conflicts
         },
         "changes": plan.changes,
+        "copper_changes": plan.copper_changes,
         // Footprints whose symbol is gone, with what the plan does about
         // each. Listed on every run; deleted only with
         // `delete_orphan_footprints`.
@@ -982,22 +1010,13 @@ fn plan_sync_with(
                 continue;
             }
         }
-        if footprint.footprint_id != component.footprint_id {
-            diagnostics.push(conflict(
-                "footprint_id_changed",
-                format!(
-                    "{} uses {} on the board but {} in the schematic",
-                    component.reference, footprint.footprint_id, component.footprint_id
-                ),
-                Some(&component.reference),
-            ));
-            continue;
-        }
+        let replace_with = (footprint.footprint_id != component.footprint_id)
+            .then(|| component.footprint_id.clone());
         // A pad the schematic connects and the live footprint lacks used to
         // reach `apply_footprint_fields` and fail the apply, after a dry run
         // that said `ready` (#657).
         let missing = missing_pads(&component.pad_nets, &footprint.pad_numbers);
-        if !missing.is_empty() {
+        if replace_with.is_none() && !missing.is_empty() {
             diagnostics.push(pad_missing_conflict(
                 &component.reference,
                 &footprint.footprint_id,
@@ -1026,7 +1045,10 @@ fn plan_sync_with(
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            if board.unresolved_copper
+                || (board.routed_nets.contains_key(old_net)
+                    && !completion::whole_net_target(design, board, old_net, new_net))
+            {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -1041,7 +1063,8 @@ fn plan_sync_with(
         }
 
         let field_changes = field_changes(&component.fields, &footprint.fields);
-        let needs_update = footprint.reference != component.reference
+        let needs_update = replace_with.is_some()
+            || footprint.reference != component.reference
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
@@ -1049,8 +1072,10 @@ fn plan_sync_with(
             || !field_changes.is_empty();
         if needs_update {
             counts.fields_updated.planned += field_changes.len();
+            counts.footprints_replaced.planned += usize::from(replace_with.is_some());
             changes.push(PlannedChange::Update {
                 kiid: footprint.kiid.clone(),
+                replace_with,
                 reference: component.reference.clone(),
                 value: component.value.clone(),
                 symbol_path: component.symbol_path.clone(),
@@ -1167,6 +1192,7 @@ fn plan_sync_with(
         counts.added.planned = 0;
         counts.updated.planned = 0;
         counts.pads_reassigned.planned = 0;
+        counts.footprints_replaced.planned = 0;
         counts.fields_updated.planned = 0;
         counts.orphans_deleted.planned = 0;
         // Nothing is deleted from a conflicted plan; the footprint stays.
@@ -1184,12 +1210,20 @@ fn plan_sync_with(
     } else {
         PlanStatus::Ready
     };
+    let copper_changes = if status == PlanStatus::Conflict {
+        Vec::new()
+    } else {
+        completion::copper_changes(design, board)
+    };
+    counts.copper_reassigned.planned = copper_changes.len();
     let plan_revision = plan_revision(netlist_source, board);
     SyncPlan {
         status,
         plan_revision,
         counts,
         changes,
+        copper_changes,
+        replacements: BTreeMap::new(),
         diagnostics,
         unassigned,
         orphans,
@@ -2243,6 +2277,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     for item in footprint_items {
         let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
             .context("KiCad returned an invalid footprint item")?;
+        completion::validate_terminals(&instance)?;
         let footprint = board_footprint_from_instance(&instance)?;
         let kiid = footprint.kiid.clone();
         footprints.push(footprint);
@@ -2256,9 +2291,14 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
     let mut copper = Vec::new();
+    let mut unresolved_copper = false;
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
-        if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
+        let track = kiapi::board::types::Track::decode(item.value.as_slice())
+            .context("invalid track in live snapshot")?;
+        {
+            unresolved_copper |= track.net.as_ref().is_none_or(|net| net.name.is_empty());
             record_routed_net(&mut routed_nets, track.net.as_ref());
+            completion::capture_copper(&mut items, &item, track.id.as_ref())?;
             copper.extend(copper_item(
                 "track",
                 track.id.as_ref(),
@@ -2270,8 +2310,12 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
-        if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
+        let arc = kiapi::board::types::Arc::decode(item.value.as_slice())
+            .context("invalid arc in live snapshot")?;
+        {
+            unresolved_copper |= arc.net.as_ref().is_none_or(|net| net.name.is_empty());
             record_routed_net(&mut routed_nets, arc.net.as_ref());
+            completion::capture_copper(&mut items, &item, arc.id.as_ref())?;
             copper.extend(copper_item(
                 "arc",
                 arc.id.as_ref(),
@@ -2283,8 +2327,12 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
-        if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+        let via = kiapi::board::types::Via::decode(item.value.as_slice())
+            .context("invalid via in live snapshot")?;
+        {
+            unresolved_copper |= via.net.as_ref().is_none_or(|net| net.name.is_empty());
             record_routed_net(&mut routed_nets, via.net.as_ref());
+            completion::capture_copper(&mut items, &item, via.id.as_ref())?;
             // A via is a point here. Its drill and annular ring are not read,
             // so it is given a 1 mm width, which reaches 0.5 mm beyond its
             // centre: wider than any ordinary via.
@@ -2298,10 +2346,10 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             ));
         }
     }
-    if !client
+    unresolved_copper |= !client
         .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
+        .is_empty();
+    if unresolved_copper {
         // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
         // reassignment on a zoned board therefore fails closed.
         for net in net_codes.keys() {
@@ -2320,6 +2368,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     });
     Ok(LiveSnapshot {
         state: BoardState {
+            unresolved_copper,
             footprints,
             routed_nets,
             copper,
@@ -2641,6 +2690,7 @@ fn prepare_footprint_source(
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
     let (width, height) = footprint_dimensions(&pads, &graphics);
     Ok(PreparedFootprint {
+        source: source.into(),
         pads,
         graphics,
         fields,
@@ -2678,7 +2728,7 @@ fn apply_library_data(
     Ok(())
 }
 
-/// Prepare every footprint the plan adds. One that cannot be prepared does
+/// Prepare every footprint the plan adds or uses as a replacement. One that cannot be prepared does
 /// not stop the rest: stopping at the first produced a single diagnostic that
 /// named neither the footprint nor a part, and hid every other unusable
 /// footprint behind it (#657).
@@ -2692,13 +2742,18 @@ fn prepare_additions(
     let mut prepared = BTreeMap::new();
     let mut unprepared: BTreeMap<String, UnpreparedFootprint> = BTreeMap::new();
     for change in &plan.changes {
-        let PlannedChange::Add {
-            footprint_id,
-            reference,
-            ..
-        } = change
-        else {
-            continue;
+        let (footprint_id, reference) = match change {
+            PlannedChange::Add {
+                footprint_id,
+                reference,
+                ..
+            } => (footprint_id, reference),
+            PlannedChange::Update {
+                replace_with: Some(id),
+                reference,
+                ..
+            } => (id, reference),
+            _ => continue,
         };
         if prepared.contains_key(footprint_id) {
             continue;
@@ -2769,6 +2824,18 @@ fn refuse_plan(plan: &mut SyncPlan, diagnostics: Vec<SyncDiagnostic>) {
     plan.counts.added.planned = 0;
     plan.counts.updated.planned = 0;
     plan.counts.pads_reassigned.planned = 0;
+    plan.counts.footprints_replaced.planned = 0;
+    plan.counts.fields_updated.planned = 0;
+    plan.counts.board_only_preserved.planned += plan.counts.orphans_deleted.planned;
+    plan.counts.orphans_deleted.planned = 0;
+    for orphan in &mut plan.orphans {
+        if orphan.outcome == OrphanOutcome::Delete {
+            orphan.outcome = OrphanOutcome::KeptPlanConflict;
+        }
+    }
+    plan.counts.copper_reassigned.planned = 0;
+    plan.copper_changes.clear();
+    plan.replacements.clear();
     plan.counts.conflicts.planned += diagnostics.len();
     plan.diagnostics.extend(diagnostics);
     plan.changes.clear();
@@ -3021,9 +3088,10 @@ fn build_mutation_items(
                 creates.push(build_added_footprint(change, part, &snapshot.net_codes)?);
             }
             PlannedChange::Update { kiid, .. } => {
-                let item = snapshot
-                    .items
+                let item = plan
+                    .replacements
                     .get(kiid)
+                    .or_else(|| snapshot.items.get(kiid))
                     .with_context(|| format!("planned footprint {kiid} disappeared"))?;
                 updates.push(update_footprint_item(item, change, &snapshot.net_codes)?);
             }
@@ -3034,6 +3102,13 @@ fn build_mutation_items(
                 deletes.push(kiid.clone());
             }
         }
+    }
+    for change in &plan.copper_changes {
+        let item = snapshot
+            .items
+            .get(&change.kiid)
+            .context("planned copper disappeared")?;
+        updates.push(completion::reassign_copper(item, &change.to)?);
     }
     Ok(Mutations {
         creates,
@@ -3706,6 +3781,7 @@ mod tests {
 
     fn board_with(footprints: Vec<BoardFootprint>) -> BoardState {
         BoardState {
+            unresolved_copper: false,
             copper: Vec::new(),
             footprints,
             routed_nets: BTreeMap::new(),
@@ -3730,6 +3806,7 @@ mod tests {
             unassigned: Vec::new(),
         };
         let board = BoardState {
+            unresolved_copper: false,
             copper: Vec::new(),
             footprints: vec![
                 BoardFootprint {
@@ -3928,6 +4005,7 @@ mod tests {
         assert_eq!(before.get("kiapi.board.types.BoardText"), Some(&1));
 
         let change = PlannedChange::Update {
+            replace_with: None,
             field_changes: Vec::new(),
             kiid: "u1-kiid".to_string(),
             reference: "U1".to_string(),
@@ -4129,6 +4207,7 @@ mod tests {
         let item =
             konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
         let change = PlannedChange::Update {
+            replace_with: None,
             field_changes: Vec::new(),
             kiid: "keep-kiid".to_string(),
             reference: "R2".to_string(),
@@ -4181,6 +4260,7 @@ mod tests {
             unassigned: Vec::new(),
         };
         let board = BoardState {
+            unresolved_copper: false,
             copper: Vec::new(),
             footprints: vec![BoardFootprint {
                 pads: Vec::new(),
@@ -4238,7 +4318,7 @@ mod tests {
     }
 
     #[test]
-    fn footprint_swap_conflicts_but_an_unrouted_net_change_is_planned() {
+    fn footprint_swap_and_an_unrouted_net_change_are_planned() {
         let design = ExportedDesign {
             bom_excluded: Vec::new(),
             components: vec![resistor("R1", "/sheet/existing")],
@@ -4248,11 +4328,8 @@ mod tests {
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
         let swap = plan_sync("netlist", &design, &board_with(vec![footprint]));
-        assert_eq!(swap.status, PlanStatus::Conflict);
-        assert!(swap
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "footprint_id_changed"));
+        assert_eq!(swap.status, PlanStatus::Ready);
+        assert_eq!(swap.counts.footprints_replaced.planned, 1);
 
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint
@@ -4377,6 +4454,7 @@ mod tests {
             )
         };
         let board = BoardState {
+            unresolved_copper: false,
             copper: Vec::new(),
             footprints: Vec::new(),
             routed_nets: BTreeMap::new(),
@@ -5299,6 +5377,8 @@ mod tests {
 
     fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
         SyncPlan {
+            copper_changes: Vec::new(),
+            replacements: BTreeMap::new(),
             status: PlanStatus::Ready,
             plan_revision: "reviewed".to_string(),
             counts: SyncCounts {
@@ -5549,12 +5629,14 @@ mod tests {
         schematic: PathBuf,
         board: PathBuf,
         exported: PathBuf,
+        cli: PathBuf,
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
         /// The footprints the mock board holds now: the seed, plus what was
         /// created, with updates applied and deletions removed.
         held: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
         /// The KIIDs `DeleteItems` received, in order.
         deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tracks: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
     }
 
     /// What the mock board holds before the sync runs.
@@ -5588,6 +5670,9 @@ mod tests {
         /// What was sent with its mounting style and models, but DNP cleared:
         /// one flag lost while everything the old check looked at survives.
         WithoutDnp,
+        MovedPad,
+        WrongDescription,
+        MalformedCopper,
     }
 
     impl ServedSync {
@@ -5636,10 +5721,12 @@ mod tests {
             let board_items = held.clone();
             let created_log = created.clone();
             let deleted_log = deleted.clone();
-            let tracks = seed.tracks.clone();
+            let tracks = std::sync::Arc::new(std::sync::Mutex::new(seed.tracks.clone()));
+            let track_items = tracks.clone();
             let has_seed = !seed.footprints.is_empty() || !seed.tracks.is_empty();
             let ignore_deletes = seed.ignore_deletes;
             let ignore_updates = seed.ignore_updates;
+            let did_write = std::sync::atomic::AtomicBool::new(false);
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -5680,12 +5767,35 @@ mod tests {
                                     "outline",
                                 )]
                             }
-                            _ if request.types.contains(&traces) => tracks.clone(),
+                            _ if request.types.contains(&traces) => {
+                                if matches!(readback, Readback::MalformedCopper)
+                                    && did_write.load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    vec![prost_types::Any {
+                                        type_url: "type.googleapis.com/kiapi.board.types.Track"
+                                            .into(),
+                                        value: vec![255],
+                                    }]
+                                } else {
+                                    track_items.lock().unwrap().clone()
+                                }
+                            }
                             _ if request.types.contains(&footprints) => board_items
                                 .lock()
                                 .unwrap()
                                 .iter()
-                                .map(|item| read_back(item, readback))
+                                .map(|item| {
+                                    read_back(
+                                        item,
+                                        if matches!(readback, Readback::WrongDescription)
+                                            && !did_write.load(std::sync::atomic::Ordering::SeqCst)
+                                        {
+                                            Readback::AsSent
+                                        } else {
+                                            readback
+                                        },
+                                    )
+                                })
                                 .collect(),
                             _ => Vec::new(),
                         };
@@ -5779,12 +5889,34 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("UpdateItems") {
+                        did_write.store(true, std::sync::atomic::Ordering::SeqCst);
                         let request =
                             kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
                                 .expect("UpdateItems request");
                         if !ignore_updates {
                             let mut board = board_items.lock().unwrap();
                             for update in &request.items {
+                                if konnect_ipc::builders::any_is(update, "kiapi.board.types.Track")
+                                {
+                                    let id =
+                                        kiapi::board::types::Track::decode(update.value.as_slice())
+                                            .unwrap()
+                                            .id
+                                            .unwrap();
+                                    let mut tracks = track_items.lock().unwrap();
+                                    let slot = tracks
+                                        .iter_mut()
+                                        .find(|item| {
+                                            kiapi::board::types::Track::decode(
+                                                item.value.as_slice(),
+                                            )
+                                            .unwrap()
+                                            .id == Some(id.clone())
+                                        })
+                                        .unwrap();
+                                    *slot = update.clone();
+                                    continue;
+                                }
                                 let kiid = footprint_kiid(update);
                                 if let Some(slot) =
                                     board.iter_mut().find(|held| footprint_kiid(held) == kiid)
@@ -5865,9 +5997,11 @@ mod tests {
                 schematic,
                 board,
                 exported,
+                cli,
                 created,
                 held,
                 deleted,
+                tracks,
             }
         }
 
@@ -5957,7 +6091,7 @@ mod tests {
     /// A created item as the mock's board lists it back.
     fn read_back(item: &prost_types::Any, readback: Readback) -> prost_types::Any {
         match readback {
-            Readback::AsSent => item.clone(),
+            Readback::AsSent | Readback::MalformedCopper => item.clone(),
             Readback::WithoutLibraryData => {
                 let mut footprint =
                     konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
@@ -5971,6 +6105,32 @@ mod tests {
                     });
                 }
                 konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
+            Readback::WrongDescription => {
+                let mut fp =
+                    api::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                set_field_text(
+                    &mut fp.description_field,
+                    "Description",
+                    "wrong on readback",
+                );
+                konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance")
+            }
+            Readback::MovedPad => {
+                let mut fp =
+                    api::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                let child = fp
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .iter_mut()
+                    .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                    .unwrap();
+                let mut pad = api::board::types::Pad::decode(child.value.as_slice()).unwrap();
+                pad.position.as_mut().unwrap().x_nm += 1000;
+                *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance")
             }
             Readback::WithoutDnp => {
                 let mut footprint =
@@ -6322,7 +6482,7 @@ mod tests {
             .apply(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
             .await;
 
-        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["status"], "applied_with_differences", "{applied:#}");
         let messages: Vec<&str> = applied["diagnostics"]
             .as_array()
             .unwrap()
@@ -6359,7 +6519,7 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["status"], "applied_with_differences", "{applied:#}");
         assert_eq!(
             applied["diagnostics"].as_array().unwrap().len(),
             1,
@@ -6964,6 +7124,7 @@ mod tests {
 
         assert_eq!(plan["coverage"]["fields_updated"]["planned"], 1);
         assert_eq!(applied["coverage"]["fields_updated"]["applied"], 0);
+        assert_eq!(applied["coverage"]["footprints_updated"]["applied"], 0);
         let codes = applied["diagnostics"]
             .as_array()
             .unwrap()
@@ -7171,6 +7332,7 @@ mod tests {
 
     fn orphan_board(footprints: Vec<BoardFootprint>, copper: Vec<CopperItem>) -> BoardState {
         BoardState {
+            unresolved_copper: false,
             footprints,
             routed_nets: BTreeMap::new(),
             copper,
@@ -7203,7 +7365,7 @@ mod tests {
     #[test]
     fn a_conflicted_plan_deletes_no_orphan() {
         let mut swapped = board_resistor("R1", Some("/sheet/r1"));
-        swapped.footprint_id = "Resistor_SMD:R_0805".to_string();
+        swapped.pad_numbers.clear();
         let orphan = board_resistor("R9", Some("/sheet/r9"));
         let board = orphan_board(vec![swapped, orphan], Vec::new());
         let design = design_of(vec![resistor("R1", "/sheet/r1")]);
@@ -7289,5 +7451,656 @@ mod tests {
                 ),
             ])
         );
+    }
+    const COMPLETION_SOURCE: &str =
+        include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+    fn completion_native_item(back: bool) -> prost_types::Any {
+        let part = prepare_footprint_source(COMPLETION_SOURCE).unwrap();
+        let item = build_added_footprint(
+            &planned_add("C1", STOCK_0603, &["1", "2"]),
+            &part,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mut fp = api::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        fp.id = Some(api::common::types::Kiid {
+            value: "completion-footprint".into(),
+        });
+        fp.position = Some(api::common::types::Vector2 {
+            x_nm: 25_000_000,
+            y_nm: 35_000_000,
+        });
+        fp.orientation = Some(api::common::types::Angle {
+            value_degrees: 37.0,
+        });
+        fp.layer = if back {
+            api::board::types::BoardLayer::BlBCu as i32
+        } else {
+            api::board::types::BoardLayer::BlFCu as i32
+        };
+        fp.locked = api::common::types::LockedState::LsLocked as i32;
+        super::super::pcb_footprint_update::replacement_for_sync(
+            &konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance"),
+            STOCK_0603,
+            COMPLETION_SOURCE,
+            &BTreeMap::new(),
+        )
+        .unwrap()
+    }
+    fn install_completion_target(served: &ServedSync, source: &str) -> String {
+        let id = "Capacitor_SMD:CompletionSwap";
+        std::fs::write(
+            served
+                .board
+                .parent()
+                .unwrap()
+                .join("Capacitor_SMD.pretty/CompletionSwap.kicad_mod"),
+            source,
+        )
+        .unwrap();
+        fielded_netlist(&[("C1", &[])]).replace(STOCK_0603, id)
+    }
+    #[tokio::test]
+    async fn completion_replacement_preserves_instance_and_is_idempotent_on_both_sides() {
+        for back in [false, true] {
+            let mut initial = api::board::types::FootprintInstance::decode(
+                completion_native_item(back).value.as_slice(),
+            )
+            .unwrap();
+            set_field_text(
+                &mut initial.description_field,
+                "Description",
+                "schematic desired",
+            );
+            let original =
+                konnect_ipc::builders::pack_any(&initial, "kiapi.board.types.FootprintInstance");
+            let before =
+                api::board::types::FootprintInstance::decode(original.value.as_slice()).unwrap();
+            let served = ServedSync::holding(Seed {
+                footprints: vec![original],
+                ..Default::default()
+            })
+            .await;
+            let library_default =
+                COMPLETION_SOURCE.replacen("(property \"Value\"", "(property \"Description\"", 1);
+            install_completion_target(&served, &library_default);
+            let netlist = fielded_netlist(&[("C1", &[("Description", "schematic desired")])])
+                .replace(STOCK_0603, "Capacitor_SMD:CompletionSwap");
+            let (plan, applied) = served
+                .plan_then_apply(&netlist, serde_json::json!({}))
+                .await;
+            assert_eq!(
+                plan["changes"][0]["replace_with"],
+                "Capacitor_SMD:CompletionSwap"
+            );
+            assert_eq!(applied["status"], "applied", "{applied:#}");
+            assert_eq!(applied["coverage"]["footprints_replaced"]["applied"], 1);
+            let after = &served.held_footprints()[0];
+            assert_eq!(field_text(&after.description_field), "schematic desired");
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.position, before.position);
+            assert_eq!(after.orientation, before.orientation);
+            assert_eq!(after.layer, before.layer);
+            assert_eq!(after.locked, before.locked);
+            assert_eq!(after.symbol_path, before.symbol_path);
+            assert_eq!(after.overrides, before.overrides);
+            assert_eq!(
+                after
+                    .definition
+                    .as_ref()
+                    .unwrap()
+                    .id
+                    .as_ref()
+                    .unwrap()
+                    .entry_name,
+                "CompletionSwap"
+            );
+            assert_eq!(
+                board_footprint_from_instance(after).unwrap().pad_nets,
+                board_footprint_from_instance(&before).unwrap().pad_nets
+            );
+            assert_eq!(served.dry_run(&netlist).await["status"], "noop");
+            assert!(served.created.lock().unwrap().is_empty());
+            assert!(served.deleted.lock().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn completion_replacement_refuses_routed_geometry_changes_and_missing_pads() {
+        let original = completion_native_item(false);
+        let served = ServedSync::holding(Seed {
+            footprints: vec![original.clone(), SeedFootprint::linked("R9").build()],
+            tracks: vec![seeded_track("attached", "C1-1", (25.0, 35.0), (30.0, 35.0))],
+            ..Default::default()
+        })
+        .await;
+        let changed = COMPLETION_SOURCE.replacen("(at -0.775 0)", "(at -1.775 0)", 1);
+        assert_ne!(changed, COMPLETION_SOURCE);
+        let netlist = install_completion_target(&served, &changed);
+        let (_, plan) = served
+            .run(
+                &netlist,
+                serde_json::json!({"delete_orphan_footprints":true}),
+            )
+            .await;
+        assert_eq!(plan["status"], "conflict", "{plan:#}");
+        assert_eq!(
+            plan["diagnostics"][0]["code"],
+            "footprint_replacement_unsafe"
+        );
+        assert_eq!(plan["coverage"]["footprints_replaced"]["planned"], 0);
+        assert_eq!(served.held.lock().unwrap()[0], original);
+        assert_eq!(plan["coverage"]["orphans_deleted"]["planned"], 0);
+        assert_eq!(
+            plan["orphan_footprints"][0]["outcome"],
+            "kept_plan_conflict"
+        );
+        let netlist = install_completion_target(&served, COMPLETION_SOURCE)
+            .replace("(pin \"2\")", "(pin \"3\")");
+        assert_eq!(served.dry_run(&netlist).await["status"], "conflict");
+    }
+    #[tokio::test]
+    async fn completion_replacement_allows_stationary_routed_pads() {
+        let track = seeded_track("attached", "C1-1", (25.0, 35.0), (30.0, 35.0));
+        let served = ServedSync::holding(Seed {
+            footprints: vec![completion_native_item(true)],
+            tracks: vec![track.clone()],
+            ..Default::default()
+        })
+        .await;
+        let netlist = install_completion_target(&served, COMPLETION_SOURCE);
+        let (_, applied) = served
+            .plan_then_apply(&netlist, serde_json::json!({}))
+            .await;
+        assert_eq!(
+            applied["coverage"]["footprints_replaced"]["applied"], 1,
+            "{applied:#}"
+        );
+        assert_eq!(served.tracks.lock().unwrap()[0], track);
+    }
+    #[tokio::test]
+    async fn completion_revision_binds_library_bytes_and_same_kiid_motion() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![completion_native_item(false)],
+            ..Default::default()
+        })
+        .await;
+        let netlist = install_completion_target(&served, COMPLETION_SOURCE);
+        let plan = served.dry_run(&netlist).await;
+        install_completion_target(&served, &format!("{COMPLETION_SOURCE}\n"));
+        let (_, refused) = served
+            .run(
+                &netlist,
+                serde_json::json!({"dry_run":false,"expected_plan_revision":plan["plan_revision"]}),
+            )
+            .await;
+        assert_eq!(refused["status"], "conflict");
+        assert_eq!(refused["diagnostics"][0]["code"], "stale_plan_revision");
+        let before = served.dry_run(&netlist).await;
+        {
+            let mut held = served.held.lock().unwrap();
+            let mut fp =
+                api::board::types::FootprintInstance::decode(held[0].value.as_slice()).unwrap();
+            fp.position.as_mut().unwrap().x_nm += 1_000_000;
+            held[0] = konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+        }
+        let (_,refused)=served.run(&netlist,serde_json::json!({"dry_run":false,"expected_plan_revision":before["plan_revision"]})).await;
+        assert_eq!(refused["status"], "conflict");
+        assert_eq!(refused["diagnostics"][0]["code"], "stale_plan_revision");
+    }
+    #[tokio::test]
+    async fn completion_ignored_replacement_is_partial_not_applied() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![completion_native_item(false)],
+            ignore_updates: true,
+            ..Default::default()
+        })
+        .await;
+        let netlist = install_completion_target(&served, COMPLETION_SOURCE);
+        let (_, applied) = served
+            .plan_then_apply(&netlist, serde_json::json!({}))
+            .await;
+        assert_eq!(applied["status"], "applied_with_differences");
+        assert_eq!(applied["coverage"]["footprints_updated"]["applied"], 0);
+        assert_eq!(applied["coverage"]["footprints_replaced"]["applied"], 0);
+        assert!(applied["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "sync_update_readback_differs"));
+    }
+    #[tokio::test]
+    async fn completion_whole_net_reassignment_preserves_copper_and_counts_readback() {
+        for ignored in [false, true] {
+            let old = seeded_track("rename-track", "C1-1", (1.0, 2.0), (8.0, 9.0));
+            let served = ServedSync::holding(Seed {
+                footprints: vec![seeded_in_sync("C1").build()],
+                tracks: vec![old.clone()],
+                ignore_updates: ignored,
+                ..Default::default()
+            })
+            .await;
+            let netlist = fielded_netlist(&[("C1", &[])]).replace("C1-1", "RENAMED");
+            let (plan, applied) = served
+                .plan_then_apply(&netlist, serde_json::json!({}))
+                .await;
+            assert_eq!(plan["copper_changes"][0]["kiid"], "rename-track");
+            assert_eq!(plan["copper_changes"][0]["from"], "C1-1");
+            assert_eq!(plan["copper_changes"][0]["to"], "RENAMED");
+            assert_eq!(
+                applied["coverage"]["copper_reassigned"]["applied"],
+                usize::from(!ignored)
+            );
+            assert_eq!(
+                applied["coverage"]["pads_reassigned"]["applied"],
+                usize::from(!ignored)
+            );
+            assert_eq!(
+                applied["coverage"]["footprints_updated"]["applied"],
+                usize::from(!ignored)
+            );
+            let after =
+                api::board::types::Track::decode(served.tracks.lock().unwrap()[0].value.as_slice())
+                    .unwrap();
+            let before = api::board::types::Track::decode(old.value.as_slice()).unwrap();
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.start, before.start);
+            assert_eq!(after.end, before.end);
+            assert_eq!(after.width, before.width);
+            assert_eq!(after.layer, before.layer);
+            assert_eq!(
+                after.net.unwrap().name,
+                if ignored { "C1-1" } else { "RENAMED" }
+            );
+            assert_eq!(
+                applied["status"],
+                if ignored {
+                    "applied_with_differences"
+                } else {
+                    "applied"
+                }
+            );
+            if !ignored {
+                assert_eq!(served.dry_run(&netlist).await["status"], "noop");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn completion_copper_geometry_changes_invalidate_the_reviewed_revision() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("C1").build()],
+            tracks: vec![seeded_track("same-id", "C1-1", (1.0, 2.0), (8.0, 9.0))],
+            ..Default::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("C1", &[])]).replace("C1-1", "RENAMED");
+        let plan = served.dry_run(&netlist).await;
+        {
+            let mut tracks = served.tracks.lock().unwrap();
+            let mut track = api::board::types::Track::decode(tracks[0].value.as_slice()).unwrap();
+            track.width.as_mut().unwrap().value_nm += 10;
+            tracks[0] = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        }
+        let (_, refused) = served
+            .run(
+                &netlist,
+                serde_json::json!({"dry_run":false,"expected_plan_revision":plan["plan_revision"]}),
+            )
+            .await;
+        assert_eq!(refused["diagnostics"][0]["code"], "stale_plan_revision");
+    }
+    #[test]
+    fn completion_requires_whole_net_consensus_and_known_zone_coverage() {
+        let mut part = resistor("R1", "/sheet/r1");
+        part.pad_nets.insert("1".into(), "NEW".into());
+        let design = design_of(vec![part]);
+        let mut board = board_with(vec![board_resistor("R1", Some("/sheet/r1"))]);
+        board.routed_nets.insert("VCC".into(), 1);
+        board.copper.push(CopperItem {
+            kiid: "track".into(),
+            kind: "track",
+            net: "VCC".into(),
+            layer: "F.Cu".into(),
+            ends: vec![],
+            half_width: 0.1,
+        });
+        assert!(completion::whole_net_target(&design, &board, "VCC", "NEW"));
+        assert_eq!(
+            plan_sync("netlist", &design, &board).copper_changes.len(),
+            1
+        );
+        let mut empty_destination = design.clone();
+        empty_destination.components[0]
+            .pad_nets
+            .insert("1".into(), String::new());
+        assert!(!completion::whole_net_target(
+            &empty_destination,
+            &board,
+            "VCC",
+            ""
+        ));
+        assert!(!completion::whole_net_target(&design, &board, "", "NEW"));
+        board.routed_nets.insert("VCC".into(), 2);
+        assert!(!completion::whole_net_target(&design, &board, "VCC", "NEW"));
+        board.routed_nets.insert("VCC".into(), 1);
+        board.unresolved_copper = true;
+        assert!(!completion::whole_net_target(&design, &board, "VCC", "NEW"));
+        assert_eq!(
+            plan_sync("netlist", &design, &board).status,
+            PlanStatus::Conflict
+        );
+        board.unresolved_copper = false;
+        board
+            .footprints
+            .push(board_resistor("R2", Some("/sheet/r2")));
+        assert!(!completion::whole_net_target(&design, &board, "VCC", "NEW"));
+        let plan = plan_sync("netlist", &design, &board);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.copper_changes.is_empty());
+        board.footprints.pop();
+        board.footprints[0]
+            .pad_nets
+            .insert("2".into(), "VCC".into());
+        assert!(!completion::whole_net_target(&design, &board, "VCC", "NEW"));
+        board.footprints[0]
+            .pad_nets
+            .insert("2".into(), "GND".into());
+        board.footprints[0].not_in_schematic = true;
+        assert!(!completion::whole_net_target(&design, &board, "VCC", "NEW"));
+    }
+    #[test]
+    fn completion_typed_arc_and_via_changes_only_touch_net_identity() {
+        use konnect_ipc::builders::pack_any;
+        let net = Some(api::board::types::Net {
+            name: "OLD".into(),
+            code: Some(api::board::types::NetCode { value: 71 }),
+        });
+        let arc = api::board::types::Arc {
+            net: net.clone(),
+            id: Some(api::common::types::Kiid {
+                value: "arc".into(),
+            }),
+            width: Some(api::common::types::Distance { value_nm: 300_000 }),
+            ..Default::default()
+        };
+        let mut expected = arc.clone();
+        expected.net = Some(api::board::types::Net {
+            name: "NEW".into(),
+            code: None,
+        });
+        assert_eq!(
+            completion::reassign_copper(&pack_any(&arc, "kiapi.board.types.Arc"), "NEW").unwrap(),
+            pack_any(&expected, "kiapi.board.types.Arc")
+        );
+        let via = api::board::types::Via {
+            net,
+            id: Some(api::common::types::Kiid {
+                value: "via".into(),
+            }),
+            position: Some(api::common::types::Vector2 { x_nm: 2, y_nm: 3 }),
+            ..Default::default()
+        };
+        let mut expected = via.clone();
+        expected.net = Some(api::board::types::Net {
+            name: "NEW".into(),
+            code: None,
+        });
+        assert_eq!(
+            completion::reassign_copper(&pack_any(&via, "kiapi.board.types.Via"), "NEW").unwrap(),
+            pack_any(&expected, "kiapi.board.types.Via")
+        );
+        assert!(completion::reassign_copper(
+            &prost_types::Any {
+                type_url: "unsupported".into(),
+                value: vec![]
+            },
+            "NEW"
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_readback_detects_replacement_pad_geometry_changes() {
+        for readback in [Readback::MovedPad, Readback::WrongDescription] {
+            let served = ServedSync::build(
+                None,
+                Vec::new(),
+                readback,
+                Seed {
+                    footprints: vec![completion_native_item(false)],
+                    ..Default::default()
+                },
+            )
+            .await;
+            let netlist = install_completion_target(&served, COMPLETION_SOURCE);
+            let (_, applied) = served
+                .plan_then_apply(&netlist, serde_json::json!({}))
+                .await;
+            assert_eq!(applied["status"], "applied_with_differences");
+            assert_eq!(applied["coverage"]["footprints_replaced"]["applied"], 0);
+        }
+    }
+    #[tokio::test]
+    async fn completion_unnetted_copper_is_not_complete_connectivity() {
+        let served = ServedSync::holding(Seed {
+            footprints: vec![seeded_in_sync("C1").build()],
+            tracks: vec![seeded_track("unnetted", "", (1.0, 2.0), (3.0, 4.0))],
+            ..Default::default()
+        })
+        .await;
+        let netlist = fielded_netlist(&[("C1", &[])]).replace("C1-1", "NEW");
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "conflict");
+        assert!(plan["copper_changes"].as_array().unwrap().is_empty());
+        let netlist = install_completion_target(&served, COMPLETION_SOURCE);
+        assert_eq!(served.dry_run(&netlist).await["status"], "conflict");
+    }
+    #[tokio::test]
+    async fn completion_malformed_live_copper_names_the_decode_failure() {
+        let served = ServedSync::holding(Seed {
+            tracks: vec![prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.Track".into(),
+                value: vec![255],
+            }],
+            ..Default::default()
+        })
+        .await;
+        let client = konnect_ipc::KiCadIpcClient::new(served._kicad.address().to_string());
+        let error = snapshot_board(&client, &served.board).err().unwrap();
+        assert!(format!("{error:#}").contains("invalid track in live snapshot"));
+    }
+
+    #[tokio::test]
+    async fn completion_failed_post_commit_verification_reports_uncertain_outcome() {
+        let served = ServedSync::build(
+            None,
+            Vec::new(),
+            Readback::MalformedCopper,
+            Seed {
+                footprints: vec![seeded_in_sync("C1").build()],
+                tracks: vec![seeded_track("readback", "C1-1", (1.0, 2.0), (8.0, 9.0))],
+                ..Default::default()
+            },
+        )
+        .await;
+        let netlist = fielded_netlist(&[("C1", &[])]).replace("C1-1", "RENAMED");
+        let plan = served.dry_run(&netlist).await;
+        let (is_error, result) = served
+            .run(
+                &netlist,
+                serde_json::json!({"dry_run":false,"expected_plan_revision":plan["plan_revision"]}),
+            )
+            .await;
+        assert!(is_error, "{result:#}");
+        assert!(
+            result.to_string().contains("mutation_outcome_uncertain"),
+            "{result:#}"
+        );
+        let track =
+            api::board::types::Track::decode(served.tracks.lock().unwrap()[0].value.as_slice())
+                .unwrap();
+        assert_eq!(track.net.unwrap().name, "RENAMED");
+    }
+
+    #[tokio::test]
+    async fn completion_ambiguous_repeated_pad_is_refused_by_served_preflight() {
+        let item = completion_native_item(false);
+        let mut fp = api::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let definition = fp.definition.as_mut().unwrap();
+        let item = definition
+            .items
+            .iter()
+            .find(|i| konnect_ipc::builders::any_is(i, "kiapi.board.types.Pad"))
+            .unwrap();
+        let mut pad = api::board::types::Pad::decode(item.value.as_slice()).unwrap();
+        pad.net.as_mut().unwrap().name = "OTHER".into();
+        definition.items.push(konnect_ipc::builders::pack_any(
+            &pad,
+            "kiapi.board.types.Pad",
+        ));
+        let served = ServedSync::holding(Seed {
+            footprints: vec![konnect_ipc::builders::pack_any(
+                &fp,
+                "kiapi.board.types.FootprintInstance",
+            )],
+            ..Default::default()
+        })
+        .await;
+        let plan = served.dry_run(&fielded_netlist(&[("C1", &[])])).await;
+        assert_eq!(plan["status"], "conflict");
+        assert!(plan["diagnostics"].to_string().contains("multiple nets"));
+    }
+
+    /// Actual release stdio transport; protobuf mock IPC and export stand-in.
+    #[tokio::test]
+    #[ignore = "build the release fork at HEAD first"]
+    async fn completion_release_binary_stdio_dogfood() {
+        use std::io::{BufRead, Write};
+        let served = ServedSync::holding(Seed {
+            footprints: vec![completion_native_item(true)],
+            tracks: vec![seeded_track(
+                "release-track",
+                "C1-1",
+                (1.0, 2.0),
+                (8.0, 9.0),
+            )],
+            ..Default::default()
+        })
+        .await;
+        let netlist =
+            install_completion_target(&served, COMPLETION_SOURCE).replace("C1-1", "RENAMED");
+        std::fs::write(&served.exported, netlist).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let exe = repo.join("target/release/konnect");
+        let home = repo.join("target/dogfood-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let state = tempfile::tempdir_in(&home).unwrap();
+        let config = state.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "kicad_cli = {}\nipc_address = {}\neager_toolsets = true\n",
+                serde_json::to_string(&served.cli.to_string_lossy()).unwrap(),
+                serde_json::to_string(served._kicad.address()).unwrap()
+            ),
+        )
+        .unwrap();
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new(&exe)
+                .arg("--config")
+                .arg(&config)
+                .env("HOME", &home)
+                .env("KONNECT_STATE_DIR", &home)
+                .env_remove("KICAD_API_SOCKET")
+                .env_remove("KICAD_API_TOKEN")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut sequence = 0;
+        let mut request = |method: &str, params: serde_json::Value| -> serde_json::Value {
+            sequence += 1;
+            writeln!(
+                child.0.stdin.as_mut().unwrap(),
+                "{}",
+                serde_json::json!({"jsonrpc":"2.0","id":sequence,"method":method,"params":params})
+            )
+            .unwrap();
+            child.0.stdin.as_mut().unwrap().flush().unwrap();
+            loop {
+                let line = receive
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap()
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if value["id"] == sequence {
+                    assert!(value.get("error").is_none(), "{value:#}");
+                    return value["result"].clone();
+                }
+            }
+        };
+        request(
+            "initialize",
+            serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"sync-dogfood","version":"1"}}),
+        );
+        let mut call = |name: &str, args: serde_json::Value| -> serde_json::Value {
+            let result = request(
+                "tools/call",
+                serde_json::json!({"name":name,"arguments":args}),
+            );
+            assert_ne!(result["isError"], true, "{result:#}");
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let info = call("get_installation_info", serde_json::json!({}));
+        assert_eq!(
+            PathBuf::from(info["runtime"]["executable_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            exe.canonicalize().unwrap()
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(
+            info["build"]["commit"],
+            String::from_utf8(head.stdout).unwrap().trim()
+        );
+        call("load_toolset", serde_json::json!({"name":"simulation"}));
+        call("load_toolset", serde_json::json!({"name":"sch_export"}));
+        let args = serde_json::json!({"schematic":served.schematic,"board":served.board});
+        let plan = call("update_pcb_from_schematic", args.clone());
+        assert_eq!(plan["status"], "ready", "{plan:#}");
+        assert_eq!(plan["coverage"]["footprints_replaced"]["planned"], 1);
+        assert_eq!(plan["coverage"]["copper_reassigned"]["planned"], 1);
+        let mut apply = args.clone();
+        apply["dry_run"] = serde_json::json!(false);
+        apply["expected_plan_revision"] = plan["plan_revision"].clone();
+        let applied = call("update_pcb_from_schematic", apply);
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        assert_eq!(applied["coverage"]["footprints_replaced"]["applied"], 1);
+        assert_eq!(applied["coverage"]["copper_reassigned"]["applied"], 1);
+        assert_eq!(call("update_pcb_from_schematic", args)["status"], "noop");
     }
 }

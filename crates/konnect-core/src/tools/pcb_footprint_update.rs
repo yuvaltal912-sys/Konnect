@@ -2155,6 +2155,24 @@ fn field_text(field: &Option<kiapi::board::types::Field>) -> String {
         .unwrap_or_default()
 }
 
+/// Sync replacement uses the same typed rebuild and instance-preservation path
+/// as a library refresh, with the schematic selecting the new library identity.
+pub(super) fn replacement_for_sync(
+    item: &prost_types::Any,
+    library_id: &str,
+    source: &str,
+    net_codes: &BTreeMap<String, i32>,
+) -> Result<prost_types::Any> {
+    let library = parse_library_footprint(library_id, source)?;
+    let mut current = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+    current
+        .definition
+        .as_mut()
+        .context("missing footprint definition")?
+        .id = library.definition.id.clone();
+    Ok(build_updated_instance(&current, &library, net_codes, &BTreeSet::new())?.item)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

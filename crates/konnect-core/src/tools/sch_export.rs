@@ -216,7 +216,11 @@ pub fn tools() -> Vec<ToolDef> {
              Description, user fields) is copied to its footprint, and the changes are listed \
              per footprint. A footprint whose symbol is gone is listed under \
              `orphan_footprints`; `delete_orphan_footprints` deletes them, and refuses one \
-             with tracks attached unless `delete_orphans_with_tracks` is also set.",
+             with tracks attached unless `delete_orphans_with_tracks` is also set. Changed \
+             footprint IDs can be replaced in place while preserving instance state. Routed \
+             net changes require unanimous whole-net intent and known copper coverage; \
+             changed routed-pad geometry, splits and unknown zone connectivity refuse. \
+             Inspect applied_with_differences or uncertain outcomes before retrying.",
             json!({
                 "type": "object",
                 "properties": {
