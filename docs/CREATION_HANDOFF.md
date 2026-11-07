@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
+**Last updated:** 2026-11-08. PRs #30–#36 are merged on main d0880ac. The owner authorized the remaining PR 13 work: rule edit/delete, general expressions and safe DSN/SES integration. Its continuation is claimed on `codex/pr13-rules-completion` in an isolated worktree. All nine baseline macOS gate checks passed before this claim. Q3 is separately in progress in #37 and does not own these rule/routing files. The installed binary remains protected.
 
 ## Start here
 
@@ -43,11 +43,11 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Integrated from [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31) in the creation alignment PR |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
-| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
+| Q3 | One design-intent record per project (rails, currents, interfaces, fab target). Ranks 12, 29 and 38 read from it. It gets its own PR before PR 11; PR 11 may take a per-call currents argument as an interim |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
-| 13 | DRC rule writer | none | Integrated from [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) in the creation alignment PR; initial slice only, remaining work below |
+| 13 | DRC rule writer | none | In progress: continuation on `codex/pr13-rules-completion` (custom_rules.rs, drc_rule_writer.rs, verification.rs, specctra.rs, specctra_ses.rs, pcb_export.rs, pcb_routing.rs); initial slice merged as #35 |
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
