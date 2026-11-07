@@ -3,6 +3,13 @@
 //! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
+#[path = "drc_project_rules.rs"]
+mod drc_project_rules;
+#[path = "drc_rule_writer.rs"]
+mod drc_rule_writer;
+#[path = "project_json_guard.rs"]
+mod project_json_guard;
+
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
@@ -16,7 +23,7 @@ use tokio::task;
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "run_drc",
             "Run the Design Rule Check on the PCB and return structured violation results, \
@@ -65,7 +72,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
                     "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
                     "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
-                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" }
+                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" },
+                    "min_copper_edge_clearance": {"type":"number","description":"Copper-to-edge minimum in mm; -0.01 is KiCad's legacy sentinel"},
+                    "min_silk_clearance": {"type":"number","description":"Silkscreen clearance minimum in mm"},
+                    "min_via_annular_width": {"type":"number","description":"Minimum via annular width in mm"}
                 },
                 "required": ["board"]
             }),
@@ -236,7 +246,10 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_check_clearance(args, ctx).await }
         ),
-    ]
+    ];
+    tools.push(drc_rule_writer::tool());
+    tools.extend(drc_project_rules::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -426,7 +439,13 @@ async fn handle_set_design_rules(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
+    let board = get_path(args, "board")?.canonicalize()?;
+    if let Some(refusal) = drc_rule_writer::board_lock_refusal(&board) {
+        return Ok(refusal);
+    }
+    if let Some(refusal) = project_json_guard::schematic_lock_refusal(&board) {
+        return Ok(refusal);
+    }
     // KiCad rewrites the project file from memory when it saves the board, so
     // a rule written here while it holds the board is reverted (#791). Asked
     // before the read too: the file can be older than what KiCad holds.
@@ -436,8 +455,12 @@ async fn handle_set_design_rules(
         return Ok(refusal);
     }
     let project_path = sibling_project_path(&board);
-    let project_content = tokio::fs::read_to_string(&project_path).await?;
-    let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
+    let project_content = project_json_guard::project_source(&project_path)?;
+    let mut project = project_json_guard::parse(&project_content)?;
+    let extra = match project_json_guard::minima(args) {
+        Ok(v) => v,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
 
     let mut changed = Vec::new();
 
@@ -462,10 +485,34 @@ async fn handle_set_design_rules(
         }
     }
 
+    for (key, value) in extra {
+        project_rules.insert(key.into(), json!(value));
+        changed.push(format!("{key} = {value}"));
+    }
     if !changed.is_empty() {
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        if let Some(refusal) =
+            crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "design rule")
+                .await?
+        {
+            return Ok(refusal);
+        }
+        if let Some(refusal) = drc_rule_writer::board_lock_refusal(&board) {
+            return Ok(refusal);
+        }
+        if let Some(refusal) = project_json_guard::schematic_lock_refusal(&board) {
+            return Ok(refusal);
+        }
+        if let Err(error) =
+            project_json_guard::write_verified(&project_path, &project_content, &content)
+        {
+            return Ok(project_json_guard::uncertain(
+                &project_path,
+                "set_design_rules",
+                error.to_string(),
+            ));
+        }
     }
 
     Ok(CallToolResult::text(
@@ -484,8 +531,8 @@ async fn handle_get_design_rules(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let project_path = sibling_project_path(&board);
-    let content = tokio::fs::read_to_string(&project_path).await?;
-    let project: serde_json::Value = serde_json::from_str(&content)?;
+    let content = project_json_guard::project_source(&project_path)?;
+    let project = project_json_guard::parse(&content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -496,7 +543,10 @@ async fn handle_get_design_rules(
                 "min_trace_width": project_rule_value(&project, "min_track_width"),
                 "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
                 "min_via_size": project_rule_value(&project, "min_via_diameter"),
-                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
+                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole"),
+                "min_copper_edge_clearance": project_rule_value(&project,"min_copper_edge_clearance"),
+                "min_silk_clearance": project_rule_value(&project,"min_silk_clearance"),
+                "min_via_annular_width": project_rule_value(&project,"min_via_annular_width")
             }
         }))
         .unwrap(),
@@ -1633,7 +1683,10 @@ mod tests {
             "min_trace_width": 0.25,
             "min_via_drill": 0.30,
             "min_via_size": 0.70,
-            "min_hole_to_hole": 0.45
+            "min_hole_to_hole": 0.45,
+            "min_copper_edge_clearance": 0.3,
+            "min_silk_clearance": 0.2,
+            "min_via_annular_width": 0.15
         });
         let result = handle_set_design_rules(&args, &test_ctx()).await.unwrap();
         assert!(!result.is_error);
@@ -1647,8 +1700,92 @@ mod tests {
         assert_eq!(rules["min_through_hole_diameter"], 0.30);
         assert_eq!(rules["min_via_diameter"], 0.70);
         assert_eq!(rules["min_hole_to_hole"], 0.45);
+        assert_eq!(rules["min_copper_edge_clearance"], 0.3);
+        assert_eq!(rules["min_silk_clearance"], 0.2);
+        assert_eq!(rules["min_via_annular_width"], 0.15);
+        let response = handle_get_design_rules(&json!({"board":board}), &test_ctx())
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &response.content[0] else {
+            panic!()
+        };
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["rules"]["min_copper_edge_clearance"], 0.3);
+        assert_eq!(result["rules"]["min_silk_clearance"], 0.2);
+        assert_eq!(result["rules"]["min_via_annular_width"], 0.15);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn design_rule_board_alias_targets_physical_project() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        let alias = d.path().join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&alias).unwrap();
+        let board = real.join("board.kicad_pcb");
+        std::fs::write(&board, blank_board()).unwrap();
+        std::fs::write(real.join("board.kicad_pro"), blank_project()).unwrap();
+        std::fs::write(alias.join("board.kicad_pro"), blank_project()).unwrap();
+        let link = alias.join("board.kicad_pcb");
+        symlink(&board, &link).unwrap();
+        let result = handle_set_design_rules(
+            &json!({"board":link,"min_via_annular_width":0.2}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(alias.join("board.kicad_pro")).unwrap(),
+            blank_project()
+        );
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(real.join("board.kicad_pro")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["board"]["design_settings"]["rules"]["min_via_annular_width"],
+            0.2
+        );
+    }
+    #[tokio::test]
+    async fn invalid_new_minimum_refuses_the_whole_project_edit() {
+        let d = tempfile::tempdir().unwrap();
+        let board = d.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        std::fs::write(&board, blank_board()).unwrap();
+        let original = blank_project();
+        std::fs::write(&project, original).unwrap();
+        for (field, value) in [
+            ("min_copper_edge_clearance", json!(-0.02)),
+            ("min_silk_clearance", json!(101)),
+            ("min_via_annular_width", json!(null)),
+            ("min_via_annular_width", json!(0.0000011)),
+        ] {
+            let mut args = json!({"board":board,"min_clearance":0.35});
+            args[field] = value;
+            let result = handle_set_design_rules(&args, &test_ctx()).await.unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), original);
+        }
+    }
+    #[tokio::test]
+    async fn duplicate_project_keys_refuse_minimum_edits_without_writing() {
+        let d = tempfile::tempdir().unwrap();
+        let board = d.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        std::fs::write(&board, blank_board()).unwrap();
+        let original = "{\"board\":{},\"board\":{}}";
+        std::fs::write(&project, original).unwrap();
+        let result = handle_set_design_rules(
+            &json!({"board":board,"min_via_annular_width":0.2}),
+            &test_ctx(),
+        )
+        .await;
+        assert!(result.is_err() || result.unwrap().is_error);
+        assert_eq!(std::fs::read_to_string(project).unwrap(), original);
+    }
     fn text_of(result: &CallToolResult) -> String {
         match result.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),

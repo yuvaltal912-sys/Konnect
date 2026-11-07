@@ -402,7 +402,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 10 tools
+### `verification` · 13 tools
 **Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
@@ -417,6 +417,9 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
+| `create_custom_drc_rule` | Preview or create an unconditional clearance or track-width minimum. Requires a scratch KiCad DRC witness and matching preview revision; reports DRC on a saved-board copy and refuses unsupported existing rules. |
+| `set_netclass_diff_pair` | Preview or apply differential-pair width, gap and via gap to a saved project netclass with a revision check. |
+| `delete_netclass` | Preview or delete a saved project netclass with no saved pattern or assignment references; does not inspect schematic connectivity. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |
 
 ---
