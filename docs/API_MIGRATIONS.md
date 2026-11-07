@@ -43,6 +43,60 @@ Creation PR 6 (`docs/CREATION_HANDOFF.md`).
   schematic root; unsupported `#` comment lines are refused before locating
   edit spans, so a commented example cannot be mistaken for the live header.
 
+## Unreleased: placement routing objectives and pad-level proximity (minor release)
+
+Creation PR 8 (`docs/CREATION_HANDOFF.md`). `score_placement` remains read-only
+and reads one exact live snapshot or its disclosed saved-file fallback.
+
+- **New argument `max_net_references`**, integer 2–256, default 8. Routing
+  estimates include named nets spanning at least two distinct references up to
+  this limit. Nets above it and single-reference nets are counted as policy
+  exclusions; unassigned pads are reported separately. Net identity uses names,
+  and pad positions are board coordinates including footprint transforms.
+- **New `routing_metrics`** describes a deterministic Euclidean minimum spanning
+  tree over pad sites on each eligible net. `wirelength_mm` sums straight MST
+  edges; `proper_crossings` counts strict interior intersections between edges
+  on different nets. Endpoint touches and collinear overlaps are excluded.
+  Physically separate same-number pads remain separate sites. These are planar
+  placement proxies: existing copper, layers, routed length, actual unrouted
+  connectivity, shorts and DRC are not evaluated by this metric.
+- **Numeric scores now include routing deductions.** Wirelength costs
+  `ceil(20 × total_MST_length / (edge_count × board_diagonal))`, capped at 20;
+  crossings cost 2 points each, capped at 20. Empty eligible edge sets cost 0.
+  Raw metrics remain available for same-topology comparisons despite integer
+  rounding/caps. These advisory weights are not calibrated engineering limits.
+  Hard failures and outline status still determine `verdict`; the numeric score
+  cannot override them. A score that was 100 can now be lower without a new
+  geometric defect.
+- **New `score_incomplete` and `decoupling_coverage`** disclose missing source,
+  ambiguous identities, unavailable normalization, work-budget exhaustion and
+  unproven associations. Unavailable routing aggregates or deductions are null,
+  not trustworthy zeroes. Bounded diagnostic samples have separate truncation
+  markers; sample truncation does not truncate exact aggregate calculations.
+  A scalar score with incomplete evidence is not proof of improvement. Legacy
+  placement previews retain their diagnostic plan but block applying a claimed
+  improvement when either score is incomplete.
+- **Decoupling distances use matching pad anchors**, replacing capacitor
+  courtyard-center to IC courtyard-edge distances. Associations disclose pad
+  numbers, both positions, qualifying net, fanout and association basis. A
+  same-net non-ground pair within its capacitor-family limit can qualify as
+  `pin_adjacent` even on a high-fanout rail; a farther pair needs bounded fanout,
+  otherwise it remains unproven. Family limits remain 2.5/5/10 mm. These are
+  proximity/association heuristics, not proof of power-pin role, datasheet intent
+  or routed current-loop length.
+- **Connector filtering checks every named capacitor terminal net** against an
+  accessible matching connector pad, using the worst nearest-pair distance.
+  Eligibility uses footprint mounting side and the index's through-stack flag;
+  unusual pads authored on the opposite side from their footprint are not
+  separately layer-validated. One nearby terminal or a nearby
+  courtyard cannot waive a distant other terminal. Witness counts/truncation
+  remain distinct from the complete distance evaluation.
+- **Existing row planners are unchanged.** A mechanical courtyard-based row can
+  now be blocked by the better pad/routing judge. This does not add autonomous
+  placement/routing, pin-aware row planning or wider outline support to legacy
+  planners. Their before/after comparisons use the default fanout policy of 8;
+  do not compare those scalar scores with a custom-policy scoring call.
+
 ## Unreleased: render images and focused views (minor release)
 
 Creation PR 4 (`docs/CREATION_HANDOFF.md`).
