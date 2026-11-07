@@ -1756,7 +1756,7 @@ mod tests {
         let project = board.with_extension("kicad_pro");
         std::fs::write(&board, blank_board()).unwrap();
         let original = blank_project();
-        std::fs::write(&project, &original).unwrap();
+        std::fs::write(&project, original).unwrap();
         for (field, value) in [
             ("min_copper_edge_clearance", json!(-0.02)),
             ("min_silk_clearance", json!(101)),
