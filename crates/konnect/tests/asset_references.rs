@@ -974,6 +974,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "points_drawn",
         "points_in_run",
         "signals_plotted",
+        // Result field of `get_design_intent`.
+        "missing_sections",
     ];
 
     let mut phantom = Vec::new();

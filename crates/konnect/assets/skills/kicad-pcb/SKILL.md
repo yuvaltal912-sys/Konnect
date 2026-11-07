@@ -85,6 +85,8 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 - Read [`references/trace-width-table.md`](references/trace-width-table.md) when
   sizing a current-carrying trace, via, or controlled-impedance route. It defines
   the required calculation inputs and acceptance record; it is not a lookup table.
+  Take the net's current, temperature rise and copper weight from
+  `get_design_intent` when they are recorded, and say which inputs were not.
 - Read [`references/design-rules.md`](references/design-rules.md) when creating
   netclasses, configuring project constraints, or adjudicating DRC results.
 

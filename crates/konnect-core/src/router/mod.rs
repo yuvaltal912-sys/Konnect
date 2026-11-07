@@ -203,7 +203,11 @@ mod tests {
                         "copy_routing_pattern/properties/net_map" |
                         "apply_template/properties/net_mappings" |
                         "assign_simulation_model/properties/pin_map" |
-                        "compare_netlist/properties/intended"
+                        "compare_netlist/properties/intended" |
+                        // One section of a typed record. The handler's
+                        // deny_unknown_fields model closes it and names the
+                        // offending key's location, which dispatch cannot.
+                        "set_design_intent/properties/value"
                     ),
                         "unreviewed open input record: {path}"
                     );

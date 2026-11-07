@@ -11,6 +11,7 @@ mod board_stackup;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
+pub mod design_intent;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;

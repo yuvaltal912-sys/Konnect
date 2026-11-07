@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PRs #30–#36 are merged on main d0880ac. The owner authorized the remaining PR 13 work: rule edit/delete, general expressions and safe DSN/SES integration. Its continuation is claimed on `codex/pr13-rules-completion` in an isolated worktree. All nine baseline macOS gate checks passed before this claim. Q3 is separately in progress in #37 and does not own these rule/routing files. The installed binary remains protected.
+**Last updated:** 2026-11-08. PRs #30–#36 are merged, and Q3 is merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). Main ea579b2 is merged into the PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38), on `codex/pr13-rules-completion` in an isolated worktree. The continuation implements rule edit/delete, general expressions and guarded DSN/SES integration; final verification is recorded on the merged branch. All nine pre-change baseline checks passed on d0880ac. PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate. The installed binary remains protected.
 
 ## Start here
 
@@ -43,7 +43,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Integrated from [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31) in the creation alignment PR |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
-| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | In progress (branch `feat/creation-design-intent`, Claude); must land before PR 11 |
+| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Merged: [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). PR 11 is unblocked |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
@@ -59,7 +59,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. Finish **PR 13**: general rule expressions and rule editing/deletion, then safe custom-rule DSN/SES handling. The integrated initial slice does not complete that scope.
 2. **PR 14**: checkpoints and readiness report.
-3. **Q3**, then **PR 11**: design-intent record before the honest review/current audit.
+3. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
 4. **PR 15**: ERC/DRC baselines.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
@@ -73,6 +73,19 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - Use the noreply identity from `AGENTS.md`, including integration merge commits. A previous GitHub merge attempt rejected this identity; do not silently substitute a personal email.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
+
+## Q3, the design-intent record (merged, #37)
+
+One record per project at `<project_dir>/.konnect/design_intent.json`, in `tools/design_intent.rs`, served by two `config` tools (starter kit, so they are listed without `load_toolset`):
+
+- `get_design_intent` returns the record, `source` (`file` or `absent`), a content `revision` (`sha256:` of the file text) and `missing_sections`, so a dependent result can name what was never recorded. Net names are stored as given and are not checked against the design (`net_names_checked: false`).
+- `set_design_intent` replaces one section (`rails`, `currents`, `interfaces`, `fab_target`) and keeps the others. An existing record needs `expected_revision`; a missing or wrong one is `stale_target` and writes nothing. `dry_run` validates and returns the `candidate_revision`. Writes are conditional on the text that was read, then read back. The directory must hold a `.kicad_pro`, so a mistyped path leaves no stray folder.
+
+The record is closed and typed (`schema_version` 1, `deny_unknown_fields`, sections checked for shape before serde, which would otherwise read a struct from a positional array). Refused: duplicate names, a net in two rails or in both a rail and `currents`, non-positive currents, impedances and fab sizes, tolerance outside (0, 100], a layer count other than 1 or an even 2 to 32, inner copper on a board of two layers or fewer, a via diameter not larger than its drill, differential pairs naming nets outside the interface, and a differential impedance with no pairs. A file that cannot be used is `invalid_configuration` for both tools and is never replaced.
+
+The input schema leaves `value` open (`additionalProperties: true`) on purpose. Dispatch closes object schemas by default, which refused every `fab_target` object; unit calls bypass dispatch, so only the release-binary probe caught it. `the_dispatch_schema_admits_every_section_shape` now covers it.
+
+Readers: rank 12 (current audit) takes rail and net currents, `max_temp_rise_c` and copper weights; rank 29 (circuit-aware review) takes rails with `source_ref`; rank 38 (net classes from the schematic) takes interfaces, pairs and impedances. `read_design_intent` is the crate-level entry point for them. The shipped review and PCB skills now point at `get_design_intent`. Not done here: checking net names against the schematic or board, and any reader.
 
 ## PR 6, small schematic edits (integrated, #30)
 
