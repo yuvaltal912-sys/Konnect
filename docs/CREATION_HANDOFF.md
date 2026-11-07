@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 4 (#28) and 5 (#29) are merged. PR 6 (#30) and PR 8 (#31) are implemented and await review. The owner authorized continuing: PR 10 is claimed on `feat/library-correctness`, branched from main ca5a3ba. Its draft is being opened before implementation. The pre-change macOS gate passed all nine checks (3,430 workspace tests, 9 doctests, 93 live simulation tests). The installed binary hash is unchanged. Existing PR detail sections and limits below remain intact.
+**Last updated:** 2026-11-07. PRs 4 (#28) and 5 (#29) are merged. PR 6 (#30), PR 8 (#31) and PR 10 (#32) are implemented in drafts awaiting review. PR 10 was claimed before implementation on `feat/library-correctness`, branched from main ca5a3ba. Its baseline passed all nine macOS checks (3,430 workspace tests, 9 doctests, 93 live simulation tests). See the PR 10 section for scope and verification. Existing PR detail sections and limits remain intact.
 
 ## Start here
 
@@ -44,7 +44,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Not started |
 | Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
-| 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs) |
+| 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs), draft [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32); implemented, awaiting review |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Not started |
 | 13 | DRC rule writer | none | Not started |
@@ -59,7 +59,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
 2. **PR 5** is merged (#29): shipped creation guidance. **PR 6** is implemented in draft #30, awaiting review.
-3. **PR 8** is implemented in draft #31: wirelength/crossing terms, fanout filtering and pad-level decoupling. Then **PR 10** (library correctness), after owner approval.
+3. **PR 8** is implemented in draft #31: wirelength/crossing terms, fanout filtering and pad-level decoupling. **PR 10** is implemented in draft #32 (library correctness).
 4. Then 9b, 12, 13, 14, Q3, 11 and 15.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
@@ -280,3 +280,32 @@ Research ranks 6 and 7 (C19, C17, A14's containment part). One model of the boar
 - **Limits.** Field text boxes are estimated from the font size (KiCad's glyph metrics are not available), so text findings are warnings and say `estimated`. `score_placement` still uses the axis-aligned courtyard box for overlaps and containment (exact at 0°, 90°, 180°, 270°; a superset at other angles), while the review checks use the oriented box. Custom-shape pads are the box of their primitives (`approximate_shape`). Zones are their authored outline, not the fill. Footprint graphics, dimensions and tables are not in the query (`not_included` says so). Overlapping outline rings are read by the even-odd rule, which treats an overlap as a hole. `query_traces` lists straight segments only, as before. macOS only; Windows and Linux were not run.
 - **Verify.** The gate in `docs/SIMULATION_HANDOFF.md`, plus the oracle: `KICAD_CLI=/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli cargo test -p konnect-core --lib board_geometry -- --ignored`.
 
+
+## PR 10, library correctness (draft, #32)
+
+The claim commit and draft preceded implementation. Adds `edit_symbol` and
+`check_symbol_footprint` in the library toolset, with implementation and tests
+in `tools/library_correctness.rs`.
+
+- Partial edits cover Value, Reference prefix, Footprint, Description, Datasheet
+  and keywords. Omitted fields and existing geometry/field positioning remain
+  intact; writes check the original revision and independently read back saved
+  metadata. `create_symbol` gains footprint, description and keywords, refuses
+  duplicate names, and verifies saved fields. `delete_symbol` uses structural
+  spans and refuses deletion of an inherited base.
+- Pin/pad comparison uses effective inherited pin identifier sets, ignoring
+  unnumbered mechanical pads and collapsing repeated identifiers. Missing/extra
+  pads fail; unresolved chains or unreadable/absent identifiers are incomplete.
+  It does not prove a physical pin map or datasheet correspondence.
+- Searches rank exact names, prefixes, substrings and metadata, require all query
+  words, merge global/project registrations with project precedence, then page
+  the complete ranked result. Failures of discovered entries are disclosed.
+  Missing/invalid library tables and nested table-expansion diagnostics remain
+  outside that completeness claim.
+- Verification: the baseline gate was green. 178 focused library tests (13 new) and 20 isolated
+  guard-break controls exercise metadata, saved verification, structural edits,
+  inheritance, identifier mismatch and ranked/paged project search. The full
+  after-commit gate and release-binary scratch dogfood are required at closeout;
+  their results are reported in the PR. No live project or installed binary is
+  used for mutation. Windows/Linux, GUI library refresh and physical pin-map
+  validation remain unverified.
