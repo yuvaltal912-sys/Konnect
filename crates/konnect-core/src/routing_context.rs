@@ -444,6 +444,10 @@ mod tests {
         let project = board.with_extension("kicad_pro");
         std::os::unix::fs::symlink(&file, &project).unwrap();
         assert!(Snapshot::read(&board).is_err());
+        assert!(read_optional_with(&project, |_| panic!(
+            "an existing sidecar link must not be followed"
+        ))
+        .is_err());
         std::fs::remove_file(&project).unwrap();
         std::fs::create_dir(&project).unwrap();
         assert!(Snapshot::read(&board).is_err());

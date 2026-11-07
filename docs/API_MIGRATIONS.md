@@ -58,8 +58,8 @@ Creation PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pu
   the captured revisions and custom width bounds. `apply_specctra_ses` preserves
   its live commit followed by verification/compensating-deletion workflow. Its
   description now states that ordering correctly. Receipt identities must be
-  disjoint from original copper, and the full observed identity inventory must
-  match. DRC sees a private candidate with the captured `.kicad_pro`/`.kicad_dru`,
+  disjoint from every original board UUID, including footprints and pads. IPC
+  copper identities must match the source and serialized candidate inventories. DRC sees a private candidate with the captured `.kicad_pro`/`.kicad_dru`,
   never arbitrary siblings of the requested candidate output filename.
 - Custom-rule application requires a complete, clean PCB/unconnected-item report,
   all severities including exclusions, and proof that required clearance/width

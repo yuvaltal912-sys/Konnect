@@ -415,6 +415,8 @@ mod tests {
         )
         .is_err());
         assert!(change(&src, "One", None, Operation::Edit).is_err());
+        assert!(change(&src, "One", Some(""), Operation::Edit).is_err());
+        assert!(change("(version 1)", "New", None, Operation::Create).is_err());
     }
     #[test]
     fn trailing_replacement_comments_cannot_hide_an_adjacent_rule() {
@@ -455,6 +457,8 @@ mod tests {
             "(rule \"X\" (constraint clearance (min 0.2mm) (max 0.3mm)))",
             "(rule \"X\" (constraint clearance (min 0.2)))",
             "(rule \"X\" (constraint clearance (min NaNmm)))",
+            "(rule \"X\" (constraint clearance (min garbagemm)))",
+            "(rule \"X\" (constraint clearance 0.2mm))",
             "(rule \"X\" (constraint clearance (min 100.1mm)))",
         ] {
             assert!(

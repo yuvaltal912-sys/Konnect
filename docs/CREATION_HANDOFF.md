@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PRs #30–#36 are merged, and Q3 is merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). Main ea579b2 is merged into the PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38), on `codex/pr13-rules-completion` in an isolated worktree. The continuation implements rule edit/delete, general expressions and guarded DSN/SES integration; final verification is recorded on the merged branch. All nine pre-change baseline checks passed on d0880ac. PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate. The installed binary remains protected.
+**Last updated:** 2026-11-08. PRs #30–#36 are merged, and Q3 is merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). Main ea579b2 is merged into the PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38), on `codex/pr13-rules-completion` in an isolated worktree. The continuation implements rule edit/delete, general expressions and guarded DSN/SES integration. Its 88 removal controls each caused an actual failing test, then source was restored. Final verification is recorded on the merged branch. All nine pre-change baseline checks passed on d0880ac. PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate. The installed binary remains protected.
 
 ## Start here
 
@@ -48,7 +48,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | In progress: continuation on `codex/pr13-rules-completion` (custom_rules.rs, routing_context.rs, drc_rule_writer.rs, project_json_guard.rs, verification.rs, specctra.rs, specctra_ses.rs, pcb_export.rs, pcb_routing.rs); initial slice merged as #35; continuation draft [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38) |
-| 14 | Checkpoints and readiness report | none | Not started |
+| 14 | Checkpoints and readiness report | none | In progress on `feat/creation-checkpoints` (`tools/checkpoints.rs`, project toolset), open [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); separate from PR 13 |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
 ## Next: what to pick
@@ -466,10 +466,12 @@ require re-export. Native require mode refuses custom files; prefer uses Rust.
 SES verification runs DRC only in a private copy with the captured sidecars.
 Custom-rule candidates require complete, clean PCB/unconnected-item evidence, all severities
 and enabled required checks. Failed verification compensates only verified new
-identities; exact restored serialization proves rollback, otherwise the outcome
-is uncertain. No save, refill or schematic-parity check is requested. Coverage,
-ignored checks and source are explicit. The final gate, guard-break controls and
-release probes are recorded on #38 after the implementation commit.
+identities, disjoint from all original board UUIDs. Source, IPC and serialized
+candidate routing identities must agree. Exact restored serialization proves
+rollback; otherwise the outcome is uncertain. No save, refill or schematic-parity check is requested. Coverage,
+ignored checks and source are explicit. All 88 guard-removal controls produced actual test failures and source was
+restored. The final gate and release probes are recorded on #38 after the
+implementation commit.
 
 Real KiCad GUI/undo, the owner-deferred Freerouting run, hosted CI and Windows/
 Linux are not established by the mock IPC tests or native scratch CLI tests.

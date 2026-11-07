@@ -591,6 +591,44 @@ struct ApplyEvidence {
     drc_included_severities: serde_json::Value,
 }
 
+fn snapshot_routing_ids(source: &str) -> anyhow::Result<(HashSet<String>, HashSet<String>)> {
+    let root = konnect_sexp::parse_sexp(source)?;
+    anyhow::ensure!(
+        root.head() == Some("kicad_pcb"),
+        "routing snapshot is not a PCB"
+    );
+    fn walk(node: &konnect_sexp::SexpNode, ids: &mut HashSet<String>) -> anyhow::Result<()> {
+        if node.head() == Some("uuid") {
+            let id = node
+                .get(1)
+                .and_then(konnect_sexp::SexpNode::as_str)
+                .filter(|v| !v.is_empty())
+                .context("live snapshot has an unreadable UUID")?;
+            ids.insert(id.to_owned());
+        }
+        for child in node.children().unwrap_or(&[]) {
+            walk(child, ids)?;
+        }
+        Ok(())
+    }
+    let mut all = HashSet::new();
+    walk(&root, &mut all)?;
+    let mut copper = HashSet::new();
+    for node in root
+        .children()
+        .unwrap()
+        .iter()
+        .filter(|n| matches!(n.head(), Some("segment" | "arc" | "via")))
+    {
+        let id = node
+            .find_str("uuid")
+            .filter(|v| !v.is_empty())
+            .context("routing object in snapshot has no UUID")?;
+        copper.insert(id.to_owned());
+    }
+    Ok((all, copper))
+}
+
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
     use konnect_ipc::gen::kiapi::board::types::{Arc, Track, Via};
 
@@ -715,6 +753,8 @@ async fn handle_apply_specctra_ses(
             );
         }
         let original_ids=created_route_item_ids(&existing_tracks.iter().chain(existing_arcs.iter()).chain(existing_vias.iter()).cloned().collect::<Vec<_>>())?.into_iter().collect::<HashSet<_>>();
+        let (protected_ids,source_ids)=snapshot_routing_ids(&before)?;
+        if source_ids!=original_ids {anyhow::bail!("IPC routing identities disagree with the serialized source snapshot");}
         let net_codes = client
             .get_nets_in(document.clone())?
             .into_iter()
@@ -791,7 +831,7 @@ async fn handle_apply_specctra_ses(
                 );
             }
             let ids=created_route_item_ids(&created)?;
-            if ids.iter().any(|id|original_ids.contains(id)){anyhow::bail!("created route receipt reused an original copper identity");}
+            if ids.iter().any(|id|protected_ids.contains(id)){anyhow::bail!("created route receipt reused an original board identity");}
             Ok(ids)
         })?;
 
@@ -821,6 +861,8 @@ async fn handle_apply_specctra_ses(
             let expected_ids=original_ids.iter().chain(created_ids.iter()).cloned().collect::<HashSet<_>>();
             if observed_ids!=expected_ids {anyhow::bail!("post-commit routing identity inventory differs from receipts");}
             let candidate_source = client.save_document_to_string_in(document.clone())?;
+            let (_,serialized_ids)=snapshot_routing_ids(&candidate_source)?;
+            if serialized_ids!=expected_ids {anyhow::bail!("serialized candidate routing identities disagree with IPC readback");}
             konnect_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
             let drc = runtime.block_on(crate::routing_context::candidate_drc(&cli_path, &candidate_source, &snapshot))?;

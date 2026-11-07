@@ -34,6 +34,9 @@ struct Fault {
     change_rules_in_probe: bool,
     change_class_in_drc: bool,
     change_board_in_drc: bool,
+    footprint_receipt: bool,
+    wrong_initial_id: bool,
+    stale_source: bool,
 }
 struct State {
     items: Vec<prost_types::Any>,
@@ -79,15 +82,58 @@ fn originals() -> Vec<prost_types::Any> {
     ]
 }
 fn serialized(state: &State) -> String {
-    let mut ids = state.items.iter().map(id).collect::<Vec<_>>();
-    ids.sort();
-    let mut original = vec![OLD_TRACK.to_string(), OLD_VIA.to_string()];
-    original.sort();
-    if ids == original {
-        SOURCE.into()
-    } else {
-        format!("{SOURCE}\n# inventory {ids:?}\n")
+    if state.items == originals() {
+        return SOURCE.into();
     }
+    let mut base = SOURCE.to_owned();
+    let mut ranges = konnect_sexp::writer::find_direct_child_blocks(SOURCE, "kicad_pcb")
+        .into_iter()
+        .filter(|(a, b)| {
+            matches!(
+                konnect_sexp::parse_sexp(&SOURCE[*a..*b]).unwrap().head(),
+                Some("segment" | "via")
+            )
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|r| r.0);
+    for (a, b) in ranges.into_iter().rev() {
+        base.replace_range(a..b, "");
+    }
+    let mut copper = String::new();
+    for item in &state.items {
+        if item.type_url.ends_with("Track") {
+            let t = pcb::Track::decode(item.value.as_slice()).unwrap();
+            let start = t.start.unwrap();
+            let end = t.end.unwrap();
+            let locked = if t.locked == common::LockedState::LsLocked as i32 {
+                "(locked yes)"
+            } else {
+                ""
+            };
+            copper.push_str(&format!("(segment (start {} {}) (end {} {}) (width {}) (layer \"F.Cu\") (net {}) (uuid {}) {locked})\n",start.x_nm as f64/1e6,start.y_nm as f64/1e6,end.x_nm as f64/1e6,end.y_nm as f64/1e6,t.width.unwrap().value_nm as f64/1e6,crate::custom_rules::quote(&t.net.unwrap().name),crate::custom_rules::quote(&t.id.unwrap().value)));
+        } else {
+            let v = pcb::Via::decode(item.value.as_slice()).unwrap();
+            let pos = v.position.unwrap();
+            let stack = v.pad_stack.unwrap();
+            let diameter = stack
+                .copper_layers
+                .iter()
+                .filter_map(|l| l.size.as_ref())
+                .map(|s| s.x_nm.max(s.y_nm))
+                .max()
+                .unwrap();
+            let drill = stack.drill.unwrap().diameter.unwrap().x_nm;
+            let locked = if v.locked == common::LockedState::LsLocked as i32 {
+                "(locked yes)"
+            } else {
+                ""
+            };
+            copper.push_str(&format!("(via (at {} {}) (size {}) (drill {}) (layers \"F.Cu\" \"B.Cu\") (net {}) (uuid {}) {locked})\n",pos.x_nm as f64/1e6,pos.y_nm as f64/1e6,diameter as f64/1e6,drill as f64/1e6,crate::custom_rules::quote(&v.net.unwrap().name),crate::custom_rules::quote(&v.id.unwrap().value)));
+        }
+    }
+    let end = base.rfind(')').unwrap();
+    base.insert_str(end, &copper);
+    base
 }
 
 struct Scene {
@@ -97,6 +143,7 @@ struct Scene {
     ses: std::path::PathBuf,
     manifest: std::path::PathBuf,
     handler: McpHandler,
+    cli: std::path::PathBuf,
     _server: crate::test_support::MockIpcServer,
     state: Arc<Mutex<State>>,
     writes: Arc<AtomicUsize>,
@@ -182,7 +229,11 @@ impl Scene {
                     return Some(pack_any(
                         &cmd::SavedDocumentResponse {
                             document: r.document,
-                            contents: serialized(&st),
+                            contents: if fault.stale_source {
+                                SOURCE.into()
+                            } else {
+                                serialized(&st)
+                            },
                         },
                         "kiapi.common.commands.SavedDocumentResponse",
                     ));
@@ -244,6 +295,13 @@ impl Scene {
                         })
                         .cloned()
                         .collect::<Vec<_>>();
+                    if fault.wrong_initial_id
+                        && !items.is_empty()
+                        && r.types
+                            .contains(&(common::KiCadObjectType::KotPcbTrace as i32))
+                    {
+                        items[0] = with_id(items[0].clone(), "wrong-original-id");
+                    }
                     if fault.swap_readback_id
                         && st.items.len() > 2
                         && !items.is_empty()
@@ -291,6 +349,11 @@ impl Scene {
                         let item = with_id(item, &format!("00000000-0000-4000-8000-{number:012}"));
                         st.items.push(item.clone());
                         receipts.push(item);
+                    }
+                    if fault.footprint_receipt {
+                        let root = konnect_sexp::parse_sexp(SOURCE).unwrap();
+                        let old = root.find("footprint").unwrap().find_str("uuid").unwrap();
+                        receipts[0] = with_id(receipts[0].clone(), old);
                     }
                     if fault.wrong_receipt {
                         receipts[0] = with_id(receipts[0].clone(), OLD_TRACK);
@@ -351,6 +414,7 @@ impl Scene {
             ses,
             manifest,
             handler,
+            cli,
             _server: server,
             state,
             writes,
@@ -427,6 +491,10 @@ async fn served_custom_rule_export_plan_apply_uses_private_candidate_context() {
 async fn served_nonclean_or_incomplete_or_suppressed_custom_drc_proves_rollback() {
     for fault in [
         Fault {
+            stale_source: true,
+            ..Default::default()
+        },
+        Fault {
             bad_drc: true,
             ..Default::default()
         },
@@ -459,6 +527,10 @@ async fn served_nonclean_or_incomplete_or_suppressed_custom_drc_proves_rollback(
 async fn served_failed_restoration_or_colliding_receipt_reports_uncertainty() {
     for fault in [
         Fault {
+            footprint_receipt: true,
+            ..Default::default()
+        },
+        Fault {
             change_board_in_drc: true,
             ..Default::default()
         },
@@ -486,7 +558,7 @@ async fn served_failed_restoration_or_colliding_receipt_reports_uncertainty() {
                 "external copper must survive compensation"
             );
         }
-        if fault.wrong_receipt {
+        if fault.wrong_receipt || fault.footprint_receipt {
             scene.unchanged();
             assert_eq!(
                 scene.writes.load(Ordering::SeqCst),
@@ -582,4 +654,213 @@ async fn served_export_rejects_live_classes_that_change_between_snapshots() {
     assert_eq!(result["isError"], true, "{result:#}");
     assert!(!output.exists());
     assert_eq!(scene.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn served_initial_ipc_inventory_must_match_serialized_source_before_mutation() {
+    let scene = Scene::new(Fault {
+        wrong_initial_id: true,
+        ..Default::default()
+    })
+    .await;
+    let result = scene.apply().await;
+    assert_eq!(result["isError"], true, "{result:#}");
+    assert_eq!(scene.writes.load(Ordering::SeqCst), 0);
+    scene.unchanged();
+}
+#[test]
+fn snapshot_identity_inputs_and_empty_receipts_are_not_guessed() {
+    for source in [
+        "(other)",
+        "(kicad_pcb (footprint (uuid \"\")))",
+        "(kicad_pcb (segment))",
+    ] {
+        assert!(snapshot_routing_ids(source).is_err(), "{source}");
+    }
+    let item = with_id(originals()[0].clone(), "");
+    assert!(created_route_item_ids(&[item]).is_err());
+    let (all, copper) = snapshot_routing_ids(SOURCE).unwrap();
+    assert!(all.len() > copper.len());
+    assert!(all.contains(OLD_TRACK));
+    assert_eq!(copper.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "build the release fork at HEAD first; private IPC/CLI doubles"]
+async fn custom_rule_release_binary_stdio_dogfood() {
+    use std::io::{BufRead, Write};
+    use std::path::PathBuf;
+    let h = Scene::new(Fault::default()).await;
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let exe = repo.join("target/release/konnect");
+    let home = repo.join("target/dogfood-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let state = tempfile::tempdir_in(&home).unwrap();
+    // The normal mock uses inproc://, which cannot cross process boundaries.
+    // Own a private IPC endpoint and forward raw messages inside this process.
+    use nng::options::Options;
+    let address = format!("ipc://{}", state.path().join("fork.sock").display());
+    let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+    socket.listen(&address).unwrap();
+    let control = socket.clone();
+    let upstream = h._server.address().to_string();
+    let worker = std::thread::spawn(move || {
+        let forward = nng::Socket::new(nng::Protocol::Req0).unwrap();
+        forward
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        forward.dial(&upstream).unwrap();
+        while let Ok(message) = socket.recv() {
+            if forward.send(message).is_err() {
+                break;
+            }
+            let Ok(response) = forward.recv() else { break };
+            if socket.send(response).is_err() {
+                break;
+            }
+        }
+    });
+    struct Bridge {
+        control: nng::Socket,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Bridge {
+        fn drop(&mut self) {
+            self.control.close();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+    let _bridge = Bridge {
+        control,
+        worker: Some(worker),
+    };
+    let config = state.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "ipc_address = {}\neager_toolsets = true\nkicad_cli = {}\nlog_level = \"error\"\n",
+            serde_json::to_string(&address).unwrap(),
+            serde_json::to_string(h.cli.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        std::process::Command::new(&exe)
+            .arg("--config")
+            .arg(&config)
+            .env("HOME", &home)
+            .env("KONNECT_STATE_DIR", &home)
+            .env_remove("KICAD_API_SOCKET")
+            .env_remove("KICAD_API_TOKEN")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut sequence = 0;
+    let mut request = |method: &str, params: serde_json::Value| -> serde_json::Value {
+        sequence += 1;
+        writeln!(
+            child.0.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":sequence,"method":method,"params":params})
+        )
+        .unwrap();
+        child.0.stdin.as_mut().unwrap().flush().unwrap();
+        loop {
+            let line = receive
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if value["id"] == sequence {
+                assert!(value.get("error").is_none(), "{value:#}");
+                return value["result"].clone();
+            }
+        }
+    };
+    request(
+        "initialize",
+        serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pr13-routing-dogfood","version":"1"}}),
+    );
+    let mut call = |name: &str, args: serde_json::Value| -> serde_json::Value {
+        let result = request(
+            "tools/call",
+            serde_json::json!({"name":name,"arguments":args}),
+        );
+        assert_ne!(result["isError"], true, "{result:#}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let info = call("get_installation_info", serde_json::json!({}));
+    assert_eq!(
+        PathBuf::from(info["runtime"]["executable_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        exe.canonicalize().unwrap()
+    );
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        info["build"]["commit"],
+        String::from_utf8(head.stdout).unwrap().trim()
+    );
+    call("load_toolset", serde_json::json!({"name":"simulation"}));
+    call("load_toolset", serde_json::json!({"name":"pcb_routing"}));
+
+    call("load_toolset", json!({"name":"pcb_export"}));
+    let output = h.dir.path().join("runtime.dsn");
+    let exported = call(
+        "export_specctra_dsn",
+        json!({"board":h.board,"output":output,"native_bridge_mode":"prefer"}),
+    );
+    assert_eq!(
+        exported["custom_rule_projection"],
+        "conservative_global_minima"
+    );
+    assert!(exported["routing_context"]["custom_rules_sha256"].is_string());
+    let manifest = exported["manifest_output_path"].clone();
+    let plan = call(
+        "plan_specctra_ses_import",
+        json!({"board":h.board,"ses_path":h.ses,"manifest_path":manifest}),
+    );
+    assert_eq!(plan["mutated"], false);
+    assert_eq!(plan["track_count"], 2);
+    assert_eq!(h.writes.load(Ordering::SeqCst), 0);
+    let candidate = h.dir.path().join("runtime-candidate.kicad_pcb");
+    let result = call(
+        "apply_specctra_ses",
+        json!({"board":h.board,"ses_path":h.ses,"manifest_path":manifest,"candidate_output_path":candidate}),
+    );
+    assert_eq!(result["created_count"], 3);
+    assert_eq!(result["drc"]["custom_rules_checked"], true);
+    assert_eq!(result["drc"]["clean"], true);
+    assert_eq!(result["ipc_readback"], "exact_identity_and_count_match");
+    assert_eq!(h.state.lock().unwrap().items.len(), 5);
+    assert_eq!(std::fs::read_to_string(&h.board).unwrap(), SOURCE);
+    assert!(candidate.exists());
 }
