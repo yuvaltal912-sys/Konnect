@@ -661,7 +661,6 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "score_incomplete",
         "routing_metrics",
         "decoupling_coverage",
-
         // Library compatibility result fields.
         "missing_pads",
         "extra_pads",

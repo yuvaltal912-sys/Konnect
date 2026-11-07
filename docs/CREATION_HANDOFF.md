@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 6 (#30), 8 (#31), 10 (#32), 9b (#33) and 12 (#34) are implemented in drafts awaiting review. PR 13 is claimed on `codex/drc-rule-writer`, based on main ca5a3ba. All nine baseline macOS checks passed (3,430 workspace tests, 9 doctests, 93 live simulation tests). The draft precedes implementation. A narrow rule writer, scratch KiCad validation, project minima and independent netclass operations are in progress; PR 13 is not complete.
+**Last updated:** 2026-11-07. The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. The integration PR records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
 
 ## Start here
 
@@ -38,29 +38,29 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 3 | Response budget for ERC, DRC and list tools | none | Merged: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21). Leftovers (C24 stale-fill field, A30's other long results) are open under rank 3 |
 | 4 | Inline renders as image blocks; region and side options | none | Merged: [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28). Follow-ups: inline layer and library-item renders (rank 25), a generated difference image for `inline_diff` |
 | 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Merged: [#29](https://github.com/yuvaltal912-sys/Konnect/pull/29) |
-| 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | In progress (branch `feat/schematic-small-edits`), draft [#30](https://github.com/yuvaltal912-sys/Konnect/pull/30); implemented, awaiting review |
+| 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Integrated from [#30](https://github.com/yuvaltal912-sys/Konnect/pull/30) in the creation alignment PR |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
-| 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | In progress (branch `feat/placement-objectives`), draft [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31); implemented, awaiting review |
+| 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Integrated from [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31) in the creation alignment PR |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
-| 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | In progress (branch `codex/sync-replacement`; pcb_sync.rs, pcb_sync_completion.rs, pcb_footprint_update.rs, sch_export.rs), draft [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33); implemented, awaiting review |
+| 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
 | Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
-| 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs), draft [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32); implemented, awaiting review |
+| 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
-| 12 | Routing batch and readback | none | In progress (branch `codex/routing-batch-readback`; pcb_routing.rs, pcb_routing_batch.rs and its tests, outcome.rs), draft [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34); implemented, awaiting review |
-| 13 | DRC rule writer | none | In progress (branch `codex/drc-rule-writer`; verification.rs, drc_rule_writer.rs, drc_project_rules.rs, project_json_guard.rs), draft [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35); initial rule-writer slice in progress |
+| 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
+| 13 | DRC rule writer | none | Integrated from [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) in the creation alignment PR; initial slice only, remaining work below |
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
 ## Next: what to pick
 
-**Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. If another row is "In progress", don't touch the code files it names.
+**Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
-**Recommended order**, by research rank and what is unblocked:
+**Recommended order**, after the owner approves the next implementation:
 
-1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
-2. **PR 5** is merged (#29): shipped creation guidance. **PR 6** is implemented in draft #30, awaiting review.
-3. **PR 8** is implemented in draft #31: wirelength/crossing terms, fanout filtering and pad-level decoupling. **PR 10** is implemented in draft #32 (library correctness).
-4. **PR 9b** is implemented in draft #33 with the conservative limits below. **PR 12** is implemented in draft #34. Then 13, 14, Q3, 11 and 15, after owner approval.
+1. Finish **PR 13**: general rule expressions and rule editing/deletion, then safe custom-rule DSN/SES handling. The integrated initial slice does not complete that scope.
+2. **PR 14**: checkpoints and readiness report.
+3. **Q3**, then **PR 11**: design-intent record before the honest review/current audit.
+4. **PR 15**: ERC/DRC baselines.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
 
@@ -71,10 +71,47 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 **Known traps.**
 
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
-- GitHub merge commits carry the owner's Gmail, because the account's email-privacy setting is off. Commits you make yourself use the noreply address from `AGENTS.md`.
+- Use the noreply identity from `AGENTS.md`, including integration merge commits. A previous GitHub merge attempt rejected this identity; do not silently substitute a personal email.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
 
-## PR 8, placement objectives (draft, #31)
+## PR 6, small schematic edits (integrated, #30)
+
+The claim-only commit and draft preceded implementation, from merged `main`.
+
+- `rotate_schematic_component` accepts `rotation` and/or absolute `mirror`
+  (`x`, `y`, `none`). Omitted transforms are preserved across every resolved
+  placed unit. Field text and no-connects follow the transform, junctions are
+  reconciled, and prospective and saved state are checked. Connected wires do
+  not move; pin-aligning replacement and wire stretching remain separate work.
+- `edit_schematic_component` accepts DNP/BOM/board/simulation inclusion booleans
+  for all resolved units. Component mutation/get/list observations expose saved
+  nested `flags`. Unrequested legacy simulation-token absence is preserved.
+  New components copy resolved library defaults, including inheritance; an
+  additional unit keeps consistent package choices. Missing and explicit-false
+  simulation exclusion are equivalent for that check, while untouched units
+  keep their existing token representation.
+- New `set_schematic_title_block` in `sch_hierarchy` partially updates one saved
+  sheet's title/date/revision/company/comments1–9. Targeted edits preserve other
+  bytes, omitted values, unknown list children, indentation and CRLF. Invalid or
+  ambiguous metadata, malformed child shapes, unsupported comment lines and
+  implicit/multiple roots are refused. A revision/lock-protected write is
+  followed by independent saved verification; failure then reports uncertainty.
+- API migrations, tool directory and schematic guidance describe the changes.
+  `cargo xtask fix-doc-counts` updates generated counts for the one added tool.
+- Focused verification: 13 new component tests, 16 normal title-block tests and
+  the ignored real KiCad SVG oracle passed, as did the existing library suite.
+  All 57 removal controls caused actual failures and were restored: 25 title,
+  32 component/library/schema, including one explicitly structural assertion of
+  the redundant published mirror-type metadata. These are not model-behavior
+  tests. The first full gate exposed the separate power-symbol constructor's
+  missing flag copy and two exact served-response expectations; these were
+  fixed, with a served power regression and its removal control. The corrected
+  final workspace gate and release/stdio checks are recorded on #30.
+- No installed-binary update, live-project edit, variant support or Claude
+  runtime was used. Client GUI behavior, Windows/Linux and hosted CI remain
+  unverified. CodeRabbit's prior-PR review is still blocked by authentication.
+
+## PR 8, placement objectives (integrated, #31)
 
 The claim-only commit and draft preceded implementation. This PR is independent
 of PR 6 and adds no new tools; it upgrades the existing scorer on PR 7's layer.
@@ -281,7 +318,7 @@ Research ranks 6 and 7 (C19, C17, A14's containment part). One model of the boar
 - **Verify.** The gate in `docs/SIMULATION_HANDOFF.md`, plus the oracle: `KICAD_CLI=/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli cargo test -p konnect-core --lib board_geometry -- --ignored`.
 
 
-## PR 10, library correctness (draft, #32)
+## PR 10, library correctness (integrated, #32)
 
 The claim commit and draft preceded implementation. Adds `edit_symbol` and
 `check_symbol_footprint` in the library toolset, with implementation and tests
@@ -310,7 +347,7 @@ in `tools/library_correctness.rs`.
   used for mutation. Windows/Linux, GUI library refresh and physical pin-map
   validation remain unverified.
 
-## PR 9b, sync replacement and routed nets (draft, #33)
+## PR 9b, sync replacement and routed nets (integrated, #33)
 
 The claim commit and draft preceded implementation. No new tools or arguments.
 `pcb_sync_completion.rs` holds the new preparation, revision and readback helpers;
@@ -345,7 +382,7 @@ adapter to its existing instance-preserving rebuild.
   a different schematic identity remain explicit follow-ups. Saving the board
   and refilling zones are not part of this sync.
 
-## PR 12, verified routing batches (draft, #34)
+## PR 12, verified routing batches (integrated, #34)
 
 The claim commit and draft preceded implementation. A shared live routing path
 in `pcb_routing_batch.rs` serves three new tools and four upgraded tools.
@@ -377,7 +414,7 @@ in `pcb_routing_batch.rs` serves three new tools and four upgraded tools.
   release probe uses a private IPC bridge to a protobuf mock and scratch files.
   Differential-pair routing, delete_trace and Specctra keep their own contracts.
 
-## PR 13, initial rule-writer slice (in progress, draft #35)
+## PR 13, initial rule-writer slice (initial slice integrated, #35)
 
 `create_custom_drc_rule` is a deliberately narrow first step: it previews or
 creates one unconditional clearance or track-width minimum, and refuses an
@@ -394,5 +431,4 @@ that the scratch rules loaded; the command's exit status alone does not. It also
 project, reporting counts and disclosing missing external libraries, parity and
 zone refill. It never runs DRC directly on the original. Real KiCad scratch tests cover preview,
 apply, an observed target-rule violation and malformed-rule rejection. PR 13
-now also adds three project minima and independent preview/apply tools for differential-pair settings and deletion of netclasses unreferenced in saved project data. Project writes reject duplicate keys and linked files, check editor locks and verify conditional writes. Schematic connectivity and live netclass validation are not inspected. General rule expressions/edit/delete and safe DSN handling remain open. In particular, PR #34's SES import does not yet validate a scratch candidate with the source custom rules, so custom-rule export/import remains blocked. The netclass code in
-`pcb_routing.rs` is claimed by PR #34 and must not be touched while it is open.
+now also adds three project minima and independent preview/apply tools for differential-pair settings and deletion of netclasses unreferenced in saved project data. Project writes reject duplicate keys and linked files, check editor locks and verify conditional writes. Schematic connectivity and live netclass validation are not inspected. General rule expressions/edit/delete and safe DSN handling remain open. In particular, PR #34's SES import does not yet validate a scratch candidate with the source custom rules, so custom-rule export/import remains blocked. PR #34's routing code is included in this integration; a later PR 13 continuation must still preserve its routing contracts and prove custom-rule import safety before lifting the refusal.

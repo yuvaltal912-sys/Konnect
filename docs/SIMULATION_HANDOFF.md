@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-06. Simulation v1, its three follow-up fixes, the reliability repairs (PR #15) and M1 of the datasheet-model series (PR #16) are merged. M2 (TVS, MOSFET, BJT) is complete on `feat/simulation-datasheet-models-m2`, committed locally and not pushed, with no PR yet. M3 is next; ask the owner before starting it.
+**Last updated:** 2026-11-07. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23, and the current macOS live simulation suite passes. M3 has not started; ask the owner before starting it.
 
 ## Start here
 
@@ -31,7 +31,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11, the three fixes after them, the reliability repairs and M1 are merged to `main` on the `fork` remote, each as a merge commit.
+PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -49,15 +49,17 @@ PRs 1 to 11, the three fixes after them, the reliability repairs and M1 are merg
 | Fix | [#13](https://github.com/yuvaltal912-sys/Konnect/pull/13) | `fix/replace-component-sim-fields` | Merged as `5d5eeb5` |
 | Repairs | [#15](https://github.com/yuvaltal912-sys/Konnect/pull/15) | `fix/simulation-validation-and-results` | Merged as `15f7137` |
 | M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Merged as `d10dbe1` |
+| M2 | [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) | `feat/simulation-datasheet-models-m2` | Merged as `d228d5f` |
+| Version check | [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23) | `fix/live-test-ngspice-version` | Merged as `bdafc67` |
 
 ## Current work: models fitted to datasheet values (M1)
 
-The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 is merged as PR #16, and M2 is next and not started:
+The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3 is next and has not started:
 
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
-| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **TVS done** (kinds `tvs`, `tvs_bidirectional`); **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); not pushed, no PR yet |
+| M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); merged as [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) |
 | M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
@@ -116,7 +118,7 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 
 Formatting, workspace tests (3,226 passed, 139 ignored), doctests (9 passed, 2 ignored), the live simulation tests (92 passed; the one failure is the ngspice 44.2 pin, a red baseline reported and not fixed), Clippy with warnings denied, `cargo deny check licenses`, documentation counts and the release build. The installed binary hash is unchanged. Not run: the dogfood run by pipe, hosted CI, Windows and Linux, and the KiCad dialog round trip, which stays an owner check.
 
-**The ngspice 44.2 pin is fixed (branch `fix/live-test-ngspice-version`).** `a_real_operating_point_runs_and_leaves_the_project_untouched` pinned the engine version to `44.2`, but KiCad ships its own libngspice, and 10.0.8 ships 45.2. The test now checks that a `MAJOR.MINOR` version of 44 or later is reported. With this fix the live suite has no red baseline.
+**The ngspice 44.2 pin is fixed (merged as [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23)).** `a_real_operating_point_runs_and_leaves_the_project_untouched` pinned the engine version to `44.2`, but KiCad ships its own libngspice, and 10.0.8 ships 45.2. The test now checks that a `MAJOR.MINOR` version of 44 or later is reported. With this fix the live suite has no red baseline.
 
 ## Simulation validation and stored results (merged as PR #15)
 
@@ -154,7 +156,7 @@ PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on mac
 - **The copy is exact and has no argument.** `ki_*` fields stay in the library. A caller changes a `Sim.*` value afterwards with `edit_schematic_component`.
 - **The post-write readback checks the copied fields** (they are in `ComponentTargetUnit.fields`), so a placement that loses one is reported, not passed.
 - **`replace_component` is the other half, and has its own section below.** It is not a placement, so this fix left it alone; it keeps no old fields any more (see "What the `replace_component` fix changed"). Parts placed before the placement fix still read `unmodelled_symbols` with `copy_library_sim_fields`.
-- **Limits left:** fields are read from the schematic's embedded library copy (as Footprint is), so a stale embedded copy places stale fields until `update_symbols_from_library`. Konnect still does not copy the library's `exclude_from_sim` attribute or legacy simulation fields during placement. `Sim_Library`/`Sim_Name` are not aliases recognized by KiCad 10.0.1. The readback compares against the same list the writer used, so it proves the write and not the extraction; the extraction is tested on its own in `library.rs`.
+- **Limits left:** fields are read from the schematic's embedded library copy (as Footprint is), so a stale embedded copy places stale fields until `update_symbols_from_library`. Creation PR 6 (#30), consolidated in the creation integration, adds inherited library inclusion attributes including `exclude_from_sim`. Legacy simulation fields still remain outside this modern `Sim.*` placement copy. `Sim_Library`/`Sim_Name` are not aliases recognized by KiCad 10.0.1. The readback compares against the same list the writer used, so it proves the write and not the extraction; the extraction is tested on its own in `library.rs`.
 - **Tests:** `tools/sim_field_placement_tests.rs` (one test per path, with a quoted `Sim.Params` value), a template test in `templates.rs`, and two ignored live tests at the end of `simulation_live.rs`: a diode placed by `add_schematic_component` and another by `batch_place_components` simulate, and the same circuit with the instance `Sim.*` fields cut out is refused as `unmodelled_symbols`. Evidence is E110 and E111 in the plan. There is no "X4" in the plan (its open questions are Q1 to Q17); E45 and E74 are the evidence behind this row.
 
 ### What the `replace_component` fix changed
