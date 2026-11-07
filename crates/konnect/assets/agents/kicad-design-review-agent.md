@@ -51,8 +51,18 @@ Execute in this order — do not skip steps:
 
 **Phase 2: Formal Rule Checks**
 - Run `run_erc` — review every error and warning
-- Run `get_drc_violations` if a PCB exists — review every violation
-- Check net connectivity matches intent: `compare_netlist` against the intended `{net: ["REF.PIN"]}`, or against a reference design
+- Run `get_drc_violations` if a PCB exists — review every violation. For live PCB
+  evidence, when save/refill is authorized, first use `run_drc` with
+  `sync_live_board` and `refill_zones`. Inspect `source`, `live_board_synced`,
+  `zones_refilled` and `zone_refill_source`; leave those mutating options false
+  on subsequent page calls. Otherwise identify the evidence as saved-file only
+- Follow `next_offset` while `truncated` is true, or inspect the full `output`
+  report, preserving source and filters and avoiding edits while paging. Unread
+  required pages keep the review `INCOMPLETE`; restart if the source changes
+- Inspect `get_schematic_netlist` and compare intent using `compare_netlist`
+  against an independently prepared `{net: ["REF.PIN"]}` with `scope: "complete"`,
+  or against an accepted reference design. Read `result`, `passed` and `counts`;
+  a `fail` is a finding and `incomplete` is blocked evidence
 - Mark an unavailable or structurally incomplete required check `BLOCKED`; the
   overall verdict is then `INCOMPLETE`
 
@@ -63,6 +73,11 @@ Execute in this order — do not skip steps:
 - Protection: evaluate exposed interfaces against the stated environment
 - Manufacturing: check footprint assignments, courtyard overlaps, silkscreen readability
 - Thermal: flag high-power components without thermal relief or heatsinking
+
+The aggregate audits are heuristics, not witnesses for every item above.
+`audit_decoupling` does not measure PCB distance, and `audit_power_rails` does not
+prove current capacity, voltage compatibility or sequencing. Collect separate
+datasheet, physical or measured evidence before marking those checks passed.
 
 **Phase 4: Best Practice Checks**
 - Pull-ups on open-drain buses (I2C, reset lines)
@@ -78,6 +93,11 @@ connectivity, ERC, or DRC establish that it is a fabrication blocker. Use
 warnings or questions for uncorroborated best-practice findings. A required
 check that is missing, failed to execute, or reports impossible coverage makes
 the review `INCOMPLETE` rather than ready.
+
+Schematic evidence reads saved files; ask the owner to save unsaved editor
+changes in KiCad. `save_project` saves only the PCB. For a missing capability,
+stop that step, report the tool gap and give the concrete KiCad GUI action;
+do not substitute direct source-file edits for a missing tool.
 
 ### Output Format
 
@@ -104,6 +124,7 @@ Produce a structured Markdown report:
 - [PASS/FAIL/BLOCKED/N/A] Unused active inputs reconciled
 - [PASS/FAIL/BLOCKED/N/A] ERC collected with `run_erc`
 - [PASS/FAIL/BLOCKED/N/A] DRC collected with `get_drc_violations`
+- [PASS/FAIL/BLOCKED/N/A] Connectivity compared with independent intent/reference
 - [PASS/FAIL/BLOCKED/N/A] Footprint assignments verified
 - [PASS/FAIL/BLOCKED/N/A] Mechanical requirements verified
 

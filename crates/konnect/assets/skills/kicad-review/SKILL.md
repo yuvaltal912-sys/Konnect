@@ -21,7 +21,7 @@ Load the required toolsets for design review:
 ```
 load_toolset('sch_analysis')     # find_orphan_items, find_shorted_nets, find_single_pin_nets
 load_toolset('verification')     # run_drc; check_clearance anchor/courtyard spacing; rules
-load_toolset('sch_export')       # run_erc
+load_toolset('sch_export')       # run_erc, get_schematic_netlist, compare_netlist
 load_toolset('pcb_export')       # get_drc_violations
 load_toolset('manufacturing')    # validate_for_manufacturing
 load_toolset('design_review')    # audit_decoupling, audit_connections, audit_power_rails, etc.
@@ -35,6 +35,29 @@ load_toolset('pcb_routing')      # query_traces, get_nets_list
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
+
+## Saved state and complete reports
+
+Schematic checks read saved files. Ask the owner to save unsaved editor changes
+before collecting that evidence; `save_project` saves only the open PCB. When
+saving/refilling is authorized, use `run_drc(board, sync_live_board=true,
+refill_zones=true)` to establish saved, filled PCB evidence. Inspect `source`,
+`live_board_synced`, `zones_refilled` and `zone_refill_source`. Otherwise have
+the owner save/refill in KiCad, or identify the review as saved-file evidence.
+If optional report publication fails after saving, inspect `source_evidence`
+before retrying; do not repeat the save/refill blindly.
+
+`run_erc`, `run_drc`, and `get_drc_violations` can return one page of violations.
+Their totals and `by_rule` summarize the whole check, not just that page. Follow
+`next_offset` while `truncated` is true, preserving source, severity and other
+filters, or inspect the complete report written through `output`. Establish
+save/refill once; subsequent DRC page calls should leave `sync_live_board` and
+`refill_zones` false. Avoid design edits while paging; if the source changes,
+restart collection. Raising `limit` does not bypass the response byte cap.
+Unread required pages or an unavailable full report keep the verdict `INCOMPLETE`.
+
+The same paging rule applies to component, library and netlist inventories when
+they report `truncated` and `next_offset`. A first page cannot prove full coverage.
 
 ## Evidence hierarchy
 
@@ -112,6 +135,24 @@ A one-pin net is a heuristic review candidate:
 
 ## Formal Checks
 
+### Compare connectivity with intent
+
+Use `get_schematic_netlist(schematic)` to inspect hierarchy-wide saved
+connectivity, following any pages. Prepare the intended `{net: ["REF.PIN"]}`
+table independently from requirements, or use an accepted reference schematic
+or netlist. Do not derive the expected table from the current drawing and then
+call that an intent check.
+
+```
+compare_netlist(schematic, intended, scope="complete")
+```
+
+For a full design check, cover its intended connections and use `scope: "complete"`:
+the default `listed_pins` can ignore other pins joined to those listed. The
+reference-design forms compare completely without this option. Read `result`,
+`passed`, `counts` and diagnostics. `result: "fail"` is a connectivity failure;
+`result: "incomplete"` is blocked evidence. Neither supports a passing review.
+
 ### ERC — Electrical Rules Check
 
 ```
@@ -163,11 +204,10 @@ files have one result per KiCad sheet instance, identified by the
 audit_decoupling(schematic, schematic_scope="hierarchy")
 ```
 
-Checks:
-- Every IC power pin has a bypass capacitor
-- Capacitor is placed close to the pin (PCB proximity)
-- Appropriate capacitor values (100nF ceramic minimum)
-- Bulk capacitance present for high-current ICs
+This is a schematic connectivity heuristic for capacitors on IC power nets;
+it does not measure PCB proximity. Verify applicable values and pin connections
+against the datasheet, and collect separate pad-level placement evidence for
+physical decoupling. Missing physical evidence is not a passed distance check.
 
 ### Connection Audit
 
@@ -175,11 +215,10 @@ Checks:
 audit_connections(schematic, schematic_scope="hierarchy")
 ```
 
-Checks:
-- All expected connections are made
-- No nets with unexpected fan-out
-- Signal integrity basics (termination on long traces)
-- Pull-up/pull-down resistors where required (I2C, reset pins, enable pins)
+This checks common connection mistakes, including candidate missing pull-ups,
+LED resistors, floating inputs and output conflicts. It does not establish all
+intended signal paths or signal integrity. Use `compare_netlist` for intent and
+requirements/datasheets for termination and pull-up decisions.
 
 ### Power Rail Audit
 
@@ -187,12 +226,10 @@ Checks:
 audit_power_rails(schematic, schematic_scope="hierarchy")
 ```
 
-Checks:
-- All power rails have proper source (regulator, connector, etc.)
-- Current capacity matches expected load
-- Voltage levels are consistent (no 3.3V device on 5V rail)
-- Power sequencing considered for multi-rail designs
-- Power flags present (avoids ERC false positives)
+This looks for candidate missing bulk capacitors, power test points and
+regulator output capacitors. It does not establish current capacity, voltage
+compatibility or sequencing. Verify those separately from datasheets, design
+loads and suitable calculations or measurements; report missing evidence.
 
 ### Manufacturing Audit
 
@@ -200,13 +237,10 @@ Checks:
 audit_manufacturing()
 ```
 
-Checks:
-- All footprints are fab-house compatible
-- Pad sizes meet minimum requirements
-- Silkscreen readability
-- Test point accessibility
-- Fiducial marks present (for SMT assembly)
-- Mechanical clearances around mounting holes
+Read the returned issues and outline evidence, including true Edge.Cuts closure
+and footprint containment. This audit does not establish every fab-house rule,
+drill size, silkscreen readability, test-point access or assembly requirement.
+Collect those separately under the manufacturing skill's acceptance workflow.
 
 ---
 
@@ -349,8 +383,9 @@ Present findings grouped by severity with actionable fix suggestions:
 4. **Run DRC after fixes** — verify that corrections did not introduce new violations
 5. **Do not approve a design with CRITICAL issues** — even if the user says "it's fine"
 6. **Load toolsets first** — check `get_active_toolsets()` and load what you need
-7. **Save before reviewing** — ensures checks run against current state
+7. **Identify the checked state** — save schematic edits in KiCad and establish saved/refilled PCB evidence before dependent checks
 8. **Offer to fix** — after reporting, offer to use MCP tools to resolve issues
 9. **Re-run after fixes** — always verify fixes resolved the issue and created no new ones
 10. **Document waivers** — if user explicitly waives a warning, note it in the report
 11. **Never soften `INCOMPLETE`** — partial or failed coverage is not a passing review
+12. **Report tool gaps** — stop the unsupported step, name the blocker and give the concrete KiCad GUI action needed; keep required evidence blocked until obtained

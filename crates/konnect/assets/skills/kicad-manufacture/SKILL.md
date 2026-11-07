@@ -55,7 +55,10 @@ one current authority, and no decision rests on an undated table in this skill.
 ## 2. Establish direct design evidence
 
 Run direct KiCad DRC against the saved target board and resolve every error or
-record a deliberate, reviewable waiver. Then run:
+record a deliberate, reviewable waiver. Follow `next_offset` while `truncated`
+is true, or inspect the complete `output` report; unread required pages keep
+release `INCOMPLETE`. Save/refill once before paging, preserve source and filters,
+and restart if the board changes. Then run:
 
 ```
 validate_for_manufacturing(board, fab_house?)
@@ -63,18 +66,20 @@ validate_for_manufacturing(board, fab_house?)
 
 The current handler checks only:
 
-- presence of at least one `Edge.Cuts` item;
+- true Edge.Cuts outline closure and footprint containment, including rounded
+  outlines and cut-outs; inspect `outline`, skipped geometry and any intentional
+  `edge_mount_references` allowances;
 - presence of footprints;
 - the configured minimum trace width against its built-in fab profile;
 - the coarse case where several nets exist but no routed tracks exist; and
 - direct `kicad-cli` DRC evidence, which must be available and complete for a
   `READY` verdict.
 
-Read `verdict`, `issues`, and `drc` together. A null or incomplete `drc`, a
+Read `verdict`, `issues`, and `drc` together, plus `outline`. A null or incomplete `drc`, a
 `NOT READY` verdict, or an unadjudicated issue blocks release.
 
-This preflight does not prove outline closure, copper on every pad, drill-size
-acceptance, silkscreen clearance, stackup compatibility, or assembly readiness.
+This preflight does not prove copper on every pad, drill-size acceptance,
+silkscreen clearance, stackup compatibility, or assembly readiness.
 Establish those separately with direct DRC, the selected fabricator's current
 contract, Gerber/drill inspection, BOM/CPL review, and the order preview.
 

@@ -22,8 +22,7 @@ Before any schematic work, load the required toolsets:
 load_toolset('sch_components')   # place, move, rotate, delete symbols
 load_toolset('sch_wiring')       # wires, net labels, power symbols, connections
 load_toolset('sch_analysis')     # connection validation, short and orphan checks
-load_toolset('sch_export')       # direct ERC and rendered schematic evidence
-load_toolset('project')          # save_project before formal checks
+load_toolset('sch_export')       # hierarchy-wide netlist, direct ERC and renders
 ```
 
 Load additional toolsets as needed:
@@ -31,6 +30,8 @@ Load additional toolsets as needed:
 ```
 load_toolset('library')          # search_symbols, get_symbol_info, list_symbol_libraries
 load_toolset('sch_batch')        # batch operations for 3+ items
+load_toolset('sch_hierarchy')    # sheets, sheet pins and their validation
+load_toolset('sch_bus')          # bus segments, entries and labelled pin fan-out
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -48,7 +49,16 @@ search the active libraries when the required part is absent or package-specific
 1. Search the library first: use `search_symbols` to find the correct lib_id
 2. Get pin info: use `get_symbol_info` to see pin names, numbers, and positions
 3. Place on the 1.27mm grid (KiCAD default schematic grid)
-4. Verify placement with `list_schematic_components`
+4. Verify placement with `list_schematic_components`; follow `next_offset` while
+   `truncated` is true so a short page is not mistaken for the whole sheet
+
+For multi-unit ICs, place every required unit, including a separate power unit,
+using `add_schematic_component` with the same `reference` and the resolved
+`unit` number (units start at 1). `get_symbol_info` lists library pins across
+units; it does not prove those units are placed. Confirm required power pins
+appear in `get_schematic_pin_locations` before wiring. If the unit number cannot
+be established through the available tools, report the gap and identify the
+KiCad symbol/unit selection needed instead of guessing.
 
 ### Package-sensitive and custom parts
 
@@ -120,8 +130,9 @@ pattern.
 | Two pins physically close (<30mm)       | `connect_pins`          | Direct wire, auto-routed                 |
 | Named signal (SDA, MOSI, EN, etc.)      | `connect_to_net`        | Stub wire + net label, cleaner           |
 | Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, global net          |
-| Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
-| Cross-sheet signal                      | Global label            | Connects across schematic sheets         |
+| Bus signals (D0-D7)                     | `connect_pins_to_bus`   | Named wire stubs and entries to a bus     |
+| Parent/child sheet signal                | Hierarchical label + sheet pin | Explicit sheet interface          |
+| Signal shared across all sheets          | Global label            | One net across sheets and instances      |
 | Multiple pins to same net (3+)          | `batch_connect_to_net`  | Efficient bulk operation                 |
 
 ### connect_pins
@@ -192,6 +203,22 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
   instance of a repeated sheet (each node's own 5V, say) takes a local net
   label via `connect_to_net` instead — `power:+5V` there shorts all the
   instances' rails together.
+
+### Hierarchical sheets and buses
+
+Load `sch_hierarchy` for a multi-sheet design. Use `add_hierarchical_sheet` to
+link a child, add its interface labels with `add_schematic_net_label` and
+`label_type: hierarchical_label`, then `import_sheet_pins` on the parent.
+`get_sheet_hierarchy` discovers the tree; `validate_sheet_pins` checks matching
+labels, pins and sheet-edge placement before ERC. Reusing a child file creates
+another instance; `duplicate_sheet` creates an independent copy.
+
+Load `sch_bus` when drawing a bus. Draw its segment with `add_bus` (or
+`batch_add_bus`), attach a vector label such as `D[0..7]` or a group label such
+as `{SDA SCL}`, then call `connect_pins_to_bus` with `connections` entries
+`{reference, pin_number, net}` and either `bus_x` or `bus_y`. It adds each stub,
+entry and member label; names must match the bus label. A bus line alone does
+not establish member connectivity. Verify the result through the root netlist.
 
 ---
 
@@ -280,13 +307,28 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 ### Verification Workflow
 
 1. Place and wire complete functional blocks.
-2. Run `annotate_schematic`, then save with `save_project`.
+2. Run `annotate_schematic` and inspect its outcome. Schematic editing tools
+   already write their changes; `save_project` saves only a live PCB. If the
+   owner has unsaved schematic editor changes, have them save in KiCad before
+   checks, which read the saved files.
 3. Run `validate_wire_connections` and `validate_component_connections`.
 4. Run `find_shorted_nets`; reconcile each finding against the intended nets.
 5. Run `find_orphan_items` as a heuristic and corroborate its findings.
-6. Run direct KiCad ERC with `run_erc` and classify every violation.
+6. Run `run_erc` on the root schematic and classify every violation. Follow
+   `next_offset` while `truncated` is true; `total`, `errors`, `warnings` and
+   `by_rule` describe the whole report. Pass `output` for a full JSON report
+   on disk when needed.
 7. Run `render_schematic_png` with inline output and inspect the actual image.
-8. Final check: run `compare_netlist` with the intended `{net: ["REF.PIN"]}`. It compares pin sets across the whole hierarchy, so net names do not matter. Anything under `missing`, `split`, `merged` or `extra`, or a verdict of `incomplete`, is a connection you did not intend or could not prove.
+8. Final connectivity check: run `compare_netlist` on the root sheet with
+   `intended: {net: ["REF.PIN"]}` and `scope: "complete"`. Prepare that table
+   from requirements before wiring; copying the actual netlist as intent
+   cannot establish correctness. Names do not matter: pin sets are compared
+   across the hierarchy. Require `result: "pass"`, `passed: true` and zero
+   `counts` for `missing`, `split`, `merged` and `extra`; `fail` or `incomplete`
+   remains unfinished. The default `listed_pins` scope proves only its listed
+   subset and is insufficient for a complete-design claim. For investigation,
+   `get_schematic_netlist` reads the saved hierarchy; follow its `next_offset`
+   and check `pins_truncated` before treating a displayed net as exhaustive.
 9. Fix findings and repeat every check invalidated by the edits.
 
 ---
@@ -326,6 +368,10 @@ impossible coverage, or contradicts stronger evidence without resolution, the
 result is `INCOMPLETE`. Report the blocked evidence and stop short of a clean or
 production-ready claim.
 
+When a needed editing operation has no supported tool, report the tool gap and
+the concrete KiCad GUI steps needed to continue. Keep it incomplete until the
+saved result can be checked; do not substitute direct source-file edits.
+
 ## Rules
 
 1. **Never edit .kicad_sch files directly** — all changes go through MCP tools
@@ -335,6 +381,6 @@ production-ready claim.
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
 6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels; the exception is a rail that must stay separate per instance of a repeated sheet, which takes a local label because power symbols are global
 7. **Net labels for named signals** — keeps schematics readable
-8. **Save frequently** — call `save_project` after major operations
+8. **Check saved evidence** — inspect each editing result and query it back; schematic tools write immediately, while unsaved KiCad editor changes require a GUI save
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting
 10. **Batch for bulk** — use batch toolset for 3+ repetitive operations
