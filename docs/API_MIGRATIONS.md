@@ -3,6 +3,56 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: verified routing batches and in-place edits (minor release)
+
+Creation PR 12. New `route_batch(board, tracks?, vias?)` applies explicit copper
+in one live KiCad undo commit. Each track entry has `net_name`, `layer`, optional
+`width` and 2–201 `points: [{x,y}, ...]`; every adjacent pair becomes a segment.
+Via entries take `net_name`, `x`, `y`, optional `drill` and `pad_size`. At least
+one object is required; expanded segments plus vias are limited to 200. Every
+entry is prepared before mutation. This tool does not plan a route or avoid
+obstacles, and does not replace the documented Freerouting failure policy.
+
+`route_trace`, `route_pad_to_pad` and `add_via` use the same verified creation
+path. Nets must already exist on the live board and copper layers must be
+enabled. Pad routing checks live reference/pad uniqueness, net membership and
+layer coverage; it refuses repeated physical anchors rather than selecting the
+first. The L-bend remains horizontal then vertical, without clearance proof.
+
+Omitted widths now use the live effective netclass preferred width. Explicit
+widths below it are refused by Konnect's `at_least_preferred_width` policy.
+KiCad's preferred width is not itself a DRC minimum or current-capacity proof.
+Via dimensions default to the live class drill/diameter. Missing live rules do
+not fall back to saved project settings or guessed defaults. Copper dimensions
+round to nearest nanometer before width/annulus checks. Coordinates are bounded
+to ±2000 mm, dimensions to 1 nm–100 mm; via diameter must exceed drill after
+rounding and zero-length segments refuse.
+
+New `query_vias(board, net_name?, limit?, offset?)` reads live via KIIDs,
+positions, net, pad-stack layer list and primary diameter/drill with the shared paging/byte
+budget. `delete_via(board, uuid)` requires an observed unlocked via and proves
+absence after deletion; a trace or stale KIID is not accepted.
+
+`modify_trace` now requires only `board` and `uuid`, plus at least one of its
+existing optional trace fields. It updates the observed straight trace in place,
+preserving KIID, parent, lock and omitted values. Locked/unknown-state objects
+refuse. No delete-and-recreate operation occurs.
+
+Creation replies add `created`, `modified`, `deleted`, their verified counts,
+readback KIIDs and rule-check evidence. Existing single-item geometry fields are
+copied from readback; `source` is now `live_kicad_ipc`. A complete reply requires
+matching receipts, object identity, net/geometry readback and inventory checks.
+Commit/readback failures return `mutation_outcome_uncertain`; inspect the open
+board before retrying, even if backend recovery may have run. These seven tools
+adopt the shared outcome envelope (one request is one outcome unit; copper-item
+counts remain separate). Protocol/schema rejections retain the framework error
+contract; handler-level results carry the envelope. Preflight refusals are failed,
+with no writes; uncertain
+outcomes do not claim rollback. Query/deletion have no saved-file fallback.
+
+No clearance/short/DRC pass, zone refill or save is implied. `delete_trace`,
+differential-pair routing and Specctra import retain their existing contracts.
+
 ## Unreleased: render images and focused views (minor release)
 
 Creation PR 4 (`docs/CREATION_HANDOFF.md`).

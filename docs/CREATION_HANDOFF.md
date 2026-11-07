@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. PRs 6 (#30), 8 (#31), 10 (#32) and 9b (#33) are implemented in drafts awaiting review. The owner authorized continuing: PR 12 is claimed on `codex/routing-batch-readback`, branched from main ca5a3ba. Its draft is being opened before implementation. All nine baseline macOS checks passed (3,430 workspace tests, 9 doctests, 93 live simulation tests); the installed binary hash is unchanged.
+**Last updated:** 2026-11-07. PRs 6 (#30), 8 (#31), 10 (#32), 9b (#33) and 12 (#34) are implemented in drafts awaiting review. PR 12 was claimed before implementation on `codex/routing-batch-readback`, branched from main ca5a3ba. All nine baseline checks passed (3,430 workspace tests, 9 doctests, 93 live simulation tests). The PR 12 section records scope and limits; exact final verification is reported in the PR.
 
 ## Start here
 
@@ -46,7 +46,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | In progress (branch `feat/library-correctness`; library.rs and library_correctness.rs), draft [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32); implemented, awaiting review |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
-| 12 | Routing batch and readback | none | In progress (branch `codex/routing-batch-readback`; pcb_routing.rs, pcb_routing_batch.rs and its tests, outcome.rs) |
+| 12 | Routing batch and readback | none | In progress (branch `codex/routing-batch-readback`; pcb_routing.rs, pcb_routing_batch.rs and its tests, outcome.rs), draft [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34); implemented, awaiting review |
 | 13 | DRC rule writer | none | Not started |
 | 14 | Checkpoints and readiness report | none | Not started |
 | 15 | ERC/DRC baselines | 3 | Not started |
@@ -60,7 +60,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 1. **PR 4** is merged (#28): inline image blocks, schematic region crops, board side/zoom.
 2. **PR 5** is merged (#29): shipped creation guidance. **PR 6** is implemented in draft #30, awaiting review.
 3. **PR 8** is implemented in draft #31: wirelength/crossing terms, fanout filtering and pad-level decoupling. **PR 10** is implemented in draft #32 (library correctness).
-4. **PR 9b** is implemented in draft #33 with the conservative limits below. Then 12, 13, 14, Q3, 11 and 15, after owner approval.
+4. **PR 9b** is implemented in draft #33 with the conservative limits below. **PR 12** is implemented in draft #34. Then 13, 14, Q3, 11 and 15, after owner approval.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
 
@@ -344,3 +344,35 @@ adapter to its existing instance-preserving rebuild.
   Arbitrary partial net splits, routed-pad relocation and reference reuse under
   a different schematic identity remain explicit follow-ups. Saving the board
   and refilling zones are not part of this sync.
+
+## PR 12, verified routing batches (draft, #34)
+
+The claim commit and draft preceded implementation. A shared live routing path
+in `pcb_routing_batch.rs` serves three new tools and four upgraded tools.
+
+- `route_batch` expands explicit polylines and through vias, max 200 objects,
+  preflights the complete request and writes one undo commit. `route_trace`,
+  `route_pad_to_pad` and `add_via` use the same creation/readback checks.
+- Nets and effective rules come from live IPC; enabled copper layers and live
+  pad net/layer membership are checked. Repeated pad anchors refuse. Preferred
+  netclass widths are Konnect's lower routing-policy bound, not KiCad DRC or
+  current-capacity proof. Widths/drills/diameters round to nanometers before
+  checks. Missing live evidence refuses rather than using saved defaults.
+- `modify_trace` updates an unlocked observed straight trace in place, retaining
+  KIID and omitted fields. `query_vias` is paged/byte-bounded; `delete_via` checks
+  type/lock and post-write absence. All use exact requested-board binding.
+- Creation receipts and readback must agree on identities, nets, geometry and
+  inventory. Commit or post-write verification failures are explicit uncertain
+  outcomes; inspect before retrying. These seven tools adopt the shared outcome
+  envelope, counting one request separately from copper-item counts.
+- Verification covers served MCP, live-vs-saved pad anchors, mixed batches,
+  rounding, class/layer/net failures, stale/type/lock refusals, modified/deleted
+  postconditions and faulty receipts/readback. The full after-commit gate and
+  release stdio probe are required at closeout; exact results are in the PR.
+  All 45 guard-break controls caused actual test failures, then source was
+  restored. The focused routing suite has 68 passing tests; the old live-pad
+  regressions are retained in the shared served harness.
+- Not claimed: path planning, obstacle/short/clearance checks, DRC, zone refill
+  or save. Real KiCad GUI IPC/undo and Windows/Linux remain unverified. The
+  release probe uses a private IPC bridge to a protobuf mock and scratch files.
+  Differential-pair routing, delete_trace and Specctra keep their own contracts.
