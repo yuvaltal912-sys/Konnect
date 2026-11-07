@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). PR 4 is implemented on `feat/inline-render-images`, draft [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28), awaiting owner review. Its pre-change macOS gate passed formatting, 3,401 workspace tests, doctests, all 93 live simulation tests, Clippy, licenses, doc counts and the release build. The final gate and fork-by-stdio evidence are recorded on the PR after its implementation commit. The installed binary's hash is unchanged. Do not start another PR without the owner's OK.
+**Last updated:** 2026-11-07. Merged: PRs 1, 2 (with its review fixes), 2b, 3, 7, the first half of 9, and the ngspice test fix (#23). PR 4 is implemented in draft [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28), awaiting review. The owner explicitly approved starting the next independent PR on 2026-11-07: PR 5 is claimed on `docs/creation-workflow-guidance`, branched from `main`; its draft is being opened before implementation. PR 4's code files are outside this work. The pre-change macOS gate passed formatting, 3,401 workspace tests, doctests, all 93 live simulation tests, Clippy, licenses, doc counts and the release build. The installed binary's hash is unchanged.
 
 ## Start here
 
@@ -37,7 +37,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 2b | Freerouting on real boards: DSN export accepts rounded and arc outlines and roundrect pads and keeps zones and pours as fixed copper; install path or setup guidance | 2 | Merged: [#26](https://github.com/yuvaltal912-sys/Konnect/pull/26) |
 | 3 | Response budget for ERC, DRC and list tools | none | Merged: [#21](https://github.com/yuvaltal912-sys/Konnect/pull/21). Leftovers (C24 stale-fill field, A30's other long results) are open under rank 3 |
 | 4 | Inline renders as image blocks; region and side options | none | In progress (branch `feat/inline-render-images`), draft [#28](https://github.com/yuvaltal912-sys/Konnect/pull/28); implemented, awaiting review |
-| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | Not started |
+| 5 | Guidance fixes in the shipped skills and agents; Freerouting path documented. Also (2026-11-06): if the DSN export or Freerouting fails, stop and report the blocker instead of hand-rolling a router, and never finish with unrouted nets without saying so | 1, 2, 2b | In progress (branch `docs/creation-workflow-guidance`) |
 | 6 | Small schematic edits: mirror after placement, DNP and BOM flags, title block | none | Not started |
 | 7 | Board geometry layer: `query_board_region`, true outline containment | none | Merged: [#25](https://github.com/yuvaltal912-sys/Konnect/pull/25). Follow-ups on the layer: free-space finder, copper islands, planned-copper clearance (C18, C23, C15) |
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Not started |
