@@ -223,11 +223,23 @@ an unproved outline is not completion evidence.
 - `score_placement` reports a 0-100 score with named deductions. Hard failures
   (courtyard overlaps, parts outside a proven outline) decide the verdict
   regardless of the number, and a board with no outline can never pass.
-  **decoupling_associations** names the non-ground, bounded-fanout evidence used
-  for cap-to-IC distance checks; **unproven_decoupling_caps** identifies caps the
-  scorer deliberately did not guess about. `interface_filter_caps` lists caps
-  within their family limit of a connector carrying every one of their nets;
-  do not drag those cable-filtering parts toward an IC.
+  Read **score_incomplete**, **routing_metrics** and **decoupling_coverage**
+  before comparing numeric scores. Routing metrics estimate fanout-filtered
+  straight MST wirelength and projected crossings; they do not inspect routed
+  copper, layers, shorts or DRC. `max_net_references` defaults to 8 and accepts
+  2–256; retain the same policy when comparing placements. Missing data is
+  unavailable evidence, not zero cost. Samples may truncate without truncating
+  the aggregate calculation.
+  **decoupling_associations** reports matching pad numbers/positions and
+  non-ground net evidence. A truly pad-adjacent cap can qualify on a larger
+  rail; distant associations still need bounded fanout. These are planar
+  proximity heuristics, not datasheet or current-loop proof.
+  **unproven_decoupling_caps** identifies caps the scorer did not guess about.
+  `interface_filter_caps` requires nearby accessible pad pairs for every named
+  capacitor terminal net, using the worst nearest-pair distance. A connector
+  courtyard or one close terminal is insufficient; do not drag proven
+  cable-filtering parts toward an IC. Mechanical row planners are unchanged
+  and may now return a blocked plan under the improved judge.
 - Outside-outline and connector-edge evidence is judged against the true
   Edge.Cuts outline, rounded corners and cut-outs included, and every
   `outside_outline` failure carries its `overhang_mm`. An outline that does not
