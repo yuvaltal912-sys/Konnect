@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-07. The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
+**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is claimed on `feat/creation-checkpoints`. Before that, 2026-11-07: The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
 
 ## Start here
 
@@ -48,7 +48,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Integrated from [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) in the creation alignment PR; initial slice only, remaining work below |
-| 14 | Checkpoints and readiness report | none | Not started |
+| 14 | Checkpoints and readiness report | none | In progress (branch `feat/creation-checkpoints`) |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
 ## Next: what to pick
