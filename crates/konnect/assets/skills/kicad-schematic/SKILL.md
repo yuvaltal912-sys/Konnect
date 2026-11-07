@@ -60,6 +60,25 @@ appear in `get_schematic_pin_locations` before wiring. If the unit number cannot
 be established through the available tools, report the gap and identify the
 KiCad symbol/unit selection needed instead of guessing.
 
+### Editing existing symbols and sheet metadata
+
+For an existing component, `rotate_schematic_component` accepts `rotation`
+and/or `mirror` (`x`, `y`, `none`). Omitted values stay unchanged. KiCad's x
+mirror reverses screen Y; y reverses screen X. Connected wires do not follow the
+transformed pins, so query their locations and repeat connectivity checks.
+
+Use `edit_schematic_component` for boolean `dnp`, `in_bom`, `on_board` and
+`exclude_from_sim` attributes across every placed unit. Inspect the saved
+readback; omitted flags remain unchanged. New components use resolved library
+defaults; an added unit retains consistent existing package choices. A `unit`
+selector for field text does not make these flags
+unit-specific.
+
+For sheet metadata, load `sch_hierarchy` and call `set_schematic_title_block`
+with `title`, `date`, `revision`, `company` and/or a `comments` object keyed
+`"1"`–`"9"`. Omitted entries are preserved; an empty string clears an entry.
+This edits the named saved sheet, not the PCB or every child sheet.
+
 ### Package-sensitive and custom parts
 
 Before placing or wiring a custom symbol, a manufacturer-specific discrete,

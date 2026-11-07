@@ -1118,6 +1118,12 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
             value: symbol.value_str().unwrap_or_default().to_string(),
             footprint: symbol.footprint().unwrap_or_default().to_string(),
             sim_fields: Vec::new(),
+            flags: konnect_schematic_editor::library::SymbolFlags {
+                dnp: symbol.dnp,
+                in_bom: symbol.in_bom,
+                on_board: symbol.on_board,
+                exclude_from_sim: symbol.exclude_from_sim,
+            },
         };
         let expected = sch_components::ComponentTargetUnit::placement(
             &uuid,
@@ -1193,6 +1199,12 @@ fn native_placement_readback_requires_requested_values() {
                 symbol.footprint().unwrap_or_default().to_string()
             },
             sim_fields: Vec::new(),
+            flags: konnect_schematic_editor::library::SymbolFlags {
+                dnp: symbol.dnp,
+                in_bom: symbol.in_bom,
+                on_board: symbol.on_board,
+                exclude_from_sim: symbol.exclude_from_sim,
+            },
         };
         let expected = sch_components::ComponentTargetUnit::placement(
             &symbol.uuid,

@@ -421,6 +421,25 @@ fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a
 /// Read these from the embedded definition rather than resolving the library
 /// again: the embedded copy is already flattened for derived symbols and is
 /// the exact definition the schematic instance refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolFlags {
+    pub dnp: bool,
+    pub in_bom: bool,
+    pub on_board: bool,
+    pub exclude_from_sim: Option<bool>,
+}
+
+impl Default for SymbolFlags {
+    fn default() -> Self {
+        Self {
+            dnp: false,
+            in_bom: true,
+            on_board: true,
+            exclude_from_sim: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymbolMetadata {
     /// The reference prefix, such as `R` or `#FLG`.
@@ -433,6 +452,9 @@ pub struct SymbolMetadata {
     /// KiCad's simulator reads these from the placed instance only, so a
     /// placement has to copy them (`Sim.Device`, `Sim.Pins`, `Sim.Params`, ...).
     pub sim_fields: Vec<(String, String)>,
+    /// Library-owned inclusion defaults. Missing attributes retain KiCad's
+    /// defaults; absent simulation exclusion is not a format upgrade.
+    pub flags: SymbolFlags,
 }
 
 /// Read the metadata fields of `lib_id` from the schematic's embedded symbol.
@@ -471,6 +493,12 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
         datasheet: value("Datasheet"),
         description: value("Description"),
         sim_fields,
+        flags: SymbolFlags {
+            dnp: symbol.get_bool("dnp").unwrap_or(false),
+            in_bom: symbol.get_bool("in_bom").unwrap_or(true),
+            on_board: symbol.get_bool("on_board").unwrap_or(true),
+            exclude_from_sim: symbol.get_bool("exclude_from_sim"),
+        },
     }
 }
 
@@ -751,7 +779,7 @@ mod suggestion_tests {
         std::fs::create_dir_all(&symdir).unwrap();
         std::fs::write(
             symdir.join("LM2904.kicad_sym"),
-            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"LM2904\"\n\t\t(pin_names (offset 0.127))\n\t\t(in_bom yes)\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"LM2904\" (at 0 0 0))\n\t\t(property \"Footprint\" \"Package_DIP:DIP-8_W7.62mm\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"lm2904.pdf\" (at 0 0 0))\n\t\t(symbol \"LM2904_1_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t\t(symbol \"LM2904_2_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"7\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"LM2904\"\n\t\t(pin_names (offset 0.127))\n\t\t(in_bom no)\n\t\t(on_board no)\n\t\t(exclude_from_sim yes)\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"LM2904\" (at 0 0 0))\n\t\t(property \"Footprint\" \"Package_DIP:DIP-8_W7.62mm\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"lm2904.pdf\" (at 0 0 0))\n\t\t(symbol \"LM2904_1_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t\t(symbol \"LM2904_2_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"7\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
         )
         .unwrap();
         std::fs::write(
@@ -801,6 +829,16 @@ mod suggestion_tests {
             "properties the child lacks are inherited:\n{out}"
         );
         let metadata = symbol_metadata(&sch, "Amp:NE5532");
+        assert_eq!(
+            metadata.flags,
+            SymbolFlags {
+                dnp: false,
+                in_bom: false,
+                on_board: false,
+                exclude_from_sim: Some(true)
+            },
+            "library attributes inherit through the flattened definition"
+        );
         assert_eq!(metadata.value, "NE5532", "the child's own Value wins");
         assert_eq!(
             metadata.footprint, "Package_DIP:DIP-8_W7.62mm",
@@ -997,6 +1035,7 @@ mod field_anchor_tests {
                 datasheet: "~".to_string(),
                 description: "Resistor".to_string(),
                 sim_fields: Vec::new(),
+                flags: SymbolFlags::default(),
             }
         );
         assert_eq!(symbol_metadata(&sch, "Device:C"), SymbolMetadata::default());

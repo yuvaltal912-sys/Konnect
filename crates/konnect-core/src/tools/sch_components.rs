@@ -4,6 +4,10 @@
 //! round-trip parsing.  Pin coordinate math still delegates to
 //! `konnect_sexp::geometry::transform_pin`.
 
+#[cfg(test)]
+#[path = "schematic_small_edit_tests.rs"]
+mod schematic_small_edit_tests;
+
 use crate::mcp::{
     error::ToolErrorKind,
     protocol::{CallToolResult, ToolContent},
@@ -19,6 +23,7 @@ use crate::tools::{
     },
     ReembedOutcome, ToolContext, ToolDef,
 };
+use cse::library::SymbolFlags;
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
@@ -42,8 +47,8 @@ pub fn tools() -> Vec<ToolDef> {
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
              to the 1.27mm schematic grid. Preserves every saved hierarchy instance, reports \
-             committed-file readback, copies the library Value and Footprint unless explicitly \
-             overridden, and refuses stale instance metadata before writing. \
+             committed-file readback, copies library fields and inclusion flags (or preserves \
+             the current package flags for an added unit), and refuses stale instance metadata before writing. \
              Specify position in schematic mm coordinates.",
             json!({
                 "type": "object",
@@ -78,12 +83,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component, and move or hide the text of any of them.",
+            "Update fields and inclusion flags consistently across every placed unit of a component, and move or hide field text. Omitted flags are preserved; unit selects field-text placement only.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string", "description": "Current reference designator" },
+                    "dnp": { "type": "boolean", "description": "Do not populate; applies to every placed unit" },
+                    "in_bom": { "type": "boolean", "description": "Include component in BOM" },
+                    "on_board": { "type": "boolean", "description": "Include component on PCB" },
+                    "exclude_from_sim": { "type": "boolean", "description": "Exclude component from simulation; omission preserves the existing token, including absence" },
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
@@ -117,7 +126,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_component",
-            "Get a component's shared properties and every placed unit's position. Use get_schematic_pin_locations for pins.",
+            "Get a component's shared properties and every placed unit's position and inclusion flags. Use get_schematic_pin_locations for pins.",
             json!({
                 "type": "object",
                 "properties": {
@@ -175,6 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
             "rotate_schematic_component",
             "Set the lowest-numbered unit's absolute rotation and rotate every other placed \
              unit by the same delta. Does NOT adjust connected wires. Each unit's \
+             optional mirror is set to the requested absolute axis; omitted rotation or mirror is preserved. \
              Reference and Value text turns with its body, keeping any offset the caller \
              gave it; use reset_schematic_field_positions to put fields back on their \
              library anchors instead. Junction dots are \
@@ -187,9 +197,11 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string" },
-                    "rotation": { "type": "number", "description": "Absolute rotation in degrees" }
+                    "rotation": { "type": "number", "description": "Absolute rotation in degrees; omit for mirror-only edits" },
+                    "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Absolute reflection for every placed unit: x negates screen-Y, y negates screen-X, none clears it" }
                 },
-                "required": ["schematic", "reference", "rotation"]
+                "required": ["schematic", "reference"],
+                "anyOf": [{"required": ["rotation"]}, {"required": ["mirror"]}]
             }),
             |args, ctx| async move { handle_rotate_schematic_component(args, ctx).await }
         ),
@@ -721,7 +733,7 @@ pub(crate) fn place_one_component(
         return Err(crate::tools::lib_symbol_not_found_error(lib_id, src));
     }
     let metadata = cse::library::symbol_metadata(sch, lib_id);
-    let fields = PlacementFields::resolve(lib_id, &metadata, value, footprint);
+    let mut fields = PlacementFields::resolve(lib_id, &metadata, value, footprint);
     // Unannotated, but keeping the library prefix: annotation numbers `R?`
     // as `R1`, while a bare `?` becomes `1` and a `#FLG` loses the `#` that
     // keeps it off the board (#669).
@@ -729,6 +741,29 @@ pub(crate) fn place_one_component(
         Some(reference) => reference.to_owned(),
         None => format!("{}?", metadata.reference),
     };
+    // An additional unit belongs to the existing package. Preserve its
+    // current inclusion settings rather than resetting a user-edited DNP/BOM
+    // decision to library defaults when another gate is placed later.
+    let mut existing: Vec<_> = sch
+        .symbols
+        .iter()
+        .filter(|symbol| !reference.contains('?') && symbol.reference() == Some(reference.as_str()))
+        .collect();
+    existing.sort_by(|a, b| (a.unit, &a.uuid).cmp(&(b.unit, &b.uuid)));
+    if let Some(first) = existing.first() {
+        let first = symbol_flags(first);
+        let effective = |mut flags: SymbolFlags| {
+            flags.exclude_from_sim = Some(flags.exclude_from_sim.unwrap_or(false));
+            flags
+        };
+        if existing
+            .iter()
+            .any(|symbol| effective(symbol_flags(symbol)) != effective(first))
+        {
+            return Err(crate::tools::invalid_arg("reference", "existing placed units have inconsistent inclusion flags; set them consistently before adding another unit"));
+        }
+        fields.flags = first;
+    }
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
@@ -743,6 +778,7 @@ pub(crate) fn place_one_component(
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(lib_id, x, y);
+    apply_symbol_flags(&mut sym, fields.flags);
     sym.at.rotation = Some(rotation);
     sym.set_mirror(mirror);
     sym.unit = unit;
@@ -867,6 +903,7 @@ pub(crate) struct PlacementFields {
     /// The library's `Sim.*` fields, copied as they stand: no tool argument
     /// overrides them (`edit_schematic_component` does that afterwards).
     pub(crate) sim_fields: Vec<(String, String)>,
+    pub(crate) flags: SymbolFlags,
 }
 
 impl PlacementFields {
@@ -889,6 +926,7 @@ impl PlacementFields {
             value: value.unwrap_or(library_value).to_owned(),
             footprint: footprint.unwrap_or(&metadata.footprint).to_owned(),
             sim_fields: metadata.sim_fields.clone(),
+            flags: metadata.flags,
         }
     }
 }
@@ -898,6 +936,54 @@ pub(crate) struct PlacedComponent {
     pub(crate) uuid: String,
     pub(crate) reference: String,
     pub(crate) fields: PlacementFields,
+}
+
+fn symbol_flags(symbol: &cse::Symbol) -> SymbolFlags {
+    SymbolFlags {
+        dnp: symbol.dnp,
+        in_bom: symbol.in_bom,
+        on_board: symbol.on_board,
+        exclude_from_sim: symbol.exclude_from_sim,
+    }
+}
+
+fn apply_symbol_flags(symbol: &mut cse::Symbol, flags: SymbolFlags) {
+    symbol.dnp = flags.dnp;
+    symbol.in_bom = flags.in_bom;
+    symbol.on_board = flags.on_board;
+    symbol.exclude_from_sim = flags.exclude_from_sim;
+}
+
+fn flags_json(flags: SymbolFlags) -> serde_json::Value {
+    json!({"dnp": flags.dnp, "in_bom": flags.in_bom, "on_board": flags.on_board, "exclude_from_sim": flags.exclude_from_sim})
+}
+
+fn requested_flags(
+    args: &serde_json::Value,
+) -> Result<BTreeMap<&'static str, bool>, CallToolResult> {
+    let mut flags = BTreeMap::new();
+    for key in ["dnp", "in_bom", "on_board", "exclude_from_sim"] {
+        if let Some(value) = args.get(key) {
+            let Some(value) = value.as_bool() else {
+                return Err(crate::tools::invalid_arg(key, "must be true or false"));
+            };
+            flags.insert(key, value);
+        }
+    }
+    Ok(flags)
+}
+
+fn edit_flags(mut flags: SymbolFlags, edits: &BTreeMap<&str, bool>) -> SymbolFlags {
+    for (&key, &value) in edits {
+        match key {
+            "dnp" => flags.dnp = value,
+            "in_bom" => flags.in_bom = value,
+            "on_board" => flags.on_board = value,
+            "exclude_from_sim" => flags.exclude_from_sim = Some(value),
+            _ => unreachable!("validated flag name"),
+        }
+    }
+    flags
 }
 
 #[derive(Debug, Clone)]
@@ -912,6 +998,7 @@ pub(crate) struct ComponentTargetUnit {
     /// The placement's `(mirror ...)` axis, bound like rotation so a
     /// reflection that fails to reach the file cannot pass the readback.
     mirror: Option<String>,
+    flags: SymbolFlags,
     instances: Vec<(String, String)>,
 }
 
@@ -944,6 +1031,7 @@ impl ComponentTargetUnit {
             y,
             rotation,
             mirror: mirror.map(str::to_owned),
+            flags: fields.flags,
             fields: BTreeMap::from([
                 ("Reference".to_owned(), reference.to_owned()),
                 ("Value".to_owned(), fields.value.clone()),
@@ -1024,6 +1112,7 @@ fn verify_component_expectations(
             })?;
         // Separate comparisons keep each identity/intent obligation explicit.
         for (field, matches) in [
+            ("flags", unit["flags"] == flags_json(target.flags)),
             (
                 "unit",
                 unit["unit"].as_u64() == Some(u64::from(target.unit)),
@@ -1218,6 +1307,7 @@ fn component_target_from_source(
             // mirror, so binding what the file already carries makes the
             // readback assert they left it alone.
             mirror: symbol.mirror.clone(),
+            flags: symbol_flags(&symbol),
             instances: instance_paths,
         });
     }
@@ -1471,6 +1561,7 @@ fn component_mutation_readback_from_schematic(
             "field_placements": field_placements,
             "instance_paths": instance_paths,
             "instance_references": instance_references
+            ,"flags": flags_json(symbol_flags(symbol))
         }));
     }
     let anchor = observed[0];
@@ -1492,6 +1583,7 @@ fn component_mutation_readback_from_schematic(
         "unit_count": units.len(),
         "units": units,
         "fields": fields
+        ,"flags": flags_json(symbol_flags(anchor))
     }))
 }
 
@@ -1657,7 +1749,7 @@ fn commit_verified_component_mutation(
     }
     commit_command(path, command)?;
 
-    let committed = match cse::Schematic::load(path) {
+    let committed = match load_committed_component_schematic(path) {
         Ok(schematic) => schematic,
         Err(error) => {
             return Ok(Err(super::mutation_outcome_uncertain(
@@ -1709,6 +1801,7 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
         "unit_count",
         "units",
         "fields",
+        "flags",
     ] {
         result[key] = observed[key].clone();
     }
@@ -3068,9 +3161,13 @@ async fn handle_edit_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let flag_edits = match requested_flags(args) {
+        Ok(edits) => edits,
+        Err(error) => return Ok(error),
+    };
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let target = match component_target_from_source(&sch_path, &expected, &reference) {
+    let mut target = match component_target_from_source(&sch_path, &expected, &reference) {
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
@@ -3281,6 +3378,26 @@ async fn handle_edit_schematic_component(
         )));
     }
 
+    if !flag_edits.is_empty() {
+        let mut schematic = cse::Schematic::from_source(&sch_path, content)?;
+        for unit in &mut target.units {
+            unit.flags = edit_flags(unit.flags, &flag_edits);
+            let symbol = schematic
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.uuid == unit.uuid)
+                .expect("resolved target is present in the candidate");
+            let flags = edit_flags(symbol_flags(symbol), &flag_edits);
+            apply_symbol_flags(symbol, flags);
+        }
+        content = schematic.to_source();
+        changed.extend(
+            flag_edits
+                .iter()
+                .map(|(key, value)| format!("{key} → {value} ({} unit(s))", target.units.len())),
+        );
+    }
+
     let intent = ComponentMutationIntent::new(target.with_fields(&expected_fields))
         .with_field_placements(applied_placements, placement_unit);
     let observed = if !changed.is_empty() {
@@ -3376,6 +3493,7 @@ async fn handle_get_schematic_component(
                 "mirror_x": unit_mirror.contains('x'),
                 "mirror_y": unit_mirror.contains('y'),
                 "uuid": symbol.uuid
+                ,"flags": flags_json(symbol_flags(symbol))
             })
         })
         .collect();
@@ -3393,6 +3511,7 @@ async fn handle_get_schematic_component(
         "unit_count": units.len(),
         "units": units,
         "properties": symbol_properties(anchor)
+        ,"flags": flags_json(symbol_flags(anchor))
     })))
 }
 
@@ -3424,6 +3543,7 @@ pub(crate) async fn handle_list_schematic_components(
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y'),
+                "flags": flags_json(symbol_flags(sym)),
                 "properties": symbol_properties(sym)
             })
         })
@@ -3522,10 +3642,32 @@ async fn handle_rotate_schematic_component(
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
     };
-    let rotation = match require_f64(args, "rotation") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let rotation = match args.get("rotation") {
+        None => None,
+        Some(value) => match value.as_f64().filter(|value| value.is_finite()) {
+            Some(value) => Some(value),
+            None => {
+                return Ok(crate::tools::invalid_arg(
+                    "rotation",
+                    "must be a finite number",
+                ))
+            }
+        },
     };
+    let mirror = match args.get("mirror") {
+        None => None,
+        Some(value) if value.is_string() => match mirror_arg(args, "mirror") {
+            Ok(value) => Some(value),
+            Err(error) => return Ok(error),
+        },
+        Some(_) => return Ok(crate::tools::invalid_arg("mirror", "must be x, y or none")),
+    };
+    if rotation.is_none() && mirror.is_none() {
+        return Ok(crate::tools::invalid_arg(
+            "rotation",
+            "provide rotation or mirror",
+        ));
+    }
 
     let before_source = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
@@ -3541,9 +3683,15 @@ async fn handle_rotate_schematic_component(
         .iter()
         .find(|symbol| symbol.uuid == *anchor_uuid)
         .expect("structural target UUID is present in the loaded schematic");
-    let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
+    let rotation_delta =
+        rotation.map_or(0.0, |rotation| rotation - anchor.at.rotation.unwrap_or(0.0));
     for unit in &mut target.units {
-        unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+        if rotation.is_some() {
+            unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+        }
+        if let Some(mirror) = mirror {
+            unit.mirror = mirror.map(str::to_owned);
+        }
     }
     for symbol in sch
         .symbols
@@ -3556,8 +3704,14 @@ async fn handle_rotate_schematic_component(
         // and re-saves anything else, so an unnormalized angle survives only
         // until KiCad touches the file and then silently diverges from what
         // this response reported.
-        let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
-        symbol.set_rotation(new_rotation);
+        if rotation.is_some() {
+            let new_rotation =
+                (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
+            symbol.set_rotation(new_rotation);
+        }
+        if let Some(mirror) = mirror {
+            symbol.set_mirror(mirror);
+        }
     }
     // A turn relocates pin endpoints exactly as a move does, so the markers on
     // those pins travel with them here too (#626).
@@ -3567,15 +3721,37 @@ async fn handle_rotate_schematic_component(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
+    #[cfg(test)]
+    let candidate = apply_component_prospective_fault(candidate);
+    let prospective = cse::Schematic::from_source(&sch_path, candidate.clone())?;
+    if let Err(error) = verified_component_readback(&sch_path, &prospective, &target) {
+        return Ok(error);
+    }
     write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
             Ok(moved) => moved,
             Err(error) => return Ok(error),
         };
-    let observed = match load_component_mutation_readback(&sch_path, &target)? {
+    let committed = match load_committed_component_schematic(&sch_path) {
+        Ok(committed) => committed,
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "rotate_schematic_component",
+                format!("committed readback failed: {error}"),
+            ))
+        }
+    };
+    let observed = match verified_component_readback(&sch_path, &committed, &target) {
         Ok(observed) => observed,
-        Err(error) => return Ok(error),
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "rotate_schematic_component",
+                tool_error_summary(&error),
+            ))
+        }
     };
     let mut result = json!({
         "rotated": observed["reference"],

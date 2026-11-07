@@ -3,6 +3,46 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: schematic mirroring, component flags and title blocks (minor release)
+
+Creation PR 6 (`docs/CREATION_HANDOFF.md`).
+
+- **`rotate_schematic_component` accepts `mirror: "x" | "y" | "none"`.**
+  `rotation` is now optional; supply at least one of `rotation` or `mirror`.
+  A mirror-only call preserves each placed unit's rotation. An omitted mirror
+  preserves each unit's existing reflection; `"none"` clears it. The requested
+  reflection applies to every resolved placed unit of the reference. KiCad's
+  `x` reflection reverses screen Y; `y` reverses screen X. Field positions and
+  no-connect markers follow their symbols/pins, and junctions are re-judged.
+  Connected wires remain in place, so query pins and recheck connectivity after
+  a transform that moves endpoints.
+- **`edit_schematic_component` accepts boolean component attributes** `dnp`,
+  `in_bom`, `on_board` and `exclude_from_sim`. These apply to all resolved placed
+  units, even when `unit` selects one unit's field-text placement. Omitted flags
+  retain their saved values. Invalid supplied values refuse before sibling
+  edits are written. Component observations expose saved attributes in a
+  `flags` object at component and per-unit level. A null `exclude_from_sim`
+  means the legacy token is absent; that absence is preserved unless changed.
+- **New components inherit library attributes.** Single, batch and power-symbol
+  placement copy the resolved symbol's flags, including inherited library
+  defaults. Absent flags keep KiCad's standard defaults. This can change BOM,
+  board or simulation inclusion for a library symbol that explicitly excludes
+  itself; inspect the placed component instead of assuming inclusion. Adding
+  another unit to an existing component retains that package's consistent flag
+  choices. Conflicting saved inclusion choices must be reconciled before adding
+  another unit.
+- **New tool `set_schematic_title_block`** (sch_hierarchy toolset) edits one saved
+  sheet's `title`, `date`, `revision`, `company` and `comments`. Supply at least
+  one metadata field. Comments, when supplied, are a nonempty object keyed by
+  strings `"1"` through `"9"`; omitted fields and comment indices
+  remain unchanged, and an empty string clears a supplied entry. `revision`
+  maps to KiCad's `rev` node. The tool preserves unrelated source, checks the
+  prospective update, writes through the revision/lock boundary, and reports
+  independent saved-file readback. Duplicate or malformed title-block metadata
+  is refused rather than resolved by guesswork. It requires one explicit
+  schematic root; unsupported `#` comment lines are refused before locating
+  edit spans, so a commented example cannot be mistaken for the live header.
+
 ## Unreleased: render images and focused views (minor release)
 
 Creation PR 4 (`docs/CREATION_HANDOFF.md`).

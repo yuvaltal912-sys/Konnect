@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **238 registered tools** + **7 always-visible meta-tools** = **245 total**
+- **239 registered tools** + **7 always-visible meta-tools** = **246 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -92,13 +92,13 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies the library Value and Footprint unless explicitly overridden, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
+| `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies library Value/Footprint unless overridden and resolved library inclusion flags, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
-| `edit_schematic_component` | Update shared fields consistently across every placed unit of a component, and move or hide any field's text. |
-| `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
+| `edit_schematic_component` | Update shared fields and boolean DNP/BOM/board/simulation inclusion attributes across every resolved placed unit, and move or hide field text. Omitted attributes stay unchanged; a field-text `unit` selector does not narrow component-wide flags. |
+| `get_schematic_component` | Get shared properties, saved inclusion flags and every placed unit's position and attributes for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `count` is every instance. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
-| `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. Does NOT adjust connected wires; junction dots are re-judged where the pins turned, and a no-connect flag travels with the pin it protects. |
+| `rotate_schematic_component` | Set rotation and/or absolute `mirror` (`x`, `y`, `none`) across resolved placed units. Omitted rotation/reflection is preserved. Does NOT adjust connected wires; field text and no-connect markers follow their symbols/pins, and junction dots are re-judged. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Konnect's own implementation; kicad-cli has no annotate command. |
@@ -209,7 +209,7 @@ and Windows servers do not.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. Every symbol field (Datasheet, Description, user fields) is copied to its footprint and listed per footprint. A footprint whose symbol is gone is listed under `orphan_footprints`; `delete_orphan_footprints` deletes them, and refuses one with tracks attached unless `delete_orphans_with_tracks` is also set. |
 
-### `sch_hierarchy` · 14 tools
+### `sch_hierarchy` · 15 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
 
@@ -217,6 +217,7 @@ and Windows servers do not.
 |------|-------------|
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
+| `set_schematic_title_block` | Partially edit one saved sheet's title, date, revision, company and comments 1–9. Omitted values are preserved; empty strings clear supplied entries. Preserves unrelated source and returns independently observed saved metadata. |
 | `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Patches existing symbols' instance paths if the linked file already has components. |
 | `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
 | `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |

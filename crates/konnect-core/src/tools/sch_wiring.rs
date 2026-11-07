@@ -216,7 +216,7 @@ pub fn tools() -> Vec<ToolDef> {
              1.27mm grid like the other placers, and reports the placed coordinates. Auto-numbers the \
              internal #PWR reference to the lowest number free on the sheet. Preserves every \
              saved hierarchy instance and reports committed-file readback; refuses stale \
-             instance metadata before writing.",
+             instance metadata before writing. Copies resolved library inclusion flags.",
             json!({
                 "type": "object",
                 "properties": {
