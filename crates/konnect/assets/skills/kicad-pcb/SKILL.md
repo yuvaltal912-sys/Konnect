@@ -315,6 +315,8 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    unavailable. The tool locates the JAR and a compatible Java; it does not
    install either. If unavailable, stop and report the returned setup steps;
    continue only after the installation or capability blocker is resolved.
+   If `version_policy.warning` is set, tell the user which release is
+   recommended and why; it does not block routing.
 2. With the exact named board open over IPC and placement/rules settled, call
    `export_specctra_dsn(board, output='new-job.dsn')`. Keep the returned DSN and
    reverse manifest together. Rust export is the default

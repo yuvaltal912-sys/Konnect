@@ -137,7 +137,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_freerouting",
-            "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that a Java it can run on is available. Reads the Java version the JAR needs from the JAR itself, finds a Java that meets it, and, when something is missing, returns `setup` with the exact steps (where to get the JAR and which Java to install). Nothing is downloaded or installed for you.",
+            "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that a Java it can run on is available. Reads the Java version the JAR needs from the JAR itself, finds a Java that meets it, and, when something is missing, returns `setup` with the exact steps (where to get the JAR and which Java to install). `version_policy` names the Freerouting release Konnect recommends, with the measured reason, and warns when the installed JAR is a different one. Nothing is downloaded or installed for you.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2237,6 +2237,32 @@ async fn run_java_command(
     }
 }
 
+/// Freerouting arguments that keep a probe quiet: no GUI, no telemetry, no
+/// analytics (2.x turns both on by default).
+const FREEROUTING_QUIET_ARGUMENTS: &[&str] = &[
+    "--gui.enabled=false",
+    "--profile.allow_telemetry=false",
+    "--usage_and_diagnostic_data.disable_analytics=true",
+];
+
+/// `version_policy` for an installed JAR. The JAR is hashed only when it
+/// claims the recommended version, so a different version costs nothing.
+async fn installed_version_policy(jar: &Path, version_output: Option<&str>) -> serde_json::Value {
+    let claimed = version_output
+        .and_then(crate::freerouting_setup::version_in_output)
+        .or_else(|| crate::freerouting_setup::version_in_file_name(jar));
+    let sha = if claimed.as_deref() == Some(crate::freerouting_setup::RECOMMENDED.version) {
+        let path = jar.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::freerouting_setup::file_sha256(&path).ok())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    crate::freerouting_setup::version_policy(Some(jar), version_output, sha.as_deref())
+}
+
 async fn handle_check_freerouting(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2258,7 +2284,8 @@ async fn handle_check_freerouting(
             "searched_locations": roots.iter().map(FreeroutingSearchRoot::evidence).collect::<Vec<_>>(),
             "note": "No Freerouting JAR was found in any searched location. Install Freerouting \
                      (KiCad's Plugin and Content Manager, or \
-                     https://github.com/freerouting/freerouting/releases), or pass jar_path."
+                     https://github.com/freerouting/freerouting/releases), or pass jar_path.",
+            "version_policy": crate::freerouting_setup::version_policy(None, None, None)
         }))),
         FreeroutingJar::Found(jar_path) => {
             let requirement = crate::freerouting_setup::jar_requirement(&jar_path);
@@ -2299,17 +2326,42 @@ async fn handle_check_freerouting(
                         "Freerouting was found, but it needs Java {} or newer ({}); {seen}. The steps are in `setup`.",
                         requirement.required_java_major, requirement.basis
                     ),
-                    "setup": setup
+                    "setup": setup,
+                    "version_policy": installed_version_policy(&jar_path, None).await
                 })));
             };
 
+            // Headless, with no GUI and telemetry off: without these, 2.1.0
+            // opens its window after printing the version and never exits,
+            // and 2.x turns telemetry on by default. A version run with the
+            // GUI off exits 1 because it was given no board; the version line
+            // it printed is the proof that the JAR started on this Java.
+            let version_tmp = tempfile::tempdir().ok();
             let mut freerouting_command = tokio::process::Command::new(&java.command);
-            freerouting_command.args(["-jar", jar_path.to_str().unwrap_or(""), "--version"]);
+            freerouting_command.arg("-Djava.awt.headless=true");
+            // Its own home and temp folder: 2.x writes settings and a log
+            // there (2.5 under ~/Library), which a probe should not leave in
+            // the owner's.
+            if let Some(tmp) = &version_tmp {
+                freerouting_command
+                    .arg(format!("-Duser.home={}", tmp.path().display()))
+                    .arg(format!("-Djava.io.tmpdir={}", tmp.path().display()));
+            }
+            freerouting_command
+                .args(["-jar", jar_path.to_str().unwrap_or(""), "--version"])
+                .args(FREEROUTING_QUIET_ARGUMENTS);
             let freerouting = run_java_command(&mut freerouting_command).await;
             let (version_checked, version_output) = match freerouting {
-                Ok(output) => (output.status.success(), command_output(&output)),
+                Ok(output) => {
+                    let text = command_output(&output);
+                    let named = crate::freerouting_setup::version_in_output(&text).is_some();
+                    (output.status.success() || named, text)
+                }
                 Err(error) => (false, error),
             };
+            let version_policy =
+                installed_version_policy(&jar_path, version_checked.then_some(&*version_output))
+                    .await;
             let bridge = crate::freerouting_mcp::probe_local(&jar_path, Some(&java.command)).await;
             Ok(CallToolResult::json(&json!({
                 "available": version_checked,
@@ -2329,7 +2381,8 @@ async fn handle_check_freerouting(
                 "native_mcp_tool_count": bridge.tool_count,
                 "native_mcp_diagnostics": bridge.diagnostics,
                 "bridge_error": bridge.error,
-                "setup": setup
+                "setup": setup,
+                "version_policy": version_policy
             })))
         }
     }
@@ -3928,6 +3981,23 @@ mod freerouting_setup_tests {
         assert_eq!(body["version_checked"], true, "{body}");
         assert_eq!(body["available"], true, "{body}");
         assert_eq!(body["setup"]["status"], "ready");
+        // The fake answers "Freerouting 2.1.0", which is not the recommended
+        // release, so the policy says so with the measured reason.
+        let policy = &body["version_policy"];
+        assert_eq!(policy["installed_version"], "2.1.0", "{body}");
+        assert_eq!(
+            policy["installed_version_basis"],
+            "the JAR's --version output"
+        );
+        assert_eq!(policy["matches_recommended"], false);
+        assert_eq!(
+            policy["recommended_version"],
+            crate::freerouting_setup::RECOMMENDED.version
+        );
+        assert!(policy["warning"]
+            .as_str()
+            .unwrap()
+            .contains(crate::freerouting_setup::RECOMMENDED.reason));
         // A JAR for an older Java is happy with the old one.
         let old_jar = fake_jar(dir.path(), "freerouting-1.9.0.jar", 61);
         let java17 = fake_java(dir.path(), "java17", 17);
@@ -3990,6 +4060,101 @@ mod freerouting_setup_tests {
         assert!(text.contains("brew install openjdk@21"), "{text}");
         assert!(text.contains("Nothing was routed"), "{text}");
         assert!(!ses.exists(), "no output was created");
+    }
+
+    /// Freerouting 2.1.0 prints its version and exits 1 when the GUI is off
+    /// and no board is given; that still proves the JAR starts. The probe runs
+    /// headless with telemetry off.
+    #[tokio::test]
+    async fn a_version_printed_before_a_nonzero_exit_counts_and_the_probe_is_quiet() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.1.0.jar", 65);
+        let args_log = dir.path().join("args.txt");
+        let java = write_script(
+            dir.path(),
+            "java21-cli",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\n\
+                 for a in \"$@\"; do case \"$a\" in --version) echo \"$*\" > '{}';; esac; done\n\
+                 case \"$*\" in *--version*) echo '2026-11-08 INFO   Freerouting v2.1.0 (build-date: 2025-04-12)'; \
+                 echo 'ERROR  Both an input file and an output file must be specified' >&2; exit 1;; esac\n\
+                 exit 1\n",
+                args_log.display()
+            ),
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let body = body(&result);
+        assert_eq!(body["version_checked"], true, "{body}");
+        assert_eq!(body["available"], true, "{body}");
+        assert_eq!(
+            body["version_policy"]["installed_version"], "2.1.0",
+            "{body}"
+        );
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        for quiet in [
+            "-Djava.awt.headless=true",
+            "-Duser.home=",
+            "-Djava.io.tmpdir=",
+            "--gui.enabled=false",
+            "--profile.allow_telemetry=false",
+            "--usage_and_diagnostic_data.disable_analytics=true",
+        ] {
+            assert!(args.contains(quiet), "{quiet} in {args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recommended_release_is_hashed_and_a_rebuild_is_named() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let name = crate::freerouting_setup::RECOMMENDED.jar_name;
+        let jar = fake_jar(dir.path(), name, 65);
+        let java = write_script(
+            dir.path(),
+            "java21-quiet",
+            "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\nexit 0\n",
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let policy = body(&result)["version_policy"].clone();
+        assert_eq!(
+            policy["installed_version_basis"], "the JAR's file name",
+            "{policy}"
+        );
+        assert_eq!(policy["matches_recommended"], true, "{policy}");
+        // A fake JAR named like the release is not the release.
+        assert_eq!(policy["sha256_matches_release"], false, "{policy}");
+        assert!(policy["warning"]
+            .as_str()
+            .unwrap()
+            .contains("not the published release"));
+    }
+
+    #[tokio::test]
+    async fn too_old_a_java_still_reports_the_version_policy() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.3.0.jar", 65);
+        let java = fake_java(dir.path(), "java11b", 11);
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let body = body(&result);
+        assert_eq!(body["java_sufficient"], false, "{body}");
+        assert_eq!(
+            body["version_policy"]["installed_version"], "2.3.0",
+            "{body}"
+        );
+        assert_eq!(body["version_policy"]["matches_recommended"], false);
     }
 
     #[tokio::test]

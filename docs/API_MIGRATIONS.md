@@ -3,6 +3,27 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: Freerouting version policy
+
+Creation rank 32 part 2 (B34, D24; `docs/CREATION_HANDOFF.md`). Additive.
+
+- `check_freerouting` adds `version_policy` to every answer: `recommended_version`,
+  `recommended_jar`, `recommended_url`, `recommended_sha256` (GitHub's release
+  digest), `reason` (measured by `cargo xtask freerouting-bench`, see `DEV.md`),
+  `measured`, `installed_version` with `installed_version_basis` (the JAR's
+  `--version` output, else its file name), `matches_recommended`,
+  `sha256_matches_release` (checked only when the versions match) and `warning`
+  (`null`, or what differs and how to get the recommended release). A
+  different version still routes; the warning does not block anything.
+- The `--version` probe runs headless, with the GUI, telemetry and analytics
+  off, and in its own temporary `user.home`. Before, Freerouting 2.1.0 opened its
+  window after printing the version and the probe timed out, so a working
+  install read `available: false`. A probe that prints a Freerouting version
+  line now counts as `version_checked` even when the JAR then exits 1 (2.1.0
+  does, because no board was given).
+- `setup`'s download step and `version_policy` text name the recommended
+  release instead of "the latest 2.x".
+
 ## Unreleased: ERC and DRC baselines
 
 Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains
