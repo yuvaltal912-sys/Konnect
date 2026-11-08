@@ -3,6 +3,21 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: ERC and DRC baselines
+
+Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains
+`save_check_baseline`, `compare_check_baseline` and `list_check_baselines`.
+Nothing existing changes shape; `run_erc` and the baselines now share one ERC
+entry point, so both refuse a sub-sheet the same way.
+
+Baselines live at `<project_dir>/.konnect/baselines/erc/<name>.json` and
+`.../drc/<name>.json` (`schema_version` 1), beside the visual baselines'
+`<sheet>.png`/`<sheet>.json`. Names are `[A-Za-z0-9._-]`, up to 64 characters,
+not starting with `.`. A violation's key is a hash of the check, DRC category,
+rule, ERC sheet and sorted item identities; severity, prose and positions are
+not in it. Repeats get `~2`, `~3`. A compare re-keys the stored violations with
+the running binary's rule, so a later key change cannot mismatch old files.
+
 ## Unreleased: honest manufacturing review and trace current audit
 
 Creation PR 11 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains

@@ -249,6 +249,7 @@ pub fn tools() -> Vec<ToolDef> {
     ];
     tools.extend(drc_rule_writer::tools());
     tools.extend(drc_project_rules::tools());
+    tools.extend(super::check_baselines::tools());
     tools
 }
 

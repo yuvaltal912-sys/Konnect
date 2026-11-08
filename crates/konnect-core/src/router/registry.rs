@@ -118,9 +118,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "verification",
-        description: "DRC, design rules, layer constraints, clearance checks, KiCAD UI control (ERC is in sch_export)",
+        description: "DRC, design rules, ERC/DRC baselines (save, compare, list), layer constraints, clearance checks, KiCAD UI control (ERC is in sch_export)",
         category: "verification",
-        tool_count: 15,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "config",
