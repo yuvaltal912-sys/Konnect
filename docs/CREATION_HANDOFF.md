@@ -60,6 +60,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
 2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35); the `cargo deny` advisories (its own PR).
+   - The `cargo deny` advisories fix is in progress on branch `fix/cargo-deny-advisories` (lockfile and `deny.toml` only).
 3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), LCSC import (rank 33).
 
 PR 13's rule editing, deletion and static expression workflow is complete within
