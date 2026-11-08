@@ -290,6 +290,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
                     },
+                    "pours": {
+                        "type": "string",
+                        "enum": ["fixed", "omit"],
+                        "default": "fixed",
+                        "description": "'fixed' (default) gives the router every copper pour as fixed copper of its net, from the zone outline. 'omit' leaves pours out so the router can route through their area; refill zones and run DRC after apply_specctra_ses. Rule areas are always kept."
+                    },
                     "native_bridge_mode": {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
@@ -732,6 +738,22 @@ async fn handle_export_specctra_dsn(
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
+    let omit_pours = match args.get("pours").and_then(serde_json::Value::as_str) {
+        None | Some("fixed") => false,
+        Some("omit") => true,
+        Some(_) => {
+            return Ok(invalid_export_argument(
+                "pours",
+                "must be 'fixed' or 'omit'",
+            ))
+        }
+    };
+    if omit_pours && native_bridge_mode == "require" {
+        return Ok(invalid_export_argument(
+            "pours",
+            "'omit' needs the Rust exporter: KiCad's native exporter always writes pours; use native_bridge_mode 'prefer' or 'disable'",
+        ));
+    }
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -807,7 +829,13 @@ async fn handle_export_specctra_dsn(
         let rules_after=client.get_effective_routing_rules_in(document)?;
         if rules!=rules_after {anyhow::bail!("live routing classes changed during export");}
         snapshot_for_ipc.ensure_unchanged(&board_for_ipc)?;
-        let export = crate::specctra::export_dsn_with_context(&board_for_ipc, &before, &rules, &snapshot_for_ipc)?;
+        let export = crate::specctra::export_dsn_with_context(
+            &board_for_ipc,
+            &before,
+            &rules,
+            &snapshot_for_ipc,
+            crate::specctra::ExportOptions { omit_pours },
+        )?;
         Ok((export, before))
     })
     .await?;
@@ -828,7 +856,13 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() {
+    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() || omit_pours {
+        if omit_pours && native_bridge_mode == "prefer" {
+            bridge_diagnostics.push(
+                "pours were left out, which only the Rust exporter does; the native bridge was not used"
+                    .to_string(),
+            );
+        }
         baseline
     } else {
         let attempt = crate::native_specctra_bridge::try_export(&board_path).await;

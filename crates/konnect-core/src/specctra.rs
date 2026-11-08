@@ -208,6 +208,10 @@ struct SupportedProfile {
     /// layer, on the board and in footprints.
     #[serde(default)]
     copper_graphic_keepout_count: usize,
+    /// The board's pours were left out of the DSN (`zone_plane_count` still
+    /// counts them); they need a refill after the import.
+    #[serde(default)]
+    pours_omitted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -270,10 +274,33 @@ struct ManifestPadstack {
     drill_um: Option<i64>,
 }
 
+/// Choices the caller makes about what the router is given.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExportOptions {
+    /// Leave copper pours out of the DSN, so the router may route through
+    /// their area (refill them after the import). Rule areas stay.
+    pub omit_pours: bool,
+}
+
+#[cfg(test)]
 pub(crate) fn export_dsn(
     board_path: &Path,
     board_source: &str,
     effective_rules: &IpcEffectiveRoutingRules,
+) -> Result<ExportBundle> {
+    export_dsn_with_options(
+        board_path,
+        board_source,
+        effective_rules,
+        ExportOptions::default(),
+    )
+}
+
+pub(crate) fn export_dsn_with_options(
+    board_path: &Path,
+    board_source: &str,
+    effective_rules: &IpcEffectiveRoutingRules,
+    options: ExportOptions,
 ) -> Result<ExportBundle> {
     let tree = parse_sexp(board_source).context("parse KiCad IPC board snapshot")?;
     if tree.head() != Some("kicad_pcb") {
@@ -311,7 +338,15 @@ pub(crate) fn export_dsn(
         pins.dedup();
     }
 
-    for zone in &zones {
+    // What the router is given: every rule area, and the pours unless the
+    // caller left them out. The manifest still counts the board's pours, so
+    // the importer can check the board kept them.
+    let routed_zones: Vec<ZoneModel> = zones
+        .iter()
+        .filter(|zone| !(options.omit_pours && zone.kind == ZoneKind::Plane))
+        .cloned()
+        .collect();
+    for zone in &routed_zones {
         if let Some(net) = &zone.net {
             if !net_pins.contains_key(net) {
                 bail!(
@@ -353,7 +388,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
-        &zones,
+        &routed_zones,
         &board_keepouts,
     )?;
     let dsn = serialize_and_validate(pcb)?;
@@ -361,6 +396,7 @@ pub(crate) fn export_dsn(
     let manifest = build_manifest(
         board_path,
         &source_sha256,
+        options.omit_pours,
         skipped_without_pads,
         board_keepouts.len(),
         &copper_stack,
@@ -393,9 +429,10 @@ pub(crate) fn export_dsn_with_context(
     source: &str,
     rules: &IpcEffectiveRoutingRules,
     snapshot: &crate::routing_context::Snapshot,
+    options: ExportOptions,
 ) -> Result<ExportBundle> {
     let adjusted = snapshot.project_rules(rules)?;
-    let mut bundle = export_dsn(board, source, &adjusted)?;
+    let mut bundle = export_dsn_with_options(board, source, &adjusted, options)?;
     let mut manifest: Manifest = serde_json::from_str(&bundle.manifest)?;
     manifest.routing_context = Some(snapshot.seal(rules)?);
     manifest.supported_profile.custom_rules = snapshot.rules.is_some();
@@ -414,6 +451,11 @@ pub(crate) fn adopt_native_dsn(
     {
         let manifest: Manifest =
             serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
+        if manifest.supported_profile.pours_omitted {
+            bail!(
+                "native DSN not adopted: the pours were left out, and KiCad's exporter always writes them"
+            );
+        }
         if let Some(back) = manifest.components.iter().find(|c| c.kicad_side == "back") {
             bail!(
                 "native DSN not adopted: '{}' is a back-side part, which KiCad's exporter writes as \
@@ -1679,11 +1721,12 @@ fn is_hidden(node: &SexpNode) -> bool {
 /// `gr_*`, footprint space for an `fp_*`), or `None` when it is not on copper
 /// or draws nothing. Lines, arcs, curves and unfilled outlines are paths as
 /// wide as their stroke plus the chord tolerance; filled shapes are polygons;
-/// text is a square centred on its anchor that covers its glyph box at any
-/// rotation and justification (glyphs are not measured, so it is generous).
+/// text is a rectangle at its own angle and justification, sized for the
+/// widest glyphs (they are not measured, so it is generous, never short).
 fn copper_graphic_keepouts(
     node: &SexpNode,
     copper_layers: &[String],
+    parent_rotation: f64,
 ) -> Result<Option<Vec<dsn::Shape>>> {
     let Some(head) = node.head() else {
         return Ok(None);
@@ -1815,22 +1858,74 @@ fn copper_graphic_keepouts(
                 return Ok(None);
             }
             let at = mm_pair(node, "at")?;
-            let font = node.find("effects").and_then(|e| e.find("font"));
+            let effects = node.find("effects");
+            let font = effects.and_then(|e| e.find("font"));
             let size = font.and_then(|f| f.find("size"));
+            // KiCad writes a font size as (size height width).
             let h = size.and_then(|s| s.get_f64(1)).unwrap_or(1.0).abs();
             let w = size.and_then(|s| s.get_f64(2)).unwrap_or(h).abs();
             let t = font
                 .and_then(|f| f.find_f64("thickness"))
                 .unwrap_or(0.15 * h)
                 .abs();
+            let justify: Vec<&str> = effects
+                .and_then(|e| e.find("justify"))
+                .map(|j| {
+                    j.children()
+                        .unwrap_or(&[])
+                        .iter()
+                        .skip(1)
+                        .filter_map(SexpNode::as_str)
+                        .collect()
+                })
+                .unwrap_or_default();
             let lines: Vec<&str> = text.split('\n').collect();
             let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f64;
-            // A glyph advance stays under 1.25 em in KiCad's fonts; a full
-            // width each way covers left, centre and right justification.
-            let half_w = longest * w * 1.25 + t;
-            let half_h = lines.len() as f64 * h * 1.6 + t;
-            let r = (half_w * half_w + half_h * half_h).sqrt() + GRAPHIC_TOLERANCE_MM;
-            ring_filled_square(&layers, at, r)
+            // A glyph advance stays under 1.1 em in KiCad's fonts, even a
+            // line of W; the stroke and the chord tolerance go on every side.
+            let length = longest * w * 1.1;
+            let pad = t + GRAPHIC_TOLERANCE_MM;
+            // Along the text: its justification decides which side of the
+            // anchor it runs to. Mirrored text reads the other way, so it
+            // gets both sides.
+            let (along_min, along_max) = if justify.contains(&"mirror") {
+                (-length, length)
+            } else if justify.contains(&"left") {
+                (0.0, length)
+            } else if justify.contains(&"right") {
+                (-length, 0.0)
+            } else {
+                (-length / 2.0, length / 2.0)
+            };
+            // Across it: every line, either side of the anchor (vertical
+            // justification only moves it within this).
+            let across = lines.len() as f64 * h * 1.5;
+            // The text angle is in board space (like a pad's); a footprint's
+            // text is drawn in footprint space, so take the footprint's turn
+            // off.
+            let angle = node.find("at").and_then(|a| a.get_f64(3)).unwrap_or(0.0) - parent_rotation;
+            let (c, sn) = (angle.to_radians().cos(), angle.to_radians().sin());
+            // Unit vectors in KiCad's Y-down frame: along the text, then down
+            // the page.
+            let (ux, uy) = (c, -sn);
+            let (vx, vy) = (sn, c);
+            let corner = |a: f64, b: f64| (at.0 + a * ux + b * vx, at.1 + a * uy + b * vy);
+            let corners = [
+                corner(along_min - pad, -across - pad),
+                corner(along_max + pad, -across - pad),
+                corner(along_max + pad, across + pad),
+                corner(along_min - pad, across + pad),
+            ];
+            layers
+                .iter()
+                .map(|layer| {
+                    dsn::Shape::Polygon(dsn::Polygon {
+                        layer: layer.clone(),
+                        width: 0.0,
+                        coords: corners.iter().copied().map(dsn_point).collect(),
+                    })
+                })
+                .collect()
         }
         "text_box" => {
             let corners: Vec<(f64, f64)> = match node.find("pts") {
@@ -1867,25 +1962,6 @@ fn copper_graphic_keepouts(
     Ok(Some(shapes))
 }
 
-fn ring_filled_square(layers: &[String], (x, y): (f64, f64), r: f64) -> Vec<dsn::Shape> {
-    let corners = [
-        (x - r, y - r),
-        (x + r, y - r),
-        (x + r, y + r),
-        (x - r, y + r),
-    ];
-    layers
-        .iter()
-        .map(|layer| {
-            dsn::Shape::Polygon(dsn::Polygon {
-                layer: layer.clone(),
-                width: 0.0,
-                coords: corners.iter().copied().map(dsn_point).collect(),
-            })
-        })
-        .collect()
-}
-
 /// Board-level copper graphics and text, as structure keepouts.
 fn board_copper_keepouts(tree: &SexpNode, copper_layers: &[String]) -> Result<Vec<dsn::Shape>> {
     let mut out = Vec::new();
@@ -1899,7 +1975,7 @@ fn board_copper_keepouts(tree: &SexpNode, copper_layers: &[String]) -> Result<Ve
         {
             bail!("unsupported routing profile: a board '{head}' on a copper layer cannot be given to the router");
         }
-        if let Some(shapes) = copper_graphic_keepouts(node, copper_layers)
+        if let Some(shapes) = copper_graphic_keepouts(node, copper_layers, 0.0)
             .with_context(|| format!("board '{head}' on copper"))?
         {
             out.extend(shapes);
@@ -1948,7 +2024,12 @@ fn footprints(
         let at = footprint.find("at").context("footprint has no position")?;
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
-        let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
+        // In [0, 360): Freerouting echoes `-90` as `270`, and the importer
+        // checks that the router moved nothing.
+        let rotation_degrees = normalized_degrees(finite_number(
+            at.get_f64(3).or(Some(0.0)),
+            "footprint rotation",
+        )?);
         let image_name = format!("konnect_image_{reference}");
 
         // Footprint copper graphics and visible copper text, in footprint
@@ -1960,7 +2041,7 @@ fn footprints(
             if !(head.starts_with("fp_") || head == "property") {
                 continue;
             }
-            if let Some(shapes) = copper_graphic_keepouts(node, copper_layers)
+            if let Some(shapes) = copper_graphic_keepouts(node, copper_layers, rotation_degrees)
                 .with_context(|| format!("footprint '{reference}' '{head}' on copper"))?
             {
                 copper_keepouts.extend(shapes);
@@ -2607,6 +2688,7 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
 fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
+    pours_omitted: bool,
     skipped_without_pads: usize,
     board_keepout_count: usize,
     copper_stack: &[(String, &'static str)],
@@ -2695,6 +2777,7 @@ fn build_manifest(
             zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
             footprints_without_pads: skipped_without_pads,
+            pours_omitted,
             copper_graphic_keepout_count: board_keepout_count
                 + footprints
                     .iter()

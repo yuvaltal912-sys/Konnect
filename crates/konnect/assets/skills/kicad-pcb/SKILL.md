@@ -340,7 +340,9 @@ rectangle, rounded-rectangle, and oval pads; one closed outline made from
 supported lines/arcs, rectangle, circle, or polygon. Outline arcs/circles become
 chords within 5 um, and rounded pads use their bounding rectangles. Existing
 pours become fixed planes and track/via-blocking rule areas become keepouts from
-zone outlines, not their fills; thermal reliefs are not modelled. Mounting
+zone outlines, not their fills; thermal reliefs are not modelled. A large pour
+then leaves the router little room: pass `pours="omit"` to route through pour
+areas, then refill zones and run DRC after the import. Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
 Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,

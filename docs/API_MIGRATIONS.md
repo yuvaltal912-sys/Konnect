@@ -25,6 +25,10 @@ matching manifests. Old manifests (two layers, front side) still import.
 - **Pad orientation fix:** a pin's `rotate` is now the pad angle relative to
   its part. It was the board-space angle, so a part turned 90° or 270° had its
   non-square pads turned twice in the router. DSNs of such boards change.
+- **Placement angle fix:** placements are written with angles in [0, 360),
+  and the SES importer compares directions. Freerouting writes a `-90`
+  placement back as `270`, so every board with a part at a negative angle was
+  refused as "SES changes placement"; older manifests still import.
 - **Drill offset fix:** `(drill d (offset x y))` now moves the padstack copper.
   It was ignored (the exporter looked for the offset on the pad), so offset
   copper sat on its hole. A pad-level `offset`, which KiCad does not write, is
@@ -38,6 +42,16 @@ matching manifests. Old manifests (two layers, front side) still import.
   visible copper text, on the board and in footprints, are keepouts that cover
   them; they were silently invisible to the router before. Copper dimensions
   and images are refused. Manifest: `supported_profile.copper_graphic_keepout_count`.
+- **New `pours` argument** (`fixed` default, or `omit`): `omit` leaves copper
+  pours out of the DSN so the router can route through their area, as the
+  usual autoroute-then-refill workflow does; rule areas stay. The manifest
+  still counts the pours (`zone_plane_count`) and says `pours_omitted`; the
+  importer checks the board kept them. Refill zones and run DRC after
+  `apply_specctra_ses`. KiCad's native exporter always writes pours, so
+  `require` is refused with `omit` and `prefer` uses the Rust exporter.
+- **SES repeats:** `plan_specctra_ses_import` and `apply_specctra_ses` apply an
+  exact repeat (same net, layer, width and geometry) once and report
+  `duplicates_skipped`, where they used to refuse the whole SES.
 - **Padless footprints** (logos) are left out of the DSN; counted in
   `supported_profile.footprints_without_pads`.
 - **Board names** with spaces, quotes or parentheses are written as DSN tokens

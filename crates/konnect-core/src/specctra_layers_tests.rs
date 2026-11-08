@@ -42,27 +42,81 @@ fn manifest(bundle: &ExportBundle) -> serde_json::Value {
 /// (Specctra's Y-up frame) by the place rotation, plus the place position,
 /// in DSN micrometres. Computed from the DSN alone.
 fn router_pin_positions(dsn: &str) -> BTreeMap<String, (f64, f64, String)> {
-    let identity = dsn_identity(&parse_dsn_sexp(dsn).unwrap()).unwrap();
+    // Read straight from the DSN tree, independent of the exporter's own
+    // identity parser: placements, image pins and padstack layers.
+    let tree = parse_dsn_sexp(dsn).unwrap();
+    let num = |n: &SexpNode, i: usize| -> f64 {
+        n.get(i)
+            .and_then(SexpNode::as_str)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let library = tree.find("library").unwrap();
+    let mut padstack_layers: BTreeMap<String, String> = BTreeMap::new();
+    for padstack in library.find_all("padstack") {
+        let name = padstack
+            .get(1)
+            .and_then(SexpNode::as_str)
+            .unwrap()
+            .to_string();
+        let layers: Vec<String> = padstack
+            .find_all("shape")
+            .into_iter()
+            .filter_map(|shape| {
+                shape
+                    .children()?
+                    .get(1)?
+                    .get(1)?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        padstack_layers.insert(name, layers.join(","));
+    }
+    let mut images: BTreeMap<String, Vec<(String, String, f64, f64)>> = BTreeMap::new();
+    for image in library.find_all("image") {
+        let name = image.get(1).and_then(SexpNode::as_str).unwrap().to_string();
+        let pins = image
+            .find_all("pin")
+            .into_iter()
+            .map(|pin| {
+                let data: Vec<&SexpNode> = pin
+                    .children()
+                    .unwrap()
+                    .iter()
+                    .skip(1)
+                    .filter(|c| c.head() != Some("rotate"))
+                    .collect();
+                (
+                    data[0].as_str().unwrap().to_string(),
+                    data[1].as_str().unwrap().to_string(),
+                    data[2].as_str().unwrap().parse().unwrap(),
+                    data[3].as_str().unwrap().parse().unwrap(),
+                )
+            })
+            .collect();
+        images.insert(name, pins);
+    }
     let mut out = BTreeMap::new();
-    for (reference, place) in &identity.components {
-        assert_eq!(
-            place.side, "front",
-            "{reference}: the DSN never mirrors a part"
-        );
-        let theta = f64::from_bits(place.rotation.0).to_radians();
-        for (pin, geometry) in &place.pins {
-            let (lx, ly) = (geometry.x as f64, geometry.y as f64);
-            let x = place.x as f64 + lx * theta.cos() - ly * theta.sin();
-            let y = place.y as f64 + lx * theta.sin() + ly * theta.cos();
-            let layers = identity.padstacks[&geometry.padstack]
-                .iter()
-                .map(|shape| match shape {
-                    DsnShapeIdentity::Circle { layer, .. }
-                    | DsnShapeIdentity::Rect { layer, .. } => layer.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            out.insert(format!("{reference}-{pin}"), (x, y, layers));
+    for component in tree.find("placement").unwrap().find_all("component") {
+        let image = component.get(1).and_then(SexpNode::as_str).unwrap();
+        for place in component.find_all("place") {
+            let reference = place.get(1).and_then(SexpNode::as_str).unwrap();
+            assert_eq!(
+                place.get(4).and_then(SexpNode::as_str),
+                Some("front"),
+                "{reference}: the DSN never mirrors a part"
+            );
+            let (px, py, theta) = (num(place, 2), num(place, 3), num(place, 5).to_radians());
+            for (padstack, pin, lx, ly) in &images[image] {
+                let x = px + lx * theta.cos() - ly * theta.sin();
+                let y = py + lx * theta.sin() + ly * theta.cos();
+                out.insert(
+                    format!("{reference}-{pin}"),
+                    (x, y, padstack_layers[padstack].clone()),
+                );
+            }
         }
     }
     out
@@ -591,26 +645,52 @@ fn copper_text_and_graphics_become_keepouts_that_cover_them() {
     let keepouts = structure.find_all("keepout");
     // The In2.Cu pour is a plane, not a keepout: these two are the graphics.
     assert_eq!(keepouts.len(), 2, "{structure:?}");
-    // The text square covers a 4-character, 1 mm glyph box at any angle: it
-    // reaches past 104 ± 5 mm and 47 ± 6 mm (half-width 4·1.25+0.15).
+    // The text keepout is a rectangle at the text's 30°: it covers a
+    // 4-character, 1 mm line (true glyphs reach about ±1.8 mm along it and
+    // ±0.5 mm across) and stays near that size instead of a square for every
+    // rotation (the old form was 67 mm wide on a demo board and blocked it).
     let text = keepouts
         .iter()
         .find_map(|k| k.find("polygon"))
         .expect("text keepout is a polygon");
-    let xs: Vec<f64> = text
+    let v: Vec<f64> = text
         .children()
         .unwrap()
         .iter()
         .skip(3)
         .filter_map(|n| n.as_str()?.parse().ok())
-        .step_by(2)
         .collect();
-    let (min_x, max_x) = xs
+    let corners: Vec<(f64, f64)> = v
+        .chunks(2)
+        .map(|p| (p[0] / 1000.0, -p[1] / 1000.0))
+        .collect();
+    // Back into the text's own frame (Y down, 30° CCW on screen).
+    let (c, s) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+    let local: Vec<(f64, f64)> = corners
         .iter()
+        .map(|(x, y)| {
+            let (dx, dy) = (x - 104.0, y - 47.0);
+            (dx * c - dy * s, dx * s + dy * c)
+        })
+        .collect();
+    let along = local
+        .iter()
+        .map(|p| p.0)
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| {
-            (a.min(*x), b.max(*x))
+            (a.min(x), b.max(x))
         });
-    assert!(min_x <= 99_000.0 && max_x >= 109_000.0, "{text:?}");
+    let across = local
+        .iter()
+        .map(|p| p.1)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), y| {
+            (a.min(y), b.max(y))
+        });
+    assert!(along.0 <= -1.8 && along.1 >= 1.8, "{along:?}");
+    assert!(across.0 <= -0.5 && across.1 >= 0.5, "{across:?}");
+    assert!(
+        along.1 - along.0 < 6.0 && across.1 - across.0 < 4.0,
+        "{along:?} {across:?}"
+    );
     // The line keeps its stroke plus the chord tolerance.
     let line = keepouts.iter().find_map(|k| k.find("path")).unwrap();
     assert_eq!(line.get(1).and_then(SexpNode::as_str), Some("B.Cu"));
@@ -712,4 +792,299 @@ fn a_board_name_with_a_space_is_a_valid_dsn_and_its_ses_imports() {
         .replace("(base_design \"board\")", "(base_design \"sonde_xilinx\")");
     crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &ses)
         .unwrap();
+}
+
+/// Live acceptance: export each board in a folder, route it with
+/// Freerouting, and run the SES through the strict import planner.
+/// `KONNECT_DSN_PROBE_DIR=<dir> FREEROUTING_JAR=<jar> FREEROUTING_JAVA=<java>
+/// cargo test -p konnect-core freerouting_routes_a_folder -- --ignored --nocapture`.
+/// Each Freerouting run is capped at `FREEROUTING_SECONDS` (default 600).
+#[test]
+#[ignore = "needs KONNECT_DSN_PROBE_DIR, FREEROUTING_JAR and Java 21"]
+fn freerouting_routes_a_folder() {
+    let dir = std::path::PathBuf::from(std::env::var("KONNECT_DSN_PROBE_DIR").expect("dir"));
+    let jar = std::env::var("FREEROUTING_JAR").expect("FREEROUTING_JAR");
+    let java = std::env::var("FREEROUTING_JAVA").unwrap_or_else(|_| "java".to_string());
+    let cap: u64 = std::env::var("FREEROUTING_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "kicad_pcb"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let tree = parse_sexp(&source).unwrap();
+        let table = top_level_net_table(&tree);
+        let mut rules = IpcEffectiveRoutingRules::new();
+        for fp in tree.find_all("footprint") {
+            for pad in fp.find_all("pad") {
+                if let Some(net) = pad.find("net").and_then(|n| resolve_net(n, &table)) {
+                    rules.insert(
+                        net,
+                        IpcRoutingRules {
+                            class_name: "Default".to_string(),
+                            constituents: vec!["Default".to_string()],
+                            track_width_mm: Some(0.2),
+                            clearance_mm: Some(0.2),
+                            via_diameter_mm: Some(0.6),
+                            via_drill_mm: Some(0.3),
+                        },
+                    );
+                }
+            }
+        }
+        let options = ExportOptions {
+            omit_pours: std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some(),
+        };
+        let Ok(bundle) = export_dsn_with_options(&path, &source, &rules, options) else {
+            continue; // the export probe reports refusals
+        };
+        let work = tempfile::tempdir().unwrap();
+        // `KONNECT_PROBE_KEEP=<dir>` keeps each DSN and SES for inspection.
+        let out_dir = std::env::var_os("KONNECT_PROBE_KEEP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| work.path().to_path_buf());
+        let dsn_path = out_dir.join(dsn_design_name(&name).replace(".kicad_pcb", ".dsn"));
+        let ses_path = dsn_path.with_extension("ses");
+        std::fs::write(&dsn_path, &bundle.dsn).unwrap();
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new(&java)
+            .arg("-jar")
+            .arg(&jar)
+            .arg("-de")
+            .arg(&dsn_path)
+            .arg("-do")
+            .arg(&ses_path)
+            .arg("-mp")
+            .arg("20")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("launch Freerouting");
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if started.elapsed().as_secs() > cap {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+        let output = child.wait_with_output().ok();
+        let log = output
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+        let unrouted = log
+            .lines()
+            .rev()
+            .find(|l| {
+                l.to_lowercase().contains("unrouted") || l.to_lowercase().contains("incomplete")
+            })
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let secs = started.elapsed().as_secs();
+        let Some(status) = status else {
+            println!("ROUTE {name}: Freerouting stopped after the {cap}s cap");
+            continue;
+        };
+        let Ok(ses) = std::fs::read_to_string(&ses_path) else {
+            println!(
+                "ROUTE {name}: Freerouting exited {status} in {secs}s without an SES; last log: {}",
+                log.lines().last().unwrap_or("")
+            );
+            continue;
+        };
+        match crate::specctra_ses::parse_import_plan(&path, &source, &bundle.manifest, &ses) {
+            Ok(plan) => println!(
+                "ROUTE {name}: routed in {secs}s, import plan OK: {} tracks, {} arcs, {} vias; {unrouted}",
+                plan.tracks.len(), plan.arcs.len(), plan.vias.len()
+            ),
+            Err(error) => println!("ROUTE {name}: SES refused by the import planner: {error:#}"),
+        }
+    }
+}
+
+/// Freerouting 2.5.0 echoed KiCad's `-90` placement as `270`, and the
+/// importer refused every such board as moved. The export now writes angles
+/// in [0, 360), and the importer compares directions, so a manifest written
+/// with `-90` still matches an SES that says `270`.
+#[test]
+fn a_negative_placement_angle_survives_freeroutings_normalisation() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let bundle = export_dsn(&board_path, FOUR_LAYER, &rules()).unwrap();
+    let mut m = manifest(&bundle);
+    let r2 = m["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c["reference"] == "R2")
+        .unwrap();
+    // The fixture stores R2 at -90.
+    assert_eq!(m["components"][r2]["rotation_degrees"], 270.0);
+    assert!(
+        bundle.dsn.contains("(place R2 110000 -50000 front 270)"),
+        "{}",
+        bundle.dsn
+    );
+    let ses = ses_for(&m);
+    crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &ses)
+        .unwrap();
+    // An older manifest that recorded -90 still accepts Freerouting's 270.
+    m["components"][r2]["rotation_degrees"] = json!(-90.0);
+    crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &m.to_string(), &ses).unwrap();
+    // A real turn is still refused.
+    let turned = ses.replace(
+        "(place R2 1100000 -500000 front 270)",
+        "(place R2 1100000 -500000 front 180)",
+    );
+    assert_ne!(turned, ses);
+    let error =
+        crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &turned)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("changes placement"), "{error}");
+}
+
+/// Diagnostic: every DSN pin against the pad position the shared board model
+/// computes. `KONNECT_DSN_PROBE_FILE=<board> cargo test -p konnect-core
+/// probe_pins_match_the_board_model -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs KONNECT_DSN_PROBE_FILE"]
+fn probe_pins_match_the_board_model() {
+    let path = std::path::PathBuf::from(std::env::var("KONNECT_DSN_PROBE_FILE").unwrap());
+    let source = std::fs::read_to_string(&path).unwrap();
+    let tree = parse_sexp(&source).unwrap();
+    let table = top_level_net_table(&tree);
+    let mut rules = IpcEffectiveRoutingRules::new();
+    for fp in tree.find_all("footprint") {
+        for pad in fp.find_all("pad") {
+            if let Some(net) = pad.find("net").and_then(|n| resolve_net(n, &table)) {
+                rules.insert(
+                    net,
+                    IpcRoutingRules {
+                        class_name: "Default".to_string(),
+                        constituents: vec!["Default".to_string()],
+                        track_width_mm: Some(0.2),
+                        clearance_mm: Some(0.2),
+                        via_diameter_mm: Some(0.6),
+                        via_drill_mm: Some(0.3),
+                    },
+                );
+            }
+        }
+    }
+    let bundle = export_dsn(&path, &source, &rules).unwrap();
+    let pins = router_pin_positions(&bundle.dsn);
+    let geometry = konnect_sexp::board_geometry::BoardGeometry::from_tree(&tree);
+    let m = manifest(&bundle);
+    let (mut worst, mut off, mut total) = (0.0f64, 0, 0);
+    for c in m["components"].as_array().unwrap() {
+        let reference = c["reference"].as_str().unwrap();
+        let fp = geometry.footprint(reference).unwrap();
+        for p in c["pads"].as_array().unwrap() {
+            let dsn_pin = p["dsn_pin"].as_str().unwrap();
+            let (x, y, _) = &pins[dsn_pin];
+            let number = p["pad_number"].as_str().unwrap();
+            let best = fp
+                .pads
+                .iter()
+                .filter(|g| g.number == number)
+                .map(|g| ((x / 1000.0 - g.at.0).powi(2) + (-y / 1000.0 - g.at.1).powi(2)).sqrt())
+                .fold(f64::INFINITY, f64::min);
+            total += 1;
+            worst = worst.max(best);
+            if best > 0.001 {
+                off += 1;
+                if off <= 5 {
+                    println!("OFF {dsn_pin}: {best:.4} mm");
+                }
+            }
+        }
+    }
+    println!("PINS {total} checked, {off} off by more than 1 um, worst {worst:.4} mm");
+}
+
+/// `pours: "omit"` leaves the In2.Cu pour out of the DSN so the router can
+/// cross its area, while the manifest still counts it for the importer.
+#[test]
+fn omitted_pours_leave_the_dsn_but_stay_in_the_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let options = ExportOptions { omit_pours: true };
+    let bundle = export_dsn_with_options(&board_path, FOUR_LAYER, &rules(), options).unwrap();
+    assert!(!bundle.dsn.contains("(plane"), "{}", bundle.dsn);
+    let m = manifest(&bundle);
+    assert_eq!(m["supported_profile"]["pours_omitted"], true);
+    assert_eq!(m["supported_profile"]["zone_plane_count"], 1);
+    // The import plan still binds the board, pour included.
+    let ses = ses_for(&m);
+    crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &ses)
+        .unwrap();
+    // The default keeps it.
+    assert!(export().dsn.contains("(plane GND"));
+    // KiCad's exporter always writes pours, so it is not adopted.
+    let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+    let error = adopt_native_dsn(bundle, native.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pours were left out"), "{error}");
+}
+
+/// Freerouting 2.5.0 wrote one segment twice on two demo boards, and the
+/// importer refused the whole SES. An exact repeat is now applied once and
+/// counted; a segment that differs in width is still its own track.
+#[test]
+fn an_exact_repeat_in_the_ses_is_applied_once_and_counted() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let bundle = export_dsn(&board_path, FOUR_LAYER, &rules()).unwrap();
+    let ses = ses_for(&manifest(&bundle));
+    let wire = "        (wire\n          (path In1.Cu 2500\n            1037300 -560000\n            1037300 -530000\n          )\n        )\n";
+    assert!(ses.contains(wire));
+    let repeated = ses.replacen(wire, &format!("{wire}{wire}"), 1);
+    let plan = crate::specctra_ses::parse_import_plan(
+        &board_path,
+        FOUR_LAYER,
+        &bundle.manifest,
+        &repeated,
+    )
+    .unwrap();
+    assert_eq!(plan.duplicates_skipped, 1);
+    assert_eq!(
+        plan.tracks.iter().filter(|t| t.layer == "In1.Cu").count(),
+        1
+    );
+    let wider = wire.replace("2500", "3000");
+    let distinct = ses.replacen(wire, &format!("{wire}{wider}"), 1);
+    let plan = crate::specctra_ses::parse_import_plan(
+        &board_path,
+        FOUR_LAYER,
+        &bundle.manifest,
+        &distinct,
+    )
+    .unwrap();
+    assert_eq!(plan.duplicates_skipped, 0);
+    assert_eq!(
+        plan.tracks.iter().filter(|t| t.layer == "In1.Cu").count(),
+        2
+    );
 }

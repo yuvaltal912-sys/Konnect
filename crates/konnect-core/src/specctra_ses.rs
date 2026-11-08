@@ -25,6 +25,9 @@ pub(crate) struct SesImportPlan {
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
+    /// Exact repeats in the SES (same net, layer, width and geometry),
+    /// applied once.
+    pub duplicates_skipped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -105,6 +108,11 @@ struct SupportedProfile {
     #[serde(default)]
     #[allow(dead_code)]
     copper_graphic_keepout_count: usize,
+    /// The pours were left out of the DSN; the zone inventory is still
+    /// checked against the board.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pours_omitted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,7 +231,7 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
-    let (tracks, arcs, vias) = parse_network(
+    let (tracks, arcs, vias, duplicates_skipped) = parse_network(
         one_child(routes, "network_out")?,
         route_resolution,
         &manifest,
@@ -254,6 +262,7 @@ pub(crate) fn parse_import_plan(
         tracks,
         arcs,
         vias,
+        duplicates_skipped,
     })
 }
 
@@ -481,7 +490,7 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
             if x_um != component.x_um
                 || y_um != component.y_um
                 || side != component.side
-                || (rotation - component.rotation_degrees).abs() > 1e-9
+                || !same_angle(rotation, component.rotation_degrees)
             {
                 bail!("SES changes placement of component '{reference}'");
             }
@@ -496,6 +505,13 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
         bail!("SES placement omits component(s): {}", missing.join(", "));
     }
     Ok(())
+}
+
+/// Two angles in degrees that name the same direction: Freerouting writes a
+/// `-90` placement back as `270`.
+fn same_angle(a: f64, b: f64) -> bool {
+    let d = (a - b).rem_euclid(360.0);
+    d.min(360.0 - d) <= 1e-9
 }
 
 fn validate_parser(node: &SexpNode) -> Result<()> {
@@ -583,11 +599,10 @@ fn validate_library(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Re
     Ok(())
 }
 
-fn parse_network(
-    node: &SexpNode,
-    resolution: f64,
-    manifest: &Manifest,
-) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>)> {
+/// Tracks, arcs and vias from an SES, and how many exact repeats were skipped.
+type ParsedNetwork = (Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>, usize);
+
+fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Result<ParsedNetwork> {
     require_direct_shape(node, 0, &["net"])?;
     let nets = manifest
         .nets
@@ -611,6 +626,10 @@ fn parse_network(
     let mut seen_tracks = BTreeSet::new();
     let mut seen_arcs = BTreeSet::new();
     let mut seen_vias = BTreeSet::new();
+    // Freerouting can write one segment, arc or via twice. An exact repeat
+    // (same net, layer, width and geometry) adds no copper: it is counted and
+    // applied once. Anything that differs is a distinct item.
+    let mut duplicates = 0usize;
 
     for net_node in node.find_all("net") {
         require_direct_shape(net_node, 1, &["wire", "via"])?;
@@ -667,7 +686,8 @@ fn parse_network(
                             endpoints,
                         );
                         if !seen_tracks.insert(key) {
-                            bail!("SES repeats a route segment on net '{net_name}'");
+                            duplicates += 1;
+                            continue;
                         }
                         tracks.push(SesTrack {
                             net_name: net_name.to_string(),
@@ -733,20 +753,21 @@ fn parse_network(
                         (ordered_f64(end.0), ordered_f64(end.1)),
                         (ordered_f64(center.0), ordered_f64(center.1)),
                     );
-                    if !seen_arcs.insert(key) {
-                        bail!("SES repeats an arc on net '{net_name}'");
+                    if seen_arcs.insert(key) {
+                        arcs.push(SesArc {
+                            net_name: net_name.to_string(),
+                            layer: (*layer).to_string(),
+                            width_mm,
+                            start_x_mm: start.0,
+                            start_y_mm: start.1,
+                            mid_x_mm: mid.0,
+                            mid_y_mm: mid.1,
+                            end_x_mm: end.0,
+                            end_y_mm: end.1,
+                        });
+                    } else {
+                        duplicates += 1;
                     }
-                    arcs.push(SesArc {
-                        net_name: net_name.to_string(),
-                        layer: (*layer).to_string(),
-                        width_mm,
-                        start_x_mm: start.0,
-                        start_y_mm: start.1,
-                        mid_x_mm: mid.0,
-                        mid_y_mm: mid.1,
-                        end_x_mm: end.0,
-                        end_y_mm: end.1,
-                    });
                 }
                 _ => bail!("SES wire for net '{net_name}' must contain exactly one path or qarc"),
             }
@@ -779,7 +800,8 @@ fn parse_network(
             let y_mm = -y_um / UM_PER_MM;
             let key = (net_name.to_string(), ordered_f64(x_mm), ordered_f64(y_mm));
             if !seen_vias.insert(key) {
-                bail!("SES repeats a via on net '{net_name}'");
+                duplicates += 1;
+                continue;
             }
             vias.push(SesVia {
                 net_name: net_name.to_string(),
@@ -792,7 +814,7 @@ fn parse_network(
             });
         }
     }
-    Ok((tracks, arcs, vias))
+    Ok((tracks, arcs, vias, duplicates))
 }
 
 fn parse_resolution(node: &SexpNode) -> Result<f64> {
@@ -1010,8 +1032,14 @@ mod tests {
         let custom="(version 1)(rule \"Minimums\" (constraint clearance (min 0.200001mm)) (constraint track_width (min 0.300001mm)))";
         std::fs::write(board.with_extension("kicad_dru"), custom).unwrap();
         let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
-        let export =
-            crate::specctra::export_dsn_with_context(&board, &source, &rules(), &snapshot).unwrap();
+        let export = crate::specctra::export_dsn_with_context(
+            &board,
+            &source,
+            &rules(),
+            &snapshot,
+            Default::default(),
+        )
+        .unwrap();
         let body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         assert_eq!(body["supported_profile"]["custom_rules"], true);
         assert!(body["routing_context"]["project_sha256"].is_string());
@@ -1042,8 +1070,14 @@ mod tests {
         std::fs::write(board.with_extension("kicad_dru"), "(version 1)").unwrap();
         assert!(parse_import_plan(&board, &source, &legacy, sample_ses()).is_err());
         let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
-        let export =
-            crate::specctra::export_dsn_with_context(&board, &source, &rules(), &snapshot).unwrap();
+        let export = crate::specctra::export_dsn_with_context(
+            &board,
+            &source,
+            &rules(),
+            &snapshot,
+            Default::default(),
+        )
+        .unwrap();
         let mut body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         body["supported_profile"]["custom_rules"] = serde_json::json!(false);
         assert!(parse_import_plan(&board, &source, &body.to_string(), sample_ses()).is_err());
