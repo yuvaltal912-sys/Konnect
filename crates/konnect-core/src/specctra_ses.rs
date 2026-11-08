@@ -886,7 +886,7 @@ fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Resul
             .unwrap_or_default();
         let nets: BTreeSet<&str> = narrow.iter().map(|n| n.0.as_str()).collect();
         bail!(
-            "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). Freerouting's automatic neck-down does this; route again with it off (route_specctra_dsn's default)",
+            "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). Freerouting necks tracks down at pins in its fanout stage and with automatic neck-down; route again with both off (route_specctra_dsn's default)",
             narrow.len(),
             nets.len()
         );

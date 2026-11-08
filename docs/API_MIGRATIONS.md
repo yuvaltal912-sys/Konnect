@@ -26,10 +26,13 @@ reference board with Freerouting 2.5.0.
   back with Freerouting's `get_effective_settings`; any sent setting not in
   effect refuses the run, names the setting, and routes nothing. A Freerouting
   without `update_job_settings` and `get_effective_settings` is refused when
-  settings are sent. The result adds `effective_settings` (each sent setting as
-  in effect, by dotted name) and `optimizer` (`passes`, `early_stop`,
-  `score_before`, `score_after` and up to 12 log lines, from `get_job_logs`;
-  `null` when the log cannot be read).
+  settings are sent. Freerouting's fanout stage is now always off
+  (`fanout.enabled: false`, also in `rules_applied.fanout_enabled`): in 2.5.0
+  it necks tracks down at pins even with automatic neck-down off, and the SES
+  importer refuses such tracks. The result adds `effective_settings` (each sent
+  setting as in effect, by dotted name) and `optimizer` (`passes`,
+  `early_stop`, `stop_reason`, `score_before`, `score_after` and up to 12 log
+  lines, from `get_job_logs`; `null` when the log cannot be read).
 - **`export_specctra_dsn`** grows each unplated-hole keepout (and each
   ringless, netless plated hole) by the project's `min_hole_clearance` less the
   smallest class clearance, so the router keeps the hole clearance; the result

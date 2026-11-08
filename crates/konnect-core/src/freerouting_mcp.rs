@@ -71,6 +71,12 @@ pub(crate) struct RouteSettings {
     /// cannot reach it (`neck_width_um`): the narrowest width the manifest
     /// allows, so no track ends up below the project's floor.
     pub retry_width_um: Option<f64>,
+    /// Freerouting's fanout stage (`fanout.enabled`). In 2.5.0 it necks a
+    /// track down at the pin whatever `automatic_neckdown` says
+    /// (`FoundConnectionInserter` runs its micro neck-down when fanout or
+    /// neck-down is on), which the SES importer refuses, so
+    /// `route_specctra_dsn` turns it off.
+    pub fanout_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +104,9 @@ pub(crate) struct OptimizerReport {
     pub passes: u32,
     /// A pass stopped early after consecutive items could not be improved.
     pub early_stop: bool,
+    /// Why the optimizer stopped or never ran, when the log says (a pass
+    /// improved less than the threshold; the board was not fully routed).
+    pub stop_reason: Option<String>,
     pub score_before: Option<f64>,
     pub score_after: Option<f64>,
     /// The optimizer's own log lines, at most [`MAX_OPTIMIZER_LINES`].
@@ -185,6 +194,9 @@ fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
     }
     if let Some(enabled) = settings.optimizer_enabled {
         job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
+    }
+    if let Some(enabled) = settings.fanout_enabled {
+        job_settings.insert("fanout".to_string(), json!({ "enabled": enabled }));
     }
     if let Some(neckdown) = settings.automatic_neckdown {
         job_settings.insert("automatic_neckdown".to_string(), json!(neckdown));
@@ -327,6 +339,21 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
         }
         if line.contains("early after") {
             report.early_stop = true;
+        }
+        let reason = [
+            "Stopping optimizer because ",
+            "Skipping optimization stage: ",
+        ]
+        .iter()
+        .find_map(|marker| line.find(marker).map(|at| &line[at + marker.len()..]));
+        if let Some(reason) = reason {
+            report.stop_reason = Some(
+                reason
+                    .trim_end_matches('.')
+                    .chars()
+                    .take(MAX_LOG_LINE_CHARS)
+                    .collect(),
+            );
         }
         if line.contains("Optimization stage completed") {
             report.score_before = number_after(line, "baseline optimizer score: ");
@@ -1046,6 +1073,7 @@ mod tests {
             automatic_neckdown: Some(false),
             copper_to_edge_clearance_um: Some(500.0),
             retry_width_um: Some(200.0),
+            fanout_enabled: Some(false),
         }
     }
 
@@ -1062,12 +1090,14 @@ mod tests {
                 "automatic_neckdown",
                 "autorouter.max_passes",
                 "copper_to_edge_clearance_um",
+                "fanout.enabled",
                 "job_timeout",
                 "neck_width_um",
                 "optimizer.enabled",
             ]
         );
         assert_eq!(body["neck_width_um"], json!(200.0));
+        assert_eq!(body["fanout"], json!({ "enabled": false }));
         assert_eq!(body["job_timeout"], json!("00:10:00"));
         let none = job_settings(&RouteSettings {
             max_passes: None,
@@ -1076,6 +1106,7 @@ mod tests {
             automatic_neckdown: None,
             copper_to_edge_clearance_um: None,
             retry_width_um: None,
+            fanout_enabled: None,
             ..all_settings()
         });
         assert!(none.is_empty());
@@ -1094,12 +1125,13 @@ mod tests {
                 "job_timeout": "00:10:00",
                 "autorouter": { "max_passes": 20, "enabled": true },
                 "optimizer": { "enabled": true, "max_passes": 100 },
+                "fanout": { "enabled": false, "max_passes": 100 },
                 "scoring": { "via_costs": 50 }
             }
         });
         let effective = check_effective_settings(&sent, &applied).unwrap();
         assert_eq!(effective["neck_width_um"], json!(200.0));
-        assert_eq!(effective.len(), 6);
+        assert_eq!(effective.len(), 7);
         let as_text = expand_text_content(json!({
             "content": [{ "type": "text", "text": applied.to_string() }]
         }));
@@ -1121,6 +1153,16 @@ mod tests {
                 && error.contains("nothing was routed"),
             "{error}"
         );
+        // Fanout left on (2.5.0's default) necks tracks at pins.
+        let mut fanout_on = applied.clone();
+        fanout_on["body"]["fanout"]["enabled"] = json!(true);
+        let error = check_effective_settings(&sent, &fanout_on)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("fanout.enabled: sent false, in effect true"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1139,10 +1181,30 @@ mod tests {
         assert_eq!(report.score_before, Some(349.49));
         assert_eq!(report.score_after, Some(356.87));
         assert_eq!(report.log.len(), 5);
+        assert_eq!(report.stop_reason, None);
         assert_eq!(
             optimizer_report(&json!({ "body": [] })),
             OptimizerReport::default()
         );
+        // Freerouting 2.5.0's own line when a pass gains too little.
+        let threshold = json!({ "body": [
+            { "type": "INFO", "message": "[FFE3BD] Optimizer pass #1: optimizer score 503.77 -> 513.55 (IMPROVED, 1.9432%), router score: 1000.00, incomplete connections: 0, clearance violations: 0." },
+            { "type": "INFO", "message": "[FFE3BD] Stopping optimizer because the improvement in this pass (1.9432%) is below the threshold (2.50%)." }
+        ]});
+        let report = optimizer_report(&threshold);
+        assert_eq!((report.passes, report.early_stop), (1, false));
+        assert_eq!(
+            report.stop_reason.as_deref(),
+            Some("the improvement in this pass (1.9432%) is below the threshold (2.50%)")
+        );
+        // And when it never ran.
+        let skipped = json!({ "body": [{ "type": "INFO", "message": "[1DA299] Skipping optimization stage: the board has 1 unrouted connection(s) (optimizer only runs on completely routed boards)." }] });
+        let report = optimizer_report(&skipped);
+        assert_eq!(report.passes, 0);
+        assert!(report
+            .stop_reason
+            .unwrap()
+            .starts_with("the board has 1 unrouted connection(s)"));
     }
 
     /// A stand-in for Freerouting's stdio MCP server: a shell script that
@@ -1169,7 +1231,7 @@ mod tests {
         ]
         .join(",");
         let settings = format!(
-            r#"{{"status":200,"body":{{"automatic_neckdown":false,"copper_to_edge_clearance_um":500.0,"neck_width_um":{effective_neck_width},"job_timeout":"00:10:00","autorouter":{{"max_passes":20}},"optimizer":{{"enabled":true}}}}}}"#
+            r#"{{"status":200,"body":{{"automatic_neckdown":false,"copper_to_edge_clearance_um":500.0,"neck_width_um":{effective_neck_width},"job_timeout":"00:10:00","autorouter":{{"max_passes":20}},"optimizer":{{"enabled":true}},"fanout":{{"enabled":false}}}}}}"#
         );
         let logs = r#"{"status":200,"body":[{"type":"INFO","message":"Optimizer pass #1: optimizer score 10.00 -> 10.00 (UNCHANGED, 0.0000%)"},{"type":"INFO","message":"Stopping optimization pass #1 early after 12 consecutive items could not be improved."},{"type":"INFO","message":"Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 10.00, final router score: 1000.00, final optimizer score: 10.00"}]}"#;
         let script = format!(
@@ -1355,6 +1417,7 @@ done
                 automatic_neckdown: None,
                 copper_to_edge_clearance_um: None,
                 retry_width_um: None,
+                fanout_enabled: None,
             },
         )
         .await
@@ -1393,6 +1456,7 @@ done
                     automatic_neckdown: None,
                     copper_to_edge_clearance_um: None,
                     retry_width_um: None,
+                    fanout_enabled: None,
                 },
             )
             .await
@@ -1444,6 +1508,7 @@ done
                     automatic_neckdown: None,
                     copper_to_edge_clearance_um: None,
                     retry_width_um: None,
+                    fanout_enabled: None,
                 },
             )
             .await

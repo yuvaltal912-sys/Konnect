@@ -2227,6 +2227,7 @@ mod specctra_live_undo_test {
                 automatic_neckdown: None,
                 copper_to_edge_clearance_um: None,
                 retry_width_um: None,
+                fanout_enabled: None,
             },
         )
         .await
