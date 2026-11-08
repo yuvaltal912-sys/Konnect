@@ -22,9 +22,9 @@ pub static STARTER_KIT: &[&str] = &["project", "config"];
 pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     ToolsetMeta {
         name: "project",
-        description: "Create, open, save, rename, snapshot KiCAD projects, and launch the live schematic viewer",
+        description: "Create, open, save, rename, snapshot KiCAD projects, restorable checkpoints, the edit-readiness report, and the live schematic viewer",
         category: "project",
-        tool_count: 7,
+        tool_count: 11,
     },
     ToolsetMeta {
         name: "editor_navigation",

@@ -1,6 +1,7 @@
 //! `project` toolset — create, open, save, and snapshot KiCAD projects.
 //!
 //! Tools: create_project, open_project, save_project, get_project_info, snapshot_project
+//! (plus the checkpoint and readiness tools from `checkpoints.rs`)
 //!
 //! KiCAD interface:
 //!   - create_project   → file system (template)
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "create_project",
             "Create a new KiCAD project at the given path. Creates the directory, \
@@ -106,8 +107,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "snapshot_project",
-            "Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. \
-             Useful for saving progress before major edits.",
+            "Export the schematic and PCB to PDF as a timestamped visual record. The PDFs \
+             cannot be restored; for a restorable copy of the design files use \
+             create_checkpoint.",
             json!({
                 "type": "object",
                 "properties": {
@@ -151,7 +153,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_open_viewer(args, ctx).await }
         ),
-    ]
+    ];
+    tools.extend(crate::tools::checkpoints::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

@@ -48,7 +48,7 @@ fn project_hash(schematic: &Path) -> std::io::Result<String> {
 }
 
 /// `yyyymmddThhmmss` in UTC. Days to a date is Howard Hinnant's `civil_from_days`.
-fn stamp(seconds: u64) -> String {
+pub(crate) fn stamp(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64 + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days.rem_euclid(146_097);

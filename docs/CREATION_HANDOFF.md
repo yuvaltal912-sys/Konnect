@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 251 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
+**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is implemented on [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39), awaiting review. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 255 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
 
 ## Start here
 
@@ -48,7 +48,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
-| 14 | Checkpoints and readiness report | none | In progress on `feat/creation-checkpoints` (`tools/checkpoints.rs`, project toolset), open [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); separate from PR 13 |
+| 14 | Checkpoints and readiness report | none | Implemented on `feat/creation-checkpoints`, [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39), awaiting review |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
 ## Next: what to pick
@@ -57,7 +57,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Recommended order**, after the owner approves the next implementation:
 
-1. **PR 14** is already implemented separately in open [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); review and validate that PR without duplicating its work.
+1. **PR 14**: checkpoints and readiness report, implemented on [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); review and merge.
 2. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
 3. **PR 15**: ERC/DRC baselines.
 
@@ -76,6 +76,19 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - Use the noreply identity from `AGENTS.md`, including integration merge commits. A previous GitHub merge attempt rejected this identity; do not silently substitute a personal email.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
+
+## PR 14, checkpoints and readiness report (#39)
+
+Four tools in the `project` toolset (starter kit, so no `load_toolset`), in `tools/checkpoints.rs`:
+
+- `create_checkpoint` copies the saved design files to `<project_dir>/.konnect/checkpoints/<id>/` with a SHA-256 manifest. It builds in a hidden `.partial-*` folder, reads every copy back, re-reads the project and refuses (`stale_target`) if a save landed during the copy, then renames into place. Open KiCad documents are named in `locks_present`: their unsaved changes are not captured.
+- `list_checkpoints`: newest first by millisecond time, each with changed/missing/added counts against the saved files. Malformed checkpoints are listed under `unreadable`.
+- `restore_checkpoint` previews by default and applies only with the preview's revision, which binds the checkpoint, the subset and every target's current digest. It refuses while a target has a KiCad lock or is open over IPC, while the project lock is present, while a journal is pending, or for a board seen live this session. It verifies the stored copies, takes a `pre_restore` checkpoint (`undo_checkpoint`), writes through `commit_file_transaction`, and reads every file back. It never deletes files added since.
+- `get_edit_readiness`: per file, lock state, open in KiCad, seen live, pending journals, and `edit_route` (`file`, `live`, `blocked`). It says once when KiCad does not answer over IPC (C13). It never clears a lock: KiCad locks carry no PID.
+
+The shipped `konnect` skill now tells agents to check readiness before writing and to checkpoint risky work instead of zipping files by hand. `snapshot_project` no longer calls its PDFs a checkpoint.
+
+Verified on macOS: 32 unit tests over scratch fixtures, including mock KiCads holding the board and schematic open or answering without documents, and a stdio run of the release binary on a scratch copy of the `pic_programmer` demo (checkpoint, preview, apply with readback, undo listed, locked restore refused), and 9 negative controls (project lock, revision, copy integrity, live route, IPC-open board, symlinked parent folder, root-sheet lock covering sub-sheets, AppleDouble `._*` files, journal verdict), each caught by a test. An independent review found five defects, all fixed here: a lock or conflict mid-commit was reported as "nothing written" (now claimed only when every target reads as before and no journal is left, otherwise `mutation_outcome_uncertain`); a symlinked folder inside the project let restore read or write outside it; a sub-sheet of an open schematic read as editable (KiCad locks only the root sheet); `._*` files broke checkpoints; and a pending journal could leave the verdict `ready`. Not verified: a live KiCad GUI, the mid-commit lock path and a save racing the copy (both guarded, neither has a test), restore with IPC timing out, Windows and Linux. KiCad 10's own local history (`.history`) is excluded, not read. So is the Q3 design-intent record (`.konnect/design_intent.json`): checkpoints hold KiCad design files only.
 
 ## Q3, the design-intent record (merged, #37)
 

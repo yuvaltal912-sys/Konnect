@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: project checkpoints and edit readiness
+
+Creation PR 14 (`docs/CREATION_HANDOFF.md`). The `project` toolset (starter kit)
+gains `create_checkpoint`, `list_checkpoints`, `restore_checkpoint` and
+`get_edit_readiness`. Nothing existing changes shape. `snapshot_project`'s
+description no longer calls its PDFs a checkpoint: they cannot be restored.
+
+Checkpoints live at `<project_dir>/.konnect/checkpoints/<id>/` (a `manifest.json`
+with a SHA-256 per file, and `files/`). Captured: `.kicad_pro`, `.kicad_sch`,
+`.kicad_pcb`, `.kicad_dru`, `.kicad_sym`, `.kicad_mod`, `sym-lib-table` and
+`fp-lib-table`, recursively, skipping hidden folders (including KiCad 10's
+`.history`), `*-backups`, lock and autosave files, `.kicad_prl` and symlinks.
+Files must be UTF-8. `restore_checkpoint` previews by default and applies only
+with `dry_run: false` and the preview's `expected_revision`; it is refused while
+a target has a KiCad lock or is open over IPC, while the project lock
+(`~<name>.kicad_pro.lck`) is present, while a transaction journal is pending, or
+for a board seen live earlier in the session. It never deletes files.
+
 ## Unreleased: complete rule edits and revision-bound custom-rule routing (minor release)
 
 Creation PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38).
