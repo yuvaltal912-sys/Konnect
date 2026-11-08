@@ -900,23 +900,7 @@ fn ideal_diode(
             *value = value.max(0.0);
         }
     };
-    // The corner between regulation and full conduction can trap one start,
-    // so the fit also starts with the regulation taking every value, and
-    // keeps the better.
-    let mut regulated = start.clone();
-    if free == 3 {
-        regulated[1] = 0.0;
-        regulated[2] = used
-            .last()
-            .zip(used.first())
-            .map_or(0.0, |(l, f)| ((l.1 - f.1) / (l.0 - f.0)).max(0.0));
-    }
-    let cost = |p: &[f64]| residuals(p).iter().map(|r| r * r).sum::<f64>();
-    let best = [start.clone(), regulated]
-        .iter()
-        .map(|s| fit::least_squares(residuals, s, clamp))
-        .min_by(|a, b| cost(a).total_cmp(&cost(b)))
-        .unwrap_or(start);
+    let best = fit::least_squares(residuals, &start, clamp);
     let (vreg, ron, rreg) = unpack(&best);
     let mut law = law_of(&best);
     if let Some(c) = single(Quantity::ReverseCurrent) {
