@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 259 registered tools plus 7 meta-tools (266). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The PR 15 follow-up (`run_design_review` reads a DRC baseline) is in draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged, and so are #45 (`cargo deny` green, one owner-kept ignore), #46 (call log isolation, rank 35), #47 (the review reads a DRC baseline) and #44 (PR 16: Specctra DSN for real boards; Freerouting 2.5.0 routed all 9 exporting KiCad demo boards through the strict import planner). Open for review: #48–#54 (see below). Catalogue on main: 259 registered tools plus 7 meta-tools. GitHub merges use the noreply author (see Known traps). The installed binary remains protected.
 
 ## Start here
 
@@ -49,23 +49,22 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
-| 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: `run_design_review` reads a DRC baseline, draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) |
-| 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
+| 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: `run_design_review` reads a DRC baseline, merged [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) |
+| 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Merged: [#44](https://github.com/yuvaltal912-sys/Konnect/pull/44). Part 2 (version policy, benchmark) in [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) |
 
 ## Next: what to pick
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
-**In review:** PR 15 follow-up, `run_design_review` reads a DRC baseline, draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) on branch `feat/creation-review-reads-baselines`. Files: `tools/design_review.rs`, `tools/check_baselines.rs`. Section below.
+**Open PRs** (owner review; files each owns in its section or PR body): [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48) board construction (rank 21), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49) rank 3 leftovers, [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50) inline renders (rank 25), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) Freerouting version policy and benchmark (rank 32 part 2), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52) part import from local files (rank 33), and simulation M3 in [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) then [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54). Don't touch a file an open PR owns.
 
-**Recommended order**, after the owner approves the next implementation:
+**Owner direction (2026-11-08):** routing quality on boards like the owner's (power and mixed-signal, roughly 30–150 parts, 2–4 layers, pours, high-current nets) matters more than completing very large boards. Measure wirelength against the HPWL bound, vias and layer changes per net, 90° and acute corners, width compliance per net class and design-intent current, and DRC after a refill; completion is only a gate.
 
-1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
-2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35).
-   - The `cargo deny` advisories fix is in review: draft [#45](https://github.com/yuvaltal912-sys/Konnect/pull/45) (branch `fix/cargo-deny-advisories`). Semver lockfile updates (h2, rustls, rustls-webpki, tokio, webpki-root-certs, hyper, which drops `pin-utils`), `zip` 8 to 9 with no code change, and one `deny.toml` ignore (RUSTSEC-2024-0449, `unsafe-libyaml`, dev-only), which the owner chose to keep (2026-11-08). Once merged, `cargo deny check` is green on main.
-3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), LCSC import (rank 33).
+**Recommended next**, after the owner approves:
 
-- Rank 35 (keep tests out of the real call log; one `write_all` per record): implemented, draft [#46](https://github.com/yuvaltal912-sys/Konnect/pull/46) on branch `feat/creation-call-log-isolation`, awaiting the owner's review. Don't touch `observability.rs` or the call-log wiring in `mcp/handler.rs` until it merges.
+1. Circuit-aware review (rank 29, reads the Q3 rails); `design_review.rs` is free now that #47 is merged.
+2. A routing-quality loop on the owner-style corpus: power and critical nets first (short, wide, locked), Freerouting for the rest, then a quality report comparing runs and settings; this is the Q1 "second opinion" with shared metrics.
+3. Rest of rank 32: custom pad shapes, local clearance overrides, blind/buried vias, keeping some pours while omitting others.
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
@@ -73,7 +72,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
 
-- The real Freerouting run, `freerouting_routes_the_rounded_board` (ignored). Java 21 is now installed at `/opt/homebrew/opt/openjdk@21` (the system `java` is still 11). The owner deferred the live run; ask before running it.
+- `apply_specctra_ses` of a Freerouting session into a live KiCad, then refill and DRC (PR 16 proved export, routing and the import plan; the live apply is not run).
 - PR 9 against a live KiCad: `crates/konnect/tests/live_kicad_tools.rs`, on a disposable board.
 - PR 14 against a live KiCad: checkpoint, edit in the GUI, restore refused while open, restore after closing, on a disposable project.
 - Windows and Linux for the whole series, at the end.
@@ -84,8 +83,30 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Use the noreply identity from `AGENTS.md`, including merge commits. Since the owner turned on email privacy (2026-11-08), GitHub merges work with `gh pr merge N --merge --match-head-commit <full sha> --author-email 274043415+yuvaltal912-sys@users.noreply.github.com` (first used for #42); check the merge commit's `%ae`. If GitHub refuses, stop and ask: never substitute a personal email or fast-forward `main`. Pushes are refused when the branch tip carries a personal email, so put a noreply commit on top.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
+- Under heavy machine load (several sessions running tests at once, load average above 30) the IPC mock tests in `pcb_sync` and `custom_rule_tests` time out (`GetOpenDocuments … Timed out`). They pass alone; rerun them before calling a gate red.
+- Freerouting 2.5.0 needs Java 25 (class file 69); Java 21 fails with `UnsupportedClassVersionError`.
 
-## Rank 35, call log isolation (draft, #46)
+## PR 16, Specctra DSN for real boards (merged, #44)
+
+Rank 32 (D7), first part. Merged as [#44](https://github.com/yuvaltal912-sys/Konnect/pull/44) from `feat/creation-dsn-widening`. The claim-only commit and draft preceded implementation, from main 966a89d. Code in `specctra.rs` and `specctra_ses.rs`; tests in `specctra_layers_tests.rs` over a fixture KiCad 10.0.8's own `pcbnew` wrote (`specctra_four_layer_back.kicad_pcb`: 4 layers with a `power` layer, a back-side part at 90°, a through-hole part, a locked In1.Cu track, a locked via, an In2.Cu pour).
+
+- **Layers:** 2 to 32 copper layers in stack order; KiCad `power` layers become Specctra `power` layers. Through-hole and via padstacks cover the stack.
+- **Back side:** a back part is written as a front placement with its pads at their true board positions on B.Cu (KiCad stores flipped pads already mirrored, and the same rotation maps them; checked against `pcbnew`'s `PAD::GetPosition`), so the router never mirrors. KiCad's native exporter is not adopted for these boards.
+- **Three pre-existing bugs fixed:** pin `rotate` was the board-space pad angle, so parts at 90°/270° had non-square pads turned twice; drill offsets were ignored (looked for on the pad, not in the drill), putting offset copper on its hole; and placements kept KiCad's negative angles, which Freerouting echoes normalised (`-90` → `270`), so the importer refused every such board as moved. Placements are now in [0, 360) and the importer compares directions.
+- **`pours: "omit"`** (new argument, default `fixed`): leaves copper pours out of the DSN so the router can cross their area, the usual route-then-refill workflow; rule areas stay, the manifest still counts the pours. Without it a board-wide pour, exported from its outline as fixed copper since PR 2b, blocks most routing (complex_hierarchy: 86 unrouted with it, 0 without).
+- **SES repeats:** Freerouting 2.5.0 wrote the same segment twice on two demo boards; an exact repeat (same net, layer, width and geometry) is now applied once and counted (`duplicates_skipped`), instead of refusing the whole SES.
+- **Copper text keepouts** are rectangles at the text's own angle and justification (1.1 em per glyph), not a square for every rotation: that square was 67 mm wide on one demo board.
+- **Pads and copper the router never saw:** `connect` pads, SMD pads on either outer layer, plated slots, repeated and empty pad numbers (`MP@1`, `@1`), unplated and ringless unconnected holes as keepouts, copperless pads and padless footprints skipped, copper graphics and text as covering keepouts (they were invisible to the router before), board names with spaces.
+
+Real-board check: KiCad 10.0.1's demo boards, scratch copies with routing stripped by a line-based script (it could not parse one board's formatting, so 17 were probed), through the ignored probe `probe_dsn_export_over_a_folder`. Before this PR 2 of 17 exported; now 9 do, including two 4-layer boards and boards with 14, 81 and 103 back-side parts. The 8 refused stop on what is still unsupported: custom pad shapes (2), local clearance overrides (2), open outlines (2), a `jumper` layer (1), duplicate footprint references (1).
+
+Live routing (2026-11-08): Freerouting 2.5.0 (it needs Java 25: `/opt/homebrew/opt/openjdk@25`, installed with the owner's OK) routed all 9 exporting boards with `pours: "omit"`, and the strict import planner accepted every SES, through the ignored test `freerouting_routes_a_folder`. Six reported 0 unrouted (complex_hierarchy, both ecc83, interf_u, multichannel_mixer, sonde xilinx); the 4-layer coldfire had 3 unrouted (3011 tracks, 248 vias, 6 min) and the 4-layer video 8 of 588 nets (8370 tracks, 901 vias, 24 min); one log did not report a count. Every pin of six boards (3,922) matched the board model within 1 µm (`probe_pins_match_the_board_model`). Not run: `apply_specctra_ses` into a live KiCad and DRC after a refill.
+
+Not done (the rest of rank 32 and follow-ups): the Freerouting version policy and benchmark (B34, D24) are in their own PR; custom pad shapes, local clearance overrides, blind/buried vias, copper text as exact outlines, and the exporter's own option to keep some pours (per net) while omitting others.
+
+Verified on macOS (2026-11-08): the gate (fmt, 3759 lib and integration tests with 0 failures, doc tests, clippy `-D warnings`, `cargo deny check licenses`, `fix-doc-counts`, release build); 22 new tests in `specctra_layers_tests.rs` (plus three ignored probes), with back-side pad positions and orientations checked against KiCad 10.0.8's `pcbnew`; existing 2-layer DSN output unchanged; 9 negative controls (relative pad rotation, drill offset, native back-side refusal, copper-graphic keepouts, through-via span, SES layer count, unique pin ids, design-name token, placement-angle comparison), each caught by a test. Not verified: a live KiCad (the export reads the IPC snapshot; tests feed it the saved file), Windows and Linux.
+
+## Rank 35, call log isolation (merged, #46)
 
 Findings C1 and C2. Test traffic was about 94% of the owner's real call log, and 1,028 of its lines held records glued together by concurrent writers.
 
@@ -95,7 +116,7 @@ Findings C1 and C2. Test traffic was about 94% of the owner's real call log, and
 
 Verified on macOS (2026-11-08): the gate (fmt; 3739 lib and integration tests, 0 failures; doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts`; release build). `simulation_live` was skipped: this PR does not touch simulation. New tests: override resolution; the `cfg(test)` guard with no env at all; a handler built in a child test process with HOME at a temp folder and every override removed writes nothing there; four processes appending 1,600 records to one file give only whole lines; a test process does not resolve the real path; a spawned server with HOME and `KONNECT_STATE_DIR` at a temp folder logs only into the state folder, and with the log off writes none. A stdio run of the release binary with that isolation logged 2 whole records in its state folder. Three negative controls each caught by a test: `writeln!` back (3 of 3 runs), the `cfg(test)` guard removed, the cargo `[env]` removed. The owner's existing log was not read, changed or cleaned. Not done: the `server_version`, `pid` and `session_id` record fields that C1 also proposed, rotation, and Windows and Linux.
 
-## PR 15 follow-up, the review reads a DRC baseline (draft, #47)
+## PR 15 follow-up, the review reads a DRC baseline (merged, #47)
 
 `run_design_review` takes `baseline`, the name of a DRC baseline of the same board (`save_check_baseline` with `board`). It is loaded before anything runs with `check_baselines::load_for_compare`, now shared with `compare_check_baseline`, so a missing name (the stored names are listed), a damaged file, a symlinked store, a baseline of another board, an invalid name and `baseline` without `board` are all refusals and run nothing. The review's DRC run is normalized and diffed with PR 15's `normalize_drc` and `diff`; no key logic is repeated.
 
