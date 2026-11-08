@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-08. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08; load switch, eFuse and ideal diode are not started.
+**Last updated:** 2026-11-08. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08; load switch, eFuse and ideal diode are in progress on branch `feat/simulation-datasheet-models-m3-switches`, stacked on #53.
 
 ## Start here
 
@@ -51,7 +51,8 @@ PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are 
 | M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Merged as `d10dbe1` |
 | M2 | [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) | `feat/simulation-datasheet-models-m2` | Merged as `d228d5f` |
 | Version check | [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23) | `fix/live-test-ngspice-version` | Merged as `bdafc67` |
-| M3 (first part) | [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) | `feat/simulation-datasheet-models-m3` | Draft, not merged |
+| M3 (first part) | [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) | `feat/simulation-datasheet-models-m3` | Open, not merged |
+| M3 (switches) | draft PR | `feat/simulation-datasheet-models-m3-switches` | In progress, merges after #53 |
 
 ## Datasheet models: M1 and M2 merged
 
@@ -61,7 +62,7 @@ The owner asked for a design and its parts' datasheets to be enough to simulate.
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
 | M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); merged as [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) |
-| M3 | Behavioural ICs. **Done in draft #53:** `op_amp`, `comparator`, `ldo`, `voltage_reference`. **Not started:** load switch, eFuse, ideal diode (the next PR; see "M3 progress") |
+| M3 | Behavioural ICs. **Done in draft #53:** `op_amp`, `comparator`, `ldo`, `voltage_reference`. **In progress** (branch `feat/simulation-datasheet-models-m3-switches`, stacked on #53): load switch, eFuse, ideal diode |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
 
