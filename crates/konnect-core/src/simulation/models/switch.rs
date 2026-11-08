@@ -262,6 +262,9 @@ pub(crate) fn build(kind: Kind, name: &str, characteristics: &[Characteristic]) 
     Ok(model)
 }
 
+/// An eFuse's undervoltage and overvoltage thresholds, as set.
+type Window = (Option<f64>, Option<f64>);
+
 /// The input an eFuse value is read at, inside its window.
 fn window_input(lockout: Option<f64>, cutoff: Option<f64>) -> f64 {
     match (lockout, cutoff) {
@@ -272,10 +275,7 @@ fn window_input(lockout: Option<f64>, cutoff: Option<f64>) -> f64 {
     }
 }
 
-fn efuse(
-    model: &mut Model,
-    characteristics: &[Characteristic],
-) -> Fitted<(Law, (Option<f64>, Option<f64>))> {
+fn efuse(model: &mut Model, characteristics: &[Characteristic]) -> Fitted<(Law, Window)> {
     let single = |quantity| of(characteristics, quantity).first().copied();
     let on = single(Quantity::SwitchOnResistance).ok_or_else(|| {
         Invalid::new("characteristics", "an efuse needs its switch_on_resistance")
@@ -473,7 +473,7 @@ fn check_efuse(
     model: &mut Model,
     bench: &mut Bench,
     law: &Law,
-    (lockout, cutoff): (Option<f64>, Option<f64>),
+    (lockout, cutoff): Window,
     characteristics: &[Characteristic],
 ) {
     let single = |quantity| of(characteristics, quantity).first().copied();
