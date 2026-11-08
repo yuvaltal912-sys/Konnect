@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged, and so are #45 (`cargo deny` green, one owner-kept ignore), #46 (call log isolation, rank 35), #47 (the review reads a DRC baseline) and #44 (PR 16: Specctra DSN for real boards; Freerouting 2.5.0 routed all 9 exporting KiCad demo boards through the strict import planner). Open for review: #48–#54 (see below). Catalogue on main: 259 registered tools plus 7 meta-tools. GitHub merges use the noreply author (see Known traps). The installed binary remains protected.
+**Last updated:** 2026-11-08 (night). main is 535bf2e: the 15 core creation PRs, PR 16 (#44), #45, #46 and #47 are merged. Open, all awaiting the owner's review: #48–#58 (list below). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 259 registered tools plus 7 meta-tools. Work stopped here at the owner's request; nothing is running.
 
 ## Start here
 
@@ -57,15 +57,32 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
-**Open PRs** (owner review; files each owns in its section or PR body): [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48) board construction (rank 21), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49) rank 3 leftovers, [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50) inline renders (rank 25), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) Freerouting version policy and benchmark (rank 32 part 2), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52) part import from local files (rank 33), and simulation M3 in [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) then [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54). Don't touch a file an open PR owns.
+**Open PRs** (owner review; each PR's section or body names the files it owns, so don't touch them until it merges):
 
-**Owner direction (2026-11-08):** routing quality on boards like the owner's (power and mixed-signal, roughly 30–150 parts, 2–4 layers, pours, high-current nets) matters more than completing very large boards. Measure wirelength against the HPWL bound, vias and layer changes per net, 90° and acute corners, width compliance per net class and design-intent current, and DRC after a refill; completion is only a gate.
+| PR | What | State |
+|---|---|---|
+| [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48) | Board construction tools: footprint lock, rule areas, zone delete, polygon outlines (rank 21) | draft, gate green |
+| [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49) | Rank 3 leftovers: DRC `zone_fill_state`, paged long results | draft, merged with main, gate green |
+| [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50) | Inline layer and library renders, `inline_diff` difference image (rank 25) | draft, gate green |
+| [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) | Freerouting version policy and quality benchmark (rank 32 part 2); recommends 2.5.0 on Java 25 | draft, gate green |
+| [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52) | Part import from local KiCad files (rank 33; no network: EasyEDA's terms) | ready, merged with main |
+| [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53), then [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) | Simulation M3: op-amp, comparator, LDO, reference; then load switch, eFuse, ideal diode (stacked: merge #53 first) | #53 ready, #54 draft; live suite 96/96 |
+| [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55) | Circuit-aware review against the layout checklist (rank 29) | draft |
+| [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56) | Layout quality audit `audit_layout_quality`: return paths, decoupling loops, bottlenecks, one comparable score | draft |
+| [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57) | Freerouting MCP started without telemetry and outside the home folder | draft |
+| [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58) | PR 16b, route at the project's rules (section below) | draft, gate green |
+
+Several of these edit the same shared docs (`CREATION_HANDOFF.md`, `tool-directory.md`, `API_MIGRATIONS.md`) and the tool counts: whoever merges second merges main in, keeps every PR's entries, and reruns `cargo xtask fix-doc-counts`. #51, #57 and #58 all touch `freerouting_mcp.rs`/`integration.rs` in different functions.
+
+**Owner direction (2026-11-08):** routing many traces is easy; routing them optimally is what he wants, on boards like his (power and mixed-signal, roughly 30–150 parts, 2–4 layers, pours, high-current nets). [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md) is the standard: return paths, decoupling loops, protection and termination placement, widths for current. Completion is only a gate; he wants to give the currents of the main traces himself, through `set_design_intent`.
+
+**Reference board:** a private, git-ignored copy of one owner-chosen board (100 parts, 2 layers) and its scripts are in `target/creation-research/reference-boards/` (`apply_ses.py` writes an SES into a board copy with KiCad's `pcbnew`, then refill and `kicad-cli pcb drc`). Keep its results out of tracked docs apart from counts.
 
 **Recommended next**, after the owner approves:
 
-1. Circuit-aware review (rank 29, reads the Q3 rails); `design_review.rs` is free now that #47 is merged.
-2. A routing-quality loop on the owner-style corpus: power and critical nets first (short, wide, locked), Freerouting for the rest, then a quality report comparing runs and settings; this is the Q1 "second opinion" with shared metrics.
-3. Rest of rank 32: custom pad shapes, local clearance overrides, blind/buried vias, keeping some pours while omitting others.
+1. Close the length gap: with #58, the reference board routes clean but about 30% longer than its existing routing, with acute corners the layout audit (#56) counts. Tune Freerouting's `optimizerScoring` (excess wire length, vias, bends) and route critical and power nets first, scoring each run with `audit_layout_quality` until it beats the existing routing on every measure.
+2. Explain the refill touching two connector pads in one of the #58 runs (KiCad GUI check).
+3. Rest of rank 32: custom pad shapes, local clearance overrides, blind/buried vias, per-net choice of which pours to keep.
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
