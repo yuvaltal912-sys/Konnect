@@ -60,6 +60,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Owner direction (2026-11-08):** routing quality on boards like the owner's (power and mixed-signal, roughly 30–150 parts, 2–4 layers, pours, high-current nets) matters more than completing very large boards. Measure wirelength against the HPWL bound, vias and layer changes per net, 90° and acute corners, width compliance per net class and design-intent current, and DRC after a refill; completion is only a gate.
 
+**Layout quality audit: In progress (branch `feat/layout-quality-audit`).** A read-only `audit_layout_quality(board)` that scores a routed board against the owner's layout checklist (return paths, decoupling loops, hot loops, vias and detours, corners, current sizing), so a routing loop can compare runs. New module `tools/layout_quality.rs` only; one registration line in `design_review::tools()`. Don't touch these files.
+
 **Recommended next**, after the owner approves:
 
 1. Circuit-aware review (rank 29, reads the Q3 rails); `design_review.rs` is free now that #47 is merged.
