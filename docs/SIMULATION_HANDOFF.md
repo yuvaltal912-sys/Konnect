@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-08. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08; the rest, load switch, eFuse and ideal diode, is in draft [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54), stacked on #53, which merges first. With both, M3 is complete.
+**Last updated:** 2026-11-08 (switches). Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08; the rest, load switch, eFuse and ideal diode, is in draft [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54), stacked on #53, which merges first. With both, M3 is complete.
 
 ## Start here
 
@@ -169,6 +169,10 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
   - A load switch has no quick output discharge or undervoltage lockout, and blocks reverse current.
   - An ideal diode turns off at once on reverse current, with no reverse threshold or turn-off delay.
   - The eFuse stand-in in Protection Scenarios remains the tool for a fault's timing.
+
+### M3 gate (macOS, 2026-11-08, switches)
+
+Formatting, workspace tests (3,747 passed, 157 ignored), doctests (9 passed, 2 ignored), the live simulation tests (96 passed, none failed: no red baseline), Clippy with warnings denied, `cargo deny check licenses`, documentation counts (unchanged) and the release build, at `ac33339`. The installed binary hash is unchanged (`3de188bb775ab4ce...`). Dogfood by pipe, on a scratch copy of `demos/simulation`, with `get_installation_info` naming the fork binary and HEAD: an `efuse` with its window, a `load_switch` with an enable threshold and rise time, an `ideal_diode` with a forward curve and reverse current, and a windowless `efuse`, all written within 0.014 percent. The last was attached to `LM317_power_supply` `U1`, and the transient read 14.098 V out against 14.103 V rectified, `as_drawn` with `fitted_model` for `U1`. A value read outside the window was refused on its field. Not run: hosted CI, Windows and Linux, the KiCad dialog round trip and a run in KiCad's GUI simulator.
 
 ### M3 gate (macOS, 2026-11-08, first part)
 
