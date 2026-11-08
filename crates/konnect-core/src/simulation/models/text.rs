@@ -421,39 +421,170 @@ fn check_continuations(
     Ok(count)
 }
 
+/// Functions a behavioural line may call. Each takes and gives a plain
+/// number; none reads a file, a string or the engine's state.
+const FUNCTIONS: [&str; 6] = ["min", "max", "sqrt", "tanh", "exp", "ln"];
+/// The longest expression Konnect writes on one behavioural line.
+const MAX_EXPRESSION: usize = 4096;
+
+/// A `B` line's value, `V=...` or `I=...`: numbers as [`number`] writes them,
+/// node voltages `v(a)` or `v(a,b)` of the subcircuit's own nodes, `+ - * /`,
+/// parentheses, and the calls in [`FUNCTIONS`]. Nothing else, so no word,
+/// string, brace, `$`, `#` or `;` can reach the engine's parser.
+fn check_expression(value: &str) -> bool {
+    let Some(expression) = value
+        .strip_prefix("V=")
+        .or_else(|| value.strip_prefix("I="))
+    else {
+        return false;
+    };
+    if expression.is_empty() || expression.len() > MAX_EXPRESSION {
+        return false;
+    }
+    let bytes = expression.as_bytes();
+    // What the next token may be: an operand (after an operator, an opening
+    // parenthesis, a comma, or at the start) or an operator (after an operand).
+    let mut want_operand = true;
+    // For each open parenthesis, whether it is a call that takes two
+    // arguments, and whether its comma has been seen.
+    let mut open: Vec<(bool, bool)> = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if want_operand {
+            if byte == b'-' {
+                // A unary minus.
+                at += 1;
+                continue;
+            }
+            if byte == b'(' {
+                open.push((false, false));
+                at += 1;
+                continue;
+            }
+            if byte.is_ascii_digit() {
+                let end = number_end(bytes, at);
+                if !is_number(&expression[at..end]) {
+                    return false;
+                }
+                at = end;
+                want_operand = false;
+                continue;
+            }
+            if byte.is_ascii_lowercase() {
+                let end = at + bytes[at..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_lowercase())
+                    .count();
+                let word = &expression[at..end];
+                if bytes.get(end) != Some(&b'(') {
+                    return false;
+                }
+                if word == "v" {
+                    let Some(close) = expression[end..].find(')') else {
+                        return false;
+                    };
+                    let inside = &expression[end + 1..end + close];
+                    let nodes: Vec<&str> = inside.split(',').collect();
+                    if nodes.is_empty() || nodes.len() > 2 || !nodes.iter().all(|n| is_node(n)) {
+                        return false;
+                    }
+                    at = end + close + 1;
+                    want_operand = false;
+                    continue;
+                }
+                if !FUNCTIONS.contains(&word) {
+                    return false;
+                }
+                open.push((matches!(word, "min" | "max"), false));
+                at = end + 1;
+                continue;
+            }
+            return false;
+        }
+        match byte {
+            b'+' | b'-' | b'*' | b'/' => want_operand = true,
+            b',' => {
+                match open.last_mut() {
+                    Some((true, comma @ false)) => *comma = true,
+                    _ => return false,
+                }
+                want_operand = true;
+            }
+            b')' => match open.pop() {
+                Some((two, comma)) if two == comma => {}
+                _ => return false,
+            },
+            _ => return false,
+        }
+        at += 1;
+    }
+    !want_operand && open.is_empty()
+}
+
+/// Where a number that starts at `at` ends: digits, a point, digits, `e`, an
+/// optional minus and digits.
+fn number_end(bytes: &[u8], mut at: usize) -> usize {
+    while at < bytes.len() && (bytes[at].is_ascii_digit() || bytes[at] == b'.') {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'e') {
+        at += 1;
+        if bytes.get(at) == Some(&b'-') {
+            at += 1;
+        }
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+    }
+    at
+}
+
+/// An element name Konnect writes: its type letter, then up to seven
+/// uppercase letters and digits.
+fn element_name(token: &str, letter: char) -> bool {
+    token.len() >= 2
+        && token.len() <= 8
+        && token.starts_with(letter)
+        && token[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
 fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
-    let inner_models: Vec<String> = lines
+    let model_names = |types: &[&str]| -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| line.strip_prefix(".model "))
+            .filter_map(|rest| {
+                let (model, kind) = rest.split_once(' ')?;
+                types.contains(&kind).then(|| model.to_string())
+            })
+            .collect()
+    };
+    let inner_models = model_names(&["D"]);
+    let bjt_models = model_names(&["NPN", "PNP"]);
+    let mos_models = model_names(&["VDMOS"]);
+    // The voltage sources a current-controlled source may sense.
+    let sources: Vec<&str> = lines
         .iter()
-        .filter_map(|line| line.strip_prefix(".model "))
-        .filter_map(|rest| rest.strip_suffix(" D"))
-        .map(str::to_string)
-        .collect();
-    let bjt_models: Vec<String> = lines
-        .iter()
-        .filter_map(|line| line.strip_prefix(".model "))
-        .filter_map(|rest| {
-            rest.strip_suffix(" NPN")
-                .or_else(|| rest.strip_suffix(" PNP"))
-        })
-        .map(str::to_string)
-        .collect();
-    let mos_models: Vec<String> = lines
-        .iter()
-        .filter_map(|line| line.strip_prefix(".model "))
-        .filter_map(|rest| rest.strip_suffix(" VDMOS"))
-        .map(str::to_string)
+        .filter_map(|line| line.split(' ').next())
+        .filter(|first| element_name(first, 'V') || *first == super::SENSE_SOURCE)
         .collect();
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
         let tokens: Vec<&str> = line.split(' ').collect();
         let number_line = |tokens: &[&str]| matches!(tokens, [_, a, b, value] if is_node(a) && is_node(b) && is_number(value));
-        let ok = match tokens.first().copied() {
-            Some(".model") => {
+        let first = tokens.first().copied().unwrap_or_default();
+        let ok = match first {
+            ".model" => {
                 let model = tokens.get(1).copied().unwrap_or_default();
                 let suffix = model.strip_prefix(name).unwrap_or_default();
                 let (allowed, flag): (&[&str], bool) = match (tokens.get(2).copied(), suffix) {
-                    (Some("D"), "_f" | "_b") if tokens.len() == 3 => (&DIODE_PARAMETERS, false),
+                    (Some("D"), "_f" | "_b" | "_c") if tokens.len() == 3 => {
+                        (&DIODE_PARAMETERS, false)
+                    }
                     (Some("VDMOS"), "_m") if tokens.len() == 3 => (&MOSFET_PARAMETERS, true),
                     (Some("NPN" | "PNP"), "_q") if tokens.len() == 3 => (&BJT_PARAMETERS, false),
                     _ => {
@@ -463,27 +594,49 @@ fn check_subcircuit_body(lines: &[&str], name: &str) -> Result<(), String> {
                 index += 1 + check_continuations(&lines[index + 1..], index + 1, allowed, flag)?;
                 continue;
             }
-            Some("Q1") => {
+            "Q1" => {
                 matches!(
                     tokens.as_slice(),
                     [_, c, b, e, model] if is_node(c) && is_node(b) && is_node(e)
                         && bjt_models.iter().any(|m| m == model)
                 )
             }
-            Some("M1") => {
+            "M1" => {
                 matches!(
                     tokens.as_slice(),
                     [_, d, g, s, model] if is_node(d) && is_node(g) && is_node(s)
                         && mos_models.iter().any(|m| m == model)
                 )
             }
-            Some("VKONNECT") => {
+            _ if first == super::SENSE_SOURCE => {
                 matches!(tokens.as_slice(), [_, a, b, "0"] if is_node(a) && is_node(b))
             }
-            Some("R1" | "R2" | "RL" | "L1" | "C1") => number_line(&tokens),
-            Some("DF" | "DB" | "DG" | "DH") => matches!(
+            _ if ["R", "L", "C", "V", "I"]
+                .iter()
+                .any(|letter| element_name(first, letter.chars().next().unwrap_or('R'))) =>
+            {
+                number_line(&tokens)
+            }
+            _ if element_name(first, 'D') => matches!(
                 tokens.as_slice(),
                 [_, a, b, model] if is_node(a) && is_node(b) && inner_models.iter().any(|m| m == model)
+            ),
+            // Linear voltage- and current-controlled sources: two output
+            // nodes, two sensed nodes and a gain.
+            _ if element_name(first, 'E') || element_name(first, 'G') => matches!(
+                tokens.as_slice(),
+                [_, a, b, c, d, gain] if is_node(a) && is_node(b) && is_node(c) && is_node(d)
+                    && is_number(gain)
+            ),
+            // A voltage that reads the current of one of this body's sources.
+            _ if element_name(first, 'H') => matches!(
+                tokens.as_slice(),
+                [_, a, b, source, gain] if is_node(a) && is_node(b)
+                    && sources.contains(source) && is_number(gain)
+            ),
+            _ if element_name(first, 'B') => matches!(
+                tokens.as_slice(),
+                [_, a, b, value] if is_node(a) && is_node(b) && check_expression(value)
             ),
             _ => false,
         };
@@ -641,6 +794,79 @@ mod tests {
             let text = rehash(&body.replacen("IS=", &format!("{byte}IS="), 1));
             assert!(check_fitted(text.as_bytes()).is_err(), "{byte:?} passed");
         }
+    }
+
+    fn behavioural_file(line: &str) -> String {
+        let body = format!(
+            ".subckt amp_fit INP INN OUT\nEMID mid INN OUT INN 5.000000e-1\n{line}\nRA a mid 1.000000e6\n\
+             VS a OUT 0.000000e0\nHS hs mid VS 1.000000e0\n.ends amp_fit\n"
+        );
+        file("op_amp", "amp_fit", &body)
+    }
+
+    #[test]
+    fn behavioural_lines_take_only_numbers_node_voltages_and_plain_functions() {
+        for good in [
+            "BG mid a I=max(min(1.000000e-1*(v(INP,INN)-2.000000e-3),7.957747e-3),-7.957747e-3)",
+            "BO a mid V=((v(INP)+v(hs,mid))-sqrt((v(INP)-v(hs,mid))*(v(INP)-v(hs,mid))+1.000000e-6))/2.000000e0",
+            "BQ INP mid I=1.000000e-3*v(INP,mid)/sqrt(v(INP,mid)*v(INP,mid)+1.000000e-2)",
+            "BT a mid I=2.500000e-3*tanh(v(a,mid)/1.000000e-1)",
+            "BX a mid I=1.000000e0*v(a)/exp(5.000000e-1*ln(v(a)+1.000000e-6))",
+            "BN a mid V=-v(INP)",
+            "EG a mid INP INN 1.000000e5",
+            "GG mid a INP INN 1.000000e-3",
+            "VOS INP a 1.000000e-3",
+            "IB INP mid 2.000000e-8",
+            "CA a mid 1.000000e-9",
+            "HX a mid VS 1.000000e0",
+        ] {
+            let text = behavioural_file(good);
+            assert!(check_fitted(text.as_bytes()).is_ok(), "{good}: {:?}", check_fitted(text.as_bytes()));
+        }
+        for bad in [
+            // Anything that is not a number, a node voltage or a plain call.
+            "BG mid a I=v(INP)*$x",
+            "BG mid a I=shell(1.000000e0)",
+            "BG mid a V={x}",
+            "BG mid a V=`echo`",
+            "BG mid a V=v(INP)#1",
+            "BG mid a V=v(INP);x",
+            "BG mid a V=i(VS)",
+            "BG mid a V=temper",
+            "BG mid a V=pow(v(INP),2.000000e0)",
+            "BG mid a V=1.5",
+            "BG mid a V=1m",
+            "BG mid a V=\"x\"",
+            "BG mid a R=1.000000e0",
+            // Malformed: the engine might read these some other way.
+            "BG mid a V=v(INP",
+            "BG mid a V=v(INP,INN,OUT)",
+            "BG mid a V=v(a.b)",
+            "BG mid a V=min(1.000000e0)",
+            "BG mid a V=sqrt(1.000000e0,2.000000e0)",
+            "BG mid a V=v(INP)*",
+            "BG mid a V=v(INP)v(INN)",
+            "BG mid a V=(v(INP)",
+            "BG mid a V=v(INP))",
+            "BG mid a V=",
+            "BG mid a V=v(INP) tc1=1",
+            // Other element lines with words where numbers go.
+            "EG a mid INP INN gain",
+            "EG a mid INP 1.000000e5",
+            "HX a mid VNONE 1.000000e0",
+            "VOS INP a DC 1.000000e-3",
+            "VOS INP a PULSE(0 1)",
+            "IB INP mid 1m",
+            "XA a mid amp_fit",
+            "KC L1 L2 1.000000e0",
+            "Bg mid a V=v(INP)",
+            "BTOOLONGNAME a mid V=v(INP)",
+        ] {
+            let text = behavioural_file(bad);
+            assert!(check_fitted(text.as_bytes()).is_err(), "{bad} passed");
+        }
+        let long = format!("BG mid a V={}", vec!["v(INP)"; 800].join("+"));
+        assert!(check_fitted(behavioural_file(&long).as_bytes()).is_err());
     }
 
     #[test]

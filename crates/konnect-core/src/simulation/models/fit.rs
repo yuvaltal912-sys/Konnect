@@ -89,7 +89,7 @@ pub(crate) fn root(f: impl Fn(f64) -> f64, mut low: f64, mut high: f64) -> Optio
 
 /// Solve `a x = b` by Gaussian elimination with partial pivoting. None for a
 /// singular system.
-fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+pub(crate) fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     let n = b.len();
     for column in 0..n {
         let pivot =
