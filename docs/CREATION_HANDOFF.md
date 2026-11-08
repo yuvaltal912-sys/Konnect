@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is implemented on [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39), awaiting review. Before that, 2026-11-07: The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
+**Last updated:** 2026-11-08. Q3 (design-intent record) is merged: [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). The PR 13 continuation ([#38](https://github.com/yuvaltal912-sys/Konnect/pull/38)) and PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) are open on their own branches; PR 14 is implemented and awaiting review. Before that, 2026-11-07: The owner authorized merging all six creation drafts and aligning the project. PRs #30–#35 are consolidated on `codex/creation-alignment`, including all original feature commits. PRs 6, 8, 10, 9b and 12 are implemented; PR 13 has a validated initial slice, with its remaining work below. [Integration PR #36](https://github.com/yuvaltal912-sys/Konnect/pull/36) records the combined macOS gate and scratch runtime checks. The installed binary remains protected.
 
 ## Start here
 
@@ -43,7 +43,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 8 | Placement objective: wirelength, crossings, pin-level decoupling | 7 | Integrated from [#31](https://github.com/yuvaltal912-sys/Konnect/pull/31) in the creation alignment PR |
 | 9 | Sync completion: field copy and orphan delete in `update_pcb_from_schematic` | none | Merged, first half: field copy and orphan delete: [#24](https://github.com/yuvaltal912-sys/Konnect/pull/24) |
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
-| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Not started; must land before PR 11 |
+| Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Merged: [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). PR 11 is unblocked |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
@@ -59,7 +59,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. Finish **PR 13**: general rule expressions and rule editing/deletion, then safe custom-rule DSN/SES handling. The integrated initial slice does not complete that scope.
 2. **PR 14**: checkpoints and readiness report, implemented on [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); review and merge.
-3. **Q3**, then **PR 11**: design-intent record before the honest review/current audit.
+3. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
 4. **PR 15**: ERC/DRC baselines.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
@@ -85,7 +85,20 @@ Four tools in the `project` toolset (starter kit, so no `load_toolset`), in `too
 
 The shipped `konnect` skill now tells agents to check readiness before writing and to checkpoint risky work instead of zipping files by hand. `snapshot_project` no longer calls its PDFs a checkpoint.
 
-Verified on macOS: 32 unit tests over scratch fixtures, including mock KiCads holding the board and schematic open or answering without documents, and a stdio run of the release binary on a scratch copy of the `pic_programmer` demo (checkpoint, preview, apply with readback, undo listed, locked restore refused), and 9 negative controls (project lock, revision, copy integrity, live route, IPC-open board, symlinked parent folder, root-sheet lock covering sub-sheets, AppleDouble `._*` files, journal verdict), each caught by a test. An independent review found five defects, all fixed here: a lock or conflict mid-commit was reported as "nothing written" (now claimed only when every target reads as before and no journal is left, otherwise `mutation_outcome_uncertain`); a symlinked folder inside the project let restore read or write outside it; a sub-sheet of an open schematic read as editable (KiCad locks only the root sheet); `._*` files broke checkpoints; and a pending journal could leave the verdict `ready`. Not verified: a live KiCad GUI, the mid-commit lock path and a save racing the copy (both guarded, neither has a test), restore with IPC timing out, Windows and Linux. KiCad 10's own local history (`.history`) is excluded, not read.
+Verified on macOS: 32 unit tests over scratch fixtures, including mock KiCads holding the board and schematic open or answering without documents, and a stdio run of the release binary on a scratch copy of the `pic_programmer` demo (checkpoint, preview, apply with readback, undo listed, locked restore refused), and 9 negative controls (project lock, revision, copy integrity, live route, IPC-open board, symlinked parent folder, root-sheet lock covering sub-sheets, AppleDouble `._*` files, journal verdict), each caught by a test. An independent review found five defects, all fixed here: a lock or conflict mid-commit was reported as "nothing written" (now claimed only when every target reads as before and no journal is left, otherwise `mutation_outcome_uncertain`); a symlinked folder inside the project let restore read or write outside it; a sub-sheet of an open schematic read as editable (KiCad locks only the root sheet); `._*` files broke checkpoints; and a pending journal could leave the verdict `ready`. Not verified: a live KiCad GUI, the mid-commit lock path and a save racing the copy (both guarded, neither has a test), restore with IPC timing out, Windows and Linux. KiCad 10's own local history (`.history`) is excluded, not read. So is the Q3 design-intent record (`.konnect/design_intent.json`): checkpoints hold KiCad design files only.
+
+## Q3, the design-intent record (merged, #37)
+
+One record per project at `<project_dir>/.konnect/design_intent.json`, in `tools/design_intent.rs`, served by two `config` tools (starter kit, so they are listed without `load_toolset`):
+
+- `get_design_intent` returns the record, `source` (`file` or `absent`), a content `revision` (`sha256:` of the file text) and `missing_sections`, so a dependent result can name what was never recorded. Net names are stored as given and are not checked against the design (`net_names_checked: false`).
+- `set_design_intent` replaces one section (`rails`, `currents`, `interfaces`, `fab_target`) and keeps the others. An existing record needs `expected_revision`; a missing or wrong one is `stale_target` and writes nothing. `dry_run` validates and returns the `candidate_revision`. Writes are conditional on the text that was read, then read back. The directory must hold a `.kicad_pro`, so a mistyped path leaves no stray folder.
+
+The record is closed and typed (`schema_version` 1, `deny_unknown_fields`, sections checked for shape before serde, which would otherwise read a struct from a positional array). Refused: duplicate names, a net in two rails or in both a rail and `currents`, non-positive currents, impedances and fab sizes, tolerance outside (0, 100], a layer count other than 1 or an even 2 to 32, inner copper on a board of two layers or fewer, a via diameter not larger than its drill, differential pairs naming nets outside the interface, and a differential impedance with no pairs. A file that cannot be used is `invalid_configuration` for both tools and is never replaced.
+
+The input schema leaves `value` open (`additionalProperties: true`) on purpose. Dispatch closes object schemas by default, which refused every `fab_target` object; unit calls bypass dispatch, so only the release-binary probe caught it. `the_dispatch_schema_admits_every_section_shape` now covers it.
+
+Readers: rank 12 (current audit) takes rail and net currents, `max_temp_rise_c` and copper weights; rank 29 (circuit-aware review) takes rails with `source_ref`; rank 38 (net classes from the schematic) takes interfaces, pairs and impedances. `read_design_intent` is the crate-level entry point for them. The shipped review and PCB skills now point at `get_design_intent`. Not done here: checking net names against the schematic or board, and any reader.
 
 ## PR 6, small schematic edits (integrated, #30)
 

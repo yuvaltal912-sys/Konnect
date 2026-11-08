@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **251 registered tools** + **7 always-visible meta-tools** = **258 total**
+- **253 registered tools** + **7 always-visible meta-tools** = **260 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -430,9 +430,9 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Configuration
 
-### `config` · 7 tools
+### `config` · 9 tools
 **Purpose:** User preferences, project rules, design rules, fab constraints. **Call `load_user_config` at session start.**
-**Source:** [`crates/konnect-core/src/tools/config.rs`](crates/konnect-core/src/tools/config.rs)
+**Source:** [`crates/konnect-core/src/tools/config.rs`](crates/konnect-core/src/tools/config.rs), [`design_intent.rs`](crates/konnect-core/src/tools/design_intent.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -443,6 +443,8 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `get_effective_config` | Return the merged config (user defaults + project overrides) with `sources` for each half. The config Claude should use for design decisions; refuses rather than merge defaults in place of a file that cannot be used. |
 | `add_design_rule` | Add a natural-language design rule Claude should follow. Examples: "Always use 100nF X7R for MCU decoupling within 3mm of power pin". |
 | `list_design_rules` | List all active design rules (user-level + project-level). |
+| `get_design_intent` | Read the project's design-intent record (`<project_dir>/.konnect/design_intent.json`): power rails, currents of other nets, interfaces with impedance targets, and the fab target. `source` is `file` or `absent`; `missing_sections` names empty sections so a dependent result can say what it lacked; `revision` is what a write needs. Net names are not checked against the design. An unusable file is refused (`invalid_configuration`). |
+| `set_design_intent` | Replace one section (`rails`, `currents`, `interfaces`, `fab_target`) and keep the others. The record is closed and typed: unknown keys, duplicate names, a net claimed twice and non-positive values are refused. An existing record needs `expected_revision` from `get_design_intent` (`stale_target` otherwise, writing nothing); `dry_run` validates without writing; the write is read back. The directory must hold a `.kicad_pro`. |
 
 ---
 

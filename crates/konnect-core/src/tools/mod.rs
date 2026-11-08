@@ -12,6 +12,7 @@ pub(crate) mod checkpoints;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
+pub mod design_intent;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;
