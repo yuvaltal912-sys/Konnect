@@ -283,6 +283,10 @@ diagnostics and unevaluated coverage, and do not describe the design as ready,
 passing, clean, or looking good. Findings gathered before the coverage gap are
 still valid and should still be reported.
 
+With `baseline` (a DRC baseline saved before an edit), the verdict counts only
+DRC violations new since it. Say so, and report the unchanged count under
+`baseline`: a board whose known violations match its baseline is not a clean board.
+
 Collect direct `run_erc`, `get_drc_violations`, short, and connectivity evidence
 separately. Then compare the aggregate findings with that stronger evidence and
 report any disagreement.

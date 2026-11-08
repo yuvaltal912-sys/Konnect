@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 259 registered tools plus 7 meta-tools (266). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 259 registered tools plus 7 meta-tools (266). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The PR 15 follow-up (`run_design_review` reads a DRC baseline) is in draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47). The installed binary remains protected.
 
 ## Start here
 
@@ -49,12 +49,14 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
-| 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: read baselines in `run_design_review` (now unblocked) |
+| 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: `run_design_review` reads a DRC baseline, draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
 
 ## Next: what to pick
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
+
+**In review:** PR 15 follow-up, `run_design_review` reads a DRC baseline, draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) on branch `feat/creation-review-reads-baselines`. Files: `tools/design_review.rs`, `tools/check_baselines.rs`. Section below.
 
 **Recommended order**, after the owner approves the next implementation:
 
@@ -93,6 +95,18 @@ Findings C1 and C2. Test traffic was about 94% of the owner's real call log, and
 
 Verified on macOS (2026-11-08): the gate (fmt; 3739 lib and integration tests, 0 failures; doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts`; release build). `simulation_live` was skipped: this PR does not touch simulation. New tests: override resolution; the `cfg(test)` guard with no env at all; a handler built in a child test process with HOME at a temp folder and every override removed writes nothing there; four processes appending 1,600 records to one file give only whole lines; a test process does not resolve the real path; a spawned server with HOME and `KONNECT_STATE_DIR` at a temp folder logs only into the state folder, and with the log off writes none. A stdio run of the release binary with that isolation logged 2 whole records in its state folder. Three negative controls each caught by a test: `writeln!` back (3 of 3 runs), the `cfg(test)` guard removed, the cargo `[env]` removed. The owner's existing log was not read, changed or cleaned. Not done: the `server_version`, `pid` and `session_id` record fields that C1 also proposed, rotation, and Windows and Linux.
 
+## PR 15 follow-up, the review reads a DRC baseline (draft, #47)
+
+`run_design_review` takes `baseline`, the name of a DRC baseline of the same board (`save_check_baseline` with `board`). It is loaded before anything runs with `check_baselines::load_for_compare`, now shared with `compare_check_baseline`, so a missing name (the stored names are listed), a damaged file, a symlinked store, a baseline of another board, an invalid name and `baseline` without `board` are all refusals and run nothing. The review's DRC run is normalized and diffed with PR 15's `normalize_drc` and `diff`; no key logic is repeated.
+
+- Counted against the verdict: new violations, severity increases (`baseline_severity` given) and violations in a category the baseline did not report (`not_compared`, since nothing vouches for them). Each finding carries `baseline_change` and `baseline_key`. Unchanged and lowered ones are not findings.
+- `design_review.baseline` names what was used: `name`, `path`, `revision` (SHA-256 of the stored file), `created_utc`, `source`, then the counts (new, raised, lowered, unchanged, resolved, not compared), per-rule tallies, up to 20 resolved violations, `keying`, `source_changed_since_baseline` and `warnings` (`options_differ` when the baseline ran with refill or live sync: the review runs neither). `null` without the argument.
+- The verdict ends with the comparison, e.g. `NOT READY — … (DRC counted against baseline 'pre-route': 1 new, 1 unchanged, 1 resolved)`. `drc` keeps the run's absolute counts.
+- DRC that cannot run: INCOMPLETE as before, and `baseline.status` is `not_compared` with `reason: drc_unavailable`.
+- ERC: the review runs none, so an ERC baseline does not apply; the schema says so. The `kicad-review` skill now says to report the unchanged count and not to call such a board clean.
+
+Verified on macOS: 6 unit tests (`design_review_baseline_tests.rs`) over a scratch project with a stand-in `kicad-cli`: new/unchanged/resolved in the verdict with the re-measured and moved violation matched; an unchanged board LOOKS GOOD against its baseline and NOT READY without it; severity raised counts and lowered does not; a category missing from the baseline counts; every refusal runs no DRC and leaves a damaged file as it was; DRC unavailable keeps the review INCOMPLETE. The 23 PR 15 tests pass after the loader refactor. 4 negative controls, each caught: counting unchanged findings, dropping severity raises, ignoring a missing baseline, dropping not-compared categories. The gate (2026-11-08): fmt; 3747 lib and integration tests passed, 1 failed and then fixed (`asset_references` caught a backticked field in the new skill line; rerun 12/12, and the `konnect` crate 191/191 afterwards); doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts` (no change, 259 + 7); release build; installed binary SHA-256 still `3de188bb775ab4ce`. `simulation_live` skipped (not touched). Not verified: a live kicad-cli run (the PR 15 live test covers the keys), Windows and Linux.
+
 ## PR 15, ERC/DRC baselines (merged, #43)
 
 Three tools in the `verification` toolset (15 to 18), in `tools/check_baselines.rs`. Finding C4: agents diffed ERC/DRC reports by hand in Bash 18 times to prove an edit broke nothing.
@@ -105,7 +119,7 @@ Stable keys: a hash of check, DRC category, rule, ERC sheet and the sorted item 
 
 Verified on macOS: 23 unit tests over scratch projects with a stand-in `kicad-cli` (new/resolved/unchanged for ERC and DRC; a re-run reordered, moved, with items swapped and DRC prose re-measured matches exactly; made-up UUIDs; repeats; severity changes; missing categories; refusals before any run; damaged and renamed baseline files; a symlinked `.konnect`; 1,500 changes under the client cap with paging covering each once), 12 negative controls each caught by a test, and the ignored live test `live_rerun_of_an_unchanged_project_matches_its_baseline` with kicad-cli 10.0.8 on a scratch copy of the KiCad 10 `pic_programmer` demo (5 ERC and 5 DRC violations, every item keyed by UUID, re-run 0 new and 0 resolved). `cargo test -p konnect-core -p konnect` and clippy pass. Not verified: a live edit between save and compare, `sync_live_board` against a live KiCad (it reuses `drc::run`, already covered), a KiCad 8 board, Windows and Linux.
 
-Follow-ups, not in this PR: read baselines in `run_design_review` (unblocked now that PR 11 is merged); a delete tool (overwrite covers replacement today); the documented edit loop in the skills and agents (rank C29).
+Follow-ups, not in this PR: read baselines in `run_design_review` (draft #47, section above); a delete tool (overwrite covers replacement today); the documented edit loop in the skills and agents (rank C29).
 
 ## PR 11, honest review and current audit (merged, #42)
 
