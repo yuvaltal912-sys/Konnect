@@ -12,6 +12,11 @@ outline stay), and exported with KiCad's own Specctra exporter as
 and nothing is saved back. This uses KiCad's exporter, not Konnect's, so the
 corpus does not depend on any Konnect change.
 
+With `--stripped-boards` it writes `<output>/<board name>.kicad_pcb` instead:
+the same scratch copy with its routing stripped, saved by KiCad, as input for
+an exporter that reads boards (Konnect's own, through PR 16's ignored test
+`freerouting_routes_a_folder` with `KONNECT_PROBE_KEEP`).
+
 Each board is exported in its own process: KiCad 10's Python bindings return a
 bare SWIG object from the second `LoadBoard` in one process.
 """
@@ -32,7 +37,7 @@ def strip_routing(board):
 
 
 def export_one(copy, target):
-    """Load one scratch copy, strip its routing, export it. Prints one line."""
+    """Load one scratch copy, strip its routing, export or save it. Prints one line."""
     import pcbnew
 
     name = os.path.splitext(os.path.basename(copy))[0]
@@ -42,7 +47,10 @@ def export_one(copy, target):
         print(f"refuse {name}: no footprints")
         return 1
     removed = strip_routing(board)
-    ok = pcbnew.ExportSpecctraDSN(board, target)
+    if target.endswith(".kicad_pcb"):
+        ok = pcbnew.SaveBoard(target, board)
+    else:
+        ok = pcbnew.ExportSpecctraDSN(board, target)
     if ok and os.path.exists(target):
         print(f"export {name}: {footprints} footprints, {removed} routing items stripped")
         return 0
@@ -55,9 +63,14 @@ def export_one(copy, target):
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--one":
         sys.exit(export_one(sys.argv[2], sys.argv[3]))
-    if len(sys.argv) != 3:
+    args = sys.argv[1:]
+    suffix = ".dsn"
+    if args and args[0] == "--stripped-boards":
+        suffix = ".kicad_pcb"
+        args = args[1:]
+    if len(args) != 2:
         sys.exit(__doc__)
-    source, output = (os.path.abspath(p) for p in sys.argv[1:])
+    source, output = (os.path.abspath(p) for p in args)
     os.makedirs(output, exist_ok=True)
     boards = []
     for root, _dirs, files in os.walk(source):
@@ -67,7 +80,7 @@ def main():
     with tempfile.TemporaryDirectory() as scratch:
         for path in boards:
             name = os.path.splitext(os.path.basename(path))[0]
-            target = os.path.join(output, name + ".dsn")
+            target = os.path.join(output, name + suffix)
             if os.path.exists(target):
                 print(f"skip   {name}: {target} exists")
                 continue

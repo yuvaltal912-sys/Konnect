@@ -54,7 +54,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 ## Next: what to pick
 
-**Rank 32 part 2 (B34, D24): In progress (branch `feat/creation-freerouting-benchmark`).** An opt-in `cargo xtask freerouting-bench` over a folder of Specctra DSN files (completion, vias, wirelength, runtime, determinism per Freerouting version), then a recommended version with its measured reason in `check_freerouting`. Owns `xtask`, `freerouting_setup.rs` and the `check_freerouting` handler in `integration.rs`.
+**Rank 32 part 2 (B34, D24): ready for review, draft [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) (branch `feat/creation-freerouting-benchmark`).** `cargo xtask freerouting-bench` and the recommended Freerouting release in `check_freerouting`; see its section below.
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
@@ -87,6 +87,20 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
 - Under heavy machine load (several sessions running tests at once, load average above 30) the IPC mock tests in `pcb_sync` and `custom_rule_tests` time out (`GetOpenDocuments … Timed out`). They pass alone; rerun them before calling a gate red.
 - Freerouting 2.5.0 needs Java 25 (class file 69); Java 21 fails with `UnsupportedClassVersionError`.
+- Freerouting 2.x turns telemetry and analytics on by default and keeps its settings and log in the user's home (2.5 under `~/Library/Application Support/freerouting` and `~/Library/Logs/freerouting`). Pass `--profile.allow_telemetry=false --usage_and_diagnostic_data.disable_analytics=true` and a scratch `-Duser.home`; `xtask/freerouting-bench/quiet-java.sh` does both. `route_specctra_dsn` and the MCP probe in `check_freerouting` (`freerouting_mcp.rs`) do not yet.
+- Freerouting 2.3 and later stop with a `NullPointerException` when their `freerouting.json` has no `profile.id`.
+
+## Rank 32 part 2, Freerouting version policy and benchmark (draft, #51)
+
+B34 and D24, from main 966a89d, merged with main after #44 to #47. Files: `xtask/src/freerouting_bench/` (new), `xtask/freerouting-bench/` (corpus script, quiet Java wrapper), `freerouting_setup.rs`, the `check_freerouting` handler in `integration.rs`. Usage is in `DEV.md`, "Freerouting benchmark (opt-in)".
+
+- **`cargo xtask freerouting-bench`**, opt-in, never in CI: any folder of DSN files, one or more JARs, two runs each. Completion is a gate (0 unrouted, 0 clearance violations, within Freerouting's own job budget); boards that pass get quality: wiring over an any-angle lower bound (half the pins' convex hull) and over HPWL, vias and vias per net, layer changes, acute and 90° corners away from pads, tracks, segments below their net class width, runtime, determinism (same copper in any order). Ranking: gate failures, then defects, wire/bound, vias, determinism, runtime, over the boards every competing version passed. Each run has its own `user.home` and temp folder with telemetry off. `--rescore` re-measures a finished run without Java. Results stay under `target/freerouting-bench/`.
+- **`check_freerouting`** reports `version_policy`: recommended 2.5.0 (needs Java 25), its URL, SHA-256, the measured reason, and a warning when the installed JAR is another version or not the published file. Its `--version` probe now runs headless with telemetry off in a scratch home: 2.1.0 used to open its window and time out, so a working install read unavailable.
+- **Measured (2026-11-08, Java 25, 120 s budget, all four releases):** on 10 boards exported by Konnect with pours omitted (5 KiCad demos of 15 to 114 parts, 5 fixtures), 2.5.0 passed the gate on 10, 2.1.0 on 7, 2.3.0 and 2.4.1 on 5 each. 2.5.0's two runs matched on all 10, 2.1.0's on 2 of 7. On the 5 boards all passed, 2.5.0 and 2.4.1 tied for shortest wiring (1.195 x the bound) and fewest vias. A second corpus from KiCad's own exporter (pours kept) also ranked 2.5.0 first, with no release completing 4 of its 12 boards. Caveat: 2.5.0 necks traces down near pads (202 segments below class width on 4 boards; 2.1.0 had none, but 13 acute corners).
+
+Verified on macOS: the gate after merging main (fmt; 3,813 lib and integration tests, one of them first red on this PR's own skill wording and green after the fix; doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts` unchanged; release build; `simulation_live` skipped, not touched), a stdio run of the release binary (`check_freerouting` on the 2.1.0 KiCad plugin JAR: available, warned with the measured reason; on 2.5.0: matches, digest verified, no warning), 38 xtask unit tests without Java (DSN and SES readers, pin placement incl. back side, hull bound, corners, layer changes, widths, gate, ranking, report and JSON), version-policy tests over fake JARs and Java scripts, the ignored check of the pinned digest and Java 25 against the real 2.5.0 JAR, and the real benchmark runs above. Not verified: the owner's own boards (the corpus still comes from KiCad's demos), the boards' real net-class widths in the Konnect-exported corpus (PR 16's probe writes a flat 0.2 mm), Windows and Linux.
+
+Follow-ups: start Freerouting quietly in `route_specctra_dsn` and the MCP probe (`freerouting_mcp.rs`); the owner's board corpus; a setting sweep (passes, optimizer) on it with the same metrics.
 
 ## PR 16, Specctra DSN for real boards (merged, #44)
 

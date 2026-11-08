@@ -58,8 +58,8 @@ pub(crate) const RECOMMENDED: RecommendedRelease = RecommendedRelease {
         "https://github.com/freerouting/freerouting/releases/download/v2.5.0/freerouting-2.5.0.jar",
     sha256: "f6f51bb02245e8e717f9359bd260cc9c5c0b1bc0acc8b7cb2cd5b8ffeb5de3c7",
     java_major: 25,
-    reason: "on 12 boards of 2 to 114 parts it routed 8 completely with no clearance violation, as many as 2.1.0 and 3 more than 2.3.0 and 2.4.1; its two runs laid the same copper on 7 of those 8, against 3 of 8 for 2.1.0; and on the boards every release completed it had the shortest wiring and the fewest vias.",
-    measured: "2026-11-08 with cargo xtask freerouting-bench: Freerouting 2.1.0, 2.3.0, 2.4.1 and 2.5.0 on Java 25.0.5, 2 runs per board, a 120 s job budget, over 7 KiCad 10 demo boards exported by KiCad's own Specctra exporter and 5 test fixtures. No release completed 4 of the boards. On the boards it completed, 2.5.0 left 148 segments below their net class width (on 2 boards) and 1 acute corner, where 2.1.0 left none and 5.",
+    reason: "on 10 boards of 2 to 114 parts exported by Konnect it routed all 10 completely with no clearance violation, against 7 for 2.1.0 and 5 each for 2.3.0 and 2.4.1; its two runs laid the same copper on all 10, against 2 of 7 for 2.1.0; and on the boards every release completed its wiring was as short, with as few vias, as the best of the others.",
+    measured: "2026-11-08 with cargo xtask freerouting-bench: Freerouting 2.1.0, 2.3.0, 2.4.1 and 2.5.0 on Java 25.0.5, 2 runs per board, a 120 s job budget, over 5 KiCad 10 demo boards exported by Konnect with pours omitted and 5 test fixtures. A second corpus exported by KiCad's own exporter (7 demos with pours, and the fixtures) also ranked 2.5.0 first. On its completed boards 2.5.0 left 202 segments below their net class width (necked down, on 4 boards) and 1 acute corner, where 2.1.0 left none and 13.",
 };
 
 /// A Freerouting version such as `2.1.0` named in `--version` output or a log

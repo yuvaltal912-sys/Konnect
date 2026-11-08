@@ -457,8 +457,17 @@ cargo xtask freerouting-bench \
   Python: `…/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -I
   xtask/freerouting-bench/export_kicad_dsn.py ~/ClaudeCode/kicad-10.0.1/demos target/freerouting-bench/corpus`.
   It copies each board into a scratch folder, strips tracks, arcs and vias, and
-  exports `<board>.dsn`. Source boards are never written. A corpus exported by
-  Konnect's own `export_specctra_dsn` goes in the same way: pass its folder.
+  exports `<board>.dsn`. Source boards are never written. KiCad's exporter
+  writes every pour as fixed copper, which blocks routing on boards with a
+  board-wide pour, so prefer Konnect's own exporter with pours omitted (PR 16):
+  write stripped boards with `export_kicad_dsn.py --stripped-boards <demos> <dir>`,
+  then run PR 16's ignored test only for its DSNs:
+  `KONNECT_DSN_PROBE_DIR=<dir> KONNECT_PROBE_KEEP=<out> KONNECT_PROBE_OMIT_POURS=1
+  FREEROUTING_JAR=<jar> FREEROUTING_JAVA=xtask/freerouting-bench/quiet-java.sh
+  FREEROUTING_SECONDS=2 cargo test -p konnect-core --lib freerouting_routes_a_folder
+  -- --ignored`. The wrapper starts Freerouting in a throwaway home with
+  telemetry off; delete the partial `.ses` files it leaves in `<out>`. Its
+  routing rules are a flat 0.2 mm for every net, not the boards' own classes.
   Pick boards like the ones being designed (about 15 to 150 parts, 2 to 4
   layers, pours): the huge demos (`video`, `kit-dev-coldfire`, `jetson`,
   `vme-wren`) take the whole budget and say little about quality.
