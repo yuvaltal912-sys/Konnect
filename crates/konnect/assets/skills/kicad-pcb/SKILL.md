@@ -99,9 +99,12 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 Follow this sequence for a clean PCB workflow:
 
-1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
+1. **Board outline** — `set_board_size`, or `add_board_outline` with a rectangle or,
+   for a shaped board, `points` (a corner may carry an arc midpoint for the next edge). Both outline tools
    append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
-   without it leaves two overlapping outlines and a DRC failure.
+   without it leaves two overlapping outlines and a DRC failure. Add mechanical and
+   antenna keepouts now with `add_rule_area`, and lock fixed parts (connectors,
+   mounting) with `set_footprint_lock`, so placement and routing respect them.
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
@@ -137,7 +140,9 @@ Follow this sequence for a clean PCB workflow:
 
 Do NOT add copper pours before routing is complete — they interfere with interactive routing.
 Preserve existing zones: the DSN exporter supports their outlines, and removing them
-changes the design. Refill after routing and check the resulting copper.
+changes the design. Refill after routing and check the resulting copper. A rule area
+that forbids tracks or vias is exported as a Freerouting keepout; `list_zones` shows
+each zone's kind and flags, and `delete_zone` removes one only when asked.
 
 ---
 
@@ -184,9 +189,11 @@ board now has the intended placement:
 2. **Build the held set.** Include every caller-identified intentional
    placement. A diagnostic `auto_place_from_schematic` dry-run reports saved-board
    lock records in its **held** list; accept those only when that saved file is
-   known current. `get_component_list` does not expose lock state, so if neither
-   current saved evidence nor the caller establishes the KiCad-locked references,
-   report `BLOCKED` and ask the caller to confirm them. Never send a held
+   known current. `set_footprint_lock` without `locked` reads every footprint's
+   lock state from the saved file; when the board is open in KiCad with unsaved
+   edits, that file may be stale, so if neither current saved evidence nor the
+   caller establishes the KiCad-locked references, report `BLOCKED` and ask the
+   caller to confirm them. Never send a held
    reference to any placement, rotation, or flip call, including a batch.
 3. **Plan a small explicit batch.** Prefer one functional group and the fewest
    references needed to test the improvement. `auto_place_from_schematic` is a

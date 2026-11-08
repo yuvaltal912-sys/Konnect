@@ -27,6 +27,10 @@ use konnect_sexp::{
 use serde_json::json;
 use std::path::Path;
 
+// Board construction (rank 21): footprint lock, rule areas, zone list/delete.
+#[path = "board_construction.rs"]
+mod board_construction;
+
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
 fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
     let sides = [
@@ -1054,7 +1058,7 @@ fn entry_indent(content: &str, open_pos: usize) -> Option<String> {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "set_board_size",
             "Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. \
@@ -1161,9 +1165,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_board_outline",
-            "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
-             corners. This appends: on a board that already has an outline it leaves two \
-             overlapping rectangles and a DRC failure, so replacing one means calling \
+            "Add a board outline on Edge.Cuts: a rectangle (x1, y1, x2, y2), optionally with \
+             circular rounded corners, or a polygon ('points'), whose edges may be arcs. A \
+             polygon must be simple (no crossing edges); it is written as Edge.Cuts lines and \
+             arcs, which the design review, placement scoring and export_specctra_dsn read as \
+             one closed outline. This appends: on a board that already has an outline it \
+             leaves two outlines and a DRC failure, so replacing one means calling \
              delete_graphics(layer='Edge.Cuts') first.",
             json!({
                 "type": "object",
@@ -1173,9 +1180,27 @@ pub fn tools() -> Vec<ToolDef> {
                     "y1":             { "type": "number", "description": "Top-left Y in mm" },
                     "x2":             { "type": "number", "description": "Bottom-right X in mm" },
                     "y2":             { "type": "number", "description": "Bottom-right Y in mm" },
-                    "corner_radius":  { "type": "number", "minimum": 0, "description": "Circular corner radius in mm; must not exceed half the shorter side (0 = sharp)", "default": 0 }
+                    "corner_radius":  { "type": "number", "minimum": 0, "description": "Circular corner radius in mm; must not exceed half the shorter side (0 = sharp). Rectangle only", "default": 0 },
+                    "points": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "arc_mid": {
+                                    "type": "object",
+                                    "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                                    "required": ["x", "y"],
+                                    "description": "Makes the edge from this corner to the next an arc through this point"
+                                }
+                            },
+                            "required": ["x", "y"]
+                        },
+                        "description": "Polygon corners in mm, in order, at least 3; instead of x1..y2. The last corner joins the first."
+                    }
                 },
-                "required": ["board", "x1", "y1", "x2", "y2"]
+                "required": ["board"]
             }),
             |args, ctx| async move { handle_add_board_outline(args, ctx).await }
         )
@@ -1293,7 +1318,9 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         super::board_stackup::tool(),
-    ]
+    ];
+    tools.extend(board_construction::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -2096,6 +2123,9 @@ async fn handle_add_board_outline(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    if args.get("points").is_some_and(|points| !points.is_null()) {
+        return add_polygon_board_outline(args, ctx, board_path).await;
+    }
     let x1 = match require_f64(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -2181,6 +2211,204 @@ async fn handle_add_board_outline(
         "fallback_reason": fallback_reason.evidence(),
         "warning": fallback_reason.warning()
     })))
+}
+
+/// `add_board_outline`'s polygon mode: corners with optional arc edges,
+/// checked to be one simple closed loop before anything is written, through
+/// the same live-or-file gate as the rectangle.
+async fn add_polygon_board_outline(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    board_path: std::path::PathBuf,
+) -> anyhow::Result<CallToolResult> {
+    if let Some(field) = ["x1", "y1", "x2", "y2", "corner_radius"]
+        .into_iter()
+        .find(|field| args.get(*field).is_some_and(|v| !v.is_null()))
+    {
+        return Ok(crate::tools::invalid_arg(
+            field,
+            "give either 'points' or a rectangle, not both; round a polygon's corners with arc_mid",
+        ));
+    }
+    let primitives = match polygon_outline(&args["points"]) {
+        Ok(primitives) => primitives,
+        Err(result) => return Ok(result),
+    };
+    let w = 0.05_f64;
+    let line_count = primitives
+        .iter()
+        .filter(|primitive| matches!(primitive, OutlinePrimitive::Line { .. }))
+        .count();
+    let arc_count = primitives.len() - line_count;
+    let corners: Vec<(f64, f64)> = primitives
+        .iter()
+        .map(|primitive| match primitive {
+            OutlinePrimitive::Line { start, .. } | OutlinePrimitive::Arc { start, .. } => *start,
+        })
+        .collect();
+    let bbox = corners.iter().fold(
+        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+        |(a, b, c, d), (x, y)| (a.min(*x), b.min(*y), c.max(*x), d.max(*y)),
+    );
+    let describe = |source: &str| {
+        json!({
+            "shape": "polygon",
+            "corner_count": corners.len(),
+            "line_count": line_count, "arc_count": arc_count,
+            "bbox": { "x1": bbox.0, "y1": bbox.1, "x2": bbox.2, "y2": bbox.3 },
+            "source": source,
+        })
+    };
+
+    let items = outline_items(&primitives, w);
+    let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board outline", move |c| {
+        c.create_items(items).map(|_| ())
+    })
+    .await?
+    {
+        BoardWrite::Ipc(()) => return Ok(CallToolResult::json(&describe("ipc"))),
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::File(reason) => reason,
+    };
+
+    let content = konnect_sexp::writer::read_consistent(&board_path)?;
+    let existing = read_file_graphics(&content)
+        .into_iter()
+        .filter(|g| g.layer == "Edge.Cuts")
+        .count();
+    let outline = format_outline(&primitives, "Edge.Cuts", w);
+    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, outline)]);
+    if let Err(error) =
+        konnect_sexp::writer::write_atomic_if_unchanged(&board_path, &content, &new_content)
+    {
+        return Ok(match error {
+            konnect_sexp::SexpError::Conflict { .. } => CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target: board_path.display().to_string(),
+                    reason: "the file changed while the outline was being written".to_string(),
+                },
+                "The board file changed between the read and the write, so the outline was \
+                 not written. Retry.",
+            ),
+            other => CallToolResult::error(format!("The outline was not written: {other}")),
+        });
+    }
+    // Readback: the file now holds the previous Edge.Cuts shapes plus ours.
+    let written = std::fs::read_to_string(&board_path)?;
+    let now = read_file_graphics(&written)
+        .into_iter()
+        .filter(|g| g.layer == "Edge.Cuts")
+        .count();
+    if now != existing + primitives.len() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::MutationOutcomeUncertain {
+                operation: "add_board_outline".to_string(),
+                path: board_path.display().to_string(),
+                reason: format!(
+                    "expected {} Edge.Cuts shapes after the write, read {now}",
+                    existing + primitives.len()
+                ),
+            },
+            "The outline was written, but reading the board back did not show exactly the \
+             new shapes. Inspect Edge.Cuts before retrying.",
+        ));
+    }
+    let mut body = describe("file");
+    body["fallback_reason"] = fallback_reason.evidence();
+    body["warning"] = json!(fallback_reason.warning());
+    body["readback"] = json!("verified");
+    if existing > 0 {
+        body["existing_edge_cuts_shapes"] = json!(existing);
+        body["note"] = json!(format!(
+            "Edge.Cuts already held {existing} shape(s); the board now has more than one \
+             outline. Remove the old one with delete_graphics(layer='Edge.Cuts', uuids=[...])."
+        ));
+    }
+    Ok(CallToolResult::json(&body))
+}
+
+/// The lines and arcs of a polygon outline. Each corner may carry `arc_mid`,
+/// making the edge to the next corner an arc through that point. The loop is
+/// checked simple with every arc sampled densely along its circle.
+fn polygon_outline(points: &serde_json::Value) -> Result<Vec<OutlinePrimitive>, CallToolResult> {
+    let Some(items) = points.as_array() else {
+        return Err(crate::tools::invalid_arg(
+            "points",
+            "must be an array of {x, y} corners",
+        ));
+    };
+    // Each corner, and the arc midpoint of the edge leaving it, if any.
+    type Corner = ((f64, f64), Option<(f64, f64)>);
+    let mut corners: Vec<Corner> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let xy = |value: &serde_json::Value| {
+            Some((value.get("x")?.as_f64()?, value.get("y")?.as_f64()?))
+        };
+        let Some(corner) = xy(item) else {
+            return Err(crate::tools::invalid_arg(
+                "points",
+                &format!("corner {index} needs numeric 'x' and 'y'"),
+            ));
+        };
+        let mid = match item.get("arc_mid") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => match xy(value) {
+                Some(mid) => Some(mid),
+                None => {
+                    return Err(crate::tools::invalid_arg(
+                        "points",
+                        &format!("corner {index}: arc_mid needs numeric 'x' and 'y'"),
+                    ))
+                }
+            },
+        };
+        corners.push((corner, mid));
+    }
+    // A closing corner equal to the first adds nothing.
+    if corners.len() > 3 && corners.first().map(|c| c.0) == corners.last().map(|c| c.0) {
+        let (_, mid) = corners.pop().expect("non-empty");
+        if mid.is_some() {
+            return Err(crate::tools::invalid_arg(
+                "points",
+                "the closing corner repeats the first; put its arc_mid on the corner before it",
+            ));
+        }
+    }
+    let mut primitives = Vec::with_capacity(corners.len());
+    let mut chorded: Vec<(f64, f64)> = Vec::with_capacity(corners.len() * 2);
+    for (index, (start, mid)) in corners.iter().enumerate() {
+        let end = corners[(index + 1) % corners.len()].0;
+        chorded.push(*start);
+        match mid {
+            None => primitives.push(OutlinePrimitive::Line { start: *start, end }),
+            Some(mid) => {
+                let twice_area =
+                    (mid.0 - start.0) * (end.1 - start.1) - (mid.1 - start.1) * (end.0 - start.0);
+                if !mid.0.is_finite() || !mid.1.is_finite() || twice_area.abs() < 1e-9 {
+                    return Err(crate::tools::invalid_arg(
+                        "points",
+                        &format!(
+                            "corner {index}: arc_mid lies on the straight edge, so it makes no arc"
+                        ),
+                    ));
+                }
+                chorded.extend(board_construction::arc_inner_points(*start, *mid, end));
+                primitives.push(OutlinePrimitive::Arc {
+                    start: *start,
+                    mid: *mid,
+                    end,
+                });
+            }
+        }
+    }
+    if let Err(reason) = board_construction::check_simple_ring(&chorded) {
+        return Err(crate::tools::invalid_arg(
+            "points",
+            &format!("the outline is not one simple closed loop: {reason}"),
+        ));
+    }
+    Ok(primitives)
 }
 
 fn graphic_json(
