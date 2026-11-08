@@ -8,6 +8,7 @@
 use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::component_class;
 use crate::tools::sch_connectivity::{net_graph_for, NetGraph, NetRoot};
 use crate::tools::{
     get_path, invalid_arg, placed_pins_by_reference, project_name_for, sch_hierarchy, ToolContext,
@@ -23,14 +24,14 @@ use konnect_sexp::{
     },
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "audit_decoupling",
             "Audit schematic connectivity between IC power nets and decoupling capacitors. \
@@ -95,19 +96,25 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "audit_manufacturing",
-            "DFM checks for the configured fab house: component spacing, silkscreen overlap, \
-             via-in-pad, acid traps, board outline issues. The outline check reads the true \
+            "DFM checks of the saved board against a fab's limits: track widths, via drill, \
+             diameter and annular ring, through-hole drills and pad rings, via-in-pad on SMD \
+             pads, track-to-track acid traps (under 90°), the project's own DRC minimums \
+             against the fab, and the board outline. The outline check reads the true \
              Edge.Cuts outline (rounded corners and cut-outs included) and reports each \
              footprint whose courtyard, pads or silkscreen field text cross or sit outside it, \
-             with the overhang in mm; parts in 'edge_mount_references' are listed as intentional.",
+             with the overhang in mm; parts in 'edge_mount_references' are listed as \
+             intentional. Limits come from 'fab_house', else the design-intent fab target \
+             (get_design_intent), whose own minimums win for that house. Silkscreen over \
+             copper, courtyard overlap and copper clearance are left to run_drc, and the \
+             response says so under 'delegated_to_drc'; 'checks' says what each check \
+             covered and 'not_checked' what nothing covered.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "fab_house": {
                         "type": "string",
-                        "description": "Target manufacturer: 'jlcpcb' (default), 'pcbway', 'oshpark'",
-                        "default": "jlcpcb"
+                        "description": "Target manufacturer: 'jlcpcb', 'pcbway', 'oshpark'. Omitted: the design-intent fab target's house, else 'jlcpcb'"
                     },
                     "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
                 },
@@ -160,7 +167,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_check_bom_health(args, ctx).await }
         ),
-    ]
+    ];
+    tools.extend(super::trace_current::tools());
+    tools
 }
 
 // ─── Audit types ─────────────────────────────────────────────────────────────
@@ -172,6 +181,9 @@ struct AuditFinding {
     component: Option<String>,
     issue: String,
     recommendation: String,
+    /// The rule that classified the pin, part or rail this finding is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classified_by: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -248,9 +260,12 @@ async fn handle_audit_decoupling_file(
     let mut findings = Vec::new();
     let mut pass_count = 0;
     let mut total_power_pins = 0;
+    let mut ground_pins_skipped = 0;
+    let mut pins_by_rule: BTreeMap<&'static str, usize> = BTreeMap::new();
 
     // Collect all capacitor references and their net connections
-    let (cap_roots, _) = capacitor_nets(&mut graph, &placed);
+    let caps = capacitor_nets(&mut graph, &placed);
+    let cap_roots = caps.all;
 
     // For each IC (non-passive, non-connector component), check power pins
     for (inst, pins) in &placed {
@@ -262,23 +277,43 @@ async fn handle_audit_decoupling_file(
             || inst.lib_id.contains("Jack")
             || inst.lib_id.contains("Header");
 
-        if is_passive || is_connector {
+        // Power symbols and flags (`#PWR01`, `#FLG01`) carry a hidden
+        // `power_in` pin that names the rail; they are not parts to decouple.
+        let is_virtual = inst.reference.starts_with('#') || inst.lib_id.starts_with("power:");
+
+        if is_passive || is_connector || is_virtual {
             continue;
         }
 
-        // Find power pins (power_in type, or named VCC/VDD/VBUS/3V3/etc.)
+        // Power pins: KiCad's `power_in` type, or a VCC/VDD/3V3-style name on
+        // a pin typed only `passive` or `unspecified`.
         for (pin, transform) in pins {
-            let is_power_pin = is_power_pin_name(&pin.name);
-            if !is_power_pin {
+            let Some(rule) = component_class::power_pin_rule(&pin.electrical_type, &pin.name)
+            else {
                 continue;
-            }
-            total_power_pins += 1;
+            };
 
             // Get the endpoint position of this power pin
             let (px, py) = pin_endpoint(pin, *transform);
+            let pin_root = graph.root_at(px, py);
+
+            // A power input on ground (GND, VSS) is the capacitor's other end,
+            // not a pin that needs one. Its net's names decide when it has
+            // any; an unnamed net falls back to the pin's own name.
+            let net_names = graph.aliases_of_root(pin_root);
+            let on_ground = if net_names.is_empty() {
+                component_class::is_ground_name(&pin.name)
+            } else {
+                net_names.iter().any(|n| component_class::is_ground_name(n))
+            };
+            if on_ground {
+                ground_pins_skipped += 1;
+                continue;
+            }
+            total_power_pins += 1;
+            *pins_by_rule.entry(rule).or_insert(0) += 1;
 
             // Check if there's a capacitor connected to a net that this pin is on
-            let pin_root = graph.root_at(px, py);
 
             if cap_roots.contains(&pin_root) {
                 pass_count += 1;
@@ -301,6 +336,7 @@ async fn handle_audit_decoupling_file(
                         "Add a 100nF ceramic capacitor close to {} pin '{}'",
                         inst.reference, pin.name
                     ),
+                    classified_by: Some(rule),
                 });
             }
         }
@@ -314,6 +350,9 @@ async fn handle_audit_decoupling_file(
             "findings": findings,
             "pass_count": pass_count,
             "total_power_pins": total_power_pins,
+            "ground_pins_skipped": ground_pins_skipped,
+            "power_pins_by_rule": pins_by_rule,
+            "capacitors_by_rule": caps.by_rule,
             "summary": format!(
                 "{}/{} power pins have decoupling. {} issues found.",
                 pass_count, total_power_pins, findings.len()
@@ -368,6 +407,7 @@ async fn handle_audit_connections_file(
                                     "Add a 4.7k pull-up resistor from {} to VCC",
                                     net_name
                                 ),
+                                classified_by: None,
                             });
                         }
                     }
@@ -398,6 +438,7 @@ async fn handle_audit_connections_file(
                                 "Add a 10k pull-up resistor from {} to VCC with 100nF cap to GND",
                                 net_name
                             ),
+                            classified_by: None,
                         });
                     }
                 }
@@ -436,7 +477,8 @@ async fn handle_audit_power_rails_file(
     let rails = power_rails(&mut graph, &labels);
 
     // Check each power net for bulk capacitance
-    let (cap_roots, bulk_cap_roots) = capacitor_nets(&mut graph, &placed);
+    let caps = capacitor_nets(&mut graph, &placed);
+    let (cap_roots, bulk_cap_roots) = (&caps.all, &caps.bulk);
 
     for rail in &rails {
         let PowerRail {
@@ -453,6 +495,7 @@ async fn handle_audit_power_rails_file(
                 component: None,
                 issue: format!("Power rail '{}' has no decoupling capacitors", net),
                 recommendation: format!("Add at least one 100nF ceramic cap on the '{}' rail", net),
+                classified_by: Some(rail.classified_by),
             });
         } else if !bulk_cap_roots.contains(root) {
             findings.push(AuditFinding {
@@ -464,6 +507,7 @@ async fn handle_audit_power_rails_file(
                     "Add a 10uF or larger electrolytic/ceramic cap on the '{}' rail near the power source",
                     net
                 ),
+                classified_by: Some(rail.classified_by),
             });
         }
     }
@@ -484,6 +528,7 @@ async fn handle_audit_power_rails_file(
                 component: None,
                 issue: format!("Power rail '{}' has no test point", net),
                 recommendation: format!("Add a test point on '{}' for debugging", net),
+                classified_by: Some(rail.classified_by),
             });
         }
     }
@@ -492,6 +537,12 @@ async fn handle_audit_power_rails_file(
         serde_json::to_string(&json!({
             "audit": "power_rails",
             "power_nets": rails.iter().map(|rail| &rail.name).collect::<Vec<_>>(),
+            "rails_by_rule": rails.iter().fold(BTreeMap::<&str, usize>::new(), |mut m, rail| {
+                *m.entry(rail.classified_by).or_insert(0) += 1;
+                m
+            }),
+            "capacitors_by_rule": caps.by_rule,
+            "capacitor_values_unparsed": caps.unparsed,
             "findings": findings,
             "summary": format!("{} power rail issues found across {} rails.", findings.len(), rails.len())
         }))
@@ -506,29 +557,44 @@ async fn handle_audit_manufacturing(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
-    info!(board = %board_path.display(), fab_house = %fab_house, "[BETA] Running DFM audit");
+    let requested_house = args["fab_house"].as_str();
+    info!(board = %board_path.display(), fab_house = ?requested_house, "[BETA] Running DFM audit");
 
-    let content = tokio::fs::read_to_string(&board_path).await?;
-    let tree = parse_sexp(&content)?;
-
-    let mut findings = Vec::new();
-
-    // Get fab constraints for the target fab house
-    let (min_trace, _min_space, _min_drill, _min_annular) = match fab_house {
-        "jlcpcb" => (0.127, 0.127, 0.3, 0.13), // JLCPCB standard capability
-        "pcbway" => (0.1, 0.1, 0.2, 0.1),
-        "oshpark" => (0.152, 0.152, 0.254, 0.127), // 6mil/6mil
-        _ => (0.15, 0.15, 0.3, 0.13),
-    };
-
-    // The board outline: does it exist and close, and does everything sit
-    // inside it? This used to test for the string "Edge.Cuts", which every
-    // KiCad 6+ board contains in its layer table, so it could never fire.
     let edge_mount = match crate::tools::board_geometry::parse_allowlist(args) {
         Ok(list) => list,
         Err(refusal) => return Ok(refusal),
     };
+
+    let content = tokio::fs::read_to_string(&board_path).await?;
+    let tree = parse_sexp(&content)?;
+
+    // The design-intent fab target, when one is recorded next to the board.
+    let project_dir = board_path.parent().unwrap_or(Path::new("."));
+    let intent_path = crate::tools::design_intent::design_intent_path(project_dir);
+    let (intent, intent_note) = match crate::tools::design_intent::read_design_intent(&intent_path)
+    {
+        crate::tools::design_intent::IntentRead::Loaded { intent, .. } => (Some(intent), None),
+        crate::tools::design_intent::IntentRead::Absent => (None, None),
+        crate::tools::design_intent::IntentRead::Unusable { reason } => (
+            None,
+            Some(format!(
+                "the design-intent record at '{}' cannot be used ({reason}); its fab target was ignored",
+                intent_path.display()
+            )),
+        ),
+    };
+    let mut limits = crate::tools::dfm::fab_limits(
+        requested_house,
+        intent.as_ref().and_then(|i| i.fab_target.as_ref()),
+    );
+    limits.notes.extend(intent_note);
+    let fab_house = limits.house.clone();
+
+    let mut findings = Vec::new();
+
+    // The board outline: does it exist and close, and does everything sit
+    // inside it? This used to test for the string "Edge.Cuts", which every
+    // KiCad 6+ board contains in its layer table, so it could never fire.
     let geometry = konnect_sexp::board_geometry::BoardGeometry::from_tree(&tree);
     let outline_check = geometry.outline_check(&edge_mount);
     findings.extend(
@@ -540,8 +606,43 @@ async fn handle_audit_manufacturing(
                 component: i.component,
                 issue: i.issue,
                 recommendation: i.fix,
+                classified_by: None,
             }),
     );
+
+    // Geometry against the fab limits. These replace a "silkscreen overlap"
+    // check that compared footprint anchors under 1 mm apart, and a trace
+    // width check that read a setup key KiCad 6+ boards never write: their
+    // rules live in the .kicad_pro.
+    let mut dfm = crate::tools::dfm::check_board(&geometry, &limits);
+    let project_path = board_path.with_extension("kicad_pro");
+    match crate::tools::verification::project_json_guard::project_source(&project_path)
+        .and_then(|text| crate::tools::verification::project_json_guard::parse(&text))
+    {
+        Ok(project) => crate::tools::dfm::check_rule_minimums(&project, &limits, &mut dfm),
+        Err(error) => {
+            dfm.checks.insert(
+                "project_rule_minimums",
+                crate::tools::dfm::Coverage::not_checked(format!(
+                    "no readable project file at '{}': {error}",
+                    project_path.display()
+                )),
+            );
+        }
+    }
+    let mut dfm_findings: Vec<Value> = Vec::new();
+    for issue in dfm.issues {
+        let mut finding = serde_json::to_value(AuditFinding {
+            severity: issue.severity,
+            category: "dfm",
+            component: issue.component,
+            issue: issue.issue,
+            recommendation: issue.fix,
+            classified_by: None,
+        })?;
+        finding["location"] = issue.at;
+        dfm_findings.push(finding);
+    }
 
     // Check for footprints on both sides (assembly complexity)
     let fps = tree.find_all("footprint");
@@ -571,44 +672,32 @@ async fn handle_audit_manufacturing(
                 front_count, back_count
             ),
             recommendation: "Verify your fab house supports dual-side assembly. JLCPCB charges extra for back-side SMT.".to_string(),
+            classified_by: None,
         });
     }
 
-    // Check for silkscreen overlapping pads
-    let silkscreen_issues = check_silkscreen_overlap(&content, &tree);
-    findings.extend(silkscreen_issues);
-
-    // Check design rules in setup section
-    let _setup = tree.find("setup");
-    if let Some(_setup) = _setup {
-        // Check trace width
-        if let Some(trace_min) = find_design_rule_value(&content, "min_trace_width") {
-            if trace_min < min_trace {
-                findings.push(AuditFinding {
-                    severity: "error",
-                    category: "dfm",
-                    component: None,
-                    issue: format!(
-                        "Minimum trace width ({:.3}mm) is below {} capability ({:.3}mm)",
-                        trace_min, fab_house, min_trace
-                    ),
-                    recommendation: format!(
-                        "Increase minimum trace width to at least {:.3}mm",
-                        min_trace
-                    ),
-                });
-            }
-        }
-    }
+    let mut all_findings: Vec<Value> = findings
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    all_findings.extend(dfm_findings);
+    let mut checks = serde_json::to_value(&dfm.checks)?;
+    checks["outline"] = json!({ "status": "checked" });
+    let skipped = &geometry.skipped;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "manufacturing",
             "fab_house": fab_house,
+            "fab_limits": limits.to_json(),
             "components": { "front": front_count, "back": back_count },
             "outline": crate::tools::board_geometry::outline_check_json(&outline_check, &geometry.outline),
-            "findings": findings,
-            "summary": format!("{} DFM issues found for {}.", findings.len(), fab_house)
+            "checks": checks,
+            "delegated_to_drc": crate::tools::dfm::DELEGATED_TO_DRC,
+            "not_checked": crate::tools::dfm::NOT_CHECKED,
+            "items_unreadable": skipped,
+            "findings": all_findings,
+            "summary": format!("{} DFM issues found for {}.", all_findings.len(), fab_house)
         }))
         .unwrap(),
     ))
@@ -1139,6 +1228,7 @@ async fn handle_run_design_review(
 
     let mut board_coverage = None;
     let mut drc_summary = None;
+    let mut current_audit = json!({ "status": "not_run", "reason": "no_board" });
     if let Some(board) = args["board"].as_str() {
         let board_path = PathBuf::from(board);
         match inspect_board_coverage(&board_path) {
@@ -1179,6 +1269,29 @@ async fn handle_run_design_review(
         let result = handle_audit_manufacturing(args, ctx).await;
         manufacturing.record(&board_path, result, &mut diagnostics);
         audits.push(manufacturing);
+
+        // Routed copper against the recorded currents. With no record, or no
+        // currents in it, the audit has nothing to check: that is reported
+        // under coverage, not as a failure, so a design that never recorded
+        // currents is not made INCOMPLETE by it.
+        let current = crate::tools::trace_current::audit(&board_path, None);
+        match current
+            .as_ref()
+            .ok()
+            .filter(|r| !r.is_error)
+            .and_then(|r| audit_result_json(r.clone()).ok())
+            .and_then(|body| body["status"].as_str().map(str::to_string))
+        {
+            Some(status) if status != "checked" => {
+                current_audit = json!({ "status": "not_run", "reason": status });
+            }
+            _ => {
+                let mut trace = AuditAggregate::new("trace_current");
+                trace.record(&board_path, current, &mut diagnostics);
+                current_audit = json!({ "status": trace.status() });
+                audits.push(trace);
+            }
+        }
 
         // KiCad's own DRC is the authority on whether a board is clean, and
         // this review never asked it. It ran four schematic audits plus a DFM
@@ -1362,6 +1475,9 @@ async fn handle_run_design_review(
                     // is INCOMPLETE. Never zero: this review must not be able to
                     // imply a clean board it did not check.
                     "drc": drc_summary,
+                    // `complete`/`partial`/`failed`, or `not_run` with why: no board,
+                    // no design-intent record, or no currents recorded in it.
+                    "trace_current": current_audit,
                     "diagnostics": diagnostics
                 }
             }))
@@ -1412,6 +1528,7 @@ async fn handle_check_bom_health_file(
                 issue: format!("{} has no value assigned", reference),
                 recommendation: "Set the component value (e.g., '100nF', '10k', 'STM32F411')"
                     .to_string(),
+                classified_by: None,
             });
         }
 
@@ -1425,6 +1542,7 @@ async fn handle_check_bom_health_file(
                 component: Some(reference.to_owned()),
                 issue: format!("{} ({}) has no footprint assigned", reference, value),
                 recommendation: "Assign a footprint before PCB layout".to_string(),
+                classified_by: None,
             });
         }
 
@@ -1443,6 +1561,7 @@ async fn handle_check_bom_health_file(
                 recommendation:
                     "Add an MPN property for accurate BOM generation and supply chain lookup"
                         .to_string(),
+                classified_by: None,
             });
         }
     }
@@ -1465,27 +1584,6 @@ async fn handle_check_bom_health_file(
 }
 
 // ─── Helper functions ────────────────────────────────────────────────────────
-
-fn is_power_pin_name(name: &str) -> bool {
-    let upper = name.to_uppercase();
-    upper.starts_with("VCC")
-        || upper.starts_with("VDD")
-        || upper.starts_with("VBUS")
-        || upper.starts_with("V+")
-        || upper.starts_with("VIN")
-        || upper.starts_with("3V3")
-        || upper.starts_with("5V")
-        || upper.starts_with("1V")
-        || upper.starts_with("2V")
-        || upper == "AVCC"
-        || upper == "AVDD"
-        || upper == "DVCC"
-        || upper == "DVDD"
-        || upper.starts_with("VCAP")
-        || upper.starts_with("VREF")
-        || upper.contains("POWER")
-        || upper.contains("PWR")
-}
 
 fn has_i2c_pins(pins: &[PlacedPin]) -> bool {
     let names: Vec<String> = pins.iter().map(|(p, _)| p.name.to_uppercase()).collect();
@@ -1527,46 +1625,48 @@ fn pin_net_roots(graph: &mut NetGraph, pins: &[PlacedPin]) -> HashSet<NetRoot> {
         .collect()
 }
 
-/// `C1` is a capacitor, `CN1` is a connector.
-fn is_capacitor(inst: &konnect_sexp::schematic::SymbolInstance) -> bool {
-    inst.reference.starts_with('C') && !inst.reference.starts_with("CN")
+/// Nets with a capacitor on them, the subset carrying bulk capacitance
+/// (>= 10 µF), and how each capacitor was recognised.
+struct CapacitorNets {
+    all: HashSet<NetRoot>,
+    bulk: HashSet<NetRoot>,
+    /// Capacitors per classification rule.
+    by_rule: BTreeMap<&'static str, usize>,
+    /// References of capacitors whose value did not parse, so their bulk
+    /// status is unknown rather than silently "not bulk".
+    unparsed: Vec<String>,
 }
 
-/// Whether a capacitor's value reads as bulk capacitance (>= 10uF).
-///
-/// The `10µ`/`22µ`/`47µ` arms never match — `to_uppercase` maps U+00B5 MICRO
-/// SIGN to Greek `Μ`. Left as found: that is a value-parsing bug, not a
-/// net-resolution one.
-fn is_bulk_capacitor_value(value: &str) -> bool {
-    let upper = value.to_uppercase();
-    upper.contains("10U")
-        || upper.contains("22U")
-        || upper.contains("47U")
-        || upper.contains("100U")
-        || upper.contains("220U")
-        || upper.contains("470U")
-        || upper.contains("1000U")
-        || upper.contains("10µ")
-        || upper.contains("22µ")
-        || upper.contains("47µ")
-}
-
-/// Nets with a capacitor on them, and the subset carrying bulk capacitance
-/// (>= 10uF). One pass, since the second is a subset of the first.
-fn capacitor_nets(
-    graph: &mut NetGraph,
-    placed: &[PlacedUnit],
-) -> (HashSet<NetRoot>, HashSet<NetRoot>) {
-    let mut all = HashSet::new();
-    let mut bulk = HashSet::new();
-    for (inst, pins) in placed.iter().filter(|(inst, _)| is_capacitor(inst)) {
-        let nets = pin_net_roots(graph, pins);
-        if is_bulk_capacitor_value(&inst.value) {
-            bulk.extend(nets.iter().cloned());
+/// One pass over the placed units, since bulk is a subset of all.
+fn capacitor_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> CapacitorNets {
+    let mut caps = CapacitorNets {
+        all: HashSet::new(),
+        bulk: HashSet::new(),
+        by_rule: BTreeMap::new(),
+        unparsed: Vec::new(),
+    };
+    let mut seen_refs: HashSet<&str> = HashSet::new();
+    for (inst, pins) in placed {
+        let Some(rule) = component_class::capacitor_rule(&inst.lib_id, &inst.reference) else {
+            continue;
+        };
+        let first_unit = seen_refs.insert(inst.reference.as_str());
+        if first_unit {
+            *caps.by_rule.entry(rule).or_insert(0) += 1;
         }
-        all.extend(nets);
+        let nets = pin_net_roots(graph, pins);
+        match component_class::parse_si_value(&inst.value) {
+            Some(farads) if component_class::is_bulk_capacitance(farads) => {
+                caps.bulk.extend(nets.iter().cloned());
+            }
+            Some(_) => {}
+            None if first_unit => caps.unparsed.push(inst.reference.clone()),
+            None => {}
+        }
+        caps.all.extend(nets);
     }
-    (all, bulk)
+    caps.unparsed.sort();
+    caps
 }
 
 /// Nets with a test point on them.
@@ -1618,6 +1718,9 @@ struct PowerRail {
     /// symbol calls `GND` and a global label calls `RETURN` is still ground,
     /// even though the global label wins the name.
     names: BTreeSet<String>,
+    /// `power_symbol` when a power symbol names the net, else `label_name`
+    /// (a label whose name reads like a rail).
+    classified_by: &'static str,
 }
 
 impl PowerRail {
@@ -1645,18 +1748,29 @@ fn power_rails(graph: &mut NetGraph, labels: &[Label]) -> Vec<PowerRail> {
     // asked in that order. Collecting names while deciding made the answer
     // depend on label order: a rail claimed by the `+3V3` symbol lost the `VCC`
     // label read before it.
-    let mut rail_roots: BTreeSet<NetRoot> = BTreeSet::new();
+    let mut rail_roots: BTreeMap<NetRoot, &'static str> = BTreeMap::new();
     for label in labels
         .iter()
         .filter(|label| label.kind == LabelKind::PowerSymbol || is_power_net_name(&label.net))
     {
-        rail_roots.insert(graph.root_at(label.x, label.y));
+        let rule = if label.kind == LabelKind::PowerSymbol {
+            "power_symbol"
+        } else {
+            "label_name"
+        };
+        let entry = rail_roots
+            .entry(graph.root_at(label.x, label.y))
+            .or_insert(rule);
+        if rule == "power_symbol" {
+            *entry = rule;
+        }
     }
     let mut rails: Vec<PowerRail> = rail_roots
         .into_iter()
-        .map(|root| {
+        .map(|(root, classified_by)| {
             let names = graph.aliases_of_root(root);
             PowerRail {
+                classified_by,
                 name: graph
                     .name_of_root(root)
                     .or_else(|| names.iter().next().cloned())
@@ -1683,63 +1797,6 @@ fn is_power_net_name(name: &str) -> bool {
         || upper == "AGND"
         || upper.starts_with("+")
         || upper.starts_with("V+")
-}
-
-fn check_silkscreen_overlap(
-    _content: &str,
-    tree: &konnect_sexp::parser::SexpNode,
-) -> Vec<AuditFinding> {
-    // Simplified check: look for footprints that are very close together
-    // A full implementation would check bounding boxes of silkscreen elements
-    let fps = tree.find_all("footprint");
-    let mut findings = Vec::new();
-
-    let positions: Vec<(String, f64, f64)> = fps
-        .iter()
-        .filter_map(|fp| {
-            let reference = fp
-                .find_all("property")
-                .iter()
-                .find(|p| p.get(1).and_then(|n| n.as_str()) == Some("Reference"))
-                .and_then(|p| p.get(2))
-                .and_then(|n| n.as_str())?
-                .to_string();
-            let at = fp.find("at")?;
-            let x = at.get_f64(1)?;
-            let y = at.get_f64(2)?;
-            Some((reference, x, y))
-        })
-        .collect();
-
-    for i in 0..positions.len() {
-        for j in (i + 1)..positions.len() {
-            let (ref ref_a, xa, ya) = positions[i];
-            let (ref ref_b, xb, yb) = positions[j];
-            let dist = ((xa - xb).powi(2) + (ya - yb).powi(2)).sqrt();
-            if dist < 1.0 {
-                // Less than 1mm apart
-                findings.push(AuditFinding {
-                    severity: "warning",
-                    category: "dfm",
-                    component: Some(format!("{}, {}", ref_a, ref_b)),
-                    issue: format!(
-                        "{} and {} are only {:.2}mm apart — possible silkscreen overlap or assembly issue",
-                        ref_a, ref_b, dist
-                    ),
-                    recommendation: "Increase spacing between components to at least 1mm for reliable assembly".to_string(),
-                });
-            }
-        }
-    }
-    findings
-}
-
-fn find_design_rule_value(content: &str, rule_name: &str) -> Option<f64> {
-    let pat = format!("({} ", rule_name);
-    let pos = content.find(&pat)?;
-    let after = &content[pos + pat.len()..];
-    let end = after.find(')')?;
-    after[..end].trim().parse().ok()
 }
 
 fn extract_findings(result: &CallToolResult) -> Result<Vec<Value>, String> {
@@ -2323,6 +2380,62 @@ mod review_completion_tests {
             .unwrap()
             .iter()
             .any(|item| item["code"] == "drc_unavailable"));
+    }
+
+    /// The review runs the current audit when the design-intent record holds
+    /// currents, and says it did not run (without making the review
+    /// INCOMPLETE on that account) when there is no record.
+    #[tokio::test]
+    async fn the_review_reports_whether_the_current_audit_ran() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("clean.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(&board, crate::tools::dfm::tests::board("")).unwrap();
+
+        let without = review(&root, Some(&board)).await;
+        assert_eq!(
+            without["design_review"]["trace_current"],
+            json!({ "status": "not_run", "reason": "no_design_intent" }),
+            "{without}"
+        );
+        assert!(!without["design_review"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["audit"] == "trace_current"));
+
+        let intent = crate::tools::design_intent::design_intent_path(tmp.path());
+        std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+        std::fs::write(
+            &intent,
+            json!({ "schema_version": 1, "currents": [{ "net": "N1", "max_current_a": 3.0 }] })
+                .to_string(),
+        )
+        .unwrap();
+        let with = review(&root, Some(&board)).await;
+        let report = &with["design_review"];
+        assert_eq!(report["trace_current"]["status"], "complete", "{with}");
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["audit"] == "trace_current" && f["severity"] == "error"),
+            "{with}"
+        );
+
+        // A record that cannot be read is a failed audit, not a silent skip.
+        std::fs::write(&intent, "{ not json").unwrap();
+        let broken = review(&root, Some(&board)).await;
+        assert_eq!(
+            broken["design_review"]["trace_current"]["status"], "failed",
+            "{broken}"
+        );
     }
 
     /// #246: `find_all` is direct-children-only and pads are nested, so the
@@ -3171,5 +3284,136 @@ mod outline_audit_tests {
         .await
         .unwrap();
         assert!(result.is_error);
+    }
+}
+
+#[cfg(test)]
+mod honest_dfm_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn body(result: CallToolResult) -> Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn project(rules: Value, intent: Option<Value>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("demo.kicad_pcb");
+        std::fs::write(&board, crate::tools::dfm::tests::board("")).unwrap();
+        std::fs::write(
+            dir.path().join("demo.kicad_pro"),
+            serde_json::to_string(&json!({ "board": { "design_settings": { "rules": rules } } }))
+                .unwrap(),
+        )
+        .unwrap();
+        if let Some(intent) = intent {
+            let path = crate::tools::design_intent::design_intent_path(dir.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, intent.to_string()).unwrap();
+        }
+        (dir, board)
+    }
+
+    fn issues(report: &Value) -> Vec<String> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["issue"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The served audit reports every check's coverage, what it leaves to DRC,
+    /// and no longer the anchor-distance "silkscreen overlap" guess.
+    #[tokio::test]
+    async fn the_audit_says_what_it_checked_and_what_it_left_to_drc() {
+        let (_dir, board) = project(json!({ "min_track_width": 0.1 }), None);
+        let report = body(
+            handle_audit_manufacturing(&json!({ "board": board }), &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(report["fab_house"], "jlcpcb");
+        for check in [
+            "track_width",
+            "via_size",
+            "pad_holes",
+            "via_in_pad",
+            "acid_trap",
+            "project_rule_minimums",
+            "outline",
+        ] {
+            assert_eq!(
+                report["checks"][check]["status"], "checked",
+                "{check}: {report}"
+            );
+        }
+        assert!(report["delegated_to_drc"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("silk_over_copper")));
+        let issues = issues(&report);
+        assert!(issues
+            .iter()
+            .all(|i| !i.contains("possible silkscreen overlap")));
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("minimum track width rule (0.100 mm)")));
+        assert!(issues.iter().any(|i| i.contains("via-in-pad")));
+        // Each grouped geometry finding says where to look.
+        let narrow = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["issue"].as_str().unwrap().contains("track segment"))
+            .unwrap();
+        assert_eq!(narrow["location"]["uuids"], json!(["t-narrow"]));
+    }
+
+    #[tokio::test]
+    async fn the_design_intent_fab_target_chooses_the_house_and_its_minimums() {
+        let intent = json!({ "schema_version": 1, "fab_target": {
+            "house": "pcbway", "min_track_mm": 0.09
+        }});
+        let (_dir, board) = project(json!({}), Some(intent));
+        let report = body(
+            handle_audit_manufacturing(&json!({ "board": board }), &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(report["fab_house"], "pcbway");
+        assert_eq!(report["fab_limits"]["min_track_mm"]["mm"], 0.09);
+        assert_eq!(
+            report["fab_limits"]["min_track_mm"]["source"],
+            "design_intent"
+        );
+        assert_eq!(
+            report["fab_limits"]["min_via_drill_mm"]["source"],
+            "built_in_table"
+        );
+        assert!(issues(&report)
+            .iter()
+            .all(|i| !i.contains("minimum track width 0.")));
+    }
+
+    #[tokio::test]
+    async fn a_board_without_a_project_file_says_the_rule_check_did_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("lonely.kicad_pcb");
+        std::fs::write(&board, crate::tools::dfm::tests::board("")).unwrap();
+        let report = body(
+            handle_audit_manufacturing(&json!({ "board": board }), &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            report["checks"]["project_rule_minimums"]["status"],
+            "not_checked"
+        );
     }
 }

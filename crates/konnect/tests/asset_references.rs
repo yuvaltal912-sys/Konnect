@@ -657,6 +657,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // Manufacturing and trace-current response fields and statuses
+        // (creation PR 11).
+        "fab_limits",
+        "delegated_to_drc",
+        "not_checked",
+        "no_currents_recorded",
         // Checkpoint and readiness response fields (creation PR 14).
         "edit_route",
         // Placement PR 8 response fields, not callable tool names.

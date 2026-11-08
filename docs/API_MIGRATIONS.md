@@ -18,6 +18,43 @@ rule, ERC sheet and sorted item identities; severity, prose and positions are
 not in it. Repeats get `~2`, `~3`. A compare re-keys the stored violations with
 the running binary's rule, so a later key change cannot mismatch old files.
 
+## Unreleased: honest manufacturing review and trace current audit
+
+Creation PR 11 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains
+`audit_trace_current(board, default_temp_rise_c?)`. Existing tools keep their
+arguments; their results and some verdicts change:
+
+- **`audit_manufacturing`** no longer emits "possible silkscreen overlap" for
+  footprint anchors under 1 mm apart, and no longer reads `min_trace_width` from
+  the board's `setup` (KiCad 6+ never writes it). It now checks track widths, via
+  drill, diameter and annular ring, through-hole drills and plated pad rings,
+  via-in-pad on SMD pads, track-to-track acid traps and the `.kicad_pro` DRC
+  minimums against the fab, so a board that passed before can now fail. New
+  fields: `fab_limits` (each value with its `source`), `checks`,
+  `delegated_to_drc`, `not_checked`, `items_unreadable`, and `location` on
+  geometry findings. `fab_house` has no schema default: omitted, the design-intent
+  fab target's house is used, else `jlcpcb` as before. The design-intent record's
+  own minimums replace the built-in table for that house.
+- **`audit_decoupling`** takes power pins from KiCad's `power_in` type; a
+  `VCC`-style name counts only on a pin typed `passive` or `unspecified`. A typed
+  `power_in` pin with an unusual name is now audited, a typed `input` named
+  `VREF` no longer is, and pins on ground nets and power symbols are skipped
+  (`ground_pins_skipped`). Findings carry `classified_by`; the result adds
+  `power_pins_by_rule` and `capacitors_by_rule`.
+- **Capacitor and value classification** (`audit_decoupling`,
+  `audit_power_rails`, `run_design_review`): a capacitor is a `Device:C`-style
+  library symbol, else a `C<digit>` reference, so `CR1` is no longer one. Values
+  go through one SI parser (`100n`, `4u7`, `0.1µF`, `10uF/25V`); `µ` values now
+  count as bulk. `audit_power_rails` adds `rails_by_rule`, `capacitors_by_rule`
+  and `capacitor_values_unparsed`. `score_placement`'s decoupling families read
+  values through the same parser, so `0.1µF`, `1 µF` and `100nF/50V` now match
+  their family.
+- **`run_design_review`** with a board also runs `audit_trace_current`. Its
+  findings join the verdict under audit `trace_current`, and
+  `design_review.trace_current` says whether it ran. No record, or no currents
+  in it, is `not_run` and does not make the review incomplete; an unusable
+  record is a failed audit and does.
+
 ## Unreleased: project checkpoints and edit readiness
 
 Creation PR 14 (`docs/CREATION_HANDOFF.md`). The `project` toolset (starter kit)

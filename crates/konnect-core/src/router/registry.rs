@@ -130,9 +130,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "design_review",
-        description: "AI-powered design audits: decoupling, connections, power rails, DFM, BOM health",
+        description: "AI-powered design audits: decoupling, connections, power rails, DFM, trace current, BOM health",
         category: "review",
-        tool_count: 6,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "templates",

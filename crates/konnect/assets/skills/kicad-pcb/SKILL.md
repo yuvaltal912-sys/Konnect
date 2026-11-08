@@ -87,6 +87,9 @@ Always call `get_active_toolsets()` first to see what is already loaded.
   the required calculation inputs and acceptance record; it is not a lookup table.
   Take the net's current, temperature rise and copper weight from
   `get_design_intent` when they are recorded, and say which inputs were not.
+  After routing, `audit_trace_current(board)` checks every segment and via of
+  those nets against IPC-2221; it covers the thermal limit only, not voltage
+  drop.
 - Read [`references/design-rules.md`](references/design-rules.md) when creating
   netclasses, configuring project constraints, or adjudicating DRC results.
 
