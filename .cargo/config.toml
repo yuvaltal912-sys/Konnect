@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Test processes never append to the owner's real call log (finding C1). Cargo
+# passes this to everything it runs, `cargo test` and `cargo run` included, and
+# children inherit it. Set KONNECT_CALL_LOG to an absolute path to keep a log.
+[env]
+KONNECT_CALL_LOG = "off"
