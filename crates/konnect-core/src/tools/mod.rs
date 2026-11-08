@@ -23,6 +23,7 @@ mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
+mod layout_quality;
 mod jlcpcb_midpoints;
 mod lcsc_packages;
 pub mod library;
