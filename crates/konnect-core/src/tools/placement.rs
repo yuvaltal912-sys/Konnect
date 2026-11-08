@@ -1947,18 +1947,19 @@ type Obstacle = ((f64, f64), (f64, f64), Side);
 /// The distance limit for a capacitor value's decoupling family, `None` for
 /// values outside the three families. `100nF`/`0.1uF` bypass caps belong at
 /// the pin (2.5 mm); `1uF` bulk-ish caps within 5 mm; `10uF` bulk within
-/// 10 mm. Case-insensitive, tolerant of a trailing F and of `µ` for `u`.
+/// 10 mm. The value goes through the shared SI parser, so `0.1µF`, `100n`,
+/// `1 µF`, `1000nF` and `10uF/25V` all land in their family.
 fn decoupling_limit_mm(value: &str) -> Option<f64> {
-    let normalized = value.trim().to_ascii_lowercase().replace('µ', "u");
-    let family = match normalized.strip_suffix('f') {
-        Some(stripped) => stripped,
-        None => normalized.as_str(),
-    };
-    match family {
-        "100n" | "0.1u" | ".1u" => Some(2.5),
-        "1u" | "1000n" => Some(5.0),
-        "10u" => Some(10.0),
-        _ => None,
+    let farads = super::component_class::parse_si_value(value)?;
+    let is = |nominal: f64| (farads - nominal).abs() <= nominal * 1e-6;
+    if is(100e-9) {
+        Some(2.5)
+    } else if is(1e-6) {
+        Some(5.0)
+    } else if is(10e-6) {
+        Some(10.0)
+    } else {
+        None
     }
 }
 

@@ -70,7 +70,7 @@ pub(crate) fn parse(source: &str) -> anyhow::Result<Value> {
 }
 
 /// Read a saved project without treating missing, unreadable or linked files as defaults.
-pub(super) fn project_source(path: &std::path::Path) -> anyhow::Result<String> {
+pub(crate) fn project_source(path: &std::path::Path) -> anyhow::Result<String> {
     let metadata = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(
         metadata.file_type().is_file(),

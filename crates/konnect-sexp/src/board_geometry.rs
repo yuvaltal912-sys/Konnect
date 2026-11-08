@@ -246,6 +246,13 @@ pub struct PadGeom {
     pub at: Pt,
     pub pin_function: Option<String>,
     pub through_hole: bool,
+    /// KiCad's pad type: `smd`, `thru_hole`, `np_thru_hole` or `connect`.
+    pub kind: String,
+    /// The pad's `(size w h)` in its own frame, in mm.
+    pub size: (f64, f64),
+    /// The smallest drill dimension in mm (an oval drill's minor axis), or
+    /// `None` when the pad has no drill.
+    pub drill: Option<f64>,
     /// The shape is a box standing in for a custom-pad geometry.
     pub approximate: bool,
 }
@@ -571,6 +578,17 @@ fn read_footprint(
     })
 }
 
+/// The smallest positive dimension of a `(drill d)` or `(drill oval w h)`.
+fn drill_minor(drill: &SexpNode) -> Option<f64> {
+    drill
+        .children()?
+        .iter()
+        .skip(1)
+        .filter_map(|n| n.as_str()?.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .reduce(f64::min)
+}
+
 fn finite(v: f64) -> Option<f64> {
     v.is_finite().then_some(v)
 }
@@ -661,6 +679,9 @@ fn read_pad(
         at: (cx, cy),
         pin_function: pad.find_str("pinfunction").map(str::to_string),
         through_hole: matches!(kind, "thru_hole" | "np_thru_hole"),
+        kind: kind.to_string(),
+        size: (w, h),
+        drill: pad.find("drill").and_then(drill_minor),
         approximate,
     })
 }
