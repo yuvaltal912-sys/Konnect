@@ -24,6 +24,82 @@ Creation rank 32 part 2 (B34, D24; `docs/CREATION_HANDOFF.md`). Additive.
 - `setup`'s download step and `version_policy` text name the recommended
   release instead of "the latest 2.x".
 
+## Unreleased: Specctra DSN for real boards
+
+Creation PR 16 (`docs/CREATION_HANDOFF.md`). No tool arguments change.
+`export_specctra_dsn` accepts more boards and writes some existing ones
+differently; `plan_specctra_ses_import` and `apply_specctra_ses` accept the
+matching manifests. Old manifests (two layers, front side) still import.
+
+- **Copper layers:** 2 to 32 in stack order (`F.Cu`, `In1.Cu`…, `B.Cu`).
+  A KiCad `power` layer is written as a Specctra `power` layer, which the router
+  keeps tracks off. `jumper` layers, gaps in the inner numbering and odd counts
+  are refused. Locked tracks may sit on any copper layer; a locked through via
+  is accepted whatever the stack. Manifest: `layers[].dsn_type`,
+  `supported_profile.copper_layers` is the real count.
+- **Back-side parts:** written as front placements whose pads sit at their
+  true board positions on B.Cu (the file already stores them mirrored), so the
+  router never mirrors anything. Manifest: `components[].kicad_side`, and
+  `supported_profile.component_side` is `front_and_back` when any part is on
+  the back. KiCad's native exporter is not adopted for such boards; `prefer`
+  falls back to the Rust exporter and `require` refuses.
+- **Pad orientation fix:** a pin's `rotate` is now the pad angle relative to
+  its part. It was the board-space angle, so a part turned 90° or 270° had its
+  non-square pads turned twice in the router. DSNs of such boards change.
+- **Placement angle fix:** placements are written with angles in [0, 360),
+  and the SES importer compares directions. Freerouting writes a `-90`
+  placement back as `270`, so every board with a part at a negative angle was
+  refused as "SES changes placement"; older manifests still import.
+- **Drill offset fix:** `(drill d (offset x y))` now moves the padstack copper.
+  It was ignored (the exporter looked for the offset on the pad), so offset
+  copper sat on its hole. A pad-level `offset`, which KiCad does not write, is
+  refused.
+- **Pads:** `connect` pads are SMD pads; an SMD pad may be on either outer layer
+  of either side; plated slots (`drill oval`) are accepted. Repeated pad numbers
+  get pins `NUMBER@1`, `NUMBER@2` and empty ones `@1`, `@2`; the manifest keeps
+  the KiCad number in `pad_number`. Pads with no copper are skipped.
+- **Holes and copper graphics:** unplated holes, and plated holes with no ring
+  and no net, are image keepouts on every copper layer. Copper graphics and
+  visible copper text, on the board and in footprints, are keepouts that cover
+  them; they were silently invisible to the router before. Copper dimensions
+  and images are refused. Manifest: `supported_profile.copper_graphic_keepout_count`.
+- **New `pours` argument** (`fixed` default, or `omit`): `omit` leaves copper
+  pours out of the DSN so the router can route through their area, as the
+  usual autoroute-then-refill workflow does; rule areas stay. The manifest
+  still counts the pours (`zone_plane_count`) and says `pours_omitted`; the
+  importer checks the board kept them. Refill zones and run DRC after
+  `apply_specctra_ses`. KiCad's native exporter always writes pours, so
+  `require` is refused with `omit` and `prefer` uses the Rust exporter.
+- **SES repeats:** `plan_specctra_ses_import` and `apply_specctra_ses` apply an
+  exact repeat (same net, layer, width and geometry) once and report
+  `duplicates_skipped`, where they used to refuse the whole SES.
+- **Padless footprints** (logos) are left out of the DSN; counted in
+  `supported_profile.footprints_without_pads`.
+- **Board names** with spaces, quotes or parentheses are written as DSN tokens
+  with `_` (`sonde_xilinx.kicad_pcb`); the SES importer accepts that name as
+  the base design.
+
+## Unreleased: `run_design_review` reads a DRC baseline
+
+PR 15 follow-up (`docs/CREATION_HANDOFF.md`). `run_design_review` takes an
+optional `baseline`: the name of a DRC baseline that `save_check_baseline`
+stored for the same board. Without it nothing changes, apart from a new
+`design_review.baseline` field that is `null`.
+
+With it, DRC is matched with the baseline by PR 15's stable keys. Only new
+violations, severity increases and violations in a category the baseline did
+not report count as findings; each carries `baseline_change` (`new`,
+`severity_raised` with `baseline_severity`, or `not_compared`) and
+`baseline_key`. Unchanged, lowered and resolved ones are counted under
+`design_review.baseline`, which also names the baseline (`name`, `path`,
+`revision`: the SHA-256 of the stored file, `created_utc`) and carries
+`warnings` such as `options_differ`. `drc` keeps the run's absolute counts, and
+the verdict ends with the comparison, for example `(DRC counted against
+baseline 'pre-route': 1 new, 1 unchanged, 1 resolved)`. A missing, damaged or
+other-board baseline, or `baseline` without `board`, is refused before anything
+runs. When DRC cannot run, the review is INCOMPLETE as before and `baseline`
+says `not_compared`. The review runs no ERC, so ERC baselines do not apply.
+
 ## Unreleased: ERC and DRC baselines
 
 Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains

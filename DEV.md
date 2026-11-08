@@ -358,6 +358,10 @@ Every `tools/call` flows through `McpHandler::execute_tool`, which wraps the dis
   - Windows: `%APPDATA%\konnect\logs\calls.jsonl`
   - macOS: `~/Library/Application Support/konnect/logs/calls.jsonl`
   - Linux: `~/.konnect/logs/calls.jsonl`
+
+  `KONNECT_CALL_LOG` overrides that: `off` disables the file, an absolute path replaces it, anything else disables it with a warning. Without it, a set `KONNECT_STATE_DIR` keeps the log at `$KONNECT_STATE_DIR/logs/calls.jsonl`. Each record is serialised with its newline into one buffer and written with a single `write_all` on an append-mode handle, so processes logging at once never share a line.
+
+  **Tests never write the real log.** Under `cfg(test)` `calls_log_path()` is `None` for konnect-core's own tests, and `.cargo/config.toml` sets `KONNECT_CALL_LOG=off` for everything cargo runs (`cargo test`, and `cargo run` too: set an absolute path there to keep a log). The stdio test helper sets it again for the servers it spawns. A test that needs a log points `KONNECT_CALL_LOG` or `KONNECT_STATE_DIR` at a temporary folder.
 - **Structured `tracing` events** (`tool_call_start` + `tool_call_end`) carrying `call_id`, `tool`, `toolset`, `status`, `dur_ms` — greppable in the stderr log.
 
 Each `CallRecord` includes: `call_id`, `ts` (unix ms), `tool`, `toolset` (optional — `None` for meta-tools), `dur_ms`, `status` (`ok` / `error` / `not_found`), `error_kind`, `args_bytes`, `result_bytes`.

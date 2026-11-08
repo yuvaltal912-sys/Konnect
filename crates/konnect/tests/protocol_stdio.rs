@@ -64,6 +64,10 @@ impl McpProcess {
         command.env_remove("KICAD_API_SOCKET");
         command.env_remove("KICAD_API_TOKEN");
         command.env_remove("KONNECT_STATE_DIR");
+        // No test process appends to the owner's real call log (finding C1),
+        // even when run outside `cargo`, whose `[env]` already sets this. A test
+        // that wants a log passes its own value in `env`.
+        command.env("KONNECT_CALL_LOG", "off");
         if let Some(dir) = dir {
             command.current_dir(dir);
             if isolate_home {
@@ -279,6 +283,88 @@ fn the_default_process_ignores_host_configuration_and_keeps_state_private() {
     for directory in ["logs", "run"] {
         assert!(!preferences.parent().unwrap().join(directory).exists());
     }
+}
+
+/// Every file under `root` named `calls.jsonl`.
+fn call_logs_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == "calls.jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Finding C1: test traffic was about 94% of the owner's real call log. This
+/// process runs under `cargo`, whose `.cargo/config.toml` `[env]` turns the log
+/// off, so nothing linked into it resolves the real path either.
+#[test]
+fn test_processes_do_not_resolve_the_real_call_log() {
+    let resolved = konnect_core::observability::calls_log_path();
+    assert_ne!(
+        resolved,
+        Some(konnect_core::observability::default_calls_log_path()),
+        "a test process must not append to the user's call log"
+    );
+}
+
+/// With HOME and `KONNECT_STATE_DIR` pointed at a temporary folder, the server
+/// logs into that state folder and nowhere under HOME, so the user's real log is
+/// never touched. With the log off, it writes no log at all.
+#[test]
+fn an_isolated_server_logs_into_its_state_dir_and_never_under_home() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("konnect.toml"), "").unwrap();
+    let state_log = home.path().join("state").join("logs").join("calls.jsonl");
+    let home_log = user_config_under(home.path())
+        .parent()
+        .unwrap()
+        .join("logs")
+        .join("calls.jsonl");
+    {
+        // An empty KONNECT_CALL_LOG counts as unset, so the state folder decides.
+        let mut p =
+            McpProcess::spawn_with_env(Some(home.path()), true, &[("KONNECT_CALL_LOG", "")]);
+        p.call_tool("list_toolboxes", json!({}));
+        let stats = McpProcess::tool_body(&p.call_tool("server_stats", json!({})));
+        assert_eq!(
+            stats["log_path"],
+            json!(state_log.to_string_lossy()),
+            "{stats}"
+        );
+    }
+    let contents = std::fs::read_to_string(&state_log).unwrap();
+    let tools: Vec<String> = contents
+        .lines()
+        .map(|line| {
+            let record: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("not one whole record ({e}): {line}"));
+            record["tool"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert!(tools.contains(&"list_toolboxes".to_string()), "{tools:?}");
+    assert!(
+        !home_log.exists(),
+        "nothing may land on the HOME-based default path"
+    );
+    assert_eq!(call_logs_under(home.path()), vec![state_log]);
+
+    let off = tempfile::tempdir().unwrap();
+    std::fs::write(off.path().join("konnect.toml"), "").unwrap();
+    {
+        let mut p = McpProcess::spawn_configured(Some(off.path()), true);
+        p.call_tool("list_toolboxes", json!({}));
+        let stats = McpProcess::tool_body(&p.call_tool("server_stats", json!({})));
+        assert!(stats.get("log_path").is_none(), "{stats}");
+    }
+    assert!(call_logs_under(off.path()).is_empty());
 }
 
 #[test]

@@ -5,7 +5,7 @@ use super::error::{extract_error_kind, ToolErrorKind};
 use super::protocol::*;
 use super::server::McpServerState;
 use crate::observability::{
-    default_calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
+    calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
 };
 use crate::outcome::OutcomeStatus;
 use crate::router::{meta_tools, ToolRouter};
@@ -86,7 +86,7 @@ impl McpHandler {
             router.load_starter_kit().await;
         }
 
-        let observer = CallObserver::new(Some(default_calls_log_path()));
+        let observer = CallObserver::new(calls_log_path());
         let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
             .into_iter()
             .map(|tool| {
@@ -3130,5 +3130,69 @@ mod label_children_dispatch_tests {
         assert!(!written.contains("fields_autoplaced yes"), "{written}");
         assert!(after(&written, "(at 187.96 275.59 0)").starts_with("(fields_autoplaced)"));
         assert!(after(&written, "(at 394.97 69.85 0)").starts_with("(fields_autoplaced)"));
+    }
+}
+
+#[cfg(test)]
+mod call_log_isolation_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    const CHILD_ENV: &str = "KONNECT_TEST_HANDLER_LOG_CHILD";
+
+    /// Finding C1: every handler built by this crate's tests used to append to
+    /// the owner's real call log. Under `cfg(test)` it keeps calls in memory.
+    /// The check runs in a child copy of this test binary with HOME pointed at
+    /// a temporary folder and every log override removed, so only the
+    /// `cfg(test)` guard can keep it from the HOME-based default path.
+    #[tokio::test]
+    async fn a_handler_built_in_tests_has_no_call_log() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let handler = McpHandler::new(ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: true,
+                eager_toolsets: false,
+            })
+            .await
+            .expect("handler builds");
+            let params = CallToolParams {
+                name: "server_stats".to_string(),
+                arguments: Some(json!({})),
+            };
+            handler.execute_tool(&params).await;
+            let snapshot = handler.observer().snapshot().await;
+            assert_eq!(snapshot.total_calls, 1);
+            assert_eq!(snapshot.log_path, None);
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let name = format!(
+            "{}::a_handler_built_in_tests_has_no_call_log",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([name.as_str(), "--exact", "--test-threads=1", "--quiet"])
+            .env(CHILD_ENV, "1")
+            .env_remove("KONNECT_CALL_LOG")
+            .env_remove("KONNECT_STATE_DIR")
+            .env("HOME", home.path())
+            .env("APPDATA", home.path())
+            .env("USERPROFILE", home.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run child test process");
+        assert!(status.success(), "the child's assertions failed");
+        let left: Vec<_> = std::fs::read_dir(home.path())
+            .expect("read temp home")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert!(left.is_empty(), "the handler wrote under HOME: {left:?}");
     }
 }
