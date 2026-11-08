@@ -39,6 +39,25 @@ fn server_arguments() -> &'static [&'static str] {
         "--mcp_server-endpoints=http://127.0.0.1:37964",
         "--mcp_server.stdio=true",
         "--gui.enabled=false",
+        // Freerouting 2.x turns telemetry and analytics on by default.
+        "--profile.allow_telemetry=false",
+        "--usage_and_diagnostic_data.disable_analytics=true",
+    ]
+}
+
+/// JVM options, placed before `-jar`. Freerouting writes its settings and a
+/// log under `user.home` (2.5) or `java.io.tmpdir` (2.1); pointing both at a
+/// scratch directory keeps that out of the owner's home.
+fn jvm_arguments(scratch: &Path) -> [std::ffi::OsString; 3] {
+    let property = |name: &str, dir: PathBuf| {
+        let mut argument = std::ffi::OsString::from(format!("-D{name}="));
+        argument.push(dir);
+        argument
+    };
+    [
+        "-Djava.awt.headless=true".into(),
+        property("user.home", scratch.join("home")),
+        property("java.io.tmpdir", scratch.join("tmp")),
     ]
 }
 
@@ -455,6 +474,9 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
+    /// Freerouting's home and temp directories. Declared last so it is removed
+    /// only after the child is gone.
+    _scratch: tempfile::TempDir,
 }
 
 impl LocalMcpClient {
@@ -472,8 +494,17 @@ impl LocalMcpClient {
     }
 
     fn spawn(jar: &Path, java: Option<&Path>) -> Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("konnect-freerouting-")
+            .tempdir()
+            .context("create Freerouting scratch directory")?;
+        for name in ["home", "tmp"] {
+            std::fs::create_dir(scratch.path().join(name))
+                .context("create Freerouting scratch directory")?;
+        }
         let mut command = Command::new(java.unwrap_or_else(|| Path::new("java")));
         command
+            .args(jvm_arguments(scratch.path()))
             .arg("-jar")
             .arg(jar)
             .args(server_arguments())
@@ -513,6 +544,7 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
+            _scratch: scratch,
         })
     }
 
@@ -847,6 +879,69 @@ mod tests {
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn telemetry_is_switched_off_on_the_command_line() {
+        let arguments = server_arguments();
+        assert!(arguments.contains(&"--profile.allow_telemetry=false"));
+        assert!(arguments.contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+    }
+
+    /// A `java` that records its arguments and the properties it was given,
+    /// then answers the MCP handshake and exits when stdin closes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_starts_java_headless_with_a_scratch_home_and_no_telemetry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("arguments.txt");
+        let java = dir.path().join("java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n\
+                 while read -r line; do\n\
+                 case \"$line\" in\n\
+                 *'\"initialize\"'*) echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}';;\n\
+                 *'\"tools/list\"'*) echo '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"tools\":[]}}}}';;\n\
+                 esac\n\
+                 done\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let probe = probe_local(Path::new("/x/freerouting.jar"), Some(&java)).await;
+        // The empty tool list is refused; the handshake is what matters here.
+        assert!(probe.native_mcp_available, "{probe:?}");
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let jar = lines.iter().position(|line| *line == "-jar").unwrap();
+        let before_jar = &lines[..jar];
+        assert!(
+            before_jar.contains(&"-Djava.awt.headless=true"),
+            "{recorded}"
+        );
+        let home = before_jar
+            .iter()
+            .find_map(|line| line.strip_prefix("-Duser.home="))
+            .expect("user.home is set before -jar");
+        let tmp = before_jar
+            .iter()
+            .find_map(|line| line.strip_prefix("-Djava.io.tmpdir="))
+            .expect("java.io.tmpdir is set before -jar");
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        assert!(!real_home.is_empty() && home != real_home, "{home}");
+        assert!(Path::new(home).starts_with(std::env::temp_dir()), "{home}");
+        assert!(Path::new(tmp).starts_with(std::env::temp_dir()), "{tmp}");
+        assert!(lines[jar + 1..].contains(&"--profile.allow_telemetry=false"));
+        assert!(lines[jar + 1..].contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+        assert!(
+            !Path::new(home).exists(),
+            "the scratch directory outlives the child"
+        );
     }
 
     #[test]
