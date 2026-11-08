@@ -68,8 +68,9 @@ design path.
    before enabling broad stackup mutation.
 3. Correct the native Specctra-export selection boundary in
    [#670](https://github.com/mixelpixx/Konnect/issues/670).
-4. Expand the Freerouting round trip beyond its current two-layer boundary in
-   [#449](https://github.com/mixelpixx/Konnect/issues/449).
+4. Expand the Freerouting round trip beyond its two-layer boundary in
+   [#449](https://github.com/mixelpixx/Konnect/issues/449). Done in the fork's
+   creation PR 16: 2 to 32 copper layers and back-side parts.
 5. Add rule areas through [#715](https://github.com/mixelpixx/Konnect/issues/715)
    only with the round-trip preservation contract tracked by
    [#722](https://github.com/mixelpixx/Konnect/issues/722).

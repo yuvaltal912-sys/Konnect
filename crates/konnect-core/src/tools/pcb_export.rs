@@ -255,14 +255,24 @@ pub fn tools() -> Vec<ToolDef> {
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. Saved project/rule files and live class preferences are revision-bound. Exactly one PCB must be open. Unconditional numeric clearance/track-width minima use a conservative Rust projection; other custom rule forms refuse export. Native require mode refuses custom rules. The supported \
-             profile is narrow: two copper layers, front-side SMD or through-hole footprints, \
+             profile: 2 to 32 copper layers in stack order (a KiCad power layer is a Specctra \
+             power layer the router keeps tracks off), SMD or through-hole footprints on either \
+             side (a back-side part is written with its pads at their true board positions on \
+             B.Cu, never mirrored by the router; KiCad's native exporter is not adopted for it), \
              circle, rectangle, rounded-rectangle and oval pads (a rounded rectangle is written \
              as its bounding rectangle, never smaller than the copper), and one closed outline \
              of lines, arcs, a rectangle, a circle or a polygon, where arcs and circles become \
-             chords within 5 um. Copper pours become fixed planes of their net and rule areas \
+             chords within 5 um. Pad angles are written relative to their part, and a drill \
+             offset moves the padstack copper off its hole. Repeated or empty pad numbers get \
+             unique pins (`MP@1`, `@1`); unplated holes, and plated holes with no ring and no \
+             net, become keepouts; pads with no copper and footprints with no pads are left \
+             out. Copper graphics and text on the board or in footprints become keepouts that \
+             cover them (text as a generous square, since glyphs are not measured). \
+             Copper pours become fixed planes of their net and rule areas \
              that forbid tracks or vias become keepouts, taken from the zone outline (not the \
              fill), so check DRC after a refill. Locked straight tracks and vias are fixed wiring; \
-             unlocked routing, routed arcs, other pad shapes, curves, and unrepresentable custom rules and \
+             unlocked routing, routed arcs, custom pad shapes, local clearance overrides, \
+             copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
             json!({

@@ -81,6 +81,21 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
 
+## PR 16, Specctra DSN for real boards (draft, #44)
+
+Rank 32 (D7), first part. Branch `feat/creation-dsn-widening`, draft [#44](https://github.com/yuvaltal912-sys/Konnect/pull/44). The claim-only commit and draft preceded implementation, from main 966a89d. Code in `specctra.rs` and `specctra_ses.rs`; tests in `specctra_layers_tests.rs` over a fixture KiCad 10.0.8's own `pcbnew` wrote (`specctra_four_layer_back.kicad_pcb`: 4 layers with a `power` layer, a back-side part at 90°, a through-hole part, a locked In1.Cu track, a locked via, an In2.Cu pour).
+
+- **Layers:** 2 to 32 copper layers in stack order; KiCad `power` layers become Specctra `power` layers. Through-hole and via padstacks cover the stack.
+- **Back side:** a back part is written as a front placement with its pads at their true board positions on B.Cu (KiCad stores flipped pads already mirrored, and the same rotation maps them; checked against `pcbnew`'s `PAD::GetPosition`), so the router never mirrors. KiCad's native exporter is not adopted for these boards.
+- **Two pre-existing bugs fixed:** pin `rotate` was the board-space pad angle, so parts at 90°/270° had non-square pads turned twice; and drill offsets were ignored (looked for on the pad, not in the drill), putting offset copper on its hole.
+- **Pads and copper the router never saw:** `connect` pads, SMD pads on either outer layer, plated slots, repeated and empty pad numbers (`MP@1`, `@1`), unplated and ringless unconnected holes as keepouts, copperless pads and padless footprints skipped, copper graphics and text as covering keepouts (they were invisible to the router before), board names with spaces.
+
+Real-board check: KiCad 10.0.1's demo boards, scratch copies with routing stripped by a line-based script (it could not parse one board's formatting, so 17 were probed), through the ignored probe `probe_dsn_export_over_a_folder`. Before this PR 2 of 17 exported; now 9 do, including two 4-layer boards and boards with 14, 81 and 103 back-side parts. The 8 refused stop on what is still unsupported: custom pad shapes (2), local clearance overrides (2), open outlines (2), a `jumper` layer (1), duplicate footprint references (1).
+
+Not done (the rest of rank 32 and follow-ups): Freerouting has not routed any of these DSNs yet (the live run needs a Freerouting jar and Java 21; ask the owner), the Freerouting version policy and benchmark (B34, D24), custom pad shapes, local clearance overrides, blind/buried vias, copper graphics as exact text outlines.
+
+Verified on macOS (2026-11-08): the gate (fmt, 3759 lib and integration tests with 0 failures, doc tests, clippy `-D warnings`, `cargo deny check licenses`, `fix-doc-counts`, release build); 19 new tests in `specctra_layers_tests.rs`, with back-side pad positions and orientations checked against KiCad 10.0.8's `pcbnew`; existing 2-layer DSN output unchanged; 8 negative controls (relative pad rotation, drill offset, native back-side refusal, copper-graphic keepouts, through-via span, SES layer count, unique pin ids, design-name token), each caught by a test. Not verified: a live KiCad (the export reads the IPC snapshot; tests feed it the saved file), Windows and Linux.
+
 ## PR 15, ERC/DRC baselines (merged, #43)
 
 Three tools in the `verification` toolset (15 to 18), in `tools/check_baselines.rs`. Finding C4: agents diffed ERC/DRC reports by hand in Bash 18 times to prove an edit broke nothing.

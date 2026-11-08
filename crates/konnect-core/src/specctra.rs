@@ -58,11 +58,18 @@ struct PadstackKey {
     size_x_um: i64,
     size_y_um: i64,
     drill_um: Option<i64>,
+    /// Where the copper sits relative to the hole, in the pad's own frame
+    /// with Y up: KiCad's `(drill … (offset x y))`.
+    offset_x_um: i64,
+    offset_y_um: i64,
 }
 
 #[derive(Debug, Clone)]
 struct PadModel {
+    /// KiCad's pad number, possibly empty or repeated.
     number: String,
+    /// The unique DSN pin id (see [`pin_ids`]).
+    dsn_id: String,
     x_um: i64,
     y_um: i64,
     rotation_degrees: f64,
@@ -78,7 +85,27 @@ struct FootprintModel {
     x_um: i64,
     y_um: i64,
     rotation_degrees: f64,
+    /// The KiCad side, `front` or `back`. The DSN always places a part on
+    /// the front: a back part's file already holds its pads mirrored, so its
+    /// image is written with every pad at its true board position and its
+    /// SMD pads on B.Cu, and the router never mirrors anything.
+    kicad_side: &'static str,
     pads: Vec<PadModel>,
+    /// Unplated holes, written as image keepouts on every copper layer.
+    holes: Vec<HoleModel>,
+    /// Copper graphics and visible copper text, as image keepout shapes in
+    /// footprint space.
+    copper_keepouts: Vec<dsn::Shape>,
+}
+
+/// An unplated hole in image coordinates.
+#[derive(Debug, Clone)]
+struct HoleModel {
+    x_um: i64,
+    y_um: i64,
+    rotation_degrees: f64,
+    size_x_um: i64,
+    size_y_um: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +201,13 @@ struct SupportedProfile {
     zone_keepout_count: usize,
     custom_rules: bool,
     outline: String,
+    /// Footprints with no pads or holes, left out of the DSN.
+    #[serde(default)]
+    footprints_without_pads: usize,
+    /// Keepouts standing for copper graphics and text, one per item and
+    /// layer, on the board and in footprints.
+    #[serde(default)]
+    copper_graphic_keepout_count: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -181,6 +215,13 @@ struct ManifestLayer {
     kicad_name: String,
     dsn_name: String,
     index: usize,
+    /// `signal`, or `power` for a KiCad power layer the router keeps tracks off.
+    #[serde(default = "signal_layer")]
+    dsn_type: String,
+}
+
+fn signal_layer() -> String {
+    "signal".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -191,8 +232,16 @@ struct ManifestComponent {
     x_um: i64,
     y_um: i64,
     rotation_degrees: f64,
+    /// The side in the DSN, always `front` (see [`FootprintModel::kicad_side`]).
     side: String,
+    /// The side in KiCad, `front` or `back`.
+    #[serde(default = "front_side")]
+    kicad_side: String,
     pads: Vec<ManifestPin>,
+}
+
+fn front_side() -> String {
+    "front".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -231,11 +280,13 @@ pub(crate) fn export_dsn(
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
     }
 
-    let copper_layers = copper_layers(&tree)?;
+    let copper_stack = copper_stack(&tree)?;
+    let copper_layers: Vec<String> = copper_stack.iter().map(|(name, _)| name.clone()).collect();
     let outline = simple_closed_outline(&tree)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
-    let footprints = footprints(&tree, &net_table)?;
+    let board_keepouts = board_copper_keepouts(&tree, &copper_layers)?;
+    let (footprints, skipped_without_pads) = footprints(&tree, &net_table, &copper_layers)?;
     let zones = zones(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
@@ -248,7 +299,7 @@ pub(crate) fn export_dsn(
                 net_pins
                     .entry(net.clone())
                     .or_default()
-                    .push(format!("{}-{}", footprint.reference, pad.number));
+                    .push(format!("{}-{}", footprint.reference, pad.dsn_id));
             }
         }
     }
@@ -293,7 +344,7 @@ pub(crate) fn export_dsn(
 
     let pcb = build_pcb(
         board_path,
-        &copper_layers,
+        &copper_stack,
         &outline,
         &footprints,
         &net_pins,
@@ -303,13 +354,16 @@ pub(crate) fn export_dsn(
         &via_names,
         &locked_routing,
         &zones,
+        &board_keepouts,
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
     let manifest = build_manifest(
         board_path,
         &source_sha256,
-        &copper_layers,
+        skipped_without_pads,
+        board_keepouts.len(),
+        &copper_stack,
         &footprints,
         &net_pins,
         &net_classes,
@@ -357,6 +411,18 @@ pub(crate) fn adopt_native_dsn(
     mut baseline: ExportBundle,
     native_dsn: String,
 ) -> Result<ExportBundle> {
+    {
+        let manifest: Manifest =
+            serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
+        if let Some(back) = manifest.components.iter().find(|c| c.kicad_side == "back") {
+            bail!(
+                "native DSN not adopted: '{}' is a back-side part, which KiCad's exporter writes as \
+                 a mirrored image and Konnect writes unmirrored at its true pad positions; use the \
+                 Rust exporter (native_bridge_mode 'disable' or 'prefer')",
+                back.reference
+            );
+        }
+    }
     validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
     let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Konnect baseline DSN")?;
     let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
@@ -364,7 +430,6 @@ pub(crate) fn adopt_native_dsn(
     let native_identity = dsn_identity(&native_tree)?;
     let mut manifest: Manifest =
         serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
-
     let layer_names = correlate_layers(&baseline_identity, &native_identity)?;
     let (class_names, via_names) = correlate_classes(&baseline_identity, &native_identity)?;
     let padstack_names = correlate_components(&baseline_identity, &native_identity)?;
@@ -435,6 +500,8 @@ struct DsnPinIdentity {
     padstack: String,
     x: i64,
     y: i64,
+    /// The pin's `(rotate r)`, if it has one.
+    rotation: Option<OrderedF64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -526,12 +593,28 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
         let name = dsn_atom(image, 1, "image name")?.to_string();
         let mut pins = BTreeMap::new();
         for pin in image.find_all("pin") {
+            // `(pin padstack [(rotate r)] number x y)`: the optional rotation
+            // is a sub-list between the padstack and the number.
+            let rotation = match pin.find("rotate") {
+                Some(rotate) => Some(OrderedF64::new(dsn_number(rotate, 1, "pin rotation")?)?),
+                None => None,
+            };
+            let positional = SexpNode::List(
+                pin.children()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|child| child.head() != Some("rotate"))
+                    .cloned()
+                    .collect(),
+            );
+            let pin = &positional;
             let padstack = dsn_atom(pin, 1, "pin padstack")?.to_string();
             let number = dsn_atom(pin, 2, "pin number")?.to_string();
             let identity = DsnPinIdentity {
                 padstack,
                 x: dsn_integer(pin, 3, "pin x")?,
                 y: dsn_integer(pin, 4, "pin y")?,
+                rotation,
             };
             if pins.insert(number, identity).is_some() {
                 bail!("DSN image '{name}' repeats a pin number");
@@ -725,6 +808,11 @@ fn correlate_components(
             if baseline_pin.x != native_pin.x || baseline_pin.y != native_pin.y {
                 bail!("native DSN changed pin position for component '{reference}' pin '{pin}'");
             }
+            let degrees =
+                |r: Option<OrderedF64>| r.map_or(0.0, |r| f64::from_bits(r.0)).rem_euclid(360.0);
+            if (degrees(baseline_pin.rotation) - degrees(native_pin.rotation)).abs() > 1e-9 {
+                bail!("native DSN changed pin rotation for component '{reference}' pin '{pin}'");
+            }
             let baseline_shape = baseline
                 .padstacks
                 .get(&baseline_pin.padstack)
@@ -903,11 +991,16 @@ fn locked_routing(
             .filter_map(SexpNode::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        if layers != copper_layers {
+        // KiCad writes a through via as its outer layers whatever the stack.
+        let through = [
+            copper_layers.first().cloned().unwrap_or_default(),
+            copper_layers.last().cloned().unwrap_or_default(),
+        ];
+        if layers != through {
             bail!(
-                "unsupported locked via layer span [{}]; expected [{}]",
+                "unsupported locked via layer span [{}]; expected the through span [{}]",
                 layers.join(", "),
-                copper_layers.join(", ")
+                through.join(", ")
             );
         }
         let net = via
@@ -959,27 +1052,94 @@ fn locked_routing(
     Ok(routing)
 }
 
-fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
+/// The most copper layers KiCad allows.
+const MAX_COPPER_LAYERS: usize = 32;
+
+/// The board's copper layers in stack order (`F.Cu`, `In1.Cu` … `InN.Cu`,
+/// `B.Cu`), each with its Specctra layer type: KiCad `power` layers are
+/// `power` (the router keeps tracks off them), `signal` and `mixed` are
+/// `signal`. A `jumper` layer, a gap in the inner numbering, an odd count or
+/// a missing outer layer is refused.
+fn copper_stack(tree: &SexpNode) -> Result<Vec<(String, &'static str)>> {
     let layers = tree.find("layers").context("board has no layers table")?;
-    let mut copper = layers
-        .children()
-        .unwrap_or(&[])
-        .iter()
-        .skip(1)
-        // Layer table rows are `(numeric-id "name" type)`, so the layer name
-        // is the first data item even though the numeric id is the list head.
-        .filter_map(|layer| layer.get(1).and_then(SexpNode::as_str))
-        .filter(|name| name.ends_with(".Cu"))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    copper.dedup();
-    if copper != ["F.Cu".to_string(), "B.Cu".to_string()] {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for row in layers.children().unwrap_or(&[]).iter().skip(1) {
+        // Layer table rows are `(numeric-id "name" type ["user name"])`, so the
+        // canonical name is the first data item even though the numeric id is
+        // the list head. A user name never replaces it.
+        let Some(name) = row.get(1).and_then(SexpNode::as_str) else {
+            continue;
+        };
+        if !name.ends_with(".Cu") {
+            continue;
+        }
+        let kind = row.get(2).and_then(SexpNode::as_str).unwrap_or("signal");
+        if rows.iter().any(|(seen, _)| seen == name) {
+            bail!("board layer table repeats copper layer '{name}'");
+        }
+        rows.push((name.to_string(), kind.to_string()));
+    }
+    let inner_index = |name: &str| -> Option<usize> {
+        name.strip_prefix("In")?.strip_suffix(".Cu")?.parse().ok()
+    };
+    let has = |name: &str| rows.iter().any(|(n, _)| n == name);
+    if !has("F.Cu") || !has("B.Cu") {
         bail!(
-            "unsupported first routing profile: expected exactly F.Cu and B.Cu, got [{}]",
-            copper.join(", ")
+            "unsupported routing profile: copper layers [{}] do not include both F.Cu and B.Cu",
+            rows.iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
-    Ok(copper)
+    let mut inner: Vec<usize> = Vec::new();
+    for (name, _) in &rows {
+        if name == "F.Cu" || name == "B.Cu" {
+            continue;
+        }
+        let index = inner_index(name)
+            .with_context(|| format!("unsupported routing profile: copper layer '{name}'"))?;
+        inner.push(index);
+    }
+    inner.sort_unstable();
+    if inner.iter().enumerate().any(|(i, index)| *index != i + 1) {
+        bail!(
+            "unsupported routing profile: inner copper layers are not In1.Cu to In{}.Cu without gaps",
+            inner.len()
+        );
+    }
+    let count = inner.len() + 2;
+    if !count.is_multiple_of(2) || count > MAX_COPPER_LAYERS {
+        bail!("unsupported routing profile: {count} copper layers (KiCad uses an even count, 2 to 32)");
+    }
+    let mut order = vec!["F.Cu".to_string()];
+    order.extend((1..=inner.len()).map(|i| format!("In{i}.Cu")));
+    order.push("B.Cu".to_string());
+    order
+        .into_iter()
+        .map(|name| {
+            let kind = &rows
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("listed above")
+                .1;
+            let dsn = match kind.as_str() {
+                "signal" | "mixed" => "signal",
+                "power" => "power",
+                other => {
+                    bail!("unsupported routing profile: copper layer '{name}' has type '{other}'")
+                }
+            };
+            Ok((name, dsn))
+        })
+        .collect()
+}
+
+fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
+    Ok(copper_stack(tree)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// One open Edge.Cuts piece: a line or an arc, with the chord points between
@@ -1411,19 +1571,366 @@ pub(crate) fn zone_counts(board_source: &str) -> Result<(usize, usize)> {
     ))
 }
 
+/// A board file name as a DSN token: whitespace, quotes and parentheses
+/// become `_`, which the DSN writer would otherwise emit bare and break the
+/// file (`sonde xilinx.kicad_pcb`). The SES importer accepts the same form.
+pub(crate) fn dsn_design_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_whitespace() || matches!(c, '"' | '(' | ')') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The angle `degrees` in `[0, 360)`, with float noise at whole degrees removed.
+fn normalized_degrees(degrees: f64) -> f64 {
+    let d = degrees.rem_euclid(360.0);
+    let r = d.round();
+    let d = if (d - r).abs() < 1e-9 { r } else { d };
+    if d >= 360.0 {
+        0.0
+    } else {
+        d
+    }
+}
+
+/// The DSN pin ids of a footprint's copper pads, in pad order. A number used
+/// once is its own id. A repeated number (two `MP` mounting pads) gets
+/// `MP@1`, `MP@2`, and an unnumbered pad `@1`, `@2`, so every pin is unique
+/// while the manifest keeps the KiCad number.
+fn pin_ids(numbers: &[String]) -> Vec<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for number in numbers {
+        *counts.entry(number.as_str()).or_default() += 1;
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    numbers
+        .iter()
+        .map(|number| {
+            let n = seen.entry(number.as_str()).or_default();
+            *n += 1;
+            if counts[number.as_str()] == 1 && !number.is_empty() {
+                number.clone()
+            } else {
+                format!("{number}@{n}")
+            }
+        })
+        .collect()
+}
+
+/// Chord tolerance for copper graphics, in millimetres. Keepouts are
+/// widened by it, so a chorded arc still covers the true copper.
+const GRAPHIC_TOLERANCE_MM: f64 = 0.005;
+
+/// A KiCad millimetre point as a DSN micrometre point (Y up).
+fn dsn_point((x, y): (f64, f64)) -> dsn::Point {
+    dsn::Point {
+        x: (x * UM_PER_MM).round(),
+        y: (-y * UM_PER_MM).round(),
+    }
+}
+
+fn mm_pair(node: &SexpNode, tag: &str) -> Result<(f64, f64)> {
+    xy_mm(node, tag)
+}
+
+/// The copper layers a graphic or text item is on (`*.Cu` is all of them).
+fn graphic_copper_layers(node: &SexpNode, copper_layers: &[String]) -> Vec<String> {
+    let mut named: Vec<&str> = node.find_str("layer").into_iter().collect();
+    if let Some(list) = node.find("layers") {
+        named.extend(
+            list.children()
+                .unwrap_or(&[])
+                .iter()
+                .skip(1)
+                .filter_map(SexpNode::as_str),
+        );
+    }
+    let mut out: Vec<String> = Vec::new();
+    for layer in named {
+        if layer == "*.Cu" {
+            out.extend(copper_layers.iter().cloned());
+        } else if copper_layers.iter().any(|c| c == layer) {
+            out.push(layer.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_hidden(node: &SexpNode) -> bool {
+    node.find_str("hide") == Some("yes")
+        || node.find("effects").is_some_and(|e| {
+            e.find_str("hide") == Some("yes")
+                || e.children()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|c| c.as_str() == Some("hide"))
+        })
+}
+
+/// The keepout shapes (one per copper layer) that cover one copper graphic or
+/// text item, in the coordinates its own `(at)`/points use (board space for a
+/// `gr_*`, footprint space for an `fp_*`), or `None` when it is not on copper
+/// or draws nothing. Lines, arcs, curves and unfilled outlines are paths as
+/// wide as their stroke plus the chord tolerance; filled shapes are polygons;
+/// text is a square centred on its anchor that covers its glyph box at any
+/// rotation and justification (glyphs are not measured, so it is generous).
+fn copper_graphic_keepouts(
+    node: &SexpNode,
+    copper_layers: &[String],
+) -> Result<Option<Vec<dsn::Shape>>> {
+    let Some(head) = node.head() else {
+        return Ok(None);
+    };
+    let layers = graphic_copper_layers(node, copper_layers);
+    if layers.is_empty() {
+        return Ok(None);
+    }
+    let kind = head.trim_start_matches("gr_").trim_start_matches("fp_");
+    let stroke = node
+        .find("stroke")
+        .and_then(|s| s.find_f64("width"))
+        .or_else(|| node.find_f64("width"))
+        .unwrap_or(0.0)
+        .max(0.0);
+    let filled = matches!(
+        node.find("fill")
+            .and_then(|f| f.get(1))
+            .and_then(SexpNode::as_str),
+        Some("yes" | "solid")
+    ) || node.find("fill").and_then(|f| f.find_str("type")) == Some("solid");
+    let width_um = ((stroke + 2.0 * GRAPHIC_TOLERANCE_MM) * UM_PER_MM).round();
+    let path = |pts: Vec<(f64, f64)>| -> Vec<dsn::Shape> {
+        layers
+            .iter()
+            .map(|layer| {
+                dsn::Shape::Path(dsn::Path {
+                    layer: layer.clone(),
+                    width: width_um,
+                    coords: pts.iter().copied().map(dsn_point).collect(),
+                })
+            })
+            .collect()
+    };
+    let ring = |mut pts: Vec<(f64, f64)>| -> Vec<dsn::Shape> {
+        if filled {
+            return layers
+                .iter()
+                .map(|layer| {
+                    dsn::Shape::Polygon(dsn::Polygon {
+                        layer: layer.clone(),
+                        width: width_um,
+                        coords: pts.iter().copied().map(dsn_point).collect(),
+                    })
+                })
+                .collect();
+        }
+        pts.push(pts[0]);
+        path(pts)
+    };
+    use konnect_sexp::planar::{flatten_bezier, tessellate_arc, tessellate_circle};
+    let shapes = match kind {
+        "line" => path(vec![mm_pair(node, "start")?, mm_pair(node, "end")?]),
+        "arc" => path(tessellate_arc(
+            mm_pair(node, "start")?,
+            mm_pair(node, "mid")
+                .context("copper arc has no midpoint (open and save it in KiCad 10)")?,
+            mm_pair(node, "end")?,
+            GRAPHIC_TOLERANCE_MM,
+        )),
+        "circle" => {
+            let (c, e) = (mm_pair(node, "center")?, mm_pair(node, "end")?);
+            let r = ((e.0 - c.0).powi(2) + (e.1 - c.1).powi(2)).sqrt();
+            ring(tessellate_circle(
+                c,
+                r + GRAPHIC_TOLERANCE_MM,
+                GRAPHIC_TOLERANCE_MM,
+            ))
+        }
+        "rect" => {
+            let (a, b) = (mm_pair(node, "start")?, mm_pair(node, "end")?);
+            ring(vec![a, (b.0, a.1), b, (a.0, b.1)])
+        }
+        "poly" => {
+            let pts = node.find("pts").context("copper polygon has no points")?;
+            let mut ring_pts = Vec::new();
+            for item in pts.children().unwrap_or(&[]).iter().skip(1) {
+                match item.head() {
+                    Some("xy") => ring_pts.push((
+                        finite_number(item.get_f64(1), "polygon x")?,
+                        finite_number(item.get_f64(2), "polygon y")?,
+                    )),
+                    Some("arc") => ring_pts.extend(tessellate_arc(
+                        mm_pair(item, "start")?,
+                        mm_pair(item, "mid")?,
+                        mm_pair(item, "end")?,
+                        GRAPHIC_TOLERANCE_MM,
+                    )),
+                    other => bail!("copper polygon holds an unsupported '{other:?}'"),
+                }
+            }
+            if ring_pts.len() < 3 {
+                bail!("copper polygon has fewer than three points");
+            }
+            ring(ring_pts)
+        }
+        "curve" => {
+            let q: Vec<(f64, f64)> = node
+                .find("pts")
+                .context("copper curve has no points")?
+                .find_all("xy")
+                .into_iter()
+                .map(|xy| -> Result<(f64, f64)> {
+                    Ok((
+                        finite_number(xy.get_f64(1), "curve x")?,
+                        finite_number(xy.get_f64(2), "curve y")?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            if q.len() != 4 {
+                bail!("copper curve does not have four control points");
+            }
+            path(flatten_bezier(q[0], q[1], q[2], q[3], GRAPHIC_TOLERANCE_MM))
+        }
+        "text" | "property" => {
+            if is_hidden(node) {
+                return Ok(None);
+            }
+            let text = match kind {
+                "property" => node.get(2).and_then(SexpNode::as_str).unwrap_or(""),
+                _ => node
+                    .get(1)
+                    .and_then(SexpNode::as_str)
+                    .filter(|t| !matches!(*t, "reference" | "value" | "user"))
+                    .or_else(|| node.get(2).and_then(SexpNode::as_str))
+                    .unwrap_or(""),
+            };
+            if text.trim().is_empty() {
+                return Ok(None);
+            }
+            let at = mm_pair(node, "at")?;
+            let font = node.find("effects").and_then(|e| e.find("font"));
+            let size = font.and_then(|f| f.find("size"));
+            let h = size.and_then(|s| s.get_f64(1)).unwrap_or(1.0).abs();
+            let w = size.and_then(|s| s.get_f64(2)).unwrap_or(h).abs();
+            let t = font
+                .and_then(|f| f.find_f64("thickness"))
+                .unwrap_or(0.15 * h)
+                .abs();
+            let lines: Vec<&str> = text.split('\n').collect();
+            let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f64;
+            // A glyph advance stays under 1.25 em in KiCad's fonts; a full
+            // width each way covers left, centre and right justification.
+            let half_w = longest * w * 1.25 + t;
+            let half_h = lines.len() as f64 * h * 1.6 + t;
+            let r = (half_w * half_w + half_h * half_h).sqrt() + GRAPHIC_TOLERANCE_MM;
+            ring_filled_square(&layers, at, r)
+        }
+        "text_box" => {
+            let corners: Vec<(f64, f64)> = match node.find("pts") {
+                Some(pts) => pts
+                    .find_all("xy")
+                    .into_iter()
+                    .map(|xy| -> Result<(f64, f64)> {
+                        Ok((
+                            finite_number(xy.get_f64(1), "text box x")?,
+                            finite_number(xy.get_f64(2), "text box y")?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+                None => {
+                    let (a, b) = (mm_pair(node, "start")?, mm_pair(node, "end")?);
+                    vec![a, (b.0, a.1), b, (a.0, b.1)]
+                }
+            };
+            layers
+                .iter()
+                .map(|layer| {
+                    dsn::Shape::Polygon(dsn::Polygon {
+                        layer: layer.clone(),
+                        width: width_um,
+                        coords: corners.iter().copied().map(dsn_point).collect(),
+                    })
+                })
+                .collect()
+        }
+        other => bail!(
+            "unsupported routing profile: a '{other}' item on copper cannot be given to the router"
+        ),
+    };
+    Ok(Some(shapes))
+}
+
+fn ring_filled_square(layers: &[String], (x, y): (f64, f64), r: f64) -> Vec<dsn::Shape> {
+    let corners = [
+        (x - r, y - r),
+        (x + r, y - r),
+        (x + r, y + r),
+        (x - r, y + r),
+    ];
+    layers
+        .iter()
+        .map(|layer| {
+            dsn::Shape::Polygon(dsn::Polygon {
+                layer: layer.clone(),
+                width: 0.0,
+                coords: corners.iter().copied().map(dsn_point).collect(),
+            })
+        })
+        .collect()
+}
+
+/// Board-level copper graphics and text, as structure keepouts.
+fn board_copper_keepouts(tree: &SexpNode, copper_layers: &[String]) -> Result<Vec<dsn::Shape>> {
+    let mut out = Vec::new();
+    for node in tree.children().unwrap_or(&[]) {
+        let Some(head) = node.head() else { continue };
+        if !(head.starts_with("gr_") || head == "dimension" || head == "image") {
+            continue;
+        }
+        if (head == "dimension" || head == "image")
+            && !graphic_copper_layers(node, copper_layers).is_empty()
+        {
+            bail!("unsupported routing profile: a board '{head}' on a copper layer cannot be given to the router");
+        }
+        if let Some(shapes) = copper_graphic_keepouts(node, copper_layers)
+            .with_context(|| format!("board '{head}' on copper"))?
+        {
+            out.extend(shapes);
+        }
+    }
+    Ok(out)
+}
+
 fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
-) -> Result<Vec<FootprintModel>> {
+    copper_layers: &[String],
+) -> Result<(Vec<FootprintModel>, usize)> {
     let mut output = Vec::new();
     let mut references = BTreeSet::new();
+    let mut skipped_without_pads = 0;
     for footprint in tree.find_all("footprint") {
+        // A footprint with no pads and no holes (a logo, a fiducial-free
+        // graphic) has nothing for the router; leave it out.
+        if footprint.find_all("pad").is_empty() {
+            skipped_without_pads += 1;
+            continue;
+        }
         let layer = footprint
             .find_str("layer")
             .context("footprint has no layer")?;
-        if layer != "F.Cu" {
-            bail!("unsupported first routing profile: footprint on '{layer}'");
-        }
+        let kicad_side = match layer {
+            "F.Cu" => "front",
+            "B.Cu" => "back",
+            other => bail!("unsupported routing profile: footprint on '{other}'"),
+        };
         if footprint.find("clearance").is_some() {
             bail!("unsupported first routing profile: footprint has a local clearance override");
         }
@@ -1444,46 +1951,91 @@ fn footprints(
         let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
         let image_name = format!("konnect_image_{reference}");
 
+        // Footprint copper graphics and visible copper text, in footprint
+        // space, as image keepouts. The file holds a back part's graphics
+        // already mirrored, like its pads.
+        let mut copper_keepouts = Vec::new();
+        for node in footprint.children().unwrap_or(&[]) {
+            let Some(head) = node.head() else { continue };
+            if !(head.starts_with("fp_") || head == "property") {
+                continue;
+            }
+            if let Some(shapes) = copper_graphic_keepouts(node, copper_layers)
+                .with_context(|| format!("footprint '{reference}' '{head}' on copper"))?
+            {
+                copper_keepouts.extend(shapes);
+            }
+        }
         let mut pads = Vec::new();
-        let mut pad_numbers = BTreeSet::new();
+        let mut holes = Vec::new();
         for pad in footprint.find_all("pad") {
             let number = pad
                 .get(1)
                 .and_then(SexpNode::as_str)
-                .filter(|number| !number.is_empty())
-                .context("footprint contains an unnumbered pad")?
+                .context("pad has no number field")?
                 .to_string();
-            if !pad_numbers.insert(number.clone()) {
-                bail!("footprint '{reference}' has duplicate pad number '{number}'");
-            }
+            let label = if number.is_empty() {
+                format!("{reference} (unnumbered pad)")
+            } else {
+                format!("{reference}-{number}")
+            };
             let pad_type = pad
                 .get(2)
                 .and_then(SexpNode::as_str)
                 .context("pad has no type")?;
-            if !matches!(pad_type, "smd" | "thru_hole") {
-                bail!(
-                    "unsupported first routing profile: pad {reference}-{number} has type '{pad_type}'"
-                );
+            if !matches!(pad_type, "smd" | "connect" | "thru_hole" | "np_thru_hole") {
+                bail!("unsupported routing profile: pad {label} has type '{pad_type}'");
             }
+            let at = pad.find("at").context("pad has no position")?;
+            let px_um = finite_um(at.get_f64(1), "pad x")?;
+            let py_um = -finite_um(at.get_f64(2), "pad y")?;
+            // KiCad stores a pad's angle in board space, the footprint's
+            // rotation included; the DSN wants it relative to the image.
+            let pad_angle = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
+            let relative = normalized_degrees(pad_angle - rotation_degrees);
+            let size = pad.find("size").context("pad has no size")?;
+            let size_x_um = positive_um(size.get_f64(1), "pad width")?;
+            let size_y_um = positive_um(size.get_f64(2), "pad height")?;
+            let drill = pad.find("drill");
+            // An oval drill is `(drill oval w h)`, a round one `(drill d)`.
+            let drill_dims = match drill {
+                None => None,
+                Some(d) if d.get(1).and_then(SexpNode::as_str) == Some("oval") => Some((
+                    positive_um(d.get_f64(2), "pad drill width")?,
+                    positive_um(d.get_f64(3).or(d.get_f64(2)), "pad drill height")?,
+                )),
+                Some(d) => {
+                    let v = positive_um(d.get_f64(1), "pad drill")?;
+                    Some((v, v))
+                }
+            };
+
+            if pad_type == "np_thru_hole" {
+                // An unplated hole: no pin, an obstacle on every copper layer,
+                // as large as the larger of its pad and its drill.
+                let (dx, dy) = drill_dims.unwrap_or((size_x_um, size_y_um));
+                holes.push(HoleModel {
+                    x_um: px_um,
+                    y_um: py_um,
+                    rotation_degrees: relative,
+                    size_x_um: size_x_um.max(dx),
+                    size_y_um: size_y_um.max(dy),
+                });
+                continue;
+            }
+
             let shape = match pad.get(3).and_then(SexpNode::as_str) {
                 Some("circle") => PadShape::Circle,
                 Some("rect") => PadShape::Rect,
                 Some("roundrect") => PadShape::RoundRect,
                 Some("oval") => PadShape::Oval,
-                Some(other) => bail!(
-                    "unsupported first routing profile: pad {reference}-{number} has shape '{other}'"
-                ),
-                None => bail!("pad {reference}-{number} has no shape"),
+                Some(other) => {
+                    bail!("unsupported routing profile: pad {label} has shape '{other}'")
+                }
+                None => bail!("pad {label} has no shape"),
             };
-            let at = pad.find("at").context("pad has no position")?;
-            let x_um = finite_um(at.get_f64(1), "pad x")?;
-            let y_um = -finite_um(at.get_f64(2), "pad y")?;
-            let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
-            let size = pad.find("size").context("pad has no size")?;
-            let size_x_um = positive_um(size.get_f64(1), "pad width")?;
-            let size_y_um = positive_um(size.get_f64(2), "pad height")?;
             if shape == PadShape::Circle && size_x_um != size_y_um {
-                bail!("circle pad {reference}-{number} does not have equal X/Y size");
+                bail!("circle pad {label} does not have equal X/Y size");
             }
             // An oval of equal sides is a circle.
             let shape = if shape == PadShape::Oval && size_x_um == size_y_um {
@@ -1493,23 +2045,30 @@ fn footprints(
             };
             if pad.find("clearance").is_some() {
                 bail!(
-                    "unsupported first routing profile: pad {reference}-{number} has a local clearance override"
+                    "unsupported first routing profile: pad {label} has a local clearance override"
                 );
             }
             if pad.find_str("remove_unused_layers") == Some("yes") {
-                bail!(
-                    "unsupported first routing profile: pad {reference}-{number} removes copper on unused layers"
-                );
+                bail!("unsupported first routing profile: pad {label} removes copper on unused layers");
             }
+            // KiCad writes a pad's shape offset inside its drill. Before PR 16
+            // the exporter looked for it on the pad, never found it, and put
+            // offset copper (a TO-92's pads) on its hole instead.
             if let Some(offset) = pad.find("offset") {
-                let offset_x_um = finite_um(offset.get_f64(1), "pad offset x")?;
-                let offset_y_um = finite_um(offset.get_f64(2), "pad offset y")?;
-                if offset_x_um != 0 || offset_y_um != 0 {
-                    bail!(
-                        "unsupported first routing profile: pad {reference}-{number} has a non-zero shape offset"
-                    );
+                // Not where KiCad writes it: refuse rather than guess its frame.
+                let x = finite_um(offset.get_f64(1), "pad offset x")?;
+                let y = finite_um(offset.get_f64(2), "pad offset y")?;
+                if x != 0 || y != 0 {
+                    bail!("unsupported first routing profile: pad {label} has a non-zero shape offset outside its drill");
                 }
             }
+            let (offset_x_um, offset_y_um) = match drill.and_then(|d| d.find("offset")) {
+                Some(offset) => (
+                    finite_um(offset.get_f64(1), "pad offset x")?,
+                    -finite_um(offset.get_f64(2), "pad offset y")?,
+                ),
+                None => (0, 0),
+            };
             let layers = pad
                 .find("layers")
                 .and_then(SexpNode::children)
@@ -1520,43 +2079,65 @@ fn footprints(
                 .filter(|layer| layer.ends_with(".Cu") || *layer == "*.Cu")
                 .map(str::to_string)
                 .collect::<Vec<_>>();
-            let (layers, drill_um) = if pad_type == "smd" {
-                if layers != ["F.Cu".to_string()] {
+            // A pad with no copper (a paste or mask aperture) is nothing the
+            // router can touch.
+            if layers.is_empty() {
+                continue;
+            }
+            let net = pad
+                .find("net")
+                .and_then(|node| resolve_net(node, net_table));
+            // A plated hole with no ring and no net (a plated mounting hole
+            // drilled to its pad size) is a hole to the router, like an
+            // unplated one.
+            if pad_type == "thru_hole" && net.is_none() {
+                if let Some((dx, dy)) = drill_dims {
+                    if dx >= size_x_um && dy >= size_y_um {
+                        holes.push(HoleModel {
+                            x_um: px_um,
+                            y_um: py_um,
+                            rotation_degrees: relative,
+                            size_x_um: size_x_um.max(dx),
+                            size_y_um: size_y_um.max(dy),
+                        });
+                        continue;
+                    }
+                }
+            }
+            let (layers, drill_um) = if pad_type == "smd" || pad_type == "connect" {
+                // One outer copper layer, either side: the DSN never mirrors,
+                // so a pad's own layer is the layer the router sees.
+                if layers != ["F.Cu".to_string()] && layers != ["B.Cu".to_string()] {
                     bail!(
-                        "unsupported SMD pad {reference}-{number}: copper layers are [{}]",
+                        "unsupported SMD pad {label}: copper layers are [{}], not one outer layer",
                         layers.join(", ")
                     );
                 }
                 (layers, None)
             } else {
+                // A plated hole has copper on every layer of the stack (pads
+                // that remove unused layers are refused above).
                 if !(layers == ["*.Cu".to_string()]
                     || layers == ["F.Cu".to_string(), "B.Cu".to_string()])
                 {
                     bail!(
-                        "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
+                        "unsupported through-hole pad {label}: copper layers are [{}]",
                         layers.join(", ")
                     );
                 }
-                let drill = pad.find("drill").context("through-hole pad has no drill")?;
-                if drill.get(1).and_then(SexpNode::as_str) == Some("oval") {
-                    bail!("unsupported through-hole pad {reference}-{number}: oval drill");
+                let (dx, dy) = drill_dims.context("through-hole pad has no drill")?;
+                // The router sees the copper; a slot only has to fit inside it.
+                if dx >= size_x_um || dy >= size_y_um {
+                    bail!("pad {label} drill {dx}x{dy} um is not smaller than its copper size");
                 }
-                let drill_um = positive_um(drill.get_f64(1), "pad drill")?;
-                if drill_um >= size_x_um.min(size_y_um) {
-                    bail!(
-                        "pad {reference}-{number} drill {drill_um} um is not smaller than its copper size"
-                    );
-                }
-                (vec!["F.Cu".to_string(), "B.Cu".to_string()], Some(drill_um))
+                (copper_layers.to_vec(), Some(dx.min(dy)))
             };
-            let net = pad
-                .find("net")
-                .and_then(|node| resolve_net(node, net_table));
             pads.push(PadModel {
                 number,
-                x_um,
-                y_um,
-                rotation_degrees,
+                dsn_id: String::new(),
+                x_um: px_um,
+                y_um: py_um,
+                rotation_degrees: relative,
                 net,
                 padstack: PadstackKey {
                     shape,
@@ -1564,13 +2145,21 @@ fn footprints(
                     size_x_um,
                     size_y_um,
                     drill_um,
+                    offset_x_um,
+                    offset_y_um,
                 },
             });
         }
-        if pads.is_empty() {
-            bail!("footprint '{reference}' has no pads");
+        // Stable order: by KiCad number, then position, so repeated numbers
+        // get their `@n` the same way on every export.
+        pads.sort_by(|left, right| {
+            (&left.number, left.x_um, left.y_um).cmp(&(&right.number, right.x_um, right.y_um))
+        });
+        let ids = pin_ids(&pads.iter().map(|p| p.number.clone()).collect::<Vec<_>>());
+        for (pad, id) in pads.iter_mut().zip(ids) {
+            pad.dsn_id = id;
         }
-        pads.sort_by(|left, right| left.number.cmp(&right.number));
+        holes.sort_by_key(|hole| (hole.x_um, hole.y_um));
         output.push(FootprintModel {
             reference,
             kiid,
@@ -1578,11 +2167,14 @@ fn footprints(
             x_um,
             y_um,
             rotation_degrees,
+            kicad_side,
             pads,
+            holes,
+            copper_keepouts,
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
-    Ok(output)
+    Ok((output, skipped_without_pads))
 }
 
 fn normalize_rules(
@@ -1625,7 +2217,7 @@ fn normalize_rules(
 #[allow(clippy::too_many_arguments)]
 fn build_pcb(
     board_path: &Path,
-    copper_layers: &[String],
+    copper_stack: &[(String, &'static str)],
     outline: &[(i64, i64)],
     footprints: &[FootprintModel],
     net_pins: &BTreeMap<String, Vec<String>>,
@@ -1635,17 +2227,19 @@ fn build_pcb(
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
     zones: &[ZoneModel],
+    board_keepouts: &[dsn::Shape],
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
         .next()
         .context("routing model has no rule class")?;
-    let layers = copper_layers
+    let copper_layers: Vec<String> = copper_stack.iter().map(|(name, _)| name.clone()).collect();
+    let layers = copper_stack
         .iter()
         .enumerate()
-        .map(|(index, name)| dsn::Layer {
+        .map(|(index, (name, kind))| dsn::Layer {
             name: name.clone(),
-            r#type: "signal".to_string(),
+            r#type: kind.to_string(),
             property: Some(dsn::Property { index }),
         })
         .collect();
@@ -1686,12 +2280,32 @@ fn build_pcb(
                 .map(|pad| dsn::Pin {
                     name: padstack_names[&pad.padstack].clone(),
                     rotate: (pad.rotation_degrees != 0.0).then_some(pad.rotation_degrees),
-                    id: pad.number.clone(),
+                    id: pad.dsn_id.clone(),
                     x: pad.x_um as f64,
                     y: pad.y_um as f64,
                 })
                 .collect(),
-            keepouts: dsn::Keepouts(Vec::new()),
+            keepouts: dsn::Keepouts(
+                footprint
+                    .holes
+                    .iter()
+                    .flat_map(|hole| {
+                        copper_layers
+                            .iter()
+                            .map(move |layer| hole_shape(hole, layer))
+                    })
+                    // Already in image coordinates: footprint space with Y up,
+                    // the frame the pins use.
+                    .chain(footprint.copper_keepouts.iter().cloned())
+                    .map(|shape| dsn::Keepout {
+                        kind: dsn::KeepoutKind::Normal,
+                        id_: String::new(),
+                        sequence_number: None,
+                        shape,
+                        rule: None,
+                    })
+                    .collect(),
+            ),
         })
         .collect();
 
@@ -1805,11 +2419,12 @@ fn build_pcb(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(dsn::Pcb {
-        name: board_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("board.kicad_pcb")
-            .to_string(),
+        name: dsn_design_name(
+            board_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("board.kicad_pcb"),
+        ),
         parser: Some(dsn::Parser {
             string_quote: Some('"'),
             space_in_quoted_tokens: Some(true),
@@ -1848,6 +2463,14 @@ fn build_pcb(
                         shape: dsn::Shape::Polygon(zone_polygon(zone)),
                         rule: None,
                     })
+                    // Copper graphics and text: nothing may cross them.
+                    .chain(board_keepouts.iter().cloned().map(|shape| dsn::Keepout {
+                        kind: dsn::KeepoutKind::Normal,
+                        id_: String::new(),
+                        sequence_number: None,
+                        shape,
+                        rule: None,
+                    }))
                     .collect(),
             ),
             via: dsn::ViaNames {
@@ -1872,7 +2495,43 @@ fn build_pcb(
     })
 }
 
+/// An unplated hole as a keepout on `layer`: a circle, or for a slot the
+/// stadium of its long axis, turned by the hole's angle in the image.
+fn hole_shape(hole: &HoleModel, layer: &str) -> dsn::Shape {
+    let (cx, cy) = (hole.x_um as f64, hole.y_um as f64);
+    if hole.size_x_um == hole.size_y_um {
+        return dsn::Shape::Circle(dsn::Circle {
+            layer: layer.to_string(),
+            diameter: hole.size_x_um as f64,
+            offset: Some(dsn::Point { x: cx, y: cy }),
+        });
+    }
+    let half = (hole.size_x_um - hole.size_y_um).abs() as f64 / 2.0;
+    let (ux, uy) = if hole.size_x_um >= hole.size_y_um {
+        (half, 0.0)
+    } else {
+        (0.0, half)
+    };
+    let t = hole.rotation_degrees.to_radians();
+    let (rx, ry) = (ux * t.cos() - uy * t.sin(), ux * t.sin() + uy * t.cos());
+    dsn::Shape::Path(dsn::Path {
+        layer: layer.to_string(),
+        width: hole.size_x_um.min(hole.size_y_um) as f64,
+        coords: vec![
+            dsn::Point {
+                x: cx - rx,
+                y: cy - ry,
+            },
+            dsn::Point {
+                x: cx + rx,
+                y: cy + ry,
+            },
+        ],
+    })
+}
+
 fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
+    let (ox, oy) = (key.offset_x_um as f64, key.offset_y_um as f64);
     let shapes = key
         .layers
         .iter()
@@ -1880,16 +2539,16 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
             PadShape::Circle => dsn::Shape::Circle(dsn::Circle {
                 layer: layer.clone(),
                 diameter: key.size_x_um as f64,
-                offset: None,
+                offset: (ox != 0.0 || oy != 0.0).then_some(dsn::Point { x: ox, y: oy }),
             }),
             // A rounded rectangle is written as its bounding rectangle: the router
             // may not use the corners, and never sees copper it does not have.
             PadShape::Rect | PadShape::RoundRect => dsn::Shape::Rect(dsn::Rect {
                 layer: layer.clone(),
-                x1: -(key.size_x_um as f64) / 2.0,
-                y1: -(key.size_y_um as f64) / 2.0,
-                x2: key.size_x_um as f64 / 2.0,
-                y2: key.size_y_um as f64 / 2.0,
+                x1: ox - (key.size_x_um as f64) / 2.0,
+                y1: oy - (key.size_y_um as f64) / 2.0,
+                x2: ox + key.size_x_um as f64 / 2.0,
+                y2: oy + key.size_y_um as f64 / 2.0,
             }),
             // A stadium: a path along the long axis as wide as the short one.
             PadShape::Oval => {
@@ -1902,7 +2561,16 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
                 dsn::Shape::Path(dsn::Path {
                     layer: layer.clone(),
                     width: key.size_x_um.min(key.size_y_um) as f64,
-                    coords: vec![dsn::Point { x: -x, y: -y }, dsn::Point { x, y }],
+                    coords: vec![
+                        dsn::Point {
+                            x: ox - x,
+                            y: oy - y,
+                        },
+                        dsn::Point {
+                            x: ox + x,
+                            y: oy + y,
+                        },
+                    ],
                 })
             }
         })
@@ -1939,7 +2607,9 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
 fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
-    copper_layers: &[String],
+    skipped_without_pads: usize,
+    board_keepout_count: usize,
+    copper_stack: &[(String, &'static str)],
     footprints: &[FootprintModel],
     net_pins: &BTreeMap<String, Vec<String>>,
     net_classes: &BTreeMap<String, String>,
@@ -1958,12 +2628,13 @@ fn build_manifest(
             y_um: footprint.y_um,
             rotation_degrees: footprint.rotation_degrees,
             side: "front".to_string(),
+            kicad_side: footprint.kicad_side.to_string(),
             pads: footprint
                 .pads
                 .iter()
                 .map(|pad| ManifestPin {
                     pad_number: pad.number.clone(),
-                    dsn_pin: format!("{}-{}", footprint.reference, pad.number),
+                    dsn_pin: format!("{}-{}", footprint.reference, pad.dsn_id),
                     net: pad.net.clone(),
                     padstack_name: padstack_names[&pad.padstack].clone(),
                 })
@@ -1990,11 +2661,13 @@ fn build_manifest(
             drill_um: key.drill_um,
         })
         .collect::<Vec<_>>();
+    let copper_layers: Vec<String> = copper_stack.iter().map(|(name, _)| name.clone()).collect();
+    let any_back = footprints.iter().any(|f| f.kicad_side == "back");
     padstacks.extend(via_names.iter().map(|(rule, name)| ManifestPadstack {
         name: name.clone(),
         purpose: "via".to_string(),
         shape: PadShape::Circle,
-        layers: copper_layers.to_vec(),
+        layers: copper_layers.clone(),
         size_x_um: rule.via_diameter_um,
         size_y_um: rule.via_diameter_um,
         drill_um: Some(rule.via_drill_um),
@@ -2009,8 +2682,8 @@ fn build_manifest(
         coordinate_unit: "um".to_string(),
         resolution: DSN_RESOLUTION as u32,
         supported_profile: SupportedProfile {
-            copper_layers: 2,
-            component_side: "front".to_string(),
+            copper_layers: copper_layers.len() as u32,
+            component_side: if any_back { "front_and_back" } else { "front" }.to_string(),
             pad_shapes: ["circle", "rect", "roundrect", "oval"]
                 .map(str::to_string)
                 .to_vec(),
@@ -2021,17 +2694,24 @@ fn build_manifest(
             zone_plane_count: zones.iter().filter(|z| z.kind == ZoneKind::Plane).count(),
             zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
+            footprints_without_pads: skipped_without_pads,
+            copper_graphic_keepout_count: board_keepout_count
+                + footprints
+                    .iter()
+                    .map(|f| f.copper_keepouts.len())
+                    .sum::<usize>(),
             outline: "one closed loop of Edge.Cuts lines, arcs, a rectangle, a circle or a \
                       polygon, with arcs and circles as chords within 5 um"
                 .to_string(),
         },
-        layers: copper_layers
+        layers: copper_stack
             .iter()
             .enumerate()
-            .map(|(index, layer)| ManifestLayer {
+            .map(|(index, (layer, kind))| ManifestLayer {
                 kicad_name: layer.clone(),
                 dsn_name: layer.clone(),
                 index,
+                dsn_type: kind.to_string(),
             })
             .collect(),
         components,
@@ -2833,3 +3513,7 @@ mod tests {
         assert!(!plan.tracks.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "specctra_layers_tests.rs"]
+mod layers_tests;

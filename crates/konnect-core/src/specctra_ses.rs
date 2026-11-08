@@ -96,6 +96,15 @@ struct SupportedProfile {
     zone_keepout_count: usize,
     custom_rules: bool,
     outline: String,
+    /// Informational: padless footprints the export left out. The import
+    /// neither needs nor checks it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    footprints_without_pads: usize,
+    /// Informational, like `footprints_without_pads`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    copper_graphic_keepout_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +113,12 @@ struct ManifestLayer {
     kicad_name: String,
     dsn_name: String,
     index: usize,
+    #[serde(default = "signal_layer")]
+    dsn_type: String,
+}
+
+fn signal_layer() -> String {
+    "signal".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,7 +131,13 @@ struct ManifestComponent {
     y_um: i64,
     rotation_degrees: f64,
     side: String,
+    #[serde(default = "front_side")]
+    kicad_side: String,
     pads: Vec<ManifestPin>,
+}
+
+fn front_side() -> String {
+    "front".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,7 +196,9 @@ pub(crate) fn parse_import_plan(
     // target board remains bound by the manifest path and snapshot hash below;
     // accept only that self-consistent transport alias, never an unrelated
     // design name.
-    if actual_base != expected_base && actual_base != session_id {
+    // The exporter writes the board name as a DSN token (spaces as `_`).
+    let expected_token = crate::specctra::dsn_design_name(expected_base);
+    if actual_base != expected_base && actual_base != expected_token && actual_base != session_id {
         bail!(
             "SES base_design '{actual_base}' matches neither board '{expected_base}' nor session '{session_id}'"
         );
@@ -252,12 +275,17 @@ fn validate_manifest(
             manifest.resolution
         );
     }
-    if manifest.supported_profile.copper_layers != 2
-        || manifest.supported_profile.component_side != "front"
+    let copper = manifest.supported_profile.copper_layers;
+    if !(2..=32).contains(&copper)
+        || !copper.is_multiple_of(2)
+        || !matches!(
+            manifest.supported_profile.component_side.as_str(),
+            "front" | "front_and_back"
+        )
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
     {
-        bail!("manifest does not describe the supported first routing profile");
+        bail!("manifest does not describe a supported routing profile");
     }
     let (locked_track_count, locked_via_count) = locked_routing_counts(board_source)?;
     let has_locked_routing = locked_track_count > 0 || locked_via_count > 0;
@@ -335,8 +363,20 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains an invalid or duplicate layer mapping");
         }
     }
-    if layer_names.len() != 2 {
-        bail!("manifest must contain exactly two copper layer mappings");
+    if layer_names.len() != manifest.supported_profile.copper_layers as usize {
+        bail!(
+            "manifest must contain one mapping per copper layer ({} expected)",
+            manifest.supported_profile.copper_layers
+        );
+    }
+    let indices: Vec<usize> = layer_indices.into_iter().collect();
+    if indices != (0..layer_names.len()).collect::<Vec<_>>()
+        || manifest
+            .layers
+            .iter()
+            .any(|layer| !matches!(layer.dsn_type.as_str(), "signal" | "power"))
+    {
+        bail!("manifest layer mappings are not a contiguous signal/power copper stack");
     }
 
     let net_names = manifest
@@ -362,13 +402,23 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             || component.image_name.is_empty()
             || !component.rotation_degrees.is_finite()
             || component.side != "front"
+            || !matches!(component.kicad_side.as_str(), "front" | "back")
             || !references.insert(component.reference.as_str())
         {
             bail!("manifest contains invalid component placement metadata");
         }
+        let mut pin_ids = BTreeSet::new();
         for pin in &component.pads {
-            if pin.pad_number.is_empty()
-                || pin.dsn_pin != format!("{}-{}", component.reference, pin.pad_number)
+            // A pin is `REF-NUMBER`, or `REF-NUMBER@n` for a repeated or
+            // empty number (see the exporter's `pin_ids`).
+            let base = format!("{}-{}", component.reference, pin.pad_number);
+            let suffixed = pin
+                .dsn_pin
+                .strip_prefix(&base)
+                .and_then(|rest| rest.strip_prefix('@'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if !(pin.dsn_pin == base && !pin.pad_number.is_empty() || suffixed)
+                || !pin_ids.insert(pin.dsn_pin.as_str())
                 || !padstack_names.contains(pin.padstack_name.as_str())
                 || pin
                     .net
@@ -386,6 +436,13 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
         if net.class_name.is_empty() || net.pins.is_empty() {
             bail!("manifest net '{}' is incomplete", net.name);
         }
+    }
+    let any_back = manifest
+        .components
+        .iter()
+        .any(|component| component.kicad_side == "back");
+    if any_back != (manifest.supported_profile.component_side == "front_and_back") {
+        bail!("manifest component sides disagree with its routing profile");
     }
     Ok(())
 }
