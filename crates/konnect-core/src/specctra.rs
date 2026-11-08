@@ -32,6 +32,9 @@ const MAX_ARC_SEGMENTS: usize = 4096;
 pub(crate) struct ExportBundle {
     pub dsn: String,
     pub manifest: String,
+    /// Nets widened to their design-intent current: net, from and to (mm),
+    /// current, temperature rise.
+    pub intent_widths: Vec<serde_json::Value>,
     pub source_sha256: String,
     pub component_count: usize,
     pub pad_count: usize,
@@ -180,6 +183,13 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    /// The width and clearance of each class, so the importer can refuse a
+    /// track the router narrowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    classes: Vec<ManifestClass>,
+    /// Nets widened to their design-intent current.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    intent_widths: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -212,6 +222,17 @@ struct SupportedProfile {
     /// counts them); they need a refill after the import.
     #[serde(default)]
     pours_omitted: bool,
+    /// The project's copper-to-edge clearance, for the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copper_edge_clearance_um: Option<i64>,
+}
+
+/// One routing class: the width every track of its nets must keep.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ManifestClass {
+    name: String,
+    track_width_um: i64,
+    clearance_um: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -261,6 +282,11 @@ struct ManifestNet {
     name: String,
     pins: Vec<String>,
     class_name: String,
+    /// The narrowest a track of this net may be, when that is below its
+    /// class: a net widened to its design-intent current keeps its base width
+    /// as the floor, for the connections the router can only reach at it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_track_width_um: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -274,12 +300,130 @@ struct ManifestPadstack {
     drill_um: Option<i64>,
 }
 
+/// What the router needs from the export's reverse manifest beside `dsn`
+/// (`<dsn>.konnect.json`): the project's copper-to-edge clearance, and the
+/// narrowest width any net may take (its base width for a widened net, else
+/// its class), which is the width a failed wide connection is retried at.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct RoutingHints {
+    pub copper_edge_clearance_um: Option<i64>,
+    pub retry_width_um: Option<i64>,
+}
+
+pub(crate) fn manifest_routing_hints(dsn: &Path) -> RoutingHints {
+    let mut name = dsn.as_os_str().to_os_string();
+    name.push(".konnect.json");
+    let Some(value) = std::fs::read_to_string(std::path::PathBuf::from(name))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return RoutingHints::default();
+    };
+    let class_width: BTreeMap<&str, i64> = value["classes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["name"].as_str()?, c["track_width_um"].as_i64()?)))
+        .collect();
+    let retry_width_um = value["nets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| {
+            n["min_track_width_um"]
+                .as_i64()
+                .or_else(|| class_width.get(n["class_name"].as_str()?).copied())
+        })
+        .min();
+    RoutingHints {
+        copper_edge_clearance_um: value["supported_profile"]["copper_edge_clearance_um"].as_i64(),
+        retry_width_um,
+    }
+}
+
+/// Each net with a design-intent current, widened to the IPC-2221 width for
+/// that current on the worst copper layer of the stack (inner layers need more
+/// copper), with copper thickness from the record, else the stackup, else
+/// 1 oz / 0.5 oz, as `audit_trace_current` computes it. A net is never made
+/// narrower. With no record nothing changes; an unusable record refuses.
+pub(crate) fn widen_for_intent(
+    board: &Path,
+    source: &str,
+    rules: &IpcEffectiveRoutingRules,
+) -> Result<(IpcEffectiveRoutingRules, Vec<serde_json::Value>)> {
+    use crate::tools::design_intent::{design_intent_path, read_design_intent, IntentRead};
+    use crate::tools::trace_current::{copper_for, is_outer, required_area_mm2, requirements};
+    let dir = board.parent().unwrap_or(Path::new("."));
+    let path = design_intent_path(dir);
+    let intent = match read_design_intent(&path) {
+        IntentRead::Absent => return Ok((rules.clone(), Vec::new())),
+        IntentRead::Unusable { reason } => bail!(
+            "the design-intent record at '{}' cannot be used ({reason}); fix it or pass widths_from_intent: false",
+            path.display()
+        ),
+        IntentRead::Loaded { intent, .. } => intent,
+    };
+    let tree = parse_sexp(source).context("parse board for intent widths")?;
+    // Only layers the router may put a track on decide the width.
+    let layers: Vec<String> = copper_stack(&tree)?
+        .into_iter()
+        .filter(|(_, kind)| *kind == "signal")
+        .map(|(name, _)| name)
+        .collect();
+    let copper = copper_for(&tree, &intent);
+    let mut out = rules.clone();
+    let mut report = Vec::new();
+    for req in requirements(&intent, 10.0, false) {
+        let Some(rule) = out.get_mut(&req.net) else {
+            report.push(serde_json::json!({
+                "net": req.net, "current_a": req.amps, "status": "not_routed",
+                "reason": "the board has no routable net of this name",
+            }));
+            continue;
+        };
+        let (needed, limiting) = layers
+            .iter()
+            .map(|layer| {
+                let (t, _) = copper.thickness(layer);
+                (
+                    required_area_mm2(req.amps, req.rise_c, is_outer(layer)) / t,
+                    layer.clone(),
+                )
+            })
+            .fold(
+                (0.0f64, String::new()),
+                |a, b| if b.0 > a.0 { b } else { a },
+            );
+        // Up to the next whole micrometre, so the DSN never rounds it below.
+        let needed = (needed * 1000.0).ceil() / 1000.0;
+        let from = rule.track_width_mm.unwrap_or(0.0);
+        if needed > from + 1e-9 {
+            rule.track_width_mm = Some(needed);
+            report.push(serde_json::json!({
+                "net": req.net, "current_a": req.amps, "temp_rise_c": req.rise_c,
+                "from_mm": from, "to_mm": needed, "limiting_layer": limiting, "status": "widened",
+            }));
+        } else {
+            report.push(serde_json::json!({
+                "net": req.net, "current_a": req.amps, "temp_rise_c": req.rise_c,
+                "width_mm": from, "needed_mm": needed, "status": "already_wide_enough",
+            }));
+        }
+    }
+    Ok((out, report))
+}
+
 /// Choices the caller makes about what the router is given.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ExportOptions {
     /// Leave copper pours out of the DSN, so the router may route through
     /// their area (refill them after the import). Rule areas stay.
     pub omit_pours: bool,
+    /// The project's copper-to-board-edge clearance, recorded in the manifest
+    /// for the router (the DSN has no place for it).
+    pub copper_edge_clearance_um: Option<i64>,
+    /// Widen nets with a design-intent current to the IPC-2221 width.
+    pub widths_from_intent: bool,
 }
 
 #[cfg(test)]
@@ -357,6 +501,15 @@ pub(crate) fn export_dsn_with_options(
     }
 
     let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules)?;
+    let manifest_classes: Vec<ManifestClass> = class_nets
+        .keys()
+        .enumerate()
+        .map(|(index, rule)| ManifestClass {
+            name: format!("konnect_class_{:04}", index + 1),
+            track_width_um: rule.track_width_um,
+            clearance_um: rule.clearance_um,
+        })
+        .collect();
 
     let mut padstack_keys = BTreeSet::new();
     for footprint in &footprints {
@@ -396,7 +549,8 @@ pub(crate) fn export_dsn_with_options(
     let manifest = build_manifest(
         board_path,
         &source_sha256,
-        options.omit_pours,
+        &manifest_classes,
+        options,
         skipped_without_pads,
         board_keepouts.len(),
         &copper_stack,
@@ -412,6 +566,7 @@ pub(crate) fn export_dsn_with_options(
     Ok(ExportBundle {
         dsn,
         manifest,
+        intent_widths: Vec::new(),
         source_sha256,
         component_count: footprints.len(),
         pad_count: footprints
@@ -432,8 +587,26 @@ pub(crate) fn export_dsn_with_context(
     options: ExportOptions,
 ) -> Result<ExportBundle> {
     let adjusted = snapshot.project_rules(rules)?;
+    let (adjusted, widened) = if options.widths_from_intent {
+        widen_for_intent(board, source, &adjusted)?
+    } else {
+        (adjusted, Vec::new())
+    };
     let mut bundle = export_dsn_with_options(board, source, &adjusted, options)?;
     let mut manifest: Manifest = serde_json::from_str(&bundle.manifest)?;
+    // A widened net may still meet a pad it can only reach at its base width;
+    // the router retries such a connection at the project minimum, and that
+    // base width is the floor the importer holds the net to.
+    for net in &mut manifest.nets {
+        if let Some(w) = widened
+            .iter()
+            .find(|w| w["net"] == net.name && w["status"] == "widened")
+        {
+            net.min_track_width_um = w["from_mm"].as_f64().map(|mm| (mm * 1000.0).round() as i64);
+        }
+    }
+    manifest.intent_widths = widened.clone();
+    bundle.intent_widths = widened;
     manifest.routing_context = Some(snapshot.seal(rules)?);
     manifest.supported_profile.custom_rules = snapshot.rules.is_some();
     bundle.manifest = serde_json::to_string_pretty(&manifest)?;
@@ -506,6 +679,11 @@ pub(crate) fn adopt_native_dsn(
             .get(&net.class_name)
             .with_context(|| format!("native DSN omitted class mapping for '{}'", net.name))?
             .clone();
+    }
+    for class in &mut manifest.classes {
+        if let Some(native) = class_names.get(&class.name) {
+            class.name = native.clone();
+        }
     }
     for padstack in &mut manifest.padstacks {
         let mapping = if padstack.purpose == "via" {
@@ -2688,7 +2866,8 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
 fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
-    pours_omitted: bool,
+    classes: &[ManifestClass],
+    options: ExportOptions,
     skipped_without_pads: usize,
     board_keepout_count: usize,
     copper_stack: &[(String, &'static str)],
@@ -2729,6 +2908,7 @@ fn build_manifest(
             name: name.clone(),
             pins: pins.clone(),
             class_name: net_classes[name].clone(),
+            min_track_width_um: None,
         })
         .collect();
     let mut padstacks = padstack_names
@@ -2777,7 +2957,8 @@ fn build_manifest(
             zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
             footprints_without_pads: skipped_without_pads,
-            pours_omitted,
+            pours_omitted: options.omit_pours,
+            copper_edge_clearance_um: options.copper_edge_clearance_um,
             copper_graphic_keepout_count: board_keepout_count
                 + footprints
                     .iter()
@@ -2800,6 +2981,8 @@ fn build_manifest(
         components,
         nets,
         padstacks,
+        classes: classes.to_vec(),
+        intent_widths: Vec::new(),
     })
     .context("serialize routing manifest")
 }

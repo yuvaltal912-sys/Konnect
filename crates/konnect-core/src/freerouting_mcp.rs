@@ -60,6 +60,17 @@ pub(crate) struct RouteSettings {
     pub overall_timeout: Duration,
     /// The Java to run the JAR with; `java` on `PATH` when unset.
     pub java: Option<PathBuf>,
+    /// Freerouting's automatic neck-down at pins. It narrows a track below its
+    /// net class to reach a small pad, which breaks the project's minimum, so
+    /// `route_specctra_dsn` turns it off unless asked.
+    pub automatic_neckdown: Option<bool>,
+    /// The project's copper-to-board-edge clearance, which the DSN does not
+    /// carry.
+    pub copper_to_edge_clearance_um: Option<f64>,
+    /// The width Freerouting retries a connection at when the class width
+    /// cannot reach it (`neckWidthUm`): the narrowest width the manifest
+    /// allows, so no track ends up below the project's floor.
+    pub retry_width_um: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +146,33 @@ pub(crate) async fn probe_local(jar: &Path, java: Option<&Path>) -> BridgeProbe 
             error: Some(format!("{error:#}")),
         },
     }
+}
+
+/// The `update_job_settings` body for these settings.
+fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
+    let mut job_settings = Map::new();
+    if let Some(max_passes) = settings.max_passes {
+        job_settings.insert("maxPasses".to_string(), json!(max_passes));
+    }
+    if let Some(enabled) = settings.optimizer_enabled {
+        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
+    }
+    if let Some(neckdown) = settings.automatic_neckdown {
+        job_settings.insert("automaticNeckdown".to_string(), json!(neckdown));
+    }
+    if let Some(edge) = settings.copper_to_edge_clearance_um {
+        job_settings.insert("copperToEdgeClearanceUm".to_string(), json!(edge));
+    }
+    if let Some(width) = settings.retry_width_um {
+        job_settings.insert("neckWidthUm".to_string(), json!(width));
+    }
+    if let Some(seconds) = settings.job_timeout_seconds {
+        job_settings.insert(
+            "jobTimeoutString".to_string(),
+            Value::String(duration_string(seconds)),
+        );
+    }
+    job_settings
 }
 
 pub(crate) async fn route_local(
@@ -325,19 +363,7 @@ async fn run_state_machine(
         )
         .await?;
 
-    let mut job_settings = Map::new();
-    if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
-    }
-    if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
-    }
-    if let Some(seconds) = settings.job_timeout_seconds {
-        job_settings.insert(
-            "jobTimeoutString".to_string(),
-            Value::String(duration_string(seconds)),
-        );
-    }
+    let job_settings = job_settings(settings);
     if !job_settings.is_empty() {
         if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
@@ -822,6 +848,35 @@ mod tests {
     }
 
     #[test]
+    fn neckdown_and_edge_clearance_reach_the_job_settings() {
+        let settings = RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            poll_interval: std::time::Duration::from_secs(1),
+            overall_timeout: std::time::Duration::from_secs(10),
+            java: None,
+            automatic_neckdown: Some(false),
+            copper_to_edge_clearance_um: Some(500.0),
+            retry_width_um: Some(200.0),
+        };
+        let body = job_settings(&settings);
+        assert_eq!(body["automaticNeckdown"], json!(false));
+        assert_eq!(body["copperToEdgeClearanceUm"], json!(500.0));
+        assert_eq!(body["neckWidthUm"], json!(200.0));
+        let none = job_settings(&RouteSettings {
+            automatic_neckdown: None,
+            copper_to_edge_clearance_um: None,
+            retry_width_um: None,
+            ..settings
+        });
+        assert!(
+            none.get("automaticNeckdown").is_none()
+                && none.get("copperToEdgeClearanceUm").is_none()
+        );
+    }
+
+    #[test]
     fn duration_settings_use_documented_shape() {
         assert_eq!(duration_string(5 * 60), "00:05:00");
         assert_eq!(duration_string(25 * 60 * 60), "25:00:00");
@@ -923,6 +978,9 @@ mod tests {
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
                 java: None,
+                automatic_neckdown: None,
+                copper_to_edge_clearance_um: None,
+                retry_width_um: None,
             },
         )
         .await
@@ -958,6 +1016,9 @@ mod tests {
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                     java: None,
+                    automatic_neckdown: None,
+                    copper_to_edge_clearance_um: None,
+                    retry_width_um: None,
                 },
             )
             .await
@@ -1006,6 +1067,9 @@ mod tests {
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                     java: None,
+                    automatic_neckdown: None,
+                    copper_to_edge_clearance_um: None,
+                    retry_width_um: None,
                 },
             )
             .await

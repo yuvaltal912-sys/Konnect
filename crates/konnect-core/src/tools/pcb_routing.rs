@@ -2224,6 +2224,9 @@ mod specctra_live_undo_test {
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
                 java: None,
+                automatic_neckdown: None,
+                copper_to_edge_clearance_um: None,
+                retry_width_um: None,
             },
         )
         .await

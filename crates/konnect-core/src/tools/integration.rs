@@ -160,6 +160,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "java_path": { "type": "string", "description": "Path to a Java executable to use (optional); see check_freerouting." },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
+                    "allow_neckdown": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Let Freerouting narrow tracks below their net class to reach small pads. Off by default: the narrowed tracks break the project's minimum width, and the SES importer refuses them."
+                    },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
@@ -168,6 +173,26 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_route_specctra_dsn(args, ctx).await }
         ),
     ]
+}
+
+/// Freerouting's automatic neck-down narrows tracks below their class, which
+/// breaks the project's minimum and the SES importer refuses; it is off unless
+/// the caller asks for it.
+fn allow_neckdown(args: &serde_json::Value) -> bool {
+    args["allow_neckdown"].as_bool().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod route_rule_tests {
+    use super::allow_neckdown;
+    use serde_json::json;
+
+    #[test]
+    fn neckdown_is_off_unless_asked_for() {
+        assert!(!allow_neckdown(&json!({})));
+        assert!(!allow_neckdown(&json!({ "allow_neckdown": false })));
+        assert!(allow_neckdown(&json!({ "allow_neckdown": true })));
+    }
 }
 
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
@@ -2389,6 +2414,11 @@ async fn handle_route_specctra_dsn(
         .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
     let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
     let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
+    // The export's reverse manifest beside the DSN carries the project's
+    // copper-to-edge clearance; Freerouting takes it as a job setting.
+    let hints = crate::specctra::manifest_routing_hints(&dsn);
+    let edge_clearance = hints.copper_edge_clearance_um;
+    let allow_neckdown = allow_neckdown(args);
     let settings = crate::freerouting_mcp::RouteSettings {
         max_passes,
         optimizer_enabled: args["optimizer_enabled"].as_bool(),
@@ -2396,6 +2426,9 @@ async fn handle_route_specctra_dsn(
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
         java: Some(java),
+        automatic_neckdown: Some(allow_neckdown),
+        copper_to_edge_clearance_um: edge_clearance.map(|um| um as f64),
+        retry_width_um: hints.retry_width_um.map(|um| um as f64),
     };
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
@@ -2415,6 +2448,12 @@ async fn handle_route_specctra_dsn(
         "bridge": {
             "mode": "dsn_ses_file_round_trip",
             "cloud_used": false
+        },
+        "rules_applied": {
+            "automatic_neckdown": allow_neckdown,
+            "copper_to_edge_clearance_um": edge_clearance,
+            "copper_to_edge_clearance_source": if edge_clearance.is_some() { "export_manifest" } else { "none: no manifest beside the DSN, or it records no clearance" },
+            "retry_width_um": hints.retry_width_um,
         },
         "artifacts": {
             "dsn_path": dsn,

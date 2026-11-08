@@ -296,6 +296,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "default": "fixed",
                         "description": "'fixed' (default) gives the router every copper pour as fixed copper of its net, from the zone outline. 'omit' leaves pours out so the router can route through their area; refill zones and run DRC after apply_specctra_ses. Rule areas are always kept."
                     },
+                    "widths_from_intent": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. The result lists every widened net."
+                    },
                     "native_bridge_mode": {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
@@ -748,6 +753,17 @@ async fn handle_export_specctra_dsn(
             ))
         }
     };
+    let widths_from_intent = args["widths_from_intent"].as_bool().unwrap_or(true);
+    // The project's copper-to-edge clearance (`min_copper_edge_clearance`),
+    // which the DSN cannot hold; the manifest carries it to the router.
+    let copper_edge_clearance_um = std::fs::read_to_string(board_path.with_extension("kicad_pro"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|project| {
+            project["board"]["design_settings"]["rules"]["min_copper_edge_clearance"].as_f64()
+        })
+        .filter(|mm| mm.is_finite() && *mm > 0.0)
+        .map(|mm| (mm * 1000.0).round() as i64);
     if omit_pours && native_bridge_mode == "require" {
         return Ok(invalid_export_argument(
             "pours",
@@ -834,7 +850,11 @@ async fn handle_export_specctra_dsn(
             &before,
             &rules,
             &snapshot_for_ipc,
-            crate::specctra::ExportOptions { omit_pours },
+            crate::specctra::ExportOptions {
+                omit_pours,
+                copper_edge_clearance_um,
+                widths_from_intent,
+            },
         )?;
         Ok((export, before))
     })
@@ -957,12 +977,14 @@ async fn handle_export_specctra_dsn(
             "pad_count": export.pad_count,
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
+            "intent_widths": export.intent_widths,
+            "copper_edge_clearance_um": copper_edge_clearance_um,
             "capabilities": {
                 "dsn_export_available": true,
                 "ses_import_available": true,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_locked_routing_zones_and_conservative_custom_minima"
+                "supported_profile": "two_to_32_layers_either_side_locked_routing_zones_and_conservative_custom_minima"
             }
         })
         .to_string(),

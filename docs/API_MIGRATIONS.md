@@ -3,6 +3,32 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: route at the project's rules
+
+Creation PR 16b (`docs/CREATION_HANDOFF.md`). Found by routing the owner's
+reference board with Freerouting 2.5.0.
+
+- **`route_specctra_dsn`** turns Freerouting's automatic neck-down off
+  (`automaticNeckdown: false`); new `allow_neckdown` (default `false`) turns it
+  back on. It also passes the project's copper-to-edge clearance
+  (`copperToEdgeClearanceUm`) when the export's manifest beside the DSN records
+  one, and the narrowest width the manifest allows as Freerouting's retry width
+  (`neckWidthUm`: a connection that cannot be reached at its class width is
+  routed whole at that width, never below it). The result adds `rules_applied`.
+- **`plan_specctra_ses_import` / `apply_specctra_ses`** refuse an SES with any
+  wire narrower than its net allows, naming the worst one: the class width, or
+  for a net widened to its current its base width (`nets[].min_track_width_um`
+  in the manifest). Manifests
+  from before this release carry no class widths and are not checked.
+- **`export_specctra_dsn`** records each class's width and clearance
+  (`classes`) and the project's `min_copper_edge_clearance`
+  (`supported_profile.copper_edge_clearance_um`) in the manifest. New
+  `widths_from_intent` (default `true`): each net with a design-intent current
+  (`currents`, and rails with `max_current_a`) is widened to the IPC-2221 width
+  for that current on the stack's worst signal layer, never narrowed; the result
+  and the manifest list them under `intent_widths`. An unusable design-intent
+  record now refuses the export unless `widths_from_intent` is `false`.
+
 ## Unreleased: Specctra DSN for real boards
 
 Creation PR 16 (`docs/CREATION_HANDOFF.md`). No tool arguments change.
