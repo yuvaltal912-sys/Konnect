@@ -51,6 +51,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: `run_design_review` reads a DRC baseline, merged [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Merged: [#44](https://github.com/yuvaltal912-sys/Konnect/pull/44). Part 2 (version policy, benchmark) in [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) |
+| 16b | Route at the project's rules: no Freerouting neck-down, the importer enforces class widths, copper-to-edge clearance in the DSN, power widths from design-intent currents (IPC-2221) | 16, Q3, 11 | In progress (branch `feat/creation-route-at-project-rules`) |
 
 ## Next: what to pick
 
