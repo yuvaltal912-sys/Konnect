@@ -51,6 +51,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: read baselines in `run_design_review` (now unblocked) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
+| R21 | Board construction (rank 21: A13, B25): footprint lock/unlock, rule areas (keepouts) that survive the DSN export, zone delete, polygon board outlines | 2b | In progress (branch `feat/creation-board-construction`) |
 
 ## Next: what to pick
 
