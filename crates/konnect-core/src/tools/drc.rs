@@ -61,6 +61,258 @@ pub(crate) struct DrcSourceEvidence {
     pub live_board_synced: bool,
     pub zones_refilled: bool,
     pub zone_refill_source: Option<&'static str>,
+    /// Whether the zone fills this DRC read were current (#C24). See
+    /// [`zone_fill_check`].
+    pub zone_fill: Value,
+}
+
+impl DrcSourceEvidence {
+    /// `zone_fill_state` and its evidence, for a DRC result's top level.
+    pub(crate) fn zone_fill_fields(&self) -> serde_json::Map<String, Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("zone_fill_state".into(), self.zone_fill["state"].clone());
+        fields.insert("zone_fill_check".into(), self.zone_fill.clone());
+        fields
+    }
+}
+
+/// Violations listed when a refill changes the DRC result, per direction.
+const ZONE_FILL_EXAMPLES: usize = 10;
+/// Zones named when their fills differ from a refill.
+const ZONE_FILL_ZONES_LISTED: usize = 10;
+
+/// A copper zone of a board (not a rule area) and its saved fill.
+struct ZoneFill {
+    key: String,
+    name: Option<String>,
+    net: Option<String>,
+    /// Each `filled_polygon`, written out and sorted, so two fills compare
+    /// equal when they hold the same polygons in any order.
+    polygons: Vec<String>,
+}
+
+fn copper_zone_fills(source: &str) -> anyhow::Result<Vec<ZoneFill>> {
+    let tree = konnect_sexp::parse_sexp(source)?;
+    Ok(tree
+        .find_all("zone")
+        .into_iter()
+        .enumerate()
+        .filter(|(_, zone)| zone.find("keepout").is_none())
+        .map(|(index, zone)| {
+            let mut polygons: Vec<String> = zone
+                .find_all("filled_polygon")
+                .into_iter()
+                .map(|polygon| format!("{polygon:?}"))
+                .collect();
+            polygons.sort();
+            let net = zone.find_str("net_name").map(str::to_owned).or_else(|| {
+                zone.find("net")
+                    .and_then(|net| net.get(1))
+                    .and_then(|name| name.as_str())
+                    .filter(|name| name.parse::<i64>().is_err())
+                    .map(str::to_owned)
+            });
+            ZoneFill {
+                key: zone
+                    .find_str("uuid")
+                    .map_or_else(|| format!("#{index}"), str::to_owned),
+                name: zone
+                    .find_str("name")
+                    .map(str::to_owned)
+                    .filter(|n| !n.is_empty()),
+                net,
+                polygons,
+            }
+        })
+        .collect())
+}
+
+/// One violation as the fill comparison counts it: what and where, not the
+/// ownership enrichment only the main run gets.
+fn violation_key(violation: &cli::DrcViolation) -> String {
+    let pos = violation
+        .pos
+        .as_ref()
+        .map_or_else(String::new, |p| format!("{:.4},{:.4}", p.x, p.y));
+    format!(
+        "{}|{}|{}|{pos}",
+        violation.severity, violation.rule, violation.description
+    )
+}
+
+fn fill_sensitive(report: &cli::DrcReport) -> Vec<&cli::DrcViolation> {
+    report
+        .violations
+        .iter()
+        .chain(report.unconnected_items.iter().flatten())
+        .collect()
+}
+
+/// The violations of `from` that `other` lacks, counted with multiplicity.
+fn only_in<'a>(
+    from: &[&'a cli::DrcViolation],
+    other: &[&cli::DrcViolation],
+) -> Vec<&'a cli::DrcViolation> {
+    let mut remaining: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for violation in other {
+        *remaining.entry(violation_key(violation)).or_default() += 1;
+    }
+    from.iter()
+        .copied()
+        .filter(
+            |violation| match remaining.get_mut(&violation_key(violation)) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    false
+                }
+                _ => true,
+            },
+        )
+        .collect()
+}
+
+fn violation_json(violation: &cli::DrcViolation) -> Value {
+    json!({
+        "severity": violation.severity,
+        "rule": violation.rule,
+        "description": violation.description,
+        "pos": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+    })
+}
+
+/// Whether the zone fills `report` was computed from were current (#C24).
+///
+/// `state` is `fresh` when the zones were refilled for this run, when the
+/// board has no copper zones, or when a refill of a private copy produced the
+/// same fills; `stale` when that refill changed any zone's fill; `unknown` when
+/// no comparison was made or it failed, with `reason`. When stale, the
+/// violations a refill clears or adds are counted and the first few listed.
+/// The comparison is a second, analysis-only DRC on a scratch copy of the
+/// board and its project rules; the board itself is never written.
+pub(crate) async fn zone_fill_check(
+    ctx: &ToolContext,
+    board: &Path,
+    refilled: bool,
+    check: bool,
+    report: &cli::DrcReport,
+) -> Value {
+    if refilled {
+        return json!({ "state": "fresh", "method": "refilled_for_this_run" });
+    }
+    let unknown = |method: &str, zones: Option<usize>, reason: String| {
+        json!({
+            "state": "unknown",
+            "method": method,
+            "copper_zones": zones,
+            "reason": reason,
+            "hint": "Pass refill_zones: true to run DRC on fresh fills, or leave check_zone_fills on.",
+        })
+    };
+    let saved = match tokio::fs::read_to_string(board)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|source| copper_zone_fills(&source))
+    {
+        Ok(zones) => zones,
+        Err(error) => {
+            return unknown(
+                "check_failed",
+                None,
+                format!("could not read the board's zones: {error:#}"),
+            )
+        }
+    };
+    if saved.is_empty() {
+        return json!({ "state": "fresh", "method": "no_copper_zones", "copper_zones": 0 });
+    }
+    if !check {
+        return unknown(
+            "not_checked",
+            Some(saved.len()),
+            "check_zone_fills was false and the zones were not refilled".into(),
+        );
+    }
+    let comparison = async {
+        let scratch = tempfile::tempdir()?;
+        let name = board.file_name().context("board path has no file name")?;
+        let copy = scratch.path().join(name);
+        tokio::fs::copy(board, &copy).await?;
+        // The fill depends on the project's clearances, so the rules travel
+        // with the copy. Neither file is required.
+        for extension in ["kicad_pro", "kicad_dru"] {
+            let rules = board.with_extension(extension);
+            if rules.is_file() {
+                tokio::fs::copy(&rules, copy.with_extension(extension)).await?;
+            }
+        }
+        let refilled_report = cli::refill_drc_on_private_copy(&ctx.config.kicad_cli, &copy).await?;
+        let refilled = copper_zone_fills(&tokio::fs::read_to_string(&copy).await?)?;
+        anyhow::Ok((refilled_report, refilled))
+    };
+    use anyhow::Context as _;
+    let (refilled_report, refilled) = match comparison.await {
+        Ok(result) => result,
+        Err(error) => {
+            return unknown(
+                "check_failed",
+                Some(saved.len()),
+                format!("the refill comparison did not complete: {error:#}"),
+            )
+        }
+    };
+    let fresh: std::collections::HashMap<&str, &Vec<String>> = refilled
+        .iter()
+        .map(|zone| (zone.key.as_str(), &zone.polygons))
+        .collect();
+    let differing: Vec<&ZoneFill> = saved
+        .iter()
+        .filter(|zone| fresh.get(zone.key.as_str()) != Some(&&zone.polygons))
+        .collect();
+    let before = fill_sensitive(report);
+    let after = fill_sensitive(&refilled_report);
+    let cleared = only_in(&before, &after);
+    let added = only_in(&after, &before);
+    let state = if differing.is_empty() {
+        "fresh"
+    } else {
+        "stale"
+    };
+    let mut result = json!({
+        "state": state,
+        "method": "compared_with_refill",
+        "copper_zones": saved.len(),
+        "zones_differing": differing.len(),
+        "violations_cleared_by_refill": cleared.len(),
+        "violations_added_by_refill": added.len(),
+    });
+    if !differing.is_empty() {
+        result["differing_zones"] = json!(differing
+            .iter()
+            .take(ZONE_FILL_ZONES_LISTED)
+            .map(|zone| json!({ "uuid": zone.key, "name": zone.name, "net": zone.net }))
+            .collect::<Vec<_>>());
+        result["hint"] = json!(if cleared.is_empty() && added.is_empty() {
+            "The saved zone fills are out of date, but a refill does not change these DRC results."
+        } else {
+            "The saved zone fills are out of date and a refill changes these DRC results. \
+             Refill the zones (refill_zones: true, or the refill_zones tool) and run DRC again."
+        });
+    }
+    if !cleared.is_empty() {
+        result["cleared_by_refill"] = json!(cleared
+            .iter()
+            .take(ZONE_FILL_EXAMPLES)
+            .map(|v| violation_json(v))
+            .collect::<Vec<_>>());
+    }
+    if !added.is_empty() {
+        result["added_by_refill"] = json!(added
+            .iter()
+            .take(ZONE_FILL_EXAMPLES)
+            .map(|v| violation_json(v))
+            .collect::<Vec<_>>());
+    }
+    result
 }
 
 /// Preserve completed work when optional report publication fails afterwards.
@@ -150,6 +402,14 @@ pub(crate) async fn run(
         (Ok(sync), Ok(refill)) => (sync, refill),
         (Err(error), _) | (_, Err(error)) => return Ok(Err(error)),
     };
+    // On unless the caller turns it off: a DRC on stale fills misleads (#C24).
+    let check_fills = match args.get("check_zone_fills") {
+        None => true,
+        Some(_) => match option("check_zone_fills") {
+            Ok(check) => check,
+            Err(error) => return Ok(Err(error)),
+        },
+    };
     // Refuse obvious publication errors before any live save/refill. Later
     // permission changes or filesystem races still need applied-state recovery.
     if let Some(output) = args["output"].as_str() {
@@ -225,6 +485,7 @@ pub(crate) async fn run(
             Err(error) => return Ok(Err(uncertain(board, "verify_drc_source", error))),
         }
     }
+    let zone_fill = zone_fill_check(ctx, board, refill, check_fills, &report).await;
     Ok(Ok((
         report,
         DrcSourceEvidence {
@@ -236,6 +497,7 @@ pub(crate) async fn run(
             } else {
                 None
             },
+            zone_fill,
         },
     )))
 }
@@ -925,5 +1187,255 @@ mod tests {
                 "refill must actually compute copper"
             );
         }
+    }
+}
+
+/// C24: `zone_fill_state` says whether the fills a DRC read were current, by
+/// refilling a private copy, and never writes the board.
+#[cfg(all(test, unix))]
+mod zone_fill_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use serde_json::json;
+
+    fn board(fill: &str) -> String {
+        format!(
+            r#"(kicad_pcb (version 20260206) (generator "test")
+  (net 0 "")
+  (net 1 "GND")
+  (zone (net 1) (net_name "GND") (layer "F.Cu") (uuid "z-pour") (name "pour")
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))
+    (filled_polygon (layer "F.Cu") (pts {fill})))
+  (zone (net 0) (net_name "") (layer "F.Cu") (uuid "z-keepout")
+    (keepout (tracks not_allowed) (vias allowed) (pads allowed) (copperpour allowed) (footprints allowed))
+    (polygon (pts (xy 20 20) (xy 30 20) (xy 30 30))))
+)
+"#
+        )
+    }
+    const FILL: &str = "(xy 0.5 0.5) (xy 9.5 0.5) (xy 9.5 9.5) (xy 0.5 9.5)";
+    const REFILL: &str = "(xy 0.5 0.5) (xy 9.5 0.5) (xy 9.5 6) (xy 0.5 6)";
+    const STALE_REPORT: &str = r#"{"violations":[{"type":"clearance","severity":"error","description":"Clearance violation (zone pour and track)","items":[{"description":"Zone pour","pos":{"x":9.5,"y":9.5},"uuid":"z-pour"}]},{"type":"silk_overlap","severity":"warning","description":"Silkscreen overlap","items":[{"description":"Text","pos":{"x":1,"y":1}}]}],"unconnected_items":[],"schematic_parity":[]}"#;
+    const REFILLED_REPORT: &str = r#"{"violations":[{"type":"silk_overlap","severity":"warning","description":"Silkscreen overlap","items":[{"description":"Text","pos":{"x":1,"y":1}}]}],"unconnected_items":[]}"#;
+
+    struct Scene {
+        dir: tempfile::TempDir,
+        board: std::path::PathBuf,
+        ctx: ToolContext,
+    }
+
+    impl Scene {
+        /// A stand-in kicad-cli: the main DRC writes `main.json`; a run with
+        /// `--save-board` writes `refill.json` and saves `refilled.kicad_pcb`
+        /// over the board it was given. Every call is logged.
+        fn new(saved: &str, refilled: Option<&str>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("demo.kicad_pcb");
+            std::fs::write(&board, saved).unwrap();
+            std::fs::write(board.with_extension("kicad_pro"), "{}").unwrap();
+            std::fs::write(dir.path().join("main.json"), STALE_REPORT).unwrap();
+            std::fs::write(dir.path().join("refill.json"), REFILLED_REPORT).unwrap();
+            let refill_step = match refilled {
+                Some(text) => {
+                    std::fs::write(dir.path().join("refilled.kicad_pcb"), text).unwrap();
+                    format!(
+                        "cp '{0}/refilled.kicad_pcb' \"$last\"; cp '{0}/refill.json' \"$out\"",
+                        dir.path().display()
+                    )
+                }
+                None => "echo refill failed >&2; exit 3".into(),
+            };
+            let script = format!(
+                "#!/bin/sh\nout=''; save=0; prev=''\nfor a; do\n  [ \"$prev\" = --output ] && out=\"$a\"\n  [ \"$a\" = --save-board ] && save=1\n  prev=\"$a\"; last=\"$a\"\ndone\necho \"$*\" >> '{0}/calls'\nif [ $save = 1 ]; then\n  [ -f \"$(dirname \"$last\")/demo.kicad_pro\" ] || exit 4\n  {refill_step}\nelse\n  cp '{0}/main.json' \"$out\"\nfi\nexit 0\n",
+                dir.path().display()
+            );
+            let cli = cli::test_support::write_script(dir.path(), "kicad-cli", &script, "");
+            let ctx = ToolContext::new(
+                ServerConfig {
+                    kicad_cli: cli.display().to_string(),
+                    ..Default::default()
+                },
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            );
+            Scene { dir, board, ctx }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        async fn run(&self, tool: &str, extra: Value) -> (bool, Value) {
+            let mut args = json!({ "board": self.board.display().to_string(), "severity": "info" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = match tool {
+                "run_drc" => super::super::verification::handle_run_drc(&args, &self.ctx).await,
+                _ => super::super::pcb_export::handle_get_drc_violations(&args, &self.ctx).await,
+            }
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text");
+            };
+            (result.is_error, serde_json::from_str(text).unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_fills_are_reported_with_the_violations_a_refill_clears() {
+        for tool in ["run_drc", "get_drc_violations"] {
+            let saved = board(FILL);
+            let scene = Scene::new(&saved, Some(&board(REFILL)));
+            let (error, body) = scene.run(tool, json!({})).await;
+            assert!(!error, "{body}");
+            assert_eq!(body["zone_fill_state"], "stale", "{tool}: {body}");
+            let check = &body["zone_fill_check"];
+            assert_eq!(check["method"], "compared_with_refill");
+            assert_eq!(check["copper_zones"], 1, "the keepout is not a copper zone");
+            assert_eq!(check["zones_differing"], 1);
+            assert_eq!(check["differing_zones"][0]["uuid"], "z-pour");
+            assert_eq!(check["differing_zones"][0]["net"], "GND");
+            assert_eq!(check["violations_cleared_by_refill"], 1);
+            assert_eq!(check["violations_added_by_refill"], 0);
+            assert_eq!(check["cleared_by_refill"][0]["rule"], "clearance");
+            assert!(check["hint"].as_str().unwrap().contains("refill"));
+            // The main result is still the saved fills' result, whole.
+            assert_eq!(body["design_rule_violations"], 2);
+            assert_eq!(std::fs::read_to_string(&scene.board).unwrap(), saved);
+            let calls = scene.calls();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(!calls[0].contains("--save-board"));
+            assert!(calls[1].contains("--refill-zones --save-board"));
+            let board_arg = calls[1].split(' ').next_back().unwrap();
+            assert_ne!(
+                std::path::Path::new(board_arg),
+                scene.board.as_path(),
+                "the refill must run on a copy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fills_a_refill_reproduces_are_fresh() {
+        let saved = board(FILL);
+        let scene = Scene::new(&saved, Some(&saved));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "fresh", "{body}");
+        assert_eq!(body["zone_fill_check"]["zones_differing"], 0);
+        assert!(body["zone_fill_check"].get("differing_zones").is_none());
+    }
+
+    #[tokio::test]
+    async fn refilled_runs_unzoned_boards_and_opt_outs_need_no_second_pass() {
+        let scene = Scene::new(&board(FILL), Some(&board(REFILL)));
+        let (_, refilled) = scene.run("run_drc", json!({ "refill_zones": true })).await;
+        assert_eq!(refilled["zone_fill_state"], "fresh");
+        assert_eq!(
+            refilled["zone_fill_check"]["method"],
+            "refilled_for_this_run"
+        );
+        let (_, skipped) = scene
+            .run("run_drc", json!({ "check_zone_fills": false }))
+            .await;
+        assert_eq!(skipped["zone_fill_state"], "unknown");
+        assert_eq!(skipped["zone_fill_check"]["method"], "not_checked");
+        assert_eq!(scene.calls().len(), 2, "one DRC each, no refill copy");
+
+        let unzoned = "(kicad_pcb (version 20260206) (generator \"test\"))\n";
+        let scene = Scene::new(unzoned, Some(unzoned));
+        let (_, body) = scene.run("get_drc_violations", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "fresh");
+        assert_eq!(body["zone_fill_check"]["method"], "no_copper_zones");
+        assert_eq!(scene.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_comparison_is_unknown_and_keeps_the_drc_result() {
+        let scene = Scene::new(&board(FILL), None);
+        let (error, body) = scene.run("run_drc", json!({})).await;
+        assert!(!error, "{body}");
+        assert_eq!(body["zone_fill_state"], "unknown");
+        assert_eq!(body["zone_fill_check"]["method"], "check_failed");
+        assert!(body["zone_fill_check"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("refill"));
+        assert_eq!(body["design_rule_violations"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_check_flag_is_refused_before_any_drc() {
+        let scene = Scene::new(&board(FILL), Some(&board(REFILL)));
+        let (error, body) = scene
+            .run("run_drc", json!({ "check_zone_fills": "yes" }))
+            .await;
+        assert!(error, "{body}");
+        assert!(scene.calls().is_empty());
+    }
+
+    /// Real KiCad on a scratch copy of a demo board: its fills were made by an
+    /// older KiCad, so this one's refill differs (stale); once refilled and
+    /// saved, a second check finds them fresh. Needs `KICAD_CLI`.
+    #[tokio::test]
+    #[ignore = "runs the real kicad-cli; set KICAD_CLI"]
+    async fn real_kicad_finds_old_fills_stale_and_refilled_ones_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("pic_programmer.kicad_pcb");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../konnect-sexp/tests/fixtures/pic_programmer.kicad_pcb"
+            ),
+            &board,
+        )
+        .unwrap();
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: std::env::var("KICAD_CLI").expect("KICAD_CLI"),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let args = json!({ "board": board.display().to_string() });
+        let check = |result: CallToolResult| -> Value {
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text");
+            };
+            serde_json::from_str(text).unwrap()
+        };
+        let before = std::fs::read(&board).unwrap();
+        let old = check(
+            super::super::verification::handle_run_drc(&args, &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            old["zone_fill_state"], "stale",
+            "{}",
+            old["zone_fill_check"]
+        );
+        assert_eq!(
+            std::fs::read(&board).unwrap(),
+            before,
+            "the board is never written"
+        );
+        // Refill and save the scratch board the way the owner would.
+        cli::refill_drc_on_private_copy(&ctx.config.kicad_cli, &board)
+            .await
+            .unwrap();
+        let new = check(
+            super::super::verification::handle_run_drc(&args, &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            new["zone_fill_state"], "fresh",
+            "{}",
+            new["zone_fill_check"]
+        );
     }
 }

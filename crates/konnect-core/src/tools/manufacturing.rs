@@ -87,7 +87,9 @@ pub fn tools() -> Vec<ToolDef> {
              outside it, with the overhang in mm; parts in 'edge_mount_references' are listed \
              as intentional. Returns NOT READY — never READY — if \
              DRC reports errors or could not be run, so a READY verdict always rests on \
-             evidence rather than on an absence of findings.",
+             evidence rather than on an absence of findings. `issues` is paged (`limit`, \
+             `offset`) and stops at a size cap; `issue_count` and `issues_by_severity` count \
+             every issue and the verdict reads them all.",
             json!({
                 "type": "object",
                 "properties": {
@@ -97,7 +99,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Target manufacturer: 'jlcpcb', 'pcbway', 'oshpark'",
                         "default": "jlcpcb"
                     },
-                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
+                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema(),
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 100, "description": "Most issues to list" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "First issue to list" }
                 },
                 "required": ["board"]
             }),
@@ -1022,6 +1026,10 @@ async fn handle_validate_for_manufacturing(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
+    let (offset, limit) = match super::response_budget::window(args, 100) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
 
     info!(
         board = %board.display(),
@@ -1163,29 +1171,49 @@ async fn handle_validate_for_manufacturing(
         "[BETA] Manufacturing validation complete"
     );
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "verdict": verdict,
-            "fab_house": fab_house,
-            "board_info": {
-                "footprint_count": fp_count,
-                "copper_layers": copper_layers,
-                "net_count": net_count,
-                "track_count": track_count
-            },
-            // Null means DRC did not run, and an issue above says so. Never a
-            // zeroed-out object: this tool must not be able to imply a clean
-            // board it never checked.
-            "drc": drc_summary,
-            "outline": crate::tools::board_geometry::outline_check_json(&outline_check, &geometry.outline),
-            "issues": issues,
-            "summary": format!(
-                "{}: {} issues found. {} footprints, {} copper layers.",
-                verdict, issues.len(), fp_count, copper_layers
-            )
-        }))
-        .unwrap(),
-    ))
+    // One DRC error is one issue, so a board with hundreds overflowed the
+    // client (#A30). The verdict and the counts read every issue.
+    let mut by_severity = serde_json::Map::new();
+    for issue in &issues {
+        let severity = issue["severity"].as_str().unwrap_or("").to_owned();
+        let count = by_severity.entry(severity).or_insert(json!(0));
+        *count = json!(count.as_u64().unwrap_or(0) + 1);
+    }
+    let page =
+        super::response_budget::page(&issues, offset, limit, super::response_budget::BYTE_BUDGET);
+    let mut body = json!({
+        "verdict": verdict,
+        "fab_house": fab_house,
+        "board_info": {
+            "footprint_count": fp_count,
+            "copper_layers": copper_layers,
+            "net_count": net_count,
+            "track_count": track_count
+        },
+        // Null means DRC did not run, and an issue above says so. Never a
+        // zeroed-out object: this tool must not be able to imply a clean
+        // board it never checked.
+        "drc": drc_summary,
+        "outline": crate::tools::board_geometry::outline_check_json(&outline_check, &geometry.outline),
+        "issue_count": issues.len(),
+        "issues_by_severity": by_severity,
+        "issues": page.items,
+        "summary": format!(
+            "{}: {} issues found. {} footprints, {} copper layers.",
+            verdict, issues.len(), fp_count, copper_layers
+        )
+    });
+    if let Some(fields) = body.as_object_mut() {
+        page.describe(fields);
+        page.hint(
+            fields,
+            &format!(
+                "Pass offset {} for the next page; run_drc lists the DRC violations by rule.",
+                page.offset + page.items.len()
+            ),
+        );
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 async fn handle_estimate_cost(

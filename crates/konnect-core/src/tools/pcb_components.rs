@@ -2095,11 +2095,15 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_component_list",
-            "List all footprints on the board with their positions, layers, and values.",
+            "List all footprints on the board with their positions, layers, and values. \
+             The list is paged (`limit`, default 500, and `offset`) and stops at a size cap; \
+             `count` is every footprint, and `truncated` and `next_offset` say what is left.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string" }
+                    "board": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 500, "description": "Most footprints to list" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "First footprint to list" }
                 },
                 "required": ["board"]
             }),
@@ -3608,10 +3612,15 @@ async fn handle_get_pad_position(
 }
 
 async fn handle_get_component_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fps = ipc!(ctx, _args, |c| c.list_footprints());
+    // Refused before KiCad is asked anything.
+    let (offset, limit) = match super::response_budget::window(args, 500) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
+    let fps = ipc!(ctx, args, |c| c.list_footprints());
     let items: Vec<serde_json::Value> = fps
         .iter()
         .map(|fp| {
@@ -3625,7 +3634,7 @@ async fn handle_get_component_list(
         })
         .collect();
     Ok(CallToolResult::json(
-        &json!({ "count": items.len(), "components": items }),
+        &super::response_budget::list_response("components", &items, offset, limit),
     ))
 }
 
@@ -7377,5 +7386,99 @@ mod required_count_tests {
         .await
         .expect("no anyhow");
         assert!(result.is_error, "an explicit zero must still be rejected");
+    }
+}
+
+/// A30: `get_component_list` pages a large board and counts every footprint.
+#[cfg(test)]
+mod component_list_budget_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    use serde_json::Value;
+
+    async fn list(count: usize, extra: Value) -> (bool, Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("big.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))\n").unwrap();
+        let footprints: Vec<prost_types::Any> = (0..count)
+            .map(|i| {
+                let text = |value: String| kiapi::board::types::Field {
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: value,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let fp = kiapi::board::types::FootprintInstance {
+                    position: Some(konnect_ipc::builders::vec2(i as f64, 2.0 * i as f64)),
+                    reference_field: Some(text(format!("R{i}"))),
+                    value_field: Some(text("10k 1% 0603 thick film".into())),
+                    ..Default::default()
+                };
+                konnect_ipc::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance")
+            })
+            .collect();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            command.type_url.ends_with("GetItems").then(|| {
+                konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: footprints.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )
+            })
+        });
+        let mut args = json!({ "board": board.to_string_lossy() });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let result =
+            handle_get_component_list(&args, &ctx_talking_to(server.address().to_string()))
+                .await
+                .unwrap();
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else {
+            panic!("expected text");
+        };
+        assert!(text.len() < 50_000, "over the client's cap: {}", text.len());
+        (result.is_error, serde_json::from_str(text).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_large_board_pages_and_counts_every_footprint() {
+        let (err, first) = list(1500, json!({})).await;
+        assert!(!err, "{first}");
+        assert_eq!(first["count"], 1500);
+        assert_eq!(first["truncated"], true);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut offset = 0u64;
+        loop {
+            let (_, page) = list(1500, json!({ "offset": offset })).await;
+            assert_eq!(page["count"], 1500, "the whole board, on every page");
+            for component in page["components"].as_array().unwrap() {
+                assert!(seen.insert(component["reference"].as_str().unwrap().to_owned()));
+            }
+            match page["next_offset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 1500);
+    }
+
+    #[tokio::test]
+    async fn a_small_board_is_whole_and_a_bad_limit_is_refused() {
+        let (_, body) = list(3, json!({})).await;
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["components"].as_array().unwrap().len(), 3);
+        assert_eq!(body["truncated"], false);
+        assert!(body.get("next_offset").is_none());
+        let (err, body) = list(3, json!({ "limit": 0 })).await;
+        assert!(err, "{body}");
     }
 }

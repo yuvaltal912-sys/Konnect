@@ -102,7 +102,9 @@ pub fn tools() -> Vec<ToolDef> {
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
-             add_schematic_component; annotate_schematic numbers it.",
+             add_schematic_component; annotate_schematic numbers it. Each placed entry is \
+             compact unless detail is 'full'; a very large batch's lists are cut to fit the \
+             response (`truncated_lists`) while the counts stay whole.",
             json!({
                 "type": "object",
                 "properties": {
@@ -123,6 +125,10 @@ pub fn tools() -> Vec<ToolDef> {
                             },
                             "required": ["lib_id", "x", "y"]
                         }
+                    },
+                    "detail": {
+                        "type": "string", "enum": ["compact", "full"], "default": "compact",
+                        "description": "'compact' (default) lists each placed symbol's reference, value, footprint, lib_id, uuid, unit, position and mirror. 'full' adds every field, flag, unit list and hierarchy instance path, about 1.4 kB per part."
                     }
                 },
                 "required": ["schematic", "components"]
@@ -640,6 +646,11 @@ pub(crate) async fn handle_batch_connect_to_net(
         body["label_type"] = json!(label_type);
     }
     body["nets_joined"] = joined;
+    super::response_budget::fit_value(
+        &mut body,
+        &["errors", "nets_joined", "added"],
+        "Every pin counted in added_count is connected in the saved schematic.",
+    );
     let mut result = CallToolResult::json(&body);
     // Every pin skipped is a failed call, as in batch_connect_pins.
     result.is_error = added.is_empty() && !errors.is_empty();
@@ -663,6 +674,30 @@ fn error_text(result: &CallToolResult) -> String {
     }
 }
 
+/// The fields of a placement readback a caller needs to find and edit the
+/// symbol; `detail: "full"` keeps the rest (#A30).
+fn compact_placement(full: &Value) -> Value {
+    let mut entry = serde_json::Map::new();
+    for key in [
+        "reference",
+        "value",
+        "footprint",
+        "lib_id",
+        "uuid",
+        "unit",
+        "x",
+        "y",
+        "rotation",
+        "mirror_x",
+        "mirror_y",
+    ] {
+        if let Some(value) = full.get(key) {
+            entry.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(entry)
+}
+
 async fn handle_batch_place_components(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
@@ -671,6 +706,19 @@ async fn handle_batch_place_components(
     let components = match args["components"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'components' array")),
+    };
+    let full_detail = match args.get("detail") {
+        None | Some(Value::Null) => false,
+        Some(value) => match value.as_str() {
+            Some("compact") => false,
+            Some("full") => true,
+            _ => {
+                return Ok(crate::tools::invalid_arg(
+                    "detail",
+                    "must be 'compact' or 'full'; nothing was placed",
+                ))
+            }
+        },
     };
 
     let before_source = read_consistent(&sch_path)?;
@@ -875,14 +923,27 @@ async fn handle_batch_place_components(
         crate::outcome::OutcomeStatus::Failed => Some(crate::outcome::retry_whole_request()),
         crate::outcome::OutcomeStatus::Uncertain => unreachable!(),
     };
-    let mut result = CallToolResult::json(&json!({
-        "placed": placed,
+    let listed: Vec<Value> = if full_detail {
+        placed.clone()
+    } else {
+        placed.iter().map(compact_placement).collect()
+    };
+    let mut body = json!({
+        "placed": listed,
         "placed_count": placed.len(),
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
         "errors": errors,
         "failures": failures
-    }));
+    });
+    // Failures first: they are what a caller acts on.
+    super::response_budget::fit_value(
+        &mut body,
+        &["failures", "errors", "placed"],
+        "Every placement listed in placed_count is in the saved schematic; \
+         list_schematic_components reads them back.",
+    );
+    let mut result = CallToolResult::json(&body);
     result.is_error = placed.is_empty() && !errors.is_empty();
     Ok(crate::outcome::attach(
         result,
@@ -963,12 +1024,19 @@ async fn handle_batch_connect_pins(
         write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
-    let mut result = CallToolResult::json(&json!({
+    let error_count = errors.len();
+    let mut body = json!({
         "connected_count": connected,
         "errors": errors,
         "nets_joined": super::sch_wiring::nets_joined(&before, &new_content)
-    }));
-    result.is_error = connected == 0 && !errors.is_empty();
+    });
+    super::response_budget::fit_value(
+        &mut body,
+        &["errors", "nets_joined"],
+        "Every pair counted in connected_count is wired in the saved schematic.",
+    );
+    let mut result = CallToolResult::json(&body);
+    result.is_error = connected == 0 && error_count > 0;
     Ok(result)
 }
 
@@ -2406,6 +2474,117 @@ mod batch_place_and_connect_tests {
         );
     }
 
+    const COMPACT_KEYS: [&str; 11] = [
+        "reference",
+        "value",
+        "footprint",
+        "lib_id",
+        "uuid",
+        "unit",
+        "x",
+        "y",
+        "rotation",
+        "mirror_x",
+        "mirror_y",
+    ];
+
+    fn placement_batch(count: usize, extra: serde_json::Value) -> serde_json::Value {
+        let components: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                json!({
+                    "lib_id": "Device:R",
+                    "x": 20.32 + (i % 20) as f64 * 10.16,
+                    "y": 20.32 + (i / 20) as f64 * 10.16,
+                    "reference": format!("R{}", i + 1)
+                })
+            })
+            .collect();
+        let mut args = json!({ "components": components });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    }
+
+    /// A30: about 1.35 kB a part overflowed the client. A large batch now lists
+    /// compact entries, cut to the cap, with every count whole.
+    #[tokio::test]
+    async fn a_large_batch_stays_under_the_cap_and_counts_every_placement() {
+        let (_d, path) = seeded_schematic();
+        let mut args = placement_batch(300, json!({}));
+        args["schematic"] = json!(path.display().to_string());
+        let result = handle_batch_place_components(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected JSON text")
+        };
+        assert!(text.len() < 50_000, "over the client's cap: {}", text.len());
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["placed_count"], 300);
+        assert_eq!(
+            response["outcome"]["status"], "complete",
+            "{}",
+            response["outcome"]
+        );
+        let shown = response["placed"].as_array().unwrap();
+        assert!(!shown.is_empty() && shown.len() < 300, "{}", shown.len());
+        assert_eq!(response["truncated_lists"]["placed"]["total"], 300);
+        assert_eq!(response["truncated_lists"]["placed"]["shown"], shown.len());
+        assert!(response["hint"]
+            .as_str()
+            .unwrap()
+            .contains("list_schematic_components"));
+        for entry in shown {
+            let keys: std::collections::BTreeSet<&str> = entry
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(keys.iter().all(|key| COMPACT_KEYS.contains(key)), "{entry}");
+        }
+        // Every one is in the file, listed or not.
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(sch.symbols.by_reference("R300").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_small_batch_is_whole_and_full_detail_keeps_every_field() {
+        for (detail, full) in [(json!({}), false), (json!({ "detail": "full" }), true)] {
+            let (_d, path) = seeded_schematic();
+            let mut args = placement_batch(2, detail);
+            args["schematic"] = json!(path.display().to_string());
+            let result = handle_batch_place_components(&args, &test_ctx())
+                .await
+                .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected JSON text")
+            };
+            let response: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert!(response.get("truncated_lists").is_none() && response.get("hint").is_none());
+            let entry = &response["placed"][1];
+            assert_eq!(entry["reference"], "R2");
+            assert!(entry["uuid"].is_string() && entry["x"].is_number());
+            assert_eq!(entry.get("fields").is_some(), full, "{entry}");
+            assert_eq!(entry.get("instance_paths").is_some(), full, "{entry}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_detail_is_refused_before_anything_is_placed() {
+        let (_d, path) = seeded_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut args = placement_batch(2, json!({ "detail": "everything" }));
+        args["schematic"] = json!(path.display().to_string());
+        let result = handle_batch_place_components(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn batch_placement_uses_library_fields_and_per_entry_overrides() {
         let (_d, path) = seeded_schematic();
@@ -2416,7 +2595,8 @@ mod batch_place_and_connect_tests {
                     { "lib_id": "Device:WITH_DEFAULTS", "x": 100.0, "y": 100.0, "reference": "U1" },
                     { "lib_id": "Device:WITH_DEFAULTS", "x": 120.0, "y": 100.0, "reference": "U2",
                       "value": "Explicit Value", "footprint": "Package_DIP:DIP-14_W7.62mm" }
-                ]
+                ],
+                "detail": "full"
             }),
             &test_ctx(),
         )

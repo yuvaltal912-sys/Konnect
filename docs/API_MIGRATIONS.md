@@ -3,6 +3,53 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: zone fill state on DRC, and the other long results paged (minor release)
+
+Rank 3 leftovers (`docs/CREATION_HANDOFF.md`, C24 and A30). No argument is
+removed. New result fields and two default changes:
+
+- **`run_drc`, `get_drc_violations`**: new `zone_fill_state` (`fresh`, `stale`
+  or `unknown`) and `zone_fill_check` (its `method`, `copper_zones`, and when
+  compared `zones_differing`, `differing_zones`, `violations_cleared_by_refill`,
+  `violations_added_by_refill` and up to 10 examples each way). New argument
+  `check_zone_fills`, default **true**: when zones are not refilled and the board
+  has copper zones, a second, analysis-only DRC with `--refill-zones
+  --save-board` runs on a private copy of the board and its `.kicad_pro` and
+  `.kicad_dru`, and the fills are compared. That doubles DRC time on such boards;
+  pass `false` to skip it (`unknown`, `not_checked`). The board is never written.
+  `source_evidence` in a DRC baseline and in a report-write failure carries the
+  same `zone_fill` object.
+- **`batch_place_components`**: each `placed` entry is now compact by default
+  (`reference`, `value`, `footprint`, `lib_id`, `uuid`, `unit`, `x`, `y`,
+  `rotation`, `mirror_x`, `mirror_y`). Pass `detail: "full"` for the previous
+  entry (fields, flags, units, project, instance paths). An unknown `detail` is
+  refused before anything is placed.
+- **Batch edits** (`batch_place_components`, `batch_connect_to_net`,
+  `batch_connect_pins`, `batch_add_wire`, `batch_add_no_connect`): a list that
+  would pass the size cap is cut, failures and errors first. Only then do
+  `truncated_lists` (`{list: {shown, total}}`) and `hint` appear; the counts
+  (`placed_count`, `added_count`, `connected_count`, `added_wires`, `outcome`)
+  stay whole. A result that fits is unchanged. The edit has already happened, so
+  there is no `offset`; the saved schematic holds every change.
+- **`update_pcb_from_schematic`**: `changes` is paged, new `limit` (default 100)
+  and `offset`, with `change_count`, `shown`, `offset`, `limit`, `truncated` and,
+  when cut, `next_offset` and `hint`. A dry run pages the same plan: call again
+  with `offset` and the same arguments, and check `plan_revision`. An apply has
+  no `next_offset`. `diagnostics`, `unassigned_footprints`, `orphan_footprints`,
+  `deleted_footprints` and `copper_changes` share at most half the budget and are
+  cut through `truncated_lists`. `coverage` counts every item. A caller that read
+  every change of a large plan in one call must now follow `next_offset`.
+- **`validate_for_manufacturing`**: `issues` is paged, new `limit` (default 100)
+  and `offset`, with the same paging fields, plus `issue_count` and
+  `issues_by_severity` over every issue. The verdict and `summary` still read
+  them all.
+- **`get_component_list`**: paged through the shared list shape, new `limit`
+  (default 500) and `offset`; `count` is still every footprint, and `shown`,
+  `offset`, `limit`, `truncated` and `next_offset` are new.
+- **`query_traces`**: new `offset`. A page also ends at the size cap before
+  `limit` (`byte_capped`, `next_offset`, `hint`). `count` is still the segments
+  shown and `total_matches` all of them.
+
 ## Unreleased: ERC and DRC baselines
 
 Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains

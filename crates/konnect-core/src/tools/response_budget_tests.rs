@@ -360,3 +360,221 @@ async fn library_lists_page_and_count_every_library() {
     assert_eq!(last["libraries"].as_array().unwrap().len(), 60);
     assert_eq!(last["truncated"], false);
 }
+
+// ─── Rank 3 leftovers (A30): batch edits, manufacturing check ───────────────
+
+async fn call_tool(
+    tools: Vec<super::ToolDef>,
+    name: &str,
+    args: Value,
+    ctx: ToolContext,
+) -> CallToolResult {
+    let tool = tools.into_iter().find(|tool| tool.name == name).unwrap();
+    (tool.handler)(&args, std::sync::Arc::new(ctx))
+        .await
+        .unwrap()
+}
+
+const EMPTY_SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
+
+fn empty_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("batch.kicad_sch");
+    std::fs::write(&path, EMPTY_SCH).unwrap();
+    (dir, path)
+}
+
+#[tokio::test]
+async fn a_large_no_connect_batch_is_cut_to_the_cap_with_the_count_whole() {
+    let (_dir, path) = empty_schematic();
+    let positions: Vec<Value> = (0..3000)
+        .map(|i| json!({ "x": 1.27 * (i % 100) as f64, "y": 1.27 * (i / 100) as f64 }))
+        .collect();
+    let result = call_tool(
+        super::sch_wiring::tools(),
+        "batch_add_no_connect",
+        json!({ "schematic": path.display().to_string(), "positions": positions }),
+        plain_ctx(),
+    )
+    .await;
+    assert!(text_len(&result) < CLIENT_CAP, "{}", text_len(&result));
+    let body = body(&result);
+    assert_eq!(body["added_count"], 3000);
+    assert_eq!(body["truncated_lists"]["added"]["total"], 3000);
+    let shown = body["added"].as_array().unwrap().len();
+    assert!(shown > 100 && shown < 3000, "{shown}");
+    assert_eq!(body["truncated_lists"]["added"]["shown"], shown);
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        written.matches("(no_connect").count(),
+        3000,
+        "every marker is saved"
+    );
+}
+
+#[tokio::test]
+async fn a_small_no_connect_batch_is_unchanged() {
+    let (_dir, path) = empty_schematic();
+    let result = call_tool(
+        super::sch_wiring::tools(),
+        "batch_add_no_connect",
+        json!({ "schematic": path.display().to_string(), "positions": [{ "x": 1.27, "y": 2.54 }, { "y": 1 }] }),
+        plain_ctx(),
+    )
+    .await;
+    let body = body(&result);
+    let keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["added", "added_count", "errors"], "{body}");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn thousands_of_failed_pin_pairs_stay_under_the_cap_and_say_how_many() {
+    let (_dir, path) = empty_schematic();
+    let connections: Vec<Value> = (0..2000)
+        .map(|i| json!({ "ref1": format!("MISSING{i}"), "pin1": "1", "ref2": format!("ABSENT{i}"), "pin2": "2" }))
+        .collect();
+    let result = call_tool(
+        super::sch_batch::tools(),
+        "batch_connect_pins",
+        json!({ "schematic": path.display().to_string(), "connections": connections }),
+        plain_ctx(),
+    )
+    .await;
+    assert!(result.is_error, "nothing connected is still a failed call");
+    assert!(text_len(&result) < CLIENT_CAP, "{}", text_len(&result));
+    let body = body(&result);
+    assert_eq!(body["connected_count"], 0);
+    assert_eq!(body["truncated_lists"]["errors"]["total"], 2000);
+    assert!(body["errors"].as_array().unwrap().len() < 2000);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), EMPTY_SCH);
+}
+
+#[cfg(unix)]
+fn manufacturing_scene(errors: usize) -> (tempfile::TempDir, std::path::PathBuf, ToolContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("board.kicad_pcb");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../konnect-sexp/tests/fixtures/board_geometry/cases.kicad_pcb"
+        ),
+        &board,
+    )
+    .unwrap();
+    let violations: Vec<Value> = (0..errors)
+        .map(|i| {
+            json!({
+                "type": format!("rule_{}", i % 7),
+                "severity": "error",
+                "description": format!("Violation {i}, described at the length KiCad uses"),
+                "items": [{ "description": "Track", "pos": { "x": 1.0, "y": 2.0 } }]
+            })
+        })
+        .collect();
+    let report = dir.path().join("report.json");
+    std::fs::write(
+        &report,
+        json!({ "violations": violations, "unconnected_items": [], "schematic_parity": [] })
+            .to_string(),
+    )
+    .unwrap();
+    let script = crate::tools::cli::test_support::write_script(
+        dir.path(),
+        "fake-kicad-cli",
+        &format!(
+            "#!/bin/sh\necho drc >> '{0}/calls'\ncp '{1}' \"$4\"\nexit 0\n",
+            dir.path().display(),
+            report.display()
+        ),
+        "",
+    );
+    let ctx = ctx_with_cli(&script);
+    (dir, board, ctx)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manufacturing_issues_page_and_the_verdict_reads_them_all() {
+    let (dir, board, _) = manufacturing_scene(900);
+    let script = dir.path().join("fake-kicad-cli");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 0u64;
+    let mut total = None;
+    loop {
+        let result = call_tool(
+            super::manufacturing::tools(),
+            "validate_for_manufacturing",
+            json!({ "board": board.display().to_string(), "offset": offset }),
+            ctx_with_cli(&script),
+        )
+        .await;
+        assert!(text_len(&result) < CLIENT_CAP, "{}", text_len(&result));
+        let page = body(&result);
+        assert_eq!(page["verdict"], "NOT READY");
+        let count = page["issue_count"].as_u64().unwrap();
+        assert!(count >= 900, "{count}");
+        assert_eq!(
+            *total.get_or_insert(count),
+            count,
+            "the count is whole on every page"
+        );
+        assert!(page["issues_by_severity"]["error"].as_u64().unwrap() >= 900);
+        assert!(page["summary"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{count} issues")));
+        for issue in page["issues"].as_array().unwrap() {
+            assert!(seen.insert(issue.to_string()), "an issue shown twice");
+        }
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen.len() as u64, total.unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_short_manufacturing_report_is_whole_and_a_bad_window_runs_nothing() {
+    let (dir, board, ctx) = manufacturing_scene(2);
+    let result = call_tool(
+        super::manufacturing::tools(),
+        "validate_for_manufacturing",
+        json!({ "board": board.display().to_string() }),
+        ctx,
+    )
+    .await;
+    let page = body(&result);
+    assert_eq!(page["truncated"], false);
+    assert_eq!(
+        page["issues"].as_array().unwrap().len() as u64,
+        page["issue_count"].as_u64().unwrap()
+    );
+    assert!(page.get("next_offset").is_none() && page.get("hint").is_none());
+    std::fs::remove_file(dir.path().join("calls")).unwrap();
+    for bad in [json!({ "limit": 0 }), json!({ "offset": "two" })] {
+        let mut args = json!({ "board": board.display().to_string() });
+        args.as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        let refused = call_tool(
+            super::manufacturing::tools(),
+            "validate_for_manufacturing",
+            args,
+            ctx_with_cli(&dir.path().join("fake-kicad-cli")),
+        )
+        .await;
+        assert!(refused.is_error, "{bad}");
+    }
+    assert!(
+        !dir.path().join("calls").exists(),
+        "a refused window ran DRC"
+    );
+}
