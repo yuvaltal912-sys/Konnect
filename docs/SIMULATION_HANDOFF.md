@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-07. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23, and the current macOS live simulation suite passes. M3 has not started; ask the owner before starting it.
+**Last updated:** 2026-11-07. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23, and the current macOS live simulation suite passes. M3 is in progress on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08.
 
 ## Start here
 
@@ -51,16 +51,17 @@ PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are 
 | M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Merged as `d10dbe1` |
 | M2 | [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) | `feat/simulation-datasheet-models-m2` | Merged as `d228d5f` |
 | Version check | [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23) | `fix/live-test-ngspice-version` | Merged as `bdafc67` |
+| M3 | draft PR | `feat/simulation-datasheet-models-m3` | In progress |
 
 ## Datasheet models: M1 and M2 merged
 
-The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3 is next and has not started:
+The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3 is in progress (branch `feat/simulation-datasheet-models-m3`):
 
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
 | M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); merged as [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) |
-| M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
+| M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode. **In progress** (branch `feat/simulation-datasheet-models-m3`) |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
 
