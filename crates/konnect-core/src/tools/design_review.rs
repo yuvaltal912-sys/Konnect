@@ -5,7 +5,9 @@
 //!
 //! These tools work on the S-expression files directly — no KiCAD running required.
 
+use super::check_baselines::{self, severity_rank, CheckKind, DrcOptions, LoadedBaseline, Record};
 use super::cli;
+use super::response_budget as budget;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::component_class;
@@ -24,7 +26,7 @@ use konnect_sexp::{
     },
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -129,7 +131,11 @@ pub fn tools() -> Vec<ToolDef> {
              KiCAD's DRC, folding its errors, unconnected items and schematic-parity findings \
              into the verdict. Reports status, coverage, and diagnostics. Returns an INCOMPLETE \
              verdict instead of approval when coverage is partial, when an audit failed, or \
-             when DRC could not run. This is the tool to call when the user asks 'is my board \
+             when DRC could not run. With 'baseline' (a DRC baseline saved by \
+             save_check_baseline on this board), DRC is compared with it: only new violations \
+             and severity increases count against the verdict, unchanged and resolved ones are \
+             counted under 'baseline', and a missing or damaged baseline is refused before \
+             anything runs. This is the tool to call when the user asks 'is my board \
              ready?' or 'review my design'.",
             json!({
                 "type": "object",
@@ -141,7 +147,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
                     },
-                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema()
+                    "edge_mount_references": crate::tools::board_geometry::allowlist_schema(),
+                    "baseline": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$",
+                        "description": "Name of a DRC baseline of this board (save_check_baseline with board). Needs board. DRC findings that match it are not counted; new ones and severity increases are. The review does not run ERC, so an ERC baseline does not apply"
+                    }
                 },
                 "required": ["schematic"]
             }),
@@ -1175,6 +1186,18 @@ async fn handle_run_design_review(
         "warning" => 1,
         _ => 0,
     };
+    // Loaded before anything runs: a wrong or damaged baseline is a refusal,
+    // never a review that quietly counted every DRC finding, or none.
+    let baseline = match read_review_baseline(args) {
+        Ok(baseline) => baseline,
+        Err(refusal) => return Ok(refusal),
+    };
+    let mut baseline_summary = baseline.as_ref().map(|loaded| {
+        let mut block = baseline_identity(loaded);
+        block["status"] = json!("not_compared");
+        block["reason"] = json!("drc_unavailable");
+        block
+    });
 
     let root_path = get_path(args, "schematic")?;
     let traversal = inspect_hierarchy(&root_path)?;
@@ -1329,16 +1352,15 @@ async fn handle_run_design_review(
                 let mut drc = AuditAggregate::new("drc");
                 drc.requested += 1;
                 drc.completed += 1;
-                drc.findings.extend(report.all().map(|violation| {
-                    json!({
-                        "severity": violation.severity,
-                        "category": "drc",
-                        "rule": violation.rule,
-                        "message": violation.description,
-                        "location": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
-                        "items": violation.items,
-                    })
-                }));
+                match &baseline {
+                    None => drc.findings.extend(report.all().map(drc_finding)),
+                    Some(loaded) => {
+                        let (counted, block) =
+                            compare_drc_with_baseline(&report, loaded, &board_path);
+                        drc.findings.extend(counted);
+                        baseline_summary = Some(block);
+                    }
+                }
                 audits.push(drc);
             }
             Err(error) => diagnostics.push(json!({
@@ -1415,6 +1437,20 @@ async fn handle_run_design_review(
     } else {
         "LOOKS GOOD — no critical issues found"
     };
+    // A baseline changes what the verdict means, so the verdict says so.
+    let verdict = match baseline_summary
+        .as_ref()
+        .filter(|block| block["status"] == "compared")
+    {
+        Some(block) => format!(
+            "{verdict} (DRC counted against baseline '{}': {} new, {} unchanged, {} resolved)",
+            block["name"].as_str().unwrap_or_default(),
+            block["new_count"],
+            block["unchanged_count"],
+            block["resolved_count"]
+        ),
+        None => verdict.to_string(),
+    };
 
     let requested_audits = audits.iter().map(|audit| audit.requested).sum::<usize>();
     let retry = if status == "complete" {
@@ -1475,6 +1511,10 @@ async fn handle_run_design_review(
                     // is INCOMPLETE. Never zero: this review must not be able to
                     // imply a clean board it did not check.
                     "drc": drc_summary,
+                    // Null without a `baseline` argument. Otherwise the stored
+                    // baseline used (name, path, revision) and, when DRC ran,
+                    // how the run compared with it.
+                    "baseline": baseline_summary,
                     // `complete`/`partial`/`failed`, or `not_run` with why: no board,
                     // no design-intent record, or no currents recorded in it.
                     "trace_current": current_audit,
@@ -1485,6 +1525,181 @@ async fn handle_run_design_review(
         ),
         outcome,
     ))
+}
+
+// ─── DRC against a stored baseline ──────────────────────────────────────────
+
+/// Resolved baselines listed by name in the response, at most.
+const BASELINE_RESOLVED_SHOWN: usize = 20;
+
+fn drc_finding(violation: &cli::DrcViolation) -> Value {
+    json!({
+        "severity": violation.severity,
+        "category": "drc",
+        "rule": violation.rule,
+        "message": violation.description,
+        "location": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+        "items": violation.items,
+    })
+}
+
+/// The `baseline` argument, loaded with PR 15's loader. It names a DRC
+/// baseline, so it needs `board`; the review runs no ERC to compare.
+fn read_review_baseline(args: &Value) -> Result<Option<LoadedBaseline>, CallToolResult> {
+    let name = match &args["baseline"] {
+        Value::Null => return Ok(None),
+        Value::String(name) if check_baselines::valid_name(name) => name,
+        Value::String(_) => {
+            return Err(invalid_arg(
+                "baseline",
+                "use letters, digits, '.', '_' and '-' only, up to 64 characters, not starting with '.'",
+            ))
+        }
+        _ => return Err(invalid_arg("baseline", "must be a baseline name (string)")),
+    };
+    let Some(board) = args["board"].as_str() else {
+        return Err(invalid_arg(
+            "baseline",
+            "names a DRC baseline, so it needs board; the review runs no ERC, so an ERC baseline does not apply. Nothing was run.",
+        ));
+    };
+    check_baselines::load_for_compare(Path::new(board), CheckKind::Drc, name, "baseline").map(Some)
+}
+
+/// What names the baseline used, whether or not DRC ran.
+fn baseline_identity(loaded: &LoadedBaseline) -> Value {
+    json!({
+        "name": loaded.baseline.name,
+        "check": "drc",
+        "path": loaded.path.display().to_string(),
+        "revision": loaded.revision,
+        "created_utc": loaded.baseline.created_utc,
+        "source": loaded.baseline.source,
+    })
+}
+
+/// Match this run's DRC with the baseline by PR 15's stable keys. Returns the
+/// findings that count against the verdict (new, severity raised, and those in
+/// a category the baseline did not report, which nothing vouches for) and the
+/// `baseline` block of the response.
+fn compare_drc_with_baseline(
+    report: &cli::DrcReport,
+    loaded: &LoadedBaseline,
+    board: &Path,
+) -> (Vec<Value>, Value) {
+    let current = check_baselines::normalize_drc(report);
+    // `normalize_drc` walks the report in `all()` order, one record each.
+    let violations: HashMap<&str, &cli::DrcViolation> = current
+        .records
+        .iter()
+        .map(|record| record.key.as_str())
+        .zip(report.all())
+        .collect();
+    let stored = &loaded.baseline;
+    let result = check_baselines::diff(
+        &stored.violations,
+        &stored.categories_reported,
+        &current.records,
+        &current.categories_reported,
+    );
+    // The review runs DRC on the saved file with no refill and no live sync.
+    let options = DrcOptions {
+        sync_live_board: false,
+        refill_zones: false,
+    };
+    let warnings = check_baselines::compare_warnings(stored, Some(options), &current, &result);
+
+    let counted_finding = |record: &Record, change: &str| {
+        let mut finding = violations
+            .get(record.key.as_str())
+            .map(|violation| drc_finding(violation))
+            .unwrap_or_else(|| {
+                json!({
+                    "severity": record.severity,
+                    "category": "drc",
+                    "rule": record.rule,
+                    "message": record.description,
+                    "items": record.items,
+                })
+            });
+        finding["baseline_change"] = json!(change);
+        finding["baseline_key"] = json!(record.key);
+        finding
+    };
+    let mut counted: Vec<Value> = result
+        .new
+        .iter()
+        .map(|record| counted_finding(record, "new"))
+        .collect();
+    let mut raised = 0usize;
+    let mut lowered = 0usize;
+    for (old, now) in &result.severity_changed {
+        if severity_rank(&now.severity) > severity_rank(&old.severity) {
+            raised += 1;
+            let mut finding = counted_finding(now, "severity_raised");
+            finding["baseline_severity"] = json!(old.severity);
+            counted.push(finding);
+        } else {
+            lowered += 1;
+        }
+    }
+    let not_compared: Vec<&Record> = current
+        .records
+        .iter()
+        .filter(|record| result.categories_not_compared.contains(&record.category))
+        .collect();
+    counted.extend(
+        not_compared
+            .iter()
+            .map(|record| counted_finding(record, "not_compared")),
+    );
+
+    let rule_rows = |records: &[Record]| -> Vec<Value> {
+        records
+            .iter()
+            .map(|r| json!({ "rule": r.rule, "severity": r.severity }))
+            .collect()
+    };
+    let resolved_shown: Vec<Value> = result
+        .resolved
+        .iter()
+        .take(BASELINE_RESOLVED_SHOWN)
+        .map(|r| {
+            json!({
+                "key": r.key,
+                "category": r.category,
+                "rule": r.rule,
+                "severity": r.severity,
+                "description": r.description,
+            })
+        })
+        .collect();
+    let mut block = baseline_identity(loaded);
+    let fields = json!({
+        "status": "compared",
+        "source_changed_since_baseline": check_baselines::sha256_file(board)
+            .ok()
+            .map(|sha| sha != stored.source_sha256),
+        "baseline_count": stored.violations.len(),
+        "current_count": current.records.len(),
+        "new_count": result.new.len(),
+        "severity_raised_count": raised,
+        "severity_lowered_count": lowered,
+        "unchanged_count": result.unchanged.len(),
+        "resolved_count": result.resolved.len(),
+        "not_compared_count": not_compared.len(),
+        "categories_not_compared": result.categories_not_compared,
+        "new_by_rule": budget::tally(&rule_rows(&result.new), "rule"),
+        "resolved_by_rule": budget::tally(&rule_rows(&result.resolved), "rule"),
+        "resolved": resolved_shown,
+        "resolved_truncated": result.resolved.len() > BASELINE_RESOLVED_SHOWN,
+        "keying": check_baselines::keying(&current.records),
+        "warnings": warnings,
+    });
+    if let (Some(block), Value::Object(fields)) = (block.as_object_mut(), fields) {
+        block.extend(fields);
+    }
+    (counted, block)
 }
 
 // ─── BOM health check ───────────────────────────────────────────────────────
@@ -3417,3 +3632,7 @@ mod honest_dfm_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "design_review_baseline_tests.rs"]
+mod baseline_tests;

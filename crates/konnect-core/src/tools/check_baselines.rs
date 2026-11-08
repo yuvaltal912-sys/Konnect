@@ -490,7 +490,7 @@ fn record_json(record: &Record, change: &str) -> Value {
     value
 }
 
-fn keying(records: &[Record]) -> Value {
+pub(crate) fn keying(records: &[Record]) -> Value {
     let (mut uuid, mut text) = (0usize, 0usize);
     for item in records.iter().flat_map(|r| &r.items) {
         match item.keyed_by {
@@ -602,7 +602,7 @@ fn check_store_dirs(project_dir: &Path, kind: CheckKind) -> Result<(), String> {
     Ok(())
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= MAX_NAME_CHARS
         && !name.starts_with('.')
@@ -694,7 +694,7 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
@@ -1044,81 +1044,24 @@ pub(crate) async fn handle_compare_check_baseline(
     };
 
     // Load the baseline first, so a wrong name runs nothing.
-    let project_dir = project_dir_of(&source);
-    if let Err(reason) = check_store_dirs(&project_dir, kind) {
-        return Ok(unusable(&store_dir(&project_dir, kind), reason));
-    }
-    let path = baseline_path(&project_dir, kind, &name);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let names = stored_names(&project_dir, kind);
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::InvalidArgument {
-                    field: "name".into(),
-                    reason: format!("no {} baseline named '{name}'", kind.dir()),
-                },
-                format!(
-                    "No {} baseline named '{name}' for this project. Stored: {}. Save one with save_check_baseline first. Nothing was run.",
-                    kind.dir(),
-                    if names.is_empty() { "none".to_string() } else { names.join(", ") }
-                ),
-            ));
-        }
-        Err(error) => return Ok(unusable(&path, error)),
+    let loaded = match load_for_compare(&source, kind, &name, "name") {
+        Ok(loaded) => loaded,
+        Err(refusal) => return Ok(refusal),
     };
-    let mut baseline = match parse_baseline(&text, kind, &name) {
-        Ok(baseline) => baseline,
-        Err(reason) => return Ok(unusable(&path, reason)),
-    };
-    // Key the stored items again with this binary's rule, so the two sides
-    // are always keyed the same way.
-    assign_keys(kind, &mut baseline.violations);
-    if baseline.source != file_name(&source) {
-        return Ok(invalid_arg(
-            kind.field(),
-            &format!(
-                "baseline '{name}' was taken on {}, not {}; compare a file with its own baseline",
-                baseline.source,
-                file_name(&source)
-            ),
-        ));
-    }
+    let baseline = loaded.baseline;
 
     let (current, drc_options, extra) = match run_check(ctx, kind, &source, args).await? {
         Ok(run) => run,
         Err(refusal) => return Ok(refusal),
     };
     let source_sha256 = sha256_file(&source)?;
-    let mut warnings = Vec::new();
-    if baseline.drc_options != drc_options {
-        warnings.push(format!(
-            "options_differ: the baseline ran with {:?}, this run with {:?}; zone-fill violations may differ for that reason alone",
-            baseline.drc_options, drc_options
-        ));
-    }
-    if baseline.kicad_version.is_some()
-        && current.kicad_version.is_some()
-        && baseline.kicad_version != current.kicad_version
-    {
-        warnings.push(format!(
-            "kicad_version_differs: baseline {}, now {}; a rule KiCad changed can show as new or resolved",
-            baseline.kicad_version.as_deref().unwrap_or(""),
-            current.kicad_version.as_deref().unwrap_or("")
-        ));
-    }
     let result = diff(
         &baseline.violations,
         &baseline.categories_reported,
         &current.records,
         &current.categories_reported,
     );
-    if !result.categories_not_compared.is_empty() {
-        warnings.push(format!(
-            "categories_not_compared: {} was reported by only one of the two runs, so its violations are neither new nor resolved",
-            result.categories_not_compared.join(", ")
-        ));
-    }
+    let warnings = compare_warnings(&baseline, drc_options, &current, &result);
 
     if let Some(output) = &output {
         let full = json!({
@@ -1169,6 +1112,108 @@ pub(crate) async fn handle_compare_check_baseline(
     }
     merge(&mut body, extra);
     Ok(CallToolResult::json(&body))
+}
+
+/// A stored baseline ready to compare against: its keys reassigned with this
+/// binary's rule, where it was read from, and its revision, the SHA-256 of
+/// the stored file, so a reader can tell which version of a name was used.
+#[derive(Debug)]
+pub(crate) struct LoadedBaseline {
+    pub baseline: Baseline,
+    pub path: PathBuf,
+    pub revision: String,
+}
+
+/// Load the `kind` baseline called `name` for `source`, before any check
+/// runs. A missing name lists the stored ones; a damaged file, a store folder
+/// that is not a plain folder, or a baseline taken on another file is
+/// refused. `field` is the argument that named the baseline. The refusal is the response to return: nothing was run.
+pub(crate) fn load_for_compare(
+    source: &Path,
+    kind: CheckKind,
+    name: &str,
+    field: &str,
+) -> Result<LoadedBaseline, CallToolResult> {
+    let project_dir = project_dir_of(source);
+    if let Err(reason) = check_store_dirs(&project_dir, kind) {
+        return Err(unusable(&store_dir(&project_dir, kind), reason));
+    }
+    let path = baseline_path(&project_dir, kind, name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let names = stored_names(&project_dir, kind);
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: field.into(),
+                    reason: format!("no {} baseline named '{name}'", kind.dir()),
+                },
+                format!(
+                    "No {} baseline named '{name}' for this project. Stored: {}. Save one with save_check_baseline first. Nothing was run.",
+                    kind.dir(),
+                    if names.is_empty() { "none".to_string() } else { names.join(", ") }
+                ),
+            ));
+        }
+        Err(error) => return Err(unusable(&path, error)),
+    };
+    let mut baseline = match parse_baseline(&text, kind, name) {
+        Ok(baseline) => baseline,
+        Err(reason) => return Err(unusable(&path, reason)),
+    };
+    // Key the stored items again with this binary's rule, so the two sides
+    // are always keyed the same way.
+    assign_keys(kind, &mut baseline.violations);
+    if baseline.source != file_name(source) {
+        return Err(invalid_arg(
+            kind.field(),
+            &format!(
+                "baseline '{name}' was taken on {}, not {}; compare a file with its own baseline",
+                baseline.source,
+                file_name(source)
+            ),
+        ));
+    }
+    Ok(LoadedBaseline {
+        baseline,
+        path,
+        revision: format!("{:x}", Sha256::digest(text.as_bytes())),
+    })
+}
+
+/// What can make a comparison misleading without making it wrong: options or
+/// a KiCad version that differ from the baseline's, and categories only one
+/// of the two runs reported.
+pub(crate) fn compare_warnings(
+    baseline: &Baseline,
+    drc_options: Option<DrcOptions>,
+    current: &Normalized,
+    result: &Diff,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if baseline.drc_options != drc_options {
+        warnings.push(format!(
+            "options_differ: the baseline ran with {:?}, this run with {:?}; zone-fill violations may differ for that reason alone",
+            baseline.drc_options, drc_options
+        ));
+    }
+    if baseline.kicad_version.is_some()
+        && current.kicad_version.is_some()
+        && baseline.kicad_version != current.kicad_version
+    {
+        warnings.push(format!(
+            "kicad_version_differs: baseline {}, now {}; a rule KiCad changed can show as new or resolved",
+            baseline.kicad_version.as_deref().unwrap_or(""),
+            current.kicad_version.as_deref().unwrap_or("")
+        ));
+    }
+    if !result.categories_not_compared.is_empty() {
+        warnings.push(format!(
+            "categories_not_compared: {} was reported by only one of the two runs, so its violations are neither new nor resolved",
+            result.categories_not_compared.join(", ")
+        ));
+    }
+    warnings
 }
 
 fn stored_names(project_dir: &Path, kind: CheckKind) -> Vec<String> {
