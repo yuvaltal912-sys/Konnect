@@ -15,6 +15,7 @@ pub(crate) mod fit;
 pub(crate) mod mosfet;
 pub(crate) mod passive;
 pub(crate) mod regulator;
+pub(crate) mod switch;
 pub(crate) mod text;
 pub(crate) mod tvs;
 
@@ -49,13 +50,16 @@ pub(crate) enum Kind {
     Comparator,
     Ldo,
     VoltageReference,
+    LoadSwitch,
+    Efuse,
+    IdealDiode,
     Resistance,
     Capacitor,
     Inductor,
 }
 
 impl Kind {
-    pub(crate) const ALL: [Kind; 17] = [
+    pub(crate) const ALL: [Kind; 20] = [
         Kind::Diode,
         Kind::SchottkyDiode,
         Kind::Led,
@@ -70,6 +74,9 @@ impl Kind {
         Kind::Comparator,
         Kind::Ldo,
         Kind::VoltageReference,
+        Kind::LoadSwitch,
+        Kind::Efuse,
+        Kind::IdealDiode,
         Kind::Resistance,
         Kind::Capacitor,
         Kind::Inductor,
@@ -91,6 +98,9 @@ impl Kind {
             Kind::Comparator => "comparator",
             Kind::Ldo => "ldo",
             Kind::VoltageReference => "voltage_reference",
+            Kind::LoadSwitch => "load_switch",
+            Kind::Efuse => "efuse",
+            Kind::IdealDiode => "ideal_diode",
             Kind::Resistance => "resistance",
             Kind::Capacitor => "capacitor",
             Kind::Inductor => "inductor",
@@ -195,6 +205,28 @@ impl Kind {
                 (QuiescentCurrent, 0, 1),
                 (CurrentLimit, 0, 1),
             ],
+            Kind::LoadSwitch => &[
+                (SwitchOnResistance, 1, 1),
+                (EnableThreshold, 0, 1),
+                (OutputRiseTime, 0, 1),
+                (QuiescentCurrent, 0, 1),
+                (CurrentLimit, 0, 1),
+            ],
+            Kind::Efuse => &[
+                (SwitchOnResistance, 1, 1),
+                (CurrentLimit, 1, 1),
+                (UndervoltageLockout, 0, 1),
+                (OvervoltageCutoff, 0, 1),
+                (QuiescentCurrent, 0, 1),
+            ],
+            // Forward values off the drop-against-current figure; with more
+            // than the fit needs, the middle one is held out.
+            Kind::IdealDiode => &[
+                (ForwardVoltage, 1, 16),
+                (SwitchOnResistance, 0, 1),
+                (ReverseCurrent, 0, 1),
+                (QuiescentCurrent, 0, 1),
+            ],
             Kind::Resistance => &[(Resistance, 1, 1), (SeriesInductance, 0, 1)],
             Kind::Capacitor => &[
                 (Capacitance, 1, 1),
@@ -261,6 +293,11 @@ pub(crate) enum Quantity {
     DropoutVoltage,
     QuiescentCurrent,
     CurrentLimit,
+    SwitchOnResistance,
+    UndervoltageLockout,
+    OvervoltageCutoff,
+    EnableThreshold,
+    OutputRiseTime,
 }
 
 pub(crate) const FORWARD_CURRENT: &str = "forward_current_amps";
@@ -283,9 +320,10 @@ pub(crate) const OVERDRIVE: &str = "overdrive_volts";
 pub(crate) const INPUT_VOLTAGE: &str = "input_voltage_volts";
 pub(crate) const OUTPUT_CURRENT: &str = "output_current_amps";
 pub(crate) const OUTPUT_VOLTAGE: &str = "output_voltage_volts";
+pub(crate) const LOAD_CAPACITANCE: &str = "load_capacitance_farads";
 
 impl Quantity {
-    pub(crate) const ALL: [Quantity; 46] = [
+    pub(crate) const ALL: [Quantity; 51] = [
         Quantity::ForwardVoltage,
         Quantity::ReverseCurrent,
         Quantity::BreakdownVoltage,
@@ -332,6 +370,11 @@ impl Quantity {
         Quantity::DropoutVoltage,
         Quantity::QuiescentCurrent,
         Quantity::CurrentLimit,
+        Quantity::SwitchOnResistance,
+        Quantity::UndervoltageLockout,
+        Quantity::OvervoltageCutoff,
+        Quantity::EnableThreshold,
+        Quantity::OutputRiseTime,
     ];
 
     pub(crate) fn name(self) -> &'static str {
@@ -382,6 +425,11 @@ impl Quantity {
             Quantity::DropoutVoltage => "dropout_voltage",
             Quantity::QuiescentCurrent => "quiescent_current",
             Quantity::CurrentLimit => "current_limit",
+            Quantity::SwitchOnResistance => "switch_on_resistance",
+            Quantity::UndervoltageLockout => "undervoltage_lockout",
+            Quantity::OvervoltageCutoff => "overvoltage_cutoff",
+            Quantity::EnableThreshold => "enable_threshold",
+            Quantity::OutputRiseTime => "output_rise_time",
         }
     }
 
@@ -399,7 +447,10 @@ impl Quantity {
             | Quantity::OutputSwingFromNegativeRail
             | Quantity::Hysteresis
             | Quantity::OutputVoltage
-            | Quantity::DropoutVoltage => "V",
+            | Quantity::DropoutVoltage
+            | Quantity::UndervoltageLockout
+            | Quantity::OvervoltageCutoff
+            | Quantity::EnableThreshold => "V",
             Quantity::ReverseCurrent
             | Quantity::LeakageCurrent
             | Quantity::DrainCurrent
@@ -413,6 +464,7 @@ impl Quantity {
             | Quantity::OnResistance
             | Quantity::GateResistance
             | Quantity::OutputResistance
+            | Quantity::SwitchOnResistance
             | Quantity::DcResistance => "ohm",
             Quantity::JunctionCapacitance
             | Quantity::Capacitance
@@ -429,7 +481,7 @@ impl Quantity {
             | Quantity::GainBandwidthProduct => "Hz",
             Quantity::CurrentGain | Quantity::OpenLoopGain => "ratio",
             Quantity::SlewRate => "V/s",
-            Quantity::PropagationDelay => "s",
+            Quantity::PropagationDelay | Quantity::OutputRiseTime => "s",
             Quantity::GateCharge | Quantity::GateDrainCharge => "C",
         }
     }
@@ -493,6 +545,12 @@ impl Quantity {
             Quantity::DropoutVoltage => (&[OUTPUT_CURRENT], &[]),
             Quantity::QuiescentCurrent => (&[INPUT_VOLTAGE], &[]),
             Quantity::CurrentLimit => (&[], &[INPUT_VOLTAGE, OUTPUT_VOLTAGE]),
+            Quantity::SwitchOnResistance => (&[OUTPUT_CURRENT], &[INPUT_VOLTAGE]),
+            Quantity::UndervoltageLockout | Quantity::OvervoltageCutoff => (&[], &[]),
+            Quantity::EnableThreshold => (&[], &[INPUT_VOLTAGE]),
+            Quantity::OutputRiseTime => {
+                (&[INPUT_VOLTAGE], &[LOAD_RESISTANCE, LOAD_CAPACITANCE])
+            }
         }
     }
 
@@ -861,6 +919,9 @@ pub(crate) fn build(
         }
         Kind::Ldo | Kind::VoltageReference => {
             regulator::build(kind, name, characteristics, temperature)?
+        }
+        Kind::LoadSwitch | Kind::Efuse | Kind::IdealDiode => {
+            switch::build(kind, name, characteristics)?
         }
         Kind::Resistance | Kind::Capacitor | Kind::Inductor => {
             passive::build(kind, name, characteristics)?

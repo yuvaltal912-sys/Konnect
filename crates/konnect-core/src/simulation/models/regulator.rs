@@ -37,21 +37,21 @@ pub(crate) const PINS: [&str; 3] = ["IN", "OUT", "COM"];
 /// The width of the corner between regulation and dropout, in volts.
 const DROPOUT_CORNER: f64 = 1e-3;
 /// The width of the current limit's corner, as a fraction of the limit.
-const LIMIT_CORNER: f64 = 1e-5;
+pub(super) const LIMIT_CORNER: f64 = 1e-5;
 /// How much the current limit pulls the output down per amp past it, as
 /// volts of output setting per amp of limit: the current at a short is then
 /// within a part in ten thousand of the limit.
-const LIMIT_STIFFNESS: f64 = 1e4;
+pub(super) const LIMIT_STIFFNESS: f64 = 1e4;
 /// An LDO driven above its setting sinks a current of this conductance's
 /// inverse: 1 uA a volt.
 const SINK_RESISTANCE: f64 = 1e6;
 /// The width of the sink corner, in amps.
-const SINK_CORNER: f64 = 1e-12;
+pub(super) const SINK_CORNER: f64 = 1e-12;
 /// The quiescent current reaches its value over the first tenth of a volt of
 /// input: `Iq Vin / sqrt(Vin^2 + 0.01)`, which is passive at 0 V.
-const QUIESCENT_KNEE: f64 = 1e-2;
+pub(super) const QUIESCENT_KNEE: f64 = 1e-2;
 /// How far above ground an output check holds `COM`.
-const COMMON_LIFT: f64 = 1.0;
+pub(super) const COMMON_LIFT: f64 = 1.0;
 /// Output values closer than this to the current limit are refused.
 const LIMIT_MARGIN: f64 = 0.9;
 
@@ -76,11 +76,11 @@ struct Law {
     sinks: bool,
 }
 
-fn smooth_max_zero(z: f64, width: f64) -> f64 {
+pub(super) fn smooth_max_zero(z: f64, width: f64) -> f64 {
     (z + (z * z + width * width).sqrt()) / 2.0
 }
 
-fn smooth_min(a: f64, b: f64, width: f64) -> f64 {
+pub(super) fn smooth_min(a: f64, b: f64, width: f64) -> f64 {
     (a + b - ((a - b) * (a - b) + width * width).sqrt()) / 2.0
 }
 
@@ -521,7 +521,7 @@ fn fit_output(points: &[Point], vin0: f64, line: bool, load: bool) -> Option<(f6
 }
 
 /// `+ k * expression`, with the sign written as an operator.
-fn term(k: f64, expression: &str) -> String {
+pub(super) fn term(k: f64, expression: &str) -> String {
     if k < 0.0 {
         format!("-{}*{expression}", number(-k))
     } else {
@@ -529,14 +529,14 @@ fn term(k: f64, expression: &str) -> String {
     }
 }
 
-fn expr_smooth_max_zero(z: &str, width: f64) -> String {
+pub(super) fn expr_smooth_max_zero(z: &str, width: f64) -> String {
     format!(
         "(({z})+sqrt(({z})*({z})+{}))/2.000000e0",
         number(width * width)
     )
 }
 
-fn expr_smooth_min(a: &str, b: &str, width: f64) -> String {
+pub(super) fn expr_smooth_min(a: &str, b: &str, width: f64) -> String {
     format!(
         "(({a})+({b})-sqrt((({a})-({b}))*(({a})-({b}))+{}))/2.000000e0",
         number(width * width)

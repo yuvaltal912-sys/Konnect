@@ -82,6 +82,14 @@ pub(crate) enum Probe {
         offset: f64,
         scale: f64,
     },
+    /// Operating point: `v(high) - v(low)`, and with `load`, that drop over the
+    /// current `(v(low) - v(base)) / ohms` a load resistor carries: a
+    /// resistance.
+    Drop {
+        high: String,
+        low: String,
+        load: Option<(String, f64)>,
+    },
     /// Transient: the rate `node` rises from `low` to `high`, by the times it
     /// first crosses each.
     Slope { node: String, low: f64, high: f64 },
@@ -123,6 +131,12 @@ pub(crate) enum Trip {
     Width,
     /// Their middle: an input offset.
     Center,
+    /// The input where the output first rises through the level: a threshold
+    /// that turns the output on.
+    Rising,
+    /// The input where the output first falls through it: one that turns it
+    /// off.
+    Falling,
 }
 
 /// Which charge a transient probe reads.
@@ -156,6 +170,7 @@ impl Probe {
             | Probe::Current { .. }
             | Probe::Charge { .. }
             | Probe::Affine { .. }
+            | Probe::Drop { .. }
             | Probe::Slope { .. }
             | Probe::Delay { .. }
             | Probe::Trip { .. } => None,
@@ -303,6 +318,19 @@ pub(crate) fn measure(
             offset,
             scale,
         } => voltage(dc?, node).map(|(value, _)| offset + scale * value),
+        Probe::Drop { high, low, load } => {
+            let dc = dc?;
+            let (top, _) = voltage(dc, high)?;
+            let (bottom, _) = voltage(dc, low)?;
+            match load {
+                None => Some(top - bottom),
+                Some((base, ohms)) => {
+                    let (base, _) = voltage(dc, base)?;
+                    let current = (bottom - base) / ohms;
+                    (current != 0.0).then(|| (top - bottom) / current)
+                }
+            }
+        }
         Probe::Slope { node, low, high } => {
             let (times, trace) = series(tran?, node)?;
             let start = crossing(&times, &trace, *low, true)?;
@@ -331,6 +359,10 @@ pub(crate) fn measure(
         } => {
             let (times, drive) = series(slow?, input)?;
             let (_, response) = series(slow?, output)?;
+            if matches!(what, Trip::Rising | Trip::Falling) {
+                let at = crossing(&times, &response, *level, *what == Trip::Rising)?;
+                return value_at(&times, &drive, at);
+            }
             let rise_at = crossing(&times, &response, *level, true)?;
             let fall_at = crossing_after(&times, &response, *level, false, rise_at)?;
             let rise = value_at(&times, &drive, rise_at)?;
@@ -338,6 +370,7 @@ pub(crate) fn measure(
             Some(match what {
                 Trip::Width => rise - fall,
                 Trip::Center => (rise + fall) / 2.0,
+                Trip::Rising | Trip::Falling => return None,
             })
         }
         Probe::Voltage {
