@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PRs #30–#36 are merged, and Q3 is merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). Main ea579b2 is merged into the PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38), on `codex/pr13-rules-completion` in an isolated worktree. The continuation implements rule edit/delete, general expressions and guarded DSN/SES integration. Its 88 removal controls each caused an actual failing test, then source was restored. Final verification is recorded on the merged branch. All nine pre-change baseline checks passed on d0880ac. PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate. The installed binary remains protected.
+**Last updated:** 2026-11-08. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 251 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
 
 ## Start here
 
@@ -47,7 +47,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
-| 13 | DRC rule writer | none | In progress: continuation on `codex/pr13-rules-completion` (custom_rules.rs, routing_context.rs, drc_rule_writer.rs, project_json_guard.rs, verification.rs, specctra.rs, specctra_ses.rs, pcb_export.rs, pcb_routing.rs); initial slice merged as #35; continuation draft [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38) |
+| 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | In progress on `feat/creation-checkpoints` (`tools/checkpoints.rs`, project toolset), open [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); separate from PR 13 |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
@@ -57,10 +57,13 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Recommended order**, after the owner approves the next implementation:
 
-1. Finish **PR 13**: general rule expressions and rule editing/deletion, then safe custom-rule DSN/SES handling. The integrated initial slice does not complete that scope.
-2. **PR 14**: checkpoints and readiness report.
-3. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
-4. **PR 15**: ERC/DRC baselines.
+1. **PR 14** is already implemented separately in open [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); review and validate that PR without duplicating its work.
+2. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
+3. **PR 15**: ERC/DRC baselines.
+
+PR 13's rule editing, deletion and static expression workflow is complete within
+its documented limits. Wider custom-rule conversion into DSN remains part of the
+later routing-profile expansion; unsupported rule semantics refuse export.
 
 **Checks still owed** (not blocking, but say so if your PR depends on them):
 
@@ -427,12 +430,12 @@ in `pcb_routing_batch.rs` serves three new tools and four upgraded tools.
   release probe uses a private IPC bridge to a protobuf mock and scratch files.
   Differential-pair routing, delete_trace and Specctra keep their own contracts.
 
-## PR 13, initial rule-writer slice (initial slice integrated, #35)
+## PR 13, initial rule-writer slice (merged, #35; historical scope)
 
-`create_custom_drc_rule` is a deliberately narrow first step: it previews or
+In #35, `create_custom_drc_rule` was a deliberately narrow first step: it previews or
 creates one unconditional clearance or track-width minimum, and refuses an
 existing rules file unless every rule is in its canonical single-line format.
-This preserves unsupported files unchanged while general rule editing is open.
+This preserved unsupported files unchanged; #38 below adds general rule editing.
 The preview revision binds board path, saved board and project bytes, existing
 rule-file bytes and the candidate.
 Apply rechecks the canonical board lock, writes atomically and verifies saved
@@ -444,12 +447,12 @@ that the scratch rules loaded; the command's exit status alone does not. It also
 project, reporting counts and disclosing missing external libraries, parity and
 zone refill. It never runs DRC directly on the original. Real KiCad scratch tests cover preview,
 apply, an observed target-rule violation and malformed-rule rejection. PR 13
-now also adds three project minima and independent preview/apply tools for differential-pair settings and deletion of netclasses unreferenced in saved project data. Project writes reject duplicate keys and linked files, check editor locks and verify conditional writes. Schematic connectivity and live netclass validation are not inspected. General rule expressions/edit/delete and safe DSN handling remain open. In particular, PR #34's SES import does not yet validate a scratch candidate with the source custom rules, so custom-rule export/import remains blocked. PR #34's routing code is included in this integration; a later PR 13 continuation must still preserve its routing contracts and prove custom-rule import safety before lifting the refusal.
+now also adds three project minima and independent preview/apply tools for differential-pair settings and deletion of netclasses unreferenced in saved project data. Project writes reject duplicate keys and linked files, check editor locks and verify conditional writes. Schematic connectivity and live netclass validation are not inspected. These were the limits of #35. Continuation #38 below closes the rule edit/delete and expression gaps and enables the explicitly supported custom-rule DSN/SES profile with revision binding, native scratch validation and verified recovery.
 
-## PR 13 continuation (in progress, draft #38)
+## PR 13 continuation (merged, #38)
 
 The claim-only commit and draft preceded implementation, from main d0880ac.
-Work is isolated in `Konnect-pr13-rules` on `codex/pr13-rules-completion`;
+Work was isolated in `Konnect-pr13-rules` on `codex/pr13-rules-completion`;
 Q3's separate config/design-intent work is outside these files.
 
 The continuation adds full-statement rule creation, named edit/delete, strict
@@ -475,3 +478,12 @@ implementation commit.
 
 Real KiCad GUI/undo, the owner-deferred Freerouting run, hosted CI and Windows/
 Linux are not established by the mock IPC tests or native scratch CLI tests.
+
+The implementation head ebab52c passed 3,645 workspace tests, 9 doctests and all
+93 live simulations, plus formatting, Clippy, licenses, catalogue counts and the
+release build. Both standalone-fork probes asserted executable path and exact
+commit; six real KiCad scratch tests passed explicitly. No real GUI/undo or
+Freerouting engine result is implied. The merge uses the owner's explicitly
+authorized ordinary fast-forward, preserving noreply commits without a force
+push. Installed SHA-256 remains
+`3de188bb775ab4ce5748ea44b94cb098c86ed5d32135e70f4c2c3817c3a4ac65`.
