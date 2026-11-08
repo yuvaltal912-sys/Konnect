@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 260 registered tools plus 7 meta-tools (267), with rank 33's `import_library_part` (draft [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52)). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 260 registered tools plus 7 meta-tools (267), with rank 33's `import_library_part` (draft [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52)). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The PR 15 follow-up (`run_design_review` reads a DRC baseline) is in draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47). The installed binary remains protected.
 
 ## Start here
 
@@ -49,7 +49,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
-| 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: read baselines in `run_design_review` (now unblocked) |
+| 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: `run_design_review` reads a DRC baseline, draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
 | R33 | Local part import (rank 33: B20, rescoped 2026-11-08): copy a KiCad-format symbol, footprint and optional 3D model the owner exported or downloaded (EasyEDA/LCSC export, SnapEDA, Ultra Librarian) into a project-local library, preview then apply by revision, never overwrite, register the libraries, run the pin-pad check. No network access: EasyEDA's terms (2026-09-21) and robots.txt forbid automated fetches | none | Draft: [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52) (branch `feat/creation-local-part-import`), implemented and verified, awaiting review |
 
@@ -57,11 +57,16 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
+**In review:** PR 15 follow-up, `run_design_review` reads a DRC baseline, draft [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) on branch `feat/creation-review-reads-baselines`. Files: `tools/design_review.rs`, `tools/check_baselines.rs`. Section below.
+
 **Recommended order**, after the owner approves the next implementation:
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
-2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35); the `cargo deny` advisories (its own PR).
+2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35).
+   - The `cargo deny` advisories fix is in review: draft [#45](https://github.com/yuvaltal912-sys/Konnect/pull/45) (branch `fix/cargo-deny-advisories`). Semver lockfile updates (h2, rustls, rustls-webpki, tokio, webpki-root-certs, hyper, which drops `pin-utils`), `zip` 8 to 9 with no code change, and one `deny.toml` ignore (RUSTSEC-2024-0449, `unsafe-libyaml`, dev-only), which the owner chose to keep (2026-11-08). Once merged, `cargo deny check` is green on main.
 3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), local part import (rank 33, draft #52).
+
+- Rank 35 (keep tests out of the real call log; one `write_all` per record): implemented, draft [#46](https://github.com/yuvaltal912-sys/Konnect/pull/46) on branch `feat/creation-call-log-isolation`, awaiting the owner's review. Don't touch `observability.rs` or the call-log wiring in `mcp/handler.rs` until it merges.
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
@@ -79,8 +84,29 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - Use the noreply identity from `AGENTS.md`, including merge commits. Since the owner turned on email privacy (2026-11-08), GitHub merges work with `gh pr merge N --merge --match-head-commit <full sha> --author-email 274043415+yuvaltal912-sys@users.noreply.github.com` (first used for #42); check the merge commit's `%ae`. If GitHub refuses, stop and ask: never substitute a personal email or fast-forward `main`. Pushes are refused when the branch tip carries a personal email, so put a noreply commit on top.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
-- `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
+
+## Rank 35, call log isolation (draft, #46)
+
+Findings C1 and C2. Test traffic was about 94% of the owner's real call log, and 1,028 of its lines held records glued together by concurrent writers.
+
+- **Path.** `observability::calls_log_path()` replaces the HOME-only default in `McpHandler::new`. `KONNECT_CALL_LOG=off` disables the file, an absolute path replaces it, anything else disables it with a warning. Otherwise a set `KONNECT_STATE_DIR` keeps the log at `logs/calls.jsonl` inside it, else the old default. Real users set neither, so their path is unchanged.
+- **Tests.** konnect-core's own tests always get `None` (`cfg(test)`). `.cargo/config.toml` `[env]` sets `KONNECT_CALL_LOG=off` for everything cargo runs, `cargo run` included (set an absolute path to keep a log there). The stdio test helper sets it again for the servers it spawns.
+- **Write.** Each record is serialised with its newline into one buffer and written with a single `write_all` on the append-mode handle. `writeln!` on a `File` had issued two writes.
+
+Verified on macOS (2026-11-08): the gate (fmt; 3739 lib and integration tests, 0 failures; doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts`; release build). `simulation_live` was skipped: this PR does not touch simulation. New tests: override resolution; the `cfg(test)` guard with no env at all; a handler built in a child test process with HOME at a temp folder and every override removed writes nothing there; four processes appending 1,600 records to one file give only whole lines; a test process does not resolve the real path; a spawned server with HOME and `KONNECT_STATE_DIR` at a temp folder logs only into the state folder, and with the log off writes none. A stdio run of the release binary with that isolation logged 2 whole records in its state folder. Three negative controls each caught by a test: `writeln!` back (3 of 3 runs), the `cfg(test)` guard removed, the cargo `[env]` removed. The owner's existing log was not read, changed or cleaned. Not done: the `server_version`, `pid` and `session_id` record fields that C1 also proposed, rotation, and Windows and Linux.
+
+## PR 15 follow-up, the review reads a DRC baseline (draft, #47)
+
+`run_design_review` takes `baseline`, the name of a DRC baseline of the same board (`save_check_baseline` with `board`). It is loaded before anything runs with `check_baselines::load_for_compare`, now shared with `compare_check_baseline`, so a missing name (the stored names are listed), a damaged file, a symlinked store, a baseline of another board, an invalid name and `baseline` without `board` are all refusals and run nothing. The review's DRC run is normalized and diffed with PR 15's `normalize_drc` and `diff`; no key logic is repeated.
+
+- Counted against the verdict: new violations, severity increases (`baseline_severity` given) and violations in a category the baseline did not report (`not_compared`, since nothing vouches for them). Each finding carries `baseline_change` and `baseline_key`. Unchanged and lowered ones are not findings.
+- `design_review.baseline` names what was used: `name`, `path`, `revision` (SHA-256 of the stored file), `created_utc`, `source`, then the counts (new, raised, lowered, unchanged, resolved, not compared), per-rule tallies, up to 20 resolved violations, `keying`, `source_changed_since_baseline` and `warnings` (`options_differ` when the baseline ran with refill or live sync: the review runs neither). `null` without the argument.
+- The verdict ends with the comparison, e.g. `NOT READY — … (DRC counted against baseline 'pre-route': 1 new, 1 unchanged, 1 resolved)`. `drc` keeps the run's absolute counts.
+- DRC that cannot run: INCOMPLETE as before, and `baseline.status` is `not_compared` with `reason: drc_unavailable`.
+- ERC: the review runs none, so an ERC baseline does not apply; the schema says so. The `kicad-review` skill now says to report the unchanged count and not to call such a board clean.
+
+Verified on macOS: 6 unit tests (`design_review_baseline_tests.rs`) over a scratch project with a stand-in `kicad-cli`: new/unchanged/resolved in the verdict with the re-measured and moved violation matched; an unchanged board LOOKS GOOD against its baseline and NOT READY without it; severity raised counts and lowered does not; a category missing from the baseline counts; every refusal runs no DRC and leaves a damaged file as it was; DRC unavailable keeps the review INCOMPLETE. The 23 PR 15 tests pass after the loader refactor. 4 negative controls, each caught: counting unchanged findings, dropping severity raises, ignoring a missing baseline, dropping not-compared categories. The gate (2026-11-08): fmt; 3747 lib and integration tests passed, 1 failed and then fixed (`asset_references` caught a backticked field in the new skill line; rerun 12/12, and the `konnect` crate 191/191 afterwards); doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts` (no change, 259 + 7); release build; installed binary SHA-256 still `3de188bb775ab4ce`. `simulation_live` skipped (not touched). Not verified: a live kicad-cli run (the PR 15 live test covers the keys), Windows and Linux.
 
 ## Rank 33, local part import (draft, #52)
 
@@ -119,7 +145,7 @@ Stable keys: a hash of check, DRC category, rule, ERC sheet and the sorted item 
 
 Verified on macOS: 23 unit tests over scratch projects with a stand-in `kicad-cli` (new/resolved/unchanged for ERC and DRC; a re-run reordered, moved, with items swapped and DRC prose re-measured matches exactly; made-up UUIDs; repeats; severity changes; missing categories; refusals before any run; damaged and renamed baseline files; a symlinked `.konnect`; 1,500 changes under the client cap with paging covering each once), 12 negative controls each caught by a test, and the ignored live test `live_rerun_of_an_unchanged_project_matches_its_baseline` with kicad-cli 10.0.8 on a scratch copy of the KiCad 10 `pic_programmer` demo (5 ERC and 5 DRC violations, every item keyed by UUID, re-run 0 new and 0 resolved). `cargo test -p konnect-core -p konnect` and clippy pass. Not verified: a live edit between save and compare, `sync_live_board` against a live KiCad (it reuses `drc::run`, already covered), a KiCad 8 board, Windows and Linux.
 
-Follow-ups, not in this PR: read baselines in `run_design_review` (unblocked now that PR 11 is merged); a delete tool (overwrite covers replacement today); the documented edit loop in the skills and agents (rank C29).
+Follow-ups, not in this PR: read baselines in `run_design_review` (draft #47, section above); a delete tool (overwrite covers replacement today); the documented edit loop in the skills and agents (rank C29).
 
 ## PR 11, honest review and current audit (merged, #42)
 
