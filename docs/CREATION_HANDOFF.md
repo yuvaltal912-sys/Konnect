@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is implemented on [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39), awaiting review. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 255 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
+**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`). Next pickable: PR 11. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 255 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
 
 ## Start here
 
@@ -48,7 +48,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 11 | Honest review and current audit | 7, Q3 | Not started |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
-| 14 | Checkpoints and readiness report | none | Implemented on `feat/creation-checkpoints`, [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39), awaiting review |
+| 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Not started |
 
 ## Next: what to pick
@@ -57,9 +57,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Recommended order**, after the owner approves the next implementation:
 
-1. **PR 14**: checkpoints and readiness report, implemented on [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39); review and merge.
-2. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
-3. **PR 15**: ERC/DRC baselines.
+1. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
+2. **PR 15**: ERC/DRC baselines.
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
@@ -69,6 +68,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 
 - The real Freerouting run, `freerouting_routes_the_rounded_board` (ignored). Java 21 is now installed at `/opt/homebrew/opt/openjdk@21` (the system `java` is still 11). The owner deferred the live run; ask before running it.
 - PR 9 against a live KiCad: `crates/konnect/tests/live_kicad_tools.rs`, on a disposable board.
+- PR 14 against a live KiCad: checkpoint, edit in the GUI, restore refused while open, restore after closing, on a disposable project.
 - Windows and Linux for the whole series, at the end.
 
 **Known traps.**
@@ -76,8 +76,10 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - Use the noreply identity from `AGENTS.md`, including integration merge commits. A previous GitHub merge attempt rejected this identity; do not silently substitute a personal email.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
+- `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
+- Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
 
-## PR 14, checkpoints and readiness report (#39)
+## PR 14, checkpoints and readiness report (merged, #39)
 
 Four tools in the `project` toolset (starter kit, so no `load_toolset`), in `tools/checkpoints.rs`:
 
