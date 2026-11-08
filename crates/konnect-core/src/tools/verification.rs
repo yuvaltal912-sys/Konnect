@@ -6,9 +6,9 @@
 #[path = "drc_project_rules.rs"]
 mod drc_project_rules;
 #[path = "drc_rule_writer.rs"]
-mod drc_rule_writer;
+pub(crate) mod drc_rule_writer;
 #[path = "project_json_guard.rs"]
-mod project_json_guard;
+pub(crate) mod project_json_guard;
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -247,7 +247,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_check_clearance(args, ctx).await }
         ),
     ];
-    tools.push(drc_rule_writer::tool());
+    tools.extend(drc_rule_writer::tools());
     tools.extend(drc_project_rules::tools());
     tools
 }

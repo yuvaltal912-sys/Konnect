@@ -61,7 +61,7 @@ impl<'de> Visitor<'de> for UniqueVisitor {
         Ok(Unique(Value::Object(out)))
     }
 }
-pub(super) fn parse(source: &str) -> anyhow::Result<Value> {
+pub(crate) fn parse(source: &str) -> anyhow::Result<Value> {
     let mut deserializer = serde_json::Deserializer::from_str(source);
     let value = Unique::deserialize(&mut deserializer)?.0;
     deserializer.end()?;

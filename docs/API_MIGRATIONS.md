@@ -21,7 +21,79 @@ a target has a KiCad lock or is open over IPC, while the project lock
 (`~<name>.kicad_pro.lck`) is present, while a transaction journal is pending, or
 for a board seen live earlier in the session. It never deletes files.
 
-, component flags and title blocks (minor release)
+## Unreleased: complete rule edits and revision-bound custom-rule routing (minor release)
+
+Creation PR 13 continuation, [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38).
+
+- **`create_custom_drc_rule`** accepts either the existing `constraint` / `minimum_mm`
+  shorthand or `rule`, one complete KiCad `(rule ...)` statement. The two forms
+  cannot be mixed. General conditions, assertions and calculator expressions are
+  compiled by KiCad. **`edit_custom_drc_rule`** replaces one uniquely named rule in
+  place; its replacement must keep the requested name. **`delete_custom_drc_rule`**
+  removes one uniquely named rule. Both retain unrelated bytes, comments and rule
+  order; deleting the last rule retains the version header and comments.
+- All three preview by default. Apply requires `dry_run: false` and the exact
+  `expected_plan_revision` from the same board/project/rule snapshot and candidate.
+  Raw rules allow readable names up to 256 UTF-8 bytes; the numeric shorthand
+  retains its 80-character ASCII name restriction and whole-nanometer range.
+  Documents are bounded to 512 KiB, 128 rules and nesting depth 64. Duplicate names,
+  malformed/trailing statements, reserved probe names, NUL and unresolved `${...}`
+  substitutions refuse. Rules are reparsed after editing to prove that unrelated
+  statements retained their meaning and order, including around comments.
+- Native validation includes every condition **and assertion** in the probe
+  condition: KiCad can otherwise ignore a failed assertion compilation while
+  returning success and loading a separate probe rule. Target DRC still runs on
+  a private saved-board/project copy. It requests all severities and reports
+  included severities and ignored checks. This is syntax/loading evidence and a
+  saved snapshot, not a live-board or manufacturing acceptance claim.
+- Writes check board ownership, board and root-schematic locks, saved project
+  ambiguity and revisions again before mutation. Conditional atomic writes and
+  independent saved-byte readback remain required. A no-op apply also rechecks
+  the original rule bytes. Successful responses add `operation`,
+  `unrelated_rules_preserved` and `readback`; uncertain writes identify the actual
+  create/edit/delete operation and require inspection before retrying.
+
+**DSN/SES profile and migration:**
+
+- `export_specctra_dsn` accepts a saved custom-rule file only when its rules are
+  unconditional clearance/track-width minima expressed as numeric millimeters.
+  Each minimum is rounded upward to the micrometer export grid and applied as a
+  lower bound on every live class, preserving larger preferences and refusing
+  incomplete or invalid live fields. Conditional, layer/severity, assertion,
+  other-constraint and arithmetic-bound rules remain explicit export refusals.
+  They can still be authored through the rule writer. With a custom-rule file,
+  `native_bridge_mode: require` refuses; `prefer` and `disable` use the Rust
+  projection. An empty version-only rule file is still captured as a rule file.
+- Production exports include additive `routing_context` metadata in the manifest:
+  exact saved project/rule presence and byte hashes, and the original live
+  effective-netclass hash. Native adoption preserves it. Exactly one PCB must be
+  open because the netclass IPC command has no document header. Saved/live state
+  is checked again during export, planning and application. Older manifests must
+  be re-exported when a saved project or rule file exists; removing metadata or
+  flipping the profile flag does not bypass the checks. Older server versions
+  can refuse the new manifest field and should not be used to import it.
+- `plan_specctra_ses_import` remains read-only and does not run DRC. It verifies
+  the captured revisions and custom width bounds. `apply_specctra_ses` preserves
+  its live commit followed by verification/compensating-deletion workflow. Its
+  description now states that ordering correctly. Receipt identities must be
+  disjoint from every original board UUID, including footprints and pads. IPC
+  copper identities must match the source and serialized candidate inventories. DRC sees a private candidate with the captured `.kicad_pro`/`.kicad_dru`,
+  never arbitrary siblings of the requested candidate output filename.
+- Custom-rule application requires a complete, clean PCB/unconnected-item report,
+  all severities including exclusions, and proof that required clearance/width
+  checks were enabled. Non-clean, missing or suppressed evidence refuses the
+  result and compensates the created items. Only exact observed restoration
+  establishes rollback; commit or recovery uncertainty returns
+  `mutation_outcome_uncertain`. Other writers' changes are preserved.
+- The SES result's `ipc_readback` changes from `exact_count_match` to
+  `exact_identity_and_count_match`. DRC adds explicit source, scope, category
+  coverage, included severities and ignored-check keys. Parity is not requested,
+  so `schematic_parity_violations` is now null rather than an unmeasured zero.
+  Zones are not refilled and external libraries are not copied. Without a custom
+  rule file the existing report-nonclean-results contract remains; callers must
+  inspect the engineering result, source and coverage before claiming readiness.
+
+## Unreleased: schematic mirroring, component flags and title blocks (minor release)
 
 Creation PR 6 (`docs/CREATION_HANDOFF.md`).
 
@@ -266,8 +338,8 @@ returned `expected_plan_revision` to apply. Deletion refuses Default, ambiguous
 names and classes referenced by saved patterns or assignments; it does not
 inspect schematic connectivity. These tools do not validate live netclasses.
 
-General rule expressions, rule editing/deletion and safe DSN custom-rule
-handling remain open. PR #34's routing files are intentionally separate.
+The continuation in #38 adds general expressions, rule editing/deletion and
+revision-bound DSN/SES handling within the explicit profile described above.
 
 ## Unreleased: render images and focused views (minor release)
 
