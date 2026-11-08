@@ -1,5 +1,5 @@
 //! Linear regulators and series voltage references, as one behavioural
-//! voltage source between `OUT` and `GND`.
+//! voltage source between `OUT` and `COM`, the ground or adjust pin.
 //!
 //! The source is the smooth lesser of two laws: the regulated output,
 //! `V0 + k (Vin - Vin0)` less a current-limit term, and the input less the
@@ -30,7 +30,10 @@ use super::{
 };
 
 /// The model's pins, in the order an instance lists its nodes.
-pub(crate) const PINS: [&str; 3] = ["IN", "OUT", "GND"];
+/// The third pin is `COM`, the part's ground or adjust pin, never `GND`:
+/// ngspice reads a node named `gnd` as ground, even a subcircuit's port, so a
+/// port of that name would tie the pin to the circuit's ground.
+pub(crate) const PINS: [&str; 3] = ["IN", "OUT", "COM"];
 /// The width of the corner between regulation and dropout, in volts.
 const DROPOUT_CORNER: f64 = 1e-3;
 /// The width of the current limit's corner, as a fraction of the limit.
@@ -47,6 +50,8 @@ const SINK_CORNER: f64 = 1e-12;
 /// The quiescent current reaches its value over the first tenth of a volt of
 /// input: `Iq Vin / sqrt(Vin^2 + 0.01)`, which is passive at 0 V.
 const QUIESCENT_KNEE: f64 = 1e-2;
+/// How far above ground an output check holds `COM`.
+const COMMON_LIFT: f64 = 1.0;
 /// Output values closer than this to the current limit are refused.
 const LIMIT_MARGIN: f64 = 0.9;
 
@@ -335,9 +340,10 @@ pub(crate) fn build(
     }
     if let Some(c) = dropout {
         let current = c.condition(OUTPUT_CURRENT).unwrap_or_default();
-        // Deep in dropout, where the input less the output is the dropout
-        // resistance's drop alone.
-        let vin = if v0 - c.value > 0.1 { v0 - c.value } else { v0 };
+        // In dropout by half the dropout voltage, where the input less the
+        // output is the dropout resistance's drop alone and the output stays
+        // above ground.
+        let vin = v0 + 0.5 * c.value;
         let id = bench.id();
         let (input, output) = (format!("{id}i"), format!("{id}o"));
         bench.dc.push(Bench::voltage(&id, &input, vin, false));
@@ -401,20 +407,27 @@ fn sink(id: &str, node: &str, amps: f64) -> String {
     }
 }
 
+/// An output value, with `COM` lifted off ground so a pin the engine tied to
+/// ground would read wrong.
 fn check_output(model: &mut Model, bench: &mut Bench, point: Point, role: Role) {
     let id = bench.id();
-    let (input, output) = (format!("{id}i"), format!("{id}o"));
-    bench.dc.push(Bench::voltage(&id, &input, point.vin, false));
-    bench.dc.push(model.instance(&id, &[&input, &output, "0"]));
+    let (input, output, common) = (format!("{id}i"), format!("{id}o"), format!("{id}c"));
+    bench
+        .dc
+        .push(Bench::voltage(&id, &input, point.vin + COMMON_LIFT, false));
+    bench
+        .dc
+        .push(Bench::voltage(&common, &common, COMMON_LIFT, false));
+    bench.dc.push(model.instance(&id, &[&input, &output, &common]));
     bench.dc.push(sink(&id, &output, point.iout));
     model.checks.push(Check {
         characteristic: point.index,
         role,
         expected: point.vout,
-        probe: Probe::Voltage {
+        probe: Probe::Affine {
             node: output,
+            offset: -COMMON_LIFT,
             scale: 1.0,
-            divide_by: 1.0,
         },
     });
 }
@@ -530,11 +543,11 @@ fn expr_smooth_min(a: &str, b: &str, width: f64) -> String {
 /// The cards: the source, its output resistance, the current sense and the
 /// input's currents.
 fn body(name: &str, law: &Law, iq: Option<f64>) -> String {
-    const CURRENT: &str = "v(hs,GND)";
+    const CURRENT: &str = "v(hs,COM)";
     let mut regulated = format!(
         "{}{}",
         number(law.v0),
-        term(law.line, &format!("(v(IN,GND)-{})", number(law.vin0)))
+        term(law.line, &format!("(v(IN,COM)-{})", number(law.vin0)))
     );
     if let Some(limit) = law.limit {
         regulated.push_str(&term(
@@ -545,7 +558,7 @@ fn body(name: &str, law: &Law, iq: Option<f64>) -> String {
             ),
         ));
     }
-    let floor = format!("v(IN,GND){}", term(-law.rdo, CURRENT));
+    let floor = format!("v(IN,COM){}", term(-law.rdo, CURRENT));
     let mut source = expr_smooth_min(&regulated, &floor, DROPOUT_CORNER);
     if !law.sinks {
         source.push_str(&term(
@@ -553,22 +566,22 @@ fn body(name: &str, law: &Law, iq: Option<f64>) -> String {
             &expr_smooth_max_zero(&format!("-{CURRENT}"), SINK_CORNER),
         ));
     }
-    let mut cards = format!(".subckt {name} IN OUT GND\nBO s GND V={source}\n");
+    let mut cards = format!(".subckt {name} IN OUT COM\nBO s COM V={source}\n");
     if law.rout > 0.0 {
         cards.push_str(&format!("ROUT s x {}\nVS x OUT 0.000000e0\n", number(law.rout)));
     } else {
         cards.push_str("VS s OUT 0.000000e0\n");
     }
-    cards.push_str("HS hs GND VS 1.000000e0\n");
+    cards.push_str("HS hs COM VS 1.000000e0\n");
     let input_current = if law.sinks {
         expr_smooth_max_zero(CURRENT, SINK_CORNER)
     } else {
         CURRENT.to_string()
     };
-    cards.push_str(&format!("BI IN GND I={input_current}\n"));
+    cards.push_str(&format!("BI IN COM I={input_current}\n"));
     if let Some(iq) = iq {
         cards.push_str(&format!(
-            "BQ IN GND I={}*v(IN,GND)/sqrt(v(IN,GND)*v(IN,GND)+{})\n",
+            "BQ IN COM I={}*v(IN,COM)/sqrt(v(IN,COM)*v(IN,COM)+{})\n",
             number(iq),
             number(QUIESCENT_KNEE)
         ));
@@ -617,7 +630,7 @@ mod tests {
     fn an_ldo_is_a_three_pin_subcircuit_in_the_fitted_grammar() {
         let model = build_model(Kind::Ldo, "tlv733_fit", &ldo_values(), 25.0).unwrap();
         let checked = text::check_fitted(model.file().as_bytes()).unwrap();
-        assert_eq!(checked.pins(), ["IN", "OUT", "GND"]);
+        assert_eq!(checked.pins(), ["IN", "OUT", "COM"]);
         assert_eq!(checked.kind, "ldo");
         // The line and load terms are fixed by three of the four values, and
         // the middle of the load order is held out.

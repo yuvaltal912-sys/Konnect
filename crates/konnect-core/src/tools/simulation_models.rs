@@ -44,7 +44,7 @@ fn characteristic_schema() -> Value {
         "properties": {
             "quantity": {
                 "enum": quantities,
-                "description": "What the value is. Units are fixed: volts, amps, ohms, farads, henries, seconds, hertz"
+                "description": "What the value is. Units are fixed: volts, amps, ohms, farads, henries, seconds, hertz, volts per second for slew_rate, and a plain ratio for current_gain and open_loop_gain (100 dB is 1e5)"
             },
             "value": positive("The datasheet value, as a plain number in the quantity's SI base unit: 0.45 for 450 mV, 1e-6 for 1 uA"),
             "conditions": {
@@ -62,9 +62,15 @@ fn characteristic_schema() -> Value {
                     "peak_pulse_current_amps": positive("For clamping_voltage: the peak pulse current the clamping voltage is stated at"),
                     "reverse_voltage_volts": non_negative("For reverse_current, above 0, junction_capacitance, where 0 gives the zero-bias CJO, and collector_base_capacitance and emitter_base_capacitance"),
                     "voltage_volts": positive("For leakage_current"),
-                    "frequency_hz": positive("For junction_capacitance (default 1 MHz), dynamic_impedance (1 kHz), capacitance (1 kHz), equivalent_series_resistance (100 kHz) and inductance (100 kHz)"),
+                    "frequency_hz": positive("For junction_capacitance (default 1 MHz), dynamic_impedance (1 kHz), capacitance (1 kHz), equivalent_series_resistance (100 kHz) and inductance (100 kHz). On an op_amp's open_loop_gain it marks a value off the Bode plot; the DC gain has none"),
                     "dc_bias_volts": non_negative("For capacitance: the DC bias it was read at, 0 for none. An MLCC loses much of its capacitance under bias, so give the value at the working voltage"),
-                    "dc_current_amps": non_negative("For inductance: the DC current it was read at, 0 for none, below saturation")
+                    "dc_current_amps": non_negative("For inductance: the DC current it was read at, 0 for none, below saturation"),
+                    "supply_voltage_volts": positive("For an op_amp or comparator: the total supply across VCC and VEE the value was read at. Needed by supply_current and the output swings"),
+                    "load_resistance_ohms": positive("For the output swings and open_loop_gain: the load, returned to mid-supply"),
+                    "overdrive_volts": positive("For propagation_delay: how far past the trip point the input steps"),
+                    "input_voltage_volts": positive("For output_voltage, quiescent_current and current_limit of an ldo or voltage_reference"),
+                    "output_current_amps": non_negative("For output_voltage (0 for no load) and dropout_voltage"),
+                    "output_voltage_volts": non_negative("For current_limit: the output voltage it was read at, 0 for a short")
                 }
             },
             "statistic": {
@@ -82,7 +88,7 @@ pub fn tools() -> Vec<ToolDef> {
     let kinds: Vec<&str> = Kind::ALL.iter().map(|kind| kind.name()).collect();
     vec![tool!(
         "create_simulation_model",
-        "Fit a SPICE model to datasheet values you read, check it on the simulator, and write it to the project's simulation_models folder only if every fitted value comes back within tolerance. Konnect never reads the datasheet: it fits and checks the numbers given. Kinds: diode, schottky_diode, led and zener need at least two forward_voltage values (a zener needs zener_voltage and dynamic_impedance instead); n_mosfet and p_mosfet (power MOSFETs, as a three-pin subcircuit) need a gate_threshold_voltage, an on_resistance and at least two drain_current values read off the transfer curve, all as magnitudes, with optional forward_voltage values for the body diode, a gate_resistance, a capacitance curve (three or more reverse_transfer_capacitance values, plus input_capacitance and output_capacitance at the same drain voltages) and gate_charge and gate_drain_charge, which are checked on a switching bench and never fitted; npn and pnp (bipolar transistors, as a three-pin subcircuit C, B, E) need at least three current_gain values at collector currents (a curve off the figure), and at least one base_emitter_voltage, all as magnitudes, with optional collector_emitter_saturation_voltage, collector_base_capacitance and emitter_base_capacitance values (reverse_voltage_volts) and a transition_frequency; tvs and tvs_bidirectional need a breakdown_voltage at its test current and a clamping_voltage at its peak pulse current (a bidirectional part takes no forward or capacitance values); resistance (a fuse's cold resistance, a jumper, a shunt), capacitor (capacitance with ESR, ESL and leakage) and inductor (inductance with DC resistance and self-resonance) are exact. Writes the model file and a .konnect.json sidecar, and touches no schematic: attach the model with assign_simulation_model.",
+        "Fit a SPICE model to datasheet values you read, check it on the simulator, and write it to the project's simulation_models folder only if every fitted value comes back within tolerance. Konnect never reads the datasheet: it fits and checks the numbers given. Kinds: diode, schottky_diode, led and zener need at least two forward_voltage values (a zener needs zener_voltage and dynamic_impedance instead); n_mosfet and p_mosfet (power MOSFETs, as a three-pin subcircuit) need a gate_threshold_voltage, an on_resistance and at least two drain_current values read off the transfer curve, all as magnitudes, with optional forward_voltage values for the body diode, a gate_resistance, a capacitance curve (three or more reverse_transfer_capacitance values, plus input_capacitance and output_capacitance at the same drain voltages) and gate_charge and gate_drain_charge, which are checked on a switching bench and never fitted; npn and pnp (bipolar transistors, as a three-pin subcircuit C, B, E) need at least three current_gain values at collector currents (a curve off the figure), and at least one base_emitter_voltage, all as magnitudes, with optional collector_emitter_saturation_voltage, collector_base_capacitance and emitter_base_capacitance values (reverse_voltage_volts) and a transition_frequency; tvs and tvs_bidirectional need a breakdown_voltage at its test current and a clamping_voltage at its peak pulse current (a bidirectional part takes no forward or capacitance values); op_amp (a five-pin behavioural subcircuit INP, INN, VCC, VEE, OUT) needs the DC open_loop_gain as a ratio and the gain_bandwidth_product, with optional open_loop_gain values off the Bode plot (each with its frequency_hz, held out against the single pole), slew_rate, input_offset_voltage, input_bias_current, supply_current, output_swing_from_positive_rail and output_swing_from_negative_rail (headroom from each rail, with the load returned to mid-supply) and output_resistance; comparator (the same five pins, push-pull output) needs one or more propagation_delay values at their overdrive_volts (three or more fit the curve's shape, and with four or more the middle one is held out), with optional hysteresis, input_offset_voltage, input_bias_current, supply_current, output swings and output_resistance; ldo and voltage_reference (three pins IN, OUT and COM, the ground or adjust pin) need one or more output_voltage values at an input voltage and output current (values at two input voltages give line regulation, at two currents load regulation, and one more is held out), an ldo also a dropout_voltage, with optional quiescent_current and current_limit; a reference also sinks current. The behavioural ICs have no loop dynamics, temperature behaviour or noise, and the result lists what each assumed; resistance (a fuse's cold resistance, a jumper, a shunt), capacitor (capacitance with ESR, ESL and leakage) and inductor (inductance with DC resistance and self-resonance) are exact. Writes the model file and a .konnect.json sidecar, and touches no schematic: attach the model with assign_simulation_model.",
         json!({
             "type": "object",
             "properties": {
@@ -1434,7 +1440,7 @@ mod tests {
         let refused = create(args.clone()).await;
         assert_eq!(field(&refused), "model_name", "{:?}", body(&refused));
         args["model_name"] = json!("fuse_fit");
-        args["kind"] = json!("op_amp");
+        args["kind"] = json!("opamp");
         assert_eq!(field(&create(args.clone()).await), "kind");
         args["kind"] = json!("resistance");
         args["characteristics"] =

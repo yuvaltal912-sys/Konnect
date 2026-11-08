@@ -355,6 +355,10 @@ fn check_cards(body: &str, name: &str) -> Result<Card, String> {
             if ports.is_empty() || ports.len() > 8 || !ports.iter().all(|port| is_node(port)) {
                 return Err("its subcircuit ports are not ones Konnect writes".to_string());
             }
+            // ngspice reads a node named gnd as ground, a port too.
+            if ports.iter().any(|port| port.eq_ignore_ascii_case("gnd")) {
+                return Err("a subcircuit port named gnd is ground to ngspice".to_string());
+            }
             let Some((last, inner)) = lines[1..].split_last() else {
                 return Err("its subcircuit is not closed".to_string());
             };
@@ -865,6 +869,12 @@ mod tests {
             let text = behavioural_file(bad);
             assert!(check_fitted(text.as_bytes()).is_err(), "{bad} passed");
         }
+        let grounded = file(
+            "ldo",
+            "reg_fit",
+            ".subckt reg_fit IN OUT GND\nVS IN OUT 0.000000e0\n.ends reg_fit\n",
+        );
+        assert!(check_fitted(grounded.as_bytes()).is_err());
         let long = format!("BG mid a V={}", vec!["v(INP)"; 800].join("+"));
         assert!(check_fitted(behavioural_file(&long).as_bytes()).is_err());
     }

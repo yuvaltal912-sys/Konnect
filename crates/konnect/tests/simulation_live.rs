@@ -4221,3 +4221,214 @@ fn both_fitted_bipolar_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin
     );
     assert_eq!(results[2]["parts"][0]["element"], "XQ2", "{}", results[2]);
 }
+
+fn typical(quantity: &str, value: f64, conditions: Value) -> Value {
+    json!({ "quantity": quantity, "value": value, "conditions": conditions, "statistic": "typical" })
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_filter() {
+    // KiCad's sallen_key demo with its AD8051 replaced by a model fitted to
+    // values of that kind of part. The filter's formula holds as it does for
+    // the vendor model: a 110 MHz part does not move a 1.6 kHz pole.
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(&demos().join("simulation/sallen_key"), project.path());
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("sallen_key.kicad_sch");
+    let swing = |quantity: &str, volts: f64| {
+        typical(
+            quantity,
+            volts,
+            json!({ "supply_voltage_volts": 10.0, "load_resistance_ohms": 1000.0 }),
+        )
+    };
+    let op_amp = json!([
+        typical("open_loop_gain", 2.5e4, json!({})),
+        typical("open_loop_gain", 22.0, json!({ "frequency_hz": 5e6 })),
+        typical("gain_bandwidth_product", 1.1e8, json!({})),
+        typical("slew_rate", 1.45e8, json!({})),
+        typical("input_offset_voltage", 1.7e-3, json!({})),
+        typical("input_bias_current", 1.4e-6, json!({})),
+        typical("supply_current", 4.4e-3, json!({ "supply_voltage_volts": 10.0 })),
+        swing("output_swing_from_positive_rail", 0.1),
+        swing("output_swing_from_negative_rail", 0.05),
+        typical("output_resistance", 30.0, json!({}))
+    ]);
+    let delay = |overdrive: f64, seconds: f64| {
+        typical(
+            "propagation_delay",
+            seconds,
+            json!({ "overdrive_volts": overdrive, "supply_voltage_volts": 5.0 }),
+        )
+    };
+    let comparator = json!([
+        delay(5e-3, 1.3e-6),
+        delay(20e-3, 0.6e-6),
+        delay(100e-3, 0.3e-6),
+        typical("hysteresis", 5e-3, json!({})),
+        typical("input_offset_voltage", 1e-3, json!({})),
+        typical("input_bias_current", 25e-9, json!({})),
+        typical("supply_current", 0.4e-3, json!({ "supply_voltage_volts": 5.0 })),
+        typical(
+            "output_swing_from_positive_rail",
+            0.2,
+            json!({ "supply_voltage_volts": 5.0, "load_resistance_ohms": 1e4 })
+        ),
+        typical(
+            "output_swing_from_negative_rail",
+            0.15,
+            json!({ "supply_voltage_volts": 5.0, "load_resistance_ohms": 1e4 })
+        ),
+        typical("output_resistance", 100.0, json!({}))
+    ]);
+    let f0 = 1.0 / (2.0 * std::f64::consts::PI * 1e3 * 100e-9);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "op_amp", "ad8051_fit", op_amp),
+            create_model(&schematic, "comparator", "lm393_fit", comparator),
+            assign_model(
+                &schematic,
+                &["U1"],
+                "ad8051_fit",
+                json!({ "1": "INP", "2": "INN", "3": "VCC", "4": "VEE", "5": "OUT" }),
+            ),
+            (
+                "run_simulation",
+                json!({
+                    "schematic": schematic,
+                    "analysis": { "kind": "ac", "start_hz": 10.0, "stop_hz": 1e6, "points": 200 },
+                    "measurements": [
+                        { "name": "edge", "kind": "bandwidth_3db", "signal": "v(/lowpass)" },
+                        { "name": "at_f0", "kind": "value_at", "signal": "v(/lowpass)", "at_hz": f0 },
+                    ],
+                }),
+            ),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+        assert_eq!(created["written"], true, "{created}");
+        // The fits are exact or nearly so: a few hundredths of a percent on
+        // the engine. A law that drifts from the engine shows here first.
+        let worst = created["verification"]["worst_error_percent"].as_f64().unwrap();
+        assert!(worst < 1.0, "{created}");
+    }
+    assert_eq!(results[0]["model_pins"], json!(["INP", "INN", "VCC", "VEE", "OUT"]));
+    let rows = results[0]["verification"]["rows"].as_array().unwrap();
+    assert!(
+        rows.iter().any(|row| row["role"] == "held_out"),
+        "{}",
+        results[0]
+    );
+    assert_eq!(
+        results[2]["outcome"]["status"], "complete",
+        "{}",
+        results[2]
+    );
+    assert_eq!(results[2]["parts"][0]["element"], "XU1", "{}", results[2]);
+    let run = &results[3];
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run["simulated_circuit"], "as_drawn");
+    assert_eq!(
+        run["circuit"]["approximations"],
+        json!([{ "code": "fitted_model", "items": ["U1"] }]),
+        "{run}"
+    );
+    near(
+        measured(run, "edge") / f0,
+        (2f64.sqrt() - 1.0).sqrt(),
+        1e-3,
+    );
+    near(measured(run, "at_f0"), -6.0206, 1e-2);
+}
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn behavioural_regulators_are_checked_on_the_engine_and_a_fitted_ldo_regulates_a_supply() {
+    // KiCad's LM317 demo with its vendor model replaced by an ldo fitted to an
+    // LM317's typical values. Its third pin is ADJ: the output sits the
+    // reference above it, and the adjust current flows out of it, so the
+    // divider (240 ohm, 1.5 kohm) sets 1.25 (1 + 1500 / 240) + 50 uA 1500 ohm.
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(
+        &demos().join("simulation/power_supplies/LM317_power_supply"),
+        project.path(),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("power_supply.kicad_sch");
+    let output = |vin: f64, amps: f64, volts: f64| {
+        typical(
+            "output_voltage",
+            volts,
+            json!({ "input_voltage_volts": vin, "output_current_amps": amps }),
+        )
+    };
+    let ldo = json!([
+        output(5.0, 0.01, 1.25),
+        output(5.0, 0.5, 1.247),
+        output(5.0, 1.0, 1.244),
+        output(40.0, 0.01, 1.2535),
+        typical("dropout_voltage", 2.0, json!({ "output_current_amps": 1.0 })),
+        typical("quiescent_current", 50e-6, json!({ "input_voltage_volts": 5.0 })),
+        typical("current_limit", 2.2, json!({ "input_voltage_volts": 10.0, "output_voltage_volts": 0.0 }))
+    ]);
+    let reference = json!([
+        output(5.0, 0.0, 2.5),
+        output(5.0, 0.01, 2.4995),
+        output(15.0, 0.0, 2.5002),
+        typical("quiescent_current", 1e-3, json!({ "input_voltage_volts": 5.0 })),
+        typical("current_limit", 0.025, json!({}))
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "ldo", "lm317_fit", ldo),
+            create_model(&schematic, "voltage_reference", "ref25_fit", reference),
+            assign_model(
+                &schematic,
+                &["U1"],
+                "lm317_fit",
+                json!({ "3": "IN", "2": "OUT", "1": "COM" }),
+            ),
+            (
+                "run_simulation",
+                json!({
+                    "schematic": schematic,
+                    "analysis": { "kind": "transient", "stop_time_seconds": 0.3, "max_step_seconds": 1e-4 },
+                    "measurements": [
+                        { "name": "out", "kind": "average", "signal": "v(/out)", "from_seconds": 0.25 },
+                        { "name": "adj", "kind": "average", "signal": "v(/adj)", "from_seconds": 0.25 },
+                        { "name": "rect", "kind": "min", "signal": "v(/rect)", "from_seconds": 0.25 },
+                    ],
+                }),
+            ),
+        ],
+    );
+    for created in &results[..2] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+        assert_eq!(created["written"], true, "{created}");
+        // The fits are exact or nearly so: a few hundredths of a percent on
+        // the engine. A law that drifts from the engine shows here first.
+        let worst = created["verification"]["worst_error_percent"].as_f64().unwrap();
+        assert!(worst < 1.0, "{created}");
+    }
+    assert_eq!(results[0]["model_pins"], json!(["IN", "OUT", "COM"]));
+    assert_eq!(
+        results[2]["outcome"]["status"], "complete",
+        "{}",
+        results[2]
+    );
+    let run = &results[3];
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run["simulated_circuit"], "as_drawn");
+    let approximations = run["circuit"]["approximations"].to_string();
+    assert!(approximations.contains("fitted_model"), "{run}");
+    let (out, adj) = (measured(run, "out"), measured(run, "adj"));
+    // The rectified input stays above the output plus the dropout.
+    assert!(measured(run, "rect") > out + 2.0, "{run}");
+    // The reference across OUT and ADJ, within the line and load terms.
+    near(out - adj, 1.25, 5e-3);
+    near(out, 1.25 * (1.0 + 1500.0 / 240.0) + 50e-6 * 1500.0, 0.06);
+}
