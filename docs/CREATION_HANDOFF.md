@@ -51,6 +51,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: read baselines in `run_design_review` (now unblocked) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
+| R25 | Inline layer and library-item renders (rank 25: C6, A25, B9, B7): board layers, a symbol and a footprint returned as MCP image blocks, plus a generated difference image for `inline_diff` (PR 4 follow-ups) | 4 | In progress (branch `feat/creation-inline-layer-library-renders`) |
 
 ## Next: what to pick
 
