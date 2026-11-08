@@ -51,7 +51,7 @@ does not establish that a missing server-side check ran.
 5. **Checkpoint risky work** — before a multi-step or hard-to-reverse edit, call `create_checkpoint`. To undo, `restore_checkpoint` (preview first, then apply with its `revision`). Copying or zipping project files by hand is not a substitute: a checkpoint is verified and its restore is refused while KiCad owns a file
 6. **Describe the change** — state in plain English what will happen before invoking any tool
 7. **Execute** — use Konnect MCP tools only
-8. **Verify** — re-query the design to confirm the change landed correctly
+8. **Verify** — re-query the design to confirm the change landed correctly. For "did this edit break anything", call `save_check_baseline` (ERC with `schematic`, DRC with `board`; `verification` toolset) before the edit and `compare_check_baseline` after it: it lists only new, resolved and re-graded violations. Do not diff ERC/DRC reports by hand in a shell
 
 ## Decision Tree
 

@@ -8,6 +8,7 @@ mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
 mod board_stackup;
+pub(crate) mod check_baselines;
 pub(crate) mod checkpoints;
 pub mod cli;
 pub mod config;

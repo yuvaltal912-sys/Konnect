@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **255 registered tools** + **7 always-visible meta-tools** = **262 total**
+- **258 registered tools** + **7 always-visible meta-tools** = **265 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -406,9 +406,9 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Verification
 
-### `verification` · 15 tools
-**Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
-**Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
+### `verification` · 18 tools
+**Purpose:** DRC, design rules, ERC/DRC baselines, layer constraints, clearance checks, KiCAD UI control. ERC itself lives in `sch_export` (`run_erc`), not here.
+**Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs), [`crates/konnect-core/src/tools/check_baselines.rs`](crates/konnect-core/src/tools/check_baselines.rs)
 
 | Tool | Description |
 |------|-------------|
@@ -427,6 +427,9 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `set_netclass_diff_pair` | Preview or apply differential-pair width, gap and via gap to a saved project netclass with a revision check. |
 | `delete_netclass` | Preview or delete a saved project netclass with no saved pattern or assignment references; does not inspect schematic connectivity. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |
+| `save_check_baseline` | Run ERC (`schematic`) or DRC (`board`) now and store every violation with a stable key as a named baseline under `<project_dir>/.konnect/baselines/<erc\|drc>/<name>.json`. Returns counts and a by-rule tally. An existing name is refused before the check runs unless `overwrite`. |
+| `compare_check_baseline` | Run the same check again and compare: `new`, `resolved` and `severity_changed` listed (paged, size-capped), unchanged counted, `verdict` `regressed` or `no_regressions`. Matched by rule and item identity (a UUID that is in the saved design, otherwise the description with measured values masked), never by position or report order. `categories_not_compared` names a DRC category only one run reported; `output` writes the whole comparison. |
+| `list_check_baselines` | List a project's ERC and DRC baselines newest first, with counts and whether the source file changed since. Unreadable files are listed apart. Read-only. |
 
 ---
 

@@ -778,9 +778,33 @@ pub(crate) async fn handle_run_erc(
         Err(refusal) => return Ok(refusal),
     };
 
-    let owning_root = match owning_project_root(&sch_path) {
+    let report = match erc_report(ctx, &sch_path).await? {
+        Ok(report) => report,
+        Err(refusal) => return Ok(refusal),
+    };
+    let response = erc_response(&report, min_severity);
+
+    // Optionally write the report to a file. The whole response goes in, not
+    // the violation array alone: the file is the copy that gets handed to
+    // another tool or another person, and a coordinate must not travel
+    // without the `coordinates` block saying what it is worth.
+    if let Some(out_path) = args["output"].as_str() {
+        std::fs::write(out_path, serde_json::to_string_pretty(&response)?)?;
+    }
+
+    Ok(CallToolResult::json(&budgeted_erc(response, offset, limit)))
+}
+
+/// Run ERC on a project's root schematic. A sheet inside another project is
+/// refused before kicad-cli starts. Shared by `run_erc` and the ERC baselines
+/// (creation PR 15), so both check exactly the same thing.
+pub(crate) async fn erc_report(
+    ctx: &ToolContext,
+    sch_path: &Path,
+) -> anyhow::Result<Result<cli::ErcReport, CallToolResult>> {
+    let owning_root = match owning_project_root(sch_path) {
         Ok(root) => root,
-        Err(error) => return Ok(error.into_tool_result()),
+        Err(error) => return Ok(Err(error.into_tool_result())),
     };
     if let Some(root) = owning_root {
         // Structured, not free text: a caller can react to `invalid_argument`
@@ -797,27 +821,16 @@ pub(crate) async fn handle_run_erc(
             root.display(),
             root.display()
         );
-        return Ok(CallToolResult::error_kind(
+        return Ok(Err(CallToolResult::error_kind(
             crate::mcp::error::ToolErrorKind::InvalidArgument {
                 field: "schematic".to_string(),
                 reason: reason.clone(),
             },
             reason,
-        ));
+        )));
     }
 
-    let report = cli::run_erc(&ctx.config.kicad_cli, &sch_path).await?;
-    let response = erc_response(&report, min_severity);
-
-    // Optionally write the report to a file. The whole response goes in, not
-    // the violation array alone: the file is the copy that gets handed to
-    // another tool or another person, and a coordinate must not travel
-    // without the `coordinates` block saying what it is worth.
-    if let Some(out_path) = args["output"].as_str() {
-        std::fs::write(out_path, serde_json::to_string_pretty(&response)?)?;
-    }
-
-    Ok(CallToolResult::json(&budgeted_erc(response, offset, limit)))
+    Ok(Ok(cli::run_erc(&ctx.config.kicad_cli, sch_path).await?))
 }
 
 /// The ERC response cut to one page. `total`, `errors`, `warnings` and

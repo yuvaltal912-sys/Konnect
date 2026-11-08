@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`). Next pickable: PR 11. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 255 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
+**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`). Next pickable: PR 11. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 258 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
 
 ## Start here
 
@@ -49,7 +49,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
-| 15 | ERC/DRC baselines | 3 | In progress (branch `feat/creation-erc-drc-baselines`) |
+| 15 | ERC/DRC baselines | 3 | Implemented, draft [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43) (branch `feat/creation-erc-drc-baselines`), awaiting owner review. Follow-up: wire baselines into `run_design_review` |
 
 ## Next: what to pick
 
@@ -78,6 +78,20 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
 - `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
+
+## PR 15, ERC/DRC baselines (draft, #43)
+
+Three tools in the `verification` toolset (15 to 18), in `tools/check_baselines.rs`. Finding C4: agents diffed ERC/DRC reports by hand in Bash 18 times to prove an edit broke nothing.
+
+- `save_check_baseline` runs ERC (`schematic`) or DRC (`board`, with `run_drc`'s `sync_live_board` and `refill_zones`) and stores every violation at `<project_dir>/.konnect/baselines/<erc|drc>/<name>.json`, beside the visual baselines. An existing name is refused before the check runs (a synced DRC saves the board) unless `overwrite`. Create-only or revision-conditional write, then read back.
+- `compare_check_baseline` loads the baseline first (a wrong name runs nothing and lists the stored names), runs the same check and lists `new`, `severity_changed` and `resolved`, paged through the PR 3 helper, with `unchanged_count`, per-rule tallies and `verdict` (`regressed` when anything is new or more severe). `output` writes everything, unchanged included. Warns when the DRC options or the ERC's KiCad version differ from the baseline's.
+- `list_check_baselines`: both kinds, newest first, `source_state` (`unchanged`, `changed`, `missing`); unreadable files listed apart.
+
+Stable keys: a hash of check, DRC category, rule, ERC sheet and the sorted item identities. Severity, prose and positions are not in it. An item is its UUID only when the UUID is in the saved design (DRC: ownership enrichment resolved it on the board; ERC: it occurs in a project `.kicad_sch`). Otherwise it is its description with measured values (`0.15 mm`, `45°`) masked, which covers KiCad 8 boards whose pads have no saved UUID. Repeats are numbered `~2`, `~3`. A DRC category that only one run reported is listed in `categories_not_compared`, never as resolved. `run_erc` and the baselines now share `sch_export::erc_report`, so both refuse a sub-sheet the same way.
+
+Verified on macOS: 23 unit tests over scratch projects with a stand-in `kicad-cli` (new/resolved/unchanged for ERC and DRC; a re-run reordered, moved, with items swapped and DRC prose re-measured matches exactly; made-up UUIDs; repeats; severity changes; missing categories; refusals before any run; damaged and renamed baseline files; a symlinked `.konnect`; 1,500 changes under the client cap with paging covering each once), 12 negative controls each caught by a test, and the ignored live test `live_rerun_of_an_unchanged_project_matches_its_baseline` with kicad-cli 10.0.8 on a scratch copy of the KiCad 10 `pic_programmer` demo (5 ERC and 5 DRC violations, every item keyed by UUID, re-run 0 new and 0 resolved). `cargo test -p konnect-core -p konnect` and clippy pass. Not verified: a live edit between save and compare, `sync_live_board` against a live KiCad (it reuses `drc::run`, already covered), a KiCad 8 board, Windows and Linux.
+
+Follow-ups, not in this PR: read baselines in `run_design_review` (PR 11 owns `design_review.rs`); a delete tool (overwrite covers replacement today); the documented edit loop in the skills and agents (rank C29).
 
 ## PR 14, checkpoints and readiness report (merged, #39)
 
