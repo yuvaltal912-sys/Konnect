@@ -56,6 +56,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
+**Rank 3 leftovers: In progress (branch `feat/creation-rank3-leftovers`).** C24 (`zone_fill_state` on DRC results) and A30's other long results (`batch_place_components`, `update_pcb_from_schematic`, `validate_for_manufacturing`, the batch wiring tools, `get_component_list`, `query_traces`).
+
 **Recommended order**, after the owner approves the next implementation:
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
