@@ -182,7 +182,9 @@ pub(crate) fn build(
     // The dropout resistance, from the dropout voltage or, for a reference
     // without one, from half the smallest headroom any output value shows.
     let largest_load = points.iter().map(|p| p.iout).fold(1e-3, f64::max);
-    let dropout = of(characteristics, Quantity::DropoutVoltage).first().copied();
+    let dropout = of(characteristics, Quantity::DropoutVoltage)
+        .first()
+        .copied();
     let rdo = match dropout {
         Some(c) => {
             let current = c.condition(OUTPUT_CURRENT).unwrap_or_default();
@@ -308,8 +310,7 @@ pub(crate) fn build(
         .assumed
         .push("no temperature behaviour and no thermal shutdown".to_string());
     model.assumed.push(if law.sinks {
-        "the output sinks current through the same output resistance it sources through"
-            .to_string()
+        "the output sinks current through the same output resistance it sources through".to_string()
     } else {
         "the output sources current only and does not conduct back into the input".to_string()
     });
@@ -418,7 +419,9 @@ fn check_output(model: &mut Model, bench: &mut Bench, point: Point, role: Role) 
     bench
         .dc
         .push(Bench::voltage(&common, &common, COMMON_LIFT, false));
-    bench.dc.push(model.instance(&id, &[&input, &output, &common]));
+    bench
+        .dc
+        .push(model.instance(&id, &[&input, &output, &common]));
     bench.dc.push(sink(&id, &output, point.iout));
     model.checks.push(Check {
         characteristic: point.index,
@@ -568,7 +571,10 @@ fn body(name: &str, law: &Law, iq: Option<f64>) -> String {
     }
     let mut cards = format!(".subckt {name} IN OUT COM\nBO s COM V={source}\n");
     if law.rout > 0.0 {
-        cards.push_str(&format!("ROUT s x {}\nVS x OUT 0.000000e0\n", number(law.rout)));
+        cards.push_str(&format!(
+            "ROUT s x {}\nVS x OUT 0.000000e0\n",
+            number(law.rout)
+        ));
     } else {
         cards.push_str("VS s OUT 0.000000e0\n");
     }
@@ -681,7 +687,10 @@ mod tests {
         let values = parsed(json!([output(5.0, 0.0, 2.5), output(5.0, 0.01, 2.499)]));
         let model = build_model(Kind::VoltageReference, "ref25_fit", &values, 25.0).unwrap();
         text::check_fitted(model.file().as_bytes()).unwrap();
-        assert!(model.assumed.iter().any(|a| a.contains("no dropout voltage")));
+        assert!(model
+            .assumed
+            .iter()
+            .any(|a| a.contains("no dropout voltage")));
         assert!(model.assumed.iter().any(|a| a.contains("sinks current")));
         assert!(!model.body.contains("1.000000e6*"));
         assert!(build_model(Kind::Ldo, "ref25_fit", &values, 25.0).is_err());
@@ -690,19 +699,33 @@ mod tests {
     #[test]
     fn values_the_law_cannot_hold_are_refused_on_their_field() {
         // A rising load line.
-        let rising = parsed(json!([output(5.0, 0.0, 3.3), output(5.0, 0.1, 3.31), dropout(0.2, 0.1)]));
+        let rising = parsed(json!([
+            output(5.0, 0.0, 3.3),
+            output(5.0, 0.1, 3.31),
+            dropout(0.2, 0.1)
+        ]));
         let error = build_model(Kind::Ldo, "x_fit", &rising, 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[0].value");
         // An output read in dropout.
         let dropped = parsed(json!([output(3.4, 0.3, 3.3), dropout(0.3, 0.3)]));
         let error = build_model(Kind::Ldo, "x_fit", &dropped, 25.0).unwrap_err();
-        assert_eq!(error.field, "characteristics[0].conditions.input_voltage_volts");
+        assert_eq!(
+            error.field,
+            "characteristics[0].conditions.input_voltage_volts"
+        );
         // An input below the output.
         let below = parsed(json!([output(3.0, 0.1, 3.3), dropout(0.3, 0.3)]));
         let error = build_model(Kind::Ldo, "x_fit", &below, 25.0).unwrap_err();
-        assert_eq!(error.field, "characteristics[0].conditions.input_voltage_volts");
+        assert_eq!(
+            error.field,
+            "characteristics[0].conditions.input_voltage_volts"
+        );
         // A dropout smaller than the load line's drop.
-        let tiny = parsed(json!([output(5.0, 0.0, 3.3), output(5.0, 0.1, 3.2), dropout(0.05, 0.1)]));
+        let tiny = parsed(json!([
+            output(5.0, 0.0, 3.3),
+            output(5.0, 0.1, 3.2),
+            dropout(0.05, 0.1)
+        ]));
         let error = build_model(Kind::Ldo, "x_fit", &tiny, 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[2].value");
         // A limit the dropout resistance could never pass.

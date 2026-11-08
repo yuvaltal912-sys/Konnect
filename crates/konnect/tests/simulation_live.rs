@@ -4250,7 +4250,11 @@ fn behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_f
         typical("slew_rate", 1.45e8, json!({})),
         typical("input_offset_voltage", 1.7e-3, json!({})),
         typical("input_bias_current", 1.4e-6, json!({})),
-        typical("supply_current", 4.4e-3, json!({ "supply_voltage_volts": 10.0 })),
+        typical(
+            "supply_current",
+            4.4e-3,
+            json!({ "supply_voltage_volts": 10.0 })
+        ),
         swing("output_swing_from_positive_rail", 0.1),
         swing("output_swing_from_negative_rail", 0.05),
         typical("output_resistance", 30.0, json!({}))
@@ -4269,7 +4273,11 @@ fn behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_f
         typical("hysteresis", 5e-3, json!({})),
         typical("input_offset_voltage", 1e-3, json!({})),
         typical("input_bias_current", 25e-9, json!({})),
-        typical("supply_current", 0.4e-3, json!({ "supply_voltage_volts": 5.0 })),
+        typical(
+            "supply_current",
+            0.4e-3,
+            json!({ "supply_voltage_volts": 5.0 })
+        ),
         typical(
             "output_swing_from_positive_rail",
             0.2,
@@ -4312,10 +4320,15 @@ fn behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_f
         assert_eq!(created["written"], true, "{created}");
         // The fits are exact or nearly so: a few hundredths of a percent on
         // the engine. A law that drifts from the engine shows here first.
-        let worst = created["verification"]["worst_error_percent"].as_f64().unwrap();
+        let worst = created["verification"]["worst_error_percent"]
+            .as_f64()
+            .unwrap();
         assert!(worst < 1.0, "{created}");
     }
-    assert_eq!(results[0]["model_pins"], json!(["INP", "INN", "VCC", "VEE", "OUT"]));
+    assert_eq!(
+        results[0]["model_pins"],
+        json!(["INP", "INN", "VCC", "VEE", "OUT"])
+    );
     let rows = results[0]["verification"]["rows"].as_array().unwrap();
     assert!(
         rows.iter().any(|row| row["role"] == "held_out"),
@@ -4336,11 +4349,7 @@ fn behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_f
         json!([{ "code": "fitted_model", "items": ["U1"] }]),
         "{run}"
     );
-    near(
-        measured(run, "edge") / f0,
-        (2f64.sqrt() - 1.0).sqrt(),
-        1e-3,
-    );
+    near(measured(run, "edge") / f0, (2f64.sqrt() - 1.0).sqrt(), 1e-3);
     near(measured(run, "at_f0"), -6.0206, 1e-2);
 }
 
@@ -4370,15 +4379,31 @@ fn behavioural_regulators_are_checked_on_the_engine_and_a_fitted_ldo_regulates_a
         output(5.0, 0.5, 1.247),
         output(5.0, 1.0, 1.244),
         output(40.0, 0.01, 1.2535),
-        typical("dropout_voltage", 2.0, json!({ "output_current_amps": 1.0 })),
-        typical("quiescent_current", 50e-6, json!({ "input_voltage_volts": 5.0 })),
-        typical("current_limit", 2.2, json!({ "input_voltage_volts": 10.0, "output_voltage_volts": 0.0 }))
+        typical(
+            "dropout_voltage",
+            2.0,
+            json!({ "output_current_amps": 1.0 })
+        ),
+        typical(
+            "quiescent_current",
+            50e-6,
+            json!({ "input_voltage_volts": 5.0 })
+        ),
+        typical(
+            "current_limit",
+            2.2,
+            json!({ "input_voltage_volts": 10.0, "output_voltage_volts": 0.0 })
+        )
     ]);
     let reference = json!([
         output(5.0, 0.0, 2.5),
         output(5.0, 0.01, 2.4995),
         output(15.0, 0.0, 2.5002),
-        typical("quiescent_current", 1e-3, json!({ "input_voltage_volts": 5.0 })),
+        typical(
+            "quiescent_current",
+            1e-3,
+            json!({ "input_voltage_volts": 5.0 })
+        ),
         typical("current_limit", 0.025, json!({}))
     ]);
     let results = call_session(
@@ -4411,7 +4436,9 @@ fn behavioural_regulators_are_checked_on_the_engine_and_a_fitted_ldo_regulates_a
         assert_eq!(created["written"], true, "{created}");
         // The fits are exact or nearly so: a few hundredths of a percent on
         // the engine. A law that drifts from the engine shows here first.
-        let worst = created["verification"]["worst_error_percent"].as_f64().unwrap();
+        let worst = created["verification"]["worst_error_percent"]
+            .as_f64()
+            .unwrap();
         assert!(worst < 1.0, "{created}");
     }
     assert_eq!(results[0]["model_pins"], json!(["IN", "OUT", "COM"]));

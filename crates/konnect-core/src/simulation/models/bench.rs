@@ -77,7 +77,11 @@ pub(crate) enum Probe {
     Gain { node: String, hz: f64, scale: f64 },
     /// Operating point: `offset + scale * v(node)`, such as a supply less an
     /// output.
-    Affine { node: String, offset: f64, scale: f64 },
+    Affine {
+        node: String,
+        offset: f64,
+        scale: f64,
+    },
     /// Transient: the rate `node` rises from `low` to `high`, by the times it
     /// first crosses each.
     Slope { node: String, low: f64, high: f64 },

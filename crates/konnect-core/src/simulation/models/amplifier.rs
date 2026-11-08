@@ -102,8 +102,7 @@ impl Core {
         let full = self.full_current(1.0);
         let mut level = supply / 2.0;
         for _ in 0..40 {
-            level =
-                supply / 2.0 - self.high_offset + self.drop(full - level / GAIN_RESISTANCE);
+            level = supply / 2.0 - self.high_offset + self.drop(full - level / GAIN_RESISTANCE);
         }
         level
     }
@@ -112,8 +111,7 @@ impl Core {
         let full = self.full_current(-1.0);
         let mut level = -supply / 2.0;
         for _ in 0..40 {
-            level =
-                -supply / 2.0 + self.low_offset - self.drop(full + level / GAIN_RESISTANCE);
+            level = -supply / 2.0 + self.low_offset - self.drop(full + level / GAIN_RESISTANCE);
         }
         level
     }
@@ -169,8 +167,7 @@ impl Core {
         );
         let diode = |volts: f64| CLAMP_IS * ((volts / (CLAMP_N * self.vt)).min(80.0).exp() - 1.0);
         let integrand = |a: f64| {
-            let net = self.stage_current(a, overdrive) - a / GAIN_RESISTANCE
-                + diode(low_clamp - a)
+            let net = self.stage_current(a, overdrive) - a / GAIN_RESISTANCE + diode(low_clamp - a)
                 - diode(a - high_clamp);
             (net > 0.0).then(|| 1.0 / net)
         };
@@ -251,9 +248,9 @@ pub(crate) fn build(
     if ib.is_none() {
         model.assumed.push("no input bias current".to_string());
     } else {
-        model.assumed.push(
-            "both inputs draw the same bias current: no offset current".to_string(),
-        );
+        model
+            .assumed
+            .push("both inputs draw the same bias current: no offset current".to_string());
     }
     if iq.is_none() {
         model
@@ -311,8 +308,7 @@ pub(crate) fn build(
                 "the DC open-loop gain must be at least 100, as a ratio: 100 dB is 1e5",
             ));
         }
-        let gbw = single(Quantity::GainBandwidthProduct)
-            .map_or(0.0, |c| c.value);
+        let gbw = single(Quantity::GainBandwidthProduct).map_or(0.0, |c| c.value);
         core.gm = dc.value / GAIN_RESISTANCE;
         core.ca = core.gm / (std::f64::consts::TAU * gbw);
         let slew = single(Quantity::SlewRate).map_or_else(
@@ -406,7 +402,9 @@ pub(crate) fn build(
     ];
     if let Some(soft) = core.soft {
         model.parameters.push(("stage_turnover".to_string(), soft));
-        model.parameters.push(("stage_power".to_string(), core.power));
+        model
+            .parameters
+            .push(("stage_power".to_string(), core.power));
     }
 
     let mut bench = Bench::default();
@@ -433,7 +431,9 @@ pub(crate) fn build(
         let product = single(Quantity::GainBandwidthProduct);
         check_gains(&mut model, &mut bench, &core, &gains, product, rout, supply);
         if let Some(c) = single(Quantity::SlewRate) {
-            check_slew(&mut model, &mut bench, &core, c, supply, swing_high, swing_low);
+            check_slew(
+                &mut model, &mut bench, &core, c, supply, swing_high, swing_low,
+            );
         }
         if let Some(c) = vos {
             let id = follower(&mut bench, &model, supply_of(Some(c), supply), 0.0);
@@ -483,9 +483,7 @@ pub(crate) fn build(
         let volts = supply_of(Some(c), supply);
         let id = held_input(&mut bench, &model, &core, volts, sign);
         let load = c.condition(LOAD_RESISTANCE).unwrap_or_default();
-        bench
-            .dc
-            .push(format!("R{id}l {id}o 0 {}", number(load)));
+        bench.dc.push(format!("R{id}l {id}o 0 {}", number(load)));
         model.checks.push(Check {
             characteristic: c.index,
             role: Role::Fit,
@@ -503,10 +501,16 @@ pub(crate) fn build(
             let volts = supply_of(Some(c), supply);
             supplies(&mut bench.ac, &id, volts);
             let (input, output) = (format!("{id}i"), format!("{id}o"));
-            bench.ac.push(Bench::voltage(&id, &input, overdrive_for(&core, 1.0), false));
-            bench
-                .ac
-                .push(model.instance(&id, &[&input, "0", &format!("{id}p"), &format!("{id}n"), &output]));
+            bench.ac.push(Bench::voltage(
+                &id,
+                &input,
+                overdrive_for(&core, 1.0),
+                false,
+            ));
+            bench.ac.push(model.instance(
+                &id,
+                &[&input, "0", &format!("{id}p"), &format!("{id}n"), &output],
+            ));
             bench.ac.push(format!("I{id}a 0 {output} DC 0 AC 1"));
             model.checks.push(Check {
                 characteristic: c.index,
@@ -662,8 +666,18 @@ fn set_turnover(core: &mut Core, soft: f64) {
 
 /// `V<id>p` and `V<id>n`: the supplies, split about ground.
 fn supplies(lines: &mut Vec<String>, id: &str, volts: f64) {
-    lines.push(Bench::voltage(&format!("{id}p"), &format!("{id}p"), volts / 2.0, false));
-    lines.push(Bench::voltage(&format!("{id}n"), &format!("{id}n"), -volts / 2.0, false));
+    lines.push(Bench::voltage(
+        &format!("{id}p"),
+        &format!("{id}p"),
+        volts / 2.0,
+        false,
+    ));
+    lines.push(Bench::voltage(
+        &format!("{id}n"),
+        &format!("{id}n"),
+        -volts / 2.0,
+        false,
+    ));
 }
 
 fn instance_nodes(id: &str, inp: &str, inn: &str) -> Vec<String> {
@@ -699,9 +713,12 @@ fn held_input(bench: &mut Bench, model: &Model, core: &Core, supply: f64, sign: 
     let id = bench.id();
     supplies(&mut bench.dc, &id, supply);
     let input = format!("{id}i");
-    bench
-        .dc
-        .push(Bench::voltage(&id, &input, overdrive_for(core, sign), false));
+    bench.dc.push(Bench::voltage(
+        &id,
+        &input,
+        overdrive_for(core, sign),
+        false,
+    ));
     let nodes = instance_nodes(&id, &input, "0");
     let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
     bench.dc.push(model.instance(&id, &nodes));
@@ -739,9 +756,10 @@ fn check_gains(
     bench
         .ac
         .push(format!("R{id}f {output} {inverting} {}", number(servo)));
-    bench
-        .ac
-        .push(format!("C{id}f {inverting} 0 {}", number(SERVO_SECONDS / servo)));
+    bench.ac.push(format!(
+        "C{id}f {inverting} 0 {}",
+        number(SERVO_SECONDS / servo)
+    ));
     for c in gains {
         let (hz, role) = match c.condition(FREQUENCY) {
             Some(hz) => (hz, Role::HeldOut),
@@ -783,9 +801,10 @@ fn check_gains(
         bench
             .ac
             .push(format!("R{id}f {output} {inverting} {}", number(servo)));
-        bench
-            .ac
-            .push(format!("C{id}f {inverting} 0 {}", number(SERVO_SECONDS / servo)));
+        bench.ac.push(format!(
+            "C{id}f {inverting} 0 {}",
+            number(SERVO_SECONDS / servo)
+        ));
         bench.ac.push(format!("I{id}a 0 {output} DC 0 AC 1"));
         model.checks.push(Check {
             characteristic: c.index,
@@ -924,7 +943,9 @@ fn check_trips(
     if hysteresis.is_none() && offset.is_none() {
         return;
     }
-    let volts = hysteresis.or(offset).map_or(supply, |c| supply_of(Some(c), supply));
+    let volts = hysteresis
+        .or(offset)
+        .map_or(supply, |c| supply_of(Some(c), supply));
     let reach = core.hysteresis + 0.01;
     // The ramp is slow enough that the output, a quarter of the way through
     // its delay at a small overdrive, lags the trip by far less than that
@@ -977,9 +998,8 @@ fn term(k: f64, expression: &str) -> String {
 }
 
 fn body(name: &str, core: &Core, temperature: f64) -> String {
-    let mut cards = format!(
-        ".subckt {name} INP INN VCC VEE OUT\nEMID mid VEE VCC VEE 5.000000e-1\n"
-    );
+    let mut cards =
+        format!(".subckt {name} INP INN VCC VEE OUT\nEMID mid VEE VCC VEE 5.000000e-1\n");
     if core.ib > 0.0 {
         cards.push_str(&format!(
             "IBP INP mid {}\nIBN INN mid {}\n",
@@ -1081,7 +1101,11 @@ mod tests {
             value("slew_rate", 0.5e6, json!({})),
             value("input_offset_voltage", 2e-3, json!({})),
             value("input_bias_current", 20e-9, json!({})),
-            value("supply_current", 0.5e-3, json!({ "supply_voltage_volts": 10.0 })),
+            value(
+                "supply_current",
+                0.5e-3,
+                json!({ "supply_voltage_volts": 10.0 }),
+            ),
             value(
                 "output_swing_from_positive_rail",
                 0.2,
@@ -1097,13 +1121,22 @@ mod tests {
     }
 
     fn delay(overdrive: f64, seconds: f64) -> Value {
-        value("propagation_delay", seconds, json!({ "overdrive_volts": overdrive }))
+        value(
+            "propagation_delay",
+            seconds,
+            json!({ "overdrive_volts": overdrive }),
+        )
     }
 
     #[test]
     fn an_op_amp_is_a_five_pin_subcircuit_whose_pole_and_slew_follow_the_datasheet() {
-        let model = build_model(Kind::OpAmp, "lm358_fit", &parsed(json!(op_amp_values())), 25.0)
-            .unwrap();
+        let model = build_model(
+            Kind::OpAmp,
+            "lm358_fit",
+            &parsed(json!(op_amp_values())),
+            25.0,
+        )
+        .unwrap();
         let checked = text::check_fitted(model.file().as_bytes()).unwrap();
         assert_eq!(checked.pins(), ["INP", "INN", "VCC", "VEE", "OUT"]);
         assert_eq!(checked.kind, "op_amp");
@@ -1118,7 +1151,11 @@ mod tests {
         assert!((imax / ca - 0.5e6).abs() < 1e-3);
         // Every value is checked, and the Bode value is held out.
         assert_eq!(model.checks.len(), 10);
-        let held: Vec<_> = model.checks.iter().filter(|c| c.role == Role::HeldOut).collect();
+        let held: Vec<_> = model
+            .checks
+            .iter()
+            .filter(|c| c.role == Role::HeldOut)
+            .collect();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].characteristic, 1);
         assert!(!model.bench.tran.is_empty() && model.bench.tran_stop > 0.0);
@@ -1159,9 +1196,18 @@ mod tests {
             value("gain_bandwidth_product", 1e6, json!({}))
         ]));
         let model = build_model(Kind::OpAmp, "bare_fit", &bare, 25.0).unwrap();
-        for note in ["no slew rate", "no input offset", "no supply voltage", "reaches each rail"] {
+        for note in [
+            "no slew rate",
+            "no input offset",
+            "no supply voltage",
+            "reaches each rail",
+        ] {
             assert!(
-                model.assumed.iter().chain(&model.fitted).any(|a| a.contains(note)),
+                model
+                    .assumed
+                    .iter()
+                    .chain(&model.fitted)
+                    .any(|a| a.contains(note)),
                 "{note}: {:?}",
                 model.assumed
             );
@@ -1176,7 +1222,11 @@ mod tests {
             delay(20e-3, 0.6e-6),
             delay(100e-3, 0.3e-6),
             value("hysteresis", 5e-3, json!({})),
-            value("output_swing_from_positive_rail", 0.2, json!({ "supply_voltage_volts": 5.0, "load_resistance_ohms": 1e4 }))
+            value(
+                "output_swing_from_positive_rail",
+                0.2,
+                json!({ "supply_voltage_volts": 5.0, "load_resistance_ohms": 1e4 })
+            )
         ]));
         let model = build_model(Kind::Comparator, "lm393_fit", &three, 25.0).unwrap();
         text::check_fitted(model.file().as_bytes()).unwrap();
@@ -1199,7 +1249,10 @@ mod tests {
         };
         for (overdrive, seconds) in [(5e-3, 1.3e-6), (20e-3, 0.6e-6), (100e-3, 0.3e-6)] {
             let reading = core.ca * core.delay_per_farad(overdrive, 5.0).unwrap();
-            assert!((reading / seconds - 1.0).abs() < 2e-3, "{overdrive}: {reading}");
+            assert!(
+                (reading / seconds - 1.0).abs() < 2e-3,
+                "{overdrive}: {reading}"
+            );
         }
         let four = parsed(json!([
             delay(5e-3, 1.3e-6),
@@ -1208,7 +1261,11 @@ mod tests {
             delay(100e-3, 0.3e-6)
         ]));
         let model = build_model(Kind::Comparator, "lm393_fit", &four, 25.0).unwrap();
-        let held: Vec<_> = model.checks.iter().filter(|c| c.role == Role::HeldOut).collect();
+        let held: Vec<_> = model
+            .checks
+            .iter()
+            .filter(|c| c.role == Role::HeldOut)
+            .collect();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].characteristic, 2);
     }
@@ -1218,7 +1275,10 @@ mod tests {
         let twice = parsed(json!([delay(5e-3, 1.3e-6), delay(5e-3, 1.0e-6)]));
         let error = build_model(Kind::Comparator, "x_fit", &twice, 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[1].conditions.overdrive_volts");
-        let gain = parsed(json!([delay(5e-3, 1.3e-6), value("open_loop_gain", 2e5, json!({}))]));
+        let gain = parsed(json!([
+            delay(5e-3, 1.3e-6),
+            value("open_loop_gain", 2e5, json!({}))
+        ]));
         let error = build_model(Kind::Comparator, "x_fit", &gain, 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[1].quantity");
         let one = parsed(json!([delay(5e-3, 1.3e-6)]));

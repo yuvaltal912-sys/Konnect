@@ -476,10 +476,11 @@ fn check_expression(value: &str) -> bool {
                 continue;
             }
             if byte.is_ascii_lowercase() {
-                let end = at + bytes[at..]
-                    .iter()
-                    .take_while(|b| b.is_ascii_lowercase())
-                    .count();
+                let end = at
+                    + bytes[at..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_lowercase())
+                        .count();
                 let word = &expression[at..end];
                 if bytes.get(end) != Some(&b'(') {
                     return false;
