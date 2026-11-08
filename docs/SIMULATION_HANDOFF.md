@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-07. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23, and the current macOS live simulation suite passes. M3 has not started; ask the owner before starting it.
+**Last updated:** 2026-11-08 (switches). Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08; the rest, load switch, eFuse and ideal diode, is in draft [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54), stacked on #53, which merges first. With both, M3 is complete.
 
 ## Start here
 
@@ -51,16 +51,18 @@ PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are 
 | M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Merged as `d10dbe1` |
 | M2 | [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) | `feat/simulation-datasheet-models-m2` | Merged as `d228d5f` |
 | Version check | [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23) | `fix/live-test-ngspice-version` | Merged as `bdafc67` |
+| M3 (first part) | [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) | `feat/simulation-datasheet-models-m3` | Open, not merged |
+| M3 (switches) | [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) | `feat/simulation-datasheet-models-m3-switches` | Draft, merges after #53 |
 
 ## Datasheet models: M1 and M2 merged
 
-The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3 is next and has not started:
+The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3's first part is in draft #53:
 
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
 | M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); merged as [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) |
-| M3 | Behavioural ICs: op-amp, comparator, LDO, reference, load switch, eFuse, ideal diode |
+| M3 | Behavioural ICs. **Done in draft #53:** `op_amp`, `comparator`, `ldo`, `voltage_reference`. **Done in draft #54** (stacked on #53): `load_switch`, `efuse`, `ideal_diode`. M3 is complete once both merge |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
 
@@ -113,6 +115,68 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 - **Bench.** Gain: a base current of `Ic/hFE` is forced and `Ic/Ib` read, so it is the gain at that base current. Vbe: the base is grounded and the emitter current forced, so the emitter sits at `-Vbe`. Saturation: both currents forced, the collector voltage read. Cobo and Cibo: a reverse bias with an AC drive, the far pin open through 1 Gohm, `Probe::Capacitance`. fT: a unit AC base current at the biased point and `Probe::CurrentMagnitude` times the test frequency (a third of fT unless the caller gives one).
 - **Tests:** eight in `bjt.rs` (the law against engine values, inverses, recovery, hold-out, saturation, grammar for both polarities, capacitances and fT, a duplicate), and `both_fitted_bipolar_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part` in `simulation_live.rs`, which fits both polarities and assigns the NPN to `Q2` of the `amplifier-ac` demo. Negative controls, each failing the live test in the expected row: `TF` not written (fT), `BR` not written (saturation), the PNP junction bias unmirrored (all three capacitances).
 - **Limits:** no Early voltage (the collector current does not rise with collector voltage), no base or emitter resistance, no temperature behaviour, the gain is checked at the base current the datasheet gain implies and not at exactly the datasheet collector current, fT is a small-signal estimate that ignores `RB`, and `ITF`/`XTF` are unused.
+
+### M3 progress: behavioural ICs (op-amp, comparator, LDO, reference done; draft #53)
+
+- **Kinds** `op_amp` and `comparator` (`simulation/models/amplifier.rs`, five pins `INP INN VCC VEE OUT`), and `ldo` and `voltage_reference` (`simulation/models/regulator.rs`, three pins `IN OUT COM`). Each is one subcircuit of behavioural lines in the fitted grammar; nothing refers to ground inside.
+- **Grammar** (`text.rs`). A subcircuit may now hold linear `E` and `G` sources, `H` sources that sense one of the body's own `V` sources, `V` and `I` sources with a plain number, any `R`/`C`/`L`/`D` named by Konnect, and `B` lines whose value is `V=` or `I=` of an expression in a closed grammar: numbers as Konnect formats them, `v(node)` or `v(node,node)`, `+ - * /`, parentheses, and `min max sqrt tanh exp ln` with their right argument counts (`check_expression`). No word, string, brace, `$`, `#`, `;`, `i(...)` or `pow` can pass, and an expression is at most 4 KiB. Clamp diodes use the `<name>_c` model suffix. A port named `gnd` is refused (see the trap below).
+- **Op-amp law.** A mid-supply node from `EMID mid VEE VCC VEE 0.5`. The input stage `BG` is `gm (Vd - Vos)` limited to `imax`, into `RA = 1 Mohm` and `CA`: `A0 = gm RA`, `GBW = gm / (2 pi CA)`, `SR = imax / CA`. Diodes clamp the gain node to each rail less the swing (`EH`/`VH`, `EL`/`VL`, referred to `mid` so the clamp current never reaches a supply pin). `EO` buffers it through `RO` and a sense source `VS`; `HS` and `BP` draw a sourcing output's current from `VCC`, so a sunk current returns through `VEE` (checked on the engine by hand: 2 mA sourced reads 2.5 mA at `VCC` and 0.5 mA at `VEE`, and the reverse when sinking). The clamp offsets are solved so each saturated output, with its datasheet load to mid-supply, reads its swing, the clamp diode's drop at the stage's current included.
+- **Op-amp bench.** Open-loop gain on AC through a DC servo (1 Mohm from the output to `INN`, which a 1 GF capacitor grounds at every frequency checked, so the offset cannot saturate the output): the DC gain at a hundredth of the pole, the product as `|A| f` at `GBW / 10`, Bode values at their own frequencies (held out against the single pole), and the output resistance as the voltage an AC current into `OUT` makes. Offset, bias and supply current on followers, swings with the output driven to a rail, and the slew rate on a follower stepped across most of its swing, timed between 10 percent and the lesser of 70 percent and the point where the input stage leaves its limit.
+- **Comparator law.** The same core with a DC gain of 1e6 and a stage `imax x / ((|x| + e)^(1-p) (|x| + v)^p)`, written with `exp` and `ln` whose arguments stay under 14. Hysteresis adds `(Vh / 2) tanh(v(a, mid) / 0.1)` to the input, so the trip points sit `Vh / 2` either side of the offset at any supply. The delay is `CA` times the integral of `da / I(a)` from the low clamp to the middle of the swing; one value fixes `CA` with `v` at its overdrive, two fit `v` too, three or more fit the sharpness `p` (0.25 to 1), and with four or more the middle one is held out. The trip points are read on a slow PWL triangle, a second transient run (`Bench.slow`), whose rate is set from the fitted law so the output lags its trip by under a thousandth of the hysteresis.
+- **Regulator law.** `BO s COM` is the smooth lesser of `V0 + k (Vin - Vin0)` (less a stiff current-limit term) and `Vin - Rdo I`, each corner `(a + b - sqrt((a - b)^2 + e^2)) / 2`. `I` is the output current through `VS`, made a voltage by `HS`. `ROUT` after the source is the load regulation. `BI` draws the output current from `IN`, and `BQ` the quiescent current, `Iq Vin / sqrt(Vin^2 + 0.01)`. An LDO sinks only 1 uA a volt; a reference sinks through `ROUT`, to `COM`. `output_voltage` values fit `V0`, `k` and `ROUT` by least squares on the terms the values fix, holding out one when there are more; `dropout_voltage` gives `Rdo`; the current-limit setting is solved on the law so the engine reads the datasheet's current at the held output. Output checks run with `COM` lifted 1 V off ground, so a pin the engine tied to ground reads wrong.
+- **Refused, with the field:** an op-amp without exactly one DC gain, or one under 100; a swing beyond half the supply, or one the stage's current cannot reach through `RA`; two delays at one overdrive; an output value with its input below it, read in dropout, or within 10 percent of the current limit; a load line that rises; a dropout no larger than the load line's drop; a current limit the dropout resistance could never pass, or read with the output at or above its setting.
+- **Three traps found on the engine:** a hard `min`/`max` clamp on an output leaves Newton a flat region, and libngspice 45.2 failed every operating-point method on it (diode clamps and the smooth forms solve at once); ngspice reads a node named `gnd` as ground, even a subcircuit's port, which tied the first LDO's third pin to ground in the LM317 run while every bench passed, so the pin is `COM` and the grammar refuses `gnd`; and a `PULSE` with no width never falls, so a triangle is a `PWL`. A fourth cost time: a clamp diode goes on pushing current into the gain node while it turns off, which made every fitted delay read 1 to 2 percent short until the delay integral included it.
+- **Tests:** 6 in `amplifier.rs`, 4 in `regulator.rs`, a grammar test of 12 accepted and 34 refused behavioural lines in `text.rs`, and two live tests: `behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_filter` (fits both kinds, assigns the op-amp to `U1` of `sallen_key`, and the AC run meets the filter's formula: the -3 dB edge within 1e-3 and -6.02 dB at f0) and `behavioural_regulators_are_checked_on_the_engine_and_a_fitted_ldo_regulates_a_supply` (fits both kinds, assigns an LM317-valued `ldo` to `U1` of `LM317_power_supply` with `COM` on ADJ, and a 0.3 s transient holds OUT 1.25 V above ADJ and 9.14 V at the output). Both require a worst engine error under 1 percent; the runs read about 0.03 percent. Negative controls, each failing a live test: the `COM` pin named `GND` with the grammar's refusal off, the clamp current left out of the delay integral, the old fixed-period trip ramp, the hysteresis term left out of the model, and the slew read into the settling tail.
+- **Limits:** a single pole (90-degree phase margin) and no second-stage dynamics, so loop stability needs the vendor model; no common-mode or supply rejection, input range, noise, offset current or temperature behaviour; the comparator output is push-pull only, its delay is checked on the rising edge with no load, and its DC gain is fixed; the regulators have no loop dynamics (a load step is answered at once), no PSRR, thermal shutdown, enable pin or reverse conduction, and the current limit is flat to a short (no foldback). The supply-pin current split of an op-amp under load is checked by hand only.
+- **Left for M3:** nothing; the switches are in #54, below.
+
+### M3 progress: switches (load switch, eFuse, ideal diode done; draft #54, stacked on #53)
+
+- **Kinds** `efuse` and `ideal_diode` (pins `IN OUT COM`) and `load_switch` (`IN OUT EN COM`), in `simulation/models/switch.rs`. Each is `VS IN x 0`, `HS hs COM VS 1` and `BO x OUT V=<drop>`: the drop across the part as a function of its own current, so the input carries exactly what the output draws.
+- **Laws.**
+  - The eFuse's drop is `Ron I / (en + Ron / 1 Gohm)` plus a stiff term past the limit, both ways. `en` is a smooth step up at the undervoltage lockout and down at the overvoltage cut-off, each a ten-thousandth of its threshold wide.
+  - The load switch's drop is the smooth larger of `Ron I` and `(1 - r) Vin`, less a 1 Mohm reverse block. `r` is the enable step through an RC (`BE`, `RE`, `CE`), so the output rises as `r Vin` whatever the load, and its 10 to 90 percent rise is `tau ln((1 - 0.1 k) / (1 - 0.9 k))` with `k` the settled output over the input.
+  - The ideal diode's drop is the smooth larger of `Vreg + Rreg I` and `Ron I`, less a blocking resistance fitted to the reverse current.
+  - The quiescent current is the regulator's `BQ`.
+- **Fits.**
+  - The eFuse's and load switch's current-limit settings are solved on the law, so the engine reads the datasheet's current at the held output.
+  - Each eFuse threshold is moved so the output crosses half the threshold exactly there.
+  - The ideal diode's `Vreg`, `Ron` (unless given) and `Rreg` are fitted by least squares on the forward values, as many as the values fix, holding out the middle one beyond that. Its start must be the drop over current at the largest current: started at the steepest ratio, the fit stalled 20 percent off (negative control below).
+- **Benches.**
+  - The input is driven by a voltage, and the output is loaded by a resistor sized by the law for the stated current. Drop and current are read from node voltages (`Probe::Drop`), with `COM` lifted 1 V for the on-resistance checks.
+  - Thresholds are read on slow PWL ramps (`Trip::Rising` and `Trip::Falling`). The enable ramp is twenty thousand time constants long, so the RC lag is a part in a hundred thousand.
+  - The rise time is read on the transient run as a `Delay` from the output's 10 percent to its 90 percent.
+- **Refused, with the field:**
+  - A value read outside the eFuse's window.
+  - A cut-off at or below the lockout.
+  - An on-resistance read within 10 percent of the limit.
+  - A limit the on-resistance could never reach.
+  - Two forward voltages at one current.
+  - A missing on-resistance or (eFuse) limit.
+- **The trap found:** a current-mode law (current as a function of the drop) was tried first. A current limit or a regulation corner is flat on one side, and on libngspice 45.2 Newton cycled between the flats. An eFuse into a resistor and an ideal diode at a light load each needed source stepping, and a current-source load on an off switch did not solve at all. The drop as a function of the sensed current solved every fixture on its first pass.
+- **Tests:**
+  - Four in `switch.rs`.
+  - One live test, `behavioural_switches_are_checked_on_the_engine_and_a_fitted_efuse_passes_a_supply`. It fits all three kinds with every value, plus a windowless eFuse that it attaches to `U1` of `LM317_power_supply`. The transient's output then averages the rectified input within 5 mV. A worst engine error under 1 percent is required.
+- **Negative controls**, each failing that live test:
+  - The current sense referred to ground instead of `COM`.
+  - The rise's time constant ignoring the load.
+  - The overvoltage step turned the wrong way.
+  - The ideal diode's fit started at the steepest ratio.
+  - A second fit start was also tried. Removing it failed no test, so it was taken out.
+- **Limits:**
+  - No hysteresis on any threshold, and no fault latch, retry, foldback, thermal shutdown or temperature behaviour.
+  - An eFuse limits a reverse current rather than blocking it.
+  - A load switch has no quick output discharge or undervoltage lockout, and blocks reverse current.
+  - An ideal diode turns off at once on reverse current, with no reverse threshold or turn-off delay.
+  - The eFuse stand-in in Protection Scenarios remains the tool for a fault's timing.
+
+### M3 gate (macOS, 2026-11-08, switches)
+
+Formatting, workspace tests (3,747 passed, 157 ignored), doctests (9 passed, 2 ignored), the live simulation tests (96 passed, none failed: no red baseline), Clippy with warnings denied, `cargo deny check licenses`, documentation counts (unchanged) and the release build, at `ac33339`. The installed binary hash is unchanged (`3de188bb775ab4ce...`). Dogfood by pipe, on a scratch copy of `demos/simulation`, with `get_installation_info` naming the fork binary and HEAD: an `efuse` with its window, a `load_switch` with an enable threshold and rise time, an `ideal_diode` with a forward curve and reverse current, and a windowless `efuse`, all written within 0.014 percent. The last was attached to `LM317_power_supply` `U1`, and the transient read 14.098 V out against 14.103 V rectified, `as_drawn` with `fitted_model` for `U1`. A value read outside the window was refused on its field. Not run: hosted CI, Windows and Linux, the KiCad dialog round trip and a run in KiCad's GUI simulator.
+
+### M3 gate (macOS, 2026-11-08, first part)
+
+Formatting, workspace tests (3,743 passed, 156 ignored), doctests (9 passed, 2 ignored), the live simulation tests (95 passed, none failed: no red baseline), Clippy with warnings denied, `cargo deny check licenses`, documentation counts (unchanged: no tool was added) and the release build. The installed binary hash is unchanged (`3de188bb775ab4ce...`). Dogfood by pipe, on a scratch copy of `demos/simulation`, with `get_installation_info` naming the fork binary and HEAD: an `op_amp` and an `ldo` written within 0.01 percent, attached to `sallen_key` `U1` and `LM317_power_supply` `U1`; the AC run's -3 dB edge read 1024.3 Hz (the formula gives 1024.3), the transient held the output at 9.134 V (9.138 V predicted), both read `as_drawn` with `fitted_model` for `U1`, and an output value in dropout was refused on its field. By hand on libngspice 45.2: the fitted LDO's input carries the load current plus the quiescent current, which leaves through `COM`. Not run: hosted CI, Windows and Linux, the KiCad dialog round trip and a run in KiCad's GUI simulator, which stay owner checks.
 
 ### M2 gate (macOS, 2026-11-06)
 
@@ -267,7 +331,7 @@ Windows and Linux follow all of these: `.github/workflows/e2e-kicad.yml` gets it
 | `crates/konnect/tests/simulation_live.rs` | Ignored tests that need KiCad |
 | `crates/konnect-core/tests/fixtures/simulation/` | Real KiCad and ngspice fixtures, with provenance. `soft_start.sp` and its reference script stand in for E31, `protection/` and its `reference.py` for E56, and `ac_loop.sp` and its reference script for E29 |
 | `crates/konnect/assets/skills/kicad-simulation/SKILL.md` | The skill, including the protection stand-ins and modelling parts from datasheets |
-| `crates/konnect-core/src/simulation/models/` | Fits to datasheet values (`diode.rs`, `passive.rs`), the fitted-file grammar and its strict check (`text.rs`), and bench fixtures and probes (`bench.rs`) |
+| `crates/konnect-core/src/simulation/models/` | Fits to datasheet values (`diode.rs`, `passive.rs`, `tvs.rs`, `mosfet.rs`, `bjt.rs`, and the behavioural ICs in `amplifier.rs`, `regulator.rs` and `switch.rs`), the fitted-file grammar and its strict check (`text.rs`), and bench fixtures and probes (`bench.rs`) |
 | `crates/konnect-core/src/tools/simulation_models.rs` | `create_simulation_model` and `assign_simulation_model` |
 | `crates/konnect-core/src/tools/simulation/bench.rs`, `assignment.rs`, `parts.rs` | The engine bench, the export check before an assignment, and readiness's `parts_needing_models` |
 
@@ -329,6 +393,10 @@ shasum -a 256 ~/.local/share/konnect/bin/konnect
 - `cargo fmt` reshapes a Rust file, so a script that edits one by exact text breaks after a format. Match by pattern, or edit by hand.
 - A reviewer's scratch `HOME` moves KiCad's IBIS cache path, so the `ibis` demo only runs from the real home.
 - Tests that touch security use nonexistent paths. Engine tests use harmless `echo` and marker files only.
+- ngspice reads a node named `gnd` as ground, a subcircuit's port included. A bench whose ground pin sits at ground cannot see it; lift the pin.
+- A `PULSE` with zero width never falls on libngspice 45.2. Write a triangle as a `PWL`.
+- A hard `min`/`max` clamp in a `B` source can fail every operating-point method. Clamp with diodes, or a smooth form.
+- A behavioural current that is flat on one side, such as a current limit, makes Newton cycle. Write the part as a voltage that depends on its sensed current instead.
 
 ## Known open items
 

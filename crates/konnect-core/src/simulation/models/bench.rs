@@ -72,6 +72,45 @@ pub(crate) enum Probe {
     /// AC at `hz`: `scale * |i(source)|`, the current a unit AC drive makes
     /// `source` carry. With `scale = hz` it reads a transition frequency.
     CurrentMagnitude { source: String, scale: f64, hz: f64 },
+    /// AC at `hz`: `scale * |v(node)|`, the gain from a unit AC drive. With
+    /// `scale = hz` it reads a gain-bandwidth product.
+    Gain { node: String, hz: f64, scale: f64 },
+    /// Operating point: `offset + scale * v(node)`, such as a supply less an
+    /// output.
+    Affine {
+        node: String,
+        offset: f64,
+        scale: f64,
+    },
+    /// Operating point: `v(high) - v(low)`, and with `load`, that drop over the
+    /// current `(v(low) - v(base)) / ohms` a load resistor carries: a
+    /// resistance.
+    Drop {
+        high: String,
+        low: String,
+        load: Option<(String, f64)>,
+    },
+    /// Transient: the rate `node` rises from `low` to `high`, by the times it
+    /// first crosses each.
+    Slope { node: String, low: f64, high: f64 },
+    /// Transient, or the slow transient with `slow`: the time from `input`
+    /// first rising through `input_level` to `output` then rising through
+    /// `output_level`.
+    Delay {
+        input: String,
+        input_level: f64,
+        output: String,
+        output_level: f64,
+        slow: bool,
+    },
+    /// Slow transient: `input` where `output` first rises through `level`, and
+    /// where it next falls through it, as their difference or their middle.
+    Trip {
+        input: String,
+        output: String,
+        level: f64,
+        what: Trip,
+    },
     /// Transient: the charge a constant gate current `amps` has delivered by
     /// the time `what` happens. Voltages are read times `sign`, so a P-channel
     /// part reads as an N-channel one.
@@ -85,6 +124,21 @@ pub(crate) enum Probe {
     },
 }
 
+/// What a pair of trip points reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Trip {
+    /// The rising trip less the falling one: a hysteresis.
+    Width,
+    /// Their middle: an input offset.
+    Center,
+    /// The input where the output first rises through the level: a threshold
+    /// that turns the output on.
+    Rising,
+    /// The input where the output first falls through it: one that turns it
+    /// off.
+    Falling,
+}
+
 /// Which charge a transient probe reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Charge {
@@ -96,15 +150,31 @@ pub(crate) enum Charge {
 }
 
 impl Probe {
-    /// Whether the probe reads a transient run.
+    /// Whether the probe reads the transient run.
     pub(crate) fn is_transient(&self) -> bool {
-        matches!(self, Probe::Charge { .. })
+        matches!(
+            self,
+            Probe::Charge { .. } | Probe::Slope { .. } | Probe::Delay { slow: false, .. }
+        )
+    }
+
+    /// Whether the probe reads the slow transient run.
+    pub(crate) fn is_slow(&self) -> bool {
+        matches!(self, Probe::Trip { .. } | Probe::Delay { slow: true, .. })
     }
 
     /// The frequency of an AC probe; none for an operating point.
     pub(crate) fn hz(&self) -> Option<f64> {
         match self {
-            Probe::Voltage { .. } | Probe::Current { .. } | Probe::Charge { .. } => None,
+            Probe::Voltage { .. }
+            | Probe::Current { .. }
+            | Probe::Charge { .. }
+            | Probe::Affine { .. }
+            | Probe::Drop { .. }
+            | Probe::Slope { .. }
+            | Probe::Delay { .. }
+            | Probe::Trip { .. } => None,
+            Probe::Gain { hz, .. } => Some(*hz),
             Probe::Capacitance { hz, .. }
             | Probe::Impedance { hz, .. }
             | Probe::Resistance { hz, .. }
@@ -126,6 +196,10 @@ pub(crate) struct Bench {
     /// For the transient run, which lasts `tran_stop` seconds.
     pub tran: Vec<String>,
     pub tran_stop: f64,
+    /// For a second transient run, `slow_stop` seconds long, for checks on
+    /// another time scale than the first, such as a slow ramp.
+    pub slow: Vec<String>,
+    pub slow_stop: f64,
     next: usize,
 }
 
@@ -171,9 +245,14 @@ pub(crate) fn ac_frequencies(checks: &[Check]) -> Vec<f64> {
 
 /// Whether any check reads the operating point.
 pub(crate) fn needs_operating_point(checks: &[Check]) -> bool {
-    checks
-        .iter()
-        .any(|check| check.probe.hz().is_none() && !check.probe.is_transient())
+    checks.iter().any(|check| {
+        check.probe.hz().is_none() && !check.probe.is_transient() && !check.probe.is_slow()
+    })
+}
+
+/// Whether any check reads the slow transient run.
+pub(crate) fn needs_slow_transient(checks: &[Check]) -> bool {
+    checks.iter().any(|check| check.probe.is_slow())
 }
 
 /// Whether any check reads the transient run.
@@ -214,6 +293,7 @@ pub(crate) fn measure(
     dc: Option<&Plot>,
     ac: &[(f64, Plot)],
     tran: Option<&Plot>,
+    slow: Option<&Plot>,
 ) -> Option<f64> {
     let tau = std::f64::consts::TAU;
     let at = |hz: f64| {
@@ -230,6 +310,69 @@ pub(crate) fn measure(
             sign,
             what,
         } => charge(tran?, gate, drain, *amps, *vds, *sign, *what),
+        Probe::Gain { node, hz, scale } => {
+            voltage(at(*hz)?, node).map(|(real, imaginary)| scale * real.hypot(imaginary))
+        }
+        Probe::Affine {
+            node,
+            offset,
+            scale,
+        } => voltage(dc?, node).map(|(value, _)| offset + scale * value),
+        Probe::Drop { high, low, load } => {
+            let dc = dc?;
+            let (top, _) = voltage(dc, high)?;
+            let (bottom, _) = voltage(dc, low)?;
+            match load {
+                None => Some(top - bottom),
+                Some((base, ohms)) => {
+                    let (base, _) = voltage(dc, base)?;
+                    let current = (bottom - base) / ohms;
+                    (current != 0.0).then(|| (top - bottom) / current)
+                }
+            }
+        }
+        Probe::Slope { node, low, high } => {
+            let (times, trace) = series(tran?, node)?;
+            let start = crossing(&times, &trace, *low, true)?;
+            let end = crossing_after(&times, &trace, *high, true, start)?;
+            (end > start).then(|| (high - low) / (end - start))
+        }
+        Probe::Delay {
+            input,
+            input_level,
+            output,
+            output_level,
+            slow: is_slow,
+        } => {
+            let plot = if *is_slow { slow? } else { tran? };
+            let (times, drive) = series(plot, input)?;
+            let (_, response) = series(plot, output)?;
+            let start = crossing(&times, &drive, *input_level, true)?;
+            let end = crossing_after(&times, &response, *output_level, true, start)?;
+            Some(end - start)
+        }
+        Probe::Trip {
+            input,
+            output,
+            level,
+            what,
+        } => {
+            let (times, drive) = series(slow?, input)?;
+            let (_, response) = series(slow?, output)?;
+            if matches!(what, Trip::Rising | Trip::Falling) {
+                let at = crossing(&times, &response, *level, *what == Trip::Rising)?;
+                return value_at(&times, &drive, at);
+            }
+            let rise_at = crossing(&times, &response, *level, true)?;
+            let fall_at = crossing_after(&times, &response, *level, false, rise_at)?;
+            let rise = value_at(&times, &drive, rise_at)?;
+            let fall = value_at(&times, &drive, fall_at)?;
+            Some(match what {
+                Trip::Width => rise - fall,
+                Trip::Center => (rise + fall) / 2.0,
+                Trip::Rising | Trip::Falling => return None,
+            })
+        }
         Probe::Voltage {
             node,
             scale,
@@ -258,17 +401,57 @@ pub(crate) fn measure(
     }
 }
 
+/// A node's voltage over a transient run, with its times.
+fn series(plot: &Plot, node: &str) -> Option<(Vec<f64>, Vec<f64>)> {
+    let times: Vec<f64> = plot.real(plot.variable("time")?).collect();
+    let resolved = signals::resolve(plot, &Signal::Voltage(node.to_string()), NO_NAMES).ok()?;
+    (resolved.values.len() == times.len()).then_some((times, resolved.values))
+}
+
+/// A trace's value at `time`, by a straight line between samples.
+fn value_at(times: &[f64], values: &[f64], time: f64) -> Option<f64> {
+    times.windows(2).zip(values.windows(2)).find_map(|(t, v)| {
+        (t[0] <= time && time <= t[1]).then(|| {
+            if t[1] > t[0] {
+                v[0] + (v[1] - v[0]) * (time - t[0]) / (t[1] - t[0])
+            } else {
+                v[1]
+            }
+        })
+    })
+}
+
+/// The first crossing at or after `after`.
+fn crossing_after(
+    times: &[f64],
+    values: &[f64],
+    level: f64,
+    rising: bool,
+    after: f64,
+) -> Option<f64> {
+    times
+        .windows(2)
+        .zip(values.windows(2))
+        .filter(|(t, _)| t[1] >= after)
+        .find_map(|(t, v)| segment_crossing(t, v, level, rising).filter(|time| *time >= after))
+}
+
 /// The first time a falling or rising trace crosses `level`, by straight lines
 /// between samples.
 fn crossing(times: &[f64], values: &[f64], level: f64, rising: bool) -> Option<f64> {
-    times.windows(2).zip(values.windows(2)).find_map(|(t, v)| {
-        let crosses = if rising {
-            v[0] < level && v[1] >= level
-        } else {
-            v[0] > level && v[1] <= level
-        };
-        crosses.then(|| t[0] + (t[1] - t[0]) * (level - v[0]) / (v[1] - v[0]))
-    })
+    times
+        .windows(2)
+        .zip(values.windows(2))
+        .find_map(|(t, v)| segment_crossing(t, v, level, rising))
+}
+
+fn segment_crossing(t: &[f64], v: &[f64], level: f64, rising: bool) -> Option<f64> {
+    let crosses = if rising {
+        v[0] < level && v[1] >= level
+    } else {
+        v[0] > level && v[1] <= level
+    };
+    crosses.then(|| t[0] + (t[1] - t[0]) * (level - v[0]) / (v[1] - v[0]))
 }
 
 fn charge(

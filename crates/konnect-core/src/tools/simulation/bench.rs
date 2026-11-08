@@ -164,25 +164,37 @@ pub(crate) async fn measure(
     }
     let mut transient = None;
     if model_bench::needs_transient(checks) {
-        let stop = model.bench.tran_stop;
-        let analysis = Analysis::from_args(&json!({
-            "kind": "transient",
-            "stop_time_seconds": stop,
-            "max_step_seconds": stop / TRAN_STEPS,
-        }))?;
-        let plot = run(
-            runtime,
-            &engine,
-            &staging_dir,
-            &file,
-            &model.bench.tran,
-            temperature,
-            &analysis,
-            project.compatibility,
-            budget.saturating_sub(started.elapsed()),
-        )
-        .await?;
-        transient = Some(plot);
+        transient = Some(
+            run_transient(
+                runtime,
+                &engine,
+                &staging_dir,
+                &file,
+                &model.bench.tran,
+                model.bench.tran_stop,
+                temperature,
+                project.compatibility,
+                budget.saturating_sub(started.elapsed()),
+            )
+            .await?,
+        );
+    }
+    let mut slow = None;
+    if model_bench::needs_slow_transient(checks) {
+        slow = Some(
+            run_transient(
+                runtime,
+                &engine,
+                &staging_dir,
+                &file,
+                &model.bench.slow,
+                model.bench.slow_stop,
+                temperature,
+                project.compatibility,
+                budget.saturating_sub(started.elapsed()),
+            )
+            .await?,
+        );
     }
     let values = checks
         .iter()
@@ -192,6 +204,7 @@ pub(crate) async fn measure(
                 operating_point.as_ref(),
                 &ac_plots,
                 transient.as_ref(),
+                slow.as_ref(),
             )
         })
         .collect();
@@ -199,6 +212,38 @@ pub(crate) async fn measure(
         engine_version: engine.version.clone(),
         values,
     })
+}
+
+/// A transient run of `stop` seconds over `fixtures`.
+#[allow(clippy::too_many_arguments)]
+async fn run_transient(
+    runtime: &crate::simulation::SimulationRuntime,
+    engine: &EngineStatus,
+    staging_dir: &Path,
+    file: &Path,
+    fixtures: &[String],
+    stop: f64,
+    temperature: f64,
+    compatibility: Compatibility,
+    budget: Duration,
+) -> Result<Plot, CallToolResult> {
+    let analysis = Analysis::from_args(&json!({
+        "kind": "transient",
+        "stop_time_seconds": stop,
+        "max_step_seconds": stop / TRAN_STEPS,
+    }))?;
+    run(
+        runtime,
+        engine,
+        staging_dir,
+        file,
+        fixtures,
+        temperature,
+        &analysis,
+        compatibility,
+        budget,
+    )
+    .await
 }
 
 /// The bench deck for one analysis, vetted with the staging folder as its
