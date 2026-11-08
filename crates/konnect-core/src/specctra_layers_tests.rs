@@ -227,7 +227,7 @@ fn two_layer_boards_export_exactly_as_before() {
 
 /// An SES as Freerouting writes one: the placement echoed, and routes on an
 /// inner layer and on B.Cu to the back-side part, with one through via.
-fn ses_for(m: &serde_json::Value) -> String {
+pub(super) fn ses_for(m: &serde_json::Value) -> String {
     let mut placement = String::new();
     for c in m["components"].as_array().unwrap() {
         placement.push_str(&format!(
@@ -848,18 +848,20 @@ fn freerouting_routes_a_folder() {
             }
         }
         // As export_specctra_dsn does: the project's rules and revision,
-        // intent widths, and the copper-to-edge clearance for the router.
-        let edge_um = std::fs::read_to_string(path.with_extension("kicad_pro"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|p| {
-                p["board"]["design_settings"]["rules"]["min_copper_edge_clearance"].as_f64()
-            })
-            .map(|mm| (mm * 1000.0).round() as i64);
+        // intent widths, and the copper-to-edge and hole clearances.
+        let project_um = |key: &str| {
+            std::fs::read_to_string(path.with_extension("kicad_pro"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|p| p["board"]["design_settings"]["rules"][key].as_f64())
+                .filter(|mm| mm.is_finite() && *mm > 0.0)
+                .map(|mm| (mm * 1000.0).round() as i64)
+        };
         let options = ExportOptions {
             omit_pours: std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some(),
-            copper_edge_clearance_um: edge_um,
+            copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
             widths_from_intent: true,
+            hole_clearance_um: project_um("min_hole_clearance"),
         };
         let Ok(snapshot) = crate::routing_context::Snapshot::read(&path) else {
             println!("ROUTE {name}: project rules could not be read");
@@ -904,7 +906,11 @@ fn freerouting_routes_a_folder() {
                 manifest_retry_width(&bundle.manifest)
                     .map(|um| format!("--router.neck_width_um={um}")),
             )
-            .args(edge_um.map(|um| format!("--router.copper_to_edge_clearance_um={um}")))
+            .args(
+                options
+                    .copper_edge_clearance_um
+                    .map(|um| format!("--router.copper_to_edge_clearance_um={um}")),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

@@ -764,6 +764,16 @@ async fn handle_export_specctra_dsn(
         })
         .filter(|mm| mm.is_finite() && *mm > 0.0)
         .map(|mm| (mm * 1000.0).round() as i64);
+    // The project's hole clearance (`min_hole_clearance`): unplated-hole
+    // keepouts are grown so the router keeps it.
+    let hole_clearance_um = std::fs::read_to_string(board_path.with_extension("kicad_pro"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|project| {
+            project["board"]["design_settings"]["rules"]["min_hole_clearance"].as_f64()
+        })
+        .filter(|mm| mm.is_finite() && *mm > 0.0)
+        .map(|mm| (mm * 1000.0).round() as i64);
     if omit_pours && native_bridge_mode == "require" {
         return Ok(invalid_export_argument(
             "pours",
@@ -854,6 +864,7 @@ async fn handle_export_specctra_dsn(
                 omit_pours,
                 copper_edge_clearance_um,
                 widths_from_intent,
+                hole_clearance_um,
             },
         )?;
         Ok((export, before))
@@ -979,6 +990,7 @@ async fn handle_export_specctra_dsn(
             "routing_class_count": export.class_count,
             "intent_widths": export.intent_widths,
             "copper_edge_clearance_um": copper_edge_clearance_um,
+            "hole_clearance_um": hole_clearance_um,
             "capabilities": {
                 "dsn_export_available": true,
                 "ses_import_available": true,

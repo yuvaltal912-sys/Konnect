@@ -225,6 +225,14 @@ struct SupportedProfile {
     /// The project's copper-to-edge clearance, for the router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     copper_edge_clearance_um: Option<i64>,
+    /// The project's hole clearance (`min_hole_clearance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hole_clearance_um: Option<i64>,
+    /// How much every unplated-hole keepout was grown on each side, so the
+    /// router keeps the hole clearance with even the smallest class
+    /// clearance: the hole clearance less that clearance, never below 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hole_keepout_growth_um: Option<i64>,
 }
 
 /// One routing class: the width every track of its nets must keep.
@@ -341,6 +349,17 @@ pub(crate) fn manifest_routing_hints(dsn: &Path) -> RoutingHints {
     }
 }
 
+/// How far to grow each unplated-hole keepout on every side. The keepout has
+/// no rule of its own, so the router keeps a class clearance from it, never
+/// less than the smallest one; growing it by the hole clearance less that
+/// clearance keeps every track at least the hole clearance from the hole.
+/// `None` when the project sets no hole clearance.
+fn hole_keepout_growth(hole_clearance_um: Option<i64>, class_nets: &RuleGroups) -> Option<i64> {
+    let hole = hole_clearance_um.filter(|um| *um > 0)?;
+    let smallest = class_nets.keys().map(|rule| rule.clearance_um).min()?;
+    Some((hole - smallest).max(0))
+}
+
 /// Each net with a design-intent current, widened to the IPC-2221 width for
 /// that current on the worst copper layer of the stack (inner layers need more
 /// copper), with copper thickness from the record, else the stackup, else
@@ -424,6 +443,10 @@ pub(crate) struct ExportOptions {
     pub copper_edge_clearance_um: Option<i64>,
     /// Widen nets with a design-intent current to the IPC-2221 width.
     pub widths_from_intent: bool,
+    /// The project's hole clearance. Unplated holes are keepouts with no rule
+    /// of their own, so the router keeps only its copper clearance from them;
+    /// each is grown by the difference instead.
+    pub hole_clearance_um: Option<i64>,
 }
 
 #[cfg(test)]
@@ -457,7 +480,7 @@ pub(crate) fn export_dsn_with_options(
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
     let board_keepouts = board_copper_keepouts(&tree, &copper_layers)?;
-    let (footprints, skipped_without_pads) = footprints(&tree, &net_table, &copper_layers)?;
+    let (mut footprints, skipped_without_pads) = footprints(&tree, &net_table, &copper_layers)?;
     let zones = zones(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
@@ -501,6 +524,13 @@ pub(crate) fn export_dsn_with_options(
     }
 
     let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules)?;
+    let hole_keepout_growth_um = hole_keepout_growth(options.hole_clearance_um, &class_nets);
+    if let Some(growth) = hole_keepout_growth_um.filter(|growth| *growth > 0) {
+        for hole in footprints.iter_mut().flat_map(|f| f.holes.iter_mut()) {
+            hole.size_x_um += 2 * growth;
+            hole.size_y_um += 2 * growth;
+        }
+    }
     let manifest_classes: Vec<ManifestClass> = class_nets
         .keys()
         .enumerate()
@@ -551,6 +581,7 @@ pub(crate) fn export_dsn_with_options(
         &source_sha256,
         &manifest_classes,
         options,
+        hole_keepout_growth_um,
         skipped_without_pads,
         board_keepouts.len(),
         &copper_stack,
@@ -2216,6 +2247,18 @@ fn footprints(
         let mut copper_keepouts = Vec::new();
         for node in footprint.children().unwrap_or(&[]) {
             let Some(head) = node.head() else { continue };
+            // Geometry the DSN does not carry yet. Leaving it out would let
+            // the router cross an antenna keepout or a slot, so refuse.
+            if head == "zone" {
+                bail!(
+                    "unsupported routing profile: footprint '{reference}' has a rule area or zone of its own, which the DSN export does not carry yet; the router could cross it"
+                );
+            }
+            if head.starts_with("fp_") && node.find_str("layer") == Some("Edge.Cuts") {
+                bail!(
+                    "unsupported routing profile: footprint '{reference}' draws on Edge.Cuts (a slot or cut-out), which the DSN export does not carry yet; the router could cross it"
+                );
+            }
             if !(head.starts_with("fp_") || head == "property") {
                 continue;
             }
@@ -2868,6 +2911,7 @@ fn build_manifest(
     source_sha256: &str,
     classes: &[ManifestClass],
     options: ExportOptions,
+    hole_keepout_growth_um: Option<i64>,
     skipped_without_pads: usize,
     board_keepout_count: usize,
     copper_stack: &[(String, &'static str)],
@@ -2959,6 +3003,8 @@ fn build_manifest(
             footprints_without_pads: skipped_without_pads,
             pours_omitted: options.omit_pours,
             copper_edge_clearance_um: options.copper_edge_clearance_um,
+            hole_clearance_um: options.hole_clearance_um,
+            hole_keepout_growth_um,
             copper_graphic_keepout_count: board_keepout_count
                 + footprints
                     .iter()
@@ -3783,3 +3829,7 @@ mod tests {
 #[cfg(test)]
 #[path = "specctra_layers_tests.rs"]
 mod layers_tests;
+
+#[cfg(test)]
+#[path = "specctra_hole_clearance_tests.rs"]
+mod hole_clearance_tests;

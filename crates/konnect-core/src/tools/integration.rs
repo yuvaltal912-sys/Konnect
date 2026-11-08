@@ -150,7 +150,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2455,6 +2455,10 @@ async fn handle_route_specctra_dsn(
             "copper_to_edge_clearance_source": if edge_clearance.is_some() { "export_manifest" } else { "none: no manifest beside the DSN, or it records no clearance" },
             "retry_width_um": hints.retry_width_um,
         },
+        // Read back from Freerouting (`get_effective_settings`): the run is
+        // refused before routing when any sent setting is not in effect.
+        "effective_settings": evidence.effective_settings,
+        "optimizer": evidence.optimizer,
         "artifacts": {
             "dsn_path": dsn,
             "ses_output_path": ses_output,

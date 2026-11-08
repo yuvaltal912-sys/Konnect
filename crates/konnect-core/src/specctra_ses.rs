@@ -132,6 +132,14 @@ struct SupportedProfile {
     #[serde(default)]
     #[allow(dead_code)]
     copper_edge_clearance_um: Option<i64>,
+    /// Informational: the project's hole clearance the export applied.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hole_clearance_um: Option<i64>,
+    /// Informational: how far each unplated-hole keepout was grown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hole_keepout_growth_um: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

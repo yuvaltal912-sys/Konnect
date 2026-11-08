@@ -9,12 +9,36 @@ Creation PR 16b (`docs/CREATION_HANDOFF.md`). Found by routing the owner's
 reference board with Freerouting 2.5.0.
 
 - **`route_specctra_dsn`** turns Freerouting's automatic neck-down off
-  (`automaticNeckdown: false`); new `allow_neckdown` (default `false`) turns it
+  (`automatic_neckdown: false`); new `allow_neckdown` (default `false`) turns it
   back on. It also passes the project's copper-to-edge clearance
-  (`copperToEdgeClearanceUm`) when the export's manifest beside the DSN records
-  one, and the narrowest width the manifest allows as Freerouting's retry width
-  (`neckWidthUm`: a connection that cannot be reached at its class width is
-  routed whole at that width, never below it). The result adds `rules_applied`.
+  (`copper_to_edge_clearance_um`) when the export's manifest beside the DSN
+  records one, and the narrowest width the manifest allows as Freerouting's
+  retry width (`neck_width_um`: a connection that cannot be reached at its
+  class width is routed whole at that width, never below it). The result adds
+  `rules_applied`.
+- **`route_specctra_dsn` job settings use the names Freerouting 2.5.0 reads.**
+  Its job API drops unknown keys without an error, and the camelCase names sent
+  before (`maxPasses`, `jobTimeoutString`, `neckWidthUm`,
+  `copperToEdgeClearanceUm`) were all dropped: the pass budget, job timeout,
+  retry width and edge clearance never applied. They are now
+  `autorouter.max_passes`, `job_timeout`, `neck_width_um` and
+  `copper_to_edge_clearance_um`. Before the job starts, the settings are read
+  back with Freerouting's `get_effective_settings`; any sent setting not in
+  effect refuses the run, names the setting, and routes nothing. A Freerouting
+  without `update_job_settings` and `get_effective_settings` is refused when
+  settings are sent. The result adds `effective_settings` (each sent setting as
+  in effect, by dotted name) and `optimizer` (`passes`, `early_stop`,
+  `score_before`, `score_after` and up to 12 log lines, from `get_job_logs`;
+  `null` when the log cannot be read).
+- **`export_specctra_dsn`** grows each unplated-hole keepout (and each
+  ringless, netless plated hole) by the project's `min_hole_clearance` less the
+  smallest class clearance, so the router keeps the hole clearance; the result
+  and the manifest record `hole_clearance_um`, and the manifest
+  `supported_profile.hole_keepout_growth_um`. Before, a track could pass 0.21 mm
+  from a hole with a 0.25 mm rule. A board whose footprints hold a rule area or
+  zone, or draw on Edge.Cuts (a slot or cut-out), is now refused, naming the
+  footprint: the DSN does not carry these yet, and leaving them out let the
+  router cross an antenna keepout or a slot.
 - **`plan_specctra_ses_import` / `apply_specctra_ses`** refuse an SES with any
   wire narrower than its net allows, naming the worst one: the class width, or
   for a net widened to its current its base width (`nets[].min_track_width_um`

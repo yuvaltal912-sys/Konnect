@@ -68,7 +68,7 @@ pub(crate) struct RouteSettings {
     /// carry.
     pub copper_to_edge_clearance_um: Option<f64>,
     /// The width Freerouting retries a connection at when the class width
-    /// cannot reach it (`neckWidthUm`): the narrowest width the manifest
+    /// cannot reach it (`neck_width_um`): the narrowest width the manifest
     /// allows, so no track ends up below the project's floor.
     pub retry_width_um: Option<f64>,
 }
@@ -83,7 +83,29 @@ pub(crate) struct RouteEvidence {
     pub ses_bytes: u64,
     pub server_protocol_version: String,
     pub diagnostics_path: Option<String>,
+    /// The settings Konnect sent, as Freerouting reports them in effect
+    /// (`get_effective_settings`), keyed by their dotted name.
+    pub effective_settings: BTreeMap<String, Value>,
+    /// What the optimizer did, read from the job log; `None` when the log
+    /// could not be read.
+    pub optimizer: Option<OptimizerReport>,
 }
+
+/// The optimizer's outcome, from Freerouting's job log.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub(crate) struct OptimizerReport {
+    /// Optimizer passes that ran.
+    pub passes: u32,
+    /// A pass stopped early after consecutive items could not be improved.
+    pub early_stop: bool,
+    pub score_before: Option<f64>,
+    pub score_after: Option<f64>,
+    /// The optimizer's own log lines, at most [`MAX_OPTIMIZER_LINES`].
+    pub log: Vec<String>,
+}
+
+const MAX_OPTIMIZER_LINES: usize = 12;
+const MAX_LOG_LINE_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BridgeProbe {
@@ -148,31 +170,175 @@ pub(crate) async fn probe_local(jar: &Path, java: Option<&Path>) -> BridgeProbe 
     }
 }
 
-/// The `update_job_settings` body for these settings.
+/// The `update_job_settings` body for these settings, under the names
+/// Freerouting 2.5.0 reads. Its job API parses the body into its router
+/// settings by their serialized snake_case names and drops any other key
+/// without an error (camelCase `neckWidthUm` was silently ignored); the flat
+/// `max_passes` is a deprecated alias of `autorouter.max_passes`.
 fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
     let mut job_settings = Map::new();
     if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
+        job_settings.insert(
+            "autorouter".to_string(),
+            json!({ "max_passes": max_passes }),
+        );
     }
     if let Some(enabled) = settings.optimizer_enabled {
         job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
     }
     if let Some(neckdown) = settings.automatic_neckdown {
-        job_settings.insert("automaticNeckdown".to_string(), json!(neckdown));
+        job_settings.insert("automatic_neckdown".to_string(), json!(neckdown));
     }
     if let Some(edge) = settings.copper_to_edge_clearance_um {
-        job_settings.insert("copperToEdgeClearanceUm".to_string(), json!(edge));
+        job_settings.insert("copper_to_edge_clearance_um".to_string(), json!(edge));
     }
     if let Some(width) = settings.retry_width_um {
-        job_settings.insert("neckWidthUm".to_string(), json!(width));
+        job_settings.insert("neck_width_um".to_string(), json!(width));
     }
     if let Some(seconds) = settings.job_timeout_seconds {
         job_settings.insert(
-            "jobTimeoutString".to_string(),
+            "job_timeout".to_string(),
             Value::String(duration_string(seconds)),
         );
     }
     job_settings
+}
+
+/// Every leaf of a settings body, by dotted name.
+fn setting_leaves(body: &Map<String, Value>) -> Vec<(String, Value)> {
+    fn walk(prefix: &str, value: &Value, out: &mut Vec<(String, Value)>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let name = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(&name, child, out);
+                }
+            }
+            leaf => out.push((prefix.to_string(), leaf.clone())),
+        }
+    }
+    let mut out = Vec::new();
+    walk("", &Value::Object(body.clone()), &mut out);
+    out
+}
+
+/// The value at a dotted name in Freerouting's effective settings, wherever
+/// the settings object sits in the tool's response (the HTTP body may be
+/// wrapped, or carried as JSON text).
+fn find_setting<'a>(response: &'a Value, name: &str) -> Option<&'a Value> {
+    let path: Vec<&str> = name.split('.').collect();
+    fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        path.iter()
+            .try_fold(value, |current, key| current.get(*key))
+    }
+    fn search<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        if let Some(found) = at(value, path) {
+            return Some(found);
+        }
+        match value {
+            Value::Object(map) => map.values().find_map(|child| search(child, path)),
+            Value::Array(items) => items.iter().find_map(|child| search(child, path)),
+            _ => None,
+        }
+    }
+    search(response, &path)
+}
+
+fn same_setting(sent: &Value, effective: &Value) -> bool {
+    match (sent.as_f64(), effective.as_f64()) {
+        (Some(a), Some(b)) => (a - b).abs() <= 1e-6 * a.abs().max(1.0),
+        _ => sent == effective,
+    }
+}
+
+/// Compare what was sent with what Freerouting says is in effect. Returns the
+/// effective value of every sent setting, or an error naming each one that
+/// is missing or different: a setting the router ignored must stop the run,
+/// not be found later in the copper.
+fn check_effective_settings(
+    sent: &Map<String, Value>,
+    response: &Value,
+) -> Result<BTreeMap<String, Value>> {
+    let mut effective = BTreeMap::new();
+    let mut wrong = Vec::new();
+    for (name, value) in setting_leaves(sent) {
+        match find_setting(response, &name) {
+            Some(found) if same_setting(&value, found) => {
+                effective.insert(name, found.clone());
+            }
+            Some(found) => wrong.push(format!("{name}: sent {value}, in effect {found}")),
+            None => wrong.push(format!(
+                "{name}: sent {value}, not in Freerouting's effective settings"
+            )),
+        }
+    }
+    if !wrong.is_empty() {
+        bail!(
+            "Freerouting did not apply the job settings, so nothing was routed: {}",
+            wrong.join("; ")
+        );
+    }
+    Ok(effective)
+}
+
+/// The optimizer's outcome from Freerouting's job log: the passes that ran,
+/// whether a pass stopped early, and the optimizer score before and after.
+fn optimizer_report(log: &Value) -> OptimizerReport {
+    fn messages(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    match child {
+                        Value::String(text) if key == "message" => out.push(text.clone()),
+                        // Text content that is not JSON may hold the log itself.
+                        Value::String(text)
+                            if key == "text" && !text.trim_start().starts_with(['{', '[']) =>
+                        {
+                            out.extend(text.lines().map(str::to_string))
+                        }
+                        _ => messages(child, out),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| messages(item, out)),
+            _ => {}
+        }
+    }
+    fn number_after(line: &str, marker: &str) -> Option<f64> {
+        let rest = &line[line.find(marker)? + marker.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+    let mut lines = Vec::new();
+    messages(log, &mut lines);
+    let mut report = OptimizerReport::default();
+    for line in lines.iter().filter(|line| line.contains("ptimiz")) {
+        if let Some(pass) = line
+            .find("Optimizer pass #")
+            .and_then(|_| number_after(line, "Optimizer pass #"))
+        {
+            report.passes = report.passes.max(pass as u32);
+        }
+        if line.contains("early after") {
+            report.early_stop = true;
+        }
+        if line.contains("Optimization stage completed") {
+            report.score_before = number_after(line, "baseline optimizer score: ");
+            report.score_after = number_after(line, "final optimizer score: ");
+        }
+        if report.log.len() < MAX_OPTIMIZER_LINES {
+            report
+                .log
+                .push(line.chars().take(MAX_LOG_LINE_CHARS).collect());
+        }
+    }
+    report
 }
 
 pub(crate) async fn route_local(
@@ -364,9 +530,12 @@ async fn run_state_machine(
         .await?;
 
     let job_settings = job_settings(settings);
+    let mut effective_settings = BTreeMap::new();
     if !job_settings.is_empty() {
-        if !tools.contains_key("update_job_settings") {
-            bail!("Freerouting MCP does not expose update_job_settings");
+        for tool in ["update_job_settings", "get_effective_settings"] {
+            if !tools.contains_key(tool) {
+                bail!("Freerouting MCP does not expose {tool}, so the job settings cannot be applied and checked (Freerouting 2.5.0 has both)");
+            }
         }
         client
             .call_tool(
@@ -374,6 +543,13 @@ async fn run_state_machine(
                 json!({ "path": { "jobId": job_id }, "body": job_settings }),
             )
             .await?;
+        let effective = client
+            .call_tool(
+                "get_effective_settings",
+                json!({ "path": { "jobId": job_id } }),
+            )
+            .await?;
+        effective_settings = check_effective_settings(&job_settings, &effective)?;
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
@@ -401,6 +577,16 @@ async fn run_state_machine(
             json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
         )
         .await?;
+    // Evidence only: a log that cannot be read leaves the route as it is.
+    let optimizer = if tools.contains_key("get_job_logs") {
+        client
+            .call_tool("get_job_logs", json!({ "path": { "jobId": job_id } }))
+            .await
+            .ok()
+            .map(|log| optimizer_report(&log))
+    } else {
+        None
+    };
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -410,6 +596,8 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        effective_settings,
+        optimizer,
     })
 }
 
@@ -847,33 +1035,219 @@ mod tests {
         assert_eq!(find_string(&value, &["sessionId"]), Some("abc".to_string()));
     }
 
-    #[test]
-    fn neckdown_and_edge_clearance_reach_the_job_settings() {
-        let settings = RouteSettings {
-            max_passes: None,
-            optimizer_enabled: None,
-            job_timeout_seconds: None,
-            poll_interval: std::time::Duration::from_secs(1),
-            overall_timeout: std::time::Duration::from_secs(10),
+    fn all_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: Some(20),
+            optimizer_enabled: Some(true),
+            job_timeout_seconds: Some(600),
+            poll_interval: std::time::Duration::from_secs(2),
+            overall_timeout: std::time::Duration::from_secs(60),
             java: None,
             automatic_neckdown: Some(false),
             copper_to_edge_clearance_um: Some(500.0),
             retry_width_um: Some(200.0),
-        };
-        let body = job_settings(&settings);
-        assert_eq!(body["automaticNeckdown"], json!(false));
-        assert_eq!(body["copperToEdgeClearanceUm"], json!(500.0));
-        assert_eq!(body["neckWidthUm"], json!(200.0));
+        }
+    }
+
+    /// The names Freerouting 2.5.0's router settings serialize under (read
+    /// from its class files: `RouterSettings`, `AutorouterSettings`,
+    /// `OptimizerSettings`). A key outside these is dropped silently.
+    #[test]
+    fn job_settings_use_the_names_freerouting_reads() {
+        let body = job_settings(&all_settings());
+        let names: Vec<String> = setting_leaves(&body).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "automatic_neckdown",
+                "autorouter.max_passes",
+                "copper_to_edge_clearance_um",
+                "job_timeout",
+                "neck_width_um",
+                "optimizer.enabled",
+            ]
+        );
+        assert_eq!(body["neck_width_um"], json!(200.0));
+        assert_eq!(body["job_timeout"], json!("00:10:00"));
         let none = job_settings(&RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
             automatic_neckdown: None,
             copper_to_edge_clearance_um: None,
             retry_width_um: None,
-            ..settings
+            ..all_settings()
         });
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn effective_settings_must_match_what_was_sent() {
+        let sent = job_settings(&all_settings());
+        // The HTTP body as the MCP tool wraps it, and as JSON text.
+        let applied = json!({
+            "status": 200,
+            "body": {
+                "automatic_neckdown": false,
+                "copper_to_edge_clearance_um": 500.0,
+                "neck_width_um": 200.0,
+                "job_timeout": "00:10:00",
+                "autorouter": { "max_passes": 20, "enabled": true },
+                "optimizer": { "enabled": true, "max_passes": 100 },
+                "scoring": { "via_costs": 50 }
+            }
+        });
+        let effective = check_effective_settings(&sent, &applied).unwrap();
+        assert_eq!(effective["neck_width_um"], json!(200.0));
+        assert_eq!(effective.len(), 6);
+        let as_text = expand_text_content(json!({
+            "content": [{ "type": "text", "text": applied.to_string() }]
+        }));
+        check_effective_settings(&sent, &as_text).unwrap();
+
+        // The 2.5.0 default for a dropped key, and a key missing altogether.
+        let mut dropped = applied.clone();
+        dropped["body"]["neck_width_um"] = json!(0.0);
+        dropped["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("job_timeout");
+        let error = check_effective_settings(&sent, &dropped)
+            .unwrap_err()
+            .to_string();
         assert!(
-            none.get("automaticNeckdown").is_none()
-                && none.get("copperToEdgeClearanceUm").is_none()
+            error.contains("neck_width_um: sent 200.0, in effect 0.0")
+                && error.contains("job_timeout")
+                && error.contains("nothing was routed"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn the_optimizer_outcome_is_read_from_the_job_log() {
+        let log = json!({ "body": [
+            { "type": "INFO", "message": "Starting optimization on 1 thread..." },
+            { "type": "INFO", "message": "Optimizer pass #1: optimizer score 349.49 -> 355.15 (IMPROVED, 1.6189%), router score: 1000.00" },
+            { "type": "INFO", "message": "Optimizer pass #2: optimizer score 355.15 -> 356.87 (IMPROVED, 0.4831%), router score: 1000.00" },
+            { "type": "INFO", "message": "Stopping optimization pass #2 early after 12 consecutive items could not be improved." },
+            { "type": "INFO", "message": "Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 349.49, final router score: 1000.00, final optimizer score: 356.87" },
+            { "type": "INFO", "message": "Autorouter pass #3 completed" }
+        ]});
+        let report = optimizer_report(&log);
+        assert_eq!(report.passes, 2);
+        assert!(report.early_stop);
+        assert_eq!(report.score_before, Some(349.49));
+        assert_eq!(report.score_after, Some(356.87));
+        assert_eq!(report.log.len(), 5);
+        assert_eq!(
+            optimizer_report(&json!({ "body": [] })),
+            OptimizerReport::default()
+        );
+    }
+
+    /// A stand-in for Freerouting's stdio MCP server: a shell script that
+    /// answers the routing state machine and reports `neck_width_um` as the
+    /// given value in its effective settings.
+    #[cfg(unix)]
+    fn fake_freerouting(dir: &Path, effective_neck_width: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let object = r#"{"type":"object","properties":{"jobId":{"type":"string"},"filePath":{"type":"string"}},"required":["jobId","filePath"]}"#;
+        let with_path = r#"{"type":"object","properties":{"path":{"type":"object","properties":{"jobId":{"type":"string"}},"required":["jobId"]}},"required":["path"]}"#;
+        let enqueue = r#"{"type":"object","properties":{"body":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},"required":["body"]}"#;
+        let tool =
+            |name: &str, schema: &str| format!(r#"{{"name":"{name}","inputSchema":{schema}}}"#);
+        let tools = [
+            tool("create_session", r#"{"type":"object","properties":{}}"#),
+            tool("enqueue_job", enqueue),
+            tool("upload_job_input_from_local_file", object),
+            tool("update_job_settings", with_path),
+            tool("get_effective_settings", with_path),
+            tool("start_job", with_path),
+            tool("get_job_details", with_path),
+            tool("get_job_logs", with_path),
+            tool("download_job_output_to_local_file", object),
+        ]
+        .join(",");
+        let settings = format!(
+            r#"{{"status":200,"body":{{"automatic_neckdown":false,"copper_to_edge_clearance_um":500.0,"neck_width_um":{effective_neck_width},"job_timeout":"00:10:00","autorouter":{{"max_passes":20}},"optimizer":{{"enabled":true}}}}}}"#
+        );
+        let logs = r#"{"status":200,"body":[{"type":"INFO","message":"Optimizer pass #1: optimizer score 10.00 -> 10.00 (UNCHANGED, 0.0000%)"},{"type":"INFO","message":"Stopping optimization pass #1 early after 12 consecutive items could not be improved."},{"type":"INFO","message":"Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 10.00, final router score: 1000.00, final optimizer score: 10.00"}]}"#;
+        let script = format!(
+            r#"#!/bin/sh
+reply() {{ printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$1" "$2"; }}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*) reply "$id" '{{"protocolVersion":"2024-11-05"}}' ;;
+    *'"method":"tools/list"'*) reply "$id" '{{"tools":[{tools}]}}' ;;
+    *'"name":"create_session"'*) reply "$id" '{{"session_id":"s1"}}' ;;
+    *'"name":"enqueue_job"'*) reply "$id" '{{"job_id":"j1"}}' ;;
+    *'"name":"get_effective_settings"'*) reply "$id" '{settings}' ;;
+    *'"name":"get_job_details"'*) reply "$id" '{{"state":"COMPLETED"}}' ;;
+    *'"name":"get_job_logs"'*) reply "$id" '{logs}' ;;
+    *'"name":"download_job_output_to_local_file"'*)
+      out=$(printf '%s' "$line" | grep -o '"filePath":"[^"]*"' | cut -d'"' -f4)
+      printf '(session "board")\n' > "$out"
+      reply "$id" '{{"message":"saved"}}' ;;
+    *) reply "$id" '{{}}' ;;
+  esac
+done
+"#
+        );
+        let path = dir.join("fake-java");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    async fn route_with_fake(
+        effective_neck_width: &str,
+    ) -> (Result<RouteEvidence>, PathBuf, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let jar = dir.join("freerouting.jar");
+        std::fs::write(&jar, b"not a jar").unwrap();
+        let dsn = dir.join("board.dsn");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let ses = dir.join("board.ses");
+        let settings = RouteSettings {
+            java: Some(fake_freerouting(&dir, effective_neck_width)),
+            ..all_settings()
+        };
+        (route_local(&jar, &dsn, &ses, &settings).await, ses, temp)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_setting_freerouting_did_not_apply_stops_the_route() {
+        let (result, ses, _temp) = route_with_fake("0.0").await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("neck_width_um: sent 200.0, in effect 0.0"),
+            "{error}"
+        );
+        assert!(
+            !ses.exists(),
+            "no SES may be written after a refused setting"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn applied_settings_and_the_optimizer_outcome_are_reported() {
+        let (result, ses, _temp) = route_with_fake("200.0").await;
+        let evidence = result.unwrap();
+        assert!(ses.is_file());
+        assert_eq!(evidence.effective_settings["neck_width_um"], json!(200.0));
+        assert_eq!(
+            evidence.effective_settings["autorouter.max_passes"],
+            json!(20)
+        );
+        let optimizer = evidence.optimizer.unwrap();
+        assert_eq!((optimizer.passes, optimizer.early_stop), (1, true));
+        assert_eq!(optimizer.score_after, Some(10.0));
     }
 
     #[test]
