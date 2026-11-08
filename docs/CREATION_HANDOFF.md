@@ -54,6 +54,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 ## Next: what to pick
 
+**Rank 32 part 2 (B34, D24): In progress (branch `feat/creation-freerouting-benchmark`).** An opt-in `cargo xtask freerouting-bench` over a folder of Specctra DSN files (completion, vias, wirelength, runtime, determinism per Freerouting version), then a recommended version with its measured reason in `check_freerouting`. Owns `xtask`, `freerouting_setup.rs` and the `check_freerouting` handler in `integration.rs`.
+
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
 **Recommended order**, after the owner approves the next implementation:
