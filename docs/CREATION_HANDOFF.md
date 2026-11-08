@@ -49,7 +49,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
-| 15 | ERC/DRC baselines | 3 | Not started |
+| 15 | ERC/DRC baselines | 3 | In progress (branch `feat/creation-erc-drc-baselines`) |
 
 ## Next: what to pick
 
