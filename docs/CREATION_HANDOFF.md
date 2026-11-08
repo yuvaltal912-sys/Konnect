@@ -60,7 +60,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
 2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35).
-   - The `cargo deny` advisories fix is in review: draft [#45](https://github.com/yuvaltal912-sys/Konnect/pull/45) (branch `fix/cargo-deny-advisories`). Semver lockfile updates (h2, rustls, rustls-webpki, tokio, webpki-root-certs, hyper, which drops `pin-utils`), `zip` 8 to 9 with no code change, and one `deny.toml` ignore (RUSTSEC-2024-0449, `unsafe-libyaml`, dev-only) for the owner to decide. Once merged, `cargo deny check` is green on main.
+   - The `cargo deny` advisories fix is in review: draft [#45](https://github.com/yuvaltal912-sys/Konnect/pull/45) (branch `fix/cargo-deny-advisories`). Semver lockfile updates (h2, rustls, rustls-webpki, tokio, webpki-root-certs, hyper, which drops `pin-utils`), `zip` 8 to 9 with no code change, and one `deny.toml` ignore (RUSTSEC-2024-0449, `unsafe-libyaml`, dev-only), which the owner chose to keep (2026-11-08). Once merged, `cargo deny check` is green on main.
 3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), LCSC import (rank 33).
 
 PR 13's rule editing, deletion and static expression workflow is complete within
