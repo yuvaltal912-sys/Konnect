@@ -56,6 +56,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Claim rule.** Pick a "Not started" row whose dependencies are all merged. Before writing code, push a first commit on your branch that changes that row's state to "In progress (branch `<name>`)" and open a draft PR, so no other agent takes it. For a partially integrated row, claim its continuation on a new branch and draft PR before implementation. If another row is "In progress", don't touch the code files it names.
 
+**In progress:** PR 15 follow-up, `run_design_review` reads a DRC baseline (only new findings count against the verdict), on branch `feat/creation-review-reads-baselines`. Files: `tools/design_review.rs`, `tools/check_baselines.rs`.
+
 **Recommended order**, after the owner approves the next implementation:
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
