@@ -62,6 +62,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35); the `cargo deny` advisories (its own PR).
 3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), LCSC import (rank 33).
 
+- Rank 35 (keep tests out of the real call log; one `write_all` per record): in progress (branch `feat/creation-call-log-isolation`). Don't touch `observability.rs` or the call-log wiring in `mcp/handler.rs`.
+
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
 later routing-profile expansion; unsupported rule semantics refuse export.
