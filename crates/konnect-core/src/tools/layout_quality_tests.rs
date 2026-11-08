@@ -36,7 +36,9 @@ fn run_with(f: &Fx, args: Value) -> Value {
     let result = audit(&f.board, &params).unwrap();
     assert!(!result.is_error, "{result:?}");
     match result.content.first() {
-        Some(crate::mcp::protocol::ToolContent::Text { text }) => serde_json::from_str(text).unwrap(),
+        Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+            serde_json::from_str(text).unwrap()
+        }
         other => panic!("expected text, got {other:?}"),
     }
 }
@@ -71,16 +73,26 @@ fn probe_boards() {
     let boards = std::env::var("LQ_PROBE_BOARDS").expect("LQ_PROBE_BOARDS");
     for path in boards.split(':').filter(|p| !p.is_empty()) {
         let dir = tempfile::tempdir().unwrap();
-        let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().to_string();
+        let name = std::path::Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let board = dir.path().join("b.kicad_pcb");
         std::fs::copy(path, &board).unwrap();
-        if let Some(pro) = std::path::Path::new(path).with_extension("kicad_pro").exists().then(|| std::path::Path::new(path).with_extension("kicad_pro")) {
+        if let Some(pro) = std::path::Path::new(path)
+            .with_extension("kicad_pro")
+            .exists()
+            .then(|| std::path::Path::new(path).with_extension("kicad_pro"))
+        {
             std::fs::copy(pro, dir.path().join("b.kicad_pro")).unwrap();
         }
         let started = std::time::Instant::now();
         let params = Params::from_args(&json!({})).unwrap_or_else(|_| panic!("args"));
         let result = audit(&board, &params).unwrap();
-        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else { panic!() };
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else {
+            panic!()
+        };
         let r: Value = serde_json::from_str(text).unwrap();
         if r["status"] != "checked" {
             println!("PROBE {name}: {}", r);
@@ -102,9 +114,16 @@ fn probe_boards() {
             started.elapsed().as_secs_f64(),
             text.len()
         );
-        println!("PROBE   metrics {}", serde_json::to_string(&r["metrics"]).unwrap());
+        println!(
+            "PROBE   metrics {}",
+            serde_json::to_string(&r["metrics"]).unwrap()
+        );
         if let Ok(out) = std::env::var("LQ_PROBE_OUT") {
-            std::fs::write(std::path::Path::new(&out).join(format!("{name}.json")), serde_json::to_string_pretty(&r).unwrap()).unwrap();
+            std::fs::write(
+                std::path::Path::new(&out).join(format!("{name}.json")),
+                serde_json::to_string_pretty(&r).unwrap(),
+            )
+            .unwrap();
         }
     }
 }
@@ -197,7 +216,9 @@ fn neck_intent(amps: f64) -> Value {
 }
 
 fn score(report: &Value, id: &str) -> f64 {
-    check(report, id)["score"].as_f64().unwrap_or_else(|| panic!("no score for {id}: {}", check(report, id)))
+    check(report, id)["score"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no score for {id}: {}", check(report, id)))
 }
 
 fn f_for<'a>(report: &'a Value, item: &str, needle: &str) -> Vec<&'a Value> {
@@ -246,9 +267,15 @@ fn a_track_over_a_plane_split_and_a_slot_is_measured_and_named() {
 #[test]
 fn a_looser_threshold_clears_the_split_finding() {
     let f = fx("plane_split.kicad_pcb", None, None);
-    let r = run_with(&f, json!({ "min_reference_coverage": 0.5, "max_void_run_mm": 20.0 }));
+    let r = run_with(
+        &f,
+        json!({ "min_reference_coverage": 0.5, "max_void_run_mm": 20.0 }),
+    );
     assert!(findings(&r, "3.1").is_empty());
-    assert_eq!(r["thresholds"]["min_reference_coverage"]["source"], "argument");
+    assert_eq!(
+        r["thresholds"]["min_reference_coverage"]["source"],
+        "argument"
+    );
     assert_eq!(r["thresholds"]["max_void_run_mm"]["value"], 20.0);
     assert_eq!(r["thresholds"]["sample_mm"]["source"], "default");
 }
@@ -258,9 +285,16 @@ fn zones_without_a_saved_fill_are_not_judged_as_voids() {
     let r = run(&fx_text(&without_fills("plane_split.kicad_pcb"), None));
     let c = check(&r, "3.1");
     assert_eq!(c["status"], "not_run", "{c}");
-    assert!(c["reason"].as_str().unwrap().contains("no saved fill"), "{c}");
+    assert!(
+        c["reason"].as_str().unwrap().contains("no saved fill"),
+        "{c}"
+    );
     assert!(findings(&r, "3.1").is_empty());
-    assert!(r["quality"]["not_scored"].as_array().unwrap().iter().any(|n| n["item"] == "3.1"));
+    assert!(r["quality"]["not_scored"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["item"] == "3.1"));
 }
 
 #[test]
@@ -275,7 +309,9 @@ fn a_layer_change_between_reference_planes_needs_a_stitching_via() {
     assert_eq!(score(&r, "3.2"), 0.5);
     let fs = findings(&r, "3.2");
     assert_eq!(fs.len(), 2, "{fs:?}");
-    assert!(fs.iter().all(|f| f["subject"].as_str().unwrap().starts_with("CLK_BARE")));
+    assert!(fs
+        .iter()
+        .all(|f| f["subject"].as_str().unwrap().starts_with("CLK_BARE")));
     let nearest = fs[0]["measured"]["nearest_stitch_mm"].as_f64().unwrap();
     assert!(nearest > 7.0, "{nearest}");
     assert_eq!(fs[0]["threshold"]["stitch_via_max_mm"], 3.0);
@@ -285,7 +321,10 @@ fn a_layer_change_between_reference_planes_needs_a_stitching_via() {
 
 #[test]
 fn a_wide_stitch_limit_accepts_a_distant_via() {
-    let r = run_with(&fx("layer_change.kicad_pcb", None, None), json!({ "stitch_via_max_mm": 30.0 }));
+    let r = run_with(
+        &fx("layer_change.kicad_pcb", None, None),
+        json!({ "stitch_via_max_mm": 30.0 }),
+    );
     assert!(findings(&r, "3.2").is_empty());
     assert_eq!(score(&r, "3.2"), 1.0);
 }
@@ -317,10 +356,22 @@ fn ground_cut_off_from_its_pads_is_an_error_and_a_floating_island_a_warning() {
     }
     stripped.push_str(rest);
     let r = run(&fx_text(&stripped, None));
-    let errors: Vec<_> = findings(&r, "3.3").into_iter().filter(|f| f["severity"] == "error").collect();
+    let errors: Vec<_> = findings(&r, "3.3")
+        .into_iter()
+        .filter(|f| f["severity"] == "error")
+        .collect();
     assert_eq!(errors.len(), 1, "{:?}", findings(&r, "3.3"));
-    assert!(errors[0]["issue"].as_str().unwrap().contains("separate copper groups"));
-    assert!(findings(&r, "3.3").iter().any(|f| f["severity"] == "warning" && f["issue"].as_str().unwrap().contains("touches no pad or via")));
+    assert!(errors[0]["issue"]
+        .as_str()
+        .unwrap()
+        .contains("separate copper groups"));
+    assert!(findings(&r, "3.3")
+        .iter()
+        .any(|f| f["severity"] == "warning"
+            && f["issue"]
+                .as_str()
+                .unwrap()
+                .contains("touches no pad or via")));
     assert!(score(&r, "3.3") < 0.5);
 }
 
@@ -360,10 +411,15 @@ fn a_tight_decoupling_loop_passes_and_a_large_one_is_measured_on_both_sides() {
 
 #[test]
 fn a_pin_with_no_capacitor_in_range_is_named() {
-    let r = run_with(&fx("decoupling.kicad_pcb", None, None), json!({ "decap_search_mm": 1.0 }));
+    let r = run_with(
+        &fx("decoupling.kicad_pcb", None, None),
+        json!({ "decap_search_mm": 1.0 }),
+    );
     let fs = findings(&r, "4.1");
     assert_eq!(fs.len(), 2, "{fs:?}");
-    assert!(fs.iter().all(|f| f["issue"].as_str().unwrap().contains("no capacitor")));
+    assert!(fs
+        .iter()
+        .all(|f| f["issue"].as_str().unwrap().contains("no capacitor")));
     assert_eq!(score(&r, "4.1"), 0.0);
     assert_eq!(check(&r, "4.1")["metrics"]["pins_without_capacitor"], 2);
 }
@@ -382,13 +438,22 @@ fn a_neck_down_on_a_recorded_current_is_found_where_it_is() {
     assert!((0.1..0.35).contains(&w), "{w}");
     assert!(f["threshold"]["required_mm"].as_f64().unwrap() > 1.3);
     assert_eq!(f["threshold"]["current_from"], "currents");
-    let (x, y) = (f["at"]["x"].as_f64().unwrap(), f["at"]["y"].as_f64().unwrap());
-    assert!((24.5..28.5).contains(&x) && (9.0..11.0).contains(&y), "{x},{y}");
+    let (x, y) = (
+        f["at"]["x"].as_f64().unwrap(),
+        f["at"]["y"].as_f64().unwrap(),
+    );
+    assert!(
+        (24.5..28.5).contains(&x) && (9.0..11.0).contains(&y),
+        "{x},{y}"
+    );
     assert!(!f["uuids"].as_array().unwrap().is_empty());
     // The wide net is clean and measured at about its 2 mm.
     let paths = c["metrics"]["paths"].as_array().unwrap();
     let wide = paths.iter().find(|p| p["net"] == "P5V_WIDE").unwrap();
-    assert!((1.8..2.3).contains(&wide["narrowest_mm"].as_f64().unwrap()), "{wide}");
+    assert!(
+        (1.8..2.3).contains(&wide["narrowest_mm"].as_f64().unwrap()),
+        "{wide}"
+    );
     assert!(score(&r, "4.3") < 1.0);
     // The existing current audit is reused: same net, an error naming the segment's UUID.
     let sizing = findings(&r, "4.2");
@@ -400,7 +465,10 @@ fn a_neck_down_on_a_recorded_current_is_found_where_it_is() {
 
 #[test]
 fn a_small_current_needs_no_neck_down_finding() {
-    let r = run_with(&fx("neck_down.kicad_pcb", Some(neck_intent(0.3)), None), json!({ "bottleneck_min_current_a": 0.1 }));
+    let r = run_with(
+        &fx("neck_down.kicad_pcb", Some(neck_intent(0.3)), None),
+        json!({ "bottleneck_min_current_a": 0.1 }),
+    );
     assert_eq!(check(&r, "4.3")["status"], "checked");
     assert!(findings(&r, "4.3").is_empty(), "{:?}", findings(&r, "4.3"));
     assert!(findings(&r, "4.2").is_empty());
@@ -413,7 +481,11 @@ fn without_a_record_the_current_checks_say_why_they_did_not_run() {
     for id in ["4.2", "4.3", "3.4"] {
         let c = check(&r, id);
         assert_eq!(c["status"], "not_run", "{id}: {c}");
-        assert!(c["reason"].as_str().unwrap().contains("current") || c["reason"].as_str().unwrap().contains("design-intent"), "{c}");
+        assert!(
+            c["reason"].as_str().unwrap().contains("current")
+                || c["reason"].as_str().unwrap().contains("design-intent"),
+            "{c}"
+        );
         assert!(c["score"].is_null());
     }
 }
@@ -429,7 +501,10 @@ fn a_bucks_input_loop_is_measured_and_the_far_capacitor_is_flagged() {
     let n1 = nodes.iter().find(|n| n["switch_net"] == "SW1").unwrap();
     let n2 = nodes.iter().find(|n| n["switch_net"] == "SW2").unwrap();
     assert_eq!(n1["topology"], "buck");
-    assert!(n1["topology_basis"].as_str().unwrap().contains("supplied by U1"));
+    assert!(n1["topology_basis"]
+        .as_str()
+        .unwrap()
+        .contains("supplied by U1"));
     assert!(n1["loop"]["loop_mm"].as_f64().unwrap() < 8.0);
     assert!(n2["loop"]["loop_mm"].as_f64().unwrap() > 25.0);
     assert_eq!(n1["loop"]["capacitor"], "C11");
@@ -441,7 +516,9 @@ fn a_bucks_input_loop_is_measured_and_the_far_capacitor_is_flagged() {
     assert!(fs[0]["issue"].as_str().unwrap().contains("input loop"));
     assert_eq!(score(&r, "8.1"), 0.5);
     // The same pin is also an ordinary decoupling finding, not a second hot-loop one.
-    assert!(findings(&r, "4.1").iter().any(|f| f["subject"].as_str().unwrap().starts_with("U2.1")));
+    assert!(findings(&r, "4.1")
+        .iter()
+        .any(|f| f["subject"].as_str().unwrap().starts_with("U2.1")));
 }
 
 #[test]
@@ -450,8 +527,19 @@ fn an_undecided_topology_is_needs_human_and_an_argument_decides_it() {
     let r = run(&f);
     let c = check(&r, "8.1");
     assert_eq!(c["status"], "not_run", "{c}");
-    assert!(r["needs_human"].as_array().unwrap().iter().any(|n| n["item"] == "8.1" && n["why"].as_str().unwrap().contains("topology not determined")));
-    let r = run_with(&f, json!({ "switching_regulators": [{ "switch_net": "SW1", "topology": "buck" }, { "switch_net": "SW2", "topology": "buck" }] }));
+    assert!(r["needs_human"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["item"] == "8.1"
+            && n["why"]
+                .as_str()
+                .unwrap()
+                .contains("topology not determined")));
+    let r = run_with(
+        &f,
+        json!({ "switching_regulators": [{ "switch_net": "SW1", "topology": "buck" }, { "switch_net": "SW2", "topology": "buck" }] }),
+    );
     assert_eq!(check(&r, "8.1")["status"], "checked");
     assert_eq!(findings(&r, "8.1").len(), 1);
 }
@@ -465,7 +553,10 @@ fn switch_node_copper_and_a_feedback_route_beside_it_are_measured() {
     let a1 = nodes.iter().find(|n| n["switch_net"] == "SW1").unwrap();
     let a2 = nodes.iter().find(|n| n["switch_net"] == "SW2").unwrap();
     // 6.5 mm × 0.8 mm track plus the pads: about 6.5 mm².
-    assert!((5.0..9.0).contains(&a1["copper_area_mm2"].as_f64().unwrap()), "{a1}");
+    assert!(
+        (5.0..9.0).contains(&a1["copper_area_mm2"].as_f64().unwrap()),
+        "{a1}"
+    );
     // Feedback found from the pin called FB; far from the node on U1, 0.4 mm from it on U2.
     assert_eq!(a1["feedback_nets"][0]["net"], "FB1");
     assert!(a1["feedback_min_gap_mm"].as_f64().unwrap() > 2.0);
@@ -476,13 +567,25 @@ fn switch_node_copper_and_a_feedback_route_beside_it_are_measured() {
     assert_eq!(fs[0]["threshold"]["min_switch_feedback_gap_mm"], 1.0);
     assert!(!fs[0]["uuids"].as_array().unwrap().is_empty());
     // A tighter area limit flags the copper itself.
-    let r = run_with(&fx("buck.kicad_pcb", Some(buck_intent()), None), json!({ "max_switch_node_area_mm2": 3.0 }));
-    assert_eq!(findings(&r, "8.2").iter().filter(|f| f["measured"].get("copper_area_mm2").is_some()).count(), 2);
+    let r = run_with(
+        &fx("buck.kicad_pcb", Some(buck_intent()), None),
+        json!({ "max_switch_node_area_mm2": 3.0 }),
+    );
+    assert_eq!(
+        findings(&r, "8.2")
+            .iter()
+            .filter(|f| f["measured"].get("copper_area_mm2").is_some())
+            .count(),
+        2
+    );
 }
 
 #[test]
 fn a_generous_hot_loop_limit_clears_the_finding() {
-    let r = run_with(&fx("buck.kicad_pcb", Some(buck_intent()), None), json!({ "hot_loop_max_mm": 100.0, "hot_loop_max_area_mm2": 500.0 }));
+    let r = run_with(
+        &fx("buck.kicad_pcb", Some(buck_intent()), None),
+        json!({ "hot_loop_max_mm": 100.0, "hot_loop_max_area_mm2": 500.0 }),
+    );
     assert!(findings(&r, "8.1").is_empty());
     assert!(score(&r, "8.1") > 0.9);
 }
@@ -495,15 +598,27 @@ fn detours_vias_and_stubs_are_measured_against_the_pin_to_pin_tree() {
     let c = check(&r, "5.1");
     assert_eq!(c["status"], "checked", "{c}");
     let rows = c["metrics"]["worst_detours"].as_array().unwrap();
-    let row = |n: &str| rows.iter().find(|r| r["net"] == n).unwrap_or_else(|| panic!("{n}: {rows:?}"));
+    let row = |n: &str| {
+        rows.iter()
+            .find(|r| r["net"] == n)
+            .unwrap_or_else(|| panic!("{n}: {rows:?}"))
+    };
     let d = row("N_DETOUR");
-    assert!((2.9..3.1).contains(&d["detour_ratio"].as_f64().unwrap()), "{d}");
+    assert!(
+        (2.9..3.1).contains(&d["detour_ratio"].as_f64().unwrap()),
+        "{d}"
+    );
     assert_eq!(d["vias"], 2);
     assert_eq!(row("N_STUB")["dangling_ends"], 1);
     assert!((0.99..1.01).contains(&row("N_CLEAN")["detour_ratio"].as_f64().unwrap()));
     let fs = findings(&r, "5.1");
     let subjects: Vec<&str> = fs.iter().map(|f| f["subject"].as_str().unwrap()).collect();
-    assert!(subjects.contains(&"N_DETOUR") && subjects.contains(&"N_STUB") && subjects.contains(&"N_CORNER"), "{subjects:?}");
+    assert!(
+        subjects.contains(&"N_DETOUR")
+            && subjects.contains(&"N_STUB")
+            && subjects.contains(&"N_CORNER"),
+        "{subjects:?}"
+    );
     assert!(!subjects.contains(&"N_CLEAN"));
     let stub = fs.iter().find(|f| f["subject"] == "N_STUB").unwrap();
     assert_eq!(stub["measured"]["dangling_ends"], 1);
@@ -531,10 +646,15 @@ fn acute_corners_reuse_the_acid_trap_check_and_right_angles_are_counted() {
     assert_eq!(m["acute_corners"], 1, "{m}");
     assert_eq!(m["acute_found_by_this_scan"], 1, "the two scans agree: {m}");
     assert!(m["right_angle_corners"].as_u64().unwrap() >= 6);
-    let acute = findings(&r, "5.3").into_iter().find(|f| f["issue"].as_str().unwrap().starts_with("Acid trap")).unwrap();
+    let acute = findings(&r, "5.3")
+        .into_iter()
+        .find(|f| f["issue"].as_str().unwrap().starts_with("Acid trap"))
+        .unwrap();
     assert_eq!(acute["subject"], "N_CORNER");
     assert_eq!(acute["severity"], "warning");
-    assert!(findings(&r, "5.3").iter().any(|f| f["severity"] == "info" && f["issue"].as_str().unwrap().starts_with("Right-angle")));
+    assert!(findings(&r, "5.3").iter().any(
+        |f| f["severity"] == "info" && f["issue"].as_str().unwrap().starts_with("Right-angle")
+    ));
 }
 
 #[test]
@@ -548,12 +668,21 @@ fn a_pair_that_drifts_apart_is_flagged_and_a_constant_gap_pair_is_not() {
     assert!(good["coupled_fraction"].as_f64().unwrap() > 0.95, "{good}");
     assert!(bad["coupled_fraction"].as_f64().unwrap() < 0.5, "{bad}");
     assert_eq!(good["source"], "name heuristic");
-    let fs: Vec<_> = findings(&r, "5.4").into_iter().filter(|f| f["severity"] == "warning").collect();
+    let fs: Vec<_> = findings(&r, "5.4")
+        .into_iter()
+        .filter(|f| f["severity"] == "warning")
+        .collect();
     assert_eq!(fs.len(), 1, "{fs:?}");
     assert!(fs[0]["subject"].as_str().unwrap().starts_with("DB_P"));
     // Length mismatch is information only: matching needs the interface's skew limit.
-    assert!(findings(&r, "5.4").iter().any(|f| f["severity"] == "info" && f["subject"].as_str().unwrap().ends_with("length")));
-    assert!(r["needs_human"].as_array().unwrap().iter().any(|n| n["item"] == "5.5"));
+    assert!(findings(&r, "5.4")
+        .iter()
+        .any(|f| f["severity"] == "info" && f["subject"].as_str().unwrap().ends_with("length")));
+    assert!(r["needs_human"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["item"] == "5.5"));
 }
 
 #[test]
@@ -589,9 +718,17 @@ fn without_any_record_every_long_signal_is_judged_and_it_is_stated() {
     let r = run(&fx("neck_down.kicad_pcb", None, None));
     assert_eq!(r["net_roles"]["design_intent"], "absent");
     assert_eq!(r["net_roles"]["critical_basis"], "fallback_all_signals");
-    let why = r["net_roles"]["critical"]["nets"]["P5V_NECK"].as_str().unwrap_or("");
-    assert!(why.starts_with("fallback") || r["net_roles"]["critical"]["count"].as_u64().unwrap() == 0, "{why}");
-    let r = run_with(&fx("plane_split.kicad_pcb", None, None), json!({ "signal_scope": "all_signals" }));
+    let why = r["net_roles"]["critical"]["nets"]["P5V_NECK"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        why.starts_with("fallback") || r["net_roles"]["critical"]["count"].as_u64().unwrap() == 0,
+        "{why}"
+    );
+    let r = run_with(
+        &fx("plane_split.kicad_pcb", None, None),
+        json!({ "signal_scope": "all_signals" }),
+    );
     assert_eq!(r["net_roles"]["critical_basis"], "all_signals");
 }
 
@@ -602,7 +739,10 @@ fn a_board_with_nets_left_unrouted_scores_below_the_routed_one() {
     assert_eq!(full["completion"]["complete"], true);
     assert_eq!(open["completion"]["complete"], false);
     assert!(open["completion"]["unrouted_nets"].as_u64().unwrap() >= 10);
-    let (a, b) = (full["quality"]["score"].as_f64().unwrap(), open["quality"]["score"].as_f64().unwrap());
+    let (a, b) = (
+        full["quality"]["score"].as_f64().unwrap(),
+        open["quality"]["score"].as_f64().unwrap(),
+    );
     assert!(b < a * 0.5, "routed {a}, stripped {b}");
     assert!(open["summary"].as_str().unwrap().contains("INCOMPLETE"));
     assert!(open["quality"]["routed_share"].as_f64().unwrap() < 0.2);
@@ -612,12 +752,21 @@ fn a_board_with_nets_left_unrouted_scores_below_the_routed_one() {
 fn good_routing_scores_above_poor_routing_of_the_same_kind() {
     // Same checks, same thresholds: the tight buck beats the loose one, per pin and per node.
     let r = run(&fx("buck.kicad_pcb", Some(buck_intent()), None));
-    let pins = check(&r, "4.1")["metrics"]["pins"].as_array().unwrap().clone();
-    let loop_of = |p: &str| pins.iter().find(|x| x["pin"] == p).unwrap()["loop"]["loop_mm"].as_f64().unwrap();
+    let pins = check(&r, "4.1")["metrics"]["pins"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let loop_of = |p: &str| {
+        pins.iter().find(|x| x["pin"] == p).unwrap()["loop"]["loop_mm"]
+            .as_f64()
+            .unwrap()
+    };
     assert!(loop_of("U1.1") * 4.0 < loop_of("U2.1"));
     assert!(r["quality"]["score"].as_f64().unwrap() > 0.0);
     let cats = r["quality"]["categories"].as_array().unwrap();
-    assert!(cats.iter().all(|c| c["score"].is_null() || (0.0..=100.0).contains(&c["score"].as_f64().unwrap())));
+    assert!(cats
+        .iter()
+        .all(|c| c["score"].is_null() || (0.0..=100.0).contains(&c["score"].as_f64().unwrap())));
     assert!(r["quality"]["weight_measured"].as_f64().unwrap() <= 1.0);
 }
 
@@ -633,7 +782,11 @@ fn every_threshold_is_listed_with_its_source_and_every_finding_names_its_item() 
         assert!(f["measured"].is_object(), "{f}");
         assert!(f["threshold"].is_object(), "{f}");
     }
-    assert!(r["needs_human"].as_array().unwrap().iter().any(|n| n["item"] == "11"));
+    assert!(r["needs_human"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["item"] == "11"));
     assert!(r["not_measured"].as_array().unwrap().len() >= 3);
 }
 
@@ -658,9 +811,15 @@ fn the_tool_is_registered_with_a_schema_that_forbids_unknown_arguments() {
     assert_eq!(defs.len(), 1);
     let t = &defs[0];
     assert_eq!(t.name, "audit_layout_quality");
-    assert!(t.input_validator.is_valid(&json!({ "board": "x.kicad_pcb" })));
-    assert!(!t.input_validator.is_valid(&json!({ "board": "x.kicad_pcb", "surprise": 1 })));
-    assert!(!t.input_validator.is_valid(&json!({ "board": "x.kicad_pcb", "sample_mm": 99 })));
+    assert!(t
+        .input_validator
+        .is_valid(&json!({ "board": "x.kicad_pcb" })));
+    assert!(!t
+        .input_validator
+        .is_valid(&json!({ "board": "x.kicad_pcb", "surprise": 1 })));
+    assert!(!t
+        .input_validator
+        .is_valid(&json!({ "board": "x.kicad_pcb", "sample_mm": 99 })));
     assert!(!t.input_validator.is_valid(&json!({})));
     for Knob(name, ..) in KNOBS {
         assert!(t.input_schema["properties"].get(*name).is_some(), "{name}");
@@ -672,7 +831,10 @@ fn a_missing_file_is_an_error_and_a_board_without_copper_layers_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let p = Params::from_args(&json!({})).unwrap_or_else(|_| panic!());
     assert!(audit(&dir.path().join("nope.kicad_pcb"), &p).is_err());
-    let f = fx_text("(kicad_pcb (version 20260206) (layers (25 \"Edge.Cuts\" user)))", None);
+    let f = fx_text(
+        "(kicad_pcb (version 20260206) (layers (25 \"Edge.Cuts\" user)))",
+        None,
+    );
     let r = run(&f);
     assert_eq!(r["status"], "not_run");
     assert!(r["reason"].as_str().unwrap().contains("no copper layers"));
@@ -686,13 +848,24 @@ fn name_rules_find_ground_power_and_critical_nets() {
         assert!(ground_by_name(g), "{g}");
         assert!(!power_by_name(g), "{g}");
     }
-    for p in ["+3V3", "5V", "12V", "/sheet/+1V8", "VCC", "VDD_IO", "VBUS", "VIN"] {
+    for p in [
+        "+3V3",
+        "5V",
+        "12V",
+        "/sheet/+1V8",
+        "VCC",
+        "VDD_IO",
+        "VBUS",
+        "VIN",
+    ] {
         assert!(power_by_name(p), "{p}");
     }
     for n in ["SDA", "N_CLEAN", "CLK_OK", "TX", "VREF_NEG", "GATE1"] {
         assert!(!ground_by_name(n), "{n}");
     }
-    assert!(critical_by_name("/mcu/SPI_SCLK") && critical_by_name("USB_DP") && !critical_by_name("SDA"));
+    assert!(
+        critical_by_name("/mcu/SPI_SCLK") && critical_by_name("USB_DP") && !critical_by_name("SDA")
+    );
     assert!(glob("N_*", "N_CLEAN") && glob("A?C", "ABC") && !glob("N_*", "X_N"));
 }
 
@@ -720,8 +893,14 @@ fn the_raster_measures_widths_lengths_and_components() {
     let (_, count) = g.components();
     assert_eq!(count, 2);
     let dt = g.distance_transform();
-    let from = g.cells_under(&konnect_sexp::board_geometry::Shape::disc((3.0, 5.0), 0.3), &[0]);
-    let to = g.cells_under(&konnect_sexp::board_geometry::Shape::disc((37.0, 5.0), 0.3), &[0]);
+    let from = g.cells_under(
+        &konnect_sexp::board_geometry::Shape::disc((3.0, 5.0), 0.3),
+        &[0],
+    );
+    let to = g.cells_under(
+        &konnect_sexp::board_geometry::Shape::disc((37.0, 5.0), 0.3),
+        &[0],
+    );
     let p = shortest_path(&g, &from, &to, 0.5).unwrap();
     assert!((p.length_mm - 34.0).abs() < 0.6, "{}", p.length_mm);
     let w = widest_path(&g, &dt, &from, &to, &[1.0], &[]).unwrap();
@@ -729,7 +908,22 @@ fn the_raster_measures_widths_lengths_and_components() {
     assert!((w.at.0 - 20.0).abs() < 2.4, "{:?}", w.at);
     // A ring with a bridged hole fills by the even-odd rule.
     let mut h = Grid::new((0.0, 0.0, 12.0, 12.0), 0.1, vec!["F.Cu".into()]);
-    h.add_ring(0, &[(1.0, 1.0), (11.0, 1.0), (11.0, 11.0), (1.0, 11.0), (1.0, 6.0), (4.0, 4.0), (4.0, 8.0), (1.0, 6.0)]);
-    assert!(h.area_mm2() > 80.0 && h.area_mm2() < 100.0, "{}", h.area_mm2());
+    h.add_ring(
+        0,
+        &[
+            (1.0, 1.0),
+            (11.0, 1.0),
+            (11.0, 11.0),
+            (1.0, 11.0),
+            (1.0, 6.0),
+            (4.0, 4.0),
+            (4.0, 8.0),
+            (1.0, 6.0),
+        ],
+    );
+    assert!(
+        h.area_mm2() > 80.0 && h.area_mm2() < 100.0,
+        "{}",
+        h.area_mm2()
+    );
 }
-

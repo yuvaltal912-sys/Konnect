@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged, and so are #45 (`cargo deny` green, one owner-kept ignore), #46 (call log isolation, rank 35), #47 (the review reads a DRC baseline) and #44 (PR 16: Specctra DSN for real boards; Freerouting 2.5.0 routed all 9 exporting KiCad demo boards through the strict import planner). Open for review: #48–#54 (see below). Catalogue on main: 259 registered tools plus 7 meta-tools. GitHub merges use the noreply author (see Known traps). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged, and so are #45 (`cargo deny` green, one owner-kept ignore), #46 (call log isolation, rank 35), #47 (the review reads a DRC baseline) and #44 (PR 16: Specctra DSN for real boards; Freerouting 2.5.0 routed all 9 exporting KiCad demo boards through the strict import planner). Open for review: #48–#54 (see below). Catalogue on main: 260 registered tools plus 7 meta-tools. GitHub merges use the noreply author (see Known traps). The installed binary remains protected.
 
 ## Start here
 
@@ -60,7 +60,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Owner direction (2026-11-08):** routing quality on boards like the owner's (power and mixed-signal, roughly 30–150 parts, 2–4 layers, pours, high-current nets) matters more than completing very large boards. Measure wirelength against the HPWL bound, vias and layer changes per net, 90° and acute corners, width compliance per net class and design-intent current, and DRC after a refill; completion is only a gate.
 
-**Layout quality audit: In progress (branch `feat/layout-quality-audit`).** A read-only `audit_layout_quality(board)` that scores a routed board against the owner's layout checklist (return paths, decoupling loops, hot loops, vias and detours, corners, current sizing), so a routing loop can compare runs. New module `tools/layout_quality.rs` only; one registration line in `design_review::tools()`. Don't touch these files.
+**Layout quality audit: In progress (branch `feat/layout-quality-audit`, draft [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56)).** Implemented and verified (see its section below); waiting for owner review. Files it owns: `tools/layout_quality*.rs`, `tests/fixtures/layout_quality/`, the registration line in `design_review::tools()` and its `tool_count` in `router/registry.rs`; `trace_current.rs` only gained `pub(crate)` on its sizing helpers.
 
 **Recommended next**, after the owner approves:
 
@@ -87,6 +87,41 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
 - Under heavy machine load (several sessions running tests at once, load average above 30) the IPC mock tests in `pcb_sync` and `custom_rule_tests` time out (`GetOpenDocuments … Timed out`). They pass alone; rerun them before calling a gate red.
 - Freerouting 2.5.0 needs Java 25 (class file 69); Java 21 fails with `UnsupportedClassVersionError`.
+
+## Layout quality audit (draft, #56)
+
+`audit_layout_quality(board, …)`: the measuring stick for "optimal" routing, in the `design_review` toolset (8 tools now; 260 + 7 meta). Read-only, from the saved board file (zone fills are read, so refill and save first). Code in `tools/layout_quality.rs` (tool, thresholds, net roles, scoring) with `_grid` (a raster of one net's copper: connectivity, area, shortest and widest paths), `_planes` (§3), `_power` (§4, §8) and `_routing` (§5, completion); tests in `layout_quality_tests.rs` over six boards `pcbnew` wrote (`tests/fixtures/layout_quality/`, `make_fixtures.py` regenerates them with KiCad 10.0.8's own Python).
+
+**Measured**, each as a finding that names the checklist item, the measured value, the threshold and UUIDs:
+
+| Item | Measure |
+|---|---|
+| 3.1 | Critical track length over the saved ground fill on the adjacent layer; stretches over voids, slots and other-net planes (splits) |
+| 3.2 | Signal vias that change reference plane, and the nearest ground via spanning both planes (or a capacitor between two different planes) |
+| 3.3 | Ground pad groups (cut-off pads) and floating islands |
+| 3.4 / 4.3 | Narrowest section on the best copper path from each rail's source to its loads, and on the ground return, against the IPC-2221 width for the recorded current |
+| 4.1 | Per IC supply pin: capacitor → pin → ground → capacitor copper path length and plan-view area, ground side included |
+| 4.2 | `audit_trace_current` reused as is; its findings are re-emitted under 4.2 |
+| 5.1 | Routed length over the pin-to-pin spanning tree (HPWL also reported), vias per connection, dangling track ends; nets carried by a pour have no ratio |
+| 5.2 | Same-layer parallel runs of unrelated signals (tighter around critical nets and switch nodes) |
+| 5.3 | Acute corners (PR 11's acid-trap check, reused) and 90° bends |
+| 5.4 | Differential pairs: coupled fraction, gap spread, via count, reference plane, dangling ends; length mismatch as information |
+| 8.1 | A buck's input loop or boost's output loop, IC-integrated or discrete (topology from the record's rail `source_ref`, else the `switching_regulators` argument, else `needs_human`) |
+| 8.2 | Switch-node copper area and the clearance of feedback routes from it (pins named FB/VFB/ADJ/SENSE/COMP, or `feedback_nets`) |
+
+**`needs_human`** (listed in the result): impedance from the stackup, rise-time and termination questions, capacitor DC-bias and ESR, intentional cuts, isolation and antenna keepouts, gate-drive, Kelvin and recirculation paths, length matching, and everything in §11.
+
+**Roles.** Ground, power and critical nets come from the design-intent record (rails at 0 V are ground; interfaces and differential pairs are critical), netclasses (name patterns) and the arguments, then net names; `net_roles` gives the source of each. With nothing recorded, every signal net over 5 mm is judged and `critical_basis` says `fallback_all_signals`.
+
+**Score.** Every check scores 0..1 against its stated threshold (the loop checks full marks up to half the limit, 0.5 at the limit, 0 at twice it); categories are weighted means (return path 0.25, decoupling and current 0.25, switching loops 0.15, routing 0.35); `quality.copper_quality` is the weighted mean of the categories that measured something, `quality.weight_measured` says how much of the weight that is, and `quality.score` is `copper_quality` times the share of multi-pad nets that are routed, so a board with nets left open cannot out-score one that routed them. `metrics` holds the flat numbers a loop compares (`3.1.reference_coverage`, `4.1.worst_loop_mm`, `5.1.wire_to_hpwl`, …). Thresholds are arguments (defaults in `thresholds`, with `source`); compare runs only with the same thresholds, net roles and completion.
+
+**Limits, said in the result.** Raster lengths and widths are good to about one cell (0.1 mm, coarser on very large boards); loop areas are plan-view, not 3-D inductance; a neck-down search judges the best single path and does not sum parallel copper; broadside coupling between layers is not measured; boards whose zones are not saved filled are not judged (the check says so); a topology the record cannot decide is not guessed.
+
+**Verified on macOS (2026-11-08).** The gate (fmt; 3796 lib and integration tests, 0 failures; doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts`; release build; installed binary SHA-256 still `3de188bb775ab4ce`; `simulation_live` skipped, not touched). A stdio run of the release binary through real dispatch (`load_toolset` design_review, then the tool, then an unknown argument refused). 31 unit tests over the six fixtures: a track over a plane split and a slot (64% over ground, 14 mm over the 3V3 region, the slot found), a missing stitching via (2 of 4 layer changes covered), a 3.8 mm against a 44 mm decoupling loop with the ground leg 23 mm of the excess, a 0.2 mm neck on a 3 A rail found at x 25–28 within one raster step, a buck whose far input capacitor makes a 31 mm hot loop against 5.5 mm, a feedback route 0.4 mm from its switch node, detours, stubs, parallel runs, acute and right-angle corners, a drifting differential pair, ground cut off from its pads, zones without a fill, nets left unrouted, refusals, and the raster itself. Negative controls (break, see a test fail, restore): any fill counted as ground, stitching always satisfied, the ground side left out of the loop, completion not weighed, the acid-trap check not reused, dangling ends never found. Cross-check against KiCad's own DRC on a real 2-layer project (5 states of one board): the audit's open ground nets ordered the four routed states as KiCad's unconnected-item counts did (0, 6, 9, 20), and the unrouted copy scores 0. Run over the 16 KiCad demo boards: 15 audited in 0.0–7.8 s each, one demo file (`RoyalBlue54L-Feather`) yields no copper-layer table to the parser and is reported `not_run`; stripping one demo's routing (61 nets open) moves its score from 64 to 15.
+
+**Not verified.** A live KiCad (the audit reads the file); a board with recorded currents and rails other than the fixtures; `simulation_live` (not touched); Windows and Linux. No datasheet, simulation or bench input is used, by design.
+
+**Follow-ups.** Shipping skill guidance (`kicad-review`, `kicad-pcb`) that says when to call it; a routing loop that runs it on each Freerouting result and keeps the best; IPC-2152 derating and pour capacity in 4.2; a 3-D loop inductance estimate from the stackup; hatched-fill and keepout-aware reference checks.
 
 ## PR 16, Specctra DSN for real boards (merged, #44)
 

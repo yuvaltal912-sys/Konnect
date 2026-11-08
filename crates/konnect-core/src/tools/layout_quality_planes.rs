@@ -100,14 +100,18 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                     let n = ((len / sample).ceil() as usize).max(1);
                     for k in 0..n {
                         let t = (k as f64 + 0.5) / n as f64;
-                        out.push((w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t));
+                        out.push((
+                            w[0].0 + (w[1].0 - w[0].0) * t,
+                            w[0].1 + (w[1].1 - w[0].1) * t,
+                        ));
                     }
                 }
                 out
             };
             // Pick the adjacent layer with the most copper of a plane under the net's tracks here.
             let mut best: Option<(usize, usize)> = None; // (layer, hits)
-            let all_samples: Vec<(usize, Vec<Pt>)> = segs.iter().map(|&s| (s, samples(s))).collect();
+            let all_samples: Vec<(usize, Vec<Pt>)> =
+                segs.iter().map(|&s| (s, samples(s))).collect();
             for &a in &adj {
                 let hits: usize = all_samples
                     .iter()
@@ -121,14 +125,18 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                         })
                     })
                     .count();
-                if best.map_or(true, |(_, h)| hits > h) {
+                if best.is_none_or(|(_, h)| hits > h) {
                     best = Some((a, hits));
                 }
             }
-            let Some((ref_layer, hits)) = best else { continue };
+            let Some((ref_layer, hits)) = best else {
+                continue;
+            };
             // Zones that exist but carry no saved fill: the answer is unknown, not "void".
             let unfilled_here = m.unfilled.iter().find(|z| {
-                z.layers.iter().any(|zl| adj.iter().any(|a| &m.layers[*a] == zl))
+                z.layers
+                    .iter()
+                    .any(|zl| adj.iter().any(|a| &m.layers[*a] == zl))
             });
             if hits == 0 {
                 if let Some(z) = unfilled_here {
@@ -226,8 +234,16 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
         if net_len == 0.0 {
             continue;
         }
-        let void_mm: f64 = runs.iter().filter(|r| r.kind == "void").map(|r| r.len).sum();
-        let other_mm: f64 = runs.iter().filter(|r| r.kind == "other_net_plane").map(|r| r.len).sum();
+        let void_mm: f64 = runs
+            .iter()
+            .filter(|r| r.kind == "void")
+            .map(|r| r.len)
+            .sum();
+        let other_mm: f64 = runs
+            .iter()
+            .filter(|r| r.kind == "other_net_plane")
+            .map(|r| r.len)
+            .sum();
         let longest = runs.iter().map(|r| r.len).fold(0.0, f64::max);
         let coverage = net_cov / net_len;
         total_len += net_len;
@@ -257,7 +273,11 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                     }
                 }
             }
-            let worst = runs.iter().max_by(|a, b| a.len.partial_cmp(&b.len).unwrap_or(std::cmp::Ordering::Equal));
+            let worst = runs.iter().max_by(|a, b| {
+                a.len
+                    .partial_cmp(&b.len)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let what = worst.map(|w| match &w.other_net {
                 Some(n) => format!("{:.1} mm over the '{n}' plane (a split)", w.len),
                 None => format!("{:.1} mm over a void or slot", w.len),
@@ -293,11 +313,19 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
         o.metrics = json!({ "cannot_judge": cannot });
         return (o, refs);
     }
-    let coverage = if total_len > 0.0 { total_cov / total_len } else { 1.0 };
+    let coverage = if total_len > 0.0 {
+        total_cov / total_len
+    } else {
+        1.0
+    };
     out.score = Some(coverage);
     if !cannot.is_empty() {
         out.status = "partial";
-        out.reason = Some(format!("{} net/layer pair(s) not judged: {}", cannot.len(), cannot.join("; ")));
+        out.reason = Some(format!(
+            "{} net/layer pair(s) not judged: {}",
+            cannot.len(),
+            cannot.join("; ")
+        ));
     }
     out.needs_human.push((
         "3.1",
@@ -351,15 +379,21 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
                 let Some(l) = t.layers.first().and_then(|l| m.layer_ix(l)) else {
                     continue;
                 };
-                let (a, b) = (t.shape.pts[0], *t.shape.pts.last().unwrap_or(&t.shape.pts[0]));
-                if dist(a, v.at) <= reach + t.shape.radius || dist(b, v.at) <= reach + t.shape.radius {
+                let (a, b) = (
+                    t.shape.pts[0],
+                    *t.shape.pts.last().unwrap_or(&t.shape.pts[0]),
+                );
+                if dist(a, v.at) <= reach + t.shape.radius
+                    || dist(b, v.at) <= reach + t.shape.radius
+                {
                     layers.insert(l);
                 }
             }
             // A pad under the via (via-in-pad) is the other layer of the change.
             for &pi in m.pads.get(net.as_str()).into_iter().flatten() {
                 let pad = m.pad(pi).1;
-                if !pad.through_hole && dist(pad.at, v.at) <= pad.size.0.max(pad.size.1) / 2.0 + 0.1 {
+                if !pad.through_hole && dist(pad.at, v.at) <= pad.size.0.max(pad.size.1) / 2.0 + 0.1
+                {
                     layers.extend(m.pad_layers(pad));
                 }
             }
@@ -368,8 +402,10 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
             }
             evaluated += 1;
             let layers: Vec<usize> = layers.into_iter().collect();
-            let choices: Vec<Option<&RefChoice>> =
-                layers.iter().map(|l| refs.get(&(net.to_string(), *l))).collect();
+            let choices: Vec<Option<&RefChoice>> = layers
+                .iter()
+                .map(|l| refs.get(&(net.to_string(), *l)))
+                .collect();
             if choices.iter().any(Option::is_none) {
                 unknown += 1;
                 continue;
@@ -379,7 +415,8 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
             if ref_layers.len() < 2 {
                 continue; // the same plane on both sides: the return current just continues
             }
-            let ref_nets: BTreeSet<&str> = choices.iter().filter_map(|c| c.net.as_deref()).collect();
+            let ref_nets: BTreeSet<&str> =
+                choices.iter().filter_map(|c| c.net.as_deref()).collect();
             if choices.iter().any(|c| c.net.is_none()) {
                 unknown += 1;
                 continue;
@@ -395,7 +432,7 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
                     if let Some((a, b)) = m.via_span(g) {
                         if a <= lo && b >= hi {
                             let d = dist(g.at, v.at);
-                            if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                            if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
                                 best = Some((d, g.uuid.clone().unwrap_or_default()));
                             }
                         }
@@ -405,7 +442,7 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
                     let (_, pad) = m.pad(pi);
                     if pad.through_hole {
                         let d = dist(pad.at, v.at);
-                        if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                        if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
                             best = Some((d, pad.uuid.clone().unwrap_or_default()));
                         }
                     }
@@ -417,7 +454,9 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
                 let nets: Vec<&&str> = ref_nets.iter().collect();
                 tied_by_cap = m.geo.footprints.iter().any(|f| {
                     super::is_cap(m.fp_ref(f))
-                        && nets.iter().all(|n| f.pads.iter().any(|p| p.net.as_deref() == Some(**n)))
+                        && nets
+                            .iter()
+                            .all(|n| f.pads.iter().any(|p| p.net.as_deref() == Some(**n)))
                         && dist(f.at, v.at) <= max_d
                 });
             }
@@ -461,9 +500,15 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
         }
     }
     if evaluated == 0 {
-        return CheckOut::not_run(id, name, "no via of a critical net joins tracks on two layers");
+        return CheckOut::not_run(
+            id,
+            name,
+            "no via of a critical net joins tracks on two layers",
+        );
     }
-    out.score = (needing > 0).then(|| satisfied as f64 / needing as f64).or(Some(1.0));
+    out.score = (needing > 0)
+        .then(|| satisfied as f64 / needing as f64)
+        .or(Some(1.0));
     if unknown > 0 {
         out.status = "partial";
         out.reason = Some(format!(
@@ -490,7 +535,9 @@ fn ground_connectivity(m: &Model) -> CheckOut {
         .roles
         .ground
         .keys()
-        .filter(|n| m.pads.contains_key(*n) || m.fills.iter().any(|f| f.net.as_deref() == Some(n.as_str())))
+        .filter(|n| {
+            m.pads.contains_key(*n) || m.fills.iter().any(|f| f.net.as_deref() == Some(n.as_str()))
+        })
         .collect();
     if grounds.is_empty() {
         return CheckOut::not_run(id, name, "no ground net with copper on the board");
@@ -500,7 +547,9 @@ fn ground_connectivity(m: &Model) -> CheckOut {
     let mut per_net = Vec::new();
     let mut floating_area = 0.0;
     for net in grounds {
-        let Some(bb) = m.net_bbox(net, 1.0) else { continue };
+        let Some(bb) = m.net_bbox(net, 1.0) else {
+            continue;
+        };
         let g = m.net_grid(net, bb, Cover::Touch);
         let (labels, count) = g.components();
         if count == 0 {
@@ -519,7 +568,12 @@ fn ground_connectivity(m: &Model) -> CheckOut {
                 .map(|(l, x, y)| labels[*l][g.idx(*x, *y)])
                 .filter(|l| *l != 0);
             match label {
-                Some(l) => with_pad.entry(l).or_default().push(format!("{}.{}", m.fp_ref(fp), pad.number)),
+                Some(l) => {
+                    with_pad
+                        .entry(l)
+                        .or_default()
+                        .push(format!("{}.{}", m.fp_ref(fp), pad.number))
+                }
                 None => unplaced += 1,
             }
         }
@@ -532,7 +586,11 @@ fn ground_connectivity(m: &Model) -> CheckOut {
                 }
             }
         }
-        let anchored: BTreeSet<u32> = with_pad.keys().copied().chain(with_via.iter().copied()).collect();
+        let anchored: BTreeSet<u32> = with_pad
+            .keys()
+            .copied()
+            .chain(with_via.iter().copied())
+            .collect();
         // Floating copper: components that hold no pad and no via.
         let mut area: HashMap<u32, (usize, (usize, usize, usize))> = HashMap::new();
         for (l, plane) in labels.iter().enumerate() {
@@ -570,7 +628,12 @@ fn ground_connectivity(m: &Model) -> CheckOut {
         if groups > 1 {
             let mut parts: Vec<(&u32, &Vec<String>)> = with_pad.iter().collect();
             parts.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
-            let minor: Vec<String> = parts.iter().skip(1).flat_map(|p| p.1.iter().cloned()).take(8).collect();
+            let minor: Vec<String> = parts
+                .iter()
+                .skip(1)
+                .flat_map(|p| p.1.iter().cloned())
+                .take(8)
+                .collect();
             out.findings.push(Finding {
                 severity: "error",
                 item: id,
@@ -606,7 +669,11 @@ fn ground_connectivity(m: &Model) -> CheckOut {
     if per_net.is_empty() {
         return CheckOut::not_run(id, name, "ground copper could not be rasterised");
     }
-    let pad_fraction = if pads_total > 0 { pads_main as f64 / pads_total as f64 } else { 1.0 };
+    let pad_fraction = if pads_total > 0 {
+        pads_main as f64 / pads_total as f64
+    } else {
+        1.0
+    };
     out.score = Some(pad_fraction * (1.0 - (0.1 * islands as f64).min(0.5)));
     out.metrics = json!({
         "nets": per_net,

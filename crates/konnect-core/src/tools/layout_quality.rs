@@ -125,18 +125,31 @@ impl Params {
             None | Some(Value::Null) => 40,
             Some(v) => match v.as_u64() {
                 Some(n) if (1..=500).contains(&n) => n as usize,
-                _ => return Err(invalid_arg("max_findings", "must be a whole number from 1 to 500")),
+                _ => {
+                    return Err(invalid_arg(
+                        "max_findings",
+                        "must be a whole number from 1 to 500",
+                    ))
+                }
             },
         };
         let scope_all_signals = match args.get("signal_scope").and_then(Value::as_str) {
             None | Some("critical") => false,
             Some("all_signals") => true,
-            Some(_) => return Err(invalid_arg("signal_scope", "must be 'critical' or 'all_signals'")),
+            Some(_) => {
+                return Err(invalid_arg(
+                    "signal_scope",
+                    "must be 'critical' or 'all_signals'",
+                ))
+            }
         };
         let mut regulators = Vec::new();
         if let Some(list) = args.get("switching_regulators").filter(|v| !v.is_null()) {
             let Some(items) = list.as_array() else {
-                return Err(invalid_arg("switching_regulators", "must be an array of {switch_net, topology}"));
+                return Err(invalid_arg(
+                    "switching_regulators",
+                    "must be an array of {switch_net, topology}",
+                ));
             };
             for item in items {
                 let net = item.get("switch_net").and_then(Value::as_str);
@@ -186,12 +199,24 @@ pub fn tools() -> Vec<ToolDef> {
     props.insert("board".into(), json!({ "type": "string", "description": "Path to the routed .kicad_pcb file (saved zone fills are read, so refill and save first). The design-intent record and netclasses are read from its project folder" }));
     props.insert("signal_scope".into(), json!({ "type": "string", "enum": ["critical", "all_signals"], "description": "Which signals get the reference-plane checks: 'critical' (default; the record's interfaces and differential pairs, netclasses and the lists below, else every signal net over 5 mm, said in net_roles) or 'all_signals'" }));
     for (name, what) in [
-        ("critical_nets", "Nets to treat as critical signals, added to those found"),
-        ("ground_nets", "Nets to treat as ground, added to those found"),
+        (
+            "critical_nets",
+            "Nets to treat as critical signals, added to those found",
+        ),
+        (
+            "ground_nets",
+            "Nets to treat as ground, added to those found",
+        ),
         ("power_nets", "Nets to treat as power, added to those found"),
-        ("feedback_nets", "Feedback nets of a switching regulator, added to those found from pin names"),
+        (
+            "feedback_nets",
+            "Feedback nets of a switching regulator, added to those found from pin names",
+        ),
     ] {
-        props.insert(name.into(), json!({ "type": "array", "items": { "type": "string" }, "description": what }));
+        props.insert(
+            name.into(),
+            json!({ "type": "array", "items": { "type": "string" }, "description": what }),
+        );
     }
     props.insert("switching_regulators".into(), json!({
         "type": "array",
@@ -280,28 +305,37 @@ pub(super) fn power_by_name(net: &str) -> bool {
     }
     let first_digit = n.chars().next().is_some_and(|c| c.is_ascii_digit());
     (first_digit && n.contains('V'))
-        || ["VCC", "VDD", "VBAT", "VIN", "VBUS", "VSYS", "VOUT", "VREG", "VPP"]
-            .iter()
-            .any(|p| n.starts_with(p))
+        || [
+            "VCC", "VDD", "VBAT", "VIN", "VBUS", "VSYS", "VOUT", "VREG", "VPP",
+        ]
+        .iter()
+        .any(|p| n.starts_with(p))
 }
 
 fn critical_by_name(net: &str) -> bool {
     let n = tail(net);
-    ["CLK", "CLOCK", "SCK", "SCLK", "XTAL", "OSC", "USB", "CANH", "CANL", "LVDS", "ETH", "HDMI"]
-        .iter()
-        .any(|p| n.contains(p))
+    [
+        "CLK", "CLOCK", "SCK", "SCLK", "XTAL", "OSC", "USB", "CANH", "CANL", "LVDS", "ETH", "HDMI",
+    ]
+    .iter()
+    .any(|p| n.contains(p))
 }
 
 fn critical_class(class: &str) -> bool {
     let c = class.to_lowercase();
-    ["clk", "clock", "crit", "analog", "sens", "rf", "speed", "diff", "usb", "can", "eth", "lvds", "ddr"]
-        .iter()
-        .any(|p| c.contains(p))
+    [
+        "clk", "clock", "crit", "analog", "sens", "rf", "speed", "diff", "usb", "can", "eth",
+        "lvds", "ddr",
+    ]
+    .iter()
+    .any(|p| c.contains(p))
 }
 
 fn power_class(class: &str) -> bool {
     let c = class.to_lowercase();
-    ["power", "pwr", "supply", "hv", "motor"].iter().any(|p| c.contains(p))
+    ["power", "pwr", "supply", "hv", "motor"]
+        .iter()
+        .any(|p| c.contains(p))
 }
 
 fn glob(pattern: &str, text: &str) -> bool {
@@ -331,7 +365,8 @@ fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Str
     let settings = &json["net_settings"];
     if let Some(patterns) = settings["netclass_patterns"].as_array() {
         for p in patterns {
-            let (Some(class), Some(pattern)) = (p["netclass"].as_str(), p["pattern"].as_str()) else {
+            let (Some(class), Some(pattern)) = (p["netclass"].as_str(), p["pattern"].as_str())
+            else {
                 continue;
             };
             for net in nets {
@@ -343,9 +378,12 @@ fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Str
     }
     if let Some(map) = settings["netclass_assignments"].as_object() {
         for (net, class) in map {
-            let class = class
-                .as_str()
-                .or_else(|| class.as_array().and_then(|a| a.first()).and_then(Value::as_str));
+            let class = class.as_str().or_else(|| {
+                class
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(Value::as_str)
+            });
             if let Some(class) = class {
                 out.entry(net.clone()).or_insert_with(|| class.to_string());
             }
@@ -573,7 +611,10 @@ impl<'a> Model<'a> {
         };
         for &i in self.tracks.get(net).into_iter().flatten() {
             let t = self.track(i);
-            let (Some(b), Some(l)) = (t.shape.bbox(), t.layers.first().and_then(|l| self.layer_ix(l))) else {
+            let (Some(b), Some(l)) = (
+                t.shape.bbox(),
+                t.layers.first().and_then(|l| self.layer_ix(l)),
+            ) else {
                 continue;
             };
             if inside(b) {
@@ -605,7 +646,9 @@ impl<'a> Model<'a> {
             }
         }
         for f in self.fills.iter().filter(|f| f.net.as_deref() == Some(net)) {
-            let Some(l) = self.layer_ix(&f.layer) else { continue };
+            let Some(l) = self.layer_ix(&f.layer) else {
+                continue;
+            };
             for r in &f.rings {
                 if inside(r.bbox) {
                     g.add_ring(l, &r.pts);
@@ -620,7 +663,10 @@ impl<'a> Model<'a> {
         self.fills.iter().position(|f| {
             f.layer == layer
                 && f.rings.iter().any(|r| {
-                    p.0 >= r.bbox.0 && p.0 <= r.bbox.2 && p.1 >= r.bbox.1 && p.1 <= r.bbox.3
+                    p.0 >= r.bbox.0
+                        && p.0 <= r.bbox.2
+                        && p.1 >= r.bbox.1
+                        && p.1 <= r.bbox.3
                         && point_in_ring(p, &r.pts)
                 })
         })
@@ -773,7 +819,7 @@ impl CheckOut {
             "checklist": checklist(self.id),
             "status": self.status,
             "reason": self.reason,
-            "score": self.score.map(|s| r3(s)),
+            "score": self.score.map(r3),
             "metrics": self.metrics,
             "findings": self.findings.len(),
         })
@@ -862,10 +908,9 @@ fn intent_roles(
         }
         for itf in &i.interfaces {
             for net in &itf.nets {
-                roles
-                    .critical
-                    .entry(net.clone())
-                    .or_insert_with(|| format!("design_intent interface '{}' ({})", itf.name, itf.kind));
+                roles.critical.entry(net.clone()).or_insert_with(|| {
+                    format!("design_intent interface '{}' ({})", itf.name, itf.kind)
+                });
             }
             for p in &itf.differential_pairs {
                 for net in [&p.positive, &p.negative] {
@@ -902,7 +947,10 @@ fn intent_roles(
                 .entry(net.clone())
                 .or_insert_with(|| "name".into());
         } else if power_by_name(net) && !roles.ground.contains_key(net) {
-            roles.power.entry(net.clone()).or_insert_with(|| "name".into());
+            roles
+                .power
+                .entry(net.clone())
+                .or_insert_with(|| "name".into());
         }
     }
     for (list, ground, power, critical) in [
@@ -982,7 +1030,8 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
 
     let mut pairs = Vec::new();
     let (intent, mut roles) = intent_roles(board, &nets, params, &mut pairs);
-    let empty_intent: DesignIntent = serde_json::from_value(json!({ "schema_version": SCHEMA_VERSION }))?;
+    let empty_intent: DesignIntent =
+        serde_json::from_value(json!({ "schema_version": SCHEMA_VERSION }))?;
     let copper = trace_current::copper_for(&tree, intent.as_ref().unwrap_or(&empty_intent));
 
     // Critical signals: the record and netclasses first; failing that, every
@@ -994,13 +1043,16 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
         }
     }
     roles.critical.retain(|n, _| nets.contains(n));
-    let basis: &'static str;
-    if params.scope_all_signals || roles.critical.is_empty() {
+    let basis: &'static str = if params.scope_all_signals || roles.critical.is_empty() {
         let mut added = 0;
         for net in &nets {
             let len: f64 = tracks
                 .get(net)
-                .map(|v| v.iter().map(|&i| path_len(&geometry.others[i].shape.pts)).sum())
+                .map(|v| {
+                    v.iter()
+                        .map(|&i| path_len(&geometry.others[i].shape.pts))
+                        .sum()
+                })
                 .unwrap_or(0.0);
             let n_pads = pads.get(net).map_or(0, Vec::len);
             if is_signal(net) && n_pads >= 2 && len >= 5.0 && !roles.critical.contains_key(net) {
@@ -1015,16 +1067,16 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
                 added += 1;
             }
         }
-        basis = if params.scope_all_signals {
+        if params.scope_all_signals {
             "all_signals"
         } else if added > 0 {
             "fallback_all_signals"
         } else {
             "none"
-        };
+        }
     } else {
-        basis = "recorded_or_named";
-    }
+        "recorded_or_named"
+    };
     roles.critical_basis = basis;
     roles.pairs = pairs;
     let positives: BTreeSet<String> = roles.pairs.iter().map(|p| p.0.clone()).collect();
@@ -1035,7 +1087,11 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
                 .strip_suffix("_P")
                 .map(|s| format!("{s}_N"))
                 .or_else(|| net.strip_suffix('+').map(|s| format!("{s}-")))
-                .or_else(|| net.strip_suffix("P").filter(|s| s.ends_with(['_', '/'])).map(|s| format!("{s}N")));
+                .or_else(|| {
+                    net.strip_suffix("P")
+                        .filter(|s| s.ends_with(['_', '/']))
+                        .map(|s| format!("{s}N"))
+                });
             if let Some(m) = mate {
                 if nets.contains(&m) && !positives.contains(net) && is_signal(net) {
                     roles.pairs.push((net.clone(), m, "name heuristic".into()));
@@ -1071,11 +1127,26 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
 
 /// Category weights of the overall score; a category with nothing measured is
 /// left out and the rest renormalised.
-const CATEGORIES: &[(&str, f64, &[(&str, f64)])] = &[
-    ("return_path", 0.25, &[("3.1", 0.5), ("3.2", 0.2), ("3.3", 0.2), ("3.4", 0.1)]),
-    ("decoupling_and_current", 0.25, &[("4.1", 0.5), ("4.2", 0.25), ("4.3", 0.25)]),
+/// Category name, weight, and its checks with their weights inside it.
+type Category = (&'static str, f64, &'static [(&'static str, f64)]);
+
+const CATEGORIES: &[Category] = &[
+    (
+        "return_path",
+        0.25,
+        &[("3.1", 0.5), ("3.2", 0.2), ("3.3", 0.2), ("3.4", 0.1)],
+    ),
+    (
+        "decoupling_and_current",
+        0.25,
+        &[("4.1", 0.5), ("4.2", 0.25), ("4.3", 0.25)],
+    ),
     ("switching_loops", 0.15, &[("8.1", 0.7), ("8.2", 0.3)]),
-    ("routing", 0.35, &[("5.1", 0.3), ("5.2", 0.2), ("5.3", 0.3), ("5.4", 0.2)]),
+    (
+        "routing",
+        0.35,
+        &[("5.1", 0.3), ("5.2", 0.2), ("5.3", 0.3), ("5.4", 0.2)],
+    ),
 ];
 
 fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeometry) -> Value {
@@ -1106,7 +1177,9 @@ fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeom
             total_weight += weight;
             categories.push(json!({ "category": name, "weight": weight, "score": r3(score * 100.0), "checks": used }));
         } else {
-            categories.push(json!({ "category": name, "weight": weight, "score": Value::Null, "checks": [] }));
+            categories.push(
+                json!({ "category": name, "weight": weight, "score": Value::Null, "checks": [] }),
+            );
         }
     }
     let copper_quality = (total_weight > 0.0).then(|| r2(weighted / total_weight * 100.0));
@@ -1116,9 +1189,15 @@ fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeom
     // share of multi-pad nets that are joined.
     let completion = routing::completion(m);
     let routed_share = {
-        let total = completion["nets_with_two_or_more_pads"].as_f64().unwrap_or(0.0);
+        let total = completion["nets_with_two_or_more_pads"]
+            .as_f64()
+            .unwrap_or(0.0);
         let open = completion["unrouted_nets"].as_f64().unwrap_or(0.0);
-        if total > 0.0 { (total - open) / total } else { 1.0 }
+        if total > 0.0 {
+            (total - open) / total
+        } else {
+            1.0
+        }
     };
     let score = copper_quality.map(|q| r2(q * routed_share));
 
@@ -1240,4 +1319,3 @@ fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeom
         "items_unreadable": geometry.skipped,
     })
 }
-

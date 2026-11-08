@@ -94,6 +94,13 @@ rule, ERC sheet and sorted item identities; severity, prose and positions are
 not in it. Repeats get `~2`, `~3`. A compare re-keys the stored violations with
 the running binary's rule, so a later key change cannot mismatch old files.
 
+## Unreleased: layout quality audit
+
+Creation work after PR 16 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset
+gains the read-only `audit_layout_quality(board, …)`. No existing tool, argument or
+result changes. `audit_trace_current`'s sizing helpers became crate-visible so the new
+audit reuses them; its own result is unchanged.
+
 ## Unreleased: honest manufacturing review and trace current audit
 
 Creation PR 11 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains

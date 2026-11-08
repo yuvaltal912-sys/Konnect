@@ -140,7 +140,10 @@ fn stackup_copper(tree: &SexpNode) -> BTreeMap<String, f64> {
     out
 }
 
-pub(crate) fn copper_for(tree: &SexpNode, intent: &crate::tools::design_intent::DesignIntent) -> Copper {
+pub(crate) fn copper_for(
+    tree: &SexpNode,
+    intent: &crate::tools::design_intent::DesignIntent,
+) -> Copper {
     let target = intent.fab_target.as_ref();
     let outer_oz = target.and_then(|t| t.outer_copper_oz);
     let inner_oz = target.and_then(|t| t.inner_copper_oz);

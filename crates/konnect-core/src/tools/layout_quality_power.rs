@@ -121,7 +121,10 @@ fn leg_path(m: &Model, net: &str, a: PadIx, b: PadIx) -> Option<LegPath> {
 
 fn ground_nets_of_cap(m: &Model, fp: usize, cap_net: &str) -> Option<(PadIx, PadIx)> {
     let f = &m.geo.footprints[fp];
-    let plus = f.pads.iter().position(|p| p.net.as_deref() == Some(cap_net))?;
+    let plus = f
+        .pads
+        .iter()
+        .position(|p| p.net.as_deref() == Some(cap_net))?;
     let minus = f
         .pads
         .iter()
@@ -206,7 +209,7 @@ fn measure_loop(m: &Model, spec: &LoopSpec, search_mm: f64) -> Result<LoopResult
             legs,
             cap_pads: [m.pad(plus).1.uuid.clone(), m.pad(minus).1.uuid.clone()],
         };
-        if best.as_ref().map_or(true, |b| res.length_mm < b.length_mm) {
+        if best.as_ref().is_none_or(|b| res.length_mm < b.length_mm) {
             best = Some(res);
         }
     }
@@ -241,7 +244,10 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
     // 4.1: every IC supply pin.
     let id = "4.1";
     let name = "decoupling_loop";
-    let (max_len, max_area) = (m.params.get("decap_max_loop_mm"), m.params.get("decap_max_loop_area_mm2"));
+    let (max_len, max_area) = (
+        m.params.get("decap_max_loop_mm"),
+        m.params.get("decap_max_loop_area_mm2"),
+    );
     let mut dec = CheckOut::checked(id, name);
     let mut rows = Vec::new();
     let mut scores = Vec::new();
@@ -253,7 +259,9 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             continue;
         }
         for (pi, pad) in f.pads.iter().enumerate() {
-            let Some(net) = pad.net.as_deref() else { continue };
+            let Some(net) = pad.net.as_deref() else {
+                continue;
+            };
             if !m.is_power(net) || switch_nets.contains(&net) {
                 continue;
             }
@@ -267,7 +275,11 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
                 .iter()
                 .enumerate()
                 .filter(|(_, g)| g.net.as_deref().is_some_and(|n| m.is_ground(n)))
-                .min_by(|a, b| dist(a.1.at, pad.at).partial_cmp(&dist(b.1.at, pad.at)).unwrap_or(std::cmp::Ordering::Equal));
+                .min_by(|a, b| {
+                    dist(a.1.at, pad.at)
+                        .partial_cmp(&dist(b.1.at, pad.at))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             let Some((gi, _)) = ground else {
                 cannot.push(format!("{} has no ground pad", m.fp_ref(f)));
                 continue;
@@ -334,7 +346,16 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
         dec.score = (!scores.is_empty()).then(|| scores.iter().sum::<f64>() / scores.len() as f64);
         if !cannot.is_empty() {
             dec.status = "partial";
-            dec.reason = Some(format!("{} pin(s) not measured: {}", cannot.len(), cannot.iter().take(3).cloned().collect::<Vec<_>>().join("; ")));
+            dec.reason = Some(format!(
+                "{} pin(s) not measured: {}",
+                cannot.len(),
+                cannot
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         lens.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = lens.get(lens.len() / 2).copied();
@@ -421,7 +442,12 @@ fn find_switchers(m: &Model) -> Vec<Switcher> {
     out
 }
 
-fn decide_topology(m: &Model, node: &str, far: &str, parts: &[usize]) -> (Option<&'static str>, String) {
+fn decide_topology(
+    m: &Model,
+    node: &str,
+    far: &str,
+    parts: &[usize],
+) -> (Option<&'static str>, String) {
     if let Some((_, t)) = m.params.regulators.iter().find(|(n, _)| n == node) {
         let t = if t == "buck" { "buck" } else { "boost" };
         return (Some(t), "argument switching_regulators".into());
@@ -434,7 +460,12 @@ fn decide_topology(m: &Model, node: &str, far: &str, parts: &[usize]) -> (Option
     let source_of = |net: &str| m.roles.rails.get(net).and_then(|r| r.source_ref.as_deref());
     if let Some(src) = source_of(far) {
         if ics.contains(&src) {
-            return (Some("buck"), format!("design_intent: rail '{far}' is supplied by {src}, the IC on the switch node"));
+            return (
+                Some("buck"),
+                format!(
+                    "design_intent: rail '{far}' is supplied by {src}, the IC on the switch node"
+                ),
+            );
         }
     }
     for &fi in parts {
@@ -451,88 +482,180 @@ fn decide_topology(m: &Model, node: &str, far: &str, parts: &[usize]) -> (Option
         }
     }
     // Voltages of the rails on each side, when the record has them.
-    (None, "design-intent record does not say which rail the regulator supplies".into())
+    (
+        None,
+        "design-intent record does not say which rail the regulator supplies".into(),
+    )
 }
 
-fn nearest_pad(m: &Model, fp: usize, to: Pt, pred: impl Fn(&konnect_sexp::board_geometry::PadGeom) -> bool) -> Option<PadIx> {
+fn nearest_pad(
+    m: &Model,
+    fp: usize,
+    to: Pt,
+    pred: impl Fn(&konnect_sexp::board_geometry::PadGeom) -> bool,
+) -> Option<PadIx> {
     m.geo.footprints[fp]
         .pads
         .iter()
         .enumerate()
         .filter(|(_, p)| pred(p))
-        .min_by(|a, b| dist(a.1.at, to).partial_cmp(&dist(b.1.at, to)).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| {
+            dist(a.1.at, to)
+                .partial_cmp(&dist(b.1.at, to))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(i, _)| (fp, i))
 }
 
 fn spec_for(m: &Model, s: &Switcher) -> Result<LoopSpec, String> {
     let topo = s.topology.ok_or("topology unknown")?;
-    let node_pad = |fp: usize| nearest_pad(m, fp, m.pad(s.inductor).1.at, |p| p.net.as_deref() == Some(s.net.as_str()));
+    let node_pad = |fp: usize| {
+        nearest_pad(m, fp, m.pad(s.inductor).1.at, |p| {
+            p.net.as_deref() == Some(s.net.as_str())
+        })
+    };
     let ground = |fp: usize, near: Pt| {
         // Prefer a pin named PGND, else the nearest ground pad.
         nearest_pad(m, fp, near, |p| {
             p.net.as_deref().is_some_and(|n| m.is_ground(n))
-                && p.pin_function.as_deref().is_some_and(|f| f.to_uppercase().starts_with("PGND"))
+                && p.pin_function
+                    .as_deref()
+                    .is_some_and(|f| f.to_uppercase().starts_with("PGND"))
         })
-        .or_else(|| nearest_pad(m, fp, near, |p| p.net.as_deref().is_some_and(|n| m.is_ground(n))))
+        .or_else(|| {
+            nearest_pad(m, fp, near, |p| {
+                p.net.as_deref().is_some_and(|n| m.is_ground(n))
+            })
+        })
     };
-    let ics: Vec<usize> = s.parts.iter().copied().filter(|&fi| is_ic(m.fp_ref(&m.geo.footprints[fi]))).collect();
-    let mosfets: Vec<usize> = s.parts.iter().copied().filter(|&fi| is_mosfet(m.fp_ref(&m.geo.footprints[fi]))).collect();
-    let diodes: Vec<usize> = s.parts.iter().copied().filter(|&fi| is_diode(m.fp_ref(&m.geo.footprints[fi]))).collect();
+    let ics: Vec<usize> = s
+        .parts
+        .iter()
+        .copied()
+        .filter(|&fi| is_ic(m.fp_ref(&m.geo.footprints[fi])))
+        .collect();
+    let mosfets: Vec<usize> = s
+        .parts
+        .iter()
+        .copied()
+        .filter(|&fi| is_mosfet(m.fp_ref(&m.geo.footprints[fi])))
+        .collect();
+    let diodes: Vec<usize> = s
+        .parts
+        .iter()
+        .copied()
+        .filter(|&fi| is_diode(m.fp_ref(&m.geo.footprints[fi])))
+        .collect();
     let power_pad_other_than = |fp: usize, not: &str, near: Pt| {
         // The input (buck) or output (boost) pin: a power pad that is not the inductor's far side.
         let named = nearest_pad(m, fp, near, |p| {
             p.net.as_deref().is_some_and(|n| n != not && m.is_power(n))
                 && p.pin_function.as_deref().is_some_and(|f| {
                     let f = f.to_uppercase();
-                    f.starts_with("VIN") || f.starts_with("PVIN") || f.starts_with("VOUT") || f == "IN" || f == "OUT"
+                    f.starts_with("VIN")
+                        || f.starts_with("PVIN")
+                        || f.starts_with("VOUT")
+                        || f == "IN"
+                        || f == "OUT"
                 })
         });
-        named.or_else(|| nearest_pad(m, fp, near, |p| p.net.as_deref().is_some_and(|n| n != not && m.is_power(n))))
+        named.or_else(|| {
+            nearest_pad(m, fp, near, |p| {
+                p.net.as_deref().is_some_and(|n| n != not && m.is_power(n))
+            })
+        })
     };
     let node_at = m.pad(s.inductor).1.at;
     if let Some(&ic) = ics.first() {
         let sw = node_pad(ic).ok_or("no pad of the IC on the switch node")?;
         let sw_at = m.pad(sw).1.at;
-        let pwr = power_pad_other_than(ic, &s.far_net, sw_at).ok_or("the IC has no power pad apart from the inductor's far side")?;
+        let pwr = power_pad_other_than(ic, &s.far_net, sw_at)
+            .ok_or("the IC has no power pad apart from the inductor's far side")?;
         let gnd = ground(ic, sw_at).ok_or("the IC has no ground pad")?;
         let cap_net = m.pad(pwr).1.net.clone().unwrap_or_default();
         if topo == "boost" {
             if let Some(&d) = diodes.first() {
                 let anode = node_pad(d).ok_or("no diode pad on the switch node")?;
-                let cathode = nearest_pad(m, d, node_at, |p| p.net.as_deref().is_some_and(|n| n != s.net && m.is_power(n)))
-                    .ok_or("the diode's other pad is not on a power net")?;
+                let cathode = nearest_pad(m, d, node_at, |p| {
+                    p.net
+                        .as_deref()
+                        .is_some_and(|n| n != s.net && m.is_power(n))
+                })
+                .ok_or("the diode's other pad is not on a power net")?;
                 let out_net = m.pad(cathode).1.net.clone().unwrap_or_default();
-                return Ok(LoopSpec { cap_net: out_net, entry: cathode, middle: vec![(s.net.clone(), anode, sw)], exit: gnd });
+                return Ok(LoopSpec {
+                    cap_net: out_net,
+                    entry: cathode,
+                    middle: vec![(s.net.clone(), anode, sw)],
+                    exit: gnd,
+                });
             }
         }
-        return Ok(LoopSpec { cap_net, entry: pwr, middle: Vec::new(), exit: gnd });
+        return Ok(LoopSpec {
+            cap_net,
+            entry: pwr,
+            middle: Vec::new(),
+            exit: gnd,
+        });
     }
     // Discrete stages.
     if topo == "buck" {
         let hs = mosfets
             .iter()
-            .find(|&&q| m.geo.footprints[q].pads.iter().any(|p| p.net.as_deref().is_some_and(|n| n != s.net && m.is_power(n))))
+            .find(|&&q| {
+                m.geo.footprints[q].pads.iter().any(|p| {
+                    p.net
+                        .as_deref()
+                        .is_some_and(|n| n != s.net && m.is_power(n))
+                })
+            })
             .copied()
             .ok_or("no high-side MOSFET (a pad on the node and one on a power net)")?;
         let ls = mosfets
             .iter()
-            .find(|&&q| q != hs && m.geo.footprints[q].pads.iter().any(|p| p.net.as_deref().is_some_and(|n| m.is_ground(n))))
+            .find(|&&q| {
+                q != hs
+                    && m.geo.footprints[q]
+                        .pads
+                        .iter()
+                        .any(|p| p.net.as_deref().is_some_and(|n| m.is_ground(n)))
+            })
             .copied()
             .ok_or("no low-side MOSFET (a pad on the node and one on ground)")?;
-        let vin = nearest_pad(m, hs, node_at, |p| p.net.as_deref().is_some_and(|n| n != s.net && m.is_power(n))).ok_or("no input pad")?;
+        let vin = nearest_pad(m, hs, node_at, |p| {
+            p.net
+                .as_deref()
+                .is_some_and(|n| n != s.net && m.is_power(n))
+        })
+        .ok_or("no input pad")?;
         let hs_sw = node_pad(hs).ok_or("no high-side pad on the node")?;
         let ls_sw = node_pad(ls).ok_or("no low-side pad on the node")?;
         let gnd = ground(ls, node_at).ok_or("no low-side ground pad")?;
-        return Ok(LoopSpec { cap_net: m.pad(vin).1.net.clone().unwrap_or_default(), entry: vin, middle: vec![(s.net.clone(), hs_sw, ls_sw)], exit: gnd });
+        return Ok(LoopSpec {
+            cap_net: m.pad(vin).1.net.clone().unwrap_or_default(),
+            entry: vin,
+            middle: vec![(s.net.clone(), hs_sw, ls_sw)],
+            exit: gnd,
+        });
     }
     let (Some(&q), Some(&d)) = (mosfets.first(), diodes.first()) else {
         return Err("boost stage without a MOSFET and a diode on the node".into());
     };
     let anode = node_pad(d).ok_or("no diode pad on the node")?;
-    let cathode = nearest_pad(m, d, node_at, |p| p.net.as_deref().is_some_and(|n| n != s.net && m.is_power(n))).ok_or("diode cathode is not on a power net")?;
+    let cathode = nearest_pad(m, d, node_at, |p| {
+        p.net
+            .as_deref()
+            .is_some_and(|n| n != s.net && m.is_power(n))
+    })
+    .ok_or("diode cathode is not on a power net")?;
     let q_sw = node_pad(q).ok_or("no MOSFET pad on the node")?;
     let gnd = ground(q, node_at).ok_or("no MOSFET ground pad")?;
-    Ok(LoopSpec { cap_net: m.pad(cathode).1.net.clone().unwrap_or_default(), entry: cathode, middle: vec![(s.net.clone(), anode, q_sw)], exit: gnd })
+    Ok(LoopSpec {
+        cap_net: m.pad(cathode).1.net.clone().unwrap_or_default(),
+        entry: cathode,
+        middle: vec![(s.net.clone(), anode, q_sw)],
+        exit: gnd,
+    })
 }
 
 fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
@@ -542,9 +665,15 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
     );
     if switchers.is_empty() {
         let why = "no switch node found: no net joins an inductor (L…) to an IC, MOSFET or diode";
-        return vec![CheckOut::not_run("8.1", "switching_hot_loop", why), CheckOut::not_run("8.2", "switch_node_copper", why)];
+        return vec![
+            CheckOut::not_run("8.1", "switching_hot_loop", why),
+            CheckOut::not_run("8.2", "switch_node_copper", why),
+        ];
     }
-    let (max_len, max_area) = (m.params.get("hot_loop_max_mm"), m.params.get("hot_loop_max_area_mm2"));
+    let (max_len, max_area) = (
+        m.params.get("hot_loop_max_mm"),
+        m.params.get("hot_loop_max_area_mm2"),
+    );
     let search = m.params.get("decap_search_mm");
     let mut hot_rows = Vec::new();
     let mut hot_scores = Vec::new();
@@ -563,7 +692,11 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
                 hot_scores.push(margin_score(ratio, 1.0));
                 worst_len = worst_len.max(r.length_mm);
                 worst_area = worst_area.max(r.area_mm2);
-                let what = if topo == "buck" { "input loop" } else { "output loop" };
+                let what = if topo == "buck" {
+                    "input loop"
+                } else {
+                    "output loop"
+                };
                 if ratio > 1.0 {
                     hot.findings.push(Finding {
                         severity: if ratio > 2.0 { "error" } else { "warning" },
@@ -587,7 +720,15 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
     }
     if hot_scores.is_empty() {
         let kept = std::mem::take(&mut hot.needs_human);
-        hot = CheckOut::not_run("8.1", "switching_hot_loop", if notes.is_empty() { "no loop could be measured".to_string() } else { notes.join("; ") });
+        hot = CheckOut::not_run(
+            "8.1",
+            "switching_hot_loop",
+            if notes.is_empty() {
+                "no loop could be measured".to_string()
+            } else {
+                notes.join("; ")
+            },
+        );
         hot.needs_human = kept;
         hot.metrics = json!({ "switch_nodes": hot_rows });
     } else {
@@ -612,19 +753,42 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
     let mut total_area = 0.0;
     let mut min_gap_seen = f64::INFINITY;
     for s in switchers {
-        let Some(bb) = m.net_bbox(&s.net, 2.0) else { continue };
+        let Some(bb) = m.net_bbox(&s.net, 2.0) else {
+            continue;
+        };
         let g = m.net_grid(&s.net, bb, Cover::Centre);
         let area = g.area_mm2();
         total_area += area;
-        let reg_ics: Vec<usize> = s.parts.iter().copied().filter(|&fi| is_ic(m.fp_ref(&m.geo.footprints[fi]))).collect();
+        let reg_ics: Vec<usize> = s
+            .parts
+            .iter()
+            .copied()
+            .filter(|&fi| is_ic(m.fp_ref(&m.geo.footprints[fi])))
+            .collect();
         // Feedback nets: named by the call, else pins called FB/VFB/ADJ/SENSE/COMP on the regulator.
-        let mut fb: Vec<(String, String)> = m.params.feedback_nets.iter().map(|n| (n.clone(), "argument".to_string())).collect();
+        let mut fb: Vec<(String, String)> = m
+            .params
+            .feedback_nets
+            .iter()
+            .map(|n| (n.clone(), "argument".to_string()))
+            .collect();
         for &fi in &reg_ics {
             for p in &m.geo.footprints[fi].pads {
-                let (Some(net), Some(func)) = (p.net.as_deref(), p.pin_function.as_deref()) else { continue };
+                let (Some(net), Some(func)) = (p.net.as_deref(), p.pin_function.as_deref()) else {
+                    continue;
+                };
                 let f = func.to_uppercase();
-                if ["FB", "VFB", "ADJ", "SENSE", "COMP", "VSENSE"].iter().any(|k| f.starts_with(k)) && !m.is_ground(net) && !m.is_power(net) && !fb.iter().any(|(n, _)| n == net) {
-                    fb.push((net.to_string(), format!("pin {} of {}", func, m.fp_ref(&m.geo.footprints[fi]))));
+                if ["FB", "VFB", "ADJ", "SENSE", "COMP", "VSENSE"]
+                    .iter()
+                    .any(|k| f.starts_with(k))
+                    && !m.is_ground(net)
+                    && !m.is_power(net)
+                    && !fb.iter().any(|(n, _)| n == net)
+                {
+                    fb.push((
+                        net.to_string(),
+                        format!("pin {} of {}", func, m.fp_ref(&m.geo.footprints[fi])),
+                    ));
                 }
             }
         }
@@ -634,19 +798,28 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
         for (net, _) in &fb {
             for &ti in m.tracks.get(net).into_iter().flatten() {
                 let t = m.track(ti);
-                let Some(l) = t.layers.first().and_then(|l| m.layer_ix(l)) else { continue };
+                let Some(l) = t.layers.first().and_then(|l| m.layer_ix(l)) else {
+                    continue;
+                };
                 // Pieces away from the regulator's own pins.
                 for w in t.shape.pts.windows(2) {
                     let len = dist(w[0], w[1]);
                     let n = ((len / 0.25).ceil() as usize).max(1);
                     for k in 0..n {
                         let f = (k as f64 + 0.5) / n as f64;
-                        let p = (w[0].0 + (w[1].0 - w[0].0) * f, w[0].1 + (w[1].1 - w[0].1) * f);
+                        let p = (
+                            w[0].0 + (w[1].0 - w[0].0) * f,
+                            w[0].1 + (w[1].1 - w[0].1) * f,
+                        );
                         if own_ics.iter().any(|c| dist(*c, p) < 3.5) {
                             continue;
                         }
                         // Adjacent layers: switch copper straight above or below.
-                        for al in [l.checked_sub(1), Some(l + 1)].into_iter().flatten().filter(|a| *a < m.layers.len()) {
+                        for al in [l.checked_sub(1), Some(l + 1)]
+                            .into_iter()
+                            .flatten()
+                            .filter(|a| *a < m.layers.len())
+                        {
                             if let Some((ix, iy)) = g.cell_of(p) {
                                 if g.is_copper(al, ix, iy) {
                                     overlap_mm += len / n as f64;
@@ -665,7 +838,11 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
                                 continue;
                             }
                             for sw in st.shape.pts.windows(2) {
-                                d = d.min(point_segment_distance(p, sw[0], sw[1]) - st.shape.radius - t.shape.radius);
+                                d = d.min(
+                                    point_segment_distance(p, sw[0], sw[1])
+                                        - st.shape.radius
+                                        - t.shape.radius,
+                                );
                             }
                         }
                         for &pi in m.pads.get(&s.net).into_iter().flatten() {
@@ -674,7 +851,9 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
                                 let _ = pf;
                                 continue;
                             }
-                            d = d.min(pad.shape.distance(&konnect_sexp::board_geometry::Shape::disc(p, t.shape.radius)));
+                            d = d.min(pad.shape.distance(
+                                &konnect_sexp::board_geometry::Shape::disc(p, t.shape.radius),
+                            ));
                         }
                         if d < gap {
                             gap = d;
@@ -688,7 +867,15 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
         let _ = (segment_distance as fn(Pt, Pt, Pt, Pt) -> f64,);
         min_gap_seen = min_gap_seen.min(gap);
         let gap_ok = gap >= min_gap;
-        let fb_score = if fb.is_empty() { 1.0 } else if overlap_mm > 0.0 { 0.0 } else if gap_ok { 1.0 } else { (gap / min_gap).clamp(0.0, 1.0) };
+        let fb_score = if fb.is_empty() {
+            1.0
+        } else if overlap_mm > 0.0 {
+            0.0
+        } else if gap_ok {
+            1.0
+        } else {
+            (gap / min_gap).clamp(0.0, 1.0)
+        };
         node_scores.push(0.5 * excess_score(area, max_area_node) + 0.5 * fb_score);
         if area > max_area_node {
             node.findings.push(Finding {
@@ -731,7 +918,11 @@ fn switching_loops(m: &Model, switchers: &[Switcher]) -> Vec<CheckOut> {
         }));
     }
     if node_scores.is_empty() {
-        node = CheckOut::not_run("8.2", "switch_node_copper", "switch node copper could not be rasterised");
+        node = CheckOut::not_run(
+            "8.2",
+            "switch_node_copper",
+            "switch node copper could not be rasterised",
+        );
     } else {
         node.score = Some(node_scores.iter().sum::<f64>() / node_scores.len() as f64);
         node.metrics = json!({
@@ -823,45 +1014,84 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
         .roles
         .currents
         .iter()
-        .filter(|c| c.amps >= min_a && !m.is_ground(&c.net) && m.pads.get(&c.net).is_some_and(|p| p.len() >= 2))
+        .filter(|c| {
+            c.amps >= min_a
+                && !m.is_ground(&c.net)
+                && m.pads.get(&c.net).is_some_and(|p| p.len() >= 2)
+        })
         .collect();
     reqs.sort_by(|a, b| a.net.cmp(&b.net));
     reqs.dedup_by(|a, b| a.net == b.net);
-    let (mut power, mut ground) = (CheckOut::checked("4.3", "neck_downs_on_power_paths"), CheckOut::checked("3.4", "ground_return_bottlenecks"));
+    let (mut power, mut ground) = (
+        CheckOut::checked("4.3", "neck_downs_on_power_paths"),
+        CheckOut::checked("3.4", "ground_return_bottlenecks"),
+    );
     if reqs.is_empty() {
         let why = if m.roles.currents.is_empty() {
             "no currents recorded in the design intent: nothing says which paths must carry how much".to_string()
         } else {
-            format!("no net with a recorded current of at least {min_a} A and two pads on the board")
+            format!(
+                "no net with a recorded current of at least {min_a} A and two pads on the board"
+            )
         };
-        return vec![CheckOut::not_run("4.3", "neck_downs_on_power_paths", &why), CheckOut::not_run("3.4", "ground_return_bottlenecks", why)];
+        return vec![
+            CheckOut::not_run("4.3", "neck_downs_on_power_paths", &why),
+            CheckOut::not_run("3.4", "ground_return_bottlenecks", why),
+        ];
     }
-    let mut cache = GridCache { grids: HashMap::new() };
+    let mut cache = GridCache {
+        grids: HashMap::new(),
+    };
     let (mut p_ratios, mut g_ratios) = (Vec::new(), Vec::new());
     let (mut p_rows, mut g_rows) = (Vec::new(), Vec::new());
     let mut runs = 0usize;
     for req in reqs {
         let pads = &m.pads[&req.net];
         // Source: the supplier from the record, else the largest pad on the net.
-        let rail_src = m.roles.rails.get(&req.net).and_then(|r| r.source_ref.clone());
+        let rail_src = m
+            .roles
+            .rails
+            .get(&req.net)
+            .and_then(|r| r.source_ref.clone());
         let area = |pi: &PadIx| {
             let p = m.pad(*pi).1;
             p.size.0 * p.size.1
         };
         let src = pads
             .iter()
-            .filter(|pi| rail_src.as_deref().map_or(true, |r| m.fp_ref(m.pad(**pi).0) == r))
-            .max_by(|a, b| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal))
-            .or_else(|| pads.iter().max_by(|a, b| area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal)))
+            .filter(|pi| {
+                rail_src
+                    .as_deref()
+                    .is_none_or(|r| m.fp_ref(m.pad(**pi).0) == r)
+            })
+            .max_by(|a, b| {
+                area(a)
+                    .partial_cmp(&area(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .or_else(|| {
+                pads.iter().max_by(|a, b| {
+                    area(a)
+                        .partial_cmp(&area(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
             .copied();
         let Some(src) = src else { continue };
         let mut sinks: Vec<PadIx> = pads.iter().copied().filter(|pi| pi.0 != src.0).collect();
-        sinks.sort_by(|a, b| dist(m.pad(*a).1.at, m.pad(src).1.at).partial_cmp(&dist(m.pad(*b).1.at, m.pad(src).1.at)).unwrap_or(std::cmp::Ordering::Equal));
+        sinks.sort_by(|a, b| {
+            dist(m.pad(*a).1.at, m.pad(src).1.at)
+                .partial_cmp(&dist(m.pad(*b).1.at, m.pad(src).1.at))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sinks.truncate(12);
         let required: Vec<f64> = m
             .layers
             .iter()
-            .map(|l| trace_current::required_area_mm2(req.amps, req.rise_c, trace_current::is_outer(l)) / m.thickness(l))
+            .map(|l| {
+                trace_current::required_area_mm2(req.amps, req.rise_c, trace_current::is_outer(l))
+                    / m.thickness(l)
+            })
             .collect();
         // Power path.
         for (kind, net_of) in [("power", None::<()>), ("ground", Some(()))] {
@@ -872,9 +1102,20 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                 let (a, b, net) = if net_of.is_none() {
                     (src, sink, req.net.clone())
                 } else {
-                    let near = |fp: usize, to: Pt| nearest_pad(m, fp, to, |p| p.net.as_deref().is_some_and(|n| m.is_ground(n)));
-                    let (Some(ga), Some(gb)) = (near(src.0, m.pad(src).1.at), near(sink.0, m.pad(sink).1.at)) else { continue };
-                    let (na, nb) = (m.pad(ga).1.net.clone().unwrap_or_default(), m.pad(gb).1.net.clone().unwrap_or_default());
+                    let near = |fp: usize, to: Pt| {
+                        nearest_pad(m, fp, to, |p| {
+                            p.net.as_deref().is_some_and(|n| m.is_ground(n))
+                        })
+                    };
+                    let (Some(ga), Some(gb)) =
+                        (near(src.0, m.pad(src).1.at), near(sink.0, m.pad(sink).1.at))
+                    else {
+                        continue;
+                    };
+                    let (na, nb) = (
+                        m.pad(ga).1.net.clone().unwrap_or_default(),
+                        m.pad(gb).1.net.clone().unwrap_or_default(),
+                    );
                     if na != nb {
                         continue;
                     }
@@ -882,7 +1123,9 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                 };
                 runs += 1;
                 if !cache.grids.contains_key(&net) {
-                    let Some(bb) = m.net_bbox(&net, 1.0) else { continue };
+                    let Some(bb) = m.net_bbox(&net, 1.0) else {
+                        continue;
+                    };
                     let g = m.net_grid(&net, bb, Cover::Centre);
                     let dt = g.distance_transform();
                     cache.grids.insert(net.clone(), (g, dt));
@@ -908,10 +1151,14 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                     Some(w) if w.width_mm.is_finite() => {
                         let need = required[w.layer];
                         let ok = w.width_mm + 1.5 * g.step >= need;
-                        let ratio = (w.width_mm / need).min(1.0).max(0.0);
+                        let ratio = (w.width_mm / need).clamp(0.0, 1.0);
                         let ratio = if ok { 1.0 } else { ratio };
                         if !ok {
-                            let target = if kind == "power" { &mut power } else { &mut ground };
+                            let target = if kind == "power" {
+                                &mut power
+                            } else {
+                                &mut ground
+                            };
                             target.findings.push(Finding {
                                 severity: if w.width_mm < 0.5 * need { "error" } else { "warning" },
                                 item: if kind == "power" { "4.3" } else { "3.4" },
@@ -927,10 +1174,19 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                                 at: Some(w.at),
                             });
                         }
-                        (json!({ "path": label, "net": net, "narrowest_mm": r2(w.width_mm), "required_mm": r2(need), "at": [r2(w.at.0), r2(w.at.1)], "layer": m.layers[w.layer] }), Some(ratio))
+                        (
+                            json!({ "path": label, "net": net, "narrowest_mm": r2(w.width_mm), "required_mm": r2(need), "at": [r2(w.at.0), r2(w.at.1)], "layer": m.layers[w.layer] }),
+                            Some(ratio),
+                        )
                     }
-                    Some(_) => (json!({ "path": label, "net": net, "note": "pads joined directly" }), Some(1.0)),
-                    None => (json!({ "path": label, "net": net, "note": "no copper path between the pads (unrouted or not rasterised)" }), None),
+                    Some(_) => (
+                        json!({ "path": label, "net": net, "note": "pads joined directly" }),
+                        Some(1.0),
+                    ),
+                    None => (
+                        json!({ "path": label, "net": net, "note": "no copper path between the pads (unrouted or not rasterised)" }),
+                        None,
+                    ),
                 };
                 if kind == "power" {
                     p_rows.push(row);
@@ -942,7 +1198,10 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
             }
         }
     }
-    for (out, ratios, rows, id) in [(&mut power, &p_ratios, &p_rows, "4.3"), (&mut ground, &g_ratios, &g_rows, "3.4")] {
+    for (out, ratios, rows, id) in [
+        (&mut power, &p_ratios, &p_rows, "4.3"),
+        (&mut ground, &g_ratios, &g_rows, "3.4"),
+    ] {
         if ratios.is_empty() {
             *out = CheckOut::not_run(id, out.name, "no source-to-load copper path could be measured (pads not joined by copper, or off the grid)");
             continue;
@@ -965,13 +1224,27 @@ fn neck_uuids(m: &Model, net: &str, at: Pt, layer: usize) -> Vec<String> {
         if t.layers.first().map(String::as_str) != Some(m.layers[layer].as_str()) {
             continue;
         }
-        let d = t.shape.pts.windows(2).map(|w| point_segment_distance(at, w[0], w[1])).fold(f64::INFINITY, f64::min);
+        let d = t
+            .shape
+            .pts
+            .windows(2)
+            .map(|w| point_segment_distance(at, w[0], w[1]))
+            .fold(f64::INFINITY, f64::min);
         if let Some(u) = &t.uuid {
             best.push((d, u.clone()));
         }
     }
-    for f in m.fills.iter().filter(|f| f.net.as_deref() == Some(net) && f.layer == m.layers[layer]) {
-        if f.rings.iter().any(|r| at.0 >= r.bbox.0 - 1.0 && at.0 <= r.bbox.2 + 1.0 && at.1 >= r.bbox.1 - 1.0 && at.1 <= r.bbox.3 + 1.0) {
+    for f in m
+        .fills
+        .iter()
+        .filter(|f| f.net.as_deref() == Some(net) && f.layer == m.layers[layer])
+    {
+        if f.rings.iter().any(|r| {
+            at.0 >= r.bbox.0 - 1.0
+                && at.0 <= r.bbox.2 + 1.0
+                && at.1 >= r.bbox.1 - 1.0
+                && at.1 <= r.bbox.3 + 1.0
+        }) {
             if let Some(u) = &f.zone_uuid {
                 best.push((0.5, u.clone()));
             }
@@ -980,4 +1253,3 @@ fn neck_uuids(m: &Model, net: &str, at: Pt, layer: usize) -> Vec<String> {
     best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     best.into_iter().take(3).map(|b| b.1).collect()
 }
-

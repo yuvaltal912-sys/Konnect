@@ -130,7 +130,13 @@ impl Grid {
         }
     }
 
-    fn cell_range(&self, minx: f64, miny: f64, maxx: f64, maxy: f64) -> (usize, usize, usize, usize) {
+    fn cell_range(
+        &self,
+        minx: f64,
+        miny: f64,
+        maxx: f64,
+        maxy: f64,
+    ) -> (usize, usize, usize, usize) {
         let clamp = |v: f64, n: usize| (v.floor().max(0.0) as usize).min(n - 1);
         (
             clamp((minx - self.x0) / self.step, self.nx),
@@ -328,7 +334,10 @@ impl Grid {
     pub fn distance_transform(&self) -> Vec<Vec<f32>> {
         let (nx, ny) = (self.nx, self.ny);
         let big = 1.0e6f32;
-        let (a, b) = (self.step as f32, (self.step * std::f64::consts::SQRT_2) as f32);
+        let (a, b) = (
+            self.step as f32,
+            (self.step * std::f64::consts::SQRT_2) as f32,
+        );
         let mut out = Vec::with_capacity(self.layers.len());
         for l in 0..self.layers.len() {
             let mut d: Vec<f32> = self.copper[l]
@@ -462,18 +471,19 @@ pub fn shortest_path(
             reached = Some(cell);
             break;
         }
-        let mut try_move = |nl: usize, nx: usize, ny: usize, step: f64, heap: &mut BinaryHeap<Item>| {
-            if !grid.is_copper(nl, nx, ny) {
-                return;
-            }
-            let c = (nl, nx, ny);
-            let nc = cost + step;
-            if nc < dist[key(c)] {
-                dist[key(c)] = nc;
-                prev[key(c)] = key(cell) as u32;
-                heap.push(Item { cost: nc, cell: c });
-            }
-        };
+        let mut try_move =
+            |nl: usize, nx: usize, ny: usize, step: f64, heap: &mut BinaryHeap<Item>| {
+                if !grid.is_copper(nl, nx, ny) {
+                    return;
+                }
+                let c = (nl, nx, ny);
+                let nc = cost + step;
+                if nc < dist[key(c)] {
+                    dist[key(c)] = nc;
+                    prev[key(c)] = key(cell) as u32;
+                    heap.push(Item { cost: nc, cell: c });
+                }
+            };
         for dy in -1i64..=1 {
             for dx in -1i64..=1 {
                 if dx == 0 && dy == 0 {
@@ -619,7 +629,11 @@ pub fn widest_path(
     let end = reached?;
     let (width, cell) = at[key(end)];
     Some(WidestPath {
-        width_mm: if width.is_finite() { width } else { f64::INFINITY },
+        width_mm: if width.is_finite() {
+            width
+        } else {
+            f64::INFINITY
+        },
         at: grid.centre(cell.1, cell.2),
         layer: cell.0,
     })
