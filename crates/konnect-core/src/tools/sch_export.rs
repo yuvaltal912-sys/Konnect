@@ -96,7 +96,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "inline_diff": { "type": "boolean", "description": "Also return the current sheet render as an MCP image block for inspection (not a difference heatmap)", "default": false }
+                    "inline_diff": { "type": "boolean", "description": "Also return a generated difference image as an MCP image block: drawing added since the baseline in green, removed in red, recoloured in orange, unchanged drawing faded, and a blue box around the changed region. The legend is in the JSON under diff_image", "default": false }
                 },
                 "required": ["schematic"]
             }),
@@ -349,7 +349,7 @@ async fn handle_render_png(
     Ok(CallToolResult::json(&response))
 }
 
-fn render_region(
+pub(super) fn render_region(
     args: &serde_json::Value,
 ) -> Result<Option<konnect_render::Region>, CallToolResult> {
     let Some(value) = args.get("region") else {
@@ -535,7 +535,7 @@ async fn handle_baseline_compare(
     } else {
         "PASS"
     };
-    let response = json!({
+    let mut response = json!({
         "status": status,
         "changed_pct_of_content": diff.changed_pct_of_content,
         "content_pixels": diff.content_pixels,
@@ -551,7 +551,30 @@ async fn handle_baseline_compare(
         "warnings": warnings,
     });
     if inline_diff {
-        return Ok(CallToolResult::json_with_png(&response, &rendered.png));
+        let image = match konnect_render::diff_image_png(&baseline_png, &rendered.png) {
+            Ok(image) => image,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "difference image failed: {error:#}"
+                )))
+            }
+        };
+        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        use konnect_render::diff_colors;
+        response["diff_image"] = json!({
+            "width_px": image.width_px,
+            "height_px": image.height_px,
+            "png_bytes": image.png.len(),
+            "legend": {
+                "added": hex(diff_colors::ADDED),
+                "removed": hex(diff_colors::REMOVED),
+                "modified": hex(diff_colors::MODIFIED),
+                "changed_bbox": hex(diff_colors::BBOX),
+                "unchanged": "current drawing faded to a quarter of its contrast",
+                "paper": "#ffffff",
+            },
+        });
+        return Ok(CallToolResult::json_with_png(&response, &image.png));
     }
     Ok(CallToolResult::json(&response))
 }
@@ -1901,29 +1924,76 @@ exit 1
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn inline_baseline_compare_keeps_drift_metadata_and_shows_current_render() {
+    async fn inline_baseline_compare_keeps_drift_metadata_and_shows_a_difference_image() {
         let (_dir, schematic, ctx) = render_scene();
         let stored = handle_baseline_set(&json!({"schematic": schematic, "width_px": 320}), &ctx)
             .await
             .unwrap();
         let stored_metadata = render_metadata(&stored);
+        let baseline = std::fs::read(stored_metadata["baseline_png"].as_str().unwrap()).unwrap();
         let inline =
             handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
                 .await
                 .unwrap();
-        let metadata = render_metadata(&inline);
+        let mut metadata = render_metadata(&inline);
         assert_eq!(metadata["status"], "PASS");
         assert_eq!(metadata["changed_pixels"], 0);
         assert_eq!(metadata["source_changed_since_baseline"], false);
+        let image = inline_png(&inline);
+        // The block is the generated difference image, not the current render.
+        assert_ne!(image, baseline);
         assert_eq!(
-            inline_png(&inline),
-            std::fs::read(stored_metadata["baseline_png"].as_str().unwrap()).unwrap()
+            image,
+            konnect_render::diff_image_png(&baseline, &baseline)
+                .unwrap()
+                .png
         );
+        assert_eq!(metadata["diff_image"]["png_bytes"], image.len());
+        assert_eq!(metadata["diff_image"]["legend"]["added"], "#00a000");
         let text_only = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
             .await
             .unwrap();
         assert_eq!(text_only.content.len(), 1);
+        metadata.as_object_mut().unwrap().remove("diff_image");
         assert_eq!(render_metadata(&text_only), metadata);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_diff_colours_drawing_added_since_the_baseline() {
+        let (dir, schematic, ctx) = render_scene();
+        handle_baseline_set(&json!({"schematic": schematic, "width_px": 320}), &ctx)
+            .await
+            .unwrap();
+        // The next export carries a large new filled block in the page's
+        // empty middle: drawing that the baseline does not have.
+        let source = dir.path().join("source.svg");
+        let svg = std::fs::read_to_string(&source).unwrap();
+        let end = svg.rfind("</svg>").unwrap();
+        let drifted = format!(
+            "{}<rect x=\"60\" y=\"60\" width=\"80\" height=\"60\" fill=\"#123456\"/>{}",
+            &svg[..end],
+            &svg[end..]
+        );
+        std::fs::write(&source, &drifted).unwrap();
+        let result =
+            handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
+                .await
+                .unwrap();
+        let metadata = render_metadata(&result);
+        assert_eq!(metadata["status"], "DRIFT", "{metadata}");
+        let (png_path, _) = baseline_paths(&schematic).unwrap();
+        let baseline = std::fs::read(png_path).unwrap();
+        let current = konnect_render::svg_to_png(drifted.as_bytes(), 320).unwrap();
+        let expected = konnect_render::diff_image_png(&baseline, &current.png).unwrap();
+        let image = inline_png(&result);
+        assert_eq!(image, expected.png);
+        assert_eq!(metadata["diff_image"]["width_px"], expected.width_px);
+        assert_eq!(metadata["diff_image"]["height_px"], expected.height_px);
+        // Against the no-change picture, the block's area is coloured in.
+        let unchanged = konnect_render::diff_image_png(&baseline, &baseline).unwrap();
+        let marked = konnect_render::diff_pngs(&unchanged.png, &image).unwrap();
+        assert!(marked.changed_pixels > 1000, "{marked:?}");
     }
 
     #[tokio::test]

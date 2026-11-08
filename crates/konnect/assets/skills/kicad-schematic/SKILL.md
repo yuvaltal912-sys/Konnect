@@ -367,7 +367,9 @@ The agent can see its own schematic. After meaningful edits:
 3. `compare_visual_baseline` — after edits: PASS/DRIFT against a 2% content
    threshold with the changed region's bounding box. "No baseline stored" is
    a normal state, and a baseline from an older renderer is flagged rather
-   than silently trusted.
+   than silently trusted. With `inline_diff` true it returns a difference
+   image: green is new drawing, red is removed, orange is recoloured, and a
+   blue box marks the changed region.
 
 Use the loop to catch what connectivity checks cannot. Completion requires
 coherent functional grouping, label-inclusive overlap inspection, clear signal

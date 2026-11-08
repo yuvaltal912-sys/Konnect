@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 259 registered tools plus 7 meta-tools (266). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 261 registered tools plus 7 meta-tools (268), counting rank 25's three render tools on draft [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The installed binary remains protected.
 
 ## Start here
 
@@ -51,7 +51,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: read baselines in `run_design_review` (now unblocked) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
-| R25 | Inline layer and library-item renders (rank 25: C6, A25, B9, B7): board layers, a symbol and a footprint returned as MCP image blocks, plus a generated difference image for `inline_diff` (PR 4 follow-ups) | 4 | In progress (branch `feat/creation-inline-layer-library-renders`) |
+| R25 | Inline layer and library-item renders (rank 25: C6, A25, B9, B7): board layers, a symbol and a footprint returned as MCP image blocks, plus a generated difference image for `inline_diff` (PR 4 follow-ups) | 4 | Draft, ready for review: [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50) (branch `feat/creation-inline-layer-library-renders`). Not done: B9's further 3D camera options (left/right/front/back, pan, rotate, multi-view batch) |
 
 ## Next: what to pick
 
@@ -237,6 +237,55 @@ The claim commit landed before code changes and the draft was opened against `ma
   (9 renderer, 8 board, 12 schematic/MCP) failed their intended tests, and all
   mutations were restored. The final macOS gate is listed on #28. No live editor IPC is needed for these tools;
   Windows, Linux and display in an actual MCP client remain unverified.
+
+## Rank 25, inline layer and library-item renders (draft, #50)
+
+Claim commit and draft PR came before code. Findings C6, A25, B9 and B7.
+
+- **The text risk did not block.** KiCad 10.0.8 `pcb export svg`, `sym export svg`
+  and `fp export svg` draw every visible string as stroke or outline paths and add
+  an invisible `opacity="0"` copy, exactly like schematic exports. A board text in a
+  TrueType font (Arial) was also plotted as outline paths. So `konnect-render`'s
+  refusal of visible `<text>` stays unchanged, with no allowance; a future export
+  that does emit visible text is refused, not rendered with a guessed font.
+- **`render_board_layers`** (`pcb_export`, beside `export_svg`): named layers of
+  the saved board as a PNG image block. Without `region` the page is the
+  board-edge bounding box (`--page-size-mode 2`); with `region` it plots on the
+  drawing sheet (`--page-size-mode 1`), where page mm equal board mm, and crops.
+  A region off the sheet is refused with a hint to drop `region`. Undeclared
+  layers are refused by name. Colours are KiCad's plot theme on the editor's dark
+  background (`#001023`), because pale silkscreen and white drill marks vanish on
+  white; `black_and_white` plots on white.
+- **`render_library_item`** (`library`): one tool, kind chosen by the path. A
+  `.kicad_sym` renders symbol `name` (`unit`, `body_style`; metadata lists units
+  and De Morgan); a `.pretty` renders footprint `name`; one `.kicad_mod` (what
+  `create_footprint` writes) is staged as a private `.pretty`, since kicad-cli
+  reads only libraries. Options for the other kind are refused. kicad-cli exits 0
+  without writing for an unknown footprint, so the file is the evidence. One tool
+  instead of two because `library` sits at the router's 20-tool cap with it; a
+  future library tool (for example rank 33's local import) must split the toolset.
+- **`compare_visual_baseline` `inline_diff`** now returns a generated difference
+  image (`konnect_render::diff_image_png`): added green, removed red, recoloured
+  orange, unchanged drawing faded, a blue box around the change; legend in
+  `diff_image`. Same canvas, threshold and background rule as the drift numbers.
+- New renderer entry points: `svg_page_to_png` (whole page with the region path's
+  8192 px height and 16 Mi pixel caps; `svg_to_png` has no height cap and stays
+  for baselines), `svg_region_to_png_on` (background colour), `page_size_mm`.
+  Renders write nothing beside the design unless `output` is given; the SVG goes
+  to a private temporary directory.
+- Verified: 25 new or rewritten tests (renderer 7, handlers 16 with a stand-in kicad-cli
+  serving SVGs the real kicad-cli 10.0.8 exported from fixture parts written for
+  this, schematic 1 rewritten and 1 new); 5 negative controls (visible-text guard,
+  height cap, undeclared layer, foreign options, diff image vs current render),
+  each failed its test and was restored. Release binary by stdio pipe: an image
+  block arrived for a demo board (full, black and white, region), a 74LS00 De
+  Morgan unit, a SOIC-8 and a single `.kicad_mod`, and for a real difference
+  image; four refusals came back as structured errors. Gate under "Verify":
+  all green except 21 IPC-mock tests in `pcb_sync`/`pcb_routing` that timed out
+  under a load average near 40 from parallel sessions and passed when rerun alone.
+  `simulation_live` was skipped (out of scope).
+- Not verified: display in an actual MCP client, Windows and Linux, kicad-cli
+  other than 10.0.8, boards placed off the drawing sheet with a region.
 
 ## PR 5, shipped creation guidance (merged, #29)
 

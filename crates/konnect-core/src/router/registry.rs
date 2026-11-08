@@ -100,15 +100,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_export",
-        description: "Gerber, PDF, SVG, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
+        description: "Gerber, PDF, SVG, inline layer render, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
         category: "pcb",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "library",
-        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
+        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models, render a symbol or footprint inline",
         category: "library",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "integration",

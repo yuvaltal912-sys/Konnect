@@ -168,6 +168,7 @@ changes the design. Refill after routing and check the resulting copper.
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 | `get_board_2d_view`       | Image of the saved board; `side` top/bottom, `zoom` above 1 for a close-up |
+| `render_board_layers`     | 2D image of named layers (`pcb_export`), e.g. `["F.SilkS", "F.Fab", "Edge.Cuts"]` for silkscreen overlaps; `region` in board mm for a close-up |
 
 ### Bounded AI-directed placement loop
 

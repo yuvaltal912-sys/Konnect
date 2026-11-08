@@ -2020,6 +2020,163 @@ pub async fn render_pcb_png(
     Ok(())
 }
 
+/// Page framing for [`pcb_layers_svg_args`]. KiCad's `--page-size-mode 2`
+/// fits the page to the board-edge bounding box, so page coordinates are
+/// relative to it; mode 1 keeps the drawing-sheet page, where page
+/// millimetres equal board coordinates. A cropped render needs the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoardSvgPage {
+    BoardArea,
+    BoardCoordinates,
+}
+
+/// KiCAD 10: `pcb export svg --output <file> --mode-single --layers <a,b>
+/// --page-size-mode <1|2> --exclude-drawing-sheet [--black-and-white] <input>`
+pub(crate) fn pcb_layers_svg_args(
+    pcb: &str,
+    output: &str,
+    layers: &[&str],
+    page: BoardSvgPage,
+    black_and_white: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "pcb",
+        "export",
+        "svg",
+        "--output",
+        output,
+        "--mode-single",
+        "--layers",
+    ]
+    .iter()
+    .map(|value| value.to_string())
+    .collect();
+    args.push(layers.join(","));
+    args.push("--page-size-mode".into());
+    args.push(
+        match page {
+            BoardSvgPage::BoardArea => "2",
+            BoardSvgPage::BoardCoordinates => "1",
+        }
+        .into(),
+    );
+    args.push("--exclude-drawing-sheet".into());
+    if black_and_white {
+        args.push("--black-and-white".into());
+    }
+    args.push(pcb.into());
+    args
+}
+
+/// Plot board layers to one SVG file for in-process rasterization.
+pub async fn export_pcb_layers_svg(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    page: BoardSvgPage,
+    black_and_white: bool,
+) -> Result<()> {
+    let args = pcb_layers_svg_args(
+        pcb.to_str().context("board path is not UTF-8")?,
+        output.to_str().context("output path is not UTF-8")?,
+        layers,
+        page,
+        black_and_white,
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    verify_nonempty_file(output, "board layer SVG").await?;
+    Ok(())
+}
+
+/// KiCAD 10: `sym export svg --output <dir> --symbol <name>
+/// [--include-hidden-pins] <library.kicad_sym>`. KiCad writes one file per
+/// unit and body style: `<name>_unit<n>.svg` and `<name>_unit<n>_demorgan.svg`.
+pub(crate) fn symbol_svg_args<'a>(
+    library: &'a str,
+    symbol: &'a str,
+    output_dir: &'a str,
+    include_hidden_pins: bool,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "sym", "export", "svg", "--output", output_dir, "--symbol", symbol,
+    ];
+    if include_hidden_pins {
+        args.push("--include-hidden-pins");
+    }
+    args.push(library);
+    args
+}
+
+pub async fn export_symbol_svg(
+    cli: &str,
+    library: &Path,
+    symbol: &str,
+    output_dir: &Path,
+    include_hidden_pins: bool,
+) -> Result<()> {
+    let args = symbol_svg_args(
+        library.to_str().context("library path is not UTF-8")?,
+        symbol,
+        output_dir.to_str().context("output path is not UTF-8")?,
+        include_hidden_pins,
+    );
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    Ok(())
+}
+
+/// KiCAD 10: `fp export svg --output <dir> --footprint <name> [--layers <a,b>]
+/// [--black-and-white] <library.pretty>`. The output directory must already exist. KiCad exits 0
+/// and writes nothing when the footprint is not in the library, so callers
+/// must look for the file.
+pub(crate) fn footprint_svg_args<'a>(
+    library_dir: &'a str,
+    footprint: &'a str,
+    output_dir: &'a str,
+    layers: &'a str,
+    black_and_white: bool,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "fp",
+        "export",
+        "svg",
+        "--output",
+        output_dir,
+        "--footprint",
+        footprint,
+    ];
+    if !layers.is_empty() {
+        args.push("--layers");
+        args.push(layers);
+    }
+    if black_and_white {
+        args.push("--black-and-white");
+    }
+    args.push(library_dir);
+    args
+}
+
+pub async fn export_footprint_svg(
+    cli: &str,
+    library_dir: &Path,
+    footprint: &str,
+    output_dir: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    let layers = layers.join(",");
+    let args = footprint_svg_args(
+        library_dir.to_str().context("library path is not UTF-8")?,
+        footprint,
+        output_dir.to_str().context("output path is not UTF-8")?,
+        &layers,
+        black_and_white,
+    );
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod schematic_export_option_tests {
     use super::*;

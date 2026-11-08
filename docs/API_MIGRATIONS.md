@@ -3,6 +3,36 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: inline layer and library-item renders, difference image
+
+Creation rank 25 (`docs/CREATION_HANDOFF.md`).
+
+- **`compare_visual_baseline` with `inline_diff: true`** now returns a
+  generated difference image in its image block instead of the current
+  full-sheet render. Drawing present now but not in the baseline is green
+  (`#00a000`), drawing removed is red (`#dc0000`), drawing in both but in a
+  different colour is orange (`#e68c00`), unchanged drawing is the current
+  render faded to a quarter of its contrast, and a 2-pixel blue (`#005aff`)
+  box surrounds the changed bounding box. The JSON gains `diff_image` with its
+  dimensions, byte count and this legend; every other field is unchanged, and
+  so are the drift metrics and threshold. A caller that wants the current
+  render calls `render_schematic_png` with `inline: true`.
+- **New `render_board_layers`** (`pcb_export`): `board` and a non-empty
+  `layers` list are required; layers the board does not declare are refused.
+  It plots the saved file with `pcb export svg`. Without `region` the page is
+  the board-edge bounding box; `region: {x, y, width, height}` is in board mm
+  and must lie on the drawing sheet. `width_px` 1..=4096 (default 1600);
+  output height at most 8192 px and area at most 16,777,216 pixels.
+  `inline` defaults to true; `output` also writes the PNG and is required
+  when `inline` is false.
+- **New `render_library_item`** (`library`): `library` is a `.kicad_sym` file
+  (with `name`, optional `unit`, `body_style`, `include_hidden_pins`), a
+  `.pretty` directory (with `name`) or one `.kicad_mod` file (`name`
+  optional), with optional `layers` and `black_and_white` for footprints.
+  An option for the other kind is refused. The metadata lists the symbol's
+  units and whether it has a De Morgan body. Same size caps and delivery
+  options as `render_board_layers`, with `width_px` defaulting to 800.
+
 ## Unreleased: ERC and DRC baselines
 
 Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains

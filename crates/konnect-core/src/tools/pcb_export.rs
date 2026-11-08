@@ -111,6 +111,19 @@ pub(crate) fn validate_position_values(
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
+    let mut tools = export_tools();
+    // The raster layer view sits beside the SVG layer export it builds on.
+    let after_export_svg = tools
+        .iter()
+        .position(|t| t.name == "export_svg")
+        .map_or(tools.len(), |i| i + 1);
+    for (offset, tool) in super::item_render::board_tools().into_iter().enumerate() {
+        tools.insert(after_export_svg + offset, tool);
+    }
+    tools
+}
+
+fn export_tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_gerber",
