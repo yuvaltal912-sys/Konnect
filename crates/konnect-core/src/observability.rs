@@ -1,5 +1,6 @@
 //! Per-call observability: ring buffer of recent calls, per-tool counters,
-//! and optional JSONL log file at `<konnect config dir>/logs/calls.jsonl`.
+//! and optional JSONL log file at `<konnect config dir>/logs/calls.jsonl`
+//! (see [`calls_log_path`] for the overrides, and why tests never reach it).
 //!
 //! Wired into `McpHandler::execute_tool` — every tool invocation (meta-tool or
 //! domain tool) lands a `CallRecord` via `CallObserver::record`. The LLM can
@@ -14,6 +15,7 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -203,15 +205,19 @@ impl CallObserver {
     }
 
     async fn append_jsonl(&self, path: &std::path::Path, rec: &CallRecord) -> std::io::Result<()> {
-        let line = serde_json::to_string(rec)
+        // The whole record, newline included, goes out in one `write_all` on an
+        // append-mode handle. `writeln!` on a `File` issues one write for the
+        // JSON and another for the newline, so two processes logging at once
+        // glued records onto one line (finding C2: 1,028 unreadable lines).
+        let mut line = serde_json::to_vec(rec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
         let mut guard = self.inner.log_handle.lock().await;
         if guard.is_none() {
             *guard = Some(OpenOptions::new().create(true).append(true).open(path)?);
         }
         if let Some(file) = guard.as_mut() {
-            writeln!(file, "{}", line)?;
-            file.flush()?;
+            file.write_all(&line)?;
         }
         Ok(())
     }
@@ -290,6 +296,64 @@ pub fn konnect_dir() -> PathBuf {
 /// Default JSONL path for per-call logs.
 pub fn default_calls_log_path() -> PathBuf {
     konnect_dir().join("logs").join("calls.jsonl")
+}
+
+/// Redirects or disables the per-call log: `off` disables it, an absolute path
+/// replaces it. Anything else disables it with a warning, so a typo never writes
+/// somewhere unexpected.
+pub const CALL_LOG_ENV: &str = "KONNECT_CALL_LOG";
+
+/// Where this process appends its per-call log, or `None` for in-memory only.
+///
+/// In order: `KONNECT_CALL_LOG` (see [`CALL_LOG_ENV`]); `KONNECT_STATE_DIR`,
+/// whose `logs/calls.jsonl` is used, so a run with an isolated state folder
+/// keeps its log there too; otherwise [`default_calls_log_path`].
+///
+/// This crate's own unit tests always get `None`: they built handlers by the
+/// hundred and made up about 94% of the owner's real log (finding C1). Other
+/// test processes run under `cargo`, whose `[env]` in `.cargo/config.toml` sets
+/// `KONNECT_CALL_LOG=off`; tests that need a log point it at a temporary path.
+pub fn calls_log_path() -> Option<PathBuf> {
+    process_calls_log_path(|key| std::env::var_os(key))
+}
+
+fn process_calls_log_path(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    resolve_calls_log_path(var, default_calls_log_path)
+}
+
+fn resolve_calls_log_path(
+    var: impl Fn(&str) -> Option<OsString>,
+    default_path: impl FnOnce() -> PathBuf,
+) -> Option<PathBuf> {
+    if let Some(value) = var(CALL_LOG_ENV).filter(|value| !value.is_empty()) {
+        if value.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        let path = PathBuf::from(&value);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        warn!(
+            "[observability] {CALL_LOG_ENV} must be `off` or an absolute path, got '{}'; JSONL logging disabled",
+            path.display()
+        );
+        return None;
+    }
+    if let Some(value) = var("KONNECT_STATE_DIR").filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(&value);
+        if root.is_absolute() {
+            return Some(root.join("logs").join("calls.jsonl"));
+        }
+        warn!(
+            "[observability] KONNECT_STATE_DIR must be an absolute path, got '{}'; JSONL logging disabled",
+            root.display()
+        );
+        return None;
+    }
+    Some(default_path())
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -412,6 +476,130 @@ mod tests {
         assert!(lines[0].contains("\"status\":\"ok\""));
         assert!(lines[1].contains("\"status\":\"error\""));
         assert!(lines[1].contains("\"error_kind\":\"boom\""));
+    }
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let pairs: Vec<(String, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), OsString::from(v)))
+            .collect();
+        move |key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn default_for_test() -> PathBuf {
+        PathBuf::from("/home/someone/.konnect/logs/calls.jsonl")
+    }
+
+    #[test]
+    fn this_crates_tests_never_resolve_a_call_log() {
+        // Finding C1: in-crate tests used to append to the owner's real log.
+        // With no override at all, only the `cfg(test)` guard stops the default.
+        assert_eq!(process_calls_log_path(|_| None), None);
+        assert_eq!(
+            process_calls_log_path(env_from(&[("KONNECT_CALL_LOG", "/tmp/x/calls.jsonl")])),
+            None
+        );
+        assert_eq!(calls_log_path(), None);
+    }
+
+    #[test]
+    fn the_log_path_resolves_overrides_before_the_default() {
+        let resolve =
+            |pairs: &[(&str, &str)]| resolve_calls_log_path(env_from(pairs), default_for_test);
+        assert_eq!(resolve(&[]), Some(default_for_test()));
+        assert_eq!(
+            resolve(&[("KONNECT_STATE_DIR", "/tmp/state")]),
+            Some(PathBuf::from("/tmp/state/logs/calls.jsonl")),
+            "an isolated state folder keeps the log with it"
+        );
+        assert_eq!(
+            resolve(&[
+                ("KONNECT_CALL_LOG", "/tmp/x/calls.jsonl"),
+                ("KONNECT_STATE_DIR", "/tmp/state"),
+            ]),
+            Some(PathBuf::from("/tmp/x/calls.jsonl")),
+            "the explicit log path wins over the state folder"
+        );
+        for off in ["off", "OFF", "Off"] {
+            assert_eq!(
+                resolve(&[
+                    ("KONNECT_CALL_LOG", off),
+                    ("KONNECT_STATE_DIR", "/tmp/state")
+                ]),
+                None
+            );
+        }
+        // A relative value disables the log rather than writing beside the cwd.
+        assert_eq!(resolve(&[("KONNECT_CALL_LOG", "calls.jsonl")]), None);
+        assert_eq!(resolve(&[("KONNECT_STATE_DIR", "state")]), None);
+        // Empty values count as unset.
+        assert_eq!(
+            resolve(&[("KONNECT_CALL_LOG", ""), ("KONNECT_STATE_DIR", "")]),
+            Some(default_for_test())
+        );
+    }
+
+    /// Set in a child copy of this test binary: the log path it appends to.
+    const APPEND_CHILD_ENV: &str = "KONNECT_TEST_APPEND_CHILD_LOG";
+    const APPEND_CHILDREN: usize = 4;
+    const RECORDS_PER_CHILD: usize = 400;
+
+    /// Finding C2. Several processes append to one log at once; every line must
+    /// still be one whole record. Each child is this test binary re-run on this
+    /// test alone, with `APPEND_CHILD_ENV` naming the shared log.
+    #[tokio::test]
+    async fn concurrent_processes_append_only_whole_lines() {
+        if let Some(path) = std::env::var_os(APPEND_CHILD_ENV) {
+            let obs = CallObserver::new(Some(PathBuf::from(path)));
+            for i in 0..RECORDS_PER_CHILD {
+                let mut rec = sample_record("append_probe", CallStatus::Ok);
+                // Vary the length so writes do not line up by accident.
+                rec.error_kind = Some("x".repeat(i % 97));
+                obs.record(rec).await;
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.jsonl");
+        let exe = std::env::current_exe().expect("test binary path");
+        let name = format!(
+            "{}::concurrent_processes_append_only_whole_lines",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let children: Vec<_> = (0..APPEND_CHILDREN)
+            .map(|_| {
+                std::process::Command::new(&exe)
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--quiet"])
+                    .env(APPEND_CHILD_ENV, &log)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn child test process")
+            })
+            .collect();
+        for mut child in children {
+            assert!(child.wait().expect("child exit").success(), "child failed");
+        }
+
+        let contents = std::fs::read_to_string(&log).expect("log read");
+        assert!(contents.ends_with('\n'), "the last record is terminated");
+        let mut ids = std::collections::HashSet::new();
+        for (n, line) in contents.lines().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line {} is not one JSON record ({e}): {line}", n + 1));
+            assert_eq!(value["tool"], "append_probe");
+            ids.insert(value["call_id"].as_str().expect("call_id").to_string());
+        }
+        assert_eq!(
+            contents.lines().count(),
+            APPEND_CHILDREN * RECORDS_PER_CHILD,
+            "every record is on its own line"
+        );
+        assert!(
+            ids.len() > RECORDS_PER_CHILD,
+            "records came from several processes"
+        );
     }
 
     #[test]
