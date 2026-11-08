@@ -59,7 +59,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 **Recommended order**, after the owner approves the next implementation:
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
-2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35); the `cargo deny` advisories (its own PR).
+2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35).
+   - The `cargo deny` advisories fix is in review: draft [#45](https://github.com/yuvaltal912-sys/Konnect/pull/45) (branch `fix/cargo-deny-advisories`). Semver lockfile updates (h2, rustls, rustls-webpki, tokio, webpki-root-certs, hyper, which drops `pin-utils`), `zip` 8 to 9 with no code change, and one `deny.toml` ignore (RUSTSEC-2024-0449, `unsafe-libyaml`, dev-only), which the owner chose to keep (2026-11-08). Once merged, `cargo deny check` is green on main.
 3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), LCSC import (rank 33).
 
 PR 13's rule editing, deletion and static expression workflow is complete within
@@ -78,7 +79,6 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - `every_simulation_demo_flattens_or_names_its_export_failure` is flaky when another test run is using `~/Library/Caches/KiCad` at the same time (IBIS demo, "Cannot find U1.cache"). Rerun it alone.
 - Use the noreply identity from `AGENTS.md`, including merge commits. Since the owner turned on email privacy (2026-11-08), GitHub merges work with `gh pr merge N --merge --match-head-commit <full sha> --author-email 274043415+yuvaltal912-sys@users.noreply.github.com` (first used for #42); check the merge commit's `%ae`. If GitHub refuses, stop and ask: never substitute a personal email or fast-forward `main`. Pushes are refused when the branch tip carries a personal email, so put a noreply commit on top.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
-- `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
 
 ## PR 15, ERC/DRC baselines (merged, #43)
