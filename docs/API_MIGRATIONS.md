@@ -58,6 +58,28 @@ matching manifests. Old manifests (two layers, front side) still import.
   with `_` (`sonde_xilinx.kicad_pcb`); the SES importer accepts that name as
   the base design.
 
+## Unreleased: circuit-aware review (`audit_circuit_design`)
+
+Creation rank 29 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains
+`audit_circuit_design(schematic, board?)`, and `run_design_review` runs it. It
+automates the schematic- and placement-level items of the owner's layout
+checklist (sections 2, 6, 8, 9) and reads the design-intent rails (`source_ref`)
+and regulator feedback dividers. Existing tools keep their arguments and
+results; new fields only.
+
+- **Findings** carry `checklist` (the item) and `rule` (the check that fired),
+  plus `evidence`. Categories are `circuit`.
+- **`checks`** lists every rule as `ran`, `no_subjects` (nothing to examine) or
+  `not_run` (`no_board`, `no_design_intent`), with examined/passed/finding/
+  skipped/unevaluated counts. `needs_human` lists checklist items no tool here
+  judges; `unproven` lists absences withheld because the net continues on another sheet.
+- **`run_design_review`** adds `audits.circuit_design` and `design_review.circuit`
+  (status, rules run and not run, unevaluated subjects, `needs_human`). Subjects the
+  audit could not evaluate with a board given (a part missing from the board, an
+  unrouted sense net) add the diagnostic `circuit_checks_unevaluated`, so the verdict
+  is INCOMPLETE. The verdict text is unchanged: LOOKS GOOD does not speak for `needs_human`.
+- An unusable design-intent record makes the review INCOMPLETE, as for `audit_trace_current`.
+
 ## Unreleased: `run_design_review` reads a DRC baseline
 
 PR 15 follow-up (`docs/CREATION_HANDOFF.md`). `run_design_review` takes an

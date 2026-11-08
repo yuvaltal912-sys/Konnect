@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged, and so are #45 (`cargo deny` green, one owner-kept ignore), #46 (call log isolation, rank 35), #47 (the review reads a DRC baseline) and #44 (PR 16: Specctra DSN for real boards; Freerouting 2.5.0 routed all 9 exporting KiCad demo boards through the strict import planner). Open for review: #48–#54 (see below). Catalogue on main: 259 registered tools plus 7 meta-tools. GitHub merges use the noreply author (see Known traps). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged, and so are #45 (`cargo deny` green, one owner-kept ignore), #46 (call log isolation, rank 35), #47 (the review reads a DRC baseline) and #44 (PR 16: Specctra DSN for real boards; Freerouting 2.5.0 routed all 9 exporting KiCad demo boards through the strict import planner). Open for review: #48–#54 (see below). Catalogue on main: 260 registered tools plus 7 meta-tools. GitHub merges use the noreply author (see Known traps). The installed binary remains protected.
 
 ## Start here
 
@@ -51,7 +51,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: `run_design_review` reads a DRC baseline, merged [#47](https://github.com/yuvaltal912-sys/Konnect/pull/47) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Merged: [#44](https://github.com/yuvaltal912-sys/Konnect/pull/44). Part 2 (version policy, benchmark) in [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51) |
-| 29 | Circuit-aware review against the owner's layout checklist (sections 2, 6, 8, 9) and the power tree from the design-intent rails (rank 29: B22, B23) | Q3, 11 | In progress (branch `feat/creation-circuit-aware-review`). Files: `design_review.rs`, `component_class.rs`, new files |
+| 29 | Circuit-aware review against the owner's layout checklist (sections 2, 6, 8, 9) and the power tree from the design-intent rails (rank 29: B22, B23 partly) | Q3, 11 | Draft [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), branch `feat/creation-circuit-aware-review`. Follow-ups: derating (B23), datasheet-driven values, hierarchy-joined nets |
 
 ## Next: what to pick
 
@@ -63,7 +63,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Recommended next**, after the owner approves:
 
-1. Circuit-aware review (rank 29, reads the Q3 rails); `design_review.rs` is free now that #47 is merged.
+1. Circuit-aware review (rank 29): draft #55, see its section.
 2. A routing-quality loop on the owner-style corpus: power and critical nets first (short, wide, locked), Freerouting for the rest, then a quality report comparing runs and settings; this is the Q1 "second opinion" with shared metrics.
 3. Rest of rank 32: custom pad shapes, local clearance overrides, blind/buried vias, keeping some pours while omitting others.
 
@@ -86,6 +86,19 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
 - Under heavy machine load (several sessions running tests at once, load average above 30) the IPC mock tests in `pcb_sync` and `custom_rule_tests` time out (`GetOpenDocuments … Timed out`). They pass alone; rerun them before calling a gate red.
 - Freerouting 2.5.0 needs Java 25 (class file 69); Java 21 fails with `UnsupportedClassVersionError`.
+
+## Rank 29, circuit-aware review (draft #55)
+
+`audit_circuit_design(schematic, board?)` in the `design_review` toolset (8 tools; 260 + 7 registered), run by `run_design_review`. Code: `circuit_model.rs` (parts, pins, nets of one sheet; board pad distances), `circuit_checks.rs` (the checks), `circuit_review.rs` (rule table, accounting, power tree, feedback), role classifiers in `component_class.rs`. The standard is the owner's layout checklist (`target/creation-research/layout-checklist.md`, git-ignored). Written from the checklist and pin names; nothing is ported from kicad-happy, so `THIRD_PARTY.md` is unchanged.
+
+- **Honesty.** Every finding has `checklist` and `rule`. `checks` gives each of the 37 rules a status: `ran`, `no_subjects` (nothing to examine) or `not_run` (`no_board`, `no_design_intent`), with examined/passed/findings/skipped/unevaluated counts. `unevaluated` (a part missing from the board, an unrouted sense net) is a gap: `run_design_review` adds the diagnostic `circuit_checks_unevaluated`, so the verdict is INCOMPLETE. `skipped` reasons starting `needs_human` need a datasheet. `unproven` holds absences withheld because the net carries a global or hierarchical label. `needs_human` lists 20 checklist items no tool here judges. The verdict text is unchanged; LOOKS GOOD does not speak for `needs_human`.
+- **Automated, placement (needs a board; pad-anchor distance, the metric `score_placement` uses, limits from its `decoupling_limit_mm`):** decoupling supply and ground legs; bulk near regulator and gate-driver supply; TVS at the connector and ahead of the circuit it protects; CAN/RS-485 transceiver near its connector; termination near the connector or transceiver; series termination at the proven driver; gate driver near its MOSFET and gate resistor at the gate; bootstrap cap at the driver pins; sense amplifier near the shunt plus a copper-graph Kelvin check; crystal load caps and crystal near the IC; ADC reference cap.
+- **Automated, schematic:** connector signals protected, protection not behind a series part; CAN termination (direct, split, jumper-selectable) is 120 ohm and the bus has no star; RS-485 termination and fail-safe bias; I2C pull-up rail against device supply (voltages from the record, else the net name) and total value, with module pull-ups named as not counted; UART TX-TX and RX-RX; USB ESD present and low-capacitance (family tables; unknown parts are left to a human) and the recorded 90 ohm pair; bootstrap cap present; gate-drive return net equals the MOSFET source net; crystal load caps present with the computed CL (3 pF stray assumed, target left to a human).
+- **Power tree (needs the record):** rail nets exist, name agrees with `voltage_v`, `source_ref` exists and is on the rail (directly or one inductor/resistor away), its input rail, and regulator feedback dividers against the recorded voltage using a built-in table of 15 reference voltages (confirm against the datasheet); an unknown regulator reports its implied reference.
+- **Thresholds are heuristics, named in `circuit_checks.rs`** (ESD 10 mm, transceiver 25 mm, gate resistor 5 mm, gate driver 15 mm, sense amp 15 mm, crystal cap 5 mm, crystal 10 mm, bootstrap 5 mm). The owner should tune them.
+- **Limits.** One circuit per schematic file: nets do not join across sheets except by the `leaves_sheet` marker. Pad distances, not trace order or routed length. Kelvin check needs tracks; a zone-joined or unrouted sense net is `unevaluated`. Connector exposure is not known (`J1` internal header looks like an external connector), so unprotected signals are `info` unless the net is in a recorded interface. I2C missing pull-ups stay with `audit_connections`. B23 derating is not started. Section 3 (return paths) belongs to the board-level audit; section 7 and the rest of 1, 4, 5, 10, 11 are `needs_human`.
+
+Verified on macOS (2026-11-08): 57 unit tests (`circuit_review_tests.rs`, one or more per rule: fires, passes, reports not-run or not-evaluated) and 5 review-integration tests (`design_review_circuit_tests.rs`) over scratch schematics and boards; clippy `-D warnings`; 4 negative controls each caught by a test (ground leg ignored, cross-sheet guard removed, unevaluated gaps not counted, Kelvin branch detection off). Not verified: a real KiCad board (no owner project was used), a live kicad-cli review with a board, Windows and Linux.
 
 ## PR 16, Specctra DSN for real boards (merged, #44)
 

@@ -264,6 +264,21 @@ assumes every item carries the full net current, so a flagged branch that only
 carries part of it is a judgement for the owner, not a pass. Name the
 `not_checked` items (IPC-2152 derating, voltage drop) as open.
 
+### Circuit Audit
+
+```
+audit_circuit_design(schematic, board)
+```
+
+Checks the owner's layout checklist items a schematic and placement can show:
+decoupling, bulk, TVS/ESD, transceiver, termination, gate-driver, sense-amplifier,
+crystal and reference-capacitor placement; CAN, RS-485, I2C, UART and USB rules;
+bootstrap and gate-drive return; and the design-intent power tree with regulator
+feedback dividers. Every finding names its checklist item and rule. Report each
+rule's status from the checks list: a rule with no subjects or not run was
+not a pass, and needs-human items are open for the owner. Absences listed under
+`unproven` continue on another sheet. Distances are pad to pad, not routed length.
+
 ---
 
 ## Full Review Shortcut

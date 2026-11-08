@@ -173,6 +173,223 @@ pub(crate) fn is_ground_name(name: &str) -> bool {
     upper.starts_with("GND") || upper.ends_with("GND") || upper.starts_with("VSS") || upper == "0V"
 }
 
+// ─── Roles for the circuit-aware review ──────────────────────────────────────
+//
+// Everything below classifies by what a symbol *is* (library name, reference
+// prefix, pin names), never by what a net is called, and each answer names the
+// rule that gave it so a finding can say why a part was taken for what it is.
+
+/// A pin or net name with case, `~{}` overbar markup, `/` and `_` removed, so
+/// `~{RE}`, `/RE` and `RE` compare equal and `CAN_H` reads `CANH`.
+pub(crate) fn norm_pin(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '~' | '{' | '}' | '/' | '_' | ' ' | '#'))
+        .collect::<String>()
+        .to_uppercase()
+}
+
+fn lib_name(lib_id: &str) -> &str {
+    lib_id.rsplit(':').next().unwrap_or(lib_id)
+}
+
+fn ref_has_prefix_digit(reference: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|p| {
+        reference
+            .strip_prefix(p)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// A resistor: `Device:R`, `R_Small`, `R_US`, … or a reference `R<digit>`.
+pub(crate) fn is_resistor(lib_id: &str, reference: &str) -> bool {
+    let name = lib_name(lib_id);
+    name == "R"
+        || name.starts_with("R_")
+        || (ref_has_prefix_digit(reference, &["R"]) && !name.starts_with("RV"))
+}
+
+/// An inductor, ferrite bead or common-mode choke in series with a signal.
+pub(crate) fn is_series_inductor(lib_id: &str, reference: &str) -> bool {
+    let name = lib_name(lib_id);
+    name == "L"
+        || name.starts_with("L_")
+        || name.starts_with("Ferrite")
+        || name.starts_with("FB")
+        || name.starts_with("L_Core")
+        || ref_has_prefix_digit(reference, &["L", "FB"])
+}
+
+/// A connector: a `Connector*` library symbol, or `J`/`CN`/`P`/`X` + digit
+/// on a symbol whose library name says connector, header, jack or USB.
+pub(crate) fn is_connector(lib_id: &str, reference: &str) -> bool {
+    let lib_upper = lib_id.to_uppercase();
+    if lib_upper.starts_with("CONNECTOR") {
+        return true;
+    }
+    let name = lib_upper.rsplit(':').next().unwrap_or("");
+    ref_has_prefix_digit(reference, &["J", "CN", "P", "X"])
+        && (name.contains("CONN")
+            || name.contains("HEADER")
+            || name.contains("JACK")
+            || name.contains("TERMINAL")
+            || name.starts_with("USB_"))
+}
+
+/// A two-terminal crystal or ceramic resonator that needs external load
+/// capacitors. Active oscillators (`Oscillator:`) carry their own.
+pub(crate) fn is_crystal(lib_id: &str, reference: &str) -> bool {
+    let name = lib_name(lib_id).to_uppercase();
+    ((name.contains("CRYSTAL") || name.contains("RESONATOR"))
+        && !lib_id.to_uppercase().starts_with("OSCILLATOR"))
+        || (ref_has_prefix_digit(reference, &["Y"]) && name.contains("XTAL"))
+}
+
+/// What a protection device is known to be.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Protection {
+    /// The family that matched, as written in the table below.
+    pub family: &'static str,
+    /// `Some(true)` low-capacitance (suits USB 2.0 data lines), `Some(false)`
+    /// a family whose junction capacitance is far too high for one, `None`
+    /// when the family spans both and the part number decides.
+    pub low_capacitance: Option<bool>,
+}
+
+/// Low-capacitance TVS/ESD arrays (a few pF per line).
+const LOW_CAP_ESD: &[&str] = &[
+    "USBLC6", "TPD1E", "TPD2E", "TPD3E", "TPD4E", "TPD6E", "TPD8E", "PRTR5V0", "SRV05", "IP4",
+    "ESDA6V1", "ESD9", "ESD5V0S", "RCLAMP05", "RCLAMP3", "SP0504", "SP3003", "NUP4",
+];
+/// Power-line TVS diodes: hundreds to thousands of pF.
+const HIGH_CAP_TVS: &[&str] = &[
+    "SMAJ", "SMBJ", "SMCJ", "SMDJ", "P6KE", "P6SMB", "1.5KE", "SM8S", "SMF", "SM712",
+];
+
+/// A TVS/ESD protection device, by its value and library symbol. The family
+/// tables are what the review can vouch for; a protection part outside them
+/// is still recognised (`low_capacitance: None`) when its symbol says
+/// `TVS`/`ESD`, so it counts as protection but not as a USB-grade one.
+pub(crate) fn protection_device(lib_id: &str, value: &str) -> Option<Protection> {
+    let value_upper = value.to_uppercase();
+    let name_upper = lib_name(lib_id).to_uppercase();
+    for family in LOW_CAP_ESD {
+        if value_upper.contains(family) || name_upper.contains(family) {
+            return Some(Protection {
+                family,
+                low_capacitance: Some(true),
+            });
+        }
+    }
+    for family in HIGH_CAP_TVS {
+        if value_upper.contains(family) || name_upper.contains(family) {
+            return Some(Protection {
+                family,
+                low_capacitance: Some(false),
+            });
+        }
+    }
+    let by_symbol = name_upper.contains("TVS")
+        || name_upper.contains("ESD")
+        || name_upper.contains("TRANSIL")
+        || lib_id.to_uppercase().starts_with("POWER_PROTECTION");
+    let by_value = value_upper.contains("TVS") || value_upper.starts_with("ESD");
+    (by_symbol || by_value).then_some(Protection {
+        family: "symbol_name",
+        low_capacitance: None,
+    })
+}
+
+/// The pin names of one part, normalised, with their indexes.
+pub(crate) struct PinNames<'a> {
+    names: Vec<(usize, String, &'a str)>,
+}
+
+impl<'a> PinNames<'a> {
+    /// `pins` is `(name, electrical_type)` in a stable order.
+    pub(crate) fn new(pins: &'a [(String, String)]) -> Self {
+        Self {
+            names: pins
+                .iter()
+                .enumerate()
+                .map(|(i, (n, t))| (i, norm_pin(n), t.as_str()))
+                .collect(),
+        }
+    }
+
+    /// The first pin whose normalised name is one of `names`.
+    pub(crate) fn find(&self, names: &[&str]) -> Option<usize> {
+        self.names
+            .iter()
+            .find(|(_, n, _)| names.contains(&n.as_str()))
+            .map(|(i, _, _)| *i)
+    }
+
+    pub(crate) fn all(&self, names: &[&str]) -> Vec<usize> {
+        self.names
+            .iter()
+            .filter(|(_, n, _)| names.contains(&n.as_str()))
+            .map(|(i, _, _)| *i)
+            .collect()
+    }
+}
+
+pub(crate) const CAN_H: &[&str] = &["CANH", "CANHIGH"];
+pub(crate) const CAN_L: &[&str] = &["CANL", "CANLOW"];
+pub(crate) const RS485_A: &[&str] = &["A", "A+", "RS485A", "DA"];
+pub(crate) const RS485_B: &[&str] = &["B", "B-", "RS485B", "DB"];
+pub(crate) const RS485_DIR: &[&str] = &["DE", "RE", "DERE", "REDE", "DEN", "REN"];
+pub(crate) const MOSFET_PINS: [&[&str]; 3] = [&["G", "GATE"], &["D", "DRAIN"], &["S", "SOURCE"]];
+pub(crate) const DRIVER_HIGH_OUT: &[&str] = &["HO", "GH", "HDRV", "DRVH", "HG", "OUTH", "TG"];
+pub(crate) const DRIVER_LOW_OUT: &[&str] = &["LO", "GL", "LDRV", "DRVL", "LG", "OUTL", "BG"];
+pub(crate) const DRIVER_BOOT: &[&str] = &["VB", "BST", "BOOT", "HB", "CBOOT", "BOOTH", "BOOT1"];
+pub(crate) const DRIVER_SWITCH: &[&str] = &["VS", "HS", "SW", "SH", "PHASE", "LX", "SWH"];
+pub(crate) const SENSE_IN_P: &[&str] = &["IN+", "INP", "VIN+", "+IN", "INPUT+", "IS+"];
+pub(crate) const SENSE_IN_N: &[&str] = &["IN-", "INN", "VIN-", "-IN", "INPUT-", "IS-"];
+pub(crate) const FEEDBACK_PINS: &[&str] = &["FB", "VFB", "ADJ", "ADJUST", "VADJ", "FBK", "FB/VO"];
+pub(crate) const UART_TX: &[&str] = &["TX", "TXD", "UTX", "TXO", "SOUT"];
+pub(crate) const UART_RX: &[&str] = &["RX", "RXD", "URX", "RXI", "SIN"];
+pub(crate) const USB_DP: &[&str] = &["D+", "DP", "USBD+", "USBDP", "USBP", "DPLUS"];
+pub(crate) const USB_DM: &[&str] = &["D-", "DM", "USBD-", "USBDM", "USBN", "DMINUS"];
+pub(crate) const ADC_REF_PINS: &[&str] =
+    &["VREF", "VREF+", "VREFP", "AREF", "REF", "VREFH", "REFP"];
+
+/// Whether a normalised pin name is a UART TX (`dir = 0`) or RX (`dir = 1`) pin,
+/// accepting a peripheral prefix (`USART1TX`, `UART2RXD`) but not `TXEN`.
+pub(crate) fn uart_direction(norm: &str) -> Option<u8> {
+    let tx = |s: &str| UART_TX.contains(&s);
+    let rx = |s: &str| UART_RX.contains(&s);
+    if tx(norm) {
+        return Some(0);
+    }
+    if rx(norm) {
+        return Some(1);
+    }
+    for suffix in ["TXD", "TX"] {
+        if let Some(stem) = norm.strip_suffix(suffix) {
+            if stem.contains("UART")
+                || stem.contains("USART")
+                || stem.contains("SERIAL")
+                || stem.contains("COM")
+            {
+                return Some(0);
+            }
+        }
+    }
+    for suffix in ["RXD", "RX"] {
+        if let Some(stem) = norm.strip_suffix(suffix) {
+            if stem.contains("UART")
+                || stem.contains("USART")
+                || stem.contains("SERIAL")
+                || stem.contains("COM")
+            {
+                return Some(1);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
