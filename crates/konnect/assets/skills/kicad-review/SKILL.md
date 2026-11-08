@@ -243,9 +243,26 @@ audit_manufacturing()
 ```
 
 Read the returned issues and outline evidence, including true Edge.Cuts closure
-and footprint containment. This audit does not establish every fab-house rule,
-drill size, silkscreen readability, test-point access or assembly requirement.
-Collect those separately under the manufacturing skill's acceptance workflow.
+and footprint containment. It checks track widths, via and hole sizes, annular
+rings, via-in-pad, track-to-track acid traps and the project's DRC minimums
+against `fab_limits`; read `checks` for what each covered. What it lists under
+`delegated_to_drc` is proven only by `run_drc`, and `not_checked` is evidence
+nobody collected. It does not establish silkscreen readability, test-point
+access or assembly requirements. Collect those separately under the
+manufacturing skill's acceptance workflow.
+
+### Current Audit
+
+```
+audit_trace_current(board)
+```
+
+Compares every track and via of each net with a recorded current against
+IPC-2221. It reads the currents from `get_design_intent`; with none recorded it
+reports `no_currents_recorded` and checks nothing, so record them first. It
+assumes every item carries the full net current, so a flagged branch that only
+carries part of it is a judgement for the owner, not a pass. Name the
+`not_checked` items (IPC-2152 derating, voltage drop) as open.
 
 ---
 

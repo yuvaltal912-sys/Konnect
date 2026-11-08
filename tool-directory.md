@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **255 registered tools** + **7 always-visible meta-tools** = **262 total**
+- **256 registered tools** + **7 always-visible meta-tools** = **263 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -452,17 +452,18 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 ## Design Review
 
-### `design_review` · 6 tools
-**Purpose:** AI-powered design audits: decoupling, connections, power rails, DFM, BOM health.
+### `design_review` · 7 tools
+**Purpose:** AI-powered design audits: decoupling, connections, power rails, DFM, trace current, BOM health.
 **Source:** [`crates/konnect-core/src/tools/design_review.rs`](crates/konnect-core/src/tools/design_review.rs)
 
 | Tool | Description |
 |------|-------------|
-| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Power pins are KiCad `power_in` pins; a `VCC`/`VDD`-style name counts only on a pin typed `passive` or `unspecified`. Pins on ground and power symbols (`#PWR`) are skipped. Each finding's `classified_by` names the rule; the result counts `power_pins_by_rule`, `capacitors_by_rule` and `ground_pins_skipped`. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. The outline check reads the true Edge.Cuts outline and names each footprint whose courtyard, pads or silkscreen text cross or sit outside it, with the overhang in mm; `edge_mount_references` lists parts that may sit on the edge on purpose. |
-| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
+| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Capacitors are found by library symbol (`Device:C`, `C_Small`, `CP`, …), else a `C<digit>` reference; values go through one SI parser (`100n`, `4u7`, `0.1µF`, `10uF/25V`), and unparsed ones are listed in `capacitor_values_unparsed` instead of read as "not bulk". Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_manufacturing` | DFM checks of the saved board against a fab's limits: track widths, via drill, diameter and annular ring, through-hole drills and pad rings, via-in-pad on SMD pads (warning on its own net, error on another), track-to-track acid traps under 90°, the `.kicad_pro` DRC minimums against the fab, and the board outline (true Edge.Cuts; each footprint crossing it named with its overhang; `edge_mount_references` lists parts that may sit on the edge on purpose). Limits: `fab_house`, else the design-intent fab target's house, else `jlcpcb`; the record's own minimums win for that house (`fab_limits` names each value's source). `checks` gives each check's coverage, `delegated_to_drc` what `run_drc` proves instead (silkscreen over copper, courtyard overlap, clearance), `not_checked` what nothing covers. |
+| `audit_trace_current` | Routed copper against the design-intent currents (`currents`, and `rails` with `max_current_a`): every track segment and via of each such net against IPC-2221 at the net's `max_temp_rise_c` (else `default_temp_rise_c`, 10 °C). Copper thickness from the record's fab target, else the board stackup, else 1 oz outer / 0.5 oz inner. Conservative: each item is assumed to carry the full net current; zones on the net soften a finding to a warning. Reports undersized segments by UUID, the narrowest per net, vias needed in parallel, recorded nets missing from the board, and `not_checked` (IPC-2152 derating, current split, pour capacity, voltage drop). Read-only. |
+| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. With a board it also runs `audit_manufacturing`, DRC and `audit_trace_current`; `trace_current` says whether the current audit ran (`not_run` with no record or no currents, which does not make the review incomplete; an unusable record does). Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
 | `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 
 ---

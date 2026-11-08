@@ -144,7 +144,7 @@ pub struct DiffPair {
 }
 
 /// What the board will be built to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FabTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,7 +414,7 @@ pub(crate) fn read_design_intent(path: &Path) -> IntentRead {
     }
 }
 
-fn unusable(path: &Path, reason: String) -> CallToolResult {
+pub(crate) fn unusable(path: &Path, reason: String) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::InvalidConfiguration {
             path: path.display().to_string(),

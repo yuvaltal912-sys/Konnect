@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. PR 14 (checkpoints and readiness report) is merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`). Next pickable: PR 11. PR 13 is merged: the initial rule-writer slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). The continuation delivers named rule edit/delete, general native-compiled expressions and guarded DSN/SES integration within the documented routing profile. Its implementation head ebab52c passed all nine macOS gate checks, 88 guard-removal controls and release/native scratch probes; final handoff-commit verification is recorded on #38. Q3 remains merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). PR 14 ([#39](https://github.com/yuvaltal912-sys/Konnect/pull/39)) remains separate and open. Catalogue: 255 registered tools plus 7 meta-tools. The owner authorized the noreply fast-forward merge; the installed binary remains protected.
+**Last updated:** 2026-11-08. PR 11 (honest review and current audit) is implemented on `feat/creation-honest-review-current-audit`, draft [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42), not merged. PR 15 (ERC/DRC baselines) is in progress in parallel on `claude/clever-cerf-ddf735`, draft [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). PR 14 is merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`). PR 13 is merged: [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35) and [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). Q3 is merged as [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37). Catalogue on this branch: 256 registered tools plus 7 meta-tools (263). The installed binary remains protected.
 
 ## Start here
 
@@ -45,11 +45,11 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 9b | Sync completion, second half: in-place footprint replace and routed-pad net reassignment | 9 | Integrated from [#33](https://github.com/yuvaltal912-sys/Konnect/pull/33) in the creation alignment PR |
 | Q3 | Design-intent record (rails, currents, interfaces, fab target), read by ranks 12, 29 and 38 | none | Merged: [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37) (`ef4b1be`). PR 11 is unblocked |
 | 10 | Library correctness: pin-pad check, symbol fields, ranked search | none | Integrated from [#32](https://github.com/yuvaltal912-sys/Konnect/pull/32) in the creation alignment PR |
-| 11 | Honest review and current audit | 7, Q3 | In progress (branch `feat/creation-honest-review-current-audit`) |
+| 11 | Honest review and current audit | 7, Q3 | Implemented, draft [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (branch `feat/creation-honest-review-current-audit`), not merged |
 | 12 | Routing batch and readback | none | Integrated from [#34](https://github.com/yuvaltal912-sys/Konnect/pull/34) in the creation alignment PR |
 | 13 | DRC rule writer | none | Merged: initial slice [#35](https://github.com/yuvaltal912-sys/Konnect/pull/35), continuation [#38](https://github.com/yuvaltal912-sys/Konnect/pull/38). DSN accepts the explicit unconditional numeric clearance/width profile; general rule authoring is broader |
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
-| 15 | ERC/DRC baselines | 3 | Not started |
+| 15 | ERC/DRC baselines | 3 | In progress (branch `claude/clever-cerf-ddf735`, draft [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43)) |
 
 ## Next: what to pick
 
@@ -57,8 +57,8 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 **Recommended order**, after the owner approves the next implementation:
 
-1. **PR 11**: honest review and current audit, reading `get_design_intent` (Q3, merged in [#37](https://github.com/yuvaltal912-sys/Konnect/pull/37)).
-2. **PR 15**: ERC/DRC baselines.
+1. **PR 11**: implemented in draft [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42); review and merge it, don't redo it.
+2. **PR 15**: in progress in draft [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43); its code files don't overlap PR 11's, but both edit this file, `tool-directory.md`, `API_MIGRATIONS.md` and the tool counts, so the second to merge resolves those.
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
@@ -78,6 +78,19 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
 - `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
+
+## PR 11, honest review and current audit (draft, #42)
+
+Ranks 14 and 12 (D15, D20, D17, C16). Branch `feat/creation-honest-review-current-audit`, draft [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42). The claim-only commit and draft preceded implementation, from main 97b7059.
+
+- **`audit_manufacturing` checks what it says.** The outline half was already fixed by PR 7. Gone: the "possible silkscreen overlap" warning (footprint anchors under 1 mm apart) and the trace-width check that read a `setup` key KiCad 6+ never writes, so it could never fire. New, in `tools/dfm.rs` over `BoardGeometry`: track widths, via drill/diameter/annular ring, through-hole drills and plated pad rings, via-in-pad on SMD pads (warning on its own net, error on another), track-to-track acid traps under 90° (junctions inside a same-net pad or via skipped and counted), and the `.kicad_pro` DRC minimums against the fab. Findings are grouped (per net and layer, per via size, per footprint) with example UUIDs in `location`. `checks` gives each check's coverage, `delegated_to_drc` what `run_drc` proves instead, `not_checked` what nothing covers. Limits: `fab_house`, else the design-intent fab target's house, else `jlcpcb`; the record's minimums win for that house, and `fab_limits` names each value's source. `PadGeom` gained `kind`, `size` and `drill`.
+- **Classification by type** (`tools/component_class.rs`, D20). Power pins: KiCad `power_in`; names only on `passive`/`unspecified` pins; ground nets and power symbols skipped. Capacitors: library symbol, else `C<digit>` reference (`CR1` no longer counts). One SI parser (`100n`, `4u7`, `0.1µF`, `10uF/25V`, `2k2`, `4R7`), shared with `score_placement`'s decoupling families. The old bulk matcher's `µ` arms never matched; they do now. Findings carry `classified_by`.
+- **`audit_trace_current`** (`tools/trace_current.rs`, `design_review` toolset, now 7 tools; catalogue 256 + 7 meta). Reads `currents` and rail `max_current_a` from the Q3 record, checks every segment and via of those nets against IPC-2221 (k = 0.048 outer, 0.024 inner), copper from the record, else the board stackup, else 1 oz / 0.5 oz. It assumes every item carries the full net current and says so; a zone of the net on the same layer turns an error into a warning. Net names are matched against the board (`nets_not_on_board`), which Q3 left open. No record or no currents is a status, not an error; an unusable record is `invalid_configuration`. The per-call currents interim from Q3 was not needed.
+- **`run_design_review`** runs it when a board is given; `design_review.trace_current` says whether it ran. A missing record does not make the review INCOMPLETE; an unusable one does.
+
+Not done: IPC-2152 derating, current split across parallel paths, pour capacity, voltage drop, acid traps at track-to-pad edges or mid-segment T-junctions, solder-mask slivers, filled/capped via status (not in the board file).
+
+Verified on macOS (2026-11-08): the gate (fmt, 3719 lib and integration tests with 0 failures, doc tests, clippy `-D warnings`, `cargo deny check licenses`, `fix-doc-counts`, release build); 40 new unit tests over scratch fixtures (SI parser, classifiers, each DFM check, fab-limit sources, IPC-2221 against the published chart, every trace-audit status) plus the review integration; a stdio run of the release binary through real dispatch (`audit_trace_current` and `audit_manufacturing` on a scratch project, unknown argument refused); 8 negative controls (ground skip, power-symbol skip, bulk tolerance, intent house match, zone softening, pad-junction skip, via annular check, RKM fraction), each caught by a test. Existing review fixtures pass unchanged. Not verified: a real KiCad board with recorded currents, a live KiCad, the `simulation_live` suite (not touched), Windows and Linux.
 
 ## PR 14, checkpoints and readiness report (merged, #39)
 

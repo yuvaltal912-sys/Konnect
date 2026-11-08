@@ -17,7 +17,10 @@ For each current-carrying net, capture:
 - the selected fabricator's current minimums and stackup.
 
 Use an accepted current-capacity method or calculator with those inputs. Record
-the method, inputs, result, and chosen margin. Changing copper weight, layer,
+the method, inputs, result, and chosen margin. `audit_trace_current` applies
+IPC-2221 to the routed board for every net whose current is in the design-intent
+record; it reports the thermal check only, assumes each segment carries the full
+net current, and leaves voltage drop and IPC-2152 derating to you. Changing copper weight, layer,
 temperature, length, or allowed drop requires a new calculation; a scale factor
 is not sufficient acceptance evidence.
 
