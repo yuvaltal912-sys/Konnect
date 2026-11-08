@@ -33,6 +33,27 @@ Creation rank 25 (`docs/CREATION_HANDOFF.md`).
   units and whether it has a De Morgan body. Same size caps and delivery
   options as `render_board_layers`, with `width_px` defaulting to 800.
 
+## Unreleased: `run_design_review` reads a DRC baseline
+
+PR 15 follow-up (`docs/CREATION_HANDOFF.md`). `run_design_review` takes an
+optional `baseline`: the name of a DRC baseline that `save_check_baseline`
+stored for the same board. Without it nothing changes, apart from a new
+`design_review.baseline` field that is `null`.
+
+With it, DRC is matched with the baseline by PR 15's stable keys. Only new
+violations, severity increases and violations in a category the baseline did
+not report count as findings; each carries `baseline_change` (`new`,
+`severity_raised` with `baseline_severity`, or `not_compared`) and
+`baseline_key`. Unchanged, lowered and resolved ones are counted under
+`design_review.baseline`, which also names the baseline (`name`, `path`,
+`revision`: the SHA-256 of the stored file, `created_utc`) and carries
+`warnings` such as `options_differ`. `drc` keeps the run's absolute counts, and
+the verdict ends with the comparison, for example `(DRC counted against
+baseline 'pre-route': 1 new, 1 unchanged, 1 resolved)`. A missing, damaged or
+other-board baseline, or `baseline` without `board`, is refused before anything
+runs. When DRC cannot run, the review is INCOMPLETE as before and `baseline`
+says `not_compared`. The review runs no ERC, so ERC baselines do not apply.
+
 ## Unreleased: ERC and DRC baselines
 
 Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains
