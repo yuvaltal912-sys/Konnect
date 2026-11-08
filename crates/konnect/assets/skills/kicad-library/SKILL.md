@@ -33,6 +33,15 @@ symbol name and footprint path. Inspect `result`, `missing_pads` and
 `extra_pads`; unresolved inheritance is incomplete evidence. An identifier-set
 match does not replace the accepted physical datasheet pin map below.
 
+To use a real part the user downloaded (an EasyEDA/LCSC export, SnapEDA, Ultra
+Librarian, a vendor's KiCad files), call `import_library_part` with the project,
+the `.kicad_sym`, the `.kicad_mod` and, if there is one, the `.step` model. Show
+the user the preview's pins, pads and pin-pad check result, then apply with its
+`revision`. The tool never downloads anything: EasyEDA's terms forbid automated
+fetches, so ask the user to export or download the files themselves. It never
+overwrites. If a symbol or footprint with that name already exists, it reports
+the blocker, and you pick another `library` name.
+
 Use `edit_symbol` for metadata-only changes; it preserves pin/graphic geometry
 and existing field positioning. Refresh placed definitions separately. Search
 results are ranked and paged: follow `next_offset` when truncated and inspect

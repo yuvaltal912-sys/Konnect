@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **259 registered tools** + **7 always-visible meta-tools** = **266 total**
+- **260 registered tools** + **7 always-visible meta-tools** = **267 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -351,8 +351,8 @@ and Windows servers do not.
 
 ## Library
 
-### `library` · 19 tools
-**Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
+### `library` · 20 tools
+**Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models, import a downloaded part into a project library.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
 | Tool | Description |
@@ -367,6 +367,7 @@ and Windows servers do not.
 | `create_symbol` | Create a schematic symbol with footprint, description and keywords, refusing duplicate names and verifying saved metadata. |
 | `edit_symbol` | Partially edit library symbol metadata (Value, Reference prefix, Footprint, Description, Datasheet and keywords), preserving pin geometry, graphics and existing property placement, with saved readback. |
 | `check_symbol_footprint` | Read-only effective pin-number vs footprint pad-number set comparison. Handles inheritance and repeated pad numbers; unresolved chains or absent identifiers are incomplete. Does not prove datasheet/physical numbering. |
+| `import_library_part` | Copy one part's KiCad-format symbol, footprint and optional 3D model from local files (an EasyEDA/LCSC export, SnapEDA or Ultra Librarian download) into `<library>.kicad_sym`, `<library>.pretty` and `<library>.3dshapes` in the project, and register both libraries. No network access. Previews by default (target paths, pins, pads, pin-pad check, `revision`); applies only with that revision, in one transaction with readback. Never overwrites a symbol, footprint, model or a nickname bound elsewhere. Sets Footprint and optional LCSC/MPN/Manufacturer fields. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |

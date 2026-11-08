@@ -273,13 +273,27 @@ async fn handle_check_symbol_footprint(
         Err(e) => return Ok(e),
     };
     let root = library(&read_consistent(&path)?)?;
-    let nodes = match chain(&root, name) {
+    if let Err(e) = chain(&root, name) {
+        return Ok(CallToolResult::json(
+            &json!({"result":"incomplete","passed":false,"reason":e.to_string()}),
+        ));
+    }
+    let footprint = parse_sexp(&read_consistent(&fp)?)?;
+    anyhow::ensure!(
+        matches!(footprint.head(), Some("footprint" | "module")),
+        "not a footprint"
+    );
+    Ok(CallToolResult::json(&pin_pad_check(
+        &root, name, &footprint,
+    )))
+}
+
+/// The identifier-set comparison behind `check_symbol_footprint`, over parsed
+/// documents so a caller can check a candidate before it is written.
+pub(super) fn pin_pad_check(root: &SexpNode, name: &str, footprint: &SexpNode) -> Value {
+    let nodes = match chain(root, name) {
         Ok(v) => v,
-        Err(e) => {
-            return Ok(CallToolResult::json(
-                &json!({"result":"incomplete","passed":false,"reason":e.to_string()}),
-            ))
-        }
+        Err(e) => return json!({"result":"incomplete","passed":false,"reason":e.to_string()}),
     };
     let mut pins = BTreeSet::new();
     let mut unreadable_pins = 0;
@@ -296,11 +310,6 @@ async fn handle_check_symbol_footprint(
             }
         }
     }
-    let footprint = parse_sexp(&read_consistent(&fp)?)?;
-    anyhow::ensure!(
-        matches!(footprint.head(), Some("footprint" | "module")),
-        "not a footprint"
-    );
     let pad_nodes = footprint.find_all("pad");
     let unreadable_pads = pad_nodes
         .iter()
@@ -322,9 +331,7 @@ async fn handle_check_symbol_footprint(
     } else {
         "fail"
     };
-    Ok(CallToolResult::json(
-        &json!({"result":result,"passed":result=="pass","pins":pins,"pads":pads,"missing_pads":missing,"extra_pads":extra,"scope":"identifier sets only; not datasheet or physical pin-map proof","source":"saved_file"}),
-    ))
+    json!({"result":result,"passed":result=="pass","pins":pins,"pads":pads,"missing_pads":missing,"extra_pads":extra,"scope":"identifier sets only; not datasheet or physical pin-map proof","source":"saved_file"})
 }
 fn rank(name: &str, text: &str, query: &str) -> Option<u32> {
     let n = name.to_lowercase();

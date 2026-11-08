@@ -106,9 +106,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library",
-        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
+        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models, import a downloaded part into a project library",
         category: "library",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "integration",

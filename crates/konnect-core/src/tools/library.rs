@@ -5,6 +5,8 @@
 
 #[path = "library_correctness.rs"]
 mod correctness;
+#[path = "library_part_import.rs"]
+mod part_import;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -467,6 +469,7 @@ pub fn tools() -> Vec<ToolDef> {
         tools.insert(after_create_footprint + offset, tool);
     }
     tools.extend(correctness::tools());
+    tools.push(part_import::tool());
     tools
 }
 

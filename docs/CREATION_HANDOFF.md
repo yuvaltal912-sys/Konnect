@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 259 registered tools plus 7 meta-tools (266). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The installed binary remains protected.
+**Last updated:** 2026-11-08. All 15 core creation PRs are merged. PR 11 (honest review and current audit) merged as [#42](https://github.com/yuvaltal912-sys/Konnect/pull/42) (`06a992c`), the first GitHub merge authored with the noreply address. PR 15 (ERC/DRC baselines) merged as [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Catalogue: 260 registered tools plus 7 meta-tools (267), with rank 33's `import_library_part` (draft [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52)). Next pickable: PR 16, the Specctra DSN profile widening (rank 32, owner decision Q2). The installed binary remains protected.
 
 ## Start here
 
@@ -51,7 +51,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 14 | Checkpoints and readiness report | none | Merged: [#39](https://github.com/yuvaltal912-sys/Konnect/pull/39) (`1e33c5f`) |
 | 15 | ERC/DRC baselines | 3 | Merged: [#43](https://github.com/yuvaltal912-sys/Konnect/pull/43). Follow-up: read baselines in `run_design_review` (now unblocked) |
 | 16 | Widen the Specctra DSN profile so Freerouting fits real boards: back-side parts, more than 2 copper layers, then a Freerouting version policy and a benchmark on KiCad's demo boards (rank 32: D7, B34, D24). PR 2b already did rounded/arc outlines, roundrect pads and zones as fixed copper | 2b, 13 | Not started |
-| R33 | Local part import (rank 33: B20, rescoped 2026-11-08): copy a KiCad-format symbol, footprint and optional 3D model the owner exported or downloaded (EasyEDA/LCSC export, SnapEDA, Ultra Librarian) into a project-local library, preview then apply by revision, never overwrite, register the libraries, run the pin-pad check. No network access: EasyEDA's terms (2026-09-21) and robots.txt forbid automated fetches | none | In progress (branch `feat/creation-local-part-import`) |
+| R33 | Local part import (rank 33: B20, rescoped 2026-11-08): copy a KiCad-format symbol, footprint and optional 3D model the owner exported or downloaded (EasyEDA/LCSC export, SnapEDA, Ultra Librarian) into a project-local library, preview then apply by revision, never overwrite, register the libraries, run the pin-pad check. No network access: EasyEDA's terms (2026-09-21) and robots.txt forbid automated fetches | none | Draft: [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52) (branch `feat/creation-local-part-import`), implemented and verified, awaiting review |
 
 ## Next: what to pick
 
@@ -61,7 +61,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 1. **PR 16**: widen the Specctra DSN profile (rank 32), the route path the owner chose for after the core PRs (Q2). Start with back-side parts and more than two copper layers on KiCad's demo boards; the live Freerouting run (below) is its acceptance check, so ask the owner before running it.
 2. Smaller follow-ups that can run beside it, since their files don't overlap `pcb_export.rs`: read ERC/DRC baselines in `run_design_review` (PR 15 follow-up); keep tests out of the real call log (rank 35); the `cargo deny` advisories (its own PR).
-3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), LCSC import (rank 33).
+3. Then the larger items: circuit-aware review (rank 29, reads the Q3 rails), board construction (rank 21), local part import (rank 33, draft #52).
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
@@ -81,6 +81,31 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Two sessions edited `CREATION_HANDOFF.md`, `tool-directory.md` and `API_MIGRATIONS.md` at once and conflicted each time. Keep every PR's rows and entries when you resolve.
 - `cargo deny check` is red on main since 2026-11-08: new RustSec advisories for `h2`, `rustls`, `webpki` and `pin-utils`, with no lockfile change. It needs its own PR; report it, don't fix it inside a feature PR.
 - Three `freerouting_setup_tests` (fake Java probes) can fail under a full parallel `cargo test --workspace` and pass alone. Rerun them alone.
+
+## Rank 33, local part import (draft, #52)
+
+Finding B20, rescoped by the owner on 2026-11-08. One `library` tool (now 20 tools), `import_library_part`, in `tools/library_part_import.rs`. The tests are in `library_part_import_tests.rs`, and the fixtures in `tests/fixtures/part_import/`.
+
+**Why local files, not an LCSC fetch.** Every peer importer reads EasyEDA's internal `easyeda.com/api/…` endpoints. EasyEDA's terms (effective 2026-09-21, section VII) restrict automated collection of their content and forbid modifying it or making derivative works. Their robots.txt disallows `/api/` for every agent, and disallows the whole site for `Claude-User`, `ClaudeBot` and `anthropic-ai`. So the tool makes no network requests. The owner exports or downloads the part's KiCad files (EasyEDA/LCSC export, SnapEDA, Ultra Librarian, a vendor's own), and the tool copies them into the project. It converts no format: the inputs must already be KiCad 6+ files (a `(module …)` footprint is refused with the `kicad-cli fp upgrade` hint). No code was taken from easyeda2kicad (AGPL-3.0) or JLC2KiCad_lib (MIT), so `THIRD_PARTY.md` is unchanged.
+
+- **Targets.** `<project>/<library>.kicad_sym` (created or appended), `<library>.pretty/<footprint>.kicad_mod`, and with `model_file` `<library>.3dshapes/<model>`. Both libraries are registered as `${KIPRJMOD}/…` in the project tables. The default `library` is `imported_parts`. The project folder must hold a `.kicad_pro`.
+- **Preview by default.** It shows every write with its action, the symbol's pins (number, name, type), the footprint's pads (number, type, shape, position, size, drill), the model action, the registrations, warnings, `blocked_by` and a `revision` (`sha256:` over each write's path, before and after images, the reused model and the blockers). Pin and pad lists are capped at 300; counts are complete.
+- **Apply** needs that revision (otherwise `stale_target`), refuses on any blocker (`plan_blocked`), then commits everything in one `commit_file_transaction` and reads every file back. The pin-pad check runs again on the saved files.
+- **Never overwrites.** Blockers: `symbol_exists`, `footprint_exists`, `model_exists` (different bytes; identical bytes are reused), `nickname_taken` (the project table binds the nickname to another library), `symbol_library_unusable`, `lib_table_unusable`, `target_is_a_symlink`, `target_has_wrong_type`. A nickname also in the global table is a warning.
+- **Fields.** Footprint becomes `<library>:<footprint>` (the old value is reported as `footprint_field_before`). Optional `lcsc` (validated `C<digits>`), `mpn` and `manufacturer` go into the LCSC, MPN and Manufacturer fields, through PR 10's field editor.
+- **Model.** `model_file` (`.step`/`.stp`/`.wrl`, UTF-8 text, format sniffed, 64 MiB cap) replaces every model reference with one `${KIPRJMOD}` reference and keeps the first one's offset, scale and rotation. Without it, existing references are kept and each is reported as `found`, `missing`, `uses_a_path_variable` or `relative_to_the_source_file_only`.
+- **Pin-pad check** is PR 10's `check_symbol_footprint` comparison, factored into `pin_pad_check` and run on the candidate. A mismatch is a warning, never a blocker (exposed or mounting pads are common).
+- **Format version.** Appending a newer-format symbol raises the library's `(version …)` and warns. Derived (`extends`) symbols are refused, with a hint to flatten them in KiCad.
+
+**Verified on macOS (2026-11-08):**
+- 10 unit tests over scratch projects. They use synthetic fixtures (an LDO symbol, an SOT-23 footprint with a transformed vendor model reference, a stub STEP file) and KiCad 10's real `Device.kicad_sym` and `C_0603_1608Metric.kicad_mod`. They cover: a preview that writes nothing, apply with readback, the model transform kept, the tables written, `check_symbol_footprint` agreeing on the saved files, missing, wrong and stale revisions, appending a second part with a version raise and unchanged tables, every overwrite blocker, the nickname guard, a reported pin-pad mismatch, and 12 refused inputs that write nothing.
+- 4 negative controls, each caught by a test: the symbol-exists blocker, the revision check, the model transform, and the nickname equivalence.
+- The existing library tests pass unchanged.
+- A stdio run of the release binary through real dispatch on a scratch project: preview, then apply with readback (5 files written, saved check `pass`), and an unknown argument refused.
+- kicad-cli 10.0.8 read the imported library and footprint on a scratch copy: `sym export svg` and `fp export svg` both plotted.
+- The full gate: fmt; 3739 lib and integration tests; doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts`; release build. Three `pcb_sync` mock-IPC tests timed out under the parallel run and pass alone (89/89). `simulation_live` was skipped because nothing in simulation changed.
+
+**Not verified:** a real EasyEDA/LCSC export, which was never downloaded (downloads need the owner's OK, and EasyEDA forbids automated fetches); placing the imported part in a schematic or board in a live KiCad; a project open in KiCad during the import (the tables are written, and the result asks to reopen the project); Windows and Linux.
 
 ## PR 15, ERC/DRC baselines (merged, #43)
 

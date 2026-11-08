@@ -3,6 +3,21 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: import a part from local files
+
+Rank 33 (`docs/CREATION_HANDOFF.md`). The `library` toolset gains
+`import_library_part`. Nothing existing changes shape. `check_symbol_footprint`
+now shares its comparison with the importer, and its output is unchanged.
+
+The tool writes `<project_dir>/<library>.kicad_sym`, `<library>.pretty/<footprint>.kicad_mod`
+and, with `model_file`, `<library>.3dshapes/<model>`, and registers the library as
+`${KIPRJMOD}/…` in the project's `sym-lib-table` and `fp-lib-table`. The default
+`library` is `imported_parts`. A preview is the default; `dry_run: false`
+needs the preview's `expected_revision` (`sha256:` over every planned write and
+blocker). Blockers: `symbol_exists`, `footprint_exists`, `model_exists`,
+`nickname_taken`, `symbol_library_unusable`, `lib_table_unusable`,
+`target_is_a_symlink`, `target_has_wrong_type`.
+
 ## Unreleased: ERC and DRC baselines
 
 Creation PR 15 (`docs/CREATION_HANDOFF.md`). The `verification` toolset gains
