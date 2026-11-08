@@ -548,9 +548,7 @@ impl Quantity {
             Quantity::SwitchOnResistance => (&[OUTPUT_CURRENT], &[INPUT_VOLTAGE]),
             Quantity::UndervoltageLockout | Quantity::OvervoltageCutoff => (&[], &[]),
             Quantity::EnableThreshold => (&[], &[INPUT_VOLTAGE]),
-            Quantity::OutputRiseTime => {
-                (&[INPUT_VOLTAGE], &[LOAD_RESISTANCE, LOAD_CAPACITANCE])
-            }
+            Quantity::OutputRiseTime => (&[INPUT_VOLTAGE], &[LOAD_RESISTANCE, LOAD_CAPACITANCE]),
         }
     }
 

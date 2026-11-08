@@ -197,15 +197,33 @@ pub(crate) fn build(kind: Kind, name: &str, characteristics: &[Characteristic]) 
                 number(STEP_WIDTH * threshold),
                 number(tau)
             );
-            model.parameters.push(("enable_threshold".to_string(), threshold));
-            model.parameters.push(("enable_time_constant".to_string(), tau));
-            check_load_switch(&mut model, &mut bench, &law, threshold, tau, characteristics);
+            model
+                .parameters
+                .push(("enable_threshold".to_string(), threshold));
+            model
+                .parameters
+                .push(("enable_time_constant".to_string(), tau));
+            check_load_switch(
+                &mut model,
+                &mut bench,
+                &law,
+                threshold,
+                tau,
+                characteristics,
+            );
             law
         }
         _ => {
             let (law, fit_points, held) = ideal_diode(&mut model, characteristics)?;
             extra = String::new();
-            check_ideal_diode(&mut model, &mut bench, &law, &fit_points, held, characteristics);
+            check_ideal_diode(
+                &mut model,
+                &mut bench,
+                &law,
+                &fit_points,
+                held,
+                characteristics,
+            );
             law
         }
     };
@@ -217,7 +235,9 @@ pub(crate) fn build(kind: Kind, name: &str, characteristics: &[Characteristic]) 
         let enable = format!("{id}e");
         if kind == Kind::LoadSwitch {
             let drive = enable_drive(&model).max(vin);
-            bench.dc.push(Bench::voltage(&enable, &enable, drive, false));
+            bench
+                .dc
+                .push(Bench::voltage(&enable, &enable, drive, false));
             bench
                 .dc
                 .push(model.instance(&id, &[&input, &output, &enable, "0"]));
@@ -324,7 +344,10 @@ fn efuse(
             - target
     };
     let setting = fit::root(reading, 0.5 * target, 1.5 * target).ok_or_else(|| {
-        Invalid::new(limit.field("value"), "no current limit reproduces this value")
+        Invalid::new(
+            limit.field("value"),
+            "no current limit reproduces this value",
+        )
     })?;
     law = with_limit(law, setting);
     // Each threshold is placed so the engine's output crosses half its input
@@ -350,9 +373,7 @@ fn efuse(
             .push("no undervoltage lockout: it conducts from 0 V".to_string());
     }
     if cutoff.is_none() {
-        model
-            .assumed
-            .push("no overvoltage cut-off".to_string());
+        model.assumed.push("no overvoltage cut-off".to_string());
     }
     model.assumed.push(
         "no hysteresis on its thresholds, no foldback and no start-up delay or slew control; a \
@@ -365,10 +386,14 @@ fn efuse(
         ("limit_stiffness".to_string(), stiffness),
     ];
     if let Some(t) = lockout {
-        model.parameters.push(("undervoltage_lockout_setting".to_string(), t));
+        model
+            .parameters
+            .push(("undervoltage_lockout_setting".to_string(), t));
     }
     if let Some(t) = cutoff {
-        model.parameters.push(("overvoltage_cutoff_setting".to_string(), t));
+        model
+            .parameters
+            .push(("overvoltage_cutoff_setting".to_string(), t));
     }
     Ok((law, (lockout, cutoff)))
 }
@@ -407,12 +432,7 @@ fn threshold_load(law: &Law, threshold: f64) -> f64 {
 
 /// The output of an eFuse at input `vin` into `load`, by the law.
 fn efuse_output(law: &Law, vin: f64, load: f64) -> f64 {
-    fit::root(
-        |out| law.drop(out / load, vin, 1.0) - (vin - out),
-        0.0,
-        vin,
-    )
-    .unwrap_or(0.0)
+    fit::root(|out| law.drop(out / load, vin, 1.0) - (vin - out), 0.0, vin).unwrap_or(0.0)
 }
 
 /// The setting at which an eFuse's output crosses half its datasheet
@@ -486,7 +506,9 @@ fn check_efuse(
             number(bench.slow_stop),
             number(c.value + span)
         ));
-        bench.slow.push(model.instance(&id, &[&input, &output, "0"]));
+        bench
+            .slow
+            .push(model.instance(&id, &[&input, &output, "0"]));
         bench.slow.push(format!(
             "R{id}l {output} 0 {}",
             number(threshold_load(law, c.value))
@@ -597,13 +619,13 @@ fn check_limit(model: &mut Model, bench: &mut Bench, c: &Characteristic, vin: f6
     });
 }
 
-fn load_switch(
-    model: &mut Model,
-    characteristics: &[Characteristic],
-) -> Fitted<(Law, f64, f64)> {
+fn load_switch(model: &mut Model, characteristics: &[Characteristic]) -> Fitted<(Law, f64, f64)> {
     let single = |quantity| of(characteristics, quantity).first().copied();
     let on = single(Quantity::SwitchOnResistance).ok_or_else(|| {
-        Invalid::new("characteristics", "a load_switch needs its switch_on_resistance")
+        Invalid::new(
+            "characteristics",
+            "a load_switch needs its switch_on_resistance",
+        )
     })?;
     let ron = on.value;
     let threshold = single(Quantity::EnableThreshold).map_or_else(
@@ -640,7 +662,10 @@ fn load_switch(
                 - target
         };
         let setting = fit::root(reading, 0.5 * target, 1.5 * target).ok_or_else(|| {
-            Invalid::new(limit.field("value"), "no current limit reproduces this value")
+            Invalid::new(
+                limit.field("value"),
+                "no current limit reproduces this value",
+            )
         })?;
         law = with_limit(law, setting);
         model
@@ -685,19 +710,18 @@ fn load_switch(
          discharge, undervoltage lockout or enable hysteresis"
             .to_string(),
     );
-    model.parameters.insert(0, ("on_resistance".to_string(), ron));
+    model
+        .parameters
+        .insert(0, ("on_resistance".to_string(), ron));
     Ok((law, threshold, tau))
 }
 
 /// A switch's settled output at `vin` into a load, or `vin` with none.
 fn final_output(law: &Law, vin: f64, load: Option<f64>) -> f64 {
     match load {
-        Some(load) => fit::root(
-            |out| law.drop(out / load, vin, 1.0) - (vin - out),
-            0.0,
-            vin,
-        )
-        .unwrap_or(vin),
+        Some(load) => {
+            fit::root(|out| law.drop(out / load, vin, 1.0) - (vin - out), 0.0, vin).unwrap_or(vin)
+        }
         None => vin - law.drop(0.0, vin, 1.0),
     }
 }
@@ -781,9 +805,10 @@ fn check_load_switch(
         bench
             .slow
             .push(model.instance(&id, &[&input, &output, &pin, "0"]));
-        bench
-            .slow
-            .push(format!("R{id}l {output} 0 {}", number(threshold_load(law, threshold))));
+        bench.slow.push(format!(
+            "R{id}l {output} 0 {}",
+            number(threshold_load(law, threshold))
+        ));
         model.checks.push(Check {
             characteristic: c.index,
             role: Role::Fit,
@@ -808,7 +833,13 @@ fn ideal_diode(
     let single = |quantity| of(characteristics, quantity).first().copied();
     let mut points: Vec<Point> = of(characteristics, Quantity::ForwardVoltage)
         .into_iter()
-        .map(|c| (c.condition(FORWARD_CURRENT).unwrap_or_default(), c.value, c.index))
+        .map(|c| {
+            (
+                c.condition(FORWARD_CURRENT).unwrap_or_default(),
+                c.value,
+                c.index,
+            )
+        })
         .collect();
     points.sort_by(|a, b| a.0.total_cmp(&b.0));
     if let Some(pair) = points.windows(2).find(|pair| pair[0].0 == pair[1].0) {
@@ -902,7 +933,10 @@ fn ideal_diode(
         };
         let guess = (volts + vreg) / target;
         let blocking = fit::root(reading, 0.5 * guess, 2.0 * guess).ok_or_else(|| {
-            Invalid::new(c.field("value"), "no blocking resistance reproduces this value")
+            Invalid::new(
+                c.field("value"),
+                "no blocking resistance reproduces this value",
+            )
         })?;
         law = Law::IdealDiode {
             vreg,
@@ -1015,7 +1049,10 @@ fn check_ideal_diode(
             },
         });
     }
-    if let Some(c) = of(characteristics, Quantity::ReverseCurrent).first().copied() {
+    if let Some(c) = of(characteristics, Quantity::ReverseCurrent)
+        .first()
+        .copied()
+    {
         let id = bench.id();
         let (input, output) = (format!("{id}i"), format!("{id}o"));
         let volts = c.condition(REVERSE_VOLTAGE).unwrap_or_default();
@@ -1159,7 +1196,11 @@ mod tests {
             value("current_limit", 2.0, json!({ "input_voltage_volts": 12.0 })),
             value("undervoltage_lockout", 4.0, json!({})),
             value("overvoltage_cutoff", 15.0, json!({})),
-            value("quiescent_current", 3e-4, json!({ "input_voltage_volts": 12.0 })),
+            value(
+                "quiescent_current",
+                3e-4,
+                json!({ "input_voltage_volts": 12.0 }),
+            ),
         ]
     }
 
@@ -1175,8 +1216,13 @@ mod tests {
 
     #[test]
     fn an_efuse_is_a_drop_whose_law_gives_back_every_value() {
-        let model = build_model(Kind::Efuse, "tps2595_fit", &parsed(json!(efuse_values())), 25.0)
-            .unwrap();
+        let model = build_model(
+            Kind::Efuse,
+            "tps2595_fit",
+            &parsed(json!(efuse_values())),
+            25.0,
+        )
+        .unwrap();
         let checked = text::check_fitted(model.file().as_bytes()).unwrap();
         assert_eq!(checked.pins(), ["IN", "OUT", "COM"]);
         assert_eq!(checked.kind, "efuse");
@@ -1192,7 +1238,10 @@ mod tests {
         for (threshold, at) in [(4.0, 4.0), (15.0, 15.0)] {
             let load = threshold_load(&law, threshold);
             let out = efuse_output(&law, at, load);
-            assert!((out - 0.5 * threshold).abs() < 1e-3 * threshold, "{threshold}: {out}");
+            assert!(
+                (out - 0.5 * threshold).abs() < 1e-3 * threshold,
+                "{threshold}: {out}"
+            );
         }
         // Outside the window it is open.
         assert!(efuse_output(&law, 3.5, 20.0) < 1e-6);
@@ -1208,29 +1257,52 @@ mod tests {
             json!({ "output_current_amps": 1.0, "input_voltage_volts": 3.0 }),
         );
         let error = build_model(Kind::Efuse, "x_fit", &parsed(json!(outside)), 25.0).unwrap_err();
-        assert_eq!(error.field, "characteristics[0].conditions.input_voltage_volts");
+        assert_eq!(
+            error.field,
+            "characteristics[0].conditions.input_voltage_volts"
+        );
         let mut inverted = efuse_values();
         inverted[3] = value("overvoltage_cutoff", 3.0, json!({}));
         let error = build_model(Kind::Efuse, "x_fit", &parsed(json!(inverted)), 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[3].value");
         let mut near_limit = efuse_values();
-        near_limit[0] = value("switch_on_resistance", 0.03, json!({ "output_current_amps": 1.9 }));
-        let error = build_model(Kind::Efuse, "x_fit", &parsed(json!(near_limit)), 25.0).unwrap_err();
-        assert_eq!(error.field, "characteristics[0].conditions.output_current_amps");
+        near_limit[0] = value(
+            "switch_on_resistance",
+            0.03,
+            json!({ "output_current_amps": 1.9 }),
+        );
+        let error =
+            build_model(Kind::Efuse, "x_fit", &parsed(json!(near_limit)), 25.0).unwrap_err();
+        assert_eq!(
+            error.field,
+            "characteristics[0].conditions.output_current_amps"
+        );
         let mut unreachable = efuse_values();
-        unreachable[0] = value("switch_on_resistance", 10.0, json!({ "output_current_amps": 0.1 }));
+        unreachable[0] = value(
+            "switch_on_resistance",
+            10.0,
+            json!({ "output_current_amps": 0.1 }),
+        );
         let error =
             build_model(Kind::Efuse, "x_fit", &parsed(json!(unreachable)), 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[1].value");
         // An eFuse needs its limit.
-        let none = parsed(json!([value("switch_on_resistance", 0.03, json!({ "output_current_amps": 1.0 }))]));
+        let none = parsed(json!([value(
+            "switch_on_resistance",
+            0.03,
+            json!({ "output_current_amps": 1.0 })
+        )]));
         assert!(build_model(Kind::Efuse, "x_fit", &none, 25.0).is_err());
     }
 
     #[test]
     fn a_load_switch_has_an_enable_pin_and_a_time_constant_for_its_rise() {
         let values = parsed(json!([
-            value("switch_on_resistance", 0.05, json!({ "output_current_amps": 1.0 })),
+            value(
+                "switch_on_resistance",
+                0.05,
+                json!({ "output_current_amps": 1.0 })
+            ),
             value("enable_threshold", 1.0, json!({})),
             value(
                 "output_rise_time",
@@ -1242,18 +1314,36 @@ mod tests {
         let checked = text::check_fitted(model.file().as_bytes()).unwrap();
         assert_eq!(checked.pins(), ["IN", "OUT", "EN", "COM"]);
         // 10 to 90 percent of the settled output, k = 10 / 10.05.
-        let k = final_output(&Law::LoadSwitch { ron: 0.05, limit: None }, 5.0, Some(10.0)) / 5.0;
+        let k = final_output(
+            &Law::LoadSwitch {
+                ron: 0.05,
+                limit: None,
+            },
+            5.0,
+            Some(10.0),
+        ) / 5.0;
         let tau = fitted(&model, "enable_time_constant");
         assert!((tau * ((1.0 - 0.1 * k) / (1.0 - 0.9 * k)).ln() - 2.2e-4).abs() < 1e-9);
         assert!(model.assumed.iter().any(|a| a.contains("no current limit")));
         // Without values, it says what it took.
-        let bare = parsed(json!([value("switch_on_resistance", 0.05, json!({ "output_current_amps": 1.0 }))]));
+        let bare = parsed(json!([value(
+            "switch_on_resistance",
+            0.05,
+            json!({ "output_current_amps": 1.0 })
+        )]));
         let model = build_model(Kind::LoadSwitch, "bare_fit", &bare, 25.0).unwrap();
-        for note in ["no enable threshold", "no rise time", "no quiescent current"] {
+        for note in [
+            "no enable threshold",
+            "no rise time",
+            "no quiescent current",
+        ] {
             assert!(model.assumed.iter().any(|a| a.contains(note)), "{note}");
         }
         // The law blocks reverse current: 1 uA a volt.
-        let law = Law::LoadSwitch { ron: 0.05, limit: None };
+        let law = Law::LoadSwitch {
+            ron: 0.05,
+            limit: None,
+        };
         let reverse = law.current_at(-5.0, 0.0, 1.0).unwrap();
         assert!(reverse < 0.0 && reverse > -1e-5, "{reverse}");
     }
@@ -1261,16 +1351,40 @@ mod tests {
     #[test]
     fn an_ideal_diode_fits_its_forward_curve_holds_one_out_and_blocks_reverse_current() {
         let values = parsed(json!([
-            value("forward_voltage", 0.021, json!({ "forward_current_amps": 0.1 })),
-            value("forward_voltage", 0.03, json!({ "forward_current_amps": 1.0 })),
-            value("forward_voltage", 0.06, json!({ "forward_current_amps": 2.0 })),
-            value("forward_voltage", 0.09, json!({ "forward_current_amps": 3.0 })),
-            value("reverse_current", 5e-7, json!({ "reverse_voltage_volts": 5.0 }))
+            value(
+                "forward_voltage",
+                0.021,
+                json!({ "forward_current_amps": 0.1 })
+            ),
+            value(
+                "forward_voltage",
+                0.03,
+                json!({ "forward_current_amps": 1.0 })
+            ),
+            value(
+                "forward_voltage",
+                0.06,
+                json!({ "forward_current_amps": 2.0 })
+            ),
+            value(
+                "forward_voltage",
+                0.09,
+                json!({ "forward_current_amps": 3.0 })
+            ),
+            value(
+                "reverse_current",
+                5e-7,
+                json!({ "reverse_voltage_volts": 5.0 })
+            )
         ]));
         let model = build_model(Kind::IdealDiode, "lm66100_fit", &values, 25.0).unwrap();
         let checked = text::check_fitted(model.file().as_bytes()).unwrap();
         assert_eq!(checked.pins(), ["IN", "OUT", "COM"]);
-        let held: Vec<_> = model.checks.iter().filter(|c| c.role == Role::HeldOut).collect();
+        let held: Vec<_> = model
+            .checks
+            .iter()
+            .filter(|c| c.role == Role::HeldOut)
+            .collect();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].characteristic, 2);
         let law = Law::IdealDiode {
@@ -1286,10 +1400,21 @@ mod tests {
         let reverse = -law.current_at(-5.0, 0.0, 1.0).unwrap();
         assert!((reverse / 5e-7 - 1.0).abs() < 1e-6, "{reverse}");
         let twice = parsed(json!([
-            value("forward_voltage", 0.02, json!({ "forward_current_amps": 0.1 })),
-            value("forward_voltage", 0.03, json!({ "forward_current_amps": 0.1 }))
+            value(
+                "forward_voltage",
+                0.02,
+                json!({ "forward_current_amps": 0.1 })
+            ),
+            value(
+                "forward_voltage",
+                0.03,
+                json!({ "forward_current_amps": 0.1 })
+            )
         ]));
         let error = build_model(Kind::IdealDiode, "x_fit", &twice, 25.0).unwrap_err();
-        assert_eq!(error.field, "characteristics[1].conditions.forward_current_amps");
+        assert_eq!(
+            error.field,
+            "characteristics[1].conditions.forward_current_amps"
+        );
     }
 }

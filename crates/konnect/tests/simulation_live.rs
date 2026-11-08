@@ -4459,3 +4459,146 @@ fn behavioural_regulators_are_checked_on_the_engine_and_a_fitted_ldo_regulates_a
     near(out - adj, 1.25, 5e-3);
     near(out, 1.25 * (1.0 + 1500.0 / 240.0) + 50e-6 * 1500.0, 0.06);
 }
+
+#[test]
+#[ignore = "needs KiCad 10 with libngspice, and KICAD_DEMOS"]
+fn behavioural_switches_are_checked_on_the_engine_and_a_fitted_efuse_passes_a_supply() {
+    // Every switch kind with its full set of values, on the engine; then an
+    // eFuse in place of the LM317 demo's regulator, which passes the
+    // rectified input to the output less its on-resistance's drop.
+    let project = tempfile::tempdir().unwrap();
+    copy_tree(
+        &demos().join("simulation/power_supplies/LM317_power_supply"),
+        project.path(),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let schematic = project.path().join("power_supply.kicad_sch");
+    let efuse = json!([
+        typical(
+            "switch_on_resistance",
+            0.03,
+            json!({ "output_current_amps": 1.0, "input_voltage_volts": 12.0 })
+        ),
+        typical("current_limit", 2.0, json!({ "input_voltage_volts": 12.0 })),
+        typical("undervoltage_lockout", 4.0, json!({})),
+        typical("overvoltage_cutoff", 15.0, json!({})),
+        typical(
+            "quiescent_current",
+            3e-4,
+            json!({ "input_voltage_volts": 12.0 })
+        )
+    ]);
+    let load_switch = json!([
+        typical(
+            "switch_on_resistance",
+            0.05,
+            json!({ "output_current_amps": 1.0, "input_voltage_volts": 5.0 })
+        ),
+        typical("enable_threshold", 1.0, json!({})),
+        typical(
+            "output_rise_time",
+            2.2e-4,
+            json!({
+                "input_voltage_volts": 5.0, "load_resistance_ohms": 10.0, "load_capacitance_farads": 1e-5
+            })
+        ),
+        typical(
+            "quiescent_current",
+            1e-5,
+            json!({ "input_voltage_volts": 5.0 })
+        ),
+        typical("current_limit", 1.5, json!({}))
+    ]);
+    let forward = |amps: f64, volts: f64| {
+        typical(
+            "forward_voltage",
+            volts,
+            json!({ "forward_current_amps": amps }),
+        )
+    };
+    let ideal_diode = json!([
+        forward(0.1, 0.021),
+        forward(1.0, 0.03),
+        forward(2.0, 0.06),
+        forward(3.0, 0.09),
+        typical(
+            "reverse_current",
+            5e-7,
+            json!({ "reverse_voltage_volts": 5.0 })
+        ),
+        typical(
+            "quiescent_current",
+            1.5e-4,
+            json!({ "input_voltage_volts": 5.0 })
+        )
+    ]);
+    // The demo's ADJ node sits near the output, so the eFuse put there has
+    // no window: its enable reads the input against that pin.
+    let plain = json!([
+        typical(
+            "switch_on_resistance",
+            0.03,
+            json!({ "output_current_amps": 1.0, "input_voltage_volts": 12.0 })
+        ),
+        typical("current_limit", 2.0, json!({ "input_voltage_volts": 12.0 }))
+    ]);
+    let results = call_session(
+        home.path(),
+        &[
+            create_model(&schematic, "efuse", "tps2595_fit", efuse),
+            create_model(&schematic, "load_switch", "tps22918_fit", load_switch),
+            create_model(&schematic, "ideal_diode", "lm66100_fit", ideal_diode),
+            create_model(&schematic, "efuse", "efuse_fit", plain),
+            assign_model(
+                &schematic,
+                &["U1"],
+                "efuse_fit",
+                json!({ "3": "IN", "2": "OUT", "1": "COM" }),
+            ),
+            (
+                "run_simulation",
+                json!({
+                    "schematic": schematic,
+                    "analysis": { "kind": "transient", "stop_time_seconds": 0.3, "max_step_seconds": 1e-4 },
+                    "measurements": [
+                        { "name": "out", "kind": "average", "signal": "v(/out)", "from_seconds": 0.25 },
+                        { "name": "rect", "kind": "average", "signal": "v(/rect)", "from_seconds": 0.25 },
+                    ],
+                }),
+            ),
+        ],
+    );
+    for created in &results[..4] {
+        assert_eq!(created["verification"]["status"], "passed", "{created}");
+        assert_eq!(created["written"], true, "{created}");
+        let worst = created["verification"]["worst_error_percent"]
+            .as_f64()
+            .unwrap();
+        assert!(worst < 1.0, "{created}");
+    }
+    assert_eq!(results[1]["model_pins"], json!(["IN", "OUT", "EN", "COM"]));
+    let rows = results[2]["verification"]["rows"].as_array().unwrap();
+    assert!(
+        rows.iter().any(|row| row["role"] == "held_out"),
+        "{}",
+        results[2]
+    );
+    assert_eq!(
+        results[4]["outcome"]["status"], "complete",
+        "{}",
+        results[4]
+    );
+    let run = &results[5];
+    assert_eq!(run["outcome"]["status"], "complete", "{run}");
+    assert_eq!(run["simulated_circuit"], "as_drawn");
+    assert!(
+        run["circuit"]["approximations"]
+            .to_string()
+            .contains("fitted_model"),
+        "{run}"
+    );
+    // About 8 mA through 30 milliohms: the output is the input.
+    let (out, rect) = (measured(run, "out"), measured(run, "rect"));
+    assert!(rect > 10.0, "{run}");
+    near(out, rect, 5e-3);
+}
