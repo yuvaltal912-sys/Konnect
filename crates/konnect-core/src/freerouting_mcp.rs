@@ -45,20 +45,37 @@ fn server_arguments() -> &'static [&'static str] {
     ]
 }
 
+/// JVM options that keep Freerouting off the network. Freerouting 2.5.0
+/// starts a version check on every launch (a GET to `api.github.com`, with
+/// no switch to turn it off), through Java's default proxy selector. Every
+/// HTTP and HTTPS request the JVM makes goes to a closed loopback port
+/// instead and fails at once. Loopback stays direct, so the MCP link to
+/// Freerouting's own servers on 127.0.0.1 is not affected.
+pub(crate) const OFFLINE_JVM_ARGUMENTS: [&str; 5] = [
+    "-Dhttp.proxyHost=127.0.0.1",
+    "-Dhttp.proxyPort=9",
+    "-Dhttps.proxyHost=127.0.0.1",
+    "-Dhttps.proxyPort=9",
+    "-Dhttp.nonProxyHosts=localhost|127.*|[::1]",
+];
+
 /// JVM options, placed before `-jar`. Freerouting writes its settings and a
 /// log under `user.home` (2.5) or `java.io.tmpdir` (2.1); pointing both at a
-/// scratch directory keeps that out of the owner's home.
-fn jvm_arguments(scratch: &Path) -> [std::ffi::OsString; 3] {
+/// scratch directory keeps that out of the owner's home. The
+/// [`OFFLINE_JVM_ARGUMENTS`] follow.
+fn jvm_arguments(scratch: &Path) -> Vec<std::ffi::OsString> {
     let property = |name: &str, dir: PathBuf| {
         let mut argument = std::ffi::OsString::from(format!("-D{name}="));
         argument.push(dir);
         argument
     };
-    [
+    let mut arguments = vec![
         "-Djava.awt.headless=true".into(),
         property("user.home", scratch.join("home")),
         property("java.io.tmpdir", scratch.join("tmp")),
-    ]
+    ];
+    arguments.extend(OFFLINE_JVM_ARGUMENTS.iter().map(std::ffi::OsString::from));
+    arguments
 }
 
 /// Freerouting 2.5's `UserDataPathResolver` takes this argument ahead of
@@ -990,6 +1007,11 @@ mod tests {
         assert!(Path::new(tmp).starts_with(std::env::temp_dir()), "{tmp}");
         assert!(lines[jar + 1..].contains(&"--profile.allow_telemetry=false"));
         assert!(lines[jar + 1..].contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+        // HTTP and HTTPS go to a closed loopback port, so 2.5.0's version
+        // check never reaches api.github.com; loopback stays direct.
+        for offline in OFFLINE_JVM_ARGUMENTS {
+            assert!(before_jar.contains(&offline), "{offline}: {recorded}");
+        }
         assert!(
             !Path::new(home).exists(),
             "the scratch directory outlives the child"
