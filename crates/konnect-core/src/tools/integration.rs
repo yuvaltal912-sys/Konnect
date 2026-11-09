@@ -2245,6 +2245,19 @@ const FREEROUTING_QUIET_ARGUMENTS: &[&str] = &[
     "--usage_and_diagnostic_data.disable_analytics=true",
 ];
 
+/// JVM options that keep a Freerouting start off the network. 2.5.0 starts a
+/// version check on every launch (a GET to `api.github.com`, with no switch
+/// to turn it off), through Java's default proxy selector. Every HTTP and
+/// HTTPS request goes to a closed loopback port instead and fails at once;
+/// loopback stays direct.
+const FREEROUTING_OFFLINE_JVM_ARGUMENTS: &[&str] = &[
+    "-Dhttp.proxyHost=127.0.0.1",
+    "-Dhttp.proxyPort=9",
+    "-Dhttps.proxyHost=127.0.0.1",
+    "-Dhttps.proxyPort=9",
+    "-Dhttp.nonProxyHosts=localhost|127.*|[::1]",
+];
+
 /// `version_policy` for an installed JAR. The JAR is hashed only when it
 /// claims the recommended version, so a different version costs nothing.
 async fn installed_version_policy(jar: &Path, version_output: Option<&str>) -> serde_json::Value {
@@ -2425,6 +2438,7 @@ async fn handle_check_freerouting(
                 .arg("-Djava.awt.headless=true")
                 .arg(format!("-Duser.home={}", scratch.path().display()))
                 .arg(format!("-Djava.io.tmpdir={}", scratch.path().display()))
+                .args(FREEROUTING_OFFLINE_JVM_ARGUMENTS)
                 .args(["-jar", jar_path.to_str().unwrap_or(""), "--version"])
                 .args(FREEROUTING_QUIET_ARGUMENTS);
             isolate_freerouting_environment(
@@ -4191,6 +4205,14 @@ mod freerouting_setup_tests {
             "--usage_and_diagnostic_data.disable_analytics=true",
         ] {
             assert!(args.contains(quiet), "{quiet} in {args}");
+        }
+        // 2.5.0's version check goes to a closed loopback port, not GitHub.
+        let before_jar = &args[..args.find("-jar").expect("-jar is passed")];
+        for offline in FREEROUTING_OFFLINE_JVM_ARGUMENTS {
+            assert!(
+                before_jar.contains(offline),
+                "{offline} before -jar in {args}"
+            );
         }
     }
 

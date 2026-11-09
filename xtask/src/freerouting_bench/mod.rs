@@ -154,6 +154,17 @@ pub fn dsn_files(dirs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// JVM options that keep a run off the network: 2.5.0 starts a version check
+/// (a GET to `api.github.com`, with no switch) on every launch. Every HTTP and
+/// HTTPS request goes to a closed loopback port instead; loopback stays direct.
+const OFFLINE_JVM_ARGUMENTS: [&str; 5] = [
+    "-Dhttp.proxyHost=127.0.0.1",
+    "-Dhttp.proxyPort=9",
+    "-Dhttps.proxyHost=127.0.0.1",
+    "-Dhttps.proxyPort=9",
+    "-Dhttp.nonProxyHosts=localhost|127.*|[::1]",
+];
+
 /// The arguments for one batch run in `run_dir`, after `java`. The run reads
 /// `run_dir/board.dsn` and writes `run_dir/board.ses`.
 pub fn freerouting_arguments(run_dir: &Path, jar: &Path, options: &Options) -> Vec<String> {
@@ -161,6 +172,9 @@ pub fn freerouting_arguments(run_dir: &Path, jar: &Path, options: &Options) -> V
         "-Djava.awt.headless=true".to_string(),
         format!("-Duser.home={}", run_dir.join("home").display()),
         format!("-Djava.io.tmpdir={}", run_dir.join("tmp").display()),
+    ];
+    args.extend(OFFLINE_JVM_ARGUMENTS.iter().map(|a| a.to_string()));
+    args.extend([
         "-jar".to_string(),
         jar.display().to_string(),
         "-de".to_string(),
@@ -175,7 +189,7 @@ pub fn freerouting_arguments(run_dir: &Path, jar: &Path, options: &Options) -> V
         "--gui.enabled=false".to_string(),
         "--profile.allow_telemetry=false".to_string(),
         "--usage_and_diagnostic_data.disable_analytics=true".to_string(),
-    ];
+    ]);
     args.extend(options.extra_args.iter().cloned());
     args
 }
@@ -758,6 +772,13 @@ mod tests {
             "--extra",
         ] {
             assert!(line.iter().any(|a| a == expected), "{expected} in {line:?}");
+        }
+        let jar = line.iter().position(|a| a == "-jar").unwrap();
+        for offline in OFFLINE_JVM_ARGUMENTS {
+            assert!(
+                line[..jar].iter().any(|a| a == offline),
+                "{offline} in {line:?}"
+            );
         }
         let pairs: Vec<(&str, &str)> = line
             .windows(2)
