@@ -28,12 +28,12 @@ const DT_EXPONENT: f64 = 0.44;
 const AREA_EXPONENT: f64 = 0.725;
 const MM_PER_MIL: f64 = 0.0254;
 /// 1 oz/ft² of copper, in mm.
-const MM_PER_OZ: f64 = 0.0348;
+pub(crate) const MM_PER_OZ: f64 = 0.0348;
 /// The plated barrel of a via, in mm (IPC-6012 class 2 average is 20 µm;
 /// 25 µm is the common fab default).
 const VIA_PLATING_MM: f64 = 0.025;
 /// Used when neither the record nor the call gives a temperature rise.
-const DEFAULT_TEMP_RISE_C: f64 = 10.0;
+pub(crate) const DEFAULT_TEMP_RISE_C: f64 = 10.0;
 /// How many undersized segments a net lists by UUID.
 const LISTED_ITEMS: usize = 10;
 
@@ -69,43 +69,43 @@ pub fn tools() -> Vec<ToolDef> {
 }
 
 /// The IPC-2221 cross-section (mm²) that carries `amps` at `rise_c`.
-fn required_area_mm2(amps: f64, rise_c: f64, external: bool) -> f64 {
+pub(crate) fn required_area_mm2(amps: f64, rise_c: f64, external: bool) -> f64 {
     let k = if external { K_EXTERNAL } else { K_INTERNAL };
     let area_mil2 = (amps / (k * rise_c.powf(DT_EXPONENT))).powf(1.0 / AREA_EXPONENT);
     area_mil2 * MM_PER_MIL * MM_PER_MIL
 }
 
 /// The IPC-2221 current (A) a cross-section of `area_mm2` carries at `rise_c`.
-fn capacity_a(area_mm2: f64, rise_c: f64, external: bool) -> f64 {
+pub(crate) fn capacity_a(area_mm2: f64, rise_c: f64, external: bool) -> f64 {
     let k = if external { K_EXTERNAL } else { K_INTERNAL };
     let area_mil2 = area_mm2 / (MM_PER_MIL * MM_PER_MIL);
     k * rise_c.powf(DT_EXPONENT) * area_mil2.powf(AREA_EXPONENT)
 }
 
-fn is_outer(layer: &str) -> bool {
+pub(crate) fn is_outer(layer: &str) -> bool {
     layer == "F.Cu" || layer == "B.Cu"
 }
 
 /// One net that must carry a current.
 #[derive(Debug, Clone)]
-struct Requirement {
-    net: String,
-    amps: f64,
-    rise_c: f64,
+pub(crate) struct Requirement {
+    pub net: String,
+    pub amps: f64,
+    pub rise_c: f64,
     rise_source: &'static str,
     /// `currents` or `rail:<name>`.
     source: String,
 }
 
 /// Copper thickness per copper layer, and where it came from.
-struct Copper {
+pub(crate) struct Copper {
     by_layer: BTreeMap<String, (f64, &'static str)>,
     outer: (f64, &'static str),
     inner: (f64, &'static str),
 }
 
 impl Copper {
-    fn thickness(&self, layer: &str) -> (f64, &'static str) {
+    pub(crate) fn thickness(&self, layer: &str) -> (f64, &'static str) {
         if let Some(t) = self.by_layer.get(layer) {
             return *t;
         }
@@ -140,7 +140,10 @@ fn stackup_copper(tree: &SexpNode) -> BTreeMap<String, f64> {
     out
 }
 
-fn copper_for(tree: &SexpNode, intent: &crate::tools::design_intent::DesignIntent) -> Copper {
+pub(crate) fn copper_for(
+    tree: &SexpNode,
+    intent: &crate::tools::design_intent::DesignIntent,
+) -> Copper {
     let target = intent.fab_target.as_ref();
     let outer_oz = target.and_then(|t| t.outer_copper_oz);
     let inner_oz = target.and_then(|t| t.inner_copper_oz);
@@ -167,7 +170,7 @@ fn copper_for(tree: &SexpNode, intent: &crate::tools::design_intent::DesignInten
     }
 }
 
-fn requirements(
+pub(crate) fn requirements(
     intent: &crate::tools::design_intent::DesignIntent,
     default_rise: f64,
     default_rise_given: bool,

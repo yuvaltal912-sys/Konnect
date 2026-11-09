@@ -315,6 +315,8 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    unavailable. The tool locates the JAR and a compatible Java; it does not
    install either. If unavailable, stop and report the returned setup steps;
    continue only after the installation or capability blocker is resolved.
+   If its version policy carries a `warning`, tell the user which release
+   is recommended and why; it does not block routing.
 2. With the exact named board open over IPC and placement/rules settled, call
    `export_specctra_dsn(board, output='new-job.dsn')`. Keep the returned DSN and
    reverse manifest together. Rust export is the default
@@ -342,7 +344,10 @@ chords within 5 um, and rounded pads use their bounding rectangles. Existing
 pours become fixed planes and track/via-blocking rule areas become keepouts from
 zone outlines, not their fills; thermal reliefs are not modelled. A large pour
 then leaves the router little room: pass `pours="omit"` to route through pour
-areas, then refill zones and run DRC after the import. Mounting
+areas, then refill zones and run DRC after the import. Record the currents of
+the main power nets with `set_design_intent` before exporting: the export
+widens those nets to their IPC-2221 width (`intent_widths`), and
+`route_specctra_dsn` keeps Freerouting from narrowing any track below its class. Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
 Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,

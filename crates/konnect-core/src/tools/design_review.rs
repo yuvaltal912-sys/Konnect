@@ -210,6 +210,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
     ];
     tools.extend(super::trace_current::tools());
+    tools.extend(super::layout_quality::tools());
     tools
 }
 

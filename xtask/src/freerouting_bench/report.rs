@@ -1,0 +1,1087 @@
+//! Turning runs into a per-board quality table, per-version totals, a ranking
+//! and a recommendation.
+//!
+//! Completion is a gate, not a score: a board passes when every run wrote a
+//! readable SES with no unrouted connection, no clearance violation and
+//! without stopping at the job budget. Versions are then compared on quality
+//! over the boards that every competing version passed.
+
+use super::parse::{Json, SesSummary};
+use super::quality::Quality;
+use super::Options;
+use std::cmp::Ordering;
+use std::path::PathBuf;
+
+/// One Freerouting run on one board.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunRecord {
+    pub exit_code: Option<i32>,
+    /// Killed at the hard limit (`--timeout-secs`): no result.
+    pub timed_out: bool,
+    /// Freerouting's own job budget ran out; the SES holds what it routed.
+    pub hit_job_budget: bool,
+    pub runtime_s: f64,
+    /// The version Freerouting printed in its log.
+    pub reported_version: Option<String>,
+    /// Freerouting logged "Analytics are disabled".
+    pub analytics_disabled: bool,
+    /// Freerouting's own count of connections left unrouted.
+    pub unrouted: Option<u64>,
+    /// `connections.maximum_count` (2.1 only).
+    pub connections: Option<u64>,
+    pub stats_vias: Option<u64>,
+    pub clearance_violations: Option<u64>,
+    pub ses: Option<SesSummary>,
+    pub ses_fingerprint: Option<String>,
+    pub quality: Option<Quality>,
+    pub quality_error: Option<String>,
+    pub error: Option<String>,
+}
+
+impl RunRecord {
+    /// A run that wrote a readable SES and reported its completion.
+    pub fn succeeded(&self) -> bool {
+        self.error.is_none() && self.ses.is_some() && self.unrouted.is_some()
+    }
+
+    pub fn one_line(&self) -> String {
+        match (&self.error, &self.ses) {
+            (Some(error), _) => format!("FAILED ({error}) after {:.1} s", self.runtime_s),
+            (None, Some(ses)) => format!(
+                "{} unrouted, {} violations, {} vias, {:.1} mm{}, {:.1} s{}, ses {}",
+                self.unrouted
+                    .map_or("? (no statistics)".to_string(), |n| n.to_string()),
+                self.clearance_violations
+                    .map_or("?".to_string(), |n| n.to_string()),
+                ses.vias,
+                ses.wirelength_mm,
+                self.quality
+                    .as_ref()
+                    .and_then(Quality::wire_ratio)
+                    .map_or(String::new(), |r| format!(" ({r:.2}x HPWL)")),
+                self.runtime_s,
+                if self.hit_job_budget {
+                    " (job budget hit)"
+                } else {
+                    ""
+                },
+                self.ses_fingerprint.as_deref().unwrap_or("-")
+            ),
+            (None, None) => "no result".to_string(),
+        }
+    }
+}
+
+/// `label`, and `(version)` after it when the two differ and the version is
+/// known.
+fn display_name(label: &str, version: &str) -> String {
+    if label == version || version == "unknown" {
+        label.to_string()
+    } else {
+        format!("{label} ({version})")
+    }
+}
+
+/// Every run of one JAR on one board.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardResult {
+    pub board: String,
+    /// The folder this JAR's runs went in, different for every JAR: the key
+    /// totals and the ranking group by.
+    pub dir: String,
+    pub version: String,
+    pub jar: PathBuf,
+    pub dsn_connections: Option<usize>,
+    pub components: Option<usize>,
+    pub signal_layers: Option<usize>,
+    pub runs: Vec<RunRecord>,
+}
+
+impl BoardResult {
+    /// The JAR as named in the report: its folder label, with the version
+    /// Freerouting reported when that differs.
+    pub fn name(&self) -> String {
+        display_name(&self.dir, &self.version)
+    }
+
+    pub fn all_succeeded(&self) -> bool {
+        !self.runs.is_empty() && self.runs.iter().all(RunRecord::succeeded)
+    }
+
+    /// The completion gate: every run complete, clean and within budget.
+    pub fn passes_gate(&self) -> bool {
+        self.all_succeeded()
+            && self.unrouted() == Some(0)
+            && self.violations() == Some(0)
+            && !self.budget_limited()
+            && self.quality().is_some()
+    }
+
+    /// Why the gate failed, in a few words.
+    pub fn gate_failure(&self) -> Option<String> {
+        if self.passes_gate() {
+            return None;
+        }
+        if let Some(error) = self.runs.iter().find_map(|run| run.error.clone()) {
+            return Some(error);
+        }
+        let mut reasons = Vec::new();
+        if let Some(n) = self.unrouted().filter(|n| *n > 0) {
+            reasons.push(format!("{n} unrouted"));
+        }
+        match self.violations() {
+            Some(n) if n > 0 => reasons.push(format!("{n} clearance violations")),
+            None if self.unrouted().is_some() => {
+                reasons.push("clearance violations not reported".to_string())
+            }
+            _ => {}
+        }
+        if self.budget_limited() {
+            reasons.push("stopped by the job budget".to_string());
+        }
+        if let Some(error) = self.runs.iter().find_map(|run| run.quality_error.clone()) {
+            reasons.push(format!("not measured: {error}"));
+        }
+        if reasons.is_empty() {
+            reasons.push("no result".to_string());
+        }
+        Some(reasons.join(", "))
+    }
+
+    /// Every run wrote the same SES, token for token. `None` with fewer than
+    /// two runs or when a run failed: there is nothing to compare.
+    pub fn same_ses(&self) -> Option<bool> {
+        self.all_agree(|r| r.ses_fingerprint.clone())
+    }
+
+    /// Every run laid the same copper: the same segments and vias, in any
+    /// order. This is what the ranking calls deterministic; `same_ses` can
+    /// be false while this is true when only the order of wires changed.
+    pub fn deterministic(&self) -> Option<bool> {
+        self.all_agree(|r| r.ses.as_ref().map(|s| s.routing_fingerprint.clone()))
+    }
+
+    /// Some run stopped at Freerouting's job budget. Its result depends on how
+    /// far the clock let it get, so it is not compared for determinism.
+    pub fn budget_limited(&self) -> bool {
+        self.runs.iter().any(|r| r.hit_job_budget)
+    }
+
+    /// The worst run's clearance violations. `None` when a run did not report
+    /// them: that fails the gate, it is not taken for none.
+    pub fn violations(&self) -> Option<u64> {
+        self.runs
+            .iter()
+            .map(|r| r.clearance_violations)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
+    }
+
+    fn all_agree(&self, key: impl Fn(&RunRecord) -> Option<String>) -> Option<bool> {
+        if self.runs.len() < 2 || !self.all_succeeded() || self.budget_limited() {
+            return None;
+        }
+        let first = key(&self.runs[0]);
+        Some(self.runs.iter().all(|r| key(r) == first))
+    }
+
+    /// The worst run's unrouted count.
+    pub fn unrouted(&self) -> Option<u64> {
+        self.runs
+            .iter()
+            .map(|r| r.unrouted)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
+    }
+
+    /// The first run's quality: the one quoted for the board.
+    pub fn quality(&self) -> Option<&Quality> {
+        self.runs.first()?.quality.as_ref()
+    }
+
+    pub fn median_runtime_s(&self) -> f64 {
+        let mut times: Vec<f64> = self.runs.iter().map(|r| r.runtime_s).collect();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        match times.len() {
+            0 => 0.0,
+            n if n % 2 == 1 => times[n / 2],
+            n => (times[n / 2 - 1] + times[n / 2]) / 2.0,
+        }
+    }
+}
+
+/// One JAR's totals: the gate over every board, quality over the boards
+/// every competing JAR passed (`compared_boards`). JARs are told apart by
+/// `label` (their folder), not by version, so a rebuild of one version stays
+/// a row of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionTotals {
+    pub label: String,
+    pub version: String,
+    pub boards: usize,
+    pub passed_boards: usize,
+    pub compared_boards: usize,
+    pub wirelength_mm: f64,
+    pub hpwl_mm: f64,
+    pub bound_mm: f64,
+    pub vias: usize,
+    pub nets_routed: usize,
+    pub layer_changes: usize,
+    pub right_corners: usize,
+    pub acute_corners: usize,
+    pub segments: usize,
+    pub narrow_segments: usize,
+    pub nondeterministic_boards: usize,
+    pub deterministic_boards: usize,
+    pub runtime_s: f64,
+}
+
+impl VersionTotals {
+    /// The JAR as named in the ranking: its label, and its version when that differs.
+    pub fn name(&self) -> String {
+        display_name(&self.label, &self.version)
+    }
+
+    pub fn gate_failures(&self) -> usize {
+        self.boards - self.passed_boards
+    }
+
+    pub fn wire_ratio(&self) -> Option<f64> {
+        (self.bound_mm > 0.0).then(|| self.wirelength_mm / self.bound_mm)
+    }
+
+    pub fn hpwl_ratio(&self) -> Option<f64> {
+        (self.hpwl_mm > 0.0).then(|| self.wirelength_mm / self.hpwl_mm)
+    }
+
+    pub fn defects(&self) -> usize {
+        self.acute_corners + self.narrow_segments
+    }
+}
+
+/// The JAR labels, in the order they first appear.
+fn labels_in_order(results: &[BoardResult]) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for result in results {
+        if !labels.contains(&result.dir) {
+            labels.push(result.dir.clone());
+        }
+    }
+    labels
+}
+
+/// Boards that every competing JAR passed. A JAR that passed no board
+/// competes on the gate alone, so it cannot empty this set.
+pub fn compared_boards(results: &[BoardResult]) -> Vec<String> {
+    let competing: Vec<String> = labels_in_order(results)
+        .into_iter()
+        .filter(|v| results.iter().any(|r| &r.dir == v && r.passes_gate()))
+        .collect();
+    let mut boards: Vec<String> = Vec::new();
+    for result in results {
+        if !boards.contains(&result.board) {
+            boards.push(result.board.clone());
+        }
+    }
+    boards
+        .into_iter()
+        .filter(|board| {
+            !competing.is_empty()
+                && competing.iter().all(|label| {
+                    results
+                        .iter()
+                        .any(|r| &r.board == board && &r.dir == label && r.passes_gate())
+                })
+        })
+        .collect()
+}
+
+pub fn totals(results: &[BoardResult]) -> Vec<VersionTotals> {
+    let compared = compared_boards(results);
+    labels_in_order(results)
+        .into_iter()
+        .map(|label| {
+            let mine: Vec<&BoardResult> = results.iter().filter(|r| r.dir == label).collect();
+            let passed = mine.iter().filter(|r| r.passes_gate()).count();
+            let measured: Vec<(&BoardResult, &Quality)> = mine
+                .iter()
+                .filter(|r| r.passes_gate() && compared.contains(&r.board))
+                .filter_map(|r| Some((*r, r.quality()?)))
+                .collect();
+            let sum = |f: &dyn Fn(&Quality) -> usize| measured.iter().map(|(_, q)| f(q)).sum();
+            let sum_f = |f: &dyn Fn(&Quality) -> f64| {
+                measured.iter().map(|(_, q)| f(q)).fold(0.0, |a, b| a + b)
+            };
+            VersionTotals {
+                boards: mine.len(),
+                passed_boards: passed,
+                compared_boards: measured.len(),
+                wirelength_mm: sum_f(&|q| q.wirelength_mm),
+                hpwl_mm: sum_f(&|q| q.hpwl_mm),
+                bound_mm: sum_f(&|q| q.bound_mm),
+                vias: sum(&|q| q.vias),
+                nets_routed: sum(&|q| q.nets_routed),
+                layer_changes: sum(&|q| q.layer_changes),
+                right_corners: sum(&|q| q.right_corners),
+                acute_corners: sum(&|q| q.acute_corners),
+                segments: sum(&|q| q.segments),
+                narrow_segments: sum(&|q| q.narrow_segments),
+                nondeterministic_boards: measured
+                    .iter()
+                    .filter(|(r, _)| r.deterministic() == Some(false))
+                    .count(),
+                deterministic_boards: measured
+                    .iter()
+                    .filter(|(r, _)| r.deterministic() == Some(true))
+                    .count(),
+                runtime_s: measured
+                    .iter()
+                    .map(|(r, _)| r.median_runtime_s())
+                    .fold(0.0, |a, b| a + b),
+                version: mine[0].version.clone(),
+                label,
+            }
+        })
+        .collect()
+}
+
+/// Best first: fewest boards failing the gate; then, on the compared boards,
+/// fewest defects (acid traps, segments below their class width), wiring
+/// closest to its lower bound (in steps of 1 %, so a negligible
+/// difference does not hide the next measure), fewest vias, fewest boards
+/// whose runs laid different copper, least time.
+pub fn rank(mut versions: Vec<VersionTotals>) -> Vec<VersionTotals> {
+    let ratio_step = |t: &VersionTotals| {
+        t.wire_ratio()
+            .map_or(u64::MAX, |r| (r * 100.0).round() as u64)
+    };
+    versions.sort_by(|a, b| {
+        (
+            a.gate_failures(),
+            a.defects(),
+            ratio_step(a),
+            a.vias,
+            a.nondeterministic_boards,
+        )
+            .cmp(&(
+                b.gate_failures(),
+                b.defects(),
+                ratio_step(b),
+                b.vias,
+                b.nondeterministic_boards,
+            ))
+            .then(
+                a.runtime_s
+                    .partial_cmp(&b.runtime_s)
+                    .unwrap_or(Ordering::Equal),
+            )
+    });
+    versions
+}
+
+pub fn describe(t: &VersionTotals) -> String {
+    let ratio = t
+        .wire_ratio()
+        .map_or("-".to_string(), |r| format!("{r:.3}"));
+    let hpwl = t
+        .hpwl_ratio()
+        .map_or("-".to_string(), |r| format!("{r:.3}"));
+    format!(
+        "{}: passed the completion gate on {} of {} boards. On the {} compared boards: wiring {ratio} x its lower bound and {hpwl} x HPWL ({:.1} mm), {} vias ({} layer changes) over {} nets, {} acute and {} right-angle corners, {} of {} segments below their class width, same routing every run on {} (differs on {}), {:.1} s",
+        t.name(),
+        t.passed_boards,
+        t.boards,
+        t.compared_boards,
+        t.wirelength_mm,
+        t.vias,
+        t.layer_changes,
+        t.nets_routed,
+        t.acute_corners,
+        t.right_corners,
+        t.narrow_segments,
+        t.segments,
+        t.deterministic_boards,
+        t.nondeterministic_boards,
+        t.runtime_s
+    )
+}
+
+fn yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    }
+}
+
+fn cell<T>(value: Option<T>, f: impl FnOnce(T) -> String) -> String {
+    value.map_or("-".to_string(), f)
+}
+
+pub fn render_markdown(results: &[BoardResult], options: &Options, java: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push_str("# Freerouting benchmark\n\n");
+    out.push_str(&format!(
+        "Java {}, {} runs per board, -mp {}, -mt {}, job budget {} s, hard limit {} s.\n\n\
+         **Gate:** every run wrote a readable SES with 0 unrouted connections (Freerouting's own count) and 0 clearance violations, within the job budget. Only boards that pass are measured for quality.\n\n\
+         **Quality** (first run): wire/bound is the wiring of the routed nets (leaving out nets that also have a pour or plane, or wiring already in the DSN) over half the perimeter of their pins' convex hull, a lower bound no wiring at any angle beats (1.00 is the unreachable ideal). wire/HPWL is the same wiring over the half-perimeter of the pins' bounding box, the usual reference; it is a bound only for 90° routing, so 45° wiring can go below 1.00. Vias/net is over nets with wiring. Layer changes are vias where wires on two layers meet. Corners are counted away from pads and vias: acute (under 89.5°, acid traps) and right (90 ± 0.5°). Tracks are unique segments; narrow ones are below their net class's width. Runtime is wall clock per run with JVM start (median). Same routing: every run laid the same segments and vias in any order.\n\n",
+        java.unwrap_or("unknown"),
+        options.runs,
+        options.max_passes,
+        options.threads,
+        options.job_timeout.as_secs(),
+        options.timeout.as_secs()
+    ));
+    out.push_str("| board | parts | layers | version | gate | wire/bound | wire/HPWL | wire mm | vias | vias/net | layer changes | acute | 90° | tracks | narrow | runtime s | same routing |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for r in results {
+        let q = r.quality().filter(|_| r.passes_gate());
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} |\n",
+            r.board.replace('|', "/"),
+            cell(r.components, |n| n.to_string()),
+            cell(r.signal_layers, |n| n.to_string()),
+            r.name().replace('|', "/"),
+            r.gate_failure()
+                .map_or("pass".to_string(), |why| format!("fail: {}", why.replace('|', "/"))),
+            cell(q.and_then(Quality::wire_ratio), |v| format!("{v:.3}")),
+            cell(q.and_then(Quality::hpwl_ratio), |v| format!("{v:.3}")),
+            cell(q, |q| format!("{:.1}", q.wirelength_mm)),
+            cell(q, |q| q.vias.to_string()),
+            cell(q.and_then(Quality::vias_per_net), |v| format!("{v:.2}")),
+            cell(q, |q| q.layer_changes.to_string()),
+            cell(q, |q| q.acute_corners.to_string()),
+            cell(q, |q| q.right_corners.to_string()),
+            cell(q, |q| q.segments.to_string()),
+            cell(q, |q| q.narrow_segments.to_string()),
+            r.median_runtime_s(),
+            yes_no(r.deterministic()),
+        ));
+    }
+    let compared = compared_boards(results);
+    let ranked = rank(totals(results));
+    out.push_str(&format!(
+        "\n## Ranking\n\nQuality is compared on the {} boards every competing version passed{}.\n\n",
+        compared.len(),
+        if compared.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", compared.join(", "))
+        }
+    ));
+    for (i, t) in ranked.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, describe(t)));
+    }
+    if let Some(best) = ranked.first() {
+        out.push_str(&format!(
+            "\nRecommended: {} (ranked by boards failing the gate, then defects, wire/bound in 1 % steps, vias, determinism, runtime).\n",
+            best.name()
+        ));
+    }
+    out
+}
+
+fn optional<T>(value: Option<T>, f: impl FnOnce(T) -> Json) -> Json {
+    value.map_or(Json::Null, f)
+}
+
+fn number(n: impl Into<f64>) -> Json {
+    Json::Number(n.into())
+}
+
+fn count(n: usize) -> Json {
+    Json::Number(n as f64)
+}
+
+fn quality_json(q: &Quality) -> Json {
+    Json::Object(vec![
+        ("nets_routed".into(), count(q.nets_routed)),
+        ("wirelength_mm".into(), number(q.wirelength_mm)),
+        ("hpwl_mm".into(), number(q.hpwl_mm)),
+        ("bound_mm".into(), number(q.bound_mm)),
+        ("hpwl_ratio".into(), optional(q.hpwl_ratio(), number)),
+        ("plane_nets_routed".into(), count(q.plane_nets_routed)),
+        ("prewired_nets_routed".into(), count(q.prewired_nets_routed)),
+        ("wire_ratio".into(), optional(q.wire_ratio(), number)),
+        ("vias".into(), count(q.vias)),
+        ("vias_per_net".into(), optional(q.vias_per_net(), number)),
+        ("layer_changes".into(), count(q.layer_changes)),
+        ("right_corners".into(), count(q.right_corners)),
+        ("acute_corners".into(), count(q.acute_corners)),
+        ("segments".into(), count(q.segments)),
+        ("narrow_segments".into(), count(q.narrow_segments)),
+        ("unknown_nets".into(), count(q.unknown_nets)),
+        (
+            "widths".into(),
+            Json::Array(
+                q.widths
+                    .iter()
+                    .map(|w| {
+                        Json::Object(vec![
+                            ("class".into(), Json::Text(w.class.clone())),
+                            ("width_mm".into(), number(w.width_mm)),
+                            ("segments".into(), count(w.segments)),
+                            ("narrow_segments".into(), count(w.narrow_segments)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&str>) -> Json {
+    let runs = |r: &BoardResult| {
+        Json::Array(
+            r.runs
+                .iter()
+                .map(|run| {
+                    Json::Object(vec![
+                        ("exit_code".into(), optional(run.exit_code, number)),
+                        ("timed_out".into(), Json::Bool(run.timed_out)),
+                        ("hit_job_budget".into(), Json::Bool(run.hit_job_budget)),
+                        ("runtime_s".into(), number(run.runtime_s)),
+                        (
+                            "reported_version".into(),
+                            optional(run.reported_version.clone(), Json::Text),
+                        ),
+                        (
+                            "analytics_disabled".into(),
+                            Json::Bool(run.analytics_disabled),
+                        ),
+                        (
+                            "unrouted".into(),
+                            optional(run.unrouted, |n| number(n as f64)),
+                        ),
+                        (
+                            "connections".into(),
+                            optional(run.connections, |n| number(n as f64)),
+                        ),
+                        (
+                            "stats_vias".into(),
+                            optional(run.stats_vias, |n| number(n as f64)),
+                        ),
+                        (
+                            "clearance_violations".into(),
+                            optional(run.clearance_violations, |n| number(n as f64)),
+                        ),
+                        (
+                            "ses_vias".into(),
+                            optional(run.ses.as_ref(), |s| count(s.vias)),
+                        ),
+                        (
+                            "duplicate_segments".into(),
+                            optional(run.ses.as_ref(), |s| count(s.duplicate_segments)),
+                        ),
+                        (
+                            "ses_fingerprint".into(),
+                            optional(run.ses_fingerprint.clone(), Json::Text),
+                        ),
+                        (
+                            "routing_fingerprint".into(),
+                            optional(run.ses.as_ref(), |s| {
+                                Json::Text(s.routing_fingerprint.clone())
+                            }),
+                        ),
+                        (
+                            "quality".into(),
+                            optional(run.quality.as_ref(), quality_json),
+                        ),
+                        (
+                            "quality_error".into(),
+                            optional(run.quality_error.clone(), Json::Text),
+                        ),
+                        ("error".into(), optional(run.error.clone(), Json::Text)),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    let ranked = rank(totals(results));
+    Json::Object(vec![
+        (
+            "java".into(),
+            optional(java.map(str::to_string), Json::Text),
+        ),
+        ("runs_per_board".into(), number(options.runs)),
+        ("max_passes".into(), number(options.max_passes)),
+        ("threads".into(), number(options.threads)),
+        (
+            "job_timeout_s".into(),
+            number(options.job_timeout.as_secs() as f64),
+        ),
+        ("timeout_s".into(), number(options.timeout.as_secs() as f64)),
+        (
+            "boards".into(),
+            Json::Array(
+                results
+                    .iter()
+                    .map(|r| {
+                        Json::Object(vec![
+                            ("board".into(), Json::Text(r.board.clone())),
+                            ("dir".into(), Json::Text(r.dir.clone())),
+                            ("version".into(), Json::Text(r.version.clone())),
+                            ("jar".into(), Json::Text(r.jar.display().to_string())),
+                            ("components".into(), optional(r.components, count)),
+                            ("signal_layers".into(), optional(r.signal_layers, count)),
+                            ("dsn_connections".into(), optional(r.dsn_connections, count)),
+                            ("passes_gate".into(), Json::Bool(r.passes_gate())),
+                            (
+                                "gate_failure".into(),
+                                optional(r.gate_failure(), Json::Text),
+                            ),
+                            (
+                                "deterministic".into(),
+                                optional(r.deterministic(), Json::Bool),
+                            ),
+                            ("same_ses".into(), optional(r.same_ses(), Json::Bool)),
+                            ("runs".into(), runs(r)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "compared_boards".into(),
+            Json::Array(
+                compared_boards(results)
+                    .into_iter()
+                    .map(Json::Text)
+                    .collect(),
+            ),
+        ),
+        (
+            "ranking".into(),
+            Json::Array(ranked.iter().map(|t| Json::Text(describe(t))).collect()),
+        ),
+        (
+            "recommended".into(),
+            optional(ranked.first().map(VersionTotals::name), Json::Text),
+        ),
+    ])
+}
+
+pub fn to_json(value: &Json) -> String {
+    let mut out = String::new();
+    write_json(value, 0, &mut out);
+    out.push('\n');
+    out
+}
+
+fn write_json(value: &Json, indent: usize, out: &mut String) {
+    let pad = |n: usize| "  ".repeat(n);
+    match value {
+        Json::Null => out.push_str("null"),
+        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Number(n) if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 => {
+            out.push_str(&format!("{}", *n as i64))
+        }
+        Json::Number(n) if n.is_finite() => out.push_str(&format!("{n}")),
+        Json::Number(_) => out.push_str("null"),
+        Json::Text(s) => {
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        Json::Array(items) if items.is_empty() => out.push_str("[]"),
+        Json::Array(items) => {
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(&pad(indent + 1));
+                write_json(item, indent + 1, out);
+                out.push_str(if i + 1 < items.len() { ",\n" } else { "\n" });
+            }
+            out.push_str(&pad(indent));
+            out.push(']');
+        }
+        Json::Object(fields) if fields.is_empty() => out.push_str("{}"),
+        Json::Object(fields) => {
+            out.push_str("{\n");
+            for (i, (key, item)) in fields.iter().enumerate() {
+                out.push_str(&pad(indent + 1));
+                write_json(&Json::Text(key.clone()), indent + 1, out);
+                out.push_str(": ");
+                write_json(item, indent + 1, out);
+                out.push_str(if i + 1 < fields.len() { ",\n" } else { "\n" });
+            }
+            out.push_str(&pad(indent));
+            out.push('}');
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::parse::{parse_json_prefix, statistics_block};
+    use super::*;
+
+    fn quality(mm: f64, hpwl: f64, vias: usize) -> Quality {
+        Quality {
+            nets_routed: 2,
+            wirelength_mm: mm,
+            hpwl_mm: hpwl,
+            bound_mm: hpwl,
+            vias,
+            segments: 4,
+            ..Quality::default()
+        }
+    }
+
+    fn run(unrouted: u64, vias: usize, mm: f64, secs: f64, fingerprint: &str) -> RunRecord {
+        RunRecord {
+            exit_code: Some(0),
+            runtime_s: secs,
+            unrouted: Some(unrouted),
+            clearance_violations: Some(0),
+            ses: Some(SesSummary {
+                nets_with_wiring: 2,
+                vias,
+                wire_segments: 4,
+                duplicate_segments: 0,
+                wirelength_mm: mm,
+                routing_fingerprint: fingerprint.to_string(),
+            }),
+            ses_fingerprint: Some(fingerprint.to_string()),
+            quality: Some(quality(mm, 10.0, vias)),
+            ..RunRecord::default()
+        }
+    }
+
+    fn failed() -> RunRecord {
+        RunRecord {
+            exit_code: Some(1),
+            error: Some("no SES written (exit Some(1))".into()),
+            runtime_s: 2.0,
+            ..RunRecord::default()
+        }
+    }
+
+    fn board(board: &str, version: &str, runs: Vec<RunRecord>) -> BoardResult {
+        BoardResult {
+            board: board.into(),
+            dir: version.into(),
+            version: version.into(),
+            jar: PathBuf::from(format!("/j/freerouting-{version}.jar")),
+            dsn_connections: Some(10),
+            components: Some(40),
+            signal_layers: Some(2),
+            runs,
+        }
+    }
+
+    fn options() -> Options {
+        super::super::parse_options(&["--jar".to_string(), "a.jar".to_string()]).unwrap()
+    }
+
+    #[test]
+    fn the_gate_needs_complete_clean_runs_within_budget() {
+        let good = board(
+            "a",
+            "v",
+            vec![run(0, 1, 11.0, 1.0, "x"), run(0, 1, 11.0, 1.0, "x")],
+        );
+        assert!(good.passes_gate());
+        assert_eq!(good.gate_failure(), None);
+        let open = board(
+            "a",
+            "v",
+            vec![run(2, 1, 11.0, 1.0, "x"), run(0, 1, 11.0, 1.0, "x")],
+        );
+        assert_eq!(open.gate_failure().as_deref(), Some("2 unrouted"));
+        let mut dirty = run(0, 1, 11.0, 1.0, "x");
+        dirty.clearance_violations = Some(3);
+        assert_eq!(
+            board("a", "v", vec![dirty]).gate_failure().as_deref(),
+            Some("3 clearance violations")
+        );
+        let mut slow = run(0, 1, 11.0, 61.0, "x");
+        slow.hit_job_budget = true;
+        assert_eq!(
+            board("a", "v", vec![slow]).gate_failure().as_deref(),
+            Some("stopped by the job budget")
+        );
+        let broken = board("a", "v", vec![run(0, 1, 11.0, 1.0, "x"), failed()]);
+        assert!(broken.gate_failure().unwrap().starts_with("no SES written"));
+        let mut unmeasured = run(0, 1, 11.0, 1.0, "x");
+        unmeasured.quality = None;
+        unmeasured.quality_error = Some("bad DSN".into());
+        assert!(board("a", "v", vec![unmeasured])
+            .gate_failure()
+            .unwrap()
+            .contains("not measured: bad DSN"));
+    }
+
+    #[test]
+    fn violations_a_run_did_not_report_fail_the_gate() {
+        let mut unknown = run(0, 1, 11.0, 1.0, "x");
+        unknown.clearance_violations = None;
+        let result = board("a", "v", vec![unknown.clone(), unknown]);
+        assert_eq!(result.violations(), None);
+        assert!(!result.passes_gate());
+        assert_eq!(
+            result.gate_failure().as_deref(),
+            Some("clearance violations not reported")
+        );
+        // One run unreported is enough.
+        let mut one = run(0, 1, 11.0, 1.0, "x");
+        one.clearance_violations = None;
+        assert!(!board("a", "v", vec![run(0, 1, 11.0, 1.0, "x"), one]).passes_gate());
+    }
+
+    #[test]
+    fn a_label_shows_its_version_only_when_it_adds_something() {
+        assert_eq!(display_name("2.5.0", "2.5.0"), "2.5.0");
+        assert_eq!(display_name("2.5.0-2", "2.5.0"), "2.5.0-2 (2.5.0)");
+        assert_eq!(display_name("unknown-2", "unknown"), "unknown-2");
+    }
+
+    #[test]
+    fn two_jars_of_one_version_stay_two_rows() {
+        let mut rebuild = board(
+            "b",
+            "2.5.0",
+            vec![run(0, 1, 11.0, 1.0, "x"), run(0, 1, 11.0, 1.0, "x")],
+        );
+        rebuild.dir = "2.5.0-2".into();
+        rebuild.jar = PathBuf::from("/b/freerouting-2.5.0.jar");
+        let release = board(
+            "b",
+            "2.5.0",
+            vec![run(0, 1, 12.0, 1.0, "y"), run(0, 1, 12.0, 1.0, "y")],
+        );
+        let results = vec![release, rebuild];
+        let rows = totals(&results);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|t| t.boards == 1 && t.version == "2.5.0"));
+        let names: Vec<String> = rows.iter().map(VersionTotals::name).collect();
+        assert_eq!(names, ["2.5.0", "2.5.0-2 (2.5.0)"]);
+        let markdown = render_markdown(&results, &options(), None);
+        assert!(markdown.contains("| 2.5.0-2 (2.5.0) |"), "{markdown}");
+        let text = to_json(&results_json(&results, &options(), None));
+        let (parsed, _) = parse_json_prefix(&text).unwrap();
+        let Some(Json::Array(boards)) = parsed.at("boards") else {
+            panic!("boards")
+        };
+        assert_eq!(boards[0].text_at("dir"), Some("2.5.0"));
+        assert_eq!(boards[1].text_at("dir"), Some("2.5.0-2"));
+    }
+
+    #[test]
+    fn determinism_needs_two_successful_runs_with_one_fingerprint() {
+        let same = board(
+            "a",
+            "v",
+            vec![run(0, 1, 1.0, 1.0, "x"), run(0, 1, 1.0, 3.0, "x")],
+        );
+        assert_eq!(same.deterministic(), Some(true));
+        assert_eq!(same.median_runtime_s(), 2.0);
+        let differ = board(
+            "a",
+            "v",
+            vec![run(0, 1, 1.0, 1.0, "x"), run(1, 1, 1.0, 1.0, "y")],
+        );
+        assert_eq!(differ.deterministic(), Some(false));
+        assert_eq!(differ.unrouted(), Some(1), "the worst run counts");
+        assert_eq!(
+            board("a", "v", vec![run(0, 1, 1.0, 1.0, "x")]).deterministic(),
+            None
+        );
+        let broken = board("a", "v", vec![run(0, 1, 1.0, 1.0, "x"), failed()]);
+        assert_eq!(broken.deterministic(), None);
+        assert_eq!(broken.unrouted(), None);
+    }
+
+    #[test]
+    fn wires_written_in_another_order_are_the_same_routing() {
+        let mut second = run(0, 1, 1.0, 1.0, "x");
+        second.ses_fingerprint = Some("reordered".into());
+        let result = board("a", "v", vec![run(0, 1, 1.0, 1.0, "x"), second]);
+        assert_eq!(result.deterministic(), Some(true));
+        assert_eq!(result.same_ses(), Some(false));
+    }
+
+    #[test]
+    fn a_run_stopped_by_the_job_budget_is_not_compared_for_determinism() {
+        let mut first = run(12, 4, 50.0, 61.0, "p");
+        first.hit_job_budget = true;
+        let result = board("big", "v", vec![first, run(10, 4, 52.0, 61.0, "q")]);
+        assert!(result.budget_limited());
+        assert_eq!(result.deterministic(), None);
+        assert!(!result.passes_gate());
+    }
+
+    #[test]
+    fn quality_is_compared_only_on_boards_every_competing_version_passed() {
+        let results = vec![
+            board(
+                "easy",
+                "a",
+                vec![run(0, 2, 12.0, 1.0, "x"), run(0, 2, 12.0, 1.0, "x")],
+            ),
+            board(
+                "easy",
+                "b",
+                vec![run(0, 2, 15.0, 1.0, "y"), run(0, 2, 15.0, 1.0, "y")],
+            ),
+            // b fails "hard"; a's routing of it must not count against a.
+            board(
+                "hard",
+                "a",
+                vec![run(0, 9, 90.0, 9.0, "z"), run(0, 9, 90.0, 9.0, "z")],
+            ),
+            board(
+                "hard",
+                "b",
+                vec![run(3, 1, 5.0, 1.0, "w"), run(3, 1, 5.0, 1.0, "w")],
+            ),
+            // c passes nothing: it competes on the gate alone.
+            board("easy", "c", vec![failed(), failed()]),
+            board("hard", "c", vec![failed(), failed()]),
+        ];
+        assert_eq!(compared_boards(&results), vec!["easy".to_string()]);
+        let ranked = rank(totals(&results));
+        let order: Vec<&str> = ranked.iter().map(|t| t.version.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c"]);
+        let a = &ranked[0];
+        assert_eq!((a.passed_boards, a.compared_boards, a.vias), (2, 1, 2));
+        assert!((a.wire_ratio().unwrap() - 1.2).abs() < 1e-9);
+        assert_eq!(ranked[1].gate_failures(), 1);
+        assert_eq!((ranked[2].passed_boards, ranked[2].compared_boards), (0, 0));
+        let text = describe(a);
+        assert!(text.starts_with("a: passed the completion gate on 2 of 2 boards. On the 1 compared boards: wiring 1.200 x"), "{text}");
+    }
+
+    #[test]
+    fn defects_outrank_wirelength_which_outranks_vias_then_determinism() {
+        let with = |mm: f64, vias: usize, acute: usize, fp: &str| {
+            let mut r = run(0, vias, mm, 1.0, fp);
+            r.quality.as_mut().unwrap().acute_corners = acute;
+            r
+        };
+        let results = vec![
+            // shortest, but an acid trap
+            board(
+                "x",
+                "trap",
+                vec![with(10.0, 0, 1, "t"), with(10.0, 0, 1, "t")],
+            ),
+            // 0.4 % longer than "lean" (same 1 % step), more vias
+            board(
+                "x",
+                "viaful",
+                vec![with(11.04, 6, 0, "v"), with(11.04, 6, 0, "v")],
+            ),
+            board(
+                "x",
+                "lean",
+                vec![with(11.0, 2, 0, "l"), with(11.0, 2, 0, "m")],
+            ),
+            // longer by a full step
+            board(
+                "x",
+                "long",
+                vec![with(13.0, 0, 0, "g"), with(13.0, 0, 0, "g")],
+            ),
+        ];
+        let order: Vec<String> = rank(totals(&results))
+            .into_iter()
+            .map(|t| t.version)
+            .collect();
+        assert_eq!(order, ["lean", "viaful", "long", "trap"]);
+    }
+
+    #[test]
+    fn ties_on_quality_go_to_the_repeatable_then_the_faster_version() {
+        let results = vec![
+            board(
+                "a",
+                "slow",
+                vec![run(0, 2, 5.0, 9.0, "x"), run(0, 2, 5.0, 9.0, "x")],
+            ),
+            board(
+                "a",
+                "quick",
+                vec![run(0, 2, 5.0, 2.0, "y"), run(0, 2, 5.0, 2.0, "y")],
+            ),
+            board(
+                "a",
+                "wobbly",
+                vec![run(0, 2, 5.0, 1.0, "u"), run(0, 2, 5.0, 1.0, "w")],
+            ),
+        ];
+        let order: Vec<String> = rank(totals(&results))
+            .into_iter()
+            .map(|t| t.version)
+            .collect();
+        assert_eq!(order, ["quick", "slow", "wobbly"]);
+    }
+
+    #[test]
+    fn the_report_and_its_json_say_the_same_thing() {
+        let results = vec![
+            board(
+                "demo|1",
+                "2.5.0",
+                vec![run(0, 2, 12.5, 3.0, "x"), run(0, 2, 12.5, 3.0, "x")],
+            ),
+            board("demo|1", "2.1.0", vec![failed(), failed()]),
+        ];
+        let markdown = render_markdown(&results, &options(), Some("25.0.5"));
+        assert!(
+            markdown.contains("| demo/1 | 40 | 2 | 2.5.0 | pass | 1.250 | 1.250 | 12.5 | 2 | 1.00 | 0 | 0 | 0 | 4 | 0 | 3.0 | yes |"),
+            "{markdown}"
+        );
+        assert!(
+            markdown
+                .contains("| demo/1 | 40 | 2 | 2.1.0 | fail: no SES written (exit Some(1)) | - |"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("Recommended: 2.5.0"), "{markdown}");
+        assert!(
+            markdown.contains("compared on the 1 boards every competing version passed: demo|1"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("-0.0"), "{markdown}");
+
+        let text = to_json(&results_json(&results, &options(), Some("25.0.5")));
+        let (parsed, used) = parse_json_prefix(&text).expect("valid JSON");
+        assert_eq!(text[used..].trim(), "");
+        assert_eq!(parsed.text_at("recommended"), Some("2.5.0"));
+        assert_eq!(parsed.number_at("job_timeout_s"), Some(60.0));
+        let Some(Json::Array(boards)) = parsed.at("boards") else {
+            panic!("boards")
+        };
+        assert_eq!(boards[0].text_at("board"), Some("demo|1"));
+        assert_eq!(boards[0].at("passes_gate"), Some(&Json::Bool(true)));
+        assert_eq!(boards[1].at("passes_gate"), Some(&Json::Bool(false)));
+        let Some(Json::Array(runs)) = boards[0].at("runs") else {
+            panic!("runs")
+        };
+        assert_eq!(runs[0].number_at("quality.wire_ratio"), Some(1.25));
+        assert_eq!(runs[0].number_at("quality.vias"), Some(2.0));
+        assert!(statistics_block(&format!("log line\n{text}")).is_some());
+    }
+
+    #[test]
+    fn json_text_is_escaped() {
+        let value = Json::Object(vec![("k\"".into(), Json::Text("a\\b\n\u{1}µ".into()))]);
+        let text = to_json(&value);
+        assert!(text.contains(r#""k\"": "a\\b\n\u0001µ""#), "{text}");
+        assert_eq!(parse_json_prefix(&text).unwrap().0, value);
+        assert_eq!(to_json(&Json::Number(f64::NAN)).trim(), "null");
+        assert_eq!(to_json(&Json::Number(2.5)).trim(), "2.5");
+        assert_eq!(to_json(&Json::Number(-3.0)).trim(), "-3");
+    }
+}

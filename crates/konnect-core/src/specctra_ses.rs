@@ -79,6 +79,21 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    #[serde(default)]
+    classes: Vec<ManifestClass>,
+    /// Informational: nets the export widened to their design-intent current.
+    #[serde(default)]
+    #[allow(dead_code)]
+    intent_widths: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestClass {
+    name: String,
+    track_width_um: i64,
+    #[allow(dead_code)]
+    clearance_um: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +128,18 @@ struct SupportedProfile {
     #[serde(default)]
     #[allow(dead_code)]
     pours_omitted: bool,
+    /// Informational here: `route_specctra_dsn` reads it for the router.
+    #[serde(default)]
+    #[allow(dead_code)]
+    copper_edge_clearance_um: Option<i64>,
+    /// Informational: the project's hole clearance the export applied.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hole_clearance_um: Option<i64>,
+    /// Informational: how far each unplated-hole keepout was grown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hole_keepout_growth_um: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +190,8 @@ struct ManifestNet {
     name: String,
     pins: Vec<String>,
     class_name: String,
+    #[serde(default)]
+    min_track_width_um: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -630,6 +659,27 @@ fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Resul
     // (same net, layer, width and geometry) adds no copper: it is counted and
     // applied once. Anything that differs is a distinct item.
     let mut duplicates = 0usize;
+    // The width each net's class demands. Freerouting's neck-down narrows a
+    // track below it to reach a small pad; such a track breaks the project's
+    // rules, so the whole SES is refused. Manifests from before PR 16b carry
+    // no classes and are not checked here.
+    let class_width_mm: BTreeMap<&str, f64> = manifest
+        .classes
+        .iter()
+        .map(|class| (class.name.as_str(), class.track_width_um as f64 / UM_PER_MM))
+        .collect();
+    let net_width_mm: BTreeMap<&str, f64> = manifest
+        .nets
+        .iter()
+        .filter_map(|net| {
+            let floor = match net.min_track_width_um {
+                Some(um) => um as f64 / UM_PER_MM,
+                None => *class_width_mm.get(net.class_name.as_str())?,
+            };
+            Some((net.name.as_str(), floor))
+        })
+        .collect();
+    let mut narrow: Vec<(String, f64, f64)> = Vec::new();
 
     for net_node in node.find_all("net") {
         require_direct_shape(net_node, 1, &["wire", "via"])?;
@@ -658,6 +708,11 @@ fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Resul
                         "path width",
                     )?;
                     let width_mm = width_um / UM_PER_MM;
+                    if let Some(min) = net_width_mm.get(net_name) {
+                        if width_mm < min - 0.0005 {
+                            narrow.push((net_name.to_string(), width_mm, *min));
+                        }
+                    }
                     let points = data[2..]
                         .chunks_exact(2)
                         .map(|pair| {
@@ -713,6 +768,11 @@ fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Resul
                         resolution,
                         "qarc width",
                     )? / UM_PER_MM;
+                    if let Some(min) = net_width_mm.get(net_name) {
+                        if width_mm < min - 0.0005 {
+                            narrow.push((net_name.to_string(), width_mm, *min));
+                        }
+                    }
                     let point = |x: &str, y: &str, label: &str| -> Result<(f64, f64)> {
                         Ok((
                             scaled(number_text(x, &format!("{label} x"))?, resolution, label)?
@@ -813,6 +873,38 @@ fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Resul
                 size_mm: padstack.size_x_um as f64 / UM_PER_MM,
             });
         }
+    }
+    if !narrow.is_empty() {
+        let (net, width, min) = narrow
+            .iter()
+            .min_by(|a, b| {
+                (a.1 - a.2)
+                    .partial_cmp(&(b.1 - b.2))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
+            .unwrap_or_default();
+        let nets: BTreeSet<&str> = narrow.iter().map(|n| n.0.as_str()).collect();
+        // Freerouting's retry width (`neck_width_um`) is one value for every
+        // net. A run that sent the narrowest floor on the board as that width
+        // (an older Konnect did, and so would a hand-set job) narrows a wider
+        // net to exactly it, which the cause below names.
+        let retry_mm = net_width_mm.values().copied().fold(f64::INFINITY, f64::min);
+        if let Some((retry_net, retry_wire, retry_floor)) = narrow
+            .iter()
+            .find(|n| n.2 > retry_mm + 0.0005 && (n.1 - retry_mm).abs() <= 0.0005)
+        {
+            bail!(
+                "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). '{retry_net}' has a wire at {retry_wire:.3} mm, the narrowest floor on the board, though its own floor is {retry_floor:.3} mm, which points at Freerouting's retry width (neck_width_um): it is one value for every net and narrows any net's retried connection to it. Route again with route_specctra_dsn, which sends no retry width when the nets' floors differ",
+                narrow.len(),
+                nets.len()
+            );
+        }
+        bail!(
+            "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). Freerouting necks tracks down at pins in its fanout stage and with automatic neck-down; route again with both off (route_specctra_dsn's default)",
+            narrow.len(),
+            nets.len()
+        );
     }
     Ok((tracks, arcs, vias, duplicates))
 }

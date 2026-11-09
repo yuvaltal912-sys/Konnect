@@ -657,6 +657,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // Specctra export result field (creation PR 16b).
+        "intent_widths",
         // Manufacturing and trace-current response fields and statuses
         // (creation PR 11).
         "fab_limits",
