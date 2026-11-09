@@ -481,6 +481,9 @@ pub struct Candidate {
     pub failed_runs: usize,
     /// A run that failed, or was not scored: the candidate cannot be chosen.
     pub incomplete: bool,
+    /// Some run was stopped by Freerouting's job budget: its routing is what
+    /// the clock allowed, said beside the candidate but not a gate.
+    pub budget_limited: bool,
     /// G1 completion, G2 DRC, G3 width: failed in some run.
     pub failed_gates: [bool; 3],
     pub acute: Option<f64>,
@@ -544,6 +547,7 @@ pub fn candidates(results: &[BoardResult]) -> Vec<Candidate> {
                 scored: scored.len(),
                 failed_runs: r.runs.iter().filter(|run| !run.succeeded()).count(),
                 incomplete: scored.len() < r.runs.len() || !r.all_succeeded(),
+                budget_limited: r.budget_limited(),
                 failed_gates,
                 acute: metric("5.3.acute_corners"),
                 signal_ratio: worst(scored.iter().map(|(_, c)| c.signal_ratio)),
@@ -632,7 +636,7 @@ pub fn describe_candidate(c: &Candidate) -> String {
         why.join(", ")
     };
     format!(
-        "{}: {gates}; {} acute corners, signals x{}, power x{}, {} right angles, {} vias off the pour nets, copper quality {}, {:.1} s; {} the baseline",
+        "{}: {gates}; {} acute corners, signals x{}, power x{}, {} right angles, {} vias off the pour nets, copper quality {}, {:.1} s; {} the baseline{}",
         c.name,
         cell(c.acute, |v| format!("{v:.0}")),
         ratio_cell(c.signal_ratio),
@@ -641,7 +645,12 @@ pub fn describe_candidate(c: &Candidate) -> String {
         cell(c.vias, |v| v.to_string()),
         cell(c.copper_quality, |v| format!("{v:.1}")),
         c.runtime_s,
-        c.verdict.word()
+        c.verdict.word(),
+        if c.budget_limited {
+            " (a run was stopped by the job budget)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1707,6 +1716,7 @@ mod tests {
             scored: 2,
             failed_runs: 0,
             incomplete: false,
+            budget_limited: false,
             failed_gates: [false; 3],
             acute: Some(0.0),
             signal_ratio: Some(1.05),
@@ -1906,6 +1916,12 @@ mod tests {
         entry.runs[0] = judged(&context, scored(30.0, 0.0, 60.0));
         entry.runs[0].error = Some("settings not in effect: x".into());
         assert!(candidates(std::slice::from_ref(&entry))[0].incomplete);
+        // A run the job budget stopped is said so, and is not a gate.
+        entry.runs[0].error = None;
+        entry.runs[1].hit_job_budget = true;
+        let c = &candidates(std::slice::from_ref(&entry))[0];
+        assert!(c.budget_limited && c.passes());
+        assert!(describe_candidate(c).ends_with("(a run was stopped by the job budget)"));
         // Entries of a bench that scored nothing are not candidates.
         assert!(candidates(&[board("V1", "v", vec![run(0, 1, 11.0, 1.0, "x")])]).is_empty());
     }

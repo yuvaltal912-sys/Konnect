@@ -73,7 +73,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 
 | Row | Delivers | Depends on | Files it owns | State |
 |---|---|---|---|---|
-| S5 | Measure first: a settings and DSN-variant sweep on the reference board through #51's harness, each run scored with `audit_layout_quality` plus length by net category (ground, power, signals); picks one preset. No product code | merged | `xtask/src/freerouting_bench/` (`mod.rs`, `report.rs`, new `board_score.rs`), new `xtask/freerouting-bench/score_board.py` and `stage_merge.py`, `DEV.md` | In progress (branch `claude/creation-s5-routing-measure-46323d`). Needs the owner's OK for up to 60 isolated Freerouting jobs and for the thresholds |
+| S5 | Measure first: a settings and DSN-variant sweep on the reference board through #51's harness, each run scored with `audit_layout_quality` plus length by net category (ground, power, signals); picks one preset. No product code | merged | `xtask/src/freerouting_bench/` (`mod.rs`, `report.rs`, new `board_score.rs`), new `xtask/freerouting-bench/score_board.py` and `stage_merge.py`, `DEV.md` | In progress (branch `claude/creation-s5-routing-measure-46323d`): the harness is built and gated (section "Row S5" below). The sweep itself waits for the owner's OK: up to 60 isolated Freerouting jobs, the thresholds, and his currents or test currents |
 | S6 | Ground through the pour: no intent widening for pour nets, a per-zone `pours` policy in the DSN, stitching after refill | S5's result | `specctra.rs`, `specctra_ses.rs`, `tools/pcb_export.rs`, new `specctra_pours_tests.rs`, new 2- and 4-layer pour fixtures | Not started |
 | S7 | Stitching-via and corner clean-up planner, read-only (Q1: a second opinion, never the author) | merged | new `tools/route_refine.rs` with its tests and fixtures, the registry count, the `kicad-pcb` skill | Not started. Can run beside S6: no shared code files |
 | S9 | Power and critical nets first, applied locked, then the rest | S5, S6, S7, the live apply check | `konnect-ipc/src/builders.rs`, `tools/pcb_routing.rs`, `freerouting_mcp.rs`, `tools/integration.rs` | Not started |
@@ -124,6 +124,28 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Freerouting 2.5.0 treats a `copper_to_edge_clearance_um` within 1e-9 of 250 as its own default (`HeadlessBoardManager.applyCopperToEdgeClearanceOverride`): it skips the override, or clamps it to the outline's minimum pin gap, logging at debug only, while `get_effective_settings` still reports 250. A project asking for exactly 0.25 mm would route closer to the edge than asked. `route_specctra_dsn` sends 250.001.
 - Freerouting 2.5.0's retry width (`neck_width_um`) is one value for every net, applied to any failed connection (`AutorouteConnectionRouter.retryConnectionNecked`, no per-net filter). Send it only when no net's floor is above it.
 - Konnect's Freerouting JAR search does not look in `~/.local/share/freerouting/<version>`; pass `jar_path`.
+- On macOS a KiCad binary (`kicad-cli`, KiCad's Python) finds its settings folder without reading `HOME`, and so does anything that starts one, the `konnect` binary's start-up probe included: with `HOME` pointed at `target/dogfood-home` and nothing else, the real `~/Library/Preferences/kicad/10.0/kicad_common.json` was re-saved once (seen 2026-11-10; content kept). Set `KICAD_CONFIG_HOME` to a scratch folder for every such child, as the bench's `--score` does.
+- `export_specctra_dsn` needs a live KiCad. For a file-based DSN of a scratch board, run the ignored test `freerouting_routes_a_folder` with `KONNECT_PROBE_KEEP=<dir>` and `FREEROUTING_JAVA=/usr/bin/true`: the export is written and nothing starts Freerouting.
+- Freerouting 2.5.0 logs "Applied CLI router setting" at debug level, so a normal log does not show which settings took; it logs "Failed to apply CLI router setting" as a warning and routes on with its default. The bench fails such a run and compares each given setting with the `freerouting.json` the run saved.
+
+## Row S5, routing measurement on the reference board (in progress)
+
+Branch `claude/creation-s5-routing-measure-46323d`, from main `c9ba0ce`; the first commit only claimed the row. No product code: everything is in `xtask/` and docs. Usage is in `DEV.md`, "Freerouting benchmark (opt-in)".
+
+**Built.** `cargo xtask freerouting-bench` now ranks router settings and DSN variants, not only JAR versions:
+
+- `--config NAME=ARGS` (repeatable): a named set of router settings, routed and ranked on its own. Only `--router.<path>=<value>` and the router's short flags are let through, each setting once, so a config cannot turn telemetry on or move a run's files.
+- `--score <spec.json>`: every run, and the board's existing routing as the baseline row, goes through one pipeline on scratch copies: the session into a copy of the project (`score_board.py`, KiCad's Python), refill and DRC by `kicad-cli` under a scratch `KICAD_CONFIG_HOME` with iterative refill off, `audit_layout_quality` through this checkout's own `konnect` by pipe, then track length by net category (pour nets, power nets, signals) and the share of each power net below its intent width.
+- Three gates per run (G1 completion, G2 no DRC type above the baseline's count, G3 widths) and the quality bands of the owner's plan, all thresholds named in the spec. Candidates (a config on a DSN, quoted at its worst run) rank by the gates, then acute corners, signal length, power length, right angles, vias, copper quality, runtime.
+- Each run records what is known of its effective settings; a setting Freerouting did not take fails the run.
+- `--max-jobs` with a `jobs.log` ledger, `--resume`, and `--rescore` from the saved score files without running anything.
+- `stage_merge.py` (experiment only) edits an exported DSN: a net out of its widened class, a pour dropped, one layer's trace costs, and a first run's session merged in as fixed wiring for staged routing.
+
+**Checked without routing** (2026-11-10, macOS, KiCad 10.0.8): the pipeline was run over the seven sessions recorded on 2026-11-08 and the existing routing. It gives the counts recorded then: the existing routing has 6 unconnected, 205 vias (53 on the pour net) and 147 DRC items in 4 types; the #58 result has 0 unconnected, the same DRC counts as the baseline (iterative refill off), 125 vias, and track x1.31 overall, x1.12 on signals and x1.21 on power nets. Measured by `audit_layout_quality` itself for the first time: 0 acute and 3 right-angle corners on the existing routing against 11 and 76 on the #58 result. Every recorded result fails G3: two of the five power nets run about half their length below their intent width.
+
+**Verified.** 78 xtask unit tests without Java, KiCad or Konnect (46 before), among them config parsing, the DRC-baseline diff, the category split, the width share and its stretches, the gates, the bands, the ranking, the report and its JSON, and `--rescore` over saved score files. 32 negative controls: each guard broken in the source, its test failed, the file restored. The job cap refused a plan before any Freerouting start. The gate is in the PR.
+
+**Not done.** The sweep (settings on the #58 DSN, DSN variants with the best settings, confirmation runs) and the choice of one preset: they wait for the owner's OK. No Freerouting job has run on this branch.
 
 ## PR 16b, route at the project's rules (merged, #58)
 
