@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **265 registered tools** + **7 always-visible meta-tools** = **272 total**
+- **267 registered tools** + **7 always-visible meta-tools** = **274 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -201,9 +201,9 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
-| `render_schematic_png` | Render a sheet or `region: {x, y, width, height}` in page mm to PNG at `width_px`, using deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds a real MCP PNG image block alongside JSON metadata. Region output is capped at 8192 pixels high and 16,777,216 pixels total. |
+| `render_schematic_png` | Render a sheet or `region: {x, y, width, height}` in page mm to PNG at `width_px`, using deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds a real MCP PNG image block alongside JSON metadata. Region output is capped at 8192 pixels high and 16,777,216 pixels total; an inline image over 8000 px a side or 3,750,000 PNG bytes is refused, and the file is still written. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
-| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged. `inline_diff` adds the current full-sheet render as an MCP PNG image block alongside the metrics (not a difference heatmap). |
+| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged. `inline_diff` adds a generated difference image as an MCP PNG image block alongside the metrics: added drawing green, removed red, recoloured orange, unchanged drawing faded, and a blue box around the change; the legend is in `diff_image`. Over 16,777,216 pixels, 8000 px a side or 3,750,000 PNG bytes the image is skipped: `diff_image` is null, a warning names a baseline `width_px` that fits, and status and metrics are unchanged. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
@@ -332,7 +332,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 
 ---
 
-### `pcb_export` · 14 tools
+### `pcb_export` · 15 tools
 **Purpose:** Gerber, PDF, SVG, 3D model, BOM, revision-bound Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.
 **Source:** [`crates/konnect-core/src/tools/pcb_export.rs`](crates/konnect-core/src/tools/pcb_export.rs)
 
@@ -341,6 +341,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
 | `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. |
 | `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. |
+| `render_board_layers` | Plot named board layers (2D, from the saved file) and return a PNG as an MCP image block next to JSON metadata. Framed on the board-edge bounding box, or a `region: {x, y, width, height}` crop in board mm at `width_px`. KiCad's default plot colours on its default dark board background, or `black_and_white`. Layers are named by canonical or user name; undeclared or ambiguous names are refused. Capped at 4096 px wide, 8192 px high and 16,777,216 pixels; inline at 8000 px a side and 3,750,000 PNG bytes. |
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
@@ -357,7 +358,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 
 ## Library
 
-### `library` · 19 tools
+### `library` · 20 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -382,6 +383,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Rank footprints by name, description and tags across global/project libraries, with paging and skipped-entry diagnostics. |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
+| `render_library_item` | Render one symbol unit (`.kicad_sym` + `name`, `unit`, `body_style`) or footprint (`.pretty` + `name`, or one `.kicad_mod` file; optional `layers`) and return a PNG as an MCP image block next to JSON metadata, for a visual check before placing the part. Footprint layers must be KiCad layer names and a footprint name must not be a path. Options for the other kind are refused unless null or their default. Capped at 4096 px wide, 8192 px high and 16,777,216 pixels; inline at 8000 px a side and 3,750,000 PNG bytes. |
 
 ---
 

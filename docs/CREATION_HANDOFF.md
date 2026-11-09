@@ -2,7 +2,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-09. #58 (PR 16b) gained a follow-up: job settings under the names Freerouting 2.5.0 reads, checked with `get_effective_settings`; fanout always off; hole clearance for unplated holes; footprint rule areas and slots refused (section below). An independent review of every open PR followed (step 3 of the resolution plan); #58 then fixed its six verified findings: pad-less footprints, the single retry width, the 250 um edge sentinel, widening from no width, and optimizer timeouts. The owner approved the library-cap fix for #52 (`import_library_part` registered in `integration`), to land with #52's merge. main is 535bf2e: the 15 core creation PRs, PR 16 (#44), #45, #46 and #47 are merged. Open, all awaiting the owner's review: #48–#58 (list below). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 265 registered tools plus 7 meta-tools. Work stopped here at the owner's request; nothing is running.
+**Last updated:** 2026-11-09. #58 (PR 16b) gained a follow-up: job settings under the names Freerouting 2.5.0 reads, checked with `get_effective_settings`; fanout always off; hole clearance for unplated holes; footprint rule areas and slots refused (section below). An independent review of every open PR followed (step 3 of the resolution plan); #58 then fixed its six verified findings: pad-less footprints, the single retry width, the 250 um edge sentinel, widening from no width, and optimizer timeouts. The owner approved the library-cap fix for #52 (`import_library_part` registered in `integration`), to land with #52's merge. main is 535bf2e: the 15 core creation PRs, PR 16 (#44), #45, #46 and #47 are merged. Open, all awaiting the owner's review: #48–#58 (list below). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 267 registered tools plus 7 meta-tools. Work stopped here at the owner's request; nothing is running.
 
 ## Start here
 
@@ -54,6 +54,7 @@ One PR at a time, each on its own branch from `main`. Ask the owner before start
 | 16b | Route at the project's rules: no Freerouting neck-down, the importer enforces class widths, copper-to-edge clearance in the DSN, power widths from design-intent currents (IPC-2221) | 16, Q3, 11 | In progress (branch `feat/creation-route-at-project-rules`) |
 | 29 | Circuit-aware review against the owner's layout checklist (sections 2, 6, 8, 9) and the power tree from the design-intent rails (rank 29: B22, B23 partly) | Q3, 11 | Draft [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), branch `feat/creation-circuit-aware-review`. Follow-ups: derating (B23), datasheet-driven values, hierarchy-joined nets |
 | R21 | Board construction (rank 21: A13, B25): footprint lock/unlock, rule areas (keepouts) that survive the DSN export, zone delete, polygon board outlines | 2b | Implemented, draft [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48) (branch `feat/creation-board-construction`); waiting for review and merge |
+| R25 | Inline layer and library-item renders (rank 25: C6, A25, B9, B7): board layers, a symbol and a footprint returned as MCP image blocks, plus a generated difference image for `inline_diff` (PR 4 follow-ups) | 4 | Draft, ready for review: [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50) (branch `feat/creation-inline-layer-library-renders`). Not done: B9's further 3D camera options (left/right/front/back, pan, rotate, multi-view batch) |
 
 ## Next: what to pick
 
@@ -477,6 +478,96 @@ The claim commit landed before code changes and the draft was opened against `ma
   (9 renderer, 8 board, 12 schematic/MCP) failed their intended tests, and all
   mutations were restored. The final macOS gate is listed on #28. No live editor IPC is needed for these tools;
   Windows, Linux and display in an actual MCP client remain unverified.
+
+## Rank 25, inline layer and library-item renders (draft, #50)
+
+Claim commit and draft PR came before code. Findings C6, A25, B9 and B7.
+
+- **The text risk did not block.** KiCad 10.0.8 `pcb export svg`, `sym export svg`
+  and `fp export svg` draw every visible string as stroke or outline paths and add
+  an invisible `opacity="0"` copy, exactly like schematic exports. A board text in a
+  TrueType font (Arial) was also plotted as outline paths. So `konnect-render`'s
+  refusal of visible `<text>` stays unchanged, with no allowance; a future export
+  that does emit visible text is refused, not rendered with a guessed font.
+- **`render_board_layers`** (`pcb_export`, beside `export_svg`): named layers of
+  the saved board as a PNG image block. Without `region` the page is the
+  board-edge bounding box (`--page-size-mode 2`); with `region` it plots on the
+  drawing sheet (`--page-size-mode 1`), where page mm equal board mm, and crops.
+  A region off the sheet is refused with a hint to drop `region`. Undeclared
+  layers are refused by name. Colours are KiCad's default plot colours on its
+  default dark board background (`#001023`), because pale silkscreen and white
+  drill marks vanish on white; `black_and_white` plots on white.
+- **`render_library_item`** (`library`): one tool, kind chosen by the path. A
+  `.kicad_sym` renders symbol `name` (`unit`, `body_style`; metadata lists units
+  and De Morgan); a `.pretty` renders footprint `name`; one `.kicad_mod` (what
+  `create_footprint` writes) is staged as a private `.pretty`, since kicad-cli
+  reads only libraries. Options for the other kind are refused. kicad-cli exits 0
+  without writing for an unknown footprint, so the file is the evidence. One tool
+  instead of two because `library` sits at the router's 20-tool cap with it; a
+  future library tool (for example rank 33's local import) must split the toolset.
+- **`compare_visual_baseline` `inline_diff`** now returns a generated difference
+  image (`konnect_render::diff_image_png`): added green, removed red, recoloured
+  orange, unchanged drawing faded, a blue box around the change; legend in
+  `diff_image`. Same canvas, threshold and background rule as the drift numbers.
+- New renderer entry points: `svg_page_to_png` (whole page with the region path's
+  8192 px height and 16 Mi pixel caps; `svg_to_png` has no height cap and stays
+  for baselines), `svg_region_to_png_on` (background colour), `page_size_mm`.
+  Renders write nothing beside the design unless `output` is given; the SVG goes
+  to a private temporary directory.
+- Verified: 25 new or rewritten tests (renderer 7, handlers 16 with a stand-in kicad-cli
+  serving SVGs the real kicad-cli 10.0.8 exported from fixture parts written for
+  this, schematic 1 rewritten and 1 new); 5 negative controls (visible-text guard,
+  height cap, undeclared layer, foreign options, diff image vs current render),
+  each failed its test and was restored. Release binary by stdio pipe: an image
+  block arrived for a demo board (full, black and white, region), a 74LS00 De
+  Morgan unit, a SOIC-8 and a single `.kicad_mod`, and for a real difference
+  image; four refusals came back as structured errors. Gate under "Verify":
+  all green except 21 IPC-mock tests in `pcb_sync`/`pcb_routing` that timed out
+  under a load average near 40 from parallel sessions and passed when rerun alone.
+  `simulation_live` was skipped (out of scope).
+- Not verified: display in an actual MCP client, Windows and Linux, kicad-cli
+  other than 10.0.8, boards placed off the drawing sheet with a region.
+- **Review follow-up (2026-11-09), nine findings fixed:**
+  - The difference image is an extra. When it would exceed 16 Mi pixels or the
+    inline budget, `compare_visual_baseline` still returns status and metrics,
+    with `diff_image` null and a `diff_image_skipped` warning that names a
+    baseline `width_px` that fits.
+  - Colours are pinned: `pcb` and `fp export svg` get `--theme _builtin_default`
+    unless `black_and_white`. That is KiCad 10's built-in default theme
+    (`COLOR_BUILTIN_DEFAULT`), whose board background is `#001023`. Before, the
+    plot followed each machine's editor theme.
+  - Footprint `layers` are checked before kicad-cli runs, against KiCad's
+    canonical names and its default user names (`LSET::Name` and `LayerName` in
+    KiCad 10.0.1). kicad-cli only reports an unknown name and plots the rest.
+  - Board layers may be named by their user name too. Konnect passes kicad-cli
+    the canonical name and reports what was asked. A name that matches two
+    layers, or a canonical name another layer carries as its user name (kicad-cli
+    reads user names first), is refused.
+  - An option of the other kind at null or at its documented default is accepted.
+  - A footprint name that is absolute, holds a path separator or `..` is refused
+    before any path is joined. Symbol names never reach a path in Konnect;
+    kicad-cli replaces separators in its own file names.
+  - One inline budget for the inline images of `render_board_layers`,
+    `render_library_item`, `render_schematic_png` and the difference image: at most
+    8000 px a side and 3,750,000 PNG bytes, the Claude API's per-image limits.
+    Over it, the call is refused with the remedies, and a file already written is
+    named. File-only output keeps the 8192 px cap, so baselines do not change.
+  - Whole-page renders get page wording and a `width_px` that fits; an inline
+    page is held to the 8000 px side first, so that width also fits inline.
+  - The stand-in kicad-cli knows a one-unit symbol, named `<name>_unit1.svg` as
+    in KiCad 10.0.1's `doSymExportSvg`.
+  - Seen in source, not fixed: KiCad 10 names a symbol with custom body-style
+    names `<name>_unit<n>_<style>.svg`. Konnect does not parse that suffix, so
+    such a symbol is refused with "wrote no SVG", not misdrawn.
+  - Not in the budget: `get_board_2d_view` (clamped to 4000 px a side, no byte
+    check).
+- Review follow-up verified on macOS (2026-11-09): fmt; 3783 lib and integration
+  tests, 0 failures; 9 doc tests; clippy `-D warnings`; `cargo deny check
+  licenses`; `fix-doc-counts`, no change (261 + 7); installed binary SHA-256
+  still `3de188bb775ab4ce`. 14 new tests and 5 extended ones, all with the
+  stand-in kicad-cli or in-process renders. 19 negative controls, each failed
+  its test and was restored. Not run: kicad-cli or Freerouting on a real
+  board, an MCP client, the release build, the ignored `simulation_live` tests.
 
 ## PR 5, shipped creation guidance (merged, #29)
 

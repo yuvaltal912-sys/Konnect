@@ -284,6 +284,61 @@ get one. `delete_zone` refuses a name or a UUID that more than one zone carries
 keepout is KiCad's: tracks, vias and pads forbidden; copper pours and
 footprints allowed.
 
+## Unreleased: inline layer and library-item renders, difference image
+
+Creation rank 25 (`docs/CREATION_HANDOFF.md`).
+
+- **`compare_visual_baseline` with `inline_diff: true`** now returns a
+  generated difference image in its image block instead of the current
+  full-sheet render. Drawing present now but not in the baseline is green
+  (`#00a000`), drawing removed is red (`#dc0000`), drawing in both but in a
+  different colour is orange (`#e68c00`), unchanged drawing is the current
+  render faded to a quarter of its contrast, and a 2-pixel blue (`#005aff`)
+  box surrounds the changed bounding box. The JSON gains `diff_image` with its
+  dimensions, byte count and this legend; every other field is unchanged, and
+  so are the drift metrics and threshold. A caller that wants the current
+  render calls `render_schematic_png` with `inline: true`. The image is an
+  extra: when it would exceed 16,777,216 pixels, 8000 px on a side or
+  3,750,000 PNG bytes, there is no image block, `diff_image` is `null`, and
+  `warnings` gains a `diff_image_skipped` entry with the reason and a baseline
+  `width_px` that fits. Status and metrics are returned either way.
+- **Inline image budget.** Each inline image from `render_board_layers`,
+  `render_library_item`, `render_schematic_png` with `inline: true`, and the
+  difference image above is held to the Claude API's per-image limits: at
+  most 8000 px on a side and 3,750,000 PNG bytes (about 5 MB once
+  base64-encoded). Over the budget the render tools return an error that names
+  the limit and the remedies (a lower `width_px`, a narrower `region`, or
+  `inline: false` with `output`), and the path of any PNG already written.
+  A whole page that would be over 8000 px tall is refused before it is
+  rasterized, with a `width_px` that fits inline. For `render_schematic_png`
+  this is new: it used to return an inline image of any size. File-only output
+  keeps the 8192 px cap, so baselines do not change. `get_board_2d_view` is
+  outside the budget.
+- **New `render_board_layers`** (`pcb_export`): `board` and a non-empty
+  `layers` list are required. A layer is named by its canonical name or its
+  user name; kicad-cli receives the canonical name and `layers` in the result
+  is the list as asked. A layer the board does not declare, a name that matches
+  two layers, or a canonical name that another layer carries as its user name
+  is refused. It plots the saved file with `pcb export svg` in KiCad's built-in
+  default colour theme (`--theme _builtin_default`) unless `black_and_white`.
+  Without `region` the page is the board-edge bounding box;
+  `region: {x, y, width, height}` is in board mm
+  and must lie on the drawing sheet. `width_px` 1..=4096 (default 1600);
+  output height at most 8192 px and area at most 16,777,216 pixels.
+  `inline` defaults to true; `output` also writes the PNG and is required
+  when `inline` is false.
+- **New `render_library_item`** (`library`): `library` is a `.kicad_sym` file
+  (with `name`, optional `unit`, `body_style`, `include_hidden_pins`), a
+  `.pretty` directory (with `name`) or one `.kicad_mod` file (`name`
+  optional), with optional `layers` and `black_and_white` for footprints.
+  Footprint `layers` must be KiCad layer names, canonical (`F.SilkS`) or
+  KiCad's default user names (`F.Silkscreen`), and a footprint `name` must be
+  a bare name, not a path. An option for the other kind is refused unless it
+  is `null` or its documented default. Footprints plot in the same pinned
+  theme. The metadata lists the symbol's units and whether it has a De Morgan
+  body. Same size caps and delivery options as `render_board_layers`, with
+  `width_px` defaulting to 800.
+
 ## Unreleased: `run_design_review` reads a DRC baseline
 
 PR 15 follow-up (`docs/CREATION_HANDOFF.md`). `run_design_review` takes an

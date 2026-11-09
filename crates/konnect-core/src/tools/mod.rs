@@ -26,6 +26,7 @@ mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
+pub(crate) mod item_render;
 mod jlcpcb_midpoints;
 mod layout_quality;
 mod lcsc_packages;
