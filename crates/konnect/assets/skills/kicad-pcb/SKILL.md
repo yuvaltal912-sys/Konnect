@@ -342,7 +342,10 @@ chords within 5 um, and rounded pads use their bounding rectangles. Existing
 pours become fixed planes and track/via-blocking rule areas become keepouts from
 zone outlines, not their fills; thermal reliefs are not modelled. A large pour
 then leaves the router little room: pass `pours="omit"` to route through pour
-areas, then refill zones and run DRC after the import. Mounting
+areas, then refill zones and run DRC after the import. Record the currents of
+the main power nets with `set_design_intent` before exporting: the export
+widens those nets to their IPC-2221 width (`intent_widths`), and
+`route_specctra_dsn` keeps Freerouting from narrowing any track below its class. Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
 Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,

@@ -3,6 +3,72 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: route at the project's rules
+
+Creation PR 16b (`docs/CREATION_HANDOFF.md`). Found by routing the owner's
+reference board with Freerouting 2.5.0.
+
+- **`route_specctra_dsn`** turns Freerouting's automatic neck-down off
+  (`automatic_neckdown: false`); new `allow_neckdown` (default `false`) turns it
+  back on. It also passes the project's copper-to-edge clearance
+  (`copper_to_edge_clearance_um`) when the export's manifest beside the DSN
+  records one, and Freerouting's retry width (`neck_width_um`: a connection that
+  cannot be reached at its net's width is routed whole at that width) only when
+  every net's floor (its class width, or its base width when widened to a
+  current) is the same width. Freerouting applies the one retry width to any
+  failed connection of any net, so with different floors it would take a wider
+  net below its own; the retry is then off (`neck_width_um` 0 is sent) and
+  `rules_applied.retry_width_um` is `null`, with
+  `rules_applied.retry_off_reason` saying why. A project edge clearance of
+  exactly 0.25 mm is sent as 250.001 um, because Freerouting 2.5.0
+  reads 250 as its own default and skips the override. The result adds
+  `rules_applied`.
+- **`route_specctra_dsn` job settings use the names Freerouting 2.5.0 reads.**
+  Its job API drops unknown keys without an error, and the camelCase names sent
+  before (`maxPasses`, `jobTimeoutString`, `neckWidthUm`,
+  `copperToEdgeClearanceUm`) were all dropped: the pass budget, job timeout,
+  retry width and edge clearance never applied. They are now
+  `autorouter.max_passes`, `job_timeout`, `neck_width_um` and
+  `copper_to_edge_clearance_um`. Before the job starts, the settings are read
+  back with Freerouting's `get_effective_settings`; any sent setting not in
+  effect refuses the run, names the setting, and routes nothing. A Freerouting
+  without `update_job_settings` and `get_effective_settings` is refused when
+  settings are sent. Freerouting's fanout stage is now always off
+  (`fanout.enabled: false`, also in `rules_applied.fanout_enabled`): in 2.5.0
+  it necks tracks down at pins even with automatic neck-down off, and the SES
+  importer refuses such tracks. The result adds `effective_settings` (each sent
+  setting as in effect, by dotted name) and `optimizer` (`passes`,
+  `early_stop`, `stop_reason`, `score_before`, `score_after` and up to 12 log
+  lines, from `get_job_logs`; `null` when the log cannot be read).
+  `stop_reason` also covers the optimizer's time limit and item limit.
+- **`export_specctra_dsn`** grows each unplated-hole keepout (and each
+  ringless, netless plated hole) by the project's `min_hole_clearance` less the
+  smallest class clearance, so the router keeps the hole clearance; the result
+  and the manifest record `hole_clearance_um`, and the manifest
+  `supported_profile.hole_keepout_growth_um`. Before, a track could pass 0.21 mm
+  from a hole with a 0.25 mm rule. A board whose footprints hold a rule area or
+  zone, or draw on Edge.Cuts (a slot or cut-out), is now refused, naming the
+  footprint (its Reference, else its UUID), whether or not it has pads: the DSN
+  does not carry these yet, and leaving them out let the router cross an
+  antenna keepout or a slot.
+- **`plan_specctra_ses_import` / `apply_specctra_ses`** refuse an SES with any
+  wire narrower than its net allows, naming the worst one: the class width, or
+  for a net widened to its current its base width (`nets[].min_track_width_um`
+  in the manifest). Manifests
+  from before this release carry no class widths and are not checked. When a
+  refused wire is exactly the narrowest floor on the board, the message names
+  Freerouting's single retry width as the cause, not fanout or neck-down.
+- **`export_specctra_dsn`** records each class's width and clearance
+  (`classes`) and the project's `min_copper_edge_clearance`
+  (`supported_profile.copper_edge_clearance_um`) in the manifest. New
+  `widths_from_intent` (default `true`): each net with a design-intent current
+  (`currents`, and rails with `max_current_a`) is widened to the IPC-2221 width
+  for that current on the stack's worst signal layer, never narrowed (a net
+  whose rule has no track width is left as it is, so the export still refuses
+  it as incomplete, and the list shows it as `not_widened`); the result
+  and the manifest list them under `intent_widths`. An unusable design-intent
+  record now refuses the export unless `widths_from_intent` is `false`.
+
 ## Unreleased: Specctra DSN for real boards
 
 Creation PR 16 (`docs/CREATION_HANDOFF.md`). No tool arguments change.
@@ -52,8 +118,11 @@ matching manifests. Old manifests (two layers, front side) still import.
 - **SES repeats:** `plan_specctra_ses_import` and `apply_specctra_ses` apply an
   exact repeat (same net, layer, width and geometry) once and report
   `duplicates_skipped`, where they used to refuse the whole SES.
-- **Padless footprints** (logos) are left out of the DSN; counted in
-  `supported_profile.footprints_without_pads`.
+- **Padless footprints** (a footprint with no pads) are not placed in the DSN;
+  counted in `supported_profile.footprints_without_pads`. Their copper
+  graphics and text still become keepouts (board level, turned and moved with
+  the part), counted in `copper_graphic_keepout_count`; their rule areas and
+  Edge.Cuts graphics are refused (see the 16b entry above).
 - **Board names** with spaces, quotes or parentheses are written as DSN tokens
   with `_` (`sonde_xilinx.kicad_pcb`); the SES importer accepts that name as
   the base design.
