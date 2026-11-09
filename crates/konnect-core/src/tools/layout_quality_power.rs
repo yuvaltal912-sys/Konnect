@@ -2,7 +2,7 @@
 //! (switching regulators' critical loop and switch-node copper), plus the §3
 //! ground-return bottleneck, which shares the neck-down search.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use konnect_sexp::parser::SexpNode;
 use konnect_sexp::planar::{point_segment_distance, segment_distance, Pt};
@@ -254,6 +254,7 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
     let mut lens = Vec::new();
     let (mut areas, mut no_cap, mut cannot) = (Vec::new(), 0usize, Vec::new());
     let mut pins = 0usize;
+    let mut switch_pins_left: Vec<String> = Vec::new();
     'ics: for (fi, f) in m.geo.footprints.iter().enumerate() {
         if !is_ic(m.fp_ref(f)) {
             continue;
@@ -262,7 +263,12 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             let Some(net) = pad.net.as_deref() else {
                 continue;
             };
-            if !m.is_power(net) || switch_nets.contains(&net) {
+            if !m.is_power(net) {
+                continue;
+            }
+            if switch_nets.contains(&net) {
+                // Named as a switch node by the caller: judged by 8.1 and 8.2, not here.
+                switch_pins_left.push(pad_label(m, (fi, pi)));
                 continue;
             }
             if pins >= 300 {
@@ -341,7 +347,15 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
     }
     let mut hot = Vec::new();
     if pins == 0 {
-        dec = CheckOut::not_run(id, name, "no IC (reference U…/IC…) has a pad on a power net; record rails in the design intent or pass power_nets");
+        dec = CheckOut::not_run(
+            id,
+            name,
+            if switch_pins_left.is_empty() {
+                "no IC (reference U…/IC…) has a pad on a power net; record rails in the design intent or pass power_nets".to_string()
+            } else {
+                format!("the only IC pads on power nets ({}) are on switch nodes named in switching_regulators, which 8.1 and 8.2 judge", switch_pins_left.join(", "))
+            },
+        );
     } else {
         dec.score = (!scores.is_empty()).then(|| scores.iter().sum::<f64>() / scores.len() as f64);
         if !cannot.is_empty() {
@@ -364,6 +378,7 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             "supply_pins": pins,
             "measured": lens.len(),
             "pins_without_capacitor": no_cap,
+            "switch_node_pins_left_to_8_1_8_2": { "count": switch_pins_left.len(), "pins": switch_pins_left.iter().take(10).collect::<Vec<_>>() },
             "compare": {
                 "worst_loop_mm": lens.last().map(|v| r2(*v)),
                 "median_loop_mm": median.map(r2),
@@ -415,8 +430,10 @@ fn find_switchers(m: &Model) -> Vec<Switcher> {
         if parts.is_empty() {
             continue;
         }
-        // A rail with an inductor in series (a power inductor on a power net) is a filter, not a node.
-        if m.is_power(net) && m.roles.power.get(net).is_some_and(|s| s != "name") {
+        // A rail with an inductor in series (a buck's output feeding its loads, an LC filter) is
+        // a filter, not a node, whatever gave the net its power role (record, netclass, argument
+        // or name). Only the caller can say a power-looking net is a switch node.
+        if m.is_power(net) && !m.params.regulators.iter().any(|(n, _)| n == net) {
             continue;
         }
         let ind_fp = &m.geo.footprints[ind.0];
@@ -961,7 +978,10 @@ fn current_sizing(m: &Model, board: &std::path::Path) -> CheckOut {
     }
     let mut out = CheckOut::checked(id, name);
     let nets = v["nets"].as_array().cloned().unwrap_or_default();
-    let mut bad = 0usize;
+    // Nets, not findings: one net can have an undersized track and too few vias, and a net
+    // listed under both `currents` and a rail appears twice.
+    let checked: BTreeSet<&str> = nets.iter().filter_map(|n| n["net"].as_str()).collect();
+    let mut bad: BTreeSet<String> = BTreeSet::new();
     for f in v["findings"].as_array().into_iter().flatten() {
         let sev = f["severity"].as_str().unwrap_or("info");
         if sev == "info" {
@@ -976,7 +996,7 @@ fn current_sizing(m: &Model, board: &std::path::Path) -> CheckOut {
             .filter_map(|u| u["uuid"].as_str().map(str::to_string))
             .collect();
         if body.is_some() {
-            bad += 1;
+            bad.insert(net.clone());
         }
         out.findings.push(Finding {
             severity: if sev == "error" { "error" } else { "warning" },
@@ -990,13 +1010,13 @@ fn current_sizing(m: &Model, board: &std::path::Path) -> CheckOut {
             at: None,
         });
     }
-    let n = nets.len().max(1);
-    out.score = (!nets.is_empty()).then(|| 1.0 - (bad.min(n) as f64 / n as f64));
+    let n = checked.len().max(1);
+    out.score = (!checked.is_empty()).then(|| 1.0 - (bad.len().min(n) as f64 / n as f64));
     out.metrics = json!({
-        "nets_checked": nets.len(),
-        "nets_with_problems": bad,
+        "nets_checked": checked.len(),
+        "nets_with_problems": bad.len(),
         "via": "audit_trace_current",
-        "compare": { "nets_undersized": bad },
+        "compare": { "nets_undersized": bad.len() },
         "not_checked_there": v["not_checked"],
     });
     out
@@ -1045,6 +1065,12 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
     let (mut p_ratios, mut g_ratios) = (Vec::new(), Vec::new());
     let (mut p_rows, mut g_rows) = (Vec::new(), Vec::new());
     let mut runs = 0usize;
+    // What was left out, by net: loads beyond the per-net limit, paths past the global cap,
+    // and ground returns with no ground pad to start from.
+    let mut loads_left: Vec<(String, usize)> = Vec::new();
+    let mut cap_left: BTreeMap<String, usize> = BTreeMap::new();
+    let mut no_ground_pad: Vec<String> = Vec::new();
+    let max_loads = (40 / reqs.len()).clamp(2, 12);
     for req in reqs {
         let pads = &m.pads[&req.net];
         // Source: the supplier from the record, else the largest pad on the net.
@@ -1084,7 +1110,15 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                 .partial_cmp(&dist(m.pad(*b).1.at, m.pad(src).1.at))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        sinks.truncate(12);
+        // The loads kept are spread from the nearest to the farthest: the far ones are the
+        // likeliest to sit behind a neck, so the nearest N alone would miss them.
+        if sinks.len() > max_loads {
+            loads_left.push((req.net.clone(), sinks.len() - max_loads));
+            let n = sinks.len();
+            sinks = (0..max_loads)
+                .map(|i| sinks[i * (n - 1) / (max_loads - 1)])
+                .collect();
+        }
         let required: Vec<f64> = m
             .layers
             .iter()
@@ -1096,9 +1130,6 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
         // Power path.
         for (kind, net_of) in [("power", None::<()>), ("ground", Some(()))] {
             for &sink in &sinks {
-                if runs >= 80 {
-                    break;
-                }
                 let (a, b, net) = if net_of.is_none() {
                     (src, sink, req.net.clone())
                 } else {
@@ -1110,6 +1141,11 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                     let (Some(ga), Some(gb)) =
                         (near(src.0, m.pad(src).1.at), near(sink.0, m.pad(sink).1.at))
                     else {
+                        no_ground_pad.push(format!(
+                            "{} → {}",
+                            pad_label(m, src),
+                            pad_label(m, sink)
+                        ));
                         continue;
                     };
                     let (na, nb) = (
@@ -1117,10 +1153,19 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
                         m.pad(gb).1.net.clone().unwrap_or_default(),
                     );
                     if na != nb {
+                        no_ground_pad.push(format!(
+                            "{} → {} (grounds are different nets)",
+                            pad_label(m, src),
+                            pad_label(m, sink)
+                        ));
                         continue;
                     }
                     (ga, gb, na)
                 };
+                if runs >= 80 {
+                    *cap_left.entry(req.net.clone()).or_default() += 1;
+                    continue;
+                }
                 runs += 1;
                 if !cache.grids.contains_key(&net) {
                     let Some(bb) = m.net_bbox(&net, 1.0) else {
@@ -1198,21 +1243,66 @@ fn bottlenecks(m: &Model) -> Vec<CheckOut> {
             }
         }
     }
+    let left_json = json!({
+        "loads_beyond_the_per_net_limit": loads_left.iter().map(|(n, c)| json!({ "net": n, "loads_not_measured": c })).collect::<Vec<_>>(),
+        "per_net_limit": max_loads,
+        "paths_past_the_global_cap_of_80": cap_left.iter().map(|(n, c)| json!({ "net": n, "paths_not_measured": c })).collect::<Vec<_>>(),
+        "ground_returns_without_a_ground_pad": { "count": no_ground_pad.len(), "listed": no_ground_pad.iter().take(10).collect::<Vec<_>>() },
+    });
+    let mut left_notes: Vec<String> = Vec::new();
+    if !loads_left.is_empty() {
+        left_notes.push(format!(
+            "{} net(s) have more loads than the {max_loads} measured per net ({})",
+            loads_left.len(),
+            loads_left
+                .iter()
+                .take(5)
+                .map(|(n, c)| format!("{n}: {c} not measured"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !cap_left.is_empty() {
+        left_notes.push(format!(
+            "the cap of 80 source-to-load paths was reached, so {} path(s) on {} net(s) were not measured ({})",
+            cap_left.values().sum::<usize>(),
+            cap_left.len(),
+            cap_left.keys().take(5).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
     for (out, ratios, rows, id) in [
         (&mut power, &p_ratios, &p_rows, "4.3"),
         (&mut ground, &g_ratios, &g_rows, "3.4"),
     ] {
+        let mut notes = left_notes.clone();
+        if id == "3.4" && !no_ground_pad.is_empty() {
+            notes.push(format!(
+                "{} ground return(s) had no ground pad to start from",
+                no_ground_pad.len()
+            ));
+        }
         if ratios.is_empty() {
-            *out = CheckOut::not_run(id, out.name, "no source-to-load copper path could be measured (pads not joined by copper, or off the grid)");
+            // The reason keeps what was left out, so a load with no ground pad is not
+            // hidden behind the generic wording.
+            let reason = std::iter::once("no source-to-load copper path could be measured (pads not joined by copper, or off the grid)".to_string())
+                .chain(notes)
+                .collect::<Vec<_>>()
+                .join("; ");
+            *out = CheckOut::not_run(id, out.name, reason);
             continue;
         }
         out.score = Some(ratios.iter().sum::<f64>() / ratios.len() as f64);
         out.metrics = json!({
             "paths": rows.iter().take(25).cloned().collect::<Vec<_>>(),
             "paths_measured": ratios.len(),
+            "paths_not_measured": left_json.clone(),
             "compare": { "narrow_paths": ratios.iter().filter(|r| **r < 1.0).count() },
             "method": "widest-path search over a raster of the net's copper: the path whose narrowest local width (twice the distance to the nearest non-copper cell) is largest, against the IPC-2221 width for the recorded current on that layer; end pads are exempt; a single best path is judged, parallel copper is not summed; layer changes are free here (via capacity is audited by audit_trace_current)",
         });
+        if !notes.is_empty() {
+            out.status = "partial";
+            out.reason = Some(notes.join("; "));
+        }
     }
     vec![power, ground]
 }

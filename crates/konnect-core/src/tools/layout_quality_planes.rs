@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use konnect_sexp::planar::Pt;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::grid::Cover;
+use super::routing;
 use super::{dist, path_len, r2, r3, CheckOut, Finding, Model};
 
 pub(super) fn run(m: &Model) -> (Vec<CheckOut>, RefMap) {
@@ -17,13 +18,14 @@ pub(super) fn run(m: &Model) -> (Vec<CheckOut>, RefMap) {
 /// What lies on the reference layer under one sample of a track.
 #[derive(Clone, Debug, PartialEq)]
 enum Under {
-    Ground(String),
+    /// The plane the track is referenced to (a ground or a power net).
+    Reference(String),
     Other(String),
     Void,
 }
 
 /// For a (net, track layer): the adjacent layer judged to be its reference,
-/// and the ground net found there.
+/// and the ground or power net that plane carries.
 #[derive(Clone, Debug)]
 pub(super) struct RefChoice {
     pub layer: usize,
@@ -108,28 +110,28 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 }
                 out
             };
-            // Pick the adjacent layer with the most copper of a plane under the net's tracks here.
-            let mut best: Option<(usize, usize)> = None; // (layer, hits)
+            // Pick the adjacent layer with the most plane copper (ground or power: the checklist
+            // asks for an uninterrupted adjacent reference plane, not for ground only) under
+            // the net's tracks here; a tie goes to the layer with more ground.
+            let mut best: Option<(usize, usize, usize)> = None; // (layer, hits, ground hits)
             let all_samples: Vec<(usize, Vec<Pt>)> =
                 segs.iter().map(|&s| (s, samples(s))).collect();
             for &a in &adj {
-                let hits: usize = all_samples
-                    .iter()
-                    .flat_map(|(_, pts)| pts)
-                    .filter(|p| {
-                        m.fill_at(&m.layers[a], **p).is_some_and(|f| {
-                            m.fills[f]
-                                .net
-                                .as_deref()
-                                .is_some_and(|n| m.is_ground(n) || m.is_power(n))
-                        })
-                    })
-                    .count();
-                if best.is_none_or(|(_, h)| hits > h) {
-                    best = Some((a, hits));
+                let (mut hits, mut ground_hits) = (0usize, 0usize);
+                for p in all_samples.iter().flat_map(|(_, pts)| pts) {
+                    let net_here = m
+                        .fill_at(&m.layers[a], *p)
+                        .and_then(|f| m.fills[f].net.as_deref());
+                    if let Some(n) = net_here.filter(|n| m.is_ground(n) || m.is_power(n)) {
+                        hits += 1;
+                        ground_hits += usize::from(m.is_ground(n));
+                    }
+                }
+                if best.is_none_or(|(_, h, g)| (hits, ground_hits) > (h, g)) {
+                    best = Some((a, hits, ground_hits));
                 }
             }
-            let Some((ref_layer, hits)) = best else {
+            let Some((ref_layer, hits, _)) = best else {
                 continue;
             };
             // Zones that exist but carry no saved fill: the answer is unknown, not "void".
@@ -151,7 +153,31 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 }
             }
             let ref_name = m.layers[ref_layer].clone();
-            let mut ground_net: Option<String> = None;
+            // The plane the net is referenced to on this layer: the ground or power net with
+            // most samples. Every ground counts as the same reference (AGND beside GND is one
+            // plane for this purpose); a different power net, or a signal net, is a split.
+            let mut by_net: BTreeMap<&str, usize> = BTreeMap::new();
+            for p in all_samples.iter().flat_map(|(_, pts)| pts) {
+                if let Some(n) = m
+                    .fill_at(&ref_name, *p)
+                    .and_then(|f| m.fills[f].net.as_deref())
+                    .filter(|n| m.is_ground(n) || m.is_power(n))
+                {
+                    *by_net.entry(n).or_default() += 1;
+                }
+            }
+            let reference_net: Option<String> = by_net
+                .iter()
+                .max_by(|a, b| {
+                    a.1.cmp(b.1)
+                        .then_with(|| m.is_ground(a.0).cmp(&m.is_ground(b.0)))
+                })
+                .map(|(n, _)| n.to_string());
+            let is_reference = |n: &str| match &reference_net {
+                Some(r) if m.is_ground(r) => m.is_ground(n),
+                Some(r) => n == r,
+                None => false,
+            };
             let mut layer_len = 0.0;
             let mut layer_cov = 0.0;
             for (seg, pts) in &all_samples {
@@ -165,7 +191,7 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 let flush = |cur: &mut Option<(Under, f64, Pt)>, runs: &mut Vec<Run>| {
                     if let Some((u, len, from)) = cur.take() {
                         match u {
-                            Under::Ground(_) => {}
+                            Under::Reference(_) => {}
                             Under::Other(n) => runs.push(Run {
                                 kind: "other_net_plane",
                                 len,
@@ -186,16 +212,13 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 for p in pts {
                     let under = match m.fill_at(&ref_name, *p) {
                         Some(f) => match m.fills[f].net.clone() {
-                            Some(n) if m.is_ground(&n) => {
-                                ground_net.get_or_insert_with(|| n.clone());
-                                Under::Ground(n)
-                            }
+                            Some(n) if is_reference(&n) => Under::Reference(n),
                             Some(n) => Under::Other(n),
                             None => Under::Void,
                         },
                         None => Under::Void,
                     };
-                    if matches!(under, Under::Ground(_)) {
+                    if matches!(under, Under::Reference(_)) {
                         layer_cov += per;
                     }
                     layer_len += per;
@@ -218,15 +241,16 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 (net.clone(), l),
                 RefChoice {
                     layer: ref_layer,
-                    net: ground_net.clone(),
+                    net: reference_net.clone(),
                 },
             );
             layers_info.push(json!({
                 "track_layer": m.layers[l],
                 "reference_layer": ref_name,
-                "reference_net": ground_net,
+                "reference_net": reference_net,
+                "reference_kind": reference_net.as_deref().map(|n| if m.is_ground(n) { "ground" } else { "power" }),
                 "length_mm": r2(layer_len),
-                "over_ground_mm": r2(layer_cov),
+                "over_reference_mm": r2(layer_cov),
             }));
             net_len += layer_len;
             net_cov += layer_cov;
@@ -261,7 +285,7 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
             "void_mm": r2(void_mm),
             "other_net_plane_mm": r2(other_mm),
             "longest_run_mm": r2(longest),
-            "runs_off_ground": runs.len(),
+            "runs_off_reference": runs.len(),
             "layers": layers_info,
         }));
         if coverage < min_cov || longest > max_void {
@@ -279,7 +303,7 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let what = worst.map(|w| match &w.other_net {
-                Some(n) => format!("{:.1} mm over the '{n}' plane (a split)", w.len),
+                Some(n) => format!("{:.1} mm over the '{n}' copper, a different net from the reference plane (a split)", w.len),
                 None => format!("{:.1} mm over a void or slot", w.len),
             });
             out.findings.push(Finding {
@@ -289,12 +313,12 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 measured: json!({ "coverage": r3(coverage), "longest_run_mm": r2(longest), "void_mm": r2(void_mm), "other_net_plane_mm": r2(other_mm), "runs": runs.len() }),
                 threshold: json!({ "min_reference_coverage": min_cov, "max_void_run_mm": max_void }),
                 issue: format!(
-                    "Net '{net}' runs {:.0}% of its {:.1} mm over solid ground on the adjacent layer; longest stretch off ground {}",
+                    "Net '{net}' runs {:.0}% of its {:.1} mm over its reference plane (solid ground or power) on the adjacent layer; longest stretch off it {}",
                     coverage * 100.0,
                     net_len,
                     what.unwrap_or_else(|| "none".into())
                 ),
-                fix: "Keep the net over an unbroken ground plane: move it off the split, void or slot, or close the plane under it".into(),
+                fix: "Keep the net over an unbroken reference plane: move it off the split, void or slot, or close the plane under it".into(),
                 uuids,
                 at: worst.map(|w| w.from),
             });
@@ -338,14 +362,14 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
         "reference_coverage": r3(coverage),
         "compare": {
             "reference_coverage": r3(coverage),
-            "length_off_ground_mm": r2(total_len - total_cov),
+            "length_off_reference_mm": r2(total_len - total_cov),
             "void_mm": r2(total_void),
             "other_net_plane_mm": r2(total_other),
-            "longest_run_off_ground_mm": r2(worst_run),
-            "runs_off_ground": crossings,
+            "longest_run_off_reference_mm": r2(worst_run),
+            "runs_off_reference": crossings,
         },
         "nets": per_net.into_iter().take(20).collect::<Vec<_>>(),
-        "method": "tracks sampled every sample_mm; a sample counts as referenced when the saved zone fill of a ground net covers it on the adjacent layer with the most plane copper under the net (fills are the real copper: voids, slots, antipads and splits are in them)",
+        "method": "tracks sampled every sample_mm; a sample counts as referenced when the saved zone fill of the net's reference plane covers it on the adjacent layer with the most plane copper (ground or power) under the net; the reference plane on that layer is the ground or power net with most samples, and a different net's copper is a split (fills are the real copper: voids, slots, antipads and splits are in them)",
     });
     (out, refs)
 }
@@ -367,7 +391,8 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
     }
     let mut out = CheckOut::checked(id, name);
     let (mut evaluated, mut needing, mut satisfied, mut unknown) = (0usize, 0usize, 0usize, 0usize);
-    let mut worst = 0.0f64;
+    let mut worst: Option<f64> = None;
+    let mut no_candidate = 0usize;
     for net in signal_nets {
         for &vi in &m.vias[net] {
             let v = m.track(vi);
@@ -465,7 +490,10 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
                 satisfied += 1;
                 continue;
             }
-            worst = worst.max(d.unwrap_or(f64::INFINITY).min(1e6));
+            match d {
+                Some(d) => worst = Some(worst.map_or(d, |w| w.max(d))),
+                None => no_candidate += 1,
+            }
             let layer_names: Vec<&str> = layers.iter().map(|l| m.layers[*l].as_str()).collect();
             let mut uuids = vec![v.uuid.clone().unwrap_or_default()];
             if let Some((_, u)) = &best {
@@ -521,12 +549,19 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
         "stitched": satisfied,
         "not_judged": unknown,
         "compare": { "unstitched_layer_changes": needing - satisfied },
-        "worst_nearest_mm": if worst.is_finite() && worst > 0.0 { json!(r2(worst)) } else { Value::Null },
+        // Null when no unstitched change has any candidate at all; those are counted apart.
+        "worst_nearest_mm": worst.map(r2),
+        "worst_nearest_note": (worst.is_none() && no_candidate > 0)
+            .then_some("no ground via or through-hole pad spans the reference planes for any unstitched layer change, so there is no distance to report"),
+        "unstitched_with_no_candidate_on_board": no_candidate,
     });
     out
 }
 
 // ─── 3.3 ground connectivity ─────────────────────────────────────────────────
+
+/// A pad's label (`REF.number`) and UUID.
+type PadRef = (String, Option<String>);
 
 fn ground_connectivity(m: &Model) -> CheckOut {
     let id = "3.3";
@@ -546,7 +581,18 @@ fn ground_connectivity(m: &Model) -> CheckOut {
     let (mut pads_total, mut pads_main, mut islands) = (0usize, 0usize, 0usize);
     let mut per_net = Vec::new();
     let mut floating_area = 0.0;
+    let mut cannot: Vec<String> = Vec::new();
     for net in grounds {
+        // A zone with no saved fill adds no copper to the file: its pads would read as cut off
+        // and its area as missing. The answer is unknown, not bad.
+        if let Some(z) = m.unfilled_zone_of(net) {
+            cannot.push(format!(
+                "ground net '{net}': zone {} on {} has no saved fill (refill zones and save the board)",
+                z.uuid.as_deref().unwrap_or("?"),
+                z.layers.join("/")
+            ));
+            continue;
+        }
         let Some(bb) = m.net_bbox(net, 1.0) else {
             continue;
         };
@@ -555,43 +601,36 @@ fn ground_connectivity(m: &Model) -> CheckOut {
         if count == 0 {
             continue;
         }
-        // Component of each pad and via.
-        let mut with_pad: HashMap<u32, Vec<String>> = HashMap::new();
-        let mut with_via: BTreeSet<u32> = BTreeSet::new();
-        let mut unplaced = 0usize;
-        for &pi in m.pads.get(net).into_iter().flatten() {
+        // Pad groups come from the real shapes (a pad 0.15 mm short of its copper is cut off,
+        // as for KiCad); the raster only tells which of its copper is anchored to a pad.
+        let pad_list = m.pads.get(net).cloned().unwrap_or_default();
+        let exact = routing::pad_groups(m, net);
+        let mut with_pad: HashMap<usize, Vec<PadRef>> = HashMap::new();
+        for (&pi, &grp) in pad_list.iter().zip(&exact) {
             let (fp, pad) = m.pad(pi);
-            let layers = m.pad_layers(pad);
+            with_pad
+                .entry(grp)
+                .or_default()
+                .push((format!("{}.{}", m.fp_ref(fp), pad.number), pad.uuid.clone()));
+        }
+        let mut anchored: BTreeSet<u32> = BTreeSet::new();
+        let mut unplaced = 0usize;
+        for &pi in &pad_list {
+            let (_, pad) = m.pad(pi);
             let label = g
-                .cells_under(&pad.shape, &layers)
+                .cells_under(&pad.shape, &m.pad_layers(pad))
                 .first()
                 .map(|(l, x, y)| labels[*l][g.idx(*x, *y)])
                 .filter(|l| *l != 0);
             match label {
                 Some(l) => {
-                    with_pad
-                        .entry(l)
-                        .or_default()
-                        .push(format!("{}.{}", m.fp_ref(fp), pad.number))
+                    anchored.insert(l);
                 }
                 None => unplaced += 1,
             }
         }
-        for &vi in m.vias.get(net).into_iter().flatten() {
-            let v = m.track(vi);
-            if let (Some((lo, _)), Some((ix, iy))) = (m.via_span(v), g.cell_of(v.at)) {
-                let l = labels[lo][g.idx(ix, iy)];
-                if l != 0 {
-                    with_via.insert(l);
-                }
-            }
-        }
-        let anchored: BTreeSet<u32> = with_pad
-            .keys()
-            .copied()
-            .chain(with_via.iter().copied())
-            .collect();
-        // Floating copper: components that hold no pad and no via.
+        // Floating copper: components that hold no pad. A via alone does not anchor copper:
+        // it joins layers, not the copper to anything that carries current.
         let mut area: HashMap<u32, (usize, (usize, usize, usize))> = HashMap::new();
         for (l, plane) in labels.iter().enumerate() {
             for (i, lab) in plane.iter().enumerate() {
@@ -608,7 +647,7 @@ fn ground_connectivity(m: &Model) -> CheckOut {
             .filter(|(a, _, _)| *a >= 0.5)
             .collect();
         floating.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let net_pads: usize = with_pad.values().map(Vec::len).sum::<usize>() + unplaced;
+        let net_pads: usize = pad_list.len();
         let main = with_pad.values().map(Vec::len).max().unwrap_or(0);
         let groups = with_pad.len();
         pads_total += net_pads;
@@ -626,14 +665,10 @@ fn ground_connectivity(m: &Model) -> CheckOut {
             "grid_step_mm": r3(g.step),
         }));
         if groups > 1 {
-            let mut parts: Vec<(&u32, &Vec<String>)> = with_pad.iter().collect();
-            parts.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
-            let minor: Vec<String> = parts
-                .iter()
-                .skip(1)
-                .flat_map(|p| p.1.iter().cloned())
-                .take(8)
-                .collect();
+            let mut parts: Vec<(&usize, &Vec<PadRef>)> = with_pad.iter().collect();
+            parts.sort_by_key(|p| (std::cmp::Reverse(p.1.len()), *p.0));
+            let minor_pads: Vec<&PadRef> = parts.iter().skip(1).flat_map(|p| p.1.iter()).collect();
+            let minor: Vec<String> = minor_pads.iter().map(|p| p.0.clone()).take(8).collect();
             out.findings.push(Finding {
                 severity: "error",
                 item: id,
@@ -642,7 +677,7 @@ fn ground_connectivity(m: &Model) -> CheckOut {
                 threshold: json!({ "pad_groups": 1 }),
                 issue: format!("Ground net '{net}' is in {groups} separate copper groups; {} pad(s) are cut off from the main group (e.g. {})", net_pads - main, minor.join(", ")),
                 fix: "Connect the groups with a track, pour or via, or correct the net assignment".into(),
-                uuids: Vec::new(),
+                uuids: minor_pads.iter().filter_map(|p| p.1.clone()).take(8).collect(),
                 at: None,
             });
         }
@@ -652,9 +687,9 @@ fn ground_connectivity(m: &Model) -> CheckOut {
                 item: id,
                 subject: format!("{net} island on {}", m.layers[*l]),
                 measured: json!({ "area_mm2": r2(*a) }),
-                threshold: json!({ "connected_to_a_pad_or_via": true }),
-                issue: format!("{a:.1} mm² of '{net}' copper on {} touches no pad or via of the net", m.layers[*l]),
-                fix: "Stitch the island to the ground plane with a via, or remove it (zone island removal)".into(),
+                threshold: json!({ "touches_a_pad_of_the_net": true }),
+                issue: format!("{a:.1} mm² of '{net}' copper on {} touches no pad of the net", m.layers[*l]),
+                fix: "Connect the island to a ground pad or the ground plane, or remove it (zone island removal); a via alone does not tie it to anything".into(),
                 uuids: m
                     .fills
                     .iter()
@@ -667,7 +702,19 @@ fn ground_connectivity(m: &Model) -> CheckOut {
         }
     }
     if per_net.is_empty() {
-        return CheckOut::not_run(id, name, "ground copper could not be rasterised");
+        return if cannot.is_empty() {
+            CheckOut::not_run(id, name, "ground copper could not be rasterised")
+        } else {
+            CheckOut::not_run(id, name, cannot.join("; "))
+        };
+    }
+    if !cannot.is_empty() {
+        out.status = "partial";
+        out.reason = Some(format!(
+            "{} ground net(s) not judged: {}",
+            cannot.len(),
+            cannot.join("; ")
+        ));
     }
     let pad_fraction = if pads_total > 0 {
         pads_main as f64 / pads_total as f64
@@ -677,12 +724,13 @@ fn ground_connectivity(m: &Model) -> CheckOut {
     out.score = Some(pad_fraction * (1.0 - (0.1 * islands as f64).min(0.5)));
     out.metrics = json!({
         "nets": per_net,
+        "not_judged": cannot,
         "compare": {
             "ground_pads_in_main_group": r3(pad_fraction),
             "floating_ground_islands": islands,
             "floating_ground_area_mm2": r2(floating_area),
         },
-        "method": "ground copper (tracks, vias, pads, saved zone fills) rasterised; touching cells join; islands under 0.5 mm² are ignored",
+        "method": "ground pads grouped by the real shapes of the net's tracks, vias, pads and saved zone fills (touching within 0.01 mm on a shared layer); floating islands from a raster of the same copper: touching cells join and a component holding no pad of the net counts, islands under 0.5 mm² are ignored; ground nets whose zone has no saved fill are not judged",
     });
     out
 }

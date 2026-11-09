@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use konnect_sexp::planar::{point_segment_distance, segment_distance, Pt};
 use serde_json::{json, Value};
 
-use super::grid::Cover;
 use super::planes::RefMap;
 use super::{dist, excess_score, path_len, r2, r3, CheckOut, Finding, Model};
 use crate::tools::dfm;
@@ -14,6 +13,110 @@ use crate::tools::dfm;
 /// Pads of a net and the copper groups they fall into.
 pub(crate) struct Conn {
     pub groups: usize,
+    /// A zone of the net has no saved fill, so a split may only be a pour that was never filled.
+    pub unfilled_zone: Option<String>,
+}
+
+/// Largest gap between two copper edges still counted as touching (mm); the same tolerance the
+/// dangling-end test uses.
+const TOUCH_MM: f64 = 0.01;
+
+/// The copper group of each pad of `net`, aligned with `m.pads[net]`. Decided on the real
+/// shapes, not the raster: two items are joined when they share a copper layer and their
+/// shapes touch within [`TOUCH_MM`], so a track that stops 0.15 mm short of its pad is open,
+/// as it is for KiCad. A pad with no copper layer gets a group of its own.
+pub(super) fn pad_groups(m: &Model, net: &str) -> Vec<usize> {
+    use konnect_sexp::board_geometry::Shape;
+    struct Item {
+        shape: Shape,
+        mask: u64,
+        bbox: (f64, f64, f64, f64),
+    }
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let bit = |l: usize| if l < 64 { 1u64 << l } else { 0 };
+    let mut items: Vec<Item> = Vec::new();
+    let add = |shape: Shape, mask: u64, items: &mut Vec<Item>| -> Option<usize> {
+        let bbox = shape.bbox()?;
+        if mask == 0 {
+            return None;
+        }
+        items.push(Item { shape, mask, bbox });
+        Some(items.len() - 1)
+    };
+    for &i in m.tracks.get(net).into_iter().flatten() {
+        let t = m.track(i);
+        if let Some(l) = t.layers.first().and_then(|l| m.layer_ix(l)) {
+            add(t.shape.clone(), bit(l), &mut items);
+        }
+    }
+    for &i in m.vias.get(net).into_iter().flatten() {
+        let v = m.track(i);
+        if let Some((lo, hi)) = m.via_span(v) {
+            let mask = (lo..=hi).fold(0, |a, l| a | bit(l));
+            add(v.shape.clone(), mask, &mut items);
+        }
+    }
+    let pad_item: Vec<Option<usize>> = m
+        .pads
+        .get(net)
+        .into_iter()
+        .flatten()
+        .map(|&pi| {
+            let pad = m.pad(pi).1;
+            let mask = m.pad_layers(pad).into_iter().fold(0, |a, l| a | bit(l));
+            add(pad.shape.clone(), mask, &mut items)
+        })
+        .collect();
+    for f in m.fills.iter().filter(|f| f.net.as_deref() == Some(net)) {
+        let Some(l) = m.layer_ix(&f.layer) else {
+            continue;
+        };
+        for r in &f.rings {
+            add(Shape::polygon(r.pts.clone()), bit(l), &mut items);
+        }
+    }
+    // Sweep along x; only items whose boxes meet are measured, and never two already joined.
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| {
+        items[a]
+            .bbox
+            .0
+            .partial_cmp(&items[b].bbox.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut parent: Vec<usize> = (0..items.len()).collect();
+    for (k, &a) in order.iter().enumerate() {
+        for &b in &order[k + 1..] {
+            if items[b].bbox.0 > items[a].bbox.2 + TOUCH_MM {
+                break;
+            }
+            let (ia, ib) = (&items[a], &items[b]);
+            if ia.mask & ib.mask == 0
+                || ia.bbox.1 > ib.bbox.3 + TOUCH_MM
+                || ib.bbox.1 > ia.bbox.3 + TOUCH_MM
+            {
+                continue;
+            }
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb && ia.shape.distance(&ib.shape) <= TOUCH_MM {
+                parent[ra] = rb;
+            }
+        }
+    }
+    pad_item
+        .iter()
+        .enumerate()
+        .map(|(k, it)| match it {
+            Some(i) => find(&mut parent, *i),
+            None => items.len() + k,
+        })
+        .collect()
 }
 
 pub(super) fn connectivity<'a>(m: &'a Model) -> &'a HashMap<String, Conn> {
@@ -23,31 +126,14 @@ pub(super) fn connectivity<'a>(m: &'a Model) -> &'a HashMap<String, Conn> {
             if pads.len() < 2 {
                 continue;
             }
-            let Some(bb) = m.net_bbox(net, 1.0) else {
-                continue;
-            };
-            let g = m.net_grid(net, bb, Cover::Touch);
-            let (labels, _) = g.components();
-            let mut seen: BTreeSet<u32> = BTreeSet::new();
-            let mut lost = 0usize;
-            for &pi in pads {
-                let pad = m.pad(pi).1;
-                let label = g
-                    .cells_under(&pad.shape, &m.pad_layers(pad))
-                    .first()
-                    .map(|(l, x, y)| labels[*l][g.idx(*x, *y)])
-                    .filter(|l| *l != 0);
-                match label {
-                    Some(l) => {
-                        seen.insert(l);
-                    }
-                    None => lost += 1,
-                }
-            }
+            let groups: BTreeSet<usize> = pad_groups(m, net).into_iter().collect();
             out.insert(
                 net.clone(),
                 Conn {
-                    groups: seen.len() + lost,
+                    groups: groups.len(),
+                    unfilled_zone: m
+                        .unfilled_zone_of(net)
+                        .map(|z| z.uuid.clone().unwrap_or_else(|| "?".into())),
                 },
             );
         }
@@ -57,19 +143,41 @@ pub(super) fn connectivity<'a>(m: &'a Model) -> &'a HashMap<String, Conn> {
 
 pub(super) fn completion(m: &Model) -> Value {
     let conn = connectivity(m);
-    let mut unrouted: Vec<(&String, usize)> = conn
-        .iter()
-        .filter(|(_, c)| c.groups > 1)
-        .map(|(n, c)| (n, c.groups))
-        .collect();
+    let mut unrouted: Vec<(&String, usize)> = Vec::new();
+    // Open nets that own a zone with no saved fill: the pour may be what joins them.
+    let mut not_judged: Vec<(&String, usize, &String)> = Vec::new();
+    for (n, c) in conn.iter().filter(|(_, c)| c.groups > 1) {
+        match &c.unfilled_zone {
+            Some(z) => not_judged.push((n, c.groups, z)),
+            None => unrouted.push((n, c.groups)),
+        }
+    }
     unrouted.sort();
-    json!({
-        "complete": unrouted.is_empty(),
+    not_judged.sort();
+    let complete = if !unrouted.is_empty() {
+        json!(false)
+    } else if !not_judged.is_empty() {
+        Value::Null
+    } else {
+        json!(true)
+    };
+    let mut out = json!({
+        "complete": complete,
+        "status": if not_judged.is_empty() { "checked" } else { "partial" },
         "nets_with_two_or_more_pads": conn.len(),
         "unrouted_nets": unrouted.len(),
         "unrouted_listed": unrouted.iter().take(20).map(|(n, g)| json!({ "net": n, "copper_groups": g })).collect::<Vec<_>>(),
-        "method": "pads of a net joined through its tracks, vias and saved zone fills (raster, touching cells join); a gate, not a quality measure",
-    })
+        "nets_not_judged": not_judged.len(),
+        "not_judged_listed": not_judged.iter().take(20).map(|(n, g, z)| json!({ "net": n, "copper_groups": g, "zone": z })).collect::<Vec<_>>(),
+        "method": "pads of a net joined through its tracks, vias, pads and saved zone fills when their shapes touch (within 0.01 mm) on a shared copper layer; a gate, not a quality measure",
+    });
+    if !not_judged.is_empty() {
+        out["reason"] = json!(format!(
+            "{} open net(s) own a zone with no saved fill, so whether the pour joins them is unknown (refill zones and save the board); they are left out of routed_share",
+            not_judged.len()
+        ));
+    }
+    out
 }
 
 pub(super) fn run(m: &Model, refs: &RefMap) -> Vec<CheckOut> {
@@ -163,6 +271,14 @@ fn stubs_of(m: &Model, net: &str) -> Vec<(String, Pt)> {
     out
 }
 
+/// Names of nets a measure left out, bounded; `count` is the true total.
+fn named(list: &[(String, &str)]) -> Value {
+    json!({
+        "count": list.len(),
+        "listed": list.iter().take(20).map(|(n, why)| json!({ "net": n, "why": why })).collect::<Vec<_>>(),
+    })
+}
+
 fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
     let id = "5.1";
     let name = "detours_vias_stubs";
@@ -177,8 +293,11 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
     let (mut vias_total, mut stubs_total, mut measured) = (0usize, 0usize, 0usize);
     let (mut weighted, mut weight) = (0.0, 0.0);
     let mut rows: Vec<(f64, Value)> = Vec::new();
-    let mut skipped_pour = 0usize;
-    let mut skipped_unrouted = 0usize;
+    // Nets a measure could not judge, named: never only counted.
+    let mut no_ratio: Vec<(String, &str)> = Vec::new();
+    let mut no_via_ratio: Vec<(String, &str)> = Vec::new();
+    let mut not_scored: Vec<(String, &str)> = Vec::new();
+    let mut skipped_unrouted: Vec<(String, &str)> = Vec::new();
     let mut nets: Vec<&String> = m.tracks.keys().collect();
     nets.sort();
     for net in nets {
@@ -192,9 +311,15 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
         if pads.len() < 2 {
             continue;
         }
-        let c = conn.get(net);
-        if c.is_some_and(|c| c.groups > 1) {
-            skipped_unrouted += 1;
+        if let Some(c) = conn.get(net).filter(|c| c.groups > 1) {
+            skipped_unrouted.push((
+                net.clone(),
+                if c.unfilled_zone.is_some() {
+                    "open, and its zone has no saved fill"
+                } else {
+                    "not fully routed"
+                },
+            ));
             continue;
         }
         let has_pour = m
@@ -211,25 +336,47 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
         stubs_total += stubs.len();
         vias_total += vias;
         let mst = mst_len(&pads);
-        let vpc = vias as f64 / (pads.len() - 1) as f64;
-        let ratio = (mst > 1.0 && !has_pour).then(|| routed / mst);
-        if has_pour {
-            skipped_pour += 1;
+        // Ground, power and pour nets carry stitching, thermal and fan-out vias the checklist
+        // asks for (§3, §4), so their vias are not layer changes to count against the net.
+        let judge_vias = !(has_pour || m.is_ground(net) || m.is_power(net));
+        let vpc = judge_vias.then(|| vias as f64 / (pads.len() - 1) as f64);
+        // A tree under 1 mm is judged against 1 mm, so two pads side by side cannot hide a
+        // long route.
+        let ratio = (!has_pour).then(|| routed / mst.max(1.0));
+        if !judge_vias {
+            no_via_ratio.push((
+                net.clone(),
+                if m.is_ground(net) || m.is_power(net) {
+                    "ground or power net: its vias are stitching, not layer changes"
+                } else {
+                    "carried by a pour: its vias join the pour"
+                },
+            ));
         }
-        let mut s = excess_score(vpc, max_vias.max(0.5));
+        if ratio.is_none() {
+            no_ratio.push((net.clone(), "carried by a pour"));
+        }
+        let mut s = vpc.map_or(1.0, |v| excess_score(v, max_vias.max(0.5)));
         if let Some(r) = ratio {
             s = s.min(excess_score(r, max_ratio));
             wire += routed;
-            mst_total += mst;
+            // The same 1 mm floor as the per-net ratio, so the total agrees with them.
+            mst_total += mst.max(1.0);
             hp_total += hpwl(&pads);
             measured += 1;
         }
         if !stubs.is_empty() {
             s *= 0.7;
         }
-        let w = routed.max(1.0);
-        weighted += s * w;
-        weight += w;
+        // A net with neither a detour nor a via ratio was not measured: it must not lift the
+        // score just by having no dangling end. Its stubs are still findings and counted.
+        if ratio.is_some() || vpc.is_some() {
+            let w = routed.max(1.0);
+            weighted += s * w;
+            weight += w;
+        } else {
+            not_scored.push((net.clone(), "no detour ratio and no via ratio"));
+        }
         let uuid_of = |net: &str| -> Vec<String> {
             m.tracks[net]
                 .iter()
@@ -237,13 +384,19 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
                 .take(8)
                 .collect()
         };
-        if ratio.is_some_and(|r| r > max_ratio) || vpc > max_vias || !stubs.is_empty() {
+        if ratio.is_some_and(|r| r > max_ratio)
+            || vpc.is_some_and(|v| v > max_vias)
+            || !stubs.is_empty()
+        {
             let mut why = Vec::new();
             if let Some(r) = ratio.filter(|r| *r > max_ratio) {
                 why.push(format!("routed {routed:.1} mm for a {mst:.1} mm pin-to-pin tree ({r:.2}×; limit {max_ratio}×)"));
             }
-            if vpc > max_vias {
-                why.push(format!("{vias} via(s) for {} connection(s) ({vpc:.1} per connection; limit {max_vias})", pads.len() - 1));
+            if let Some(v) = vpc.filter(|v| *v > max_vias) {
+                why.push(format!(
+                    "{vias} via(s) for {} connection(s) ({v:.1} per connection; limit {max_vias})",
+                    pads.len() - 1
+                ));
             }
             if !stubs.is_empty() {
                 why.push(format!("{} dangling track end(s)", stubs.len()));
@@ -252,7 +405,7 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
                 severity: "warning",
                 item: id,
                 subject: net.clone(),
-                measured: json!({ "routed_mm": r2(routed), "pin_tree_mm": r2(mst), "detour_ratio": ratio.map(r2), "vias": vias, "vias_per_connection": r2(vpc), "dangling_ends": stubs.len(), "stub_uuids": stubs.iter().take(5).map(|s| s.0.clone()).collect::<Vec<_>>() }),
+                measured: json!({ "routed_mm": r2(routed), "pin_tree_mm": r2(mst), "detour_ratio": ratio.map(r2), "vias": vias, "vias_per_connection": vpc.map(r2), "dangling_ends": stubs.len(), "stub_uuids": stubs.iter().take(5).map(|s| s.0.clone()).collect::<Vec<_>>() }),
                 threshold: json!({ "max_detour_ratio": max_ratio, "max_vias_per_connection": max_vias, "dangling_ends": 0 }),
                 issue: format!("Net '{net}': {}", why.join("; ")),
                 fix: "Re-route more directly, remove the spur, or drop the extra layer changes".into(),
@@ -263,22 +416,29 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
         rows.push((ratio.unwrap_or(0.0), json!({ "net": net, "routed_mm": r2(routed), "pin_tree_mm": r2(mst), "detour_ratio": ratio.map(r2), "vias": vias, "dangling_ends": stubs.len() })));
     }
     if rows.is_empty() {
-        return (
-            CheckOut::not_run(
-                id,
-                name,
-                "no completely routed net with tracks and two or more pads",
-            ),
-            stub_counts,
+        let mut o = CheckOut::not_run(
+            id,
+            name,
+            "no completely routed net with tracks and two or more pads",
         );
+        o.metrics = json!({ "unrouted_nets_skipped": named(&skipped_unrouted) });
+        return (o, stub_counts);
     }
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    out.score = Some(weighted / weight);
+    if weight > 0.0 {
+        out.score = Some(weighted / weight);
+    } else {
+        out.status = "partial";
+        out.reason = Some("no net could be given a detour or via ratio (all are carried by a pour, or are ground or power nets); only dangling ends were checked".into());
+    }
     out.metrics = json!({
         "nets_measured": rows.len(),
         "nets_with_a_detour_ratio": measured,
-        "pour_carried_nets_without_a_ratio": skipped_pour,
-        "unrouted_nets_skipped": skipped_unrouted,
+        "pour_carried_nets_without_a_ratio": no_ratio.iter().filter(|n| n.1 == "carried by a pour").count(),
+        "nets_without_a_detour_ratio": named(&no_ratio),
+        "nets_without_a_via_ratio": named(&no_via_ratio),
+        "nets_not_scored": named(&not_scored),
+        "unrouted_nets_skipped": named(&skipped_unrouted),
         "compare": {
             "wire_to_pin_tree": (mst_total > 0.0).then(|| r3(wire / mst_total)),
             "wire_to_hpwl": (hp_total > 0.0).then(|| r3(wire / hp_total)),
@@ -287,7 +447,7 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
             "dangling_ends": stubs_total,
         },
         "worst_detours": rows.into_iter().take(10).map(|r| r.1).collect::<Vec<_>>(),
-        "method": "routed track length over the Euclidean minimum spanning tree of the net's pad centres (a tree shorter than any rectilinear route; HPWL also reported); nets carried by a pour have no ratio",
+        "method": "routed track length over the Euclidean minimum spanning tree of the net's pad centres (a tree shorter than any rectilinear route; HPWL also reported); a tree under 1 mm is judged against 1 mm; vias per connection are counted on signal nets only (ground, power and pour nets carry stitching vias); nets that get no ratio are named in the metrics and, with no ratio at all, are left out of the score",
     });
     (out, stub_counts)
 }
@@ -306,6 +466,16 @@ fn parallel_runs(m: &Model) -> CheckOut {
     let run_limit = m.params.get("parallel_max_run_mm");
     // Segments of signal nets, bucketed by layer and 3 mm cell.
     let cell = 3.0;
+    // A pair is compared only inside a shared cell, so each segment is filed over its box grown
+    // by the farthest a partner can be: twice the gap limit (aggressors) between the two edges,
+    // plus both half-widths. Without it a pair across a cell line is never compared.
+    let max_r = m
+        .tracks
+        .values()
+        .flatten()
+        .map(|&i| m.track(i).shape.radius)
+        .fold(0.0f64, f64::max);
+    let reach = 2.0 * gap_limit + 2.0 * max_r;
     let mut buckets: HashMap<(String, i64, i64), Vec<(usize, usize)>> = HashMap::new();
     let mut segs: Vec<(String, String, Pt, Pt, f64, Option<String>)> = Vec::new();
     let pair_of: HashMap<&str, &str> = m
@@ -336,8 +506,8 @@ fn parallel_runs(m: &Model) -> CheckOut {
                     t.shape.radius,
                     t.uuid.clone(),
                 ));
-                let (x0, x1) = (w[0].0.min(w[1].0), w[0].0.max(w[1].0));
-                let (y0, y1) = (w[0].1.min(w[1].1), w[0].1.max(w[1].1));
+                let (x0, x1) = (w[0].0.min(w[1].0) - reach, w[0].0.max(w[1].0) + reach);
+                let (y0, y1) = (w[0].1.min(w[1].1) - reach, w[0].1.max(w[1].1) + reach);
                 for cx in ((x0 / cell).floor() as i64)..=((x1 / cell).floor() as i64) {
                     for cy in ((y0 / cell).floor() as i64)..=((y1 / cell).floor() as i64) {
                         buckets
@@ -561,6 +731,31 @@ fn corners(m: &Model) -> CheckOut {
     }
     let mut out = CheckOut::checked(id, name);
     for i in &acute {
+        // The tracks of the net that end at the corner (the acid-trap check gives only a position).
+        let at = (
+            i.at["x"].as_f64().unwrap_or(0.0),
+            i.at["y"].as_f64().unwrap_or(0.0),
+        );
+        let (net, layer) = (
+            i.at["net"].as_str().unwrap_or(""),
+            i.at["layer"].as_str().unwrap_or(""),
+        );
+        let uuids: Vec<String> = m
+            .tracks
+            .get(net)
+            .into_iter()
+            .flatten()
+            .map(|&ti| m.track(ti))
+            .filter(|t| {
+                t.layers.first().map(String::as_str) == Some(layer)
+                    && [t.shape.pts.first(), t.shape.pts.last()]
+                        .into_iter()
+                        .flatten()
+                        .any(|e| dist(*e, at) <= 0.05 + t.shape.radius)
+            })
+            .filter_map(|t| t.uuid.clone())
+            .take(8)
+            .collect();
         out.findings.push(Finding {
             severity: "warning",
             item: id,
@@ -569,11 +764,8 @@ fn corners(m: &Model) -> CheckOut {
             threshold: json!({ "minimum_interior_angle_deg": 90 }),
             issue: i.issue.clone(),
             fix: i.fix.clone(),
-            uuids: Vec::new(),
-            at: Some((
-                i.at["x"].as_f64().unwrap_or(0.0),
-                i.at["y"].as_f64().unwrap_or(0.0),
-            )),
+            uuids,
+            at: Some(at),
         });
     }
     right_rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -780,7 +972,11 @@ fn diff_pairs(m: &Model, refs: &RefMap, stubs: &HashMap<String, usize>) -> Check
                 threshold: json!({ "needed_when": "the interface's timing says so" }),
                 issue: format!("Pair {pn}/{nn} differs by {:.2} mm in length; whether that matters needs the interface's skew limit", (lp - ln).abs()),
                 fix: "Match only if the interface requires it".into(),
-                uuids: Vec::new(),
+                uuids: [pn, nn]
+                    .iter()
+                    .flat_map(|n| m.tracks[*n].iter().take(4))
+                    .filter_map(|&i| m.track(i).uuid.clone())
+                    .collect(),
                 at: None,
             });
         }

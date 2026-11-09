@@ -101,6 +101,9 @@ gains the read-only `audit_layout_quality(board, …)`. No existing tool, argume
 result changes. `audit_trace_current`'s sizing helpers became crate-visible so the new
 audit reuses them; its own result is unchanged.
 
+`completion.complete` is `true`, `false` or `null`: `null` means open nets own a zone with no saved
+fill, so the gate could not judge them (`completion.status` is `partial`, with a `reason`).
+
 ## Unreleased: honest manufacturing review and trace current audit
 
 Creation PR 11 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains

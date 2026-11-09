@@ -52,7 +52,7 @@ struct Knob(&'static str, f64, f64, f64, &'static str);
 
 const KNOBS: &[Knob] = &[
     Knob("sample_mm", 0.25, 0.05, 2.0, "§3 spacing of the samples taken along a critical track to see what lies on its reference layer"),
-    Knob("min_reference_coverage", 0.90, 0.0, 1.0, "§3 least share of a critical net's length that must run over solid ground on an adjacent layer"),
+    Knob("min_reference_coverage", 0.90, 0.0, 1.0, "§3 least share of a critical net's length that must run over its solid reference plane (ground or power) on an adjacent layer"),
     Knob("max_void_run_mm", 2.0, 0.1, 100.0, "§3 longest stretch of one track allowed over a void, slot or other-net plane"),
     Knob("stitch_via_max_mm", 3.0, 0.1, 50.0, "§3 farthest a ground stitching via may sit from a signal via that changes reference plane"),
     Knob("decap_search_mm", 15.0, 1.0, 100.0, "§4 how far from an IC supply pin a decoupling capacitor is looked for"),
@@ -279,7 +279,9 @@ pub(super) struct Roles {
     pub pairs: Vec<(String, String, String)>,
     pub rails: HashMap<String, Rail>,
     pub currents: Vec<CurrentReq>,
-    pub netclass: HashMap<String, String>,
+    /// Every netclass of a net: explicit assignments and all matching patterns, as KiCad's
+    /// effective (composite) netclass joins them.
+    pub netclass: HashMap<String, Vec<String>>,
     pub intent: &'static str,
     pub critical_basis: &'static str,
 }
@@ -353,8 +355,11 @@ fn glob(pattern: &str, text: &str) -> bool {
     )
 }
 
-fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+/// The netclasses of each net. KiCad 10 (`NET_SETTINGS::GetEffectiveNetClass`) does not let an
+/// explicit assignment win over a pattern or the other way round: every explicit assignment and
+/// every matching pattern joins one composite netclass. So a net keeps all of them here.
+fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let pro = board.with_extension("kicad_pro");
     let Ok(text) = std::fs::read_to_string(pro) else {
         return out;
@@ -363,6 +368,25 @@ fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Str
         return out;
     };
     let settings = &json["net_settings"];
+    let mut add = |net: &str, class: &str| {
+        let classes = out.entry(net.to_string()).or_default();
+        if !classes.iter().any(|c| c == class) {
+            classes.push(class.to_string());
+        }
+    };
+    if let Some(map) = settings["netclass_assignments"].as_object() {
+        for (net, class) in map {
+            match class {
+                Value::String(c) => add(net, c),
+                Value::Array(list) => {
+                    for c in list.iter().filter_map(Value::as_str) {
+                        add(net, c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     if let Some(patterns) = settings["netclass_patterns"].as_array() {
         for p in patterns {
             let (Some(class), Some(pattern)) = (p["netclass"].as_str(), p["pattern"].as_str())
@@ -371,25 +395,15 @@ fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Str
             };
             for net in nets {
                 if glob(pattern, net) {
-                    out.entry(net.clone()).or_insert_with(|| class.to_string());
+                    add(net, class);
                 }
             }
         }
     }
-    if let Some(map) = settings["netclass_assignments"].as_object() {
-        for (net, class) in map {
-            let class = class.as_str().or_else(|| {
-                class
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(Value::as_str)
-            });
-            if let Some(class) = class {
-                out.entry(net.clone()).or_insert_with(|| class.to_string());
-            }
-        }
-    }
-    out.retain(|_, c| c != "Default");
+    out.retain(|_, classes| {
+        classes.retain(|c| c != "Default");
+        !classes.is_empty()
+    });
     out
 }
 
@@ -546,6 +560,11 @@ impl<'a> Model<'a> {
 
     pub fn is_power(&self, net: &str) -> bool {
         self.roles.power.contains_key(net)
+    }
+
+    /// A zone of `net` that carries no saved fill: its copper is unknown, not absent.
+    pub fn unfilled_zone_of(&self, net: &str) -> Option<&UnfilledZone> {
+        self.unfilled.iter().find(|z| z.net.as_deref() == Some(net))
     }
 
     pub fn thickness(&self, layer: &str) -> f64 {
@@ -928,17 +947,18 @@ fn intent_roles(
         }
     }
     for net in nets {
-        if let Some(class) = roles.netclass.get(net) {
-            if power_class(class) && !roles.ground.contains_key(net) {
+        if let Some(classes) = roles.netclass.get(net) {
+            let label = classes.join(", ");
+            if classes.iter().any(|c| power_class(c)) && !roles.ground.contains_key(net) {
                 roles
                     .power
                     .entry(net.clone())
-                    .or_insert_with(|| format!("netclass '{class}'"));
-            } else if critical_class(class) {
+                    .or_insert_with(|| format!("netclass '{label}'"));
+            } else if classes.iter().any(|c| critical_class(c)) {
                 roles
                     .critical
                     .entry(net.clone())
-                    .or_insert_with(|| format!("netclass '{class}'"));
+                    .or_insert_with(|| format!("netclass '{label}'"));
             }
         }
         if ground_by_name(net) && !roles.power.contains_key(net) {
@@ -1189,9 +1209,11 @@ fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeom
     // share of multi-pad nets that are joined.
     let completion = routing::completion(m);
     let routed_share = {
+        // Nets whose pour was never filled are not judged, so they are not counted either way.
         let total = completion["nets_with_two_or_more_pads"]
             .as_f64()
-            .unwrap_or(0.0);
+            .unwrap_or(0.0)
+            - completion["nets_not_judged"].as_f64().unwrap_or(0.0);
         let open = completion["unrouted_nets"].as_f64().unwrap_or(0.0);
         if total > 0.0 {
             (total - open) / total
@@ -1280,7 +1302,11 @@ fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeom
             if categories.iter().filter(|c| !c["score"].is_null()).count() == 1 { "y" } else { "ies" },
             total_weight * 100.0,
             errors, warnings, infos,
-            if completion["complete"] == true { "complete" } else { "INCOMPLETE (scores are not comparable with a complete run)" },
+            match completion["complete"] {
+                Value::Bool(true) => "complete".to_string(),
+                Value::Bool(false) => "INCOMPLETE (scores are not comparable with a complete run)".to_string(),
+                _ => format!("NOT FULLY JUDGED ({} open net(s) own a zone with no saved fill; refill and save)", completion["nets_not_judged"]),
+            },
         ),
         "quality": {
             "score": score,
@@ -1290,7 +1316,7 @@ fn assemble(board: &Path, m: &Model, checks: Vec<CheckOut>, geometry: &BoardGeom
             "weight_measured": r2(total_weight),
             "categories": categories,
             "not_scored": not_scored,
-            "comparable_when": "same board, same thresholds, same net_roles, and both runs complete",
+            "comparable_when": "same board, same thresholds, same net_roles, and both runs complete (completion.complete true)",
         },
         "completion": completion,
         "metrics": metrics,

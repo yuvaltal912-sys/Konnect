@@ -240,7 +240,7 @@ fn a_track_over_a_plane_split_and_a_slot_is_measured_and_named() {
     let bad = nets.iter().find(|n| n["net"] == "CLK_SPLIT").unwrap();
     // The clean net sits over solid ground its whole length.
     assert!(ok["coverage"].as_f64().unwrap() > 0.98, "{ok}");
-    assert_eq!(ok["runs_off_ground"], 0);
+    assert_eq!(ok["runs_off_reference"], 0);
     // The other crosses a 3 mm slot (x 20..23) and the 3V3 region (x 40..54): 17 of 48 mm.
     let cov = bad["coverage"].as_f64().unwrap();
     assert!((0.58..0.72).contains(&cov), "{bad}");
@@ -249,13 +249,13 @@ fn a_track_over_a_plane_split_and_a_slot_is_measured_and_named() {
     let void = bad["void_mm"].as_f64().unwrap();
     assert!((2.0..4.5).contains(&void), "slot {void}");
     // The slot, the 3V3 region, and the sliver of clearance between that region and ground.
-    assert!(bad["runs_off_ground"].as_u64().unwrap() >= 2, "{bad}");
+    assert!(bad["runs_off_reference"].as_u64().unwrap() >= 2, "{bad}");
     // One finding, for the bad net only, with the measured value, the threshold and a UUID.
     let fs = findings(&r, "3.1");
     assert_eq!(fs.len(), 1, "{fs:?}");
     let f = fs[0];
     assert_eq!(f["subject"], "CLK_SPLIT");
-    assert!(f["issue"].as_str().unwrap().contains("'3V3' plane"));
+    assert!(f["issue"].as_str().unwrap().contains("'3V3' copper"));
     assert_eq!(f["threshold"]["min_reference_coverage"], 0.9);
     assert_eq!(f["threshold"]["max_void_run_mm"], 2.0);
     assert!(f["checklist"].as_str().unwrap().starts_with("§3"));
@@ -371,7 +371,7 @@ fn ground_cut_off_from_its_pads_is_an_error_and_a_floating_island_a_warning() {
             && f["issue"]
                 .as_str()
                 .unwrap()
-                .contains("touches no pad or via")));
+                .contains("touches no pad of the net")));
     assert!(score(&r, "3.3") < 0.5);
 }
 
@@ -925,5 +925,831 @@ fn the_raster_measures_widths_lengths_and_components() {
         h.area_mm2() > 80.0 && h.area_mm2() < 100.0,
         "{}",
         h.area_mm2()
+    );
+}
+
+// ─── Review follow-up: boards written by hand ────────────────────────────────
+
+/// One pad of a hand-written part.
+struct Pd {
+    num: String,
+    at: (f64, f64),
+    net: String,
+    size: (f64, f64),
+    layer: &'static str,
+}
+
+fn pd(num: &str, dx: f64, dy: f64, net: &str) -> Pd {
+    Pd {
+        num: num.into(),
+        at: (dx, dy),
+        net: net.into(),
+        size: (0.6, 0.6),
+        layer: "F.Cu",
+    }
+}
+
+impl Pd {
+    fn size(mut self, w: f64, h: f64) -> Pd {
+        self.size = (w, h);
+        self
+    }
+    fn on(mut self, layer: &'static str) -> Pd {
+        self.layer = layer;
+        self
+    }
+}
+
+/// A small `.kicad_pcb` written as text: parts, tracks, vias and zones, nothing else. The
+/// six `pcbnew` fixtures cover the shapes the checks were built on; these boards isolate one
+/// situation each.
+struct Bd {
+    layers: Vec<&'static str>,
+    body: String,
+    n: u32,
+}
+
+impl Bd {
+    fn new(layers: &[&'static str]) -> Bd {
+        Bd {
+            layers: layers.to_vec(),
+            body: String::new(),
+            n: 0,
+        }
+    }
+
+    fn uuid(&mut self) -> String {
+        self.n += 1;
+        format!("00000000-0000-4000-8000-{:012}", self.n)
+    }
+
+    fn part(&mut self, reference: &str, at: (f64, f64), pads: Vec<Pd>) -> &mut Bd {
+        let (u, ur, uv) = (self.uuid(), self.uuid(), self.uuid());
+        self.body.push_str(&format!(
+            "(footprint \"\" (layer \"F.Cu\") (uuid \"{u}\") (at {} {})\n\
+             (property \"Reference\" \"{reference}\" (at 0 0 0) (layer \"F.SilkS\") (uuid \"{ur}\") (effects (font (size 1 1))))\n\
+             (property \"Value\" \"{reference}\" (at 0 0 0) (layer \"F.Fab\") (uuid \"{uv}\") (effects (font (size 1 1))))\n",
+            at.0, at.1
+        ));
+        for p in pads {
+            let pu = self.uuid();
+            let layers = if p.layer == "*.Cu" {
+                "\"*.Cu\" \"*.Mask\"".to_string()
+            } else {
+                format!("\"{}\"", p.layer)
+            };
+            let kind = if p.layer == "*.Cu" {
+                "thru_hole circle"
+            } else {
+                "smd rect"
+            };
+            let drill = if p.layer == "*.Cu" { "(drill 0.5)" } else { "" };
+            self.body.push_str(&format!(
+                "(pad \"{}\" {kind} (at {} {}) (size {} {}) {drill} (layers {layers}) (net \"{}\") (uuid \"{pu}\"))\n",
+                p.num, p.at.0, p.at.1, p.size.0, p.size.1, p.net
+            ));
+        }
+        self.body.push_str(")\n");
+        self
+    }
+
+    fn seg(&mut self, layer: &str, a: (f64, f64), b: (f64, f64), width: f64, net: &str) -> &mut Bd {
+        let u = self.uuid();
+        self.body.push_str(&format!(
+            "(segment (start {} {}) (end {} {}) (width {width}) (layer \"{layer}\") (net \"{net}\") (uuid \"{u}\"))\n",
+            a.0, a.1, b.0, b.1
+        ));
+        self
+    }
+
+    fn via(&mut self, at: (f64, f64), net: &str) -> &mut Bd {
+        let u = self.uuid();
+        let (first, last) = (self.layers[0], self.layers[self.layers.len() - 1]);
+        self.body.push_str(&format!(
+            "(via (at {} {}) (size 0.6) (drill 0.3) (layers \"{first}\" \"{last}\") (net \"{net}\") (uuid \"{u}\"))\n",
+            at.0, at.1
+        ));
+        self
+    }
+
+    /// A rectangular zone; `filled` writes its saved fill, otherwise it is left unfilled.
+    fn zone(&mut self, net: &str, layer: &str, r: (f64, f64, f64, f64), filled: bool) -> &mut Bd {
+        let u = self.uuid();
+        let pts = format!(
+            "(xy {} {}) (xy {} {}) (xy {} {}) (xy {} {})",
+            r.0, r.1, r.2, r.1, r.2, r.3, r.0, r.3
+        );
+        let fill = if filled {
+            format!(
+                "(fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n(filled_polygon (layer \"{layer}\") (pts {pts}))"
+            )
+        } else {
+            "(fill (thermal_gap 0.5) (thermal_bridge_width 0.5))".to_string()
+        };
+        self.body.push_str(&format!(
+            "(zone (net \"{net}\") (layer \"{layer}\") (uuid \"{u}\") (hatch edge 0.5) (connect_pads (clearance 0.3)) (min_thickness 0.2)\n{fill}\n(polygon (pts {pts})))\n"
+        ));
+        self
+    }
+
+    fn text(&self) -> String {
+        let layers: String = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let n = match *l {
+                    "F.Cu" => 0,
+                    "B.Cu" => 2,
+                    _ => 4 + 2 * (i as i32 - 1),
+                };
+                format!("({n} \"{l}\" signal)")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "(kicad_pcb (version 20260206) (generator \"pcbnew\") (general (thickness 1.6)) (paper \"A4\")\n(layers {layers} (25 \"Edge.Cuts\" user))\n{}\n)\n",
+            self.body
+        )
+    }
+
+    fn fx(&self, intent: Option<Value>) -> Fx {
+        fx_text(&self.text(), intent)
+    }
+}
+
+const TWO: [&str; 2] = ["F.Cu", "B.Cu"];
+const FOUR: [&str; 4] = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"];
+
+fn subjects<'a>(fs: &[&'a Value]) -> Vec<&'a str> {
+    fs.iter().map(|f| f["subject"].as_str().unwrap()).collect()
+}
+
+/// A buck (U1, L1) whose output rail feeds a load IC (U2) and a capacitor, and a second load IC
+/// (U3) on another rail.
+fn buck_feeding_a_load() -> Bd {
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "U1",
+        (5.0, 10.0),
+        vec![pd("1", -0.5, 0.0, "SW"), pd("2", 0.5, 0.0, "GND")],
+    );
+    b.part(
+        "L1",
+        (10.0, 10.0),
+        vec![pd("1", -0.5, 0.0, "SW"), pd("2", 0.5, 0.0, "+3V3")],
+    );
+    b.part(
+        "U2",
+        (20.0, 10.0),
+        vec![pd("1", -0.5, 0.0, "+3V3"), pd("2", 0.5, 0.0, "GND")],
+    );
+    b.part(
+        "C5",
+        (20.0, 12.0),
+        vec![pd("1", -0.5, 0.0, "+3V3"), pd("2", 0.5, 0.0, "GND")],
+    );
+    b.part(
+        "U3",
+        (30.0, 10.0),
+        vec![pd("1", -0.5, 0.0, "+5V"), pd("2", 0.5, 0.0, "GND")],
+    );
+    b.part(
+        "C6",
+        (30.0, 12.0),
+        vec![pd("1", -0.5, 0.0, "+5V"), pd("2", 0.5, 0.0, "GND")],
+    );
+    b.seg("F.Cu", (4.5, 10.0), (9.5, 10.0), 0.4, "SW");
+    b.seg("F.Cu", (10.5, 10.0), (19.5, 10.0), 0.4, "+3V3");
+    b.seg("F.Cu", (19.5, 10.0), (19.5, 12.0), 0.4, "+3V3");
+    b.seg("F.Cu", (20.5, 10.0), (20.5, 12.0), 0.4, "GND");
+    b.seg("F.Cu", (29.5, 10.0), (29.5, 12.0), 0.4, "+5V");
+    b.seg("F.Cu", (30.5, 10.0), (30.5, 12.0), 0.4, "GND");
+    b
+}
+
+#[test]
+fn a_power_rail_behind_an_inductor_is_a_filter_not_a_switch_node() {
+    // No design intent, only the default netclass: +3V3 is a power rail by its name alone.
+    let r = run(&buck_feeding_a_load().fx(None));
+    // The load IC's supply pin is still measured for decoupling.
+    let pins = check(&r, "4.1")["metrics"]["pins"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(pins.iter().any(|p| p["pin"] == "U2.1"), "{pins:?}");
+    assert_eq!(check(&r, "4.1")["metrics"]["supply_pins"], 2);
+    // Only SW is a switch node: 8.1 asks about it alone, and 8.2 measures only its copper.
+    let hot = check(&r, "8.1");
+    assert!(hot["reason"].as_str().unwrap().contains("'SW'"), "{hot}");
+    assert!(!hot["reason"].as_str().unwrap().contains("+3V3"), "{hot}");
+    assert!(r["needs_human"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|n| { n["item"] != "8.1" || !n["why"].as_str().unwrap().contains("+3V3") }));
+    let nodes = check(&r, "8.2")["metrics"]["switch_nodes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(nodes[0]["switch_net"], "SW");
+    assert!(f_for(&r, "8.2", "+3V3").is_empty());
+}
+
+#[test]
+fn a_switch_node_the_caller_names_leaves_its_supply_pins_to_8_1_and_is_counted() {
+    let r = run_with(
+        &buck_feeding_a_load().fx(None),
+        json!({ "switching_regulators": [{ "switch_net": "+3V3", "topology": "buck" }] }),
+    );
+    let c = check(&r, "4.1");
+    assert_eq!(c["metrics"]["supply_pins"], 1, "{c}");
+    let left = &c["metrics"]["switch_node_pins_left_to_8_1_8_2"];
+    assert_eq!(left["count"], 1, "{left}");
+    assert_eq!(left["pins"][0], "U2.1");
+    // The one switch node 8.2 measures is the named one.
+    let nodes = check(&r, "8.2")["metrics"]["switch_nodes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(nodes.iter().any(|n| n["switch_net"] == "+3V3"), "{nodes:?}");
+}
+
+#[test]
+fn stitching_vias_on_ground_do_not_count_against_5_1() {
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "J1",
+        (5.0, 5.0),
+        vec![pd("1", 0.0, 0.0, "GND"), pd("2", 10.0, 0.0, "GND")],
+    );
+    b.seg("F.Cu", (5.0, 5.0), (15.0, 5.0), 0.3, "GND");
+    b.zone("GND", "B.Cu", (1.0, 1.0, 40.0, 20.0), true);
+    for i in 0..10 {
+        b.via((6.0 + i as f64 * 1.5, 8.0), "GND");
+    }
+    // A signal net that hops layers three times for one connection is still judged.
+    b.part("S1", (5.0, 15.0), vec![pd("1", 0.0, 0.0, "SIG")]);
+    b.part(
+        "S2",
+        (15.0, 15.0),
+        vec![pd("1", 0.0, 0.0, "SIG").on("B.Cu")],
+    );
+    b.seg("F.Cu", (5.0, 15.0), (8.0, 15.0), 0.2, "SIG");
+    b.via((8.0, 15.0), "SIG");
+    b.seg("B.Cu", (8.0, 15.0), (10.0, 15.0), 0.2, "SIG");
+    b.via((10.0, 15.0), "SIG");
+    b.seg("F.Cu", (10.0, 15.0), (12.0, 15.0), 0.2, "SIG");
+    b.via((12.0, 15.0), "SIG");
+    b.seg("B.Cu", (12.0, 15.0), (15.0, 15.0), 0.2, "SIG");
+    let r = run(&b.fx(None));
+    let fs = findings(&r, "5.1");
+    assert_eq!(subjects(&fs), vec!["SIG"], "{fs:?}");
+    assert!(fs[0]["issue"].as_str().unwrap().contains("3 via(s)"));
+    // The metric says which nets got no via ratio, and why.
+    let listed = check(&r, "5.1")["metrics"]["nets_without_a_via_ratio"]["listed"].clone();
+    assert!(
+        listed.as_array().unwrap().iter().any(|n| n["net"] == "GND"),
+        "{listed}"
+    );
+    // Ground's vias leave the score alone: only SIG is scored, and it scores badly.
+    assert_eq!(score(&r, "5.1"), 0.5);
+}
+
+#[test]
+fn stitching_vias_on_a_ground_net_without_a_pour_do_not_count_against_5_1() {
+    // No zone at all: the role alone keeps ground's vias out of the via ratio.
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "J1",
+        (5.0, 5.0),
+        vec![pd("1", 0.0, 0.0, "GND"), pd("2", 10.0, 0.0, "GND")],
+    );
+    b.seg("F.Cu", (5.0, 5.0), (15.0, 5.0), 0.3, "GND");
+    for i in 0..6 {
+        b.via((6.0 + i as f64 * 1.5, 5.0), "GND");
+    }
+    let r = run(&b.fx(None));
+    let fs = findings(&r, "5.1");
+    assert!(fs.is_empty(), "{fs:?}");
+    let listed = check(&r, "5.1")["metrics"]["nets_without_a_via_ratio"]["listed"].clone();
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["net"] == "GND"
+                && n["why"].as_str().unwrap_or_default().contains("stitching")),
+        "{listed}"
+    );
+}
+
+fn parallel_pair_board(y: f64) -> Bd {
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "A1",
+        (0.0, y),
+        vec![pd("1", 0.0, 0.0, "SIG_A"), pd("2", 20.0, 0.0, "SIG_A")],
+    );
+    b.part(
+        "B1",
+        (0.0, y + 0.4),
+        vec![pd("1", 0.0, 0.0, "SIG_B"), pd("2", 20.0, 0.0, "SIG_B")],
+    );
+    b.seg("F.Cu", (0.0, y), (20.0, y), 0.2, "SIG_A");
+    b.seg("F.Cu", (0.0, y + 0.4), (20.0, y + 0.4), 0.2, "SIG_B");
+    b
+}
+
+#[test]
+fn a_parallel_pair_across_a_cell_boundary_is_still_reported() {
+    // 2.9 and 3.3 fall either side of a 3 mm cell line; 1.9 and 2.3 do not.
+    for y in [1.9, 2.9] {
+        let r = run(&parallel_pair_board(y).fx(None));
+        let fs = findings(&r, "5.2");
+        assert_eq!(subjects(&fs), vec!["SIG_A / SIG_B"], "y = {y}: {fs:?}");
+        assert!((19.0..21.0).contains(&fs[0]["measured"]["parallel_mm"].as_f64().unwrap()));
+    }
+}
+
+#[test]
+fn a_ground_island_held_only_by_a_dangling_via_is_floating() {
+    let mut b = Bd::new(&FOUR);
+    b.part(
+        "J1",
+        (5.0, 5.0),
+        vec![pd("1", 0.0, 0.0, "GND"), pd("2", 5.0, 0.0, "GND")],
+    );
+    b.seg("F.Cu", (5.0, 5.0), (10.0, 5.0), 0.3, "GND");
+    b.via((7.5, 5.0), "GND");
+    b.zone("GND", "In1.Cu", (0.0, 0.0, 30.0, 20.0), true);
+    // A pour on In2.Cu away from every other ground copper, with one via inside it.
+    b.zone("GND", "In2.Cu", (40.0, 0.0, 45.0, 5.0), true);
+    b.via((42.5, 2.5), "GND");
+    let r = run(&b.fx(None));
+    let fs = findings(&r, "3.3");
+    assert_eq!(fs.len(), 1, "{fs:?}");
+    assert_eq!(fs[0]["severity"], "warning");
+    assert!(fs[0]["subject"].as_str().unwrap().contains("island"));
+    assert!(fs[0]["measured"]["area_mm2"].as_f64().unwrap() > 20.0);
+    assert_eq!(
+        check(&r, "3.3")["metrics"]["compare"]["floating_ground_islands"],
+        1
+    );
+    assert!(score(&r, "3.3") < 1.0);
+    // The control: the same board without the island has nothing to report.
+    let mut c = Bd::new(&FOUR);
+    c.part(
+        "J1",
+        (5.0, 5.0),
+        vec![pd("1", 0.0, 0.0, "GND"), pd("2", 5.0, 0.0, "GND")],
+    );
+    c.seg("F.Cu", (5.0, 5.0), (10.0, 5.0), 0.3, "GND");
+    c.via((7.5, 5.0), "GND");
+    c.zone("GND", "In1.Cu", (0.0, 0.0, 30.0, 20.0), true);
+    let r = run(&c.fx(None));
+    assert!(findings(&r, "3.3").is_empty(), "{:?}", findings(&r, "3.3"));
+    assert_eq!(score(&r, "3.3"), 1.0);
+}
+
+/// Two 1 mm pads 10 mm apart on one net, joined by a 0.25 mm track that stops `end_x` along.
+fn gap_board(end_x: f64) -> Bd {
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "P1",
+        (0.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "SIG").size(1.0, 1.0)],
+    );
+    b.part(
+        "P2",
+        (10.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "SIG").size(1.0, 1.0)],
+    );
+    b.seg("F.Cu", (0.0, 0.0), (end_x, 0.0), 0.25, "SIG");
+    b
+}
+
+#[test]
+fn a_track_that_stops_short_of_its_pad_is_unrouted() {
+    // Copper ends at end_x + 0.125; the far pad's edge is at 9.5. Gaps of 0.12 and 0.2 mm
+    // joined on the grown raster; they are open for KiCad.
+    for end_x in [9.255, 9.175] {
+        let r = run(&gap_board(end_x).fx(None));
+        assert_eq!(
+            r["completion"]["unrouted_nets"], 1,
+            "end {end_x}: {}",
+            r["completion"]
+        );
+        assert_eq!(r["completion"]["complete"], false);
+        assert_eq!(r["quality"]["routed_share"], 0.0);
+    }
+    // A track that reaches the pad is routed.
+    let r = run(&gap_board(9.6).fx(None));
+    assert_eq!(r["completion"]["unrouted_nets"], 0, "{}", r["completion"]);
+    assert_eq!(r["completion"]["complete"], true);
+}
+
+#[test]
+fn a_ground_pad_a_gap_away_from_its_copper_is_cut_off() {
+    // Ground pads 10 mm apart; the track stops 0.12 mm short of the second one.
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "P1",
+        (0.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "GND").size(1.0, 1.0)],
+    );
+    b.part(
+        "P2",
+        (10.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "GND").size(1.0, 1.0)],
+    );
+    b.seg("F.Cu", (0.0, 0.0), (9.255, 0.0), 0.25, "GND");
+    let r = run(&b.fx(None));
+    let errors: Vec<_> = findings(&r, "3.3")
+        .into_iter()
+        .filter(|f| f["severity"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{:?}", findings(&r, "3.3"));
+    assert!(errors[0]["issue"]
+        .as_str()
+        .unwrap()
+        .contains("2 separate copper groups"));
+    // Reaching the pad joins them.
+    let mut c = Bd::new(&TWO);
+    c.part(
+        "P1",
+        (0.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "GND").size(1.0, 1.0)],
+    );
+    c.part(
+        "P2",
+        (10.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "GND").size(1.0, 1.0)],
+    );
+    c.seg("F.Cu", (0.0, 0.0), (9.6, 0.0), 0.25, "GND");
+    assert!(findings(&run(&c.fx(None)), "3.3").is_empty());
+}
+
+#[test]
+fn a_net_with_two_current_problems_counts_once() {
+    let mut b = Bd::new(&TWO);
+    b.part(
+        "J1",
+        (0.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "P_NECK").size(2.0, 2.0)],
+    );
+    b.part(
+        "J2",
+        (20.0, 0.0),
+        vec![pd("1", 0.0, 0.0, "P_NECK").size(2.0, 2.0)],
+    );
+    b.seg("F.Cu", (0.0, 0.0), (20.0, 0.0), 0.2, "P_NECK");
+    b.via((10.0, 0.0), "P_NECK");
+    b.part(
+        "J3",
+        (0.0, 10.0),
+        vec![pd("1", 0.0, 0.0, "P_WIDE").size(2.0, 2.0)],
+    );
+    b.part(
+        "J4",
+        (20.0, 10.0),
+        vec![pd("1", 0.0, 0.0, "P_WIDE").size(2.0, 2.0)],
+    );
+    b.seg("F.Cu", (0.0, 10.0), (20.0, 10.0), 2.0, "P_WIDE");
+    let intent = json!({ "schema_version": 1, "currents": [
+        { "net": "P_NECK", "max_current_a": 3.0 }, { "net": "P_WIDE", "max_current_a": 1.0 }] });
+    let r = run(&b.fx(Some(intent)));
+    let fs = findings(&r, "4.2");
+    assert_eq!(fs.len(), 2, "two problems on one net: {fs:?}");
+    assert!(fs.iter().all(|f| f["subject"] == "P_NECK"));
+    let c = check(&r, "4.2");
+    assert_eq!(c["metrics"]["nets_checked"], 2, "{c}");
+    assert_eq!(c["metrics"]["nets_with_problems"], 1, "{c}");
+    assert_eq!(score(&r, "4.2"), 0.5);
+}
+
+#[test]
+fn a_track_over_a_solid_power_plane_is_referenced_not_split() {
+    let mut b = Bd::new(&FOUR);
+    b.part(
+        "J1",
+        (5.0, 5.0),
+        vec![pd("1", 0.0, 0.0, "GND"), pd("2", 2.0, 0.0, "+3V3")],
+    );
+    b.part("A1", (5.0, 15.0), vec![pd("1", 0.0, 0.0, "CLK").on("B.Cu")]);
+    b.part(
+        "A2",
+        (45.0, 15.0),
+        vec![pd("1", 0.0, 0.0, "CLK").on("B.Cu")],
+    );
+    b.seg("B.Cu", (5.0, 15.0), (45.0, 15.0), 0.2, "CLK");
+    b.zone("GND", "In1.Cu", (0.0, 0.0, 50.0, 30.0), true);
+    b.zone("+3V3", "In2.Cu", (0.0, 0.0, 50.0, 30.0), true);
+    let r = run_with(&b.fx(None), json!({ "critical_nets": ["CLK"] }));
+    let c = check(&r, "3.1");
+    let clk = c["metrics"]["nets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["net"] == "CLK")
+        .unwrap();
+    assert!(clk["coverage"].as_f64().unwrap() > 0.98, "{clk}");
+    assert_eq!(clk["layers"][0]["reference_net"], "+3V3");
+    assert_eq!(clk["layers"][0]["reference_kind"], "power");
+    assert!(findings(&r, "3.1").is_empty(), "{:?}", findings(&r, "3.1"));
+    assert_eq!(score(&r, "3.1"), c["score"].as_f64().unwrap());
+    assert!(score(&r, "3.1") > 0.98);
+}
+
+#[test]
+fn a_split_in_a_power_reference_plane_is_still_a_split() {
+    // The power plane is half +3V3 and half +5V: a track over both crosses a split.
+    let mut b = Bd::new(&FOUR);
+    b.part(
+        "J1",
+        (5.0, 5.0),
+        vec![pd("1", 0.0, 0.0, "+3V3"), pd("2", 2.0, 0.0, "+5V")],
+    );
+    b.part("A1", (5.0, 15.0), vec![pd("1", 0.0, 0.0, "CLK").on("B.Cu")]);
+    b.part(
+        "A2",
+        (45.0, 15.0),
+        vec![pd("1", 0.0, 0.0, "CLK").on("B.Cu")],
+    );
+    b.seg("B.Cu", (5.0, 15.0), (45.0, 15.0), 0.2, "CLK");
+    b.zone("+3V3", "In2.Cu", (0.0, 0.0, 30.0, 30.0), true);
+    b.zone("+5V", "In2.Cu", (30.5, 0.0, 50.0, 30.0), true);
+    let r = run_with(&b.fx(None), json!({ "critical_nets": ["CLK"] }));
+    let fs = findings(&r, "3.1");
+    assert_eq!(fs.len(), 1, "{fs:?}");
+    assert!(fs[0]["issue"].as_str().unwrap().contains("'+5V' copper"));
+}
+
+#[test]
+fn zones_without_a_saved_fill_leave_ground_and_completion_unjudged() {
+    let r = run(&fx_text(&without_fills("plane_split.kicad_pcb"), None));
+    // 3.3 does not call the pads of an unfilled pour "cut off".
+    let c = check(&r, "3.3");
+    assert_eq!(c["status"], "not_run", "{c}");
+    assert!(
+        c["reason"].as_str().unwrap().contains("no saved fill"),
+        "{c}"
+    );
+    assert!(findings(&r, "3.3").iter().all(|f| f["severity"] != "error"));
+    // The gate does not count those nets as unrouted, and says it did not judge them.
+    let comp = &r["completion"];
+    assert_eq!(comp["unrouted_nets"], 0, "{comp}");
+    assert!(comp["nets_not_judged"].as_u64().unwrap() >= 1, "{comp}");
+    assert_eq!(comp["status"], "partial");
+    assert!(comp["complete"].is_null());
+    assert!(comp["reason"].as_str().unwrap().contains("no saved fill"));
+    assert_eq!(r["quality"]["routed_share"], 1.0);
+    assert!(r["summary"].as_str().unwrap().contains("NOT FULLY JUDGED"));
+}
+
+#[test]
+fn nets_not_judged_for_an_unfilled_zone_are_left_out_of_the_routed_share() {
+    // GND joins its pads only through a zone that was never filled; SIG is really open.
+    let mut b = gap_board(9.255);
+    b.part(
+        "G1",
+        (0.0, 10.0),
+        vec![pd("1", 0.0, 0.0, "GND").size(1.0, 1.0)],
+    );
+    b.part(
+        "G2",
+        (10.0, 10.0),
+        vec![pd("1", 0.0, 0.0, "GND").size(1.0, 1.0)],
+    );
+    b.zone("GND", "B.Cu", (-2.0, 8.0, 12.0, 12.0), false);
+    let r = run(&b.fx(None));
+    let comp = &r["completion"];
+    assert_eq!(comp["unrouted_nets"], 1, "{comp}");
+    assert_eq!(comp["nets_not_judged"], 1, "{comp}");
+    assert_eq!(comp["complete"], false);
+    // One judged net and it is open: the share is 0, not 1 of 2.
+    assert_eq!(r["quality"]["routed_share"], 0.0);
+}
+
+#[test]
+fn nets_left_out_of_5_1_are_named_and_a_short_tree_is_still_judged() {
+    let mut b = Bd::new(&TWO);
+    // Two pads 0.8 mm apart joined by 8.8 mm of copper: judged against a 1 mm floor.
+    b.part("P1", (10.0, 10.0), vec![pd("1", 0.0, 0.0, "SHORT")]);
+    b.part("P2", (10.8, 10.0), vec![pd("1", 0.0, 0.0, "SHORT")]);
+    b.seg("F.Cu", (10.0, 10.0), (10.0, 14.0), 0.2, "SHORT");
+    b.seg("F.Cu", (10.0, 14.0), (10.8, 14.0), 0.2, "SHORT");
+    b.seg("F.Cu", (10.8, 14.0), (10.8, 10.0), 0.2, "SHORT");
+    // A straight net as the control.
+    b.part("P3", (20.0, 10.0), vec![pd("1", 0.0, 0.0, "LONG")]);
+    b.part("P4", (30.0, 10.0), vec![pd("1", 0.0, 0.0, "LONG")]);
+    b.seg("F.Cu", (20.0, 10.0), (30.0, 10.0), 0.2, "LONG");
+    // Ground carried by a pour: no detour ratio and no via ratio, so it is named, not scored.
+    b.part("G1", (10.0, 20.0), vec![pd("1", 0.0, 0.0, "GND")]);
+    b.part("G2", (20.0, 20.0), vec![pd("1", 0.0, 0.0, "GND")]);
+    b.seg("F.Cu", (10.0, 20.0), (12.0, 20.0), 0.3, "GND");
+    b.zone("GND", "F.Cu", (5.0, 18.0, 25.0, 22.0), true);
+    let r = run(&b.fx(None));
+    let fs = findings(&r, "5.1");
+    assert_eq!(subjects(&fs), vec!["SHORT"], "{fs:?}");
+    assert!(fs[0]["measured"]["detour_ratio"].as_f64().unwrap() > 5.0);
+    let m = &check(&r, "5.1")["metrics"];
+    assert_eq!(
+        m["nets_without_a_detour_ratio"]["listed"][0]["net"], "GND",
+        "{m}"
+    );
+    assert_eq!(m["nets_without_a_detour_ratio"]["count"], 1);
+    assert_eq!(m["nets_not_scored"]["listed"][0]["net"], "GND", "{m}");
+    assert_eq!(m["nets_without_a_via_ratio"]["listed"][0]["net"], "GND");
+}
+
+/// A source pad and `loads` load pads (one part each) on a 2 mm bar along `y`, net `net`.
+fn rail(b: &mut Bd, net: &str, y: f64, loads: usize) {
+    b.part("J", (0.0, y), vec![pd("1", 0.0, 0.0, net).size(3.0, 3.0)]);
+    for k in 0..loads {
+        b.part(
+            &format!("R{k}"),
+            (6.0 + 2.0 * k as f64, y),
+            vec![pd("1", 0.0, 0.0, net)],
+        );
+    }
+    b.seg(
+        "F.Cu",
+        (0.0, y),
+        (6.0 + 2.0 * (loads as f64 - 1.0), y),
+        2.0,
+        net,
+    );
+}
+
+#[test]
+fn loads_beyond_the_per_net_limit_are_said_and_the_farthest_is_measured() {
+    let mut b = Bd::new(&TWO);
+    rail(&mut b, "VZ", 0.0, 14);
+    let intent =
+        json!({ "schema_version": 1, "currents": [{ "net": "VZ", "max_current_a": 3.0 }] });
+    let r = run(&b.fx(Some(intent)));
+    let c = check(&r, "4.3");
+    assert_eq!(c["status"], "partial", "{c}");
+    assert!(c["reason"].as_str().unwrap().contains("more loads"), "{c}");
+    let left = &c["metrics"]["paths_not_measured"]["loads_beyond_the_per_net_limit"];
+    assert_eq!(left[0]["net"], "VZ");
+    assert_eq!(left[0]["loads_not_measured"], 2);
+    // The loads kept run from the nearest to the farthest (R13 is 28 mm along).
+    let paths = c["metrics"]["paths"].as_array().unwrap();
+    assert!(
+        paths
+            .iter()
+            .any(|p| p["path"].as_str().unwrap().ends_with("R13.1")),
+        "{paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|p| p["path"].as_str().unwrap().ends_with("R0.1")),
+        "{paths:?}"
+    );
+}
+
+#[test]
+fn a_ground_return_with_no_ground_pad_is_named_when_3_4_does_not_run() {
+    let mut b = Bd::new(&TWO);
+    rail(&mut b, "VZ", 0.0, 3);
+    let intent =
+        json!({ "schema_version": 1, "currents": [{ "net": "VZ", "max_current_a": 1.0 }] });
+    let r = run(&b.fx(Some(intent)));
+    let c = check(&r, "3.4");
+    assert_eq!(c["status"], "not_run", "{c}");
+    assert!(
+        c["reason"].as_str().unwrap().contains("had no ground pad"),
+        "{c}"
+    );
+}
+
+#[test]
+fn paths_past_the_global_cap_are_counted_by_net() {
+    let mut b = Bd::new(&TWO);
+    let mut currents = Vec::new();
+    for i in 0..41 {
+        let net = format!("VN{i:02}");
+        rail(&mut b, &net, 5.0 * i as f64, 2);
+        currents.push(json!({ "net": net, "max_current_a": 1.0 }));
+    }
+    let r = run(&b.fx(Some(json!({ "schema_version": 1, "currents": currents }))));
+    let c = check(&r, "4.3");
+    assert_eq!(c["status"], "partial", "{c}");
+    assert!(c["reason"].as_str().unwrap().contains("cap of 80"), "{c}");
+    let capped = c["metrics"]["paths_not_measured"]["paths_past_the_global_cap_of_80"]
+        .as_array()
+        .unwrap();
+    assert_eq!(capped.len(), 1, "{capped:?}");
+    assert_eq!(capped[0]["net"], "VN40");
+    assert_eq!(capped[0]["paths_not_measured"], 2);
+}
+
+#[test]
+fn an_explicit_netclass_assignment_and_a_pattern_both_apply_as_in_kicad() {
+    // KiCad joins every assigned and every matching pattern class into one effective class.
+    let pro = json!({ "net_settings": { "classes": [],
+        "netclass_patterns": [{ "netclass": "Analog", "pattern": "*" }],
+        "netclass_assignments": { "N_STUB": ["Power"] } } });
+    let r = run(&fx("routing.kicad_pcb", None, Some(pro)));
+    assert!(
+        r["net_roles"]["power"]["nets"].get("N_STUB").is_some(),
+        "{}",
+        r["net_roles"]
+    );
+    // The same net with two matching patterns, Analog first.
+    let pro = json!({ "net_settings": { "classes": [], "netclass_patterns": [
+        { "netclass": "Analog", "pattern": "N_STUB" },
+        { "netclass": "Power", "pattern": "N_*" }] } });
+    let r = run(&fx("routing.kicad_pcb", None, Some(pro)));
+    let why = r["net_roles"]["power"]["nets"]["N_STUB"].as_str().unwrap();
+    assert!(why.contains("Analog") && why.contains("Power"), "{why}");
+}
+
+fn without_vias_of(name: &str, net: &str) -> String {
+    let text = std::fs::read_to_string(fixture_path(name)).unwrap();
+    let mut out = String::new();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("\n\t(via") {
+        out.push_str(&rest[..i]);
+        let mut depth = 0;
+        let mut end = i + 1;
+        for (k, c) in rest[i + 1..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1 + k + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &rest[i..end];
+        if !block.contains(&format!("(net \"{net}\")")) {
+            out.push_str(block);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn no_stitching_candidate_is_null_not_a_million_millimetres() {
+    let r = run(&fx_text(
+        &without_vias_of("layer_change.kicad_pcb", "GND"),
+        None,
+    ));
+    let c = check(&r, "3.2");
+    assert!(!findings(&r, "3.2").is_empty(), "{c}");
+    assert!(c["metrics"]["worst_nearest_mm"].is_null(), "{c}");
+    assert!(c["metrics"]["worst_nearest_note"]
+        .as_str()
+        .unwrap()
+        .contains("no distance to report"));
+    assert!(
+        c["metrics"]["unstitched_with_no_candidate_on_board"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(findings(&r, "3.2")
+        .iter()
+        .all(|f| f["measured"]["nearest_stitch_mm"].is_null()));
+}
+
+#[test]
+fn findings_name_the_items_they_are_about() {
+    let r = run(&fx("routing.kicad_pcb", None, None));
+    // Acute corners: the tracks that meet at the corner.
+    let acute = findings(&r, "5.3")
+        .into_iter()
+        .find(|f| f["issue"].as_str().unwrap().starts_with("Acid trap"))
+        .unwrap();
+    assert!(!acute["uuids"].as_array().unwrap().is_empty(), "{acute}");
+    // A pair's length mismatch: tracks of both nets.
+    let skew = f_for(&r, "5.4", "length");
+    assert!(!skew.is_empty());
+    assert!(skew
+        .iter()
+        .all(|f| !f["uuids"].as_array().unwrap().is_empty()));
+    // Ground cut off from its pads: the pads that are cut off.
+    let text = without_vias_of("plane_split.kicad_pcb", "GND");
+    let r = run(&fx_text(&text, None));
+    let cut: Vec<_> = findings(&r, "3.3")
+        .into_iter()
+        .filter(|f| f["severity"] == "error")
+        .collect();
+    assert_eq!(cut.len(), 1, "{cut:?}");
+    assert!(
+        !cut[0]["uuids"].as_array().unwrap().is_empty(),
+        "{}",
+        cut[0]
     );
 }
