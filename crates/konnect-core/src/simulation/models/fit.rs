@@ -89,7 +89,7 @@ pub(crate) fn root(f: impl Fn(f64) -> f64, mut low: f64, mut high: f64) -> Optio
 
 /// Solve `a x = b` by Gaussian elimination with partial pivoting. None for a
 /// singular system.
-fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+pub(crate) fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     let n = b.len();
     for column in 0..n {
         let pivot =
@@ -114,6 +114,37 @@ fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
         x[row] = (b[row] - tail) / a[row][row];
     }
     x.iter().all(|value| value.is_finite()).then_some(x)
+}
+
+/// Whether a least-squares fit's normal matrix fixes every term. The matrix is
+/// scaled to a unit diagonal, so terms of any size compare alike, and then
+/// factored: a pivot below a part in 1e12 of that diagonal means the values
+/// leave some term free, which `solve`'s absolute test lets through as an
+/// arbitrary answer.
+pub(crate) fn independent(normal: &[Vec<f64>]) -> bool {
+    let n = normal.len();
+    let scale: Vec<f64> = (0..n).map(|i| normal[i][i].sqrt()).collect();
+    if scale.iter().any(|s| !(s.is_finite() && *s > 0.0)) {
+        return false;
+    }
+    // Cholesky on the scaled matrix, whose diagonal is one.
+    let mut l = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in 0..=i {
+            let scaled = normal[i][j] / (scale[i] * scale[j]);
+            let sum: f64 = (0..j).map(|k| l[i][k] * l[j][k]).sum();
+            if i == j {
+                let pivot = scaled - sum;
+                if !(pivot.is_finite() && pivot > 1e-12) {
+                    return false;
+                }
+                l[i][i] = pivot.sqrt();
+            } else {
+                l[i][j] = (scaled - sum) / l[j][j];
+            }
+        }
+    }
+    true
 }
 
 /// The parameters that make the squares of `residuals` least, by
@@ -259,6 +290,32 @@ mod tests {
             |p| p[1] = p[1].min(0.3),
         );
         assert!((held[1] - 0.3).abs() < 1e-9, "{held:?}");
+    }
+
+    #[test]
+    fn a_normal_matrix_that_leaves_a_term_free_is_not_independent() {
+        let normal = |rows: &[[f64; 3]]| {
+            let mut a = vec![vec![0.0; 3]; 3];
+            for r in rows {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        a[i][j] += r[i] * r[j];
+                    }
+                }
+            }
+            a
+        };
+        // Two rows fix two of three terms; roundoff leaves solve a pivot far
+        // above its absolute floor, so it returns an answer.
+        let two = normal(&[[1.0, 0.0, -1e-3], [1.0, 7.0, -1e-2]]);
+        assert!(!independent(&two));
+        // A nearly singular matrix keeps a small positive pivot, which only
+        // the relative floor catches.
+        let near = 1.0 - 1e-14;
+        assert!(!independent(&[vec![1.0, near], vec![near, 1.0]]));
+        // Terms of very different sizes still count when they are fixed.
+        let three = normal(&[[1.0, 0.0, -1e-6], [1.0, 7.0, -1e-6], [1.0, 0.0, -2e-6]]);
+        assert!(independent(&three));
     }
 
     #[test]
