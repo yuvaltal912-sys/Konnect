@@ -5,6 +5,8 @@
 
 #[path = "library_correctness.rs"]
 mod correctness;
+#[path = "library_part_import.rs"]
+mod part_import;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -469,6 +471,14 @@ pub fn tools() -> Vec<ToolDef> {
     tools.extend(correctness::tools());
     tools.extend(super::item_render::library_tools());
     tools
+}
+
+/// `import_library_part` is registered in the `integration` toolset, next to
+/// the JLCPCB part search and datasheet tools, so that `library` stays within
+/// the router's 20-tool cap (`MAX_TOOLS_PER_TOOLSET`) once
+/// `render_library_item` joins it.
+pub(crate) fn part_import_tool() -> ToolDef {
+    part_import::tool()
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

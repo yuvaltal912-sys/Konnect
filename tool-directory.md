@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **267 registered tools** + **7 always-visible meta-tools** = **274 total**
+- **268 registered tools** + **7 always-visible meta-tools** = **275 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -389,8 +389,8 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 
 ## Integration
 
-### `integration` · 9 tools
-**Purpose:** JLCPCB parts database, local Freerouting MCP routing, datasheet URLs.
+### `integration` · 10 tools
+**Purpose:** JLCPCB parts database, importing a downloaded part's KiCad files into a project library, local Freerouting MCP routing, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
 | Tool | Description |
@@ -402,6 +402,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
+| `import_library_part` | Copy one part's KiCad-format symbol, footprint and optional 3D model from local files (an EasyEDA/LCSC export, SnapEDA or Ultra Librarian download) into `<library>.kicad_sym`, `<library>.pretty` and `<library>.3dshapes` in the project, and register both libraries. No network access. Previews by default (target paths, pins, pads, pin-pad check, `revision`); applies only with that revision, in one transaction with readback. Never overwrites: reuses an identical footprint or model, and blocks on an existing symbol, a different footprint or model, a nickname bound elsewhere, a library registered under another nickname or a disabled registration. Sets Footprint and optional LCSC/MPN/Manufacturer fields. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, then report `engine_found`, `native_mcp_available`, and `bridge_available` as separate observed facts. Reads the Java version the JAR needs from the JAR itself, finds a Java that meets it (`java_path`, `JAVA_HOME`, `PATH`, the usual JDK folders), and returns `setup` with the exact steps when the JAR or the Java is missing. `version_policy` names the recommended Freerouting release with its measured reason and warns when the installed JAR differs. `available` is false when the JAR prints its version and then crashes. Downloads and installs nothing. |
 | `route_specctra_dsn` | Route a DSN through the discovered local Freerouting JAR's native headless MCP server and create a new SES without cloud upload or replacement. The owned unauthenticated service is loopback-only; its child is reaped on every exit path. Refuses before starting anything when no Java meets the JAR's requirement. Freerouting's automatic neck-down is off unless `allow_neckdown` is set; the project's copper-to-edge clearance and, only when every net has the same minimum width, Freerouting's retry width come from the export's manifest; `rules_applied` says what was used and, when the retry is off, why (`retry_off_reason`). |
 

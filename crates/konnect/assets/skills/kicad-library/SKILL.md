@@ -24,6 +24,7 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info,
                            # render_library_item
+load_toolset('integration')    # import_library_part (a downloaded part's KiCad files)
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -33,6 +34,17 @@ Before layout, use `check_symbol_footprint` with the symbol library path,
 symbol name and footprint path. Inspect `result`, `missing_pads` and
 `extra_pads`; unresolved inheritance is incomplete evidence. An identifier-set
 match does not replace the accepted physical datasheet pin map below.
+
+To use a real part the user downloaded (an EasyEDA/LCSC export, SnapEDA, Ultra
+Librarian, a vendor's KiCad files), load `integration` and call `import_library_part` with the project,
+the `.kicad_sym`, the `.kicad_mod` and, if there is one, the `.step` model. Show
+the user the preview's pins, pads and pin-pad check result, then apply with its
+`revision`. The tool never downloads anything: EasyEDA's terms forbid automated
+fetches, so ask the user to export or download the files themselves. It never
+overwrites. A footprint or model already in the library with the same bytes is
+reused, so parts that share a footprint can go into one library. An existing
+symbol, or a different footprint or model with the same name, is a blocker:
+pick another `library` name.
 
 Use `edit_symbol` for metadata-only changes; it preserves pin/graphic geometry
 and existing field positioning. Refresh placed definitions separately. Search
