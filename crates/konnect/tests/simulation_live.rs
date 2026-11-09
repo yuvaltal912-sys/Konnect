@@ -4244,7 +4244,12 @@ fn behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_f
         )
     };
     let op_amp = json!([
-        typical("open_loop_gain", 2.5e4, json!({})),
+        // The DC gain at a load, which the gain bench applies.
+        typical(
+            "open_loop_gain",
+            2.5e4,
+            json!({ "load_resistance_ohms": 1000.0 })
+        ),
         typical("open_loop_gain", 22.0, json!({ "frequency_hz": 5e6 })),
         typical("gain_bandwidth_product", 1.1e8, json!({})),
         typical("slew_rate", 1.45e8, json!({})),

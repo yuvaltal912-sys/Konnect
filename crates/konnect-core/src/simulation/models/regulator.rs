@@ -143,6 +143,15 @@ pub(crate) fn build(
     let (fit_points, held) = hold_out(&points);
     let law_line = distinct(&fit_points, |p| p.vin);
     let law_load = distinct(&fit_points, |p| p.iout);
+    if !separable(&fit_points) {
+        return Err(Invalid::new(
+            "characteristics",
+            "the output_voltage values change input voltage and load current together, so \
+             line regulation cannot be told from load regulation; add a value at one of their \
+             input voltages and another load current, or at one of their load currents and \
+             another input voltage",
+        ));
+    }
     let vin0 = points[0].vin;
     let (v0, line, rout) = fit_output(&fit_points, vin0, law_line, law_load).ok_or_else(|| {
         Invalid::new(
@@ -451,6 +460,28 @@ fn unknowns(points: &[Point]) -> usize {
     1 + usize::from(distinct(points, |p| p.vin)) + usize::from(distinct(points, |p| p.iout))
 }
 
+/// Whether points that vary in both input voltage and load current vary them
+/// apart, so the line and load terms are each fixed: the two must not lie on
+/// one line in the (input voltage, load current) plane. Points that vary in
+/// one alone, or in neither, are separable.
+fn separable(points: &[Point]) -> bool {
+    if !(distinct(points, |p| p.vin) && distinct(points, |p| p.iout)) {
+        return true;
+    }
+    let n = points.len() as f64;
+    let mean_v = points.iter().map(|p| p.vin).sum::<f64>() / n;
+    let mean_i = points.iter().map(|p| p.iout).sum::<f64>() / n;
+    let (mut vv, mut ii, mut vi) = (0.0, 0.0, 0.0);
+    for p in points {
+        let (dv, di) = (p.vin - mean_v, p.iout - mean_i);
+        vv += dv * dv;
+        ii += di * di;
+        vi += dv * di;
+    }
+    // One less the squared correlation of input voltage with load current.
+    vv * ii - vi * vi > 1e-6 * vv * ii
+}
+
 /// With more values than the fit needs, the one nearest the middle of the
 /// load (then input) order whose absence leaves every term fixed is held out.
 fn hold_out(points: &[Point]) -> (Vec<Point>, Option<Point>) {
@@ -480,7 +511,7 @@ fn hold_out(points: &[Point]) -> (Vec<Point>, Option<Point>) {
             .filter(|(at, _)| *at != held)
             .map(|(_, p)| *p)
             .collect();
-        if unknowns(&rest) == needed {
+        if unknowns(&rest) == needed && separable(&rest) {
             return (rest, Some(points[held]));
         }
     }
@@ -511,6 +542,9 @@ fn fit_output(points: &[Point], vin0: f64, line: bool, load: bool) -> Option<(f6
                 normal[a][b] += r[a] * r[b];
             }
         }
+    }
+    if !fit::independent(&normal) {
+        return None;
     }
     let solution = fit::solve(normal, rhs)?;
     let mut terms = solution.into_iter();
@@ -694,6 +728,62 @@ mod tests {
         assert!(model.assumed.iter().any(|a| a.contains("sinks current")));
         assert!(!model.body.contains("1.000000e6*"));
         assert!(build_model(Kind::Ldo, "ref25_fit", &values, 25.0).is_err());
+    }
+
+    #[test]
+    fn values_that_change_input_and_load_together_are_refused() {
+        // Two values that differ in both input voltage and load current leave
+        // three terms to two equations.
+        let diagonal = parsed(json!([output(5.0, 1e-3, 2.5), output(12.0, 0.01, 2.499)]));
+        let error = build_model(Kind::VoltageReference, "x_fit", &diagonal, 25.0).unwrap_err();
+        assert_eq!(error.field, "characteristics");
+        assert!(error
+            .reason
+            .contains("line regulation cannot be told from load regulation"));
+        // So do three on one line in input voltage and load current.
+        let collinear = parsed(json!([
+            output(5.0, 0.0, 3.3),
+            output(8.0, 0.01, 3.299),
+            output(11.0, 0.02, 3.297)
+        ]));
+        let error = build_model(Kind::VoltageReference, "x_fit", &collinear, 25.0).unwrap_err();
+        assert_eq!(error.field, "characteristics");
+        // The fit itself refuses such a design rather than solve it to an
+        // arbitrary answer.
+        let points: Vec<Point> = [(5.0, 1e-3, 2.5), (12.0, 0.01, 2.499)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (vin, iout, vout))| Point {
+                vin,
+                iout,
+                vout,
+                index,
+            })
+            .collect();
+        assert!(fit_output(&points, 5.0, true, true).is_none());
+    }
+
+    #[test]
+    fn the_value_that_separates_line_from_load_is_never_held_out() {
+        // Three values on one line and one off it, which sits in the middle of
+        // the load order; holding it out would leave the rest on the line.
+        // The law: 3.3 V, 1 mV/V, 0.1 ohm.
+        let values = parsed(json!([
+            output(5.0, 0.0, 3.3),
+            output(8.0, 0.01, 3.302),
+            output(11.0, 0.02, 3.304),
+            output(11.0, 0.0, 3.306)
+        ]));
+        let model = build_model(Kind::VoltageReference, "x_fit", &values, 25.0).unwrap();
+        let held: Vec<_> = model
+            .checks
+            .iter()
+            .filter(|c| c.role == Role::HeldOut)
+            .map(|c| c.characteristic)
+            .collect();
+        assert_eq!(held, [1]);
+        assert!((fitted(&model, "line_regulation") - 1e-3).abs() < 1e-9);
+        assert!((fitted(&model, "output_resistance") - 0.1).abs() < 1e-9);
     }
 
     #[test]

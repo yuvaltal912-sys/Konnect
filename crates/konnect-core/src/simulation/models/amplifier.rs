@@ -65,6 +65,12 @@ const TRANSIENT_TOLERANCES: &str = ".options reltol=1e-4 vntol=1e-7 abstol=1e-13
 /// output to the inverting input, and a capacitor that grounds that input at
 /// every frequency a check reads. Their product is the servo's time constant.
 const SERVO_SECONDS: f64 = 1e15;
+/// A DC open-loop gain at or below this is refused: datasheets state the gain
+/// as 40 to 160 dB, and a voltage-feedback op-amp's ratio is far above 160.
+const DB_LIKE_GAIN: f64 = 160.0;
+/// The least input-stage linear range, slew rate over `2 pi GBW`, taken as a
+/// slew rate in V/s; real parts sit at tens of millivolts or more.
+const MIN_LINEAR_RANGE: f64 = 1e-3;
 
 /// The fitted core.
 #[derive(Debug, Clone, Copy)]
@@ -302,26 +308,58 @@ pub(crate) fn build(
                  values off the Bode plot carry their frequency_hz",
             ));
         };
-        if dc.value < 100.0 {
+        if dc.value <= DB_LIKE_GAIN {
             return Err(Invalid::new(
                 dc.field("value"),
-                "the DC open-loop gain must be at least 100, as a ratio: 100 dB is 1e5",
+                format!(
+                    "the DC open-loop gain is a ratio, and {} reads as dB: give 10^(dB/20), \
+                     so 100 dB is 1e5; no voltage-feedback op-amp has a gain this low",
+                    number(dc.value)
+                ),
             ));
         }
         let gbw = single(Quantity::GainBandwidthProduct).map_or(0.0, |c| c.value);
-        core.gm = dc.value / GAIN_RESISTANCE;
+        // A gain stated at a load is the core's gain less the output
+        // resistance's share of it.
+        let unloaded = match dc.condition(LOAD_RESISTANCE) {
+            Some(load) => {
+                if core.rout > 0.0 {
+                    model.fitted.push(format!(
+                        "the DC gain unloaded, from the gain at {} ohm and the output resistance",
+                        number(load)
+                    ));
+                }
+                dc.value * (load + core.rout) / load
+            }
+            None => dc.value,
+        };
+        core.gm = unloaded / GAIN_RESISTANCE;
         core.ca = core.gm / (std::f64::consts::TAU * gbw);
-        let slew = single(Quantity::SlewRate).map_or_else(
-            || {
+        let slew = match single(Quantity::SlewRate) {
+            None => {
                 model.assumed.push(format!(
                     "no slew rate: the input stage is linear over {} V, which gives {} V/s",
                     number(ASSUMED_LINEAR_RANGE),
                     number(std::f64::consts::TAU * gbw * ASSUMED_LINEAR_RANGE)
                 ));
                 std::f64::consts::TAU * gbw * ASSUMED_LINEAR_RANGE
-            },
-            |c| c.value,
-        );
+            }
+            // The slew rate over the gain-bandwidth product is the input
+            // stage's linear range: tens of millivolts or more on a real part,
+            // and a millionth of that for a value given in V/us.
+            Some(c) if c.value / (std::f64::consts::TAU * gbw) < MIN_LINEAR_RANGE => {
+                return Err(Invalid::new(
+                    c.field("value"),
+                    format!(
+                        "this slew rate is too slow for the gain-bandwidth product: it leaves \
+                         the input stage linear over {} V; slew_rate is in V/s, so 0.3 V/us \
+                         is 3e5",
+                        number(c.value / (std::f64::consts::TAU * gbw))
+                    ),
+                ));
+            }
+            Some(c) => c.value,
+        };
         core.imax = slew * core.ca;
         gains.push(dc);
         gains.extend(at_frequency);
@@ -725,8 +763,49 @@ fn held_input(bench: &mut Bench, model: &Model, core: &Core, supply: f64, sign: 
     id
 }
 
-/// The open-loop gain, by a unit AC drive on `INP` with a DC servo from the
-/// output to `INN`, so the offset cannot saturate the output.
+/// The servo resistor for a gain fixture at `supply`: the bias current
+/// through it must leave the output well inside the rails.
+fn servo_resistance(core: &Core, supply: f64) -> f64 {
+    if core.ib > 0.0 {
+        (0.05 * supply / core.ib).min(1e6)
+    } else {
+        1e6
+    }
+}
+
+/// An open-loop gain fixture: a unit AC drive on `INP` with a DC servo from
+/// the output to `INN`, so the offset cannot saturate the output, at `supply`
+/// and with `load` from the output to ground, which is mid-supply. Returns the
+/// output node.
+fn gain_fixture(
+    bench: &mut Bench,
+    model: &Model,
+    core: &Core,
+    supply: f64,
+    load: Option<f64>,
+) -> String {
+    let id = bench.id();
+    let (input, inverting, output) = (format!("{id}i"), format!("{id}m"), format!("{id}o"));
+    supplies(&mut bench.ac, &id, supply);
+    bench.ac.push(Bench::voltage(&id, &input, 0.0, true));
+    let nodes = instance_nodes(&id, &input, &inverting);
+    let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
+    bench.ac.push(model.instance(&id, &nodes));
+    let servo = servo_resistance(core, supply);
+    bench
+        .ac
+        .push(format!("R{id}f {output} {inverting} {}", number(servo)));
+    bench.ac.push(format!(
+        "C{id}f {inverting} 0 {}",
+        number(SERVO_SECONDS / servo)
+    ));
+    if let Some(load) = load {
+        bench.ac.push(format!("R{id}l {output} 0 {}", number(load)));
+    }
+    output
+}
+
+/// The open-loop gain, each value on a fixture at its own supply and load.
 fn check_gains(
     model: &mut Model,
     bench: &mut Bench,
@@ -739,38 +818,29 @@ fn check_gains(
     let a0 = core.gm * GAIN_RESISTANCE;
     let gbw = core.gm / (std::f64::consts::TAU * core.ca);
     let pole = gbw / a0;
-    let id = bench.id();
-    let (input, inverting, output) = (format!("{id}i"), format!("{id}m"), format!("{id}o"));
-    supplies(&mut bench.ac, &id, supply);
-    bench.ac.push(Bench::voltage(&id, &input, 0.0, true));
-    let nodes = instance_nodes(&id, &input, &inverting);
-    let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
-    bench.ac.push(model.instance(&id, &nodes));
-    // The bias current through the servo resistor must leave the output well
-    // inside the rails.
-    let servo = if core.ib > 0.0 {
-        (0.05 * supply / core.ib).min(1e6)
-    } else {
-        1e6
+    // One fixture for each supply and load the values state.
+    let mut fixtures: Vec<(f64, Option<f64>, String)> = Vec::new();
+    let mut fixture = |bench: &mut Bench, model: &Model, c: &Characteristic| -> String {
+        let (volts, load) = (supply_of(Some(c), supply), c.condition(LOAD_RESISTANCE));
+        if let Some((_, _, output)) = fixtures.iter().find(|f| f.0 == volts && f.1 == load) {
+            return output.clone();
+        }
+        let output = gain_fixture(bench, model, core, volts, load);
+        fixtures.push((volts, load, output.clone()));
+        output
     };
-    bench
-        .ac
-        .push(format!("R{id}f {output} {inverting} {}", number(servo)));
-    bench.ac.push(format!(
-        "C{id}f {inverting} 0 {}",
-        number(SERVO_SECONDS / servo)
-    ));
     for c in gains {
         let (hz, role) = match c.condition(FREQUENCY) {
             Some(hz) => (hz, Role::HeldOut),
             None => (pole / 100.0, Role::Fit),
         };
+        let node = fixture(bench, model, c);
         model.checks.push(Check {
             characteristic: c.index,
             role,
             expected: c.value,
             probe: Probe::Gain {
-                node: output.clone(),
+                node,
                 hz,
                 scale: 1.0,
             },
@@ -779,17 +849,19 @@ fn check_gains(
     if let Some(c) = product {
         // Far above the pole, the gain times the frequency is the product.
         let hz = gbw / 10.0;
+        let node = fixture(bench, model, c);
         model.checks.push(Check {
             characteristic: c.index,
             role: Role::Fit,
             expected: c.value,
             probe: Probe::Gain {
-                node: output.clone(),
+                node,
                 hz,
                 scale: hz,
             },
         });
     }
+    let servo = servo_resistance(core, supply);
     if let Some(c) = rout {
         let id = bench.id();
         let (input, inverting, output) = (format!("{id}i"), format!("{id}m"), format!("{id}o"));
@@ -1187,6 +1259,77 @@ mod tests {
         delayed.push(delay(0.01, 1e-6));
         let error = build_model(Kind::OpAmp, "x_fit", &parsed(json!(delayed)), 25.0).unwrap_err();
         assert_eq!(error.field, "characteristics[10].quantity");
+    }
+
+    #[test]
+    fn a_gain_in_db_or_a_slew_rate_in_v_per_us_is_refused() {
+        // 120 typed as dB would fit a pole at GBW / 120.
+        for db in [40.0, 120.0, 160.0] {
+            let mut gain = op_amp_values();
+            gain[0] = value("open_loop_gain", db, json!({}));
+            let error = build_model(Kind::OpAmp, "x_fit", &parsed(json!(gain)), 25.0).unwrap_err();
+            assert_eq!(error.field, "characteristics[0].value");
+            assert!(error.reason.contains("reads as dB"), "{}", error.reason);
+        }
+        // 0.3 typed as V/us would slew a million times too slowly.
+        let mut slow = op_amp_values();
+        slow[3] = value("slew_rate", 0.3, json!({}));
+        let error = build_model(Kind::OpAmp, "x_fit", &parsed(json!(slow)), 25.0).unwrap_err();
+        assert_eq!(error.field, "characteristics[3].value");
+        assert!(error.reason.contains("V/s"), "{}", error.reason);
+        // The same rate in V/s is taken.
+        slow[3] = value("slew_rate", 0.3e6, json!({}));
+        build_model(Kind::OpAmp, "x_fit", &parsed(json!(slow)), 25.0).unwrap();
+    }
+
+    #[test]
+    fn a_gain_stated_at_a_load_and_supply_is_fitted_and_checked_there() {
+        // The first supply stated is 10 V, so only the gain's own 5 V puts
+        // its fixture at 5 V.
+        let values = parsed(json!([
+            value(
+                "supply_current",
+                0.5e-3,
+                json!({ "supply_voltage_volts": 10.0 })
+            ),
+            value(
+                "open_loop_gain",
+                1e5,
+                json!({ "load_resistance_ohms": 2000.0, "supply_voltage_volts": 5.0 })
+            ),
+            value("gain_bandwidth_product", 1e6, json!({})),
+            value("output_resistance", 1000.0, json!({}))
+        ]));
+        let model = build_model(Kind::OpAmp, "x_fit", &values, 25.0).unwrap();
+        // The core's gain is raised by the output resistance's share.
+        let a0 = fitted(&model, "transconductance") * GAIN_RESISTANCE;
+        assert!((a0 - 1.5e5).abs() < 1e-6, "{a0}");
+        // The gain's check reads an output loaded by 2 kohm on a 5 V supply.
+        let check = model.checks.iter().find(|c| c.characteristic == 1).unwrap();
+        let Probe::Gain { node, .. } = &check.probe else {
+            panic!("{:?}", check.probe)
+        };
+        let id = node.strip_suffix('o').unwrap();
+        assert!(model
+            .bench
+            .ac
+            .contains(&format!("R{id}l {node} 0 2.000000e3")));
+        assert!(model
+            .bench
+            .ac
+            .contains(&format!("V{id}p {id}p 0 DC 2.500000e0")));
+        // The product, which states neither, is read on an unloaded fixture.
+        let product = model.checks.iter().find(|c| c.characteristic == 2).unwrap();
+        let Probe::Gain { node: other, .. } = &product.probe else {
+            panic!("{:?}", product.probe)
+        };
+        assert_ne!(other, node);
+        let other_id = other.strip_suffix('o').unwrap();
+        assert!(!model
+            .bench
+            .ac
+            .iter()
+            .any(|line| line.starts_with(&format!("R{other_id}l "))));
     }
 
     #[test]
