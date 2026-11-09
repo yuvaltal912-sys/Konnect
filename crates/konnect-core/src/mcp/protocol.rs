@@ -196,6 +196,7 @@ impl CallToolResult {
 
     /// Keep machine-readable facts in text and the PNG in an MCP image block,
     /// where image-capable clients can inspect it without parsing base64 text.
+    /// Callers check [`inline_over_budget`] first.
     pub fn json_with_png(metadata: &impl Serialize, png: &[u8]) -> Self {
         use base64::Engine as _;
         let mut result = Self::json(metadata);
@@ -205,6 +206,82 @@ impl CallToolResult {
         });
         result
     }
+}
+
+// ─── Inline image budget ─────────────────────────────────────────────────────
+
+/// The largest side an inline image block may have: the Claude API's
+/// documented per-image limit of 8000 px.
+pub const INLINE_IMAGE_MAX_SIDE_PX: u32 = 8000;
+
+/// The largest PNG an inline image block may carry. The Claude API's
+/// documented per-image limit is 5 MB, and 3,750,000 bytes are 5,000,000
+/// once base64-encoded.
+pub const INLINE_IMAGE_MAX_PNG_BYTES: usize = 3_750_000;
+
+/// An image too large for an inline block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineOverBudget {
+    /// Which limit the image breaks, with its numbers.
+    pub reason: String,
+    /// The widest `width_px` at the same aspect ratio that should fit.
+    pub fit_width_px: u32,
+}
+
+impl InlineOverBudget {
+    /// The refusal a tool returns instead of the image: the limit and the
+    /// remedies, where `narrow` adds the tool's own (such as a region), and
+    /// a PNG file already written is named rather than hidden.
+    pub fn refusal(&self, narrow: &str, written: Option<&std::path::Path>) -> CallToolResult {
+        let written = written
+            .map(|path| format!(" The PNG was still written to {}.", path.display()))
+            .unwrap_or_default();
+        CallToolResult::error(format!(
+            "the render is too large to return inline: {}. Lower width_px (about {} or less \
+             fits){narrow}, or set 'inline' false with an 'output' path.{written}",
+            self.reason, self.fit_width_px
+        ))
+    }
+}
+
+/// The one inline budget every image-returning tool checks before
+/// [`CallToolResult::json_with_png`]. `None` when the image fits.
+pub fn inline_over_budget(
+    width_px: u32,
+    height_px: u32,
+    png_bytes: usize,
+) -> Option<InlineOverBudget> {
+    let reason = if width_px.max(height_px) > INLINE_IMAGE_MAX_SIDE_PX {
+        format!(
+            "the image is {width_px} x {height_px} px, over the inline limit of \
+             {INLINE_IMAGE_MAX_SIDE_PX} px per side"
+        )
+    } else if png_bytes > INLINE_IMAGE_MAX_PNG_BYTES {
+        format!(
+            "the PNG is {png_bytes} bytes, over the inline limit of \
+             {INLINE_IMAGE_MAX_PNG_BYTES} bytes (about 5 MB once base64-encoded)"
+        )
+    } else {
+        return None;
+    };
+    Some(InlineOverBudget {
+        reason,
+        fit_width_px: inline_fit_width_px(width_px, height_px, Some(png_bytes)),
+    })
+}
+
+/// The widest width at the same aspect ratio that keeps both sides within
+/// [`INLINE_IMAGE_MAX_SIDE_PX`] and, when the PNG size is known, its bytes
+/// within [`INLINE_IMAGE_MAX_PNG_BYTES`]. PNG size is assumed to scale
+/// with pixel area, less a 10% margin, so that part is an estimate.
+pub fn inline_fit_width_px(width_px: u32, height_px: u32, png_bytes: Option<usize>) -> u32 {
+    let longest = f64::from(width_px.max(height_px).max(1));
+    // One pixel of slack for the caller's rounding of the other side.
+    let mut scale = (f64::from(INLINE_IMAGE_MAX_SIDE_PX - 1) / longest).min(1.0);
+    if let Some(bytes) = png_bytes.filter(|bytes| *bytes > INLINE_IMAGE_MAX_PNG_BYTES) {
+        scale = scale.min(0.9 * (INLINE_IMAGE_MAX_PNG_BYTES as f64 / bytes as f64).sqrt());
+    }
+    ((f64::from(width_px) * scale).floor() as u32).clamp(1, width_px.max(1))
 }
 
 // ─── MCP Notifications ───────────────────────────────────────────────────────
@@ -250,6 +327,22 @@ mod tests {
             })
         );
         assert_eq!(value["isError"], false);
+    }
+
+    #[test]
+    fn inline_budget_refuses_a_side_over_8000_px_or_a_png_over_3_75_mb() {
+        assert_eq!(inline_over_budget(8000, 8000, 3_750_000), None);
+        let tall = inline_over_budget(1600, 8160, 1000).unwrap();
+        assert!(tall.reason.contains("1600 x 8160 px"), "{tall:?}");
+        assert!(tall.reason.contains("8000 px per side"), "{tall:?}");
+        // 1568 px wide keeps the region's height at 7997 px.
+        assert_eq!(tall.fit_width_px, 1568);
+        let heavy = inline_over_budget(4096, 4096, 7_500_000).unwrap();
+        assert!(heavy.reason.contains("7500000 bytes"), "{heavy:?}");
+        assert!(heavy.reason.contains("3750000 bytes"), "{heavy:?}");
+        // Half the bytes needs about 1/sqrt(2) of the width, less the margin.
+        assert_eq!(heavy.fit_width_px, 2606);
+        assert_eq!(inline_fit_width_px(100, 50, None), 100);
     }
 
     #[test]

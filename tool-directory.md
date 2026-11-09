@@ -201,9 +201,9 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
-| `render_schematic_png` | Render a sheet or `region: {x, y, width, height}` in page mm to PNG at `width_px`, using deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds a real MCP PNG image block alongside JSON metadata. Region output is capped at 8192 pixels high and 16,777,216 pixels total. |
+| `render_schematic_png` | Render a sheet or `region: {x, y, width, height}` in page mm to PNG at `width_px`, using deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds a real MCP PNG image block alongside JSON metadata. Region output is capped at 8192 pixels high and 16,777,216 pixels total; an inline image over 8000 px a side or 3,750,000 PNG bytes is refused, and the file is still written. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
-| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged. `inline_diff` adds a generated difference image as an MCP PNG image block alongside the metrics: added drawing green, removed red, recoloured orange, unchanged drawing faded, and a blue box around the change; the legend is in `diff_image`. |
+| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged. `inline_diff` adds a generated difference image as an MCP PNG image block alongside the metrics: added drawing green, removed red, recoloured orange, unchanged drawing faded, and a blue box around the change; the legend is in `diff_image`. Over 16,777,216 pixels, 8000 px a side or 3,750,000 PNG bytes the image is skipped: `diff_image` is null, a warning names a baseline `width_px` that fits, and status and metrics are unchanged. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
@@ -335,7 +335,7 @@ and Windows servers do not.
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
 | `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. |
 | `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. |
-| `render_board_layers` | Plot named board layers (2D, from the saved file) and return a PNG as an MCP image block next to JSON metadata. Framed on the board-edge bounding box, or a `region: {x, y, width, height}` crop in board mm at `width_px`. KiCad plot colours on the editor's dark background, or `black_and_white`. Undeclared layers are refused; capped at 4096 px wide, 8192 px high and 16,777,216 pixels. |
+| `render_board_layers` | Plot named board layers (2D, from the saved file) and return a PNG as an MCP image block next to JSON metadata. Framed on the board-edge bounding box, or a `region: {x, y, width, height}` crop in board mm at `width_px`. KiCad's default plot colours on its default dark board background, or `black_and_white`. Layers are named by canonical or user name; undeclared or ambiguous names are refused. Capped at 4096 px wide, 8192 px high and 16,777,216 pixels; inline at 8000 px a side and 3,750,000 PNG bytes. |
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
@@ -377,7 +377,7 @@ and Windows servers do not.
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Rank footprints by name, description and tags across global/project libraries, with paging and skipped-entry diagnostics. |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
-| `render_library_item` | Render one symbol unit (`.kicad_sym` + `name`, `unit`, `body_style`) or footprint (`.pretty` + `name`, or one `.kicad_mod` file; optional `layers`) and return a PNG as an MCP image block next to JSON metadata, for a visual check before placing the part. Options for the other kind are refused; capped at 4096 px wide, 8192 px high and 16,777,216 pixels. |
+| `render_library_item` | Render one symbol unit (`.kicad_sym` + `name`, `unit`, `body_style`) or footprint (`.pretty` + `name`, or one `.kicad_mod` file; optional `layers`) and return a PNG as an MCP image block next to JSON metadata, for a visual check before placing the part. Footprint layers must be KiCad layer names and a footprint name must not be a path. Options for the other kind are refused unless null or their default. Capped at 4096 px wide, 8192 px high and 16,777,216 pixels; inline at 8000 px a side and 3,750,000 PNG bytes. |
 
 ---
 

@@ -2030,8 +2030,15 @@ pub enum BoardSvgPage {
     BoardCoordinates,
 }
 
+/// KiCad's built-in default colour theme (`COLOR_SETTINGS::COLOR_BUILTIN_DEFAULT`
+/// in KiCad 10's `color_settings.cpp`), whose board background is `#001023`.
+/// Without `--theme`, `pcb` and `fp export svg` plot in whatever theme this
+/// machine's PCB editor uses, which need not suit that background.
+pub(crate) const DEFAULT_PLOT_THEME: &str = "_builtin_default";
+
 /// KiCAD 10: `pcb export svg --output <file> --mode-single --layers <a,b>
-/// --page-size-mode <1|2> --exclude-drawing-sheet [--black-and-white] <input>`
+/// --page-size-mode <1|2> --exclude-drawing-sheet
+/// [--theme _builtin_default | --black-and-white] <input>`
 pub(crate) fn pcb_layers_svg_args(
     pcb: &str,
     output: &str,
@@ -2063,6 +2070,9 @@ pub(crate) fn pcb_layers_svg_args(
     args.push("--exclude-drawing-sheet".into());
     if black_and_white {
         args.push("--black-and-white".into());
+    } else {
+        args.push("--theme".into());
+        args.push(DEFAULT_PLOT_THEME.into());
     }
     args.push(pcb.into());
     args
@@ -2127,7 +2137,8 @@ pub async fn export_symbol_svg(
 }
 
 /// KiCAD 10: `fp export svg --output <dir> --footprint <name> [--layers <a,b>]
-/// [--black-and-white] <library.pretty>`. The output directory must already exist. KiCad exits 0
+/// [--theme _builtin_default | --black-and-white] <library.pretty>`. The
+/// output directory must already exist. KiCad exits 0
 /// and writes nothing when the footprint is not in the library, so callers
 /// must look for the file.
 pub(crate) fn footprint_svg_args<'a>(
@@ -2152,6 +2163,9 @@ pub(crate) fn footprint_svg_args<'a>(
     }
     if black_and_white {
         args.push("--black-and-white");
+    } else {
+        args.push("--theme");
+        args.push(DEFAULT_PLOT_THEME);
     }
     args.push(library_dir);
     args
@@ -2196,6 +2210,42 @@ mod schematic_export_option_tests {
             .map(|index| args[index + 1]);
         assert_eq!(theme, Some("Solarized Dark"));
         assert_eq!(args.last().copied(), Some("/tmp/design.kicad_sch"));
+    }
+
+    #[test]
+    fn board_and_footprint_plots_pin_the_default_theme_unless_black_and_white() {
+        let value_after = |args: &[&str], flag: &str| {
+            args.iter()
+                .position(|argument| *argument == flag)
+                .map(|index| args[index + 1].to_string())
+        };
+        let board = pcb_layers_svg_args(
+            "b.kicad_pcb",
+            "o.svg",
+            &["F.Cu"],
+            BoardSvgPage::BoardArea,
+            false,
+        );
+        let board: Vec<&str> = board.iter().map(String::as_str).collect();
+        assert_eq!(
+            value_after(&board, "--theme").as_deref(),
+            Some("_builtin_default")
+        );
+        let footprint = footprint_svg_args("lib.pretty", "R1", "out", "", false);
+        assert_eq!(
+            value_after(&footprint, "--theme").as_deref(),
+            Some("_builtin_default")
+        );
+        // Black and white ignores theme colours, so no theme is named.
+        let board = pcb_layers_svg_args(
+            "b.kicad_pcb",
+            "o.svg",
+            &["F.Cu"],
+            BoardSvgPage::BoardArea,
+            true,
+        );
+        assert!(!board.iter().any(|argument| argument == "--theme"));
+        assert!(!footprint_svg_args("lib.pretty", "R1", "out", "", true).contains(&"--theme"));
     }
 
     #[test]

@@ -57,6 +57,9 @@ pub const WHITE: [u8; 3] = [255, 255, 255];
 /// pale silkscreen and white drill marks that vanish on white paper.
 pub const BOARD_BACKGROUND: [u8; 3] = [0x00, 0x10, 0x23];
 
+/// The most pixels a region, page or difference image may have (16 Mi).
+pub const MAX_PIXELS: u64 = 16 * 1024 * 1024;
+
 /// [`svg_region_to_png`] on an opaque `background` colour.
 pub fn svg_region_to_png_on(
     svg: &[u8],
@@ -64,43 +67,116 @@ pub fn svg_region_to_png_on(
     region: Region,
     background: [u8; 3],
 ) -> Result<Rendered> {
+    render_framed(svg, width_px, Some(region), background)
+}
+
+/// Refusals name what the caller framed: a region of the page, or the
+/// whole page, which has no region to widen.
+fn framing_noun(region: Option<Region>) -> &'static str {
+    if region.is_some() {
+        "region"
+    } else {
+        "page"
+    }
+}
+
+/// The widest `width_px` at which a whole page keeps both sides within
+/// `max_side_px` (8192 for the render cap) and its area within
+/// [`MAX_PIXELS`].
+pub fn page_fit_width_px(page_width_mm: f64, page_height_mm: f64, max_side_px: u32) -> u32 {
+    let max_side = f64::from(max_side_px);
+    let height_at = |width: u32| {
+        (f64::from(width) * page_height_mm / page_width_mm)
+            .round()
+            .max(1.0)
+    };
+    let by_height = max_side * page_width_mm / page_height_mm;
+    let by_area = (MAX_PIXELS as f64 * page_width_mm / page_height_mm).sqrt();
+    let mut width = by_height.min(by_area).min(max_side).floor().max(1.0) as u32;
+    while width > 1
+        && (height_at(width) > max_side || f64::from(width) * height_at(width) > MAX_PIXELS as f64)
+    {
+        width -= 1;
+    }
+    width
+}
+
+/// Rasterize `region` of the page, or the whole page when it is `None`.
+fn render_framed(
+    svg: &[u8],
+    width_px: u32,
+    region: Option<Region>,
+    background: [u8; 3],
+) -> Result<Rendered> {
+    let noun = framing_noun(region);
     if width_px == 0 || width_px > 8192 {
         bail!("width_px must be 1..=8192, got {width_px}");
     }
-    if ![region.x_mm, region.y_mm, region.width_mm, region.height_mm]
-        .iter()
-        .all(|value| value.is_finite())
-        || region.x_mm < 0.0
-        || region.y_mm < 0.0
-        || region.width_mm <= 0.0
-        || region.height_mm <= 0.0
-    {
-        bail!("region must have finite nonnegative x_mm/y_mm and positive width_mm/height_mm");
+    if let Some(region) = region {
+        if ![region.x_mm, region.y_mm, region.width_mm, region.height_mm]
+            .iter()
+            .all(|value| value.is_finite())
+            || region.x_mm < 0.0
+            || region.y_mm < 0.0
+            || region.width_mm <= 0.0
+            || region.height_mm <= 0.0
+        {
+            bail!("region must have finite nonnegative x_mm/y_mm and positive width_mm/height_mm");
+        }
     }
 
     let source = std::str::from_utf8(svg).context("SVG is not UTF-8")?;
     let document = parse_document(source)?;
-    let (page_width_mm, page_height_mm) = page_size_of(&document)?;
-    if region.x_mm + region.width_mm > page_width_mm
-        || region.y_mm + region.height_mm > page_height_mm
-    {
-        bail!("region lies outside the SVG page ({page_width_mm} x {page_height_mm} mm)");
-    }
+    let (page_width_mm, page_height_mm) = page_size_of(&document, noun)?;
+    let region = match region {
+        Some(region) => {
+            if region.x_mm + region.width_mm > page_width_mm
+                || region.y_mm + region.height_mm > page_height_mm
+            {
+                bail!("region lies outside the SVG page ({page_width_mm} x {page_height_mm} mm)");
+            }
+            region
+        }
+        None => Region {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            width_mm: page_width_mm,
+            height_mm: page_height_mm,
+        },
+    };
 
     let height = (f64::from(width_px) * region.height_mm / region.width_mm)
         .round()
         .max(1.0);
+    let page_hint = || {
+        format!(
+            "a {page_width_mm} x {page_height_mm} mm page fits at width_px {} or less",
+            page_fit_width_px(page_width_mm, page_height_mm, 8192)
+        )
+    };
     if !height.is_finite() || height > 8192.0 {
+        if noun == "page" {
+            bail!(
+                "page output height exceeds 8192 pixels at width_px {width_px}; {}",
+                page_hint()
+            );
+        }
         bail!("region output height exceeds 8192 pixels; reduce width_px or widen the region");
     }
     let height_px = height as u32;
-    if u64::from(width_px) * u64::from(height_px) > 16 * 1024 * 1024 {
+    if u64::from(width_px) * u64::from(height_px) > MAX_PIXELS {
+        if noun == "page" {
+            bail!(
+                "page output exceeds 16777216 pixels at width_px {width_px}; {}",
+                page_hint()
+            );
+        }
         bail!("region output exceeds 16777216 pixels; reduce width_px");
     }
 
     // Apply the same font policy as full-sheet renders.
     if svg_contains_visible_text(svg) {
-        bail!("SVG contains visible <text> elements; region rendering requires stroke-font paths");
+        bail!("SVG contains visible <text> elements; {noun} rendering requires stroke-font paths");
     }
     let tree =
         usvg::Tree::from_data(svg, &usvg::Options::default()).context("SVG did not parse")?;
@@ -114,7 +190,7 @@ pub fn svg_region_to_png_on(
         (-region.y_mm * pixels_per_mm) as f32,
     );
     if !transform.is_finite() {
-        bail!("region is too small for the renderer's coordinate precision");
+        bail!("{noun} is too small for the renderer's coordinate precision");
     }
 
     let mut pixmap =
@@ -148,14 +224,14 @@ fn parse_document(source: &str) -> Result<usvg::roxmltree::Document<'_>> {
     .context("SVG did not parse")
 }
 
-fn page_size_of(document: &usvg::roxmltree::Document<'_>) -> Result<(f64, f64)> {
+fn page_size_of(document: &usvg::roxmltree::Document<'_>, noun: &str) -> Result<(f64, f64)> {
     let root = document.root_element();
     let page_mm = |attribute: &str| -> Result<f64> {
         root.attribute(attribute)
             .and_then(|value| value.trim().strip_suffix("mm"))
             .and_then(|value| value.trim().parse::<f64>().ok())
             .filter(|value| value.is_finite() && *value > 0.0)
-            .with_context(|| format!("region rendering requires a positive SVG {attribute} in mm"))
+            .with_context(|| format!("{noun} rendering requires a positive SVG {attribute} in mm"))
     };
     Ok((page_mm("width")?, page_mm("height")?))
 }
@@ -164,7 +240,7 @@ fn page_size_of(document: &usvg::roxmltree::Document<'_>) -> Result<(f64, f64)> 
 /// Refuses an SVG without explicit positive millimetre dimensions.
 pub fn page_size_mm(svg: &[u8]) -> Result<(f64, f64)> {
     let source = std::str::from_utf8(svg).context("SVG is not UTF-8")?;
-    page_size_of(&parse_document(source)?)
+    page_size_of(&parse_document(source)?, "page")
 }
 
 /// Rasterize a whole KiCad SVG page (a board plot, a library symbol or a
@@ -172,20 +248,10 @@ pub fn page_size_mm(svg: &[u8]) -> Result<(f64, f64)> {
 /// millimetre page dimensions are required, the output height is at most
 /// 8192 px and the area at most 16 Mi pixels, and visible `<text>` is
 /// refused. Unlike [`svg_to_png`], a very tall page cannot produce an
-/// unbounded image. Visual baselines keep using [`svg_to_png`].
+/// unbounded image. Visual baselines keep using [`svg_to_png`]. Refusals
+/// speak of the page, and a size refusal names a `width_px` that fits.
 pub fn svg_page_to_png(svg: &[u8], width_px: u32, background: [u8; 3]) -> Result<Rendered> {
-    let (width_mm, height_mm) = page_size_mm(svg)?;
-    svg_region_to_png_on(
-        svg,
-        width_px,
-        Region {
-            x_mm: 0.0,
-            y_mm: 0.0,
-            width_mm,
-            height_mm,
-        },
-        background,
-    )
+    render_framed(svg, width_px, None, background)
 }
 
 /// Rasterize SVG bytes to a PNG at the given pixel width (height follows the
@@ -348,7 +414,7 @@ pub mod diff_colors {
 /// uses, with the same noise threshold and background rule. Changed pixels
 /// are coloured by [`diff_colors`]; unchanged drawing is faded to a quarter
 /// of its contrast; a bounding-box outline marks the changed region so a
-/// small change is findable. The canvas is refused above 16 Mi pixels.
+/// small change is findable. The canvas is refused above [`MAX_PIXELS`].
 pub fn diff_image_png(before: &[u8], after: &[u8]) -> Result<Rendered> {
     let a = image::load_from_memory(before)
         .context("before image did not decode")?
@@ -361,7 +427,7 @@ pub fn diff_image_png(before: &[u8], after: &[u8]) -> Result<Rendered> {
     if width == 0 || height == 0 {
         bail!("difference image has no area");
     }
-    if u64::from(width) * u64::from(height) > 16 * 1024 * 1024 {
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
         bail!("difference image would exceed 16777216 pixels");
     }
 
@@ -737,6 +803,60 @@ mod tests {
         let tall = br##"<svg xmlns="http://www.w3.org/2000/svg" width="1mm" height="100mm"/>"##;
         let err = svg_page_to_png(tall, 100, WHITE).unwrap_err();
         assert!(err.to_string().contains("height exceeds"), "{err}");
+    }
+
+    #[test]
+    fn page_refusals_speak_of_the_page_and_name_a_width_that_fits() {
+        // A 1 x 80 pin header's page is about 5.7 x 206 mm.
+        let header = br##"<svg xmlns="http://www.w3.org/2000/svg" width="5.7mm" height="206mm" viewBox="0 0 5.7 206"><rect width="5.7" height="206"/></svg>"##;
+        let err = svg_page_to_png(header, 800, WHITE).unwrap_err().to_string();
+        assert!(err.contains("height exceeds 8192"), "{err}");
+        assert!(err.contains("width_px 226 or less"), "{err}");
+        assert!(!err.contains("region"), "{err}");
+        assert_eq!(svg_page_to_png(header, 226, WHITE).unwrap().height_px, 8168);
+        assert!(svg_page_to_png(header, 227, WHITE).is_err());
+        // The same page within an 8000 px side: 221 px gives 7987 px.
+        assert_eq!(page_fit_width_px(5.7, 206.0, 8000), 221);
+
+        let wide = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="120mm"/>"#;
+        let err = svg_page_to_png(wide, 4000, WHITE).unwrap_err().to_string();
+        assert!(err.contains("exceeds 16777216 pixels"), "{err}");
+        // 3739 x 4487 = 16,776,893 pixels.
+        assert!(err.contains("width_px 3739 or less"), "{err}");
+        assert!(!err.contains("region"), "{err}");
+
+        for svg in [
+            RECT_SVG,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="0mm" height="10mm"/>"#,
+        ] {
+            let err = svg_page_to_png(svg, 100, WHITE).unwrap_err().to_string();
+            assert!(
+                err.contains("page rendering requires a positive SVG"),
+                "{err}"
+            );
+        }
+        let text = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"><text x="1" y="8">hi</text></svg>"#;
+        let err = svg_page_to_png(text, 100, WHITE).unwrap_err().to_string();
+        assert!(!err.contains("region"), "{err}");
+
+        // The region path keeps its own wording.
+        let region = Region {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            width_mm: 5.7,
+            height_mm: 206.0,
+        };
+        let err = svg_region_to_png(header, 800, region)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("widen the region"), "{err}");
+        let err = svg_region_to_png(RECT_SVG, 100, region)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("region rendering requires a positive SVG"),
+            "{err}"
+        );
     }
 
     #[test]

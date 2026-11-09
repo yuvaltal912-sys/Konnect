@@ -66,10 +66,11 @@ d=$(dirname "$0")
 printf '%s\n' "$@" > "$d/argv.txt"
 [ -f "$d/fail" ] && { echo "Failed to load" >&2; exit 3; }
 [ -f "$d/empty" ] && exit 0
-out=""; mode=""; prev=""
+out=""; mode=""; sym=""; prev=""
 for a in "$@"; do
   [ "$prev" = "--output" ] && out="$a"
   [ "$prev" = "--page-size-mode" ] && mode="$a"
+  [ "$prev" = "--symbol" ] && sym="$a"
   prev="$a"
 done
 if [ -f "$d/visible_text" ]; then
@@ -83,7 +84,12 @@ if [ -f "$d/visible_text" ]; then
 fi
 case "$1" in
   pcb) if [ "$mode" = "1" ]; then cp "$d/board_sheet.svg" "$out"; else cp "$d/board_area.svg" "$out"; fi ;;
-  sym) mkdir -p "$out" && cp "$d"/DUAL_unit1.svg "$d"/DUAL_unit2.svg "$out"/ ;;
+  sym) mkdir -p "$out"
+       # KiCad 10 names every unit <name>_unit<n>.svg, a single unit too
+       # (doSymExportSvg in eeschema_jobs_handler.cpp). For one-unit SINGLE
+       # the stand-in serves DUAL's unit-1 drawing: only the name is tested.
+       if [ "$sym" = "SINGLE" ]; then cp "$d/DUAL_unit1.svg" "$out/SINGLE_unit1.svg"
+       else cp "$d"/DUAL_unit1.svg "$d"/DUAL_unit2.svg "$out"/; fi ;;
   fp) cp "$d/TEST_PAD2.svg" "$out/" ;;
 esac
 "##,
@@ -208,6 +214,11 @@ async fn board_layers_render_inline_framed_on_the_board_area() {
     assert!(argv.contains(&"--exclude-drawing-sheet".to_string()));
     assert!(argv.contains(&"--mode-single".to_string()));
     assert!(!argv.contains(&"--black-and-white".to_string()));
+    // Colours come from KiCad's built-in default theme, not this machine's.
+    assert_eq!(
+        scene.value_after("--theme").as_deref(),
+        Some("_builtin_default")
+    );
     assert_eq!(argv.last(), Some(&scene.board.display().to_string()));
     // The SVG went to a private directory, never next to the board.
     let svg_out = PathBuf::from(scene.value_after("--output").unwrap());
@@ -273,10 +284,9 @@ async fn board_black_and_white_reaches_kicad_and_uses_white_paper() {
             .await,
     );
     assert_eq!(meta["background"], "#ffffff");
-    assert!(scene
-        .argv()
-        .unwrap()
-        .contains(&"--black-and-white".to_string()));
+    let argv = scene.argv().unwrap();
+    assert!(argv.contains(&"--black-and-white".to_string()));
+    assert!(!argv.contains(&"--theme".to_string()), "{argv:?}");
 }
 
 #[cfg(unix)]
@@ -331,8 +341,8 @@ async fn board_refuses_bad_arguments_before_running_kicad() {
         "{unknown}"
     );
     assert!(
-        unknown.contains("Edge.Cuts"),
-        "lists the declared layers: {unknown}"
+        unknown.contains("Edge.Cuts") && unknown.contains("F.SilkS (F.Silkscreen)"),
+        "lists the declared layers with their user names: {unknown}"
     );
     assert!(scene.argv().is_none(), "kicad-cli never ran");
 
@@ -343,6 +353,103 @@ async fn board_refuses_bad_arguments_before_running_kicad() {
     .await
     .unwrap();
     assert!(refusal(&missing).contains("file_not_found"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn board_layers_accept_user_names_and_pass_kicad_the_canonical_name() {
+    let scene = Scene::new();
+    let meta = metadata(
+        &scene
+            .board(json!({"layers": ["F.Silkscreen", "F.Courtyard", "Edge.Cuts"], "width_px": 200}))
+            .await,
+    );
+    assert_eq!(
+        scene.value_after("--layers").as_deref(),
+        Some("F.SilkS,F.CrtYd,Edge.Cuts")
+    );
+    // The metadata reports what was asked.
+    assert_eq!(
+        meta["layers"],
+        json!(["F.Silkscreen", "F.Courtyard", "Edge.Cuts"])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn board_layer_names_kicad_would_read_as_another_layer_are_refused() {
+    let scene = Scene::new();
+    // F.CrtYd renamed to "F.SilkS": kicad-cli reads user names first, so
+    // "F.SilkS" on its command line would plot the courtyard.
+    let source = std::fs::read_to_string(&scene.board).unwrap();
+    let renamed = source.replace(
+        r#"(31 "F.CrtYd" user "F.Courtyard")"#,
+        r#"(31 "F.CrtYd" user "F.SilkS")"#,
+    );
+    assert_ne!(renamed, source);
+    std::fs::write(&scene.board, renamed).unwrap();
+
+    let both = refusal(&scene.board(json!({"layers": ["F.SilkS"]})).await);
+    assert!(
+        both.contains("more than one board layer") && both.contains("F.CrtYd (F.SilkS)"),
+        "{both}"
+    );
+    let shadowed = refusal(&scene.board(json!({"layers": ["F.Silkscreen"]})).await);
+    assert!(
+        shadowed.contains("layer F.CrtYd has the user name 'F.SilkS'"),
+        "{shadowed}"
+    );
+    assert!(scene.argv().is_none(), "kicad-cli never ran");
+
+    metadata(
+        &scene
+            .board(json!({"layers": ["F.CrtYd"], "width_px": 100}))
+            .await,
+    );
+    assert_eq!(scene.value_after("--layers").as_deref(), Some("F.CrtYd"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_renders_over_the_client_limits_are_refused_and_files_are_named() {
+    let scene = Scene::new();
+    // A 1 x 40.5 mm sliver at 200 px is 200 x 8100 px: inside the 8192 px
+    // render cap, over the 8000 px inline limit.
+    let sliver = json!({"x": 80, "y": 30, "width": 1, "height": 40.5});
+    let tall = refusal(
+        &scene
+            .board(json!({"layers": ["F.Cu"], "width_px": 200, "region": sliver}))
+            .await,
+    );
+    assert!(tall.contains("200 x 8100 px"), "{tall}");
+    assert!(tall.contains("8000 px per side"), "{tall}");
+    assert!(tall.contains("about 197 or less"), "{tall}");
+    assert!(
+        tall.contains("'region'") && tall.contains("'inline' false"),
+        "{tall}"
+    );
+    assert_eq!(tall.matches("written").count(), 0, "{tall}");
+
+    // A file asked for is still written, and the refusal says where.
+    let output = scene.dir.path().join("renders/sliver.png");
+    let named = refusal(
+        &scene
+            .board(json!({"layers": ["F.Cu"], "width_px": 200, "region": sliver, "output": output}))
+            .await,
+    );
+    assert!(
+        named.contains(&format!("still written to {}", output.display())),
+        "{named}"
+    );
+    assert!(output.is_file());
+
+    // File-only output keeps the 8192 px render cap.
+    let file_only = metadata(
+        &scene
+            .board(json!({"layers": ["F.Cu"], "width_px": 200, "region": sliver, "inline": false, "output": output}))
+            .await,
+    );
+    assert_eq!(file_only["height_px"], 8100);
 }
 
 #[cfg(unix)]
@@ -479,7 +586,93 @@ async fn symbol_export_failures_are_reported() {
     assert!(empty.contains("wrote no SVG"), "{empty}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_single_unit_symbol_is_found_by_kicads_unit1_file_name() {
+    let scene = Scene::new();
+    let result = scene.symbol(json!({"name": "SINGLE"})).await;
+    let meta = metadata(&result);
+    assert_eq!(
+        image(&result),
+        konnect_render::svg_page_to_png(&fixture("DUAL_unit1.svg"), 800, konnect_render::WHITE)
+            .unwrap()
+            .png
+    );
+    assert_eq!(meta["symbol"], "SINGLE");
+    assert_eq!(meta["unit"], 1);
+    assert_eq!(meta["units"], json!([1]));
+    assert_eq!(meta["has_demorgan"], false);
+    let unit = refusal(&scene.symbol(json!({"name": "SINGLE", "unit": 2})).await);
+    assert!(unit.contains("'unit'") && unit.contains("[1]"), "{unit}");
+}
+
 // ─── render_library_footprint ────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test]
+async fn footprint_layers_are_checked_against_kicads_layer_names() {
+    let scene = Scene::new();
+    let typo = refusal(
+        &scene
+            .footprint(json!({"name": "TEST_PAD2", "layers": ["F.Cu", "F.Silk"]}))
+            .await,
+    );
+    assert!(
+        typo.contains("'layers'") && typo.contains("'F.Silk' is not a KiCad layer name"),
+        "{typo}"
+    );
+    assert!(
+        typo.contains("F.SilkS") && typo.contains("F.Silkscreen"),
+        "lists the accepted names: {typo}"
+    );
+    assert!(scene.argv().is_none(), "kicad-cli never ran");
+
+    // KiCad's default user names are accepted and passed on canonically.
+    let meta = metadata(
+        &scene
+            .footprint(json!({"name": "TEST_PAD2", "layers": ["F.Cu", "F.Silkscreen", "F.Courtyard", "User.Eco1"]}))
+            .await,
+    );
+    assert_eq!(
+        scene.value_after("--layers").as_deref(),
+        Some("F.Cu,F.SilkS,F.CrtYd,Eco1.User")
+    );
+    assert_eq!(
+        meta["layers"],
+        json!(["F.Cu", "F.Silkscreen", "F.Courtyard", "User.Eco1"])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_footprint_name_that_is_a_path_is_refused_before_any_join() {
+    let scene = Scene::new();
+    // A stale SVG beside a footprint outside the library: an absolute name
+    // would find both, and kicad-cli, writing nothing, would leave the stale
+    // file to be returned as the render.
+    let elsewhere = scene.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(
+        elsewhere.join("TEST_PAD2.kicad_mod"),
+        fixture("konnect_test.pretty/TEST_PAD2.kicad_mod"),
+    )
+    .unwrap();
+    std::fs::write(elsewhere.join("TEST_PAD2.svg"), fixture("TEST_PAD2.svg")).unwrap();
+    scene.switch("empty");
+    for name in [
+        elsewhere.join("TEST_PAD2").display().to_string(),
+        "../konnect_test.pretty/TEST_PAD2".to_string(),
+        "..".to_string(),
+        "a\\b".to_string(),
+    ] {
+        let message = refusal(&scene.footprint(json!({ "name": name })).await);
+        assert!(
+            message.contains("'name'") && message.contains("is a path"),
+            "{name}: {message}"
+        );
+    }
+    assert!(scene.argv().is_none(), "kicad-cli never ran");
+}
 
 #[cfg(unix)]
 #[tokio::test]
@@ -510,6 +703,10 @@ async fn footprint_from_a_pretty_library_renders_inline() {
         scene.argv().unwrap().last(),
         Some(&scene.footprints.display().to_string())
     );
+    assert_eq!(
+        scene.value_after("--theme").as_deref(),
+        Some("_builtin_default")
+    );
 
     let plain = scene
         .footprint(json!({"name": "TEST_PAD2", "black_and_white": true}))
@@ -518,6 +715,7 @@ async fn footprint_from_a_pretty_library_renders_inline() {
     let argv = scene.argv().unwrap();
     assert!(!argv.contains(&"--layers".to_string()));
     assert!(argv.contains(&"--black-and-white".to_string()));
+    assert!(!argv.contains(&"--theme".to_string()), "{argv:?}");
 }
 
 #[cfg(unix)]
@@ -590,11 +788,11 @@ async fn library_kind_comes_from_the_path_and_foreign_options_are_refused() {
     for (args, field) in [
         (json!({"name": "TEST_PAD2", "unit": 2}), "unit"),
         (
-            json!({"name": "TEST_PAD2", "body_style": "standard"}),
+            json!({"name": "TEST_PAD2", "body_style": "demorgan"}),
             "body_style",
         ),
         (
-            json!({"name": "TEST_PAD2", "include_hidden_pins": false}),
+            json!({"name": "TEST_PAD2", "include_hidden_pins": true}),
             "include_hidden_pins",
         ),
     ] {
@@ -605,6 +803,62 @@ async fn library_kind_comes_from_the_path_and_foreign_options_are_refused() {
         );
     }
     assert!(scene.argv().is_none(), "kicad-cli never ran");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreign_options_at_null_or_their_default_are_accepted() {
+    let scene = Scene::new();
+    metadata(
+        &scene
+            .footprint(json!({"name": "TEST_PAD2", "unit": 1, "body_style": "standard", "include_hidden_pins": false}))
+            .await,
+    );
+    assert!(scene.argv().is_some(), "kicad-cli ran");
+    metadata(
+        &scene
+            .footprint(json!({"name": "TEST_PAD2", "unit": null, "body_style": null}))
+            .await,
+    );
+    metadata(
+        &scene
+            .symbol(json!({"name": "DUAL", "black_and_white": false, "layers": null}))
+            .await,
+    );
+    // `layers` documents no literal default, so a list is still refused.
+    let listed = refusal(&scene.symbol(json!({"name": "DUAL", "layers": []})).await);
+    assert!(listed.contains("'layers'"), "{listed}");
+}
+
+#[test]
+fn an_inline_page_refusal_names_a_width_that_fits_inline() {
+    // A 1 x 80 pin header's page is about 5.7 x 206 mm: 226 px fits the
+    // 8192 px render cap (8168 px tall) but not the 8000 px inline side.
+    let header = br##"<svg xmlns="http://www.w3.org/2000/svg" width="5.7mm" height="206mm" viewBox="0 0 5.7 206"><rect width="5.7" height="206"/></svg>"##;
+    let at = |width_px, inline| Delivery {
+        inline,
+        output: None,
+        width_px,
+    };
+    let err = render_page(&at(800, true), header, konnect_render::WHITE)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("inline limit of 8000 px"), "{err}");
+    assert!(err.contains("fits inline at width_px 221 or less"), "{err}");
+    assert!(!err.contains("region"), "{err}");
+    let err = render_page(&at(226, true), header, konnect_render::WHITE)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("width_px 221 or less"), "{err}");
+    let fits = render_page(&at(221, true), header, konnect_render::WHITE).unwrap();
+    assert_eq!(fits.height_px, 7987);
+    // A file-only render keeps the 8192 px render cap.
+    let file = render_page(&at(226, false), header, konnect_render::WHITE).unwrap();
+    assert_eq!(file.height_px, 8168);
+    let err = render_page(&at(800, false), header, konnect_render::WHITE)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("width_px 226 or less"), "{err}");
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────

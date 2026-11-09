@@ -279,9 +279,9 @@ Claim commit and draft PR came before code. Findings C6, A25, B9 and B7.
   board-edge bounding box (`--page-size-mode 2`); with `region` it plots on the
   drawing sheet (`--page-size-mode 1`), where page mm equal board mm, and crops.
   A region off the sheet is refused with a hint to drop `region`. Undeclared
-  layers are refused by name. Colours are KiCad's plot theme on the editor's dark
-  background (`#001023`), because pale silkscreen and white drill marks vanish on
-  white; `black_and_white` plots on white.
+  layers are refused by name. Colours are KiCad's default plot colours on its
+  default dark board background (`#001023`), because pale silkscreen and white
+  drill marks vanish on white; `black_and_white` plots on white.
 - **`render_library_item`** (`library`): one tool, kind chosen by the path. A
   `.kicad_sym` renders symbol `name` (`unit`, `body_style`; metadata lists units
   and De Morgan); a `.pretty` renders footprint `name`; one `.kicad_mod` (what
@@ -312,6 +312,47 @@ Claim commit and draft PR came before code. Findings C6, A25, B9 and B7.
   `simulation_live` was skipped (out of scope).
 - Not verified: display in an actual MCP client, Windows and Linux, kicad-cli
   other than 10.0.8, boards placed off the drawing sheet with a region.
+- **Review follow-up (2026-11-09), nine findings fixed:**
+  - The difference image is an extra. When it would exceed 16 Mi pixels or the
+    inline budget, `compare_visual_baseline` still returns status and metrics,
+    with `diff_image` null and a `diff_image_skipped` warning that names a
+    baseline `width_px` that fits.
+  - Colours are pinned: `pcb` and `fp export svg` get `--theme _builtin_default`
+    unless `black_and_white`. That is KiCad 10's built-in default theme
+    (`COLOR_BUILTIN_DEFAULT`), whose board background is `#001023`. Before, the
+    plot followed each machine's editor theme.
+  - Footprint `layers` are checked before kicad-cli runs, against KiCad's
+    canonical names and its default user names (`LSET::Name` and `LayerName` in
+    KiCad 10.0.1). kicad-cli only reports an unknown name and plots the rest.
+  - Board layers may be named by their user name too. Konnect passes kicad-cli
+    the canonical name and reports what was asked. A name that matches two
+    layers, or a canonical name another layer carries as its user name (kicad-cli
+    reads user names first), is refused.
+  - An option of the other kind at null or at its documented default is accepted.
+  - A footprint name that is absolute, holds a path separator or `..` is refused
+    before any path is joined. Symbol names never reach a path in Konnect;
+    kicad-cli replaces separators in its own file names.
+  - One inline budget for the inline images of `render_board_layers`,
+    `render_library_item`, `render_schematic_png` and the difference image: at most
+    8000 px a side and 3,750,000 PNG bytes, the Claude API's per-image limits.
+    Over it, the call is refused with the remedies, and a file already written is
+    named. File-only output keeps the 8192 px cap, so baselines do not change.
+  - Whole-page renders get page wording and a `width_px` that fits; an inline
+    page is held to the 8000 px side first, so that width also fits inline.
+  - The stand-in kicad-cli knows a one-unit symbol, named `<name>_unit1.svg` as
+    in KiCad 10.0.1's `doSymExportSvg`.
+  - Seen in source, not fixed: KiCad 10 names a symbol with custom body-style
+    names `<name>_unit<n>_<style>.svg`. Konnect does not parse that suffix, so
+    such a symbol is refused with "wrote no SVG", not misdrawn.
+  - Not in the budget: `get_board_2d_view` (clamped to 4000 px a side, no byte
+    check).
+- Review follow-up verified on macOS (2026-11-09): fmt; 3783 lib and integration
+  tests, 0 failures; 9 doc tests; clippy `-D warnings`; `cargo deny check
+  licenses`; `fix-doc-counts`, no change (261 + 7); installed binary SHA-256
+  still `3de188bb775ab4ce`. 14 new tests and 5 extended ones, all with the
+  stand-in kicad-cli or in-process renders. 19 negative controls, each failed
+  its test and was restored. Not run: kicad-cli or Freerouting on a real
+  board, an MCP client, the release build, the ignored `simulation_live` tests.
 
 ## PR 5, shipped creation guidance (merged, #29)
 

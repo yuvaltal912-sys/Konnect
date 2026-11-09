@@ -10,7 +10,7 @@
 //! through the same helper the schematic renders use.
 
 use crate::mcp::error::ToolErrorKind;
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::protocol::{inline_over_budget, CallToolResult, INLINE_IMAGE_MAX_SIDE_PX};
 use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use serde_json::{json, Value};
@@ -27,9 +27,11 @@ pub(super) fn board_tools() -> Vec<ToolDef> {
          as an MCP image block next to JSON metadata. Reads the saved .kicad_pcb file. Without \
          'region' the image frames the board-edge bounding box; with 'region' it crops a \
          rectangle given in board millimetres (the coordinates the editor and the board tools \
-         use) at the requested width, for a close-up. Colours follow KiCad's plot theme on the \
-         editor's dark background; 'black_and_white' plots black on white. Width is capped at \
-         4096 px, height at 8192 px and area at 16,777,216 pixels. Use get_board_2d_view for a \
+         use) at the requested width, for a close-up. Colours are KiCad's default plot colours \
+         on its default dark board background; 'black_and_white' plots black on white. Width is \
+         capped at 4096 px, height at 8192 px and area at 16,777,216 pixels. An inline image is \
+         refused above 8000 px on a side or 3,750,000 PNG bytes (the Claude API's per-image \
+         limits); 'output' with 'inline' false has no such limit. Use get_board_2d_view for a \
          3D picture.",
         json!({
             "type": "object",
@@ -37,7 +39,7 @@ pub(super) fn board_tools() -> Vec<ToolDef> {
                 "board": { "type": "string", "description": "Path to the saved .kicad_pcb file" },
                 "layers": {
                     "type": "array",
-                    "description": "Layer names to plot, such as [\"F.Cu\", \"F.SilkS\", \"Edge.Cuts\"]. Each must be declared by the board",
+                    "description": "Layer names to plot, such as [\"F.Cu\", \"F.SilkS\", \"Edge.Cuts\"]. Each must be declared by the board, by its canonical name or its user name (such as F.Silkscreen)",
                     "items": { "type": "string" },
                     "minItems": 1
                 },
@@ -67,20 +69,23 @@ pub(super) fn library_tools() -> Vec<ToolDef> {
          footprint. The library path picks the kind: a .kicad_sym file renders symbol 'name' \
          (one unit and body style; the metadata lists the others); a .pretty directory renders \
          footprint 'name'; a single .kicad_mod file, such as create_footprint writes, renders \
-         that footprint. Symbols draw on white; footprints use KiCad's plot colours on the \
-         editor's dark background unless 'black_and_white'. Width is capped at 4096 px, height \
-         at 8192 px and area at 16,777,216 pixels.",
+         that footprint. Symbols draw on white; footprints use KiCad's default plot colours on \
+         its default dark board background unless 'black_and_white'. An option for the other \
+         kind is refused unless it is null or its default. Width is capped at 4096 px, height \
+         at 8192 px and area at 16,777,216 pixels. An inline image is refused above 8000 px on \
+         a side or 3,750,000 PNG bytes (the Claude API's per-image limits); 'output' with \
+         'inline' false has no such limit.",
         json!({
             "type": "object",
             "properties": {
                 "library": { "type": "string", "description": "A .kicad_sym file, a .pretty directory, or one .kicad_mod file" },
-                "name": { "type": "string", "description": "Symbol or footprint name in the library. Optional for a .kicad_mod file, whose footprint is its file stem" },
+                "name": { "type": "string", "description": "Symbol or footprint name in the library. Optional for a .kicad_mod file, whose footprint is its file stem. A footprint name is a bare name, not a path" },
                 "unit": { "type": "integer", "description": "Symbols only: unit number to render", "default": 1, "minimum": 1 },
                 "body_style": { "type": "string", "enum": ["standard", "demorgan"], "description": "Symbols only", "default": "standard" },
                 "include_hidden_pins": { "type": "boolean", "description": "Symbols only", "default": false },
                 "layers": {
                     "type": "array",
-                    "description": "Footprints only: layer names to plot (default: KiCad's footprint plot set)",
+                    "description": "Footprints only: layer names to plot (default: KiCad's footprint plot set). Canonical names such as F.SilkS, or KiCad's default user names such as F.Silkscreen",
                     "items": { "type": "string" }
                 },
                 "black_and_white": { "type": "boolean", "description": "Footprints only: plot black on white", "default": false },
@@ -97,8 +102,22 @@ pub(super) fn library_tools() -> Vec<ToolDef> {
 const SYMBOL_ONLY: [&str; 3] = ["unit", "body_style", "include_hidden_pins"];
 const FOOTPRINT_ONLY: [&str; 2] = ["layers", "black_and_white"];
 
+/// An option of the other kind asks for nothing when it is null or the
+/// default the schema documents, so a client that fills in defaults is not
+/// refused. `layers` documents no literal default; only null passes.
+fn asks_for_nothing(field: &str, value: &Value) -> bool {
+    value.is_null()
+        || match field {
+            "unit" => value.as_u64() == Some(1),
+            "body_style" => value.as_str() == Some("standard"),
+            "include_hidden_pins" | "black_and_white" => value.as_bool() == Some(false),
+            _ => false,
+        }
+}
+
 /// Pick the renderer by the library's file type, and refuse an option that
-/// belongs to the other kind instead of ignoring it.
+/// belongs to the other kind instead of ignoring it, unless it asks for
+/// nothing ([`asks_for_nothing`]).
 pub(crate) async fn handle_render_library_item(
     args: &Value,
     ctx: &ToolContext,
@@ -119,7 +138,10 @@ pub(crate) async fn handle_render_library_item(
     } else {
         ("footprint", &SYMBOL_ONLY[..])
     };
-    if let Some(field) = foreign.iter().find(|field| args.get(**field).is_some()) {
+    if let Some(field) = foreign.iter().find(|field| {
+        args.get(**field)
+            .is_some_and(|value| !asks_for_nothing(field, value))
+    }) {
         return Ok(invalid(
             field,
             format!(
@@ -213,11 +235,14 @@ fn string_list(args: &Value, field: &str) -> Result<Vec<String>, CallToolResult>
 }
 
 /// Rasterize, optionally write, and answer. Dimensions and byte counts come
-/// from the produced image, never from the request.
+/// from the produced image, never from the request. An image over the
+/// inline budget is refused with its remedies; `narrow` adds the tool's own
+/// (such as a region), and a file already written is named, not hidden.
 fn respond(
     delivery: &Delivery,
     rendered: anyhow::Result<konnect_render::Rendered>,
     mut metadata: Value,
+    narrow: &str,
 ) -> anyhow::Result<CallToolResult> {
     let rendered = match rendered {
         Ok(rendered) => rendered,
@@ -238,11 +263,45 @@ fn respond(
     metadata["height_px"] = json!(rendered.height_px);
     metadata["png_bytes"] = json!(rendered.png.len());
     metadata["renderer"] = json!(konnect_render::RENDERER_ID);
-    if delivery.inline {
-        Ok(CallToolResult::json_with_png(&metadata, &rendered.png))
-    } else {
-        Ok(CallToolResult::json(&metadata))
+    if !delivery.inline {
+        return Ok(CallToolResult::json(&metadata));
     }
+    if let Some(over) =
+        inline_over_budget(rendered.width_px, rendered.height_px, rendered.png.len())
+    {
+        return Ok(over.refusal(narrow, delivery.output.as_deref()));
+    }
+    Ok(CallToolResult::json_with_png(&metadata, &rendered.png))
+}
+
+/// Rasterize a whole page. A page bound for an inline block is first held
+/// to the inline side limit, so its refusal names a `width_px` that also
+/// fits inline, not one that only fits the 8192 px render cap.
+fn render_page(
+    delivery: &Delivery,
+    svg: &[u8],
+    paper: [u8; 3],
+) -> anyhow::Result<konnect_render::Rendered> {
+    if delivery.inline {
+        if let Ok((width_mm, height_mm)) = konnect_render::page_size_mm(svg) {
+            let height_px = (f64::from(delivery.width_px) * height_mm / width_mm).round();
+            if height_px > f64::from(INLINE_IMAGE_MAX_SIDE_PX) {
+                anyhow::bail!(
+                    "page output height would be {height_px} px at width_px {}, over the inline \
+                     limit of {INLINE_IMAGE_MAX_SIDE_PX} px per side; a {width_mm} x {height_mm} \
+                     mm page fits inline at width_px {} or less, or set 'inline' false with an \
+                     'output' path",
+                    delivery.width_px,
+                    konnect_render::page_fit_width_px(
+                        width_mm,
+                        height_mm,
+                        INLINE_IMAGE_MAX_SIDE_PX
+                    )
+                );
+            }
+        }
+    }
+    konnect_render::svg_page_to_png(svg, delivery.width_px, paper)
 }
 
 fn background(black_and_white: bool) -> [u8; 3] {
@@ -290,20 +349,15 @@ pub(crate) async fn handle_render_board_layers(
         Err(error) => return Err(error.into()),
     };
     // A layer the board does not declare would plot as nothing, which reads
-    // as "the layer is empty". Refuse it by name instead.
-    let declared: Vec<String> =
-        konnect_sexp::layers::layers(&konnect_sexp::parser::parse_sexp(&source)?)
-            .into_iter()
-            .map(|layer| layer.name)
-            .collect();
-    if let Some(unknown) = layers.iter().find(|layer| !declared.contains(layer)) {
-        return Ok(invalid(
-            "layers",
-            format!(
-                "board does not declare layer '{unknown}'; declared: {}",
-                declared.join(", ")
-            ),
-        ));
+    // as "the layer is empty". Refuse it by name instead. A layer may be
+    // named by its canonical or its user name.
+    let declared = konnect_sexp::layers::layers(&konnect_sexp::parser::parse_sexp(&source)?);
+    let mut kicad_layers = Vec::with_capacity(layers.len());
+    for requested in &layers {
+        match kicad_board_layer(&declared, requested) {
+            Ok(name) => kicad_layers.push(name),
+            Err(reason) => return Ok(invalid("layers", reason)),
+        }
     }
 
     let page = if region.is_some() {
@@ -313,7 +367,7 @@ pub(crate) async fn handle_render_board_layers(
     };
     let staging = tempfile::tempdir()?;
     let svg_path = staging.path().join("board.svg");
-    let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
+    let layer_refs: Vec<&str> = kicad_layers.iter().map(String::as_str).collect();
     cli::export_pcb_layers_svg(
         &ctx.config.kicad_cli,
         &board,
@@ -341,7 +395,7 @@ pub(crate) async fn handle_render_board_layers(
                 },
             )
         }
-        None => konnect_render::svg_page_to_png(&svg, delivery.width_px, paper),
+        None => render_page(&delivery, &svg, paper),
     };
     let page_mm = konnect_render::page_size_mm(&svg).ok();
     let framing = match (&region, page_mm) {
@@ -367,7 +421,62 @@ pub(crate) async fn handle_render_board_layers(
             "black_and_white": black_and_white,
             "source": "saved file",
         }),
+        ", narrow or add a 'region'",
     )
+}
+
+/// `F.SilkS (F.Silkscreen)`: a declared layer's canonical name, with the
+/// user name the editor shows when it differs.
+fn describe_layer(layer: &konnect_sexp::layers::Layer) -> String {
+    match &layer.user_name {
+        Some(user) if *user != layer.name => format!("{} ({user})", layer.name),
+        _ => layer.name.clone(),
+    }
+}
+
+/// The name to hand kicad-cli for a requested board layer, or why there is
+/// none. A request may use a layer's canonical name or its user name.
+///
+/// kicad-cli 10 (`PCBNEW_JOBS_HANDLER::convertLayerArg`) looks a name up
+/// among the board's user names first and its canonical names second, so
+/// Konnect passes the canonical name, and refuses when another layer
+/// carries that canonical name as its user name: kicad-cli would plot that
+/// other layer instead.
+fn kicad_board_layer(
+    declared: &[konnect_sexp::layers::Layer],
+    requested: &str,
+) -> Result<String, String> {
+    let named: Vec<&konnect_sexp::layers::Layer> = declared
+        .iter()
+        .filter(|layer| layer.name == requested || layer.user_name.as_deref() == Some(requested))
+        .collect();
+    let layer = match named.as_slice() {
+        [layer] => *layer,
+        [] => {
+            let all: Vec<String> = declared.iter().map(describe_layer).collect();
+            return Err(format!(
+                "board does not declare layer '{requested}'; declared: {}",
+                all.join(", ")
+            ));
+        }
+        several => {
+            let all: Vec<String> = several.iter().map(|layer| describe_layer(layer)).collect();
+            return Err(format!(
+                "'{requested}' names more than one board layer: {}",
+                all.join(", ")
+            ));
+        }
+    };
+    if let Some(other) = declared.iter().find(|other| {
+        other.name != layer.name && other.user_name.as_deref() == Some(layer.name.as_str())
+    }) {
+        return Err(format!(
+            "'{requested}' is layer {}, but layer {} has the user name '{}', and kicad-cli \
+             reads user names first; rename that layer in the board setup",
+            layer.name, other.name, layer.name
+        ));
+    }
+    Ok(layer.name.clone())
 }
 
 // ─── render_library_symbol ───────────────────────────────────────────────────
@@ -471,7 +580,7 @@ async fn handle_render_library_symbol(
     let svg = std::fs::read(svg_path)?;
     respond(
         &delivery,
-        konnect_render::svg_page_to_png(&svg, delivery.width_px, konnect_render::WHITE),
+        render_page(&delivery, &svg, konnect_render::WHITE),
         json!({
             "library": library.display().to_string(),
             "symbol": symbol,
@@ -482,10 +591,53 @@ async fn handle_render_library_symbol(
             "include_hidden_pins": include_hidden_pins,
             "background": hex(konnect_render::WHITE),
         }),
+        "",
     )
 }
 
 // ─── render_library_footprint ────────────────────────────────────────────────
+
+/// KiCad's default user names for the fixed layers whose canonical name
+/// differs, as `LayerName()` in KiCad 10's `common/layer_id.cpp` gives them.
+/// For a footprint, which has no board and so no renamed layers, kicad-cli
+/// reads `--layers` against canonical names and these names only.
+const DEFAULT_USER_NAMES: [(&str, &str); 10] = [
+    ("F.Adhesive", "F.Adhes"),
+    ("B.Adhesive", "B.Adhes"),
+    ("F.Silkscreen", "F.SilkS"),
+    ("B.Silkscreen", "B.SilkS"),
+    ("User.Drawings", "Dwgs.User"),
+    ("User.Comments", "Cmts.User"),
+    ("User.Eco1", "Eco1.User"),
+    ("User.Eco2", "Eco2.User"),
+    ("F.Courtyard", "F.CrtYd"),
+    ("B.Courtyard", "B.CrtYd"),
+];
+
+/// The canonical name of a footprint layer given by its canonical or its
+/// default user name. kicad-cli only reports an unknown name and plots the
+/// rest, so an unchecked typo would read as "this layer is empty".
+fn footprint_layer(requested: &str) -> Option<&str> {
+    if konnect_sexp::layers::is_canonical_name(requested) {
+        return Some(requested);
+    }
+    DEFAULT_USER_NAMES
+        .iter()
+        .find(|(user, _)| *user == requested)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// A footprint name is joined into paths, so it must be one plain path
+/// component: not absolute, no separator, no `..`.
+fn is_bare_name(name: &str) -> bool {
+    !name.contains(['/', '\\'])
+        && !name.contains("..")
+        && !Path::new(name).is_absolute()
+        && matches!(
+            Path::new(name).components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(_)]
+        )
+}
 
 async fn handle_render_library_footprint(
     args: &Value,
@@ -499,10 +651,32 @@ async fn handle_render_library_footprint(
             _ => return Ok(invalid("name", "must be a non-empty footprint name")),
         },
     };
+    if let Some(name) = named.as_ref().filter(|name| !is_bare_name(name)) {
+        return Ok(invalid(
+            "name",
+            format!("'{name}' is a path; give the footprint's bare name in the library"),
+        ));
+    }
     let layers = match string_list(args, "layers") {
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
+    let mut kicad_layers = Vec::with_capacity(layers.len());
+    for requested in &layers {
+        let Some(canonical) = footprint_layer(requested) else {
+            let user_names: Vec<&str> = DEFAULT_USER_NAMES.iter().map(|(user, _)| *user).collect();
+            return Ok(invalid(
+                "layers",
+                format!(
+                    "'{requested}' is not a KiCad layer name; accepted: {}, In1.Cu to In30.Cu, \
+                     User.1 to User.45, or a default user name: {}",
+                    konnect_sexp::layers::FIXED_NAMES.join(", "),
+                    user_names.join(", ")
+                ),
+            ));
+        };
+        kicad_layers.push(canonical);
+    }
     let delivery = match delivery(args, 800) {
         Ok(delivery) => delivery,
         Err(error) => return Ok(error),
@@ -553,13 +727,12 @@ async fn handle_render_library_footprint(
 
     let out_dir = staging.path().join("svg");
     std::fs::create_dir(&out_dir)?;
-    let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
     if let Err(error) = cli::export_footprint_svg(
         &ctx.config.kicad_cli,
         &library_dir,
         &footprint,
         &out_dir,
-        &layer_refs,
+        &kicad_layers,
         black_and_white,
     )
     .await
@@ -582,7 +755,7 @@ async fn handle_render_library_footprint(
     let paper = background(black_and_white);
     respond(
         &delivery,
-        konnect_render::svg_page_to_png(&svg, delivery.width_px, paper),
+        render_page(&delivery, &svg, paper),
         json!({
             "library": library.display().to_string(),
             "footprint": footprint,
@@ -590,6 +763,7 @@ async fn handle_render_library_footprint(
             "background": hex(paper),
             "black_and_white": black_and_white,
         }),
+        "",
     )
 }
 

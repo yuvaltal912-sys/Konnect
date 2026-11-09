@@ -85,7 +85,7 @@ pub fn copper_layer_count(board: &SexpNode) -> usize {
 
 /// The fixed layer names, i.e. every `BoardLayer` variant that is neither
 /// `In<n>.Cu` nor `User.<n>` nor a sentinel.
-const FIXED_NAMES: &[&str] = &[
+pub const FIXED_NAMES: &[&str] = &[
     "F.Cu",
     "B.Cu",
     "B.Adhes",
