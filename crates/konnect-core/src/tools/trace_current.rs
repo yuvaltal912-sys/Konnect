@@ -88,10 +88,10 @@ pub(crate) fn is_outer(layer: &str) -> bool {
 
 /// One net that must carry a current.
 #[derive(Debug, Clone)]
-struct Requirement {
-    net: String,
-    amps: f64,
-    rise_c: f64,
+pub(crate) struct Requirement {
+    pub net: String,
+    pub amps: f64,
+    pub rise_c: f64,
     rise_source: &'static str,
     /// `currents` or `rail:<name>`.
     source: String,
@@ -170,7 +170,7 @@ pub(crate) fn copper_for(
     }
 }
 
-fn requirements(
+pub(crate) fn requirements(
     intent: &crate::tools::design_intent::DesignIntent,
     default_rise: f64,
     default_rise_given: bool,

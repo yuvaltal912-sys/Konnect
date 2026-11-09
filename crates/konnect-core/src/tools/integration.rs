@@ -150,7 +150,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -160,6 +160,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "java_path": { "type": "string", "description": "Path to a Java executable to use (optional); see check_freerouting." },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
+                    "allow_neckdown": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Let Freerouting narrow tracks below their net class to reach small pads. Off by default: the narrowed tracks break the project's minimum width, and the SES importer refuses them."
+                    },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
                 },
@@ -168,6 +173,93 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_route_specctra_dsn(args, ctx).await }
         ),
     ]
+}
+
+/// Freerouting's automatic neck-down narrows tracks below their class, which
+/// breaks the project's minimum and the SES importer refuses; it is off unless
+/// the caller asks for it.
+fn allow_neckdown(args: &serde_json::Value) -> bool {
+    args["allow_neckdown"].as_bool().unwrap_or(false)
+}
+
+/// The job settings `route_specctra_dsn` sends. Fanout is always off:
+/// Freerouting 2.5.0's fanout stage necks tracks down at pins even with
+/// automatic neck-down off, and the SES importer refuses such tracks.
+fn route_settings(
+    args: &serde_json::Value,
+    hints: &crate::specctra::RoutingHints,
+    java: PathBuf,
+) -> anyhow::Result<crate::freerouting_mcp::RouteSettings> {
+    let max_passes = args["max_passes"]
+        .as_u64()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
+    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
+    Ok(crate::freerouting_mcp::RouteSettings {
+        max_passes,
+        optimizer_enabled: args["optimizer_enabled"].as_bool(),
+        job_timeout_seconds: args["job_timeout_seconds"].as_u64(),
+        poll_interval: std::time::Duration::from_secs(3),
+        overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
+        java: Some(java),
+        automatic_neckdown: Some(allow_neckdown(args)),
+        copper_to_edge_clearance_um: hints.copper_edge_clearance_um.map(|um| um as f64),
+        // With the retry off, 0 is sent rather than nothing, so a stored
+        // `neck_width_um` (a `freerouting.json` in the real home) cannot turn
+        // it back on; the read-back then checks it.
+        retry_width_um: hints
+            .retry_width_um
+            .map(|um| um as f64)
+            .or(hints.retry_off_reason.map(|_| 0.0)),
+        fanout_enabled: Some(false),
+    })
+}
+
+#[cfg(test)]
+mod route_rule_tests {
+    use super::{allow_neckdown, route_settings};
+    use serde_json::json;
+
+    #[test]
+    fn fanout_and_neckdown_are_off_by_default() {
+        let hints = crate::specctra::RoutingHints {
+            copper_edge_clearance_um: Some(500),
+            retry_width_um: Some(200),
+            retry_off_reason: None,
+        };
+        let java = std::path::PathBuf::from("java");
+        let settings = route_settings(&json!({}), &hints, java.clone()).unwrap();
+        assert_eq!(settings.fanout_enabled, Some(false));
+        assert_eq!(settings.automatic_neckdown, Some(false));
+        assert_eq!(settings.copper_to_edge_clearance_um, Some(500.0));
+        assert_eq!(settings.retry_width_um, Some(200.0));
+        // Asking for neck-down does not turn fanout on.
+        let asked = route_settings(&json!({ "allow_neckdown": true }), &hints, java).unwrap();
+        assert_eq!(asked.fanout_enabled, Some(false));
+    }
+
+    #[test]
+    fn no_retry_width_is_sent_when_the_manifest_turned_it_off() {
+        let hints = crate::specctra::RoutingHints {
+            copper_edge_clearance_um: None,
+            retry_width_um: None,
+            retry_off_reason: Some(crate::specctra::RETRY_OFF_DIFFERENT_FLOORS),
+        };
+        let settings =
+            route_settings(&json!({}), &hints, std::path::PathBuf::from("java")).unwrap();
+        // Sent as 0, so a stored neck width cannot turn the retry back on.
+        assert_eq!(settings.retry_width_um, Some(0.0));
+        let body = crate::freerouting_mcp::job_settings(&settings);
+        assert_eq!(body["neck_width_um"], json!(0.0));
+    }
+
+    #[test]
+    fn neckdown_is_off_unless_asked_for() {
+        assert!(!allow_neckdown(&json!({})));
+        assert!(!allow_neckdown(&json!({ "allow_neckdown": false })));
+        assert!(allow_neckdown(&json!({ "allow_neckdown": true })));
+    }
 }
 
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
@@ -2381,22 +2473,12 @@ async fn handle_route_specctra_dsn(
         }
         return Ok(result);
     };
-    let java = java.command.clone();
-    let max_passes = args["max_passes"]
-        .as_u64()
-        .map(u32::try_from)
-        .transpose()
-        .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
-    let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
-    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
-    let settings = crate::freerouting_mcp::RouteSettings {
-        max_passes,
-        optimizer_enabled: args["optimizer_enabled"].as_bool(),
-        job_timeout_seconds,
-        poll_interval: std::time::Duration::from_secs(3),
-        overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
-        java: Some(java),
-    };
+    // The export's reverse manifest beside the DSN carries the project's
+    // copper-to-edge clearance; Freerouting takes it as a job setting.
+    let hints = crate::specctra::manifest_routing_hints(&dsn);
+    let edge_clearance = hints.copper_edge_clearance_um;
+    let allow_neckdown = allow_neckdown(args);
+    let settings = route_settings(args, &hints, java.command.clone())?;
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
@@ -2416,6 +2498,19 @@ async fn handle_route_specctra_dsn(
             "mode": "dsn_ses_file_round_trip",
             "cloud_used": false
         },
+        "rules_applied": {
+            "automatic_neckdown": allow_neckdown,
+            "fanout_enabled": settings.fanout_enabled,
+            "copper_to_edge_clearance_um": edge_clearance,
+            "copper_to_edge_clearance_source": if edge_clearance.is_some() { "export_manifest" } else { "none: no manifest beside the DSN, or it records no clearance" },
+            "retry_width_um": hints.retry_width_um,
+            // Why no retry width was sent, when the nets' floors differ.
+            "retry_off_reason": hints.retry_off_reason,
+        },
+        // Read back from Freerouting (`get_effective_settings`): the run is
+        // refused before routing when any sent setting is not in effect.
+        "effective_settings": evidence.effective_settings,
+        "optimizer": evidence.optimizer,
         "artifacts": {
             "dsn_path": dsn,
             "ses_output_path": ses_output,

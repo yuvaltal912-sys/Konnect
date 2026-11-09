@@ -227,7 +227,7 @@ fn two_layer_boards_export_exactly_as_before() {
 
 /// An SES as Freerouting writes one: the placement echoed, and routes on an
 /// inner layer and on B.Cu to the back-side part, with one through via.
-fn ses_for(m: &serde_json::Value) -> String {
+pub(super) fn ses_for(m: &serde_json::Value) -> String {
     let mut placement = String::new();
     for c in m["components"].as_array().unwrap() {
         placement.push_str(&format!(
@@ -794,6 +794,14 @@ fn a_board_name_with_a_space_is_a_valid_dsn_and_its_ses_imports() {
         .unwrap();
 }
 
+/// The retry width `route_specctra_dsn` would pass, from manifest text.
+fn manifest_retry_width(manifest_text: &str) -> Option<i64> {
+    let temp = tempfile::tempdir().ok()?;
+    let dsn = temp.path().join("x.dsn");
+    std::fs::write(temp.path().join("x.dsn.konnect.json"), manifest_text).ok()?;
+    manifest_routing_hints(&dsn).retry_width_um
+}
+
 /// Live acceptance: export each board in a folder, route it with
 /// Freerouting, and run the SES through the strict import planner.
 /// `KONNECT_DSN_PROBE_DIR=<dir> FREEROUTING_JAR=<jar> FREEROUTING_JAVA=<java>
@@ -839,10 +847,40 @@ fn freerouting_routes_a_folder() {
                 }
             }
         }
+        // As export_specctra_dsn does: the project's rules and revision,
+        // intent widths, and the copper-to-edge and hole clearances.
+        let project_um = |key: &str| {
+            std::fs::read_to_string(path.with_extension("kicad_pro"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|p| p["board"]["design_settings"]["rules"][key].as_f64())
+                .filter(|mm| mm.is_finite() && *mm > 0.0)
+                .map(|mm| (mm * 1000.0).round() as i64)
+        };
         let options = ExportOptions {
             omit_pours: std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some(),
+            copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
+            widths_from_intent: true,
+            hole_clearance_um: project_um("min_hole_clearance"),
         };
-        let Ok(bundle) = export_dsn_with_options(&path, &source, &rules, options) else {
+        let Ok(snapshot) = crate::routing_context::Snapshot::read(&path) else {
+            println!("ROUTE {name}: project rules could not be read");
+            continue;
+        };
+        let exported = export_dsn_with_context(&path, &source, &rules, &snapshot, options);
+        if let Ok(bundle) = &exported {
+            for w in bundle
+                .intent_widths
+                .iter()
+                .filter(|w| w["status"] == "widened")
+            {
+                println!(
+                    "WIDEN {name}: {} {} -> {} mm",
+                    w["net"], w["from_mm"], w["to_mm"]
+                );
+            }
+        }
+        let Ok(bundle) = exported else {
             continue; // the export probe reports refusals
         };
         let work = tempfile::tempdir().unwrap();
@@ -863,6 +901,16 @@ fn freerouting_routes_a_folder() {
             .arg(&ses_path)
             .arg("-mp")
             .arg("20")
+            .arg("--router.automatic_neckdown=false")
+            .args(
+                manifest_retry_width(&bundle.manifest)
+                    .map(|um| format!("--router.neck_width_um={um}")),
+            )
+            .args(
+                options
+                    .copper_edge_clearance_um
+                    .map(|um| format!("--router.copper_to_edge_clearance_um={um}")),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -1028,7 +1076,10 @@ fn omitted_pours_leave_the_dsn_but_stay_in_the_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let board_path = temp.path().join("board.kicad_pcb");
     std::fs::write(&board_path, FOUR_LAYER).unwrap();
-    let options = ExportOptions { omit_pours: true };
+    let options = ExportOptions {
+        omit_pours: true,
+        ..Default::default()
+    };
     let bundle = export_dsn_with_options(&board_path, FOUR_LAYER, &rules(), options).unwrap();
     assert!(!bundle.dsn.contains("(plane"), "{}", bundle.dsn);
     let m = manifest(&bundle);
@@ -1087,4 +1138,408 @@ fn an_exact_repeat_in_the_ses_is_applied_once_and_counted() {
         plan.tracks.iter().filter(|t| t.layer == "In1.Cu").count(),
         2
     );
+}
+
+// ─── PR 16b: route at the project's rules ────────────────────────────────────
+
+/// On the owner's reference board Freerouting's neck-down wrote 0.15 mm
+/// tracks into a 0.2 mm class, and the importer took them. It now refuses a
+/// wire narrower than its net's class, and names the worst one.
+#[test]
+fn a_wire_narrower_than_its_class_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let bundle = export_dsn(&board_path, FOUR_LAYER, &rules()).unwrap();
+    let m = manifest(&bundle);
+    assert_eq!(m["classes"][0]["track_width_um"], 250);
+    let ses = ses_for(&m);
+    // The class is 0.25 mm; neck the In1.Cu wire down to 0.15 mm.
+    let necked = ses.replacen("(path In1.Cu 2500", "(path In1.Cu 1500", 1);
+    assert_ne!(necked, ses);
+    let error =
+        crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &necked)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("narrower than their net allows"), "{error}");
+    assert!(
+        error.contains("0.150 mm on 'GND'") && error.contains("0.250 mm"),
+        "{error}"
+    );
+    // A manifest from before PR 16b has no classes, so nothing is checked.
+    let mut old = m.clone();
+    old.as_object_mut().unwrap().remove("classes");
+    crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &old.to_string(), &necked)
+        .unwrap();
+}
+
+/// A net with a design-intent current is widened to the IPC-2221 width on the
+/// stack's worst layer (an inner one here), never narrowed, and the export
+/// says so; nets with no current keep their class.
+#[test]
+fn design_intent_currents_widen_their_nets() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
+    std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &intent_path,
+        json!({ "schema_version": 1, "currents": [
+            { "net": "GND", "max_current_a": 3.0 },
+            { "net": "VCC", "max_current_a": 0.05 },
+            { "net": "NOPE", "max_current_a": 1.0 }
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let (widened, report) = widen_for_intent(&board_path, FOUR_LAYER, &rules()).unwrap();
+    let gnd = widened["GND"].track_width_mm.unwrap();
+    // 3 A at 10 °C on 0.5 oz inner copper (the limiting layer): about 4.8 mm.
+    let expected =
+        crate::tools::trace_current::required_area_mm2(3.0, 10.0, false) / (0.5 * 0.0348);
+    assert!((gnd - expected).abs() < 0.001, "{gnd} vs {expected}");
+    assert_eq!(widened["VCC"].track_width_mm, Some(0.25), "never narrowed");
+    let status = |net: &str| report.iter().find(|r| r["net"] == net).unwrap()["status"].clone();
+    assert_eq!(status("GND"), "widened");
+    assert_eq!(status("VCC"), "already_wide_enough");
+    assert_eq!(status("NOPE"), "not_routed");
+    let limiting = report.iter().find(|r| r["net"] == "GND").unwrap()["limiting_layer"].clone();
+    assert!(limiting.as_str().unwrap().starts_with("In"), "{limiting}");
+    // The widened rule reaches the DSN as its own class.
+    let bundle = export_dsn(&board_path, FOUR_LAYER, &widened).unwrap();
+    let m = manifest(&bundle);
+    let widths: BTreeSet<i64> = m["classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["track_width_um"].as_i64().unwrap())
+        .collect();
+    assert!(
+        widths.contains(&250) && widths.iter().any(|w| *w > 4000),
+        "{widths:?}"
+    );
+    // No record: nothing changes. A broken record refuses.
+    std::fs::write(&intent_path, "{ broken").unwrap();
+    assert!(widen_for_intent(&board_path, FOUR_LAYER, &rules()).is_err());
+    std::fs::remove_file(&intent_path).unwrap();
+    let (same, report) = widen_for_intent(&board_path, FOUR_LAYER, &rules()).unwrap();
+    assert_eq!(same["GND"].track_width_mm, Some(0.25));
+    assert!(report.is_empty());
+}
+
+/// The project's copper-to-edge clearance travels in the manifest beside the
+/// DSN, where `route_specctra_dsn` reads it for Freerouting.
+#[test]
+fn the_edge_clearance_travels_beside_the_dsn() {
+    let temp = tempfile::tempdir().unwrap();
+    let options = ExportOptions {
+        copper_edge_clearance_um: Some(500),
+        ..Default::default()
+    };
+    let bundle =
+        export_dsn_with_options(Path::new("board.kicad_pcb"), FOUR_LAYER, &rules(), options)
+            .unwrap();
+    let dsn = temp.path().join("job.dsn");
+    std::fs::write(&dsn, &bundle.dsn).unwrap();
+    assert_eq!(
+        manifest_routing_hints(&dsn),
+        RoutingHints::default(),
+        "no manifest yet"
+    );
+    std::fs::write(temp.path().join("job.dsn.konnect.json"), &bundle.manifest).unwrap();
+    let hints = manifest_routing_hints(&dsn);
+    assert_eq!(hints.copper_edge_clearance_um, Some(500));
+    assert_eq!(hints.retry_width_um, Some(250), "the narrowest class");
+}
+
+/// A net widened to its current keeps its base width as the floor: the
+/// router retries a connection it cannot reach wide at that width, and the
+/// importer takes it, while anything narrower is still refused.
+#[test]
+fn a_widened_net_may_fall_back_to_its_base_width_and_no_lower() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
+    std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &intent_path,
+        json!({ "schema_version": 1, "currents": [{ "net": "GND", "max_current_a": 3.0 }] })
+            .to_string(),
+    )
+    .unwrap();
+    let snapshot = crate::routing_context::Snapshot::read(&board_path).unwrap();
+    let options = ExportOptions {
+        widths_from_intent: true,
+        ..Default::default()
+    };
+    let bundle =
+        export_dsn_with_context(&board_path, FOUR_LAYER, &rules(), &snapshot, options).unwrap();
+    let m = manifest(&bundle);
+    let gnd = m["nets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "GND")
+        .unwrap();
+    assert_eq!(gnd["min_track_width_um"], 250, "{gnd}");
+    assert!(bundle
+        .intent_widths
+        .iter()
+        .any(|w| w["net"] == "GND" && w["status"] == "widened"));
+    let ses = ses_for(&m);
+    // The fixture SES routes GND at 0.25 mm, its base width: accepted.
+    crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &ses)
+        .unwrap();
+    // Below the base width: refused.
+    let necked = ses.replacen("(path In1.Cu 2500", "(path In1.Cu 1500", 1);
+    let error =
+        crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &necked)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("floor 0.250 mm"), "{error}");
+}
+
+// ─── PR 16b review follow-up: pad-less footprints, retry width, no-width rules ─
+
+const PADLESS_HOOK: &str = "\t(via\n";
+
+/// A footprint with no pads at (104, 44) turned 90°, holding `body`.
+fn with_padless(reference: &str, body: &str) -> String {
+    let footprint = format!(
+        "\t(footprint \"Pkg:Padless\" (layer \"F.Cu\") (uuid \"padless-uuid\") (at 104 44 90) (property \"Reference\" \"{reference}\" (at 0 0 0) (layer \"F.SilkS\") (uuid \"pl\") (effects (font (size 1 1))))\n{body}\n\t)\n{PADLESS_HOOK}"
+    );
+    let board = FOUR_LAYER.replacen(PADLESS_HOOK, &footprint, 1);
+    assert_ne!(board, FOUR_LAYER, "fixture shape changed");
+    board
+}
+
+fn export_error(board: &str) -> String {
+    export_dsn(Path::new("board.kicad_pcb"), board, &rules())
+        .unwrap_err()
+        .to_string()
+}
+
+const ANTENNA_ZONE: &str = "(zone (net 0) (net_name \"\") (layers \"F.Cu\") (uuid \"fz1\") (name \"antenna\") (hatch edge 0.5) (connect_pads (clearance 0)) (min_thickness 0.25) (keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed)) (fill (thermal_gap 0.5) (thermal_bridge_width 0.5)) (polygon (pts (xy -1 -1) (xy 1 -1) (xy 1 1) (xy -1 1))))";
+
+/// An antenna keepout or a slot is often a footprint with no pads. The pad-less
+/// skip used to run first, so the board exported with the keepout missing.
+#[test]
+fn a_padless_footprint_with_a_zone_or_edge_cut_is_refused_and_named() {
+    let error = export_error(&with_padless("ANT1", ANTENNA_ZONE));
+    assert!(
+        error.contains("footprint 'ANT1'") && error.contains("rule area"),
+        "{error}"
+    );
+    // No Reference text: the footprint is named by its UUID.
+    let error = export_error(&with_padless("", ANTENNA_ZONE));
+    assert!(error.contains("footprint 'padless-uuid'"), "{error}");
+    let slot = "(fp_rect (start -1 -1) (end 1 1) (stroke (width 0.1) (type solid)) (fill no) (layer \"Edge.Cuts\") (uuid \"fe\"))";
+    let error = export_error(&with_padless("SLOT1", slot));
+    assert!(
+        error.contains("footprint 'SLOT1'") && error.contains("Edge.Cuts"),
+        "{error}"
+    );
+    // The same footprint with silkscreen only is still accepted and counted.
+    let silk = "(fp_rect (start -1 -1) (end 1 1) (stroke (width 0.1) (type solid)) (fill no) (layer \"F.SilkS\") (uuid \"fs\"))";
+    let bundle = export_dsn(
+        Path::new("board.kicad_pcb"),
+        &with_padless("LOGO1", silk),
+        &rules(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest(&bundle)["supported_profile"]["footprints_without_pads"],
+        1
+    );
+}
+
+/// Copper graphics on a footprint with no pads (a copper logo) are in the
+/// router's way: they become board keepouts, turned and moved with the part.
+#[test]
+fn copper_graphics_on_a_padless_footprint_become_keepouts_in_board_space() {
+    // A 2 mm line along the part's X; the part is at (104, 44) turned 90°
+    // counter-clockwise, so it runs from (104, 44) up to (104, 42) on the board.
+    let line = "(fp_line (start 0 0) (end 2 0) (stroke (width 0.2) (type solid)) (layer \"F.Cu\") (uuid \"fl\"))";
+    let base = export_dsn(Path::new("board.kicad_pcb"), FOUR_LAYER, &rules()).unwrap();
+    let base_count = manifest(&base)["supported_profile"]["copper_graphic_keepout_count"]
+        .as_u64()
+        .unwrap();
+    let bundle = export_dsn(
+        Path::new("board.kicad_pcb"),
+        &with_padless("LOGO1", line),
+        &rules(),
+    )
+    .unwrap();
+    let m = manifest(&bundle);
+    assert_eq!(
+        m["supported_profile"]["copper_graphic_keepout_count"]
+            .as_u64()
+            .unwrap(),
+        base_count + 1
+    );
+    assert_eq!(m["supported_profile"]["footprints_without_pads"], 1);
+    // It is not a placed part.
+    assert!(m["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["reference"] != "LOGO1"));
+    let tree = parse_dsn_sexp(&bundle.dsn).unwrap();
+    let structure = tree.find("structure").unwrap();
+    let path = structure
+        .find_all("keepout")
+        .into_iter()
+        .filter_map(|k| k.find("path"))
+        .find(|p| p.get(1).and_then(SexpNode::as_str) == Some("F.Cu"))
+        .expect("the logo line is a structure keepout on F.Cu");
+    let numbers: Vec<f64> = path
+        .children()
+        .unwrap()
+        .iter()
+        .skip(3)
+        .filter_map(|n| n.as_str()?.parse().ok())
+        .collect();
+    assert_eq!(numbers, vec![104000.0, -44000.0, 104000.0, -42000.0]);
+    // Stroke 0.2 mm plus the chord tolerance on each side.
+    assert_eq!(path.get(2).and_then(SexpNode::as_str), Some("210"));
+}
+
+fn two_class_rules(gnd_width: f64, vcc_width: f64) -> IpcEffectiveRoutingRules {
+    let mut rules = rules();
+    rules.get_mut("GND").unwrap().track_width_mm = Some(gnd_width);
+    rules.get_mut("VCC").unwrap().track_width_mm = Some(vcc_width);
+    rules
+}
+
+fn hints_of(bundle: &ExportBundle) -> RoutingHints {
+    let temp = tempfile::tempdir().unwrap();
+    let dsn = temp.path().join("job.dsn");
+    std::fs::write(temp.path().join("job.dsn.konnect.json"), &bundle.manifest).unwrap();
+    manifest_routing_hints(&dsn)
+}
+
+/// Freerouting retries any failed connection at its one retry width, so it is
+/// sent only when no net's floor is above it.
+#[test]
+fn the_retry_width_is_off_when_net_classes_have_different_floors() {
+    let board = Path::new("board.kicad_pcb");
+    // One class: the retry width is that class's width.
+    let same = export_dsn(board, FOUR_LAYER, &rules()).unwrap();
+    let hints = hints_of(&same);
+    assert_eq!(hints.retry_width_um, Some(250));
+    assert_eq!(hints.retry_off_reason, None);
+    // GND 0.5 mm, VCC 0.25 mm: a 0.25 mm retry would take GND below its class.
+    let two = export_dsn(board, FOUR_LAYER, &two_class_rules(0.5, 0.25)).unwrap();
+    let hints = hints_of(&two);
+    assert_eq!(hints.retry_width_um, None);
+    assert_eq!(hints.retry_off_reason, Some(RETRY_OFF_DIFFERENT_FLOORS));
+    assert!(hints
+        .retry_off_reason
+        .unwrap()
+        .contains("different minimum widths"));
+}
+
+/// A widened net's floor is its base width, so widening alone keeps the retry
+/// on, at that width.
+#[test]
+fn a_widened_net_keeps_the_retry_on_at_the_shared_base_width() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
+    std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &intent_path,
+        json!({ "schema_version": 1, "currents": [{ "net": "GND", "max_current_a": 3.0 }] })
+            .to_string(),
+    )
+    .unwrap();
+    let snapshot = crate::routing_context::Snapshot::read(&board_path).unwrap();
+    let options = ExportOptions {
+        widths_from_intent: true,
+        ..Default::default()
+    };
+    let bundle =
+        export_dsn_with_context(&board_path, FOUR_LAYER, &rules(), &snapshot, options).unwrap();
+    let hints = hints_of(&bundle);
+    assert_eq!(hints.retry_width_um, Some(250));
+    assert_eq!(hints.retry_off_reason, None);
+}
+
+/// A run that sent the narrowest floor as Freerouting's retry width narrows a
+/// wider net to exactly that width; the importer names that cause. A track
+/// narrower than every floor is still put down to fanout and neck-down.
+#[test]
+fn a_wire_at_the_retry_width_gets_the_retry_width_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let bundle = export_dsn(&board_path, FOUR_LAYER, &two_class_rules(0.5, 0.25)).unwrap();
+    let m = manifest(&bundle);
+    let ses = ses_for(&m);
+    // `ses_for` routes GND at 0.25 mm: the narrowest floor on the board
+    // (VCC's), below GND's 0.5 mm class.
+    let error =
+        crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &ses)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("retry width (neck_width_um): it is one value for every net")
+            && error.contains("'GND'")
+            && error.contains("0.250 mm")
+            && error.contains("0.500 mm"),
+        "{error}"
+    );
+    // Narrower than any floor: not the retry width, so the old advice stands.
+    let necked = ses
+        .replace("(path In1.Cu 2500", "(path In1.Cu 1500")
+        .replace("(path B.Cu 2500", "(path B.Cu 1500");
+    let error =
+        crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &necked)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        !error.contains("retry width") && error.contains("fanout"),
+        "{error}"
+    );
+}
+
+/// A rule with no track width stays incomplete: intent widening must not
+/// fill it from the current, or the export would accept it.
+#[test]
+fn a_net_with_no_track_width_is_not_widened_and_is_still_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let board_path = temp.path().join("board.kicad_pcb");
+    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
+    std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &intent_path,
+        json!({ "schema_version": 1, "currents": [{ "net": "VCC", "max_current_a": 2.0 }] })
+            .to_string(),
+    )
+    .unwrap();
+    let mut incomplete = rules();
+    incomplete.get_mut("VCC").unwrap().track_width_mm = None;
+    let (widened, report) = widen_for_intent(&board_path, FOUR_LAYER, &incomplete).unwrap();
+    assert_eq!(widened["VCC"].track_width_mm, None, "left as it was");
+    let vcc = report.iter().find(|r| r["net"] == "VCC").unwrap();
+    assert_eq!(vcc["status"], "not_widened");
+    let error = export_dsn(&board_path, FOUR_LAYER, &widened)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("track width"), "{error}");
+    // Through the whole export, with intent widening on.
+    let snapshot = crate::routing_context::Snapshot::read(&board_path).unwrap();
+    let options = ExportOptions {
+        widths_from_intent: true,
+        ..Default::default()
+    };
+    let error = export_dsn_with_context(&board_path, FOUR_LAYER, &incomplete, &snapshot, options)
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(!error.is_empty());
 }
