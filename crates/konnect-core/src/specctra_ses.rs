@@ -25,6 +25,9 @@ pub(crate) struct SesImportPlan {
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
+    /// Exact repeats in the SES (same net, layer, width and geometry),
+    /// applied once.
+    pub duplicates_skipped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -76,6 +79,21 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    #[serde(default)]
+    classes: Vec<ManifestClass>,
+    /// Informational: nets the export widened to their design-intent current.
+    #[serde(default)]
+    #[allow(dead_code)]
+    intent_widths: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestClass {
+    name: String,
+    track_width_um: i64,
+    #[allow(dead_code)]
+    clearance_um: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +114,32 @@ struct SupportedProfile {
     zone_keepout_count: usize,
     custom_rules: bool,
     outline: String,
+    /// Informational: padless footprints the export left out. The import
+    /// neither needs nor checks it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    footprints_without_pads: usize,
+    /// Informational, like `footprints_without_pads`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    copper_graphic_keepout_count: usize,
+    /// The pours were left out of the DSN; the zone inventory is still
+    /// checked against the board.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pours_omitted: bool,
+    /// Informational here: `route_specctra_dsn` reads it for the router.
+    #[serde(default)]
+    #[allow(dead_code)]
+    copper_edge_clearance_um: Option<i64>,
+    /// Informational: the project's hole clearance the export applied.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hole_clearance_um: Option<i64>,
+    /// Informational: how far each unplated-hole keepout was grown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hole_keepout_growth_um: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +148,12 @@ struct ManifestLayer {
     kicad_name: String,
     dsn_name: String,
     index: usize,
+    #[serde(default = "signal_layer")]
+    dsn_type: String,
+}
+
+fn signal_layer() -> String {
+    "signal".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,7 +166,13 @@ struct ManifestComponent {
     y_um: i64,
     rotation_degrees: f64,
     side: String,
+    #[serde(default = "front_side")]
+    kicad_side: String,
     pads: Vec<ManifestPin>,
+}
+
+fn front_side() -> String {
+    "front".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +190,8 @@ struct ManifestNet {
     name: String,
     pins: Vec<String>,
     class_name: String,
+    #[serde(default)]
+    min_track_width_um: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,7 +233,9 @@ pub(crate) fn parse_import_plan(
     // target board remains bound by the manifest path and snapshot hash below;
     // accept only that self-consistent transport alias, never an unrelated
     // design name.
-    if actual_base != expected_base && actual_base != session_id {
+    // The exporter writes the board name as a DSN token (spaces as `_`).
+    let expected_token = crate::specctra::dsn_design_name(expected_base);
+    if actual_base != expected_base && actual_base != expected_token && actual_base != session_id {
         bail!(
             "SES base_design '{actual_base}' matches neither board '{expected_base}' nor session '{session_id}'"
         );
@@ -200,7 +260,7 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
-    let (tracks, arcs, vias) = parse_network(
+    let (tracks, arcs, vias, duplicates_skipped) = parse_network(
         one_child(routes, "network_out")?,
         route_resolution,
         &manifest,
@@ -231,6 +291,7 @@ pub(crate) fn parse_import_plan(
         tracks,
         arcs,
         vias,
+        duplicates_skipped,
     })
 }
 
@@ -252,12 +313,17 @@ fn validate_manifest(
             manifest.resolution
         );
     }
-    if manifest.supported_profile.copper_layers != 2
-        || manifest.supported_profile.component_side != "front"
+    let copper = manifest.supported_profile.copper_layers;
+    if !(2..=32).contains(&copper)
+        || !copper.is_multiple_of(2)
+        || !matches!(
+            manifest.supported_profile.component_side.as_str(),
+            "front" | "front_and_back"
+        )
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
     {
-        bail!("manifest does not describe the supported first routing profile");
+        bail!("manifest does not describe a supported routing profile");
     }
     let (locked_track_count, locked_via_count) = locked_routing_counts(board_source)?;
     let has_locked_routing = locked_track_count > 0 || locked_via_count > 0;
@@ -335,8 +401,20 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains an invalid or duplicate layer mapping");
         }
     }
-    if layer_names.len() != 2 {
-        bail!("manifest must contain exactly two copper layer mappings");
+    if layer_names.len() != manifest.supported_profile.copper_layers as usize {
+        bail!(
+            "manifest must contain one mapping per copper layer ({} expected)",
+            manifest.supported_profile.copper_layers
+        );
+    }
+    let indices: Vec<usize> = layer_indices.into_iter().collect();
+    if indices != (0..layer_names.len()).collect::<Vec<_>>()
+        || manifest
+            .layers
+            .iter()
+            .any(|layer| !matches!(layer.dsn_type.as_str(), "signal" | "power"))
+    {
+        bail!("manifest layer mappings are not a contiguous signal/power copper stack");
     }
 
     let net_names = manifest
@@ -362,13 +440,23 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             || component.image_name.is_empty()
             || !component.rotation_degrees.is_finite()
             || component.side != "front"
+            || !matches!(component.kicad_side.as_str(), "front" | "back")
             || !references.insert(component.reference.as_str())
         {
             bail!("manifest contains invalid component placement metadata");
         }
+        let mut pin_ids = BTreeSet::new();
         for pin in &component.pads {
-            if pin.pad_number.is_empty()
-                || pin.dsn_pin != format!("{}-{}", component.reference, pin.pad_number)
+            // A pin is `REF-NUMBER`, or `REF-NUMBER@n` for a repeated or
+            // empty number (see the exporter's `pin_ids`).
+            let base = format!("{}-{}", component.reference, pin.pad_number);
+            let suffixed = pin
+                .dsn_pin
+                .strip_prefix(&base)
+                .and_then(|rest| rest.strip_prefix('@'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if !(pin.dsn_pin == base && !pin.pad_number.is_empty() || suffixed)
+                || !pin_ids.insert(pin.dsn_pin.as_str())
                 || !padstack_names.contains(pin.padstack_name.as_str())
                 || pin
                     .net
@@ -386,6 +474,13 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
         if net.class_name.is_empty() || net.pins.is_empty() {
             bail!("manifest net '{}' is incomplete", net.name);
         }
+    }
+    let any_back = manifest
+        .components
+        .iter()
+        .any(|component| component.kicad_side == "back");
+    if any_back != (manifest.supported_profile.component_side == "front_and_back") {
+        bail!("manifest component sides disagree with its routing profile");
     }
     Ok(())
 }
@@ -424,7 +519,7 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
             if x_um != component.x_um
                 || y_um != component.y_um
                 || side != component.side
-                || (rotation - component.rotation_degrees).abs() > 1e-9
+                || !same_angle(rotation, component.rotation_degrees)
             {
                 bail!("SES changes placement of component '{reference}'");
             }
@@ -439,6 +534,13 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
         bail!("SES placement omits component(s): {}", missing.join(", "));
     }
     Ok(())
+}
+
+/// Two angles in degrees that name the same direction: Freerouting writes a
+/// `-90` placement back as `270`.
+fn same_angle(a: f64, b: f64) -> bool {
+    let d = (a - b).rem_euclid(360.0);
+    d.min(360.0 - d) <= 1e-9
 }
 
 fn validate_parser(node: &SexpNode) -> Result<()> {
@@ -526,11 +628,10 @@ fn validate_library(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Re
     Ok(())
 }
 
-fn parse_network(
-    node: &SexpNode,
-    resolution: f64,
-    manifest: &Manifest,
-) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>)> {
+/// Tracks, arcs and vias from an SES, and how many exact repeats were skipped.
+type ParsedNetwork = (Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>, usize);
+
+fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Result<ParsedNetwork> {
     require_direct_shape(node, 0, &["net"])?;
     let nets = manifest
         .nets
@@ -554,6 +655,31 @@ fn parse_network(
     let mut seen_tracks = BTreeSet::new();
     let mut seen_arcs = BTreeSet::new();
     let mut seen_vias = BTreeSet::new();
+    // Freerouting can write one segment, arc or via twice. An exact repeat
+    // (same net, layer, width and geometry) adds no copper: it is counted and
+    // applied once. Anything that differs is a distinct item.
+    let mut duplicates = 0usize;
+    // The width each net's class demands. Freerouting's neck-down narrows a
+    // track below it to reach a small pad; such a track breaks the project's
+    // rules, so the whole SES is refused. Manifests from before PR 16b carry
+    // no classes and are not checked here.
+    let class_width_mm: BTreeMap<&str, f64> = manifest
+        .classes
+        .iter()
+        .map(|class| (class.name.as_str(), class.track_width_um as f64 / UM_PER_MM))
+        .collect();
+    let net_width_mm: BTreeMap<&str, f64> = manifest
+        .nets
+        .iter()
+        .filter_map(|net| {
+            let floor = match net.min_track_width_um {
+                Some(um) => um as f64 / UM_PER_MM,
+                None => *class_width_mm.get(net.class_name.as_str())?,
+            };
+            Some((net.name.as_str(), floor))
+        })
+        .collect();
+    let mut narrow: Vec<(String, f64, f64)> = Vec::new();
 
     for net_node in node.find_all("net") {
         require_direct_shape(net_node, 1, &["wire", "via"])?;
@@ -582,6 +708,11 @@ fn parse_network(
                         "path width",
                     )?;
                     let width_mm = width_um / UM_PER_MM;
+                    if let Some(min) = net_width_mm.get(net_name) {
+                        if width_mm < min - 0.0005 {
+                            narrow.push((net_name.to_string(), width_mm, *min));
+                        }
+                    }
                     let points = data[2..]
                         .chunks_exact(2)
                         .map(|pair| {
@@ -610,7 +741,8 @@ fn parse_network(
                             endpoints,
                         );
                         if !seen_tracks.insert(key) {
-                            bail!("SES repeats a route segment on net '{net_name}'");
+                            duplicates += 1;
+                            continue;
                         }
                         tracks.push(SesTrack {
                             net_name: net_name.to_string(),
@@ -636,6 +768,11 @@ fn parse_network(
                         resolution,
                         "qarc width",
                     )? / UM_PER_MM;
+                    if let Some(min) = net_width_mm.get(net_name) {
+                        if width_mm < min - 0.0005 {
+                            narrow.push((net_name.to_string(), width_mm, *min));
+                        }
+                    }
                     let point = |x: &str, y: &str, label: &str| -> Result<(f64, f64)> {
                         Ok((
                             scaled(number_text(x, &format!("{label} x"))?, resolution, label)?
@@ -676,20 +813,21 @@ fn parse_network(
                         (ordered_f64(end.0), ordered_f64(end.1)),
                         (ordered_f64(center.0), ordered_f64(center.1)),
                     );
-                    if !seen_arcs.insert(key) {
-                        bail!("SES repeats an arc on net '{net_name}'");
+                    if seen_arcs.insert(key) {
+                        arcs.push(SesArc {
+                            net_name: net_name.to_string(),
+                            layer: (*layer).to_string(),
+                            width_mm,
+                            start_x_mm: start.0,
+                            start_y_mm: start.1,
+                            mid_x_mm: mid.0,
+                            mid_y_mm: mid.1,
+                            end_x_mm: end.0,
+                            end_y_mm: end.1,
+                        });
+                    } else {
+                        duplicates += 1;
                     }
-                    arcs.push(SesArc {
-                        net_name: net_name.to_string(),
-                        layer: (*layer).to_string(),
-                        width_mm,
-                        start_x_mm: start.0,
-                        start_y_mm: start.1,
-                        mid_x_mm: mid.0,
-                        mid_y_mm: mid.1,
-                        end_x_mm: end.0,
-                        end_y_mm: end.1,
-                    });
                 }
                 _ => bail!("SES wire for net '{net_name}' must contain exactly one path or qarc"),
             }
@@ -722,7 +860,8 @@ fn parse_network(
             let y_mm = -y_um / UM_PER_MM;
             let key = (net_name.to_string(), ordered_f64(x_mm), ordered_f64(y_mm));
             if !seen_vias.insert(key) {
-                bail!("SES repeats a via on net '{net_name}'");
+                duplicates += 1;
+                continue;
             }
             vias.push(SesVia {
                 net_name: net_name.to_string(),
@@ -735,7 +874,39 @@ fn parse_network(
             });
         }
     }
-    Ok((tracks, arcs, vias))
+    if !narrow.is_empty() {
+        let (net, width, min) = narrow
+            .iter()
+            .min_by(|a, b| {
+                (a.1 - a.2)
+                    .partial_cmp(&(b.1 - b.2))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
+            .unwrap_or_default();
+        let nets: BTreeSet<&str> = narrow.iter().map(|n| n.0.as_str()).collect();
+        // Freerouting's retry width (`neck_width_um`) is one value for every
+        // net. A run that sent the narrowest floor on the board as that width
+        // (an older Konnect did, and so would a hand-set job) narrows a wider
+        // net to exactly it, which the cause below names.
+        let retry_mm = net_width_mm.values().copied().fold(f64::INFINITY, f64::min);
+        if let Some((retry_net, retry_wire, retry_floor)) = narrow
+            .iter()
+            .find(|n| n.2 > retry_mm + 0.0005 && (n.1 - retry_mm).abs() <= 0.0005)
+        {
+            bail!(
+                "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). '{retry_net}' has a wire at {retry_wire:.3} mm, the narrowest floor on the board, though its own floor is {retry_floor:.3} mm, which points at Freerouting's retry width (neck_width_um): it is one value for every net and narrows any net's retried connection to it. Route again with route_specctra_dsn, which sends no retry width when the nets' floors differ",
+                narrow.len(),
+                nets.len()
+            );
+        }
+        bail!(
+            "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). Freerouting necks tracks down at pins in its fanout stage and with automatic neck-down; route again with both off (route_specctra_dsn's default)",
+            narrow.len(),
+            nets.len()
+        );
+    }
+    Ok((tracks, arcs, vias, duplicates))
 }
 
 fn parse_resolution(node: &SexpNode) -> Result<f64> {
@@ -953,8 +1124,14 @@ mod tests {
         let custom="(version 1)(rule \"Minimums\" (constraint clearance (min 0.200001mm)) (constraint track_width (min 0.300001mm)))";
         std::fs::write(board.with_extension("kicad_dru"), custom).unwrap();
         let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
-        let export =
-            crate::specctra::export_dsn_with_context(&board, &source, &rules(), &snapshot).unwrap();
+        let export = crate::specctra::export_dsn_with_context(
+            &board,
+            &source,
+            &rules(),
+            &snapshot,
+            Default::default(),
+        )
+        .unwrap();
         let body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         assert_eq!(body["supported_profile"]["custom_rules"], true);
         assert!(body["routing_context"]["project_sha256"].is_string());
@@ -985,8 +1162,14 @@ mod tests {
         std::fs::write(board.with_extension("kicad_dru"), "(version 1)").unwrap();
         assert!(parse_import_plan(&board, &source, &legacy, sample_ses()).is_err());
         let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
-        let export =
-            crate::specctra::export_dsn_with_context(&board, &source, &rules(), &snapshot).unwrap();
+        let export = crate::specctra::export_dsn_with_context(
+            &board,
+            &source,
+            &rules(),
+            &snapshot,
+            Default::default(),
+        )
+        .unwrap();
         let mut body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
         body["supported_profile"]["custom_rules"] = serde_json::json!(false);
         assert!(parse_import_plan(&board, &source, &body.to_string(), sample_ses()).is_err());

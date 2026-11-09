@@ -222,7 +222,9 @@ pub fn tools() -> Vec<ToolDef> {
              footprint IDs can be replaced in place while preserving instance state. Routed \
              net changes require unanimous whole-net intent and known copper coverage; \
              changed routed-pad geometry, splits and unknown zone connectivity refuse. \
-             Inspect applied_with_differences or uncertain outcomes before retrying.",
+             Inspect applied_with_differences or uncertain outcomes before retrying. \
+             `changes` is paged (`limit`, `offset`) and the other lists are cut to fit the \
+             response (`truncated_lists`); `coverage` and `change_count` count every item.",
             json!({
                 "type": "object",
                 "properties": {
@@ -231,7 +233,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
                     "delete_orphan_footprints": { "type": "boolean", "description": "Delete board footprints whose symbol is no longer in the saved schematic. Board-only, unlinked and locked footprints are never deleted. Pass the same value to the dry run and the apply", "default": false },
-                    "delete_orphans_with_tracks": { "type": "boolean", "description": "Also delete an orphan footprint that has tracks, arcs or vias on its pads. The copper stays on the board. Needs delete_orphan_footprints", "default": false }
+                    "delete_orphans_with_tracks": { "type": "boolean", "description": "Also delete an orphan footprint that has tracks, arcs or vias on its pads. The copper stays on the board. Needs delete_orphan_footprints", "default": false },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 100, "description": "Most planned changes to list. coverage and change_count count them all" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "First planned change to list" }
                 },
                 "required": ["schematic", "board"]
             }),

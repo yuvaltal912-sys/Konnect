@@ -76,9 +76,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
+        description: "Board outline (rectangle or polygon), layers, zones and rule areas (keepouts), footprint locks, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -130,9 +130,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "design_review",
-        description: "AI-powered design audits: decoupling, connections, power rails, DFM, trace current, BOM health",
+        description: "AI-powered design audits: decoupling, connections, power rails, DFM, trace current, layout quality, circuit-aware checklist review, BOM health",
         category: "review",
-        tool_count: 7,
+        tool_count: 9,
     },
     ToolsetMeta {
         name: "templates",

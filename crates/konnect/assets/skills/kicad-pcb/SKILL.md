@@ -99,9 +99,19 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 Follow this sequence for a clean PCB workflow:
 
-1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
+1. **Board outline** — `set_board_size`, or `add_board_outline` with a rectangle or,
+   for a shaped board, `points` (a corner may carry an arc midpoint for the next edge). Both outline tools
    append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
-   without it leaves two overlapping outlines and a DRC failure.
+   without it leaves two overlapping outlines and a DRC failure. Add mechanical and
+   antenna keepouts now with `add_rule_area` (its defaults are KiCad's: tracks, vias
+   and pads forbidden; set `copperpour` in its `keepout` to keep pours out too), and
+   lock fixed parts (connectors, mounting) with `set_footprint_lock`. Only
+   `auto_place_from_schematic` and `refine_placement_force_directed` hold a locked
+   footprint, and `update_pcb_from_schematic` keeps a locked orphan instead of
+   deleting it. `move_component`, `rotate_component`, `flip_component`,
+   `set_component_placements`, `align_components` and `place_decoupling_caps` do not
+   check the lock, so keep locked references out of them. Routing never moves a
+   footprint.
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
@@ -137,7 +147,9 @@ Follow this sequence for a clean PCB workflow:
 
 Do NOT add copper pours before routing is complete — they interfere with interactive routing.
 Preserve existing zones: the DSN exporter supports their outlines, and removing them
-changes the design. Refill after routing and check the resulting copper.
+changes the design. Refill after routing and check the resulting copper. A rule area
+that forbids tracks or vias is exported as a Freerouting keepout; `list_zones` shows
+each zone's kind and flags, and `delete_zone` removes one only when asked.
 
 ---
 
@@ -185,9 +197,11 @@ board now has the intended placement:
 2. **Build the held set.** Include every caller-identified intentional
    placement. A diagnostic `auto_place_from_schematic` dry-run reports saved-board
    lock records in its **held** list; accept those only when that saved file is
-   known current. `get_component_list` does not expose lock state, so if neither
-   current saved evidence nor the caller establishes the KiCad-locked references,
-   report `BLOCKED` and ask the caller to confirm them. Never send a held
+   known current. `set_footprint_lock` without `locked` reads every footprint's
+   lock state from the saved file; when the board is open in KiCad with unsaved
+   edits, that file may be stale, so if neither current saved evidence nor the
+   caller establishes the KiCad-locked references, report `BLOCKED` and ask the
+   caller to confirm them. Never send a held
    reference to any placement, rotation, or flip call, including a batch.
 3. **Plan a small explicit batch.** Prefer one functional group and the fewest
    references needed to test the improvement. `auto_place_from_schematic` is a
@@ -205,7 +219,9 @@ board now has the intended placement:
    a diagnostic whole-board plan into an autonomous bulk mutation.
 5. **Read back the exact requested live board.** After every batch, call
    `get_component_list` for that board and verify each requested reference's
-   observed position, rotation, and layer. Call `get_board_info` and require
+   observed position, rotation, and layer. The list is paged: while
+   `truncated` is true, follow `next_offset` before calling a reference
+   missing, or read each one with `find_component`. Call `get_board_info` and require
    `source: "ipc"` before treating this as live-board proof (`score_placement`
    names the same live authority **source: "live_ipc"**). A saved-file or CLI
    observation may support a separate check, but report it as saved/CLI evidence
@@ -316,6 +332,8 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    unavailable. The tool locates the JAR and a compatible Java; it does not
    install either. If unavailable, stop and report the returned setup steps;
    continue only after the installation or capability blocker is resolved.
+   If its version policy carries a `warning`, tell the user which release
+   is recommended and why; it does not block routing.
 2. With the exact named board open over IPC and placement/rules settled, call
    `export_specctra_dsn(board, output='new-job.dsn')`. Keep the returned DSN and
    reverse manifest together. Rust export is the default
@@ -335,16 +353,24 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
 6. Finish with the synchronized refill/DRC procedure below. The import's
    candidate check does not establish that existing zone fills are current.
 
-**Current limits:** two copper layers and front-side SMD or through-hole
-footprints; circle, rectangle, rounded-rectangle, and oval pads; one closed
-outline made from supported lines/arcs, rectangle, circle, or polygon. Outline
-arcs/circles become chords within 5 um, and rounded pads use their bounding
-rectangles. Existing pours become fixed planes and track/via-blocking rule areas
-become keepouts from zone outlines, not their fills; thermal reliefs are not
-modelled. Locked straight tracks/vias are preserved. Unlocked routing, routed
-arcs, other pad shapes, curves, custom DRC rules, incomplete routing rules,
-back-side footprints, and more copper layers are refused. `flip_component`
-supports back-side placement, but that does not widen this DSN profile.
+**Current limits:** 2 to 32 copper layers (KiCad power layers stay off-limits
+to the router) and SMD or through-hole footprints on either side; circle,
+rectangle, rounded-rectangle, and oval pads; one closed outline made from
+supported lines/arcs, rectangle, circle, or polygon. Outline arcs/circles become
+chords within 5 um, and rounded pads use their bounding rectangles. Existing
+pours become fixed planes and track/via-blocking rule areas become keepouts from
+zone outlines, not their fills; thermal reliefs are not modelled. A large pour
+then leaves the router little room: pass `pours="omit"` to route through pour
+areas, then refill zones and run DRC after the import. Record the currents of
+the main power nets with `set_design_intent` before exporting: the export
+widens those nets to their IPC-2221 width (`intent_widths`), and
+`route_specctra_dsn` keeps Freerouting from narrowing any track below its class. Mounting
+holes and copper graphics or text become keepouts (text as a generous square).
+Locked straight tracks (on any copper layer) and through vias are preserved.
+Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,
+custom DRC rules, incomplete routing rules, blind/buried vias, copper
+dimensions and KiCad `jumper` layers are refused. Boards with back-side parts
+use the Rust exporter: KiCad's native exporter is not adopted for them.
 
 If DSN export, Freerouting, or SES import fails, stop and report the exact
 blocker. Do not hand-roll a router or direct-edit the board as a fallback. If
