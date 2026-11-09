@@ -20,7 +20,19 @@ Creation rank 32 part 2 (B34, D24; `docs/CREATION_HANDOFF.md`). Additive.
   window after printing the version and the probe timed out, so a working
   install read `available: false`. A probe that prints a Freerouting version
   line now counts as `version_checked` even when the JAR then exits 1 (2.1.0
-  does, because no board was given).
+  does, because no board was given), unless the output after that line shows a
+  Java exception trace or a Freerouting ERROR line other than the complaint
+  that no board was given. Then `available` and `version_checked` are false and
+  `version_output` holds the crash.
+- If the probe's scratch folder cannot be made, the JAR is not started:
+  `available` and `version_checked` are false, and `note` names the error.
+  The probe also removes every inherited `FREEROUTING__*` variable and points
+  `XDG_*`, `APPDATA` and `LOCALAPPDATA` into the scratch folder. The native MCP
+  probe (`freerouting_mcp.rs`) is not isolated yet.
+- Versions compare by their numbers, so `freerouting-2.5.jar` is the
+  recommended 2.5.0 and its digest is checked. A pre-release such as
+  `2.5.0-SNAPSHOT` keeps its suffix in `installed_version` and is never
+  `matches_recommended`.
 - `setup`'s download step and `version_policy` text name the recommended
   release instead of "the latest 2.x".
 

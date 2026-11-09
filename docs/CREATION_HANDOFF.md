@@ -102,6 +102,17 @@ Verified on macOS: the gate after merging main (fmt; 3,813 lib and integration t
 
 Follow-ups: start Freerouting quietly in `route_specctra_dsn` and the MCP probe (`freerouting_mcp.rs`); the owner's board corpus; a setting sweep (passes, optimizer) on it with the same metrics.
 
+**Review follow-up (2026-11-09).** Seven verified findings fixed, each with a test that fails without it:
+- The `--version` probe fails closed: no scratch folder means the JAR is not started (`available` and `version_checked` false, `note` names the error). It also removes inherited `FREEROUTING__*` variables and pins `XDG_*`, `APPDATA` and `LOCALAPPDATA` into the scratch folder. `probe_local` in `freerouting_mcp.rs` is untouched here; its isolation comes with #57.
+- A version line followed by a Java exception trace or a Freerouting ERROR line (not the expected "no input/output file" complaint of a board-less headless run) is a start-up crash, not `available`.
+- The bench trusts 2.3+'s own `finished with state:` line over the wall clock for the job budget; the wall clock stays the test for 2.1.
+- Each `--jar` gets a unique folder label (`-2`, `-3` on a clash, `unknown` too), saved as `dir` in `results.json`; `--rescore` reads it (old files fall back to the file-name label), and totals and ranking are per folder with the version shown.
+- A run that does not report its clearance-violation count fails the gate.
+- Versions compare by zero-padded numbers (`2.5` is `2.5.0`); `-SNAPSHOT` and other pre-release suffixes are kept and never the release.
+- The bench seeds `home/.config/freerouting` (where 2.5 reads on Linux) and pins the `XDG_*`, `APPDATA`, `LOCALAPPDATA` folders into the run folder.
+
+Verified (review follow-up): fmt; 3,838 lib and integration tests passed, 0 failed (the 46 xtask tests included); 9 doc tests; clippy `-D warnings`; `cargo deny check licenses`; `fix-doc-counts` unchanged; 19 negative controls, each guard broken in source, its test failed, restored byte for byte; one real 2.5.0 probe run the way `check_freerouting` starts it (headless, scratch home, folders pinned): banner, two WARN lines and the expected no-board complaint, so a healthy start, and every file it wrote stayed in the scratch home (its output is now a test); `simulation_live` and the release build skipped. Not verified: the bench against a real JAR (its helpers are unit-tested), Windows and Linux paths.
+
 ## PR 16, Specctra DSN for real boards (merged, #44)
 
 Rank 32 (D7), first part. Merged as [#44](https://github.com/yuvaltal912-sys/Konnect/pull/44) from `feat/creation-dsn-widening`. The claim-only commit and draft preceded implementation, from main 966a89d. Code in `specctra.rs` and `specctra_ses.rs`; tests in `specctra_layers_tests.rs` over a fixture KiCad 10.0.8's own `pcbnew` wrote (`specctra_four_layer_back.kicad_pcb`: 4 layers with a `power` layer, a back-side part at 90°, a through-hole part, a locked In1.Cu track, a locked via, an In2.Cu pour).

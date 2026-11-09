@@ -2251,7 +2251,12 @@ async fn installed_version_policy(jar: &Path, version_output: Option<&str>) -> s
     let claimed = version_output
         .and_then(crate::freerouting_setup::version_in_output)
         .or_else(|| crate::freerouting_setup::version_in_file_name(jar));
-    let sha = if claimed.as_deref() == Some(crate::freerouting_setup::RECOMMENDED.version) {
+    let sha = if claimed.as_deref().is_some_and(|version| {
+        crate::freerouting_setup::same_version(
+            version,
+            crate::freerouting_setup::RECOMMENDED.version,
+        )
+    }) {
         let path = jar.to_path_buf();
         tokio::task::spawn_blocking(move || crate::freerouting_setup::file_sha256(&path).ok())
             .await
@@ -2261,6 +2266,55 @@ async fn installed_version_policy(jar: &Path, version_output: Option<&str>) -> s
         None
     };
     crate::freerouting_setup::version_policy(Some(jar), version_output, sha.as_deref())
+}
+
+/// Keeps a Freerouting child's settings, log and data inside `home`, whatever
+/// the owner's environment says. 2.5's `UserDataPathResolver` lets
+/// `FREEROUTING__USER_DATA_PATH` and `FREEROUTING__LOGGING__FILE__LOCATION`
+/// override `user.home`, and `AppPaths` lets the XDG variables and (on
+/// Windows) `APPDATA` and `LOCALAPPDATA` do the same. So every inherited
+/// `FREEROUTING__*` variable (`inherited` lists the names) is removed and the
+/// folder variables point into `home`.
+fn isolate_freerouting_environment(
+    command: &mut tokio::process::Command,
+    home: &Path,
+    inherited: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    for name in inherited {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("FREEROUTING__")
+        {
+            command.env_remove(name);
+        }
+    }
+    for (name, folder) in [
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("APPDATA", "AppData/Roaming"),
+        ("LOCALAPPDATA", "AppData/Local"),
+    ] {
+        command.env(name, home.join(folder));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test sets this to see the answer when the probe's scratch folder
+    /// cannot be made.
+    static PROBE_SCRATCH_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The scratch folder the version probe runs in.
+fn version_probe_scratch() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(test)]
+    if PROBE_SCRATCH_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("no space left on device (test)"));
+    }
+    tempfile::tempdir()
 }
 
 async fn handle_check_freerouting(
@@ -2335,27 +2389,59 @@ async fn handle_check_freerouting(
             // opens its window after printing the version and never exits,
             // and 2.x turns telemetry on by default. A version run with the
             // GUI off exits 1 because it was given no board; the version line
-            // it printed is the proof that the JAR started on this Java.
-            let version_tmp = tempfile::tempdir().ok();
+            // it printed is the proof that the JAR started on this Java, as
+            // long as nothing after it says the start-up then crashed.
+            //
+            // Its own home, temp and settings folders: 2.x writes settings
+            // and a log there (2.5 under ~/Library), which a probe should not
+            // leave in the owner's. Without a scratch folder the JAR is not
+            // started, rather than started in the owner's home.
+            let scratch = match version_probe_scratch() {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    return Ok(CallToolResult::json(&json!({
+                        "available": false,
+                        "engine_found": true,
+                        "native_mcp_available": false,
+                        "bridge_available": false,
+                        "jar_path": jar_path,
+                        "java_available": true,
+                        "java_sufficient": true,
+                        "java_command": java.command,
+                        "java_major": java.major,
+                        "required_java_major": requirement.required_java_major,
+                        "java_output": java.version_output,
+                        "version_checked": false,
+                        "note": format!(
+                            "Freerouting was not started: a scratch folder for its version check could not be made ({error}). The JAR and the Java were found; free disk space or fix the temp folder and check again."
+                        ),
+                        "setup": setup,
+                        "version_policy": installed_version_policy(&jar_path, None).await
+                    })));
+                }
+            };
             let mut freerouting_command = tokio::process::Command::new(&java.command);
-            freerouting_command.arg("-Djava.awt.headless=true");
-            // Its own home and temp folder: 2.x writes settings and a log
-            // there (2.5 under ~/Library), which a probe should not leave in
-            // the owner's.
-            if let Some(tmp) = &version_tmp {
-                freerouting_command
-                    .arg(format!("-Duser.home={}", tmp.path().display()))
-                    .arg(format!("-Djava.io.tmpdir={}", tmp.path().display()));
-            }
             freerouting_command
+                .arg("-Djava.awt.headless=true")
+                .arg(format!("-Duser.home={}", scratch.path().display()))
+                .arg(format!("-Djava.io.tmpdir={}", scratch.path().display()))
                 .args(["-jar", jar_path.to_str().unwrap_or(""), "--version"])
                 .args(FREEROUTING_QUIET_ARGUMENTS);
+            isolate_freerouting_environment(
+                &mut freerouting_command,
+                scratch.path(),
+                std::env::vars_os().map(|(name, _)| name),
+            );
             let freerouting = run_java_command(&mut freerouting_command).await;
             let (version_checked, version_output) = match freerouting {
                 Ok(output) => {
                     let text = command_output(&output);
                     let named = crate::freerouting_setup::version_in_output(&text).is_some();
-                    (output.status.success() || named, text)
+                    (
+                        output.status.success()
+                            || (named && !crate::freerouting_setup::startup_crashed(&text)),
+                        text,
+                    )
                 }
                 Err(error) => (false, error),
             };
@@ -4106,6 +4192,177 @@ mod freerouting_setup_tests {
         ] {
             assert!(args.contains(quiet), "{quiet} in {args}");
         }
+    }
+
+    /// 2.5.0 logs its banner before it reads its settings, so a JAR that
+    /// prints it and then dies must not read as available.
+    #[tokio::test]
+    async fn a_banner_followed_by_a_startup_crash_is_not_available() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.0.jar", 65);
+        let java = write_script(
+            dir.path(),
+            "java21-crash",
+            "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\n\
+             case \"$*\" in *--version*) echo '2026-11-09 INFO Freerouting v2.5.0 (build-date: 2026-10-05)'; \
+             echo 'Exception in thread \"main\" java.lang.NullPointerException' >&2; \
+             printf '\\tat app.freerouting.startup.GlobalSettingsBootstrap.initialize(GlobalSettingsBootstrap.java:1)\\n' >&2; exit 1;; esac\n\
+             exit 1\n",
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let body = body(&result);
+        assert_eq!(body["version_checked"], false, "{body}");
+        assert_eq!(body["available"], false, "{body}");
+        assert!(
+            body["version_output"]
+                .as_str()
+                .unwrap()
+                .contains("NullPointerException"),
+            "{body}"
+        );
+    }
+
+    /// With no scratch folder the JAR is not started, because the alternative
+    /// is to start it in the owner's home.
+    #[tokio::test]
+    async fn without_a_scratch_folder_the_jar_is_not_started() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        PROBE_SCRATCH_FAILS.with(|fails| fails.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.1.0.jar", 65);
+        let started = dir.path().join("started.txt");
+        let java = write_script(
+            dir.path(),
+            "java21-marker",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\n\
+                 echo started > '{}'; echo 'Freerouting v2.1.0'; exit 0\n",
+                started.display()
+            ),
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx()).await;
+        PROBE_SCRATCH_FAILS.with(|fails| fails.set(false));
+        let body = body(&result.unwrap());
+        assert_eq!(body["available"], false, "{body}");
+        assert_eq!(body["version_checked"], false, "{body}");
+        assert_eq!(body["engine_found"], true, "{body}");
+        assert_eq!(body["java_sufficient"], true, "{body}");
+        let note = body["note"].as_str().unwrap();
+        assert!(
+            note.contains("not started") && note.contains("no space left on device"),
+            "{note}"
+        );
+        assert_eq!(body["version_policy"]["installed_version"], "2.1.0");
+        assert!(!started.exists(), "the JAR must not have been started");
+    }
+
+    /// The probe's settings, state and cache folders are inside its scratch
+    /// home, whatever the owner's XDG variables say.
+    #[tokio::test]
+    async fn the_probe_keeps_every_settings_folder_in_its_scratch_home() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.0.jar", 65);
+        let env_log = dir.path().join("env.txt");
+        let args_log = dir.path().join("args.txt");
+        let java = write_script(
+            dir.path(),
+            "java21-env",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\n\
+                 case \"$*\" in *--version*) env > '{}'; echo \"$*\" > '{}'; \
+                 echo 'Freerouting v2.5.0'; exit 1;; esac\nexit 1\n",
+                env_log.display(),
+                args_log.display()
+            ),
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        assert_eq!(body(&result)["available"], true);
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        let home = args
+            .split_whitespace()
+            .find_map(|a| a.strip_prefix("-Duser.home="))
+            .expect("-Duser.home");
+        let env = std::fs::read_to_string(&env_log).unwrap();
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            let value = env
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} not set in {env}"));
+            assert!(value.starts_with(home), "{name}={value} is not in {home}");
+        }
+    }
+
+    #[test]
+    fn inherited_freerouting_settings_are_removed_and_folders_pinned() {
+        let mut command = tokio::process::Command::new("java");
+        isolate_freerouting_environment(
+            &mut command,
+            Path::new("/scratch"),
+            [
+                "PATH",
+                "FREEROUTING__USER_DATA_PATH",
+                "freerouting__logging__x",
+            ]
+            .map(std::ffi::OsString::from),
+        );
+        let envs: std::collections::BTreeMap<String, Option<String>> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(envs["FREEROUTING__USER_DATA_PATH"], None);
+        assert_eq!(envs["freerouting__logging__x"], None);
+        assert!(!envs.contains_key("PATH"), "unrelated variables are kept");
+        assert_eq!(envs["XDG_CONFIG_HOME"].as_deref(), Some("/scratch/.config"));
+        assert_eq!(
+            envs["LOCALAPPDATA"].as_deref(),
+            Some("/scratch/AppData/Local")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_version_name_is_the_recommended_release_and_is_hashed() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.jar", 65);
+        let java = write_script(
+            dir.path(),
+            "java21-quiet2",
+            "#!/bin/sh\nif [ \"$1\" = '-version' ]; then echo 'openjdk version \"21.0.1\"' >&2; exit 0; fi\nexit 0\n",
+            "",
+        );
+        let result =
+            handle_check_freerouting(&json!({ "jar_path": jar, "java_path": java }), &ctx())
+                .await
+                .unwrap();
+        let policy = body(&result)["version_policy"].clone();
+        assert_eq!(policy["matches_recommended"], true, "{policy}");
+        // It was hashed (a fake JAR is not the release), not skipped.
+        assert_eq!(policy["sha256_matches_release"], false, "{policy}");
     }
 
     #[tokio::test]

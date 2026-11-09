@@ -476,9 +476,11 @@ cargo xtask freerouting-bench \
   Freerouting 2.5.0 needs Java 25 (class file 69); 2.1 to 2.4 need 21.
 - **Isolation.** Each run gets its own folder under `--out` (default
   `target/freerouting-bench/<unix time>`) with a copy of the DSN and its own
-  `user.home` and `java.io.tmpdir`. So a run neither reads nor changes the
-  settings of a Freerouting you use, and 2.5's `~/Library` settings and log stay
-  in the run folder. Telemetry, contact and analytics are off in the seeded
+  `user.home` and `java.io.tmpdir`, with the `XDG_*`, `APPDATA` and
+  `LOCALAPPDATA` folders pointed into it and any inherited `FREEROUTING__*`
+  variable removed. So a run neither reads nor changes the settings of a
+  Freerouting you use, and 2.5's `~/Library` settings and log stay in the run
+  folder. Telemetry, contact and analytics are off in the seeded
   `freerouting.json`, on the command line and in the environment. Freerouting
   2.x turns them on by default. The seeded settings also carry an all-zero
   `profile.id`: 2.3 and later stop with a `NullPointerException` without one.
@@ -486,12 +488,20 @@ cargo xtask freerouting-bench \
   board data.
 - **Budget.** `--job-timeout-secs` (default 60) is Freerouting's own
   `router.job_timeout`: a job that hits it stops and writes what it routed.
-  `--timeout-secs` (default 600) kills the process. 2.1.0 sometimes ignores its
-  budget or exits without an SES; both count as a failed run.
+  `--timeout-secs` (default 600) kills the process. 2.3 and later log their own
+  outcome for each job, and that decides whether the budget was hit; for 2.1,
+  which logs none, a run that lasted the whole budget counts. 2.1.0 sometimes
+  ignores its budget or exits without an SES; both count as a failed run.
+- **Same version twice.** Each `--jar` gets its own folder under `--out`, named
+  by the version in its file name, with `-2`, `-3` added when that is taken (and
+  `unknown` for a file that names none). Totals and the ranking are per folder,
+  with the reported version after it when it differs, so a rebuild stays a row of
+  its own. `results.json` saves the folder as `dir` for `--rescore`.
 - **Gate.** Completion is a gate, not a score. A board passes when every run
   wrote a readable SES with 0 unrouted connections (Freerouting's own count: 2.1's
   statistics block, the last `unrouted and N violation(s)` or `incomplete
-  connections` line in 2.3 to 2.5), 0 clearance violations, within the budget.
+  connections` line in 2.3 to 2.5), 0 clearance violations (a run that does not
+  report the count fails), within the budget.
 - **Quality**, measured from the DSN (pin positions, nets, net classes) and the
   first run's SES, on boards that pass:
   - wire/bound: wiring of the routed nets over half the perimeter of their

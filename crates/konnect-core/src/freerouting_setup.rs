@@ -63,7 +63,9 @@ pub(crate) const RECOMMENDED: RecommendedRelease = RecommendedRelease {
 };
 
 /// A Freerouting version such as `2.1.0` named in `--version` output or a log
-/// line (`Freerouting v2.1.0 (build-date: …)`, `Freerouting 2.1.0`).
+/// line (`Freerouting v2.1.0 (build-date: …)`, `Freerouting 2.1.0`). A
+/// pre-release suffix is kept (`2.5.0-SNAPSHOT`), so it is never taken for the
+/// release.
 pub(crate) fn version_in_output(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let at = line.find("Freerouting ")? + "Freerouting ".len();
@@ -79,22 +81,106 @@ pub(crate) fn version_in_file_name(jar: &Path) -> Option<String> {
     dotted_version(stem.trim_start_matches(|c: char| !c.is_ascii_digit()))
 }
 
-/// The leading `N.N` or `N.N.N` of `text`.
+/// Suffixes that mark a build as not the release (`-SNAPSHOT`, `-rc1`).
+/// Others, such as `-executable`, are packaging and are dropped.
+const PRE_RELEASE_MARKERS: &[&str] = &["snapshot", "alpha", "beta", "rc", "dev", "pre"];
+
+/// The leading `N.N` or `N.N.N` of `text`, with a pre-release suffix if one
+/// follows directly.
 fn dotted_version(text: &str) -> Option<String> {
-    let version: String = text
+    let taken: String = text
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
-    let version = version.trim_end_matches('.');
+    let version = taken.trim_end_matches('.');
     let parts: Vec<&str> = version.split('.').collect();
-    (parts.len() >= 2 && parts.iter().all(|p| !p.is_empty())).then(|| version.to_string())
+    if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut version = version.to_string();
+    if version.len() == taken.len() {
+        if let Some(tag) = text[taken.len()..].strip_prefix('-') {
+            let tag: String = tag
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+                .collect();
+            let tag = tag.trim_end_matches('.');
+            let lower = tag.to_ascii_lowercase();
+            if PRE_RELEASE_MARKERS.iter().any(|m| lower.starts_with(m)) {
+                version.push('-');
+                version.push_str(tag);
+            }
+        }
+    }
+    Some(version)
 }
 
+/// The number list of a version, padded to three parts so `2.5` is `2.5.0`.
 fn version_key(version: &str) -> Vec<u64> {
-    version
+    let mut key: Vec<u64> = version
+        .split('-')
+        .next()
+        .unwrap_or("")
         .split('.')
         .map(|part| part.parse().unwrap_or(0))
-        .collect()
+        .collect();
+    while key.len() < 3 {
+        key.push(0);
+    }
+    key
+}
+
+/// Order two versions by their numbers, zero-padded: `2.5` equals `2.5.0`.
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (version_key(a), version_key(b));
+    let len = a.len().max(b.len());
+    a.resize(len, 0);
+    b.resize(len, 0);
+    a.cmp(&b)
+}
+
+/// The same release: equal numbers, zero-padded, and the same pre-release
+/// suffix (none, for the release). `2.5` is `2.5.0`; `2.5.0-SNAPSHOT` is not.
+pub(crate) fn same_version(a: &str, b: &str) -> bool {
+    let suffix = |v: &str| v.split_once('-').map(|(_, tag)| tag.to_ascii_lowercase());
+    compare_versions(a, b) == std::cmp::Ordering::Equal && suffix(a) == suffix(b)
+}
+
+/// The text of a version probe shows the JAR died while starting, after it
+/// had printed its version: a Java exception trace, or a Freerouting ERROR
+/// log line other than the expected complaint that a headless run was given
+/// no board (2.1 to 2.5 print it after startup succeeded and exit 1).
+///
+/// Only text from the version line on is read: 2.5.0 logs a recoverable
+/// look-and-feel error before its banner and carries on.
+pub(crate) fn startup_crashed(text: &str) -> bool {
+    const EXPECTED: &str = "Both an input file and an output file must be specified";
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let from = lines
+        .iter()
+        .position(|line| version_in_output(line).is_some())
+        .unwrap_or(0);
+    lines[from..].iter().any(|line| {
+        if line.contains(EXPECTED) {
+            return false;
+        }
+        let first = line
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        let exception_name =
+            first.contains('.') && (first.ends_with("Exception") || first.ends_with("Error"));
+        let frame = line.starts_with("at ") && line.ends_with(')') && line.contains('(');
+        let error_level = line
+            .split_whitespace()
+            .take(3)
+            .any(|word| matches!(word, "ERROR" | "SEVERE" | "FATAL"));
+        line.starts_with("Exception in thread")
+            || line.starts_with("Caused by:")
+            || exception_name
+            || frame
+            || error_level
+    })
 }
 
 /// SHA-256 of a file, as lowercase hex.
@@ -139,7 +225,9 @@ pub(crate) fn version_policy_for(
         },
         (None, None) => (None, None),
     };
-    let matches = installed.as_deref().map(|v| v == recommended.version);
+    let matches = installed
+        .as_deref()
+        .map(|v| same_version(v, recommended.version));
     let sha_matches = match (matches, jar_sha256) {
         (Some(true), Some(sha)) => Some(sha.eq_ignore_ascii_case(recommended.sha256)),
         _ => None,
@@ -155,7 +243,7 @@ pub(crate) fn version_policy_for(
             recommended.version
         )),
         (Some(_), Some(version), Some(false), _) => {
-            let relation = match version_key(version).cmp(&version_key(recommended.version)) {
+            let relation = match compare_versions(version, recommended.version) {
                 std::cmp::Ordering::Less => "older than",
                 std::cmp::Ordering::Greater => "newer than, and not measured against,",
                 std::cmp::Ordering::Equal => "different from",
@@ -614,7 +702,11 @@ pub(crate) mod tests {
                 Some("2.1.0"),
             ),
             ("Freerouting 2.1.0", Some("2.1.0")),
-            ("x\nINFO Freerouting v2.5.0-SNAPSHOT", Some("2.5.0")),
+            (
+                "x\nINFO Freerouting v2.5.0-SNAPSHOT (build",
+                Some("2.5.0-SNAPSHOT"),
+            ),
+            ("Freerouting v2.6.0-rc1", Some("2.6.0-rc1")),
             ("Freerouting started", None),
             ("Error: could not open the jar", None),
         ] {
@@ -623,6 +715,7 @@ pub(crate) mod tests {
         for (name, version) in [
             ("freerouting-2.3.0.jar", Some("2.3.0")),
             ("freerouting-2.4.1-executable.jar", Some("2.4.1")),
+            ("freerouting-2.5.0-SNAPSHOT.jar", Some("2.5.0-SNAPSHOT")),
             ("freerouting.jar", None),
             ("freerouting-2.jar", None),
         ] {
@@ -689,6 +782,103 @@ pub(crate) mod tests {
             warning.contains("2.10.0 is newer than, and not measured against,"),
             "{warning}"
         );
+    }
+
+    #[test]
+    fn versions_compare_by_zero_padded_numbers() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_versions("2.5", "2.5.0"), Equal);
+        assert_eq!(compare_versions("2.5.0", "2.5"), Equal);
+        assert_eq!(compare_versions("2.10", "2.5.0"), Greater);
+        assert_eq!(compare_versions("2.1", "2.5.0"), Less);
+        assert!(same_version("2.5", "2.5.0"));
+        assert!(same_version("2.5.0", "2.5.0"));
+        assert!(!same_version("2.5.1", "2.5.0"));
+        // The release has no suffix; a snapshot is not it.
+        assert!(!same_version("2.5.0-SNAPSHOT", "2.5.0"));
+        assert!(same_version("2.5.0-snapshot", "2.5.0-SNAPSHOT"));
+    }
+
+    #[test]
+    fn a_short_version_is_the_same_release_and_its_digest_is_checked() {
+        let policy = version_policy_for(
+            &MEASURED,
+            Some(Path::new("/x/freerouting-2.5.jar")),
+            None,
+            Some("AB12"),
+        );
+        assert_eq!(policy["installed_version"], "2.5");
+        assert_eq!(policy["matches_recommended"], true, "{policy}");
+        assert_eq!(policy["sha256_matches_release"], true, "{policy}");
+        assert_eq!(policy["warning"], Value::Null, "{policy}");
+    }
+
+    #[test]
+    fn a_snapshot_is_reported_as_one_and_never_as_the_release() {
+        let policy = version_policy_for(
+            &MEASURED,
+            None,
+            Some("INFO Freerouting v2.5.0-SNAPSHOT (build-date: 2026-10-05)"),
+            Some("AB12"),
+        );
+        assert_eq!(policy["installed_version"], "2.5.0-SNAPSHOT");
+        assert_eq!(policy["matches_recommended"], false, "{policy}");
+        assert_eq!(policy["sha256_matches_release"], Value::Null);
+        // No JAR was given, so there is nothing to warn about; with one, it
+        // says the snapshot differs from the release.
+        let policy = version_policy_for(
+            &MEASURED,
+            Some(Path::new("/x/freerouting.jar")),
+            Some("INFO Freerouting v2.5.0-SNAPSHOT"),
+            None,
+        );
+        let warning = policy["warning"].as_str().unwrap();
+        assert!(
+            warning.contains("2.5.0-SNAPSHOT is different from the recommended 2.5.0"),
+            "{warning}"
+        );
+    }
+
+    /// What the 2.5.0 release printed for this exact probe (headless, no
+    /// board, isolated home), recorded on macOS on 2026-11-09: two WARN lines
+    /// and the expected complaint, twice. A healthy start.
+    #[test]
+    fn the_real_2_5_0_probe_output_is_a_healthy_start() {
+        let text = "2026-11-09 12:45:48.575 INFO   Freerouting v2.5.0 (build-date: 2026-10-05)
+2026-11-09 12:45:48.834 INFO   Hardware: 15 CPU cores, 565 CPU score, 6144 MB RAM
+2026-11-09 12:45:48.835 WARN   Unknown command line argument: --version
+2026-11-09 12:45:48.840 WARN   GUI is disabled and you don't have a console available, so the only feedback from Freerouting is in the log.
+2026-11-09 12:45:49.963 ERROR  Both an input file and an output file must be specified with command line arguments if you are running in CLI mode.
+2026-11-09 12:45:49.963 ERROR  Both an input file and an output file must be specified with command line arguments if you are running in CLI mode.
+";
+        assert_eq!(version_in_output(text).as_deref(), Some("2.5.0"));
+        assert!(!startup_crashed(text));
+    }
+
+    #[test]
+    fn a_banner_followed_by_a_crash_is_a_startup_crash_but_a_missing_board_is_not() {
+        let banner = "2026-11-09 INFO   Freerouting v2.5.0 (build-date: 2026-10-05)";
+        // What a healthy headless run with no board prints (stdout, then stderr).
+        let healthy = format!(
+            "{banner}\n2026-11-09 ERROR  Both an input file and an output file must be specified with command line arguments if you are running in CLI mode."
+        );
+        assert!(!startup_crashed(&healthy));
+        assert!(!startup_crashed(banner));
+        for crash in [
+            "Exception in thread \"main\" java.lang.NullPointerException",
+            "java.lang.NullPointerException: Cannot invoke \"String.length()\"",
+            "\tat app.freerouting.startup.GlobalSettingsBootstrap.initialize(GlobalSettingsBootstrap.java:1)",
+            "Caused by: java.io.IOException: disk full",
+            "2026-11-09 ERROR  Could not read freerouting.json",
+        ] {
+            let text = format!("{banner}\n{crash}");
+            assert!(startup_crashed(&text), "{crash}");
+            // The expected complaint beside a real crash does not hide it.
+            assert!(startup_crashed(&format!("{healthy}\n{crash}")), "{crash}");
+        }
+        // 2.5.0 logs a recoverable look-and-feel error before its banner.
+        let before = format!("2026-11-09 ERROR  Look and feel unavailable\n{healthy}");
+        assert!(!startup_crashed(&before));
     }
 
     #[test]

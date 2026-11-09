@@ -186,10 +186,19 @@ pub fn hh_mm_ss(duration: Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// The job ran out of its budget: 2.5 logs `TIMED_OUT` or "completed with
-/// timeout"; 2.1 says nothing, so a run that lasted the whole budget counts.
+/// The job ran out of its budget. 2.3 and later log `TIMED_OUT` or "completed
+/// with timeout", and a `finished with state:` line for every job, so their
+/// own word decides: the process wall clock also holds JVM start-up and the
+/// SES write, which the job's budget does not. 2.1 says nothing, so for it a
+/// run that lasted the whole budget counts.
 pub fn hit_job_budget(stdout: &str, runtime: Duration, budget: Duration) -> bool {
-    stdout.contains("TIMED_OUT") || stdout.contains("completed with timeout") || runtime >= budget
+    if stdout.contains("TIMED_OUT") || stdout.contains("completed with timeout") {
+        return true;
+    }
+    if stdout.contains("finished with state:") {
+        return false;
+    }
+    runtime >= budget
 }
 
 /// Settings Freerouting reads from its `freerouting.json` before the command
@@ -201,12 +210,58 @@ const SEEDED_SETTINGS: &str = r#"{"profile":{"id":"00000000-0000-0000-0000-00000
 
 /// Where the Freerouting releases benchmarked so far look for
 /// `freerouting.json`, relative to the run folder: 2.1 under
-/// `java.io.tmpdir`, 2.5 under `user.home` (macOS, then Linux).
+/// `java.io.tmpdir`, 2.5 under `user.home` (`Library/Application Support` on
+/// macOS, `.config` on Linux; `.local/share` there is only its data folder).
+/// 2.5 also copies a settings file from `java.io.tmpdir/freerouting` when it
+/// finds none in its own folder.
 const SETTINGS_PLACES: &[&str] = &[
     "tmp/freerouting",
     "home/Library/Application Support/freerouting",
-    "home/.local/share/freerouting",
+    "home/.config/freerouting",
 ];
+
+/// The environment of one run: telemetry, contact and analytics off, and the
+/// settings, state, cache and data folders pinned inside the run folder.
+/// 2.5 lets `XDG_*` (Linux) and `APPDATA` and `LOCALAPPDATA` (Windows) override
+/// `user.home`, so a host that sets them would send the run to the owner's
+/// real folders. Pairs with [`freerouting_env_removed`].
+pub fn freerouting_env(run_dir: &Path) -> Vec<(String, String)> {
+    let home = run_dir.join("home");
+    let at = |folder: &str| home.join(folder).display().to_string();
+    [
+        ("FREEROUTING__PROFILE__ALLOW_TELEMETRY", "false".to_string()),
+        ("FREEROUTING__PROFILE__ALLOW_CONTACT", "false".to_string()),
+        (
+            "FREEROUTING__USAGE_AND_DIAGNOSTIC_DATA__DISABLE_ANALYTICS",
+            "true".to_string(),
+        ),
+        ("XDG_CONFIG_HOME", at(".config")),
+        ("XDG_STATE_HOME", at(".local/state")),
+        ("XDG_CACHE_HOME", at(".cache")),
+        ("XDG_DATA_HOME", at(".local/share")),
+        ("APPDATA", at("AppData/Roaming")),
+        ("LOCALAPPDATA", at("AppData/Local")),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
+}
+
+/// Inherited `FREEROUTING__*` variables to drop, from `names` (the process
+/// environment's): `FREEROUTING__USER_DATA_PATH` and
+/// `FREEROUTING__LOGGING__FILE__LOCATION` would override the run's own
+/// folders. Those [`freerouting_env`] sets itself are kept for it to set.
+pub fn freerouting_env_removed(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let ours: Vec<String> = freerouting_env(Path::new(""))
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names
+        .into_iter()
+        .filter(|name| name.to_ascii_uppercase().starts_with("FREEROUTING__"))
+        .filter(|name| !ours.contains(name))
+        .collect()
+}
 
 /// Every `freerouting.log` below `dir`, concatenated.
 fn logs_below(dir: &Path) -> String {
@@ -272,9 +327,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         out.display()
     );
 
+    let jars = options
+        .jars
+        .iter()
+        .map(|jar| jar.canonicalize().map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let labels = jar_labels(&jars);
     let mut results: Vec<BoardResult> = Vec::new();
-    for jar in &options.jars {
-        let jar = jar.canonicalize().map_err(|e| e.to_string())?;
+    for (jar, label) in jars.iter().zip(&labels) {
+        let jar = jar.clone();
         let file_version = jar
             .file_name()
             .and_then(|n| n.to_str())
@@ -288,11 +349,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let dsn_board = quality::DsnBoard::parse(&dsn_text);
             let mut runs = Vec::new();
             for index in 1..=options.runs {
-                let label = file_version
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                debug_assert_eq!(label, jar_label(&jar));
-                let dir = out.join(&label).join(&board).join(format!("run{index}"));
+                let dir = out.join(label).join(&board).join(format!("run{index}"));
                 let record = run_once(&java, &jar, dsn, dsn_board.as_ref().ok(), &dir, &options);
                 eprintln!(
                     "  {label:>8} {board:<48} run {index}: {}",
@@ -307,6 +364,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .unwrap_or_else(|| "unknown".to_string());
             results.push(BoardResult {
                 board,
+                dir: label.clone(),
                 version,
                 jar: jar.clone(),
                 dsn_connections: dsn_connection_count(&dsn_text),
@@ -369,15 +427,16 @@ fn run_once(
         return record;
     };
     let started = Instant::now();
-    let child = Command::new(java)
+    let mut command = Command::new(java);
+    for name in freerouting_env_removed(
+        std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()),
+    ) {
+        command.env_remove(name);
+    }
+    let child = command
         .args(freerouting_arguments(dir, jar, options))
         .current_dir(dir)
-        .env("FREEROUTING__PROFILE__ALLOW_TELEMETRY", "false")
-        .env("FREEROUTING__PROFILE__ALLOW_CONTACT", "false")
-        .env(
-            "FREEROUTING__USAGE_AND_DIAGNOSTIC_DATA__DISABLE_ANALYTICS",
-            "true",
-        )
+        .envs(freerouting_env(dir))
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -470,12 +529,31 @@ fn read_ses(record: &mut RunRecord, text: &str, board: Option<&quality::DsnBoard
     }
 }
 
-/// The folder name a JAR's runs go in.
+/// The folder name a JAR's runs go in, from its file name's version.
 fn jar_label(jar: &Path) -> String {
     jar.file_name()
         .and_then(|n| n.to_str())
         .and_then(version_from_file_name)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// One folder name per JAR, all different: a second JAR with a label already
+/// taken (a rebuild of the same version, or two files that name none) gets
+/// `-2`, then `-3`. Otherwise their runs would overwrite each other's files and
+/// their totals would merge.
+pub fn jar_labels(jars: &[PathBuf]) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for jar in jars {
+        let base = jar_label(jar);
+        let mut label = base.clone();
+        let mut n = 2;
+        while labels.contains(&label) {
+            label = format!("{base}-{n}");
+            n += 1;
+        }
+        labels.push(label);
+    }
+    labels
 }
 
 /// Re-measure a finished run from `dir/results.json` and each run folder's
@@ -507,6 +585,9 @@ pub fn rescore(dir: &Path) -> Result<(), String> {
         let board = text_of(saved_board, "board").ok_or("a board has no name")?;
         let version = text_of(saved_board, "version").unwrap_or_default();
         let jar = PathBuf::from(text_of(saved_board, "jar").unwrap_or_default());
+        // The folder this board's runs were written to; a results.json from
+        // before it was saved falls back to the label the JAR's name gives.
+        let label = text_of(saved_board, "dir").unwrap_or_else(|| jar_label(&jar));
         let Some(Json::Array(saved_runs)) = saved_board.at("runs") else {
             continue;
         };
@@ -514,7 +595,7 @@ pub fn rescore(dir: &Path) -> Result<(), String> {
         let mut runs = Vec::new();
         for (index, saved_run) in saved_runs.iter().enumerate() {
             let run_dir = dir
-                .join(jar_label(&jar))
+                .join(&label)
                 .join(&board)
                 .join(format!("run{}", index + 1));
             if dsn_board.is_none() {
@@ -545,6 +626,7 @@ pub fn rescore(dir: &Path) -> Result<(), String> {
         }
         results.push(BoardResult {
             board,
+            dir: label,
             version,
             jar,
             dsn_connections: saved_board.number_at("dsn_connections").map(|n| n as usize),
@@ -713,8 +795,10 @@ mod tests {
             quick,
             budget
         ));
-        assert!(hit_job_budget(
-            "finished with state: COMPLETED",
+        // 2.3 and later report their own outcome; trust it over the process
+        // wall clock, which also holds JVM start-up and the SES write.
+        assert!(!hit_job_budget(
+            "INFO   Job 'x' finished with state: COMPLETED (elapsed: 58.90 seconds)",
             Duration::from_secs(61),
             budget
         ));
@@ -723,6 +807,125 @@ mod tests {
             quick,
             budget
         ));
+        // 2.1 says nothing, so the wall clock decides.
+        assert!(hit_job_budget("", Duration::from_secs(61), budget));
+        assert!(!hit_job_budget("", quick, budget));
+    }
+
+    #[test]
+    fn two_jars_with_one_version_get_folders_of_their_own() {
+        let jars = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        assert_eq!(
+            jar_labels(&jars(&[
+                "/a/freerouting-2.5.0.jar",
+                "/b/freerouting-2.5.0.jar",
+                "/c/freerouting-2.1.0.jar",
+                "/d/freerouting-2.5.0.jar",
+            ])),
+            ["2.5.0", "2.5.0-2", "2.1.0", "2.5.0-3"]
+        );
+        // JARs that name no version are not merged either.
+        assert_eq!(
+            jar_labels(&jars(&["/a/freerouting.jar", "/b/freerouting.jar"])),
+            ["unknown", "unknown-2"]
+        );
+    }
+
+    #[test]
+    fn settings_are_seeded_where_2_5_reads_them() {
+        assert!(SETTINGS_PLACES.contains(&"home/.config/freerouting"));
+        assert!(SETTINGS_PLACES.contains(&"home/Library/Application Support/freerouting"));
+        assert!(SETTINGS_PLACES.contains(&"tmp/freerouting"));
+        assert!(!SETTINGS_PLACES.contains(&"home/.local/share/freerouting"));
+    }
+
+    #[test]
+    fn a_run_pins_its_settings_folders_into_its_own_folder() {
+        let env = freerouting_env(Path::new("/run"));
+        let get = |name: &str| {
+            env.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("{name} in {env:?}"))
+        };
+        assert_eq!(get("XDG_CONFIG_HOME"), "/run/home/.config");
+        assert_eq!(get("XDG_STATE_HOME"), "/run/home/.local/state");
+        assert_eq!(get("XDG_CACHE_HOME"), "/run/home/.cache");
+        assert_eq!(get("XDG_DATA_HOME"), "/run/home/.local/share");
+        assert_eq!(get("APPDATA"), "/run/home/AppData/Roaming");
+        assert_eq!(get("LOCALAPPDATA"), "/run/home/AppData/Local");
+        assert_eq!(get("FREEROUTING__PROFILE__ALLOW_TELEMETRY"), "false");
+        // The seeded config folder is the one XDG_CONFIG_HOME names.
+        assert!(SETTINGS_PLACES
+            .iter()
+            .any(|p| format!("/run/{p}") == format!("{}/freerouting", get("XDG_CONFIG_HOME"))));
+    }
+
+    #[test]
+    fn inherited_freerouting_settings_that_would_leave_the_run_folder_are_dropped() {
+        let names = [
+            "PATH",
+            "FREEROUTING__USER_DATA_PATH",
+            "FREEROUTING__LOGGING__FILE__LOCATION",
+            "FREEROUTING__PROFILE__ALLOW_TELEMETRY",
+        ]
+        .map(String::from);
+        // The three the run sets itself are not removed; it overrides them.
+        assert_eq!(
+            freerouting_env_removed(names),
+            [
+                "FREEROUTING__USER_DATA_PATH",
+                "FREEROUTING__LOGGING__FILE__LOCATION"
+            ]
+        );
+    }
+
+    /// `--rescore` reads each board's runs from the folder the run wrote to,
+    /// which is saved as `dir`; an older results.json without it falls back to
+    /// the JAR's file name.
+    #[test]
+    fn rescoring_reads_the_saved_folder_and_falls_back_to_the_jar_name() {
+        let dsn = crate::repo_root()
+            .join("crates/konnect-core/tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let root =
+            std::env::temp_dir().join(format!("konnect-bench-rescore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let components = |saved_dir: Option<&str>, run_folder: &str| {
+            let out = root.join(format!("{}-{run_folder}", saved_dir.unwrap_or("old")));
+            let run = out.join(run_folder).join("b").join("run1");
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::copy(&dsn, run.join("board.dsn")).unwrap();
+            let dir_field = saved_dir.map_or(String::new(), |d| format!(r#""dir":"{d}","#));
+            std::fs::write(
+                out.join("results.json"),
+                format!(
+                    r#"{{"boards":[{{"board":"b",{dir_field}"version":"2.5.0","jar":"/a/freerouting-2.5.0.jar","runs":[{{"exit_code":0}}]}}]}}"#
+                ),
+            )
+            .unwrap();
+            rescore(&out).unwrap();
+            let text = std::fs::read_to_string(out.join("results.json")).unwrap();
+            let (json, _) = parse::parse_json_prefix(&text).unwrap();
+            let Some(parse::Json::Array(boards)) = json.at("boards") else {
+                panic!("boards in {text}")
+            };
+            (
+                boards[0].text_at("dir").map(str::to_string),
+                boards[0].number_at("components"),
+            )
+        };
+        // Saved dir "2.5.0-2": the second 2.5.0 JAR's folder, not "2.5.0".
+        assert_eq!(
+            components(Some("2.5.0-2"), "2.5.0-2"),
+            (Some("2.5.0-2".to_string()), Some(2.0))
+        );
+        assert_eq!(components(Some("2.5.0-2"), "2.5.0").1, None);
+        // No saved dir: the JAR's name gives "2.5.0".
+        assert_eq!(
+            components(None, "2.5.0"),
+            (Some("2.5.0".to_string()), Some(2.0))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

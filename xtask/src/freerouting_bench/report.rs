@@ -72,10 +72,23 @@ impl RunRecord {
     }
 }
 
+/// `label`, and `(version)` after it when the two differ and the version is
+/// known.
+fn display_name(label: &str, version: &str) -> String {
+    if label == version || version == "unknown" {
+        label.to_string()
+    } else {
+        format!("{label} ({version})")
+    }
+}
+
 /// Every run of one JAR on one board.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoardResult {
     pub board: String,
+    /// The folder this JAR's runs went in, different for every JAR: the key
+    /// totals and the ranking group by.
+    pub dir: String,
     pub version: String,
     pub jar: PathBuf,
     pub dsn_connections: Option<usize>,
@@ -85,6 +98,12 @@ pub struct BoardResult {
 }
 
 impl BoardResult {
+    /// The JAR as named in the report: its folder label, with the version
+    /// Freerouting reported when that differs.
+    pub fn name(&self) -> String {
+        display_name(&self.dir, &self.version)
+    }
+
     pub fn all_succeeded(&self) -> bool {
         !self.runs.is_empty() && self.runs.iter().all(RunRecord::succeeded)
     }
@@ -93,7 +112,7 @@ impl BoardResult {
     pub fn passes_gate(&self) -> bool {
         self.all_succeeded()
             && self.unrouted() == Some(0)
-            && self.violations() == 0
+            && self.violations() == Some(0)
             && !self.budget_limited()
             && self.quality().is_some()
     }
@@ -110,8 +129,12 @@ impl BoardResult {
         if let Some(n) = self.unrouted().filter(|n| *n > 0) {
             reasons.push(format!("{n} unrouted"));
         }
-        if self.violations() > 0 {
-            reasons.push(format!("{} clearance violations", self.violations()));
+        match self.violations() {
+            Some(n) if n > 0 => reasons.push(format!("{n} clearance violations")),
+            None if self.unrouted().is_some() => {
+                reasons.push("clearance violations not reported".to_string())
+            }
+            _ => {}
         }
         if self.budget_limited() {
             reasons.push("stopped by the job budget".to_string());
@@ -144,13 +167,15 @@ impl BoardResult {
         self.runs.iter().any(|r| r.hit_job_budget)
     }
 
-    /// The worst run's clearance violations; unknown counts as none.
-    pub fn violations(&self) -> u64 {
+    /// The worst run's clearance violations. `None` when a run did not report
+    /// them: that fails the gate, it is not taken for none.
+    pub fn violations(&self) -> Option<u64> {
         self.runs
             .iter()
-            .filter_map(|r| r.clearance_violations)
+            .map(|r| r.clearance_violations)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
             .max()
-            .unwrap_or(0)
     }
 
     fn all_agree(&self, key: impl Fn(&RunRecord) -> Option<String>) -> Option<bool> {
@@ -187,10 +212,13 @@ impl BoardResult {
     }
 }
 
-/// One version's totals: the gate over every board, quality over the boards
-/// every competing version passed (`compared_boards`).
+/// One JAR's totals: the gate over every board, quality over the boards
+/// every competing JAR passed (`compared_boards`). JARs are told apart by
+/// `label` (their folder), not by version, so a rebuild of one version stays
+/// a row of its own.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionTotals {
+    pub label: String,
     pub version: String,
     pub boards: usize,
     pub passed_boards: usize,
@@ -211,6 +239,11 @@ pub struct VersionTotals {
 }
 
 impl VersionTotals {
+    /// The JAR as named in the ranking: its label, and its version when that differs.
+    pub fn name(&self) -> String {
+        display_name(&self.label, &self.version)
+    }
+
     pub fn gate_failures(&self) -> usize {
         self.boards - self.passed_boards
     }
@@ -228,22 +261,23 @@ impl VersionTotals {
     }
 }
 
-fn versions_in_order(results: &[BoardResult]) -> Vec<String> {
-    let mut versions: Vec<String> = Vec::new();
+/// The JAR labels, in the order they first appear.
+fn labels_in_order(results: &[BoardResult]) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
     for result in results {
-        if !versions.contains(&result.version) {
-            versions.push(result.version.clone());
+        if !labels.contains(&result.dir) {
+            labels.push(result.dir.clone());
         }
     }
-    versions
+    labels
 }
 
-/// Boards that every competing version passed. A version that passed no
-/// board competes on the gate alone, so it cannot empty this set.
+/// Boards that every competing JAR passed. A JAR that passed no board
+/// competes on the gate alone, so it cannot empty this set.
 pub fn compared_boards(results: &[BoardResult]) -> Vec<String> {
-    let competing: Vec<String> = versions_in_order(results)
+    let competing: Vec<String> = labels_in_order(results)
         .into_iter()
-        .filter(|v| results.iter().any(|r| &r.version == v && r.passes_gate()))
+        .filter(|v| results.iter().any(|r| &r.dir == v && r.passes_gate()))
         .collect();
     let mut boards: Vec<String> = Vec::new();
     for result in results {
@@ -255,10 +289,10 @@ pub fn compared_boards(results: &[BoardResult]) -> Vec<String> {
         .into_iter()
         .filter(|board| {
             !competing.is_empty()
-                && competing.iter().all(|version| {
+                && competing.iter().all(|label| {
                     results
                         .iter()
-                        .any(|r| &r.board == board && &r.version == version && r.passes_gate())
+                        .any(|r| &r.board == board && &r.dir == label && r.passes_gate())
                 })
         })
         .collect()
@@ -266,10 +300,10 @@ pub fn compared_boards(results: &[BoardResult]) -> Vec<String> {
 
 pub fn totals(results: &[BoardResult]) -> Vec<VersionTotals> {
     let compared = compared_boards(results);
-    versions_in_order(results)
+    labels_in_order(results)
         .into_iter()
-        .map(|version| {
-            let mine: Vec<&BoardResult> = results.iter().filter(|r| r.version == version).collect();
+        .map(|label| {
+            let mine: Vec<&BoardResult> = results.iter().filter(|r| r.dir == label).collect();
             let passed = mine.iter().filter(|r| r.passes_gate()).count();
             let measured: Vec<(&BoardResult, &Quality)> = mine
                 .iter()
@@ -306,7 +340,8 @@ pub fn totals(results: &[BoardResult]) -> Vec<VersionTotals> {
                     .iter()
                     .map(|(r, _)| r.median_runtime_s())
                     .fold(0.0, |a, b| a + b),
-                version,
+                version: mine[0].version.clone(),
+                label,
             }
         })
         .collect()
@@ -355,7 +390,7 @@ pub fn describe(t: &VersionTotals) -> String {
         .map_or("-".to_string(), |r| format!("{r:.3}"));
     format!(
         "{}: passed the completion gate on {} of {} boards. On the {} compared boards: wiring {ratio} x its lower bound and {hpwl} x HPWL ({:.1} mm), {} vias ({} layer changes) over {} nets, {} acute and {} right-angle corners, {} of {} segments below their class width, same routing every run on {} (differs on {}), {:.1} s",
-        t.version,
+        t.name(),
         t.passed_boards,
         t.boards,
         t.compared_boards,
@@ -408,7 +443,7 @@ pub fn render_markdown(results: &[BoardResult], options: &Options, java: Option<
             r.board.replace('|', "/"),
             cell(r.components, |n| n.to_string()),
             cell(r.signal_layers, |n| n.to_string()),
-            r.version.replace('|', "/"),
+            r.name().replace('|', "/"),
             r.gate_failure()
                 .map_or("pass".to_string(), |why| format!("fail: {}", why.replace('|', "/"))),
             cell(q.and_then(Quality::wire_ratio), |v| format!("{v:.3}")),
@@ -442,7 +477,7 @@ pub fn render_markdown(results: &[BoardResult], options: &Options, java: Option<
     if let Some(best) = ranked.first() {
         out.push_str(&format!(
             "\nRecommended: {} (ranked by boards failing the gate, then defects, wire/bound in 1 % steps, vias, determinism, runtime).\n",
-            best.version
+            best.name()
         ));
     }
     out
@@ -586,6 +621,7 @@ pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&st
                     .map(|r| {
                         Json::Object(vec![
                             ("board".into(), Json::Text(r.board.clone())),
+                            ("dir".into(), Json::Text(r.dir.clone())),
                             ("version".into(), Json::Text(r.version.clone())),
                             ("jar".into(), Json::Text(r.jar.display().to_string())),
                             ("components".into(), optional(r.components, count)),
@@ -622,7 +658,7 @@ pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&st
         ),
         (
             "recommended".into(),
-            optional(ranked.first().map(|t| t.version.clone()), Json::Text),
+            optional(ranked.first().map(VersionTotals::name), Json::Text),
         ),
     ])
 }
@@ -735,6 +771,7 @@ mod tests {
     fn board(board: &str, version: &str, runs: Vec<RunRecord>) -> BoardResult {
         BoardResult {
             board: board.into(),
+            dir: version.into(),
             version: version.into(),
             jar: PathBuf::from(format!("/j/freerouting-{version}.jar")),
             dsn_connections: Some(10),
@@ -784,6 +821,61 @@ mod tests {
             .gate_failure()
             .unwrap()
             .contains("not measured: bad DSN"));
+    }
+
+    #[test]
+    fn violations_a_run_did_not_report_fail_the_gate() {
+        let mut unknown = run(0, 1, 11.0, 1.0, "x");
+        unknown.clearance_violations = None;
+        let result = board("a", "v", vec![unknown.clone(), unknown]);
+        assert_eq!(result.violations(), None);
+        assert!(!result.passes_gate());
+        assert_eq!(
+            result.gate_failure().as_deref(),
+            Some("clearance violations not reported")
+        );
+        // One run unreported is enough.
+        let mut one = run(0, 1, 11.0, 1.0, "x");
+        one.clearance_violations = None;
+        assert!(!board("a", "v", vec![run(0, 1, 11.0, 1.0, "x"), one]).passes_gate());
+    }
+
+    #[test]
+    fn a_label_shows_its_version_only_when_it_adds_something() {
+        assert_eq!(display_name("2.5.0", "2.5.0"), "2.5.0");
+        assert_eq!(display_name("2.5.0-2", "2.5.0"), "2.5.0-2 (2.5.0)");
+        assert_eq!(display_name("unknown-2", "unknown"), "unknown-2");
+    }
+
+    #[test]
+    fn two_jars_of_one_version_stay_two_rows() {
+        let mut rebuild = board(
+            "b",
+            "2.5.0",
+            vec![run(0, 1, 11.0, 1.0, "x"), run(0, 1, 11.0, 1.0, "x")],
+        );
+        rebuild.dir = "2.5.0-2".into();
+        rebuild.jar = PathBuf::from("/b/freerouting-2.5.0.jar");
+        let release = board(
+            "b",
+            "2.5.0",
+            vec![run(0, 1, 12.0, 1.0, "y"), run(0, 1, 12.0, 1.0, "y")],
+        );
+        let results = vec![release, rebuild];
+        let rows = totals(&results);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|t| t.boards == 1 && t.version == "2.5.0"));
+        let names: Vec<String> = rows.iter().map(VersionTotals::name).collect();
+        assert_eq!(names, ["2.5.0", "2.5.0-2 (2.5.0)"]);
+        let markdown = render_markdown(&results, &options(), None);
+        assert!(markdown.contains("| 2.5.0-2 (2.5.0) |"), "{markdown}");
+        let text = to_json(&results_json(&results, &options(), None));
+        let (parsed, _) = parse_json_prefix(&text).unwrap();
+        let Some(Json::Array(boards)) = parsed.at("boards") else {
+            panic!("boards")
+        };
+        assert_eq!(boards[0].text_at("dir"), Some("2.5.0"));
+        assert_eq!(boards[1].text_at("dir"), Some("2.5.0-2"));
     }
 
     #[test]
