@@ -70,7 +70,7 @@ pub(crate) fn page(all: &[Value], offset: usize, limit: usize, budget: usize) ->
     let mut used = 0usize;
     let mut byte_capped = false;
     for item in all.iter().skip(offset).take(limit) {
-        let cost = serde_json::to_string(item).map_or(0, |text| text.len()) + 1;
+        let cost = cost(item);
         if !items.is_empty() && used + cost > budget {
             byte_capped = true;
             break;
@@ -89,7 +89,32 @@ pub(crate) fn page(all: &[Value], offset: usize, limit: usize, budget: usize) ->
     }
 }
 
+/// Characters one item costs in a response, with its separator.
+fn cost(item: &Value) -> usize {
+    serde_json::to_string(item).map_or(0, |text| text.len()) + 1
+}
+
 impl Page {
+    /// Characters the shown items cost, as [`page`] counted them.
+    pub(crate) fn used(&self) -> usize {
+        self.items.iter().map(cost).sum()
+    }
+
+    /// Replace the hint [`Page::describe`] wrote, for a tool whose next step
+    /// is not `severity` or `output`. Nothing is written for a whole list.
+    pub(crate) fn hint(&self, fields: &mut Map<String, Value>, advice: &str) {
+        if self.truncated {
+            fields.insert(
+                "hint".into(),
+                json!(format!(
+                    "Showing {} of {}. {advice}",
+                    self.items.len(),
+                    self.total
+                )),
+            );
+        }
+    }
+
     /// The fields that tell a reader what the page is: add these beside the items.
     pub(crate) fn describe(&self, fields: &mut Map<String, Value>) {
         fields.insert("shown".into(), json!(self.items.len()));
@@ -110,6 +135,21 @@ impl Page {
                     self.items.len(),
                     self.total
                 )),
+            );
+        }
+        // An empty page past the end looks like the end of a list: a stale
+        // `next_offset` from an earlier, longer result must say otherwise.
+        if self.items.is_empty() && self.offset > 0 && self.offset >= self.total {
+            fields.insert("offset_past_end".into(), json!(true));
+            let advice = match self.total {
+                0 => "the list is empty; pass offset 0".to_owned(),
+                total => format!(
+                    "the list has {total}; pass an offset below {total}, or 0 for the first page"
+                ),
+            };
+            fields.insert(
+                "hint".into(),
+                json!(format!("offset {} is past the end: {advice}.", self.offset)),
             );
         }
     }
@@ -137,6 +177,50 @@ pub(crate) fn list_response(key: &str, all: &[Value], offset: usize, limit: usiz
         );
     }
     Value::Object(fields)
+}
+
+/// Cut each named list in `body` to what fits in `budget`, in the order given,
+/// and say which were cut. For results a second call cannot page, such as a
+/// batch edit that already happened: the counts beside the lists stay whole,
+/// `truncated_lists` gives `shown` and `total` for each list that was cut, and
+/// `hint` says where the rest is. A result that fits is left exactly as it
+/// was. Returns the characters the kept lists cost.
+pub(crate) fn fit_lists(
+    body: &mut Map<String, Value>,
+    keys: &[&str],
+    budget: usize,
+    advice: &str,
+) -> usize {
+    let mut used = 0usize;
+    let mut cut = Map::new();
+    for key in keys {
+        let Some(Value::Array(all)) = body.get(*key) else {
+            continue;
+        };
+        let page = page(all, 0, all.len(), budget.saturating_sub(used));
+        used += page.used();
+        if page.truncated {
+            cut.insert(
+                (*key).into(),
+                json!({ "shown": page.items.len(), "total": page.total }),
+            );
+            body.insert((*key).into(), Value::Array(page.items));
+        }
+    }
+    if !cut.is_empty() {
+        let lists: Vec<&str> = cut.keys().map(String::as_str).collect();
+        let note = format!("Cut to fit the response: {}. {advice}", lists.join(", "));
+        body.insert("truncated_lists".into(), Value::Object(cut));
+        body.entry("hint").or_insert(json!(note));
+    }
+    used
+}
+
+/// [`fit_lists`] on a whole JSON result with the full [`BYTE_BUDGET`].
+pub(crate) fn fit_value(body: &mut Value, keys: &[&str], advice: &str) {
+    if let Some(fields) = body.as_object_mut() {
+        fit_lists(fields, keys, BYTE_BUDGET, advice);
+    }
 }
 
 /// How many items each `(rule, severity)` has, most first, over every item and
@@ -214,6 +298,31 @@ mod tests {
         assert_eq!(fields["truncated"], false);
     }
 
+    /// Review #49: a stale offset gave an empty page with `truncated: false`
+    /// and no hint, which reads as the end of the list.
+    #[test]
+    fn an_offset_past_the_end_is_flagged_with_the_total() {
+        let all = items(3, |i| format!("r{i}"));
+        for (offset, flagged) in [(0, false), (2, false), (3, true), (5_000, true)] {
+            let mut fields = Map::new();
+            page(&all, offset, 10, BYTE_BUDGET).describe(&mut fields);
+            assert_eq!(fields.get("offset_past_end").is_some(), flagged, "{offset}");
+            if flagged {
+                let hint = fields["hint"].as_str().unwrap();
+                assert!(
+                    hint.contains("past the end") && hint.contains("has 3"),
+                    "{hint}"
+                );
+            }
+        }
+        let mut fields = Map::new();
+        page(&[], 1, 10, BYTE_BUDGET).describe(&mut fields);
+        assert_eq!(fields["offset_past_end"], true);
+        let mut fields = Map::new();
+        page(&[], 0, 10, BYTE_BUDGET).describe(&mut fields);
+        assert!(fields.get("offset_past_end").is_none() && fields.get("hint").is_none());
+    }
+
     #[test]
     fn the_byte_budget_ends_a_page_before_the_limit() {
         let all = items(500, |i| format!("a_rather_long_rule_name_number_{i:04}"));
@@ -237,6 +346,41 @@ mod tests {
         assert!(first.truncated);
         let second = page(&all, 1, 10, 100);
         assert_eq!((second.items.len(), second.truncated), (1, false));
+    }
+
+    #[test]
+    fn fitted_lists_share_one_budget_in_priority_order() {
+        let mut body = Map::new();
+        body.insert("failures".into(), json!(items(3, |i| format!("f{i}"))));
+        body.insert("placed".into(), json!(items(500, |i| format!("p{i:04}"))));
+        body.insert("placed_count".into(), json!(500));
+        let used = fit_lists(&mut body, &["failures", "placed"], 2_000, "Read the file.");
+        assert!(used <= 2_000, "{used}");
+        assert_eq!(
+            body["failures"].as_array().unwrap().len(),
+            3,
+            "first list kept whole"
+        );
+        let shown = body["placed"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 500);
+        assert_eq!(body["placed_count"], 500, "counts are not touched");
+        assert_eq!(body["truncated_lists"]["placed"]["total"], 500);
+        assert_eq!(body["truncated_lists"]["placed"]["shown"], shown);
+        assert!(body["truncated_lists"].get("failures").is_none());
+        assert!(body["hint"]
+            .as_str()
+            .unwrap()
+            .contains("placed. Read the file."));
+    }
+
+    #[test]
+    fn fitted_lists_leave_a_short_result_unchanged() {
+        let mut body = Map::new();
+        body.insert("added".into(), json!(items(5, |i| format!("a{i}"))));
+        body.insert("missing".into(), json!("not a list"));
+        let before = body.clone();
+        fit_lists(&mut body, &["added", "absent", "missing"], BYTE_BUDGET, "x");
+        assert_eq!(body, before);
     }
 
     #[test]

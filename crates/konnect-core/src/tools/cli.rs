@@ -1057,6 +1057,32 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
     Ok(report)
 }
 
+/// DRC after a zone refill, with the refilled board saved over `copy`, so its
+/// fills can be compared with the ones the board was saved with. Only for a
+/// private copy: `--save-board` rewrites the file, and a timeout kills the
+/// child. Schematic parity is not asked for; the copy has no schematic.
+pub async fn refill_drc_on_private_copy(cli: &str, copy: &Path) -> Result<DrcReport> {
+    let out_path = copy.with_extension("drc.json");
+    let out = out_path.to_str().context("scratch path is not UTF-8")?;
+    let board = copy.to_str().context("scratch path is not UTF-8")?;
+    let args = [
+        "pcb",
+        "drc",
+        "--output",
+        out,
+        "--format",
+        "json",
+        "--refill-zones",
+        "--save-board",
+        board,
+    ];
+    run_cli_owned(cli, &args, LONG_TIMEOUT, true).await?;
+    let json_str = tokio::fs::read_to_string(&out_path)
+        .await
+        .context("DRC output file not found")?;
+    parse_drc_report(&serde_json::from_str(&json_str)?)
+}
+
 /// The `kicad-cli pcb drc` argument list. Split out so a test can pin what is
 /// sent without running kicad-cli.
 ///

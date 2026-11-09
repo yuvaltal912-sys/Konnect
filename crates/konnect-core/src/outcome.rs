@@ -78,12 +78,31 @@ pub fn summary(
     })
 }
 
-pub fn retry_failed_items(indexes: Vec<usize>) -> Value {
+/// Failed indexes a retry lists before the rest are only counted, so a batch
+/// with thousands of failures stays inside the client's size cap.
+pub const MAX_RETRY_INDEXES: usize = 1_000;
+
+pub fn retry_failed_items(mut indexes: Vec<usize>) -> Value {
+    let total = indexes.len();
+    if total <= MAX_RETRY_INDEXES {
+        return json!({
+            "safe": true,
+            "scope": "failed_items",
+            "item_indexes": indexes,
+            "instruction": "correct and retry only the listed input items"
+        });
+    }
+    indexes.truncate(MAX_RETRY_INDEXES);
     json!({
         "safe": true,
         "scope": "failed_items",
         "item_indexes": indexes,
-        "instruction": "correct and retry only the listed input items"
+        "item_indexes_total": total,
+        "item_indexes_truncated": true,
+        "instruction": format!(
+            "correct and retry the listed input items; only the first {MAX_RETRY_INDEXES} of \
+             {total} failed items are listed, so read the target back before retrying the rest"
+        )
     })
 }
 
@@ -269,5 +288,21 @@ mod tests {
         assert_eq!(body["placed_count"], 2);
         assert_eq!(body["outcome"]["status"], "partial");
         assert_eq!(status(&result), Some(OutcomeStatus::Partial));
+    }
+
+    #[test]
+    fn a_long_retry_list_is_capped_and_says_how_many_failed() {
+        let short = retry_failed_items(vec![1, 4]);
+        assert_eq!(short["item_indexes"], json!([1, 4]));
+        assert!(short.get("item_indexes_truncated").is_none());
+
+        let long = retry_failed_items((0..10_000).collect());
+        assert_eq!(
+            long["item_indexes"].as_array().unwrap().len(),
+            MAX_RETRY_INDEXES
+        );
+        assert_eq!(long["item_indexes_total"], 10_000);
+        assert_eq!(long["item_indexes_truncated"], true);
+        assert!(serde_json::to_string(&long).unwrap().len() < 8_000);
     }
 }

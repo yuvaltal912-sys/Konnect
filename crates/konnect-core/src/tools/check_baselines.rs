@@ -64,7 +64,8 @@ pub fn tools() -> Vec<ToolDef> {
         "schematic": { "type": "string", "description": "Root .kicad_sch of the project, for an ERC baseline. Pass this or board." },
         "board": { "type": "string", "description": "The .kicad_pcb, for a DRC baseline. Pass this or schematic." },
         "sync_live_board": { "type": "boolean", "default": false, "description": "DRC only: as run_drc. Bind the open board, optionally refill, save and verify before the CLI check." },
-        "refill_zones": { "type": "boolean", "default": false, "description": "DRC only: as run_drc. Refill before checking." }
+        "refill_zones": { "type": "boolean", "default": false, "description": "DRC only: as run_drc. Refill before checking." },
+        "check_zone_fills": { "type": "boolean", "default": true, "description": "DRC only: as run_drc. When zones are not refilled, refill a private copy and compare, recorded in source_evidence.zone_fill. Costs a second DRC on boards with copper zones; false skips it." }
     });
     let mut save_properties = target_properties.clone();
     let mut compare_properties = target_properties;
@@ -678,6 +679,12 @@ fn read_target(args: &Value) -> Result<(CheckKind, PathBuf), CallToolResult> {
             "sync_live_board and refill_zones apply to DRC (board) only",
         ));
     }
+    if kind == CheckKind::Erc && args["check_zone_fills"] == json!(false) {
+        return Err(invalid_arg(
+            "check_zone_fills",
+            "applies to DRC (board) only",
+        ));
+    }
     Ok((kind, path))
 }
 
@@ -806,7 +813,12 @@ fn collect_uuids(text: &str, into: &mut HashSet<String>) {
 /// The DRC arguments `drc::run` reads, and nothing else.
 fn drc_args(args: &Value) -> Value {
     let mut subset = json!({});
-    for field in ["sync_live_board", "refill_zones", "output"] {
+    for field in [
+        "sync_live_board",
+        "refill_zones",
+        "check_zone_fills",
+        "output",
+    ] {
         if !args[field].is_null() {
             subset[field] = args[field].clone();
         }
