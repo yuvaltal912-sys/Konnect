@@ -37,10 +37,15 @@ use std::path::Path;
 /// The five keepout flags of a KiCad rule area, in the order KiCad writes them.
 pub(crate) const KEEPOUT_FLAGS: [&str; 5] = ["tracks", "vias", "pads", "copperpour", "footprints"];
 
-/// What a new rule area forbids when the caller does not say: routing and
-/// pours, the usual antenna or mechanical keepout. Pads and footprints stay
-/// allowed, as in KiCad's own rule-area dialog.
-const DEFAULT_FORBIDDEN: [bool; 5] = [true, true, false, true, false];
+/// What a new rule area forbids when the caller does not say: what KiCad 10's
+/// own new rule area starts with. Tracks, vias and pads are forbidden; copper
+/// pours and footprints are allowed. Source: the `ZONE_SETTINGS` constructor in
+/// KiCad 10.0.1's `pcbnew/zone_settings.cpp`, which the rule-area dialog opens
+/// from through the board's default zone settings
+/// (`pcbnew/tools/zone_create_helper.cpp`). KiCad then remembers the last zone
+/// settings used in a session; a file has no such memory, so this starts from
+/// the constructor's values.
+const DEFAULT_FORBIDDEN: [bool; 5] = [true, true, true, false, false];
 
 pub(crate) fn tools() -> Vec<ToolDef> {
     vec![
@@ -51,8 +56,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              'references'). With 'locked' it previews the change and returns a 'revision'; call \
              again with the same arguments plus expected_revision to apply. Applying refuses \
              while KiCad holds the board open or its lock file is present, writes only if the \
-             file still matches the preview, and reads the file back. KiCad's placement and \
-             routing tools leave a locked footprint where it is.",
+             file still matches the preview, and reads the file back. Of Konnect's placement tools, only \
+             auto_place_from_schematic and refine_placement_force_directed hold a locked \
+             footprint where it is, and update_pcb_from_schematic keeps a locked orphan \
+             footprint instead of deleting it. move_component, rotate_component, flip_component, \
+             set_component_placements, align_components and place_decoupling_caps do not check \
+             the lock, so keep locked references out of them. Routing never moves a footprint: \
+             apply_specctra_ses refuses a session that changes any placement.",
             json!({
                 "type": "object",
                 "properties": {
@@ -73,13 +83,14 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "add_rule_area",
             "Add a KiCad rule area (keepout zone) to the saved board file: a rectangle \
              (x1, y1, x2, y2) or a simple polygon ('points'), on one or more copper layers. \
-             'keepout' says what is forbidden inside; by default tracks, vias and copper pours, \
-             while pads and footprints stay allowed. A rule area that forbids tracks or vias is \
-             exported by export_specctra_dsn as a keepout, so Freerouting routes around it. \
-             Previews by default and returns a 'revision'; call again with the same arguments \
-             plus expected_revision to apply. Applying refuses while KiCad holds the board open \
-             or its lock file is present, writes only if the file still matches the preview, \
-             and reads the file back.",
+             'keepout' says what is forbidden inside. The default is KiCad's own for a new rule \
+             area: tracks, vias and pads forbidden, copper pours and footprints allowed; an \
+             antenna keepout usually also sets copperpour true. A rule area that forbids \
+             tracks or vias is exported by export_specctra_dsn as a keepout, so Freerouting \
+             routes around it. Previews by default and returns a 'revision'; call again with \
+             the same arguments plus expected_revision to apply. Applying refuses while KiCad \
+             holds the board open or its lock file is present, writes only if the file still \
+             matches the preview, and reads the file back.",
             json!({
                 "type": "object",
                 "properties": {
@@ -107,8 +118,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                         "properties": {
                             "tracks":     { "type": "boolean", "description": "Forbid tracks (default true)" },
                             "vias":       { "type": "boolean", "description": "Forbid vias (default true)" },
-                            "pads":       { "type": "boolean", "description": "Forbid pads (default false)" },
-                            "copperpour": { "type": "boolean", "description": "Forbid copper pours (default true)" },
+                            "pads":       { "type": "boolean", "description": "Forbid pads (default true)" },
+                            "copperpour": { "type": "boolean", "description": "Forbid copper pours (default false)" },
                             "footprints": { "type": "boolean", "description": "Forbid footprints (default false)" }
                         },
                         "description": "true forbids the item inside the area. At least one must be forbidden."
@@ -140,11 +151,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
             "delete_zone",
             "Delete copper zones or rule areas from the saved board file, by UUID ('uuids', \
              from list_zones) or by name ('names'). A name that matches more than one zone is \
-             refused; use UUIDs. Zones inside footprints are not touched. Previews by default \
-             and returns a 'revision'; call again with the same arguments plus \
-             expected_revision to apply. Applying refuses while KiCad holds the board open or \
-             its lock file is present, writes only if the file still matches the preview, and \
-             reads the file back. Run refill_zones afterwards if copper zones remain.",
+             refused; use UUIDs. A UUID that more than one zone carries is refused too, whether \
+             it was named or the zone was picked by name. Zones inside footprints are not \
+             touched. Previews by default and returns a 'revision'; call again with the same \
+             arguments plus expected_revision to apply. Applying refuses while KiCad holds the \
+             board open or its lock file is present, writes only if the file still matches the \
+             preview, and reads the file back. Run refill_zones afterwards if copper zones \
+             remain.",
             json!({
                 "type": "object",
                 "properties": {
@@ -220,16 +233,19 @@ fn expected_revision(args: &Value) -> Result<Option<String>, CallToolResult> {
     }
 }
 
-fn stale(board: &Path, actual: &str) -> CallToolResult {
+/// The refusal for a revision that does not match. It carries no revision: the
+/// current one would authorise exactly this request on the current file, which
+/// nobody has previewed, so the caller has to preview again to get it (as
+/// `restore_checkpoint` does).
+fn stale(board: &Path) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::StaleTarget {
             target: board.display().to_string(),
-            reason: format!("revision is now {actual}"),
+            reason: "revision_mismatch".to_string(),
         },
-        format!(
-            "The board file or the request changed since the preview, so nothing was written. \
-             Preview again (omit expected_revision) and apply with the new revision {actual}."
-        ),
+        "The board file or the request changed since the preview, so nothing was written. \
+         Preview again (omit expected_revision) to see what would change, and apply with the \
+         revision that preview returns.",
     )
 }
 
@@ -596,7 +612,7 @@ async fn handle_set_footprint_lock(
         })));
     };
     if expected != current {
-        return Ok(stale(&board, &current));
+        return Ok(stale(&board));
     }
     if changed_count == 0 {
         return Ok(CallToolResult::json(&json!({
@@ -797,39 +813,287 @@ pub(crate) fn check_simple_ring(ring: &[(f64, f64)]) -> Result<(), String> {
     Ok(())
 }
 
-/// Points strictly inside the arc from `start` through `mid` to `end`, every
-/// few degrees along its circle, for the simplicity check of an outline that
-/// has arc edges. The caller has checked the three points are not collinear.
-pub(crate) fn arc_inner_points(
+/// How close two things must be, in mm, to count as touching.
+const TOUCH_MM: f64 = 1e-9;
+
+/// The circle and sweep of the arc from `start` through `mid` to `end`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArcGeom {
+    center: (f64, f64),
+    radius: f64,
+    /// Angle of `start`, seen from the centre.
+    a0: f64,
+    /// Signed angle from `start` to `end`, the way that passes `mid`.
+    sweep: f64,
+}
+
+impl ArcGeom {
+    /// `None` when the three points are collinear or not finite.
+    pub(crate) fn new(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> Option<Self> {
+        // Circumcentre, relative to `start` for precision far from the origin.
+        let (bx, by) = (mid.0 - start.0, mid.1 - start.1);
+        let (cx, cy) = (end.0 - start.0, end.1 - start.1);
+        let d = 2.0 * (bx * cy - by * cx);
+        if !d.is_finite() || d == 0.0 {
+            return None;
+        }
+        let (b2, c2) = (bx * bx + by * by, cx * cx + cy * cy);
+        let (ux, uy) = ((cy * b2 - by * c2) / d, (bx * c2 - cx * b2) / d);
+        let center = (start.0 + ux, start.1 + uy);
+        let radius = ux.hypot(uy);
+        if !center.0.is_finite() || !center.1.is_finite() || !radius.is_finite() {
+            return None;
+        }
+        let angle = |p: (f64, f64)| (p.1 - center.1).atan2(p.0 - center.0);
+        let tau = std::f64::consts::TAU;
+        let (a0, am, a1) = (angle(start), angle(mid), angle(end));
+        // Sweep from start to end in the direction that passes the midpoint.
+        let ccw = |from: f64, to: f64| (to - from).rem_euclid(tau);
+        let sweep = if ccw(a0, am) < ccw(a0, a1) {
+            ccw(a0, a1)
+        } else {
+            -(tau - ccw(a0, a1))
+        };
+        Some(Self {
+            center,
+            radius,
+            a0,
+            sweep,
+        })
+    }
+
+    /// Whether `p`, a point on the arc's circle, lies on the arc, its ends
+    /// included, give or take `TOUCH_MM` along the circle.
+    fn covers(&self, p: (f64, f64)) -> bool {
+        let tau = std::f64::consts::TAU;
+        let theta = (p.1 - self.center.1).atan2(p.0 - self.center.0);
+        let along = if self.sweep >= 0.0 {
+            (theta - self.a0).rem_euclid(tau)
+        } else {
+            (self.a0 - theta).rem_euclid(tau)
+        };
+        let slack = TOUCH_MM / self.radius;
+        along <= self.sweep.abs() + slack || along >= tau - slack
+    }
+
+    /// Bounding box `(x1, y1, x2, y2)`: the ends, and each point where the
+    /// circle reaches furthest left, right, up or down, if the arc passes it.
+    fn extent(&self, start: (f64, f64), end: (f64, f64)) -> (f64, f64, f64, f64) {
+        let ((cx, cy), r) = (self.center, self.radius);
+        [(cx + r, cy), (cx, cy + r), (cx - r, cy), (cx, cy - r)]
+            .into_iter()
+            .filter(|p| self.covers(*p))
+            .chain([start, end])
+            .fold(
+                (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+                |(x1, y1, x2, y2), (x, y)| (x1.min(x), y1.min(y), x2.max(x), y2.max(y)),
+            )
+    }
+}
+
+/// Bounding box `(x1, y1, x2, y2)` of the arc from `start` through `mid` to
+/// `end`, bulge included. Three collinear points give the box of the three.
+pub(crate) fn arc_extent(
     start: (f64, f64),
     mid: (f64, f64),
     end: (f64, f64),
+) -> (f64, f64, f64, f64) {
+    match ArcGeom::new(start, mid, end) {
+        Some(arc) => arc.extent(start, end),
+        None => [start, mid, end].into_iter().fold(
+            (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+            |(x1, y1, x2, y2), (x, y)| (x1.min(x), y1.min(y), x2.max(x), y2.max(y)),
+        ),
+    }
+}
+
+/// An outline corner, and the midpoint of the arc to the next corner, if any.
+pub(crate) type OutlineCorner = ((f64, f64), Option<(f64, f64)>);
+
+/// One edge of an outline.
+enum Edge {
+    Line((f64, f64), (f64, f64)),
+    Arc(ArcGeom),
+}
+
+fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+/// Where the segment `a`–`b` meets the circle of `arc` (not yet limited to the
+/// arc's sweep). `shared` holds the segment's ends that are also ends of the
+/// arc: those are meetings by construction and are not returned, and the
+/// other meeting is found from them exactly, so a tangent join is not lost to
+/// rounding.
+fn segment_circle_points(
+    a: (f64, f64),
+    b: (f64, f64),
+    arc: &ArcGeom,
+    shared: &[(f64, f64)],
 ) -> Vec<(f64, f64)> {
-    let (ax, ay, bx, by, cx, cy) = (start.0, start.1, mid.0, mid.1, end.0, end.1);
-    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
-    let a2 = ax * ax + ay * ay;
-    let b2 = bx * bx + by * by;
-    let c2 = cx * cx + cy * cy;
-    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
-    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
-    let radius = ((ax - ux).powi(2) + (ay - uy).powi(2)).sqrt();
-    let angle = |p: (f64, f64)| (p.1 - uy).atan2(p.0 - ux);
-    let tau = std::f64::consts::TAU;
-    let (a0, am, a1) = (angle(start), angle(mid), angle(end));
-    // Sweep from start to end in the direction that passes the midpoint.
-    let ccw = |from: f64, to: f64| (to - from).rem_euclid(tau);
-    let sweep = if ccw(a0, am) < ccw(a0, a1) {
-        ccw(a0, a1)
-    } else {
-        -(tau - ccw(a0, a1))
+    let d = (b.0 - a.0, b.1 - a.1);
+    let f = (a.0 - arc.center.0, a.1 - arc.center.1);
+    // |a + t d - centre|^2 = r^2, as qa t^2 + qb t + qc = 0.
+    let qa = d.0 * d.0 + d.1 * d.1;
+    let qb = 2.0 * (f.0 * d.0 + f.1 * d.1);
+    let qc = f.0 * f.0 + f.1 * f.1 - arc.radius * arc.radius;
+    let roots: Vec<f64> = match (shared.contains(&a), shared.contains(&b)) {
+        (true, true) => Vec::new(),
+        // The roots sum to -qb/qa; one of them is the shared end.
+        (true, false) => vec![-qb / qa],
+        (false, true) => vec![-qb / qa - 1.0],
+        (false, false) => {
+            let disc = qb * qb - 4.0 * qa * qc;
+            if disc < 0.0 {
+                // No crossing; a near-tangent within TOUCH_MM still touches.
+                let t = -qb / (2.0 * qa);
+                let closest = (a.0 + t * d.0, a.1 + t * d.1);
+                if (distance(closest, arc.center) - arc.radius).abs() <= TOUCH_MM {
+                    vec![t]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                let q = -0.5 * (qb + qb.signum() * disc.sqrt());
+                if q == 0.0 {
+                    vec![0.0]
+                } else {
+                    vec![q / qa, qc / q]
+                }
+            }
+        }
     };
-    let steps = ((sweep.abs() / (5.0_f64).to_radians()).ceil() as usize).max(2);
-    (1..steps)
-        .map(|i| {
-            let t = a0 + sweep * i as f64 / steps as f64;
-            (ux + radius * t.cos(), uy + radius * t.sin())
-        })
+    let slack = TOUCH_MM / qa.sqrt();
+    roots
+        .into_iter()
+        .filter(|t| *t >= -slack && *t <= 1.0 + slack)
+        .map(|t| (a.0 + t * d.0, a.1 + t * d.1))
         .collect()
+}
+
+/// Where the circles of two arcs meet (not yet limited to their sweeps).
+/// With a shared end `v`, the other meeting is `v` mirrored across the line
+/// through the centres.
+fn circle_circle_points(one: &ArcGeom, two: &ArcGeom, shared: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let (dx, dy) = (two.center.0 - one.center.0, two.center.1 - one.center.1);
+    let d = dx.hypot(dy);
+    if d == 0.0 {
+        return Vec::new();
+    }
+    let (ux, uy) = (dx / d, dy / d);
+    if let Some(v) = shared.first() {
+        let along = (v.0 - one.center.0) * ux + (v.1 - one.center.1) * uy;
+        let foot = (one.center.0 + along * ux, one.center.1 + along * uy);
+        return vec![(2.0 * foot.0 - v.0, 2.0 * foot.1 - v.1)];
+    }
+    let (r1, r2) = (one.radius, two.radius);
+    if d > r1 + r2 + TOUCH_MM || d < (r1 - r2).abs() - TOUCH_MM {
+        return Vec::new();
+    }
+    let along = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d);
+    let h = (r1 * r1 - along * along).max(0.0).sqrt();
+    let base = (one.center.0 + along * ux, one.center.1 + along * uy);
+    vec![
+        (base.0 - h * uy, base.1 + h * ux),
+        (base.0 + h * uy, base.1 - h * ux),
+    ]
+}
+
+/// Whether two edges of an outline meet anywhere but at the corners in
+/// `shared`, the ones they have in common.
+fn edges_meet(one: &Edge, two: &Edge, shared: &[(f64, f64)]) -> bool {
+    let away = |p: &(f64, f64)| shared.iter().all(|s| distance(*p, *s) > TOUCH_MM);
+    match (one, two) {
+        (Edge::Line(a1, a2), Edge::Line(b1, b2)) => match shared.first() {
+            None => segments_touch(*a1, *a2, *b1, *b2),
+            // Straight neighbours meet beyond their corner only by folding
+            // back along one line.
+            Some(v) => {
+                let p = if a1 == v { *a2 } else { *a1 };
+                let q = if b1 == v { *b2 } else { *b1 };
+                cross(p, *v, q).abs() <= 1e-12
+                    && (p.0 - v.0) * (q.0 - v.0) + (p.1 - v.1) * (q.1 - v.1) > 0.0
+            }
+        },
+        (Edge::Line(a, b), Edge::Arc(arc)) | (Edge::Arc(arc), Edge::Line(a, b)) => {
+            segment_circle_points(*a, *b, arc, shared)
+                .iter()
+                .any(|p| away(p) && arc.covers(*p))
+        }
+        (Edge::Arc(g1), Edge::Arc(g2)) => {
+            if distance(g1.center, g2.center) <= TOUCH_MM
+                && (g1.radius - g2.radius).abs() <= TOUCH_MM
+            {
+                // One circle: the arcs overlap when their spans do.
+                let tau = std::f64::consts::TAU;
+                let gap = (g1.a0 + g1.sweep / 2.0 - g2.a0 - g2.sweep / 2.0).rem_euclid(tau);
+                let gap = gap.min(tau - gap);
+                return gap < (g1.sweep.abs() + g2.sweep.abs()) / 2.0 - TOUCH_MM / g1.radius;
+            }
+            circle_circle_points(g1, g2, shared)
+                .iter()
+                .any(|p| away(p) && g1.covers(*p) && g2.covers(*p))
+        }
+    }
+}
+
+/// Check that the closed outline through `corners` is one simple loop. Each
+/// corner may carry the midpoint of an arc to the next corner. Straight edges
+/// only go through `check_simple_ring`. With an arc, every pair of edges is
+/// intersected exactly (segment with circle, circle with circle, then limited
+/// to each arc's sweep), so a crossing cannot hide between an arc and its
+/// chords: no corner may repeat, and no edge may meet another except a
+/// neighbour at their shared corner.
+pub(crate) fn check_simple_outline(corners: &[OutlineCorner]) -> Result<(), String> {
+    let points: Vec<(f64, f64)> = corners.iter().map(|(p, _)| *p).collect();
+    if corners.iter().all(|(_, mid)| mid.is_none()) {
+        return check_simple_ring(&points);
+    }
+    let finite = |p: &(f64, f64)| p.0.is_finite() && p.1.is_finite();
+    if !corners
+        .iter()
+        .all(|(p, mid)| finite(p) && mid.as_ref().is_none_or(finite))
+    {
+        return Err("every coordinate must be finite".to_string());
+    }
+    let n = corners.len();
+    if n < 2 {
+        return Err(format!(
+            "needs at least 2 corners when an edge is an arc, got {n}"
+        ));
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            if distance(points[i], points[j]) < 1e-9 {
+                return Err(format!("corners {i} and {j} are the same point"));
+            }
+        }
+    }
+    let mut edges = Vec::with_capacity(n);
+    for (i, (start, mid)) in corners.iter().enumerate() {
+        let end = points[(i + 1) % n];
+        edges.push(match mid {
+            None => Edge::Line(*start, end),
+            Some(mid) => Edge::Arc(
+                ArcGeom::new(*start, *mid, end)
+                    .ok_or_else(|| format!("edge {i}: the arc's midpoint is on its chord"))?,
+            ),
+        });
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            // Edge k runs from corner k to corner k + 1.
+            let shared: Vec<(f64, f64)> = [i, (i + 1) % n]
+                .into_iter()
+                .filter(|c| *c == j || *c == (j + 1) % n)
+                .map(|c| points[c])
+                .collect();
+            if edges_meet(&edges[i], &edges[j], &shared) {
+                return Err(format!("edge {i} crosses or touches edge {j}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read `points` as a list of `{x, y}` in mm. A closing point equal to the
@@ -1111,7 +1375,7 @@ async fn handle_add_rule_area(args: &Value, ctx: &ToolContext) -> anyhow::Result
         return Ok(CallToolResult::json(&body));
     };
     if expected != current {
-        return Ok(stale(&board, &current));
+        return Ok(stale(&board));
     }
 
     let uuid = new_uuid();
@@ -1204,6 +1468,8 @@ fn zone_net(zone: &SexpNode) -> Option<String> {
     }
 }
 
+/// Points whose bounding box is the zone outline's: each corner, and for an
+/// arc the corners of its own box, bulge included.
 fn zone_corners(zone: &SexpNode) -> Vec<(f64, f64)> {
     zone.find_all("polygon")
         .into_iter()
@@ -1215,11 +1481,20 @@ fn zone_corners(zone: &SexpNode) -> Vec<(f64, f64)> {
                 .zip(item.get_f64(2))
                 .into_iter()
                 .collect::<Vec<_>>(),
-            Some("arc") => ["start", "mid", "end"]
-                .iter()
-                .filter_map(|tag| item.find(tag))
-                .filter_map(|p| p.get_f64(1).zip(p.get_f64(2)))
-                .collect(),
+            Some("arc") => {
+                let points: Vec<(f64, f64)> = ["start", "mid", "end"]
+                    .iter()
+                    .filter_map(|tag| item.find(tag))
+                    .filter_map(|p| p.get_f64(1).zip(p.get_f64(2)))
+                    .collect();
+                match points.as_slice() {
+                    [start, mid, end] => {
+                        let (x1, y1, x2, y2) = arc_extent(*start, *mid, *end);
+                        vec![(x1, y1), (x2, y2)]
+                    }
+                    _ => points,
+                }
+            }
             _ => Vec::new(),
         })
         .collect()
@@ -1328,18 +1603,23 @@ async fn handle_delete_zone(args: &Value, ctx: &ToolContext) -> anyhow::Result<C
         .filter(|b| b.node.head() == Some("zone"))
         .collect();
 
+    let carrying = |uuid: &str| -> Vec<usize> {
+        zones
+            .iter()
+            .enumerate()
+            .filter(|(_, z)| node_uuid(&z.node).as_deref() == Some(uuid))
+            .map(|(i, _)| i)
+            .collect()
+    };
     let mut selected: BTreeSet<usize> = BTreeSet::new();
     let mut unknown: Vec<String> = Vec::new();
     for uuid in &uuids {
-        match zones
-            .iter()
-            .position(|z| node_uuid(&z.node).as_deref() == Some(uuid.as_str()))
-        {
-            Some(index) => {
-                selected.insert(index);
-            }
-            None => unknown.push(format!("uuid {uuid}")),
+        let matches = carrying(uuid);
+        if matches.is_empty() {
+            unknown.push(format!("uuid {uuid}"));
         }
+        // Every zone that carries it; a shared UUID is refused below.
+        selected.extend(matches);
     }
     let mut ambiguous: Vec<String> = Vec::new();
     for name in &names {
@@ -1388,6 +1668,32 @@ async fn handle_delete_zone(args: &Value, ctx: &ToolContext) -> anyhow::Result<C
             ),
         ));
     }
+    // A target whose UUID another zone carries too, picked by that UUID or by
+    // its name: the readback could not tell which zone went, so it is
+    // refused before anything is written.
+    let mut duplicated: Vec<String> = Vec::new();
+    for index in &selected {
+        if let Some(uuid) = node_uuid(&zones[*index].node) {
+            let count = carrying(&uuid).len();
+            let entry = format!("{uuid} ({count} zones)");
+            if count > 1 && !duplicated.contains(&entry) {
+                duplicated.push(entry);
+            }
+        }
+    }
+    if !duplicated.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::AmbiguousTarget {
+                target: "uuids".to_string(),
+                candidates: duplicated.clone(),
+            },
+            format!(
+                "More than one zone carries the same UUID: {}. Nothing was deleted. Fix the \
+                 duplicate UUID in KiCad, then list_zones again.",
+                duplicated.join("; ")
+            ),
+        ));
+    }
 
     let targets: Vec<&Block> = selected.iter().map(|i| zones[*i]).collect();
     let described: Vec<Value> = targets.iter().map(|z| describe_zone(&z.node)).collect();
@@ -1412,7 +1718,7 @@ async fn handle_delete_zone(args: &Value, ctx: &ToolContext) -> anyhow::Result<C
         })));
     };
     if expected != current {
-        return Ok(stale(&board, &current));
+        return Ok(stale(&board));
     }
 
     let edits = targets

@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: board construction tools
+
+Rank 21 (`docs/CREATION_HANDOFF.md`, #48). The `pcb_board` toolset gains
+`set_footprint_lock`, `add_rule_area`, `list_zones` and `delete_zone`.
+`add_board_outline` gains a polygon mode: `points` instead of x1, y1, x2, y2
+(no longer required), each corner optionally with `arc_mid` to make the next
+edge an arc. The rectangle mode is unchanged. A polygon is refused if any edges
+cross or touch; arcs are intersected exactly. Its result carries `bbox`, which
+includes each arc's bulge.
+
+The three writers preview by default and apply only with the preview's
+`revision`. A revision that does not match is refused as `stale_target` with
+reason `revision_mismatch`, and the refusal names no revision: preview again to
+get one. `delete_zone` refuses a name or a UUID that more than one zone carries
+(`ambiguous_target`) before anything is written. `add_rule_area`'s default
+keepout is KiCad's: tracks, vias and pads forbidden; copper pours and
+footprints allowed.
+
 ## Unreleased: `run_design_review` reads a DRC baseline
 
 PR 15 follow-up (`docs/CREATION_HANDOFF.md`). `run_design_review` takes an

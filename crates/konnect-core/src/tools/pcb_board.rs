@@ -2240,20 +2240,28 @@ async fn add_polygon_board_outline(
         .filter(|primitive| matches!(primitive, OutlinePrimitive::Line { .. }))
         .count();
     let arc_count = primitives.len() - line_count;
-    let corners: Vec<(f64, f64)> = primitives
+    // An arc's bulge counts: its box takes in every axis extreme it passes.
+    let bbox = primitives
         .iter()
         .map(|primitive| match primitive {
-            OutlinePrimitive::Line { start, .. } | OutlinePrimitive::Arc { start, .. } => *start,
+            OutlinePrimitive::Line { start, end } => (
+                start.0.min(end.0),
+                start.1.min(end.1),
+                start.0.max(end.0),
+                start.1.max(end.1),
+            ),
+            OutlinePrimitive::Arc { start, mid, end } => {
+                board_construction::arc_extent(*start, *mid, *end)
+            }
         })
-        .collect();
-    let bbox = corners.iter().fold(
-        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
-        |(a, b, c, d), (x, y)| (a.min(*x), b.min(*y), c.max(*x), d.max(*y)),
-    );
+        .fold(
+            (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+            |(a, b, c, d), (x1, y1, x2, y2)| (a.min(x1), b.min(y1), c.max(x2), d.max(y2)),
+        );
     let describe = |source: &str| {
         json!({
             "shape": "polygon",
-            "corner_count": corners.len(),
+            "corner_count": primitives.len(),
             "line_count": line_count, "arc_count": arc_count,
             "bbox": { "x1": bbox.0, "y1": bbox.1, "x2": bbox.2, "y2": bbox.3 },
             "source": source,
@@ -2330,7 +2338,7 @@ async fn add_polygon_board_outline(
 
 /// The lines and arcs of a polygon outline. Each corner may carry `arc_mid`,
 /// making the edge to the next corner an arc through that point. The loop is
-/// checked simple with every arc sampled densely along its circle.
+/// checked simple with every arc intersected exactly against the other edges.
 fn polygon_outline(points: &serde_json::Value) -> Result<Vec<OutlinePrimitive>, CallToolResult> {
     let Some(items) = points.as_array() else {
         return Err(crate::tools::invalid_arg(
@@ -2376,10 +2384,8 @@ fn polygon_outline(points: &serde_json::Value) -> Result<Vec<OutlinePrimitive>, 
         }
     }
     let mut primitives = Vec::with_capacity(corners.len());
-    let mut chorded: Vec<(f64, f64)> = Vec::with_capacity(corners.len() * 2);
     for (index, (start, mid)) in corners.iter().enumerate() {
         let end = corners[(index + 1) % corners.len()].0;
-        chorded.push(*start);
         match mid {
             None => primitives.push(OutlinePrimitive::Line { start: *start, end }),
             Some(mid) => {
@@ -2393,7 +2399,6 @@ fn polygon_outline(points: &serde_json::Value) -> Result<Vec<OutlinePrimitive>, 
                         ),
                     ));
                 }
-                chorded.extend(board_construction::arc_inner_points(*start, *mid, end));
                 primitives.push(OutlinePrimitive::Arc {
                     start: *start,
                     mid: *mid,
@@ -2402,7 +2407,7 @@ fn polygon_outline(points: &serde_json::Value) -> Result<Vec<OutlinePrimitive>, 
             }
         }
     }
-    if let Err(reason) = board_construction::check_simple_ring(&chorded) {
+    if let Err(reason) = board_construction::check_simple_outline(&corners) {
         return Err(crate::tools::invalid_arg(
             "points",
             &format!("the outline is not one simple closed loop: {reason}"),

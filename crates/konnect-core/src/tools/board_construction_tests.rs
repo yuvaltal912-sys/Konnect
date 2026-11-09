@@ -247,16 +247,107 @@ async fn a_board_changed_after_the_preview_is_stale_and_untouched() {
     assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
 }
 
+type WriterFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CallToolResult>>>;
+type WriterCall = fn(Value) -> WriterFuture;
+
+fn run_lock(args: Value) -> WriterFuture {
+    Box::pin(async move { lock(args).await.unwrap() })
+}
+
+fn run_rule_area(args: Value) -> WriterFuture {
+    Box::pin(async move { rule_area(args).await.unwrap() })
+}
+
+fn run_delete(args: Value) -> WriterFuture {
+    Box::pin(async move { delete(args).await.unwrap() })
+}
+
+/// Each writer's arguments, and a call that runs it with no KiCad.
+fn writers(board: &Path) -> Vec<(Value, WriterCall)> {
+    vec![
+        (
+            json!({ "board": board, "references": ["R1"], "locked": true }),
+            run_lock as WriterCall,
+        ),
+        (
+            json!({ "board": board, "layers": ["F.Cu"], "x1": 90, "y1": 40, "x2": 95, "y2": 45 }),
+            run_rule_area,
+        ),
+        (
+            json!({ "board": board, "names": ["no_route_keepout"] }),
+            run_delete,
+        ),
+    ]
+}
+
+fn lock_refusal_reason(result: &CallToolResult) -> String {
+    assert_eq!(kind(result), "unsafe_file_fallback");
+    let parsed: Value = serde_json::from_str(&text(result)).unwrap();
+    parsed["error"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[tokio::test]
 async fn a_kicad_lock_file_refuses_the_write() {
     let (_dir, board) = scratch(FIXTURE);
     let lock_path = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
     std::fs::write(&lock_path, "user host").unwrap();
-    let result = lock(json!({ "board": board, "references": ["R1"], "locked": true }))
-        .await
-        .unwrap();
-    assert_eq!(kind(&result), "unsafe_file_fallback");
+    for (args, call) in writers(&board) {
+        let result = call(args.clone()).await;
+        assert_eq!(lock_refusal_reason(&result), "kicad_lock_present", "{args}");
+    }
     assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
+}
+
+#[tokio::test]
+async fn a_lock_file_that_appears_after_the_preview_refuses_every_apply() {
+    for index in 0..3 {
+        let (_dir, board) = scratch(FIXTURE);
+        let (args, call) = writers(&board).swap_remove(index);
+        let preview = body(&call(args.clone()).await);
+        assert_eq!(preview["mode"], "preview");
+        let lock_path = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        std::fs::write(&lock_path, "user host").unwrap();
+        let mut apply = args;
+        apply["expected_revision"] = preview["revision"].clone();
+        let result = call(apply.clone()).await;
+        assert_eq!(
+            lock_refusal_reason(&result),
+            "kicad_lock_present",
+            "{apply}"
+        );
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
+    }
+}
+
+/// `commit` is the backstop for a lock or an edit that lands after the
+/// preflight: it must refuse, name the reason and leave the file alone.
+#[test]
+fn commit_refuses_a_lock_or_an_edit_that_appears_at_write_time() {
+    let (_dir, board) = scratch(FIXTURE);
+    let lock_path = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+    std::fs::write(&lock_path, "user host").unwrap();
+    let Err(locked) = commit(&board, FIXTURE, "(kicad_pcb)", "set_footprint_lock") else {
+        panic!("commit wrote past a KiCad lock file");
+    };
+    assert_eq!(lock_refusal_reason(&locked), "kicad_lock_present");
+    assert!(
+        text(&locked).contains("nothing was written"),
+        "{}",
+        text(&locked)
+    );
+    assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
+
+    std::fs::remove_file(&lock_path).unwrap();
+    let edited = FIXTURE.replace("(hatch edge 0.5)", "(hatch edge 0.6)");
+    std::fs::write(&board, &edited).unwrap();
+    let Err(changed) = commit(&board, FIXTURE, "(kicad_pcb)", "add_rule_area") else {
+        panic!("commit wrote over a file that changed");
+    };
+    assert_eq!(kind(&changed), "stale_target");
+    assert_eq!(std::fs::read_to_string(&board).unwrap(), edited);
 }
 
 #[tokio::test]
@@ -324,8 +415,13 @@ async fn a_rule_area_survives_the_specctra_export_as_a_keepout_per_layer() {
         true
     );
     assert_eq!(applied["readback"], "verified");
-    assert_eq!(applied["rule_area"]["keepout"]["tracks"], "not_allowed");
-    assert_eq!(applied["rule_area"]["keepout"]["pads"], "allowed");
+    // No 'keepout' given: KiCad 10's own new-rule-area defaults
+    // (ZONE_SETTINGS in pcbnew/zone_settings.cpp).
+    assert_eq!(
+        applied["rule_area"]["keepout"],
+        json!({ "tracks": "not_allowed", "vias": "not_allowed", "pads": "not_allowed",
+                "copperpour": "allowed", "footprints": "allowed" })
+    );
 
     let (after, manifest) = dsn_of(&board);
     assert_eq!(
@@ -436,7 +532,7 @@ async fn bad_rule_areas_are_refused_before_anything_is_written() {
         json!({ "board": board, "layers": ["F.SilkS"], "x1": 0, "y1": 0, "x2": 1, "y2": 1 }),
         json!({ "board": board, "layers": ["In1.Cu"], "x1": 0, "y1": 0, "x2": 1, "y2": 1 }),
         json!({ "board": board, "layers": ["F.Cu"], "x1": 0, "y1": 0, "x2": 1, "y2": 1,
-                "keepout": { "tracks": false, "vias": false, "copperpour": false } }),
+                "keepout": { "tracks": false, "vias": false, "pads": false } }),
         json!({ "board": board, "layers": ["F.Cu"], "x1": 0, "y1": 0, "x2": 1, "y2": 1, "name": "no_route_keepout" }),
         json!({ "board": board, "layers": ["F.Cu"], "x1": 0, "y1": 0, "x2": 1 }),
         json!({ "board": board, "layers": ["F.Cu"], "x1": 0, "y1": 0, "x2": 1, "y2": 1, "points": [] }),
@@ -449,6 +545,16 @@ async fn bad_rule_areas_are_refused_before_anything_is_written() {
     assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
 }
 
+/// A `stale_target` refusal that hands back no revision: the caller must
+/// preview again to get one.
+fn assert_stale_without_revision(result: &CallToolResult) {
+    assert_eq!(kind(result), "stale_target");
+    let refusal = text(result);
+    assert!(!refusal.contains("sha256:"), "{refusal}");
+    let parsed: Value = serde_json::from_str(&refusal).unwrap();
+    assert_eq!(parsed["error"]["reason"], "revision_mismatch", "{refusal}");
+}
+
 #[tokio::test]
 async fn a_rule_area_preview_does_not_authorise_a_different_area() {
     let (_dir, board) = scratch(FIXTURE);
@@ -458,8 +564,69 @@ async fn a_rule_area_preview_does_not_authorise_a_different_area() {
     let mut other = args;
     other["x2"] = json!(88);
     other["expected_revision"] = preview["revision"].clone();
-    assert_eq!(kind(&rule_area(other).await.unwrap()), "stale_target");
+    let refused = rule_area(other.clone()).await.unwrap();
+    assert_stale_without_revision(&refused);
+    // The revision a preview of the other area would hand out is not in it.
+    let mut other_preview = other.clone();
+    other_preview["expected_revision"] = Value::Null;
+    let wanted = body(&rule_area(other_preview).await.unwrap())["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!text(&refused).contains(&wanted));
+    // A guessed revision is refused the same way.
+    other["expected_revision"] = json!(format!("sha256:{}", "0".repeat(64)));
+    assert_stale_without_revision(&rule_area(other).await.unwrap());
     assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
+}
+
+#[tokio::test]
+async fn a_stale_refusal_hands_back_no_revision_for_any_writer() {
+    let cases: [(Value, Value, WriterCall); 3] = [
+        (
+            json!({ "references": ["R1"], "locked": true }),
+            json!({ "references": ["R2"], "locked": true }),
+            run_lock,
+        ),
+        (
+            json!({ "layers": ["F.Cu"], "x1": 82, "y1": 32, "x2": 86, "y2": 36 }),
+            json!({ "layers": ["B.Cu"], "x1": 82, "y1": 32, "x2": 86, "y2": 36 }),
+            run_rule_area,
+        ),
+        (
+            json!({ "names": ["no_route_keepout"] }),
+            json!({ "uuids": ["44444444-4444-4444-8444-444444444441"] }),
+            run_delete,
+        ),
+    ];
+    for (previewed, other, call) in cases {
+        let (_dir, board) = scratch(FIXTURE);
+        let with_board = |mut args: Value| {
+            args["board"] = json!(board);
+            args
+        };
+        let preview = body(&call(with_board(previewed.clone())).await);
+        // Another request with this preview's revision.
+        let mut swapped = with_board(other.clone());
+        swapped["expected_revision"] = preview["revision"].clone();
+        let refused = call(swapped.clone()).await;
+        assert_stale_without_revision(&refused);
+        let wanted = body(&call(with_board(other.clone())).await)["revision"].clone();
+        assert!(!text(&refused).contains(wanted.as_str().unwrap()));
+        // Resending the refusal's own text as a revision still writes nothing.
+        swapped["expected_revision"] = json!(text(&refused));
+        assert_stale_without_revision(&call(swapped).await);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
+
+        // The same request after the file changed: the old revision is
+        // refused, and the refusal names no new one.
+        let edited = FIXTURE.replace("(hatch edge 0.5)", "(hatch edge 0.6)");
+        std::fs::write(&board, &edited).unwrap();
+        let mut again = with_board(previewed);
+        again["expected_revision"] = preview["revision"].clone();
+        assert_stale_without_revision(&call(again).await);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), edited);
+    }
 }
 
 /// KiCad's own pcbnew loads what `add_rule_area` and `set_footprint_lock`
@@ -472,7 +639,7 @@ async fn live_pcbnew_loads_the_written_rule_area_and_lock() {
     preview_and_apply(
         json!({ "board": board, "layers": ["F.Cu", "B.Cu"], "name": "antenna",
                 "points": [{ "x": 82, "y": 32 }, { "x": 90, "y": 32 }, { "x": 86, "y": 40 }],
-                "keepout": { "vias": false, "footprints": true } }),
+                "keepout": { "tracks": true, "vias": false, "pads": false, "copperpour": true, "footprints": true } }),
         rule_area,
     )
     .await;
@@ -573,12 +740,42 @@ async fn deleting_by_uuid_takes_exactly_that_zone() {
     let listed = body(&handle_list_zones(&json!({ "board": board })).await.unwrap());
     assert_eq!(listed["count"], 1);
     assert_eq!(listed["zones"][0]["name"], "no_route_keepout");
-    // The rest of the file is what it was, minus that one block.
-    let written = std::fs::read_to_string(&board).unwrap();
-    assert_eq!(
-        top_level_blocks(&written).unwrap().len() + 1,
-        top_level_blocks(FIXTURE).unwrap().len()
+    // The rest of the file is what it was, byte for byte, minus that one
+    // block and the whitespace before it.
+    let pour = top_level_blocks(FIXTURE)
+        .unwrap()
+        .into_iter()
+        .find(|b| node_uuid(&b.node).as_deref() == Some("44444444-4444-4444-8444-444444444441"))
+        .unwrap();
+    let (start, end) = find_block_with_leading_whitespace(FIXTURE, pour.start).unwrap();
+    let expected = format!("{}{}", &FIXTURE[..start], &FIXTURE[end..]);
+    assert_eq!(std::fs::read_to_string(&board).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn a_uuid_two_zones_carry_is_refused_before_anything_is_written() {
+    // The keepout takes the pour's UUID: two zones now carry it.
+    let twin = FIXTURE.replace(
+        "(uuid \"44444444-4444-4444-8444-444444444442\")",
+        "(uuid \"44444444-4444-4444-8444-444444444441\")",
     );
+    let (_dir, board) = scratch(&twin);
+    let by_uuid = json!({ "board": board, "uuids": ["44444444-4444-4444-8444-444444444441"] });
+    let refused = delete(by_uuid.clone()).await.unwrap();
+    assert_eq!(kind(&refused), "ambiguous_target");
+    assert!(text(&refused).contains("(2 zones)"), "{}", text(&refused));
+    // Picking one of them by its unique name is refused too: the readback
+    // could not tell which zone went.
+    let by_name = delete(json!({ "board": board, "names": ["no_route_keepout"] }))
+        .await
+        .unwrap();
+    assert_eq!(kind(&by_name), "ambiguous_target");
+    assert!(text(&by_name).contains("(2 zones)"), "{}", text(&by_name));
+    // With a revision, the refusal still comes first.
+    let mut apply = by_uuid;
+    apply["expected_revision"] = json!(format!("sha256:{}", "0".repeat(64)));
+    assert_eq!(kind(&delete(apply).await.unwrap()), "ambiguous_target");
+    assert_eq!(std::fs::read_to_string(&board).unwrap(), twin);
 }
 
 #[tokio::test]
@@ -674,6 +871,12 @@ async fn a_polygon_outline_with_an_arc_edge_is_one_loop_the_dsn_export_accepts()
         (Some(5), Some(1))
     );
     assert!(result.get("existing_edge_cuts_shapes").is_none());
+    // The arc through (80, 30), (105, 26), (130, 30) tops out at y = 26.
+    let bbox = &result["bbox"];
+    for (field, want) in [("x1", 80.0), ("y1", 26.0), ("x2", 130.0), ("y2", 70.0)] {
+        let got = bbox[field].as_f64().unwrap();
+        assert!((got - want).abs() < 1e-9, "{field}: {bbox}");
+    }
     let written = std::fs::read_to_string(&board).unwrap();
     assert_eq!(written.matches("(gr_arc").count(), 1);
     // The outline reader behind the design review and score_placement sees
@@ -735,7 +938,7 @@ async fn bad_polygon_outlines_are_refused_without_writing() {
         json!({ "board": board, "points": [{ "x": 0, "y": 0 }, { "x": 4, "y": 0 }] }),
         json!({ "board": board, "points": [{ "x": 0, "y": 0, "arc_mid": { "x": 2, "y": 0 } }, { "x": 4, "y": 0 }, { "x": 4, "y": 4 }] }),
         // An arc edge whose circle swings out across both side edges (at
-        // y = 5.33): only sampling along the arc sees it; its chords do not.
+        // y = 5.33): its chord does not cross them, the arc does.
         json!({ "board": board, "points": [{ "x": 0, "y": 0, "arc_mid": { "x": 2, "y": 6 } }, { "x": 4, "y": 0 }, { "x": 4, "y": 8 }, { "x": 0, "y": 8 }] }),
         json!({ "board": board, "points": [{ "x": 0, "y": 0 }, { "x": 4, "y": 0 }, { "x": 4, "y": 4 }], "x1": 0 }),
         json!({ "board": board, "points": [{ "x": 0, "y": 0 }, { "x": 4, "y": 0 }, { "x": 4, "y": 4 }], "corner_radius": 1 }),
@@ -747,22 +950,178 @@ async fn bad_polygon_outlines_are_refused_without_writing() {
     assert_eq!(std::fs::read_to_string(&board).unwrap(), FIXTURE);
 }
 
+/// The reviewer's counter-example: a spike whose tip pokes 0.065 mm past a
+/// shallow arc of radius 145 (centre (100, -105)). Every 5-degree chord of
+/// the arc passes beyond the tip, so a sampled check accepted it.
+#[tokio::test]
+async fn a_spike_through_a_shallow_arc_is_refused_and_one_short_of_it_is_not() {
+    let spike = |tip_y: f64| {
+        json!([
+            { "x": 200, "y": 0, "arc_mid": { "x": 100, "y": 40 } },
+            { "x": 0, "y": 0 }, { "x": 0, "y": 100 }, { "x": 92.874, "y": 100 },
+            { "x": 93.874, "y": tip_y }, { "x": 94.874, "y": 100 }, { "x": 200, "y": 100 }
+        ])
+    };
+    let source = without_outline();
+    let (_dir, board) = scratch(&source);
+    let crossing = outline(json!({ "board": board, "points": spike(39.8057) })).await;
+    assert_eq!(kind(&crossing), "invalid_argument");
+    assert!(
+        text(&crossing).contains("not one simple closed loop"),
+        "{}",
+        text(&crossing)
+    );
+    assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    // The arc is at y = 39.8705 there; a tip at 39.95 stays inside it.
+    let clear = body(&outline(json!({ "board": board, "points": spike(39.95) })).await);
+    assert_eq!(clear["readback"], "verified");
+}
+
 #[test]
-fn arc_samples_follow_the_side_the_midpoint_is_on() {
+fn arc_geometry_follows_the_side_the_midpoint_is_on() {
     // A half circle of radius 2 above the x axis (KiCad Y grows down, but
-    // the geometry does not care): every sample is on the circle, above.
-    let up = arc_inner_points((0.0, 0.0), (2.0, 2.0), (4.0, 0.0));
-    assert!(up.len() > 10);
-    for (x, y) in &up {
-        assert!(((x - 2.0).powi(2) + y.powi(2) - 4.0).abs() < 1e-9);
-        assert!(*y > 0.0);
-    }
-    let down = arc_inner_points((0.0, 0.0), (2.0, -2.0), (4.0, 0.0));
-    assert!(down.iter().all(|(_, y)| *y < 0.0));
+    // the geometry does not care).
+    let up = ArcGeom::new((0.0, 0.0), (2.0, 2.0), (4.0, 0.0)).unwrap();
+    assert!((up.radius - 2.0).abs() < 1e-12);
+    assert!(up.covers((2.0, 2.0)));
+    assert!(!up.covers((2.0, -2.0)));
+    let down = ArcGeom::new((0.0, 0.0), (2.0, -2.0), (4.0, 0.0)).unwrap();
+    assert!(down.covers((2.0, -2.0)) && !down.covers((2.0, 2.0)));
     // A three-quarter arc goes the long way round.
-    let long = arc_inner_points((2.0, 0.0), (-2.0, 0.0), (0.0, -2.0));
-    assert!(long.iter().any(|(x, y)| *x < -1.9 && y.abs() < 0.2));
-    assert!(long.iter().all(|(x, y)| !(*x > 0.5 && *y < -0.5)));
+    let long = ArcGeom::new((2.0, 0.0), (-2.0, 0.0), (0.0, -2.0)).unwrap();
+    assert!(long.covers((0.0, 2.0)));
+    assert!(!long.covers((2.0_f64.sqrt(), -(2.0_f64.sqrt()))));
+    assert!(ArcGeom::new((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)).is_none());
+    // Its box: the ends and the axis extremes it passes, not the midpoint's.
+    assert_eq!(
+        arc_extent((0.0, 0.0), (2.0, 2.0), (4.0, 0.0)),
+        (0.0, 0.0, 4.0, 2.0)
+    );
+    let (x1, y1, x2, y2) = arc_extent((2.0, 0.0), (-2.0, 0.0), (0.0, -2.0));
+    assert!((x1 + 2.0).abs() < 1e-12 && (y1 + 2.0).abs() < 1e-12);
+    assert!((x2 - 2.0).abs() < 1e-12 && (y2 - 2.0).abs() < 1e-12);
+    // An asymmetric arc's top is not its midpoint: through (−√2, √2) and
+    // up to (0, 2) before coming down to (2, 0).
+    let (_, _, _, top) = arc_extent(
+        (-(2.0_f64.sqrt()), -(2.0_f64.sqrt())),
+        (-(2.0_f64.sqrt()), 2.0_f64.sqrt()),
+        (2.0, 0.0),
+    );
+    assert!((top - 2.0).abs() < 1e-12, "{top}");
+}
+
+#[test]
+fn the_exact_outline_check_accepts_simple_arcs_and_refuses_crossings() {
+    let line = |x: f64, y: f64| ((x, y), None);
+    let arc = |x: f64, y: f64, mx: f64, my: f64| ((x, y), Some((mx, my)));
+    let s = std::f64::consts::FRAC_1_SQRT_2;
+    let ok = [
+        // A rounded rectangle: every arc joins its lines tangentially.
+        vec![
+            line(1.0, 0.0),
+            arc(9.0, 0.0, 9.0 + s, 1.0 - s),
+            line(10.0, 1.0),
+            arc(10.0, 5.0, 9.0 + s, 5.0 + s),
+            line(9.0, 6.0),
+            arc(1.0, 6.0, 1.0 - s, 5.0 + s),
+            line(0.0, 5.0),
+            arc(0.0, 1.0, 1.0 - s, 1.0 - s),
+        ],
+        // A D: one arc and its chord.
+        vec![arc(0.0, 0.0, 2.0, 2.0), line(4.0, 0.0)],
+        // A circle made of two half arcs.
+        vec![arc(0.0, 0.0, 2.0, 2.0), arc(4.0, 0.0, 2.0, -2.0)],
+        // A crescent: two arcs bulging the same way.
+        vec![arc(0.0, 0.0, 2.0, 2.0), arc(4.0, 0.0, 2.0, 1.0)],
+    ];
+    for corners in ok {
+        assert_eq!(check_simple_outline(&corners), Ok(()), "{corners:?}");
+    }
+    let refused = [
+        // The arc swings out across both side edges.
+        vec![
+            arc(0.0, 0.0, 2.0, 6.0),
+            line(4.0, 0.0),
+            line(4.0, 8.0),
+            line(0.0, 8.0),
+        ],
+        // A corner of the square sits on the arc's circle, inside its sweep.
+        vec![
+            arc(0.0, 0.0, 2.0, -2.0),
+            line(4.0, 0.0),
+            line(2.0, 2.0),
+            line(2.0, -2.0),
+        ],
+        // A straight edge tangent to an arc it does not join.
+        vec![
+            arc(0.0, 0.0, 2.0, 2.0),
+            line(4.0, 0.0),
+            line(4.0, 2.0),
+            line(-1.0, 2.0),
+            line(-1.0, 0.0),
+        ],
+        // The same corner twice.
+        vec![arc(0.0, 0.0, 2.0, 2.0), line(4.0, 0.0), line(0.0, 0.0)],
+        vec![arc(0.0, 0.0, f64::NAN, 2.0), line(4.0, 0.0)],
+    ];
+    for corners in refused {
+        assert!(check_simple_outline(&corners).is_err(), "{corners:?}");
+    }
+    // Two arcs on one circle that fold back over each other: the upper half
+    // circle, then back from 0 to 135 degrees along it. The first pair
+    // checked, edges 0 and 1, is the overlap.
+    let folded = [
+        arc(0.0, 0.0, 2.0, 2.0),
+        arc(4.0, 0.0, 2.0 + 2.0 * s, 2.0 * s),
+        line(2.0 - 2.0 * s, 2.0 * s),
+    ];
+    assert_eq!(
+        check_simple_outline(&folded),
+        Err("edge 0 crosses or touches edge 1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn list_zones_boxes_an_arc_edge_by_its_bulge() {
+    // The pour's right edge becomes an arc of radius 25 about (105, 50)
+    // through (129, 57): it reaches x = 130, past all three of its points.
+    let source = FIXTURE.replace(
+        "(xy 85 35) (xy 125 35) (xy 125 65) (xy 85 65)",
+        "(xy 85 35) (arc (start 125 35) (mid 129 57) (end 125 65)) (xy 85 65)",
+    );
+    assert_ne!(source, FIXTURE);
+    let (_dir, board) = scratch(&source);
+    let listed = body(
+        &handle_list_zones(&json!({ "board": board, "kind": "copper" }))
+            .await
+            .unwrap(),
+    );
+    let bbox = &listed["zones"][0]["bbox"];
+    assert!(
+        (bbox["x2"].as_f64().unwrap() - 130.0).abs() < 1e-9,
+        "{bbox}"
+    );
+    assert_eq!(bbox["x1"], 85.0);
+}
+
+#[test]
+fn the_lock_tool_names_which_tools_honour_a_lock() {
+    let description = tools()
+        .into_iter()
+        .find(|t| t.name == "set_footprint_lock")
+        .unwrap()
+        .description;
+    for name in [
+        "auto_place_from_schematic",
+        "refine_placement_force_directed",
+        "move_component",
+        "set_component_placements",
+        "do not check the lock",
+        "update_pcb_from_schematic keeps a locked orphan",
+    ] {
+        assert!(description.contains(name), "{name}: {description}");
+    }
+    assert!(!description.contains("placement and routing tools leave"));
 }
 
 #[test]

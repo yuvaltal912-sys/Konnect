@@ -103,8 +103,15 @@ Follow this sequence for a clean PCB workflow:
    for a shaped board, `points` (a corner may carry an arc midpoint for the next edge). Both outline tools
    append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
    without it leaves two overlapping outlines and a DRC failure. Add mechanical and
-   antenna keepouts now with `add_rule_area`, and lock fixed parts (connectors,
-   mounting) with `set_footprint_lock`, so placement and routing respect them.
+   antenna keepouts now with `add_rule_area` (its defaults are KiCad's: tracks, vias
+   and pads forbidden; set `copperpour` in its `keepout` to keep pours out too), and
+   lock fixed parts (connectors, mounting) with `set_footprint_lock`. Only
+   `auto_place_from_schematic` and `refine_placement_force_directed` hold a locked
+   footprint, and `update_pcb_from_schematic` keeps a locked orphan instead of
+   deleting it. `move_component`, `rotate_component`, `flip_component`,
+   `set_component_placements`, `align_components` and `place_decoupling_caps` do not
+   check the lock, so keep locked references out of them. Routing never moves a
+   footprint.
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
