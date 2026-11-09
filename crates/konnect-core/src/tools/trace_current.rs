@@ -28,12 +28,12 @@ const DT_EXPONENT: f64 = 0.44;
 const AREA_EXPONENT: f64 = 0.725;
 const MM_PER_MIL: f64 = 0.0254;
 /// 1 oz/ft² of copper, in mm.
-const MM_PER_OZ: f64 = 0.0348;
+pub(crate) const MM_PER_OZ: f64 = 0.0348;
 /// The plated barrel of a via, in mm (IPC-6012 class 2 average is 20 µm;
 /// 25 µm is the common fab default).
 const VIA_PLATING_MM: f64 = 0.025;
 /// Used when neither the record nor the call gives a temperature rise.
-const DEFAULT_TEMP_RISE_C: f64 = 10.0;
+pub(crate) const DEFAULT_TEMP_RISE_C: f64 = 10.0;
 /// How many undersized segments a net lists by UUID.
 const LISTED_ITEMS: usize = 10;
 
@@ -76,7 +76,7 @@ pub(crate) fn required_area_mm2(amps: f64, rise_c: f64, external: bool) -> f64 {
 }
 
 /// The IPC-2221 current (A) a cross-section of `area_mm2` carries at `rise_c`.
-fn capacity_a(area_mm2: f64, rise_c: f64, external: bool) -> f64 {
+pub(crate) fn capacity_a(area_mm2: f64, rise_c: f64, external: bool) -> f64 {
     let k = if external { K_EXTERNAL } else { K_INTERNAL };
     let area_mil2 = area_mm2 / (MM_PER_MIL * MM_PER_MIL);
     k * rise_c.powf(DT_EXPONENT) * area_mil2.powf(AREA_EXPONENT)
