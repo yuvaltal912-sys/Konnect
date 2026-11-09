@@ -159,6 +159,36 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_run_design_review(args, ctx).await }
         ),
         tool!(
+            "audit_circuit_design",
+            "Circuit-aware review against the owner's PCB layout checklist (sections 2, 6, 8, 9) \
+             and the design-intent power tree. Reads parts, pins and nets from every schematic \
+             sheet; with 'board' also measures pad-to-pad placement distances (decoupling supply \
+             and ground legs, bulk capacitors, TVS/ESD at the connector and ahead of the circuit, \
+             CAN/RS-485 transceiver and termination, series termination at the driver, gate \
+             driver and gate resistor, bootstrap capacitor, current-sense amplifier and a \
+             Kelvin check of its copper, crystal and ADC reference capacitors). Schematic rules: \
+             CAN/RS-485 termination value and fail-safe bias, I2C pull-up rail and value, UART \
+             TX/RX, USB ESD, bootstrap, gate-drive return net. With a design-intent record: rail \
+             nets and voltages, each rail's source_ref and input, and regulator feedback dividers \
+             against the output voltage. Every finding names its 'checklist' item and the 'rule' \
+             that fired. 'checks' reports each rule as ran, needs_human, no_subjects or not_run, with counts; \
+             'needs_human' lists what no tool here can judge, with each subject a rule met but \
+             could not judge; 'unproven' lists absences withheld because the net continues on \
+             another sheet; a sheet used twice is audited once per use ('unaudited_sheet_uses' \
+             lists any use that could not be read) and DNP or off-board parts are left out \
+             ('unfitted_parts'). Nothing here approves a board.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to the root .kicad_sch file; every reachable sheet is read, and the design-intent record beside it" },
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file (optional; placement rules do not run without it)" }
+                },
+                "required": ["schematic"],
+                "additionalProperties": false
+            }),
+            |args, ctx| async move { handle_audit_circuit_design(args, ctx).await }
+        ),
+        tool!(
             "check_bom_health",
             "Analyze the BOM for supply chain risks: parts with no MPN, lifecycle warnings, \
              low stock, parts not available from preferred distributors. Defaults to one \
@@ -180,6 +210,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
     ];
     tools.extend(super::trace_current::tools());
+    tools.extend(super::layout_quality::tools());
     tools
 }
 
@@ -244,6 +275,21 @@ async fn handle_audit_power_rails(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     handle_scoped_schematic_audit(StandaloneSchematicAudit::PowerRails, args, ctx).await
+}
+
+async fn handle_audit_circuit_design(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let root_path = get_path(args, "schematic")?;
+    let board = args["board"].as_str().map(PathBuf::from);
+    let traversal = inspect_hierarchy(&root_path)?;
+    super::circuit_review::audit_uses(
+        &root_path,
+        &circuit_sheet_uses(&traversal.auditable_instances),
+        board.as_deref(),
+        traversal.diagnostics,
+    )
 }
 
 async fn handle_check_bom_health(
@@ -818,6 +864,22 @@ impl AuditAggregate {
 struct SchematicSheetInstance {
     path: PathBuf,
     instance_path: String,
+    /// The sheets' names the way board nets are prefixed: `/` or `/Power/`.
+    name_path: String,
+}
+
+/// Every auditable use of a sheet, for the circuit-aware review.
+fn circuit_sheet_uses(
+    instances: &[SchematicSheetInstance],
+) -> Vec<super::circuit_review::SheetUse> {
+    instances
+        .iter()
+        .map(|sheet| super::circuit_review::SheetUse {
+            file: sheet.path.clone(),
+            instance_path: Some(sheet.instance_path.clone()),
+            name_path: Some(sheet.name_path.clone()),
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -832,6 +894,7 @@ struct SchematicHierarchyTraversal {
 fn collect_hierarchy(
     path: &Path,
     instance_path: &str,
+    name_path: &str,
     node: &Value,
     traversal: &mut SchematicHierarchyTraversal,
 ) {
@@ -853,6 +916,7 @@ fn collect_hierarchy(
         traversal.auditable_instances.push(SchematicSheetInstance {
             path: path.to_path_buf(),
             instance_path: instance_path.to_string(),
+            name_path: name_path.to_string(),
         });
     }
 
@@ -881,9 +945,14 @@ fn collect_hierarchy(
                     }));
                     format!("unknown-{index}")
                 });
+            let child_name = child
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&child_uuid);
             collect_hierarchy(
                 &parent.join(file),
                 &format!("{instance_path}{child_uuid}/"),
+                &format!("{name_path}{child_name}/"),
                 child,
                 traversal,
             );
@@ -897,7 +966,7 @@ fn inspect_hierarchy(root_path: &Path) -> anyhow::Result<SchematicHierarchyTrave
     let hierarchy =
         sch_hierarchy::build_hierarchy_node(root_path, &project_name, 0, &mut hierarchy_visited)?;
     let mut traversal = SchematicHierarchyTraversal::default();
-    collect_hierarchy(root_path, "/", &hierarchy, &mut traversal);
+    collect_hierarchy(root_path, "/", "/", &hierarchy, &mut traversal);
     Ok(traversal)
 }
 
@@ -1234,6 +1303,62 @@ async fn handle_run_design_review(
         audits[3].record(schematic_path, result, &mut diagnostics);
     }
 
+    // Circuit-aware review (creation rank 29): the checklist's placement,
+    // interface, power-stage and protection items, and the power tree. It runs
+    // on the schematic alone and adds the board's distances when one is given.
+    // A rule that could not run is reported, never counted as passed; subjects
+    // it could not evaluate (a part missing from the board, say) make the
+    // review INCOMPLETE the way an unavailable DRC does.
+    let circuit_body = {
+        let result = super::circuit_review::audit_uses(
+            &root_path,
+            &circuit_sheet_uses(&traversal.auditable_instances),
+            args["board"].as_str().map(Path::new),
+            Vec::new(),
+        );
+        let body = result
+            .as_ref()
+            .ok()
+            .filter(|r| !r.is_error)
+            .and_then(|r| audit_result_json(r.clone()).ok());
+        let mut circuit = AuditAggregate::new("circuit_design");
+        circuit.record(&root_path, result, &mut diagnostics);
+        audits.push(circuit);
+        body
+    };
+    if let Some(body) = &circuit_body {
+        let gaps = body["coverage"]["unevaluated_subjects"]
+            .as_u64()
+            .unwrap_or(0);
+        if gaps > 0 {
+            diagnostics.push(json!({
+                "code": "circuit_checks_unevaluated",
+                "source": root_path.display().to_string(),
+                "message": format!(
+                    "{gaps} subject(s) of the circuit-aware review could not be evaluated \
+                     (see audit_circuit_design 'checks' for each rule's reasons and \
+                     'unaudited_sheet_uses' for sheets it did not read), so this review \
+                     cannot speak for them"
+                )
+            }));
+        }
+    }
+    let circuit_summary = match &circuit_body {
+        Some(body) => json!({
+            "status": body["status"],
+            "rules": body["coverage"]["rules"],
+            "rules_ran": body["coverage"]["ran"],
+            "rules_not_run": body["coverage"]["not_run"],
+            "unevaluated_subjects": body["coverage"]["unevaluated_subjects"],
+            "needs_human_subjects": body["coverage"]["needs_human_subjects"],
+            "unaudited_sheet_uses": body["coverage"]["unaudited_sheet_uses"],
+            "unfitted_parts": body["coverage"]["unfitted_parts"],
+            "unproven": body["unproven"].as_array().map(Vec::len),
+            "needs_human": body["needs_human"],
+        }),
+        None => json!({ "status": "failed" }),
+    };
+
     if schematic_coverage.symbol_instances == 0 {
         diagnostics.push(json!({
             "code": "zero_symbol_instances",
@@ -1518,6 +1643,10 @@ async fn handle_run_design_review(
                     // `complete`/`partial`/`failed`, or `not_run` with why: no board,
                     // no design-intent record, or no currents recorded in it.
                     "trace_current": current_audit,
+                    // The circuit-aware review's own accounting. A verdict of
+                    // LOOKS GOOD does not speak for `needs_human`: those are
+                    // checklist items no tool here can judge.
+                    "circuit": circuit_summary,
                     "diagnostics": diagnostics
                 }
             }))
@@ -3636,3 +3765,7 @@ mod honest_dfm_tests {
 #[cfg(test)]
 #[path = "design_review_baseline_tests.rs"]
 mod baseline_tests;
+
+#[cfg(test)]
+#[path = "design_review_circuit_tests.rs"]
+mod circuit_tests;

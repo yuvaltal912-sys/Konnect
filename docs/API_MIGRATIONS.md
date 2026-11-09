@@ -3,6 +3,198 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: route at the project's rules
+
+Creation PR 16b (`docs/CREATION_HANDOFF.md`). Found by routing the owner's
+reference board with Freerouting 2.5.0.
+
+- **`route_specctra_dsn`** turns Freerouting's automatic neck-down off
+  (`automatic_neckdown: false`); new `allow_neckdown` (default `false`) turns it
+  back on. It also passes the project's copper-to-edge clearance
+  (`copper_to_edge_clearance_um`) when the export's manifest beside the DSN
+  records one, and Freerouting's retry width (`neck_width_um`: a connection that
+  cannot be reached at its net's width is routed whole at that width) only when
+  every net's floor (its class width, or its base width when widened to a
+  current) is the same width. Freerouting applies the one retry width to any
+  failed connection of any net, so with different floors it would take a wider
+  net below its own; the retry is then off (`neck_width_um` 0 is sent) and
+  `rules_applied.retry_width_um` is `null`, with
+  `rules_applied.retry_off_reason` saying why. A project edge clearance of
+  exactly 0.25 mm is sent as 250.001 um, because Freerouting 2.5.0
+  reads 250 as its own default and skips the override. The result adds
+  `rules_applied`.
+- **`route_specctra_dsn` job settings use the names Freerouting 2.5.0 reads.**
+  Its job API drops unknown keys without an error, and the camelCase names sent
+  before (`maxPasses`, `jobTimeoutString`, `neckWidthUm`,
+  `copperToEdgeClearanceUm`) were all dropped: the pass budget, job timeout,
+  retry width and edge clearance never applied. They are now
+  `autorouter.max_passes`, `job_timeout`, `neck_width_um` and
+  `copper_to_edge_clearance_um`. Before the job starts, the settings are read
+  back with Freerouting's `get_effective_settings`; any sent setting not in
+  effect refuses the run, names the setting, and routes nothing. A Freerouting
+  without `update_job_settings` and `get_effective_settings` is refused when
+  settings are sent. Freerouting's fanout stage is now always off
+  (`fanout.enabled: false`, also in `rules_applied.fanout_enabled`): in 2.5.0
+  it necks tracks down at pins even with automatic neck-down off, and the SES
+  importer refuses such tracks. The result adds `effective_settings` (each sent
+  setting as in effect, by dotted name) and `optimizer` (`passes`,
+  `early_stop`, `stop_reason`, `score_before`, `score_after` and up to 12 log
+  lines, from `get_job_logs`; `null` when the log cannot be read).
+  `stop_reason` also covers the optimizer's time limit and item limit.
+- **`export_specctra_dsn`** grows each unplated-hole keepout (and each
+  ringless, netless plated hole) by the project's `min_hole_clearance` less the
+  smallest class clearance, so the router keeps the hole clearance; the result
+  and the manifest record `hole_clearance_um`, and the manifest
+  `supported_profile.hole_keepout_growth_um`. Before, a track could pass 0.21 mm
+  from a hole with a 0.25 mm rule. A board whose footprints hold a rule area or
+  zone, or draw on Edge.Cuts (a slot or cut-out), is now refused, naming the
+  footprint (its Reference, else its UUID), whether or not it has pads: the DSN
+  does not carry these yet, and leaving them out let the router cross an
+  antenna keepout or a slot.
+- **`plan_specctra_ses_import` / `apply_specctra_ses`** refuse an SES with any
+  wire narrower than its net allows, naming the worst one: the class width, or
+  for a net widened to its current its base width (`nets[].min_track_width_um`
+  in the manifest). Manifests
+  from before this release carry no class widths and are not checked. When a
+  refused wire is exactly the narrowest floor on the board, the message names
+  Freerouting's single retry width as the cause, not fanout or neck-down.
+- **`export_specctra_dsn`** records each class's width and clearance
+  (`classes`) and the project's `min_copper_edge_clearance`
+  (`supported_profile.copper_edge_clearance_um`) in the manifest. New
+  `widths_from_intent` (default `true`): each net with a design-intent current
+  (`currents`, and rails with `max_current_a`) is widened to the IPC-2221 width
+  for that current on the stack's worst signal layer, never narrowed (a net
+  whose rule has no track width is left as it is, so the export still refuses
+  it as incomplete, and the list shows it as `not_widened`); the result
+  and the manifest list them under `intent_widths`. An unusable design-intent
+  record now refuses the export unless `widths_from_intent` is `false`.
+
+## Unreleased: Freerouting version policy
+
+Creation rank 32 part 2 (B34, D24; `docs/CREATION_HANDOFF.md`). Additive.
+
+- `check_freerouting` adds `version_policy` to every answer: `recommended_version`,
+  `recommended_jar`, `recommended_url`, `recommended_sha256` (GitHub's release
+  digest), `reason` (measured by `cargo xtask freerouting-bench`, see `DEV.md`),
+  `measured`, `installed_version` with `installed_version_basis` (the JAR's
+  `--version` output, else its file name), `matches_recommended`,
+  `sha256_matches_release` (checked only when the versions match) and `warning`
+  (`null`, or what differs and how to get the recommended release). A
+  different version still routes; the warning does not block anything.
+- The `--version` probe runs headless, with the GUI, telemetry and analytics
+  off, and in its own temporary `user.home`. Before, Freerouting 2.1.0 opened its
+  window after printing the version and the probe timed out, so a working
+  install read `available: false`. A probe that prints a Freerouting version
+  line now counts as `version_checked` even when the JAR then exits 1 (2.1.0
+  does, because no board was given), unless the output after that line shows a
+  Java exception trace or a Freerouting ERROR line other than the complaint
+  that no board was given. Then `available` and `version_checked` are false and
+  `version_output` holds the crash.
+- If the probe's scratch folder cannot be made, the JAR is not started:
+  `available` and `version_checked` are false, and `note` names the error.
+  The probe also removes every inherited `FREEROUTING__*` variable and points
+  `XDG_*`, `APPDATA` and `LOCALAPPDATA` into the scratch folder. The native MCP
+  probe (`freerouting_mcp.rs`) is isolated the same way since #57.
+- Versions compare by their numbers, so `freerouting-2.5.jar` is the
+  recommended 2.5.0 and its digest is checked. A pre-release such as
+  `2.5.0-SNAPSHOT` keeps its suffix in `installed_version` and is never
+  `matches_recommended`.
+- `setup`'s download step and `version_policy` text name the recommended
+  release instead of "the latest 2.x".
+
+## Unreleased: Specctra DSN for real boards
+
+Creation PR 16 (`docs/CREATION_HANDOFF.md`). No tool arguments change.
+`export_specctra_dsn` accepts more boards and writes some existing ones
+differently; `plan_specctra_ses_import` and `apply_specctra_ses` accept the
+matching manifests. Old manifests (two layers, front side) still import.
+
+- **Copper layers:** 2 to 32 in stack order (`F.Cu`, `In1.Cu`…, `B.Cu`).
+  A KiCad `power` layer is written as a Specctra `power` layer, which the router
+  keeps tracks off. `jumper` layers, gaps in the inner numbering and odd counts
+  are refused. Locked tracks may sit on any copper layer; a locked through via
+  is accepted whatever the stack. Manifest: `layers[].dsn_type`,
+  `supported_profile.copper_layers` is the real count.
+- **Back-side parts:** written as front placements whose pads sit at their
+  true board positions on B.Cu (the file already stores them mirrored), so the
+  router never mirrors anything. Manifest: `components[].kicad_side`, and
+  `supported_profile.component_side` is `front_and_back` when any part is on
+  the back. KiCad's native exporter is not adopted for such boards; `prefer`
+  falls back to the Rust exporter and `require` refuses.
+- **Pad orientation fix:** a pin's `rotate` is now the pad angle relative to
+  its part. It was the board-space angle, so a part turned 90° or 270° had its
+  non-square pads turned twice in the router. DSNs of such boards change.
+- **Placement angle fix:** placements are written with angles in [0, 360),
+  and the SES importer compares directions. Freerouting writes a `-90`
+  placement back as `270`, so every board with a part at a negative angle was
+  refused as "SES changes placement"; older manifests still import.
+- **Drill offset fix:** `(drill d (offset x y))` now moves the padstack copper.
+  It was ignored (the exporter looked for the offset on the pad), so offset
+  copper sat on its hole. A pad-level `offset`, which KiCad does not write, is
+  refused.
+- **Pads:** `connect` pads are SMD pads; an SMD pad may be on either outer layer
+  of either side; plated slots (`drill oval`) are accepted. Repeated pad numbers
+  get pins `NUMBER@1`, `NUMBER@2` and empty ones `@1`, `@2`; the manifest keeps
+  the KiCad number in `pad_number`. Pads with no copper are skipped.
+- **Holes and copper graphics:** unplated holes, and plated holes with no ring
+  and no net, are image keepouts on every copper layer. Copper graphics and
+  visible copper text, on the board and in footprints, are keepouts that cover
+  them; they were silently invisible to the router before. Copper dimensions
+  and images are refused. Manifest: `supported_profile.copper_graphic_keepout_count`.
+- **New `pours` argument** (`fixed` default, or `omit`): `omit` leaves copper
+  pours out of the DSN so the router can route through their area, as the
+  usual autoroute-then-refill workflow does; rule areas stay. The manifest
+  still counts the pours (`zone_plane_count`) and says `pours_omitted`; the
+  importer checks the board kept them. Refill zones and run DRC after
+  `apply_specctra_ses`. KiCad's native exporter always writes pours, so
+  `require` is refused with `omit` and `prefer` uses the Rust exporter.
+- **SES repeats:** `plan_specctra_ses_import` and `apply_specctra_ses` apply an
+  exact repeat (same net, layer, width and geometry) once and report
+  `duplicates_skipped`, where they used to refuse the whole SES.
+- **Padless footprints** (a footprint with no pads) are not placed in the DSN;
+  counted in `supported_profile.footprints_without_pads`. Their copper
+  graphics and text still become keepouts (board level, turned and moved with
+  the part), counted in `copper_graphic_keepout_count`; their rule areas and
+  Edge.Cuts graphics are refused (see the 16b entry above).
+- **Board names** with spaces, quotes or parentheses are written as DSN tokens
+  with `_` (`sonde_xilinx.kicad_pcb`); the SES importer accepts that name as
+  the base design.
+
+## Unreleased: circuit-aware review (`audit_circuit_design`)
+
+Creation rank 29 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains
+`audit_circuit_design(schematic, board?)`, and `run_design_review` runs it. It
+automates the schematic- and placement-level items of the owner's layout
+checklist (sections 2, 6, 8, 9) and reads the design-intent rails (`source_ref`)
+and regulator feedback dividers. Existing tools keep their arguments and
+results; new fields only.
+
+- **Findings** carry `checklist` (the item) and `rule` (the check that fired),
+  plus `evidence`. Categories are `circuit`.
+- **`checks`** lists every rule as `ran`, `needs_human` (every subject needed a
+  datasheet or other human input), `no_subjects` (nothing to examine, or only
+  subjects outside the rule's remit, with the skip count) or `not_run`
+  (`no_board`, `no_design_intent`), with examined/passed/finding/skipped/
+  needs_human/unevaluated counts. The top-level `needs_human` lists checklist
+  items no tool here judges and, with a `rule` and `subject`, each subject a
+  rule could not judge; `unproven` lists absences withheld because the net
+  continues on another sheet or a CAN bus passes a multi-pin choke.
+- **Sheets and parts.** A sheet used more than once is audited once per use, with
+  designators read from each symbol's `(instances)` record; findings carry
+  `sheet_instance_path`. Uses that cannot be read that way are listed under
+  `unaudited_sheet_uses`. Parts marked `dnp` or `on_board no` are left out of
+  every rule and listed under `unfitted_parts` (a count and the first 25).
+  `coverage` gains `needs_human_subjects`, `unaudited_sheet_uses` and
+  `unfitted_parts`, and the body gains `sheet_instances`.
+- **`run_design_review`** adds `audits.circuit_design` and `design_review.circuit`
+  (status, rules run and not run, unevaluated subjects, `needs_human` and its
+  subject count, unaudited sheet uses, unfitted parts). Subjects the audit could
+  not evaluate, with or without a board (a part missing from the board, an
+  unrouted sense net, an unreadable termination value, a sheet use it did not
+  audit), add the diagnostic `circuit_checks_unevaluated`, so the verdict is
+  INCOMPLETE. Subjects that need a human do not. The verdict text is unchanged: LOOKS GOOD does not speak for `needs_human`.
+- An unusable design-intent record makes the review INCOMPLETE, as for `audit_trace_current`.
+
 ## Unreleased: zone fill state on DRC, and the other long results paged (minor release)
 
 Rank 3 leftovers (`docs/CREATION_HANDOFF.md`, C24 and A30). No argument is
@@ -109,6 +301,16 @@ not starting with `.`. A violation's key is a hash of the check, DRC category,
 rule, ERC sheet and sorted item identities; severity, prose and positions are
 not in it. Repeats get `~2`, `~3`. A compare re-keys the stored violations with
 the running binary's rule, so a later key change cannot mismatch old files.
+
+## Unreleased: layout quality audit
+
+Creation work after PR 16 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset
+gains the read-only `audit_layout_quality(board, …)`. No existing tool, argument or
+result changes. `audit_trace_current`'s sizing helpers became crate-visible so the new
+audit reuses them; its own result is unchanged.
+
+`completion.complete` is `true`, `false` or `null`: `null` means open nets own a zone with no saved
+fill, so the gate could not judge them (`completion.status` is `partial`, with a `reason`).
 
 ## Unreleased: honest manufacturing review and trace current audit
 

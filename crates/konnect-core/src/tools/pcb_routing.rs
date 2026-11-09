@@ -2311,8 +2311,14 @@ mod specctra_live_undo_test {
             .expect("capture routing rules");
         let snapshot =
             crate::routing_context::Snapshot::read(&board).expect("capture routing context");
-        let export = crate::specctra::export_dsn_with_context(&board, &before, &rules, &snapshot)
-            .expect("export locked-routing fixture");
+        let export = crate::specctra::export_dsn_with_context(
+            &board,
+            &before,
+            &rules,
+            &snapshot,
+            Default::default(),
+        )
+        .expect("export locked-routing fixture");
 
         let temp = tempfile::tempdir().expect("create output directory");
         let dsn = temp.path().join("board.dsn");
@@ -2332,6 +2338,10 @@ mod specctra_live_undo_test {
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
                 java: None,
+                automatic_neckdown: None,
+                copper_to_edge_clearance_um: None,
+                retry_width_um: None,
+                fanout_enabled: None,
             },
         )
         .await

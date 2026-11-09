@@ -255,14 +255,24 @@ pub fn tools() -> Vec<ToolDef> {
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. Saved project/rule files and live class preferences are revision-bound. Exactly one PCB must be open. Unconditional numeric clearance/track-width minima use a conservative Rust projection; other custom rule forms refuse export. Native require mode refuses custom rules. The supported \
-             profile is narrow: two copper layers, front-side SMD or through-hole footprints, \
+             profile: 2 to 32 copper layers in stack order (a KiCad power layer is a Specctra \
+             power layer the router keeps tracks off), SMD or through-hole footprints on either \
+             side (a back-side part is written with its pads at their true board positions on \
+             B.Cu, never mirrored by the router; KiCad's native exporter is not adopted for it), \
              circle, rectangle, rounded-rectangle and oval pads (a rounded rectangle is written \
              as its bounding rectangle, never smaller than the copper), and one closed outline \
              of lines, arcs, a rectangle, a circle or a polygon, where arcs and circles become \
-             chords within 5 um. Copper pours become fixed planes of their net and rule areas \
+             chords within 5 um. Pad angles are written relative to their part, and a drill \
+             offset moves the padstack copper off its hole. Repeated or empty pad numbers get \
+             unique pins (`MP@1`, `@1`); unplated holes, and plated holes with no ring and no \
+             net, become keepouts; pads with no copper and footprints with no pads are left \
+             out. Copper graphics and text on the board or in footprints become keepouts that \
+             cover them (text as a generous square, since glyphs are not measured). \
+             Copper pours become fixed planes of their net and rule areas \
              that forbid tracks or vias become keepouts, taken from the zone outline (not the \
              fill), so check DRC after a refill. Locked straight tracks and vias are fixed wiring; \
-             unlocked routing, routed arcs, other pad shapes, curves, and unrepresentable custom rules and \
+             unlocked routing, routed arcs, custom pad shapes, local clearance overrides, \
+             copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
             json!({
@@ -279,6 +289,17 @@ pub fn tools() -> Vec<ToolDef> {
                     "manifest_output_path": {
                         "type": "string",
                         "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
+                    },
+                    "pours": {
+                        "type": "string",
+                        "enum": ["fixed", "omit"],
+                        "default": "fixed",
+                        "description": "'fixed' (default) gives the router every copper pour as fixed copper of its net, from the zone outline. 'omit' leaves pours out so the router can route through their area; refill zones and run DRC after apply_specctra_ses. Rule areas are always kept."
+                    },
+                    "widths_from_intent": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. The result lists every widened net."
                     },
                     "native_bridge_mode": {
                         "type": "string",
@@ -724,6 +745,43 @@ async fn handle_export_specctra_dsn(
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
+    let omit_pours = match args.get("pours").and_then(serde_json::Value::as_str) {
+        None | Some("fixed") => false,
+        Some("omit") => true,
+        Some(_) => {
+            return Ok(invalid_export_argument(
+                "pours",
+                "must be 'fixed' or 'omit'",
+            ))
+        }
+    };
+    let widths_from_intent = args["widths_from_intent"].as_bool().unwrap_or(true);
+    // The project's copper-to-edge clearance (`min_copper_edge_clearance`),
+    // which the DSN cannot hold; the manifest carries it to the router.
+    let copper_edge_clearance_um = std::fs::read_to_string(board_path.with_extension("kicad_pro"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|project| {
+            project["board"]["design_settings"]["rules"]["min_copper_edge_clearance"].as_f64()
+        })
+        .filter(|mm| mm.is_finite() && *mm > 0.0)
+        .map(|mm| (mm * 1000.0).round() as i64);
+    // The project's hole clearance (`min_hole_clearance`): unplated-hole
+    // keepouts are grown so the router keeps it.
+    let hole_clearance_um = std::fs::read_to_string(board_path.with_extension("kicad_pro"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|project| {
+            project["board"]["design_settings"]["rules"]["min_hole_clearance"].as_f64()
+        })
+        .filter(|mm| mm.is_finite() && *mm > 0.0)
+        .map(|mm| (mm * 1000.0).round() as i64);
+    if omit_pours && native_bridge_mode == "require" {
+        return Ok(invalid_export_argument(
+            "pours",
+            "'omit' needs the Rust exporter: KiCad's native exporter always writes pours; use native_bridge_mode 'prefer' or 'disable'",
+        ));
+    }
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -799,7 +857,18 @@ async fn handle_export_specctra_dsn(
         let rules_after=client.get_effective_routing_rules_in(document)?;
         if rules!=rules_after {anyhow::bail!("live routing classes changed during export");}
         snapshot_for_ipc.ensure_unchanged(&board_for_ipc)?;
-        let export = crate::specctra::export_dsn_with_context(&board_for_ipc, &before, &rules, &snapshot_for_ipc)?;
+        let export = crate::specctra::export_dsn_with_context(
+            &board_for_ipc,
+            &before,
+            &rules,
+            &snapshot_for_ipc,
+            crate::specctra::ExportOptions {
+                omit_pours,
+                copper_edge_clearance_um,
+                widths_from_intent,
+                hole_clearance_um,
+            },
+        )?;
         Ok((export, before))
     })
     .await?;
@@ -820,7 +889,13 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() {
+    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() || omit_pours {
+        if omit_pours && native_bridge_mode == "prefer" {
+            bridge_diagnostics.push(
+                "pours were left out, which only the Rust exporter does; the native bridge was not used"
+                    .to_string(),
+            );
+        }
         baseline
     } else {
         let attempt = crate::native_specctra_bridge::try_export(&board_path).await;
@@ -915,12 +990,15 @@ async fn handle_export_specctra_dsn(
             "pad_count": export.pad_count,
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
+            "intent_widths": export.intent_widths,
+            "copper_edge_clearance_um": copper_edge_clearance_um,
+            "hole_clearance_um": hole_clearance_um,
             "capabilities": {
                 "dsn_export_available": true,
                 "ses_import_available": true,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_locked_routing_zones_and_conservative_custom_minima"
+                "supported_profile": "two_to_32_layers_either_side_locked_routing_zones_and_conservative_custom_minima"
             }
         })
         .to_string(),
