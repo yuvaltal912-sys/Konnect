@@ -22,7 +22,8 @@ using Konnect MCP tools. ALL modifications go through MCP tools — never edit
 load_toolset('library')    # search_symbols, search_footprints, create_symbol, create_footprint,
                            # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
                            # set_footprint_models, get_footprint_info, register_symbol_library,
-                           # register_footprint_library, get_symbol_info
+                           # register_footprint_library, get_symbol_info,
+                           # render_library_item
 load_toolset('integration')    # import_library_part (a downloaded part's KiCad files)
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
@@ -138,7 +139,9 @@ Before creating or wiring a package-sensitive part:
 5. Reconcile three counts: datasheet leads, symbol pins, footprint pads.
    Document any intentional duplicate or mechanical-only pad.
 6. Read the result back with `get_symbol_info` and `get_footprint_info`
-   rather than trusting what you just wrote.
+   rather than trusting what you just wrote, then look at it:
+   `render_library_item` returns the symbol unit or footprint as an image.
+   Inspect the image itself for pin sides, numbering, pad pitch and courtyard.
 7. **Refuse to use the part in a real schematic** while any mirror,
    reversal, duplicate, missing lead or view ambiguity is unresolved.
 

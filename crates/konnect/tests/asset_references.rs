@@ -657,6 +657,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // Specctra export result field (creation PR 16b).
+        "intent_widths",
         // Manufacturing and trace-current response fields and statuses
         // (creation PR 11).
         "fab_limits",
@@ -892,6 +894,29 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "collector_base_capacitance",
         "emitter_base_capacitance",
         "transition_frequency",
+        "op_amp",
+        "frequency_hz",
+        "open_loop_gain",
+        "gain_bandwidth_product",
+        "slew_rate",
+        "input_offset_voltage",
+        "input_bias_current",
+        "supply_current",
+        "supply_voltage_volts",
+        "output_swing_from_positive_rail",
+        "output_swing_from_negative_rail",
+        "load_resistance_ohms",
+        "output_resistance",
+        "propagation_delay",
+        "overdrive_volts",
+        "voltage_reference",
+        "output_voltage",
+        "input_voltage_volts",
+        "output_current_amps",
+        "dropout_voltage",
+        "quiescent_current",
+        "current_limit",
+        "output_voltage_volts",
         "collector_current_amps",
         "collector_emitter_voltage_volts",
         "base_current_amps",

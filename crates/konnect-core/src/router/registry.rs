@@ -76,9 +76,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
+        description: "Board outline (rectangle or polygon), layers, zones and rule areas (keepouts), footprint locks, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -100,15 +100,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_export",
-        description: "Gerber, PDF, SVG, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
+        description: "Gerber, PDF, SVG, inline layer render, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
         category: "pcb",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "library",
-        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
+        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models, render a symbol or footprint inline",
         category: "library",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "integration",
@@ -130,9 +130,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "design_review",
-        description: "AI-powered design audits: decoupling, connections, power rails, DFM, trace current, BOM health",
+        description: "AI-powered design audits: decoupling, connections, power rails, DFM, trace current, layout quality, circuit-aware checklist review, BOM health",
         category: "review",
-        tool_count: 7,
+        tool_count: 9,
     },
     ToolsetMeta {
         name: "templates",

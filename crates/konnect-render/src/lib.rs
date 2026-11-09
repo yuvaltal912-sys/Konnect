@@ -47,62 +47,136 @@ pub struct Region {
 /// The full-sheet renderer remains separate so existing visual baselines keep
 /// exactly the same rasterization path.
 pub fn svg_region_to_png(svg: &[u8], width_px: u32, region: Region) -> Result<Rendered> {
+    svg_region_to_png_on(svg, width_px, region, WHITE)
+}
+
+/// White paper, the schematic and symbol background.
+pub const WHITE: [u8; 3] = [255, 255, 255];
+
+/// KiCad's default board-editor background. Board and footprint plots use
+/// pale silkscreen and white drill marks that vanish on white paper.
+pub const BOARD_BACKGROUND: [u8; 3] = [0x00, 0x10, 0x23];
+
+/// The most pixels a region, page or difference image may have (16 Mi).
+pub const MAX_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// [`svg_region_to_png`] on an opaque `background` colour.
+pub fn svg_region_to_png_on(
+    svg: &[u8],
+    width_px: u32,
+    region: Region,
+    background: [u8; 3],
+) -> Result<Rendered> {
+    render_framed(svg, width_px, Some(region), background)
+}
+
+/// Refusals name what the caller framed: a region of the page, or the
+/// whole page, which has no region to widen.
+fn framing_noun(region: Option<Region>) -> &'static str {
+    if region.is_some() {
+        "region"
+    } else {
+        "page"
+    }
+}
+
+/// The widest `width_px` at which a whole page keeps both sides within
+/// `max_side_px` (8192 for the render cap) and its area within
+/// [`MAX_PIXELS`].
+pub fn page_fit_width_px(page_width_mm: f64, page_height_mm: f64, max_side_px: u32) -> u32 {
+    let max_side = f64::from(max_side_px);
+    let height_at = |width: u32| {
+        (f64::from(width) * page_height_mm / page_width_mm)
+            .round()
+            .max(1.0)
+    };
+    let by_height = max_side * page_width_mm / page_height_mm;
+    let by_area = (MAX_PIXELS as f64 * page_width_mm / page_height_mm).sqrt();
+    let mut width = by_height.min(by_area).min(max_side).floor().max(1.0) as u32;
+    while width > 1
+        && (height_at(width) > max_side || f64::from(width) * height_at(width) > MAX_PIXELS as f64)
+    {
+        width -= 1;
+    }
+    width
+}
+
+/// Rasterize `region` of the page, or the whole page when it is `None`.
+fn render_framed(
+    svg: &[u8],
+    width_px: u32,
+    region: Option<Region>,
+    background: [u8; 3],
+) -> Result<Rendered> {
+    let noun = framing_noun(region);
     if width_px == 0 || width_px > 8192 {
         bail!("width_px must be 1..=8192, got {width_px}");
     }
-    if ![region.x_mm, region.y_mm, region.width_mm, region.height_mm]
-        .iter()
-        .all(|value| value.is_finite())
-        || region.x_mm < 0.0
-        || region.y_mm < 0.0
-        || region.width_mm <= 0.0
-        || region.height_mm <= 0.0
-    {
-        bail!("region must have finite nonnegative x_mm/y_mm and positive width_mm/height_mm");
+    if let Some(region) = region {
+        if ![region.x_mm, region.y_mm, region.width_mm, region.height_mm]
+            .iter()
+            .all(|value| value.is_finite())
+            || region.x_mm < 0.0
+            || region.y_mm < 0.0
+            || region.width_mm <= 0.0
+            || region.height_mm <= 0.0
+        {
+            bail!("region must have finite nonnegative x_mm/y_mm and positive width_mm/height_mm");
+        }
     }
 
     let source = std::str::from_utf8(svg).context("SVG is not UTF-8")?;
-    // KiCad includes an external DOCTYPE declaration. roxmltree does not
-    // fetch external resources; allowing the declaration lets real exports
-    // be inspected in the same way as they are parsed by usvg.
-    let document = usvg::roxmltree::Document::parse_with_options(
-        source,
-        usvg::roxmltree::ParsingOptions {
-            allow_dtd: true,
-            ..Default::default()
+    let document = parse_document(source)?;
+    let (page_width_mm, page_height_mm) = page_size_of(&document, noun)?;
+    let region = match region {
+        Some(region) => {
+            if region.x_mm + region.width_mm > page_width_mm
+                || region.y_mm + region.height_mm > page_height_mm
+            {
+                bail!("region lies outside the SVG page ({page_width_mm} x {page_height_mm} mm)");
+            }
+            region
+        }
+        None => Region {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            width_mm: page_width_mm,
+            height_mm: page_height_mm,
         },
-    )
-    .context("SVG did not parse")?;
-    let root = document.root_element();
-    let page_mm = |attribute: &str| -> Result<f64> {
-        root.attribute(attribute)
-            .and_then(|value| value.trim().strip_suffix("mm"))
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .with_context(|| format!("region rendering requires a positive SVG {attribute} in mm"))
     };
-    let page_width_mm = page_mm("width")?;
-    let page_height_mm = page_mm("height")?;
-    if region.x_mm + region.width_mm > page_width_mm
-        || region.y_mm + region.height_mm > page_height_mm
-    {
-        bail!("region lies outside the SVG page ({page_width_mm} x {page_height_mm} mm)");
-    }
 
     let height = (f64::from(width_px) * region.height_mm / region.width_mm)
         .round()
         .max(1.0);
+    let page_hint = || {
+        format!(
+            "a {page_width_mm} x {page_height_mm} mm page fits at width_px {} or less",
+            page_fit_width_px(page_width_mm, page_height_mm, 8192)
+        )
+    };
     if !height.is_finite() || height > 8192.0 {
+        if noun == "page" {
+            bail!(
+                "page output height exceeds 8192 pixels at width_px {width_px}; {}",
+                page_hint()
+            );
+        }
         bail!("region output height exceeds 8192 pixels; reduce width_px or widen the region");
     }
     let height_px = height as u32;
-    if u64::from(width_px) * u64::from(height_px) > 16 * 1024 * 1024 {
+    if u64::from(width_px) * u64::from(height_px) > MAX_PIXELS {
+        if noun == "page" {
+            bail!(
+                "page output exceeds 16777216 pixels at width_px {width_px}; {}",
+                page_hint()
+            );
+        }
         bail!("region output exceeds 16777216 pixels; reduce width_px");
     }
 
     // Apply the same font policy as full-sheet renders.
     if svg_contains_visible_text(svg) {
-        bail!("SVG contains visible <text> elements; region rendering requires stroke-font paths");
+        bail!("SVG contains visible <text> elements; {noun} rendering requires stroke-font paths");
     }
     let tree =
         usvg::Tree::from_data(svg, &usvg::Options::default()).context("SVG did not parse")?;
@@ -116,12 +190,17 @@ pub fn svg_region_to_png(svg: &[u8], width_px: u32, region: Region) -> Result<Re
         (-region.y_mm * pixels_per_mm) as f32,
     );
     if !transform.is_finite() {
-        bail!("region is too small for the renderer's coordinate precision");
+        bail!("{noun} is too small for the renderer's coordinate precision");
     }
 
     let mut pixmap =
         tiny_skia::Pixmap::new(width_px, height_px).context("could not allocate pixmap")?;
-    pixmap.fill(tiny_skia::Color::WHITE);
+    pixmap.fill(tiny_skia::Color::from_rgba8(
+        background[0],
+        background[1],
+        background[2],
+        255,
+    ));
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     let png = pixmap.encode_png().context("PNG encoding failed")?;
     Ok(Rendered {
@@ -129,6 +208,50 @@ pub fn svg_region_to_png(svg: &[u8], width_px: u32, region: Region) -> Result<Re
         width_px,
         height_px,
     })
+}
+
+/// KiCad includes an external DOCTYPE declaration. roxmltree does not fetch
+/// external resources; allowing the declaration lets real exports be
+/// inspected in the same way as they are parsed by usvg.
+fn parse_document(source: &str) -> Result<usvg::roxmltree::Document<'_>> {
+    usvg::roxmltree::Document::parse_with_options(
+        source,
+        usvg::roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .context("SVG did not parse")
+}
+
+fn page_size_of(document: &usvg::roxmltree::Document<'_>, noun: &str) -> Result<(f64, f64)> {
+    let root = document.root_element();
+    let page_mm = |attribute: &str| -> Result<f64> {
+        root.attribute(attribute)
+            .and_then(|value| value.trim().strip_suffix("mm"))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .with_context(|| format!("{noun} rendering requires a positive SVG {attribute} in mm"))
+    };
+    Ok((page_mm("width")?, page_mm("height")?))
+}
+
+/// The physical page size `(width_mm, height_mm)` a KiCad SVG declares.
+/// Refuses an SVG without explicit positive millimetre dimensions.
+pub fn page_size_mm(svg: &[u8]) -> Result<(f64, f64)> {
+    let source = std::str::from_utf8(svg).context("SVG is not UTF-8")?;
+    page_size_of(&parse_document(source)?, "page")
+}
+
+/// Rasterize a whole KiCad SVG page (a board plot, a library symbol or a
+/// footprint) at `width_px` with the same guards as [`svg_region_to_png`]:
+/// millimetre page dimensions are required, the output height is at most
+/// 8192 px and the area at most 16 Mi pixels, and visible `<text>` is
+/// refused. Unlike [`svg_to_png`], a very tall page cannot produce an
+/// unbounded image. Visual baselines keep using [`svg_to_png`]. Refusals
+/// speak of the page, and a size refusal names a `width_px` that fits.
+pub fn svg_page_to_png(svg: &[u8], width_px: u32, background: [u8; 3]) -> Result<Rendered> {
+    render_framed(svg, width_px, None, background)
 }
 
 /// Rasterize SVG bytes to a PNG at the given pixel width (height follows the
@@ -271,6 +394,99 @@ pub fn diff_pngs(before: &[u8], after: &[u8]) -> Result<PixelDiff> {
         changed_pct: pct,
         changed_pct_of_content: pct_of_content,
         changed_bbox: bbox,
+    })
+}
+
+/// Colours of the generated difference image. Unchanged drawing is faded so
+/// that the change stands out; the legend travels in the tool's metadata.
+pub mod diff_colors {
+    /// Drawn now, blank in the baseline.
+    pub const ADDED: [u8; 3] = [0, 160, 0];
+    /// Drawn in the baseline, blank now.
+    pub const REMOVED: [u8; 3] = [220, 0, 0];
+    /// Drawn in both, in a different colour.
+    pub const MODIFIED: [u8; 3] = [230, 140, 0];
+    /// Outline around the changed region's bounding box.
+    pub const BBOX: [u8; 3] = [0, 90, 255];
+}
+
+/// Render a difference image of two PNGs on the same canvas [`diff_pngs`]
+/// uses, with the same noise threshold and background rule. Changed pixels
+/// are coloured by [`diff_colors`]; unchanged drawing is faded to a quarter
+/// of its contrast; a bounding-box outline marks the changed region so a
+/// small change is findable. The canvas is refused above [`MAX_PIXELS`].
+pub fn diff_image_png(before: &[u8], after: &[u8]) -> Result<Rendered> {
+    let a = image::load_from_memory(before)
+        .context("before image did not decode")?
+        .to_rgba8();
+    let b = image::load_from_memory(after)
+        .context("after image did not decode")?
+        .to_rgba8();
+    let width = a.width().max(b.width());
+    let height = a.height().max(b.height());
+    if width == 0 || height == 0 {
+        bail!("difference image has no area");
+    }
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+        bail!("difference image would exceed 16777216 pixels");
+    }
+
+    let background = dominant_color(&a);
+    let mut out = image::RgbImage::new(width, height);
+    let mut bbox: Option<(u32, u32, u32, u32)> = None;
+    for y in 0..height {
+        for x in 0..width {
+            let pa = pixel_or_white(&a, x, y);
+            let pb = pixel_or_white(&b, x, y);
+            let delta = pa
+                .iter()
+                .zip(pb.iter())
+                .map(|(ca, cb)| ca.abs_diff(*cb))
+                .max()
+                .unwrap_or(0);
+            let colour = if delta > DIFF_THRESHOLD {
+                bbox = Some(match bbox {
+                    None => (x, y, x, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                });
+                match (pa == background, pb == background) {
+                    (true, false) => diff_colors::ADDED,
+                    (false, true) => diff_colors::REMOVED,
+                    _ => diff_colors::MODIFIED,
+                }
+            } else if pb == background {
+                [255, 255, 255]
+            } else {
+                pb.map(|c| 255 - (255 - c) / 4)
+            };
+            out.put_pixel(x, y, image::Rgb(colour));
+        }
+    }
+
+    if let Some((x0, y0, x1, y1)) = bbox {
+        let margin = 3;
+        let (x0, y0) = (x0.saturating_sub(margin), y0.saturating_sub(margin));
+        let (x1, y1) = ((x1 + margin).min(width - 1), (y1 + margin).min(height - 1));
+        let mut paint = |x: u32, y: u32| out.put_pixel(x, y, image::Rgb(diff_colors::BBOX));
+        for t in 0..2 {
+            for x in x0..=x1 {
+                paint(x, (y0 + t).min(y1));
+                paint(x, y1.saturating_sub(t).max(y0));
+            }
+            for y in y0..=y1 {
+                paint((x0 + t).min(x1), y);
+                paint(x1.saturating_sub(t).max(x0), y);
+            }
+        }
+    }
+
+    let mut png = Vec::new();
+    out.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .context("PNG encoding failed")?;
+    Ok(Rendered {
+        png,
+        width_px: width,
+        height_px: height,
     })
 }
 
@@ -563,5 +779,145 @@ mod tests {
         assert_eq!(diff.changed_pixels, 0);
         assert_eq!(diff.changed_pct, 0.0);
         assert!(diff.changed_bbox.is_none());
+    }
+
+    #[test]
+    fn page_render_uses_the_whole_mm_page_and_reports_its_size() {
+        assert_eq!(page_size_mm(MM_SVG).unwrap(), (100.0, 50.0));
+        let out = svg_page_to_png(MM_SVG, 200, WHITE).unwrap();
+        assert_eq!((out.width_px, out.height_px), (200, 100));
+        let img = image::load_from_memory(&out.png).unwrap().to_rgba8();
+        // viewBox 10 20 200 100 on a 100 x 50 mm page: the dark square at
+        // x 70..90 user units sits at 30..40 mm, i.e. pixels 60..80.
+        assert_eq!(img.get_pixel(70, 30).0, [0x11, 0x22, 0x33, 255]);
+        assert_eq!(img.get_pixel(110, 30).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(5, 5).0, [255, 255, 255, 255]);
+        let dark = svg_page_to_png(MM_SVG, 200, BOARD_BACKGROUND).unwrap();
+        let img = image::load_from_memory(&dark.png).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(5, 5).0, [0x00, 0x10, 0x23, 255]);
+        assert_eq!(img.get_pixel(70, 30).0, [0x11, 0x22, 0x33, 255]);
+    }
+
+    #[test]
+    fn page_render_caps_a_tall_page_instead_of_allocating_it() {
+        let tall = br##"<svg xmlns="http://www.w3.org/2000/svg" width="1mm" height="100mm"/>"##;
+        let err = svg_page_to_png(tall, 100, WHITE).unwrap_err();
+        assert!(err.to_string().contains("height exceeds"), "{err}");
+    }
+
+    #[test]
+    fn page_refusals_speak_of_the_page_and_name_a_width_that_fits() {
+        // A 1 x 80 pin header's page is about 5.7 x 206 mm.
+        let header = br##"<svg xmlns="http://www.w3.org/2000/svg" width="5.7mm" height="206mm" viewBox="0 0 5.7 206"><rect width="5.7" height="206"/></svg>"##;
+        let err = svg_page_to_png(header, 800, WHITE).unwrap_err().to_string();
+        assert!(err.contains("height exceeds 8192"), "{err}");
+        assert!(err.contains("width_px 226 or less"), "{err}");
+        assert!(!err.contains("region"), "{err}");
+        assert_eq!(svg_page_to_png(header, 226, WHITE).unwrap().height_px, 8168);
+        assert!(svg_page_to_png(header, 227, WHITE).is_err());
+        // The same page within an 8000 px side: 221 px gives 7987 px.
+        assert_eq!(page_fit_width_px(5.7, 206.0, 8000), 221);
+
+        let wide = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="120mm"/>"#;
+        let err = svg_page_to_png(wide, 4000, WHITE).unwrap_err().to_string();
+        assert!(err.contains("exceeds 16777216 pixels"), "{err}");
+        // 3739 x 4487 = 16,776,893 pixels.
+        assert!(err.contains("width_px 3739 or less"), "{err}");
+        assert!(!err.contains("region"), "{err}");
+
+        for svg in [
+            RECT_SVG,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="0mm" height="10mm"/>"#,
+        ] {
+            let err = svg_page_to_png(svg, 100, WHITE).unwrap_err().to_string();
+            assert!(
+                err.contains("page rendering requires a positive SVG"),
+                "{err}"
+            );
+        }
+        let text = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"><text x="1" y="8">hi</text></svg>"#;
+        let err = svg_page_to_png(text, 100, WHITE).unwrap_err().to_string();
+        assert!(!err.contains("region"), "{err}");
+
+        // The region path keeps its own wording.
+        let region = Region {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            width_mm: 5.7,
+            height_mm: 206.0,
+        };
+        let err = svg_region_to_png(header, 800, region)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("widen the region"), "{err}");
+        let err = svg_region_to_png(RECT_SVG, 100, region)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("region rendering requires a positive SVG"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn page_render_refuses_visible_text_and_pages_without_mm() {
+        let text = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"><text x="1" y="8">hi</text></svg>"#;
+        let err = svg_page_to_png(text, 100, WHITE).unwrap_err();
+        assert!(err.to_string().contains("visible <text>"), "{err}");
+        let err = svg_page_to_png(RECT_SVG, 100, WHITE).unwrap_err();
+        assert!(err.to_string().contains("positive SVG"), "{err}");
+    }
+
+    #[test]
+    fn diff_image_colours_added_removed_and_unchanged_drawing() {
+        let before = svg_to_png(RECT_SVG, 100).unwrap();
+        let moved: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect x="30" y="10" width="30" height="20" fill="#112233"/></svg>"##;
+        let after = svg_to_png(moved, 100).unwrap();
+        let out = diff_image_png(&before.png, &after.png).unwrap();
+        assert_eq!((out.width_px, out.height_px), (100, 50));
+        let img = image::load_from_memory(&out.png).unwrap().to_rgb8();
+        // Old site only (x 10..30): removed. New site only (x 40..60): added.
+        assert_eq!(img.get_pixel(15, 20).0, diff_colors::REMOVED);
+        assert_eq!(img.get_pixel(50, 20).0, diff_colors::ADDED);
+        // Overlap (x 30..40) is unchanged drawing, faded, not a change colour.
+        let overlap = img.get_pixel(35, 20).0;
+        assert_eq!(overlap, [0x11, 0x22, 0x33].map(|c: u8| 255 - (255 - c) / 4));
+        // Paper stays white and the bbox outline brackets the change.
+        assert_eq!(img.get_pixel(90, 45).0, [255, 255, 255]);
+        assert_eq!(img.get_pixel(7, 20).0, diff_colors::BBOX);
+        assert_eq!(img.get_pixel(62, 20).0, diff_colors::BBOX);
+    }
+
+    #[test]
+    fn diff_image_of_identical_renders_has_no_change_colours() {
+        let a = svg_to_png(RECT_SVG, 100).unwrap();
+        let out = diff_image_png(&a.png, &a.png).unwrap();
+        let img = image::load_from_memory(&out.png).unwrap().to_rgb8();
+        for colour in [
+            diff_colors::ADDED,
+            diff_colors::REMOVED,
+            diff_colors::MODIFIED,
+            diff_colors::BBOX,
+        ] {
+            assert!(!img.pixels().any(|p| p.0 == colour), "{colour:?}");
+        }
+    }
+
+    #[test]
+    fn diff_image_marks_a_recoloured_drawing_as_modified() {
+        let before = svg_to_png(RECT_SVG, 100).unwrap();
+        let red: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect x="10" y="10" width="30" height="20" fill="#ff0000"/></svg>"##;
+        let after = svg_to_png(red, 100).unwrap();
+        let img = image::load_from_memory(&diff_image_png(&before.png, &after.png).unwrap().png)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(img.get_pixel(25, 20).0, diff_colors::MODIFIED);
+    }
+
+    #[test]
+    fn diff_image_refuses_undecodable_input() {
+        let a = svg_to_png(RECT_SVG, 10).unwrap();
+        let err = diff_image_png(b"not a png", &a.png).unwrap_err();
+        assert!(err.to_string().contains("before image"), "{err}");
     }
 }

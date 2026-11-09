@@ -469,6 +469,7 @@ pub fn tools() -> Vec<ToolDef> {
         tools.insert(after_create_footprint + offset, tool);
     }
     tools.extend(correctness::tools());
+    tools.extend(super::item_render::library_tools());
     tools
 }
 

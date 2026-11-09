@@ -119,7 +119,8 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
     });
     let mut args = match name {
         "add_schematic_component" => component,
-        "batch_place_components" => json!({"components": [
+        // The full readback carries the instance paths this test checks.
+        "batch_place_components" => json!({"detail": "full", "components": [
             component,
             {"lib_id": "complex_hierarchy:R", "reference": "R999", "x": 110.1, "y": 80.2}
         ]}),

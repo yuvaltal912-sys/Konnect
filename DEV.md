@@ -113,7 +113,7 @@ Konnect/
 │   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting MCP, datasheets)
 │   │           ├── verification.rs   # 10 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
-│   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits); trace_current.rs adds audit_trace_current
+│   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits); trace_current.rs adds audit_trace_current; layout_quality.rs (+ _grid, _planes, _power, _routing) adds audit_layout_quality; circuit_review.rs, circuit_checks.rs and circuit_model.rs add audit_circuit_design
 │   │           ├── templates.rs      # 4 tools (6 built-in reference circuit templates)
 │   │           └── manufacturing.rs  # 3 tools (export package, validate, cost estimate)
 │   │
@@ -372,7 +372,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 260 tools (267 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 268 tools (275 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -437,6 +437,109 @@ watch-directory, render-snapshot, event-debounce, and incremental-render-selecti
 and Tauri command/event plumbing stay thin and untested, matching this codebase's existing
 convention for other `kicad-cli`-calling code.
 
+## Freerouting benchmark (opt-in)
+
+`cargo xtask freerouting-bench` routes a folder of Specctra DSN files with one or
+more Freerouting JARs and reports, per board and version, whether the routing is
+complete and how good it is. It needs Java and the JARs, takes minutes to hours,
+and is **never part of CI or `cargo test`**. Only its parsing, measuring and
+ranking are unit tests (`cargo test -p xtask`, no Java).
+
+```bash
+cargo xtask freerouting-bench \
+  --jar ~/.local/share/freerouting/2.5.0/freerouting-2.5.0.jar \
+  --jar /path/to/freerouting-2.1.0.jar \
+  --dsn-dir target/freerouting-bench/moderate --job-timeout-secs 120
+```
+
+- **Corpus.** The default is the `.dsn` fixtures in `crates/konnect-core/tests/fixtures`.
+  For real boards, export KiCad's demos with KiCad's own exporter, using KiCad's
+  Python: `…/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -I
+  xtask/freerouting-bench/export_kicad_dsn.py ~/ClaudeCode/kicad-10.0.1/demos target/freerouting-bench/corpus`.
+  It copies each board into a scratch folder, strips tracks, arcs and vias, and
+  exports `<board>.dsn`. Source boards are never written. KiCad's exporter
+  writes every pour as fixed copper, which blocks routing on boards with a
+  board-wide pour, so prefer Konnect's own exporter with pours omitted (PR 16):
+  write stripped boards with `export_kicad_dsn.py --stripped-boards <demos> <dir>`,
+  then run PR 16's ignored test only for its DSNs:
+  `KONNECT_DSN_PROBE_DIR=<dir> KONNECT_PROBE_KEEP=<out> KONNECT_PROBE_OMIT_POURS=1
+  FREEROUTING_JAR=<jar> FREEROUTING_JAVA=xtask/freerouting-bench/quiet-java.sh
+  FREEROUTING_SECONDS=2 cargo test -p konnect-core --lib freerouting_routes_a_folder
+  -- --ignored`. The wrapper starts Freerouting in a throwaway home with
+  telemetry off; delete the partial `.ses` files it leaves in `<out>`. Its
+  routing rules are a flat 0.2 mm for every net, not the boards' own classes.
+  Pick boards like the ones being designed (about 15 to 150 parts, 2 to 4
+  layers, pours): the huge demos (`video`, `kit-dev-coldfire`, `jetson`,
+  `vme-wren`) take the whole budget and say little about quality.
+- **Java.** One JVM runs every JAR, so versions are compared on the same Java.
+  The default is the newest of Homebrew's `openjdk@25` and `openjdk@21`.
+  Freerouting 2.5.0 needs Java 25 (class file 69); 2.1 to 2.4 need 21.
+- **Isolation.** Each run gets its own folder under `--out` (default
+  `target/freerouting-bench/<unix time>`) with a copy of the DSN and its own
+  `user.home` and `java.io.tmpdir`, with the `XDG_*`, `APPDATA` and
+  `LOCALAPPDATA` folders pointed into it and any inherited `FREEROUTING__*`
+  variable removed. So a run neither reads nor changes the settings of a
+  Freerouting you use, and 2.5's `~/Library` settings and log stay in the run
+  folder. Telemetry, contact and analytics are off in the seeded
+  `freerouting.json`, on the command line and in the environment. Freerouting
+  2.x turns them on by default. The seeded settings also carry an all-zero
+  `profile.id`: 2.3 and later stop with a `NullPointerException` without one.
+  Freerouting's update check still asks GitHub for the latest release, with no
+  board data.
+- **Budget.** `--job-timeout-secs` (default 60) is Freerouting's own
+  `router.job_timeout`: a job that hits it stops and writes what it routed.
+  `--timeout-secs` (default 600) kills the process. 2.3 and later log their own
+  outcome for each job, and that decides whether the budget was hit; for 2.1,
+  which logs none, a run that lasted the whole budget counts. 2.1.0 sometimes
+  ignores its budget or exits without an SES; both count as a failed run.
+- **Same version twice.** Each `--jar` gets its own folder under `--out`, named
+  by the version in its file name, with `-2`, `-3` added when that is taken (and
+  `unknown` for a file that names none). Totals and the ranking are per folder,
+  with the reported version after it when it differs, so a rebuild stays a row of
+  its own. `results.json` saves the folder as `dir` for `--rescore`.
+- **Gate.** Completion is a gate, not a score. A board passes when every run
+  wrote a readable SES with 0 unrouted connections (Freerouting's own count: 2.1's
+  statistics block, the last `unrouted and N violation(s)` or `incomplete
+  connections` line in 2.3 to 2.5), 0 clearance violations (a run that does not
+  report the count fails), within the budget.
+- **Quality**, measured from the DSN (pin positions, nets, net classes) and the
+  first run's SES, on boards that pass:
+  - wire/bound: wiring of the routed nets over half the perimeter of their
+    pins' convex hull, a lower bound no wiring at any angle beats (a walk around
+    any tree joining the pins encloses that hull). wire/HPWL is the usual
+    reference, over the half-perimeter of the pins' bounding box; it bounds only
+    90° routing, so Freerouting's 45° wiring can go below 1.00. Nets that also
+    have a plane or pour, or wiring already in the DSN (Freerouting keeps it but
+    does not write it to the SES), are left out. Pin positions mirror x for
+    back-side parts, then turn counter-clockwise.
+  - vias, vias per routed net, and layer changes (vias where wires on two layers
+    meet; a via that only drops into a pour is not one).
+  - acute corners (under 89.5°, acid traps) and right-angle corners (90 ± 0.5°),
+    counted away from pads and vias.
+  - tracks (unique segments) and narrow segments (below their net class's
+    width; per class in `results.json`). Freerouting necks traces down near pads.
+  - runtime (wall clock per run, JVM start included, median) and determinism:
+    two runs are the same routing when they laid the same segments and vias in
+    any order (2.1 sometimes writes the same copper in another order). Runs
+    stopped by the budget are not compared.
+- **Ranking.** Fewest boards failing the gate. Then, on the boards every
+  competing version passed (a version that passed none competes on the gate
+  alone): fewest defects (acute corners plus narrow segments), wire/bound in 1 %
+  steps, fewest vias, fewest boards whose runs differ, least runtime. The top
+  entry is printed as `Recommended:`.
+- **Rescore.** `cargo xtask freerouting-bench --rescore <results folder>`
+  re-measures a finished run from its saved `board.dsn`, `board.ses` and
+  `results.json`, without Java, and rewrites its report. Use it after changing
+  a metric instead of routing again.
+- **Output.** `summary.md` (per-board table and ranking) and `results.json`,
+  plus each run's `stdout.log`, `stderr.log`, `board.ses` and Freerouting's own log.
+  Everything stays under `target/`. Quote only counts in tracked docs.
+- **Updating the recommendation.** `check_freerouting` reports `version_policy`
+  from `RECOMMENDED` in `crates/konnect-core/src/freerouting_setup.rs`: the
+  version, the release URL and SHA-256 from GitHub's release API, and the
+  measured reason. Change it only from a fresh run, with the counts in the
+  reason and the date, JARs, Java and corpus size in `measured`.
+
 ## Adding a New Tool
 
 Fixed input records are closed by `ToolDef::new` before the schema is advertised
@@ -457,12 +560,12 @@ direct handler calls still require checked readers for their domain rules.
 
 ## Current Stats
 
-- **22 toolsets, 260 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **22 toolsets, 268 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 267 tools (260 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 275 tools (268 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

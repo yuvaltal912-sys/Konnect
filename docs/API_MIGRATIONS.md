@@ -3,6 +3,342 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: route at the project's rules
+
+Creation PR 16b (`docs/CREATION_HANDOFF.md`). Found by routing the owner's
+reference board with Freerouting 2.5.0.
+
+- **`route_specctra_dsn`** turns Freerouting's automatic neck-down off
+  (`automatic_neckdown: false`); new `allow_neckdown` (default `false`) turns it
+  back on. It also passes the project's copper-to-edge clearance
+  (`copper_to_edge_clearance_um`) when the export's manifest beside the DSN
+  records one, and Freerouting's retry width (`neck_width_um`: a connection that
+  cannot be reached at its net's width is routed whole at that width) only when
+  every net's floor (its class width, or its base width when widened to a
+  current) is the same width. Freerouting applies the one retry width to any
+  failed connection of any net, so with different floors it would take a wider
+  net below its own; the retry is then off (`neck_width_um` 0 is sent) and
+  `rules_applied.retry_width_um` is `null`, with
+  `rules_applied.retry_off_reason` saying why. A project edge clearance of
+  exactly 0.25 mm is sent as 250.001 um, because Freerouting 2.5.0
+  reads 250 as its own default and skips the override. The result adds
+  `rules_applied`.
+- **`route_specctra_dsn` job settings use the names Freerouting 2.5.0 reads.**
+  Its job API drops unknown keys without an error, and the camelCase names sent
+  before (`maxPasses`, `jobTimeoutString`, `neckWidthUm`,
+  `copperToEdgeClearanceUm`) were all dropped: the pass budget, job timeout,
+  retry width and edge clearance never applied. They are now
+  `autorouter.max_passes`, `job_timeout`, `neck_width_um` and
+  `copper_to_edge_clearance_um`. Before the job starts, the settings are read
+  back with Freerouting's `get_effective_settings`; any sent setting not in
+  effect refuses the run, names the setting, and routes nothing. A Freerouting
+  without `update_job_settings` and `get_effective_settings` is refused when
+  settings are sent. Freerouting's fanout stage is now always off
+  (`fanout.enabled: false`, also in `rules_applied.fanout_enabled`): in 2.5.0
+  it necks tracks down at pins even with automatic neck-down off, and the SES
+  importer refuses such tracks. The result adds `effective_settings` (each sent
+  setting as in effect, by dotted name) and `optimizer` (`passes`,
+  `early_stop`, `stop_reason`, `score_before`, `score_after` and up to 12 log
+  lines, from `get_job_logs`; `null` when the log cannot be read).
+  `stop_reason` also covers the optimizer's time limit and item limit.
+- **`export_specctra_dsn`** grows each unplated-hole keepout (and each
+  ringless, netless plated hole) by the project's `min_hole_clearance` less the
+  smallest class clearance, so the router keeps the hole clearance; the result
+  and the manifest record `hole_clearance_um`, and the manifest
+  `supported_profile.hole_keepout_growth_um`. Before, a track could pass 0.21 mm
+  from a hole with a 0.25 mm rule. A board whose footprints hold a rule area or
+  zone, or draw on Edge.Cuts (a slot or cut-out), is now refused, naming the
+  footprint (its Reference, else its UUID), whether or not it has pads: the DSN
+  does not carry these yet, and leaving them out let the router cross an
+  antenna keepout or a slot.
+- **`plan_specctra_ses_import` / `apply_specctra_ses`** refuse an SES with any
+  wire narrower than its net allows, naming the worst one: the class width, or
+  for a net widened to its current its base width (`nets[].min_track_width_um`
+  in the manifest). Manifests
+  from before this release carry no class widths and are not checked. When a
+  refused wire is exactly the narrowest floor on the board, the message names
+  Freerouting's single retry width as the cause, not fanout or neck-down.
+- **`export_specctra_dsn`** records each class's width and clearance
+  (`classes`) and the project's `min_copper_edge_clearance`
+  (`supported_profile.copper_edge_clearance_um`) in the manifest. New
+  `widths_from_intent` (default `true`): each net with a design-intent current
+  (`currents`, and rails with `max_current_a`) is widened to the IPC-2221 width
+  for that current on the stack's worst signal layer, never narrowed (a net
+  whose rule has no track width is left as it is, so the export still refuses
+  it as incomplete, and the list shows it as `not_widened`); the result
+  and the manifest list them under `intent_widths`. An unusable design-intent
+  record now refuses the export unless `widths_from_intent` is `false`.
+
+## Unreleased: Freerouting version policy
+
+Creation rank 32 part 2 (B34, D24; `docs/CREATION_HANDOFF.md`). Additive.
+
+- `check_freerouting` adds `version_policy` to every answer: `recommended_version`,
+  `recommended_jar`, `recommended_url`, `recommended_sha256` (GitHub's release
+  digest), `reason` (measured by `cargo xtask freerouting-bench`, see `DEV.md`),
+  `measured`, `installed_version` with `installed_version_basis` (the JAR's
+  `--version` output, else its file name), `matches_recommended`,
+  `sha256_matches_release` (checked only when the versions match) and `warning`
+  (`null`, or what differs and how to get the recommended release). A
+  different version still routes; the warning does not block anything.
+- The `--version` probe runs headless, with the GUI, telemetry and analytics
+  off, and in its own temporary `user.home`. Before, Freerouting 2.1.0 opened its
+  window after printing the version and the probe timed out, so a working
+  install read `available: false`. A probe that prints a Freerouting version
+  line now counts as `version_checked` even when the JAR then exits 1 (2.1.0
+  does, because no board was given), unless the output after that line shows a
+  Java exception trace or a Freerouting ERROR line other than the complaint
+  that no board was given. Then `available` and `version_checked` are false and
+  `version_output` holds the crash.
+- If the probe's scratch folder cannot be made, the JAR is not started:
+  `available` and `version_checked` are false, and `note` names the error.
+  The probe also removes every inherited `FREEROUTING__*` variable and points
+  `XDG_*`, `APPDATA` and `LOCALAPPDATA` into the scratch folder. The native MCP
+  probe (`freerouting_mcp.rs`) is isolated the same way since #57.
+- Versions compare by their numbers, so `freerouting-2.5.jar` is the
+  recommended 2.5.0 and its digest is checked. A pre-release such as
+  `2.5.0-SNAPSHOT` keeps its suffix in `installed_version` and is never
+  `matches_recommended`.
+- `setup`'s download step and `version_policy` text name the recommended
+  release instead of "the latest 2.x".
+
+## Unreleased: Specctra DSN for real boards
+
+Creation PR 16 (`docs/CREATION_HANDOFF.md`). No tool arguments change.
+`export_specctra_dsn` accepts more boards and writes some existing ones
+differently; `plan_specctra_ses_import` and `apply_specctra_ses` accept the
+matching manifests. Old manifests (two layers, front side) still import.
+
+- **Copper layers:** 2 to 32 in stack order (`F.Cu`, `In1.Cu`…, `B.Cu`).
+  A KiCad `power` layer is written as a Specctra `power` layer, which the router
+  keeps tracks off. `jumper` layers, gaps in the inner numbering and odd counts
+  are refused. Locked tracks may sit on any copper layer; a locked through via
+  is accepted whatever the stack. Manifest: `layers[].dsn_type`,
+  `supported_profile.copper_layers` is the real count.
+- **Back-side parts:** written as front placements whose pads sit at their
+  true board positions on B.Cu (the file already stores them mirrored), so the
+  router never mirrors anything. Manifest: `components[].kicad_side`, and
+  `supported_profile.component_side` is `front_and_back` when any part is on
+  the back. KiCad's native exporter is not adopted for such boards; `prefer`
+  falls back to the Rust exporter and `require` refuses.
+- **Pad orientation fix:** a pin's `rotate` is now the pad angle relative to
+  its part. It was the board-space angle, so a part turned 90° or 270° had its
+  non-square pads turned twice in the router. DSNs of such boards change.
+- **Placement angle fix:** placements are written with angles in [0, 360),
+  and the SES importer compares directions. Freerouting writes a `-90`
+  placement back as `270`, so every board with a part at a negative angle was
+  refused as "SES changes placement"; older manifests still import.
+- **Drill offset fix:** `(drill d (offset x y))` now moves the padstack copper.
+  It was ignored (the exporter looked for the offset on the pad), so offset
+  copper sat on its hole. A pad-level `offset`, which KiCad does not write, is
+  refused.
+- **Pads:** `connect` pads are SMD pads; an SMD pad may be on either outer layer
+  of either side; plated slots (`drill oval`) are accepted. Repeated pad numbers
+  get pins `NUMBER@1`, `NUMBER@2` and empty ones `@1`, `@2`; the manifest keeps
+  the KiCad number in `pad_number`. Pads with no copper are skipped.
+- **Holes and copper graphics:** unplated holes, and plated holes with no ring
+  and no net, are image keepouts on every copper layer. Copper graphics and
+  visible copper text, on the board and in footprints, are keepouts that cover
+  them; they were silently invisible to the router before. Copper dimensions
+  and images are refused. Manifest: `supported_profile.copper_graphic_keepout_count`.
+- **New `pours` argument** (`fixed` default, or `omit`): `omit` leaves copper
+  pours out of the DSN so the router can route through their area, as the
+  usual autoroute-then-refill workflow does; rule areas stay. The manifest
+  still counts the pours (`zone_plane_count`) and says `pours_omitted`; the
+  importer checks the board kept them. Refill zones and run DRC after
+  `apply_specctra_ses`. KiCad's native exporter always writes pours, so
+  `require` is refused with `omit` and `prefer` uses the Rust exporter.
+- **SES repeats:** `plan_specctra_ses_import` and `apply_specctra_ses` apply an
+  exact repeat (same net, layer, width and geometry) once and report
+  `duplicates_skipped`, where they used to refuse the whole SES.
+- **Padless footprints** (a footprint with no pads) are not placed in the DSN;
+  counted in `supported_profile.footprints_without_pads`. Their copper
+  graphics and text still become keepouts (board level, turned and moved with
+  the part), counted in `copper_graphic_keepout_count`; their rule areas and
+  Edge.Cuts graphics are refused (see the 16b entry above).
+- **Board names** with spaces, quotes or parentheses are written as DSN tokens
+  with `_` (`sonde_xilinx.kicad_pcb`); the SES importer accepts that name as
+  the base design.
+
+## Unreleased: circuit-aware review (`audit_circuit_design`)
+
+Creation rank 29 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains
+`audit_circuit_design(schematic, board?)`, and `run_design_review` runs it. It
+automates the schematic- and placement-level items of the owner's layout
+checklist (sections 2, 6, 8, 9) and reads the design-intent rails (`source_ref`)
+and regulator feedback dividers. Existing tools keep their arguments and
+results; new fields only.
+
+- **Findings** carry `checklist` (the item) and `rule` (the check that fired),
+  plus `evidence`. Categories are `circuit`.
+- **`checks`** lists every rule as `ran`, `needs_human` (every subject needed a
+  datasheet or other human input), `no_subjects` (nothing to examine, or only
+  subjects outside the rule's remit, with the skip count) or `not_run`
+  (`no_board`, `no_design_intent`), with examined/passed/finding/skipped/
+  needs_human/unevaluated counts. The top-level `needs_human` lists checklist
+  items no tool here judges and, with a `rule` and `subject`, each subject a
+  rule could not judge; `unproven` lists absences withheld because the net
+  continues on another sheet or a CAN bus passes a multi-pin choke.
+- **Sheets and parts.** A sheet used more than once is audited once per use, with
+  designators read from each symbol's `(instances)` record; findings carry
+  `sheet_instance_path`. Uses that cannot be read that way are listed under
+  `unaudited_sheet_uses`. Parts marked `dnp` or `on_board no` are left out of
+  every rule and listed under `unfitted_parts` (a count and the first 25).
+  `coverage` gains `needs_human_subjects`, `unaudited_sheet_uses` and
+  `unfitted_parts`, and the body gains `sheet_instances`.
+- **`run_design_review`** adds `audits.circuit_design` and `design_review.circuit`
+  (status, rules run and not run, unevaluated subjects, `needs_human` and its
+  subject count, unaudited sheet uses, unfitted parts). Subjects the audit could
+  not evaluate, with or without a board (a part missing from the board, an
+  unrouted sense net, an unreadable termination value, a sheet use it did not
+  audit), add the diagnostic `circuit_checks_unevaluated`, so the verdict is
+  INCOMPLETE. Subjects that need a human do not. The verdict text is unchanged: LOOKS GOOD does not speak for `needs_human`.
+- An unusable design-intent record makes the review INCOMPLETE, as for `audit_trace_current`.
+
+## Unreleased: zone fill state on DRC, and the other long results paged (minor release)
+
+Rank 3 leftovers (`docs/CREATION_HANDOFF.md`, C24 and A30). No argument is
+removed. New result fields and two default changes:
+
+- **`run_drc`, `get_drc_violations`**: new `zone_fill_state` (`fresh`, `stale`
+  or `unknown`) and `zone_fill_check` (its `method`, `copper_zones`, and when
+  compared `zones_differing`, `differing_zones`, `violations_cleared_by_refill`,
+  `violations_added_by_refill` and up to 10 examples each way). New argument
+  `check_zone_fills`, default **true**: when zones are not refilled and the board
+  has copper zones, a second, analysis-only DRC with `--refill-zones
+  --save-board` runs on a private copy of the board and its `.kicad_pro` and
+  `.kicad_dru`, and the fills are compared. That doubles DRC time on such boards;
+  pass `false` to skip it (`unknown`, `not_checked`). The board is never written.
+  Zones are paired by `uuid`, or `tstamp` on a KiCad 6/7 board, then by net,
+  layers and outline (`zones_compared`); a zone nothing pairs makes the state
+  `unknown` (`zones_unpaired`, `reason`), never `stale`. Each `differing_zones`
+  entry names the zone's `id`. Copper zones inside footprints are counted
+  (`footprint_zones`) but kicad-cli's refill does not fill them, so they make
+  the state `unknown` (method `not_comparable` when they are the only copper
+  zones, which runs no second DRC; also with `refill_zones: true`). The
+  violation counts leave out `lib_footprint_issues` and `lib_footprint_mismatch`
+  (`rules_not_compared`): the private copy has no library tables, and a refill
+  cannot change them. `source_evidence` in a DRC baseline and in a report-write
+  failure carries the same `zone_fill` object, and `save_check_baseline` and
+  `compare_check_baseline` take `check_zone_fills` for a board (an ERC baseline
+  refuses `false`).
+- **`batch_place_components`**: each `placed` entry is now compact by default
+  (`reference`, `value`, `footprint`, `lib_id`, `uuid`, `unit`, `x`, `y`,
+  `rotation`, `mirror_x`, `mirror_y`). Pass `detail: "full"` for the previous
+  entry; compact leaves out `schematic`, `datasheet`, `unit_count`, `added`,
+  `fields`, `flags`, `units`, `project` and the instance paths. An unknown
+  `detail` is refused before anything is placed. `outcome.retry.item_indexes`
+  lists at most 1,000 failed indexes; past that, `item_indexes_total` and
+  `item_indexes_truncated: true` say so, and the lists are cut to leave room
+  for it.
+- **Batch edits** (`batch_place_components`, `batch_connect_to_net`,
+  `batch_connect_pins`, `batch_add_wire`, `batch_add_no_connect`): a list that
+  would pass the size cap is cut, failures and errors first. Only then do
+  `truncated_lists` (`{list: {shown, total}}`) and `hint` appear; the counts
+  (`placed_count`, `added_count`, `connected_count`, `added_wires`, `outcome`)
+  stay whole. A result that fits is unchanged. The edit has already happened, so
+  there is no `offset`; the saved schematic holds every change.
+- **`update_pcb_from_schematic`**: `changes` is paged, new `limit` (default 100)
+  and `offset`, with `change_count`, `shown`, `offset`, `limit`, `truncated` and,
+  when cut, `next_offset` and `hint`. A dry run pages the same plan: call again
+  with `offset` and the same arguments, and check `plan_revision`. An apply has
+  no `next_offset`. `diagnostics`, `unassigned_footprints`, `orphan_footprints`,
+  `deleted_footprints` and `copper_changes` share at most half the budget and are
+  cut through `truncated_lists`. `coverage` counts every item. A caller that read
+  every change of a large plan in one call must now follow `next_offset`.
+- **`validate_for_manufacturing`**: `issues` is paged, new `limit` (default 100)
+  and `offset`, with the same paging fields, plus `issue_count` and
+  `issues_by_severity` over every issue. The verdict and `summary` still read
+  them all. Issues are now sorted, most severe first and then by text, so the
+  order no longer follows the checks or kicad-cli's report. New
+  `issues_fingerprint` is the same on every page of one result; a page with a
+  different one came from a changed board or DRC.
+- **`get_component_list`**: paged through the shared list shape, new `limit`
+  (default 500) and `offset`; `count` is still every footprint, and `shown`,
+  `offset`, `limit`, `truncated` and `next_offset` are new.
+- **`query_traces`**: new `offset`. A page also ends at the size cap before
+  `limit` (`byte_capped`, `next_offset`, `hint`). `count` is still the segments
+  shown and `total_matches` all of them.
+- **Every paged result** (the tools above, `run_drc`, `get_drc_violations`,
+  `run_erc`, `compare_check_baseline` and the tools that use the shared list
+  shape): an `offset` above 0 that is at or past the end of the list now adds
+  `offset_past_end: true` and a `hint` naming the total, so a stale
+  `next_offset` is not read as the end of the list. The page is still empty and
+  not an error.
+
+## Unreleased: board construction tools
+
+Rank 21 (`docs/CREATION_HANDOFF.md`, #48). The `pcb_board` toolset gains
+`set_footprint_lock`, `add_rule_area`, `list_zones` and `delete_zone`.
+`add_board_outline` gains a polygon mode: `points` instead of x1, y1, x2, y2
+(no longer required), each corner optionally with `arc_mid` to make the next
+edge an arc. The rectangle mode is unchanged. A polygon is refused if any edges
+cross or touch; arcs are intersected exactly. Its result carries `bbox`, which
+includes each arc's bulge.
+
+The three writers preview by default and apply only with the preview's
+`revision`. A revision that does not match is refused as `stale_target` with
+reason `revision_mismatch`, and the refusal names no revision: preview again to
+get one. `delete_zone` refuses a name or a UUID that more than one zone carries
+(`ambiguous_target`) before anything is written. `add_rule_area`'s default
+keepout is KiCad's: tracks, vias and pads forbidden; copper pours and
+footprints allowed.
+
+## Unreleased: inline layer and library-item renders, difference image
+
+Creation rank 25 (`docs/CREATION_HANDOFF.md`).
+
+- **`compare_visual_baseline` with `inline_diff: true`** now returns a
+  generated difference image in its image block instead of the current
+  full-sheet render. Drawing present now but not in the baseline is green
+  (`#00a000`), drawing removed is red (`#dc0000`), drawing in both but in a
+  different colour is orange (`#e68c00`), unchanged drawing is the current
+  render faded to a quarter of its contrast, and a 2-pixel blue (`#005aff`)
+  box surrounds the changed bounding box. The JSON gains `diff_image` with its
+  dimensions, byte count and this legend; every other field is unchanged, and
+  so are the drift metrics and threshold. A caller that wants the current
+  render calls `render_schematic_png` with `inline: true`. The image is an
+  extra: when it would exceed 16,777,216 pixels, 8000 px on a side or
+  3,750,000 PNG bytes, there is no image block, `diff_image` is `null`, and
+  `warnings` gains a `diff_image_skipped` entry with the reason and a baseline
+  `width_px` that fits. Status and metrics are returned either way.
+- **Inline image budget.** Each inline image from `render_board_layers`,
+  `render_library_item`, `render_schematic_png` with `inline: true`, and the
+  difference image above is held to the Claude API's per-image limits: at
+  most 8000 px on a side and 3,750,000 PNG bytes (about 5 MB once
+  base64-encoded). Over the budget the render tools return an error that names
+  the limit and the remedies (a lower `width_px`, a narrower `region`, or
+  `inline: false` with `output`), and the path of any PNG already written.
+  A whole page that would be over 8000 px tall is refused before it is
+  rasterized, with a `width_px` that fits inline. For `render_schematic_png`
+  this is new: it used to return an inline image of any size. File-only output
+  keeps the 8192 px cap, so baselines do not change. `get_board_2d_view` is
+  outside the budget.
+- **New `render_board_layers`** (`pcb_export`): `board` and a non-empty
+  `layers` list are required. A layer is named by its canonical name or its
+  user name; kicad-cli receives the canonical name and `layers` in the result
+  is the list as asked. A layer the board does not declare, a name that matches
+  two layers, or a canonical name that another layer carries as its user name
+  is refused. It plots the saved file with `pcb export svg` in KiCad's built-in
+  default colour theme (`--theme _builtin_default`) unless `black_and_white`.
+  Without `region` the page is the board-edge bounding box;
+  `region: {x, y, width, height}` is in board mm
+  and must lie on the drawing sheet. `width_px` 1..=4096 (default 1600);
+  output height at most 8192 px and area at most 16,777,216 pixels.
+  `inline` defaults to true; `output` also writes the PNG and is required
+  when `inline` is false.
+- **New `render_library_item`** (`library`): `library` is a `.kicad_sym` file
+  (with `name`, optional `unit`, `body_style`, `include_hidden_pins`), a
+  `.pretty` directory (with `name`) or one `.kicad_mod` file (`name`
+  optional), with optional `layers` and `black_and_white` for footprints.
+  Footprint `layers` must be KiCad layer names, canonical (`F.SilkS`) or
+  KiCad's default user names (`F.Silkscreen`), and a footprint `name` must be
+  a bare name, not a path. An option for the other kind is refused unless it
+  is `null` or its documented default. Footprints plot in the same pinned
+  theme. The metadata lists the symbol's units and whether it has a De Morgan
+  body. Same size caps and delivery options as `render_board_layers`, with
+  `width_px` defaulting to 800.
+
 ## Unreleased: import a part from local files
 
 Rank 33 (`docs/CREATION_HANDOFF.md`). The `integration` toolset gains
@@ -66,6 +402,16 @@ not starting with `.`. A violation's key is a hash of the check, DRC category,
 rule, ERC sheet and sorted item identities; severity, prose and positions are
 not in it. Repeats get `~2`, `~3`. A compare re-keys the stored violations with
 the running binary's rule, so a later key change cannot mismatch old files.
+
+## Unreleased: layout quality audit
+
+Creation work after PR 16 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset
+gains the read-only `audit_layout_quality(board, …)`. No existing tool, argument or
+result changes. `audit_trace_current`'s sizing helpers became crate-visible so the new
+audit reuses them; its own result is unchanged.
+
+`completion.complete` is `true`, `false` or `null`: `null` means open nets own a zone with no saved
+fill, so the gate could not judge them (`completion.status` is `partial`, with a `reason`).
 
 ## Unreleased: honest manufacturing review and trace current audit
 

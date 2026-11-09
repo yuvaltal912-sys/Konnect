@@ -49,7 +49,9 @@ pub fn tools() -> Vec<ToolDef> {
              PNG path and its actual pixel dimensions; with 'inline' true the response also \
              carries an MCP image block so the caller can inspect its own output. An optional \
              region in page millimetres renders a close-up at the requested width. Width is \
-             capped at 4096 px; region height at 8192 px and area at 16,777,216 pixels.",
+             capped at 4096 px; region height at 8192 px and area at 16,777,216 pixels. An \
+             inline image is refused above 8000 px on a side or 3,750,000 PNG bytes (the Claude \
+             API's per-image limits); the PNG file is still written.",
             json!({
                 "type": "object",
                 "properties": {
@@ -96,7 +98,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "inline_diff": { "type": "boolean", "description": "Also return the current sheet render as an MCP image block for inspection (not a difference heatmap)", "default": false }
+                    "inline_diff": { "type": "boolean", "description": "Also return a generated difference image as an MCP image block: drawing added since the baseline in green, removed in red, recoloured in orange, unchanged drawing faded, and a blue box around the changed region. The legend is in the JSON under diff_image. The image is skipped, with diff_image null and a warning naming a baseline width_px that fits, when it would exceed 16,777,216 pixels, 8000 px on a side or 3,750,000 PNG bytes; status and metrics are always returned", "default": false }
                 },
                 "required": ["schematic"]
             }),
@@ -220,7 +222,9 @@ pub fn tools() -> Vec<ToolDef> {
              footprint IDs can be replaced in place while preserving instance state. Routed \
              net changes require unanimous whole-net intent and known copper coverage; \
              changed routed-pad geometry, splits and unknown zone connectivity refuse. \
-             Inspect applied_with_differences or uncertain outcomes before retrying.",
+             Inspect applied_with_differences or uncertain outcomes before retrying. \
+             `changes` is paged (`limit`, `offset`) and the other lists are cut to fit the \
+             response (`truncated_lists`); `coverage` and `change_count` count every item.",
             json!({
                 "type": "object",
                 "properties": {
@@ -229,7 +233,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
                     "delete_orphan_footprints": { "type": "boolean", "description": "Delete board footprints whose symbol is no longer in the saved schematic. Board-only, unlinked and locked footprints are never deleted. Pass the same value to the dry run and the apply", "default": false },
-                    "delete_orphans_with_tracks": { "type": "boolean", "description": "Also delete an orphan footprint that has tracks, arcs or vias on its pads. The copper stays on the board. Needs delete_orphan_footprints", "default": false }
+                    "delete_orphans_with_tracks": { "type": "boolean", "description": "Also delete an orphan footprint that has tracks, arcs or vias on its pads. The copper stays on the board. Needs delete_orphan_footprints", "default": false },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 100, "description": "Most planned changes to list. coverage and change_count count them all" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "First planned change to list" }
                 },
                 "required": ["schematic", "board"]
             }),
@@ -344,12 +350,57 @@ async fn handle_render_png(
         "monochrome": monochrome
     });
     if inline {
+        if let Some(over) = crate::mcp::protocol::inline_over_budget(
+            rendered.width_px,
+            rendered.height_px,
+            rendered.png.len(),
+        ) {
+            return Ok(over.refusal(", narrow or add a 'region'", Some(&output_path)));
+        }
         return Ok(CallToolResult::json_with_png(&response, &rendered.png));
     }
     Ok(CallToolResult::json(&response))
 }
 
-fn render_region(
+/// The difference image when it can travel inline, or the warning that says
+/// why not and which baseline width would allow one. The image is an extra:
+/// the caller keeps status and metrics either way. `canvas_width_px` and
+/// `canvas_pixels` describe the compared canvas.
+fn diff_image_or_warning(
+    image: anyhow::Result<konnect_render::Rendered>,
+    canvas_width_px: u32,
+    canvas_pixels: u64,
+) -> Result<konnect_render::Rendered, String> {
+    let (reason, png_bytes) = match image {
+        Ok(image) => match crate::mcp::protocol::inline_over_budget(
+            image.width_px,
+            image.height_px,
+            image.png.len(),
+        ) {
+            None => return Ok(image),
+            Some(over) => (over.reason, Some(image.png.len())),
+        },
+        Err(error) => (format!("{error:#}"), None),
+    };
+    let width = canvas_width_px.max(1);
+    let height = u32::try_from(canvas_pixels.div_ceil(u64::from(width)))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let by_area = ((konnect_render::MAX_PIXELS as f64 * f64::from(width) / f64::from(height))
+        .sqrt()
+        .floor() as u32)
+        .saturating_sub(1)
+        .max(1);
+    let fit = crate::mcp::protocol::inline_fit_width_px(width, height, png_bytes)
+        .min(by_area)
+        .min(width);
+    Err(format!(
+        "diff_image_skipped: {reason}; status and metrics are unaffected. For a difference \
+         image, re-set the baseline with set_visual_baseline at width_px {fit} or less"
+    ))
+}
+
+pub(super) fn render_region(
     args: &serde_json::Value,
 ) -> Result<Option<konnect_render::Region>, CallToolResult> {
     let Some(value) = args.get("region") else {
@@ -535,7 +586,7 @@ async fn handle_baseline_compare(
     } else {
         "PASS"
     };
-    let response = json!({
+    let mut response = json!({
         "status": status,
         "changed_pct_of_content": diff.changed_pct_of_content,
         "content_pixels": diff.content_pixels,
@@ -551,7 +602,36 @@ async fn handle_baseline_compare(
         "warnings": warnings,
     });
     if inline_diff {
-        return Ok(CallToolResult::json_with_png(&response, &rendered.png));
+        let image = match diff_image_or_warning(
+            konnect_render::diff_image_png(&baseline_png, &rendered.png),
+            rendered.width_px,
+            diff.total_pixels,
+        ) {
+            Ok(image) => image,
+            Err(warning) => {
+                response["diff_image"] = serde_json::Value::Null;
+                if let Some(warnings) = response["warnings"].as_array_mut() {
+                    warnings.push(json!(warning));
+                }
+                return Ok(CallToolResult::json(&response));
+            }
+        };
+        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        use konnect_render::diff_colors;
+        response["diff_image"] = json!({
+            "width_px": image.width_px,
+            "height_px": image.height_px,
+            "png_bytes": image.png.len(),
+            "legend": {
+                "added": hex(diff_colors::ADDED),
+                "removed": hex(diff_colors::REMOVED),
+                "modified": hex(diff_colors::MODIFIED),
+                "changed_bbox": hex(diff_colors::BBOX),
+                "unchanged": "current drawing faded to a quarter of its contrast",
+                "paper": "#ffffff",
+            },
+        });
+        return Ok(CallToolResult::json_with_png(&response, &image.png));
     }
     Ok(CallToolResult::json(&response))
 }
@@ -1901,29 +1981,186 @@ exit 1
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn inline_baseline_compare_keeps_drift_metadata_and_shows_current_render() {
+    async fn inline_baseline_compare_keeps_drift_metadata_and_shows_a_difference_image() {
         let (_dir, schematic, ctx) = render_scene();
         let stored = handle_baseline_set(&json!({"schematic": schematic, "width_px": 320}), &ctx)
             .await
             .unwrap();
         let stored_metadata = render_metadata(&stored);
+        let baseline = std::fs::read(stored_metadata["baseline_png"].as_str().unwrap()).unwrap();
         let inline =
             handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
                 .await
                 .unwrap();
-        let metadata = render_metadata(&inline);
+        let mut metadata = render_metadata(&inline);
         assert_eq!(metadata["status"], "PASS");
         assert_eq!(metadata["changed_pixels"], 0);
         assert_eq!(metadata["source_changed_since_baseline"], false);
+        let image = inline_png(&inline);
+        // The block is the generated difference image, not the current render.
+        assert_ne!(image, baseline);
         assert_eq!(
-            inline_png(&inline),
-            std::fs::read(stored_metadata["baseline_png"].as_str().unwrap()).unwrap()
+            image,
+            konnect_render::diff_image_png(&baseline, &baseline)
+                .unwrap()
+                .png
         );
+        assert_eq!(metadata["diff_image"]["png_bytes"], image.len());
+        assert_eq!(metadata["diff_image"]["legend"]["added"], "#00a000");
         let text_only = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
             .await
             .unwrap();
         assert_eq!(text_only.content.len(), 1);
+        metadata.as_object_mut().unwrap().remove("diff_image");
         assert_eq!(render_metadata(&text_only), metadata);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_diff_colours_drawing_added_since_the_baseline() {
+        let (dir, schematic, ctx) = render_scene();
+        handle_baseline_set(&json!({"schematic": schematic, "width_px": 320}), &ctx)
+            .await
+            .unwrap();
+        // The next export carries a large new filled block in the page's
+        // empty middle: drawing that the baseline does not have.
+        let source = dir.path().join("source.svg");
+        let svg = std::fs::read_to_string(&source).unwrap();
+        let end = svg.rfind("</svg>").unwrap();
+        let drifted = format!(
+            "{}<rect x=\"60\" y=\"60\" width=\"80\" height=\"60\" fill=\"#123456\"/>{}",
+            &svg[..end],
+            &svg[end..]
+        );
+        std::fs::write(&source, &drifted).unwrap();
+        let result =
+            handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
+                .await
+                .unwrap();
+        let metadata = render_metadata(&result);
+        assert_eq!(metadata["status"], "DRIFT", "{metadata}");
+        let (png_path, _) = baseline_paths(&schematic).unwrap();
+        let baseline = std::fs::read(png_path).unwrap();
+        let current = konnect_render::svg_to_png(drifted.as_bytes(), 320).unwrap();
+        let expected = konnect_render::diff_image_png(&baseline, &current.png).unwrap();
+        let image = inline_png(&result);
+        assert_eq!(image, expected.png);
+        assert_eq!(metadata["diff_image"]["width_px"], expected.width_px);
+        assert_eq!(metadata["diff_image"]["height_px"], expected.height_px);
+        // Against the no-change picture, the block's area is coloured in.
+        let unchanged = konnect_render::diff_image_png(&baseline, &baseline).unwrap();
+        let marked = konnect_render::diff_pngs(&unchanged.png, &image).unwrap();
+        assert!(marked.changed_pixels > 1000, "{marked:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_diff_skips_an_oversized_difference_image_but_keeps_the_status() {
+        let (dir, schematic, ctx) = render_scene();
+        // A 1 x 81 mm page at 100 px is 100 x 8100 px: a valid baseline whose
+        // difference image is over the 8000 px inline limit.
+        std::fs::write(
+            dir.path().join("source.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="1mm" height="81mm" viewBox="0 0 1 81"><rect x="0.2" y="10" width="0.6" height="20" fill="#123456"/></svg>"##,
+        )
+        .unwrap();
+        handle_baseline_set(&json!({"schematic": schematic, "width_px": 100}), &ctx)
+            .await
+            .unwrap();
+        let result =
+            handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
+                .await
+                .unwrap();
+        assert_eq!(result.content.len(), 1, "no image block");
+        let mut metadata = render_metadata(&result);
+        assert_eq!(metadata["status"], "PASS");
+        assert_eq!(metadata["changed_pixels"], 0);
+        assert!(metadata["diff_image"].is_null(), "{metadata}");
+        let warning = metadata["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .find(|w| w.starts_with("diff_image_skipped"))
+            .unwrap_or_else(|| panic!("{metadata}"))
+            .to_string();
+        assert!(warning.contains("100 x 8100 px"), "{warning}");
+        assert!(warning.contains("8000 px per side"), "{warning}");
+        assert!(warning.contains("width_px 98 or less"), "{warning}");
+        // Everything else matches the compare without the image.
+        let text_only = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
+            .await
+            .unwrap();
+        let object = metadata.as_object_mut().unwrap();
+        object.remove("diff_image");
+        object.insert("warnings".into(), json!([]));
+        assert_eq!(render_metadata(&text_only), metadata);
+    }
+
+    #[test]
+    fn a_difference_image_over_the_pixel_cap_becomes_a_warning() {
+        // An A4 portrait baseline at 4096 px is 4096 x 5793: the drift numbers
+        // are computed, and diff_image_png refuses the canvas.
+        let refused = Err(anyhow::anyhow!(
+            "difference image would exceed 16777216 pixels"
+        ));
+        let warning = diff_image_or_warning(refused, 4096, 4096 * 5793).unwrap_err();
+        assert!(
+            warning
+                .starts_with("diff_image_skipped: difference image would exceed 16777216 pixels"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("status and metrics are unaffected"),
+            "{warning}"
+        );
+        // 3443 x 4870 = 16,767,410 pixels fits under the cap.
+        assert!(warning.contains("width_px 3443 or less"), "{warning}");
+
+        let small = konnect_render::svg_to_png(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#,
+            10,
+        )
+        .unwrap();
+        let kept = diff_image_or_warning(Ok(small), 10, 100).unwrap();
+        assert_eq!((kept.width_px, kept.height_px), (10, 10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_render_over_the_client_limits_is_refused_and_names_the_written_file() {
+        let (_dir, schematic, ctx) = render_scene();
+        // 1 x 40.5 mm at 200 px is 200 x 8100: inside the 8192 px render
+        // cap, over the 8000 px inline limit.
+        let sliver = json!({"x": 40, "y": 40, "width": 1, "height": 40.5});
+        let refused = handle_render_png(
+            &json!({"schematic": schematic, "width_px": 200, "inline": true, "region": sliver}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        assert!(
+            text.contains("200 x 8100 px") && text.contains("8000 px per side"),
+            "{text}"
+        );
+        assert!(text.contains("about 197 or less"), "{text}");
+        let written = schematic.with_extension("png");
+        assert!(
+            text.contains(&format!("still written to {}", written.display())),
+            "{text}"
+        );
+        assert!(written.is_file());
+        let file_only = handle_render_png(
+            &json!({"schematic": schematic, "width_px": 200, "region": sliver}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(render_metadata(&file_only)["height_px"], 8100);
     }
 
     #[tokio::test]

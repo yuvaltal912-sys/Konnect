@@ -7,12 +7,14 @@
 //! reproduce reads as a mismatch, and every value a fit had to take without
 //! the caller's numbers is listed as assumed.
 
+pub(crate) mod amplifier;
 pub(crate) mod bench;
 pub(crate) mod bjt;
 pub(crate) mod diode;
 pub(crate) mod fit;
 pub(crate) mod mosfet;
 pub(crate) mod passive;
+pub(crate) mod regulator;
 pub(crate) mod text;
 pub(crate) mod tvs;
 
@@ -43,13 +45,17 @@ pub(crate) enum Kind {
     PMosfet,
     Npn,
     Pnp,
+    OpAmp,
+    Comparator,
+    Ldo,
+    VoltageReference,
     Resistance,
     Capacitor,
     Inductor,
 }
 
 impl Kind {
-    pub(crate) const ALL: [Kind; 13] = [
+    pub(crate) const ALL: [Kind; 17] = [
         Kind::Diode,
         Kind::SchottkyDiode,
         Kind::Led,
@@ -60,6 +66,10 @@ impl Kind {
         Kind::PMosfet,
         Kind::Npn,
         Kind::Pnp,
+        Kind::OpAmp,
+        Kind::Comparator,
+        Kind::Ldo,
+        Kind::VoltageReference,
         Kind::Resistance,
         Kind::Capacitor,
         Kind::Inductor,
@@ -77,6 +87,10 @@ impl Kind {
             Kind::PMosfet => "p_mosfet",
             Kind::Npn => "npn",
             Kind::Pnp => "pnp",
+            Kind::OpAmp => "op_amp",
+            Kind::Comparator => "comparator",
+            Kind::Ldo => "ldo",
+            Kind::VoltageReference => "voltage_reference",
             Kind::Resistance => "resistance",
             Kind::Capacitor => "capacitor",
             Kind::Inductor => "inductor",
@@ -146,6 +160,41 @@ impl Kind {
                 (EmitterBaseCapacitance, 0, 16),
                 (TransitionFrequency, 0, 1),
             ],
+            // One open-loop gain is the DC gain; more, each at a frequency off
+            // the Bode plot, are held out against the single pole.
+            Kind::OpAmp => &[
+                (OpenLoopGain, 1, 9),
+                (GainBandwidthProduct, 1, 1),
+                (SlewRate, 0, 1),
+                (InputOffsetVoltage, 0, 1),
+                (InputBiasCurrent, 0, 1),
+                (SupplyCurrent, 0, 1),
+                (OutputSwingFromPositiveRail, 0, 1),
+                (OutputSwingFromNegativeRail, 0, 1),
+                (OutputResistance, 0, 1),
+            ],
+            Kind::Comparator => &[
+                (PropagationDelay, 1, 8),
+                (Hysteresis, 0, 1),
+                (InputOffsetVoltage, 0, 1),
+                (InputBiasCurrent, 0, 1),
+                (SupplyCurrent, 0, 1),
+                (OutputSwingFromPositiveRail, 0, 1),
+                (OutputSwingFromNegativeRail, 0, 1),
+                (OutputResistance, 0, 1),
+            ],
+            Kind::Ldo => &[
+                (OutputVoltage, 1, 16),
+                (DropoutVoltage, 1, 1),
+                (QuiescentCurrent, 0, 1),
+                (CurrentLimit, 0, 1),
+            ],
+            Kind::VoltageReference => &[
+                (OutputVoltage, 1, 16),
+                (DropoutVoltage, 0, 1),
+                (QuiescentCurrent, 0, 1),
+                (CurrentLimit, 0, 1),
+            ],
             Kind::Resistance => &[(Resistance, 1, 1), (SeriesInductance, 0, 1)],
             Kind::Capacitor => &[
                 (Capacitance, 1, 1),
@@ -197,6 +246,21 @@ pub(crate) enum Quantity {
     Inductance,
     DcResistance,
     SelfResonantFrequency,
+    OpenLoopGain,
+    GainBandwidthProduct,
+    SlewRate,
+    InputOffsetVoltage,
+    InputBiasCurrent,
+    SupplyCurrent,
+    OutputSwingFromPositiveRail,
+    OutputSwingFromNegativeRail,
+    OutputResistance,
+    PropagationDelay,
+    Hysteresis,
+    OutputVoltage,
+    DropoutVoltage,
+    QuiescentCurrent,
+    CurrentLimit,
 }
 
 pub(crate) const FORWARD_CURRENT: &str = "forward_current_amps";
@@ -213,9 +277,15 @@ pub(crate) const VOLTAGE: &str = "voltage_volts";
 pub(crate) const FREQUENCY: &str = "frequency_hz";
 pub(crate) const DC_BIAS: &str = "dc_bias_volts";
 pub(crate) const DC_CURRENT: &str = "dc_current_amps";
+pub(crate) const SUPPLY_VOLTAGE: &str = "supply_voltage_volts";
+pub(crate) const LOAD_RESISTANCE: &str = "load_resistance_ohms";
+pub(crate) const OVERDRIVE: &str = "overdrive_volts";
+pub(crate) const INPUT_VOLTAGE: &str = "input_voltage_volts";
+pub(crate) const OUTPUT_CURRENT: &str = "output_current_amps";
+pub(crate) const OUTPUT_VOLTAGE: &str = "output_voltage_volts";
 
 impl Quantity {
-    pub(crate) const ALL: [Quantity; 31] = [
+    pub(crate) const ALL: [Quantity; 46] = [
         Quantity::ForwardVoltage,
         Quantity::ReverseCurrent,
         Quantity::BreakdownVoltage,
@@ -247,6 +317,21 @@ impl Quantity {
         Quantity::Inductance,
         Quantity::DcResistance,
         Quantity::SelfResonantFrequency,
+        Quantity::OpenLoopGain,
+        Quantity::GainBandwidthProduct,
+        Quantity::SlewRate,
+        Quantity::InputOffsetVoltage,
+        Quantity::InputBiasCurrent,
+        Quantity::SupplyCurrent,
+        Quantity::OutputSwingFromPositiveRail,
+        Quantity::OutputSwingFromNegativeRail,
+        Quantity::OutputResistance,
+        Quantity::PropagationDelay,
+        Quantity::Hysteresis,
+        Quantity::OutputVoltage,
+        Quantity::DropoutVoltage,
+        Quantity::QuiescentCurrent,
+        Quantity::CurrentLimit,
     ];
 
     pub(crate) fn name(self) -> &'static str {
@@ -282,6 +367,21 @@ impl Quantity {
             Quantity::Inductance => "inductance",
             Quantity::DcResistance => "dc_resistance",
             Quantity::SelfResonantFrequency => "self_resonant_frequency",
+            Quantity::OpenLoopGain => "open_loop_gain",
+            Quantity::GainBandwidthProduct => "gain_bandwidth_product",
+            Quantity::SlewRate => "slew_rate",
+            Quantity::InputOffsetVoltage => "input_offset_voltage",
+            Quantity::InputBiasCurrent => "input_bias_current",
+            Quantity::SupplyCurrent => "supply_current",
+            Quantity::OutputSwingFromPositiveRail => "output_swing_from_positive_rail",
+            Quantity::OutputSwingFromNegativeRail => "output_swing_from_negative_rail",
+            Quantity::OutputResistance => "output_resistance",
+            Quantity::PropagationDelay => "propagation_delay",
+            Quantity::Hysteresis => "hysteresis",
+            Quantity::OutputVoltage => "output_voltage",
+            Quantity::DropoutVoltage => "dropout_voltage",
+            Quantity::QuiescentCurrent => "quiescent_current",
+            Quantity::CurrentLimit => "current_limit",
         }
     }
 
@@ -293,13 +393,26 @@ impl Quantity {
             | Quantity::BaseEmitterVoltage
             | Quantity::CollectorEmitterSaturationVoltage
             | Quantity::GateThresholdVoltage
-            | Quantity::ZenerVoltage => "V",
-            Quantity::ReverseCurrent | Quantity::LeakageCurrent | Quantity::DrainCurrent => "A",
+            | Quantity::ZenerVoltage
+            | Quantity::InputOffsetVoltage
+            | Quantity::OutputSwingFromPositiveRail
+            | Quantity::OutputSwingFromNegativeRail
+            | Quantity::Hysteresis
+            | Quantity::OutputVoltage
+            | Quantity::DropoutVoltage => "V",
+            Quantity::ReverseCurrent
+            | Quantity::LeakageCurrent
+            | Quantity::DrainCurrent
+            | Quantity::InputBiasCurrent
+            | Quantity::SupplyCurrent
+            | Quantity::QuiescentCurrent
+            | Quantity::CurrentLimit => "A",
             Quantity::DynamicImpedance
             | Quantity::Resistance
             | Quantity::EquivalentSeriesResistance
             | Quantity::OnResistance
             | Quantity::GateResistance
+            | Quantity::OutputResistance
             | Quantity::DcResistance => "ohm",
             Quantity::JunctionCapacitance
             | Quantity::Capacitance
@@ -311,8 +424,12 @@ impl Quantity {
             Quantity::SeriesInductance
             | Quantity::EquivalentSeriesInductance
             | Quantity::Inductance => "H",
-            Quantity::SelfResonantFrequency | Quantity::TransitionFrequency => "Hz",
-            Quantity::CurrentGain => "ratio",
+            Quantity::SelfResonantFrequency
+            | Quantity::TransitionFrequency
+            | Quantity::GainBandwidthProduct => "Hz",
+            Quantity::CurrentGain | Quantity::OpenLoopGain => "ratio",
+            Quantity::SlewRate => "V/s",
+            Quantity::PropagationDelay => "s",
             Quantity::GateCharge | Quantity::GateDrainCharge => "C",
         }
     }
@@ -360,6 +477,22 @@ impl Quantity {
             | Quantity::EquivalentSeriesInductance
             | Quantity::DcResistance
             | Quantity::SelfResonantFrequency => (&[], &[]),
+            Quantity::OpenLoopGain => (&[], &[FREQUENCY, SUPPLY_VOLTAGE, LOAD_RESISTANCE]),
+            Quantity::GainBandwidthProduct
+            | Quantity::SlewRate
+            | Quantity::InputOffsetVoltage
+            | Quantity::InputBiasCurrent
+            | Quantity::OutputResistance
+            | Quantity::Hysteresis => (&[], &[SUPPLY_VOLTAGE]),
+            Quantity::SupplyCurrent => (&[SUPPLY_VOLTAGE], &[]),
+            Quantity::OutputSwingFromPositiveRail | Quantity::OutputSwingFromNegativeRail => {
+                (&[SUPPLY_VOLTAGE, LOAD_RESISTANCE], &[])
+            }
+            Quantity::PropagationDelay => (&[OVERDRIVE], &[SUPPLY_VOLTAGE]),
+            Quantity::OutputVoltage => (&[INPUT_VOLTAGE, OUTPUT_CURRENT], &[]),
+            Quantity::DropoutVoltage => (&[OUTPUT_CURRENT], &[]),
+            Quantity::QuiescentCurrent => (&[INPUT_VOLTAGE], &[]),
+            Quantity::CurrentLimit => (&[], &[INPUT_VOLTAGE, OUTPUT_VOLTAGE]),
         }
     }
 
@@ -566,10 +699,14 @@ fn characteristic(index: usize, item: &Value) -> Fitted<Characteristic> {
 }
 
 /// Conditions that may be zero, for the quantity they qualify.
-const ZERO_BIAS: [(Quantity, &str); 3] = [
+const ZERO_BIAS: [(Quantity, &str); 5] = [
     (Quantity::JunctionCapacitance, REVERSE_VOLTAGE),
     (Quantity::Capacitance, DC_BIAS),
     (Quantity::Inductance, DC_CURRENT),
+    // A reference is often stated with no load, and a current limit with the
+    // output shorted.
+    (Quantity::OutputVoltage, OUTPUT_CURRENT),
+    (Quantity::CurrentLimit, OUTPUT_VOLTAGE),
 ];
 
 fn non_negative(value: Option<&Value>, field: &str) -> Fitted<f64> {
@@ -719,6 +856,12 @@ pub(crate) fn build(
         Kind::Tvs | Kind::TvsBidirectional => tvs::build(kind, name, characteristics, temperature)?,
         Kind::NMosfet | Kind::PMosfet => mosfet::build(kind, name, characteristics, temperature)?,
         Kind::Npn | Kind::Pnp => bjt::build(kind, name, characteristics, temperature)?,
+        Kind::OpAmp | Kind::Comparator => {
+            amplifier::build(kind, name, characteristics, temperature)?
+        }
+        Kind::Ldo | Kind::VoltageReference => {
+            regulator::build(kind, name, characteristics, temperature)?
+        }
         Kind::Resistance | Kind::Capacitor | Kind::Inductor => {
             passive::build(kind, name, characteristics)?
         }
@@ -786,7 +929,7 @@ mod tests {
         for quantity in Quantity::ALL {
             assert_eq!(Quantity::from_name(quantity.name()), Some(quantity));
         }
-        assert_eq!(Kind::from_name("op_amp"), None);
+        assert_eq!(Kind::from_name("opamp"), None);
     }
 
     #[test]
