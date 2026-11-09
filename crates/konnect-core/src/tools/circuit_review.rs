@@ -6,16 +6,19 @@
 //! from the design-intent record's rails (`source_ref`) and regulator
 //! feedback dividers. Every finding names the checklist item and the rule
 //! that fired. What it cannot judge (datasheet values, waveforms, bench work)
-//! is listed as `needs_human`; a rule that had nothing to examine reports
-//! `no_subjects`, and one that needs a board it was not given reports
-//! `not_run`. Neither is ever a pass.
+//! is listed as `needs_human`, and so is each subject a rule met but could not
+//! judge without a datasheet; a rule that had nothing to examine reports
+//! `no_subjects`, one whose every subject needed a human reports
+//! `needs_human`, and one that needs a board it was not given reports
+//! `not_run`. None of them is ever a pass.
 //!
 //! Written from the checklist and the parts' pin names; no code is ported
 //! from another project.
 //!
-//! The model is one [`Circuit`] per schematic file, so a net that continues
-//! on another sheet is marked and absence-type findings about it are listed
-//! under `unproven` instead of being asserted. Distances are pad-anchor
+//! The model is one [`Circuit`] per use of a schematic file (a sheet used
+//! twice is two circuits, each read with its own designators), so a net that
+//! continues on another sheet is marked and absence-type findings about it
+//! are listed under `unproven` instead of being asserted. Distances are pad-anchor
 //! Euclidean, the metric `score_placement` uses for decoupling; they are not
 //! routed lengths.
 
@@ -24,10 +27,13 @@ use std::path::{Path, PathBuf};
 
 use konnect_sexp::board_geometry::BoardGeometry;
 use konnect_sexp::parser::parse_sexp;
+use konnect_sexp::schematic::read_schematic;
 use serde_json::{json, Value};
 
 use crate::mcp::protocol::CallToolResult;
-use crate::tools::circuit_model::{rail_voltage_from_name, round3, BoardView, Circuit, Part};
+use crate::tools::circuit_model::{
+    rail_voltage_from_name, round3, BoardView, Circuit, Part, SheetPlace,
+};
 use crate::tools::component_class::{self, FEEDBACK_PINS};
 use crate::tools::design_intent::{
     design_intent_path, read_design_intent, DesignIntent, IntentRead,
@@ -355,6 +361,10 @@ pub(super) struct Stat {
     pub findings: usize,
     /// Subjects outside the rule's remit, with why.
     pub skipped: Vec<String>,
+    /// Subjects the rule met but cannot judge without a datasheet or other
+    /// human input, as `(subject, why)`. Not a pass, and not a gap a tool
+    /// could close, so they do not make a review incomplete by themselves.
+    pub needs_human: Vec<(String, String)>,
     /// Subjects the rule should have judged but could not, with why. A gap in
     /// the review, not a pass.
     pub unevaluated: Vec<String>,
@@ -388,6 +398,13 @@ impl Report {
 
     pub fn skip(&mut self, id: &'static str, why: impl Into<String>) {
         self.stat(id).skipped.push(why.into());
+    }
+
+    /// A subject that only a human (with a datasheet, say) can judge.
+    pub fn needs_human(&mut self, id: &'static str, subject: &str, why: impl Into<String>) {
+        self.stat(id)
+            .needs_human
+            .push((subject.to_string(), why.into()));
     }
 
     /// A subject that needed board data (or another input) and had none.
@@ -465,11 +482,47 @@ pub(super) fn read_intent(root: &Path) -> (Option<DesignIntent>, IntentState, Pa
 
 // ─── Orchestration ───────────────────────────────────────────────────────────
 
-/// Audit `files` (every schematic file of one hierarchy) and, when given,
-/// `board`. `Err` only when no schematic could be read at all.
+/// One use of a schematic file in the hierarchy.
+#[derive(Debug, Clone)]
+pub(super) struct SheetUse {
+    pub file: PathBuf,
+    /// The hierarchy walk's chain of sheet UUIDs: `/` for the root.
+    pub instance_path: Option<String>,
+    /// The sheets' names, the way board nets are prefixed: `/` or `/Power/`.
+    pub name_path: Option<String>,
+}
+
+/// Audit `files` (each schematic file of one hierarchy once, hierarchy
+/// unknown) and, when given, `board`.
+#[cfg(test)]
 pub(super) fn audit_files(
     root: &Path,
     files: &[PathBuf],
+    board: Option<&Path>,
+    diagnostics: Vec<Value>,
+) -> anyhow::Result<CallToolResult> {
+    let uses: Vec<SheetUse> = files
+        .iter()
+        .map(|file| SheetUse {
+            file: file.clone(),
+            instance_path: None,
+            name_path: None,
+        })
+        .collect();
+    audit_uses(root, &uses, board, diagnostics)
+}
+
+/// Audit every use of every sheet in `uses` and, when given, `board`. `Err`
+/// only when no schematic could be read at all.
+///
+/// A file used more than once is audited once per use, with each symbol's
+/// designator read from its `(instances ...)` record for that use. A use whose
+/// designators cannot be read that way is not audited and is reported under
+/// `unaudited_sheet_uses`, which makes the review partial: auditing only one
+/// use would pass the others unseen.
+pub(super) fn audit_uses(
+    root: &Path,
+    uses: &[SheetUse],
     board: Option<&Path>,
     mut diagnostics: Vec<Value>,
 ) -> anyhow::Result<CallToolResult> {
@@ -481,18 +534,92 @@ pub(super) fn audit_files(
         ));
     }
 
-    let mut circuits = Vec::new();
-    for file in files {
-        match Circuit::load(file) {
-            Ok(c) => circuits.push(c),
-            Err(error) => diagnostics.push(json!({
-                "code": "schematic_parse_failed",
-                "source": file.display().to_string(),
-                "message": error.to_string(),
-            })),
-        }
+    let root_uuid = read_schematic(root).ok().and_then(|(_, tree)| {
+        tree.find_str("uuid")
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+    });
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut times_used: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    for u in uses {
+        *times_used.entry(canonical(&u.file)).or_default() += 1;
     }
-    if circuits.is_empty() {
+
+    let mut circuits: Vec<Circuit> = Vec::new();
+    let mut unaudited: Vec<Value> = Vec::new();
+    for u in uses {
+        let place = SheetPlace {
+            symbol_path: root_uuid.as_ref().and_then(|r| {
+                u.instance_path
+                    .as_ref()
+                    .map(|p| format!("/{r}{}", p.trim_end_matches('/')))
+            }),
+            instance_path: u.instance_path.clone(),
+            name_path: u.name_path.clone(),
+        };
+        let circuit = match Circuit::load_at(&u.file, &place) {
+            Ok(c) => c,
+            Err(error) => {
+                diagnostics.push(json!({
+                    "code": "schematic_parse_failed",
+                    "source": u.file.display().to_string(),
+                    "message": error.to_string(),
+                }));
+                continue;
+            }
+        };
+        let key = canonical(&u.file);
+        if times_used.get(&key).copied().unwrap_or(1) > 1 {
+            let why = if place.symbol_path.is_none() {
+                Some(
+                    "the sheet is used more than once and the root schematic carries no uuid to \
+                     read each use's designators from"
+                        .to_string(),
+                )
+            } else if !circuit.reference_unresolved.is_empty() {
+                Some(format!(
+                    "the sheet is used more than once and {} symbol(s) ({}) have no instance \
+                     record for this use, so its designators cannot be read",
+                    circuit.reference_unresolved.len(),
+                    circuit
+                        .reference_unresolved
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            } else {
+                circuits
+                    .iter()
+                    .filter(|c| canonical(&c.file) == key)
+                    .find_map(|c| {
+                        circuit
+                            .parts
+                            .iter()
+                            .find(|p| c.part(&p.reference).is_some())
+                            .map(|p| {
+                                format!(
+                                    "the sheet is used more than once and {} has the same \
+                                     designator in another use, so the board cannot tell them apart",
+                                    p.reference
+                                )
+                            })
+                    })
+            };
+            if let Some(why) = why {
+                unaudited.push(json!({
+                    "source": u.file.display().to_string(),
+                    "sheet_instance_path": u.instance_path,
+                    "sheet_name_path": u.name_path,
+                    "why": why,
+                }));
+                continue;
+            }
+        }
+        circuits.push(circuit);
+    }
+    if circuits.is_empty() && unaudited.is_empty() {
         anyhow::bail!("no schematic file could be read");
     }
 
@@ -519,22 +646,31 @@ pub(super) fn audit_files(
     let mut report = Report::default();
     for circuit in &circuits {
         let source = circuit.file.display().to_string();
+        let sheet = circuit.sheet.instance_path.clone();
         let before = report.findings.len();
         let unproven_before = report.unproven.len();
         let interfaces_before = report.interfaces.len();
         let crystals_before = report.crystals.len();
         super::circuit_checks::run(circuit, board_view.as_ref(), intent.as_ref(), &mut report);
+        let tag = |v: &mut Value| {
+            v["source"] = json!(source);
+            if let Some(path) = &sheet {
+                v["sheet_instance_path"] = json!(path);
+            }
+        };
+        report.findings[before..].iter_mut().for_each(tag);
+        report.unproven[unproven_before..].iter_mut().for_each(tag);
+        report.interfaces[interfaces_before..]
+            .iter_mut()
+            .for_each(tag);
+        report.crystals[crystals_before..].iter_mut().for_each(tag);
+    }
+    // Design-level: the recorded USB pair impedance does not depend on a sheet.
+    if let Some(intent) = &intent {
+        let before = report.findings.len();
+        super::circuit_checks::usb_pair_impedance(intent, &mut report);
         for f in &mut report.findings[before..] {
-            f["source"] = json!(source);
-        }
-        for u in &mut report.unproven[unproven_before..] {
-            u["source"] = json!(source);
-        }
-        for i in &mut report.interfaces[interfaces_before..] {
-            i["source"] = json!(source);
-        }
-        for c in &mut report.crystals[crystals_before..] {
-            c["source"] = json!(source);
+            f["source"] = json!(intent_path.display().to_string());
         }
     }
     let power_tree = power_tree(&circuits, intent.as_ref(), &mut report);
@@ -545,7 +681,8 @@ pub(super) fn audit_files(
     let mut checks = Vec::new();
     let mut ran = 0usize;
     let mut not_run = 0usize;
-    let mut gaps = 0usize;
+    // A sheet use that was not audited is a gap, not a pass.
+    let mut gaps = unaudited.len();
     for r in RULES {
         let stat = report.stats.get(r.id);
         let blocked = match r.needs {
@@ -559,21 +696,57 @@ pub(super) fn audit_files(
             Needs::Intent if !have_intent => Some("no_design_intent"),
             Needs::Intent => None,
         };
-        let (status, detail) = match (blocked, stat) {
+        let (status, detail): (&str, Option<String>) = match (blocked, stat) {
             (Some(reason), _) => {
                 not_run += 1;
-                ("not_run", Some(reason))
+                ("not_run", Some(reason.to_string()))
             }
             (None, Some(s)) if s.examined > 0 => {
                 ran += 1;
                 gaps += s.unevaluated.len();
                 ("ran", None)
             }
-            _ => {
+            (None, Some(s)) if !s.needs_human.is_empty() => {
+                ran += 1;
+                (
+                    "needs_human",
+                    Some(format!(
+                        "none of this rule's {} subject(s) could be judged without a human \
+                         (see needs_human_reasons){}",
+                        s.needs_human.len() + s.skipped.len(),
+                        if s.skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; {} more were outside its remit", s.skipped.len())
+                        }
+                    )),
+                )
+            }
+            (None, Some(s)) if !s.skipped.is_empty() => {
                 ran += 1;
                 (
                     "no_subjects",
-                    Some("nothing in the design for this rule to examine"),
+                    Some(format!(
+                        "{} subject(s) were outside this rule's remit and none was judged \
+                         (see skipped_reasons)",
+                        s.skipped.len()
+                    )),
+                )
+            }
+            _ => {
+                ran += 1;
+                // Subjects withheld as unproven were there; only an empty rule is empty.
+                let withheld = report.unproven.iter().filter(|u| u["rule"] == r.id).count();
+                (
+                    "no_subjects",
+                    Some(if withheld > 0 {
+                        format!(
+                            "{withheld} subject(s) were withheld as unproven and none was \
+                             judged (see unproven)"
+                        )
+                    } else {
+                        "nothing in the design for this rule to examine".to_string()
+                    }),
                 )
             }
         };
@@ -593,6 +766,15 @@ pub(super) fn audit_files(
             entry["findings"] = json!(s.findings);
             entry["unevaluated"] = json!(s.unevaluated.len());
             entry["skipped"] = json!(s.skipped.len());
+            entry["needs_human"] = json!(s.needs_human.len());
+            if !s.needs_human.is_empty() {
+                entry["needs_human_reasons"] = json!(s
+                    .needs_human
+                    .iter()
+                    .take(5)
+                    .map(|(subject, why)| format!("{subject}: {why}"))
+                    .collect::<Vec<_>>());
+            }
             if !s.unevaluated.is_empty() {
                 entry["unevaluated_reasons"] =
                     json!(s.unevaluated.iter().take(5).collect::<Vec<_>>());
@@ -614,9 +796,33 @@ pub(super) fn audit_files(
 
     let errors = report.findings.iter().filter(|f| rank(f) == 0).count();
     let warnings = report.findings.iter().filter(|f| rank(f) == 1).count();
-    let needs_human: Vec<Value> = NEEDS_HUMAN
+    let mut needs_human: Vec<Value> = NEEDS_HUMAN
         .iter()
         .map(|(section, item, why)| json!({"checklist": section, "item": item, "why": why}))
+        .collect();
+    let checklist_items = needs_human.len();
+    // The subjects the rules met and could not judge, each with its subject.
+    let mut needs_human_subjects = 0usize;
+    for r in RULES {
+        for (subject, why) in report
+            .stats
+            .get(r.id)
+            .map(|s| s.needs_human.as_slice())
+            .unwrap_or_default()
+        {
+            needs_human_subjects += 1;
+            needs_human.push(
+                json!({"rule": r.id, "checklist": r.checklist, "subject": subject, "why": why}),
+            );
+        }
+    }
+    let unfitted: Vec<Value> = circuits
+        .iter()
+        .flat_map(|c| {
+            c.unfitted.iter().map(move |u| {
+                json!({"reference": u.reference, "why": u.why, "source": c.file.display().to_string()})
+            })
+        })
         .collect();
     let unresolved_symbols: usize = circuits.iter().map(|c| c.unresolved_symbols).sum();
     let status = if gaps > 0 || !diagnostics.is_empty() || unresolved_symbols > 0 {
@@ -626,12 +832,11 @@ pub(super) fn audit_files(
     };
     let summary = format!(
         "{} finding(s) ({errors} error, {warnings} warning) from {ran} rule(s) that could run; \
-         {not_run} rule(s) not run{}; {gaps} subject(s) could not be evaluated; {} checklist \
-         item(s) need a human. Nothing here passes a board: a rule with no subjects or no \
-         input is not a pass.",
+         {not_run} rule(s) not run{}; {gaps} subject(s) could not be evaluated; \
+         {needs_human_subjects} subject(s) and {checklist_items} checklist item(s) need a human. \
+         Nothing here passes a board: a rule with no subjects or no input is not a pass.",
         report.findings.len(),
         if have_board { "" } else { " (no board given)" },
-        needs_human.len(),
     );
     let _ = board_diag;
 
@@ -641,7 +846,12 @@ pub(super) fn audit_files(
         "scope": "per_schematic_file",
         "standard": "owner's PCB layout checklist, sections 2, 6, 8 and 9 plus the design-intent power tree",
         "distance_metric": "pad_anchor_euclidean_xy",
-        "schematic_files": circuits.len(),
+        "schematic_files": circuits
+            .iter()
+            .map(|c| c.file.as_path())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        "sheet_instances": circuits.len(),
         "board": have_board,
         "design_intent": match &intent_state {
             IntentState::Absent => json!({"status": "absent", "path": intent_path.display().to_string()}),
@@ -655,7 +865,16 @@ pub(super) fn audit_files(
             "ran": ran,
             "not_run": not_run,
             "unevaluated_subjects": gaps,
+            "needs_human_subjects": needs_human_subjects,
+            "unaudited_sheet_uses": unaudited.len(),
+            "unfitted_parts": unfitted.len(),
             "unresolved_symbols": unresolved_symbols,
+        },
+        "unaudited_sheet_uses": unaudited,
+        "unfitted_parts": {
+            "count": unfitted.len(),
+            "note": "marked dnp or not on the board in the schematic: no rule counts them as fitted, and none looks for them on the board",
+            "parts": unfitted.iter().take(25).collect::<Vec<_>>(),
         },
         "power_tree": power_tree,
         "interfaces": report.interfaces,
@@ -719,19 +938,31 @@ fn vref_for(part: &Part) -> Option<(&'static str, f64, f64)> {
 }
 
 /// A regulator: a `Regulator_*` library symbol, or a part with an input pin
-/// and an output, switch or feedback pin.
+/// and an output, switch or feedback pin. A gate driver (a `Driver_*` library
+/// symbol, or a part with gate-driver outputs) is not one, and neither is a
+/// part whose `IN`/`OUT` pins are plain signals: a match on pin names alone
+/// needs a `power_in`/`power_out` pin or a switch or feedback pin.
 pub(super) fn is_regulator(part: &Part) -> bool {
-    if part.lib_id.to_uppercase().starts_with("REGULATOR_") {
+    let lib = part.lib_id.to_uppercase();
+    if lib.starts_with("REGULATOR_") {
         return true;
+    }
+    if lib.starts_with("DRIVER_") || super::circuit_checks::gate_driver(part).is_some() {
+        return false;
     }
     let names = part.pin_names();
     let pins = component_class::PinNames::new(&names);
-    let input = pins.find(&["VIN", "IN", "VI", "INPUT", "PVIN"]).is_some();
-    let out = pins
-        .find(&["VOUT", "OUT", "VO", "OUTPUT", "SW", "LX"])
-        .is_some()
-        || pins.find(FEEDBACK_PINS).is_some();
-    input && out && part.pins.len() >= 3 && !part.reference.starts_with('J')
+    let input = pins.find(&["VIN", "IN", "VI", "INPUT", "PVIN"]);
+    let output = pins.find(&["VOUT", "OUT", "VO", "OUTPUT"]);
+    let switch = pins.find(&["SW", "LX"]);
+    let feedback = pins.find(FEEDBACK_PINS);
+    let typed = input.is_some_and(|i| part.pins[i].electrical_type == "power_in")
+        || output.is_some_and(|o| part.pins[o].electrical_type == "power_out");
+    input.is_some()
+        && (output.is_some() || switch.is_some() || feedback.is_some())
+        && (typed || switch.is_some() || feedback.is_some())
+        && part.pins.len() >= 3
+        && !part.reference.starts_with('J')
 }
 
 struct Located<'a> {
@@ -842,11 +1073,26 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
                     "rail_source_missing",
                     "warning",
                     Some(src),
-                    format!(
-                        "Rail '{}' records source_ref {src}, which is not a part of this schematic hierarchy",
-                        rail.name
-                    ),
-                    "Correct source_ref in the design-intent record, or annotate the part.".into(),
+                    match circuits
+                        .iter()
+                        .flat_map(|c| &c.unfitted)
+                        .find(|u| u.reference == *src)
+                    {
+                        Some(u) => format!(
+                            "Rail '{}' records source_ref {src}, which is not fitted ({})",
+                            rail.name,
+                            if u.why == "dnp" {
+                                "marked DNP"
+                            } else {
+                                "excluded from the board"
+                            }
+                        ),
+                        None => format!(
+                            "Rail '{}' records source_ref {src}, which is not a part of this schematic hierarchy",
+                            rail.name
+                        ),
+                    },
+                    "Correct source_ref in the design-intent record, annotate the part, or fit it.".into(),
                     json!({"rail": rail.name, "source_ref": src}),
                 );
                 entry["source_kind"] = json!("missing");
@@ -935,21 +1181,36 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
 }
 
 /// Whether a part has a pin on one of the rail's nets, or on a net one
-/// inductor, ferrite or resistor away from it (a switcher's SW pin reaches its
-/// rail through the inductor, its FB pin through the divider).
+/// series part away from it. Which pin may take the hop depends on the part:
+/// a regulator's switch or output pin reaches its rail through an inductor or
+/// ferrite, its feedback pin through the divider resistor, and no other pin
+/// (power-good, enable, soft-start, reset) links it to anything. Any pin of
+/// a part that is not a regulator, a connector say, may reach the rail through
+/// an inductor or ferrite, but never through a resistor.
 fn part_reaches_rail(circuit: &Circuit, part: &Part, rail_nets: &[String]) -> bool {
     let on = |key: &str| {
         circuit
             .net(key)
             .is_some_and(|n| rail_nets.iter().any(|r| n.matches_name(r)))
     };
-    part.pins.iter().any(|pin| {
+    let regulator = is_regulator(part);
+    let names = part.pin_names();
+    let pin_names = component_class::PinNames::new(&names);
+    let feedback = pin_names.all(FEEDBACK_PINS);
+    let switch_or_output = pin_names.all(&[
+        "SW", "LX", "PH", "PHASE", "SWITCH", "VOUT", "OUT", "VO", "OUTPUT",
+    ]);
+    part.pins.iter().enumerate().any(|(i, pin)| {
+        let by_inductor =
+            !regulator || switch_or_output.contains(&i) || pin.electrical_type == "power_out";
+        let by_resistor = feedback.contains(&i);
         on(&pin.net)
             || circuit.on_net(&pin.net).iter().any(|(q, _)| {
                 q.reference != part.reference
                     && q.is_two_terminal()
-                    && (component_class::is_series_inductor(&q.lib_id, &q.reference)
-                        || component_class::is_resistor(&q.lib_id, &q.reference))
+                    && ((by_inductor
+                        && component_class::is_series_inductor(&q.lib_id, &q.reference))
+                        || (by_resistor && component_class::is_resistor(&q.lib_id, &q.reference)))
                     && circuit.across(q, &pin.net).is_some_and(on)
             })
     })
@@ -1013,7 +1274,7 @@ fn feedback(
                 format!(" ({} with an unreadable value)", unparsed.len())
             }
         );
-        report.skip("feedback_vout_mismatch", format!("needs_human: {why}"));
+        report.needs_human("feedback_vout_mismatch", &part.reference, why.clone());
         return Some(json!({"status": "divider_not_recognised", "reason": why}));
     }
     let (rt, r_top) = top[0];
@@ -1031,11 +1292,12 @@ fn feedback(
     });
     let Some((key, vref, slack)) = table else {
         // Cannot be judged without the part's reference; say what it implies.
-        report.skip(
+        report.needs_human(
             "feedback_vout_mismatch",
+            &part.reference,
             format!(
-                "needs_human: {}: reference voltage of '{}' is not in the built-in table; the recorded {} V implies {:.3} V",
-                part.reference, part.value, rail.voltage_v, rail.voltage_v / ratio
+                "reference voltage of '{}' is not in the built-in table; the recorded {} V implies {:.3} V",
+                part.value, rail.voltage_v, rail.voltage_v / ratio
             ),
         );
         out["status"] = json!("reference_unknown");

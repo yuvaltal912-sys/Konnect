@@ -1,7 +1,10 @@
 //! The circuit as the circuit-aware review sees it: parts with their pins, the
 //! net each pin is on, and (optionally) where each part sits on the board.
 //!
-//! One [`Circuit`] is one schematic file. Nets are the per-file net graph's
+//! One [`Circuit`] is one use of one schematic file: a sheet used twice is two
+//! circuits, each with the designators its own `(instances ...)` records give.
+//! Parts marked `dnp` or `on_board no` are not parts of the circuit; they are
+//! listed as unfitted. Nets are the per-file net graph's
 //! (`sch_connectivity`), so a net that continues on another sheet through a
 //! global or hierarchical label is marked `leaves_sheet`: a check that wants
 //! to say "nothing is connected here" must not say it about such a net.
@@ -63,6 +66,9 @@ pub(crate) struct Net {
     pub leaves_sheet: bool,
     /// A power symbol names it.
     pub power_symbol: bool,
+    /// The sheet the net's circuit sits on, as board nets prefix it
+    /// (`/` for the root, `/Power/`); `None` when the hierarchy is unknown.
+    pub sheet_path: Option<String>,
 }
 
 impl Net {
@@ -85,31 +91,124 @@ impl Net {
         !self.is_ground() && (self.power_symbol || self.names.iter().any(|n| looks_like_rail(n)))
     }
 
+    /// Whether `name` (a recorded net name) names this net. A bare name or a
+    /// `/X` matches an alias `X` wherever it sits. A `/A/B/X` is the board's
+    /// spelling of a net local to sheet `/A/B/`: it matches only in a circuit
+    /// on that sheet, never a same-named net on another sheet.
     pub fn matches_name(&self, name: &str) -> bool {
         let want = name.trim_start_matches('/');
-        self.names.iter().any(|n| n.trim_start_matches('/') == want)
+        if self.names.iter().any(|n| n.trim_start_matches('/') == want) {
+            return true;
+        }
+        let Some((dir, local)) = name.strip_prefix('/').and_then(|r| r.rsplit_once('/')) else {
+            return false;
+        };
+        self.sheet_path.as_deref() == Some(format!("/{dir}/").as_str())
+            && self
+                .names
+                .iter()
+                .any(|n| n.trim_start_matches('/') == local)
     }
 }
 
-/// One schematic file.
+/// Where a circuit sits in the hierarchy.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SheetPlace {
+    /// The path KiCad writes in a symbol's `(instances (project (path ...)))`:
+    /// `/<root uuid>` for the root sheet, `/<root uuid>/<sheet uuid>` below it.
+    pub symbol_path: Option<String>,
+    /// The hierarchy walk's chain of sheet UUIDs: `/` or `/<uuid>/<uuid>/`.
+    pub instance_path: Option<String>,
+    /// The sheets' names, the way board nets are prefixed: `/` or `/Power/`.
+    pub name_path: Option<String>,
+}
+
+/// A part left out of the circuit because it is not fitted.
+#[derive(Debug, Clone)]
+pub(crate) struct Unfitted {
+    pub reference: String,
+    pub why: &'static str,
+}
+
+/// What a symbol's own node says besides its pins.
+struct SymbolMeta {
+    dnp: bool,
+    on_board: bool,
+    /// `(instance path, reference)` from `(instances (project (path ...)))`.
+    references: Vec<(String, String)>,
+}
+
+fn symbol_metas(tree: &SexpNode) -> HashMap<String, SymbolMeta> {
+    let root_uuid = tree.find_str("uuid").unwrap_or("");
+    let mut out = HashMap::new();
+    for symbol in tree.find_all("symbol") {
+        let Some(uuid) = symbol.find_str("uuid") else {
+            continue;
+        };
+        let mut references = Vec::new();
+        for project in symbol
+            .find("instances")
+            .map(|i| i.find_all("project"))
+            .unwrap_or_default()
+        {
+            for path in project.find_all("path") {
+                let (Some(instance), Some(reference)) = (
+                    path.get(1).and_then(SexpNode::as_str),
+                    path.find_str("reference"),
+                ) else {
+                    continue;
+                };
+                // An older file writes the root sheet as "/".
+                let full = if instance == "/" && !root_uuid.is_empty() {
+                    format!("/{root_uuid}")
+                } else {
+                    instance.trim_end_matches('/').to_string()
+                };
+                references.push((full, reference.to_string()));
+            }
+        }
+        out.insert(
+            uuid.to_string(),
+            SymbolMeta {
+                // The same reading as pcb_sync.
+                dnp: symbol.find_str("dnp") == Some("yes"),
+                on_board: symbol.find_str("on_board") != Some("no"),
+                references,
+            },
+        );
+    }
+    out
+}
+
+/// One use of one schematic file.
 #[derive(Debug)]
 pub(crate) struct Circuit {
     pub file: PathBuf,
+    pub sheet: SheetPlace,
     pub parts: Vec<Part>,
     pub nets: BTreeMap<String, Net>,
     /// Placed symbols whose library definition did not resolve: their pins
     /// are unknown, so nothing is concluded about them.
     pub unresolved_symbols: usize,
+    /// Parts marked `dnp` or `on_board no`: not in `parts`, so no rule counts
+    /// them and none looks for them on the board.
+    pub unfitted: Vec<Unfitted>,
+    /// Symbols (by their property reference) that have no
+    /// `(instances ...)` record for this circuit's sheet path, so the
+    /// designator used is the property's and may belong to another use of the
+    /// sheet. Empty when the hierarchy is unknown.
+    pub reference_unresolved: Vec<String>,
 }
 
 impl Circuit {
-    pub fn load(file: &Path) -> anyhow::Result<Circuit> {
+    pub fn load_at(file: &Path, place: &SheetPlace) -> anyhow::Result<Circuit> {
         let (_, tree) = read_schematic(file)?;
-        Ok(Self::from_tree(file, &tree))
+        Ok(Self::from_tree(file, &tree, place))
     }
 
-    pub fn from_tree(file: &Path, tree: &SexpNode) -> Circuit {
+    pub fn from_tree(file: &Path, tree: &SexpNode, place: &SheetPlace) -> Circuit {
         let placed = placed_pins_by_reference(tree);
+        let metas = symbol_metas(tree);
         let wires = extract_wires(tree);
         let labels = extract_all_net_labels(tree);
         let mut graph = net_graph_for(tree, &wires, &labels);
@@ -132,14 +231,47 @@ impl Circuit {
         let mut parts: Vec<Part> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut nets: BTreeMap<String, Net> = BTreeMap::new();
+        let mut unfitted: Vec<Unfitted> = Vec::new();
+        let mut reference_unresolved: Vec<String> = Vec::new();
         for (inst, pins) in &placed {
             // Power symbols and flags name nets; they are not parts.
             if inst.reference.starts_with('#') || inst.lib_id.starts_with("power:") {
                 continue;
             }
-            let at = *index.entry(inst.reference.clone()).or_insert_with(|| {
+            let meta = inst.uuid.as_ref().and_then(|u| metas.get(u));
+            // The designator for this use of the sheet: its own instance
+            // record, else the property.
+            let recorded = place.symbol_path.as_ref().and_then(|path| {
+                meta.and_then(|m| {
+                    m.references
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .map(|(_, r)| r.clone())
+                })
+            });
+            let fell_back = place.symbol_path.is_some() && recorded.is_none();
+            let reference = recorded.unwrap_or_else(|| inst.reference.clone());
+            if let Some(m) = meta {
+                let why = if m.dnp {
+                    Some("dnp")
+                } else if !m.on_board {
+                    Some("not_on_board")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    if !unfitted.iter().any(|u| u.reference == reference) {
+                        unfitted.push(Unfitted { reference, why });
+                    }
+                    continue;
+                }
+            }
+            if fell_back && !reference_unresolved.contains(&reference) {
+                reference_unresolved.push(reference.clone());
+            }
+            let at = *index.entry(reference.clone()).or_insert_with(|| {
                 parts.push(Part {
-                    reference: inst.reference.clone(),
+                    reference: reference.clone(),
                     lib_id: inst.lib_id.clone(),
                     value: inst.value.clone(),
                     pins: Vec::new(),
@@ -162,6 +294,7 @@ impl Circuit {
                     pins: Vec::new(),
                     leaves_sheet: leaves.contains_key(&root),
                     power_symbol: symbol_roots.contains_key(&root),
+                    sheet_path: place.name_path.clone(),
                 });
                 let pin_index = parts[at].pins.len();
                 net.pins.push((at, pin_index));
@@ -183,9 +316,12 @@ impl Circuit {
             .count();
         Circuit {
             file: file.to_path_buf(),
+            sheet: place.clone(),
             parts,
             nets,
             unresolved_symbols: total.saturating_sub(resolved),
+            unfitted,
+            reference_unresolved,
         }
     }
 

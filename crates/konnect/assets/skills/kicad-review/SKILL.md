@@ -275,9 +275,12 @@ decoupling, bulk, TVS/ESD, transceiver, termination, gate-driver, sense-amplifie
 crystal and reference-capacitor placement; CAN, RS-485, I2C, UART and USB rules;
 bootstrap and gate-drive return; and the design-intent power tree with regulator
 feedback dividers. Every finding names its checklist item and rule. Report each
-rule's status from the checks list: a rule with no subjects or not run was
-not a pass, and needs-human items are open for the owner. Absences listed under
-`unproven` continue on another sheet. Distances are pad to pad, not routed length.
+rule's status from the checks list: a rule with no subjects, one whose subjects
+all needed a human, or one not run was not a pass, and needs-human items are open
+for the owner. Absences listed under `unproven` continue on another sheet or pass
+a choke. A sheet used twice is audited once per use; uses the audit lists as
+unaudited were not read. Parts marked DNP or off the board are left out and
+listed as unfitted. Distances are pad to pad, not routed length.
 
 ---
 

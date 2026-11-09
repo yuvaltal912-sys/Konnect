@@ -18,10 +18,43 @@ pub(crate) struct P {
     lib: &'static str,
     val: &'static str,
     pins: Vec<PinSpec>,
+    dnp: bool,
+    on_board: bool,
+    /// `(instance path, reference)` records, as a reused sheet's symbols carry.
+    instances: Vec<(&'static str, &'static str)>,
 }
 
 pub(crate) fn p(r: &'static str, lib: &'static str, val: &'static str, pins: Vec<PinSpec>) -> P {
-    P { r, lib, val, pins }
+    P {
+        r,
+        lib,
+        val,
+        pins,
+        dnp: false,
+        on_board: true,
+        instances: Vec::new(),
+    }
+}
+
+impl P {
+    /// Marked do-not-populate.
+    pub(crate) fn dnp(mut self) -> P {
+        self.dnp = true;
+        self
+    }
+
+    /// Marked `on_board no`.
+    pub(crate) fn off_board(mut self) -> P {
+        self.on_board = false;
+        self
+    }
+
+    /// An `(instances (project (path ...)))` record: this symbol is
+    /// `reference` on the sheet at `path`.
+    pub(crate) fn instance(mut self, path: &'static str, reference: &'static str) -> P {
+        self.instances.push((path, reference));
+        self
+    }
 }
 
 /// A part with pins `(number, name, electrical type, net)`.
@@ -92,12 +125,26 @@ pub(crate) fn schematic(parts: &[P]) -> String {
     for (i, part) in parts.iter().enumerate() {
         let x = 20.0 + 30.0 * i as f64;
         let y = 100.0;
+        let instances = if part.instances.is_empty() {
+            String::new()
+        } else {
+            let paths: String = part
+                .instances
+                .iter()
+                .map(|(path, reference)| {
+                    format!("(path \"{path}\" (reference \"{reference}\") (unit 1))")
+                })
+                .collect();
+            format!("    (instances (project \"demo\" {paths}))\n")
+        };
         body.push_str(&format!(
-            "  (symbol (lib_id \"{lib}\") (at {x} {y} 0) (unit 1) (in_bom yes) (on_board yes) (dnp no) (uuid \"{u}\")\n    (property \"Reference\" \"{r}\" (at {x} {y} 0))\n    (property \"Value\" \"{v}\" (at {x} {y} 0))\n    (property \"Footprint\" \"\" (at {x} {y} 0))\n  )\n",
+            "  (symbol (lib_id \"{lib}\") (at {x} {y} 0) (unit 1) (in_bom yes) (on_board {ob}) (dnp {dnp}) (uuid \"{u}\")\n    (property \"Reference\" \"{r}\" (at {x} {y} 0))\n    (property \"Value\" \"{v}\" (at {x} {y} 0))\n    (property \"Footprint\" \"\" (at {x} {y} 0))\n{instances}  )\n",
             lib = part.lib,
             u = next(),
             r = part.r,
             v = part.val,
+            ob = if part.on_board { "yes" } else { "no" },
+            dnp = if part.dnp { "yes" } else { "no" },
         ));
         for (k, (_, _, _, net)) in part.pins.iter().enumerate() {
             let ly = y - 2.54 * k as f64;
@@ -170,13 +217,18 @@ pub(crate) fn fx(parts: &[P], board_text: Option<String>, intent: Option<Value>)
 }
 
 fn run(f: &Fx) -> Value {
-    let result = audit_files(
-        &f.sch,
-        std::slice::from_ref(&f.sch),
-        f.board.as_deref(),
-        vec![],
+    json_of(
+        audit_files(
+            &f.sch,
+            std::slice::from_ref(&f.sch),
+            f.board.as_deref(),
+            vec![],
+        )
+        .unwrap(),
     )
-    .unwrap();
+}
+
+fn json_of(result: crate::mcp::protocol::CallToolResult) -> Value {
     assert!(!result.is_error, "{result:?}");
     match result.content.first() {
         Some(crate::mcp::protocol::ToolContent::Text { text }) => {
@@ -202,6 +254,11 @@ fn check<'a>(v: &'a Value, rule: &str) -> &'a Value {
         .iter()
         .find(|c| c["rule"] == rule)
         .unwrap_or_else(|| panic!("no check {rule}"))
+}
+
+/// How many subjects of `rule` passed (0 when the rule examined nothing).
+fn passed(v: &Value, rule: &str) -> u64 {
+    check(v, rule)["passed"].as_u64().unwrap_or(0)
 }
 
 /// The one finding of `rule`, with the fields every finding must carry.
@@ -378,24 +435,73 @@ fn a_part_missing_from_the_board_is_an_unevaluated_gap_not_a_pass() {
 }
 
 #[test]
-fn a_cap_value_outside_the_families_is_skipped_not_judged() {
-    let parts = vec![mcu("U1", "SIG0"), cap("C1", "4n7", "+3V3", "GND")];
+fn a_cap_value_outside_the_families_is_left_to_a_human_not_judged_and_not_called_empty() {
+    for value in ["4n7", "220n", "4u7"] {
+        let parts = vec![mcu("U1", "SIG0"), cap("C1", value, "+3V3", "GND")];
+        let b = board(
+            &[
+                u1(),
+                fp(
+                    "C1",
+                    50.0,
+                    10.0,
+                    &[("1", 0.0, 0.0, "+3V3"), ("2", 1.0, 0.0, "GND")],
+                ),
+            ],
+            "",
+        );
+        let v = run(&fx(&parts, Some(b), None));
+        assert!(findings(&v, "decoupling_supply_far").is_empty(), "{value}");
+        let c = check(&v, "decoupling_supply_far");
+        assert_eq!(c["needs_human"], 1, "{value}: {c}");
+        assert_eq!(c["status"], "needs_human", "{value}: {c}");
+        assert_eq!(c["passed"], 0);
+        let reason = c["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("nothing in the design"),
+            "a rule whose only subject was met is not empty: {reason}"
+        );
+        assert!(c["needs_human_reasons"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("U1.1:"));
+        // Counted, listed with its subject, and not a gap in the review.
+        assert_eq!(v["coverage"]["needs_human_subjects"], 1);
+        assert_eq!(v["coverage"]["unevaluated_subjects"], 0);
+        assert_eq!(v["status"], "checked");
+        assert!(v["needs_human"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["rule"] == "decoupling_supply_far" && n["subject"] == "U1.1"));
+    }
+}
+
+#[test]
+fn a_rule_whose_only_subjects_were_skipped_says_so_instead_of_claiming_it_was_empty() {
+    // The regulator has no bulk capacitor: skipped (audit_power_rails reports
+    // that), and the rule had something in front of it.
+    let parts = vec![regulator("U2", "+3V3")];
     let b = board(
-        &[
-            u1(),
-            fp(
-                "C1",
-                50.0,
-                10.0,
-                &[("1", 0.0, 0.0, "+3V3"), ("2", 1.0, 0.0, "GND")],
-            ),
-        ],
+        &[fp(
+            "U2",
+            20.0,
+            10.0,
+            &[
+                ("1", 0.0, 0.0, "GND"),
+                ("2", 2.0, 0.0, "+3V3"),
+                ("3", 4.0, 0.0, "+5V"),
+            ],
+        )],
         "",
     );
     let v = run(&fx(&parts, Some(b), None));
-    assert!(findings(&v, "decoupling_supply_far").is_empty());
-    assert_eq!(check(&v, "decoupling_supply_far")["skipped"], 1);
-    assert_eq!(check(&v, "decoupling_supply_far")["status"], "no_subjects");
+    let c = check(&v, "bulk_cap_far");
+    assert_eq!(c["status"], "no_subjects", "{c}");
+    assert!(c["skipped"].as_u64().unwrap() >= 1);
+    let reason = c["reason"].as_str().unwrap();
+    assert!(reason.contains("outside this rule's remit"), "{reason}");
+    assert!(!reason.contains("nothing in the design"), "{reason}");
 }
 
 // ─── Bulk capacitor ──────────────────────────────────────────────────────────
@@ -1610,12 +1716,14 @@ fn an_i2c_rail_whose_voltage_is_unknown_is_skipped_for_a_human_not_failed() {
     let v = run(&fx(&parts, None, None));
     assert!(findings(&v, "i2c_pullup_rail").is_empty());
     let c = check(&v, "i2c_pullup_rail");
-    assert_eq!(c["skipped"], 1, "{c}");
-    assert!(c["skipped_reasons"][0]
+    assert_eq!(c["needs_human"], 1, "{c}");
+    assert_eq!(c["status"], "needs_human", "{c}");
+    assert!(c["needs_human_reasons"][0]
         .as_str()
         .unwrap()
-        .contains("needs_human"));
+        .starts_with("R1:"));
     assert_eq!(v["coverage"]["unevaluated_subjects"], 0);
+    assert_eq!(v["coverage"]["needs_human_subjects"], 1);
 }
 
 pub(crate) fn uart_dev(r: &'static str, tx: &'static str, rx: &'static str) -> P {
@@ -1727,11 +1835,12 @@ fn a_power_line_tvs_on_usb_data_fires_and_an_unknown_part_is_left_to_a_human() {
     ));
     assert!(findings(&unknown, "usb_esd_capacitance").is_empty());
     let c = check(&unknown, "usb_esd_capacitance");
-    assert!(c["skipped"].as_u64().unwrap() >= 1);
-    assert!(c["skipped_reasons"][0]
+    assert!(c["needs_human"].as_u64().unwrap() >= 1, "{c}");
+    assert_eq!(c["status"], "needs_human");
+    assert!(c["needs_human_reasons"][0]
         .as_str()
         .unwrap()
-        .contains("needs_human"));
+        .starts_with("D1:"));
 }
 
 fn usb_intent(z: Option<f64>, pairs: bool) -> Value {
@@ -1767,6 +1876,11 @@ fn the_recorded_usb_impedance_must_be_90_ohm() {
 // ─── Power tree ──────────────────────────────────────────────────────────────
 
 fn buck(top: &'static str, bottom: &'static str) -> Vec<P> {
+    buck_on("+3V3", top, bottom)
+}
+
+/// The buck with its output on net `out`.
+pub(crate) fn buck_on(out: &'static str, top: &'static str, bottom: &'static str) -> Vec<P> {
     vec![
         p(
             "U2",
@@ -1784,14 +1898,14 @@ fn buck(top: &'static str, bottom: &'static str) -> Vec<P> {
             "L1",
             "Device:L",
             "10u",
-            vec![("1", "~", "passive", "SWN"), ("2", "~", "passive", "+3V3")],
+            vec![("1", "~", "passive", "SWN"), ("2", "~", "passive", out)],
         ),
-        res("R1", top, "+3V3", "FB"),
+        res("R1", top, out, "FB"),
         res("R2", bottom, "FB", "GND"),
     ]
 }
 
-fn rails(source: &str, voltage: f64, nets: &[&str]) -> Value {
+pub(crate) fn rails(source: &str, voltage: f64, nets: &[&str]) -> Value {
     json!({"schema_version": 1, "rails": [
         {"name": "3V3", "nets": nets, "voltage_v": voltage, "source_ref": source},
         {"name": "12V", "nets": ["+12V"], "voltage_v": 12.0}
@@ -1842,8 +1956,12 @@ fn a_regulator_whose_reference_is_not_in_the_table_reports_the_implied_reference
     let fb = &v["power_tree"]["rails"][0]["feedback"];
     assert_eq!(fb["status"], "reference_unknown");
     assert!((fb["implied_reference_v"].as_f64().unwrap() - 0.793).abs() < 0.001);
-    assert_eq!(check(&v, "feedback_vout_mismatch")["skipped"], 1);
-    assert_eq!(check(&v, "feedback_vout_mismatch")["passed"], 0);
+    let c = check(&v, "feedback_vout_mismatch");
+    assert_eq!(c["needs_human"], 1, "{c}");
+    assert_eq!(c["status"], "needs_human");
+    assert_eq!(c["passed"], 0);
+    assert_eq!(v["coverage"]["needs_human_subjects"], 1);
+    assert_eq!(v["status"], "checked");
 }
 
 #[test]
@@ -1939,6 +2057,11 @@ fn part_roles_come_from_symbols_and_pin_names() {
     assert_eq!(cc::norm_pin("CAN_H"), "CANH");
     assert!(cc::is_connector("Connector_Generic:Conn_01x02", "J1"));
     assert!(!cc::is_connector("Device:R", "J1"));
+    // A test point lives in the Connector library but is no connector.
+    assert!(!cc::is_connector("Connector:TestPoint", "TP1"));
+    assert!(!cc::is_connector("Connector:TestPoint_Small", "TP2"));
+    assert!(!cc::is_connector("Connector:Conn_01x01", "TP3"));
+    assert!(cc::is_connector("Connector:USB_C_Receptacle_USB2.0", "J1"));
     assert!(cc::is_resistor("Device:R_Small", "R3") && !cc::is_resistor("Device:C", "C1"));
     assert!(cc::is_crystal("Device:Crystal_GND24", "Y1"));
     assert!(!cc::is_crystal("Oscillator:ASE-xxxMHz", "X1"));
@@ -1965,4 +2088,655 @@ fn part_roles_come_from_symbols_and_pin_names() {
     assert_eq!(cc::uart_direction("UART2RXD"), Some(1));
     assert_eq!(cc::uart_direction("TXEN"), None);
     assert_eq!(cc::uart_direction("TXD"), Some(0));
+}
+
+// ─── Review follow-up (2026-11-09) ───────────────────────────────────────────
+
+fn test_point(r: &'static str, net: &'static str) -> P {
+    p(
+        r,
+        "Connector:TestPoint",
+        "TP",
+        vec![("1", "1", "passive", net)],
+    )
+}
+
+#[test]
+fn a_test_point_on_usb_data_is_not_a_connector_the_protection_is_measured_from() {
+    let parts = vec![
+        usb_conn(),
+        usb_esd("USBLC6-2SC6", "Power_Protection:USBLC6-2SC6"),
+        test_point("TP1", "USB_DP"),
+    ];
+    let b = board(
+        &[
+            fp(
+                "J1",
+                5.0,
+                5.0,
+                &[
+                    ("1", 0.0, 0.0, "VBUS"),
+                    ("2", 1.0, 0.0, "USB_DM"),
+                    ("3", 2.0, 0.0, "USB_DP"),
+                    ("4", 3.0, 0.0, "GND"),
+                ],
+            ),
+            fp(
+                "D1",
+                8.0,
+                5.0,
+                &[
+                    ("1", 0.0, 0.0, "USB_DP"),
+                    ("2", 1.0, 0.0, "GND"),
+                    ("3", 2.0, 0.0, "USB_DM"),
+                    ("4", 3.0, 0.0, "USB_DM"),
+                    ("5", 4.0, 0.0, "VBUS"),
+                    ("6", 5.0, 0.0, "USB_DP"),
+                ],
+            ),
+            fp("TP1", 40.0, 5.0, &[("1", 0.0, 0.0, "USB_DP")]),
+        ],
+        "",
+    );
+    let v = run(&fx(&parts, Some(b), None));
+    for rule in [
+        "esd_far_from_connector",
+        "protection_beyond_circuit",
+        "connector_signal_unprotected",
+    ] {
+        assert!(findings(&v, rule).is_empty(), "{rule}: {}", v["findings"]);
+    }
+}
+
+#[test]
+fn a_test_point_on_an_unprotected_signal_is_not_an_unprotected_connector_pin() {
+    let v = run(&fx(
+        &[receiver("SIG"), test_point("TP1", "SIG")],
+        None,
+        None,
+    ));
+    assert!(
+        findings(&v, "connector_signal_unprotected").is_empty(),
+        "{}",
+        v["findings"]
+    );
+}
+
+#[test]
+fn a_test_point_on_a_can_line_does_not_make_the_bus_a_star() {
+    let j1 = p(
+        "J1",
+        "Connector_Generic:Conn_01x03",
+        "Conn",
+        vec![
+            ("1", "H", "passive", "CANH"),
+            ("2", "L", "passive", "CANL"),
+            ("3", "G", "passive", "GND"),
+        ],
+    );
+    let v = run(&fx(
+        &[can_xcvr(), can_conn(), j1, test_point("TP1", "CANH")],
+        None,
+        None,
+    ));
+    assert!(
+        findings(&v, "can_bus_branches").is_empty(),
+        "{}",
+        v["findings"]
+    );
+    assert_eq!(check(&v, "can_bus_branches")["passed"], 1);
+}
+
+// Decoupling: the pin's highest-frequency capacitor is the one judged.
+
+fn cap_fp(r: &str, x: f64) -> String {
+    fp(
+        r,
+        x,
+        10.0,
+        &[("1", 0.0, 0.0, "+3V3"), ("2", 1.0, 0.0, "GND")],
+    )
+}
+
+#[test]
+fn a_near_ten_microfarad_cap_does_not_excuse_a_far_hundred_nanofarad_cap() {
+    let parts = vec![
+        mcu("U1", "SIG0"),
+        cap("C1", "100n", "+3V3", "GND"),
+        cap("C2", "10u", "+3V3", "GND"),
+    ];
+    // C1 is 15 mm from U1.1, C2 8 mm.
+    let b = board(&[u1(), cap_fp("C1", 25.0), cap_fp("C2", 18.0)], "");
+    let v = run(&fx(&parts, Some(b), None));
+    let f = only(&v, "decoupling_supply_far");
+    assert_eq!(f["evidence"]["capacitor"], "C1", "{f}");
+    assert_eq!(f["evidence"]["limit_mm"], 2.5);
+    assert_eq!(f["severity"], "warning");
+    assert_eq!(check(&v, "decoupling_supply_far")["passed"], 0);
+}
+
+#[test]
+fn a_near_hundred_nanofarad_cap_passes_whatever_the_ten_microfarad_cap_does() {
+    let parts = vec![
+        mcu("U1", "SIG0"),
+        cap("C1", "100n", "+3V3", "GND"),
+        cap("C2", "10u", "+3V3", "GND"),
+    ];
+    let b = board(&[u1(), cap_fp("C1", 11.5), cap_fp("C2", 60.0)], "");
+    let v = run(&fx(&parts, Some(b), None));
+    assert!(
+        findings(&v, "decoupling_supply_far").is_empty(),
+        "{}",
+        v["findings"]
+    );
+    assert_eq!(check(&v, "decoupling_supply_far")["passed"], 1);
+}
+
+#[test]
+fn a_pin_with_only_a_ten_microfarad_cap_is_not_a_silent_pass() {
+    let parts = vec![mcu("U1", "SIG0"), cap("C2", "10u", "+3V3", "GND")];
+    let near = run(&fx(
+        &parts,
+        Some(board(&[u1(), cap_fp("C2", 14.0)], "")),
+        None,
+    ));
+    let f = only(&near, "decoupling_supply_far");
+    assert_eq!(f["severity"], "info");
+    assert_eq!(f["evidence"]["no_high_frequency_cap"], true);
+    assert_eq!(f["evidence"]["family_judged"], "10u");
+    assert!(f["issue"].as_str().unwrap().contains("no 100 nF or 1 uF"));
+    assert_eq!(check(&near, "decoupling_supply_far")["passed"], 0);
+
+    let far = run(&fx(
+        &parts,
+        Some(board(&[u1(), cap_fp("C2", 30.0)], "")),
+        None,
+    ));
+    let f = only(&far, "decoupling_supply_far");
+    assert_eq!(f["severity"], "warning");
+    assert_eq!(f["evidence"]["limit_mm"], 10.0);
+    assert!(f["issue"].as_str().unwrap().contains("no 100 nF or 1 uF"));
+}
+
+#[test]
+fn a_hundred_nanofarad_cap_missing_from_the_board_is_not_replaced_by_a_nearer_ten_microfarad_one() {
+    let parts = vec![
+        mcu("U1", "SIG0"),
+        cap("C1", "100n", "+3V3", "GND"),
+        cap("C2", "10u", "+3V3", "GND"),
+    ];
+    // C1 is not on the board; C2 sits beside the pin.
+    let b = board(&[u1(), cap_fp("C2", 11.0)], "");
+    let v = run(&fx(&parts, Some(b), None));
+    let c = check(&v, "decoupling_supply_far");
+    assert_eq!(c["unevaluated"], 1, "{c}");
+    assert_eq!(c["passed"], 0);
+    assert_eq!(v["status"], "partial");
+}
+
+// Unfitted parts.
+
+#[test]
+fn a_dnp_usb_esd_array_does_not_satisfy_the_protection_rule() {
+    let parts = vec![
+        usb_conn(),
+        usb_esd("USBLC6-2SC6", "Power_Protection:USBLC6-2SC6").dnp(),
+    ];
+    let v = run(&fx(&parts, None, None));
+    assert_eq!(
+        findings(&v, "usb_esd_missing").len(),
+        2,
+        "{}",
+        v["findings"]
+    );
+    assert_eq!(check(&v, "usb_esd_missing")["passed"], 0);
+    assert_eq!(v["coverage"]["unfitted_parts"], 1);
+    assert_eq!(v["unfitted_parts"]["count"], 1);
+    assert_eq!(v["unfitted_parts"]["parts"][0]["reference"], "D1");
+    assert_eq!(v["unfitted_parts"]["parts"][0]["why"], "dnp");
+}
+
+#[test]
+fn a_dnp_decoupling_cap_is_not_counted_even_when_it_sits_beside_the_pin() {
+    let parts = vec![mcu("U1", "SIG0"), cap("C1", "100n", "+3V3", "GND").dnp()];
+    let b = board(&[u1(), cap_fp("C1", 11.0)], "");
+    let v = run(&fx(&parts, Some(b), None));
+    let c = check(&v, "decoupling_supply_far");
+    assert_eq!(c["passed"], 0, "{c}");
+    assert_eq!(c["examined"].as_u64().unwrap_or(0), 0);
+    assert_eq!(v["unfitted_parts"]["parts"][0]["reference"], "C1");
+}
+
+#[test]
+fn an_off_board_part_is_not_missing_from_the_board() {
+    let parts = vec![
+        mcu("U1", "SIG0"),
+        cap("C1", "100n", "+3V3", "GND").off_board(),
+    ];
+    let v = run(&fx(&parts, Some(board(&[u1()], "")), None));
+    assert_eq!(check(&v, "decoupling_supply_far")["unevaluated"], 0);
+    assert_eq!(v["coverage"]["unevaluated_subjects"], 0);
+    assert_eq!(v["status"], "checked");
+    assert_eq!(v["unfitted_parts"]["parts"][0]["why"], "not_on_board");
+}
+
+#[test]
+fn an_unfitted_rail_source_is_reported_as_unfitted_not_as_unknown() {
+    let parts = vec![regulator("U5", "+3V3").dnp(), mcu("U1", "SIG0")];
+    let v = run(&fx(&parts, None, Some(rails("U5", 3.3, &["+3V3"]))));
+    let f = only(&v, "rail_source_missing");
+    assert!(f["issue"].as_str().unwrap().contains("not fitted"), "{f}");
+}
+
+// CAN: no pass without the evidence.
+
+#[test]
+fn a_can_transceiver_that_reaches_no_connector_is_not_a_pass() {
+    let v = run(&fx(
+        &[can_xcvr(), res("R1", "120", "CANH", "CANL")],
+        None,
+        None,
+    ));
+    let c = check(&v, "can_bus_branches");
+    assert_eq!(c["passed"], 0, "{c}");
+    assert_eq!(c["unevaluated"], 1);
+    assert_eq!(v["status"], "partial");
+}
+
+fn global_can_xcvr() -> P {
+    p(
+        "U2",
+        "Fixture:CANXCVR",
+        "TCAN",
+        vec![
+            ("1", "CANH", "bidirectional", "g:CANH"),
+            ("2", "CANL", "bidirectional", "g:CANL"),
+            ("3", "VCC", "power_in", "+5V"),
+            ("4", "GND", "power_in", "GND"),
+        ],
+    )
+}
+
+fn global_can_conn(r: &'static str) -> P {
+    p(
+        r,
+        "Connector_Generic:Conn_01x03",
+        "Conn",
+        vec![
+            ("1", "H", "passive", "g:CANH"),
+            ("2", "L", "passive", "g:CANL"),
+            ("3", "G", "passive", "GND"),
+        ],
+    )
+}
+
+#[test]
+fn a_can_bus_that_leaves_the_sheet_is_unproven_not_a_pass() {
+    for parts in [
+        vec![global_can_xcvr()],
+        vec![global_can_xcvr(), global_can_conn("J2")],
+        vec![
+            global_can_xcvr(),
+            global_can_conn("J2"),
+            global_can_conn("J3"),
+        ],
+    ] {
+        let v = run(&fx(&parts, None, None));
+        assert_eq!(passed(&v, "can_bus_branches"), 0);
+        assert!(
+            v["unproven"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u["rule"] == "can_bus_branches"),
+            "{}",
+            v["unproven"]
+        );
+        assert_eq!(v["coverage"]["unevaluated_subjects"], 0);
+    }
+    // A lone transceiver whose bus leaves the sheet: the rule had a subject, so it
+    // must not read as empty.
+    let v = run(&fx(&[global_can_xcvr()], None, None));
+    let reason = check(&v, "can_bus_branches")["reason"].as_str().unwrap();
+    assert!(reason.contains("withheld as unproven"), "{reason}");
+}
+
+#[test]
+fn a_can_bus_behind_a_common_mode_choke_is_unproven_and_names_the_choke() {
+    let choke = p(
+        "FL1",
+        "Filter:Choke_CommonMode_FerriteCore_1234",
+        "CMC",
+        vec![
+            ("1", "1", "passive", "CANH"),
+            ("2", "2", "passive", "BUS_H"),
+            ("3", "3", "passive", "CANL"),
+            ("4", "4", "passive", "BUS_L"),
+        ],
+    );
+    let on_bus = |r: &'static str| {
+        p(
+            r,
+            "Connector_Generic:Conn_01x03",
+            "Conn",
+            vec![
+                ("1", "H", "passive", "BUS_H"),
+                ("2", "L", "passive", "BUS_L"),
+                ("3", "G", "passive", "GND"),
+            ],
+        )
+    };
+    let v = run(&fx(
+        &[can_xcvr(), choke, on_bus("J2"), on_bus("J3"), on_bus("J4")],
+        None,
+        None,
+    ));
+    assert_eq!(passed(&v, "can_bus_branches"), 0);
+    let u = v["unproven"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["rule"] == "can_bus_branches")
+        .expect("unproven");
+    assert!(u["why"].as_str().unwrap().contains("FL1"), "{u}");
+}
+
+// Termination selected by a header or a JP jumper.
+
+#[test]
+fn a_two_pin_header_that_selects_the_termination_is_not_a_bus_branch() {
+    let j1 = p(
+        "J1",
+        "Connector_Generic:Conn_01x03",
+        "Conn",
+        vec![
+            ("1", "H", "passive", "CANH"),
+            ("2", "L", "passive", "CANL"),
+            ("3", "G", "passive", "GND"),
+        ],
+    );
+    let j3 = p(
+        "J3",
+        "Connector_Generic:Conn_01x02",
+        "Conn",
+        vec![("1", "1", "passive", "X"), ("2", "2", "passive", "CANL")],
+    );
+    let v = run(&fx(
+        &[
+            can_xcvr(),
+            can_conn(),
+            j1,
+            res("R1", "120", "CANH", "X"),
+            j3,
+        ],
+        None,
+        None,
+    ));
+    let term = &v["interfaces"][0]["termination"];
+    assert_eq!(term["kind"], "selectable", "{term}");
+    assert_eq!(term["selector"], "J3");
+    assert_eq!(check(&v, "can_termination_value")["passed"], 1);
+    assert!(
+        findings(&v, "can_bus_branches").is_empty(),
+        "{}",
+        v["findings"]
+    );
+    assert_eq!(
+        v["interfaces"][0]["connectors"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn a_jp_reference_jumper_selects_the_termination_whatever_its_symbol() {
+    let jp = p(
+        "JP3",
+        "Fixture:SolderBridge",
+        "SB",
+        vec![("1", "1", "passive", "X"), ("2", "2", "passive", "CANL")],
+    );
+    let v = run(&fx(
+        &[can_xcvr(), can_conn(), res("R1", "120", "CANH", "X"), jp],
+        None,
+        None,
+    ));
+    assert_eq!(v["interfaces"][0]["termination"]["kind"], "selectable");
+    assert_eq!(v["interfaces"][0]["termination"]["selector"], "JP3");
+}
+
+// USB impedance: once per design.
+
+#[test]
+fn the_recorded_usb_impedance_is_judged_once_per_design_not_once_per_sheet() {
+    let f = fx(&[usb_conn()], None, Some(usb_intent(Some(100.0), true)));
+    let child = f.sch.with_file_name("child.kicad_sch");
+    std::fs::write(&child, schematic(&[res("R9", "1k", "X", "Y")])).unwrap();
+    let v = json_of(audit_files(&f.sch, &[f.sch.clone(), child], None, vec![]).unwrap());
+    let all = findings(&v, "usb_pair_impedance");
+    assert_eq!(all.len(), 1, "{}", v["findings"]);
+    assert_eq!(check(&v, "usb_pair_impedance")["examined"], 1);
+    assert!(
+        all[0]["source"].as_str().unwrap().contains("design"),
+        "the source is the design-intent record, not a sheet: {}",
+        all[0]["source"]
+    );
+}
+
+// Power tree: which pin may link a source to its rail.
+
+fn ldo_with_power_good(r: &'static str) -> P {
+    p(
+        r,
+        "Fixture:LDO",
+        "AP2112K-5.0",
+        vec![
+            ("1", "VIN", "power_in", "+12V"),
+            ("2", "GND", "power_in", "GND"),
+            ("3", "VOUT", "power_out", "+5V"),
+            ("4", "PG", "open_collector", "PG5"),
+        ],
+    )
+}
+
+#[test]
+fn a_source_tied_to_the_rail_only_by_a_power_good_pull_up_is_not_on_the_rail() {
+    let parts = vec![
+        ldo_with_power_good("U5"),
+        res("R9", "100k", "PG5", "+3V3"),
+        mcu("U1", "SIG0"),
+    ];
+    let v = run(&fx(&parts, None, Some(rails("U5", 3.3, &["+3V3"]))));
+    assert_eq!(only(&v, "rail_source_not_on_rail")["severity"], "error");
+    assert_eq!(check(&v, "rail_source_not_on_rail")["passed"], 0);
+}
+
+#[test]
+fn a_regulator_pin_that_is_not_a_switch_or_output_does_not_link_to_a_rail_through_a_ferrite() {
+    let parts = vec![
+        ldo_with_power_good("U5"),
+        p(
+            "FB2",
+            "Device:FerriteBead",
+            "BLM",
+            vec![("1", "1", "passive", "PG5"), ("2", "2", "passive", "+3V3")],
+        ),
+        mcu("U1", "SIG0"),
+    ];
+    let v = run(&fx(&parts, None, Some(rails("U5", 3.3, &["+3V3"]))));
+    assert_eq!(only(&v, "rail_source_not_on_rail")["severity"], "error");
+}
+
+#[test]
+fn a_connector_reaches_its_rail_through_a_ferrite_but_not_through_a_resistor() {
+    let feed = |link: P| {
+        vec![
+            p(
+                "J7",
+                "Connector_Generic:Conn_01x02",
+                "Conn",
+                vec![("1", "1", "passive", "RAW"), ("2", "2", "passive", "GND")],
+            ),
+            link,
+            mcu("U1", "SIG0"),
+        ]
+    };
+    let ferrite = p(
+        "FB1",
+        "Device:FerriteBead",
+        "BLM",
+        vec![("1", "1", "passive", "RAW"), ("2", "2", "passive", "+3V3")],
+    );
+    let ok = run(&fx(&feed(ferrite), None, Some(rails("J7", 3.3, &["+3V3"]))));
+    assert_eq!(check(&ok, "rail_source_not_on_rail")["passed"], 1);
+    let bad = run(&fx(
+        &feed(res("R4", "100", "RAW", "+3V3")),
+        None,
+        Some(rails("J7", 3.3, &["+3V3"])),
+    ));
+    assert_eq!(only(&bad, "rail_source_not_on_rail")["severity"], "error");
+}
+
+// What counts as a regulator.
+
+#[test]
+fn a_low_side_gate_driver_is_not_a_regulator() {
+    let part = |lib: &'static str, pins: Vec<PinSpec>| {
+        let part = p("U3", lib, "DRV", pins);
+        crate::tools::circuit_model::Part {
+            reference: part.r.into(),
+            lib_id: part.lib.into(),
+            value: part.val.into(),
+            pins: part
+                .pins
+                .iter()
+                .map(|(num, name, ty, net)| crate::tools::circuit_model::Pin {
+                    number: (*num).into(),
+                    name: (*name).into(),
+                    electrical_type: (*ty).into(),
+                    net: (*net).into(),
+                })
+                .collect(),
+        }
+    };
+    let tc4421 = part(
+        "Driver_FET:TC4421",
+        vec![
+            ("1", "GND", "power_in", "GND"),
+            ("2", "INPUT", "input", "PWM"),
+            ("3", "NC", "no_connect", "N"),
+            ("4", "VDD", "power_in", "+12V"),
+            ("5", "~{OUTPUT}", "output", "GATE"),
+        ],
+    );
+    let fan3122 = part(
+        "Driver_FET:FAN3122xMX",
+        vec![
+            ("1", "EN", "input", "+12V"),
+            ("2", "GND", "power_in", "GND"),
+            ("3", "IN", "input", "PWM"),
+            ("4", "OUT", "output", "GATE"),
+            ("5", "V_{DD}", "power_in", "+12V"),
+        ],
+    );
+    // Same pin names in a library of the owner's own: only the pin types
+    // tell it from a regulator.
+    let homemade = part(
+        "Mine:DRIVER",
+        vec![
+            ("1", "VDD", "power_in", "+12V"),
+            ("2", "IN", "input", "PWM"),
+            ("3", "GND", "power_in", "GND"),
+            ("4", "OUT", "output", "GATE"),
+        ],
+    );
+    // Typed like a regulator, but in a Driver_* library.
+    let by_library = part(
+        "Driver_Motor:DRV8833",
+        vec![
+            ("1", "VIN", "power_in", "+12V"),
+            ("2", "GND", "power_in", "GND"),
+            ("3", "VOUT", "power_out", "MOTOR"),
+        ],
+    );
+    // A switch pin and a supply, but high- and low-side gate outputs.
+    let half_bridge = part(
+        "Fixture:BUCKCONTROLLER",
+        vec![
+            ("1", "VIN", "power_in", "+12V"),
+            ("2", "SW", "output", "SWN"),
+            ("3", "HO", "output", "GH"),
+            ("4", "LO", "output", "GL"),
+            ("5", "GND", "power_in", "GND"),
+        ],
+    );
+    for driver in [&tc4421, &fan3122, &homemade, &by_library, &half_bridge] {
+        assert!(!is_regulator(driver), "{}", driver.lib_id);
+    }
+    let ldo = part(
+        "Mine:LDO",
+        vec![
+            ("1", "VIN", "power_in", "+5V"),
+            ("2", "GND", "power_in", "GND"),
+            ("3", "VOUT", "power_out", "+3V3"),
+        ],
+    );
+    assert!(is_regulator(&ldo));
+}
+
+// Sheet-path-aware rail names.
+
+#[test]
+fn a_sheet_prefixed_net_name_matches_only_on_its_own_sheet() {
+    use crate::tools::circuit_model::Net;
+    let net = |sheet: Option<&str>| Net {
+        key: "VOUT".into(),
+        names: ["VOUT".to_string()].into_iter().collect(),
+        pins: Vec::new(),
+        leaves_sheet: false,
+        power_symbol: false,
+        sheet_path: sheet.map(str::to_string),
+    };
+    let power = net(Some("/Power/"));
+    assert!(power.matches_name("VOUT") && power.matches_name("/VOUT"));
+    assert!(power.matches_name("/Power/VOUT"));
+    assert!(!power.matches_name("/Audio/VOUT"));
+    assert!(!power.matches_name("/Power/Sub/VOUT"));
+    assert!(!net(Some("/")).matches_name("/Power/VOUT"));
+    assert!(!net(None).matches_name("/Power/VOUT"));
+    assert!(net(Some("/Power/Sub/")).matches_name("/Power/Sub/VOUT"));
+}
+
+// The tables and the docs.
+
+#[test]
+fn the_rule_count_the_docs_state_is_the_table_s() {
+    assert_eq!(RULES.len(), 36);
+}
+
+#[test]
+fn a_feedback_pin_named_with_a_slash_is_found() {
+    let pins = vec![("FB/VO".to_string(), "input".to_string())];
+    assert_eq!(
+        component_class::PinNames::new(&pins).find(FEEDBACK_PINS),
+        Some(0)
+    );
+    let pins = vec![("FB/V_{O}".to_string(), "input".to_string())];
+    assert_eq!(
+        component_class::PinNames::new(&pins).find(FEEDBACK_PINS),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_supply_pin_with_no_capacitor_at_all_is_skipped_for_audit_decoupling_not_called_a_human_check()
+{
+    let v = run(&fx(&[mcu("U1", "SIG0")], Some(board(&[u1()], "")), None));
+    let c = check(&v, "decoupling_supply_far");
+    assert_eq!(c["skipped"], 1, "{c}");
+    assert_eq!(c["needs_human"], 0);
+    assert!(c["skipped_reasons"][0]
+        .as_str()
+        .unwrap()
+        .contains("audit_decoupling"));
+    assert_eq!(v["coverage"]["needs_human_subjects"], 0);
 }

@@ -209,7 +209,8 @@ pub(crate) fn is_resistor(lib_id: &str, reference: &str) -> bool {
         || (ref_has_prefix_digit(reference, &["R"]) && !name.starts_with("RV"))
 }
 
-/// An inductor, ferrite bead or common-mode choke in series with a signal.
+/// A two-pin inductor or ferrite bead in series with a signal. A multi-pin
+/// common-mode choke is not one: see [`is_common_mode_choke`].
 pub(crate) fn is_series_inductor(lib_id: &str, reference: &str) -> bool {
     let name = lib_name(lib_id);
     name == "L"
@@ -220,9 +221,38 @@ pub(crate) fn is_series_inductor(lib_id: &str, reference: &str) -> bool {
         || ref_has_prefix_digit(reference, &["L", "FB"])
 }
 
+/// A common-mode choke: a library name that says so, or an `FL`/`CMC` + digit
+/// reference. Its winding pairs cannot be read from the symbol reliably, so
+/// the review stops at one rather than guess which pin continues which.
+pub(crate) fn is_common_mode_choke(lib_id: &str, reference: &str) -> bool {
+    let name = lib_name(lib_id).to_uppercase();
+    name.contains("CHOKE")
+        || name.contains("COMMONMODE")
+        || name.contains("COMMON_MODE")
+        || name.contains("CMC")
+        || ref_has_prefix_digit(reference, &["FL", "CMC"])
+}
+
+/// A jumper or solder bridge: a library name that says jumper, or a `JP` +
+/// digit reference.
+pub(crate) fn is_jumper(lib_id: &str, reference: &str) -> bool {
+    lib_name(lib_id).to_uppercase().contains("JUMPER") || ref_has_prefix_digit(reference, &["JP"])
+}
+
+/// A test point: a `TestPoint*` symbol (KiCad keeps them in the `Connector`
+/// library) or a `TP` + digit reference. It is a probe pad, not a connector.
+pub(crate) fn is_test_point(lib_id: &str, reference: &str) -> bool {
+    lib_name(lib_id).to_uppercase().starts_with("TESTPOINT")
+        || ref_has_prefix_digit(reference, &["TP"])
+}
+
 /// A connector: a `Connector*` library symbol, or `J`/`CN`/`P`/`X` + digit
-/// on a symbol whose library name says connector, header, jack or USB.
+/// on a symbol whose library name says connector, header, jack or USB. Test
+/// points are not connectors.
 pub(crate) fn is_connector(lib_id: &str, reference: &str) -> bool {
+    if is_test_point(lib_id, reference) {
+        return false;
+    }
     let lib_upper = lib_id.to_uppercase();
     if lib_upper.starts_with("CONNECTOR") {
         return true;
@@ -317,18 +347,21 @@ impl<'a> PinNames<'a> {
         }
     }
 
-    /// The first pin whose normalised name is one of `names`.
+    /// The first pin whose normalised name is one of `names`. The candidates
+    /// are normalised too, so `FB/VO` in a list meets a pin named `FB/VO`.
     pub(crate) fn find(&self, names: &[&str]) -> Option<usize> {
+        let wanted: Vec<String> = names.iter().map(|n| norm_pin(n)).collect();
         self.names
             .iter()
-            .find(|(_, n, _)| names.contains(&n.as_str()))
+            .find(|(_, n, _)| wanted.contains(n))
             .map(|(i, _, _)| *i)
     }
 
     pub(crate) fn all(&self, names: &[&str]) -> Vec<usize> {
+        let wanted: Vec<String> = names.iter().map(|n| norm_pin(n)).collect();
         self.names
             .iter()
-            .filter(|(_, n, _)| names.contains(&n.as_str()))
+            .filter(|(_, n, _)| wanted.contains(n))
             .map(|(i, _, _)| *i)
             .collect()
     }

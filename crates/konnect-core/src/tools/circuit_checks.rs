@@ -116,7 +116,7 @@ fn is_mosfet(p: &Part) -> Option<(usize, usize, usize)> {
     looks.then_some((g, d, s))
 }
 
-struct GateDriver {
+pub(super) struct GateDriver {
     high: Option<usize>,
     low: Option<usize>,
     boot: Option<usize>,
@@ -124,7 +124,7 @@ struct GateDriver {
     grounds: Vec<usize>,
 }
 
-fn gate_driver(p: &Part) -> Option<GateDriver> {
+pub(super) fn gate_driver(p: &Part) -> Option<GateDriver> {
     let names = p.pin_names();
     let pins = PinNames::new(&names);
     let high = pins.find(cc::DRIVER_HIGH_OUT);
@@ -327,30 +327,49 @@ fn decoupling(cx: &Cx<'_>, report: &mut Report) {
                 })
                 .collect();
             if family.is_empty() {
-                report.skip(
+                if caps_to_ground(c, &pin.net).is_empty() {
+                    report.skip(
+                        "decoupling_supply_far",
+                        format!(
+                            "{}: no capacitor to ground on {}; audit_decoupling reports missing ones",
+                            pin_label(part, pin),
+                            net.display()
+                        ),
+                    );
+                    continue;
+                }
+                report.needs_human(
                     "decoupling_supply_far",
+                    &pin_label(part, pin),
                     format!(
-                        "{}: no capacitor on {} with a value in score_placement's families (100n, 1u, 10u)",
-                        pin_label(part, pin),
+                        "no capacitor on {} has a value in score_placement's families (100n, 1u, 10u)",
                         net.display()
                     ),
                 );
                 continue;
             }
-            // Distances to every family cap; the nearest decides.
-            let mut best: Option<(&CapAcross, f64, f64)> = None;
+            // The pin's highest-frequency family decides: the smallest value
+            // present (100n, then 1u, then 10u), judged against its own limit.
+            // A nearer cap of a larger family does not stand in for it; 10 uF
+            // caps are bulk() 's concern while a smaller family is present.
+            let limit = family.iter().map(|(_, l)| *l).fold(f64::INFINITY, f64::min);
+            let only_bulk_family = limit >= BULK_CAP_MAX_MM;
+            let mut best: Option<(&CapAcross, f64)> = None;
             let mut failures: Vec<String> = Vec::new();
-            for (cap, limit) in &family {
+            for (cap, cap_limit) in &family {
+                if *cap_limit > limit {
+                    continue;
+                }
                 match pin_dist(board, part, pin, cap.part, cap.on) {
                     Ok(d) => {
-                        if best.is_none_or(|(_, bd, _)| d < bd) {
-                            best = Some((cap, d, *limit));
+                        if best.is_none_or(|(_, bd)| d < bd) {
+                            best = Some((cap, d));
                         }
                     }
                     Err(why) => failures.push(why),
                 }
             }
-            let Some((cap, dist, limit)) = best else {
+            let Some((cap, dist)) = best else {
                 report.unevaluated(
                     "decoupling_supply_far",
                     format!("{}: {}", pin_label(part, pin), failures.join("; ")),
@@ -358,27 +377,47 @@ fn decoupling(cx: &Cx<'_>, report: &mut Report) {
                 continue;
             };
             report.examine("decoupling_supply_far");
-            if dist <= limit {
-                report.pass("decoupling_supply_far");
-            } else {
+            let evidence = json!({
+                "ic": part.reference, "pin": pin.number, "capacitor": cap.part.reference,
+                "value": cap.part.value, "distance_mm": round3(dist), "limit_mm": limit,
+                "metric": "pad_anchor_euclidean_xy", "net": net.display(),
+                "family_judged": if only_bulk_family { "10u" } else if limit <= 2.5 { "100n" } else { "1u" },
+                "no_high_frequency_cap": only_bulk_family,
+            });
+            if dist > limit {
                 report.finding(
                     "decoupling_supply_far",
                     "warning",
                     Some(&part.reference),
                     format!(
-                        "Nearest decoupling capacitor {} ({}) is {:.2} mm from {} pin '{}' (limit {} mm for its value)",
-                        cap.part.reference, cap.part.value, dist, part.reference, pin.name, limit
+                        "Nearest decoupling capacitor {} ({}) is {:.2} mm from {} pin '{}' (limit {} mm for its value){}",
+                        cap.part.reference, cap.part.value, dist, part.reference, pin.name, limit,
+                        if only_bulk_family { "; the pin has no 100 nF or 1 uF capacitor" } else { "" }
                     ),
                     format!(
                         "Move {} beside pin {} of {}; the supply connection should be the shortest on the net",
                         cap.part.reference, pin.number, part.reference
                     ),
-                    json!({
-                        "ic": part.reference, "pin": pin.number, "capacitor": cap.part.reference,
-                        "value": cap.part.value, "distance_mm": round3(dist), "limit_mm": limit,
-                        "metric": "pad_anchor_euclidean_xy", "net": net.display(),
-                    }),
+                    evidence,
                 );
+            } else if only_bulk_family {
+                // Near enough, but only a 10 uF capacitor: not a pass.
+                report.finding(
+                    "decoupling_supply_far",
+                    "info",
+                    Some(&part.reference),
+                    format!(
+                        "{} pin '{}' has only a 10 uF-class capacitor ({}, {:.2} mm) and no 100 nF or 1 uF one, so its high-frequency decoupling was not judged",
+                        part.reference, pin.name, cap.part.reference, dist
+                    ),
+                    format!(
+                        "Add a 100 nF capacitor beside pin {} of {} unless the datasheet asks for bulk capacitance alone",
+                        pin.number, part.reference
+                    ),
+                    evidence,
+                );
+            } else {
+                report.pass("decoupling_supply_far");
             }
 
             // The ground side of the nearest capacitor.
@@ -768,11 +807,43 @@ fn connectors_reached<'a>(c: &'a Circuit, net: &str) -> Vec<(&'a Part, &'a Pin)>
     out
 }
 
+/// Whether any net a bus line reaches through two series parts continues on
+/// another sheet.
+fn bus_leaves(c: &Circuit, a: &str, b: &str) -> bool {
+    [a, b]
+        .iter()
+        .flat_map(|net| series_reach(c, net, 2).into_keys())
+        .any(|key| c.net(&key).is_some_and(|n| n.leaves_sheet))
+}
+
+/// A multi-pin choke or inductor on a net a bus line reaches, if any. A
+/// two-pin walk cannot cross it, so what lies behind it is not seen.
+fn choke_on_bus(c: &Circuit, transceiver: &Part, a: &str, b: &str) -> Option<String> {
+    let mut found: Vec<String> = [a, b]
+        .iter()
+        .flat_map(|net| series_reach(c, net, 2).into_keys())
+        .flat_map(|key| c.on_net(&key))
+        .filter(|(p, _)| {
+            p.reference != transceiver.reference
+                && p.pins.len() >= 3
+                && (cc::is_common_mode_choke(&p.lib_id, &p.reference)
+                    || cc::is_series_inductor(&p.lib_id, &p.reference))
+        })
+        .map(|(p, _)| p.reference.clone())
+        .collect();
+    found.sort();
+    found.dedup();
+    found.into_iter().next()
+}
+
 struct Termination<'a> {
     kind: &'static str,
     resistors: Vec<&'a Part>,
     /// Ohms across the pair, `None` when a value did not parse.
     ohms: Option<f64>,
+    /// The jumper, switch or two-pin header that makes it selectable. It is
+    /// part of the termination, not a connector on the bus.
+    selector: Option<&'a Part>,
 }
 
 /// The termination between two bus nets: a direct resistor, a split pair
@@ -790,6 +861,7 @@ fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> 
             kind: "direct",
             resistors: direct,
             ohms,
+            selector: None,
         });
     }
     // Split: R from a to X and from b to X, X shared.
@@ -816,11 +888,12 @@ fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> 
                     kind: "split",
                     resistors: vec![ra, rb],
                     ohms,
+                    selector: None,
                 });
             }
         }
     }
-    // Selectable: R from a to X, a jumper or switch from X to b.
+    // Selectable: R from a to X, a jumper, switch or two-pin header from X to b.
     for (ra, _) in c
         .on_net(a)
         .into_iter()
@@ -832,12 +905,16 @@ fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> 
         }
         for (sw, _) in c.on_net(x) {
             let lib = sw.lib_id.to_uppercase();
-            let selector = lib.contains("JUMPER") || lib.contains("SW_") || lib.contains("SWITCH");
+            let selector = lib.contains("SW_")
+                || lib.contains("SWITCH")
+                || cc::is_jumper(&sw.lib_id, &sw.reference)
+                || is_conn(sw);
             if selector && sw.is_two_terminal() && c.across(sw, x) == Some(b) {
                 return Some(Termination {
                     kind: "selectable",
                     resistors: vec![ra],
                     ohms: cc::parse_si_value(&ra.value),
+                    selector: Some(sw),
                 });
             }
         }
@@ -854,9 +931,17 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
         } else {
             ("rs485_termination_value", "RS-485")
         };
-        let conns_a = connectors_reached(c, ra);
-        let conns_b = connectors_reached(c, rb);
         let term = termination(c, ra, rb);
+        // A header that selects the termination is not a connector on the bus.
+        let selector = term.as_ref().and_then(|t| t.selector).map(|p| &p.reference);
+        let bus_connectors = |net: &str| -> Vec<(&Part, &Pin)> {
+            connectors_reached(c, net)
+                .into_iter()
+                .filter(|(p, _)| Some(&p.reference) != selector)
+                .collect()
+        };
+        let conns_a = bus_connectors(ra);
+        let conns_b = bus_connectors(rb);
         let mut block = json!({
             "interface": x.kind,
             "transceiver": x.part.reference,
@@ -879,6 +964,7 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                     "kind": t.kind,
                     "resistors": t.resistors.iter().map(|r| json!({"reference": r.reference, "value": r.value})).collect::<Vec<_>>(),
                     "total_ohms": t.ohms,
+                    "selector": t.selector.map(|p| &p.reference),
                 });
                 match t.ohms {
                     None => report.unevaluated(
@@ -923,8 +1009,8 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
         if x.kind == "can" {
             let distinct: BTreeSet<&str> =
                 conns_a.iter().map(|(p, _)| p.reference.as_str()).collect();
-            report.examine("can_bus_branches");
             if distinct.len() > 2 {
+                report.examine("can_bus_branches");
                 report.finding(
                     "can_bus_branches",
                     "warning",
@@ -936,7 +1022,30 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                     "Keep the bus linear (in, node, out) with short stubs; a star needs a different topology".into(),
                     json!({"transceiver": x.part.reference, "connectors": distinct}),
                 );
+            } else if let Some(choke) = choke_on_bus(c, x.part, ra, rb) {
+                report.unproven(
+                    "can_bus_branches",
+                    &x.part.reference,
+                    format!(
+                        "the bus passes through {choke}, a multi-pin choke whose winding pairs are not read, so the connectors behind it were not counted"
+                    ),
+                );
+            } else if bus_leaves(c, ra, rb) {
+                report.unproven(
+                    "can_bus_branches",
+                    &x.part.reference,
+                    "a bus net continues on another sheet, where more connectors may hang".into(),
+                );
+            } else if distinct.is_empty() {
+                report.unevaluated(
+                    "can_bus_branches",
+                    format!(
+                        "{}: no connector is reached from CANH within two series parts, so the bus topology cannot be judged",
+                        x.part.reference
+                    ),
+                );
             } else {
+                report.examine("can_bus_branches");
                 report.pass("can_bus_branches");
             }
         }
@@ -2011,11 +2120,12 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
             for dev in &devices {
                 let supplies = c.supply_nets(dev);
                 if supplies.is_empty() {
-                    report.skip(
+                    report.needs_human(
                         "i2c_pullup_rail",
+                        &dev.reference,
                         format!(
-                            "needs_human: {}: no supply pin found to compare {}'s rail with",
-                            dev.reference, pull.reference
+                            "no supply pin found to compare {}'s rail with",
+                            pull.reference
                         ),
                     );
                     continue;
@@ -2063,9 +2173,10 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
                             report.pass("i2c_pullup_rail");
                         }
                     }
-                    _ => report.skip(
+                    _ => report.needs_human(
                         "i2c_pullup_rail",
-                        format!("needs_human: {} on {} vs {}: the voltage of one rail is neither recorded nor in its name", pull.reference, net_name(c, rail), dev.reference),
+                        &pull.reference,
+                        format!("on {} vs {}: the voltage of one rail is neither recorded nor in its name", net_name(c, rail), dev.reference),
                     ),
                 }
             }
@@ -2229,16 +2340,22 @@ fn usb(cx: &Cx<'_>, report: &mut Report) {
                         json!({"protection": p.reference, "value": p.value, "family": kind.family, "line": line}),
                     );
                 }
-                None => report.skip(
+                None => report.needs_human(
                     "usb_esd_capacitance",
-                    format!("{} ({}): capacitance of this part is not in the table; check its datasheet (needs_human)", p.reference, p.value),
+                    &p.reference,
+                    format!(
+                        "{}: capacitance of this part is not in the table; check its datasheet",
+                        p.value
+                    ),
                 ),
             }
         }
     }
+}
 
-    // The recorded pair impedance.
-    let Some(intent) = cx.intent else { return };
+/// The recorded USB pair impedance. A property of the design-intent record,
+/// not of a sheet, so it is judged once per design.
+pub(super) fn usb_pair_impedance(intent: &DesignIntent, report: &mut Report) {
     for iface in intent
         .interfaces
         .iter()
