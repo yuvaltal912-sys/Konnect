@@ -5,10 +5,15 @@
 //! readable SES with no unrouted connection, no clearance violation and
 //! without stopping at the job budget. Versions are then compared on quality
 //! over the boards that every competing version passed.
+//!
+//! With `--score`, every run is also judged on the real board against its
+//! existing routing (`board_score`), and each config on each DSN is a
+//! candidate, ranked by the gates and then the owner's order of measures.
 
+use super::board_score::{BoardScore, Category, Compared, ScoreContext, Verdict};
 use super::parse::{Json, SesSummary};
 use super::quality::Quality;
-use super::Options;
+use super::{Options, SettingsEvidence};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
@@ -36,6 +41,14 @@ pub struct RunRecord {
     pub quality: Option<Quality>,
     pub quality_error: Option<String>,
     pub error: Option<String>,
+    /// What is known about the settings the run really used.
+    pub settings: Option<SettingsEvidence>,
+    /// The run measured on the real board (`--score`).
+    pub board_score: Option<BoardScore>,
+    /// That score against the baseline's.
+    pub compared: Option<Compared>,
+    /// Why the run could not be scored on the board.
+    pub score_error: Option<String>,
 }
 
 impl RunRecord {
@@ -44,11 +57,49 @@ impl RunRecord {
         self.error.is_none() && self.ses.is_some() && self.unrouted.is_some()
     }
 
+    /// Keep the run's board score, judged against the context's baseline.
+    pub fn judge(&mut self, score: BoardScore, context: &ScoreContext) {
+        self.compared = context.baseline.as_ref().ok().map(|baseline| {
+            super::board_score::compare(
+                &score,
+                baseline,
+                &context.baseline_roles(),
+                &context.spec.thresholds,
+            )
+        });
+        self.board_score = Some(score);
+        self.score_error = None;
+    }
+
+    /// The board score in a few words, for the progress line.
+    fn score_words(&self) -> String {
+        match (&self.compared, &self.score_error) {
+            (Some(compared), _) => {
+                let gates: Vec<String> = compared
+                    .gates
+                    .iter()
+                    .map(|gate| {
+                        let short = gate.name.split(' ').next().unwrap_or(gate.name);
+                        format!("{short} {}", if gate.pass() { "ok" } else { "FAIL" })
+                    })
+                    .collect();
+                format!(
+                    "; board: {}, signals x{}, power x{}",
+                    gates.join(" "),
+                    ratio_cell(compared.signal_ratio),
+                    ratio_cell(compared.power_ratio)
+                )
+            }
+            (None, Some(error)) => format!("; board: not scored ({error})"),
+            (None, None) => String::new(),
+        }
+    }
+
     pub fn one_line(&self) -> String {
         match (&self.error, &self.ses) {
             (Some(error), _) => format!("FAILED ({error}) after {:.1} s", self.runtime_s),
             (None, Some(ses)) => format!(
-                "{} unrouted, {} violations, {} vias, {:.1} mm{}, {:.1} s{}, ses {}",
+                "{} unrouted, {} violations, {} vias, {:.1} mm{}, {:.1} s{}, ses {}{}",
                 self.unrouted
                     .map_or("? (no statistics)".to_string(), |n| n.to_string()),
                 self.clearance_violations
@@ -65,17 +116,22 @@ impl RunRecord {
                 } else {
                     ""
                 },
-                self.ses_fingerprint.as_deref().unwrap_or("-")
+                self.ses_fingerprint.as_deref().unwrap_or("-"),
+                self.score_words()
             ),
             (None, None) => "no result".to_string(),
         }
     }
 }
 
-/// `label`, and `(version)` after it when the two differ and the version is
-/// known.
+/// `label`, and `(version)` after it when the label does not already say it
+/// (a config's label ends in `@<version>`) and the version is known.
 fn display_name(label: &str, version: &str) -> String {
-    if label == version || version == "unknown" {
+    let said = label == version
+        || label
+            .rsplit_once('@')
+            .is_some_and(|(_, jar_label)| jar_label == version);
+    if said || version == "unknown" {
         label.to_string()
     } else {
         format!("{label} ({version})")
@@ -91,6 +147,9 @@ pub struct BoardResult {
     pub dir: String,
     pub version: String,
     pub jar: PathBuf,
+    /// The `--config` these runs used, by name, and its arguments.
+    pub config: Option<String>,
+    pub config_args: Vec<String>,
     pub dsn_connections: Option<usize>,
     pub components: Option<usize>,
     pub signal_layers: Option<usize>,
@@ -408,6 +467,338 @@ pub fn describe(t: &VersionTotals) -> String {
     )
 }
 
+/// One config on one DSN, over all its runs, judged on the real board. A
+/// candidate is only as good as its worst run: the gates must hold in every
+/// run, and each measure is quoted at its worst.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    pub name: String,
+    pub runs: usize,
+    /// Runs with a board score.
+    pub scored: usize,
+    /// Runs that failed on their own account (no SES, unrouted count not
+    /// reported, settings not in effect).
+    pub failed_runs: usize,
+    /// A run that failed, or was not scored: the candidate cannot be chosen.
+    pub incomplete: bool,
+    /// G1 completion, G2 DRC, G3 width: failed in some run.
+    pub failed_gates: [bool; 3],
+    pub acute: Option<f64>,
+    pub signal_ratio: Option<f64>,
+    pub power_ratio: Option<f64>,
+    pub total_ratio: Option<f64>,
+    pub pour_track_mm: Option<f64>,
+    pub right_angles: Option<f64>,
+    pub vias: Option<usize>,
+    pub copper_quality: Option<f64>,
+    pub verdict: Verdict,
+    pub runtime_s: f64,
+}
+
+impl Candidate {
+    pub fn passes(&self) -> bool {
+        !self.incomplete && self.failed_gates == [false; 3]
+    }
+}
+
+fn worst(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    values
+        .collect::<Option<Vec<f64>>>()?
+        .into_iter()
+        .fold(None, |worst: Option<f64>, v| {
+            Some(worst.map_or(v, |w| w.max(v)))
+        })
+}
+
+/// The candidates of a scored run: every entry with a board score in any run.
+pub fn candidates(results: &[BoardResult]) -> Vec<Candidate> {
+    let several_boards = results.iter().any(|r| r.board != results[0].board);
+    results
+        .iter()
+        .filter(|r| {
+            r.runs
+                .iter()
+                .any(|run| run.board_score.is_some() || run.score_error.is_some())
+        })
+        .map(|r| {
+            let scored: Vec<(&BoardScore, &Compared)> = r
+                .runs
+                .iter()
+                .filter_map(|run| Some((run.board_score.as_ref()?, run.compared.as_ref()?)))
+                .collect();
+            let metric = |key: &str| worst(scored.iter().map(|(score, _)| score.audit.metric(key)));
+            let mut failed_gates = [false; 3];
+            for (_, compared) in &scored {
+                for (failed, gate) in failed_gates.iter_mut().zip(&compared.gates) {
+                    *failed |= !gate.pass();
+                }
+            }
+            let verdicts: Vec<Verdict> = scored.iter().map(|(_, c)| c.verdict()).collect();
+            Candidate {
+                name: if several_boards {
+                    format!("{} on {}", r.name(), r.board)
+                } else {
+                    r.name()
+                },
+                runs: r.runs.len(),
+                scored: scored.len(),
+                failed_runs: r.runs.iter().filter(|run| !run.succeeded()).count(),
+                incomplete: scored.len() < r.runs.len() || !r.all_succeeded(),
+                failed_gates,
+                acute: metric("5.3.acute_corners"),
+                signal_ratio: worst(scored.iter().map(|(_, c)| c.signal_ratio)),
+                power_ratio: worst(scored.iter().map(|(_, c)| c.power_ratio)),
+                total_ratio: worst(scored.iter().map(|(_, c)| c.total_ratio)),
+                pour_track_mm: worst(scored.iter().map(|(s, _)| Some(s.length(Category::Pour)))),
+                right_angles: metric("5.3.right_angle_corners"),
+                vias: scored.iter().map(|(s, _)| s.non_pour_vias()).max(),
+                copper_quality: worst(
+                    scored
+                        .iter()
+                        .map(|(s, _)| s.audit.copper_quality.map(|q| -q)),
+                )
+                .map(|q| -q),
+                verdict: [Verdict::Below, Verdict::Matches, Verdict::Beats]
+                    .into_iter()
+                    .find(|v| verdicts.contains(v))
+                    .unwrap_or(Verdict::NotMeasured),
+                runtime_s: r.median_runtime_s(),
+            }
+        })
+        .collect()
+}
+
+/// Best first, in the owner's order: the gates (a candidate with a failed or
+/// unscored run last, then completion before DRC before width), then acute
+/// corners, signal length, power length (both in steps of 1 %, since two runs
+/// of one config differ by about that), right-angle corners, vias off the
+/// pour nets, copper quality (in whole points), runtime.
+pub fn rank_candidates(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let whole = |value: Option<f64>| value.map_or(u64::MAX, |v| v.round().max(0.0) as u64);
+    let step = |ratio: Option<f64>| ratio.map_or(u64::MAX, |r| (r * 100.0).round() as u64);
+    let key = |c: &Candidate| {
+        (
+            (c.incomplete, c.failed_gates),
+            whole(c.acute),
+            step(c.signal_ratio),
+            step(c.power_ratio),
+            whole(c.right_angles),
+            c.vias.unwrap_or(usize::MAX),
+            std::cmp::Reverse(c.copper_quality.map_or(0, |q| q.round().max(0.0) as u64)),
+        )
+    };
+    candidates.sort_by(|a, b| {
+        key(a).cmp(&key(b)).then(
+            a.runtime_s
+                .partial_cmp(&b.runtime_s)
+                .unwrap_or(Ordering::Equal),
+        )
+    });
+    candidates
+}
+
+fn ratio_cell(ratio: Option<f64>) -> String {
+    ratio.map_or("-".to_string(), |r| format!("{r:.3}"))
+}
+
+fn gate_cell(failed: bool) -> &'static str {
+    if failed {
+        "FAIL"
+    } else {
+        "pass"
+    }
+}
+
+pub fn describe_candidate(c: &Candidate) -> String {
+    let gates = if c.passes() {
+        "passes every gate in every run".to_string()
+    } else {
+        let mut why = Vec::new();
+        if c.scored < c.runs {
+            why.push(format!("{} of {} runs scored", c.scored, c.runs));
+        }
+        if c.failed_runs > 0 {
+            why.push(format!("{} of {} runs failed", c.failed_runs, c.runs));
+        }
+        for (failed, name) in c
+            .failed_gates
+            .iter()
+            .zip(["G1 completion", "G2 DRC", "G3 width"])
+        {
+            if *failed {
+                why.push(format!("{name} failed"));
+            }
+        }
+        why.join(", ")
+    };
+    format!(
+        "{}: {gates}; {} acute corners, signals x{}, power x{}, {} right angles, {} vias off the pour nets, copper quality {}, {:.1} s; {} the baseline",
+        c.name,
+        cell(c.acute, |v| format!("{v:.0}")),
+        ratio_cell(c.signal_ratio),
+        ratio_cell(c.power_ratio),
+        cell(c.right_angles, |v| format!("{v:.0}")),
+        cell(c.vias, |v| v.to_string()),
+        cell(c.copper_quality, |v| format!("{v:.1}")),
+        c.runtime_s,
+        c.verdict.word()
+    )
+}
+
+/// The board-score section of the report: the baseline row, every scored
+/// run, the ranking, and why each gate that failed did.
+fn render_board_scores(results: &[BoardResult], context: &ScoreContext) -> String {
+    let mut out = String::new();
+    let t = &context.spec.thresholds;
+    out.push_str(&format!(
+        "\n## Board score\n\n\
+         Every run was put into a copy of the board, refilled and checked by kicad-cli, audited with `audit_layout_quality` (konnect {}), and measured by net category, as was the existing routing (the baseline). Intent currents: {}.\n\n\
+         **Gates** (every run of a candidate must pass all three): G1 completion: 0 unconnected in KiCad and a routed share of 1 in the audit. G2 DRC: no violation type above the baseline's count. G3 width: no track below the narrowest class width, 0 `track_width` violations, each power net (a recorded current, no pour) below its intent width on at most {:.0} % of its length and for no stretch over {} mm, and no more undersized nets or bottlenecks in the audit (4.2, 4.3) than the baseline.\n\n\
+         **Quality** is against the baseline: lengths are ratios over the nets that have track on both boards; pour nets are the nets that own a pour (the current is in the pour, so their track is quoted in mm). Matching bands: signals x{}, power x{}, pour-net track +{} mm, right angles +{}, scores -{}, loops +{:.0} %.\n\n",
+        context.konnect_commit.as_deref().map_or("unknown", |c| &c[..c.len().min(12)]),
+        context.spec.currents,
+        t.below_intent_share * 100.0,
+        t.below_intent_section_mm,
+        t.signal_match,
+        t.power_match,
+        t.pour_track_match_mm,
+        t.right_angle_match,
+        t.score_match,
+        t.loop_match * 100.0,
+    ));
+    out.push_str("| run | G1 | G2 | G3 | signals x | power x | all x | pour-net track mm | vias pour / other | acute | 90° | copper quality | unconnected | against the baseline |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    let row = |name: &str, score: &BoardScore, compared: Option<&Compared>| {
+        let gate = |i: usize| compared.map_or("-", |c| gate_cell(!c.gates[i].pass()));
+        format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {:.1} | {} / {} | {} | {} | {} | {} | {} |\n",
+            name.replace('|', "/"),
+            gate(0),
+            gate(1),
+            gate(2),
+            compared.map_or("1.000".to_string(), |c| ratio_cell(c.signal_ratio)),
+            compared.map_or("1.000".to_string(), |c| ratio_cell(c.power_ratio)),
+            compared.map_or("1.000".to_string(), |c| ratio_cell(c.total_ratio)),
+            score.length(Category::Pour),
+            score.vias[Category::Pour as usize],
+            score.non_pour_vias(),
+            cell(score.audit.metric("5.3.acute_corners"), |v| format!(
+                "{v:.0}"
+            )),
+            cell(score.audit.metric("5.3.right_angle_corners"), |v| format!(
+                "{v:.0}"
+            )),
+            cell(score.audit.copper_quality, |v| format!("{v:.1}")),
+            score.drc.unconnected,
+            compared.map_or("-", |c| c.verdict().word()),
+        )
+    };
+    match &context.baseline {
+        Ok(baseline) => out.push_str(&row("baseline (existing routing)", baseline, None)),
+        Err(error) => out.push_str(&format!("\nThe baseline was not scored: {error}\n\n")),
+    }
+    let several_boards = results.iter().any(|r| r.board != results[0].board);
+    let run_name = |r: &BoardResult, index: usize| {
+        if several_boards {
+            format!("{} on {}, run {}", r.name(), r.board, index + 1)
+        } else {
+            format!("{}, run {}", r.name(), index + 1)
+        }
+    };
+    let mut problems = String::new();
+    for r in results {
+        for (index, run) in r.runs.iter().enumerate() {
+            let name = run_name(r, index);
+            match (&run.board_score, &run.score_error) {
+                (Some(score), _) => out.push_str(&row(&name, score, run.compared.as_ref())),
+                (None, Some(error)) => {
+                    problems.push_str(&format!("- {name}: not scored: {error}\n"))
+                }
+                (None, None) => {}
+            }
+            if let Some(error) = &run.error {
+                problems.push_str(&format!("- {name}: run failed: {error}\n"));
+            }
+            for gate in run.compared.iter().flat_map(|c| &c.gates) {
+                for failure in &gate.failures {
+                    problems.push_str(&format!("- {name}: {}: {failure}\n", gate.name));
+                }
+            }
+        }
+    }
+    let ranked = rank_candidates(candidates(results));
+    out.push_str("\n### Ranking of the candidates\n\nEach config on each DSN is a candidate, quoted at its worst run.\n\n");
+    for (i, candidate) in ranked.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, describe_candidate(candidate)));
+    }
+    match ranked.first() {
+        Some(best) if best.passes() => out.push_str(&format!(
+            "\nChosen: {} (ranked by the gates, then acute corners, signal length and power length in 1 % steps, right angles, vias, copper quality, runtime).\n",
+            best.name
+        )),
+        Some(best) => out.push_str(&format!(
+            "\nNo candidate passes every gate in every run. Nearest: {}.\n",
+            best.name
+        )),
+        None => {}
+    }
+    if !problems.is_empty() {
+        out.push_str("\n### Failed gates and runs\n\n");
+        out.push_str(&problems);
+    }
+    let mut below = String::new();
+    for r in results {
+        for (index, run) in r.runs.iter().enumerate() {
+            let Some(compared) = &run.compared else {
+                continue;
+            };
+            let listed: Vec<String> = compared
+                .bands
+                .iter()
+                .filter(|band| band.verdict == Verdict::Below)
+                .map(|band| {
+                    format!(
+                        "{} {} (baseline {})",
+                        band.measure,
+                        cell(band.value, |v| format!("{v:.3}")),
+                        cell(band.baseline, |v| format!("{v:.3}"))
+                    )
+                })
+                .collect();
+            if !listed.is_empty() {
+                below.push_str(&format!(
+                    "- {}: {}\n",
+                    run_name(r, index),
+                    listed.join("; ")
+                ));
+            }
+        }
+    }
+    if !below.is_empty() {
+        out.push_str("\n### Measures below the baseline\n\n");
+        out.push_str(&below);
+    }
+    let unsure: Vec<String> = results
+        .iter()
+        .flat_map(|r| r.runs.iter().enumerate().map(move |(i, run)| (r, i, run)))
+        .filter_map(|(r, i, run)| {
+            let settings = run.settings.as_ref()?;
+            (!settings.unconfirmed.is_empty()).then(|| {
+                format!(
+                    "- {}: {}\n",
+                    run_name(r, i),
+                    settings.unconfirmed.join(", ")
+                )
+            })
+        })
+        .collect();
+    if !unsure.is_empty() {
+        out.push_str("\n### Settings Freerouting did not save back\n\nGiven on the command line and not refused, but absent from the `freerouting.json` the run wrote, so not confirmed.\n\n");
+        out.push_str(&unsure.concat());
+    }
+    out
+}
+
 fn yes_no(value: Option<bool>) -> &'static str {
     match value {
         Some(true) => "yes",
@@ -420,7 +811,12 @@ fn cell<T>(value: Option<T>, f: impl FnOnce(T) -> String) -> String {
     value.map_or("-".to_string(), f)
 }
 
-pub fn render_markdown(results: &[BoardResult], options: &Options, java: Option<&str>) -> String {
+pub fn render_markdown(
+    results: &[BoardResult],
+    options: &Options,
+    java: Option<&str>,
+    context: Option<&ScoreContext>,
+) -> String {
     let mut out = String::new();
     out.push_str("# Freerouting benchmark\n\n");
     out.push_str(&format!(
@@ -480,6 +876,9 @@ pub fn render_markdown(results: &[BoardResult], options: &Options, java: Option<
             best.name()
         ));
     }
+    if let Some(context) = context {
+        out.push_str(&render_board_scores(results, context));
+    }
     out
 }
 
@@ -532,7 +931,165 @@ fn quality_json(q: &Quality) -> Json {
     ])
 }
 
-pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&str>) -> Json {
+fn texts(values: &[String]) -> Json {
+    Json::Array(values.iter().cloned().map(Json::Text).collect())
+}
+
+fn settings_json(settings: &SettingsEvidence) -> Json {
+    Json::Object(vec![
+        ("failures".into(), texts(&settings.failures)),
+        ("differing".into(), texts(&settings.differing)),
+        ("unconfirmed".into(), texts(&settings.unconfirmed)),
+        (
+            "saved".into(),
+            Json::Object(
+                settings
+                    .saved
+                    .iter()
+                    .map(|(path, value)| (path.clone(), Json::Text(value.clone())))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// A board score as numbers. Per-net lengths stay out: `--rescore` reads them
+/// again from the run's `score/` files.
+fn score_json(score: &BoardScore) -> Json {
+    let by_category = |values: [f64; 3]| {
+        Json::Object(vec![
+            ("pour".into(), number(values[Category::Pour as usize])),
+            ("power".into(), number(values[Category::Power as usize])),
+            ("signal".into(), number(values[Category::Signal as usize])),
+        ])
+    };
+    let numbers = |map: &std::collections::BTreeMap<String, f64>| {
+        Json::Object(map.iter().map(|(k, v)| (k.clone(), number(*v))).collect())
+    };
+    Json::Object(vec![
+        ("placement".into(), Json::Text(score.placement.clone())),
+        ("segments".into(), count(score.segments)),
+        ("length_mm".into(), by_category(score.length_mm)),
+        ("total_mm".into(), number(score.total_mm())),
+        ("vias".into(), by_category(score.vias.map(|v| v as f64))),
+        (
+            "below_base_segments".into(),
+            count(score.below_base_segments),
+        ),
+        (
+            "widths".into(),
+            Json::Array(
+                score
+                    .widths
+                    .iter()
+                    .map(|w| {
+                        Json::Object(vec![
+                            ("net".into(), Json::Text(w.net.clone())),
+                            ("intent_mm".into(), number(w.intent_mm)),
+                            ("length_mm".into(), number(w.length_mm)),
+                            ("below_mm".into(), number(w.below_mm)),
+                            ("below_share".into(), number(w.below_share())),
+                            ("longest_below_mm".into(), number(w.longest_below_mm)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "drc".into(),
+            Json::Object(
+                score
+                    .drc
+                    .by_type
+                    .iter()
+                    .map(|(kind, n)| (kind.clone(), count(*n)))
+                    .collect(),
+            ),
+        ),
+        ("unconnected".into(), count(score.drc.unconnected)),
+        (
+            "audit".into(),
+            Json::Object(vec![
+                (
+                    "copper_quality".into(),
+                    optional(score.audit.copper_quality, number),
+                ),
+                ("score".into(), optional(score.audit.score, number)),
+                (
+                    "routed_share".into(),
+                    optional(score.audit.routed_share, number),
+                ),
+                (
+                    "complete".into(),
+                    optional(score.audit.complete, Json::Bool),
+                ),
+                ("categories".into(), numbers(&score.audit.categories)),
+                ("metrics".into(), numbers(&score.audit.metrics)),
+            ]),
+        ),
+    ])
+}
+
+fn compared_json(compared: &Compared) -> Json {
+    Json::Object(vec![
+        ("passes".into(), Json::Bool(compared.passes())),
+        (
+            "gates".into(),
+            Json::Array(
+                compared
+                    .gates
+                    .iter()
+                    .map(|gate| {
+                        Json::Object(vec![
+                            ("gate".into(), Json::Text(gate.name.to_string())),
+                            ("pass".into(), Json::Bool(gate.pass())),
+                            ("failures".into(), texts(&gate.failures)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "signal_ratio".into(),
+            optional(compared.signal_ratio, number),
+        ),
+        ("signal_nets".into(), count(compared.signal_nets)),
+        ("power_ratio".into(), optional(compared.power_ratio, number)),
+        ("power_nets".into(), count(compared.power_nets)),
+        ("total_ratio".into(), optional(compared.total_ratio, number)),
+        (
+            "against_baseline".into(),
+            Json::Text(compared.verdict().word().to_string()),
+        ),
+        (
+            "bands".into(),
+            Json::Array(
+                compared
+                    .bands
+                    .iter()
+                    .map(|band| {
+                        Json::Object(vec![
+                            ("measure".into(), Json::Text(band.measure.clone())),
+                            ("value".into(), optional(band.value, number)),
+                            ("baseline".into(), optional(band.baseline, number)),
+                            (
+                                "verdict".into(),
+                                Json::Text(band.verdict.word().to_string()),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+pub fn results_json(
+    results: &[BoardResult],
+    options: &Options,
+    java: Option<&str>,
+    context: Option<&ScoreContext>,
+) -> Json {
     let runs = |r: &BoardResult| {
         Json::Array(
             r.runs
@@ -594,12 +1151,65 @@ pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&st
                             optional(run.quality_error.clone(), Json::Text),
                         ),
                         ("error".into(), optional(run.error.clone(), Json::Text)),
+                        (
+                            "settings".into(),
+                            optional(run.settings.as_ref(), settings_json),
+                        ),
+                        (
+                            "board_score".into(),
+                            optional(run.board_score.as_ref(), score_json),
+                        ),
+                        (
+                            "compared".into(),
+                            optional(run.compared.as_ref(), compared_json),
+                        ),
+                        (
+                            "score_error".into(),
+                            optional(run.score_error.clone(), Json::Text),
+                        ),
                     ])
                 })
                 .collect(),
         )
     };
     let ranked = rank(totals(results));
+    let ranked_candidates = rank_candidates(candidates(results));
+    let score = context.map(|context| {
+        Json::Object(vec![
+            ("currents".into(), Json::Text(context.spec.currents.clone())),
+            ("thresholds".into(), context.spec.thresholds.to_json()),
+            (
+                "konnect_commit".into(),
+                optional(context.konnect_commit.clone(), Json::Text),
+            ),
+            (
+                "baseline".into(),
+                match &context.baseline {
+                    Ok(baseline) => score_json(baseline),
+                    Err(error) => Json::Object(vec![("error".into(), Json::Text(error.clone()))]),
+                },
+            ),
+            (
+                "ranking".into(),
+                Json::Array(
+                    ranked_candidates
+                        .iter()
+                        .map(|c| Json::Text(describe_candidate(c)))
+                        .collect(),
+                ),
+            ),
+            (
+                "chosen".into(),
+                optional(
+                    ranked_candidates
+                        .first()
+                        .filter(|c| c.passes())
+                        .map(|c| c.name.clone()),
+                    Json::Text,
+                ),
+            ),
+        ])
+    });
     Json::Object(vec![
         (
             "java".into(),
@@ -613,6 +1223,15 @@ pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&st
             number(options.job_timeout.as_secs() as f64),
         ),
         ("timeout_s".into(), number(options.timeout.as_secs() as f64)),
+        ("fr_args".into(), texts(&options.extra_args)),
+        (
+            "score_spec".into(),
+            optional(
+                context.map(|c| c.spec.source.display().to_string()),
+                Json::Text,
+            ),
+        ),
+        ("score".into(), optional(score, |score| score)),
         (
             "boards".into(),
             Json::Array(
@@ -624,6 +1243,8 @@ pub fn results_json(results: &[BoardResult], options: &Options, java: Option<&st
                             ("dir".into(), Json::Text(r.dir.clone())),
                             ("version".into(), Json::Text(r.version.clone())),
                             ("jar".into(), Json::Text(r.jar.display().to_string())),
+                            ("config".into(), optional(r.config.clone(), Json::Text)),
+                            ("config_args".into(), texts(&r.config_args)),
                             ("components".into(), optional(r.components, count)),
                             ("signal_layers".into(), optional(r.signal_layers, count)),
                             ("dsn_connections".into(), optional(r.dsn_connections, count)),
@@ -774,6 +1395,8 @@ mod tests {
             dir: version.into(),
             version: version.into(),
             jar: PathBuf::from(format!("/j/freerouting-{version}.jar")),
+            config: None,
+            config_args: Vec::new(),
             dsn_connections: Some(10),
             components: Some(40),
             signal_layers: Some(2),
@@ -845,6 +1468,9 @@ mod tests {
         assert_eq!(display_name("2.5.0", "2.5.0"), "2.5.0");
         assert_eq!(display_name("2.5.0-2", "2.5.0"), "2.5.0-2 (2.5.0)");
         assert_eq!(display_name("unknown-2", "unknown"), "unknown-2");
+        // A config's label carries the JAR's label after the `@`.
+        assert_eq!(display_name("S0@2.5.0", "2.5.0"), "S0@2.5.0");
+        assert_eq!(display_name("S0@2.5.0-2", "2.5.0"), "S0@2.5.0-2 (2.5.0)");
     }
 
     #[test]
@@ -867,9 +1493,9 @@ mod tests {
         assert!(rows.iter().all(|t| t.boards == 1 && t.version == "2.5.0"));
         let names: Vec<String> = rows.iter().map(VersionTotals::name).collect();
         assert_eq!(names, ["2.5.0", "2.5.0-2 (2.5.0)"]);
-        let markdown = render_markdown(&results, &options(), None);
+        let markdown = render_markdown(&results, &options(), None, None);
         assert!(markdown.contains("| 2.5.0-2 (2.5.0) |"), "{markdown}");
-        let text = to_json(&results_json(&results, &options(), None));
+        let text = to_json(&results_json(&results, &options(), None, None));
         let (parsed, _) = parse_json_prefix(&text).unwrap();
         let Some(Json::Array(boards)) = parsed.at("boards") else {
             panic!("boards")
@@ -1038,7 +1664,7 @@ mod tests {
             ),
             board("demo|1", "2.1.0", vec![failed(), failed()]),
         ];
-        let markdown = render_markdown(&results, &options(), Some("25.0.5"));
+        let markdown = render_markdown(&results, &options(), Some("25.0.5"), None);
         assert!(
             markdown.contains("| demo/1 | 40 | 2 | 2.5.0 | pass | 1.250 | 1.250 | 12.5 | 2 | 1.00 | 0 | 0 | 0 | 4 | 0 | 3.0 | yes |"),
             "{markdown}"
@@ -1055,7 +1681,7 @@ mod tests {
         );
         assert!(!markdown.contains("-0.0"), "{markdown}");
 
-        let text = to_json(&results_json(&results, &options(), Some("25.0.5")));
+        let text = to_json(&results_json(&results, &options(), Some("25.0.5"), None));
         let (parsed, used) = parse_json_prefix(&text).expect("valid JSON");
         assert_eq!(text[used..].trim(), "");
         assert_eq!(parsed.text_at("recommended"), Some("2.5.0"));
@@ -1072,6 +1698,314 @@ mod tests {
         assert_eq!(runs[0].number_at("quality.wire_ratio"), Some(1.25));
         assert_eq!(runs[0].number_at("quality.vias"), Some(2.0));
         assert!(statistics_block(&format!("log line\n{text}")).is_some());
+    }
+
+    fn candidate(name: &str) -> Candidate {
+        Candidate {
+            name: name.into(),
+            runs: 2,
+            scored: 2,
+            failed_runs: 0,
+            incomplete: false,
+            failed_gates: [false; 3],
+            acute: Some(0.0),
+            signal_ratio: Some(1.05),
+            power_ratio: Some(1.05),
+            total_ratio: Some(1.05),
+            pour_track_mm: Some(80.0),
+            right_angles: Some(10.0),
+            vias: Some(100),
+            copper_quality: Some(60.0),
+            verdict: Verdict::Below,
+            runtime_s: 100.0,
+        }
+    }
+
+    fn order(candidates: Vec<Candidate>) -> Vec<String> {
+        rank_candidates(candidates)
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+
+    #[test]
+    fn candidates_rank_by_the_gates_then_the_owners_order_of_measures() {
+        let with = |name: &str, edit: &dyn Fn(&mut Candidate)| {
+            let mut c = candidate(name);
+            edit(&mut c);
+            c
+        };
+        // Each line: the first beats the second on one measure although the
+        // second is better on every measure after it.
+        let better_later = |c: &mut Candidate| {
+            c.signal_ratio = Some(1.0);
+            c.power_ratio = Some(1.0);
+            c.right_angles = Some(0.0);
+            c.vias = Some(1);
+            c.copper_quality = Some(99.0);
+            c.runtime_s = 1.0;
+        };
+        // A failed gate loses to any pass, whatever the quality.
+        let failed = with("fails G3", &|c| {
+            better_later(c);
+            c.acute = Some(0.0);
+            c.failed_gates = [false, false, true];
+        });
+        assert_eq!(
+            order(vec![failed.clone(), candidate("passes")]),
+            ["passes", "fails G3"]
+        );
+        // Completion is worse to fail than DRC, and DRC worse than width.
+        let g1 = with("fails G1", &|c| c.failed_gates = [true, false, false]);
+        let g2 = with("fails G2", &|c| c.failed_gates = [false, true, false]);
+        assert_eq!(
+            order(vec![g1.clone(), failed.clone(), g2.clone()]),
+            ["fails G3", "fails G2", "fails G1"]
+        );
+        // A run that failed or was not scored is last of all.
+        let unscored = with("unscored", &|c| {
+            better_later(c);
+            c.incomplete = true;
+        });
+        assert_eq!(order(vec![unscored, g1.clone()]), ["fails G1", "unscored"]);
+        // Then acute corners.
+        let acute = with("one acute", &|c| {
+            better_later(c);
+            c.acute = Some(1.0);
+        });
+        assert_eq!(order(vec![acute, candidate("none")]), ["none", "one acute"]);
+        // Then signal length, in steps of 1 %.
+        let longer = with("signals 1.07", &|c| {
+            c.signal_ratio = Some(1.07);
+            c.power_ratio = Some(1.0);
+            c.right_angles = Some(0.0);
+        });
+        assert_eq!(
+            order(vec![longer, candidate("signals 1.05")]),
+            ["signals 1.05", "signals 1.07"]
+        );
+        // Less than a step is no difference: the next measure decides.
+        let a_hair = with("signals 1.054", &|c| {
+            c.signal_ratio = Some(1.054);
+            c.power_ratio = Some(1.02);
+        });
+        assert_eq!(
+            order(vec![candidate("signals 1.05"), a_hair]),
+            ["signals 1.054", "signals 1.05"]
+        );
+        // Then power length, right angles, vias, copper quality, runtime.
+        for (name, worse) in [
+            (
+                "power",
+                &(|c: &mut Candidate| {
+                    c.power_ratio = Some(1.08);
+                    c.right_angles = Some(0.0);
+                }) as &dyn Fn(&mut Candidate),
+            ),
+            ("right angles", &|c| {
+                c.right_angles = Some(11.0);
+                c.vias = Some(1);
+            }),
+            ("vias", &|c| {
+                c.vias = Some(101);
+                c.copper_quality = Some(99.0);
+            }),
+            ("quality", &|c| {
+                c.copper_quality = Some(58.0);
+                c.runtime_s = 1.0;
+            }),
+            ("runtime", &|c| c.runtime_s = 101.0),
+        ] {
+            assert_eq!(
+                order(vec![with(name, worse), candidate("reference")]),
+                ["reference", name],
+                "{name}"
+            );
+        }
+        // A measure that is missing is never the better one.
+        let unmeasured = with("no signal ratio", &|c| c.signal_ratio = None);
+        assert_eq!(
+            order(vec![unmeasured, candidate("measured")]),
+            ["measured", "no signal ratio"]
+        );
+    }
+
+    fn scored(signal_mm: f64, acute: f64, quality: f64) -> BoardScore {
+        use super::super::board_score::Audit;
+        BoardScore {
+            placement: "same".into(),
+            pour_nets: ["GND".to_string()].into(),
+            segments: 3,
+            length_mm: [8.0, 20.0, signal_mm],
+            vias: [2, 1, 2],
+            net_length_mm: [("GND", 8.0), ("+5V", 20.0), ("SIG", signal_mm)]
+                .map(|(net, mm)| (net.to_string(), mm))
+                .into(),
+            audit: Audit {
+                copper_quality: Some(quality),
+                score: Some(quality),
+                routed_share: Some(1.0),
+                complete: Some(true),
+                categories: [("routing".to_string(), quality)].into(),
+                metrics: [
+                    ("5.3.acute_corners", acute),
+                    ("5.3.right_angle_corners", 3.0),
+                    ("4.2.nets_undersized", 0.0),
+                    ("4.3.narrow_paths", 0.0),
+                    ("3.3.floating_ground_islands", 0.0),
+                ]
+                .map(|(key, value)| (key.to_string(), value))
+                .into(),
+            },
+            ..BoardScore::default()
+        }
+    }
+
+    fn judged(context: &ScoreContext, score: BoardScore) -> RunRecord {
+        let mut record = run(0, 2, 11.0, 30.0, "x");
+        record.judge(score, context);
+        record
+    }
+
+    #[test]
+    fn a_candidate_is_only_as_good_as_its_worst_run() {
+        let context = ScoreContext::for_tests(scored(30.0, 0.0, 60.0), &["GND", "+5V"]);
+        let mut entry = board(
+            "V1",
+            "S2@2.5.0",
+            vec![
+                judged(&context, scored(30.0, 0.0, 62.0)),
+                judged(&context, scored(33.0, 2.0, 59.0)),
+            ],
+        );
+        entry.config = Some("S2".into());
+        let c = &candidates(std::slice::from_ref(&entry))[0];
+        assert_eq!(c.name, "S2@2.5.0");
+        assert_eq!((c.runs, c.scored, c.incomplete), (2, 2, false));
+        assert_eq!(c.failed_gates, [false; 3]);
+        // The longer run, the run with more acute corners, the lower score.
+        assert!((c.signal_ratio.unwrap() - 1.1).abs() < 1e-9);
+        assert_eq!(c.acute, Some(2.0));
+        assert_eq!(c.copper_quality, Some(59.0));
+        assert_eq!(c.verdict, Verdict::Below);
+        assert!(c.passes());
+        // One run failing a gate fails the candidate.
+        let mut open = scored(30.0, 0.0, 60.0);
+        open.drc.unconnected = 1;
+        entry.runs[0] = judged(&context, open);
+        let c = &candidates(std::slice::from_ref(&entry))[0];
+        assert_eq!(c.failed_gates, [true, false, false]);
+        assert!(!c.passes());
+        // A run that could not be scored leaves the candidate incomplete.
+        entry.runs[0] = run(0, 2, 11.0, 30.0, "x");
+        entry.runs[0].score_error = Some("kicad-cli refill and DRC: exit Some(1)".into());
+        let c = &candidates(std::slice::from_ref(&entry))[0];
+        assert_eq!((c.scored, c.incomplete), (1, true));
+        assert!(!c.passes());
+        // So does a run whose settings were not in effect, scored or not.
+        entry.runs[0] = judged(&context, scored(30.0, 0.0, 60.0));
+        entry.runs[0].error = Some("settings not in effect: x".into());
+        assert!(candidates(std::slice::from_ref(&entry))[0].incomplete);
+        // Entries of a bench that scored nothing are not candidates.
+        assert!(candidates(&[board("V1", "v", vec![run(0, 1, 11.0, 1.0, "x")])]).is_empty());
+    }
+
+    #[test]
+    fn the_board_score_is_in_the_report_and_in_its_json() {
+        let context = ScoreContext::for_tests(scored(30.0, 0.0, 60.0), &["GND", "+5V"]);
+        let mut good = board(
+            "V1",
+            "S2@2.5.0",
+            vec![
+                judged(&context, scored(30.3, 0.0, 61.0)),
+                judged(&context, scored(30.6, 0.0, 61.0)),
+            ],
+        );
+        good.config = Some("S2".into());
+        good.config_args = vec!["--router.fanout.enabled=false".into()];
+        good.runs[0].settings = Some(SettingsEvidence {
+            unconfirmed: vec!["router.scoring.via_costs=25".into()],
+            ..SettingsEvidence::default()
+        });
+        let mut open = scored(29.0, 3.0, 61.0);
+        open.drc.unconnected = 4;
+        let bad = board("V0", "S0@2.5.0", vec![judged(&context, open)]);
+        let results = vec![bad, good];
+        let markdown = render_markdown(&results, &options(), None, Some(&context));
+        assert!(markdown.contains("## Board score"), "{markdown}");
+        assert!(
+            markdown.contains("Intent currents: test values."),
+            "{markdown}"
+        );
+        assert!(markdown.contains("| baseline (existing routing) | - | - | - | 1.000 | 1.000 | 1.000 | 8.0 | 2 / 3 | 0 | 3 | 60.0 | 0 | - |"), "{markdown}");
+        assert!(
+            markdown.contains("| S2@2.5.0 on V1, run 2 | pass | pass | pass | 1.020 |"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("| S0@2.5.0 on V0, run 1 | FAIL | pass | pass | 0.967 |"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("\n1. S2@2.5.0 on V1: passes every gate in every run;"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("\n2. S0@2.5.0 on V0: G1 completion failed;"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("\nChosen: S2@2.5.0 on V1 "), "{markdown}");
+        assert!(
+            markdown.contains("- S0@2.5.0 on V0, run 1: G1 completion: 4 unconnected (KiCad)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- S0@2.5.0 on V0, run 1: acute corners 3.000 (baseline 0.000)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- S2@2.5.0 on V1, run 1: router.scoring.via_costs=25"),
+            "{markdown}"
+        );
+        // Without a context there is no such section.
+        assert!(!render_markdown(&results, &options(), None, None).contains("Board score"));
+
+        let text = to_json(&results_json(&results, &options(), None, Some(&context)));
+        let (json, _) = parse_json_prefix(&text).unwrap();
+        assert_eq!(json.text_at("score_spec"), Some("/work/spec.json"));
+        assert_eq!(json.text_at("score.currents"), Some("test values"));
+        assert_eq!(json.text_at("score.chosen"), Some("S2@2.5.0 on V1"));
+        assert_eq!(json.number_at("score.thresholds.signal_match"), Some(1.03));
+        assert_eq!(
+            json.number_at("score.baseline.length_mm.signal"),
+            Some(30.0)
+        );
+        let Some(Json::Array(boards)) = json.at("boards") else {
+            panic!("boards in {text}")
+        };
+        assert_eq!(boards[1].text_at("config"), Some("S2"));
+        let Some(Json::Array(runs)) = boards[1].at("runs") else {
+            panic!("runs in {text}")
+        };
+        assert_eq!(runs[1].number_at("board_score.total_mm"), Some(58.6));
+        assert!((runs[1].number_at("compared.signal_ratio").unwrap() - 1.02).abs() < 1e-9);
+        assert_eq!(
+            runs[1].text_at("compared.against_baseline"),
+            Some("matches")
+        );
+        assert!(
+            matches!(runs[0].at("settings.unconfirmed"), Some(Json::Array(list)) if list.len() == 1)
+        );
+        // No candidate passing means none is chosen.
+        let only_bad = &results[..1];
+        let markdown = render_markdown(only_bad, &options(), None, Some(&context));
+        assert!(
+            markdown.contains("No candidate passes every gate in every run. Nearest: S0@2.5.0."),
+            "{markdown}"
+        );
+        let text = to_json(&results_json(only_bad, &options(), None, Some(&context)));
+        let (json, _) = parse_json_prefix(&text).unwrap();
+        assert_eq!(json.at("score.chosen"), Some(&Json::Null));
     }
 
     #[test]
