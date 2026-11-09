@@ -885,6 +885,21 @@ fn parse_network(node: &SexpNode, resolution: f64, manifest: &Manifest) -> Resul
             .cloned()
             .unwrap_or_default();
         let nets: BTreeSet<&str> = narrow.iter().map(|n| n.0.as_str()).collect();
+        // Freerouting's retry width (`neck_width_um`) is one value for every
+        // net. A run that sent the narrowest floor on the board as that width
+        // (an older Konnect did, and so would a hand-set job) narrows a wider
+        // net to exactly it, which the cause below names.
+        let retry_mm = net_width_mm.values().copied().fold(f64::INFINITY, f64::min);
+        if let Some((retry_net, retry_wire, retry_floor)) = narrow
+            .iter()
+            .find(|n| n.2 > retry_mm + 0.0005 && (n.1 - retry_mm).abs() <= 0.0005)
+        {
+            bail!(
+                "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). '{retry_net}' has a wire at {retry_wire:.3} mm, the narrowest floor on the board, though its own floor is {retry_floor:.3} mm, which points at Freerouting's retry width (neck_width_um): it is one value for every net and narrows any net's retried connection to it. Route again with route_specctra_dsn, which sends no retry width when the nets' floors differ",
+                narrow.len(),
+                nets.len()
+            );
+        }
         bail!(
             "SES has {} wire(s) on {} net(s) narrower than their net allows (worst: {width:.3} mm on '{net}', floor {min:.3} mm). Freerouting necks tracks down at pins in its fanout stage and with automatic neck-down; route again with both off (route_specctra_dsn's default)",
             narrow.len(),

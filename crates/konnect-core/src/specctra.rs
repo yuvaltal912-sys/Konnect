@@ -310,12 +310,43 @@ struct ManifestPadstack {
 
 /// What the router needs from the export's reverse manifest beside `dsn`
 /// (`<dsn>.konnect.json`): the project's copper-to-edge clearance, and the
-/// narrowest width any net may take (its base width for a widened net, else
-/// its class), which is the width a failed wide connection is retried at.
+/// width a failed connection may be retried at.
+///
+/// Freerouting's retry width is one value for every net: any connection that
+/// fails is retried with each layer's trace narrowed to it, whichever net it
+/// belongs to. It is safe only when no net has a floor above it, so it is
+/// sent only when every net's floor (its base width for a widened net, else
+/// its class width) is the same; otherwise the retry stays off and
+/// `retry_off_reason` says why.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct RoutingHints {
     pub copper_edge_clearance_um: Option<i64>,
     pub retry_width_um: Option<i64>,
+    pub retry_off_reason: Option<&'static str>,
+}
+
+/// Why `retry_width_um` is `None` when the nets have different floors.
+pub(crate) const RETRY_OFF_DIFFERENT_FLOORS: &str =
+    "net classes have different minimum widths, and Freerouting's retry width is one value for every net, so it would take a wider net below its own width; the retry is off (neck_width_um 0 is sent)";
+
+/// Each net's floor in micrometres: the narrowest a track of that net may be.
+pub(crate) fn manifest_net_floors(value: &serde_json::Value) -> Vec<i64> {
+    let class_width: BTreeMap<&str, i64> = value["classes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["name"].as_str()?, c["track_width_um"].as_i64()?)))
+        .collect();
+    value["nets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| {
+            n["min_track_width_um"]
+                .as_i64()
+                .or_else(|| class_width.get(n["class_name"].as_str()?).copied())
+        })
+        .collect()
 }
 
 pub(crate) fn manifest_routing_hints(dsn: &Path) -> RoutingHints {
@@ -327,25 +358,13 @@ pub(crate) fn manifest_routing_hints(dsn: &Path) -> RoutingHints {
     else {
         return RoutingHints::default();
     };
-    let class_width: BTreeMap<&str, i64> = value["classes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| Some((c["name"].as_str()?, c["track_width_um"].as_i64()?)))
-        .collect();
-    let retry_width_um = value["nets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|n| {
-            n["min_track_width_um"]
-                .as_i64()
-                .or_else(|| class_width.get(n["class_name"].as_str()?).copied())
-        })
-        .min();
+    let floors = manifest_net_floors(&value);
+    let (narrowest, widest) = (floors.iter().min().copied(), floors.iter().max().copied());
+    let same = narrowest == widest;
     RoutingHints {
         copper_edge_clearance_um: value["supported_profile"]["copper_edge_clearance_um"].as_i64(),
-        retry_width_um,
+        retry_width_um: narrowest.filter(|_| same),
+        retry_off_reason: (!same).then_some(RETRY_OFF_DIFFERENT_FLOORS),
     }
 }
 
@@ -415,7 +434,15 @@ pub(crate) fn widen_for_intent(
             );
         // Up to the next whole micrometre, so the DSN never rounds it below.
         let needed = (needed * 1000.0).ceil() / 1000.0;
-        let from = rule.track_width_mm.unwrap_or(0.0);
+        // A rule with no track width is incomplete: leave it as it is so the
+        // export refuses it, instead of filling the gap with the needed width.
+        let Some(from) = rule.track_width_mm else {
+            report.push(serde_json::json!({
+                "net": req.net, "current_a": req.amps, "status": "not_widened",
+                "reason": "the net's routing rule has no track width",
+            }));
+            continue;
+        };
         if needed > from + 1e-9 {
             rule.track_width_mm = Some(needed);
             report.push(serde_json::json!({
@@ -479,8 +506,10 @@ pub(crate) fn export_dsn_with_options(
     let outline = simple_closed_outline(&tree)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
-    let board_keepouts = board_copper_keepouts(&tree, &copper_layers)?;
-    let (mut footprints, skipped_without_pads) = footprints(&tree, &net_table, &copper_layers)?;
+    let mut board_keepouts = board_copper_keepouts(&tree, &copper_layers)?;
+    let (mut footprints, footprints_without_pads, padless_keepouts) =
+        footprints(&tree, &net_table, &copper_layers)?;
+    board_keepouts.extend(padless_keepouts);
     let zones = zones(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
@@ -582,7 +611,7 @@ pub(crate) fn export_dsn_with_options(
         &manifest_classes,
         options,
         hole_keepout_growth_um,
-        skipped_without_pads,
+        footprints_without_pads,
         board_keepouts.len(),
         &copper_stack,
         &footprints,
@@ -2193,19 +2222,120 @@ fn board_copper_keepouts(tree: &SexpNode, copper_layers: &[String]) -> Result<Ve
     Ok(out)
 }
 
+/// Refuses a footprint's own rule area or zone and its Edge.Cuts graphics (a
+/// slot or cut-out): the DSN does not carry them yet.
+fn refuse_unmodelled_footprint_geometry(footprint: &SexpNode, label: &str) -> Result<()> {
+    for node in footprint.children().unwrap_or(&[]) {
+        let Some(head) = node.head() else { continue };
+        if head == "zone" {
+            bail!(
+                "unsupported routing profile: footprint '{label}' has a rule area or zone of its own, which the DSN export does not carry yet; the router could cross it"
+            );
+        }
+        if head.starts_with("fp_") && node.find_str("layer") == Some("Edge.Cuts") {
+            bail!(
+                "unsupported routing profile: footprint '{label}' draws on Edge.Cuts (a slot or cut-out), which the DSN export does not carry yet; the router could cross it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A footprint's copper graphics and visible copper text, as keepout shapes in
+/// footprint space (Y up, the frame an image's pins use). The file holds a
+/// back part's graphics already mirrored, like its pads.
+fn footprint_copper_keepouts(
+    footprint: &SexpNode,
+    copper_layers: &[String],
+    rotation_degrees: f64,
+    label: &str,
+) -> Result<Vec<dsn::Shape>> {
+    let mut out = Vec::new();
+    for node in footprint.children().unwrap_or(&[]) {
+        let Some(head) = node.head() else { continue };
+        if !(head.starts_with("fp_") || head == "property") {
+            continue;
+        }
+        if let Some(shapes) = copper_graphic_keepouts(node, copper_layers, rotation_degrees)
+            .with_context(|| format!("footprint '{label}' '{head}' on copper"))?
+        {
+            out.extend(shapes);
+        }
+    }
+    Ok(out)
+}
+
+/// A footprint-space shape in board coordinates: turned by the footprint's
+/// rotation (counter-clockwise, the way the DSN placement turns an image),
+/// then moved to its position. Both are in the DSN frame, Y up.
+fn place_shape(
+    shape: dsn::Shape,
+    x_um: i64,
+    y_um: i64,
+    rotation_degrees: f64,
+) -> Result<dsn::Shape> {
+    let (sin, cos) = rotation_degrees.to_radians().sin_cos();
+    let map = |coords: Vec<dsn::Point>| -> Vec<dsn::Point> {
+        coords
+            .into_iter()
+            .map(|p| dsn::Point {
+                x: (p.x * cos - p.y * sin).round() + x_um as f64,
+                y: (p.x * sin + p.y * cos).round() + y_um as f64,
+            })
+            .collect()
+    };
+    Ok(match shape {
+        dsn::Shape::Path(mut path) => {
+            path.coords = map(path.coords);
+            dsn::Shape::Path(path)
+        }
+        dsn::Shape::Polygon(mut polygon) => {
+            polygon.coords = map(polygon.coords);
+            dsn::Shape::Polygon(polygon)
+        }
+        _ => bail!("a copper keepout of an unexpected shape cannot be placed"),
+    })
+}
+
+/// The footprints the router gets, how many footprints have no pads (a logo,
+/// an antenna keepout), and the copper keepouts of those that have none, which
+/// are written at board level in board coordinates: a footprint with nothing
+/// to connect is not placed, but its copper is still in the router's way.
 fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
-) -> Result<(Vec<FootprintModel>, usize)> {
+) -> Result<(Vec<FootprintModel>, usize, Vec<dsn::Shape>)> {
     let mut output = Vec::new();
     let mut references = BTreeSet::new();
-    let mut skipped_without_pads = 0;
+    let mut without_pads = 0;
+    let mut padless_keepouts = Vec::new();
     for footprint in tree.find_all("footprint") {
-        // A footprint with no pads and no holes (a logo, a fiducial-free
-        // graphic) has nothing for the router; leave it out.
+        // Named by Reference in messages, else by UUID, so a footprint that
+        // is refused can be found.
+        let label = property_value(footprint, "Reference")
+            .filter(|value| !value.is_empty())
+            .or_else(|| footprint.find_str("uuid"))
+            .unwrap_or("(unnamed)")
+            .to_string();
+        // Geometry the DSN does not carry yet is refused for every footprint,
+        // pads or not: leaving it out would let the router cross an antenna
+        // keepout or a slot.
+        refuse_unmodelled_footprint_geometry(footprint, &label)?;
+        // A footprint with no pads has nothing to connect, so it is not
+        // placed; its copper graphics and text still become keepouts.
         if footprint.find_all("pad").is_empty() {
-            skipped_without_pads += 1;
+            without_pads += 1;
+            let at = footprint.find("at").context("footprint has no position")?;
+            let x_um = finite_um(at.get_f64(1), "footprint x")?;
+            let y_um = -finite_um(at.get_f64(2), "footprint y")?;
+            let rotation = normalized_degrees(finite_number(
+                at.get_f64(3).or(Some(0.0)),
+                "footprint rotation",
+            )?);
+            for shape in footprint_copper_keepouts(footprint, copper_layers, rotation, &label)? {
+                padless_keepouts.push(place_shape(shape, x_um, y_um, rotation)?);
+            }
             continue;
         }
         let layer = footprint
@@ -2244,30 +2374,8 @@ fn footprints(
         // Footprint copper graphics and visible copper text, in footprint
         // space, as image keepouts. The file holds a back part's graphics
         // already mirrored, like its pads.
-        let mut copper_keepouts = Vec::new();
-        for node in footprint.children().unwrap_or(&[]) {
-            let Some(head) = node.head() else { continue };
-            // Geometry the DSN does not carry yet. Leaving it out would let
-            // the router cross an antenna keepout or a slot, so refuse.
-            if head == "zone" {
-                bail!(
-                    "unsupported routing profile: footprint '{reference}' has a rule area or zone of its own, which the DSN export does not carry yet; the router could cross it"
-                );
-            }
-            if head.starts_with("fp_") && node.find_str("layer") == Some("Edge.Cuts") {
-                bail!(
-                    "unsupported routing profile: footprint '{reference}' draws on Edge.Cuts (a slot or cut-out), which the DSN export does not carry yet; the router could cross it"
-                );
-            }
-            if !(head.starts_with("fp_") || head == "property") {
-                continue;
-            }
-            if let Some(shapes) = copper_graphic_keepouts(node, copper_layers, rotation_degrees)
-                .with_context(|| format!("footprint '{reference}' '{head}' on copper"))?
-            {
-                copper_keepouts.extend(shapes);
-            }
-        }
+        let copper_keepouts =
+            footprint_copper_keepouts(footprint, copper_layers, rotation_degrees, &reference)?;
         let mut pads = Vec::new();
         let mut holes = Vec::new();
         for pad in footprint.find_all("pad") {
@@ -2476,7 +2584,7 @@ fn footprints(
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
-    Ok((output, skipped_without_pads))
+    Ok((output, without_pads, padless_keepouts))
 }
 
 fn normalize_rules(
@@ -2912,7 +3020,7 @@ fn build_manifest(
     classes: &[ManifestClass],
     options: ExportOptions,
     hole_keepout_growth_um: Option<i64>,
-    skipped_without_pads: usize,
+    footprints_without_pads: usize,
     board_keepout_count: usize,
     copper_stack: &[(String, &'static str)],
     footprints: &[FootprintModel],
@@ -3000,7 +3108,7 @@ fn build_manifest(
             zone_plane_count: zones.iter().filter(|z| z.kind == ZoneKind::Plane).count(),
             zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
-            footprints_without_pads: skipped_without_pads,
+            footprints_without_pads,
             pours_omitted: options.omit_pours,
             copper_edge_clearance_um: options.copper_edge_clearance_um,
             hole_clearance_um: options.hole_clearance_um,

@@ -205,7 +205,13 @@ fn route_settings(
         java: Some(java),
         automatic_neckdown: Some(allow_neckdown(args)),
         copper_to_edge_clearance_um: hints.copper_edge_clearance_um.map(|um| um as f64),
-        retry_width_um: hints.retry_width_um.map(|um| um as f64),
+        // With the retry off, 0 is sent rather than nothing, so a stored
+        // `neck_width_um` (a `freerouting.json` in the real home) cannot turn
+        // it back on; the read-back then checks it.
+        retry_width_um: hints
+            .retry_width_um
+            .map(|um| um as f64)
+            .or(hints.retry_off_reason.map(|_| 0.0)),
         fanout_enabled: Some(false),
     })
 }
@@ -220,6 +226,7 @@ mod route_rule_tests {
         let hints = crate::specctra::RoutingHints {
             copper_edge_clearance_um: Some(500),
             retry_width_um: Some(200),
+            retry_off_reason: None,
         };
         let java = std::path::PathBuf::from("java");
         let settings = route_settings(&json!({}), &hints, java.clone()).unwrap();
@@ -230,6 +237,21 @@ mod route_rule_tests {
         // Asking for neck-down does not turn fanout on.
         let asked = route_settings(&json!({ "allow_neckdown": true }), &hints, java).unwrap();
         assert_eq!(asked.fanout_enabled, Some(false));
+    }
+
+    #[test]
+    fn no_retry_width_is_sent_when_the_manifest_turned_it_off() {
+        let hints = crate::specctra::RoutingHints {
+            copper_edge_clearance_um: None,
+            retry_width_um: None,
+            retry_off_reason: Some(crate::specctra::RETRY_OFF_DIFFERENT_FLOORS),
+        };
+        let settings =
+            route_settings(&json!({}), &hints, std::path::PathBuf::from("java")).unwrap();
+        // Sent as 0, so a stored neck width cannot turn the retry back on.
+        assert_eq!(settings.retry_width_um, Some(0.0));
+        let body = crate::freerouting_mcp::job_settings(&settings);
+        assert_eq!(body["neck_width_um"], json!(0.0));
     }
 
     #[test]
@@ -2482,6 +2504,8 @@ async fn handle_route_specctra_dsn(
             "copper_to_edge_clearance_um": edge_clearance,
             "copper_to_edge_clearance_source": if edge_clearance.is_some() { "export_manifest" } else { "none: no manifest beside the DSN, or it records no clearance" },
             "retry_width_um": hints.retry_width_um,
+            // Why no retry width was sent, when the nets' floors differ.
+            "retry_off_reason": hints.retry_off_reason,
         },
         // Read back from Freerouting (`get_effective_settings`): the run is
         // refused before routing when any sent setting is not in effect.

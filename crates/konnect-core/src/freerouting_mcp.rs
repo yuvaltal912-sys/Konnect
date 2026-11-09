@@ -179,12 +179,29 @@ pub(crate) async fn probe_local(jar: &Path, java: Option<&Path>) -> BridgeProbe 
     }
 }
 
+/// Freerouting 2.5.0 treats a copper-to-edge clearance within 1e-9 of its own
+/// default, 250 um, as "not set" (`HeadlessBoardManager.
+/// applyCopperToEdgeClearanceOverride`): it skips the override, or clamps it to
+/// the outline's minimum pin gap, logging at debug only, while
+/// `get_effective_settings` still reports 250. A project that asks for exactly
+/// 0.25 mm is sent a thousandth of a micrometre more, which the router applies
+/// as asked; the read-back is compared with what was sent.
+const FREEROUTING_EDGE_CLEARANCE_DEFAULT_UM: f64 = 250.0;
+
+fn edge_clearance_to_send(um: f64) -> f64 {
+    if (um - FREEROUTING_EDGE_CLEARANCE_DEFAULT_UM).abs() < 1e-9 {
+        FREEROUTING_EDGE_CLEARANCE_DEFAULT_UM + 0.001
+    } else {
+        um
+    }
+}
+
 /// The `update_job_settings` body for these settings, under the names
 /// Freerouting 2.5.0 reads. Its job API parses the body into its router
 /// settings by their serialized snake_case names and drops any other key
 /// without an error (camelCase `neckWidthUm` was silently ignored); the flat
 /// `max_passes` is a deprecated alias of `autorouter.max_passes`.
-fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
+pub(crate) fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
     let mut job_settings = Map::new();
     if let Some(max_passes) = settings.max_passes {
         job_settings.insert(
@@ -202,7 +219,10 @@ fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
         job_settings.insert("automatic_neckdown".to_string(), json!(neckdown));
     }
     if let Some(edge) = settings.copper_to_edge_clearance_um {
-        job_settings.insert("copper_to_edge_clearance_um".to_string(), json!(edge));
+        job_settings.insert(
+            "copper_to_edge_clearance_um".to_string(),
+            json!(edge_clearance_to_send(edge)),
+        );
     }
     if let Some(width) = settings.retry_width_um {
         job_settings.insert("neck_width_um".to_string(), json!(width));
@@ -354,6 +374,29 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
                     .take(MAX_LOG_LINE_CHARS)
                     .collect(),
             );
+        }
+        // Stops 2.5.0's BatchOptimizer logs without the words above: the
+        // stage's time limit ("Optimizer stage timed out." and "...before
+        // starting pass #N") and its item limit. These lines are the reason,
+        // so the text from the marker on is kept.
+        if let Some(at) = ["Optimizer stage timed out", "Max items limit reached"]
+            .iter()
+            .find_map(|marker| line.find(marker))
+        {
+            report.stop_reason = Some(
+                line[at..]
+                    .trim_end_matches('.')
+                    .chars()
+                    .take(MAX_LOG_LINE_CHARS)
+                    .collect(),
+            );
+        }
+        // The summary line says the stage ended on its timeout; it names the
+        // reason only when no earlier line did.
+        if line.contains("Optimization stage completed with timeout") {
+            report
+                .stop_reason
+                .get_or_insert_with(|| "optimization stage completed with timeout".to_string());
         }
         if line.contains("Optimization stage completed") {
             report.score_before = number_after(line, "baseline optimizer score: ");
@@ -1205,6 +1248,82 @@ mod tests {
             .stop_reason
             .unwrap()
             .starts_with("the board has 1 unrouted connection(s)"));
+    }
+
+    /// 2.5.0's BatchOptimizer also stops on its stage time limit and its item
+    /// limit, and its summary line says when the stage ended on the timeout.
+    #[test]
+    fn a_timed_out_or_capped_optimizer_has_a_stop_reason() {
+        let reason = |messages: &[&str]| {
+            let log = json!({ "body": messages.iter().map(|m| json!({ "type": "INFO", "message": m })).collect::<Vec<_>>() });
+            optimizer_report(&log).stop_reason
+        };
+        assert_eq!(
+            reason(&["[AB12CD] Optimizer stage timed out."]).as_deref(),
+            Some("Optimizer stage timed out")
+        );
+        assert_eq!(
+            reason(&["Optimizer stage timed out before starting pass #3"]).as_deref(),
+            Some("Optimizer stage timed out before starting pass #3")
+        );
+        assert_eq!(
+            reason(&["Max items limit reached (500). Stopping optimizer."]).as_deref(),
+            Some("Max items limit reached (500). Stopping optimizer")
+        );
+        // The summary of a timed-out stage alone still gives a reason, and
+        // its scores are still read.
+        let summary = "Optimization stage completed with timeout:. Baseline router score: 1000.00, baseline optimizer score: 10.00, final router score: 1000.00, final optimizer score: 11.00";
+        let log = json!({ "body": [{ "type": "INFO", "message": summary }] });
+        let report = optimizer_report(&log);
+        assert_eq!(
+            report.stop_reason.as_deref(),
+            Some("optimization stage completed with timeout")
+        );
+        assert_eq!(report.score_after, Some(11.0));
+        // An earlier, more specific line is kept.
+        assert_eq!(
+            reason(&["Optimizer stage timed out.", summary]).as_deref(),
+            Some("Optimizer stage timed out")
+        );
+        // A stage that completed normally has none.
+        assert_eq!(
+            reason(&[&summary.replace("completed with timeout:", "completed:")]),
+            None
+        );
+    }
+
+    /// Freerouting 2.5.0 reads an edge clearance within 1e-9 of 250 um as
+    /// "not set", so exactly 0.25 mm is sent a thousandth of a micrometre
+    /// more, and the read-back still catches a router that reports 250.
+    #[test]
+    fn an_edge_clearance_of_exactly_250_um_is_nudged_off_freeroutings_default() {
+        let body = |edge: f64| {
+            job_settings(&RouteSettings {
+                copper_to_edge_clearance_um: Some(edge),
+                ..all_settings()
+            })
+        };
+        assert_eq!(body(250.0)["copper_to_edge_clearance_um"], json!(250.001));
+        assert_eq!(
+            body(250.0000000001)["copper_to_edge_clearance_um"],
+            json!(250.001)
+        );
+        assert_eq!(body(250.5)["copper_to_edge_clearance_um"], json!(250.5));
+        assert_eq!(body(500.0)["copper_to_edge_clearance_um"], json!(500.0));
+        let mut sent = body(250.0);
+        sent.retain(|name, _| name == "copper_to_edge_clearance_um");
+        let applied = json!({ "copper_to_edge_clearance_um": 250.001 });
+        let kept = check_effective_settings(&sent, &applied).unwrap();
+        assert_eq!(kept["copper_to_edge_clearance_um"], json!(250.001));
+        // A router that clamps it back to 250 is caught.
+        let clamped = json!({ "copper_to_edge_clearance_um": 250.0 });
+        let error = check_effective_settings(&sent, &clamped)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("copper_to_edge_clearance_um: sent 250.001, in effect 250.0"),
+            "{error}"
+        );
     }
 
     /// A stand-in for Freerouting's stdio MCP server: a shell script that
