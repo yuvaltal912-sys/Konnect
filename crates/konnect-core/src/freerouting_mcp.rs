@@ -39,7 +39,81 @@ fn server_arguments() -> &'static [&'static str] {
         "--mcp_server-endpoints=http://127.0.0.1:37964",
         "--mcp_server.stdio=true",
         "--gui.enabled=false",
+        // Freerouting 2.x turns telemetry and analytics on by default.
+        "--profile.allow_telemetry=false",
+        "--usage_and_diagnostic_data.disable_analytics=true",
     ]
+}
+
+/// JVM options that keep Freerouting off the network. Freerouting 2.5.0
+/// starts a version check on every launch (a GET to `api.github.com`, with
+/// no switch to turn it off), through Java's default proxy selector. Every
+/// HTTP and HTTPS request the JVM makes goes to a closed loopback port
+/// instead and fails at once. Loopback stays direct, so the MCP link to
+/// Freerouting's own servers on 127.0.0.1 is not affected.
+pub(crate) const OFFLINE_JVM_ARGUMENTS: [&str; 5] = [
+    "-Dhttp.proxyHost=127.0.0.1",
+    "-Dhttp.proxyPort=9",
+    "-Dhttps.proxyHost=127.0.0.1",
+    "-Dhttps.proxyPort=9",
+    "-Dhttp.nonProxyHosts=localhost|127.*|[::1]",
+];
+
+/// JVM options, placed before `-jar`. Freerouting writes its settings and a
+/// log under `user.home` (2.5) or `java.io.tmpdir` (2.1); pointing both at a
+/// scratch directory keeps that out of the owner's home. The
+/// [`OFFLINE_JVM_ARGUMENTS`] follow.
+fn jvm_arguments(scratch: &Path) -> Vec<std::ffi::OsString> {
+    let property = |name: &str, dir: PathBuf| {
+        let mut argument = std::ffi::OsString::from(format!("-D{name}="));
+        argument.push(dir);
+        argument
+    };
+    let mut arguments = vec![
+        "-Djava.awt.headless=true".into(),
+        property("user.home", scratch.join("home")),
+        property("java.io.tmpdir", scratch.join("tmp")),
+    ];
+    arguments.extend(OFFLINE_JVM_ARGUMENTS.iter().map(std::ffi::OsString::from));
+    arguments
+}
+
+/// Freerouting 2.5's `UserDataPathResolver` takes this argument ahead of
+/// `user.home`, so the settings folder cannot come from anywhere else.
+fn user_data_path_argument(scratch: &Path) -> std::ffi::OsString {
+    let mut argument = std::ffi::OsString::from("--user_data_path=");
+    argument.push(scratch.join("home"));
+    argument
+}
+
+/// Variables that move Freerouting's folders ahead of `user.home`, mapped to
+/// a folder under the scratch directory. `AppPaths` reads the `XDG_*` ones on
+/// Linux and `APPDATA` and `LOCALAPPDATA` on Windows.
+const SCRATCH_FOLDER_VARIABLES: [(&str, &str); 6] = [
+    ("XDG_CONFIG_HOME", "xdg/config"),
+    ("XDG_STATE_HOME", "xdg/state"),
+    ("XDG_CACHE_HOME", "xdg/cache"),
+    ("XDG_DATA_HOME", "xdg/data"),
+    ("APPDATA", "appdata/roaming"),
+    ("LOCALAPPDATA", "appdata/local"),
+];
+
+/// Cuts the child off from the parent's Freerouting settings: every inherited
+/// `FREEROUTING__*` variable (the user-data path, the log location and the
+/// settings source) is removed, and the folder variables point into scratch.
+fn isolate_environment(command: &mut Command, scratch: &Path) {
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("FREEROUTING__")
+        {
+            command.env_remove(&name);
+        }
+    }
+    for (name, folder) in SCRATCH_FOLDER_VARIABLES {
+        command.env(name, scratch.join(folder));
+    }
 }
 
 const REQUIRED_TOOLS: &[&str] = &[
@@ -455,6 +529,10 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
+    /// Freerouting's home and temp directories. `close` removes it after the
+    /// child has exited. `Drop` hands it to the task that waits for the child,
+    /// so it goes only after the exit there too.
+    scratch: Option<tempfile::TempDir>,
 }
 
 impl LocalMcpClient {
@@ -472,15 +550,26 @@ impl LocalMcpClient {
     }
 
     fn spawn(jar: &Path, java: Option<&Path>) -> Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("konnect-freerouting-")
+            .tempdir()
+            .context("create Freerouting scratch directory")?;
+        for name in ["home", "tmp"] {
+            std::fs::create_dir(scratch.path().join(name))
+                .context("create Freerouting scratch directory")?;
+        }
         let mut command = Command::new(java.unwrap_or_else(|| Path::new("java")));
         command
+            .args(jvm_arguments(scratch.path()))
             .arg("-jar")
             .arg(jar)
             .args(server_arguments())
+            .arg(user_data_path_argument(scratch.path()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        isolate_environment(&mut command, scratch.path());
         let mut child = command
             .spawn()
             .context("start local Freerouting MCP server")?;
@@ -513,6 +602,7 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
+            scratch: Some(scratch),
         })
     }
 
@@ -659,11 +749,14 @@ impl LocalMcpClient {
 
 impl Drop for LocalMcpClient {
     fn drop(&mut self) {
+        let scratch = self.scratch.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     let _ = child.wait().await;
+                    // Removed only now: the JVM may still hold files open.
+                    drop(scratch);
                 });
             }
         }
@@ -847,6 +940,174 @@ mod tests {
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn telemetry_is_switched_off_on_the_command_line() {
+        let arguments = server_arguments();
+        assert!(arguments.contains(&"--profile.allow_telemetry=false"));
+        assert!(arguments.contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+    }
+
+    /// A `java` that records its arguments and its environment, then answers
+    /// the MCP handshake and exits when stdin closes.
+    #[cfg(unix)]
+    fn recording_java(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let arguments = dir.join("arguments.txt");
+        let environment = dir.join("environment.txt");
+        let java = dir.join("java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nenv > '{}'\n\
+                 while read -r line; do\n\
+                 case \"$line\" in\n\
+                 *'\"initialize\"'*) echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}';;\n\
+                 *'\"tools/list\"'*) echo '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"tools\":[]}}}}';;\n\
+                 esac\n\
+                 done\n",
+                arguments.display(),
+                environment.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (java, arguments, environment)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_starts_java_headless_with_a_scratch_home_and_no_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (java, record, _) = recording_java(dir.path());
+
+        let probe = probe_local(Path::new("/x/freerouting.jar"), Some(&java)).await;
+        // The empty tool list is refused; the handshake is what matters here.
+        assert!(probe.native_mcp_available, "{probe:?}");
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let jar = lines.iter().position(|line| *line == "-jar").unwrap();
+        let before_jar = &lines[..jar];
+        assert!(
+            before_jar.contains(&"-Djava.awt.headless=true"),
+            "{recorded}"
+        );
+        let home = before_jar
+            .iter()
+            .find_map(|line| line.strip_prefix("-Duser.home="))
+            .expect("user.home is set before -jar");
+        let tmp = before_jar
+            .iter()
+            .find_map(|line| line.strip_prefix("-Djava.io.tmpdir="))
+            .expect("java.io.tmpdir is set before -jar");
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        assert!(!real_home.is_empty() && home != real_home, "{home}");
+        assert!(Path::new(home).starts_with(std::env::temp_dir()), "{home}");
+        assert!(Path::new(tmp).starts_with(std::env::temp_dir()), "{tmp}");
+        assert!(lines[jar + 1..].contains(&"--profile.allow_telemetry=false"));
+        assert!(lines[jar + 1..].contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+        // HTTP and HTTPS go to a closed loopback port, so 2.5.0's version
+        // check never reaches api.github.com; loopback stays direct.
+        for offline in OFFLINE_JVM_ARGUMENTS {
+            assert!(before_jar.contains(&offline), "{offline}: {recorded}");
+        }
+        assert!(
+            !Path::new(home).exists(),
+            "the scratch directory outlives the child"
+        );
+    }
+
+    /// Freerouting 2.5 reads its folders from `--user_data_path`,
+    /// `FREEROUTING__USER_DATA_PATH` and the `XDG_*` / `APPDATA` variables
+    /// ahead of `user.home`. None of them may lead out of the scratch directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_child_cannot_be_pointed_outside_the_scratch_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (java, arguments, environment) = recording_java(dir.path());
+        let elsewhere = dir.path().join("elsewhere");
+        // Only `FREEROUTING__*` is set here: other tests in this binary read
+        // the folder variables, and the child must replace those anyway.
+        std::env::set_var("FREEROUTING__USER_DATA_PATH", &elsewhere);
+        std::env::set_var("FREEROUTING__LOGGING__FILE__LOCATION", &elsewhere);
+        std::env::set_var("FREEROUTING__KONNECT_TEST_ONLY", "1");
+
+        let probe = probe_local(Path::new("/x/freerouting.jar"), Some(&java)).await;
+
+        std::env::remove_var("FREEROUTING__USER_DATA_PATH");
+        std::env::remove_var("FREEROUTING__LOGGING__FILE__LOCATION");
+        std::env::remove_var("FREEROUTING__KONNECT_TEST_ONLY");
+        assert!(probe.native_mcp_available, "{probe:?}");
+
+        let recorded = std::fs::read_to_string(&arguments).unwrap();
+        let home = recorded
+            .lines()
+            .find_map(|line| line.strip_prefix("-Duser.home="))
+            .expect("user.home is set");
+        let scratch = Path::new(home).parent().unwrap();
+        assert!(scratch.starts_with(std::env::temp_dir()), "{scratch:?}");
+        assert!(
+            recorded
+                .lines()
+                .any(|line| line.strip_prefix("--user_data_path=") == Some(home)),
+            "{recorded}"
+        );
+
+        let variables = std::fs::read_to_string(&environment).unwrap();
+        let variables: BTreeMap<&str, &str> = variables
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let inherited: Vec<&&str> = variables
+            .keys()
+            .filter(|name| name.to_ascii_uppercase().starts_with("FREEROUTING__"))
+            .collect();
+        assert!(inherited.is_empty(), "{inherited:?}");
+        for (name, _) in SCRATCH_FOLDER_VARIABLES {
+            let value = variables
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is not set for the child"));
+            assert!(
+                Path::new(value).starts_with(scratch),
+                "{name}={value} is outside {scratch:?}"
+            );
+        }
+    }
+
+    /// Dropping a client kills the child and waits for it in the background.
+    /// The scratch directory must wait with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_client_removes_the_scratch_directory_only_after_the_child_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let java = dir.path().join("java");
+        std::fs::write(&java, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = LocalMcpClient::spawn(Path::new("/x/freerouting.jar"), Some(&java)).unwrap();
+        let pid = client.child.as_ref().unwrap().id().unwrap();
+        let scratch = client.scratch.as_ref().unwrap().path().to_path_buf();
+        assert!(scratch.is_dir());
+        assert!(process_is_running(pid));
+
+        drop(client);
+        // The runtime has not run the waiting task yet, so the child is not
+        // reaped and its folder must still be there.
+        assert!(scratch.is_dir(), "the scratch directory went with the drop");
+
+        for _ in 0..100 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!scratch.exists(), "the scratch directory was never removed");
+        assert!(
+            !process_is_running(pid),
+            "the scratch directory went before the child exited"
+        );
     }
 
     #[test]
