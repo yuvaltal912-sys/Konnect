@@ -14,10 +14,22 @@ The tool writes `<project_dir>/<library>.kicad_sym`, `<library>.pretty/<footprin
 and, with `model_file`, `<library>.3dshapes/<model>`, and registers the library as
 `${KIPRJMOD}/…` in the project's `sym-lib-table` and `fp-lib-table`. The default
 `library` is `imported_parts`. A preview is the default; `dry_run: false`
-needs the preview's `expected_revision` (`sha256:` over every planned write and
-blocker). Blockers: `symbol_exists`, `footprint_exists`, `model_exists`,
-`nickname_taken`, `symbol_library_unusable`, `lib_table_unusable`,
-`target_is_a_symlink`, `target_has_wrong_type`.
+needs the preview's `expected_revision` (`sha256:` over every planned write,
+reused file and blocker). Blockers: `symbol_exists`, `footprint_exists`,
+`model_exists`, `nickname_taken`, `library_already_registered`,
+`library_disabled`, `symbol_library_unusable`, `lib_table_unusable`,
+`target_is_a_symlink`, `target_has_wrong_type`, `target_case_mismatch`.
+
+An identical footprint or model already at its target is reused, not a
+blocker: `footprint.action` and `footprint.model.action` are `create`,
+`reuse_identical` or `blocked`, and the apply result names a reused footprint
+in `footprint_reused` (as `model_reused` for the model). A kept model
+reference reports `embedded` or `embedded_file_absent` for a
+`kicad-embed://` path. With `model_file`, embedded models that only the
+replaced references used are removed and listed in
+`footprint.model.embedded_models_removed`. A commit refused before anything
+was written is `plan_blocked` with a `transaction_refused:` or
+`cannot_create_folder:` reason.
 
 ## Unreleased: `run_design_review` reads a DRC baseline
 

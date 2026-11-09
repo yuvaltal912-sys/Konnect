@@ -15,9 +15,11 @@
 //!   registrations, the pin-pad check on the candidate, and a `revision`.
 //! - Apply only with that revision. The plan is recomputed from disk and
 //!   refused as `stale_target` when anything it depends on changed.
-//! - Never overwrite. An existing symbol, footprint or a different model file
-//!   at the target path blocks the import, and so does a project nickname
-//!   already bound to another library.
+//! - Never overwrite. An existing symbol, or a different footprint or model
+//!   file at the target path, blocks the import; an identical footprint or
+//!   model is reused. A project nickname already bound to another library, a
+//!   library already registered under another nickname, and a disabled
+//!   registration block it too.
 //! - Everything is written in one durable multi-file transaction, then read
 //!   back, and the pin-pad check runs again on the saved files.
 //! - No format conversion. The inputs must already be KiCad 6+ files.
@@ -50,8 +52,9 @@ pub(super) fn tool() -> ToolDef {
          <library>.3dshapes in the project folder, registered in the project's sym-lib-table and \
          fp-lib-table. Makes no network requests. Previews by default (dry_run: true): returns \
          the files it would write, the symbol pins, the footprint pads, the pin-pad check and a \
-         revision; apply with dry_run: false and that expected_revision. Never overwrites an \
-         existing symbol, footprint or model. Sets the symbol's Footprint field to \
+         revision; apply with dry_run: false and that expected_revision. Never overwrites: an \
+         identical footprint or model already in the library is reused, and an existing symbol \
+         or a different footprint or model blocks the import. Sets the symbol's Footprint field to \
          <library>:<footprint> and optional LCSC, MPN and Manufacturer fields. Pin-pad mismatches \
          are reported, not fixed.",
         json!({
@@ -61,7 +64,7 @@ pub(super) fn tool() -> ToolDef {
                 "symbol_file": { "type": "string", "description": "Local .kicad_sym file holding the part's symbol" },
                 "symbol_name": { "type": "string", "description": "Symbol to import; required when symbol_file holds more than one" },
                 "footprint_file": { "type": "string", "description": "Local .kicad_mod file holding the part's footprint" },
-                "model_file": { "type": "string", "description": "Optional local 3D model (.step, .stp or .wrl). It replaces the footprint's model references, keeping the first one's offset, scale and rotation" },
+                "model_file": { "type": "string", "description": "Optional local 3D model (.step, .stp or .wrl). It replaces the footprint's model references, keeping the first one's offset, scale, rotation, visibility and opacity" },
                 "library": { "type": "string", "description": "Project library nickname (letters, digits, _ . -)", "default": DEFAULT_LIBRARY },
                 "lcsc": { "type": "string", "description": "LCSC part number to record in the symbol's LCSC field, e.g. C25804" },
                 "mpn": { "type": "string", "description": "Manufacturer part number for the MPN field" },
@@ -248,6 +251,8 @@ struct Plan {
     writes: Vec<PlannedWrite>,
     /// Model file already at its target with the same bytes: referenced, not written.
     model_reused: Option<PathBuf>,
+    /// Footprint file already at its target with the same bytes: used, not written.
+    footprint_reused: Option<PathBuf>,
     registrations: Value,
     symbol_report: Value,
     footprint_report: Value,
@@ -298,12 +303,17 @@ fn read_source(path: &Path, field: &str, limit: u64) -> Result<String, PlanError
     }
     let bytes = std::fs::read(path).map_err(|error| PlanError::Io(error.into()))?;
     String::from_utf8(bytes).map_err(|_| {
+        // The model is copied as text through the transaction. A conforming
+        // STEP file is 7-bit ASCII (ISO 10303-21 escapes anything else), so a
+        // raw Latin-1 header byte means the exporter broke the format.
+        let hint = if field == "model_file" {
+            "re-export it as an ISO 10303-21 conforming (ASCII) STEP"
+        } else {
+            "KiCad library files are text"
+        };
         invalid(
             field,
-            format!(
-                "{} is not UTF-8 text; KiCad library files and STEP/VRML models are text",
-                path.display()
-            ),
+            format!("{} is not UTF-8 text; {hint}", path.display()),
         )
         .into()
     })
@@ -335,7 +345,32 @@ fn project_dir(project: &str) -> Result<PathBuf, CallToolResult> {
             format!("{} holds no .kicad_pro project file", dir.display()),
         ));
     }
-    Ok(dir)
+    // Absolute from here on: the transaction canonicalises its root and joins
+    // a relative target onto it again, so a folder relative to the server's
+    // working directory would send every write to <root>/<relative>/….
+    std::fs::canonicalize(&dir).map_err(|error| {
+        invalid(
+            "project",
+            format!("{} cannot be resolved: {error}", dir.display()),
+        )
+    })
+}
+
+/// `path` with `.` dropped and `..` applied, without reading the disk. Two
+/// spellings that agree here name the same file unless a link sits between
+/// them, which can only make a duplicate row look like one: that blocks.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Direct `(symbol …)` children of a symbol library, with byte spans.
@@ -415,8 +450,41 @@ fn pad_report(footprint: &SexpNode) -> (usize, Vec<Value>) {
     (pads.len(), listed)
 }
 
+/// KiCad 9+ addresses a model stored inside the footprint as
+/// `kicad-embed://<name>`, with the data in `(embedded_files (file …))`.
+const EMBED_PREFIX: &str = "kicad-embed://";
+
+/// Names of the footprint's embedded files of type `model`.
+fn embedded_model_names(footprint: &SexpNode) -> Vec<String> {
+    footprint
+        .find("embedded_files")
+        .map(|files| {
+            files
+                .find_all("file")
+                .into_iter()
+                .filter(|file| file.find_str("type") == Some("model"))
+                .filter_map(|file| file.find_str("name").map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Where an existing `(model …)` reference points, for the report.
-fn model_reference_state(path: &str, project_dir: &Path, footprint_file: &Path) -> &'static str {
+fn model_reference_state(
+    path: &str,
+    project_dir: &Path,
+    footprint_file: &Path,
+    footprint: &SexpNode,
+) -> &'static str {
+    // An embedded model travels inside the footprint text, which is copied
+    // as it is.
+    if let Some(name) = path.strip_prefix(EMBED_PREFIX) {
+        return if embedded_model_names(footprint).iter().any(|n| n == name) {
+            "embedded"
+        } else {
+            "embedded_file_absent"
+        };
+    }
     if let Some(rest) = path.strip_prefix("${KIPRJMOD}") {
         let rest = rest.trim_start_matches(['/', '\\']);
         return if project_dir.join(rest).is_file() {
@@ -473,13 +541,30 @@ fn indent_before(source: &str, offset: usize) -> String {
 
 /// Replace every direct `(model …)` child with one reference to `model_uri`,
 /// keeping the first existing model's transform (vendor exports align their
-/// model with it).
+/// model with it), visibility and opacity. Embedded model files that only the
+/// replaced references used are dropped with them.
 fn replace_models(source: &str, root: &SexpNode, model_uri: &str) -> anyhow::Result<String> {
     let first = root.find("model");
     let offset = first.map_or([0.0; 3], |m| xyz_of(m, "offset", [0.0; 3]));
     let scale = first.map_or([1.0; 3], |m| xyz_of(m, "scale", [1.0; 3]));
     let rotate = first.map_or([0.0; 3], |m| xyz_of(m, "rotate", [0.0; 3]));
     let xyz = |v: [f64; 3]| format!("{} {} {}", fmt_f64(v[0]), fmt_f64(v[1]), fmt_f64(v[2]));
+    // KiCad reads a bare `hide` (older files), `(hide)`, `(hide yes)` and
+    // `(hide true)` alike, and writes `(hide yes)` then `(opacity …)` before
+    // the transform.
+    let hidden = first.is_some_and(|m| {
+        m.children().unwrap_or(&[]).iter().skip(2).any(|child| {
+            child.as_str() == Some("hide")
+                || (child.head() == Some("hide")
+                    && matches!(
+                        child.get(1).and_then(SexpNode::as_str),
+                        None | Some("yes" | "true")
+                    ))
+        })
+    });
+    let opacity = first
+        .and_then(|m| m.find_f64("opacity"))
+        .filter(|o| o.is_finite() && *o != 1.0);
 
     let children = find_direct_child_blocks(source, "footprint");
     let models: Vec<(usize, usize)> = children
@@ -493,8 +578,15 @@ fn replace_models(source: &str, root: &SexpNode, model_uri: &str) -> anyhow::Res
         || "  ".to_string(),
         |(start, _)| indent_before(source, *start),
     );
+    let mut appearance = String::new();
+    if hidden {
+        appearance.push_str(&format!("\n{indent}  (hide yes)"));
+    }
+    if let Some(opacity) = opacity {
+        appearance.push_str(&format!("\n{indent}  (opacity {})", fmt_f64(opacity)));
+    }
     let block = format!(
-        "(model {}\n{indent}  (offset (xyz {}))\n{indent}  (scale (xyz {}))\n{indent}  (rotate (xyz {}))\n{indent})",
+        "(model {}{appearance}\n{indent}  (offset (xyz {}))\n{indent}  (scale (xyz {}))\n{indent}  (rotate (xyz {}))\n{indent})",
         quote_lib_table_string(model_uri),
         xyz(offset),
         xyz(scale),
@@ -522,6 +614,47 @@ fn replace_models(source: &str, root: &SexpNode, model_uri: &str) -> anyhow::Res
             format!("{lead}{indent}{block}\n"),
         ));
     }
+
+    // An embedded model a replaced reference named is dead data once the
+    // reference is gone; the whole `(embedded_files …)` goes when it empties.
+    let replaced_embeds: Vec<&str> = root
+        .find_all("model")
+        .into_iter()
+        .filter_map(|m| m.get(1)?.as_str()?.strip_prefix(EMBED_PREFIX))
+        .collect();
+    let embedded = children.iter().copied().find(|(start, end)| {
+        parse_sexp(&source[*start..*end]).is_ok_and(|node| node.head() == Some("embedded_files"))
+    });
+    if let (false, Some((files_start, files_end))) = (replaced_embeds.is_empty(), embedded) {
+        let files: Vec<(usize, usize)> =
+            find_direct_child_blocks(&source[files_start..files_end], "embedded_files")
+                .into_iter()
+                .map(|(start, end)| (files_start + start, files_start + end))
+                .collect();
+        let dropped: Vec<(usize, usize)> = files
+            .iter()
+            .copied()
+            .filter(|(start, end)| {
+                parse_sexp(&source[*start..*end]).is_ok_and(|file| {
+                    file.head() == Some("file")
+                        && file.find_str("type") == Some("model")
+                        && file
+                            .find_str("name")
+                            .is_some_and(|name| replaced_embeds.contains(&name))
+                })
+            })
+            .collect();
+        let starts = if !dropped.is_empty() && dropped.len() == files.len() {
+            vec![files_start]
+        } else {
+            dropped.iter().map(|(start, _)| *start).collect()
+        };
+        for start in starts {
+            let (a, b) = konnect_sexp::writer::find_block_with_leading_whitespace(source, start)
+                .ok_or_else(|| anyhow::anyhow!("unbalanced embedded file block"))?;
+            edits.push(SexpEdit::delete(a, b));
+        }
+    }
     let replaced = apply_edits(source.to_string(), edits);
     let parsed = parse_sexp(&replaced)?;
     anyhow::ensure!(
@@ -531,8 +664,21 @@ fn replace_models(source: &str, root: &SexpNode, model_uri: &str) -> anyhow::Res
     Ok(replaced)
 }
 
+/// The `(disabled)` and `(hidden)` flags of the table row named `nickname`.
+fn row_flags(source: &str, nickname: &str) -> (bool, bool) {
+    find_block_starts(source, "lib")
+        .into_iter()
+        .filter_map(|start| find_balanced_block(source, start))
+        .filter_map(|(start, end)| parse_sexp(&source[start..end]).ok())
+        .find(|row| row.find_str("name") == Some(nickname))
+        .map_or((false, false), |row| {
+            (row.find("disabled").is_some(), row.find("hidden").is_some())
+        })
+}
+
 /// The project lib-table write that registers `nickname` at `uri`, or the
 /// reason it is blocked.
+#[allow(clippy::too_many_arguments)]
 fn plan_registration(
     table_path: &Path,
     lib_path: &Path,
@@ -541,7 +687,14 @@ fn plan_registration(
     uri: &str,
     kind: &'static str,
     blockers: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<(Option<PlannedWrite>, &'static str), PlanError> {
+    // The transaction refuses a symlinked or non-file target; say so here
+    // rather than preview a write that apply cannot make.
+    if let Some(blocker) = target_type_blocker(table_path, false) {
+        blockers.push(blocker);
+        return Ok((None, "blocked"));
+    }
     let root = table_root_element(table_path);
     let existing = match std::fs::read_to_string(table_path) {
         Ok(text) => Some(text),
@@ -551,18 +704,33 @@ fn plan_registration(
     let source = existing
         .clone()
         .unwrap_or_else(|| format!("({root}\n  (version 7)\n)\n"));
-    let bound: Vec<String> = parse_lib_table(&source)
-        .into_iter()
+    let entries = parse_lib_table(&source);
+    let bound: Vec<String> = entries
+        .iter()
         .filter(|entry| entry["nickname"].as_str() == Some(nickname))
         .filter_map(|entry| entry["uri"].as_str().map(str::to_string))
         .collect();
+    // Same library: the same URI text, or a URI that resolves to the same
+    // file (canonicalising also folds case on a case-insensitive disk).
+    // Before the file exists nothing resolves, so a `${KIPRJMOD}` or absolute
+    // URI is compared as spelled, with `.` and `..` applied:
+    // `${KIPRJMOD}/./x.kicad_sym` still names `x.kicad_sym`.
     let target = std::fs::canonicalize(lib_path).ok();
+    let lexical_target = lexical(lib_path);
+    let spelled = |bound_uri: &str| match bound_uri.strip_prefix("${KIPRJMOD}") {
+        Some(tail) => Some(project_dir.join(tail.trim_start_matches(['/', '\\']))),
+        None => Path::new(bound_uri)
+            .is_absolute()
+            .then(|| PathBuf::from(bound_uri)),
+    };
     let same_library = |bound_uri: &str| {
         bound_uri == uri
             || (target.is_some()
                 && expand_lib_uri(bound_uri, Some(project_dir))
                     .and_then(|path| std::fs::canonicalize(path).ok())
                     == target)
+            || (target.is_none()
+                && spelled(bound_uri).is_some_and(|path| lexical(&path) == lexical_target))
     };
     if let Some(other) = bound.iter().find(|bound_uri| !same_library(bound_uri)) {
         blockers.push(format!(
@@ -570,6 +738,38 @@ fn plan_registration(
             table_path.display()
         ));
         return Ok((None, "blocked"));
+    }
+    // A new row for a library another row already registers would make
+    // KiCad list it twice.
+    if bound.is_empty() {
+        if let Some(alias) = entries.iter().find(|entry| {
+            entry["nickname"].as_str() != Some(nickname)
+                && entry["uri"].as_str().is_some_and(same_library)
+        }) {
+            blockers.push(format!(
+                "library_already_registered: {} already registers {} as '{}'; a second row would \
+                 list it twice, so pass another library name",
+                table_path.display(),
+                lib_path.display(),
+                alias["nickname"].as_str().unwrap_or_default()
+            ));
+            return Ok((None, "blocked"));
+        }
+    }
+    let (disabled, hidden) = row_flags(&source, nickname);
+    if disabled {
+        blockers.push(format!(
+            "library_disabled: {} has '{nickname}' disabled, so KiCad does not load it; enable it \
+             in KiCad's Manage Libraries or pass another library name",
+            table_path.display()
+        ));
+        return Ok((None, "blocked"));
+    }
+    if hidden {
+        warnings.push(format!(
+            "{} marks '{nickname}' hidden: KiCad loads it but its chooser does not list it",
+            table_path.display()
+        ));
     }
     match prepare_lib_table_registration(&source, root, nickname, uri, "KiCad", false) {
         Ok(prepared) if prepared.content == source && existing.is_some() => Ok((None, "unchanged")),
@@ -590,6 +790,66 @@ fn plan_registration(
             ));
             Ok((None, "blocked"))
         }
+    }
+}
+
+/// A blocker when `path` exists as a symlink or as the wrong kind of entry.
+/// The transaction refuses both, so the preview must not plan them.
+fn target_type_blocker(path: &Path, want_dir: bool) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        Some(format!("target_is_a_symlink: {}", path.display()))
+    } else if metadata.is_dir() != want_dir {
+        Some(format!(
+            "target_has_wrong_type: {} is {}",
+            path.display(),
+            if metadata.is_dir() {
+                "a folder"
+            } else {
+                "a file"
+            }
+        ))
+    } else {
+        None
+    }
+}
+
+/// A blocker when the folder holds `path` only under another case. A
+/// case-insensitive disk would use that entry while the tables name this
+/// spelling, which a case-sensitive clone cannot resolve.
+fn case_blocker(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent()?;
+    let mut variant = None;
+    for entry in std::fs::read_dir(parent).ok()?.flatten() {
+        let other = entry.file_name();
+        let Some(other) = other.to_str() else {
+            continue;
+        };
+        if other == name {
+            return None;
+        }
+        if other.to_lowercase() == name.to_lowercase() {
+            variant = Some(other.to_string());
+        }
+    }
+    variant.map(|other| {
+        format!(
+            "target_case_mismatch: {} holds '{other}', which differs from '{name}' only in case; \
+             rename the source file or the library to match the existing spelling",
+            parent.display()
+        )
+    })
+}
+
+/// Records why `path` cannot be a target and says whether it can.
+fn usable_target(path: &Path, want_dir: bool, blockers: &mut Vec<String>) -> bool {
+    match target_type_blocker(path, want_dir).or_else(|| case_blocker(path)) {
+        Some(blocker) => {
+            blockers.push(blocker);
+            false
+        }
+        None => true,
     }
 }
 
@@ -703,27 +963,9 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
     let footprint_library = project_dir.join(format!("{library}.pretty"));
     let footprint_path = footprint_library.join(format!("{footprint_name}.kicad_mod"));
     let model_dir = project_dir.join(format!("{library}.3dshapes"));
-    for (path, want_dir) in [
-        (&symbol_library, false),
-        (&footprint_library, true),
-        (&model_dir, true),
-    ] {
-        if let Ok(metadata) = std::fs::symlink_metadata(path) {
-            if metadata.file_type().is_symlink() {
-                blockers.push(format!("target_is_a_symlink: {}", path.display()));
-            } else if metadata.is_dir() != want_dir {
-                blockers.push(format!(
-                    "target_has_wrong_type: {} is {}",
-                    path.display(),
-                    if metadata.is_dir() {
-                        "a folder"
-                    } else {
-                        "a file"
-                    }
-                ));
-            }
-        }
-    }
+    let mut symbol_library_usable = usable_target(&symbol_library, false, &mut blockers);
+    let footprint_library_usable = usable_target(&footprint_library, true, &mut blockers);
+    let model_dir_usable = usable_target(&model_dir, true, &mut blockers);
     let mut writes = Vec::new();
 
     // ── Model ──
@@ -745,10 +987,16 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
             return Err(invalid("model_file", format!("file name {reason}")).into());
         }
         let model_text = read_source(model_file, "model_file", MAX_MODEL_BYTES)?;
+        // A leading UTF-8 byte-order mark is not whitespace to `trim_start`.
+        // The sniff skips it; the bytes are copied and compared as they are.
+        let head = model_text
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&model_text)
+            .trim_start();
         let looks_right = if extension.as_deref() == Some("wrl") {
-            model_text.trim_start().starts_with("#VRML")
+            head.starts_with("#VRML")
         } else {
-            model_text.trim_start().starts_with("ISO-10303-21")
+            head.starts_with("ISO-10303-21")
         };
         if !looks_right {
             return Err(invalid(
@@ -758,34 +1006,54 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
             .into());
         }
         let model_path = model_dir.join(&model_name);
-        match std::fs::read(&model_path) {
-            Ok(existing) if existing == model_text.as_bytes() => {
-                model_reused = Some(model_path.clone());
+        let model_action = if !model_dir_usable || !usable_target(&model_path, false, &mut blockers)
+        {
+            "blocked"
+        } else {
+            match std::fs::read(&model_path) {
+                Ok(existing) if existing == model_text.as_bytes() => {
+                    model_reused = Some(model_path.clone());
+                    "reuse_identical"
+                }
+                Ok(_) => {
+                    blockers.push(format!(
+                        "model_exists: {} holds a different file; rename the model or remove it",
+                        model_path.display()
+                    ));
+                    "blocked"
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    writes.push(PlannedWrite {
+                        path: model_path.clone(),
+                        kind: "model",
+                        expected: None,
+                        replacement: model_text,
+                    });
+                    "create"
+                }
+                Err(error) => return Err(PlanError::Io(error.into())),
             }
-            Ok(_) => blockers.push(format!(
-                "model_exists: {} holds a different file; rename the model or remove it",
-                model_path.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                writes.push(PlannedWrite {
-                    path: model_path.clone(),
-                    kind: "model",
-                    expected: None,
-                    replacement: model_text,
-                });
-            }
-            Err(error) => return Err(PlanError::Io(error.into())),
-        }
+        };
         let model_uri = format!("${{KIPRJMOD}}/{library}.3dshapes/{model_name}");
         let replaced = replace_models(&footprint_source, &footprint_root, &model_uri)
             .map_err(|error| invalid("footprint_file", format!("cannot set its model: {error}")))?;
         let replaced_count = footprint_root.find_all("model").len();
-        let report = json!({
+        let kept_embeds = parse_sexp(&replaced)
+            .map(|node| embedded_model_names(&node))
+            .unwrap_or_default();
+        let removed_embeds: Vec<String> = embedded_model_names(&footprint_root)
+            .into_iter()
+            .filter(|name| !kept_embeds.contains(name))
+            .collect();
+        let mut report = json!({
             "path": model_path.display().to_string(),
             "reference": model_uri,
-            "action": if model_reused.is_some() { "reuse_identical" } else { "create" },
+            "action": model_action,
             "replaced_references": replaced_count,
         });
+        if !removed_embeds.is_empty() {
+            report["embedded_models_removed"] = json!(removed_embeds);
+        }
         (replaced, report)
     } else {
         let references: Vec<Value> = footprint_root
@@ -793,8 +1061,13 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
             .iter()
             .filter_map(|model| model.get(1).and_then(SexpNode::as_str))
             .map(|path| {
-                let state = model_reference_state(path, &project_dir, &request.footprint_file);
-                if state != "found" {
+                let state = model_reference_state(
+                    path,
+                    &project_dir,
+                    &request.footprint_file,
+                    &footprint_root,
+                );
+                if !matches!(state, "found" | "embedded") {
                     warnings.push(format!(
                         "The footprint's 3D model reference '{path}' is {state}; pass model_file to copy the model into the library"
                     ));
@@ -810,24 +1083,37 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
     let footprint_candidate =
         parse_sexp(&footprint_text).map_err(|error| PlanError::Io(error.into()))?;
 
-    match std::fs::read_to_string(&footprint_path) {
-        Ok(existing) => blockers.push(format!(
-            "footprint_exists: {} {}",
-            footprint_path.display(),
-            if existing == footprint_text {
-                "already holds this footprint"
-            } else {
-                "holds a different footprint with this name"
+    // An identical footprint (a second part sharing it) is used as it is;
+    // a different one under this name is never overwritten.
+    let mut footprint_reused = None;
+    let footprint_action =
+        if !footprint_library_usable || !usable_target(&footprint_path, false, &mut blockers) {
+            "blocked"
+        } else {
+            match std::fs::read(&footprint_path) {
+                Ok(existing) if existing == footprint_text.as_bytes() => {
+                    footprint_reused = Some(footprint_path.clone());
+                    "reuse_identical"
+                }
+                Ok(_) => {
+                    blockers.push(format!(
+                        "footprint_exists: {} holds a different footprint with this name",
+                        footprint_path.display()
+                    ));
+                    "blocked"
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    writes.push(PlannedWrite {
+                        path: footprint_path.clone(),
+                        kind: "footprint",
+                        expected: None,
+                        replacement: footprint_text,
+                    });
+                    "create"
+                }
+                Err(error) => return Err(PlanError::Io(error.into())),
             }
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => writes.push(PlannedWrite {
-            path: footprint_path.clone(),
-            kind: "footprint",
-            expected: None,
-            replacement: footprint_text,
-        }),
-        Err(error) => return Err(PlanError::Io(error.into())),
-    }
+        };
 
     // ── Symbol candidate ──
     let mut fields = request.fields.clone();
@@ -849,12 +1135,25 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
         .ok_or_else(|| PlanError::Io(anyhow::anyhow!("edited symbol vanished")))?;
     let block = edited[block_start..block_end].to_string();
 
-    let existing_library = match std::fs::read_to_string(&symbol_library) {
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(PlanError::Io(error.into())),
+    let existing_library = if symbol_library_usable {
+        match std::fs::read_to_string(&symbol_library) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                blockers.push(format!(
+                    "symbol_library_unusable: {}: not UTF-8 text",
+                    symbol_library.display()
+                ));
+                symbol_library_usable = false;
+                None
+            }
+            Err(error) => return Err(PlanError::Io(error.into())),
+        }
+    } else {
+        None
     };
     let library_text = match &existing_library {
+        _ if !symbol_library_usable => None,
         Some(existing) => match correctness::library(existing) {
             Err(error) => {
                 blockers.push(format!(
@@ -932,6 +1231,7 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
         &symbol_uri,
         "symbol_lib_table",
         &mut blockers,
+        &mut warnings,
     )?;
     let (footprint_table_write, footprint_registration) = plan_registration(
         &project_dir.join("fp-lib-table"),
@@ -941,6 +1241,7 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
         &footprint_uri,
         "footprint_lib_table",
         &mut blockers,
+        &mut warnings,
     )?;
     writes.extend(symbol_table_write);
     writes.extend(footprint_table_write);
@@ -970,6 +1271,7 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
         "pad_count": pad_count,
         "pads": pads,
         "pads_listed": pad_count.min(MAX_LISTED),
+        "action": footprint_action,
         "model": model_report,
     });
     let registrations = json!({
@@ -977,7 +1279,12 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
         "footprint": { "table": project_dir.join("fp-lib-table").display().to_string(), "uri": footprint_uri, "state": footprint_registration },
     });
 
-    let revision = plan_revision(&writes, model_reused.as_deref(), &blockers);
+    let reused: Vec<&Path> = model_reused
+        .iter()
+        .chain(&footprint_reused)
+        .map(PathBuf::as_path)
+        .collect();
+    let revision = plan_revision(&writes, &reused, &blockers);
     Ok(Plan {
         project_dir,
         library,
@@ -988,6 +1295,7 @@ fn build_plan(request: &Request) -> Result<Plan, PlanError> {
         footprint_name,
         writes,
         model_reused,
+        footprint_reused,
         registrations,
         symbol_report,
         footprint_report,
@@ -1064,13 +1372,10 @@ fn append_symbol(
     Ok(apply_edits(existing.to_string(), edits))
 }
 
-/// Binds the exact transitions, the reused model and the blockers, so any
-/// change on disk or in the request yields a different revision.
-fn plan_revision(
-    writes: &[PlannedWrite],
-    model_reused: Option<&Path>,
-    blockers: &[String],
-) -> String {
+/// Binds the exact transitions, the reused model and footprint, and the
+/// blockers, so any change on disk or in the request yields a different
+/// revision.
+fn plan_revision(writes: &[PlannedWrite], reused: &[&Path], blockers: &[String]) -> String {
     let mut hasher = Sha256::new();
     for write in writes {
         hasher.update(write.path.display().to_string().as_bytes());
@@ -1086,9 +1391,10 @@ fn plan_revision(
         hasher.update(sha256_text(&write.replacement).as_bytes());
         hasher.update([0]);
     }
-    if let Some(path) = model_reused {
+    for path in reused {
         hasher.update(b"reuse:");
         hasher.update(path.display().to_string().as_bytes());
+        hasher.update([0]);
     }
     for blocker in blockers {
         hasher.update(b"blocked:");
@@ -1186,11 +1492,28 @@ fn import_blocking(request: &Request) -> anyhow::Result<CallToolResult> {
 
     // The transaction needs every parent folder to exist. Folders created
     // here are removed again when nothing was written into them.
-    let mut created_dirs = Vec::new();
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
     for write in &plan.writes {
         if let Some(parent) = write.path.parent() {
             if !parent.exists() {
-                std::fs::create_dir(parent)?;
+                if let Err(error) = std::fs::create_dir(parent) {
+                    for dir in created_dirs.iter().rev() {
+                        let _ = std::fs::remove_dir(dir);
+                    }
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::PlanBlocked {
+                            operation: OPERATION.to_string(),
+                            reasons: vec![format!(
+                                "cannot_create_folder: {}: {error}",
+                                parent.display()
+                            )],
+                        },
+                        format!(
+                            "Import refused, nothing written: cannot create {}: {error}",
+                            parent.display()
+                        ),
+                    ));
+                }
                 created_dirs.push(parent.to_path_buf());
             }
         }
@@ -1233,6 +1556,15 @@ fn import_blocking(request: &Request) -> anyhow::Result<CallToolResult> {
                     "A target file changed during the import; nothing was written. Preview again.",
                 )
             }
+            // Every target still reads as before and no journal is left, so
+            // the transaction refused before writing anything.
+            other if untouched => CallToolResult::error_kind(
+                ToolErrorKind::PlanBlocked {
+                    operation: OPERATION.to_string(),
+                    reasons: vec![format!("transaction_refused: {other}")],
+                },
+                format!("Import refused, nothing written: {other}"),
+            ),
             other => crate::tools::mutation_outcome_uncertain(
                 &plan.project_dir,
                 OPERATION,
@@ -1294,6 +1626,9 @@ fn import_blocking(request: &Request) -> anyhow::Result<CallToolResult> {
     if let Some(path) = &plan.model_reused {
         body["model_reused"] = json!(path.display().to_string());
     }
+    if let Some(path) = &plan.footprint_reused {
+        body["footprint_reused"] = json!(path.display().to_string());
+    }
     body["next"] = json!(format!(
         "Place it with add_schematic_component lib_id '{}:{}'. If KiCad has this project open, \
          reopen the project (or the library manager) so it reads the updated library tables.",
@@ -1305,17 +1640,11 @@ fn import_blocking(request: &Request) -> anyhow::Result<CallToolResult> {
     Ok(CallToolResult::json(&body))
 }
 
+/// Whether an active transaction journal is left in the project, by the
+/// transaction crate's own rule: `.abandoned.json` evidence files do not
+/// count, and a project that cannot be inspected counts as one that has one.
 fn journal_pending(project_dir: &Path) -> bool {
-    std::fs::read_dir(project_dir)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".konnect-transaction-")
-            })
-        })
-        .unwrap_or(false)
+    !konnect_sexp::inspect_file_transactions(project_dir).is_ok_and(|pending| pending.is_empty())
 }
 
 #[cfg(test)]

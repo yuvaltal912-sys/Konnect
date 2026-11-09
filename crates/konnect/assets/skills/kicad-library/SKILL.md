@@ -40,8 +40,10 @@ the `.kicad_sym`, the `.kicad_mod` and, if there is one, the `.step` model. Show
 the user the preview's pins, pads and pin-pad check result, then apply with its
 `revision`. The tool never downloads anything: EasyEDA's terms forbid automated
 fetches, so ask the user to export or download the files themselves. It never
-overwrites. If a symbol or footprint with that name already exists, it reports
-the blocker, and you pick another `library` name.
+overwrites. A footprint or model already in the library with the same bytes is
+reused, so parts that share a footprint can go into one library. An existing
+symbol, or a different footprint or model with the same name, is a blocker:
+pick another `library` name.
 
 Use `edit_symbol` for metadata-only changes; it preserves pin/graphic geometry
 and existing field positioning. Refresh placed definitions separately. Search

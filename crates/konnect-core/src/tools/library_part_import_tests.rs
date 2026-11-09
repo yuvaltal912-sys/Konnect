@@ -78,12 +78,22 @@ async fn apply(args: &Value, revision: &str) -> CallToolResult {
     call(args).await
 }
 
-/// Every file under the project, with its bytes.
+/// Every file under the project, with its bytes; a link is recorded by its
+/// target, not followed.
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            if path.is_symlink() {
+                out.insert(
+                    format!("{} ->", path.strip_prefix(base).unwrap().display()),
+                    std::fs::read_link(&path)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                        .into_bytes(),
+                );
+            } else if path.is_dir() {
                 out.insert(
                     format!("{}/", path.strip_prefix(base).unwrap().display()),
                     Vec::new(),
@@ -445,20 +455,38 @@ async fn an_existing_symbol_footprint_or_model_blocks_and_is_never_overwritten()
         .iter()
         .map(|b| b.as_str().unwrap())
         .collect();
-    assert!(
-        blockers.iter().any(|b| b.starts_with("symbol_exists:")),
-        "{blockers:?}"
-    );
-    assert!(
-        blockers
-            .iter()
-            .any(|b| b.starts_with("footprint_exists:")
-                && b.contains("already holds this footprint")),
-        "{blockers:?}"
-    );
-    // The same model bytes are reused, not a conflict.
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(blockers[0].starts_with("symbol_exists:"), "{blockers:?}");
+    // The same footprint and model bytes are reused, not a conflict.
+    assert_eq!(body["footprint"]["action"], "reuse_identical");
     assert_eq!(body["footprint"]["model"]["action"], "reuse_identical");
     let refused = apply(&args, body["revision"].as_str().unwrap()).await;
+    assert_eq!(err_kind(&refused), "plan_blocked");
+    assert_eq!(snapshot(&project.root), after_first);
+
+    // A different footprint with the same name blocks and is kept.
+    let scratch = tempfile::tempdir().unwrap();
+    let changed_footprint = scratch.path().join("changed.kicad_mod");
+    std::fs::write(
+        &changed_footprint,
+        std::fs::read_to_string(fixture("part_import/SOT-23_TEST.kicad_mod"))
+            .unwrap()
+            .replace("(at 0 -1.1)", "(at 0 -1.2)"),
+    )
+    .unwrap();
+    let mut changed = args.clone();
+    changed["footprint_file"] = json!(changed_footprint.display().to_string());
+    let body = preview(&changed).await;
+    assert_eq!(body["footprint"]["action"], "blocked");
+    assert!(
+        body["blocked_by"].as_array().unwrap().iter().any(|b| b
+            .as_str()
+            .unwrap()
+            .starts_with("footprint_exists:")
+            && b.as_str().unwrap().contains("different footprint")),
+        "{body:#}"
+    );
+    let refused = apply(&changed, body["revision"].as_str().unwrap()).await;
     assert_eq!(err_kind(&refused), "plan_blocked");
     assert_eq!(snapshot(&project.root), after_first);
 
@@ -487,6 +515,97 @@ async fn an_existing_symbol_footprint_or_model_blocks_and_is_never_overwritten()
         .unwrap()
         .iter()
         .any(|b| b.as_str().unwrap().starts_with("model_exists:")));
+    assert_eq!(body["footprint"]["model"]["action"], "blocked");
+}
+
+/// The fixture LDO under another name, so a second import is a new symbol.
+fn renamed_ldo(dir: &Path) -> String {
+    let path = dir.join("TEST_LDO_5V0.kicad_sym");
+    std::fs::write(
+        &path,
+        std::fs::read_to_string(fixture("part_import/TEST_LDO.kicad_sym"))
+            .unwrap()
+            .replace("TEST_LDO_3V3", "TEST_LDO_5V0"),
+    )
+    .unwrap();
+    path.display().to_string()
+}
+
+#[tokio::test]
+async fn a_second_part_sharing_an_identical_footprint_reuses_it() {
+    let project = project();
+    let mut args = ldo_args(&project);
+    args["model_file"] = json!(fixture("part_import/SOT-23_TEST.step")
+        .display()
+        .to_string());
+    let revision = preview(&args).await["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(apply(&args, &revision).await);
+    let footprint_path = project
+        .root
+        .join("imported_parts.pretty/SOT-23_TEST.kicad_mod");
+    let footprint_before = std::fs::read(&footprint_path).unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let mut second = args.clone();
+    second["symbol_file"] = json!(renamed_ldo(scratch.path()));
+    let body = preview(&second).await;
+    assert_eq!(body["can_apply"], true, "{body:#}");
+    assert_eq!(body["footprint"]["action"], "reuse_identical");
+    assert_eq!(body["footprint"]["model"]["action"], "reuse_identical");
+    let kinds: Vec<&str> = body["writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["symbol_library"], "only the symbol is written");
+
+    // A change to the reused footprint is caught: it becomes a
+    // footprint_exists blocker, so the revision differs.
+    let revision = body["revision"].as_str().unwrap().to_string();
+    std::fs::write(&footprint_path, b"(footprint \"SOT-23_TEST\")\n").unwrap();
+    assert_eq!(err_kind(&apply(&second, &revision).await), "stale_target");
+    std::fs::write(&footprint_path, &footprint_before).unwrap();
+
+    let saved = ok(apply(&second, &revision).await);
+    assert_eq!(
+        saved["footprint_reused"],
+        footprint_path.display().to_string()
+    );
+    assert_eq!(saved["pin_pad_check"]["result"], "pass");
+    assert_eq!(std::fs::read(&footprint_path).unwrap(), footprint_before);
+    let library = std::fs::read_to_string(project.root.join("imported_parts.kicad_sym")).unwrap();
+    let root = correctness::library(&library).unwrap();
+    let footprints: Vec<_> = root
+        .find_all("symbol")
+        .into_iter()
+        .map(|symbol| {
+            (
+                symbol
+                    .get(1)
+                    .and_then(SexpNode::as_str)
+                    .unwrap()
+                    .to_string(),
+                properties_of(symbol)["Footprint"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        footprints,
+        [
+            (
+                "TEST_LDO_3V3".to_string(),
+                "imported_parts:SOT-23_TEST".to_string()
+            ),
+            (
+                "TEST_LDO_5V0".to_string(),
+                "imported_parts:SOT-23_TEST".to_string()
+            )
+        ]
+    );
 }
 
 #[tokio::test]
@@ -712,5 +831,621 @@ fn model_replacement_inserts_one_reference_when_the_footprint_has_none() {
     assert_eq!(
         xyz_of(parsed.find("model").unwrap(), "offset", [0.0; 3]),
         [1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn model_replacement_keeps_visibility_and_opacity() {
+    for (model, visible, opacity) in [
+        (
+            "(model \"a.step\" (hide yes) (opacity 0.4) (offset (xyz 1 2 3)))",
+            false,
+            0.4,
+        ),
+        ("(model \"a.step\" hide (offset (xyz 1 2 3)))", false, 1.0),
+        ("(model \"a.step\" (hide true))", false, 1.0),
+        ("(model \"a.step\" (hide no) (opacity 0.25))", true, 0.25),
+        ("(model \"a.step\" (offset (xyz 1 2 3)))", true, 1.0),
+    ] {
+        let source = format!("(footprint \"X\"\n  {model}\n)\n");
+        let root = parse_sexp(&source).unwrap();
+        let replaced = replace_models(&source, &root, "new.step").unwrap();
+        let models =
+            crate::tools::library_footprint::models(&parse_sexp(&replaced).unwrap()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].filename, "new.step");
+        assert_eq!(models[0].visible, visible, "{model}");
+        assert_eq!(models[0].opacity, opacity, "{model}");
+    }
+}
+
+/// The fixture footprint with its model embedded the way KiCad 9+ saves it,
+/// plus `extra` more embedded files.
+fn embedded_footprint(dir: &Path, reference: &str, extra: &str) -> String {
+    let path = dir.join("SOT-23_TEST.kicad_mod");
+    let source = std::fs::read_to_string(fixture("part_import/SOT-23_TEST.kicad_mod")).unwrap();
+    let body = source
+        .replace("${KIPRJMOD}/vendor_models/SOT-23-3.step", reference)
+        .trim_end()
+        .strip_suffix(')')
+        .unwrap()
+        .to_string();
+    std::fs::write(
+        &path,
+        format!(
+            "{body}  (embedded_files\n    (file\n      (name \"SOT-23-3.step\")\n      (type model)\n      (data |KLUv/QBYAQAA|)\n      (checksum \"00\")\n    ){extra}\n  )\n)\n"
+        ),
+    )
+    .unwrap();
+    path.display().to_string()
+}
+
+#[tokio::test]
+async fn an_embedded_model_is_reported_as_embedded_and_dropped_when_replaced() {
+    let project = project();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut args = ldo_args(&project);
+    args["footprint_file"] = json!(embedded_footprint(
+        scratch.path(),
+        "kicad-embed://SOT-23-3.step",
+        ""
+    ));
+    let body = preview(&args).await;
+    assert_eq!(
+        body["footprint"]["model"]["kept_references"][0]["state"],
+        "embedded"
+    );
+    assert!(
+        !body["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("3D model reference")),
+        "{body:#}"
+    );
+
+    // A reference to an embedded file that is not there is still reported.
+    let absent = tempfile::tempdir().unwrap();
+    args["footprint_file"] = json!(embedded_footprint(
+        absent.path(),
+        "kicad-embed://other.step",
+        ""
+    ));
+    let body = preview(&args).await;
+    assert_eq!(
+        body["footprint"]["model"]["kept_references"][0]["state"],
+        "embedded_file_absent"
+    );
+    assert!(body["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("embedded_file_absent")));
+
+    // With model_file, the embedded model goes with its reference; another
+    // embedded file stays.
+    let datasheet = "\n    (file\n      (name \"ds.pdf\")\n      (type datasheet)\n      (data |AAAA|)\n      (checksum \"01\")\n    )";
+    let with_datasheet = tempfile::tempdir().unwrap();
+    args["footprint_file"] = json!(embedded_footprint(
+        with_datasheet.path(),
+        "kicad-embed://SOT-23-3.step",
+        datasheet
+    ));
+    args["model_file"] = json!(fixture("part_import/SOT-23_TEST.step")
+        .display()
+        .to_string());
+    let body = preview(&args).await;
+    assert_eq!(
+        body["footprint"]["model"]["embedded_models_removed"],
+        json!(["SOT-23-3.step"])
+    );
+    ok(apply(&args, body["revision"].as_str().unwrap()).await);
+    let saved = std::fs::read_to_string(
+        project
+            .root
+            .join("imported_parts.pretty/SOT-23_TEST.kicad_mod"),
+    )
+    .unwrap();
+    let saved = parse_sexp(&saved).unwrap();
+    assert!(embedded_model_names(&saved).is_empty());
+    let files = saved.find("embedded_files").unwrap().find_all("file");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].find_str("name"), Some("ds.pdf"));
+}
+
+#[test]
+fn an_embedded_files_block_left_empty_is_removed() {
+    let source = "(footprint \"X\"\n  (model \"kicad-embed://a.step\" (offset (xyz 0 0 0)))\n  (embedded_files\n    (file (name \"a.step\") (type model) (data |AAAA|) (checksum \"0\"))\n  )\n)\n";
+    let root = parse_sexp(source).unwrap();
+    let replaced = replace_models(source, &root, "new.step").unwrap();
+    assert!(!replaced.contains("embedded_files"), "{replaced}");
+    assert!(!replaced.contains("kicad-embed://"), "{replaced}");
+    assert_eq!(parse_sexp(&replaced).unwrap().find_all("model").len(), 1);
+}
+
+#[tokio::test]
+async fn a_step_model_with_a_byte_order_mark_is_copied_verbatim() {
+    let project = project();
+    let scratch = tempfile::tempdir().unwrap();
+    let model = scratch.path().join("BOM.step");
+    std::fs::write(
+        &model,
+        "\u{feff}ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n",
+    )
+    .unwrap();
+    let mut args = ldo_args(&project);
+    args["model_file"] = json!(model.display().to_string());
+    let body = preview(&args).await;
+    assert_eq!(body["can_apply"], true, "{body:#}");
+    assert_eq!(body["footprint"]["model"]["action"], "create");
+    ok(apply(&args, body["revision"].as_str().unwrap()).await);
+    let saved = std::fs::read(project.root.join("imported_parts.3dshapes/BOM.step")).unwrap();
+    assert_eq!(saved, std::fs::read(&model).unwrap());
+    assert!(saved.starts_with(&[0xef, 0xbb, 0xbf]));
+    // The reuse comparison is over the same verbatim bytes.
+    let body = preview(&args).await;
+    assert_eq!(body["footprint"]["model"]["action"], "reuse_identical");
+}
+
+#[tokio::test]
+async fn a_non_utf8_step_model_is_refused_with_a_re_export_hint() {
+    let project = project();
+    let scratch = tempfile::tempdir().unwrap();
+    let model = scratch.path().join("LATIN1.step");
+    std::fs::write(
+        &model,
+        b"ISO-10303-21;\nHEADER;\nFILE_NAME('M\xfcller');\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n",
+    )
+    .unwrap();
+    let mut args = ldo_args(&project);
+    args["model_file"] = json!(model.display().to_string());
+    let result = call(args).await;
+    assert_eq!(err_kind(&result), "invalid_argument");
+    assert!(
+        text(&result).contains("re-export it as an ISO 10303-21 conforming (ASCII) STEP"),
+        "{}",
+        text(&result)
+    );
+    assert_eq!(
+        snapshot(&project.root).keys().collect::<Vec<_>>(),
+        ["board.kicad_pro"]
+    );
+}
+
+#[tokio::test]
+async fn a_library_registered_under_another_nickname_blocks() {
+    let project = project();
+    let library = project.root.join("imported_parts.kicad_sym");
+    std::fs::write(
+        &library,
+        "(kicad_symbol_lib\n  (version 20241209)\n  (generator \"t\")\n)\n",
+    )
+    .unwrap();
+    // The same file by the tool's own URI text, then by an absolute path.
+    for uri in [
+        "${KIPRJMOD}/imported_parts.kicad_sym".to_string(),
+        library.display().to_string(),
+    ] {
+        std::fs::write(
+            project.root.join("sym-lib-table"),
+            format!("(sym_lib_table\n  (version 7)\n  (lib (name \"MyParts\") (type \"KiCad\") (uri \"{uri}\") (options \"\") (descr \"\"))\n)\n"),
+        )
+        .unwrap();
+        let body = preview(&ldo_args(&project)).await;
+        assert_eq!(body["can_apply"], false, "{uri}");
+        assert_eq!(body["registrations"]["symbol"]["state"], "blocked");
+        assert!(
+            body["blocked_by"].as_array().unwrap().iter().any(|b| {
+                let b = b.as_str().unwrap();
+                b.starts_with("library_already_registered:") && b.contains("'MyParts'")
+            }),
+            "{body:#}"
+        );
+    }
+    // Before the file exists, a row that spells the path another way is
+    // still the same library.
+    std::fs::remove_file(&library).unwrap();
+    std::fs::write(
+        project.root.join("sym-lib-table"),
+        "(sym_lib_table\n  (version 7)\n  (lib (name \"MyParts\") (type \"KiCad\") (uri \"${KIPRJMOD}/./sub/../imported_parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+    )
+    .unwrap();
+    let body = preview(&ldo_args(&project)).await;
+    assert_eq!(body["can_apply"], false, "{body:#}");
+    assert!(
+        body["blocked_by"].as_array().unwrap().iter().any(|b| b
+            .as_str()
+            .unwrap()
+            .starts_with("library_already_registered:")),
+        "{body:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_library_spelled_in_another_case_blocks() {
+    let project = project();
+    std::fs::create_dir(project.root.join("imported_parts.pretty")).unwrap();
+    let mut args = ldo_args(&project);
+    args["library"] = json!("Imported_Parts");
+    let body = preview(&args).await;
+    assert_eq!(body["can_apply"], false, "{body:#}");
+    assert!(
+        body["blocked_by"].as_array().unwrap().iter().any(|b| {
+            let b = b.as_str().unwrap();
+            b.starts_with("target_case_mismatch:") && b.contains("'imported_parts.pretty'")
+        }),
+        "{body:#}"
+    );
+}
+
+/// Device.kicad_sym's R with KiCad 10's C_0603: a second, unrelated part.
+fn other_part(project: &Project) -> Value {
+    json!({
+        "project": project.pro(),
+        "symbol_file": fixture("reference_prefix_kicad10/Device.kicad_sym").display().to_string(),
+        "footprint_file": fixture("c_0603_1608metric_kicad10.kicad_mod").display().to_string(),
+    })
+}
+
+#[tokio::test]
+async fn a_disabled_registration_blocks_and_a_hidden_one_warns() {
+    let project = project();
+    let args = ldo_args(&project);
+    let revision = preview(&args).await["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(apply(&args, &revision).await);
+    let table = project.root.join("sym-lib-table");
+    let registered = std::fs::read_to_string(&table).unwrap();
+    assert_eq!(registered.matches("(descr \"\"))").count(), 1);
+
+    std::fs::write(
+        &table,
+        registered.replace("(descr \"\"))", "(descr \"\") (disabled))"),
+    )
+    .unwrap();
+    let body = preview(&other_part(&project)).await;
+    assert_eq!(body["can_apply"], false);
+    assert_eq!(body["registrations"]["symbol"]["state"], "blocked");
+    assert!(
+        body["blocked_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.as_str().unwrap().starts_with("library_disabled:")),
+        "{body:#}"
+    );
+
+    std::fs::write(
+        &table,
+        registered.replace("(descr \"\"))", "(descr \"\") (hidden))"),
+    )
+    .unwrap();
+    let body = preview(&other_part(&project)).await;
+    assert_eq!(body["can_apply"], true, "{body:#}");
+    assert_eq!(body["registrations"]["symbol"]["state"], "unchanged");
+    assert!(body["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("hidden")));
+}
+
+#[tokio::test]
+async fn a_registration_under_an_equivalent_absolute_uri_is_reused() {
+    let project = project();
+    let args = ldo_args(&project);
+    let revision = preview(&args).await["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(apply(&args, &revision).await);
+    for (table, file) in [
+        ("sym-lib-table", "imported_parts.kicad_sym"),
+        ("fp-lib-table", "imported_parts.pretty"),
+    ] {
+        let path = project.root.join(table);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace(
+                &format!("${{KIPRJMOD}}/{file}"),
+                &project.root.join(file).display().to_string(),
+            ),
+        )
+        .unwrap();
+    }
+    let tables_before = (
+        std::fs::read(project.root.join("sym-lib-table")).unwrap(),
+        std::fs::read(project.root.join("fp-lib-table")).unwrap(),
+    );
+    let second = other_part(&project);
+    let body = preview(&second).await;
+    assert_eq!(body["can_apply"], true, "{body:#}");
+    assert_eq!(body["registrations"]["symbol"]["state"], "unchanged");
+    assert_eq!(body["registrations"]["footprint"]["state"], "unchanged");
+    ok(apply(&second, body["revision"].as_str().unwrap()).await);
+    assert_eq!(
+        (
+            std::fs::read(project.root.join("sym-lib-table")).unwrap(),
+            std::fs::read(project.root.join("fp-lib-table")).unwrap(),
+        ),
+        tables_before
+    );
+}
+
+/// Previews `args`, expects a blocker starting with `prefix` and no write
+/// planned onto `target`, and checks that applying the blocked revision writes
+/// nothing.
+async fn assert_blocked(project: &Project, args: &Value, prefix: &str, target: &str) {
+    let before = snapshot(&project.root);
+    let body = preview(args).await;
+    assert_eq!(body["can_apply"], false, "{prefix}: {body:#}");
+    assert!(
+        body["blocked_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.as_str().unwrap().starts_with(prefix)),
+        "{prefix}: {body:#}"
+    );
+    let target = project.root.join(target).display().to_string();
+    assert!(
+        !body["writes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["path"].as_str().unwrap().starts_with(&target)),
+        "{prefix}: a write is planned onto the blocked {target}: {body:#}"
+    );
+    let refused = apply(args, body["revision"].as_str().unwrap()).await;
+    assert_eq!(err_kind(&refused), "plan_blocked");
+    assert!(text(&refused).contains("nothing written"));
+    assert_eq!(snapshot(&project.root), before, "{prefix}");
+}
+
+#[tokio::test]
+async fn targets_of_the_wrong_kind_or_unusable_block() {
+    let case = project();
+    std::fs::write(case.root.join("imported_parts.pretty"), "not a folder\n").unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "target_has_wrong_type:",
+        "imported_parts.pretty",
+    )
+    .await;
+
+    let case = project();
+    std::fs::create_dir(case.root.join("imported_parts.kicad_sym")).unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "target_has_wrong_type:",
+        "imported_parts.kicad_sym",
+    )
+    .await;
+
+    let case = project();
+    std::fs::write(
+        case.root.join("imported_parts.kicad_sym"),
+        "(kicad_symbol_lib (version\n",
+    )
+    .unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "symbol_library_unusable:",
+        "imported_parts.kicad_sym",
+    )
+    .await;
+
+    let case = project();
+    std::fs::write(
+        case.root.join("sym-lib-table"),
+        "(sym_lib_table\n  (version 7)\n  (lib (name \"x\")\n",
+    )
+    .unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "lib_table_unusable:",
+        "sym-lib-table",
+    )
+    .await;
+
+    let case = project();
+    let row = "  (lib (name \"imported_parts\") (type \"KiCad\") (uri \"${KIPRJMOD}/imported_parts.pretty\") (options \"\") (descr \"\"))\n";
+    std::fs::write(
+        case.root.join("fp-lib-table"),
+        format!("(fp_lib_table\n  (version 7)\n{row}{row})\n"),
+    )
+    .unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "lib_table_unusable:",
+        "fp-lib-table",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_targets_and_tables_block_in_the_preview() {
+    let outside = tempfile::tempdir().unwrap();
+
+    let case = project();
+    std::os::unix::fs::symlink(outside.path(), case.root.join("imported_parts.pretty")).unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "target_is_a_symlink:",
+        "imported_parts.pretty",
+    )
+    .await;
+
+    // A dangling link where the footprint file would go.
+    let case = project();
+    std::fs::create_dir(case.root.join("imported_parts.pretty")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("gone.kicad_mod"),
+        case.root
+            .join("imported_parts.pretty/SOT-23_TEST.kicad_mod"),
+    )
+    .unwrap();
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "target_is_a_symlink:",
+        "imported_parts.pretty/SOT-23_TEST.kicad_mod",
+    )
+    .await;
+
+    // A library table linked to a file inside the project.
+    let case = project();
+    std::fs::create_dir(case.root.join("tables")).unwrap();
+    std::fs::write(
+        case.root.join("tables/sym-lib-table"),
+        "(sym_lib_table\n  (version 7)\n)\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("tables/sym-lib-table", case.root.join("sym-lib-table")).unwrap();
+    let body = preview(&ldo_args(&case)).await;
+    assert_eq!(body["registrations"]["symbol"]["state"], "blocked");
+    assert_blocked(
+        &case,
+        &ldo_args(&case),
+        "target_is_a_symlink:",
+        "sym-lib-table",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_refused_before_writing_says_nothing_was_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = project();
+    // The footprint folder exists, so apply needs to create no folder and
+    // the transaction itself is what fails.
+    std::fs::create_dir(project.root.join("imported_parts.pretty")).unwrap();
+    let args = ldo_args(&project);
+    let body = preview(&args).await;
+    assert_eq!(body["can_apply"], true, "{body:#}");
+    let before = snapshot(&project.root);
+
+    let set_mode = |mode| {
+        std::fs::set_permissions(&project.root, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    set_mode(0o555);
+    let probe = project.root.join("probe");
+    if std::fs::write(&probe, "").is_ok() {
+        // Running as root: permissions do not refuse anything here.
+        let _ = std::fs::remove_file(&probe);
+        set_mode(0o755);
+        return;
+    }
+    let refused = apply(&args, body["revision"].as_str().unwrap()).await;
+    set_mode(0o755);
+
+    assert_eq!(err_kind(&refused), "plan_blocked", "{}", text(&refused));
+    let message = text(&refused);
+    assert!(message.contains("transaction_refused:"), "{message}");
+    assert!(message.contains("nothing written"), "{message}");
+    assert!(!message.contains("may be written"), "{message}");
+    assert_eq!(snapshot(&project.root), before);
+
+    // Without the folder, creating it is what fails: refused the same way.
+    std::fs::remove_dir(project.root.join("imported_parts.pretty")).unwrap();
+    let body = preview(&args).await;
+    let before = snapshot(&project.root);
+    set_mode(0o555);
+    let refused = apply(&args, body["revision"].as_str().unwrap()).await;
+    set_mode(0o755);
+    assert_eq!(err_kind(&refused), "plan_blocked", "{}", text(&refused));
+    assert!(text(&refused).contains("cannot_create_folder:"));
+    assert_eq!(snapshot(&project.root), before);
+}
+
+#[test]
+fn only_an_active_journal_counts_as_pending() {
+    let project = project();
+    let id = "00000000-0000-4000-8000-000000000000";
+    std::fs::write(
+        project
+            .root
+            .join(format!(".konnect-transaction-{id}.abandoned.json")),
+        "{}",
+    )
+    .unwrap();
+    assert!(
+        !journal_pending(&project.root),
+        "abandoned evidence is not pending"
+    );
+    assert!(
+        journal_pending(&project.root.join("missing")),
+        "a folder that cannot be inspected counts as pending"
+    );
+    std::fs::write(
+        project.root.join(format!(".konnect-transaction-{id}.json")),
+        "{}",
+    )
+    .unwrap();
+    assert!(
+        journal_pending(&project.root),
+        "an active journal is pending"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_project_path_relative_to_the_working_folder_applies() {
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let depth = cwd.components().count();
+    let dir = tempfile::tempdir().unwrap();
+    // Nested deeper than the working folder, so a relative target joined onto
+    // the project folder a second time cannot climb back to the same place.
+    let mut root = dir.path().canonicalize().unwrap();
+    for _ in 0..depth {
+        root.push("d");
+    }
+    root.push("board");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("board.kicad_pro"), "{}\n").unwrap();
+    let mut relative = PathBuf::new();
+    for _ in 1..depth {
+        relative.push("..");
+    }
+    let relative = relative
+        .join(root.strip_prefix("/").unwrap())
+        .join("board.kicad_pro");
+    assert!(relative.is_relative());
+    let project = Project { _dir: dir, root };
+
+    let mut args = ldo_args(&project);
+    args["project"] = json!(relative.display().to_string());
+    let body = preview(&args).await;
+    assert_eq!(body["can_apply"], true, "{body:#}");
+    assert_eq!(
+        body["library"]["symbol_library"],
+        project
+            .root
+            .join("imported_parts.kicad_sym")
+            .display()
+            .to_string()
+    );
+    let saved = ok(apply(&args, body["revision"].as_str().unwrap()).await);
+    assert_eq!(saved["pin_pad_check"]["result"], "pass");
+    assert!(project.root.join("imported_parts.kicad_sym").is_file());
+    assert!(project
+        .root
+        .join("imported_parts.pretty/SOT-23_TEST.kicad_mod")
+        .is_file());
+    assert_eq!(
+        parse_lib_table(&std::fs::read_to_string(project.root.join("sym-lib-table")).unwrap())[0]
+            ["uri"],
+        "${KIPRJMOD}/imported_parts.kicad_sym"
     );
 }
