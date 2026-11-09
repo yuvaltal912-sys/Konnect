@@ -1220,6 +1220,12 @@ mod query_traces_tests {
         assert!(body.get("next_offset").is_none() && body.get("hint").is_none());
         let (err, body) = run_many(5, json!({ "offset": -1 })).await;
         assert!(err, "{body}");
+        // Review #49: a stale offset says it is past the end.
+        let (err, body) = run_many(5, json!({ "offset": 5000 })).await;
+        assert!(!err, "{body}");
+        assert_eq!(body["offset_past_end"], true, "{body}");
+        assert_eq!(body["total_matches"], 5);
+        assert!(body["hint"].as_str().unwrap().contains("past the end"));
     }
 
     #[tokio::test]

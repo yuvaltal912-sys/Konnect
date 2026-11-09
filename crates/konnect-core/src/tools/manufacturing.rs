@@ -89,7 +89,8 @@ pub fn tools() -> Vec<ToolDef> {
              DRC reports errors or could not be run, so a READY verdict always rests on \
              evidence rather than on an absence of findings. `issues` is paged (`limit`, \
              `offset`) and stops at a size cap; `issue_count` and `issues_by_severity` count \
-             every issue and the verdict reads them all.",
+             every issue and the verdict reads them all. Issues are sorted, most severe \
+             first, and `issues_fingerprint` is the same on every page of one result.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1173,6 +1174,7 @@ async fn handle_validate_for_manufacturing(
 
     // One DRC error is one issue, so a board with hundreds overflowed the
     // client (#A30). The verdict and the counts read every issue.
+    let (issues, issues_fingerprint) = ordered_issues(issues);
     let mut by_severity = serde_json::Map::new();
     for issue in &issues {
         let severity = issue["severity"].as_str().unwrap_or("").to_owned();
@@ -1197,6 +1199,7 @@ async fn handle_validate_for_manufacturing(
         "outline": crate::tools::board_geometry::outline_check_json(&outline_check, &geometry.outline),
         "issue_count": issues.len(),
         "issues_by_severity": by_severity,
+        "issues_fingerprint": issues_fingerprint,
         "issues": page.items,
         "summary": format!(
             "{}: {} issues found. {} footprints, {} copper layers.",
@@ -1208,12 +1211,37 @@ async fn handle_validate_for_manufacturing(
         page.hint(
             fields,
             &format!(
-                "Pass offset {} for the next page; run_drc lists the DRC violations by rule.",
+                "Pass offset {} for the next page; every page of one result has the same \
+                 issues_fingerprint, and a different one means the board or its DRC changed \
+                 in between. run_drc lists the DRC violations by rule.",
                 page.offset + page.items.len()
             ),
         );
     }
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
+}
+
+/// The issues in one order, most severe first and then by their text, and a
+/// fingerprint of the whole list. Each page is a fresh run, so kicad-cli's
+/// report order must not decide what a page holds, and a page from a
+/// different result must be visible as one (review #49).
+fn ordered_issues(issues: Vec<serde_json::Value>) -> (Vec<serde_json::Value>, String) {
+    use sha2::Digest;
+    let rank = |issue: &serde_json::Value| match issue["severity"].as_str() {
+        Some("error") => 0u8,
+        Some("warning") => 1,
+        Some("info") => 2,
+        _ => 3,
+    };
+    let mut keyed: Vec<(u8, String, serde_json::Value)> = issues
+        .into_iter()
+        .map(|issue| (rank(&issue), issue.to_string(), issue))
+        .collect();
+    keyed.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let issues: Vec<serde_json::Value> = keyed.into_iter().map(|(_, _, issue)| issue).collect();
+    let digest = sha2::Sha256::digest(serde_json::to_string(&issues).unwrap_or_default());
+    let fingerprint = format!("{digest:x}")[..16].to_owned();
+    (issues, fingerprint)
 }
 
 async fn handle_estimate_cost(

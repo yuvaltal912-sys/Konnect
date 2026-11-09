@@ -137,6 +137,21 @@ impl Page {
                 )),
             );
         }
+        // An empty page past the end looks like the end of a list: a stale
+        // `next_offset` from an earlier, longer result must say otherwise.
+        if self.items.is_empty() && self.offset > 0 && self.offset >= self.total {
+            fields.insert("offset_past_end".into(), json!(true));
+            let advice = match self.total {
+                0 => "the list is empty; pass offset 0".to_owned(),
+                total => format!(
+                    "the list has {total}; pass an offset below {total}, or 0 for the first page"
+                ),
+            };
+            fields.insert(
+                "hint".into(),
+                json!(format!("offset {} is past the end: {advice}.", self.offset)),
+            );
+        }
     }
 }
 
@@ -281,6 +296,31 @@ mod tests {
         last.describe(&mut fields);
         assert!(fields.get("next_offset").is_none() && fields.get("hint").is_none());
         assert_eq!(fields["truncated"], false);
+    }
+
+    /// Review #49: a stale offset gave an empty page with `truncated: false`
+    /// and no hint, which reads as the end of the list.
+    #[test]
+    fn an_offset_past_the_end_is_flagged_with_the_total() {
+        let all = items(3, |i| format!("r{i}"));
+        for (offset, flagged) in [(0, false), (2, false), (3, true), (5_000, true)] {
+            let mut fields = Map::new();
+            page(&all, offset, 10, BYTE_BUDGET).describe(&mut fields);
+            assert_eq!(fields.get("offset_past_end").is_some(), flagged, "{offset}");
+            if flagged {
+                let hint = fields["hint"].as_str().unwrap();
+                assert!(
+                    hint.contains("past the end") && hint.contains("has 3"),
+                    "{hint}"
+                );
+            }
+        }
+        let mut fields = Map::new();
+        page(&[], 1, 10, BYTE_BUDGET).describe(&mut fields);
+        assert_eq!(fields["offset_past_end"], true);
+        let mut fields = Map::new();
+        page(&[], 0, 10, BYTE_BUDGET).describe(&mut fields);
+        assert!(fields.get("offset_past_end").is_none() && fields.get("hint").is_none());
     }
 
     #[test]

@@ -83,48 +83,174 @@ const ZONE_FILL_ZONES_LISTED: usize = 10;
 
 /// A copper zone of a board (not a rule area) and its saved fill.
 struct ZoneFill {
-    key: String,
+    /// The zone's `uuid`, or its `tstamp` on a KiCad 6/7 board, lowercased.
+    id: Option<String>,
+    /// Net, layers and outline, written one way: what pairs a zone whose id
+    /// changed when kicad-cli saved the refilled copy.
+    shape: String,
+    /// Inside a footprint. kicad-cli's refill fills board zones only
+    /// (`ZONE_FILLER_TOOL::FillAllZones` walks `BOARD::Zones()`), so these
+    /// cannot be compared.
+    in_footprint: bool,
     name: Option<String>,
     net: Option<String>,
-    /// Each `filled_polygon`, written out and sorted, so two fills compare
-    /// equal when they hold the same polygons in any order.
+    /// Each `filled_polygon` as its layer and points, sorted, so two fills
+    /// compare equal when they hold the same polygons in any order, however
+    /// the numbers are written and whatever `island` marks a newer KiCad adds.
     polygons: Vec<String>,
 }
 
+/// A node written one way: numbers to six decimals, KiCad's 1 nm, so `1`,
+/// `1.0` and `1.000000` agree and no real difference is rounded away.
+fn canonical(node: &konnect_sexp::SexpNode) -> String {
+    match node.children() {
+        Some(children) => format!(
+            "({})",
+            children.iter().map(canonical).collect::<Vec<_>>().join(" ")
+        ),
+        None => {
+            let atom = node.as_str().unwrap_or_default();
+            match atom.parse::<f64>() {
+                // -0 and 0 are one coordinate.
+                Ok(0.0) => "0.000000".into(),
+                Ok(number) => format!("{number:.6}"),
+                Err(_) => atom.to_owned(),
+            }
+        }
+    }
+}
+
+fn zone_fill(zone: &konnect_sexp::SexpNode, in_footprint: bool) -> ZoneFill {
+    let mut layers: Vec<&str> = ["layer", "layers"]
+        .into_iter()
+        .filter_map(|tag| zone.find(tag))
+        .flat_map(|node| node.children().unwrap_or(&[]).iter().skip(1))
+        .filter_map(konnect_sexp::SexpNode::as_str)
+        .collect();
+    layers.sort_unstable();
+    layers.dedup();
+    let mut polygons: Vec<String> = zone
+        .find_all("filled_polygon")
+        .into_iter()
+        .map(|polygon| {
+            // KiCad 5 wrote no layer on a single-layer zone's fill.
+            let layer = polygon
+                .find_str("layer")
+                .or_else(|| (layers.len() == 1).then(|| layers[0]))
+                .unwrap_or_default();
+            let points = polygon.find("pts").map(canonical).unwrap_or_default();
+            format!("{layer}|{points}")
+        })
+        .collect();
+    polygons.sort();
+    let net = zone.find_str("net_name").map(str::to_owned).or_else(|| {
+        zone.find("net")
+            .and_then(|net| net.get(1))
+            .and_then(|name| name.as_str())
+            .filter(|name| name.parse::<i64>().is_err())
+            .map(str::to_owned)
+    });
+    let outline = zone
+        .find("polygon")
+        .and_then(|polygon| polygon.find("pts"))
+        .map(canonical)
+        .unwrap_or_default();
+    ZoneFill {
+        id: zone
+            .find_str("uuid")
+            .or_else(|| zone.find_str("tstamp"))
+            .map(|id| id.trim().to_ascii_lowercase())
+            .filter(|id| !id.is_empty()),
+        shape: format!(
+            "{}|{}|{outline}",
+            net.as_deref().unwrap_or_default(),
+            layers.join(",")
+        ),
+        in_footprint,
+        name: zone
+            .find_str("name")
+            .map(str::to_owned)
+            .filter(|n| !n.is_empty()),
+        net,
+        polygons,
+    }
+}
+
+/// The board's copper zones, then those inside footprints (`module` on a
+/// KiCad 5 board).
 fn copper_zone_fills(source: &str) -> anyhow::Result<Vec<ZoneFill>> {
     let tree = konnect_sexp::parse_sexp(source)?;
-    Ok(tree
+    let copper = |zone: &&konnect_sexp::SexpNode| zone.find("keepout").is_none();
+    let board = tree
         .find_all("zone")
         .into_iter()
-        .enumerate()
-        .filter(|(_, zone)| zone.find("keepout").is_none())
-        .map(|(index, zone)| {
-            let mut polygons: Vec<String> = zone
-                .find_all("filled_polygon")
-                .into_iter()
-                .map(|polygon| format!("{polygon:?}"))
-                .collect();
-            polygons.sort();
-            let net = zone.find_str("net_name").map(str::to_owned).or_else(|| {
-                zone.find("net")
-                    .and_then(|net| net.get(1))
-                    .and_then(|name| name.as_str())
-                    .filter(|name| name.parse::<i64>().is_err())
-                    .map(str::to_owned)
+        .filter(copper)
+        .map(|zone| zone_fill(zone, false));
+    let footprints = ["footprint", "module"]
+        .into_iter()
+        .flat_map(|tag| tree.find_all(tag))
+        .flat_map(|footprint| footprint.find_all("zone"))
+        .filter(copper)
+        .map(|zone| zone_fill(zone, true));
+    Ok(board.chain(footprints).collect())
+}
+
+fn zone_id(zone: &ZoneFill) -> Option<&str> {
+    zone.id.as_deref()
+}
+
+fn zone_shape(zone: &ZoneFill) -> Option<&str> {
+    Some(zone.shape.as_str())
+}
+
+/// Index of each key held by exactly one zone; `None` for a shared key.
+fn unique_keys(
+    zones: &[&ZoneFill],
+    key: fn(&ZoneFill) -> Option<&str>,
+) -> std::collections::HashMap<String, Option<usize>> {
+    let mut seen: std::collections::HashMap<String, Option<usize>> = Default::default();
+    for (index, zone) in zones.iter().enumerate() {
+        if let Some(key) = key(zone) {
+            seen.entry(key.to_owned())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(index));
+        }
+    }
+    seen
+}
+
+/// Pair each saved zone with its refilled self: by id where exactly one zone
+/// on each side has it, then by shape the same way. A zone nothing pairs is
+/// returned apart, never guessed at.
+fn pair_zones<'s, 'r>(
+    saved: &[&'s ZoneFill],
+    refilled: &[&'r ZoneFill],
+) -> (Vec<(&'s ZoneFill, &'r ZoneFill)>, Vec<&'s ZoneFill>) {
+    let mut pairs = Vec::new();
+    let mut taken = vec![false; refilled.len()];
+    let mut left: Vec<&'s ZoneFill> = saved.to_vec();
+    for key in [zone_id as fn(&ZoneFill) -> Option<&str>, zone_shape] {
+        let free: Vec<usize> = (0..refilled.len()).filter(|&i| !taken[i]).collect();
+        let free_zones: Vec<&ZoneFill> = free.iter().map(|&i| refilled[i]).collect();
+        let theirs = unique_keys(&free_zones, key);
+        let ours = unique_keys(&left, key);
+        let mut unpaired = Vec::new();
+        for zone in left {
+            let found = key(zone).and_then(|k| match (ours.get(k), theirs.get(k)) {
+                (Some(Some(_)), Some(Some(index))) => Some(free[*index]),
+                _ => None,
             });
-            ZoneFill {
-                key: zone
-                    .find_str("uuid")
-                    .map_or_else(|| format!("#{index}"), str::to_owned),
-                name: zone
-                    .find_str("name")
-                    .map(str::to_owned)
-                    .filter(|n| !n.is_empty()),
-                net,
-                polygons,
+            match found {
+                Some(index) => {
+                    taken[index] = true;
+                    pairs.push((zone, refilled[index]));
+                }
+                None => unpaired.push(zone),
             }
-        })
-        .collect())
+        }
+        left = unpaired;
+    }
+    (pairs, left)
 }
 
 /// One violation as the fill comparison counts it: what and where, not the
@@ -140,11 +266,17 @@ fn violation_key(violation: &cli::DrcViolation) -> String {
     )
 }
 
+/// Rules a refill cannot change and the private copy cannot reproduce: it
+/// carries no library tables, so a footprint from a project library reads as
+/// missing there. They are left out of the comparison, and its result says so.
+const RULES_NOT_COMPARED: [&str; 2] = ["lib_footprint_issues", "lib_footprint_mismatch"];
+
 fn fill_sensitive(report: &cli::DrcReport) -> Vec<&cli::DrcViolation> {
     report
         .violations
         .iter()
         .chain(report.unconnected_items.iter().flatten())
+        .filter(|violation| !RULES_NOT_COMPARED.contains(&violation.rule.as_str()))
         .collect()
 }
 
@@ -184,11 +316,16 @@ fn violation_json(violation: &cli::DrcViolation) -> Value {
 ///
 /// `state` is `fresh` when the zones were refilled for this run, when the
 /// board has no copper zones, or when a refill of a private copy produced the
-/// same fills; `stale` when that refill changed any zone's fill; `unknown` when
-/// no comparison was made or it failed, with `reason`. When stale, the
-/// violations a refill clears or adds are counted and the first few listed.
-/// The comparison is a second, analysis-only DRC on a scratch copy of the
-/// board and its project rules; the board itself is never written.
+/// same fills for every zone; `stale` when that refill changed any zone's
+/// fill; `unknown` when no comparison was made, it failed, or some zones could
+/// not be compared, with `reason`. Zones are paired by id (`uuid`, or `tstamp`
+/// on a KiCad 6/7 board), then by net, layers and outline; one nothing pairs
+/// makes the state `unknown`, never `stale`. Zones inside footprints count but
+/// cannot be compared, since kicad-cli's refill fills board zones only. The
+/// violations a refill clears or adds are counted and the first few listed,
+/// leaving out [`RULES_NOT_COMPARED`]. The comparison is a second,
+/// analysis-only DRC on a scratch copy of the board and its project rules;
+/// the board itself is never written.
 pub(crate) async fn zone_fill_check(
     ctx: &ToolContext,
     board: &Path,
@@ -196,9 +333,6 @@ pub(crate) async fn zone_fill_check(
     check: bool,
     report: &cli::DrcReport,
 ) -> Value {
-    if refilled {
-        return json!({ "state": "fresh", "method": "refilled_for_this_run" });
-    }
     let unknown = |method: &str, zones: Option<usize>, reason: String| {
         json!({
             "state": "unknown",
@@ -222,6 +356,22 @@ pub(crate) async fn zone_fill_check(
             )
         }
     };
+    let in_footprints = saved.iter().filter(|zone| zone.in_footprint).count();
+    let footprint_reason = format!(
+        "{in_footprints} copper zone(s) inside footprints: kicad-cli's refill fills board \
+         zones only, so their fills were not checked"
+    );
+    let footprint_hint = "Zones inside footprints are not refilled by kicad-cli, with or \
+                          without refill_zones; check their fills in KiCad.";
+    if refilled {
+        if in_footprints > 0 {
+            let mut result = unknown("refilled_for_this_run", Some(saved.len()), footprint_reason);
+            result["footprint_zones"] = json!(in_footprints);
+            result["hint"] = json!(footprint_hint);
+            return result;
+        }
+        return json!({ "state": "fresh", "method": "refilled_for_this_run" });
+    }
     if saved.is_empty() {
         return json!({ "state": "fresh", "method": "no_copper_zones", "copper_zones": 0 });
     }
@@ -231,6 +381,14 @@ pub(crate) async fn zone_fill_check(
             Some(saved.len()),
             "check_zone_fills was false and the zones were not refilled".into(),
         );
+    }
+    let board_zones: Vec<&ZoneFill> = saved.iter().filter(|zone| !zone.in_footprint).collect();
+    if board_zones.is_empty() {
+        // A refill would change none of them, so no second DRC runs.
+        let mut result = unknown("not_comparable", Some(saved.len()), footprint_reason);
+        result["footprint_zones"] = json!(in_footprints);
+        result["hint"] = json!(footprint_hint);
+        return result;
     }
     let comparison = async {
         let scratch = tempfile::tempdir()?;
@@ -260,42 +418,68 @@ pub(crate) async fn zone_fill_check(
             )
         }
     };
-    let fresh: std::collections::HashMap<&str, &Vec<String>> = refilled
+    let refilled_board: Vec<&ZoneFill> =
+        refilled.iter().filter(|zone| !zone.in_footprint).collect();
+    let (pairs, unpaired) = pair_zones(&board_zones, &refilled_board);
+    let differing: Vec<&ZoneFill> = pairs
         .iter()
-        .map(|zone| (zone.key.as_str(), &zone.polygons))
-        .collect();
-    let differing: Vec<&ZoneFill> = saved
-        .iter()
-        .filter(|zone| fresh.get(zone.key.as_str()) != Some(&&zone.polygons))
+        .filter(|(saved, refilled)| saved.polygons != refilled.polygons)
+        .map(|(saved, _)| *saved)
         .collect();
     let before = fill_sensitive(report);
     let after = fill_sensitive(&refilled_report);
     let cleared = only_in(&before, &after);
     let added = only_in(&after, &before);
-    let state = if differing.is_empty() {
+    let state = if !differing.is_empty() {
+        "stale"
+    } else if unpaired.is_empty() && in_footprints == 0 {
         "fresh"
     } else {
-        "stale"
+        "unknown"
     };
     let mut result = json!({
         "state": state,
         "method": "compared_with_refill",
         "copper_zones": saved.len(),
+        "zones_compared": pairs.len(),
         "zones_differing": differing.len(),
         "violations_cleared_by_refill": cleared.len(),
         "violations_added_by_refill": added.len(),
+        "rules_not_compared": RULES_NOT_COMPARED,
     });
+    let mut reasons = Vec::new();
+    if !unpaired.is_empty() {
+        result["zones_unpaired"] = json!(unpaired.len());
+        reasons.push(format!(
+            "{} zone(s) could not be paired with the refilled copy by id or by net, layers \
+             and outline, so their fills were not compared",
+            unpaired.len()
+        ));
+    }
+    if in_footprints > 0 {
+        result["footprint_zones"] = json!(in_footprints);
+        reasons.push(footprint_reason);
+    }
+    if !reasons.is_empty() {
+        result["reason"] = json!(reasons.join("; "));
+    }
     if !differing.is_empty() {
         result["differing_zones"] = json!(differing
             .iter()
             .take(ZONE_FILL_ZONES_LISTED)
-            .map(|zone| json!({ "uuid": zone.key, "name": zone.name, "net": zone.net }))
+            .map(|zone| json!({ "id": zone.id, "name": zone.name, "net": zone.net }))
             .collect::<Vec<_>>());
         result["hint"] = json!(if cleared.is_empty() && added.is_empty() {
             "The saved zone fills are out of date, but a refill does not change these DRC results."
         } else {
             "The saved zone fills are out of date and a refill changes these DRC results. \
              Refill the zones (refill_zones: true, or the refill_zones tool) and run DRC again."
+        });
+    } else if state == "unknown" {
+        result["hint"] = json!(if unpaired.is_empty() {
+            footprint_hint
+        } else {
+            "Pass refill_zones: true to run DRC on fresh fills."
         });
     }
     if !cleared.is_empty() {
@@ -1260,6 +1444,12 @@ mod zone_fill_tests {
             Scene { dir, board, ctx }
         }
 
+        /// What the `--save-board` run reports, in place of [`REFILLED_REPORT`].
+        fn with_refill_report(self, report: &str) -> Self {
+            std::fs::write(self.dir.path().join("refill.json"), report).unwrap();
+            self
+        }
+
         fn calls(&self) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join("calls"))
                 .unwrap_or_default()
@@ -1297,7 +1487,9 @@ mod zone_fill_tests {
             assert_eq!(check["method"], "compared_with_refill");
             assert_eq!(check["copper_zones"], 1, "the keepout is not a copper zone");
             assert_eq!(check["zones_differing"], 1);
-            assert_eq!(check["differing_zones"][0]["uuid"], "z-pour");
+            assert_eq!(check["differing_zones"][0]["id"], "z-pour");
+            assert_eq!(check["zones_compared"], 1);
+            assert!(check.get("reason").is_none(), "{check}");
             assert_eq!(check["differing_zones"][0]["net"], "GND");
             assert_eq!(check["violations_cleared_by_refill"], 1);
             assert_eq!(check["violations_added_by_refill"], 0);
@@ -1327,6 +1519,188 @@ mod zone_fill_tests {
         assert_eq!(body["zone_fill_state"], "fresh", "{body}");
         assert_eq!(body["zone_fill_check"]["zones_differing"], 0);
         assert!(body["zone_fill_check"].get("differing_zones").is_none());
+    }
+
+    /// A KiCad 7 board (`version 20221018`): the zone's id is a `tstamp`, its
+    /// net a number beside `net_name`. kicad-cli 10 saves the refilled copy
+    /// with `uuid`, `(net "GND")`, an `island` mark and other number spellings.
+    fn kicad7_board(id: &str, fill: &str) -> String {
+        format!(
+            r#"(kicad_pcb (version 20221018) (generator pcbnew)
+  (net 0 "")
+  (net 1 "GND")
+  (zone (net 1) (net_name "GND") (layer "F.Cu") {id} (name "pour")
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))
+    (filled_polygon (layer "F.Cu") (pts {fill})))
+)
+"#
+        )
+    }
+
+    fn kicad10_board(id: &str, fill: &str) -> String {
+        format!(
+            r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (net 0 "")
+  (net 1 "GND")
+  (zone (net "GND") (layers "F.Cu") {id} (name "pour")
+    (polygon (pts (xy 0.0 0.0) (xy 10.000 0) (xy 10 10) (xy 0 10)))
+    (filled_polygon (layer "F.Cu") (island no) (pts {fill})))
+)
+"#
+        )
+    }
+
+    const FILL_RESPELT: &str = "(xy 0.50 0.5) (xy 9.5 0.500) (xy 9.5 9.5) (xy 0.5 9.50)";
+
+    /// Review #49: matched by `uuid` alone, a `tstamp` zone missed its
+    /// refilled self and every KiCad 6/7 board read stale.
+    #[tokio::test]
+    async fn tstamp_zones_with_identical_fills_are_fresh() {
+        let saved = kicad7_board("(tstamp Z-POUR)", FILL);
+        let scene = Scene::new(
+            &saved,
+            Some(&kicad10_board("(uuid \"z-pour\")", FILL_RESPELT)),
+        );
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "fresh", "{body}");
+        let check = &body["zone_fill_check"];
+        assert_eq!(check["zones_compared"], 1);
+        assert_eq!(check["zones_differing"], 0);
+        assert!(check.get("zones_unpaired").is_none(), "{check}");
+
+        // The id pairs the zone even when its outline is written from another
+        // corner, which the shape key would not match.
+        let rotated = kicad10_board("(uuid \"z-pour\")", FILL_RESPELT).replace(
+            "(xy 0.0 0.0) (xy 10.000 0) (xy 10 10) (xy 0 10)",
+            "(xy 10 10) (xy 0 10) (xy 0 0) (xy 10 0)",
+        );
+        let scene = Scene::new(&saved, Some(&rotated));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "fresh", "{body}");
+
+        // A real change on the same zone is still stale, and named by its id.
+        let scene = Scene::new(&saved, Some(&kicad10_board("(uuid \"z-pour\")", REFILL)));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "stale", "{body}");
+        assert_eq!(
+            body["zone_fill_check"]["differing_zones"][0]["id"],
+            "z-pour"
+        );
+    }
+
+    /// An id KiCad rewrites on load (a KiCad 5 timestamp, a missing id) pairs
+    /// by net, layers and outline; a zone nothing pairs is unknown, never stale.
+    #[tokio::test]
+    async fn zones_whose_ids_change_pair_by_shape_or_are_unknown() {
+        let saved = kicad7_board("(tstamp 5C1234AB)", FILL);
+        let rewritten = "(uuid \"00000000-0000-0000-0000-00005c1234ab\")";
+        let scene = Scene::new(&saved, Some(&kicad10_board(rewritten, FILL_RESPELT)));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "fresh", "{body}");
+        assert_eq!(body["zone_fill_check"]["zones_compared"], 1);
+
+        let scene = Scene::new(&saved, Some(&kicad10_board(rewritten, REFILL)));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "stale", "{body}");
+
+        // A new id and a moved outline: no evidence either way.
+        let moved = kicad10_board(rewritten, REFILL).replace("(xy 10 10)", "(xy 10 11)");
+        let scene = Scene::new(&saved, Some(&moved));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "unknown", "{body}");
+        let check = &body["zone_fill_check"];
+        assert_eq!(check["method"], "compared_with_refill");
+        assert_eq!(check["zones_unpaired"], 1);
+        assert_eq!(check["zones_compared"], 0);
+        assert!(
+            check["reason"].as_str().unwrap().contains("paired"),
+            "{check}"
+        );
+    }
+
+    /// Review #49: the private copy has no library tables, so a footprint from
+    /// a project library is "missing" there. A refill cannot change that, so
+    /// it is not counted as the refill's doing.
+    #[tokio::test]
+    async fn library_checks_the_copy_cannot_reproduce_are_not_counted() {
+        let refill_report = r#"{"violations":[{"type":"silk_overlap","severity":"warning","description":"Silkscreen overlap","items":[{"description":"Text","pos":{"x":1,"y":1}}]},{"type":"lib_footprint_issues","severity":"warning","description":"The current configuration does not include the footprint library 'Local'","items":[{"description":"Footprint R1","pos":{"x":10,"y":10}}]}],"unconnected_items":[]}"#;
+        let saved = board(FILL);
+        let scene = Scene::new(&saved, Some(&saved)).with_refill_report(refill_report);
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        let check = &body["zone_fill_check"];
+        assert_eq!(check["violations_added_by_refill"], 0, "{check}");
+        assert!(check.get("added_by_refill").is_none(), "{check}");
+        assert_eq!(
+            check["rules_not_compared"],
+            json!(["lib_footprint_issues", "lib_footprint_mismatch"])
+        );
+    }
+
+    fn footprint_zone(fill: &str) -> String {
+        format!(
+            r#"  (footprint "Local:RF" (layer "F.Cu") (uuid "fp-1")
+    (zone (net "GND") (layers "F.Cu") (uuid "z-fp")
+      (polygon (pts (xy 40 40) (xy 45 40) (xy 45 45)))
+      (filled_polygon (layer "F.Cu") (pts {fill})))
+    (zone (layers "F.Cu") (uuid "z-fp-keepout")
+      (keepout (tracks not_allowed) (vias allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))
+      (polygon (pts (xy 50 50) (xy 55 50) (xy 55 55)))))
+"#
+        )
+    }
+
+    #[test]
+    fn copper_zones_inside_footprints_are_read() {
+        let source = format!(
+            "(kicad_pcb (version 20260206)\n{})\n",
+            footprint_zone("(xy 40 40) (xy 45 40) (xy 45 45)")
+        );
+        let zones = copper_zone_fills(&source).unwrap();
+        assert_eq!(zones.len(), 1, "the keepout is not a copper zone");
+        assert!(zones[0].in_footprint);
+        assert_eq!(zones[0].id.as_deref(), Some("z-fp"));
+    }
+
+    /// Review #49 follow-up: fills are compared to KiCad's 1 nm. Respelt
+    /// numbers agree, but a vertex moved by 20 nm is a different fill.
+    #[test]
+    fn fills_compare_to_the_nanometre_and_ignore_spelling() {
+        let polygons = |fill: &str| copper_zone_fills(&board(fill)).unwrap()[0].polygons.clone();
+        let respelt = "(xy 0.500000 0.5) (xy 9.5 0.50) (xy 9.5000 9.5) (xy 0.5 9.5)";
+        assert_eq!(polygons(FILL), polygons(respelt));
+        let moved = "(xy 0.50002 0.5) (xy 9.5 0.5) (xy 9.5 9.5) (xy 0.5 9.5)";
+        assert_ne!(polygons(FILL), polygons(moved));
+    }
+
+    /// Review #49: zones inside footprints were not read, so a board whose only
+    /// copper zones sat in footprints read fresh. kicad-cli's refill does not
+    /// fill them, so they cannot be compared: the state is unknown.
+    #[tokio::test]
+    async fn footprint_zones_are_counted_and_make_the_state_unknown() {
+        let fp = footprint_zone("(xy 40 40) (xy 45 40) (xy 45 45)");
+        let only = format!("(kicad_pcb (version 20260206) (generator \"test\")\n{fp})\n");
+        let scene = Scene::new(&only, Some(&only));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "unknown", "{body}");
+        let check = &body["zone_fill_check"];
+        assert_eq!(check["method"], "not_comparable");
+        assert_eq!(check["copper_zones"], 1);
+        assert_eq!(check["footprint_zones"], 1);
+        assert_eq!(scene.calls().len(), 1, "no refill could tell, so none ran");
+
+        let both = board(FILL).replacen("  (zone", &format!("{fp}  (zone"), 1);
+        let scene = Scene::new(&both, Some(&both));
+        let (_, body) = scene.run("run_drc", json!({})).await;
+        assert_eq!(body["zone_fill_state"], "unknown", "{body}");
+        let check = &body["zone_fill_check"];
+        assert_eq!(check["method"], "compared_with_refill");
+        assert_eq!(check["zones_compared"], 1);
+        assert_eq!(check["footprint_zones"], 1);
+        assert!(check["reason"].as_str().unwrap().contains("footprints"));
+
+        let (_, body) = scene.run("run_drc", json!({ "refill_zones": true })).await;
+        assert_eq!(body["zone_fill_state"], "unknown", "{body}");
+        assert_eq!(body["zone_fill_check"]["method"], "refilled_for_this_run");
     }
 
     #[tokio::test]
@@ -1365,6 +1739,79 @@ mod zone_fill_tests {
             .unwrap()
             .contains("refill"));
         assert_eq!(body["design_rule_violations"], 2);
+    }
+
+    /// Review #49: the DRC baseline tools dropped `check_zone_fills`, so every
+    /// save and compare on a board with zones ran DRC twice.
+    #[tokio::test]
+    async fn drc_baselines_forward_the_zone_fill_opt_out() {
+        use super::super::check_baselines as baselines;
+        let scene = Scene::new(&board(FILL), Some(&board(REFILL)));
+        let board = scene.board.display().to_string();
+        let parse = |result: CallToolResult| -> Value {
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text");
+            };
+            assert!(!result.is_error, "{text}");
+            serde_json::from_str(text).unwrap()
+        };
+        let saved = parse(
+            baselines::handle_save_check_baseline(
+                &json!({ "board": board, "name": "b", "check_zone_fills": false }),
+                &scene.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            saved["source_evidence"]["zone_fill"]["method"], "not_checked",
+            "{saved}"
+        );
+        assert_eq!(scene.calls().len(), 1, "one DRC, no refill copy");
+        let compared = parse(
+            baselines::handle_compare_check_baseline(
+                &json!({ "board": board, "name": "b", "check_zone_fills": false }),
+                &scene.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            compared["source_evidence"]["zone_fill"]["method"], "not_checked",
+            "{compared}"
+        );
+        assert_eq!(scene.calls().len(), 2);
+        // The default still compares.
+        let compared = parse(
+            baselines::handle_compare_check_baseline(
+                &json!({ "board": board, "name": "b" }),
+                &scene.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            compared["source_evidence"]["zone_fill"]["state"], "stale",
+            "{compared}"
+        );
+        assert_eq!(scene.calls().len(), 4, "a DRC and its refill copy");
+        // An ERC baseline has no zones to skip.
+        let schematic = scene.dir.path().join("demo.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch (version 20250610))\n").unwrap();
+        let refused = baselines::handle_save_check_baseline(
+            &json!({ "schematic": schematic.display().to_string(), "name": "e", "check_zone_fills": false }),
+            &scene.ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            refused.is_error && text.contains("check_zone_fills"),
+            "{text}"
+        );
+        assert_eq!(scene.calls().len(), 4, "refused before ERC ran");
     }
 
     #[tokio::test]
@@ -1436,6 +1883,38 @@ mod zone_fill_tests {
             new["zone_fill_state"], "fresh",
             "{}",
             new["zone_fill_check"]
+        );
+        // The same fills with KiCad 6/7 zone ids: kicad-cli writes them back
+        // as `uuid`, and the zones still pair (review #49).
+        let mut in_zone = false;
+        let tstamped: Vec<String> = std::fs::read_to_string(&board)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line == "\t(zone" {
+                    in_zone = true;
+                } else if in_zone && line.trim_start().starts_with("(uuid ") {
+                    in_zone = false;
+                    return line.replacen("(uuid ", "(tstamp ", 1);
+                }
+                line.to_owned()
+            })
+            .collect();
+        assert!(tstamped.iter().any(|line| line.contains("(tstamp ")));
+        std::fs::write(&board, tstamped.join("\n") + "\n").unwrap();
+        let old_ids = check(
+            super::super::verification::handle_run_drc(&args, &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            old_ids["zone_fill_state"], "fresh",
+            "{}",
+            old_ids["zone_fill_check"]
+        );
+        assert_eq!(
+            old_ids["zone_fill_check"]["zones_compared"],
+            old_ids["zone_fill_check"]["copper_zones"]
         );
     }
 }

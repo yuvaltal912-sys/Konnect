@@ -122,7 +122,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `add_wire` | Add a wire segment (H or V) between two points. Dots only the T-junctions this wire forms and the pins it passes over; the response's `nets_joined` lists the nets it merged. |
-| `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. Dots only the T-junctions the new wires form; `nets_joined` lists the nets they merged. |
+| `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. Dots only the T-junctions the new wires form; `nets_joined` lists the nets they merged; a list too long for the response is cut (`truncated_lists`) and `added_wires` stays whole. |
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified. |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
@@ -135,7 +135,7 @@ and Windows servers do not.
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
-| `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
+| `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. Lists too long for the response are cut (`truncated_lists`); `added_count` stays whole. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
 | `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. The stub must join nothing but the pin's own net: `auto` tries the other directions, and a named direction that would join is refused (`plan_blocked`). `nets_joined` lists the nets merged. The same check covers a label with no stub (`stub_length` 0); a negative length is refused; pin coordinates count as that pin; a sheet with an unreadable symbol is refused for a stub as "cannot check", while a label with no stub is judged on the wire under it. |
@@ -181,7 +181,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call; a stub that would join another net is skipped and listed in `errors`. Single read → all edits → single write. A pin whose stub or label would join another net (a label on a pin that sits mid-span on a wire with no junction counts) is skipped into `errors`, and `isError` is set when every pin was skipped. On a sheet with an unreadable symbol a stubbed pin is skipped as "cannot check". Reports `nets_joined` in every mode. |
+| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call; a stub that would join another net is skipped and listed in `errors`. Single read → all edits → single write. A pin whose stub or label would join another net (a label on a pin that sits mid-span on a wire with no junction counts) is skipped into `errors`, and `isError` is set when every pin was skipped. On a sheet with an unreadable symbol a stubbed pin is skipped as "cannot check". Reports `nets_joined` in every mode. Lists too long for the response are cut (`truncated_lists`); `added_count` stays whole. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `batch_edit_schematic_components` | Update fields on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |
@@ -191,8 +191,8 @@ and Windows servers do not.
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
-| `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
-| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. |
+| `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. Each `placed` entry is compact unless `detail: "full"`; lists too long for the response are cut (`truncated_lists`, failures first) with the counts whole, and the outcome's retry names at most 1,000 failed indexes. |
+| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. A pair whose route would join another net is skipped and listed in `errors`. Lists too long for the response are cut (`truncated_lists`); `connected_count` stays whole. |
 
 ### `sch_export` · 12 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, read and compare hierarchy-wide netlist connectivity, run ERC, and synchronize a live PCB.
@@ -211,7 +211,7 @@ and Windows servers do not.
 | `compare_netlist` | Check the drawn circuit against an intended `{net: ["REF.PIN"]}`, a second schematic, or a `.net` file, by pin sets rather than net names. Reports `missing`, `split`, `merged` and `extra` findings and a verdict of `pass`, `fail` or `incomplete` (duplicate references make a clean pass unprovable). |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `total`, `errors`, `warnings` and `by_rule` count every violation; `output` writes the full response. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
-| `update_pcb_from_schematic` | Preview or apply saved-schematic sync in one live KiCad undo commit. Copies fields, adds/deletes eligible footprints, replaces library identities in place, and reassigns whole routed nets when every old terminal agrees. Preserves instance state and copper geometry; conflicts on unsafe replacement, splits or unknown connectivity. Revision-bound apply and readback-derived completion counts. |
+| `update_pcb_from_schematic` | Preview or apply saved-schematic sync in one live KiCad undo commit. Copies fields, adds/deletes eligible footprints, replaces library identities in place, and reassigns whole routed nets when every old terminal agrees. Preserves instance state and copper geometry; conflicts on unsafe replacement, splits or unknown connectivity. Revision-bound apply and readback-derived completion counts. `changes` is paged (`limit`, default 100, `offset`) and the other lists are cut to fit (`truncated_lists`); `coverage` and `change_count` count every item. |
 
 ### `sch_hierarchy` · 15 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
@@ -280,7 +280,7 @@ and Windows servers do not.
 | `set_placed_footprint_models` | Inspect, append, replace, or remove one exact indexed 3D-model entry on a placed footprint through live KiCad IPC. Mutations require the latest inspection revision, update the complete parent footprint in one undo step, preserve unrelated entries, and return fresh readback. There is no open-board file fallback. |
 | `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. |
 | `get_pad_position` | Return the live board-space position, layers, and net assignment of a specific pad number. |
-| `get_component_list` | List all footprints on the board with positions, layers, and values. |
+| `get_component_list` | List all footprints on the board with positions, layers, and values. Paged (`limit`, default 500, `offset`) and capped in size; `count` is every footprint, and `truncated` and `next_offset` say what is left. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
@@ -300,7 +300,7 @@ and Windows servers do not.
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
-| `query_traces` | List trace segments on the board, optionally filtered by net, layer, or the pad they touch (`touching_pad`). At most `limit` (default 200) come back; `total_matches` and `truncated` say when that cut the list. |
+| `query_traces` | List trace segments on the board, optionally filtered by net, layer, or the pad they touch (`touching_pad`). At most `limit` (default 200) come back, fewer at the size cap; `total_matches`, `truncated` and `next_offset` say what is left, and `offset` reads the next page. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Partially update an observed unlocked straight trace in place, preserving its KIID and omitted fields; verify actual geometry and net. |
 | `route_batch` | Create explicit polyline segments and through vias together (max 200 objects), with complete preflight, one live undo commit and verified readback IDs. |
@@ -345,7 +345,7 @@ and Windows servers do not.
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
 | `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
-| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `by_rule` counts every violation; `output` writes the full report. |
+| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `by_rule` counts every violation; `output` writes the full report. `zone_fill_state` (`fresh`, `stale` or `unknown`) says whether the zone fills DRC read were current; `check_zone_fills: false` skips the second, private-copy DRC that decides it. |
 
 ---
 
@@ -412,7 +412,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `filtered_count`, `errors`, `warnings` and `by_rule` count every violation; `output` writes the full report. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. Paged (`limit`, `offset`) and capped in size; `truncated` and `next_offset` say what is left. `filtered_count`, `errors`, `warnings` and `by_rule` count every violation; `output` writes the full report. `zone_fill_state` (`fresh`, `stale` or `unknown`) says whether the zone fills DRC read were current; `check_zone_fills: false` skips the second, private-copy DRC that decides it. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
@@ -427,8 +427,8 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `set_netclass_diff_pair` | Preview or apply differential-pair width, gap and via gap to a saved project netclass with a revision check. |
 | `delete_netclass` | Preview or delete a saved project netclass with no saved pattern or assignment references; does not inspect schematic connectivity. |
 | `check_clearance` | Measure footprint spacing from the live KiCad board when open, otherwise the saved file. `mode: "anchor"` (default) preserves placement-origin distance and its deprecated `distance_mm` alias. `mode: "courtyard"` measures transformed authored-courtyard bbox edge distance, reports overlap, and refuses absent/unreadable courtyards or opposite-side comparisons. Neither mode measures copper clearance; use `run_drc` for that. |
-| `save_check_baseline` | Run ERC (`schematic`) or DRC (`board`) now and store every violation with a stable key as a named baseline under `<project_dir>/.konnect/baselines/<erc\|drc>/<name>.json`. Returns counts and a by-rule tally. An existing name is refused before the check runs unless `overwrite`. |
-| `compare_check_baseline` | Run the same check again and compare: `new`, `resolved` and `severity_changed` listed (paged, size-capped), unchanged counted, `verdict` `regressed` or `no_regressions`. Matched by rule and item identity (a UUID that is in the saved design, otherwise the description with measured values masked), never by position or report order. `categories_not_compared` names a DRC category only one run reported; `output` writes the whole comparison. |
+| `save_check_baseline` | Run ERC (`schematic`) or DRC (`board`) now and store every violation with a stable key as a named baseline under `<project_dir>/.konnect/baselines/<erc\|drc>/<name>.json`. Returns counts and a by-rule tally. An existing name is refused before the check runs unless `overwrite`. `sync_live_board`, `refill_zones` and `check_zone_fills` are forwarded to DRC as in `run_drc`. |
+| `compare_check_baseline` | Run the same check again and compare: `new`, `resolved` and `severity_changed` listed (paged, size-capped), unchanged counted, `verdict` `regressed` or `no_regressions`. Matched by rule and item identity (a UUID that is in the saved design, otherwise the description with measured values masked), never by position or report order. `categories_not_compared` names a DRC category only one run reported; `output` writes the whole comparison. `sync_live_board`, `refill_zones` and `check_zone_fills` are forwarded to DRC as in `run_drc`. |
 | `list_check_baselines` | List a project's ERC and DRC baselines newest first, with counts and whether the source file changed since. Unreadable files are listed apart. Read-only. |
 
 ---
@@ -498,7 +498,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
-| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline (existence, closure, and every footprint's courtyard, pads and silkscreen text against it, with overhang in mm; `edge_mount_references` excuses intentional edge parts), design rules, footprints, routing evidence, and complete DRC results. |
+| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline (existence, closure, and every footprint's courtyard, pads and silkscreen text against it, with overhang in mm; `edge_mount_references` excuses intentional edge parts), design rules, footprints, routing evidence, and complete DRC results. `issues` is paged (`limit`, default 100, `offset`), most severe first; `issue_count`, `issues_by_severity` and `issues_fingerprint` cover every issue. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
 ---

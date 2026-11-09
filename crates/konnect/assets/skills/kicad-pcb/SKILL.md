@@ -204,7 +204,9 @@ board now has the intended placement:
    a diagnostic whole-board plan into an autonomous bulk mutation.
 5. **Read back the exact requested live board.** After every batch, call
    `get_component_list` for that board and verify each requested reference's
-   observed position, rotation, and layer. Call `get_board_info` and require
+   observed position, rotation, and layer. The list is paged: while
+   `truncated` is true, follow `next_offset` before calling a reference
+   missing, or read each one with `find_component`. Call `get_board_info` and require
    `source: "ipc"` before treating this as live-board proof (`score_placement`
    names the same live authority **source: "live_ipc"**). A saved-file or CLI
    observation may support a separate check, but report it as saved/CLI evidence

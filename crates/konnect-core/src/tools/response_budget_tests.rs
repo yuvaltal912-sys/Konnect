@@ -455,6 +455,149 @@ async fn thousands_of_failed_pin_pairs_stay_under_the_cap_and_say_how_many() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), EMPTY_SCH);
 }
 
+#[tokio::test]
+async fn thousands_of_missing_pins_for_a_net_stay_under_the_cap_and_say_how_many() {
+    let (_dir, path) = empty_schematic();
+    let pins: Vec<Value> = (0..3000)
+        .map(|i| json!({ "reference": format!("MISSING{i}"), "pin_number": "1" }))
+        .collect();
+    let result = call_tool(
+        super::sch_batch::tools(),
+        "batch_connect_to_net",
+        json!({ "schematic": path.display().to_string(), "net_name": "GND", "pins": pins }),
+        plain_ctx(),
+    )
+    .await;
+    assert!(result.is_error, "nothing connected is still a failed call");
+    assert!(text_len(&result) < CLIENT_CAP, "{}", text_len(&result));
+    let body = body(&result);
+    assert_eq!(body["added_count"], 0, "{body}");
+    assert_eq!(body["truncated_lists"]["errors"]["total"], 3000);
+    let shown = body["errors"].as_array().unwrap().len();
+    assert!(shown > 0 && shown < 3000, "{shown}");
+    assert_eq!(body["truncated_lists"]["errors"]["shown"], shown);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), EMPTY_SCH);
+}
+
+/// A sheet of `pairs` label pairs, `A_<i>` above `B_<i>`, so one vertical
+/// wire per pair joins two named nets.
+fn labelled_pairs(pairs: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let label = |name: String, x: f64, y: f64, i: usize, tag: &str| {
+        format!(
+            "\t(label \"{name}\" (at {x} {y} 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid \"00000000-0000-0000-{tag}-{i:012}\"))\n"
+        )
+    };
+    let mut labels = String::new();
+    for i in 0..pairs {
+        let x = 2.54 * i as f64;
+        labels.push_str(&label(
+            format!("A_RATHER_LONG_NET_NAME_{i}"),
+            x,
+            10.16,
+            i,
+            "000a",
+        ));
+        labels.push_str(&label(
+            format!("B_RATHER_LONG_NET_NAME_{i}"),
+            x,
+            20.32,
+            i,
+            "000b",
+        ));
+    }
+    let source = EMPTY_SCH.replace("\t(sheet_instances", &format!("{labels}\t(sheet_instances"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pairs.kicad_sch");
+    std::fs::write(&path, source).unwrap();
+    (dir, path)
+}
+
+#[tokio::test]
+async fn a_wire_batch_joining_many_nets_is_cut_to_the_cap_with_the_count_whole() {
+    let pairs = 800;
+    let (_dir, path) = labelled_pairs(pairs);
+    let wires: Vec<Value> = (0..pairs)
+        .map(|i| {
+            let x = 2.54 * i as f64;
+            json!({ "x1": x, "y1": 10.16, "x2": x, "y2": 20.32 })
+        })
+        .collect();
+    let result = call_tool(
+        super::sch_wiring::tools(),
+        "batch_add_wire",
+        json!({ "schematic": path.display().to_string(), "wires": wires }),
+        plain_ctx(),
+    )
+    .await;
+    assert!(!result.is_error, "{}", body(&result));
+    assert!(text_len(&result) < CLIENT_CAP, "{}", text_len(&result));
+    let body = body(&result);
+    assert_eq!(body["added_wires"], pairs);
+    assert_eq!(body["truncated_lists"]["nets_joined"]["total"], pairs);
+    let shown = body["nets_joined"].as_array().unwrap().len();
+    assert!(shown > 0 && shown < pairs, "{shown}");
+    assert_eq!(body["truncated_lists"]["nets_joined"]["shown"], shown);
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        written.matches("(wire").count(),
+        pairs,
+        "every wire is saved"
+    );
+}
+
+/// A refused `limit` or `offset` must stop `update_pcb_from_schematic` before
+/// the netlist export: a stand-in `kicad-cli` leaves a mark when it runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn sync_refuses_a_bad_window_before_the_netlist_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let schematic = dir.path().join("demo.kicad_sch");
+    let board = dir.path().join("demo.kicad_pcb");
+    std::fs::write(&schematic, EMPTY_SCH).unwrap();
+    std::fs::write(
+        &board,
+        "(kicad_pcb (version 20260206) (generator \"test\"))\n",
+    )
+    .unwrap();
+    let mark = dir.path().join("ran");
+    let script = crate::tools::cli::test_support::write_script(
+        dir.path(),
+        "fake-kicad-cli",
+        &format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n", mark.display()),
+        "",
+    );
+    let sync = |extra: Value| {
+        let mut args = json!({
+            "schematic": schematic.display().to_string(),
+            "board": board.display().to_string(),
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let ctx = ctx_with_cli(&script);
+        async move {
+            super::pcb_sync::handle_update_pcb_from_schematic(&args, &ctx)
+                .await
+                .unwrap()
+        }
+    };
+    for bad in [
+        json!({ "limit": 0 }),
+        json!({ "limit": 10_001 }),
+        json!({ "offset": "x" }),
+        json!({ "offset": -1 }),
+    ] {
+        let refused = sync(bad.clone()).await;
+        assert!(refused.is_error, "{bad}");
+        let text = body(&refused).to_string();
+        assert!(text.contains("limit") || text.contains("offset"), "{text}");
+        assert!(!mark.exists(), "{bad} ran the netlist export");
+    }
+    // The stand-in does see a call the window lets through.
+    let _ = sync(json!({ "limit": 5, "offset": 0 })).await;
+    assert!(mark.exists(), "the control call never reached kicad-cli");
+}
+
 #[cfg(unix)]
 fn manufacturing_scene(errors: usize) -> (tempfile::TempDir, std::path::PathBuf, ToolContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -540,6 +683,83 @@ async fn manufacturing_issues_page_and_the_verdict_reads_them_all() {
     assert_eq!(seen.len() as u64, total.unwrap());
 }
 
+/// Review #49: every page reruns DRC, and kicad-cli's order decided what a page
+/// held. A stand-in that lists the same two errors in turn in either order must
+/// still give pages that cover each issue once, with one fingerprint.
+#[cfg(unix)]
+#[tokio::test]
+async fn manufacturing_pages_of_a_reordered_rerun_line_up_and_share_a_fingerprint() {
+    let (dir, board, _) = manufacturing_scene(0);
+    let report = |rules: [&str; 2]| {
+        json!({
+            "violations": rules.map(|rule| json!({
+                "type": rule, "severity": "error", "description": format!("{rule} violation"),
+                "items": [{ "description": "Track", "pos": { "x": 1.0, "y": 2.0 } }]
+            })),
+            "unconnected_items": [], "schematic_parity": []
+        })
+        .to_string()
+    };
+    std::fs::write(dir.path().join("a.json"), report(["rule_a", "rule_b"])).unwrap();
+    std::fs::write(dir.path().join("b.json"), report(["rule_b", "rule_a"])).unwrap();
+    let script = crate::tools::cli::test_support::write_script(
+        dir.path(),
+        "flipping-kicad-cli",
+        &format!(
+            "#!/bin/sh\nn=$(cat '{0}/n' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '{0}/n'\n\
+             if [ $((n % 2)) = 1 ]; then cp '{0}/a.json' \"$4\"; else cp '{0}/b.json' \"$4\"; fi\nexit 0\n",
+            dir.path().display()
+        ),
+        "",
+    );
+    let mut seen = Vec::new();
+    let mut fingerprints = std::collections::BTreeSet::new();
+    let mut offset = 0u64;
+    let total = loop {
+        let page = body(
+            &call_tool(
+                super::manufacturing::tools(),
+                "validate_for_manufacturing",
+                json!({ "board": board.display().to_string(), "limit": 1, "offset": offset }),
+                ctx_with_cli(&script),
+            )
+            .await,
+        );
+        fingerprints.insert(page["issues_fingerprint"].as_str().unwrap().to_owned());
+        seen.extend(
+            page["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(Value::to_string),
+        );
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break page["issue_count"].as_u64().unwrap(),
+        }
+    };
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(distinct.len(), seen.len(), "an issue shown twice: {seen:?}");
+    assert_eq!(seen.len() as u64, total);
+    assert!(seen.iter().any(|issue| issue.contains("rule_a")));
+    assert!(seen.iter().any(|issue| issue.contains("rule_b")));
+    assert_eq!(fingerprints.len(), 1, "{fingerprints:?}");
+
+    // A different result has a different fingerprint.
+    std::fs::write(dir.path().join("a.json"), report(["rule_a", "rule_c"])).unwrap();
+    std::fs::write(dir.path().join("n"), "0").unwrap();
+    let changed = body(
+        &call_tool(
+            super::manufacturing::tools(),
+            "validate_for_manufacturing",
+            json!({ "board": board.display().to_string() }),
+            ctx_with_cli(&script),
+        )
+        .await,
+    );
+    assert!(!fingerprints.contains(changed["issues_fingerprint"].as_str().unwrap()));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_short_manufacturing_report_is_whole_and_a_bad_window_runs_nothing() {
@@ -558,6 +778,18 @@ async fn a_short_manufacturing_report_is_whole_and_a_bad_window_runs_nothing() {
         page["issue_count"].as_u64().unwrap()
     );
     assert!(page.get("next_offset").is_none() && page.get("hint").is_none());
+    // Review #49: a stale offset says it is past the end.
+    let past = body(
+        &call_tool(
+            super::manufacturing::tools(),
+            "validate_for_manufacturing",
+            json!({ "board": board.display().to_string(), "offset": 500 }),
+            ctx_with_cli(&dir.path().join("fake-kicad-cli")),
+        )
+        .await,
+    );
+    assert_eq!(past["offset_past_end"], true, "{past}");
+    assert!(past["hint"].as_str().unwrap().contains("past the end"));
     std::fs::remove_file(dir.path().join("calls")).unwrap();
     for bad in [json!({ "limit": 0 }), json!({ "offset": "two" })] {
         let mut args = json!({ "board": board.display().to_string() });

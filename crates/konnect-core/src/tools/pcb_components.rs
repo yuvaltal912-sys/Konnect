@@ -7480,5 +7480,10 @@ mod component_list_budget_tests {
         assert!(body.get("next_offset").is_none());
         let (err, body) = list(3, json!({ "limit": 0 })).await;
         assert!(err, "{body}");
+        // Review #49: a stale offset says it is past the end.
+        let (_, body) = list(3, json!({ "offset": 3 })).await;
+        assert_eq!(body["offset_past_end"], true, "{body}");
+        assert_eq!(body["count"], 3);
+        assert!(body["hint"].as_str().unwrap().contains("past the end"));
     }
 }

@@ -781,6 +781,16 @@ fn sync_response_paged(
     if applied {
         // Applying again would not page the same plan: the board has moved on.
         fields.remove("next_offset");
+        // Past the end, the shared hint would ask for another page of a
+        // plan that is already applied.
+        if fields.contains_key("offset_past_end") {
+            fields.insert(
+                "hint".into(),
+                serde_json::json!(
+                    "Every change counted in coverage was applied; a new dry run lists what is left."
+                ),
+            );
+        }
         page.hint(
             fields,
             "Every change counted in coverage was applied; a new dry run lists what is left.",
@@ -3789,6 +3799,32 @@ mod tests {
         assert!(applied["hint"].as_str().unwrap().contains("applied"));
     }
 
+    /// Review #49: the other lists are cut through `truncated_lists`, with the
+    /// diagnostics first and the hint saying so.
+    #[test]
+    fn thousands_of_diagnostics_are_cut_to_fit_beside_the_changes() {
+        let mut plan = many_new_parts(50);
+        plan.diagnostics = (0..2000)
+            .map(|i| {
+                conflict(
+                    "library_footprint_unusable",
+                    format!("R{i}: the library footprint could not be read, so it is not placed"),
+                    Some(&format!("R{i}")),
+                )
+            })
+            .collect();
+        let body = response_json(&sync_response_paged(&plan, "conflict", 1, false, (0, 100)));
+        assert_eq!(body["truncated_lists"]["diagnostics"]["total"], 2000);
+        let shown = body["diagnostics"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 2000, "{shown}");
+        assert_eq!(body["change_count"], 50);
+        assert!(
+            !body["changes"].as_array().unwrap().is_empty(),
+            "changes keep half the budget"
+        );
+        assert!(body["hint"].as_str().unwrap().contains("diagnostics"));
+    }
+
     #[test]
     fn a_small_plan_is_listed_whole() {
         let plan = many_new_parts(3);
@@ -3800,6 +3836,18 @@ mod tests {
         );
         assert!(body.get("next_offset").is_none() && body.get("hint").is_none());
         assert!(body.get("truncated_lists").is_none());
+        // Review #49: a stale offset says it is past the end.
+        let past = response_json(&sync_response_paged(&plan, "ready", 1, false, (5_000, 100)));
+        assert_eq!(past["offset_past_end"], true, "{past}");
+        assert_eq!(past["change_count"], 3);
+        assert!(past["hint"].as_str().unwrap().contains("past the end"));
+        // Once applied there is no next page to ask for.
+        let applied = response_json(&sync_response_paged(&plan, "ready", 1, true, (5_000, 100)));
+        assert_eq!(applied["offset_past_end"], true, "{applied}");
+        assert!(
+            applied["hint"].as_str().unwrap().contains("new dry run"),
+            "{applied}"
+        );
     }
 
     /// Nothing asserted the *response* keys — every other test here reads the

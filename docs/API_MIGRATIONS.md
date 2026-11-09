@@ -17,13 +17,28 @@ removed. New result fields and two default changes:
   --save-board` runs on a private copy of the board and its `.kicad_pro` and
   `.kicad_dru`, and the fills are compared. That doubles DRC time on such boards;
   pass `false` to skip it (`unknown`, `not_checked`). The board is never written.
-  `source_evidence` in a DRC baseline and in a report-write failure carries the
-  same `zone_fill` object.
+  Zones are paired by `uuid`, or `tstamp` on a KiCad 6/7 board, then by net,
+  layers and outline (`zones_compared`); a zone nothing pairs makes the state
+  `unknown` (`zones_unpaired`, `reason`), never `stale`. Each `differing_zones`
+  entry names the zone's `id`. Copper zones inside footprints are counted
+  (`footprint_zones`) but kicad-cli's refill does not fill them, so they make
+  the state `unknown` (method `not_comparable` when they are the only copper
+  zones, which runs no second DRC; also with `refill_zones: true`). The
+  violation counts leave out `lib_footprint_issues` and `lib_footprint_mismatch`
+  (`rules_not_compared`): the private copy has no library tables, and a refill
+  cannot change them. `source_evidence` in a DRC baseline and in a report-write
+  failure carries the same `zone_fill` object, and `save_check_baseline` and
+  `compare_check_baseline` take `check_zone_fills` for a board (an ERC baseline
+  refuses `false`).
 - **`batch_place_components`**: each `placed` entry is now compact by default
   (`reference`, `value`, `footprint`, `lib_id`, `uuid`, `unit`, `x`, `y`,
   `rotation`, `mirror_x`, `mirror_y`). Pass `detail: "full"` for the previous
-  entry (fields, flags, units, project, instance paths). An unknown `detail` is
-  refused before anything is placed.
+  entry; compact leaves out `schematic`, `datasheet`, `unit_count`, `added`,
+  `fields`, `flags`, `units`, `project` and the instance paths. An unknown
+  `detail` is refused before anything is placed. `outcome.retry.item_indexes`
+  lists at most 1,000 failed indexes; past that, `item_indexes_total` and
+  `item_indexes_truncated: true` say so, and the lists are cut to leave room
+  for it.
 - **Batch edits** (`batch_place_components`, `batch_connect_to_net`,
   `batch_connect_pins`, `batch_add_wire`, `batch_add_no_connect`): a list that
   would pass the size cap is cut, failures and errors first. Only then do
@@ -42,13 +57,22 @@ removed. New result fields and two default changes:
 - **`validate_for_manufacturing`**: `issues` is paged, new `limit` (default 100)
   and `offset`, with the same paging fields, plus `issue_count` and
   `issues_by_severity` over every issue. The verdict and `summary` still read
-  them all.
+  them all. Issues are now sorted, most severe first and then by text, so the
+  order no longer follows the checks or kicad-cli's report. New
+  `issues_fingerprint` is the same on every page of one result; a page with a
+  different one came from a changed board or DRC.
 - **`get_component_list`**: paged through the shared list shape, new `limit`
   (default 500) and `offset`; `count` is still every footprint, and `shown`,
   `offset`, `limit`, `truncated` and `next_offset` are new.
 - **`query_traces`**: new `offset`. A page also ends at the size cap before
   `limit` (`byte_capped`, `next_offset`, `hint`). `count` is still the segments
   shown and `total_matches` all of them.
+- **Every paged result** (the tools above, `run_drc`, `get_drc_violations`,
+  `run_erc`, `compare_check_baseline` and the tools that use the shared list
+  shape): an `offset` above 0 that is at or past the end of the list now adds
+  `offset_past_end: true` and a `hint` naming the total, so a stale
+  `next_offset` is not read as the end of the list. The page is still empty and
+  not an error.
 
 ## Unreleased: `run_design_review` reads a DRC baseline
 

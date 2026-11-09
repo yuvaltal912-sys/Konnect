@@ -936,13 +936,20 @@ async fn handle_batch_place_components(
         "errors": errors,
         "failures": failures
     });
-    // Failures first: they are what a caller acts on.
-    super::response_budget::fit_value(
-        &mut body,
-        &["failures", "errors", "placed"],
-        "Every placement listed in placed_count is in the saved schematic; \
-         list_schematic_components reads them back.",
-    );
+    // Failures first: they are what a caller acts on. The outcome's retry list
+    // is attached after this and counts against the same budget.
+    let retry_cost = retry.as_ref().map_or(0, |retry| {
+        serde_json::to_string(retry).map_or(0, |text| text.len())
+    });
+    if let Some(fields) = body.as_object_mut() {
+        super::response_budget::fit_lists(
+            fields,
+            &["failures", "errors", "placed"],
+            super::response_budget::BYTE_BUDGET.saturating_sub(retry_cost),
+            "Every placement listed in placed_count is in the saved schematic; \
+             list_schematic_components reads them back.",
+        );
+    }
     let mut result = CallToolResult::json(&body);
     result.is_error = placed.is_empty() && !errors.is_empty();
     Ok(crate::outcome::attach(
@@ -2548,6 +2555,43 @@ mod batch_place_and_connect_tests {
         // Every one is in the file, listed or not.
         let sch = cse::Schematic::load(&path).unwrap();
         assert!(sch.symbols.by_reference("R300").is_some());
+    }
+
+    /// Review #49: the outcome's retry list is attached after the lists are cut,
+    /// so 3,000 failures in one partial batch passed the cap (about 54,700).
+    #[tokio::test]
+    async fn a_mostly_failing_batch_stays_under_the_cap_with_its_retry_list() {
+        let (_d, path) = seeded_schematic();
+        let mut components =
+            vec![json!({ "lib_id": "Device:R", "x": 20.32, "y": 20.32, "reference": "R1" })];
+        components.extend((0..3_000).map(|_| json!({ "lib_id": "Device:R", "y": 10.0 })));
+        let args = json!({ "schematic": path.display().to_string(), "components": components });
+        let result = handle_batch_place_components(&args, &test_ctx())
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected JSON text")
+        };
+        assert!(text.len() < 50_000, "over the client's cap: {}", text.len());
+        // The retry list is paid for out of the same budget as the lists.
+        assert!(
+            text.len() < crate::tools::response_budget::BYTE_BUDGET + 2_000,
+            "{}",
+            text.len()
+        );
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        let outcome = &response["outcome"];
+        assert_eq!(outcome["status"], "partial", "{outcome}");
+        assert_eq!(response["placed_count"], 1);
+        assert_eq!(outcome["failed"], 3_000);
+        let retry = &outcome["retry"];
+        assert_eq!(retry["item_indexes_total"], 3_000);
+        assert_eq!(retry["item_indexes_truncated"], true);
+        let listed = retry["item_indexes"].as_array().unwrap();
+        assert_eq!(listed.len(), crate::outcome::MAX_RETRY_INDEXES);
+        assert_eq!(listed[0], 1, "the first failed input item");
+        assert!(retry["instruction"].as_str().unwrap().contains("of 3000"));
+        assert_eq!(response["truncated_lists"]["failures"]["total"], 3_000);
     }
 
     #[tokio::test]
