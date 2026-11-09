@@ -160,6 +160,41 @@ matching manifests. Old manifests (two layers, front side) still import.
   with `_` (`sonde_xilinx.kicad_pcb`); the SES importer accepts that name as
   the base design.
 
+## Unreleased: circuit-aware review (`audit_circuit_design`)
+
+Creation rank 29 (`docs/CREATION_HANDOFF.md`). The `design_review` toolset gains
+`audit_circuit_design(schematic, board?)`, and `run_design_review` runs it. It
+automates the schematic- and placement-level items of the owner's layout
+checklist (sections 2, 6, 8, 9) and reads the design-intent rails (`source_ref`)
+and regulator feedback dividers. Existing tools keep their arguments and
+results; new fields only.
+
+- **Findings** carry `checklist` (the item) and `rule` (the check that fired),
+  plus `evidence`. Categories are `circuit`.
+- **`checks`** lists every rule as `ran`, `needs_human` (every subject needed a
+  datasheet or other human input), `no_subjects` (nothing to examine, or only
+  subjects outside the rule's remit, with the skip count) or `not_run`
+  (`no_board`, `no_design_intent`), with examined/passed/finding/skipped/
+  needs_human/unevaluated counts. The top-level `needs_human` lists checklist
+  items no tool here judges and, with a `rule` and `subject`, each subject a
+  rule could not judge; `unproven` lists absences withheld because the net
+  continues on another sheet or a CAN bus passes a multi-pin choke.
+- **Sheets and parts.** A sheet used more than once is audited once per use, with
+  designators read from each symbol's `(instances)` record; findings carry
+  `sheet_instance_path`. Uses that cannot be read that way are listed under
+  `unaudited_sheet_uses`. Parts marked `dnp` or `on_board no` are left out of
+  every rule and listed under `unfitted_parts` (a count and the first 25).
+  `coverage` gains `needs_human_subjects`, `unaudited_sheet_uses` and
+  `unfitted_parts`, and the body gains `sheet_instances`.
+- **`run_design_review`** adds `audits.circuit_design` and `design_review.circuit`
+  (status, rules run and not run, unevaluated subjects, `needs_human` and its
+  subject count, unaudited sheet uses, unfitted parts). Subjects the audit could
+  not evaluate, with or without a board (a part missing from the board, an
+  unrouted sense net, an unreadable termination value, a sheet use it did not
+  audit), add the diagnostic `circuit_checks_unevaluated`, so the verdict is
+  INCOMPLETE. Subjects that need a human do not. The verdict text is unchanged: LOOKS GOOD does not speak for `needs_human`.
+- An unusable design-intent record makes the review INCOMPLETE, as for `audit_trace_current`.
+
 ## Unreleased: `run_design_review` reads a DRC baseline
 
 PR 15 follow-up (`docs/CREATION_HANDOFF.md`). `run_design_review` takes an
