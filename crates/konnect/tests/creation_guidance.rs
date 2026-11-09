@@ -143,6 +143,35 @@ fn pcb_routing_exposes_the_whole_supported_route_and_failure_boundary() {
 }
 
 #[test]
+fn pcb_layout_says_which_tools_honour_a_footprint_lock() {
+    // Only the two planners read KiCad's lock; the explicit move tools do not,
+    // so the skill must not promise that a lock protects a part from them.
+    let text = asset("skills/kicad-pcb/SKILL.md");
+    let outline_step = text
+        .split("1. **Board outline**")
+        .nth(1)
+        .expect("missing board outline step")
+        .split("2. **Update from schematic**")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    require(
+        &outline_step,
+        &[
+            "set_footprint_lock",
+            "Only `auto_place_from_schematic` and `refine_placement_force_directed` hold",
+            "`move_component`",
+            "`set_component_placements`",
+            "do not check the lock",
+        ],
+        "PCB board outline step",
+    );
+    assert!(!text.contains("so placement and routing respect them"));
+}
+
+#[test]
 fn blocked_routing_has_an_explicit_stop_and_incomplete_handoff() {
     let text = asset("skills/kicad-pcb/SKILL.md");
     let failure = text
