@@ -2,7 +2,7 @@
 
 The current state of the simulation work. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state.
 
-**Last updated:** 2026-11-09. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08, with its review follow-up done on 2026-11-09; load switch, eFuse and ideal diode are not started.
+**Last updated:** 2026-11-10. Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is merged as [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (`f4dde06`, 2026-11-09), after its review follow-up. M3's second part (load switch, eFuse, ideal diode) is open in [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) on branch `feat/simulation-datasheet-models-m3-switches`: an independent review found four verified findings, not fixed yet. It waits, because the owner gives creation work priority (2026-11-09).
 
 ## Start here
 
@@ -31,7 +31,7 @@ Decisions already made by the owner:
 
 ## PR stack
 
-PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are merged to `main` on the `fork` remote, each as a merge commit.
+PRs 1 to 11, the three fixes after them, the reliability repairs, M1, M2 and M3's first part are merged to `main` on the `fork` remote, each as a merge commit.
 
 | Plan PR | GitHub | Branch | State |
 |---|---|---|---|
@@ -51,17 +51,18 @@ PRs 1 to 11, the three fixes after them, the reliability repairs, M1 and M2 are 
 | M1 | [#16](https://github.com/yuvaltal912-sys/Konnect/pull/16) | `feat/simulation-datasheet-models` | Merged as `d10dbe1` |
 | M2 | [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) | `feat/simulation-datasheet-models-m2` | Merged as `d228d5f` |
 | Version check | [#23](https://github.com/yuvaltal912-sys/Konnect/pull/23) | `fix/live-test-ngspice-version` | Merged as `bdafc67` |
-| M3 (first part) | [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) | `feat/simulation-datasheet-models-m3` | Draft, not merged |
+| M3 (first part) | [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) | `feat/simulation-datasheet-models-m3` | Merged as `f4dde06` |
+| M3 (second part) | [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) | `feat/simulation-datasheet-models-m3-switches` | Open: four verified review findings to fix first |
 
 ## Datasheet models: M1 and M2 merged
 
-The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18. M3's first part is in draft #53:
+The owner asked for a design and its parts' datasheets to be enough to simulate. On a real power board 102 of 116 parts had no model (E75). The series is in the session plan. M1 and M2 are merged as PRs #16 and #18, and M3's first part as #53:
 
 | PR | Delivers |
 |---|---|
 | M1 | Readiness groups the parts that need models. `create_simulation_model` fits diodes, Schottky diodes, LEDs and Zeners, plus resistances, capacitors and inductors. `assign_simulation_model` attaches a fitted model to a batch of parts. Runs disclose them |
 | M2 | MOSFET (VDMOS, as a subcircuit, with a gate-charge check), TVS, BJT. **All done** (TVS: `tvs`, `tvs_bidirectional`; MOSFET: `n_mosfet`, `p_mosfet`; BJT: `npn`, `pnp`); merged as [#18](https://github.com/yuvaltal912-sys/Konnect/pull/18) |
-| M3 | Behavioural ICs. **Done in draft #53:** `op_amp`, `comparator`, `ldo`, `voltage_reference`. **Not started:** load switch, eFuse, ideal diode (the next PR; see "M3 progress") |
+| M3 | Behavioural ICs. **Merged in #53:** `op_amp`, `comparator`, `ldo`, `voltage_reference`. **Open in #54:** load switch, eFuse, ideal diode (its review findings first; see "M3 progress") |
 | M4 | A standalone SPICE netlist in place of a schematic |
 | M5 | Vendor library import and attachment, with raw-ngspice safety vetting |
 
@@ -115,7 +116,7 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 - **Tests:** eight in `bjt.rs` (the law against engine values, inverses, recovery, hold-out, saturation, grammar for both polarities, capacitances and fT, a duplicate), and `both_fitted_bipolar_kinds_are_checked_on_the_engine_and_attach_to_a_three_pin_part` in `simulation_live.rs`, which fits both polarities and assigns the NPN to `Q2` of the `amplifier-ac` demo. Negative controls, each failing the live test in the expected row: `TF` not written (fT), `BR` not written (saturation), the PNP junction bias unmirrored (all three capacitances).
 - **Limits:** no Early voltage (the collector current does not rise with collector voltage), no base or emitter resistance, no temperature behaviour, the gain is checked at the base current the datasheet gain implies and not at exactly the datasheet collector current, fT is a small-signal estimate that ignores `RB`, and `ITF`/`XTF` are unused.
 
-### M3 progress: behavioural ICs (op-amp, comparator, LDO, reference done; draft #53)
+### M3 progress: behavioural ICs (op-amp, comparator, LDO, reference; merged, #53)
 
 - **Kinds** `op_amp` and `comparator` (`simulation/models/amplifier.rs`, five pins `INP INN VCC VEE OUT`), and `ldo` and `voltage_reference` (`simulation/models/regulator.rs`, three pins `IN OUT COM`). Each is one subcircuit of behavioural lines in the fitted grammar; nothing refers to ground inside.
 - **Grammar** (`text.rs`). A subcircuit may now hold linear `E` and `G` sources, `H` sources that sense one of the body's own `V` sources, `V` and `I` sources with a plain number, any `R`/`C`/`L`/`D` named by Konnect, and `B` lines whose value is `V=` or `I=` of an expression in a closed grammar: numbers as Konnect formats them, `v(node)` or `v(node,node)`, `+ - * /`, parentheses, and `min max sqrt tanh exp ln` with their right argument counts (`check_expression`). No word, string, brace, `$`, `#`, `;`, `i(...)` or `pow` can pass, and an expression is at most 4 KiB. Clamp diodes use the `<name>_c` model suffix. A port named `gnd` is refused (see the trap below).
@@ -127,7 +128,7 @@ Gate on macOS, 2026-11-06: formatting, workspace tests (3,197 passed, 136 ignore
 - **Three traps found on the engine:** a hard `min`/`max` clamp on an output leaves Newton a flat region, and libngspice 45.2 failed every operating-point method on it (diode clamps and the smooth forms solve at once); ngspice reads a node named `gnd` as ground, even a subcircuit's port, which tied the first LDO's third pin to ground in the LM317 run while every bench passed, so the pin is `COM` and the grammar refuses `gnd`; and a `PULSE` with no width never falls, so a triangle is a `PWL`. A fourth cost time: a clamp diode goes on pushing current into the gain node while it turns off, which made every fitted delay read 1 to 2 percent short until the delay integral included it.
 - **Tests:** 7 in `amplifier.rs`, 6 in `regulator.rs`, one in `fit.rs` for the rank test, a grammar test of 12 accepted and 34 refused behavioural lines in `text.rs`, and two live tests: `behavioural_amplifiers_are_checked_on_the_engine_and_a_fitted_op_amp_runs_a_filter` (fits both kinds, assigns the op-amp to `U1` of `sallen_key`, and the AC run meets the filter's formula: the -3 dB edge within 1e-3 and -6.02 dB at f0) and `behavioural_regulators_are_checked_on_the_engine_and_a_fitted_ldo_regulates_a_supply` (fits both kinds, assigns an LM317-valued `ldo` to `U1` of `LM317_power_supply` with `COM` on ADJ, and a 0.3 s transient holds OUT 1.25 V above ADJ and 9.14 V at the output). Both require a worst engine error under 1 percent; the runs read about 0.03 percent. Negative controls, each failing a live test: the `COM` pin named `GND` with the grammar's refusal off, the clamp current left out of the delay integral, the old fixed-period trip ramp, the hysteresis term left out of the model, and the slew read into the settling tail.
 - **Limits:** a single pole (90-degree phase margin) and no second-stage dynamics, so loop stability needs the vendor model; no common-mode or supply rejection, input range, noise, offset current or temperature behaviour; the comparator output is push-pull only, its delay is checked on the rising edge with no load, and its DC gain is fixed; the regulators have no loop dynamics (a load step is answered at once), no PSRR, thermal shutdown, enable pin or reverse conduction, and the current limit is flat to a short (no foldback). The supply-pin current split of an op-amp under load is checked by hand only.
-- **Left for M3:** load switch, eFuse and ideal diode. They fit the regulator core: a pass element `Vin - Ron I` with a limit term (eFuse), an enable threshold and a soft-start ramp (load switch, which needs a capacitor in the law), and a reverse-current cut-off (ideal diode).
+- **Left for M3, in #54 (open):** load switch, eFuse and ideal diode. They fit the regulator core: a pass element `Vin - Ron I` with a limit term (eFuse), an enable threshold and a soft-start ramp (load switch, which needs a capacitor in the law), and a reverse-current cut-off (ideal diode).
 
 ### M3 gate (macOS, 2026-11-08, first part)
 
@@ -178,6 +179,8 @@ The review baseline had two `protocol_stdio` failures caused by inherited user c
 ## Now: the plan's v1 is merged
 
 PR 1 to 11 and the placement fix are merged, which finishes the plan's v1 on macOS. The `replace_component` fix is merged too. Ask the owner before starting any follow-up. The "After PR 11" table lists what is left.
+
+**Next in simulation:** fix #54's four verified review findings, then merge it; this waits while creation work has priority. After M3, the next PR waits for the owner's choice. Recommended: M5 (vendor library import, with raw-ngspice safety vetting) before M4 (a standalone SPICE netlist), because vendor models are what fitted models cannot replace.
 
 ### What the placement fix changed that later work needs to know
 
