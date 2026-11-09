@@ -69,6 +69,39 @@ reference board with Freerouting 2.5.0.
   and the manifest list them under `intent_widths`. An unusable design-intent
   record now refuses the export unless `widths_from_intent` is `false`.
 
+## Unreleased: Freerouting version policy
+
+Creation rank 32 part 2 (B34, D24; `docs/CREATION_HANDOFF.md`). Additive.
+
+- `check_freerouting` adds `version_policy` to every answer: `recommended_version`,
+  `recommended_jar`, `recommended_url`, `recommended_sha256` (GitHub's release
+  digest), `reason` (measured by `cargo xtask freerouting-bench`, see `DEV.md`),
+  `measured`, `installed_version` with `installed_version_basis` (the JAR's
+  `--version` output, else its file name), `matches_recommended`,
+  `sha256_matches_release` (checked only when the versions match) and `warning`
+  (`null`, or what differs and how to get the recommended release). A
+  different version still routes; the warning does not block anything.
+- The `--version` probe runs headless, with the GUI, telemetry and analytics
+  off, and in its own temporary `user.home`. Before, Freerouting 2.1.0 opened its
+  window after printing the version and the probe timed out, so a working
+  install read `available: false`. A probe that prints a Freerouting version
+  line now counts as `version_checked` even when the JAR then exits 1 (2.1.0
+  does, because no board was given), unless the output after that line shows a
+  Java exception trace or a Freerouting ERROR line other than the complaint
+  that no board was given. Then `available` and `version_checked` are false and
+  `version_output` holds the crash.
+- If the probe's scratch folder cannot be made, the JAR is not started:
+  `available` and `version_checked` are false, and `note` names the error.
+  The probe also removes every inherited `FREEROUTING__*` variable and points
+  `XDG_*`, `APPDATA` and `LOCALAPPDATA` into the scratch folder. The native MCP
+  probe (`freerouting_mcp.rs`) is isolated the same way since #57.
+- Versions compare by their numbers, so `freerouting-2.5.jar` is the
+  recommended 2.5.0 and its digest is checked. A pre-release such as
+  `2.5.0-SNAPSHOT` keeps its suffix in `installed_version` and is never
+  `matches_recommended`.
+- `setup`'s download step and `version_policy` text name the recommended
+  release instead of "the latest 2.x".
+
 ## Unreleased: Specctra DSN for real boards
 
 Creation PR 16 (`docs/CREATION_HANDOFF.md`). No tool arguments change.
