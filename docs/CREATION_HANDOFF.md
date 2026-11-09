@@ -110,7 +110,7 @@ Verified on macOS: 6 unit tests (`design_review_baseline_tests.rs`) over a scrat
 
 ## Rank 33, local part import (draft, #52)
 
-Finding B20, rescoped by the owner on 2026-11-08. One `library` tool (now 20 tools), `import_library_part`, in `tools/library_part_import.rs`. The tests are in `library_part_import_tests.rs`, and the fixtures in `tests/fixtures/part_import/`.
+Finding B20, rescoped by the owner on 2026-11-08. One tool, `import_library_part`, in `tools/library_part_import.rs`. It was a `library` tool; with #50's `render_library_item` that toolset would hold 21, over the router's 20-tool cap, so it is registered in `integration` (10 tools), next to the JLCPCB part search and datasheet tools (approved by the owner on 2026-11-09). The tests are in `library_part_import_tests.rs`, and the fixtures in `tests/fixtures/part_import/`.
 
 **Why local files, not an LCSC fetch.** Every peer importer reads EasyEDA's internal `easyeda.com/api/…` endpoints. EasyEDA's terms (effective 2026-09-21, section VII) restrict automated collection of their content and forbid modifying it or making derivative works. Their robots.txt disallows `/api/` for every agent, and disallows the whole site for `Claude-User`, `ClaudeBot` and `anthropic-ai`. So the tool makes no network requests. The owner exports or downloads the part's KiCad files (EasyEDA/LCSC export, SnapEDA, Ultra Librarian, a vendor's own), and the tool copies them into the project. It converts no format: the inputs must already be KiCad 6+ files (a `(module …)` footprint is refused with the `kicad-cli fp upgrade` hint). No code was taken from easyeda2kicad (AGPL-3.0) or JLC2KiCad_lib (MIT), so `THIRD_PARTY.md` is unchanged.
 

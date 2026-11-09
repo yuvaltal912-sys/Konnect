@@ -167,6 +167,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_route_specctra_dsn(args, ctx).await }
         ),
+        // A downloaded part's KiCad files, copied into a project library. Its
+        // code lives with the library tools (`library_part_import.rs`).
+        super::library::part_import_tool(),
     ]
 }
 

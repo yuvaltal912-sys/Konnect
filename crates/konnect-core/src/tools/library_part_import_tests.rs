@@ -672,8 +672,13 @@ async fn unusable_inputs_are_refused_before_anything_is_planned() {
 }
 
 #[test]
-fn the_tool_is_registered_in_the_library_toolset_with_a_closed_schema() {
-    let tools = super::super::tools();
+fn the_tool_is_registered_in_the_integration_toolset_with_a_closed_schema() {
+    // With `render_library_item`, `library` reaches the 20-tool cap, so the
+    // importer lives in `integration`.
+    assert!(!super::super::tools()
+        .iter()
+        .any(|t| t.name == "import_library_part"));
+    let tools = crate::tools::integration::tools();
     let tool = tools
         .iter()
         .find(|t| t.name == "import_library_part")

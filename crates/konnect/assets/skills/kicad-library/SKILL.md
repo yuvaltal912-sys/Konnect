@@ -23,6 +23,7 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info
+load_toolset('integration')    # import_library_part (a downloaded part's KiCad files)
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -34,7 +35,7 @@ symbol name and footprint path. Inspect `result`, `missing_pads` and
 match does not replace the accepted physical datasheet pin map below.
 
 To use a real part the user downloaded (an EasyEDA/LCSC export, SnapEDA, Ultra
-Librarian, a vendor's KiCad files), call `import_library_part` with the project,
+Librarian, a vendor's KiCad files), load `integration` and call `import_library_part` with the project,
 the `.kicad_sym`, the `.kicad_mod` and, if there is one, the `.step` model. Show
 the user the preview's pins, pads and pin-pad check result, then apply with its
 `revision`. The tool never downloads anything: EasyEDA's terms forbid automated

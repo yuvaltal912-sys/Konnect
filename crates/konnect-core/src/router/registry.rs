@@ -106,15 +106,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library",
-        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models, import a downloaded part into a project library",
+        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
         category: "library",
-        tool_count: 20,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "integration",
-        description: "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs",
+        description: "JLCPCB parts database, importing a downloaded part's KiCad files into a project library, local Freerouting MCP routing, datasheet URLs",
         category: "integration",
-        tool_count: 9,
+        tool_count: 10,
     },
     ToolsetMeta {
         name: "verification",

@@ -5,8 +5,9 @@ removals and the supported replacement workflow.
 
 ## Unreleased: import a part from local files
 
-Rank 33 (`docs/CREATION_HANDOFF.md`). The `library` toolset gains
-`import_library_part`. Nothing existing changes shape. `check_symbol_footprint`
+Rank 33 (`docs/CREATION_HANDOFF.md`). The `integration` toolset gains
+`import_library_part` (with #50's `render_library_item`, `library` reaches
+the router's 20-tool cap; load `integration` to call it). Nothing existing changes shape. `check_symbol_footprint`
 now shares its comparison with the importer, and its output is unchanged.
 
 The tool writes `<project_dir>/<library>.kicad_sym`, `<library>.pretty/<footprint>.kicad_mod`

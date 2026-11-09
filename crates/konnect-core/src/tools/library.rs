@@ -469,8 +469,15 @@ pub fn tools() -> Vec<ToolDef> {
         tools.insert(after_create_footprint + offset, tool);
     }
     tools.extend(correctness::tools());
-    tools.push(part_import::tool());
     tools
+}
+
+/// `import_library_part` is registered in the `integration` toolset, next to
+/// the JLCPCB part search and datasheet tools, so that `library` stays within
+/// the router's 20-tool cap (`MAX_TOOLS_PER_TOOLSET`) once
+/// `render_library_item` joins it.
+pub(crate) fn part_import_tool() -> ToolDef {
+    part_import::tool()
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
