@@ -10,6 +10,13 @@
 //! moves the counts conflicts with the whole open queue at once. v0.10.0 did
 //! exactly that to eleven open pull requests. The guard stays; the
 //! hand-editing does not.
+//!
+//! `cargo xtask freerouting-bench --jar <freerouting.jar> …` routes a folder of
+//! Specctra DSN files with each JAR and records completion, vias, wirelength,
+//! runtime and determinism per board and version (see `freerouting_bench`).
+//! It needs Java and is opt-in: never part of CI or `cargo test`.
+
+mod freerouting_bench;
 
 use konnect_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
@@ -28,9 +35,16 @@ const NL: char = '\n';
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("fix-doc-counts") => fix_doc_counts(),
+        Some("freerouting-bench") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            if let Err(message) = freerouting_bench::run(&args) {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
         other => {
             eprintln!("unknown task: {other:?}");
-            eprintln!("usage: cargo xtask fix-doc-counts");
+            eprintln!("usage: cargo xtask fix-doc-counts | freerouting-bench --jar <jar> …");
             std::process::exit(2);
         }
     }

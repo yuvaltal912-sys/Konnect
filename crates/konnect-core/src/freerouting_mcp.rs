@@ -39,7 +39,81 @@ fn server_arguments() -> &'static [&'static str] {
         "--mcp_server-endpoints=http://127.0.0.1:37964",
         "--mcp_server.stdio=true",
         "--gui.enabled=false",
+        // Freerouting 2.x turns telemetry and analytics on by default.
+        "--profile.allow_telemetry=false",
+        "--usage_and_diagnostic_data.disable_analytics=true",
     ]
+}
+
+/// JVM options that keep Freerouting off the network. Freerouting 2.5.0
+/// starts a version check on every launch (a GET to `api.github.com`, with
+/// no switch to turn it off), through Java's default proxy selector. Every
+/// HTTP and HTTPS request the JVM makes goes to a closed loopback port
+/// instead and fails at once. Loopback stays direct, so the MCP link to
+/// Freerouting's own servers on 127.0.0.1 is not affected.
+pub(crate) const OFFLINE_JVM_ARGUMENTS: [&str; 5] = [
+    "-Dhttp.proxyHost=127.0.0.1",
+    "-Dhttp.proxyPort=9",
+    "-Dhttps.proxyHost=127.0.0.1",
+    "-Dhttps.proxyPort=9",
+    "-Dhttp.nonProxyHosts=localhost|127.*|[::1]",
+];
+
+/// JVM options, placed before `-jar`. Freerouting writes its settings and a
+/// log under `user.home` (2.5) or `java.io.tmpdir` (2.1); pointing both at a
+/// scratch directory keeps that out of the owner's home. The
+/// [`OFFLINE_JVM_ARGUMENTS`] follow.
+fn jvm_arguments(scratch: &Path) -> Vec<std::ffi::OsString> {
+    let property = |name: &str, dir: PathBuf| {
+        let mut argument = std::ffi::OsString::from(format!("-D{name}="));
+        argument.push(dir);
+        argument
+    };
+    let mut arguments = vec![
+        "-Djava.awt.headless=true".into(),
+        property("user.home", scratch.join("home")),
+        property("java.io.tmpdir", scratch.join("tmp")),
+    ];
+    arguments.extend(OFFLINE_JVM_ARGUMENTS.iter().map(std::ffi::OsString::from));
+    arguments
+}
+
+/// Freerouting 2.5's `UserDataPathResolver` takes this argument ahead of
+/// `user.home`, so the settings folder cannot come from anywhere else.
+fn user_data_path_argument(scratch: &Path) -> std::ffi::OsString {
+    let mut argument = std::ffi::OsString::from("--user_data_path=");
+    argument.push(scratch.join("home"));
+    argument
+}
+
+/// Variables that move Freerouting's folders ahead of `user.home`, mapped to
+/// a folder under the scratch directory. `AppPaths` reads the `XDG_*` ones on
+/// Linux and `APPDATA` and `LOCALAPPDATA` on Windows.
+const SCRATCH_FOLDER_VARIABLES: [(&str, &str); 6] = [
+    ("XDG_CONFIG_HOME", "xdg/config"),
+    ("XDG_STATE_HOME", "xdg/state"),
+    ("XDG_CACHE_HOME", "xdg/cache"),
+    ("XDG_DATA_HOME", "xdg/data"),
+    ("APPDATA", "appdata/roaming"),
+    ("LOCALAPPDATA", "appdata/local"),
+];
+
+/// Cuts the child off from the parent's Freerouting settings: every inherited
+/// `FREEROUTING__*` variable (the user-data path, the log location and the
+/// settings source) is removed, and the folder variables point into scratch.
+fn isolate_environment(command: &mut Command, scratch: &Path) {
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("FREEROUTING__")
+        {
+            command.env_remove(&name);
+        }
+    }
+    for (name, folder) in SCRATCH_FOLDER_VARIABLES {
+        command.env(name, scratch.join(folder));
+    }
 }
 
 const REQUIRED_TOOLS: &[&str] = &[
@@ -60,6 +134,23 @@ pub(crate) struct RouteSettings {
     pub overall_timeout: Duration,
     /// The Java to run the JAR with; `java` on `PATH` when unset.
     pub java: Option<PathBuf>,
+    /// Freerouting's automatic neck-down at pins. It narrows a track below its
+    /// net class to reach a small pad, which breaks the project's minimum, so
+    /// `route_specctra_dsn` turns it off unless asked.
+    pub automatic_neckdown: Option<bool>,
+    /// The project's copper-to-board-edge clearance, which the DSN does not
+    /// carry.
+    pub copper_to_edge_clearance_um: Option<f64>,
+    /// The width Freerouting retries a connection at when the class width
+    /// cannot reach it (`neck_width_um`): the narrowest width the manifest
+    /// allows, so no track ends up below the project's floor.
+    pub retry_width_um: Option<f64>,
+    /// Freerouting's fanout stage (`fanout.enabled`). In 2.5.0 it necks a
+    /// track down at the pin whatever `automatic_neckdown` says
+    /// (`FoundConnectionInserter` runs its micro neck-down when fanout or
+    /// neck-down is on), which the SES importer refuses, so
+    /// `route_specctra_dsn` turns it off.
+    pub fanout_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,7 +163,32 @@ pub(crate) struct RouteEvidence {
     pub ses_bytes: u64,
     pub server_protocol_version: String,
     pub diagnostics_path: Option<String>,
+    /// The settings Konnect sent, as Freerouting reports them in effect
+    /// (`get_effective_settings`), keyed by their dotted name.
+    pub effective_settings: BTreeMap<String, Value>,
+    /// What the optimizer did, read from the job log; `None` when the log
+    /// could not be read.
+    pub optimizer: Option<OptimizerReport>,
 }
+
+/// The optimizer's outcome, from Freerouting's job log.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub(crate) struct OptimizerReport {
+    /// Optimizer passes that ran.
+    pub passes: u32,
+    /// A pass stopped early after consecutive items could not be improved.
+    pub early_stop: bool,
+    /// Why the optimizer stopped or never ran, when the log says (a pass
+    /// improved less than the threshold; the board was not fully routed).
+    pub stop_reason: Option<String>,
+    pub score_before: Option<f64>,
+    pub score_after: Option<f64>,
+    /// The optimizer's own log lines, at most [`MAX_OPTIMIZER_LINES`].
+    pub log: Vec<String>,
+}
+
+const MAX_OPTIMIZER_LINES: usize = 12;
+const MAX_LOG_LINE_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BridgeProbe {
@@ -135,6 +251,238 @@ pub(crate) async fn probe_local(jar: &Path, java: Option<&Path>) -> BridgeProbe 
             error: Some(format!("{error:#}")),
         },
     }
+}
+
+/// Freerouting 2.5.0 treats a copper-to-edge clearance within 1e-9 of its own
+/// default, 250 um, as "not set" (`HeadlessBoardManager.
+/// applyCopperToEdgeClearanceOverride`): it skips the override, or clamps it to
+/// the outline's minimum pin gap, logging at debug only, while
+/// `get_effective_settings` still reports 250. A project that asks for exactly
+/// 0.25 mm is sent a thousandth of a micrometre more, which the router applies
+/// as asked; the read-back is compared with what was sent.
+const FREEROUTING_EDGE_CLEARANCE_DEFAULT_UM: f64 = 250.0;
+
+fn edge_clearance_to_send(um: f64) -> f64 {
+    if (um - FREEROUTING_EDGE_CLEARANCE_DEFAULT_UM).abs() < 1e-9 {
+        FREEROUTING_EDGE_CLEARANCE_DEFAULT_UM + 0.001
+    } else {
+        um
+    }
+}
+
+/// The `update_job_settings` body for these settings, under the names
+/// Freerouting 2.5.0 reads. Its job API parses the body into its router
+/// settings by their serialized snake_case names and drops any other key
+/// without an error (camelCase `neckWidthUm` was silently ignored); the flat
+/// `max_passes` is a deprecated alias of `autorouter.max_passes`.
+pub(crate) fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
+    let mut job_settings = Map::new();
+    if let Some(max_passes) = settings.max_passes {
+        job_settings.insert(
+            "autorouter".to_string(),
+            json!({ "max_passes": max_passes }),
+        );
+    }
+    if let Some(enabled) = settings.optimizer_enabled {
+        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
+    }
+    if let Some(enabled) = settings.fanout_enabled {
+        job_settings.insert("fanout".to_string(), json!({ "enabled": enabled }));
+    }
+    if let Some(neckdown) = settings.automatic_neckdown {
+        job_settings.insert("automatic_neckdown".to_string(), json!(neckdown));
+    }
+    if let Some(edge) = settings.copper_to_edge_clearance_um {
+        job_settings.insert(
+            "copper_to_edge_clearance_um".to_string(),
+            json!(edge_clearance_to_send(edge)),
+        );
+    }
+    if let Some(width) = settings.retry_width_um {
+        job_settings.insert("neck_width_um".to_string(), json!(width));
+    }
+    if let Some(seconds) = settings.job_timeout_seconds {
+        job_settings.insert(
+            "job_timeout".to_string(),
+            Value::String(duration_string(seconds)),
+        );
+    }
+    job_settings
+}
+
+/// Every leaf of a settings body, by dotted name.
+fn setting_leaves(body: &Map<String, Value>) -> Vec<(String, Value)> {
+    fn walk(prefix: &str, value: &Value, out: &mut Vec<(String, Value)>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let name = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(&name, child, out);
+                }
+            }
+            leaf => out.push((prefix.to_string(), leaf.clone())),
+        }
+    }
+    let mut out = Vec::new();
+    walk("", &Value::Object(body.clone()), &mut out);
+    out
+}
+
+/// The value at a dotted name in Freerouting's effective settings, wherever
+/// the settings object sits in the tool's response (the HTTP body may be
+/// wrapped, or carried as JSON text).
+fn find_setting<'a>(response: &'a Value, name: &str) -> Option<&'a Value> {
+    let path: Vec<&str> = name.split('.').collect();
+    fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        path.iter()
+            .try_fold(value, |current, key| current.get(*key))
+    }
+    fn search<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        if let Some(found) = at(value, path) {
+            return Some(found);
+        }
+        match value {
+            Value::Object(map) => map.values().find_map(|child| search(child, path)),
+            Value::Array(items) => items.iter().find_map(|child| search(child, path)),
+            _ => None,
+        }
+    }
+    search(response, &path)
+}
+
+fn same_setting(sent: &Value, effective: &Value) -> bool {
+    match (sent.as_f64(), effective.as_f64()) {
+        (Some(a), Some(b)) => (a - b).abs() <= 1e-6 * a.abs().max(1.0),
+        _ => sent == effective,
+    }
+}
+
+/// Compare what was sent with what Freerouting says is in effect. Returns the
+/// effective value of every sent setting, or an error naming each one that
+/// is missing or different: a setting the router ignored must stop the run,
+/// not be found later in the copper.
+fn check_effective_settings(
+    sent: &Map<String, Value>,
+    response: &Value,
+) -> Result<BTreeMap<String, Value>> {
+    let mut effective = BTreeMap::new();
+    let mut wrong = Vec::new();
+    for (name, value) in setting_leaves(sent) {
+        match find_setting(response, &name) {
+            Some(found) if same_setting(&value, found) => {
+                effective.insert(name, found.clone());
+            }
+            Some(found) => wrong.push(format!("{name}: sent {value}, in effect {found}")),
+            None => wrong.push(format!(
+                "{name}: sent {value}, not in Freerouting's effective settings"
+            )),
+        }
+    }
+    if !wrong.is_empty() {
+        bail!(
+            "Freerouting did not apply the job settings, so nothing was routed: {}",
+            wrong.join("; ")
+        );
+    }
+    Ok(effective)
+}
+
+/// The optimizer's outcome from Freerouting's job log: the passes that ran,
+/// whether a pass stopped early, and the optimizer score before and after.
+fn optimizer_report(log: &Value) -> OptimizerReport {
+    fn messages(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    match child {
+                        Value::String(text) if key == "message" => out.push(text.clone()),
+                        // Text content that is not JSON may hold the log itself.
+                        Value::String(text)
+                            if key == "text" && !text.trim_start().starts_with(['{', '[']) =>
+                        {
+                            out.extend(text.lines().map(str::to_string))
+                        }
+                        _ => messages(child, out),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| messages(item, out)),
+            _ => {}
+        }
+    }
+    fn number_after(line: &str, marker: &str) -> Option<f64> {
+        let rest = &line[line.find(marker)? + marker.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+    let mut lines = Vec::new();
+    messages(log, &mut lines);
+    let mut report = OptimizerReport::default();
+    for line in lines.iter().filter(|line| line.contains("ptimiz")) {
+        if let Some(pass) = line
+            .find("Optimizer pass #")
+            .and_then(|_| number_after(line, "Optimizer pass #"))
+        {
+            report.passes = report.passes.max(pass as u32);
+        }
+        if line.contains("early after") {
+            report.early_stop = true;
+        }
+        let reason = [
+            "Stopping optimizer because ",
+            "Skipping optimization stage: ",
+        ]
+        .iter()
+        .find_map(|marker| line.find(marker).map(|at| &line[at + marker.len()..]));
+        if let Some(reason) = reason {
+            report.stop_reason = Some(
+                reason
+                    .trim_end_matches('.')
+                    .chars()
+                    .take(MAX_LOG_LINE_CHARS)
+                    .collect(),
+            );
+        }
+        // Stops 2.5.0's BatchOptimizer logs without the words above: the
+        // stage's time limit ("Optimizer stage timed out." and "...before
+        // starting pass #N") and its item limit. These lines are the reason,
+        // so the text from the marker on is kept.
+        if let Some(at) = ["Optimizer stage timed out", "Max items limit reached"]
+            .iter()
+            .find_map(|marker| line.find(marker))
+        {
+            report.stop_reason = Some(
+                line[at..]
+                    .trim_end_matches('.')
+                    .chars()
+                    .take(MAX_LOG_LINE_CHARS)
+                    .collect(),
+            );
+        }
+        // The summary line says the stage ended on its timeout; it names the
+        // reason only when no earlier line did.
+        if line.contains("Optimization stage completed with timeout") {
+            report
+                .stop_reason
+                .get_or_insert_with(|| "optimization stage completed with timeout".to_string());
+        }
+        if line.contains("Optimization stage completed") {
+            report.score_before = number_after(line, "baseline optimizer score: ");
+            report.score_after = number_after(line, "final optimizer score: ");
+        }
+        if report.log.len() < MAX_OPTIMIZER_LINES {
+            report
+                .log
+                .push(line.chars().take(MAX_LOG_LINE_CHARS).collect());
+        }
+    }
+    report
 }
 
 pub(crate) async fn route_local(
@@ -325,22 +673,13 @@ async fn run_state_machine(
         )
         .await?;
 
-    let mut job_settings = Map::new();
-    if let Some(max_passes) = settings.max_passes {
-        job_settings.insert("maxPasses".to_string(), json!(max_passes));
-    }
-    if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
-    }
-    if let Some(seconds) = settings.job_timeout_seconds {
-        job_settings.insert(
-            "jobTimeoutString".to_string(),
-            Value::String(duration_string(seconds)),
-        );
-    }
+    let job_settings = job_settings(settings);
+    let mut effective_settings = BTreeMap::new();
     if !job_settings.is_empty() {
-        if !tools.contains_key("update_job_settings") {
-            bail!("Freerouting MCP does not expose update_job_settings");
+        for tool in ["update_job_settings", "get_effective_settings"] {
+            if !tools.contains_key(tool) {
+                bail!("Freerouting MCP does not expose {tool}, so the job settings cannot be applied and checked (Freerouting 2.5.0 has both)");
+            }
         }
         client
             .call_tool(
@@ -348,6 +687,13 @@ async fn run_state_machine(
                 json!({ "path": { "jobId": job_id }, "body": job_settings }),
             )
             .await?;
+        let effective = client
+            .call_tool(
+                "get_effective_settings",
+                json!({ "path": { "jobId": job_id } }),
+            )
+            .await?;
+        effective_settings = check_effective_settings(&job_settings, &effective)?;
     }
     client
         .call_tool("start_job", json!({ "path": { "jobId": job_id } }))
@@ -375,6 +721,16 @@ async fn run_state_machine(
             json!({ "jobId": job_id, "filePath": absolute_utf8(temporary)? }),
         )
         .await?;
+    // Evidence only: a log that cannot be read leaves the route as it is.
+    let optimizer = if tools.contains_key("get_job_logs") {
+        client
+            .call_tool("get_job_logs", json!({ "path": { "jobId": job_id } }))
+            .await
+            .ok()
+            .map(|log| optimizer_report(&log))
+    } else {
+        None
+    };
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -384,6 +740,8 @@ async fn run_state_machine(
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
         diagnostics_path: None,
+        effective_settings,
+        optimizer,
     })
 }
 
@@ -455,6 +813,10 @@ struct LocalMcpClient {
     stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
+    /// Freerouting's home and temp directories. `close` removes it after the
+    /// child has exited. `Drop` hands it to the task that waits for the child,
+    /// so it goes only after the exit there too.
+    scratch: Option<tempfile::TempDir>,
 }
 
 impl LocalMcpClient {
@@ -472,15 +834,26 @@ impl LocalMcpClient {
     }
 
     fn spawn(jar: &Path, java: Option<&Path>) -> Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("konnect-freerouting-")
+            .tempdir()
+            .context("create Freerouting scratch directory")?;
+        for name in ["home", "tmp"] {
+            std::fs::create_dir(scratch.path().join(name))
+                .context("create Freerouting scratch directory")?;
+        }
         let mut command = Command::new(java.unwrap_or_else(|| Path::new("java")));
         command
+            .args(jvm_arguments(scratch.path()))
             .arg("-jar")
             .arg(jar)
             .args(server_arguments())
+            .arg(user_data_path_argument(scratch.path()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        isolate_environment(&mut command, scratch.path());
         let mut child = command
             .spawn()
             .context("start local Freerouting MCP server")?;
@@ -513,6 +886,7 @@ impl LocalMcpClient {
             stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
+            scratch: Some(scratch),
         })
     }
 
@@ -659,11 +1033,14 @@ impl LocalMcpClient {
 
 impl Drop for LocalMcpClient {
     fn drop(&mut self) {
+        let scratch = self.scratch.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     let _ = child.wait().await;
+                    // Removed only now: the JVM may still hold files open.
+                    drop(scratch);
                 });
             }
         }
@@ -821,6 +1198,332 @@ mod tests {
         assert_eq!(find_string(&value, &["sessionId"]), Some("abc".to_string()));
     }
 
+    fn all_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: Some(20),
+            optimizer_enabled: Some(true),
+            job_timeout_seconds: Some(600),
+            poll_interval: std::time::Duration::from_secs(2),
+            overall_timeout: std::time::Duration::from_secs(60),
+            java: None,
+            automatic_neckdown: Some(false),
+            copper_to_edge_clearance_um: Some(500.0),
+            retry_width_um: Some(200.0),
+            fanout_enabled: Some(false),
+        }
+    }
+
+    /// The names Freerouting 2.5.0's router settings serialize under (read
+    /// from its class files: `RouterSettings`, `AutorouterSettings`,
+    /// `OptimizerSettings`). A key outside these is dropped silently.
+    #[test]
+    fn job_settings_use_the_names_freerouting_reads() {
+        let body = job_settings(&all_settings());
+        let names: Vec<String> = setting_leaves(&body).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "automatic_neckdown",
+                "autorouter.max_passes",
+                "copper_to_edge_clearance_um",
+                "fanout.enabled",
+                "job_timeout",
+                "neck_width_um",
+                "optimizer.enabled",
+            ]
+        );
+        assert_eq!(body["neck_width_um"], json!(200.0));
+        assert_eq!(body["fanout"], json!({ "enabled": false }));
+        assert_eq!(body["job_timeout"], json!("00:10:00"));
+        let none = job_settings(&RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            automatic_neckdown: None,
+            copper_to_edge_clearance_um: None,
+            retry_width_um: None,
+            fanout_enabled: None,
+            ..all_settings()
+        });
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn effective_settings_must_match_what_was_sent() {
+        let sent = job_settings(&all_settings());
+        // The HTTP body as the MCP tool wraps it, and as JSON text.
+        let applied = json!({
+            "status": 200,
+            "body": {
+                "automatic_neckdown": false,
+                "copper_to_edge_clearance_um": 500.0,
+                "neck_width_um": 200.0,
+                "job_timeout": "00:10:00",
+                "autorouter": { "max_passes": 20, "enabled": true },
+                "optimizer": { "enabled": true, "max_passes": 100 },
+                "fanout": { "enabled": false, "max_passes": 100 },
+                "scoring": { "via_costs": 50 }
+            }
+        });
+        let effective = check_effective_settings(&sent, &applied).unwrap();
+        assert_eq!(effective["neck_width_um"], json!(200.0));
+        assert_eq!(effective.len(), 7);
+        let as_text = expand_text_content(json!({
+            "content": [{ "type": "text", "text": applied.to_string() }]
+        }));
+        check_effective_settings(&sent, &as_text).unwrap();
+
+        // The 2.5.0 default for a dropped key, and a key missing altogether.
+        let mut dropped = applied.clone();
+        dropped["body"]["neck_width_um"] = json!(0.0);
+        dropped["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("job_timeout");
+        let error = check_effective_settings(&sent, &dropped)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("neck_width_um: sent 200.0, in effect 0.0")
+                && error.contains("job_timeout")
+                && error.contains("nothing was routed"),
+            "{error}"
+        );
+        // Fanout left on (2.5.0's default) necks tracks at pins.
+        let mut fanout_on = applied.clone();
+        fanout_on["body"]["fanout"]["enabled"] = json!(true);
+        let error = check_effective_settings(&sent, &fanout_on)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("fanout.enabled: sent false, in effect true"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_optimizer_outcome_is_read_from_the_job_log() {
+        let log = json!({ "body": [
+            { "type": "INFO", "message": "Starting optimization on 1 thread..." },
+            { "type": "INFO", "message": "Optimizer pass #1: optimizer score 349.49 -> 355.15 (IMPROVED, 1.6189%), router score: 1000.00" },
+            { "type": "INFO", "message": "Optimizer pass #2: optimizer score 355.15 -> 356.87 (IMPROVED, 0.4831%), router score: 1000.00" },
+            { "type": "INFO", "message": "Stopping optimization pass #2 early after 12 consecutive items could not be improved." },
+            { "type": "INFO", "message": "Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 349.49, final router score: 1000.00, final optimizer score: 356.87" },
+            { "type": "INFO", "message": "Autorouter pass #3 completed" }
+        ]});
+        let report = optimizer_report(&log);
+        assert_eq!(report.passes, 2);
+        assert!(report.early_stop);
+        assert_eq!(report.score_before, Some(349.49));
+        assert_eq!(report.score_after, Some(356.87));
+        assert_eq!(report.log.len(), 5);
+        assert_eq!(report.stop_reason, None);
+        assert_eq!(
+            optimizer_report(&json!({ "body": [] })),
+            OptimizerReport::default()
+        );
+        // Freerouting 2.5.0's own line when a pass gains too little.
+        let threshold = json!({ "body": [
+            { "type": "INFO", "message": "[FFE3BD] Optimizer pass #1: optimizer score 503.77 -> 513.55 (IMPROVED, 1.9432%), router score: 1000.00, incomplete connections: 0, clearance violations: 0." },
+            { "type": "INFO", "message": "[FFE3BD] Stopping optimizer because the improvement in this pass (1.9432%) is below the threshold (2.50%)." }
+        ]});
+        let report = optimizer_report(&threshold);
+        assert_eq!((report.passes, report.early_stop), (1, false));
+        assert_eq!(
+            report.stop_reason.as_deref(),
+            Some("the improvement in this pass (1.9432%) is below the threshold (2.50%)")
+        );
+        // And when it never ran.
+        let skipped = json!({ "body": [{ "type": "INFO", "message": "[1DA299] Skipping optimization stage: the board has 1 unrouted connection(s) (optimizer only runs on completely routed boards)." }] });
+        let report = optimizer_report(&skipped);
+        assert_eq!(report.passes, 0);
+        assert!(report
+            .stop_reason
+            .unwrap()
+            .starts_with("the board has 1 unrouted connection(s)"));
+    }
+
+    /// 2.5.0's BatchOptimizer also stops on its stage time limit and its item
+    /// limit, and its summary line says when the stage ended on the timeout.
+    #[test]
+    fn a_timed_out_or_capped_optimizer_has_a_stop_reason() {
+        let reason = |messages: &[&str]| {
+            let log = json!({ "body": messages.iter().map(|m| json!({ "type": "INFO", "message": m })).collect::<Vec<_>>() });
+            optimizer_report(&log).stop_reason
+        };
+        assert_eq!(
+            reason(&["[AB12CD] Optimizer stage timed out."]).as_deref(),
+            Some("Optimizer stage timed out")
+        );
+        assert_eq!(
+            reason(&["Optimizer stage timed out before starting pass #3"]).as_deref(),
+            Some("Optimizer stage timed out before starting pass #3")
+        );
+        assert_eq!(
+            reason(&["Max items limit reached (500). Stopping optimizer."]).as_deref(),
+            Some("Max items limit reached (500). Stopping optimizer")
+        );
+        // The summary of a timed-out stage alone still gives a reason, and
+        // its scores are still read.
+        let summary = "Optimization stage completed with timeout:. Baseline router score: 1000.00, baseline optimizer score: 10.00, final router score: 1000.00, final optimizer score: 11.00";
+        let log = json!({ "body": [{ "type": "INFO", "message": summary }] });
+        let report = optimizer_report(&log);
+        assert_eq!(
+            report.stop_reason.as_deref(),
+            Some("optimization stage completed with timeout")
+        );
+        assert_eq!(report.score_after, Some(11.0));
+        // An earlier, more specific line is kept.
+        assert_eq!(
+            reason(&["Optimizer stage timed out.", summary]).as_deref(),
+            Some("Optimizer stage timed out")
+        );
+        // A stage that completed normally has none.
+        assert_eq!(
+            reason(&[&summary.replace("completed with timeout:", "completed:")]),
+            None
+        );
+    }
+
+    /// Freerouting 2.5.0 reads an edge clearance within 1e-9 of 250 um as
+    /// "not set", so exactly 0.25 mm is sent a thousandth of a micrometre
+    /// more, and the read-back still catches a router that reports 250.
+    #[test]
+    fn an_edge_clearance_of_exactly_250_um_is_nudged_off_freeroutings_default() {
+        let body = |edge: f64| {
+            job_settings(&RouteSettings {
+                copper_to_edge_clearance_um: Some(edge),
+                ..all_settings()
+            })
+        };
+        assert_eq!(body(250.0)["copper_to_edge_clearance_um"], json!(250.001));
+        assert_eq!(
+            body(250.0000000001)["copper_to_edge_clearance_um"],
+            json!(250.001)
+        );
+        assert_eq!(body(250.5)["copper_to_edge_clearance_um"], json!(250.5));
+        assert_eq!(body(500.0)["copper_to_edge_clearance_um"], json!(500.0));
+        let mut sent = body(250.0);
+        sent.retain(|name, _| name == "copper_to_edge_clearance_um");
+        let applied = json!({ "copper_to_edge_clearance_um": 250.001 });
+        let kept = check_effective_settings(&sent, &applied).unwrap();
+        assert_eq!(kept["copper_to_edge_clearance_um"], json!(250.001));
+        // A router that clamps it back to 250 is caught.
+        let clamped = json!({ "copper_to_edge_clearance_um": 250.0 });
+        let error = check_effective_settings(&sent, &clamped)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("copper_to_edge_clearance_um: sent 250.001, in effect 250.0"),
+            "{error}"
+        );
+    }
+
+    /// A stand-in for Freerouting's stdio MCP server: a shell script that
+    /// answers the routing state machine and reports `neck_width_um` as the
+    /// given value in its effective settings.
+    #[cfg(unix)]
+    fn fake_freerouting(dir: &Path, effective_neck_width: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let object = r#"{"type":"object","properties":{"jobId":{"type":"string"},"filePath":{"type":"string"}},"required":["jobId","filePath"]}"#;
+        let with_path = r#"{"type":"object","properties":{"path":{"type":"object","properties":{"jobId":{"type":"string"}},"required":["jobId"]}},"required":["path"]}"#;
+        let enqueue = r#"{"type":"object","properties":{"body":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},"required":["body"]}"#;
+        let tool =
+            |name: &str, schema: &str| format!(r#"{{"name":"{name}","inputSchema":{schema}}}"#);
+        let tools = [
+            tool("create_session", r#"{"type":"object","properties":{}}"#),
+            tool("enqueue_job", enqueue),
+            tool("upload_job_input_from_local_file", object),
+            tool("update_job_settings", with_path),
+            tool("get_effective_settings", with_path),
+            tool("start_job", with_path),
+            tool("get_job_details", with_path),
+            tool("get_job_logs", with_path),
+            tool("download_job_output_to_local_file", object),
+        ]
+        .join(",");
+        let settings = format!(
+            r#"{{"status":200,"body":{{"automatic_neckdown":false,"copper_to_edge_clearance_um":500.0,"neck_width_um":{effective_neck_width},"job_timeout":"00:10:00","autorouter":{{"max_passes":20}},"optimizer":{{"enabled":true}},"fanout":{{"enabled":false}}}}}}"#
+        );
+        let logs = r#"{"status":200,"body":[{"type":"INFO","message":"Optimizer pass #1: optimizer score 10.00 -> 10.00 (UNCHANGED, 0.0000%)"},{"type":"INFO","message":"Stopping optimization pass #1 early after 12 consecutive items could not be improved."},{"type":"INFO","message":"Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 10.00, final router score: 1000.00, final optimizer score: 10.00"}]}"#;
+        let script = format!(
+            r#"#!/bin/sh
+reply() {{ printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$1" "$2"; }}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*) reply "$id" '{{"protocolVersion":"2024-11-05"}}' ;;
+    *'"method":"tools/list"'*) reply "$id" '{{"tools":[{tools}]}}' ;;
+    *'"name":"create_session"'*) reply "$id" '{{"session_id":"s1"}}' ;;
+    *'"name":"enqueue_job"'*) reply "$id" '{{"job_id":"j1"}}' ;;
+    *'"name":"get_effective_settings"'*) reply "$id" '{settings}' ;;
+    *'"name":"get_job_details"'*) reply "$id" '{{"state":"COMPLETED"}}' ;;
+    *'"name":"get_job_logs"'*) reply "$id" '{logs}' ;;
+    *'"name":"download_job_output_to_local_file"'*)
+      out=$(printf '%s' "$line" | grep -o '"filePath":"[^"]*"' | cut -d'"' -f4)
+      printf '(session "board")\n' > "$out"
+      reply "$id" '{{"message":"saved"}}' ;;
+    *) reply "$id" '{{}}' ;;
+  esac
+done
+"#
+        );
+        let path = dir.join("fake-java");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    async fn route_with_fake(
+        effective_neck_width: &str,
+    ) -> (Result<RouteEvidence>, PathBuf, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let jar = dir.join("freerouting.jar");
+        std::fs::write(&jar, b"not a jar").unwrap();
+        let dsn = dir.join("board.dsn");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let ses = dir.join("board.ses");
+        let settings = RouteSettings {
+            java: Some(fake_freerouting(&dir, effective_neck_width)),
+            ..all_settings()
+        };
+        (route_local(&jar, &dsn, &ses, &settings).await, ses, temp)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_setting_freerouting_did_not_apply_stops_the_route() {
+        let (result, ses, _temp) = route_with_fake("0.0").await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("neck_width_um: sent 200.0, in effect 0.0"),
+            "{error}"
+        );
+        assert!(
+            !ses.exists(),
+            "no SES may be written after a refused setting"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn applied_settings_and_the_optimizer_outcome_are_reported() {
+        let (result, ses, _temp) = route_with_fake("200.0").await;
+        let evidence = result.unwrap();
+        assert!(ses.is_file());
+        assert_eq!(evidence.effective_settings["neck_width_um"], json!(200.0));
+        assert_eq!(
+            evidence.effective_settings["autorouter.max_passes"],
+            json!(20)
+        );
+        let optimizer = evidence.optimizer.unwrap();
+        assert_eq!((optimizer.passes, optimizer.early_stop), (1, true));
+        assert_eq!(optimizer.score_after, Some(10.0));
+    }
+
     #[test]
     fn duration_settings_use_documented_shape() {
         assert_eq!(duration_string(5 * 60), "00:05:00");
@@ -847,6 +1550,174 @@ mod tests {
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn telemetry_is_switched_off_on_the_command_line() {
+        let arguments = server_arguments();
+        assert!(arguments.contains(&"--profile.allow_telemetry=false"));
+        assert!(arguments.contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+    }
+
+    /// A `java` that records its arguments and its environment, then answers
+    /// the MCP handshake and exits when stdin closes.
+    #[cfg(unix)]
+    fn recording_java(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let arguments = dir.join("arguments.txt");
+        let environment = dir.join("environment.txt");
+        let java = dir.join("java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nenv > '{}'\n\
+                 while read -r line; do\n\
+                 case \"$line\" in\n\
+                 *'\"initialize\"'*) echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}';;\n\
+                 *'\"tools/list\"'*) echo '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"tools\":[]}}}}';;\n\
+                 esac\n\
+                 done\n",
+                arguments.display(),
+                environment.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (java, arguments, environment)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_starts_java_headless_with_a_scratch_home_and_no_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (java, record, _) = recording_java(dir.path());
+
+        let probe = probe_local(Path::new("/x/freerouting.jar"), Some(&java)).await;
+        // The empty tool list is refused; the handshake is what matters here.
+        assert!(probe.native_mcp_available, "{probe:?}");
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let jar = lines.iter().position(|line| *line == "-jar").unwrap();
+        let before_jar = &lines[..jar];
+        assert!(
+            before_jar.contains(&"-Djava.awt.headless=true"),
+            "{recorded}"
+        );
+        let home = before_jar
+            .iter()
+            .find_map(|line| line.strip_prefix("-Duser.home="))
+            .expect("user.home is set before -jar");
+        let tmp = before_jar
+            .iter()
+            .find_map(|line| line.strip_prefix("-Djava.io.tmpdir="))
+            .expect("java.io.tmpdir is set before -jar");
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        assert!(!real_home.is_empty() && home != real_home, "{home}");
+        assert!(Path::new(home).starts_with(std::env::temp_dir()), "{home}");
+        assert!(Path::new(tmp).starts_with(std::env::temp_dir()), "{tmp}");
+        assert!(lines[jar + 1..].contains(&"--profile.allow_telemetry=false"));
+        assert!(lines[jar + 1..].contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
+        // HTTP and HTTPS go to a closed loopback port, so 2.5.0's version
+        // check never reaches api.github.com; loopback stays direct.
+        for offline in OFFLINE_JVM_ARGUMENTS {
+            assert!(before_jar.contains(&offline), "{offline}: {recorded}");
+        }
+        assert!(
+            !Path::new(home).exists(),
+            "the scratch directory outlives the child"
+        );
+    }
+
+    /// Freerouting 2.5 reads its folders from `--user_data_path`,
+    /// `FREEROUTING__USER_DATA_PATH` and the `XDG_*` / `APPDATA` variables
+    /// ahead of `user.home`. None of them may lead out of the scratch directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_child_cannot_be_pointed_outside_the_scratch_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (java, arguments, environment) = recording_java(dir.path());
+        let elsewhere = dir.path().join("elsewhere");
+        // Only `FREEROUTING__*` is set here: other tests in this binary read
+        // the folder variables, and the child must replace those anyway.
+        std::env::set_var("FREEROUTING__USER_DATA_PATH", &elsewhere);
+        std::env::set_var("FREEROUTING__LOGGING__FILE__LOCATION", &elsewhere);
+        std::env::set_var("FREEROUTING__KONNECT_TEST_ONLY", "1");
+
+        let probe = probe_local(Path::new("/x/freerouting.jar"), Some(&java)).await;
+
+        std::env::remove_var("FREEROUTING__USER_DATA_PATH");
+        std::env::remove_var("FREEROUTING__LOGGING__FILE__LOCATION");
+        std::env::remove_var("FREEROUTING__KONNECT_TEST_ONLY");
+        assert!(probe.native_mcp_available, "{probe:?}");
+
+        let recorded = std::fs::read_to_string(&arguments).unwrap();
+        let home = recorded
+            .lines()
+            .find_map(|line| line.strip_prefix("-Duser.home="))
+            .expect("user.home is set");
+        let scratch = Path::new(home).parent().unwrap();
+        assert!(scratch.starts_with(std::env::temp_dir()), "{scratch:?}");
+        assert!(
+            recorded
+                .lines()
+                .any(|line| line.strip_prefix("--user_data_path=") == Some(home)),
+            "{recorded}"
+        );
+
+        let variables = std::fs::read_to_string(&environment).unwrap();
+        let variables: BTreeMap<&str, &str> = variables
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let inherited: Vec<&&str> = variables
+            .keys()
+            .filter(|name| name.to_ascii_uppercase().starts_with("FREEROUTING__"))
+            .collect();
+        assert!(inherited.is_empty(), "{inherited:?}");
+        for (name, _) in SCRATCH_FOLDER_VARIABLES {
+            let value = variables
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is not set for the child"));
+            assert!(
+                Path::new(value).starts_with(scratch),
+                "{name}={value} is outside {scratch:?}"
+            );
+        }
+    }
+
+    /// Dropping a client kills the child and waits for it in the background.
+    /// The scratch directory must wait with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_client_removes_the_scratch_directory_only_after_the_child_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let java = dir.path().join("java");
+        std::fs::write(&java, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = LocalMcpClient::spawn(Path::new("/x/freerouting.jar"), Some(&java)).unwrap();
+        let pid = client.child.as_ref().unwrap().id().unwrap();
+        let scratch = client.scratch.as_ref().unwrap().path().to_path_buf();
+        assert!(scratch.is_dir());
+        assert!(process_is_running(pid));
+
+        drop(client);
+        // The runtime has not run the waiting task yet, so the child is not
+        // reaped and its folder must still be there.
+        assert!(scratch.is_dir(), "the scratch directory went with the drop");
+
+        for _ in 0..100 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!scratch.exists(), "the scratch directory was never removed");
+        assert!(
+            !process_is_running(pid),
+            "the scratch directory went before the child exited"
+        );
     }
 
     #[test]
@@ -923,6 +1794,10 @@ mod tests {
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(300),
                 java: None,
+                automatic_neckdown: None,
+                copper_to_edge_clearance_um: None,
+                retry_width_um: None,
+                fanout_enabled: None,
             },
         )
         .await
@@ -958,6 +1833,10 @@ mod tests {
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_millis(100),
                     java: None,
+                    automatic_neckdown: None,
+                    copper_to_edge_clearance_um: None,
+                    retry_width_um: None,
+                    fanout_enabled: None,
                 },
             )
             .await
@@ -1006,6 +1885,10 @@ mod tests {
                     poll_interval: Duration::from_secs(5),
                     overall_timeout: Duration::from_secs(300),
                     java: None,
+                    automatic_neckdown: None,
+                    copper_to_edge_clearance_um: None,
+                    retry_width_um: None,
+                    fanout_enabled: None,
                 },
             )
             .await

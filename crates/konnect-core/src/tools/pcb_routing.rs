@@ -185,8 +185,9 @@ pub fn tools() -> Vec<ToolDef> {
             "query_traces",
             "List trace segments on the board, optionally filtered by net, layer, or the pad \
              they touch. Each result includes the track's UUID, which delete_trace takes. At \
-             most 'limit' segments (default 200) come back; 'total_matches' and 'truncated' \
-             say when that cut the list, so a busy board no longer returns tens of kilobytes. \
+             most 'limit' segments (default 200) come back, fewer when they reach the size \
+             cap; 'total_matches', 'truncated' and 'next_offset' say what is left, and \
+             'offset' reads the next page. \
              For everything else near a point (pads, vias, zones), use query_board_region.",
             json!({
                 "type": "object",
@@ -203,7 +204,8 @@ pub fn tools() -> Vec<ToolDef> {
                         },
                         "required": ["reference", "pad"]
                     },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Most segments to return" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "Most segments to return" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "First matching segment to return" }
                 },
                 "required": ["board"]
             }),
@@ -1127,6 +1129,105 @@ mod query_traces_tests {
         )
     }
 
+    /// `count` segments on one net, as KiCad would list them.
+    async fn run_many(count: usize, extra: serde_json::Value) -> (bool, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, FIXTURE).unwrap();
+        let tracks: Vec<prost_types::Any> = (0..count)
+            .map(|i| {
+                let x = i as f64 * 0.5;
+                let mut t = konnect_ipc::builders::build_track(
+                    "A_RATHER_LONG_NET_NAME_FOR_SIZE",
+                    1,
+                    "F.Cu",
+                    0.25,
+                    x,
+                    0.0,
+                    x,
+                    5.0,
+                );
+                t.id = Some(kiapi::common::types::Kiid {
+                    value: format!("00000000-0000-0000-0000-{i:012}"),
+                });
+                konnect_ipc::builders::pack_any(&t, "kiapi.board.types.Track")
+            })
+            .collect();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            command.type_url.ends_with("GetItems").then(|| {
+                konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: tracks.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )
+            })
+        });
+        let mut args = json!({ "board": board.to_string_lossy() });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        let result = handle_query_traces(&args, &ctx_talking_to(server.address().to_string()))
+            .await
+            .unwrap();
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else {
+            panic!("expected text");
+        };
+        assert!(text.len() < 50_000, "over the client's cap: {}", text.len());
+        (result.is_error, serde_json::from_str(text).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_thousand_segments_stop_at_the_size_cap_and_offset_reads_on() {
+        let (err, first) = run_many(1000, json!({ "limit": 1000 })).await;
+        assert!(!err, "{first}");
+        assert_eq!(first["total_matches"], 1000);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["byte_capped"], true);
+        let shown = first["count"].as_u64().unwrap();
+        assert!(shown > 50 && shown < 1000, "{shown}");
+        assert_eq!(first["next_offset"], shown);
+        assert!(first["hint"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("offset {shown}")));
+        // Pages resume where the last stopped and cover every segment once.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut offset = 0u64;
+        loop {
+            let (_, page) = run_many(1000, json!({ "limit": 1000, "offset": offset })).await;
+            assert_eq!(page["total_matches"], 1000);
+            for trace in page["traces"].as_array().unwrap() {
+                assert!(seen.insert(trace["uuid"].as_str().unwrap().to_owned()));
+            }
+            match page["next_offset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn a_short_list_is_unpaged_and_a_bad_offset_is_refused() {
+        let (_, body) = run_many(5, json!({})).await;
+        assert_eq!(
+            (body["count"].as_u64(), body["truncated"].as_bool()),
+            (Some(5), Some(false))
+        );
+        assert!(body.get("next_offset").is_none() && body.get("hint").is_none());
+        let (err, body) = run_many(5, json!({ "offset": -1 })).await;
+        assert!(err, "{body}");
+        // Review #49: a stale offset says it is past the end.
+        let (err, body) = run_many(5, json!({ "offset": 5000 })).await;
+        assert!(!err, "{body}");
+        assert_eq!(body["offset_past_end"], true, "{body}");
+        assert_eq!(body["total_matches"], 5);
+        assert!(body["hint"].as_str().unwrap().contains("past the end"));
+    }
+
     #[tokio::test]
     async fn without_filters_every_segment_comes_back_untruncated() {
         let (err, body) = run(json!({})).await;
@@ -1328,6 +1429,10 @@ async fn handle_query_traces(
             }
         },
     };
+    let offset = match super::response_budget::window(args, limit) {
+        Ok((offset, _)) => offset,
+        Err(refusal) => return Ok(refusal),
+    };
     let touching = match args.get("touching_pad") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => {
@@ -1391,9 +1496,8 @@ async fn handle_query_traces(
         })
         .collect();
     let total = matching.len();
-    let items: Vec<serde_json::Value> = matching
+    let all: Vec<serde_json::Value> = matching
         .into_iter()
-        .take(limit)
         .map(|t| {
             json!({
                 "uuid": t.uuid,
@@ -1403,13 +1507,23 @@ async fn handle_query_traces(
             })
         })
         .collect();
-
-    Ok(CallToolResult::json(&json!({
-        "count": items.len(),
-        "total_matches": total,
-        "truncated": total > items.len(),
-        "traces": items
-    })))
+    // A thousand segments ran past the client's cap, so the size budget ends
+    // a page too, and `offset` reads on (#A30).
+    let page =
+        super::response_budget::page(&all, offset, limit, super::response_budget::BYTE_BUDGET);
+    let mut body = serde_json::Map::new();
+    body.insert("count".into(), json!(page.items.len()));
+    body.insert("total_matches".into(), json!(total));
+    page.describe(&mut body);
+    page.hint(
+        &mut body,
+        &format!(
+            "Pass offset {} for the next page, or narrow with net_name, layer or touching_pad.",
+            page.offset + page.items.len()
+        ),
+    );
+    body.insert("traces".into(), json!(page.items));
+    Ok(CallToolResult::json(&serde_json::Value::Object(body)))
 }
 
 async fn handle_get_nets_list(
@@ -2197,8 +2311,14 @@ mod specctra_live_undo_test {
             .expect("capture routing rules");
         let snapshot =
             crate::routing_context::Snapshot::read(&board).expect("capture routing context");
-        let export = crate::specctra::export_dsn_with_context(&board, &before, &rules, &snapshot)
-            .expect("export locked-routing fixture");
+        let export = crate::specctra::export_dsn_with_context(
+            &board,
+            &before,
+            &rules,
+            &snapshot,
+            Default::default(),
+        )
+        .expect("export locked-routing fixture");
 
         let temp = tempfile::tempdir().expect("create output directory");
         let dsn = temp.path().join("board.dsn");
@@ -2218,6 +2338,10 @@ mod specctra_live_undo_test {
                 poll_interval: Duration::from_secs(2),
                 overall_timeout: Duration::from_secs(180),
                 java: None,
+                automatic_neckdown: None,
+                copper_to_edge_clearance_um: None,
+                retry_width_um: None,
+                fanout_enabled: None,
             },
         )
         .await

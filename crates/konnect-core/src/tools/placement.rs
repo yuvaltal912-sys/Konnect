@@ -1949,7 +1949,7 @@ type Obstacle = ((f64, f64), (f64, f64), Side);
 /// the pin (2.5 mm); `1uF` bulk-ish caps within 5 mm; `10uF` bulk within
 /// 10 mm. The value goes through the shared SI parser, so `0.1µF`, `100n`,
 /// `1 µF`, `1000nF` and `10uF/25V` all land in their family.
-fn decoupling_limit_mm(value: &str) -> Option<f64> {
+pub(crate) fn decoupling_limit_mm(value: &str) -> Option<f64> {
     let farads = super::component_class::parse_si_value(value)?;
     let is = |nominal: f64| (farads - nominal).abs() <= nominal * 1e-6;
     if is(100e-9) {

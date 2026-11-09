@@ -1177,9 +1177,13 @@ async fn handle_batch_add_wire(
 
     let joined = nets_joined(&before, &sch.to_source());
     sch.overwrite()?;
-    Ok(CallToolResult::json(
-        &json!({ "added_wires": added, "nets_joined": joined }),
-    ))
+    let mut body = json!({ "added_wires": added, "nets_joined": joined });
+    super::response_budget::fit_value(
+        &mut body,
+        &["nets_joined"],
+        "Every wire counted in added_wires is in the saved schematic.",
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_delete_wire(
@@ -2832,11 +2836,17 @@ async fn handle_batch_add_no_connect(
     }
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "added_count": added.len(),
         "added": added,
         "errors": errors
-    })))
+    });
+    super::response_budget::fit_value(
+        &mut body,
+        &["errors", "added"],
+        "Every marker counted in added_count is in the saved schematic.",
+    );
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_delete_no_connect(

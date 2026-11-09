@@ -467,6 +467,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             "delete_orphans_with_tracks does nothing on its own; set delete_orphan_footprints too.",
         ));
     }
+    // Refused before any netlist export or KiCad request.
+    let window = match super::response_budget::window(args, SYNC_CHANGES_DEFAULT_LIMIT) {
+        Ok(window) => window,
+        Err(refusal) => return Ok(refusal),
+    };
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -558,7 +563,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             preflight.extend(completion::prepare_replacements(&mut plan, &prepared, &snapshot, &design));
             if !preflight.is_empty() {
                 refuse_plan(&mut plan, preflight);
-                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
+                return Ok(sync_response_paged(&plan, "conflict", hierarchy.len(), false, window));
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
@@ -570,7 +575,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     PlanStatus::Noop => "noop",
                     PlanStatus::Conflict => "conflict",
                 };
-                return Ok(sync_response(&plan, status, hierarchy.len(), false));
+                return Ok(sync_response_paged(&plan, status, hierarchy.len(), false, window));
             }
             if expected_revision.as_deref() != Some(plan.plan_revision.as_str()) {
                 plan.status = PlanStatus::Conflict;
@@ -582,10 +587,10 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     None,
                 ));
                 plan.changes.clear();
-                return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
+                return Ok(sync_response_paged(&plan, "conflict", hierarchy.len(), false, window));
             }
             if plan.status == PlanStatus::Noop {
-                return Ok(sync_response(&plan, "noop", hierarchy.len(), false));
+                return Ok(sync_response_paged(&plan, "noop", hierarchy.len(), false, window));
             }
 
             let Mutations {
@@ -640,7 +645,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             plan.counts.skipped_by_flag.applied = plan.counts.skipped_by_flag.planned;
             plan.counts.unassigned_footprint.applied = plan.counts.unassigned_footprint.planned;
             let status = if plan.diagnostics.is_empty() { "applied" } else { "applied_with_differences" };
-            Ok(sync_response(&plan, status, hierarchy.len(), true))
+            Ok(sync_response_paged(&plan, status, hierarchy.len(), true, window))
         },
     )
     .await?;
@@ -674,13 +679,37 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     })
 }
 
+/// Planned changes listed per call unless `limit` says otherwise.
+const SYNC_CHANGES_DEFAULT_LIMIT: usize = 100;
+
+#[cfg(test)]
 fn sync_response(
     plan: &SyncPlan,
     status: &str,
     hierarchy_files: usize,
     applied: bool,
 ) -> CallToolResult {
-    let value = serde_json::json!({
+    sync_response_paged(
+        plan,
+        status,
+        hierarchy_files,
+        applied,
+        (0, SYNC_CHANGES_DEFAULT_LIMIT),
+    )
+}
+
+/// The sync result, with `changes` paged by `(offset, limit)` and the other
+/// lists cut to fit the size cap. `coverage` and `change_count` count every
+/// item, so a page is never mistaken for the whole plan (#A30: a 340-footprint
+/// dry run reached 166 KB).
+fn sync_response_paged(
+    plan: &SyncPlan,
+    status: &str,
+    hierarchy_files: usize,
+    applied: bool,
+    (offset, limit): (usize, usize),
+) -> CallToolResult {
+    let mut value = serde_json::json!({
         "status": status,
         "plan_revision": plan.plan_revision,
         "coverage": {
@@ -720,6 +749,70 @@ fn sync_response(
         "staging": plan.staging.as_ref().map(StagingEvidence::json),
         "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
     });
+    use super::response_budget as budget;
+    let fields = value.as_object_mut().expect("sync response is an object");
+    // The short lists first, at most half the budget: diagnostics say why a
+    // plan is a conflict, and the rest name what needs a decision.
+    let used = budget::fit_lists(
+        fields,
+        &[
+            "diagnostics",
+            "unassigned_footprints",
+            "orphan_footprints",
+            "deleted_footprints",
+            "copper_changes",
+        ],
+        budget::BYTE_BUDGET / 2,
+        "coverage counts every item.",
+    );
+    let fitted_hint = fields.remove("hint");
+    let all_changes = match fields.remove("changes") {
+        Some(serde_json::Value::Array(changes)) => changes,
+        _ => Vec::new(),
+    };
+    let page = budget::page(
+        &all_changes,
+        offset,
+        limit,
+        budget::BYTE_BUDGET.saturating_sub(used),
+    );
+    fields.insert("change_count".into(), serde_json::json!(all_changes.len()));
+    page.describe(fields);
+    if applied {
+        // Applying again would not page the same plan: the board has moved on.
+        fields.remove("next_offset");
+        // Past the end, the shared hint would ask for another page of a
+        // plan that is already applied.
+        if fields.contains_key("offset_past_end") {
+            fields.insert(
+                "hint".into(),
+                serde_json::json!(
+                    "Every change counted in coverage was applied; a new dry run lists what is left."
+                ),
+            );
+        }
+        page.hint(
+            fields,
+            "Every change counted in coverage was applied; a new dry run lists what is left.",
+        );
+    } else {
+        page.hint(
+            fields,
+            &format!(
+                "Pass offset {} with the same arguments for the next page of this plan; \
+                 plan_revision stays the same while nothing changes.",
+                page.offset + page.items.len()
+            ),
+        );
+    }
+    if let Some(serde_json::Value::String(fitted)) = fitted_hint {
+        let combined = match fields.get("hint").and_then(|hint| hint.as_str()) {
+            Some(paged) => format!("{paged} {fitted}"),
+            None => fitted,
+        };
+        fields.insert("hint".into(), serde_json::json!(combined));
+    }
+    fields.insert("changes".into(), serde_json::json!(page.items));
     CallToolResult::json(&value)
 }
 
@@ -3638,6 +3731,123 @@ mod tests {
     #[test]
     fn a_repeated_assigned_reference_is_still_refused() {
         refuses_duplicate(&with_duplicate_of("R2", "C1", "R2"));
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.len() < 50_000, "over the client's cap: {}", text.len());
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn many_new_parts(count: usize) -> SyncPlan {
+        let design = ExportedDesign {
+            bom_excluded: Vec::new(),
+            components: (0..count)
+                .map(|i| resistor(&format!("R{i}"), &format!("/sheet/r{i}")))
+                .collect(),
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        plan_sync(UNASSIGNED, &design, &board_with(vec![]))
+    }
+
+    /// A30: a 340-footprint dry run reached 166 KB. The plan's changes now page,
+    /// and `coverage` and `change_count` count every one on every page.
+    #[test]
+    fn a_large_plan_pages_its_changes_and_counts_every_one() {
+        let plan = many_new_parts(600);
+        assert_eq!(plan.changes.len(), 600);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut offset = 0usize;
+        let mut pages = 0;
+        loop {
+            let page = response_json(&sync_response_paged(
+                &plan,
+                "ready",
+                1,
+                false,
+                (offset, 10_000),
+            ));
+            pages += 1;
+            assert_eq!(page["change_count"], 600);
+            assert_eq!(page["coverage"]["footprints_added"]["planned"], 600);
+            assert_eq!(page["plan_revision"], plan.plan_revision.as_str());
+            for change in page["changes"].as_array().unwrap() {
+                assert!(seen.insert(change.to_string()), "a change shown twice");
+            }
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(page["truncated"], true);
+                    assert!(page["hint"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("offset {next}")));
+                    offset = next as usize;
+                }
+                None => break,
+            }
+        }
+        assert!(pages > 1, "600 changes must not fit one response");
+        assert_eq!(seen.len(), 600);
+
+        // An applied plan cannot be paged by applying again.
+        let applied = response_json(&sync_response_paged(&plan, "applied", 1, true, (0, 100)));
+        assert_eq!(applied["truncated"], true);
+        assert!(applied.get("next_offset").is_none());
+        assert!(applied["hint"].as_str().unwrap().contains("applied"));
+    }
+
+    /// Review #49: the other lists are cut through `truncated_lists`, with the
+    /// diagnostics first and the hint saying so.
+    #[test]
+    fn thousands_of_diagnostics_are_cut_to_fit_beside_the_changes() {
+        let mut plan = many_new_parts(50);
+        plan.diagnostics = (0..2000)
+            .map(|i| {
+                conflict(
+                    "library_footprint_unusable",
+                    format!("R{i}: the library footprint could not be read, so it is not placed"),
+                    Some(&format!("R{i}")),
+                )
+            })
+            .collect();
+        let body = response_json(&sync_response_paged(&plan, "conflict", 1, false, (0, 100)));
+        assert_eq!(body["truncated_lists"]["diagnostics"]["total"], 2000);
+        let shown = body["diagnostics"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 2000, "{shown}");
+        assert_eq!(body["change_count"], 50);
+        assert!(
+            !body["changes"].as_array().unwrap().is_empty(),
+            "changes keep half the budget"
+        );
+        assert!(body["hint"].as_str().unwrap().contains("diagnostics"));
+    }
+
+    #[test]
+    fn a_small_plan_is_listed_whole() {
+        let plan = many_new_parts(3);
+        let body = response_json(&sync_response(&plan, "ready", 1, false));
+        assert_eq!(body["changes"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            (body["change_count"].as_u64(), body["truncated"].as_bool()),
+            (Some(3), Some(false))
+        );
+        assert!(body.get("next_offset").is_none() && body.get("hint").is_none());
+        assert!(body.get("truncated_lists").is_none());
+        // Review #49: a stale offset says it is past the end.
+        let past = response_json(&sync_response_paged(&plan, "ready", 1, false, (5_000, 100)));
+        assert_eq!(past["offset_past_end"], true, "{past}");
+        assert_eq!(past["change_count"], 3);
+        assert!(past["hint"].as_str().unwrap().contains("past the end"));
+        // Once applied there is no next page to ask for.
+        let applied = response_json(&sync_response_paged(&plan, "ready", 1, true, (5_000, 100)));
+        assert_eq!(applied["offset_past_end"], true, "{applied}");
+        assert!(
+            applied["hint"].as_str().unwrap().contains("new dry run"),
+            "{applied}"
+        );
     }
 
     /// Nothing asserted the *response* keys — every other test here reads the

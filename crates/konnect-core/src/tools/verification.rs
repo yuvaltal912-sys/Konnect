@@ -33,7 +33,9 @@ pub fn tools() -> Vec<ToolDef> {
              complete configured DRC ruleset; kicad-cli has no per-test selector. The list is \
              paged (`limit`, `offset`) and stops at a size cap: `filtered_count`, \
              `errors`, `warnings` and `by_rule` count every violation, `truncated` and \
-             `next_offset` say what is left, and `output` writes the full report.",
+             `next_offset` say what is left, and `output` writes the full report. \
+             `zone_fill_state` (fresh, stale or unknown) says whether the zone fills DRC read \
+             were current; when stale, `zone_fill_check` counts the violations a refill clears.",
             json!({
                 "type": "object",
                 "properties": {
@@ -41,6 +43,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
                     "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
+                    "check_zone_fills": { "type": "boolean", "default": true, "description": "When zones are not refilled, refill a private copy and compare, so zone_fill_state can say fresh or stale. Costs a second DRC on boards with copper zones; false skips it and reports unknown." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
@@ -322,6 +325,7 @@ pub(crate) async fn handle_run_drc(
             "severity_filter": severity_filter,
     });
     if let Some(object) = body.as_object_mut() {
+        object.extend(provenance.zone_fill_fields());
         object.extend(super::drc::violations_page(&filtered, offset, limit));
     }
     Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
