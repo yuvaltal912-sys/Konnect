@@ -633,7 +633,10 @@ cargo xtask freerouting-bench \
   would exceed N. `--resume` adds to the results already in `--out`: finished
   runs are kept, only the missing ones are routed, and runs that have a session
   but no board score are scored. `results.json` and `summary.md` are rewritten
-  after every run, so a stopped sweep loses at most the run in progress. Without
+  after every run, so a stopped sweep loses at most the run in progress. That
+  run's folder is routed again from scratch; if the bench was killed and its
+  Freerouting lived on, the resumed run stops it first (each run notes its
+  process id in `java.pid`), so it cannot write into the new run. Without
   `--resume`, an `--out` that already holds results is refused.
 - **Rescore.** `cargo xtask freerouting-bench --rescore <results folder>`
   re-measures a finished run from its saved `board.dsn`, `board.ses`, score

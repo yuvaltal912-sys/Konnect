@@ -918,7 +918,9 @@ fn run_once(
     config: Option<&Config>,
 ) -> RunRecord {
     let mut record = RunRecord::default();
-    // A folder left by a run that was stopped holds nothing to keep.
+    // A folder left by a run that was stopped holds nothing to keep, but its
+    // Freerouting may still be running and would write into the new run.
+    stop_leftover_run(dir);
     let _ = std::fs::remove_dir_all(dir);
     // Wiring the DSN holds as fixed comes with it as `<name>.fixed.ses`.
     let fixed = dsn.with_extension("fixed.ses");
@@ -970,6 +972,7 @@ fn run_once(
             return record;
         }
     };
+    let _ = std::fs::write(dir.join(RUN_PID_FILE), child.id().to_string());
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1031,6 +1034,43 @@ fn run_once(
     }
     apply_settings_evidence(&mut record, settings_of_run(dir, &arguments));
     record
+}
+
+/// Where a run notes the process id of its Freerouting, in its own folder.
+const RUN_PID_FILE: &str = "java.pid";
+
+/// Stop the Freerouting a stopped invocation left running in `dir`. When the
+/// bench itself is killed, the JVM it started lives on and would later write
+/// its session into the folder a resumed run is using. The process is only
+/// stopped when its command line names this run folder, so a process id that
+/// was reused by something else is left alone.
+fn stop_leftover_run(dir: &Path) {
+    let Some(pid) = std::fs::read_to_string(dir.join(RUN_PID_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let command_line = || {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+            .unwrap_or_default()
+    };
+    let ours = |line: &str| line.contains(&dir.display().to_string());
+    if !ours(&command_line()) {
+        return;
+    }
+    eprintln!(
+        "  stopping the Freerouting a stopped run left in {}",
+        dir.display()
+    );
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    let waited = Instant::now();
+    while ours(&command_line()) && waited.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Attach a run's settings evidence. A setting Freerouting did not take
@@ -1703,6 +1743,54 @@ mod tests {
         assert!(blind.differing.is_empty());
         assert_eq!(blind.unconfirmed.len(), 5);
         assert_eq!(blind.problem(), None);
+    }
+
+    /// A bench that is killed leaves its Freerouting running. A resumed run
+    /// in the same folder stops it first, and only it.
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_run_stops_the_freerouting_its_folder_was_left_with() {
+        let dir =
+            std::env::temp_dir().join(format!("konnect-bench-leftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gone = |child: &mut std::process::Child| {
+            let waited = Instant::now();
+            while waited.elapsed() < Duration::from_secs(5) {
+                if child.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        // A process whose command line names this run folder, as the JVM's does.
+        let mut leftover = Command::new("/bin/sh")
+            .args(["-c", "sleep 60; :", "leftover"])
+            .arg(format!("-Duser.home={}", dir.join("home").display()))
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.join(RUN_PID_FILE), leftover.id().to_string()).unwrap();
+        stop_leftover_run(&dir);
+        assert!(gone(&mut leftover), "the leftover process is still running");
+        // A process id that now belongs to something else is left alone.
+        let mut stranger = Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.join(RUN_PID_FILE), stranger.id().to_string()).unwrap();
+        stop_leftover_run(&dir);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "a stranger was stopped"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        // No note, nothing to stop.
+        std::fs::remove_file(dir.join(RUN_PID_FILE)).unwrap();
+        stop_leftover_run(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
