@@ -2342,6 +2342,11 @@ mod specctra_live_undo_test {
                 copper_to_edge_clearance_um: None,
                 retry_width_um: None,
                 fanout_enabled: None,
+                via_costs: None,
+                default_undesired_direction_trace_cost: None,
+                optimizer_improvement_threshold: None,
+                optimizer_max_consecutive_failures_pass1: None,
+                optimizer_max_consecutive_failures: None,
             },
         )
         .await

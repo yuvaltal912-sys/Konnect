@@ -158,8 +158,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "java_path": { "type": "string", "description": "Path to a Java executable to use (optional); see check_freerouting." },
-                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
-                    "optimizer_enabled": { "type": "boolean" },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                    "optimizer_enabled": { "type": "boolean", "default": true },
                     "allow_neckdown": {
                         "type": "boolean",
                         "default": false,
@@ -200,8 +200,8 @@ fn route_settings(
         .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
     let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
     Ok(crate::freerouting_mcp::RouteSettings {
-        max_passes,
-        optimizer_enabled: args["optimizer_enabled"].as_bool(),
+        max_passes: Some(max_passes.unwrap_or(20)),
+        optimizer_enabled: Some(args["optimizer_enabled"].as_bool().unwrap_or(true)),
         job_timeout_seconds: args["job_timeout_seconds"].as_u64(),
         poll_interval: std::time::Duration::from_secs(3),
         overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
@@ -216,6 +216,13 @@ fn route_settings(
             .map(|um| um as f64)
             .or(hints.retry_off_reason.map(|_| 0.0)),
         fanout_enabled: Some(false),
+        // S5: lower via cost, no raised direction penalty, and let the
+        // optimizer examine the board before its 0.25% improvement stop.
+        via_costs: Some(10),
+        default_undesired_direction_trace_cost: Some(1.0),
+        optimizer_improvement_threshold: Some(0.25),
+        optimizer_max_consecutive_failures_pass1: Some(1_000_000),
+        optimizer_max_consecutive_failures: Some(1_000_000),
     })
 }
 
@@ -223,6 +230,37 @@ fn route_settings(
 mod route_rule_tests {
     use super::{allow_neckdown, route_settings};
     use serde_json::json;
+
+    #[test]
+    fn measured_preset_is_sent_by_default_and_existing_overrides_survive() {
+        let hints = crate::specctra::RoutingHints::default();
+        let settings = route_settings(&json!({}), &hints, "java".into()).unwrap();
+        let body = crate::freerouting_mcp::job_settings(&settings);
+        assert_eq!(body["autorouter"]["max_passes"], 20);
+        assert_eq!(body["optimizer"]["enabled"], true);
+        assert_eq!(body["scoring"]["via_costs"], 10);
+        assert_eq!(
+            body["scoring"]["default_undesired_direction_trace_cost"],
+            1.0
+        );
+        assert_eq!(
+            body["optimizer"]["max_consecutive_failures_pass1"],
+            1_000_000
+        );
+        assert_eq!(body["optimizer"]["max_consecutive_failures"], 1_000_000);
+        // The job API accepts percentages; unlike the CLI, 0.25 means 0.25%.
+        assert_eq!(body["optimizer"]["improvement_threshold"], 0.25);
+        let settings = route_settings(
+            &json!({"max_passes": 7, "optimizer_enabled": false}),
+            &hints,
+            "java".into(),
+        )
+        .unwrap();
+        let body = crate::freerouting_mcp::job_settings(&settings);
+        assert_eq!(body["autorouter"]["max_passes"], 7);
+        assert_eq!(body["optimizer"]["enabled"], false);
+        assert_eq!(body["optimizer"]["improvement_threshold"], 0.25);
+    }
 
     #[test]
     fn fanout_and_neckdown_are_off_by_default() {

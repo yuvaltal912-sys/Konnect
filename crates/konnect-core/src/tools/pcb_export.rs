@@ -312,7 +312,7 @@ fn export_tools() -> Vec<ToolDef> {
                     "widths_from_intent": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. The result lists every widened net."
+                        "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. A net owning a copper pour keeps its effective class width even when pours are omitted; this does not verify pour capacity. intent_widths reports the width decision and reason."
                     },
                     "native_bridge_mode": {
                         "type": "string",

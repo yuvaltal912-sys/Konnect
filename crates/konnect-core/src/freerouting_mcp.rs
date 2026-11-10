@@ -151,6 +151,14 @@ pub(crate) struct RouteSettings {
     /// neck-down is on), which the SES importer refuses, so
     /// `route_specctra_dsn` turns it off.
     pub fanout_enabled: Option<bool>,
+    /// S5's measured scoring and optimizer settings. Optional here so other
+    /// internal callers can leave these at the router's own defaults.
+    pub via_costs: Option<u32>,
+    pub default_undesired_direction_trace_cost: Option<f64>,
+    /// Percent, as accepted by the job API (0.25 means 0.25%, unlike the CLI).
+    pub optimizer_improvement_threshold: Option<f64>,
+    pub optimizer_max_consecutive_failures_pass1: Option<u32>,
+    pub optimizer_max_consecutive_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,8 +291,34 @@ pub(crate) fn job_settings(settings: &RouteSettings) -> Map<String, Value> {
             json!({ "max_passes": max_passes }),
         );
     }
+    let mut optimizer = Map::new();
     if let Some(enabled) = settings.optimizer_enabled {
-        job_settings.insert("optimizer".to_string(), json!({ "enabled": enabled }));
+        optimizer.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(threshold) = settings.optimizer_improvement_threshold {
+        optimizer.insert("improvement_threshold".to_string(), json!(threshold));
+    }
+    if let Some(limit) = settings.optimizer_max_consecutive_failures_pass1 {
+        optimizer.insert("max_consecutive_failures_pass1".to_string(), json!(limit));
+    }
+    if let Some(limit) = settings.optimizer_max_consecutive_failures {
+        optimizer.insert("max_consecutive_failures".to_string(), json!(limit));
+    }
+    if !optimizer.is_empty() {
+        job_settings.insert("optimizer".to_string(), Value::Object(optimizer));
+    }
+    let mut scoring = Map::new();
+    if let Some(cost) = settings.via_costs {
+        scoring.insert("via_costs".to_string(), json!(cost));
+    }
+    if let Some(cost) = settings.default_undesired_direction_trace_cost {
+        scoring.insert(
+            "default_undesired_direction_trace_cost".to_string(),
+            json!(cost),
+        );
+    }
+    if !scoring.is_empty() {
+        job_settings.insert("scoring".to_string(), Value::Object(scoring));
     }
     if let Some(enabled) = settings.fanout_enabled {
         job_settings.insert("fanout".to_string(), json!({ "enabled": enabled }));
@@ -1210,6 +1244,11 @@ mod tests {
             copper_to_edge_clearance_um: Some(500.0),
             retry_width_um: Some(200.0),
             fanout_enabled: Some(false),
+            via_costs: Some(10),
+            default_undesired_direction_trace_cost: Some(1.0),
+            optimizer_improvement_threshold: Some(0.25),
+            optimizer_max_consecutive_failures_pass1: Some(1_000_000),
+            optimizer_max_consecutive_failures: Some(1_000_000),
         }
     }
 
@@ -1230,6 +1269,11 @@ mod tests {
                 "job_timeout",
                 "neck_width_um",
                 "optimizer.enabled",
+                "optimizer.improvement_threshold",
+                "optimizer.max_consecutive_failures",
+                "optimizer.max_consecutive_failures_pass1",
+                "scoring.default_undesired_direction_trace_cost",
+                "scoring.via_costs",
             ]
         );
         assert_eq!(body["neck_width_um"], json!(200.0));
@@ -1243,9 +1287,54 @@ mod tests {
             copper_to_edge_clearance_um: None,
             retry_width_um: None,
             fanout_enabled: None,
+            via_costs: None,
+            default_undesired_direction_trace_cost: None,
+            optimizer_improvement_threshold: None,
+            optimizer_max_consecutive_failures_pass1: None,
+            optimizer_max_consecutive_failures: None,
             ..all_settings()
         });
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn every_measured_preset_setting_is_required_in_the_readback() {
+        let sent = job_settings(&all_settings());
+        let expected = [
+            ("scoring", "via_costs", json!(10)),
+            (
+                "scoring",
+                "default_undesired_direction_trace_cost",
+                json!(1.0),
+            ),
+            (
+                "optimizer",
+                "max_consecutive_failures_pass1",
+                json!(1_000_000),
+            ),
+            ("optimizer", "max_consecutive_failures", json!(1_000_000)),
+            ("optimizer", "improvement_threshold", json!(0.25)),
+        ];
+        for (section, key, value) in expected {
+            assert_eq!(sent[section][key], value, "{section}.{key}");
+            let mut missing = json!(sent);
+            missing[section].as_object_mut().unwrap().remove(key);
+            let name = format!("{section}.{key}");
+            assert!(check_effective_settings(&sent, &missing)
+                .unwrap_err()
+                .to_string()
+                .contains(&name));
+            let mut wrong = json!(sent);
+            wrong[section][key] = json!(999);
+            assert!(check_effective_settings(&sent, &wrong)
+                .unwrap_err()
+                .to_string()
+                .contains(&name));
+        }
+        assert_eq!(
+            check_effective_settings(&sent, &json!(sent)).unwrap().len(),
+            12
+        );
     }
 
     #[test]
@@ -1260,14 +1349,14 @@ mod tests {
                 "neck_width_um": 200.0,
                 "job_timeout": "00:10:00",
                 "autorouter": { "max_passes": 20, "enabled": true },
-                "optimizer": { "enabled": true, "max_passes": 100 },
+                "optimizer": { "enabled": true, "max_passes": 100, "improvement_threshold": 0.25, "max_consecutive_failures": 1_000_000, "max_consecutive_failures_pass1": 1_000_000 },
                 "fanout": { "enabled": false, "max_passes": 100 },
-                "scoring": { "via_costs": 50 }
+                "scoring": { "via_costs": 10, "default_undesired_direction_trace_cost": 1.0 }
             }
         });
         let effective = check_effective_settings(&sent, &applied).unwrap();
         assert_eq!(effective["neck_width_um"], json!(200.0));
-        assert_eq!(effective.len(), 7);
+        assert_eq!(effective.len(), 12);
         let as_text = expand_text_content(json!({
             "content": [{ "type": "text", "text": applied.to_string() }]
         }));
@@ -1443,7 +1532,7 @@ mod tests {
         ]
         .join(",");
         let settings = format!(
-            r#"{{"status":200,"body":{{"automatic_neckdown":false,"copper_to_edge_clearance_um":500.0,"neck_width_um":{effective_neck_width},"job_timeout":"00:10:00","autorouter":{{"max_passes":20}},"optimizer":{{"enabled":true}},"fanout":{{"enabled":false}}}}}}"#
+            r#"{{"status":200,"body":{{"automatic_neckdown":false,"copper_to_edge_clearance_um":500.0,"neck_width_um":{effective_neck_width},"job_timeout":"00:10:00","autorouter":{{"max_passes":20}},"optimizer":{{"enabled":true,"improvement_threshold":0.25,"max_consecutive_failures":1000000,"max_consecutive_failures_pass1":1000000}},"scoring":{{"via_costs":10,"default_undesired_direction_trace_cost":1.0}},"fanout":{{"enabled":false}}}}}}"#
         );
         let logs = r#"{"status":200,"body":[{"type":"INFO","message":"Optimizer pass #1: optimizer score 10.00 -> 10.00 (UNCHANGED, 0.0000%)"},{"type":"INFO","message":"Stopping optimization pass #1 early after 12 consecutive items could not be improved."},{"type":"INFO","message":"Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 10.00, final router score: 1000.00, final optimizer score: 10.00"}]}"#;
         let script = format!(
@@ -1798,6 +1887,11 @@ done
                 copper_to_edge_clearance_um: None,
                 retry_width_um: None,
                 fanout_enabled: None,
+                via_costs: None,
+                default_undesired_direction_trace_cost: None,
+                optimizer_improvement_threshold: None,
+                optimizer_max_consecutive_failures_pass1: None,
+                optimizer_max_consecutive_failures: None,
             },
         )
         .await
@@ -1837,6 +1931,11 @@ done
                     copper_to_edge_clearance_um: None,
                     retry_width_um: None,
                     fanout_enabled: None,
+                    via_costs: None,
+                    default_undesired_direction_trace_cost: None,
+                    optimizer_improvement_threshold: None,
+                    optimizer_max_consecutive_failures_pass1: None,
+                    optimizer_max_consecutive_failures: None,
                 },
             )
             .await
@@ -1889,6 +1988,11 @@ done
                     copper_to_edge_clearance_um: None,
                     retry_width_um: None,
                     fanout_enabled: None,
+                    via_costs: None,
+                    default_undesired_direction_trace_cost: None,
+                    optimizer_improvement_threshold: None,
+                    optimizer_max_consecutive_failures_pass1: None,
+                    optimizer_max_consecutive_failures: None,
                 },
             )
             .await

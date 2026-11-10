@@ -383,7 +383,10 @@ fn hole_keepout_growth(hole_clearance_um: Option<i64>, class_nets: &RuleGroups) 
 /// that current on the worst copper layer of the stack (inner layers need more
 /// copper), with copper thickness from the record, else the stackup, else
 /// 1 oz / 0.5 oz, as `audit_trace_current` computes it. A net is never made
-/// narrower. With no record nothing changes; an unusable record refuses.
+/// narrower. Nets owning a copper pour keep their effective class width,
+/// including when the caller omits pours from the DSN. This is a routing
+/// policy, not a check of the pour's current capacity. With no record nothing
+/// changes; an unusable record refuses.
 pub(crate) fn widen_for_intent(
     board: &Path,
     source: &str,
@@ -402,6 +405,12 @@ pub(crate) fn widen_for_intent(
         IntentRead::Loaded { intent, .. } => intent,
     };
     let tree = parse_sexp(source).context("parse board for intent widths")?;
+    let pour_nets: BTreeSet<String> =
+        zones(&tree, &top_level_net_table(&tree), &copper_layers(&tree)?)?
+            .into_iter()
+            .filter(|zone| zone.kind == ZoneKind::Plane)
+            .filter_map(|zone| zone.net)
+            .collect();
     // Only layers the router may put a track on decide the width.
     let layers: Vec<String> = copper_stack(&tree)?
         .into_iter()
@@ -443,6 +452,14 @@ pub(crate) fn widen_for_intent(
             }));
             continue;
         };
+        if pour_nets.contains(&req.net) {
+            report.push(serde_json::json!({
+                "net": req.net, "current_a": req.amps, "status": "not_widened",
+                "from_mm": from, "to_mm": from,
+                "reason": "the net owns a copper pour; keeping its effective class width (pour capacity is not verified)",
+            }));
+            continue;
+        }
         if needed > from + 1e-9 {
             rule.track_width_mm = Some(needed);
             report.push(serde_json::json!({
@@ -3941,3 +3958,7 @@ mod layers_tests;
 #[cfg(test)]
 #[path = "specctra_hole_clearance_tests.rs"]
 mod hole_clearance_tests;
+
+#[cfg(test)]
+#[path = "specctra_pours_tests.rs"]
+mod pours_tests;

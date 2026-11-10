@@ -1,7 +1,35 @@
 # Konnect MCP API migrations
 
 Konnect's tool schemas are public API. This file records intentional argument
-removals and the supported replacement workflow.
+removals, default changes and the supported replacement workflow.
+
+## Unreleased: pour widths and the measured routing preset
+
+Creation row S6, first half (`docs/CREATION_HANDOFF.md`). No new argument.
+
+- **`export_specctra_dsn`** with `widths_from_intent: true` (the default)
+  leaves a net owning a copper pour at its effective class width, including
+  when `pours: "omit"`. `intent_widths` reports `status: "not_widened"`, the
+  unchanged `from_mm` and `to_mm`, and a reason. Copper-zone ownership, on
+  any copper layer, determines this policy; rule areas and non-copper zones
+  do not. Other current-bearing nets still widen as before. This does not
+  verify the pour's capacity. With no design-intent record, or with
+  `widths_from_intent: false`, DSN output is unchanged.
+- **`route_specctra_dsn`** now explicitly defaults to 20 autorouter passes
+  and an enabled optimizer; callers can still override `max_passes` and
+  `optimizer_enabled`. It sends S5's measured preset: `scoring.via_costs`
+  10, `scoring.default_undesired_direction_trace_cost` 1.0 (no raised
+  direction penalty), both `optimizer.max_consecutive_failures_pass1` and
+  `optimizer.max_consecutive_failures` 1,000,000, and
+  `optimizer.improvement_threshold` 0.25 percent. The job API receives
+  `0.25`; an equivalent Freerouting 2.5.0 command-line run must use
+  `0.0025`, because the CLI scales fractions differently. Every sent
+  setting is read back before routing; a missing or different value
+  refuses the run. `effective_settings` includes these added values.
+
+The existing `pours` default and choices are unchanged. Refill and KiCad
+DRC remain necessary after routing; neither this preset nor the pour-width
+policy certifies a board's current capacity or routing quality.
 
 ## Unreleased: route at the project's rules
 
