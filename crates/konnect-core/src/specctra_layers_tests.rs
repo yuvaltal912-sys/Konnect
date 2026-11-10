@@ -891,6 +891,10 @@ fn freerouting_routes_a_folder() {
         let dsn_path = out_dir.join(dsn_design_name(&name).replace(".kicad_pcb", ".dsn"));
         let ses_path = dsn_path.with_extension("ses");
         std::fs::write(&dsn_path, &bundle.dsn).unwrap();
+        // Keep the product routing hints beside the DSN for MCP acceptance runs.
+        let mut manifest_path = dsn_path.as_os_str().to_os_string();
+        manifest_path.push(".konnect.json");
+        std::fs::write(std::path::PathBuf::from(manifest_path), &bundle.manifest).unwrap();
         let started = std::time::Instant::now();
         let mut child = std::process::Command::new(&java)
             .arg("-jar")
@@ -1173,14 +1177,28 @@ fn a_wire_narrower_than_its_class_is_refused() {
         .unwrap();
 }
 
+/// Retain the original intent-width/floor tests on nets without a pour.
+fn four_layer_without_pours() -> String {
+    let mut source = FOUR_LAYER.to_string();
+    for start in konnect_sexp::writer::find_block_starts(FOUR_LAYER, "zone")
+        .into_iter()
+        .rev()
+    {
+        let (start, end) = konnect_sexp::writer::find_balanced_block(FOUR_LAYER, start).unwrap();
+        source.replace_range(start..end, "");
+    }
+    source
+}
+
 /// A net with a design-intent current is widened to the IPC-2221 width on the
 /// stack's worst layer (an inner one here), never narrowed, and the export
 /// says so; nets with no current keep their class.
 #[test]
 fn design_intent_currents_widen_their_nets() {
+    let source = four_layer_without_pours();
     let temp = tempfile::tempdir().unwrap();
     let board_path = temp.path().join("board.kicad_pcb");
-    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    std::fs::write(&board_path, &source).unwrap();
     let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
     std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -1193,7 +1211,7 @@ fn design_intent_currents_widen_their_nets() {
         .to_string(),
     )
     .unwrap();
-    let (widened, report) = widen_for_intent(&board_path, FOUR_LAYER, &rules()).unwrap();
+    let (widened, report) = widen_for_intent(&board_path, &source, &rules()).unwrap();
     let gnd = widened["GND"].track_width_mm.unwrap();
     // 3 A at 10 °C on 0.5 oz inner copper (the limiting layer): about 4.8 mm.
     let expected =
@@ -1207,7 +1225,7 @@ fn design_intent_currents_widen_their_nets() {
     let limiting = report.iter().find(|r| r["net"] == "GND").unwrap()["limiting_layer"].clone();
     assert!(limiting.as_str().unwrap().starts_with("In"), "{limiting}");
     // The widened rule reaches the DSN as its own class.
-    let bundle = export_dsn(&board_path, FOUR_LAYER, &widened).unwrap();
+    let bundle = export_dsn(&board_path, &source, &widened).unwrap();
     let m = manifest(&bundle);
     let widths: BTreeSet<i64> = m["classes"]
         .as_array()
@@ -1221,9 +1239,9 @@ fn design_intent_currents_widen_their_nets() {
     );
     // No record: nothing changes. A broken record refuses.
     std::fs::write(&intent_path, "{ broken").unwrap();
-    assert!(widen_for_intent(&board_path, FOUR_LAYER, &rules()).is_err());
+    assert!(widen_for_intent(&board_path, &source, &rules()).is_err());
     std::fs::remove_file(&intent_path).unwrap();
-    let (same, report) = widen_for_intent(&board_path, FOUR_LAYER, &rules()).unwrap();
+    let (same, report) = widen_for_intent(&board_path, &source, &rules()).unwrap();
     assert_eq!(same["GND"].track_width_mm, Some(0.25));
     assert!(report.is_empty());
 }
@@ -1258,9 +1276,10 @@ fn the_edge_clearance_travels_beside_the_dsn() {
 /// importer takes it, while anything narrower is still refused.
 #[test]
 fn a_widened_net_may_fall_back_to_its_base_width_and_no_lower() {
+    let source = four_layer_without_pours();
     let temp = tempfile::tempdir().unwrap();
     let board_path = temp.path().join("board.kicad_pcb");
-    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    std::fs::write(&board_path, &source).unwrap();
     let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
     std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -1275,7 +1294,7 @@ fn a_widened_net_may_fall_back_to_its_base_width_and_no_lower() {
         ..Default::default()
     };
     let bundle =
-        export_dsn_with_context(&board_path, FOUR_LAYER, &rules(), &snapshot, options).unwrap();
+        export_dsn_with_context(&board_path, &source, &rules(), &snapshot, options).unwrap();
     let m = manifest(&bundle);
     let gnd = m["nets"]
         .as_array()
@@ -1290,12 +1309,11 @@ fn a_widened_net_may_fall_back_to_its_base_width_and_no_lower() {
         .any(|w| w["net"] == "GND" && w["status"] == "widened"));
     let ses = ses_for(&m);
     // The fixture SES routes GND at 0.25 mm, its base width: accepted.
-    crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &ses)
-        .unwrap();
+    crate::specctra_ses::parse_import_plan(&board_path, &source, &bundle.manifest, &ses).unwrap();
     // Below the base width: refused.
     let necked = ses.replacen("(path In1.Cu 2500", "(path In1.Cu 1500", 1);
     let error =
-        crate::specctra_ses::parse_import_plan(&board_path, FOUR_LAYER, &bundle.manifest, &necked)
+        crate::specctra_ses::parse_import_plan(&board_path, &source, &bundle.manifest, &necked)
             .unwrap_err()
             .to_string();
     assert!(error.contains("floor 0.250 mm"), "{error}");
@@ -1445,9 +1463,10 @@ fn the_retry_width_is_off_when_net_classes_have_different_floors() {
 /// on, at that width.
 #[test]
 fn a_widened_net_keeps_the_retry_on_at_the_shared_base_width() {
+    let source = four_layer_without_pours();
     let temp = tempfile::tempdir().unwrap();
     let board_path = temp.path().join("board.kicad_pcb");
-    std::fs::write(&board_path, FOUR_LAYER).unwrap();
+    std::fs::write(&board_path, &source).unwrap();
     let intent_path = crate::tools::design_intent::design_intent_path(temp.path());
     std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -1462,7 +1481,7 @@ fn a_widened_net_keeps_the_retry_on_at_the_shared_base_width() {
         ..Default::default()
     };
     let bundle =
-        export_dsn_with_context(&board_path, FOUR_LAYER, &rules(), &snapshot, options).unwrap();
+        export_dsn_with_context(&board_path, &source, &rules(), &snapshot, options).unwrap();
     let hints = hints_of(&bundle);
     assert_eq!(hints.retry_width_um, Some(250));
     assert_eq!(hints.retry_off_reason, None);
