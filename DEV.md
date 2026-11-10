@@ -574,8 +574,10 @@ cargo xtask freerouting-bench \
   `xtask/freerouting-bench/stage_merge.py` (plain Python, **experiment only**)
   makes them by editing a DSN that Konnect exported: `unwiden` moves a net
   into the narrowest class, `drop-plane` removes pours by the index `planes`
-  lists, `layer-cost` sets one layer's trace costs, and `merge` puts a first
-  run's session into the DSN as fixed wiring for staged routing. Freerouting
+  lists, and `merge` puts a first run's session into the DSN as fixed wiring
+  for staged routing. (There is no edit for a layer's trace costs: a
+  hand-written `autoroute_settings` scope made Freerouting 2.5.0 read the DSN
+  as an empty board, without a warning.) Freerouting
   does not write fixed wiring back, so `merge` also writes `<name>.fixed.ses`
   beside `<name>.dsn`; the bench carries it into each run and scores both
   sessions together. An edited DSN has no reverse manifest: score it, never

@@ -10,7 +10,6 @@ is scored with `--score` (which reads the board), never imported with
     python3 -I xtask/freerouting-bench/stage_merge.py planes   <in.dsn>
     python3 -I xtask/freerouting-bench/stage_merge.py unwiden  <in.dsn> <out.dsn> <net> [<net> ...]
     python3 -I xtask/freerouting-bench/stage_merge.py drop-plane <in.dsn> <out.dsn> <index> [<index> ...]
-    python3 -I xtask/freerouting-bench/stage_merge.py layer-cost <in.dsn> <out.dsn> <layer> <preferred> <against>
     python3 -I xtask/freerouting-bench/stage_merge.py merge    <in.dsn> <stage1.ses> <out.dsn>
 
 - `classes` lists each net class with its width and net count; `planes` lists
@@ -19,13 +18,16 @@ is scored with `--score` (which reads the board), never imported with
   owns a pour then routes as a thin stub to it, not as a wide track.
 - `drop-plane` removes planes by the index `planes` prints, so only the pours
   worth keeping reach the router.
-- `layer-cost` sets one layer's trace costs (Freerouting's `layer_rule` in
-  `autoroute_settings`), to steer signals off a layer that should stay ground.
 - `merge` is staged routing: the wires and vias of a first run's session go
   into the DSN as fixed wiring, so a second run routes the rest around them.
   Freerouting keeps fixed wiring and does not write it to its session, so the
   stage-1 session is also copied to `<out>.fixed.ses`; the bench puts both
   sessions into the board when it scores the second run.
+
+There is no edit for a layer's trace costs. One was tried (a `layer_rule` in an
+`autoroute_settings` scope of the structure): Freerouting 2.5.0 then read the
+DSN as a board with no pins and one connection, routed nothing, and logged no
+warning.
 
 Inputs are never written. Plain Python 3, no KiCad.
 """
@@ -173,31 +175,6 @@ def cmd_drop_plane(tree, indexes):
         print(f"dropped plane {index}: net {net}, layer {layer}, area {area:.0f}")
 
 
-def cmd_layer_cost(tree, layer, preferred, against):
-    structure = one(tree, "structure")
-    if not any(name(l[1]) == layer for l in children(structure, "layer")):
-        raise SystemExit(f"the DSN has no layer {layer!r}")
-    for value in (preferred, against):
-        if not 0.1 <= float(value) <= 100:
-            raise SystemExit("a trace cost is a number from 0.1 to 100")
-    settings = children(structure, "autoroute_settings")
-    if not settings:
-        settings = [["autoroute_settings"]]
-        structure.append(settings[0])
-    if any(name(rule[1]) == layer for rule in children(settings[0], "layer_rule")):
-        raise SystemExit(f"layer {layer!r} already has a layer_rule")
-    settings[0].append(
-        [
-            "layer_rule",
-            layer,
-            ["active", "on"],
-            ["preferred_direction_trace_costs", preferred],
-            ["against_preferred_direction_trace_costs", against],
-        ]
-    )
-    print(f"{layer}: trace costs {preferred} along and {against} against its preferred direction")
-
-
 UNIT_UM = {"um": 1.0, "mm": 1000.0, "mil": 25.4, "inch": 25400.0}
 
 
@@ -259,9 +236,6 @@ def main(argv):
     elif len(argv) >= 5 and argv[1] == "drop-plane":
         tree = read(argv[2])
         cmd_drop_plane(tree, argv[4:])
-    elif len(argv) == 7 and argv[1] == "layer-cost":
-        tree = read(argv[2])
-        cmd_layer_cost(tree, argv[4], argv[5], argv[6])
     elif len(argv) == 5 and argv[1] == "merge":
         tree = read(argv[2])
         cmd_merge(tree, read(argv[3]))
