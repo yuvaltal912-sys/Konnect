@@ -1656,6 +1656,9 @@ mod tests {
             "--logging.file.location=/somewhere/x.log",
             "-Duser.home=/somewhere",
             "-de",
+            // Not a flag 2.5.0 knows, and nothing a sweep needs.
+            "-hr",
+            "-ll",
             "--router.",
             "--router.x",
             "--router.x=",
