@@ -628,6 +628,164 @@ fn logs_below(dir: &Path) -> String {
     out
 }
 
+/// The inputs of one run, written to `inputs.json` in its folder before
+/// Freerouting starts: with the folder's own copy of the DSN, enough to make
+/// the same run again. A run whose inputs cannot be recorded is not started.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RunInputs {
+    pub started_unix: u64,
+    /// The machine's 1, 5 and 15 minute load averages as the run started.
+    pub load_average: Option<String>,
+    pub jar_sha256: String,
+    pub dsn_sha256: String,
+    /// The fixed wiring that came with the DSN, when it has any.
+    pub fixed_ses_sha256: Option<String>,
+    /// The commit this bench was built from, and whether `xtask/` had
+    /// changes that were not committed.
+    pub harness_commit: Option<String>,
+    pub harness_dirty: bool,
+    pub java_version: Option<String>,
+    /// Everything after `java` on the command line.
+    pub arguments: Vec<String>,
+}
+
+impl RunInputs {
+    pub fn to_json(&self) -> Json {
+        let text = |value: &Option<String>| value.clone().map_or(Json::Null, Json::Text);
+        Json::Object(vec![
+            (
+                "started_unix".into(),
+                Json::Number(self.started_unix as f64),
+            ),
+            ("load_average".into(), text(&self.load_average)),
+            ("jar_sha256".into(), Json::Text(self.jar_sha256.clone())),
+            ("dsn_sha256".into(), Json::Text(self.dsn_sha256.clone())),
+            ("fixed_ses_sha256".into(), text(&self.fixed_ses_sha256)),
+            ("harness_commit".into(), text(&self.harness_commit)),
+            ("harness_dirty".into(), Json::Bool(self.harness_dirty)),
+            ("java_version".into(), text(&self.java_version)),
+            (
+                "arguments".into(),
+                Json::Array(self.arguments.iter().cloned().map(Json::Text).collect()),
+            ),
+        ])
+    }
+
+    pub fn from_json(json: &Json) -> Option<RunInputs> {
+        Some(RunInputs {
+            started_unix: json.number_at("started_unix")? as u64,
+            load_average: text_of(json, "load_average"),
+            jar_sha256: text_of(json, "jar_sha256")?,
+            dsn_sha256: text_of(json, "dsn_sha256")?,
+            fixed_ses_sha256: text_of(json, "fixed_ses_sha256"),
+            harness_commit: text_of(json, "harness_commit"),
+            harness_dirty: matches!(json.at("harness_dirty"), Some(Json::Bool(true))),
+            java_version: text_of(json, "java_version"),
+            arguments: texts_of(json, "arguments"),
+        })
+    }
+}
+
+/// Where a run keeps its inputs, in its own folder.
+const RUN_INPUTS_FILE: &str = "inputs.json";
+
+/// The SHA-256 of a file, from the system's `shasum` or `sha256sum` (the
+/// xtask has no hashing dependency of its own).
+pub fn sha256_of(path: &Path) -> Result<String, String> {
+    let tools: [(&str, &[&str]); 2] = [("shasum", &["-a", "256"]), ("sha256sum", &[])];
+    for (tool, arguments) in tools {
+        let Ok(output) = Command::new(tool).args(arguments).arg(path).output() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let digest = text.split_whitespace().next().unwrap_or_default();
+        if output.status.success()
+            && digest.len() == 64
+            && digest.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Ok(digest.to_ascii_lowercase());
+        }
+    }
+    Err(format!(
+        "no SHA-256 of {} (shasum and sha256sum both failed)",
+        path.display()
+    ))
+}
+
+/// The 1, 5 and 15 minute load averages, as `1.40 1.14 1.11`.
+fn load_average() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
+        let output = Command::new("sysctl")
+            .args(["-n", "vm.loadavg"])
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    })?;
+    let numbers: Vec<&str> = text
+        .split_whitespace()
+        .filter(|part| part.parse::<f64>().is_ok())
+        .take(3)
+        .collect();
+    (numbers.len() == 3).then(|| numbers.join(" "))
+}
+
+/// The commit of the checkout this bench was built from, and whether its
+/// `xtask/` folder has changes that are not committed.
+fn harness_state(repo: &Path) -> Option<(String, bool)> {
+    let git = |arguments: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(arguments)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"])?;
+    let dirty = git(&["status", "--porcelain", "--", "xtask"]).is_none_or(|text| !text.is_empty());
+    Some((commit, dirty))
+}
+
+/// What one invocation fixes for every run it starts.
+struct Invocation {
+    java: PathBuf,
+    java_version: Option<String>,
+    harness: Option<(String, bool)>,
+}
+
+/// Move what an earlier attempt left in `dir` aside, as
+/// `<dir>.superseded-<unix time>`: a stopped or replaced run is kept as
+/// evidence, and the new run starts in an empty folder.
+fn set_aside(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut attempt = 0;
+    loop {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let target = dir.with_file_name(format!("{name}.superseded-{stamp}{suffix}"));
+        if !target.exists() {
+            return std::fs::rename(dir, target);
+        }
+        attempt += 1;
+    }
+}
+
 /// One JAR with one config: the unit that is routed, totalled and ranked.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -776,6 +934,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .map(|jar| jar.canonicalize().map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let entries = entries(&jars, &options.configs);
+    let invocation = Invocation {
+        java: java.clone(),
+        java_version: java_version.clone(),
+        harness: harness_state(&root),
+    };
+    let jar_digests = jars
+        .iter()
+        .map(|jar| sha256_of(jar).map(|digest| (jar.clone(), digest)))
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
 
     let context = match &options.score {
         Some(spec) => {
@@ -917,8 +1084,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 let dir = out.join(label).join(&board).join(format!("run{index}"));
                 record_job(&out, label, &board, index);
                 let mut record = run_once(
-                    &java,
-                    &entry.jar,
+                    &invocation,
+                    (&entry.jar, &jar_digests[&entry.jar]),
                     dsn,
                     dsn_board.as_ref().ok(),
                     &dir,
@@ -1033,19 +1200,26 @@ fn java_version(java: &Path) -> Option<String> {
 }
 
 fn run_once(
-    java: &Path,
-    jar: &Path,
+    invocation: &Invocation,
+    (jar, jar_sha256): (&Path, &str),
     dsn: &Path,
     board: Option<&quality::DsnBoard>,
     dir: &Path,
     options: &Options,
     config: Option<&Config>,
 ) -> RunRecord {
+    let java = invocation.java.as_path();
     let mut record = RunRecord::default();
-    // A folder left by a run that was stopped holds nothing to keep, but its
-    // Freerouting may still be running and would write into the new run.
+    // A folder left by a run that was stopped is kept under another name, but
+    // its Freerouting may still be running and would write into the new run.
     stop_leftover_run(dir);
-    let _ = std::fs::remove_dir_all(dir);
+    if let Err(error) = set_aside(dir) {
+        record.error = Some(format!(
+            "cannot set the earlier {} aside: {error}",
+            dir.display()
+        ));
+        return record;
+    }
     // Wiring the DSN holds as fixed comes with it as `<name>.fixed.ses`.
     let fixed = dsn.with_extension("fixed.ses");
     let prepared = SETTINGS_PLACES
@@ -1074,6 +1248,44 @@ fn run_once(
         return record;
     };
     let arguments = freerouting_arguments(dir, jar, options, config);
+    // The inputs are on record before anything starts, or nothing starts.
+    let inputs = sha256_of(&dir.join("board.dsn")).and_then(|dsn_sha256| {
+        let fixed_ses = dir.join("fixed.ses");
+        let fixed_ses_sha256 = match fixed_ses.is_file() {
+            true => Some(sha256_of(&fixed_ses)?),
+            false => None,
+        };
+        let inputs = RunInputs {
+            started_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            load_average: load_average(),
+            jar_sha256: jar_sha256.to_string(),
+            dsn_sha256,
+            fixed_ses_sha256,
+            harness_commit: invocation
+                .harness
+                .as_ref()
+                .map(|(commit, _)| commit.clone()),
+            harness_dirty: invocation.harness.as_ref().is_none_or(|(_, dirty)| *dirty),
+            java_version: invocation.java_version.clone(),
+            arguments: arguments.clone(),
+        };
+        std::fs::write(
+            dir.join(RUN_INPUTS_FILE),
+            report::to_json(&inputs.to_json()),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(inputs)
+    });
+    match inputs {
+        Ok(inputs) => record.inputs = Some(inputs),
+        Err(error) => {
+            record.error = Some(format!("the run's inputs could not be recorded: {error}"));
+            return record;
+        }
+    }
     let started = Instant::now();
     let mut command = Command::new(java);
     for name in freerouting_env_removed(
@@ -1376,6 +1588,10 @@ fn load_saved(dir: &Path, context: Option<&ScoreContext>) -> Result<Saved, Strin
             if run_dir.join("stdout.log").is_file() {
                 apply_run_evidence(&mut record, &run_dir, &passed);
             }
+            record.inputs = std::fs::read_to_string(run_dir.join(RUN_INPUTS_FILE))
+                .ok()
+                .and_then(|text| parse::parse_json_prefix(&text))
+                .and_then(|(json, _)| RunInputs::from_json(&json));
             let score_dir = run_dir.join("score");
             match context {
                 Some(context) if score_dir.join("audit.json").is_file() => {
@@ -2127,6 +2343,137 @@ mod tests {
         std::fs::remove_file(dir.join(RUN_PID_FILE)).unwrap();
         stop_leftover_run(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_is_named_by_its_sha_256() {
+        let dir = std::env::temp_dir().join(format!("konnect-bench-sha-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abc"), "abc").unwrap();
+        assert_eq!(
+            sha256_of(&dir.join("abc")).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(sha256_of(&dir.join("absent"))
+            .unwrap_err()
+            .contains("no SHA-256"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runs_inputs_round_trip_through_json() {
+        let inputs = RunInputs {
+            started_unix: 1_794_266_161,
+            load_average: Some("1.40 1.14 1.11".into()),
+            jar_sha256: "f6".repeat(32),
+            dsn_sha256: "0a".repeat(32),
+            fixed_ses_sha256: None,
+            harness_commit: Some("5d112d9".into()),
+            harness_dirty: false,
+            java_version: Some("25.0.1".into()),
+            arguments: args(&["-jar", "fr.jar", "--router.neck_width_um=200"]),
+        };
+        let text = report::to_json(&inputs.to_json());
+        let (json, _) = parse::parse_json_prefix(&text).unwrap();
+        assert_eq!(RunInputs::from_json(&json), Some(inputs));
+        // Without the digests it is not a record of a run's inputs.
+        let (partial, _) = parse::parse_json_prefix(r#"{"started_unix":1}"#).unwrap();
+        assert_eq!(RunInputs::from_json(&partial), None);
+        // The load is three numbers, on this machine too.
+        let load = load_average().expect("a load average");
+        assert_eq!(
+            load.split(' ').filter(|n| n.parse::<f64>().is_ok()).count(),
+            3
+        );
+    }
+
+    /// The inputs are on record before the process starts, and what an
+    /// earlier attempt left in the folder is kept beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_records_its_inputs_before_it_starts_and_keeps_what_was_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("konnect-bench-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("S0@x").join("b").join("run1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("board.ses"), "an earlier attempt").unwrap();
+        // A stand-in for Java: it notes whether the inputs were there when it
+        // started, and writes no session.
+        let java = root.join("java");
+        std::fs::write(
+            &java,
+            "#!/bin/sh\n[ -f inputs.json ] && echo yes > had_inputs\necho started > started\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dsn = crate::repo_root()
+            .join("crates/konnect-core/tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let options = parse_options(&args(&["--jar", "fr.jar"])).unwrap();
+        let invocation = Invocation {
+            java: java.clone(),
+            java_version: Some("25-test".into()),
+            harness: Some(("abc123".into(), false)),
+        };
+        let config = Config::parse("S0=--router.neck_width_um=200").unwrap();
+        let record = run_once(
+            &invocation,
+            (Path::new("/j/fr.jar"), "f6f6"),
+            &dsn,
+            None,
+            &dir,
+            &options,
+            Some(&config),
+        );
+        assert!(dir.join("started").is_file(), "{:?}", record.error);
+        assert!(
+            dir.join("had_inputs").is_file(),
+            "the run started before its inputs were recorded"
+        );
+        let inputs = record.inputs.expect("inputs");
+        assert_eq!(inputs.jar_sha256, "f6f6");
+        assert_eq!(inputs.dsn_sha256, sha256_of(&dsn).unwrap());
+        assert_eq!(inputs.harness_commit.as_deref(), Some("abc123"));
+        assert!(!inputs.harness_dirty);
+        assert_eq!(
+            inputs.arguments.last().unwrap(),
+            "--router.neck_width_um=200"
+        );
+        assert!(inputs.started_unix > 1_700_000_000);
+        // The same record is in the folder, for whoever repeats the run.
+        let saved = std::fs::read_to_string(dir.join(RUN_INPUTS_FILE)).unwrap();
+        let (json, _) = parse::parse_json_prefix(&saved).unwrap();
+        assert_eq!(RunInputs::from_json(&json), Some(inputs));
+        // No session was written, and that is the run's error, not a pass.
+        assert!(record.error.unwrap().starts_with("no SES written"));
+        // The earlier attempt's folder was moved aside, not deleted.
+        assert!(!dir.join("board.ses").exists());
+        let kept: Vec<PathBuf> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("run1.superseded-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            std::fs::read_to_string(kept[0].join("board.ses")).unwrap(),
+            "an earlier attempt"
+        );
+        // Twice in one second, and both are kept.
+        std::fs::create_dir_all(&dir).unwrap();
+        set_aside(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        set_aside(&dir).unwrap();
+        let count = std::fs::read_dir(dir.parent().unwrap()).unwrap().count();
+        assert_eq!(count, 3);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

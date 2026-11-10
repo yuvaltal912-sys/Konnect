@@ -13,7 +13,7 @@
 use super::board_score::{BoardScore, Category, Compared, ScoreContext, Verdict};
 use super::parse::{Json, SesSummary};
 use super::quality::Quality;
-use super::{Options, SettingsEvidence};
+use super::{Options, RunInputs, SettingsEvidence};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
@@ -45,6 +45,8 @@ pub struct RunRecord {
     pub settings: Option<SettingsEvidence>,
     /// Freerouting's version check got an answer: the run was not offline.
     pub reached_network: bool,
+    /// What the run was started with, as recorded before it started.
+    pub inputs: Option<RunInputs>,
     /// The run measured on the real board (`--score`).
     pub board_score: Option<BoardScore>,
     /// That score against the baseline's.
@@ -500,12 +502,24 @@ pub struct Candidate {
     pub copper_quality: Option<f64>,
     pub verdict: Verdict,
     pub runtime_s: f64,
+    /// Each measure's least and greatest value over the scored runs, so a
+    /// difference between two candidates can be held against the difference
+    /// between two runs of one.
+    pub spread: Vec<(&'static str, Option<(f64, f64)>)>,
 }
 
 impl Candidate {
     pub fn passes(&self) -> bool {
         !self.incomplete && self.failed_gates == [false; 3]
     }
+}
+
+/// The least and the greatest of the values, when every run has one.
+fn range(values: impl Iterator<Item = Option<f64>>) -> Option<(f64, f64)> {
+    let values = values.collect::<Option<Vec<f64>>>()?;
+    let least = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let most = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (!values.is_empty()).then_some((least, most))
 }
 
 fn worst(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
@@ -571,6 +585,46 @@ pub fn candidates(results: &[BoardResult]) -> Vec<Candidate> {
                     .find(|v| verdicts.contains(v))
                     .unwrap_or(Verdict::NotMeasured),
                 runtime_s: r.median_runtime_s(),
+                spread: vec![
+                    (
+                        "signals x",
+                        range(scored.iter().map(|(_, c)| c.signal_ratio)),
+                    ),
+                    ("power x", range(scored.iter().map(|(_, c)| c.power_ratio))),
+                    ("all x", range(scored.iter().map(|(_, c)| c.total_ratio))),
+                    (
+                        "pour-net track mm",
+                        range(scored.iter().map(|(s, _)| Some(s.length(Category::Pour)))),
+                    ),
+                    (
+                        "vias off pour",
+                        range(scored.iter().map(|(s, _)| Some(s.non_pour_vias() as f64))),
+                    ),
+                    (
+                        "acute",
+                        range(
+                            scored
+                                .iter()
+                                .map(|(s, _)| s.audit.metric("5.3.acute_corners")),
+                        ),
+                    ),
+                    (
+                        "90°",
+                        range(
+                            scored
+                                .iter()
+                                .map(|(s, _)| s.audit.metric("5.3.right_angle_corners")),
+                        ),
+                    ),
+                    (
+                        "copper quality",
+                        range(scored.iter().map(|(s, _)| s.audit.copper_quality)),
+                    ),
+                    (
+                        "runtime s",
+                        range(r.runs.iter().map(|run| Some(run.runtime_s))),
+                    ),
+                ],
             }
         })
         .collect()
@@ -578,12 +632,13 @@ pub fn candidates(results: &[BoardResult]) -> Vec<Candidate> {
 
 /// Best first, in the owner's order: the gates (a candidate with a failed or
 /// unscored run last, then completion before DRC before width), then acute
-/// corners, signal length, power length (both in steps of 1 %, since two runs
-/// of one config differ by about that), right-angle corners, vias off the
-/// pour nets, copper quality (in whole points), runtime.
-pub fn rank_candidates(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+/// corners, signal length, power length (both in steps of `ratio_step`, which
+/// should be no finer than two runs of one config differ), right-angle
+/// corners, vias off the pour nets, copper quality (in whole points), runtime.
+pub fn rank_candidates(mut candidates: Vec<Candidate>, ratio_step: f64) -> Vec<Candidate> {
     let whole = |value: Option<f64>| value.map_or(u64::MAX, |v| v.round().max(0.0) as u64);
-    let step = |ratio: Option<f64>| ratio.map_or(u64::MAX, |r| (r * 100.0).round() as u64);
+    let ratio_step = if ratio_step > 0.0 { ratio_step } else { 0.01 };
+    let step = |ratio: Option<f64>| ratio.map_or(u64::MAX, |r| (r / ratio_step).round() as u64);
     let key = |c: &Candidate| {
         (
             (c.incomplete, c.failed_gates),
@@ -739,14 +794,42 @@ fn render_board_scores(results: &[BoardResult], context: &ScoreContext) -> Strin
             }
         }
     }
-    let ranked = rank_candidates(candidates(results));
-    out.push_str("\n### Ranking of the candidates\n\nEach config on each DSN is a candidate, quoted at its worst run.\n\n");
+    let ranked = rank_candidates(candidates(results), t.ratio_step);
+    out.push_str("\n### Spread over each candidate's runs\n\nLeast to greatest over the scored runs of one candidate. A difference between two candidates that is no larger than this is not a difference.\n\n");
+    if let Some(first) = ranked.first() {
+        out.push_str("| candidate | runs |");
+        for (measure, _) in &first.spread {
+            out.push_str(&format!(" {measure} |"));
+        }
+        out.push_str("\n|---|---|");
+        out.push_str(&"---|".repeat(first.spread.len()));
+        out.push('\n');
+    }
+    for candidate in &ranked {
+        out.push_str(&format!(
+            "| {} | {} |",
+            candidate.name.replace('|', "/"),
+            candidate.scored
+        ));
+        for (_, range) in &candidate.spread {
+            out.push_str(&match range {
+                Some((least, most)) if (most - least).abs() < 5e-4 => format!(" {least:.3} |"),
+                Some((least, most)) => format!(" {least:.3} to {most:.3} |"),
+                None => " - |".to_string(),
+            });
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n### Ranking of the candidates\n\nEach config on each DSN is a candidate, quoted at its worst run. Length ratios are compared in steps of {}.\n\n",
+        t.ratio_step
+    ));
     for (i, candidate) in ranked.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, describe_candidate(candidate)));
     }
     match ranked.first() {
         Some(best) if best.passes() => out.push_str(&format!(
-            "\nChosen: {} (ranked by the gates, then acute corners, signal length and power length in 1 % steps, right angles, vias, copper quality, runtime).\n",
+            "\nChosen: {} (ranked by the gates, then acute corners, signal length and power length in steps, right angles, vias, copper quality, runtime).\n",
             best.name
         )),
         Some(best) => out.push_str(&format!(
@@ -1129,6 +1212,10 @@ pub fn results_json(
                         ),
                         ("reached_network".into(), Json::Bool(run.reached_network)),
                         (
+                            "inputs".into(),
+                            optional(run.inputs.as_ref(), RunInputs::to_json),
+                        ),
+                        (
                             "unrouted".into(),
                             optional(run.unrouted, |n| number(n as f64)),
                         ),
@@ -1193,7 +1280,10 @@ pub fn results_json(
         )
     };
     let ranked = rank(totals(results));
-    let ranked_candidates = rank_candidates(candidates(results));
+    let ranked_candidates = rank_candidates(
+        candidates(results),
+        context.map_or(0.01, |c| c.spec.thresholds.ratio_step),
+    );
     let score = context.map(|context| {
         Json::Object(vec![
             ("currents".into(), Json::Text(context.spec.currents.clone())),
@@ -1226,6 +1316,41 @@ pub fn results_json(
                         .filter(|c| c.passes())
                         .map(|c| c.name.clone()),
                     Json::Text,
+                ),
+            ),
+            (
+                "candidates".into(),
+                Json::Array(
+                    ranked_candidates
+                        .iter()
+                        .map(|c| {
+                            Json::Object(vec![
+                                ("name".into(), Json::Text(c.name.clone())),
+                                ("runs".into(), count(c.runs)),
+                                ("scored".into(), count(c.scored)),
+                                ("passes".into(), Json::Bool(c.passes())),
+                                (
+                                    "spread".into(),
+                                    Json::Object(
+                                        c.spread
+                                            .iter()
+                                            .map(|(measure, range)| {
+                                                (
+                                                    measure.to_string(),
+                                                    optional(*range, |(least, most)| {
+                                                        Json::Array(vec![
+                                                            number(least),
+                                                            number(most),
+                                                        ])
+                                                    }),
+                                                )
+                                            })
+                                            .collect(),
+                                    ),
+                                ),
+                            ])
+                        })
+                        .collect(),
                 ),
             ),
         ])
@@ -1740,11 +1865,12 @@ mod tests {
             copper_quality: Some(60.0),
             verdict: Verdict::Below,
             runtime_s: 100.0,
+            spread: Vec::new(),
         }
     }
 
     fn order(candidates: Vec<Candidate>) -> Vec<String> {
-        rank_candidates(candidates)
+        rank_candidates(candidates, 0.01)
             .into_iter()
             .map(|c| c.name)
             .collect()
@@ -1844,6 +1970,19 @@ mod tests {
                 "{name}"
             );
         }
+        // The step is the spec's: at 3 %, one point apart is no difference,
+        // and the next measure decides.
+        let apart = |ratio_step: f64| {
+            let longer = with("signals 1.06", &|c| {
+                c.signal_ratio = Some(1.06);
+                c.power_ratio = Some(1.0);
+            });
+            rank_candidates(vec![candidate("signals 1.05"), longer], ratio_step)[0]
+                .name
+                .clone()
+        };
+        assert_eq!(apart(0.01), "signals 1.05");
+        assert_eq!(apart(0.03), "signals 1.06");
         // A measure that is missing is never the better one.
         let unmeasured = with("no signal ratio", &|c| c.signal_ratio = None);
         assert_eq!(
@@ -1909,6 +2048,19 @@ mod tests {
         assert!((c.signal_ratio.unwrap() - 1.1).abs() < 1e-9);
         assert_eq!(c.acute, Some(2.0));
         assert_eq!(c.copper_quality, Some(59.0));
+        // Beside the worst run, the spread over the runs is kept.
+        let spread = |measure: &str| {
+            c.spread
+                .iter()
+                .find(|(m, _)| *m == measure)
+                .and_then(|(_, range)| *range)
+                .unwrap_or_else(|| panic!("spread of {measure}"))
+        };
+        assert!((spread("signals x").0 - 1.0).abs() < 1e-9);
+        assert!((spread("signals x").1 - 1.1).abs() < 1e-9);
+        assert_eq!(spread("acute"), (0.0, 2.0));
+        assert_eq!(spread("copper quality"), (59.0, 62.0));
+        assert_eq!(spread("runtime s"), (30.0, 30.0));
         assert_eq!(c.verdict, Verdict::Below);
         assert!(c.passes());
         // One run failing a gate fails the candidate.
@@ -1975,6 +2127,18 @@ mod tests {
             "{markdown}"
         );
         assert!(
+            markdown.contains("### Spread over each candidate's runs"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("| S2@2.5.0 on V1 | 2 | 1.010 to 1.020 | 1.000 |"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("Length ratios are compared in steps of 0.01."),
+            "{markdown}"
+        );
+        assert!(
             markdown.contains("\n1. S2@2.5.0 on V1: passes every gate in every run;"),
             "{markdown}"
         );
@@ -2004,6 +2168,14 @@ mod tests {
         assert_eq!(json.text_at("score.currents"), Some("test values"));
         assert_eq!(json.text_at("score.chosen"), Some("S2@2.5.0 on V1"));
         assert_eq!(json.number_at("score.thresholds.signal_match"), Some(1.03));
+        assert_eq!(json.number_at("score.thresholds.ratio_step"), Some(0.01));
+        let Some(Json::Array(ranked)) = json.at("score.candidates") else {
+            panic!("candidates in {text}")
+        };
+        assert_eq!(ranked[0].text_at("name"), Some("S2@2.5.0 on V1"));
+        assert!(
+            matches!(ranked[0].at("spread.signals x"), Some(Json::Array(pair)) if pair.len() == 2)
+        );
         assert_eq!(
             json.number_at("score.baseline.length_mm.signal"),
             Some(30.0)

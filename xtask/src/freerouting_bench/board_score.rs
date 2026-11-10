@@ -113,6 +113,10 @@ pub struct Thresholds {
     /// How much a decoupling loop may grow over the baseline's and still
     /// match, as a fraction.
     pub loop_match: f64,
+    /// The step in which the ranking compares length ratios. Two candidates
+    /// closer than this are equal on length, and the next measure decides. It
+    /// should be no finer than two runs of one config differ.
+    pub ratio_step: f64,
 }
 
 impl Default for Thresholds {
@@ -126,6 +130,7 @@ impl Default for Thresholds {
             right_angle_match: 5.0,
             score_match: 1.0,
             loop_match: 0.05,
+            ratio_step: 0.01,
         }
     }
 }
@@ -133,7 +138,7 @@ impl Default for Thresholds {
 type ThresholdField = fn(&mut Thresholds) -> &mut f64;
 
 impl Thresholds {
-    const FIELDS: [(&'static str, ThresholdField); 8] = [
+    const FIELDS: [(&'static str, ThresholdField); 9] = [
         ("below_intent_share", |t| &mut t.below_intent_share),
         ("below_intent_section_mm", |t| {
             &mut t.below_intent_section_mm
@@ -144,6 +149,7 @@ impl Thresholds {
         ("right_angle_match", |t| &mut t.right_angle_match),
         ("score_match", |t| &mut t.score_match),
         ("loop_match", |t| &mut t.loop_match),
+        ("ratio_step", |t| &mut t.ratio_step),
     ];
 
     /// The defaults with the named values of `json` (an object) put in.

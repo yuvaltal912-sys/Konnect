@@ -559,6 +559,13 @@ cargo xtask freerouting-bench \
     strategies `-is` and `-us` leave no line, so they are never confirmed.
   - A run whose log shows an answer to Freerouting's version check was not
     offline, and fails.
+- **Inputs on record.** Before a run starts, its folder gets `inputs.json`:
+  the JAR's and the DSN's SHA-256 (the DSN itself is copied in as `board.dsn`),
+  every argument after `java`, the Java version, the commit this bench was
+  built from and whether `xtask/` had uncommitted changes, the start time and
+  the machine's load averages. A run whose inputs cannot be recorded is not
+  started. Runs go one at a time, so a run's time is its own; check the load
+  it started under before comparing runtimes.
 - **DSN variants.** Every `.dsn` in the corpus is routed with every config, so
   variants of one board are candidates like any other.
   `xtask/freerouting-bench/stage_merge.py` (plain Python, **experiment only**)
@@ -630,13 +637,18 @@ cargo xtask freerouting-bench \
     islands. `thresholds` in the spec replaces any limit by name
     (`below_intent_share`, `below_intent_section_mm`, `signal_match`,
     `power_match`, `pour_track_match_mm`, `right_angle_match`, `score_match`,
-    `loop_match`); an unknown name is refused.
+    `loop_match`, and `ratio_step` for the ranking); an unknown name is refused.
   - **Candidates.** Each config on each DSN is a candidate, quoted at its worst
     run. Ranking: the gates (a failed or unscored run last, then completion
     before DRC before width), acute corners, signal length and power length in
-    1 % steps, right-angle corners, vias off the pour nets, copper quality,
-    runtime. `Chosen:` names the first candidate only when it passes every gate
-    in every run.
+    steps of `ratio_step` (a threshold, 0.01 by default), right-angle corners,
+    vias off the pour nets, copper quality, runtime. `Chosen:` names the first
+    candidate only when it passes every gate in every run.
+  - **Spread.** Freerouting varies from run to run, so the report lists each
+    candidate's least and greatest value of every measure over its runs. A
+    difference between two candidates that is no larger than that is not a
+    difference: give a cell enough runs to see its spread, and set
+    `ratio_step` no finer than it before reading the ranking.
 - **Budget and resume.** Every Freerouting start is a line in `<out>/jobs.log`.
   `--max-jobs N` refuses an invocation whose runs, with those already there,
   would exceed N. `--resume` adds to the results already in `--out`: saved runs
@@ -648,7 +660,8 @@ cargo xtask freerouting-bench \
   again (and lets a config all of whose runs failed change). `results.json` and
   `summary.md` are rewritten after every run, each written beside and moved
   into place, so a stopped sweep loses at most the run in progress. That
-  run's folder is routed again from scratch; if the bench was killed and its
+  run is routed again in an empty folder, and what it left is kept beside it
+  as `run<N>.superseded-<unix time>`; if the bench was killed and its
   Freerouting lived on, the resumed run stops it first (each run notes its
   process id in `java.pid`), so it cannot write into the new run. Without
   `--resume`, an `--out` that already holds results is refused.
