@@ -1,0 +1,38 @@
+Continue the Konnect creation-track work in English. Resume the completed first half of row S6; this prompt does not approve publication, merging, or starting another row.
+
+Use this existing worktree and branch:
+- Worktree: /Users/yuvaltal/.codex/worktrees/konnect-s6-preset/Konnect
+- Branch: codex/creation-s6-pour-widths-preset
+- Main checkout: /Users/yuvaltal/ClaudeCode/Konnect
+
+Read AGENTS.md, then docs/CREATION_HANDOFF.md (especially “Now,” “Fresh-session resume,” “Row S6, first half,” and “Known traps”), docs/API_MIGRATIONS.md, and docs/S6_PR_DRAFT.md. These files and the retained evidence are the context; no previous chat history is needed.
+
+Reconcile the current state using git status, git log, git diff, git remote -v, and gh pr list --repo yuvaltal912-sys/Konnect. Preserve unfamiliar changes. If GitHub is unavailable, report the lookup failure and do not infer remote state. The last confirmed open PR was simulation #54; this S6 work had no PR and had not been pushed.
+
+Expected state:
+- Base: main 7e9a174. Local claim: dace50b. Implementation: 803ab94.
+- Last fully gated revision: ea5734885e4693c6ee814f4634d3735d0e352acc. Later handoff commits contain documentation only; check the diff rather than assuming this remains true.
+- The first half of S6 is implemented and independently reviewed. Pour-owning nets keep their effective class width, including with pours omitted, and intent_widths explains why. Other current-bearing nets still widen.
+- route_specctra_dsn sends S5's preset: 20 passes, optimizer enabled, via cost 10, direction scalar 1.0, both consecutive-failure limits 1,000,000, and 0.25% improvement threshold. Job API value: 0.25; matching CLI value: 0.0025. Existing pass and optimizer overrides remain supported; every sent setting is read back before routing.
+- The existing pours default is still fixed. The successful reference runs explicitly used the existing pours: omit option. Per-zone policy, planes and stitching were not implemented.
+
+Verification already completed:
+- Full post-commit gate: 4,201 workspace tests, 9 doc tests, 95 live simulation tests, formatting, Clippy, licenses, doc counts and release build passed.
+- Seven new tests; nine negative controls caught and restored. An earlier known IBIS cache flake passed alone and on the full rerun; the final post-commit gate passed without a retry.
+- All 18 accepted demo exports were byte-identical. Three product-MCP and three CLI runs all had zero KiCad unconnected after refill and passed the signal-length criterion; all four median copper comparisons passed the parity band. Actual router settings and isolation were verified.
+- Thermal-relief and power-width quality gates still fail in all six runs. Actual owner currents, pour capacity, live GUI SES application, another reference board, other Freerouting versions, Windows and Linux remain unverified. Do not call this electrical DRC readiness.
+
+Evidence is preserved in /Users/yuvaltal/ClaudeCode/Konnect/target/creation-research/s6/:
+- implementation/post-commit-gate/results.json and its logs
+- implementation/post-commit-smoke/installation.json
+- implementation/INDEPENDENT_REVIEW.md and reviewed-files.json
+- implementation/negative-controls/results.json
+- measurement/RESULTS.md, comparison.json, demo-comparison.json and final-provenance.json
+
+The routing measurements used dace50b plus the reviewed working diff, committed unchanged as 803ab94; the final gate and binary identity were ea57348. Archived measurement scripts retain historical absolute paths and an old commit assertion. Read them as evidence, not as ready-to-rerun commands. Do not repeat completed routing sweeps just to recover context. Revalidate if code, inputs, environment or evidence have materially changed; report missing evidence instead of assuming success.
+
+If a build or runtime check is needed, use /opt/homebrew/bin first on PATH, CARGO_TARGET_DIR=/Users/yuvaltal/ClaudeCode/Konnect/target, KICAD_DEMOS=/Users/yuvaltal/ClaudeCode/kicad-10.0.1/demos, and a scratch KICAD_CONFIG_HOME. The tested fork binary is /Users/yuvaltal/ClaudeCode/Konnect/target/release/konnect. Use /opt/homebrew/bin/python3.14 -I for helper scripts. Follow AGENTS.md for isolated Freerouting, scratch boards, noreply commits and protected files. Do not use the installed Konnect or reload_server, modify a live/reference project, or run cargo clean in the main checkout. Keep private board details out of tracked documents. Leave the unrelated untracked .serena/ directory in main untouched.
+
+Next action: confirm the resumed state briefly, show the exact title and body from docs/S6_PR_DRAFT.md, and obtain my explicit approval before any push or PR. If I approve that exact text, push only this branch to fork and open one draft PR against main in yuvaltal912-sys/Konnect; use --repo yuvaltal912-sys/Konnect on every gh command. Update docs/CREATION_HANDOFF.md with the resulting status and link. Merge, CI/Actions, auto-merge, PR comments and starting S6's second half, S7, S9 or simulation work require their own applicable authorization.
+
+Done for the initial resume when you have reconciled the state, identified any actual drift, and presented the saved publication text without repeating completed implementation or treating this prompt as approval to publish.
