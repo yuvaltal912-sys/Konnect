@@ -1,6 +1,6 @@
 # S6 proposed PR text
 
-Status (2026-11-10): shown to the owner; **not approved for publication**. No push or PR has occurred. The request to prepare a fresh-session handoff is not publication approval. Keep this text exact unless the owner asks for a revision; show any revised text before publishing.
+Status (2026-11-10): the owner approved publication and merge of this exact S6 work. The title and body below are published unchanged in [PR #62](https://github.com/yuvaltal912-sys/Konnect/pull/62). This file is retained as the publication record; do not create another PR from it. Read the PR for its current merge state.
 
 ## Exact title
 
