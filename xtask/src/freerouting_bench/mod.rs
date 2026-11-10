@@ -181,6 +181,27 @@ impl Config {
                     "config {name}: the job budget is --job-timeout-secs, the same for every config"
                 ));
             }
+            // Freerouting's command line takes an improvement threshold above
+            // 0 and below 1 for a fraction: `0.25` runs as 25 %, not 0.25 %.
+            // From 0.01 up, the value says one thing and does another.
+            let threshold = match key {
+                "-oit" => args.get(at).map(String::as_str),
+                _ if key.ends_with("improvement_threshold") => {
+                    arg.split_once('=').map(|(_, value)| value)
+                }
+                _ => None,
+            };
+            if let Some(percent) = threshold
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| (0.01..1.0).contains(value))
+            {
+                return Err(format!(
+                    "config {name}: Freerouting's command line reads an improvement threshold below 1 as a fraction, so {percent} would run as {} %: write {} for that, or {} for {percent} %",
+                    percent * 100.0,
+                    percent * 100.0,
+                    percent / 100.0
+                ));
+            }
             if seen.contains(&key) {
                 return Err(format!("config {name}: {key} is set twice"));
             }
@@ -481,6 +502,19 @@ fn same_setting(a: &str, b: &str) -> bool {
     }
 }
 
+/// A setting's value as Freerouting's command line reads it. One setting is
+/// rescaled on the way in: an `improvement_threshold` above 0 and below 1 is
+/// taken for a fraction and multiplied by 100, so `0.25` is applied as 25 %
+/// and a quarter of a percent has to be given as `0.0025`.
+fn as_the_command_line_reads(path: &str, value: &str) -> String {
+    match value.trim().parse::<f64>() {
+        Ok(number) if path.ends_with("improvement_threshold") && number > 0.0 && number < 1.0 => {
+            format!("{}", number * 100.0)
+        }
+        _ => value.to_string(),
+    }
+}
+
 /// Judge a run's settings from its `log`: what Freerouting complained about,
 /// and each `--router.` setting in `args` against the settings it says it
 /// applied. A log that lists applied settings and leaves a given one out
@@ -492,7 +526,8 @@ pub fn settings_evidence(args: &[String], log: &str) -> SettingsEvidence {
         parameters: routing_parameters(log),
         ..SettingsEvidence::default()
     };
-    for (path, value) in router_arguments(args) {
+    for (path, given) in router_arguments(args) {
+        let value = as_the_command_line_reads(&path, &given);
         match evidence
             .applied
             .iter()
@@ -503,10 +538,10 @@ pub fn settings_evidence(args: &[String], log: &str) -> SettingsEvidence {
                 .differing
                 .push(format!("router.{path} was applied as {used}, not {value}")),
             None if evidence.applied.is_empty() => {
-                evidence.unconfirmed.push(format!("router.{path}={value}"))
+                evidence.unconfirmed.push(format!("router.{path}={given}"))
             }
             None => evidence.differing.push(format!(
-                "router.{path}={value} is not among the settings Freerouting says it applied"
+                "router.{path}={given} is not among the settings Freerouting says it applied"
             )),
         }
     }
@@ -1845,13 +1880,13 @@ mod tests {
     #[test]
     fn a_config_holds_named_router_settings_and_nothing_else() {
         let config =
-            Config::parse("S2=--router.optimizer.improvement_threshold=0.25 -is prioritized")
+            Config::parse("S2=--router.optimizer.improvement_threshold=0.0025 -is prioritized")
                 .unwrap();
         assert_eq!(config.name, "S2");
         assert_eq!(
             config.args,
             [
-                "--router.optimizer.improvement_threshold=0.25",
+                "--router.optimizer.improvement_threshold=0.0025",
                 "-is",
                 "prioritized"
             ]
@@ -1886,6 +1921,20 @@ mod tests {
         assert!(refused("S=--router.job_timeout=00:20:00").contains("--job-timeout-secs"));
         assert!(refused("S=-mp").contains("needs a value"));
         assert!(refused("S=-mp --router.x=1").contains("needs a value"));
+        // A threshold that would run as a hundred times what it says.
+        let scaled = refused("S=--router.optimizer.improvement_threshold=0.25");
+        assert!(scaled.contains("would run as 25 %"), "{scaled}");
+        assert!(scaled.contains("or 0.0025 for 0.25 %"), "{scaled}");
+        assert!(refused("S=-oit 0.5").contains("would run as 50 %"));
+        for clear in ["0.0025", "1.0", "2.5", "0"] {
+            assert!(
+                Config::parse(&format!(
+                    "S=--router.optimizer.improvement_threshold={clear}"
+                ))
+                .is_ok(),
+                "{clear}"
+            );
+        }
         // Each setting once, so what a config sets is not a matter of order.
         assert!(refused("S=--router.x=1 --router.x=2").contains("set twice"));
         assert!(refused("S=-mp 5 -mp 6").contains("set twice"));
@@ -2133,6 +2182,33 @@ mod tests {
             APPLIED_LOG,
         );
         assert_eq!((fine.problem(), fine.unconfirmed.len()), (None, 0));
+        // The command line reads a threshold below 1 as a fraction: 0.0025 is
+        // applied as 0.25 (a quarter of a percent) and is in effect as given,
+        // and 0.25 is applied as 25. Any other applied value is a difference.
+        let threshold = |given: &str, applied: &str| {
+            settings_evidence(
+                &args(&[&format!(
+                    "--router.optimizer.improvement_threshold={given}"
+                )]),
+                &format!(
+                    "x DEBUG  Applied CLI router setting: router.optimizer.improvement_threshold = {applied}\n"
+                ),
+            )
+            .problem()
+        };
+        assert_eq!(threshold("0.0025", "0.25"), None);
+        assert_eq!(threshold("0.25", "25.0"), None);
+        assert_eq!(threshold("1.0", "1.0"), None);
+        assert!(threshold("0.25", "0.25")
+            .unwrap()
+            .contains("applied as 0.25, not 25"));
+        assert!(threshold("2.5", "25.0").is_some());
+        // Only that setting is rescaled.
+        let other = settings_evidence(
+            &args(&["--router.scoring.default_bend_cost=0.5"]),
+            "x DEBUG  Applied CLI router setting: router.scoring.default_bend_cost = 0.5\n",
+        );
+        assert_eq!(other.problem(), None);
         // A log that lists no applied settings (2.1) proves nothing: the
         // given settings are unconfirmed, and that is said, not passed over.
         let blind = settings_evidence(&given, "INFO   Freerouting v2.1.0");

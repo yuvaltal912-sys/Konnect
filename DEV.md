@@ -542,7 +542,10 @@ cargo xtask freerouting-bench \
   `--max-passes` or `--threads` for its runs. Give every lever a sweep compares
   in every config: Freerouting fills what is left out with its own defaults,
   and changes some of them by itself for each board (the per-layer trace
-  costs, from the board's shape).
+  costs, from the board's shape). One value is rescaled on the way in:
+  Freerouting's command line reads an improvement threshold above 0 and below 1
+  as a fraction, so `0.25` runs as 25 %. A config that gives one from 0.01 up
+  to 1 is refused; write `25` for 25 %, or `0.0025` for 0.25 %.
 - **Effective settings.** Each run records what is known of the settings it
   really used (`settings` in `results.json`), from Freerouting's own log: 2.3
   and later write one under the run's home at debug level, whatever the console
