@@ -441,9 +441,12 @@ convention for other `kicad-cli`-calling code.
 
 `cargo xtask freerouting-bench` routes a folder of Specctra DSN files with one or
 more Freerouting JARs and reports, per board and version, whether the routing is
-complete and how good it is. It needs Java and the JARs, takes minutes to hours,
-and is **never part of CI or `cargo test`**. Only its parsing, measuring and
-ranking are unit tests (`cargo test -p xtask`, no Java).
+complete and how good it is. It also ranks named router settings (`--config`)
+and DSN variants of one board, and can judge every run on the real board
+against its existing routing (`--score`). It needs Java and the JARs, takes
+minutes to hours, and is **never part of CI or `cargo test`**. Only its parsing,
+measuring and ranking are unit tests (`cargo test -p xtask`, no Java, KiCad or
+Konnect).
 
 ```bash
 cargo xtask freerouting-bench \
@@ -484,8 +487,9 @@ cargo xtask freerouting-bench \
   `freerouting.json`, on the command line and in the environment. Freerouting
   2.x turns them on by default. The seeded settings also carry an all-zero
   `profile.id`: 2.3 and later stop with a `NullPointerException` without one.
-  Freerouting's update check still asks GitHub for the latest release, with no
-  board data.
+  Every HTTP and HTTPS request goes to a closed loopback port, so 2.5.0's
+  update check (a GET to GitHub on every start, with no switch) never leaves
+  the machine.
 - **Budget.** `--job-timeout-secs` (default 60) is Freerouting's own
   `router.job_timeout`: a job that hits it stops and writes what it routed.
   `--timeout-secs` (default 600) kills the process. 2.3 and later log their own
@@ -527,10 +531,153 @@ cargo xtask freerouting-bench \
   alone): fewest defects (acute corners plus narrow segments), wire/bound in 1 %
   steps, fewest vias, fewest boards whose runs differ, least runtime. The top
   entry is printed as `Recommended:`.
+- **Settings sweep.** `--config NAME=ARGS` (repeatable) routes and ranks named
+  router settings, not only JARs. Each config with each JAR is a row of its own,
+  in the folder `<NAME>@<jar label>`. ARGS are split at spaces and may only be
+  `--router.<path>=<value>` or the router's short flags (`-mp -mt -is -us -oit
+  -inc`, each with a value), so a config cannot turn telemetry on or move a
+  run's files. Each setting may appear once, and the job budget stays
+  `--job-timeout-secs` for all. A config that sets the passes or the router's
+  threads (`--router.max_threads`, which is what 2.5 reads `-mt` as) replaces
+  `--max-passes` or `--threads` for its runs. Give every lever a sweep compares
+  in every config: Freerouting fills what is left out with its own defaults,
+  and changes some of them by itself for each board (the per-layer trace
+  costs, from the board's shape). One value is rescaled on the way in:
+  Freerouting's command line reads an improvement threshold above 0 and below 1
+  as a fraction, so `0.25` runs as 25 %. A config that gives one from 0.01 up
+  to 1 is refused; write `25` for 25 %, or `0.0025` for 0.25 %.
+- **Effective settings.** Each run records what is known of the settings it
+  really used (`settings` in `results.json`), from Freerouting's own log: 2.3
+  and later write one under the run's home at debug level, whatever the console
+  shows. (The `freerouting.json` they save back holds no router settings.)
+  - A line in which Freerouting says a setting did not take ("Failed to apply
+    CLI router setting", an unknown argument or property) fails the run:
+    Freerouting only warns and routes on with its default.
+  - Each `--router.` setting given is compared with the "Applied CLI router
+    setting" lines. Another value, or no such line in a log that has them,
+    fails the run. A log with no such lines at all (2.1) leaves the settings
+    listed as unconfirmed.
+  - The via costs and per-layer trace costs Freerouting printed for the
+    routing are kept as `routing_parameters`. The CLI-only optimizer
+    strategies `-is` and `-us` leave no line, so they are never confirmed.
+  - A run whose log shows an answer to Freerouting's version check was not
+    offline, and fails.
+- **Inputs on record.** Before a run starts, its folder gets `inputs.json`:
+  the JAR's and the DSN's SHA-256 (the DSN itself is copied in as `board.dsn`),
+  every argument after `java`, the Java version, the commit this bench was
+  built from and whether `xtask/` had uncommitted changes, the start time and
+  the machine's load averages. A run whose inputs cannot be recorded is not
+  started. Runs go one at a time, so a run's time is its own; check the load
+  it started under before comparing runtimes.
+- **DSN variants.** Every `.dsn` in the corpus is routed with every config, so
+  variants of one board are candidates like any other.
+  `xtask/freerouting-bench/stage_merge.py` (plain Python, **experiment only**)
+  makes them by editing a DSN that Konnect exported: `unwiden` moves a net
+  into the narrowest class, `drop-plane` removes pours by the index `planes`
+  lists, and `merge` puts a first run's session into the DSN as fixed wiring
+  for staged routing. (There is no edit for a layer's trace costs: a
+  hand-written `autoroute_settings` scope made Freerouting 2.5.0 read the DSN
+  as an empty board, without a warning.) Freerouting
+  does not write fixed wiring back, so `merge` also writes `<name>.fixed.ses`
+  beside `<name>.dsn`; the bench carries it into each run and scores both
+  sessions together. An edited DSN has no reverse manifest: score it, never
+  import it.
+- **Board score** (`--score <spec.json>`). The measures above come from the
+  session file alone: they cannot see a pour, a refill, KiCad's DRC or the
+  layout audit. With a spec, every run and the board's existing routing (the
+  baseline row) go through one pipeline, on scratch copies only: the session's
+  wires and vias are put into a copy of the project
+  (`xtask/freerouting-bench/score_board.py apply`, KiCad's own Python with
+  `-I -B`), `kicad-cli pcb drc --refill-zones --save-board` refills and checks
+  it, `score_board.py measure` reads the tracks, vias and zones back, and
+  `audit_layout_quality` runs through this checkout's own `target/release/konnect`
+  by pipe (state in `target/dogfood-home`; the installed Konnect is refused).
+  The spec is a JSON file kept under `target/`, since it names a private board:
+
+  ```json
+  {
+    "project": "project",
+    "board": "board.kicad_pcb",
+    "baseline": "routed.kicad_pcb",
+    "intent_dsn": "V0.dsn",
+    "kicad_config_home": "kicad-config",
+    "currents": "the owner's, entered 2026-11-10",
+    "thresholds": { "signal_match": 1.03 }
+  }
+  ```
+
+  - `project` is a folder holding the unrouted board, its `.kicad_pro`, its
+    libraries and `.konnect/design_intent.json`; it is copied whole for every
+    run. `board` is the unrouted board's file name in it, and `baseline` a
+    routed copy of the same board with the same placement. Paths are relative
+    to the spec file.
+  - `kicad_config_home` is a scratch `KICAD_CONFIG_HOME`, so no run reads or
+    writes your KiCad settings: put `ZoneFillIterativeRefill=0` in
+    `<it>/10.0/kicad_advanced` (KiCad 10.0.8's iterative refill defect, see
+    `docs/CREATION_HANDOFF.md`) and copies of your global `fp-lib-table` and
+    `sym-lib-table` beside it, or the library checks and so the DRC baseline
+    change.
+  - `currents` says where the design-intent currents came from (the owner, or
+    test values); it is quoted with every result. `intent_dsn` is the export
+    whose class widths are the intent widths (without it, each run's own DSN).
+    `kicad_python`, `kicad_cli` and `konnect` default to the macOS paths and
+    this checkout's release build: run `cargo build --release --locked -p konnect`
+    first.
+  - **Categories.** A net that owns a pour is a pour net (on these boards, the
+    ground nets); a net with a recorded current and no pour is a power net; the
+    rest are signals.
+  - **Gates**, each over every run of a candidate. G1 completion: 0 unconnected
+    in KiCad and a routed share of 1 in the audit, on the baseline's placement.
+    G2 DRC: no violation type above the baseline's count. G3 width: no track
+    below the narrowest class width, 0 `track_width` violations, each power net
+    below its intent width on at most 5 % of its length and for no stretch over
+    2 mm, and no more undersized nets or bottlenecks in the audit (4.2, 4.3)
+    than the baseline.
+  - **Quality**, against the baseline, each measure as beats, matches or below:
+    signal and power track over the baseline's on the nets that have track on
+    both boards (match up to x1.03 and x1.05), track on pour nets (+20 mm),
+    vias off the pour nets, acute corners (none), right-angle corners (+5), the
+    audit's `copper_quality` and category scores (-1), decoupling loops (+5 %),
+    reference-plane coverage, unstitched layer changes and floating ground
+    islands. `thresholds` in the spec replaces any limit by name
+    (`below_intent_share`, `below_intent_section_mm`, `signal_match`,
+    `power_match`, `pour_track_match_mm`, `right_angle_match`, `score_match`,
+    `loop_match`, and `ratio_step` for the ranking); an unknown name is refused.
+  - **Candidates.** Each config on each DSN is a candidate, quoted at its worst
+    run. Ranking: the gates (a failed or unscored run last, then completion
+    before DRC before width), acute corners, signal length and power length in
+    steps of `ratio_step` (a threshold, 0.01 by default), right-angle corners,
+    vias off the pour nets, copper quality, runtime. `Chosen:` names the first
+    candidate only when it passes every gate in every run.
+  - **Spread.** Freerouting varies from run to run, so the report lists each
+    candidate's least and greatest value of every measure over its runs. A
+    difference between two candidates that is no larger than that is not a
+    difference: give a cell enough runs to see its spread, and set
+    `ratio_step` no finer than it before reading the ranking.
+- **Budget and resume.** Every Freerouting start is a line in `<out>/jobs.log`.
+  `--max-jobs N` refuses an invocation whose runs, with those already there,
+  would exceed N. `--resume` adds to the results already in `--out`: saved runs
+  are kept, only the missing ones are routed, and runs that have a session but
+  no board score are scored. A config whose settings, or a DSN whose content,
+  is not what its saved runs used is refused, since the two would merge into
+  one candidate: give it another name. A saved run that failed stays as it is
+  unless `--retry-failed` is given, which routes it and the runs after it
+  again (and lets a config all of whose runs failed change). `results.json` and
+  `summary.md` are rewritten after every run, each written beside and moved
+  into place, so a stopped sweep loses at most the run in progress. That
+  run is routed again in an empty folder, and what it left is kept beside it
+  as `run<N>.superseded-<unix time>`; if the bench was killed and its
+  Freerouting lived on, the resumed run stops it first (each run notes its
+  process id in `java.pid`), so it cannot write into the new run. Without
+  `--resume`, an `--out` that already holds results is refused.
 - **Rescore.** `cargo xtask freerouting-bench --rescore <results folder>`
-  re-measures a finished run from its saved `board.dsn`, `board.ses` and
-  `results.json`, without Java, and rewrites its report. Use it after changing
-  a metric instead of routing again.
+  re-measures a finished run from its saved `board.dsn`, `board.ses`, score
+  files and `results.json`, without Java, KiCad or Konnect, and rewrites its
+  report. Use it after changing a metric or a threshold instead of routing
+  again. With `--score <spec.json>` it also scores the runs that have no board
+  score yet (KiCad and Konnect run; Java does not), which adds a board score to
+  an earlier bench. Results that were scored are not rewritten without their
+  scores: if the spec they name is gone, `--rescore` stops and says so.
 - **Output.** `summary.md` (per-board table and ranking) and `results.json`,
   plus each run's `stdout.log`, `stderr.log`, `board.ses` and Freerouting's own log.
   Everything stays under `target/`. Quote only counts in tracked docs.
