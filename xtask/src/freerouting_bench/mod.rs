@@ -49,7 +49,7 @@ const USAGE: &str =
        [--dsn-dir <dir> ...] [--java <java>] [--runs <n>] [--max-passes <n>]
        [--threads <n>] [--job-timeout-secs <s>] [--timeout-secs <s>] [--out <dir>]
        [--fr-arg <arg> ...] [--config <name>=<args> ...] [--score <spec.json>]
-       [--max-jobs <n>] [--resume]
+       [--max-jobs <n>] [--resume [--retry-failed]]
        cargo xtask freerouting-bench --rescore <results folder> [--score <spec.json>]
 
   --jar           a Freerouting JAR to benchmark; repeat for each version
@@ -72,8 +72,8 @@ const USAGE: &str =
   --config        NAME=ARGS: a named set of router settings, routed and ranked
                   on its own; repeat for each. ARGS are split at spaces and may
                   only be --router.<path>=<value> or the router's short flags
-                  (-mp -mt -is -us -hr -oit -inc, each with a value). A config
-                  that sets the passes or the optimizer threads replaces
+                  (-mp -mt -is -us -oit -inc, each with a value). A config
+                  that sets the passes or the router's threads replaces
                   --max-passes or --threads for its runs
   --score         judge every run on the real board against its existing
                   routing: refill and DRC with kicad-cli, the layout audit,
@@ -81,8 +81,12 @@ const USAGE: &str =
                   project folder, the baseline board and the tools (DEV.md)
   --max-jobs      refuse to start when this invocation's Freerouting runs, with
                   those already in --out's jobs.log, would exceed this many
-  --resume        add to the results already in --out: finished runs are kept
-                  and only the missing ones are routed
+  --resume        add to the results already in --out: saved runs are kept
+                  and only the missing ones are routed. A config or a DSN that
+                  is not the one its saved runs used is refused
+  --retry-failed  with --resume: a saved run that failed (no session, settings
+                  not in effect, not offline) and the runs after it are routed
+                  again; a config all of whose runs failed may change
   --rescore <dir> re-measure a finished run's folder from its saved DSN, SES,
                   score files and results.json, without Java, KiCad or
                   Konnect, and rewrite its report. With --score, runs that
@@ -110,6 +114,8 @@ pub struct Options {
     pub max_jobs: Option<u64>,
     /// Keep the finished runs already in `--out`.
     pub resume: bool,
+    /// With `resume`: route again the saved runs that failed.
+    pub retry_failed: bool,
     /// Re-measure a finished run's folder instead of routing.
     pub rescore: Option<PathBuf>,
 }
@@ -122,7 +128,7 @@ pub struct Config {
 }
 
 /// The router's short flags a config may carry, each followed by one value.
-const CONFIG_SHORT_FLAGS: [&str; 7] = ["-mp", "-mt", "-is", "-us", "-hr", "-oit", "-inc"];
+const CONFIG_SHORT_FLAGS: [&str; 6] = ["-mp", "-mt", "-is", "-us", "-oit", "-inc"];
 
 impl Config {
     /// `NAME=ARGS`. Only router settings are let through: `--router.<path>=<value>`
@@ -216,6 +222,7 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
         score: None,
         max_jobs: None,
         resume: false,
+        retry_failed: false,
         rescore: None,
     };
     let mut args = args.iter();
@@ -254,10 +261,14 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--score" => options.score = Some(value()?.into()),
             "--max-jobs" => options.max_jobs = Some(number(value()?, 1)?),
             "--resume" => options.resume = true,
+            "--retry-failed" => options.retry_failed = true,
             "--rescore" => options.rescore = Some(value()?.into()),
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option {other:?}\n{USAGE}")),
         }
+    }
+    if options.retry_failed && !options.resume {
+        return Err(format!("--retry-failed goes with --resume\n{USAGE}"));
     }
     if options.jars.is_empty() && options.rescore.is_none() {
         return Err(format!("at least one --jar is needed\n{USAGE}"));
@@ -298,8 +309,9 @@ const OFFLINE_JVM_ARGUMENTS: [&str; 5] = [
 
 /// The arguments for one batch run in `run_dir`, after `java`. The run reads
 /// `run_dir/board.dsn` and writes `run_dir/board.ses`. A config's settings
-/// come last, and a config that sets the passes or the optimizer's threads
-/// replaces the harness's own `-mp` or `-mt`, so no setting is given twice.
+/// come last, and a config that sets the passes or the router's threads
+/// replaces the harness's own `-mp` or `-mt` (2.5 reads `-mt` as
+/// `router.max_threads`), so no setting is given twice.
 pub fn freerouting_arguments(
     run_dir: &Path,
     jar: &Path,
@@ -328,7 +340,7 @@ pub fn freerouting_arguments(
     ]) {
         args.extend(["-mp".to_string(), options.max_passes.to_string()]);
     }
-    if !sets(&["-mt", "--router.optimizer.max_threads"]) {
+    if !sets(&["-mt", "--router.max_threads"]) {
         args.extend(["-mt".to_string(), options.threads.to_string()]);
     }
     args.extend([
@@ -344,18 +356,26 @@ pub fn freerouting_arguments(
     args
 }
 
-/// What is known about the settings one run really used.
+/// What is known about the settings one run really used, from Freerouting's
+/// own log. 2.3 and later write it under the run's home at debug level,
+/// whatever the console shows; the `freerouting.json` they save back holds no
+/// router settings, so it is no evidence.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SettingsEvidence {
     /// Freerouting's own complaints: a setting it could not apply, an
     /// argument or a property it does not know.
     pub failures: Vec<String>,
-    /// The router settings Freerouting saved to its `freerouting.json` when
-    /// the run ended, flattened (`optimizer.max_passes` → `100`).
-    pub saved: Vec<(String, String)>,
-    /// `--router.` settings given to the run whose saved value is another.
+    /// Every "Applied CLI router setting" line, as path (after `router.`)
+    /// and value.
+    pub applied: Vec<(String, String)>,
+    /// The routing parameters Freerouting printed for its routing: the via
+    /// costs and each layer's trace costs, after its own adjustments.
+    pub parameters: Vec<String>,
+    /// `--router.` settings given to the run that were applied with another
+    /// value, or that the log's list of applied settings leaves out.
     pub differing: Vec<String>,
-    /// `--router.` settings given to the run that the saved file does not hold.
+    /// `--router.` settings given to a run whose log lists no applied
+    /// settings at all (2.1), so they could not be checked.
     pub unconfirmed: Vec<String>,
 }
 
@@ -391,51 +411,56 @@ pub fn setting_failures(log: &str) -> Vec<String> {
     failures
 }
 
-/// The `router` object of a `freerouting.json`, flattened to dotted paths.
-/// Lists are joined with commas, as the command line takes them.
-pub fn saved_router_settings(settings: &Json) -> Vec<(String, String)> {
-    fn walk(value: &Json, path: &str, out: &mut Vec<(String, String)>) {
-        match value {
-            Json::Object(fields) => {
-                for (key, value) in fields {
-                    let path = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    walk(value, &path, out);
-                }
-            }
-            Json::Array(items) => {
-                let mut parts = Vec::new();
-                for (i, item) in items.iter().enumerate() {
-                    match item {
-                        Json::Object(_) | Json::Array(_) => {
-                            walk(item, &format!("{path}[{i}]"), out)
-                        }
-                        other => parts.push(scalar(other)),
-                    }
-                }
-                if !parts.is_empty() {
-                    out.push((path.to_string(), parts.join(",")));
-                }
-            }
-            other => out.push((path.to_string(), scalar(other))),
+/// The settings Freerouting says it applied from the command line, as
+/// (path after `router.`, value). A setting applied twice keeps its last value.
+pub fn applied_settings(log: &str) -> Vec<(String, String)> {
+    let mut applied: Vec<(String, String)> = Vec::new();
+    for line in log.lines() {
+        let Some((key, value)) = line
+            .split_once("Applied CLI router setting: ")
+            .and_then(|(_, rest)| rest.split_once(" = "))
+        else {
+            continue;
+        };
+        let key = key.trim();
+        let key = key.strip_prefix("router.").unwrap_or(key).to_string();
+        // `true (implicit from -de/-do batch mode)` is `true`.
+        let value = value.split(" (").next().unwrap_or(value).trim().to_string();
+        match applied.iter_mut().find(|(known, _)| *known == key) {
+            Some(entry) => entry.1 = value,
+            None => applied.push((key, value)),
         }
     }
-    fn scalar(value: &Json) -> String {
-        match value {
-            Json::Text(text) => text.clone(),
-            Json::Number(n) => format!("{n}"),
-            Json::Bool(b) => b.to_string(),
-            _ => "null".to_string(),
-        }
-    }
-    let mut out = Vec::new();
-    if let Some(router) = settings.at("router") {
-        walk(router, "", &mut out);
-    }
-    out
+    applied
+}
+
+/// The via and layer costs of the last "Routing Parameters" block in a log:
+/// what the router really used, after Freerouting's own board-specific changes.
+pub fn routing_parameters(log: &str) -> Vec<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| line.contains("=== Routing Parameters ==="))
+    else {
+        return Vec::new();
+    };
+    // The message is what follows the level: `<date> <time> DEBUG    Layer 1: …`.
+    let message = |line: &str| {
+        line.split_once("DEBUG")
+            .map_or(line, |(_, rest)| rest)
+            .trim()
+            .to_string()
+    };
+    lines[start + 1..]
+        .iter()
+        .map(|line| message(line))
+        .take_while(|text| {
+            text.starts_with("Via Costs")
+                || text.starts_with("Layer Costs")
+                || text.starts_with("Layer ")
+        })
+        .filter(|text| !text.starts_with("Layer Costs"))
+        .collect()
 }
 
 /// The `--router.<path>=<value>` settings among a run's arguments.
@@ -456,48 +481,49 @@ fn same_setting(a: &str, b: &str) -> bool {
     }
 }
 
-/// Judge a run's settings: what Freerouting complained about in `log`, and
-/// each `--router.` setting in `args` against what it saved in `settings`
-/// (its `freerouting.json` after the run).
-pub fn settings_evidence(args: &[String], log: &str, settings: Option<&Json>) -> SettingsEvidence {
-    let saved = settings.map(saved_router_settings).unwrap_or_default();
+/// Judge a run's settings from its `log`: what Freerouting complained about,
+/// and each `--router.` setting in `args` against the settings it says it
+/// applied. A log that lists applied settings and leaves a given one out
+/// means it was not applied; a log that lists none proves nothing either way.
+pub fn settings_evidence(args: &[String], log: &str) -> SettingsEvidence {
     let mut evidence = SettingsEvidence {
         failures: setting_failures(log),
+        applied: applied_settings(log),
+        parameters: routing_parameters(log),
         ..SettingsEvidence::default()
     };
     for (path, value) in router_arguments(args) {
-        // The job budget is the harness's own and is not a quality lever.
-        if path == "job_timeout" {
-            continue;
-        }
-        match saved.iter().find(|(saved_path, _)| *saved_path == path) {
-            Some((_, kept)) if same_setting(kept, &value) => {}
-            Some((_, kept)) => evidence
+        match evidence
+            .applied
+            .iter()
+            .find(|(applied, _)| *applied == path)
+        {
+            Some((_, used)) if same_setting(used, &value) => {}
+            Some((_, used)) => evidence
                 .differing
-                .push(format!("router.{path} is {kept}, not {value}")),
-            None => evidence.unconfirmed.push(format!("router.{path}={value}")),
+                .push(format!("router.{path} was applied as {used}, not {value}")),
+            None if evidence.applied.is_empty() => {
+                evidence.unconfirmed.push(format!("router.{path}={value}"))
+            }
+            None => evidence.differing.push(format!(
+                "router.{path}={value} is not among the settings Freerouting says it applied"
+            )),
         }
     }
-    evidence.saved = saved;
     evidence
 }
 
-/// The settings evidence of the run in `run_dir`, read from what it left
-/// there: its output, Freerouting's log and the `freerouting.json` it saved.
-fn settings_of_run(run_dir: &Path, args: &[String]) -> SettingsEvidence {
+/// Everything the run in `run_dir` printed and logged.
+fn run_output(run_dir: &Path) -> String {
     let mut log = std::fs::read_to_string(run_dir.join("stdout.log")).unwrap_or_default();
     log.push_str(&std::fs::read_to_string(run_dir.join("stderr.log")).unwrap_or_default());
     log.push_str(&logs_below(run_dir));
-    // The file the run wrote back, not one that still holds only the seed.
-    let settings = SETTINGS_PLACES
-        .iter()
-        .filter_map(|place| {
-            std::fs::read_to_string(run_dir.join(place).join("freerouting.json")).ok()
-        })
-        .filter_map(|text| parse::parse_json_prefix(&text).map(|(json, _)| json))
-        .find(|json| json.at("router").is_some());
-    settings_evidence(args, &log, settings.as_ref())
+    log
 }
+
+/// Freerouting logs this when its version check got an answer from GitHub:
+/// the run was not offline.
+const NETWORK_REPLY: &str = "GitHub release check response";
 
 /// `00:01:30` for 90 seconds, the form `router.job_timeout` takes.
 pub fn hh_mm_ss(duration: Duration) -> String {
@@ -635,6 +661,49 @@ pub fn entries(jars: &[PathBuf], configs: &[Config]) -> Vec<Entry> {
     entries
 }
 
+/// Why this entry and DSN may not add runs to `saved`, if they may not: the
+/// saved runs were routed with other settings, or from another DSN of the
+/// same name. Mixing them would make one candidate out of two. An entry with
+/// no run left (every one failed and was dropped) may start over.
+pub fn resume_conflict(
+    saved: &BoardResult,
+    entry: &Entry,
+    fr_args: &[String],
+    dsn_text: &str,
+    saved_dsn: Option<&str>,
+) -> Option<String> {
+    if saved.runs.is_empty() {
+        return None;
+    }
+    let args = entry.config.as_ref().map_or(&[][..], |c| &c.args[..]);
+    if saved.config_args != args || saved.fr_args != fr_args {
+        return Some(format!(
+            "{} on {} has saved runs with other settings: give the changed config another name, or another --out (with --retry-failed a config may change once all its runs failed)",
+            saved.dir, saved.board
+        ));
+    }
+    if saved_dsn.is_some_and(|saved_dsn| saved_dsn != dsn_text) {
+        return Some(format!(
+            "{}.dsn is not the DSN the saved runs of {} used: give the changed DSN another name, or another --out",
+            saved.board, saved.dir
+        ));
+    }
+    None
+}
+
+/// Drop a saved entry's first failed run and every run after it, so they are
+/// routed again in order. Returns how many were dropped.
+pub fn drop_failed_runs(saved: &mut BoardResult) -> usize {
+    let keep = saved
+        .runs
+        .iter()
+        .position(|run| !run.succeeded())
+        .unwrap_or(saved.runs.len());
+    let dropped = saved.runs.len() - keep;
+    saved.runs.truncate(keep);
+    dropped
+}
+
 /// The Freerouting starts recorded in `out/jobs.log`, one line each.
 fn jobs_started(out: &Path) -> u64 {
     std::fs::read_to_string(out.join("jobs.log"))
@@ -693,6 +762,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             out.display()
         ));
     }
+    if let (true, None, Some(spec)) = (has_results, &options.score, saved_score_spec(&out)) {
+        return Err(format!(
+            "the results in {} were scored on the board: pass --score {} to add to them",
+            out.display(),
+            spec.display()
+        ));
+    }
     let java_version = java_version(&java);
     let jars = options
         .jars
@@ -734,6 +810,40 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default()
     };
+    // Saved runs are only added to by the same settings on the same DSN.
+    for entry in &entries {
+        for dsn in &boards {
+            let board = board_name(dsn);
+            let Some(saved) = results
+                .iter_mut()
+                .find(|r| r.dir == entry.label && r.board == board)
+            else {
+                continue;
+            };
+            if options.retry_failed {
+                let dropped = drop_failed_runs(saved);
+                if dropped > 0 {
+                    eprintln!(
+                        "  {} {board}: {dropped} failed run(s) will be routed again",
+                        entry.label
+                    );
+                }
+            }
+            let saved_dsn =
+                std::fs::read_to_string(out.join(&entry.label).join(&board).join("run1/board.dsn"))
+                    .ok();
+            let dsn_text = std::fs::read_to_string(dsn).unwrap_or_default();
+            if let Some(conflict) = resume_conflict(
+                saved,
+                entry,
+                &options.extra_args,
+                &dsn_text,
+                saved_dsn.as_deref(),
+            ) {
+                return Err(conflict);
+            }
+        }
+    }
     let done = |results: &[BoardResult], label: &str, board: &str| {
         results
             .iter()
@@ -773,26 +883,33 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let board = board_name(dsn);
             let dsn_text = std::fs::read_to_string(dsn).unwrap_or_default();
             let dsn_board = quality::DsnBoard::parse(&dsn_text);
+            let fresh = || BoardResult {
+                board: board.clone(),
+                dir: label.clone(),
+                version: file_version
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                jar: entry.jar.clone(),
+                config: entry.config.as_ref().map(|c| c.name.clone()),
+                config_args: entry.config.as_ref().map_or(Vec::new(), |c| c.args.clone()),
+                fr_args: options.extra_args.clone(),
+                dsn_connections: dsn_connection_count(&dsn_text),
+                components: dsn_board.as_ref().ok().map(|b| b.components),
+                signal_layers: dsn_board.as_ref().ok().map(|b| b.signal_layers),
+                runs: Vec::new(),
+            };
             let slot = match results
                 .iter()
                 .position(|r| &r.dir == label && r.board == board)
             {
+                // A saved entry with no run left starts over as this one.
+                Some(slot) if results[slot].runs.is_empty() => {
+                    results[slot] = fresh();
+                    slot
+                }
                 Some(slot) => slot,
                 None => {
-                    results.push(BoardResult {
-                        board: board.clone(),
-                        dir: label.clone(),
-                        version: file_version
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        jar: entry.jar.clone(),
-                        config: entry.config.as_ref().map(|c| c.name.clone()),
-                        config_args: entry.config.as_ref().map_or(Vec::new(), |c| c.args.clone()),
-                        dsn_connections: dsn_connection_count(&dsn_text),
-                        components: dsn_board.as_ref().ok().map(|b| b.components),
-                        signal_layers: dsn_board.as_ref().ok().map(|b| b.signal_layers),
-                        runs: Vec::new(),
-                    });
+                    results.push(fresh());
                     results.len() - 1
                 }
             };
@@ -853,8 +970,15 @@ fn save(
 ) -> Result<String, String> {
     let summary = report::render_markdown(results, options, java, context);
     let json = report::to_json(&report::results_json(results, options, java, context));
-    std::fs::write(out.join("results.json"), json).map_err(|e| e.to_string())?;
-    std::fs::write(out.join("summary.md"), &summary).map_err(|e| e.to_string())?;
+    // Written beside and moved into place: a bench stopped in the middle of a
+    // write must not leave half a results.json, which holds what no file in
+    // the run folders does (exit, runtime, Freerouting's own counts).
+    for (name, text) in [("results.json", &json), ("summary.md", &summary)] {
+        let partial = out.join(format!("{name}.partial"));
+        std::fs::write(&partial, text)
+            .and_then(|()| std::fs::rename(&partial, out.join(name)))
+            .map_err(|e| format!("cannot write {}: {e}", out.join(name).display()))?;
+    }
     Ok(summary)
 }
 
@@ -1032,7 +1156,7 @@ fn run_once(
         }
         Err(_) => {}
     }
-    apply_settings_evidence(&mut record, settings_of_run(dir, &arguments));
+    apply_run_evidence(&mut record, dir, &arguments);
     record
 }
 
@@ -1070,6 +1194,19 @@ fn stop_leftover_run(dir: &Path) {
     let waited = Instant::now();
     while ours(&command_line()) && waited.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Attach what the run in `run_dir` left as evidence: its settings, judged
+/// against the arguments it was given, and whether it stayed offline.
+fn apply_run_evidence(record: &mut RunRecord, run_dir: &Path, args: &[String]) {
+    let output = run_output(run_dir);
+    apply_settings_evidence(record, settings_evidence(args, &output));
+    if output.contains(NETWORK_REPLY) {
+        record.reached_network = true;
+        record.error.get_or_insert(
+            "the run was not offline: Freerouting's version check got an answer".to_string(),
+        );
     }
 }
 
@@ -1177,7 +1314,6 @@ fn load_saved(dir: &Path, context: Option<&ScoreContext>) -> Result<Saved, Strin
     options.threads = whole("threads").unwrap_or(1) as u32;
     options.job_timeout = Duration::from_secs(whole("job_timeout_s").unwrap_or(60));
     options.timeout = Duration::from_secs(whole("timeout_s").unwrap_or(600));
-    options.extra_args = texts_of(&saved, "fr_args");
     options.score = text_of(&saved, "score_spec").map(PathBuf::from);
     let flag = |value: &Json, key: &str| matches!(value.at(key), Some(Json::Bool(true)));
     let java = text_of(&saved, "java");
@@ -1194,11 +1330,12 @@ fn load_saved(dir: &Path, context: Option<&ScoreContext>) -> Result<Saved, Strin
         let label = text_of(saved_board, "dir").unwrap_or_else(|| jar_label(&jar));
         let config = text_of(saved_board, "config");
         let config_args = texts_of(saved_board, "config_args");
+        let fr_args = texts_of(saved_board, "fr_args");
         let Some(Json::Array(saved_runs)) = saved_board.at("runs") else {
             continue;
         };
         // The settings each run was given, for its evidence.
-        let mut passed = options.extra_args.clone();
+        let mut passed = fr_args.clone();
         passed.extend(config_args.iter().cloned());
         let mut dsn_board = None;
         let mut runs = Vec::new();
@@ -1224,10 +1361,12 @@ fn load_saved(dir: &Path, context: Option<&ScoreContext>) -> Result<Saved, Strin
                 connections: count("connections"),
                 stats_vias: count("stats_vias"),
                 clearance_violations: count("clearance_violations"),
-                // An error from reading the SES or the settings is redone;
-                // any other stays.
+                // An error from reading the SES, the settings or the log is
+                // redone; any other stays.
                 error: text_of(saved_run, "error").filter(|e| {
-                    !e.starts_with("unreadable SES") && !e.starts_with("settings not in effect")
+                    !e.starts_with("unreadable SES")
+                        && !e.starts_with("settings not in effect")
+                        && !e.starts_with("the run was not offline")
                 }),
                 ..RunRecord::default()
             };
@@ -1235,7 +1374,7 @@ fn load_saved(dir: &Path, context: Option<&ScoreContext>) -> Result<Saved, Strin
                 read_ses(&mut record, &ses, dsn_board.as_ref());
             }
             if run_dir.join("stdout.log").is_file() {
-                apply_settings_evidence(&mut record, settings_of_run(&run_dir, &passed));
+                apply_run_evidence(&mut record, &run_dir, &passed);
             }
             let score_dir = run_dir.join("score");
             match context {
@@ -1259,6 +1398,7 @@ fn load_saved(dir: &Path, context: Option<&ScoreContext>) -> Result<Saved, Strin
             jar,
             config,
             config_args,
+            fr_args,
             dsn_connections: saved_board.number_at("dsn_connections").map(|n| n as usize),
             components: dsn_board.as_ref().map(|b| b.components),
             signal_layers: dsn_board.as_ref().map(|b| b.signal_layers),
@@ -1306,6 +1446,10 @@ fn score_missing(results: &mut [BoardResult], context: &ScoreContext, out: &Path
 /// now; without it, the saved score files are only read again.
 pub fn rescore(dir: &Path, score: Option<&Path>) -> Result<(), String> {
     let root = crate::repo_root();
+    // Absolute, because the scoring tools run with a run's folder as theirs.
+    let dir = &dir
+        .canonicalize()
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     let context = match (score, saved_score_spec(dir)) {
         (Some(spec), _) => {
             let context = ScoreContext::prepare(spec, &root, dir, true)?;
@@ -1314,13 +1458,14 @@ pub fn rescore(dir: &Path, score: Option<&Path>) -> Result<(), String> {
             }
             Some(context)
         }
-        (None, Some(spec)) => match ScoreContext::reload(&spec, &root, dir) {
-            Ok(context) => Some(context),
-            Err(error) => {
-                eprintln!("board scores are left out: {error}");
-                None
-            }
-        },
+        // Rewriting the report without the scores it had would drop them
+        // from results.json for good, so that is refused, not done quietly.
+        (None, Some(spec)) => Some(ScoreContext::reload(&spec, &root, dir).map_err(|error| {
+            format!(
+                "these results were scored on the board, and the scores cannot be read again: {error}. Restore {} or pass --score <spec.json>",
+                spec.display()
+            )
+        })?),
         (None, None) => None,
     };
     let mut saved = load_saved(dir, context.as_ref())?;
@@ -1590,9 +1735,11 @@ mod tests {
             );
             assert!(has(&line, "-mt"), "{passes}");
         }
-        // Likewise the optimizer's threads.
-        let threads = line("S=--router.optimizer.max_threads=14");
+        // Likewise the router's threads, which is what 2.5 reads -mt as. The
+        // optimizer's threads are another setting and leave -mt in place.
+        let threads = line("S=--router.max_threads=1");
         assert!(!has(&threads, "-mt") && has(&threads, "-mp"));
+        assert!(has(&line("S=--router.optimizer.max_threads=14"), "-mt"));
         // A setting that only starts like one of those does not count.
         assert!(has(
             &line("S=--router.autorouter.max_passes_extra=1"),
@@ -1674,7 +1821,7 @@ mod tests {
                 .is_empty()
         );
         let mut record = RunRecord::default();
-        apply_settings_evidence(&mut record, settings_evidence(&[], log, None));
+        apply_settings_evidence(&mut record, settings_evidence(&[], log));
         assert!(record
             .error
             .as_deref()
@@ -1686,63 +1833,239 @@ mod tests {
             error: Some("no SES written".into()),
             ..RunRecord::default()
         };
-        apply_settings_evidence(&mut failed, settings_evidence(&[], log, None));
+        apply_settings_evidence(&mut failed, settings_evidence(&[], log));
         assert_eq!(failed.error.as_deref(), Some("no SES written"));
         assert_eq!(failed.settings.unwrap().failures.len(), 2);
         // Clean output and no settings: nothing to complain about.
         let mut clean = RunRecord::default();
-        apply_settings_evidence(&mut clean, settings_evidence(&[], "INFO fine", None));
+        apply_settings_evidence(&mut clean, settings_evidence(&[], "INFO fine"));
         assert_eq!(clean.error, None);
     }
 
+    /// The lines of a real 2.5.0 file log (2026-11-08), which holds debug
+    /// lines whatever the console level is.
+    const APPLIED_LOG: &str = "\
+2026-11-08 18:22:28.653 WARN   Deprecated settings path '-mp / --router.max_passes'; use '--router.autorouter.max_passes' instead.
+2026-11-08 18:22:29.735 DEBUG  Applied CLI router setting: router.max_passes = 100
+2026-11-08 18:22:29.735 DEBUG  Applied CLI router setting: router.max_threads = 1
+2026-11-08 18:22:29.735 DEBUG  Applied CLI router setting: router.job_timeout = 00:02:00
+2026-11-08 18:22:29.735 DEBUG  Applied CLI router setting: router.neck_width_um = 200
+2026-11-08 18:22:29.735 DEBUG  Applied CLI router setting: router.automatic_neckdown = false
+2026-11-08 18:22:29.735 DEBUG  Applied CLI router setting: router.autorouter.enabled = true (implicit from -de/-do batch mode)
+2026-11-08 18:22:30.100 DEBUG  === Performance Profile ===
+2026-11-08 18:22:30.100 DEBUG  === Routing Parameters ===
+2026-11-08 18:22:30.100 DEBUG    Via Costs: 50, Plane Via Costs: 5
+2026-11-08 18:22:30.100 DEBUG    Layer Costs (Preferred / Against):
+2026-11-08 18:22:30.100 DEBUG      Layer 1: 1.0 / 2.2
+2026-11-08 18:22:30.100 DEBUG      Layer 2: 1.0 / 1.8
+2026-11-08 18:22:30.100 DEBUG  
+2026-11-08 18:22:30.100 DEBUG    autoroute_item                          :        4 ms total,        2 calls,      2 ms avg
+";
+
     #[test]
-    fn given_settings_are_checked_against_what_freerouting_saved() {
-        let (saved, _) = parse::parse_json_prefix(
-            r#"{"profile":{"allow_telemetry":false},
-                "router":{"neck_width_um":200.0,"automatic_neckdown":false,"job_timeout":"12:00:00",
-                          "autorouter":{"max_passes":20,"ignore_net_classes":["a","b"]},
-                          "optimizer":{"improvement_threshold":0.25},
-                          "layers":[{"bend_cost":2.0},{"bend_cost":0.0}]}}"#,
-        )
-        .unwrap();
-        let flat = saved_router_settings(&saved);
+    fn given_settings_are_checked_against_what_freerouting_says_it_applied() {
+        let applied = applied_settings(APPLIED_LOG);
         let get = |path: &str| {
-            flat.iter()
+            applied
+                .iter()
                 .find(|(p, _)| p == path)
                 .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get("neck_width_um"), Some("200"));
-        assert_eq!(get("autorouter.ignore_net_classes"), Some("a,b"));
-        assert_eq!(get("layers[0].bend_cost"), Some("2"));
-        assert_eq!(get("profile.allow_telemetry"), None);
+        assert_eq!(get("max_passes"), Some("100"));
+        assert_eq!(get("job_timeout"), Some("00:02:00"));
+        // The note after an implicit setting is not part of its value.
+        assert_eq!(get("autorouter.enabled"), Some("true"));
+        assert_eq!(applied.len(), 6);
+        // A setting applied twice keeps its last value.
+        let twice =
+            format!("{APPLIED_LOG}x DEBUG  Applied CLI router setting: router.max_threads = 4\n");
+        assert_eq!(applied_settings(&twice).len(), 6);
+        assert!(applied_settings(&twice).contains(&("max_threads".to_string(), "4".to_string())));
+
         let given = args(&[
             "-mp",
-            "20",
-            "--router.neck_width_um=200",
+            "100",
+            "--router.neck_width_um=200.0",
             "--router.automatic_neckdown=FALSE",
-            "--router.autorouter.max_passes=25",
-            "--router.optimizer.improvement_threshold=0.25",
+            "--router.max_threads=4",
             "--router.scoring.via_costs=25",
-            "--router.job_timeout=00:10:00",
+            "--router.job_timeout=00:02:00",
             "--gui.enabled=false",
         ]);
-        let evidence = settings_evidence(&given, "", Some(&saved));
-        // 200 and 200.0 are one value, and so are false and FALSE.
+        let evidence = settings_evidence(&given, APPLIED_LOG);
+        // 200 and 200.0 are one value, and so are false and FALSE. A setting
+        // applied with another value, and one the list leaves out although
+        // the log does list applied settings, were not in effect as given.
         assert_eq!(
             evidence.differing,
-            ["router.autorouter.max_passes is 20, not 25"]
+            [
+                "router.max_threads was applied as 1, not 4",
+                "router.scoring.via_costs=25 is not among the settings Freerouting says it applied"
+            ]
         );
-        // Not saved is not confirmed, and it is said so, not passed over.
-        assert_eq!(evidence.unconfirmed, ["router.scoring.via_costs=25"]);
-        assert!(evidence
-            .problem()
-            .unwrap()
-            .contains("max_passes is 20, not 25"));
-        // With nothing saved, nothing is confirmed and nothing is called wrong.
-        let blind = settings_evidence(&given, "", None);
+        assert!(evidence.unconfirmed.is_empty());
+        assert!(evidence.problem().unwrap().contains("applied as 1, not 4"));
+        // All given settings applied as given: nothing to report.
+        let fine = settings_evidence(
+            &args(&[
+                "--router.neck_width_um=200",
+                "--router.job_timeout=00:02:00",
+            ]),
+            APPLIED_LOG,
+        );
+        assert_eq!((fine.problem(), fine.unconfirmed.len()), (None, 0));
+        // A log that lists no applied settings (2.1) proves nothing: the
+        // given settings are unconfirmed, and that is said, not passed over.
+        let blind = settings_evidence(&given, "INFO   Freerouting v2.1.0");
         assert!(blind.differing.is_empty());
         assert_eq!(blind.unconfirmed.len(), 5);
         assert_eq!(blind.problem(), None);
+    }
+
+    #[test]
+    fn the_routing_parameters_freerouting_used_are_kept() {
+        assert_eq!(
+            routing_parameters(APPLIED_LOG),
+            [
+                "Via Costs: 50, Plane Via Costs: 5",
+                "Layer 1: 1.0 / 2.2",
+                "Layer 2: 1.0 / 1.8"
+            ]
+        );
+        // The last block is the one that routed.
+        let later = format!(
+            "{APPLIED_LOG}x DEBUG  === Routing Parameters ===\nx DEBUG    Via Costs: 25, Plane Via Costs: 5\nx DEBUG  \n"
+        );
+        assert_eq!(
+            routing_parameters(&later),
+            ["Via Costs: 25, Plane Via Costs: 5"]
+        );
+        assert!(routing_parameters("INFO   nothing of the kind").is_empty());
+        assert_eq!(settings_evidence(&[], APPLIED_LOG).parameters.len(), 3);
+    }
+
+    #[test]
+    fn a_run_whose_version_check_was_answered_is_not_offline() {
+        let dir = std::env::temp_dir().join(format!("konnect-bench-net-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home/Library/Logs/freerouting")).unwrap();
+        std::fs::write(dir.join("stdout.log"), "INFO   Freerouting v2.5.0\n").unwrap();
+        let log = dir.join("home/Library/Logs/freerouting/freerouting.log");
+        std::fs::write(
+            &log,
+            "2026-11-10 10:00:01.000 DEBUG  Version check skipped or timed out: java.net.ConnectException\n",
+        )
+        .unwrap();
+        let mut offline = RunRecord::default();
+        apply_run_evidence(&mut offline, &dir, &[]);
+        assert!(!offline.reached_network && offline.error.is_none());
+        std::fs::write(
+            &log,
+            "2026-11-08 18:22:30.050 DEBUG  GitHub release check response: API rate limit exceeded\n",
+        )
+        .unwrap();
+        let mut online = RunRecord::default();
+        apply_run_evidence(&mut online, &dir, &[]);
+        assert!(online.reached_network);
+        assert!(online.error.unwrap().starts_with("the run was not offline"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn saved_entry(config: &str, runs: Vec<RunRecord>) -> (BoardResult, Entry) {
+        let config = Config::parse(config).unwrap();
+        let entry = Entry {
+            jar: PathBuf::from("/a/freerouting-2.5.0.jar"),
+            label: format!("{}@2.5.0", config.name),
+            config: Some(config.clone()),
+        };
+        let saved = BoardResult {
+            board: "V0".into(),
+            dir: entry.label.clone(),
+            version: "2.5.0".into(),
+            jar: entry.jar.clone(),
+            config: Some(config.name.clone()),
+            config_args: config.args.clone(),
+            fr_args: Vec::new(),
+            dsn_connections: None,
+            components: None,
+            signal_layers: None,
+            runs,
+        };
+        (saved, entry)
+    }
+
+    fn good_run() -> RunRecord {
+        RunRecord {
+            unrouted: Some(0),
+            ses: Some(
+                parse::summarize_ses("(session s (routes (resolution um 10) (network_out)))")
+                    .unwrap(),
+            ),
+            ..RunRecord::default()
+        }
+    }
+
+    fn failed_run() -> RunRecord {
+        RunRecord {
+            error: Some("settings not in effect: x".into()),
+            ..RunRecord::default()
+        }
+    }
+
+    #[test]
+    fn saved_runs_are_only_added_to_by_the_same_settings_on_the_same_dsn() {
+        let (saved, entry) = saved_entry("S0=--router.neck_width_um=200", vec![good_run()]);
+        let none: [String; 0] = [];
+        assert_eq!(
+            resume_conflict(&saved, &entry, &none, "(pcb a)", Some("(pcb a)")),
+            None
+        );
+        // A run folder that is gone cannot contradict the DSN.
+        assert_eq!(
+            resume_conflict(&saved, &entry, &none, "(pcb a)", None),
+            None
+        );
+        // The same name with other settings would make one candidate of two.
+        let (_, changed) = saved_entry("S0=--router.neck_width_um=349", vec![]);
+        let error = resume_conflict(&saved, &changed, &none, "(pcb a)", Some("(pcb a)")).unwrap();
+        assert!(
+            error.contains("S0@2.5.0 on V0 has saved runs with other settings"),
+            "{error}"
+        );
+        // So would other --fr-arg values.
+        let extra = args(&["--router.fanout.enabled=false"]);
+        assert!(resume_conflict(&saved, &entry, &extra, "(pcb a)", Some("(pcb a)")).is_some());
+        // And another DSN under the same name.
+        let error = resume_conflict(&saved, &entry, &none, "(pcb b)", Some("(pcb a)")).unwrap();
+        assert!(error.contains("V0.dsn is not the DSN"), "{error}");
+        // An entry with no run left may start over with anything.
+        let (empty, _) = saved_entry("S0=--router.neck_width_um=200", vec![]);
+        assert_eq!(
+            resume_conflict(&empty, &changed, &none, "(pcb b)", Some("(pcb a)")),
+            None
+        );
+    }
+
+    #[test]
+    fn retrying_drops_the_first_failed_run_and_those_after_it() {
+        let (mut saved, _) = saved_entry("S0=", vec![good_run(), failed_run(), good_run()]);
+        assert_eq!(drop_failed_runs(&mut saved), 2);
+        assert_eq!(saved.runs.len(), 1);
+        assert!(saved.runs[0].succeeded());
+        // Nothing failed, nothing dropped.
+        assert_eq!(drop_failed_runs(&mut saved), 0);
+        let (mut all_failed, _) = saved_entry("S0=", vec![failed_run()]);
+        assert_eq!(drop_failed_runs(&mut all_failed), 1);
+        assert!(all_failed.runs.is_empty());
+        // It only goes with --resume.
+        assert!(parse_options(&args(&["--jar", "a", "--retry-failed"]))
+            .unwrap_err()
+            .contains("goes with --resume"));
+        assert!(
+            parse_options(&args(&["--jar", "a", "--resume", "--retry-failed"]))
+                .unwrap()
+                .retry_failed
+        );
     }
 
     /// A bench that is killed leaves its Freerouting running. A resumed run
@@ -1764,18 +2087,25 @@ mod tests {
             }
             false
         };
-        // A process whose command line names this run folder, as the JVM's does.
+        // A process whose command line names this run folder, as the JVM's
+        // does. The shell waits on its own `read`, so it starts no child that
+        // would outlive it.
         let mut leftover = Command::new("/bin/sh")
-            .args(["-c", "sleep 60; :", "leftover"])
+            .args(["-c", "read line", "leftover"])
             .arg(format!("-Duser.home={}", dir.join("home").display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         std::fs::write(dir.join(RUN_PID_FILE), leftover.id().to_string()).unwrap();
         stop_leftover_run(&dir);
         assert!(gone(&mut leftover), "the leftover process is still running");
         // A process id that now belongs to something else is left alone.
-        let mut stranger = Command::new("/bin/sh")
-            .args(["-c", "sleep 60"])
+        let mut stranger = Command::new("/bin/sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         std::fs::write(dir.join(RUN_PID_FILE), stranger.id().to_string()).unwrap();
@@ -1787,6 +2117,9 @@ mod tests {
         );
         let _ = stranger.kill();
         let _ = stranger.wait();
+        // Whatever the outcome above, nothing is left running.
+        let _ = leftover.kill();
+        let _ = leftover.wait();
         // No note, nothing to stop.
         std::fs::remove_file(dir.join(RUN_PID_FILE)).unwrap();
         stop_leftover_run(&dir);
@@ -2074,6 +2407,20 @@ mod tests {
             runs[0].text_at("compared.against_baseline"),
             Some("matches")
         );
+        // Both files were written beside and moved into place.
+        assert!(!out.join("results.json.partial").exists());
+        assert!(!out.join("summary.md.partial").exists());
+        // Results that were scored are not rewritten without their scores:
+        // with the spec gone, rescoring stops, and results.json stays.
+        let before = std::fs::read_to_string(out.join("results.json")).unwrap();
+        std::fs::rename(&spec, root.join("moved.json")).unwrap();
+        let error = rescore(&out, None).unwrap_err();
+        assert!(error.contains("the scores cannot be read again"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("results.json")).unwrap(),
+            before
+        );
+        std::fs::rename(root.join("moved.json"), &spec).unwrap();
         // The run left no session file here, so it stays a failed run and is
         // not chosen, however its saved score reads.
         let summary = std::fs::read_to_string(out.join("summary.md")).unwrap();

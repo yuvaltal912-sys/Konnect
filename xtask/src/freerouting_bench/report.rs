@@ -43,6 +43,8 @@ pub struct RunRecord {
     pub error: Option<String>,
     /// What is known about the settings the run really used.
     pub settings: Option<SettingsEvidence>,
+    /// Freerouting's version check got an answer: the run was not offline.
+    pub reached_network: bool,
     /// The run measured on the real board (`--score`).
     pub board_score: Option<BoardScore>,
     /// That score against the baseline's.
@@ -150,6 +152,8 @@ pub struct BoardResult {
     /// The `--config` these runs used, by name, and its arguments.
     pub config: Option<String>,
     pub config_args: Vec<String>,
+    /// The `--fr-arg`s these runs were given.
+    pub fr_args: Vec<String>,
     pub dsn_connections: Option<usize>,
     pub components: Option<usize>,
     pub signal_layers: Option<usize>,
@@ -802,7 +806,7 @@ fn render_board_scores(results: &[BoardResult], context: &ScoreContext) -> Strin
         })
         .collect();
     if !unsure.is_empty() {
-        out.push_str("\n### Settings Freerouting did not save back\n\nGiven on the command line and not refused, but absent from the `freerouting.json` the run wrote, so not confirmed.\n\n");
+        out.push_str("\n### Settings that could not be checked\n\nGiven on the command line and not refused, but the run's log lists no applied settings at all, so they are not confirmed.\n\n");
         out.push_str(&unsure.concat());
     }
     out
@@ -829,7 +833,7 @@ pub fn render_markdown(
     let mut out = String::new();
     out.push_str("# Freerouting benchmark\n\n");
     out.push_str(&format!(
-        "Java {}, {} runs per board, -mp {}, -mt {}, job budget {} s, hard limit {} s.\n\n\
+        "Java {}, {} runs per board, -mp {}, -mt {}, job budget {} s, hard limit {} s{}.\n\n\
          **Gate:** every run wrote a readable SES with 0 unrouted connections (Freerouting's own count) and 0 clearance violations, within the job budget. Only boards that pass are measured for quality.\n\n\
          **Quality** (first run): wire/bound is the wiring of the routed nets (leaving out nets that also have a pour or plane, or wiring already in the DSN) over half the perimeter of their pins' convex hull, a lower bound no wiring at any angle beats (1.00 is the unreachable ideal). wire/HPWL is the same wiring over the half-perimeter of the pins' bounding box, the usual reference; it is a bound only for 90° routing, so 45° wiring can go below 1.00. Vias/net is over nets with wiring. Layer changes are vias where wires on two layers meet. Corners are counted away from pads and vias: acute (under 89.5°, acid traps) and right (90 ± 0.5°). Tracks are unique segments; narrow ones are below their net class's width. Runtime is wall clock per run with JVM start (median). Same routing: every run laid the same segments and vias in any order.\n\n",
         java.unwrap_or("unknown"),
@@ -837,7 +841,12 @@ pub fn render_markdown(
         options.max_passes,
         options.threads,
         options.job_timeout.as_secs(),
-        options.timeout.as_secs()
+        options.timeout.as_secs(),
+        if results.iter().any(|r| r.config.is_some()) {
+            " (the last invocation's; a config that sets the passes or the threads replaces -mp or -mt for its runs, see config_args in results.json)"
+        } else {
+            ""
+        }
     ));
     out.push_str("| board | parts | layers | version | gate | wire/bound | wire/HPWL | wire mm | vias | vias/net | layer changes | acute | 90° | tracks | narrow | runtime s | same routing |\n");
     out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
@@ -950,15 +959,16 @@ fn settings_json(settings: &SettingsEvidence) -> Json {
         ("differing".into(), texts(&settings.differing)),
         ("unconfirmed".into(), texts(&settings.unconfirmed)),
         (
-            "saved".into(),
+            "applied".into(),
             Json::Object(
                 settings
-                    .saved
+                    .applied
                     .iter()
                     .map(|(path, value)| (path.clone(), Json::Text(value.clone())))
                     .collect(),
             ),
         ),
+        ("routing_parameters".into(), texts(&settings.parameters)),
     ])
 }
 
@@ -1117,6 +1127,7 @@ pub fn results_json(
                             "analytics_disabled".into(),
                             Json::Bool(run.analytics_disabled),
                         ),
+                        ("reached_network".into(), Json::Bool(run.reached_network)),
                         (
                             "unrouted".into(),
                             optional(run.unrouted, |n| number(n as f64)),
@@ -1232,7 +1243,6 @@ pub fn results_json(
             number(options.job_timeout.as_secs() as f64),
         ),
         ("timeout_s".into(), number(options.timeout.as_secs() as f64)),
-        ("fr_args".into(), texts(&options.extra_args)),
         (
             "score_spec".into(),
             optional(
@@ -1254,6 +1264,7 @@ pub fn results_json(
                             ("jar".into(), Json::Text(r.jar.display().to_string())),
                             ("config".into(), optional(r.config.clone(), Json::Text)),
                             ("config_args".into(), texts(&r.config_args)),
+                            ("fr_args".into(), texts(&r.fr_args)),
                             ("components".into(), optional(r.components, count)),
                             ("signal_layers".into(), optional(r.signal_layers, count)),
                             ("dsn_connections".into(), optional(r.dsn_connections, count)),
@@ -1406,6 +1417,7 @@ mod tests {
             jar: PathBuf::from(format!("/j/freerouting-{version}.jar")),
             config: None,
             config_args: Vec::new(),
+            fr_args: Vec::new(),
             dsn_connections: Some(10),
             components: Some(40),
             signal_layers: Some(2),

@@ -534,22 +534,31 @@ cargo xtask freerouting-bench \
 - **Settings sweep.** `--config NAME=ARGS` (repeatable) routes and ranks named
   router settings, not only JARs. Each config with each JAR is a row of its own,
   in the folder `<NAME>@<jar label>`. ARGS are split at spaces and may only be
-  `--router.<path>=<value>` or the router's short flags (`-mp -mt -is -us -hr
-  -oit -inc`, each with a value), so a config cannot turn telemetry on or move
-  a run's files. Each setting may appear once, and the job budget stays
-  `--job-timeout-secs` for all. A config that sets the passes or the
-  optimizer's threads replaces `--max-passes` or `--threads` for its runs.
-  Give every lever a sweep compares in every config: Freerouting fills what is
-  left out with its own defaults.
+  `--router.<path>=<value>` or the router's short flags (`-mp -mt -is -us -oit
+  -inc`, each with a value), so a config cannot turn telemetry on or move a
+  run's files. Each setting may appear once, and the job budget stays
+  `--job-timeout-secs` for all. A config that sets the passes or the router's
+  threads (`--router.max_threads`, which is what 2.5 reads `-mt` as) replaces
+  `--max-passes` or `--threads` for its runs. Give every lever a sweep compares
+  in every config: Freerouting fills what is left out with its own defaults,
+  and changes some of them by itself for each board (the per-layer trace
+  costs, from the board's shape).
 - **Effective settings.** Each run records what is known of the settings it
-  really used (`settings` in `results.json`). A line in which Freerouting says a
-  setting did not take ("Failed to apply CLI router setting", an unknown
-  argument or property) fails the run: Freerouting only warns and routes on
-  with its default. Each `--router.` setting given is also compared with the
-  `freerouting.json` Freerouting saves in the run's own home when it ends; a
-  different saved value fails the run, and a setting that file does not hold is
-  listed as unconfirmed (the CLI-only optimizer strategies `-is` and `-us`
-  always are).
+  really used (`settings` in `results.json`), from Freerouting's own log: 2.3
+  and later write one under the run's home at debug level, whatever the console
+  shows. (The `freerouting.json` they save back holds no router settings.)
+  - A line in which Freerouting says a setting did not take ("Failed to apply
+    CLI router setting", an unknown argument or property) fails the run:
+    Freerouting only warns and routes on with its default.
+  - Each `--router.` setting given is compared with the "Applied CLI router
+    setting" lines. Another value, or no such line in a log that has them,
+    fails the run. A log with no such lines at all (2.1) leaves the settings
+    listed as unconfirmed.
+  - The via costs and per-layer trace costs Freerouting printed for the
+    routing are kept as `routing_parameters`. The CLI-only optimizer
+    strategies `-is` and `-us` leave no line, so they are never confirmed.
+  - A run whose log shows an answer to Freerouting's version check was not
+    offline, and fails.
 - **DSN variants.** Every `.dsn` in the corpus is routed with every config, so
   variants of one board are candidates like any other.
   `xtask/freerouting-bench/stage_merge.py` (plain Python, **experiment only**)
@@ -630,10 +639,15 @@ cargo xtask freerouting-bench \
     in every run.
 - **Budget and resume.** Every Freerouting start is a line in `<out>/jobs.log`.
   `--max-jobs N` refuses an invocation whose runs, with those already there,
-  would exceed N. `--resume` adds to the results already in `--out`: finished
-  runs are kept, only the missing ones are routed, and runs that have a session
-  but no board score are scored. `results.json` and `summary.md` are rewritten
-  after every run, so a stopped sweep loses at most the run in progress. That
+  would exceed N. `--resume` adds to the results already in `--out`: saved runs
+  are kept, only the missing ones are routed, and runs that have a session but
+  no board score are scored. A config whose settings, or a DSN whose content,
+  is not what its saved runs used is refused, since the two would merge into
+  one candidate: give it another name. A saved run that failed stays as it is
+  unless `--retry-failed` is given, which routes it and the runs after it
+  again (and lets a config all of whose runs failed change). `results.json` and
+  `summary.md` are rewritten after every run, each written beside and moved
+  into place, so a stopped sweep loses at most the run in progress. That
   run's folder is routed again from scratch; if the bench was killed and its
   Freerouting lived on, the resumed run stops it first (each run notes its
   process id in `java.pid`), so it cannot write into the new run. Without
@@ -644,7 +658,8 @@ cargo xtask freerouting-bench \
   report. Use it after changing a metric or a threshold instead of routing
   again. With `--score <spec.json>` it also scores the runs that have no board
   score yet (KiCad and Konnect run; Java does not), which adds a board score to
-  an earlier bench.
+  an earlier bench. Results that were scored are not rewritten without their
+  scores: if the spec they name is gone, `--rescore` stops and says so.
 - **Output.** `summary.md` (per-board table and ranking) and `results.json`,
   plus each run's `stdout.log`, `stderr.log`, `board.ses` and Freerouting's own log.
   Everything stays under `target/`. Quote only counts in tracked docs.

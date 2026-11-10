@@ -260,7 +260,13 @@ impl ScoreSpec {
         })
     }
 
+    /// Read a spec file. Its paths become absolute: the scoring tools run
+    /// with a run's folder as their own, where a relative path (a relative
+    /// `KICAD_CONFIG_HOME` above all) would name something else.
     pub fn read(path: &Path, repo: &Path) -> Result<Self, String> {
+        let path = &path
+            .canonicalize()
+            .map_err(|e| format!("cannot read the score spec {}: {e}", path.display()))?;
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read the score spec {}: {e}", path.display()))?;
         Self::parse(&text, path, repo)
@@ -499,12 +505,17 @@ pub fn width_checks(measure: &Measure, roles: &Roles) -> Vec<WidthCheck> {
             at_point.entry(segment.b).or_default().push(i);
         }
         for (point, members) in &at_point {
-            for pair in members.windows(2) {
-                let joined =
-                    narrow[pair[0]].layer == narrow[pair[1]].layer || via_points.contains(point);
-                if joined {
-                    let (a, b) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-                    parent[a] = b;
+            // Every pair at the point, not only neighbours in the list: two
+            // pieces on one layer may have a piece on another layer between
+            // them.
+            for (n, &first) in members.iter().enumerate() {
+                for &second in &members[n + 1..] {
+                    let joined =
+                        narrow[first].layer == narrow[second].layer || via_points.contains(point);
+                    if joined {
+                        let (a, b) = (find(&mut parent, first), find(&mut parent, second));
+                        parent[a] = b;
+                    }
                 }
             }
         }
@@ -1607,6 +1618,33 @@ mod tests {
         assert!(parse(r#"{"project":"p","board":"../b","baseline":"r","kicad_config_home":"c","currents":"t"}"#).is_err());
     }
 
+    /// The scoring tools run with a run's folder as their own, so a spec
+    /// reached by a relative path must still name absolute files: a relative
+    /// `KICAD_CONFIG_HOME` would send KiCad to a fresh default config.
+    #[test]
+    fn a_spec_file_is_read_with_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("konnect-score-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::write(
+            root.join("spec.json"),
+            r#"{"project":"project","board":"b.kicad_pcb","baseline":"r.kicad_pcb","kicad_config_home":"cfg","currents":"test"}"#,
+        )
+        .unwrap();
+        let roundabout = root.join("inner").join("..").join("spec.json");
+        let spec = ScoreSpec::read(&roundabout, Path::new("/repo")).unwrap();
+        let real = root.canonicalize().unwrap();
+        assert_eq!(spec.source, real.join("spec.json"));
+        assert_eq!(spec.kicad_config_home, real.join("cfg"));
+        assert_eq!(spec.project, real.join("project"));
+        assert!(
+            ScoreSpec::read(&root.join("absent.json"), Path::new("/repo"))
+                .unwrap_err()
+                .contains("cannot read the score spec")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn thresholds_round_trip_through_json() {
         let custom = Thresholds {
@@ -1752,6 +1790,15 @@ mod tests {
         // Another net's via there joins nothing.
         measure.vias[0].net = "GND".into();
         assert_eq!(width_checks(&measure, &roles())[1].longest_below_mm, 3.0);
+        // Two pieces on one layer meet at a point where a piece on another
+        // layer also ends (a through-hole pad, no via): the two still join.
+        measure.vias.clear();
+        measure.segments = vec![
+            segment("+5V", "F.Cu", 200, (0, 0), (4, 0)),
+            segment("+5V", "B.Cu", 200, (4, 0), (4, 1)),
+            segment("+5V", "F.Cu", 200, (4, 0), (9, 0)),
+        ];
+        assert_eq!(width_checks(&measure, &roles())[1].longest_below_mm, 9.0);
     }
 
     #[test]
