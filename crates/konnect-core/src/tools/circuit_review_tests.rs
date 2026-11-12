@@ -847,10 +847,7 @@ fn no_termination_is_reported_as_a_fact_not_a_finding_and_the_bus_ends_are_left_
     let v = run(&fx(&[can_xcvr(), can_conn()], None, None));
     assert!(findings(&v, "can_termination_value").is_empty());
     assert_eq!(check(&v, "can_termination_value")["status"], "no_subjects");
-    assert_eq!(
-        v["interfaces"][0]["termination"]["kind"],
-        "none_on_this_sheet"
-    );
+    assert_eq!(v["interfaces"][0]["termination"]["kind"], "none_observed");
     assert!(v["interfaces"][0]["physical_ends"]
         .as_str()
         .unwrap()
@@ -2695,6 +2692,9 @@ fn a_sheet_prefixed_net_name_matches_only_on_its_own_sheet() {
         leaves_sheet: false,
         power_symbol: false,
         sheet_path: sheet.map(str::to_string),
+        scoped_names: Default::default(),
+        ambiguous_names: Default::default(),
+        origins: Default::default(),
     };
     let power = net(Some("/Power/"));
     assert!(power.matches_name("VOUT") && power.matches_name("/VOUT"));
@@ -2739,4 +2739,2709 @@ fn a_supply_pin_with_no_capacitor_at_all_is_skipped_for_audit_decoupling_not_cal
         .unwrap()
         .contains("audit_decoupling"));
     assert_eq!(v["coverage"]["needs_human_subjects"], 0);
+}
+
+// Hierarchy model fixtures deliberately exercise pin partitions, not display
+// names. Removing a join/scope/identity guard must change these assertions.
+fn joined_model(
+    sheets: &[(&str, &str, String)],
+    complete: bool,
+) -> crate::tools::circuit_model::Circuit {
+    joined_model_with(sheets, complete, &[])
+}
+
+/// `joined_model`, with the instance paths the caller reports as unaudited.
+fn joined_model_with(
+    sheets: &[(&str, &str, String)],
+    complete: bool,
+    set_aside: &[&str],
+) -> crate::tools::circuit_model::Circuit {
+    use crate::tools::circuit_model::{Circuit, SheetPlace};
+    let dir = tempfile::tempdir().unwrap();
+    let mut circuits = Vec::new();
+    for (file, instance, source) in sheets {
+        let file = dir.path().join(file);
+        std::fs::write(&file, source).unwrap();
+        let place = SheetPlace {
+            symbol_path: Some(format!(
+                "/11111111-1111-4111-8111-111111111111{}",
+                instance.trim_end_matches('/')
+            )),
+            instance_path: Some(instance.to_string()),
+            name_path: Some(instance.to_string()),
+        };
+        circuits.push(Circuit::load_at(&file, &place).unwrap());
+    }
+    let set_aside = set_aside.iter().map(|path| path.to_string()).collect();
+    Circuit::join(circuits, complete, &set_aside)
+}
+
+fn pin_net<'a>(c: &'a crate::tools::circuit_model::Circuit, reference: &str, pin: &str) -> &'a str {
+    &c.part(reference)
+        .unwrap()
+        .pins
+        .iter()
+        .find(|p| p.number == pin)
+        .unwrap()
+        .net
+}
+
+fn add_root_nodes(mut source: String, nodes: &str) -> String {
+    let end = source.rfind(')').unwrap();
+    source.insert_str(end, nodes);
+    source
+}
+
+fn hierarchy_sheet(file: &str, uuid: &str, ports: &[(&str, f64)]) -> String {
+    let pins = ports
+        .iter()
+        .map(|(name, y)| {
+            format!("(pin \"{name}\" input (at 60 {y} 0) (effects (font (size 1.27 1.27))))")
+        })
+        .collect::<String>();
+    format!("(sheet (at 20 20) (size 40 30) (uuid \"{uuid}\") (property \"Sheetname\" \"{uuid}\" (at 20 19 0)) (property \"Sheetfile\" \"{file}\" (at 20 51 0)) {pins})")
+}
+
+#[test]
+fn cross_sheet_label_scope_is_electrical_identity_not_display_text() {
+    for (a, b, connected) in [
+        ("g:BUS", "g:BUS", true),
+        ("BUS", "BUS", false),
+        ("g:BUS", "BUS", false),
+    ] {
+        let c = joined_model(
+            &[
+                (
+                    "root.kicad_sch",
+                    "/",
+                    schematic(&[res("R1", "1k", a, "LOCAL")]),
+                ),
+                (
+                    "child.kicad_sch",
+                    "/a/",
+                    schematic(&[res("R2", "1k", b, "LOCAL")]),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(pin_net(&c, "R1", "1") == pin_net(&c, "R2", "1"), connected);
+        assert_ne!(pin_net(&c, "R1", "2"), pin_net(&c, "R2", "2"));
+        assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+    }
+}
+
+fn power_fixture(reference: &'static str, local: bool) -> String {
+    schematic(&[
+        p(
+            "#PWR01",
+            "Fixture:Power",
+            "+3V3",
+            vec![("1", "VCC", "power_in", "+3V3")],
+        ),
+        res(reference, "1k", "+3V3", "LOCAL"),
+    ])
+    .replace(
+        "(symbol \"Fixture:Power\"\n",
+        &format!(
+            "(symbol \"Fixture:Power\" (power {})\n",
+            if local { "local" } else { "global" }
+        ),
+    )
+}
+
+#[test]
+fn cross_sheet_global_power_and_labels_share_scope_but_local_power_does_not() {
+    for local in [false, true] {
+        let c = joined_model(
+            &[
+                (
+                    "root.kicad_sch",
+                    "/",
+                    schematic(&[res("R1", "1k", "g:+3V3", "GND")]),
+                ),
+                ("child.kicad_sch", "/a/", power_fixture("R2", local)),
+            ],
+            true,
+        );
+        assert_eq!(pin_net(&c, "R1", "1") == pin_net(&c, "R2", "1"), !local);
+        assert_eq!(
+            c.parts.len(),
+            2,
+            "custom virtual power symbols are not fitted parts"
+        );
+    }
+}
+
+#[test]
+fn cross_sheet_exact_ports_join_through_an_empty_middle_sheet() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "INPUT", "RET")]),
+        &(hierarchy_sheet("middle.kicad_sch", "a", &[("LINK", 30.0)])
+            + "(label \"INPUT\" (at 60 30 0))"),
+    );
+    let middle = add_root_nodes(
+        schematic(&[]),
+        &(hierarchy_sheet("leaf.kicad_sch", "b", &[("REMOTE", 30.0)])
+            + "(hierarchical_label \"LINK\" (at 60 30 0) (shape input))"),
+    );
+    let leaf = schematic(&[res("R2", "1k", "REMOTE", "RET")]).replace(
+        "(label \"REMOTE\"",
+        "(hierarchical_label \"REMOTE\" (shape input)",
+    );
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("middle.kicad_sch", "/a/", middle),
+            ("leaf.kicad_sch", "/a/b/", leaf),
+        ],
+        true,
+    );
+    assert_eq!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    assert_ne!(pin_net(&c, "R1", "2"), pin_net(&c, "R2", "2"));
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+}
+
+#[test]
+fn cross_sheet_unmatched_port_and_incomplete_global_never_become_complete() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "g:BUS", "RET")]),
+        &(hierarchy_sheet("child.kicad_sch", "a", &[("EXPECTED", 30.0)])
+            + "(label \"BUS\" (at 60 30 0))"),
+    );
+    let child = schematic(&[res("R2", "1k", "DIFFERENT", "RET")]).replace(
+        "(label \"DIFFERENT\"",
+        "(hierarchical_label \"DIFFERENT\" (shape input)",
+    );
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("child.kicad_sch", "/a/", child),
+        ],
+        true,
+    );
+    assert!(!c.inventory_complete);
+    assert!(!c.connectivity_gaps.is_empty());
+    assert_ne!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+}
+
+#[test]
+fn cross_sheet_net_tie_and_series_components_do_not_union_nets() {
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            schematic(&[
+                p(
+                    "NT1",
+                    "Device:NetTie_2",
+                    "NetTie",
+                    vec![("1", "1", "passive", "g:A"), ("2", "2", "passive", "g:B")],
+                ),
+                res("R1", "0", "g:B", "g:C"),
+                p(
+                    "FB1",
+                    "Device:Ferrite_Bead",
+                    "Ferrite",
+                    vec![("1", "1", "passive", "g:C"), ("2", "2", "passive", "g:D")],
+                ),
+            ]),
+        )],
+        true,
+    );
+    for r in ["NT1", "R1", "FB1"] {
+        assert_ne!(pin_net(&c, r, "1"), pin_net(&c, r, "2"));
+    }
+}
+
+#[test]
+fn cross_sheet_unsupported_jumper_and_bus_metadata_are_gaps() {
+    for metadata in [
+        "(duplicate_pin_numbers_are_jumpers yes)",
+        "(jumper_pin_groups (1 2))",
+    ] {
+        let source = schematic(&[res("R1", "1k", "A", "B")]).replace(
+            "(symbol \"Device:R\"\n",
+            &format!("(symbol \"Device:R\" {metadata}\n"),
+        );
+        let c = joined_model(&[("root.kicad_sch", "/", source)], true);
+        assert!(!c.inventory_complete);
+        assert!(!c.connectivity_gaps.is_empty());
+    }
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            add_root_nodes(
+                schematic(&[res("R1", "1k", "A", "B")]),
+                "(bus (pts (xy 10 10) (xy 20 10)))",
+            ),
+        )],
+        true,
+    );
+    assert!(!c.inventory_complete);
+}
+
+#[test]
+fn cross_sheet_ambiguous_references_are_not_arbitrarily_selected() {
+    let source = schematic(&[res("R1", "1k", "A", "B")
+        .instance("/11111111-1111-4111-8111-111111111111", "R1")
+        .instance("/11111111-1111-4111-8111-111111111111", "R9")]);
+    let c = joined_model(&[("root.kicad_sch", "/", source)], true);
+    assert!(c.parts.is_empty());
+    assert!(!c.inventory_complete);
+    let c = joined_model(
+        &[
+            (
+                "root.kicad_sch",
+                "/",
+                schematic(&[res("R1", "1k", "A", "B")]),
+            ),
+            (
+                "child.kicad_sch",
+                "/a/",
+                schematic(&[res("R1", "1k", "A", "B")]),
+            ),
+        ],
+        true,
+    );
+    assert!(c.parts.is_empty());
+    assert!(!c.inventory_complete);
+}
+
+#[test]
+fn cross_sheet_scoped_aliases_survive_a_global_join() {
+    let c = joined_model(
+        &[
+            (
+                "root.kicad_sch",
+                "/",
+                schematic(&[res("R1", "1k", "g:VOUT", "RET")]),
+            ),
+            (
+                "child.kicad_sch",
+                "/Power/",
+                schematic(&[res("R2", "1k", "g:VOUT", "RET")]),
+            ),
+            (
+                "other.kicad_sch",
+                "/Audio/",
+                schematic(&[res("R3", "1k", "VOUT", "RET")]),
+            ),
+        ],
+        true,
+    );
+    let power = c.net(pin_net(&c, "R1", "1")).unwrap();
+    assert!(power.matches_name("/Power/VOUT"));
+    assert!(!power.matches_name("/Audio/VOUT"));
+    assert_ne!(pin_net(&c, "R1", "1"), pin_net(&c, "R3", "1"));
+}
+
+#[test]
+fn cross_sheet_net_keys_are_stable_across_reloads_and_input_order() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "g:A", "B")]),
+        "(label \"A\" (at 80 80 0))",
+    );
+    let child = schematic(&[res("R2", "1k", "g:A", "B")]);
+    let a = joined_model(
+        &[
+            ("root.kicad_sch", "/", root.clone()),
+            ("child.kicad_sch", "/a/", child.clone()),
+        ],
+        true,
+    );
+    for _ in 0..12 {
+        let b = joined_model(
+            &[
+                ("child.kicad_sch", "/a/", child.clone()),
+                ("root.kicad_sch", "/", root.clone()),
+            ],
+            true,
+        );
+        for r in ["R1", "R2"] {
+            for pin in ["1", "2"] {
+                assert_eq!(pin_net(&a, r, pin), pin_net(&b, r, pin));
+            }
+        }
+    }
+}
+
+#[test]
+fn cross_sheet_multi_unit_parts_preserve_both_origins_and_common_pins() {
+    let a = schematic(&[p(
+        "U1",
+        "Fixture:Dual",
+        "DUAL",
+        vec![("1", "A", "input", "A"), ("8", "GND", "power_in", "g:GND")],
+    )]);
+    let b = schematic(&[p(
+        "U1",
+        "Fixture:Dual",
+        "DUAL",
+        vec![("2", "B", "input", "B"), ("8", "GND", "power_in", "g:GND")],
+    )])
+    .replace("Dual_1_1", "Dual_2_1")
+    .replace("(unit 1)", "(unit 2)");
+    let c = joined_model(
+        &[("root.kicad_sch", "/", a), ("child.kicad_sch", "/a/", b)],
+        true,
+    );
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+    assert_eq!(c.parts.len(), 1);
+    assert_eq!(c.part("U1").unwrap().pins.len(), 3);
+    assert_eq!(c.origins["U1"].len(), 2);
+}
+
+#[test]
+fn cross_sheet_reused_file_uses_its_own_instance_references_and_local_nets() {
+    const A: &str = "/11111111-1111-4111-8111-111111111111/a";
+    const B: &str = "/11111111-1111-4111-8111-111111111111/b";
+    let child = schematic(&[res("R1", "1k", "LOCAL", "RET")
+        .instance(A, "R1")
+        .instance(B, "R101")]);
+    let c = joined_model(
+        &[
+            ("child.kicad_sch", "/a/", child.clone()),
+            ("child.kicad_sch", "/b/", child),
+        ],
+        true,
+    );
+    assert_eq!(c.parts.len(), 2);
+    assert_ne!(pin_net(&c, "R1", "1"), pin_net(&c, "R101", "1"));
+    assert_ne!(c.origins["R1"], c.origins["R101"]);
+    assert!(c.inventory_complete);
+}
+
+#[test]
+fn cross_sheet_unknown_global_participants_leave_the_known_partition_intact() {
+    let c = joined_model(
+        &[
+            (
+                "root.kicad_sch",
+                "/",
+                schematic(&[res("R1", "1k", "g:A", "LOCAL")]),
+            ),
+            (
+                "child.kicad_sch",
+                "/a/",
+                schematic(&[res("R2", "1k", "g:A", "LOCAL")]),
+            ),
+        ],
+        false,
+    );
+    assert_eq!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+    assert_ne!(pin_net(&c, "R1", "2"), pin_net(&c, "R2", "2"));
+    assert!(!c.inventory_complete);
+}
+
+#[test]
+fn cross_sheet_duplicate_instance_paths_are_quarantined_before_union() {
+    let c = joined_model(
+        &[
+            (
+                "first.kicad_sch",
+                "/a/",
+                schematic(&[res("R1", "1k", "LOCAL_A", "RET")]),
+            ),
+            (
+                "second.kicad_sch",
+                "/a/",
+                schematic(&[res("R2", "1k", "LOCAL_B", "RET")]),
+            ),
+        ],
+        true,
+    );
+    assert!(!c.inventory_complete);
+    assert!(
+        c.parts.is_empty(),
+        "ambiguous uses must not create positive connection evidence"
+    );
+}
+
+#[test]
+fn cross_sheet_formatted_scalar_names_join_without_becoming_buses() {
+    for name in ["g:~{RESET}", "g:A_{B}", "g:X^{2}"] {
+        let c = joined_model(
+            &[
+                (
+                    "root.kicad_sch",
+                    "/",
+                    schematic(&[res("R1", "1k", name, "A")]),
+                ),
+                (
+                    "child.kicad_sch",
+                    "/a/",
+                    schematic(&[res("R2", "1k", name, "B")]),
+                ),
+            ],
+            true,
+        );
+        assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+        assert_eq!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    }
+}
+
+#[test]
+fn cross_sheet_instance_unit_controls_the_exact_pin_universe() {
+    let source = schematic(&[
+        p("U1", "Fixture:Dual", "Dual", vec![("1", "A", "input", "A")])
+            .instance("/11111111-1111-4111-8111-111111111111/a", "U1")
+            .instance("/11111111-1111-4111-8111-111111111111/b", "U2"),
+    ]);
+    let source = source.replace("(symbol \"Dual_1_1\"", "(symbol \"Dual_2_1\" (pin input line (at 0 0 0) (length 2.54) (name \"B\") (number \"2\"))) (symbol \"Dual_1_1\"")
+        .replace("(reference \"U2\") (unit 1)", "(reference \"U2\") (unit 2)");
+    let c = joined_model(
+        &[
+            ("child.kicad_sch", "/a/", source.clone()),
+            ("child.kicad_sch", "/b/", source),
+        ],
+        true,
+    );
+    assert_eq!(
+        c.part("U1")
+            .unwrap()
+            .pins
+            .iter()
+            .map(|p| p.number.as_str())
+            .collect::<Vec<_>>(),
+        ["1"]
+    );
+    assert_eq!(
+        c.part("U2")
+            .unwrap()
+            .pins
+            .iter()
+            .map(|p| p.number.as_str())
+            .collect::<Vec<_>>(),
+        ["2"]
+    );
+    assert!(c.inventory_complete);
+}
+
+#[test]
+fn cross_sheet_unresolved_symbols_taint_local_frontiers_and_virtual_power_is_not_ignored() {
+    let physical = schematic(&[
+        res("R1", "1k", "LOCAL", "RET"),
+        res("R2", "1k", "LOCAL", "RET"),
+    ])
+    .replacen("(lib_id \"Device:R\")", "(lib_id \"Missing:Symbol\")", 1);
+    let c = joined_model(&[("root.kicad_sch", "/", physical)], true);
+    assert!(!c.inventory_complete);
+    assert!(c.net(pin_net(&c, "R2", "1")).unwrap().leaves_sheet);
+    let virtual_power = power_fixture("R2", false)
+        .replace("(lib_id \"Fixture:Power\")", "(lib_id \"Missing:Power\")");
+    let c = joined_model(&[("root.kicad_sch", "/", virtual_power)], true);
+    assert!(
+        !c.inventory_complete,
+        "unreadable virtual power connectivity is also a gap"
+    );
+}
+
+fn incomplete_labels(f: &Fx) -> Value {
+    let source = std::fs::read_to_string(&f.sch)
+        .unwrap()
+        .replace("(label ", "(global_label ");
+    std::fs::write(&f.sch, source).unwrap();
+    run(f)
+}
+
+fn is_unproven(v: &Value, rule: &str) -> bool {
+    v["unproven"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["rule"] == rule)
+}
+
+#[test]
+fn cross_sheet_incomplete_decoupling_keeps_near_small_cap_witness_but_withholds_nearest_absence() {
+    for (x, value, expected_pass) in [
+        (11.0, "100n", true),
+        (30.0, "100n", false),
+        (11.0, "1u", false),
+    ] {
+        let b = board(
+            &[
+                u1(),
+                fp(
+                    "C1",
+                    x,
+                    10.0,
+                    &[("1", 0.0, 0.0, "+3V3"), ("2", 1.0, 0.0, "GND")],
+                ),
+            ],
+            "",
+        );
+        let f = fx(
+            &[mcu("U1", "SIG0"), cap("C1", value, "+3V3", "GND")],
+            Some(b),
+            None,
+        );
+        let v = incomplete_labels(&f);
+        assert!(findings(&v, "decoupling_supply_far").is_empty(), "{v}");
+        assert_eq!(
+            passed(&v, "decoupling_supply_far"),
+            u64::from(expected_pass)
+        );
+        assert_eq!(is_unproven(&v, "decoupling_supply_far"), !expected_pass);
+    }
+}
+
+#[test]
+fn cross_sheet_incomplete_termination_reports_observed_resistance_and_keeps_proven_overload() {
+    for (value, warns) in [("120", false), ("60", true)] {
+        let f = fx(
+            &[
+                global_can_xcvr(),
+                global_can_conn("J2"),
+                res("R1", value, "g:CANH", "g:CANL"),
+            ],
+            None,
+            None,
+        );
+        let v = run(&f);
+        assert_eq!(
+            findings(&v, "can_termination_value").len(),
+            usize::from(warns),
+            "{v}"
+        );
+        assert_eq!(passed(&v, "can_termination_value"), 0);
+        let bus = v["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["interface"] == "can")
+            .unwrap();
+        assert!(bus["termination"]["total_ohms"].is_null());
+        assert!(bus["termination"]["observed_resistance_ohms"]
+            .as_f64()
+            .is_some());
+        assert_eq!(bus["connectivity_complete"], false);
+    }
+}
+
+#[test]
+fn cross_sheet_incomplete_i2c_does_not_call_an_observed_total_complete() {
+    for (value, warns) in [("47k", false), ("4k7", false), ("100", true)] {
+        let f = fx(&[i2c_dev(), res("R1", value, "SDA", "+3V3")], None, None);
+        let v = incomplete_labels(&f);
+        assert_eq!(
+            findings(&v, "i2c_pullup_value").len(),
+            usize::from(warns),
+            "{v}"
+        );
+        assert_eq!(passed(&v, "i2c_pullup_value"), 0);
+        let line = v["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["line"] == "SDA")
+            .unwrap();
+        assert!(line["effective_pull_up_ohms"].is_null());
+        assert!(line["observed_effective_pull_up_ohms"].as_f64().is_some());
+        assert_eq!(line["connectivity_complete"], false);
+        assert!(line.get("net_key").is_none(), "internal key must not leak");
+    }
+}
+
+#[test]
+fn cross_sheet_incomplete_crystal_inventory_keeps_presence_but_not_a_complete_cl() {
+    let f = fx(&xtal_parts(true), None, None);
+    let v = incomplete_labels(&f);
+    assert!(findings(&v, "crystal_load_cap_missing").is_empty());
+    assert_eq!(passed(&v, "crystal_load_cap_missing"), 2);
+    assert!(v["crystals"][0]["computed_load_capacitance_pf"].is_null());
+    assert_eq!(v["crystals"][0]["connectivity_complete"], false);
+}
+
+#[test]
+fn cross_sheet_incomplete_connector_does_not_claim_absence_even_with_protection_behind_series() {
+    let f = fx(
+        &[
+            connector("J1", "SIG"),
+            res("R1", "100", "SIG", "SIGP"),
+            tvs("D1", "SIGP"),
+            receiver("SIGP"),
+        ],
+        None,
+        None,
+    );
+    let v = incomplete_labels(&f);
+    for rule in [
+        "protection_after_series_element",
+        "connector_signal_unprotected",
+    ] {
+        assert!(findings(&v, rule).is_empty(), "{v}");
+        assert!(is_unproven(&v, rule), "{v}");
+        assert_eq!(passed(&v, rule), 0);
+    }
+}
+
+#[test]
+fn cross_sheet_scoped_aliases_escape_literal_slashes_like_board_nets() {
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            schematic(&[res("R1", "1k", "IN/OUT", "RET")]),
+        )],
+        true,
+    );
+    let net = c.net(pin_net(&c, "R1", "1")).unwrap();
+    assert!(net.matches_name("/IN{slash}OUT"));
+}
+
+#[test]
+fn cross_sheet_multiple_direct_termination_resistors_need_bank_assignment_even_on_one_sheet() {
+    for value in ["120", "240"] {
+        let v = run(&fx(
+            &[
+                can_xcvr(),
+                can_conn(),
+                res("R1", value, "CANH", "CANL"),
+                res("R2", value, "CANH", "CANL"),
+            ],
+            None,
+            None,
+        ));
+        assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+        assert_eq!(passed(&v, "can_termination_value"), 0);
+        assert!(
+            v["needs_human"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["rule"] == "can_termination_value"),
+            "{v}"
+        );
+    }
+}
+
+#[test]
+fn cross_sheet_reversed_selectable_termination_is_not_omitted_from_candidates() {
+    let v = run(&fx(
+        &[
+            can_xcvr(),
+            res("R1", "120", "CANH", "CANL"),
+            res("R2", "120", "CANL", "MID"),
+            p(
+                "JP1",
+                "Jumper:Jumper_2_Open",
+                "Jumper",
+                vec![("1", "A", "passive", "MID"), ("2", "B", "passive", "CANH")],
+            ),
+        ],
+        None,
+        None,
+    ));
+    let termination = &v["interfaces"][0]["termination"];
+    assert!(
+        termination["candidates"].as_array().unwrap().len() >= 2,
+        "{v}"
+    );
+    assert!(termination["observed_resistors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r == "R2"));
+    assert!(termination["total_ohms"].is_null());
+    assert_eq!(passed(&v, "can_termination_value"), 0);
+}
+
+#[test]
+fn cross_sheet_incomplete_bulk_and_adc_searches_keep_only_sufficient_near_witnesses() {
+    for x in [None, Some(11.0), Some(60.0)] {
+        let mut bulk = vec![regulator("U2", "+3V3")];
+        let mut bulk_board = vec![fp(
+            "U2",
+            10.0,
+            10.0,
+            &[
+                ("1", 0.0, 2.0, "GND"),
+                ("2", 2.0, 0.0, "+3V3"),
+                ("3", 0.0, 0.0, "+5V"),
+            ],
+        )];
+        if let Some(x) = x {
+            bulk.push(cap("C2", "22u", "+5V", "GND"));
+            bulk_board.push(fp(
+                "C2",
+                x,
+                10.0,
+                &[("1", 0.0, 0.0, "+5V"), ("2", 0.0, 1.0, "GND")],
+            ));
+        }
+        let v = incomplete_labels(&fx(&bulk, Some(board(&bulk_board, "")), None));
+        assert!(findings(&v, "bulk_cap_far").is_empty(), "{v}");
+        assert_eq!(passed(&v, "bulk_cap_far"), u64::from(x == Some(11.0)));
+        assert_eq!(
+            v["unproven"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u["rule"] == "bulk_cap_far" && u["component"] == "U2" && u["pin"] == "3"),
+            x != Some(11.0)
+        );
+        let mut adc = vec![p(
+            "U1",
+            "Fixture:ADC",
+            "ADC",
+            vec![
+                ("1", "VREF+", "input", "VREF"),
+                ("2", "GND", "power_in", "GND"),
+                ("3", "VDD", "power_in", "+3V3"),
+            ],
+        )];
+        let mut adc_board = vec![fp(
+            "U1",
+            10.0,
+            10.0,
+            &[
+                ("1", 0.0, 0.0, "VREF"),
+                ("2", 0.0, 2.0, "GND"),
+                ("3", 2.0, 0.0, "+3V3"),
+            ],
+        )];
+        if let Some(x) = x {
+            adc.push(cap("C1", "1u", "VREF", "GND"));
+            adc_board.push(fp(
+                "C1",
+                x,
+                10.0,
+                &[("1", 0.0, 0.0, "VREF"), ("2", 0.0, 1.0, "GND")],
+            ));
+        }
+        let v = incomplete_labels(&fx(&adc, Some(board(&adc_board, "")), None));
+        assert!(findings(&v, "adc_ref_cap_far").is_empty(), "{v}");
+        assert_eq!(passed(&v, "adc_ref_cap_far"), u64::from(x == Some(11.0)));
+        assert_eq!(is_unproven(&v, "adc_ref_cap_far"), x != Some(11.0));
+    }
+}
+
+#[test]
+fn cross_sheet_unresolved_far_end_cannot_establish_missing_capacitor_or_bias() {
+    let b = board(
+        &[
+            u1(),
+            fp(
+                "C1",
+                11.0,
+                10.0,
+                &[("1", 0.0, 0.0, "+3V3"), ("2", 0.0, 1.0, "RETURN")],
+            ),
+        ],
+        "",
+    );
+    let v = run(&fx(
+        &[mcu("U1", "SIG"), cap("C1", "100n", "+3V3", "g:RETURN")],
+        Some(b),
+        None,
+    ));
+    assert!(is_unproven(&v, "decoupling_supply_far"));
+    let v = run(&fx(
+        &[
+            rs485_xcvr(),
+            res("R1", "1k", "A", "g:UNKNOWN"),
+            res("R2", "1k", "B", "GND"),
+        ],
+        None,
+        None,
+    ));
+    assert!(findings(&v, "rs485_failsafe_bias").is_empty());
+    assert!(is_unproven(&v, "rs485_failsafe_bias"));
+}
+
+#[test]
+fn cross_sheet_incomplete_driver_and_sense_searches_do_not_claim_exhaustive_topology() {
+    let v = incomplete_labels(&fx(&series_parts(), Some(series_board(60.0)), None));
+    assert!(findings(&v, "series_termination_far_from_driver").is_empty());
+    assert!(is_unproven(&v, "series_termination_far_from_driver"));
+    let v = run(&fx(&half_bridge("g:SRC"), None, None));
+    assert!(findings(&v, "gate_drive_return_net").is_empty());
+    assert!(is_unproven(&v, "gate_drive_return_net"));
+    let v = run(&fx(&half_bridge("g:SW"), None, None));
+    assert_eq!(passed(&v, "gate_drive_return_net"), 1);
+    let mut sense = sense_parts();
+    sense.remove(1);
+    sense[0].pins[0].3 = "g:SP";
+    let v = run(&fx(&sense, Some(sense_board((20.0, 20.0), "")), None));
+    assert!(is_unproven(&v, "sense_amp_far_from_shunt"));
+}
+
+#[test]
+fn cross_sheet_incomplete_usb_keeps_known_bad_protection_but_not_absence() {
+    let bare = incomplete_labels(&fx(&[usb_conn()], None, None));
+    assert!(findings(&bare, "usb_esd_missing").is_empty());
+    assert!(is_unproven(&bare, "usb_esd_missing"));
+    let known = incomplete_labels(&fx(
+        &[usb_conn(), usb_esd("SMAJ5.0A", "Device:D_TVS_Dual")],
+        None,
+        None,
+    ));
+    assert_eq!(findings(&known, "usb_esd_capacitance").len(), 2);
+    assert_eq!(passed(&known, "usb_esd_missing"), 2);
+}
+
+#[test]
+fn cross_sheet_unsupported_label_semantics_do_not_create_proven_local_joins() {
+    for name in ["g:DATA{A B}", "g:DATA[0..3]", "g:${SIGNAL}", "g:{BUNDLE}"] {
+        let source = schematic(&[
+            res("R1", "1k", name, "LEFT"),
+            res("R2", "1k", name, "RIGHT"),
+        ]);
+        let source = if name == "g:{BUNDLE}" {
+            add_root_nodes(source, "(bus_alias \"BUNDLE\" (members \"A\" \"B\"))")
+        } else {
+            source
+        };
+        let c = joined_model(&[("root.kicad_sch", "/", source.clone())], true);
+        assert!(!c.inventory_complete);
+        assert_ne!(
+            pin_net(&c, "R1", "1"),
+            pin_net(&c, "R2", "1"),
+            "unsupported label text is not a proved electrical edge"
+        );
+        let wired = add_root_nodes(
+            source,
+            "(wire (pts (xy 20 100) (xy 50 100)) (stroke (width 0) (type default)))",
+        );
+        let c = joined_model(&[("root.kicad_sch", "/", wired)], true);
+        assert_eq!(
+            pin_net(&c, "R1", "1"),
+            pin_net(&c, "R2", "1"),
+            "explicit wire evidence remains valid"
+        );
+    }
+}
+
+#[test]
+fn cross_sheet_bare_alias_names_remain_proven_scalar_labels() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "g:LINK", "LEFT")]),
+        r#"(bus_alias "LINK" (members "A" "B"))"#,
+    );
+    let child = schematic(&[res("R2", "1k", "g:LINK", "RIGHT")]);
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("child.kicad_sch", "/a/", child),
+        ],
+        true,
+    );
+    assert!(
+        !c.inventory_complete,
+        "unsupported alias declaration remains disclosed"
+    );
+    assert_eq!(
+        pin_net(&c, "R1", "1"),
+        pin_net(&c, "R2", "1"),
+        "bare LINK is scalar, not {{LINK}} group syntax"
+    );
+}
+
+// ─── Identity and uncertainty paths found unexecuted by scoped coverage ──────
+//
+// Each case pairs the incomplete or ambiguous drawing with the complete one,
+// so the assertion fails when the guard is removed and when it is over-applied.
+
+/// One sheet holding both units of `U1` (unit 1: pins 1 and 8; unit 2: pins 2
+/// and 8). `second_value` is unit 2's value and `shared` the net of its pin 8.
+fn two_units_on_one_sheet(second_value: &'static str, shared: &'static str) -> String {
+    let mut source = schematic(&[
+        p(
+            "U1",
+            "Fixture:Dual",
+            "DUAL",
+            vec![("1", "A", "input", "A"), ("8", "GND", "power_in", "GND")],
+        ),
+        p(
+            "U1",
+            "Fixture:Dual",
+            second_value,
+            vec![("2", "B", "input", "B"), ("8", "GND", "power_in", shared)],
+        ),
+    ])
+    .replace(
+        "(symbol \"Dual_1_1\"",
+        "(symbol \"Dual_2_1\" (pin input line (at 0 0 0) (length 2.54) (name \"B\") (number \"2\")) (pin power_in line (at 0 2.54 0) (length 2.54) (name \"GND\") (number \"8\"))) (symbol \"Dual_1_1\"",
+    );
+    let second = source.rfind("(unit 1) (in_bom").unwrap();
+    source.replace_range(second..second + "(unit 1)".len(), "(unit 2)");
+    source
+}
+
+fn has_gap(c: &crate::tools::circuit_model::Circuit, text: &str) -> bool {
+    c.connectivity_gaps.iter().any(|gap| gap.contains(text))
+}
+
+#[test]
+fn cross_sheet_units_of_one_part_on_one_sheet_merge_only_when_identity_and_shared_pins_agree() {
+    // Compatible units: one part, the shared pin kept once.
+    let c = joined_model(
+        &[("root.kicad_sch", "/", two_units_on_one_sheet("DUAL", "GND"))],
+        true,
+    );
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+    assert_eq!(
+        c.part("U1")
+            .unwrap()
+            .pins
+            .iter()
+            .map(|p| p.number.as_str())
+            .collect::<Vec<_>>(),
+        ["1", "2", "8"]
+    );
+    // The shared pin drawn on two different nets: which one is real is unknown.
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            two_units_on_one_sheet("DUAL", "OTHER"),
+        )],
+        true,
+    );
+    assert!(
+        c.part("U1").is_none(),
+        "a conflicting pin is not dropped silently"
+    );
+    assert!(has_gap(&c, "ambiguous component/unit/pin identity for U1"));
+    assert!(!c.inventory_complete);
+    // Two symbols that share a designator but not a value are not one part.
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            two_units_on_one_sheet("OTHER_PART", "GND"),
+        )],
+        true,
+    );
+    assert!(c.part("U1").is_none());
+    assert!(has_gap(&c, "ambiguous component/unit/pin identity for U1"));
+    assert!(!c.inventory_complete);
+}
+
+#[test]
+fn cross_sheet_one_sheet_placing_the_same_unit_twice_is_a_gap_even_when_the_nets_agree() {
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            schematic(&[res("R1", "1k", "A", "B"), res("R1", "1k", "A", "B")]),
+        )],
+        true,
+    );
+    assert!(
+        c.part("R1").is_none(),
+        "two symbols claiming R1 unit 1 are not one known part"
+    );
+    assert!(has_gap(&c, "ambiguous component/unit/pin identity for R1"));
+    assert!(!c.inventory_complete);
+    // Every net of the sheet is then uncertain: the unknown part may sit on any.
+    assert!(c.nets.values().all(|net| net.leaves_sheet));
+}
+
+#[test]
+fn cross_sheet_sheet_symbols_without_identity_or_readable_ports_are_named_gaps() {
+    let child = || {
+        schematic(&[res("R2", "1k", "LINK", "RET")]).replace(
+            "(label \"LINK\"",
+            "(hierarchical_label \"LINK\" (shape input)",
+        )
+    };
+    let root_with = |sheet: &str| {
+        add_root_nodes(
+            schematic(&[res("R1", "1k", "INPUT", "RET")]),
+            &format!("{sheet}(label \"INPUT\" (at 60 30 0))"),
+        )
+    };
+    let properties = "(property \"Sheetname\" \"a\" (at 20 19 0)) (property \"Sheetfile\" \"child.kicad_sch\" (at 20 51 0))";
+    let port = "(pin \"LINK\" input (at 60 30 0) (effects (font (size 1.27 1.27))))";
+    for (sheet, gap) in [
+        // No UUID: the child use this symbol names cannot be identified.
+        (
+            format!("(sheet (at 20 20) (size 40 30) {properties} {port})"),
+            "sheet has no usable instance/file identity",
+        ),
+        // No file property.
+        (
+            format!(
+                "(sheet (at 20 20) (size 40 30) (uuid \"a\") (property \"Sheetname\" \"a\" (at 20 19 0)) {port})"
+            ),
+            "sheet has no usable instance/file identity",
+        ),
+        // A port with no position cannot be attached to a parent net.
+        (
+            format!(
+                "(sheet (at 20 20) (size 40 30) (uuid \"a\") {properties} (pin \"LINK\" input (effects (font (size 1.27 1.27)))))"
+            ),
+            "malformed sheet port",
+        ),
+    ] {
+        let c = joined_model(
+            &[
+                ("root.kicad_sch", "/", root_with(&sheet)),
+                ("child.kicad_sch", "/a/", child()),
+            ],
+            true,
+        );
+        assert!(has_gap(&c, gap), "{gap}: {:?}", c.connectivity_gaps);
+        assert!(!c.inventory_complete);
+        assert_ne!(
+            pin_net(&c, "R1", "1"),
+            pin_net(&c, "R2", "1"),
+            "{gap}: an unreadable sheet symbol proves no join"
+        );
+        assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+        assert!(c.net(pin_net(&c, "R2", "1")).unwrap().leaves_sheet);
+    }
+    // The same drawing with a complete sheet symbol joins and is complete.
+    let c = joined_model(
+        &[
+            (
+                "root.kicad_sch",
+                "/",
+                root_with(&format!(
+                    "(sheet (at 20 20) (size 40 30) (uuid \"a\") {properties} {port})"
+                )),
+            ),
+            ("child.kicad_sch", "/a/", child()),
+        ],
+        true,
+    );
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+    assert_eq!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+}
+
+#[test]
+fn cross_sheet_unsupported_port_names_do_not_join_parent_and_child() {
+    for name in ["DATA[0..3]", "{BUNDLE}", "${SIGNAL}"] {
+        let root = add_root_nodes(
+            schematic(&[res("R1", "1k", "INPUT", "RET")]),
+            &(hierarchy_sheet("child.kicad_sch", "a", &[(name, 30.0)])
+                + "(label \"INPUT\" (at 60 30 0))"),
+        );
+        let child = schematic(&[res("R2", "1k", "PORT", "RET")]).replace(
+            "(label \"PORT\"",
+            &format!("(hierarchical_label \"{name}\" (shape input)"),
+        );
+        let c = joined_model(
+            &[
+                ("root.kicad_sch", "/", root),
+                ("child.kicad_sch", "/a/", child),
+            ],
+            true,
+        );
+        assert!(
+            has_gap(&c, "unsupported hierarchical port name"),
+            "{name}: {:?}",
+            c.connectivity_gaps
+        );
+        assert!(has_gap(&c, "unsupported bus or variable label"));
+        assert!(!c.inventory_complete);
+        assert_ne!(
+            pin_net(&c, "R1", "1"),
+            pin_net(&c, "R2", "1"),
+            "{name}: bus or variable port text is not a proved scalar join"
+        );
+        assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+    }
+}
+
+#[test]
+fn cross_sheet_unbalanced_brace_names_are_not_scalar_joins() {
+    for name in ["g:A}B", "g:~{RESET", "g:}", "g:A{B"] {
+        let c = joined_model(
+            &[
+                (
+                    "root.kicad_sch",
+                    "/",
+                    schematic(&[res("R1", "1k", name, "A")]),
+                ),
+                (
+                    "child.kicad_sch",
+                    "/a/",
+                    schematic(&[res("R2", "1k", name, "B")]),
+                ),
+            ],
+            true,
+        );
+        assert!(
+            has_gap(&c, "unsupported bus or variable label"),
+            "{name}: {:?}",
+            c.connectivity_gaps
+        );
+        assert!(!c.inventory_complete);
+        assert_ne!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"), "{name}");
+    }
+}
+
+#[test]
+fn cross_sheet_hidden_power_input_pins_are_a_gap_and_visible_ones_are_not() {
+    let logic = || {
+        schematic(&[p(
+            "U1",
+            "Fixture:Logic",
+            "74HC00",
+            vec![("1", "A", "input", "A"), ("14", "VCC", "power_in", "VCC")],
+        )])
+    };
+    // KiCad 8 and later write `(hide yes)`; older files a bare `hide`.
+    for hide in ["(hide yes)", "hide"] {
+        let source = logic().replace(
+            "(length 2.54) (name \"VCC\")",
+            &format!("(length 2.54) {hide} (name \"VCC\")"),
+        );
+        assert!(source.contains(hide));
+        let c = joined_model(&[("root.kicad_sch", "/", source)], true);
+        assert!(
+            has_gap(
+                &c,
+                "unsupported hidden-power or internal-jumper connectivity on U1"
+            ),
+            "{hide}: {:?}",
+            c.connectivity_gaps
+        );
+        assert!(!c.inventory_complete);
+    }
+    // A hidden pin that is not a power input does not connect by name.
+    let source = logic().replace(
+        "(length 2.54) (name \"A\")",
+        "(length 2.54) (hide yes) (name \"A\")",
+    );
+    let c = joined_model(&[("root.kicad_sch", "/", source)], true);
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+    let c = joined_model(&[("root.kicad_sch", "/", logic())], true);
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+}
+
+fn unproven_for<'a>(v: &'a Value, rule: &str) -> Vec<&'a Value> {
+    v["unproven"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["rule"] == rule)
+        .collect()
+}
+
+#[test]
+fn cross_sheet_incomplete_decoupling_withholds_a_far_ground_leg_and_keeps_a_near_one() {
+    let board_with_ground_pad_at = |dx: f64| {
+        board(
+            &[
+                u1(),
+                fp(
+                    "C1",
+                    10.0,
+                    12.0,
+                    &[("1", 0.0, 0.0, "+3V3"), ("2", dx, 0.0, "GND")],
+                ),
+            ],
+            "",
+        )
+    };
+    // Supply leg 2 mm, ground leg over 4 mm (limit 2.5 mm).
+    let far = board_with_ground_pad_at(6.0);
+    let complete = run(&fx(&decoupled_parts(), Some(far.clone()), None));
+    assert_eq!(findings(&complete, "decoupling_ground_far").len(), 1);
+    let v = incomplete_labels(&fx(&decoupled_parts(), Some(far), None));
+    assert_eq!(passed(&v, "decoupling_supply_far"), 1, "{v}");
+    assert!(findings(&v, "decoupling_ground_far").is_empty(), "{v}");
+    assert_eq!(passed(&v, "decoupling_ground_far"), 0);
+    let withheld = unproven_for(&v, "decoupling_ground_far");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["component"], "U1");
+    assert_eq!(withheld[0]["pin"], "1");
+    // A short ground leg is a witness no unseen capacitor can undo.
+    let v = incomplete_labels(&fx(
+        &decoupled_parts(),
+        Some(board_with_ground_pad_at(1.0)),
+        None,
+    ));
+    assert_eq!(passed(&v, "decoupling_ground_far"), 1, "{v}");
+    assert!(unproven_for(&v, "decoupling_ground_far").is_empty());
+}
+
+#[test]
+fn cross_sheet_series_search_into_unresolved_connectivity_withholds_only_the_series_rule() {
+    // The connector net itself is complete and unprotected: that absence is
+    // proven. What sits behind R1 continues on a net we cannot follow.
+    let v = run(&fx(
+        &[
+            connector("J1", "SIG"),
+            res("R1", "100", "SIG", "g:SIGP"),
+            receiver("SIG"),
+        ],
+        None,
+        None,
+    ));
+    assert!(findings(&v, "protection_after_series_element").is_empty());
+    assert_eq!(passed(&v, "protection_after_series_element"), 0, "{v}");
+    let withheld = unproven_for(&v, "protection_after_series_element");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["component"], "J1");
+    assert_eq!(findings(&v, "connector_signal_unprotected").len(), 1);
+    // With the far side known and empty, the series rule passes.
+    let v = run(&fx(
+        &[
+            connector("J1", "SIG"),
+            res("R1", "100", "SIG", "SIGP"),
+            receiver("SIG"),
+        ],
+        None,
+        None,
+    ));
+    assert_eq!(passed(&v, "protection_after_series_element"), 1, "{v}");
+    assert!(unproven_for(&v, "protection_after_series_element").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_connector_net_withholds_far_protection_placement_only() {
+    let parts = || vec![connector("J1", "SIG"), tvs("D1", "SIG"), receiver("SIG")];
+    // TVS 35 mm from the connector pad (limit 10 mm): nearer protection may be unseen.
+    let far = incomplete_labels(&fx(&parts(), Some(protection_board(40.0, 60.0)), None));
+    assert!(findings(&far, "esd_far_from_connector").is_empty(), "{far}");
+    assert_eq!(passed(&far, "esd_far_from_connector"), 0);
+    let withheld = unproven_for(&far, "esd_far_from_connector");
+    assert_eq!(withheld.len(), 1, "{far}");
+    assert_eq!(withheld[0]["component"], "J1");
+    // TVS at the pad: a witness that stays.
+    let near = incomplete_labels(&fx(&parts(), Some(protection_board(7.0, 60.0)), None));
+    assert_eq!(passed(&near, "esd_far_from_connector"), 1, "{near}");
+    assert!(unproven_for(&near, "esd_far_from_connector").is_empty());
+    // The circuit is nearer the connector than the only protection we know of.
+    let order = incomplete_labels(&fx(&parts(), Some(protection_board(14.0, 8.0)), None));
+    assert!(
+        findings(&order, "protection_beyond_circuit").is_empty(),
+        "{order}"
+    );
+    assert_eq!(passed(&order, "protection_beyond_circuit"), 0);
+    let withheld = unproven_for(&order, "protection_beyond_circuit");
+    assert_eq!(withheld.len(), 1, "{order}");
+    assert_eq!(withheld[0]["component"], "U1");
+    // Protection between connector and circuit stays a pass.
+    let ok = incomplete_labels(&fx(&parts(), Some(protection_board(8.0, 20.0)), None));
+    assert_eq!(passed(&ok, "protection_beyond_circuit"), 1, "{ok}");
+    assert!(unproven_for(&ok, "protection_beyond_circuit").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_bus_withholds_far_transceiver_and_termination_placement() {
+    let parts = || vec![can_xcvr(), can_conn(), res("R1", "120", "CANH", "CANL")];
+    // Connector 70 mm away (limit 25 mm): a nearer one may be on an unread sheet.
+    let far = incomplete_labels(&fx(&parts(), Some(can_board(90.0, (22.0, 14.0))), None));
+    assert!(
+        findings(&far, "transceiver_far_from_connector").is_empty(),
+        "{far}"
+    );
+    assert_eq!(passed(&far, "transceiver_far_from_connector"), 0);
+    let withheld = unproven_for(&far, "transceiver_far_from_connector");
+    assert_eq!(withheld.len(), 1, "{far}");
+    assert_eq!(withheld[0]["component"], "U2");
+    // Both bus lines measured to a near connector, termination beside it.
+    let near = incomplete_labels(&fx(&parts(), Some(can_board(8.0, (22.0, 14.0))), None));
+    assert_eq!(passed(&near, "transceiver_far_from_connector"), 1, "{near}");
+    assert!(unproven_for(&near, "transceiver_far_from_connector").is_empty());
+    assert_eq!(passed(&near, "termination_far_from_endpoint"), 1);
+    assert!(unproven_for(&near, "termination_far_from_endpoint").is_empty());
+    // Termination far from every known endpoint: a nearer endpoint may be unseen.
+    let far_r = incomplete_labels(&fx(&parts(), Some(can_board(8.0, (60.0, 60.0))), None));
+    assert!(
+        findings(&far_r, "termination_far_from_endpoint").is_empty(),
+        "{far_r}"
+    );
+    assert_eq!(passed(&far_r, "termination_far_from_endpoint"), 0);
+    let withheld = unproven_for(&far_r, "termination_far_from_endpoint");
+    assert_eq!(withheld.len(), 1, "{far_r}");
+    assert_eq!(withheld[0]["component"], "R1");
+}
+
+#[test]
+fn cross_sheet_incomplete_bus_does_not_pass_a_transceiver_on_one_measured_line_or_none() {
+    // Only CANH reaches this connector; CANL's nearest connector is not known.
+    let one_line = || {
+        p(
+            "J2",
+            "Connector_Generic:Conn_01x02",
+            "Conn",
+            vec![("1", "H", "passive", "CANH"), ("2", "G", "passive", "GND")],
+        )
+    };
+    let near = || Some(can_board(8.0, (22.0, 14.0)));
+    let complete = run(&fx(&[can_xcvr(), one_line()], near(), None));
+    assert_eq!(passed(&complete, "transceiver_far_from_connector"), 1);
+    let v = incomplete_labels(&fx(&[can_xcvr(), one_line()], near(), None));
+    assert_eq!(passed(&v, "transceiver_far_from_connector"), 0, "{v}");
+    assert_eq!(unproven_for(&v, "transceiver_far_from_connector").len(), 1);
+    // No connector at all on an incomplete bus is withheld, not skipped as empty.
+    let v = incomplete_labels(&fx(&[can_xcvr()], near(), None));
+    assert_eq!(
+        unproven_for(&v, "transceiver_far_from_connector").len(),
+        1,
+        "{v}"
+    );
+    assert_eq!(passed(&v, "transceiver_far_from_connector"), 0);
+    let v = run(&fx(&[can_xcvr()], near(), None));
+    assert!(unproven_for(&v, "transceiver_far_from_connector").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_crystal_pins_withhold_a_missing_load_cap_and_an_unreadable_pin_count() {
+    // XO has no load capacitor on what is known.
+    let v = incomplete_labels(&fx(&xtal_parts(false), None, None));
+    assert!(findings(&v, "crystal_load_cap_missing").is_empty(), "{v}");
+    assert_eq!(passed(&v, "crystal_load_cap_missing"), 1);
+    let withheld = unproven_for(&v, "crystal_load_cap_missing");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["component"], "Y1");
+    let v = run(&fx(&xtal_parts(false), None, None));
+    assert_eq!(findings(&v, "crystal_load_cap_missing").len(), 1);
+    assert!(unproven_for(&v, "crystal_load_cap_missing").is_empty());
+    // One pin reads as ground and the other continues elsewhere: the two
+    // signal pins cannot be identified, which is not the same as a crystal
+    // this rule does not read.
+    let odd = |xi: &'static str| {
+        vec![p(
+            "Y1",
+            "Device:Crystal",
+            "8MHz",
+            vec![("1", "1", "passive", xi), ("2", "2", "passive", "GND")],
+        )]
+    };
+    let v = run(&fx(&odd("g:XI"), None, None));
+    assert_eq!(unproven_for(&v, "crystal_load_cap_missing").len(), 1, "{v}");
+    let v = run(&fx(&odd("XI"), None, None));
+    assert!(unproven_for(&v, "crystal_load_cap_missing").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_i2c_line_without_known_devices_or_with_an_unresolved_pull_up_is_withheld()
+{
+    let header = |sda: &'static str| {
+        p(
+            "J1",
+            "Connector_Generic:Conn_01x02",
+            "Conn",
+            vec![("1", "SDA", "passive", sda), ("2", "GND", "passive", "GND")],
+        )
+    };
+    // A header carries SDA off this sheet: devices and pull-ups may be there.
+    let v = run(&fx(&[header("g:SDA")], None, None));
+    let withheld = unproven_for(&v, "i2c_pullup_value");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["net"], "SDA");
+    assert!(withheld[0].get("net_key").is_none(), "internal key leaked");
+    let v = run(&fx(&[header("SDA")], None, None));
+    assert!(unproven_for(&v, "i2c_pullup_value").is_empty());
+
+    // R1 leaves SDA for a net that is not a known rail and continues
+    // elsewhere: it may be a pull-up whose rail is named on another sheet.
+    let line = |v: &Value| {
+        v["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["line"] == "SDA")
+            .unwrap()
+            .clone()
+    };
+    let v = run(&fx(
+        &[i2c_dev(), res("R1", "4k7", "SDA", "g:PULL")],
+        None,
+        None,
+    ));
+    assert_eq!(line(&v)["connectivity_complete"], false, "{v}");
+    assert!(unproven_for(&v, "i2c_pullup_value")
+        .iter()
+        .any(|u| u["net"] == "SDA"));
+    let v = run(&fx(
+        &[i2c_dev(), res("R1", "4k7", "SDA", "PULL")],
+        None,
+        None,
+    ));
+    assert_eq!(line(&v)["connectivity_complete"], true, "{v}");
+    assert!(unproven_for(&v, "i2c_pullup_value").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_uart_net_with_one_known_endpoint_is_withheld_not_ignored() {
+    let lone = |tx: &'static str| vec![uart_dev("U1", tx, "RX_LOCAL")];
+    let v = run(&fx(&lone("g:LINK"), None, None));
+    let withheld = unproven_for(&v, "uart_tx_rx_crossed");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["net"], "LINK");
+    assert!(findings(&v, "uart_tx_rx_crossed").is_empty());
+    assert_eq!(passed(&v, "uart_tx_rx_crossed"), 0);
+    // A complete net with one endpoint is not a UART link to judge.
+    let v = run(&fx(&lone("LINK"), None, None));
+    assert!(unproven_for(&v, "uart_tx_rx_crossed").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_usb_data_net_away_from_any_known_connector_is_withheld() {
+    let phy = |dp: &'static str, dm: &'static str| {
+        p(
+            "U1",
+            "Fixture:USBPHY",
+            "PHY",
+            vec![
+                ("1", "USB_DP", "bidirectional", dp),
+                ("2", "USB_DM", "bidirectional", dm),
+                ("3", "VDD", "power_in", "+3V3"),
+                ("4", "GND", "power_in", "GND"),
+            ],
+        )
+    };
+    let v = run(&fx(&[phy("g:USB_DP", "g:USB_DM")], None, None));
+    assert_eq!(unproven_for(&v, "usb_esd_missing").len(), 2, "{v}");
+    assert!(findings(&v, "usb_esd_missing").is_empty());
+    assert_eq!(passed(&v, "usb_esd_missing"), 0);
+    let v = run(&fx(&[phy("USB_DP", "USB_DM")], None, None));
+    assert!(unproven_for(&v, "usb_esd_missing").is_empty());
+}
+
+#[test]
+fn cross_sheet_complete_reference_pin_without_a_capacitor_is_skipped_not_withheld() {
+    let adc = || {
+        vec![p(
+            "U1",
+            "Fixture:ADC",
+            "ADC",
+            vec![
+                ("1", "VREF+", "input", "VREF"),
+                ("2", "GND", "power_in", "GND"),
+                ("3", "VDD", "power_in", "+3V3"),
+            ],
+        )]
+    };
+    let b = || {
+        Some(board(
+            &[fp(
+                "U1",
+                10.0,
+                10.0,
+                &[
+                    ("1", 0.0, 0.0, "VREF"),
+                    ("2", 0.0, 2.0, "GND"),
+                    ("3", 2.0, 0.0, "+3V3"),
+                ],
+            )],
+            "",
+        ))
+    };
+    // Everything on the reference net is known: the absence is audit_decoupling's
+    // to report, and this rule says it had nothing to place.
+    let v = run(&fx(&adc(), b(), None));
+    assert!(unproven_for(&v, "adc_ref_cap_far").is_empty(), "{v}");
+    assert_eq!(check(&v, "adc_ref_cap_far")["skipped"], 1);
+    // The same pin on a net that may continue: withheld instead.
+    let v = incomplete_labels(&fx(&adc(), b(), None));
+    assert_eq!(unproven_for(&v, "adc_ref_cap_far").len(), 1, "{v}");
+    assert_eq!(passed(&v, "adc_ref_cap_far"), 0);
+}
+
+// ─── Cases added for mutants the first scoped mutation run left alive ────────
+
+#[test]
+fn cross_sheet_a_capacitor_to_a_ground_that_continues_elsewhere_is_still_a_known_capacitor() {
+    // The supply net is complete; only the ground it returns to is global. A
+    // proved ground stays a proved ground, so the far capacitor is a finding.
+    let ic = p(
+        "U1",
+        "Fixture:MCU",
+        "MCU",
+        vec![
+            ("1", "VDD", "power_in", "+3V3"),
+            ("2", "GND", "power_in", "g:GND"),
+            ("3", "PA0", "input", "SIG0"),
+        ],
+    );
+    let b = board(
+        &[
+            u1(),
+            fp(
+                "C1",
+                30.0,
+                10.0,
+                &[("1", 0.0, 0.0, "+3V3"), ("2", 1.0, 0.0, "GND")],
+            ),
+        ],
+        "",
+    );
+    let v = run(&fx(
+        &[ic, cap("C1", "100n", "+3V3", "g:GND")],
+        Some(b),
+        None,
+    ));
+    assert_eq!(findings(&v, "decoupling_supply_far").len(), 1, "{v}");
+    assert!(unproven_for(&v, "decoupling_supply_far").is_empty());
+}
+
+#[test]
+fn cross_sheet_incomplete_placement_limits_stay_inclusive_like_the_complete_rules() {
+    // Exactly on the limit is a pass for the complete rule and stays a
+    // witness when the inventory is incomplete: only "farther than" is withheld.
+    let decoupled = board(
+        &[
+            u1(),
+            fp(
+                "C1",
+                10.0,
+                12.5,
+                &[("1", 0.0, 0.0, "+3V3"), ("2", 2.0, 0.0, "GND")],
+            ),
+        ],
+        "",
+    );
+    let v = incomplete_labels(&fx(&decoupled_parts(), Some(decoupled), None));
+    for rule in ["decoupling_supply_far", "decoupling_ground_far"] {
+        assert_eq!(passed(&v, rule), 1, "{rule}: {v}");
+        assert!(unproven_for(&v, rule).is_empty(), "{rule}");
+    }
+    // Bulk capacitor exactly 10 mm from VIN.
+    let bulk = board(
+        &[
+            fp(
+                "U2",
+                10.0,
+                10.0,
+                &[
+                    ("1", 0.0, 0.0, "GND"),
+                    ("2", 3.0, 0.0, "+3V3"),
+                    ("3", 6.0, 0.0, "+5V"),
+                ],
+            ),
+            fp(
+                "C2",
+                26.0,
+                10.0,
+                &[("1", 0.0, 0.0, "+5V"), ("2", 1.0, 0.0, "GND")],
+            ),
+        ],
+        "",
+    );
+    let v = incomplete_labels(&fx(
+        &[regulator("U2", "+3V3"), cap("C2", "22u", "+5V", "GND")],
+        Some(bulk),
+        None,
+    ));
+    assert_eq!(passed(&v, "bulk_cap_far"), 1, "{v}");
+    assert!(unproven_for(&v, "bulk_cap_far")
+        .iter()
+        .all(|u| u["pin"] != "3"));
+    // TVS exactly 10 mm from the connector pad; the circuit exactly the order
+    // margin (1 mm) nearer than the TVS, which is not "before the protection".
+    let protected = || vec![connector("J1", "SIG"), tvs("D1", "SIG"), receiver("SIG")];
+    let v = incomplete_labels(&fx(&protected(), Some(protection_board(15.0, 60.0)), None));
+    assert_eq!(passed(&v, "esd_far_from_connector"), 1, "{v}");
+    assert!(unproven_for(&v, "esd_far_from_connector").is_empty());
+    for complete in [true, false] {
+        let f = fx(&protected(), Some(protection_board(14.0, 13.0)), None);
+        let v = if complete {
+            run(&f)
+        } else {
+            incomplete_labels(&f)
+        };
+        assert_eq!(passed(&v, "protection_beyond_circuit"), 1, "{v}");
+        assert!(findings(&v, "protection_beyond_circuit").is_empty());
+        assert!(unproven_for(&v, "protection_beyond_circuit").is_empty());
+    }
+    // Connector exactly 25 mm from the transceiver, termination exactly 25 mm
+    // from the nearest endpoint pin.
+    let v = incomplete_labels(&fx(
+        &[can_xcvr(), can_conn(), res("R1", "120", "CANH", "CANL")],
+        Some(can_board(45.0, (20.0, 35.0))),
+        None,
+    ));
+    for rule in [
+        "transceiver_far_from_connector",
+        "termination_far_from_endpoint",
+    ] {
+        assert_eq!(passed(&v, rule), 1, "{rule}: {v}");
+        assert!(unproven_for(&v, rule).is_empty(), "{rule}");
+    }
+}
+
+#[test]
+fn cross_sheet_a_lone_connector_pin_on_an_incomplete_signal_net_is_withheld_but_a_rail_is_not() {
+    let lone = |net: &'static str| vec![connector("J1", net)];
+    // Nothing else is on the net here, but the net continues: the circuit and
+    // its protection may be on a sheet that was not read.
+    let v = run(&fx(&lone("g:SIG"), None, None));
+    let withheld = unproven_for(&v, "connector_signal_unprotected");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["component"], "J1");
+    assert_eq!(withheld[0]["pin"], "1");
+    assert!(findings(&v, "connector_signal_unprotected").is_empty());
+    // A complete net with nothing attached is not a signal path.
+    let v = run(&fx(&lone("SIG"), None, None));
+    assert!(unproven_for(&v, "connector_signal_unprotected").is_empty());
+    // A power-entry pin is a human judgement, incomplete or not.
+    let v = run(&fx(&lone("g:+5V"), None, None));
+    assert!(unproven_for(&v, "connector_signal_unprotected").is_empty());
+}
+
+#[test]
+fn cross_sheet_one_unresolved_bus_line_makes_the_whole_bus_search_incomplete() {
+    for (high, low) in [("g:CANH", "CANL"), ("CANH", "g:CANL")] {
+        let v = run(&fx(
+            &[
+                p(
+                    "U2",
+                    "Fixture:CANXCVR",
+                    "TCAN",
+                    vec![
+                        ("1", "CANH", "bidirectional", high),
+                        ("2", "CANL", "bidirectional", low),
+                        ("3", "VCC", "power_in", "+5V"),
+                        ("4", "GND", "power_in", "GND"),
+                    ],
+                ),
+                p(
+                    "J2",
+                    "Connector_Generic:Conn_01x03",
+                    "Conn",
+                    vec![
+                        ("1", "H", "passive", high),
+                        ("2", "L", "passive", low),
+                        ("3", "G", "passive", "GND"),
+                    ],
+                ),
+            ],
+            None,
+            None,
+        ));
+        assert_eq!(passed(&v, "can_bus_branches"), 0, "{high}/{low}: {v}");
+        assert_eq!(unproven_for(&v, "can_bus_branches").len(), 1);
+        assert_eq!(v["interfaces"][0]["connectivity_complete"], false);
+    }
+}
+
+#[test]
+fn cross_sheet_selectable_termination_needs_a_resistor_a_floating_node_and_a_selector() {
+    let kind = |parts: &[P]| {
+        run(&fx(parts, None, None))["interfaces"][0]["termination"]["kind"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let two_pin = |r: &'static str, lib: &'static str, a: &'static str, b: &'static str| {
+        p(
+            r,
+            lib,
+            "X",
+            vec![("1", "A", "passive", a), ("2", "B", "passive", b)],
+        )
+    };
+    // A slide switch (lib id carries `SW_`, not `SWITCH`) selects like a jumper.
+    assert_eq!(
+        kind(&[
+            can_xcvr(),
+            res("R1", "120", "CANH", "X"),
+            two_pin("S1", "Fixture:SW_SPST", "X", "CANL"),
+        ]),
+        "selectable"
+    );
+    // A capacitor in the resistor's place is not a termination.
+    assert_eq!(
+        kind(&[
+            can_xcvr(),
+            cap("C9", "100n", "CANH", "X"),
+            two_pin("JP1", "Jumper:Jumper_2_Open", "X", "CANL"),
+        ]),
+        "none_observed"
+    );
+    // A pull-down to ground with a header from ground to the other line is
+    // not a selectable termination: the middle node must be a floating one.
+    assert_eq!(
+        kind(&[
+            can_xcvr(),
+            res("R1", "120", "CANH", "GND"),
+            two_pin("J5", "Connector_Generic:Conn_01x02", "GND", "CANL"),
+        ]),
+        "none_observed"
+    );
+}
+
+#[test]
+fn cross_sheet_incomplete_termination_value_keeps_only_a_proven_overload() {
+    // The pair itself is complete, but a series part leads off it to a net
+    // that continues: another termination may sit behind it.
+    let value_check = |ohms: &'static str| {
+        run(&fx(
+            &[
+                can_xcvr(),
+                can_conn(),
+                res("R1", ohms, "CANH", "CANL"),
+                res("R9", "22", "CANH", "g:FAR"),
+            ],
+            None,
+            None,
+        ))
+    };
+    let v = value_check("120");
+    assert_eq!(passed(&v, "can_termination_value"), 0, "{v}");
+    assert_eq!(unproven_for(&v, "can_termination_value").len(), 1);
+    assert_eq!(
+        v["interfaces"][0]["termination"]["connectivity_complete"],
+        false
+    );
+    // 114 ohm is the lower edge of the accepted band, not an overload: unseen
+    // parallel resistors could still pull it out of the band.
+    let v = value_check("114");
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(passed(&v, "can_termination_value"), 0);
+    assert_eq!(unproven_for(&v, "can_termination_value").len(), 1);
+    // Below the band stays a finding: more parallel resistance cannot raise it.
+    let v = value_check("100");
+    assert_eq!(findings(&v, "can_termination_value").len(), 1, "{v}");
+    // A zero-ohm link is not a termination value to call overloaded.
+    let v = value_check("0");
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(passed(&v, "can_termination_value"), 0);
+}
+
+#[test]
+fn cross_sheet_termination_exactly_at_the_limit_stands_when_another_endpoint_is_unmeasurable() {
+    // J2 is in the schematic but not on the board, so one eligible endpoint
+    // cannot be measured. R1 is exactly 25 mm from the transceiver pin: that
+    // is within the limit, and no unmeasured endpoint can make it farther.
+    let b = board(
+        &[
+            fp(
+                "U2",
+                20.0,
+                10.0,
+                &[
+                    ("1", 0.0, 0.0, "CANH"),
+                    ("2", 2.0, 0.0, "CANL"),
+                    ("3", 4.0, 0.0, "+5V"),
+                    ("4", 6.0, 0.0, "GND"),
+                    ("5", 8.0, 0.0, "TX"),
+                    ("6", 10.0, 0.0, "RX"),
+                ],
+            ),
+            fp(
+                "R1",
+                20.0,
+                35.0,
+                &[("1", 0.0, 0.0, "CANH"), ("2", 0.0, 2.0, "CANL")],
+            ),
+        ],
+        "",
+    );
+    let v = run(&fx(
+        &[can_xcvr(), can_conn(), res("R1", "120", "CANH", "CANL")],
+        Some(b),
+        None,
+    ));
+    assert_eq!(passed(&v, "termination_far_from_endpoint"), 1, "{v}");
+    assert_eq!(check(&v, "termination_far_from_endpoint")["unevaluated"], 0);
+}
+
+#[test]
+fn cross_sheet_incomplete_reference_cap_within_its_own_limit_but_not_every_family_s_is_withheld() {
+    // A 1 uF capacitor 4 mm from VREF passes its own 5 mm limit. An unseen
+    // 100 nF capacitor would be judged at 2.5 mm instead, so on an incomplete
+    // net this distance proves nothing; on a complete net it is a pass.
+    let parts = || {
+        vec![
+            p(
+                "U1",
+                "Fixture:ADC",
+                "ADC",
+                vec![
+                    ("1", "VREF+", "input", "VREF"),
+                    ("2", "GND", "power_in", "GND"),
+                    ("3", "VDD", "power_in", "+3V3"),
+                ],
+            ),
+            cap("C1", "1u", "VREF", "GND"),
+        ]
+    };
+    let b = || {
+        Some(board(
+            &[
+                fp(
+                    "U1",
+                    10.0,
+                    10.0,
+                    &[
+                        ("1", 0.0, 0.0, "VREF"),
+                        ("2", 0.0, 2.0, "GND"),
+                        ("3", 2.0, 0.0, "+3V3"),
+                    ],
+                ),
+                fp(
+                    "C1",
+                    14.0,
+                    10.0,
+                    &[("1", 0.0, 0.0, "VREF"), ("2", 0.0, 1.0, "GND")],
+                ),
+            ],
+            "",
+        ))
+    };
+    let v = run(&fx(&parts(), b(), None));
+    assert_eq!(passed(&v, "adc_ref_cap_far"), 1, "{v}");
+    let v = incomplete_labels(&fx(&parts(), b(), None));
+    assert_eq!(passed(&v, "adc_ref_cap_far"), 0, "{v}");
+    assert_eq!(unproven_for(&v, "adc_ref_cap_far").len(), 1);
+    assert!(findings(&v, "adc_ref_cap_far").is_empty());
+}
+
+// ─── Independent review A (2026-11-12): one reproduction per finding ─────────
+
+// M1: a direct resistor below the band is a low bank at every end assignment.
+#[test]
+fn cross_sheet_a_low_direct_resistor_among_several_is_a_finding_at_any_end_assignment() {
+    for (r1, r2, low) in [
+        ("60", "60", true),
+        ("60", "120", true),
+        // 114 ohm is in the band: the bound is strict.
+        ("114", "114", false),
+        ("120", "120", false),
+        ("240", "240", false),
+    ] {
+        let v = run(&fx(
+            &[
+                can_xcvr(),
+                can_conn(),
+                res("R1", r1, "CANH", "CANL"),
+                res("R2", r2, "CANH", "CANL"),
+            ],
+            None,
+            None,
+        ));
+        let human = v["needs_human"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["rule"] == "can_termination_value")
+            .count();
+        assert_eq!(
+            findings(&v, "can_termination_value").len(),
+            usize::from(low),
+            "{r1}+{r2}: {v}"
+        );
+        assert_eq!(human, usize::from(!low), "{r1}+{r2}");
+        assert_eq!(passed(&v, "can_termination_value"), 0);
+        if low {
+            let f = only(&v, "can_termination_value");
+            assert_eq!(f["evidence"]["kind"], "direct");
+            assert_eq!(f["evidence"]["low_bank"], json!(["R1"]));
+            assert_eq!(f["evidence"]["upper_bound_ohms"], 60.0);
+            assert_eq!(f["evidence"]["bank_assignment_requires_human"], true);
+        }
+    }
+    // Unseen parallel paths cannot raise 60 ohm either.
+    let v = run(&fx(
+        &[
+            global_can_xcvr(),
+            global_can_conn("J2"),
+            res("R1", "60", "g:CANH", "g:CANL"),
+            res("R2", "120", "g:CANH", "g:CANL"),
+        ],
+        None,
+        None,
+    ));
+    assert_eq!(findings(&v, "can_termination_value").len(), 1, "{v}");
+    assert!(unproven_for(&v, "can_termination_value").is_empty());
+}
+
+// m1: the same bound holds for a split bank; a selectable one may be open.
+#[test]
+fn cross_sheet_incomplete_split_below_the_band_is_a_finding_but_a_selectable_one_is_withheld() {
+    let split = |value: &'static str| {
+        vec![
+            global_can_xcvr(),
+            global_can_conn("J2"),
+            res("R1", value, "g:CANH", "MID"),
+            res("R2", value, "g:CANL", "MID"),
+        ]
+    };
+    let v = run(&fx(&split("30"), None, None));
+    let f = only(&v, "can_termination_value");
+    assert_eq!(f["evidence"]["kind"], "split");
+    assert_eq!(f["evidence"]["total_ohms"], 60.0);
+    assert_eq!(f["evidence"]["connectivity_complete"], false);
+    assert!(unproven_for(&v, "can_termination_value").is_empty());
+    // In the band on what is known: unseen parallel paths could pull it out.
+    let v = run(&fx(&split("60"), None, None));
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(passed(&v, "can_termination_value"), 0);
+    assert_eq!(unproven_for(&v, "can_termination_value").len(), 1);
+    // The bound needs the split's own middle node: one that continues out of
+    // sight may not be the node both resistors are seen on.
+    let v = run(&fx(
+        &[
+            global_can_xcvr(),
+            global_can_conn("J2"),
+            res("R1", "30", "g:CANH", "g:MID"),
+            res("R2", "30", "g:CANL", "g:MID"),
+        ],
+        None,
+        None,
+    ));
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(unproven_for(&v, "can_termination_value").len(), 1);
+    let v = run(&fx(
+        &[
+            global_can_xcvr(),
+            global_can_conn("J2"),
+            res("R1", "60", "g:CANH", "X"),
+            p(
+                "JP1",
+                "Jumper:Jumper_2_Open",
+                "Jumper",
+                vec![("1", "A", "passive", "X"), ("2", "B", "passive", "g:CANL")],
+            ),
+        ],
+        None,
+        None,
+    ));
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(unproven_for(&v, "can_termination_value").len(), 1);
+}
+
+// m2: a gap belongs to one use and says which, with that use's designator.
+#[test]
+fn cross_sheet_per_use_gaps_name_their_use_and_its_designator() {
+    const A: &str = "/11111111-1111-4111-8111-111111111111/a";
+    const B: &str = "/11111111-1111-4111-8111-111111111111/b";
+    let child = schematic(&[
+        res("R1", "1k", "LOCAL", "RET")
+            .instance(A, "R1")
+            .instance(B, "R101"),
+        res("R2", "1k", "LOCAL", "RET")
+            .instance(A, "R2")
+            .instance(B, "R102"),
+    ])
+    .replacen("(lib_id \"Device:R\")", "(lib_id \"Missing:Symbol\")", 1);
+    let c = joined_model(
+        &[
+            ("child.kicad_sch", "/a/", child.clone()),
+            ("child.kicad_sch", "/b/", child),
+        ],
+        true,
+    );
+    let gaps: Vec<&String> = c
+        .connectivity_gaps
+        .iter()
+        .filter(|gap| gap.contains("unresolved symbol connectivity"))
+        .collect();
+    assert_eq!(gaps.len(), 2, "{:?}", c.connectivity_gaps);
+    assert_eq!(c.unresolved_symbols, 2, "counted per use, across uses");
+    assert!(gaps
+        .iter()
+        .any(|gap| gap.contains("[/a/]") && gap.ends_with("for R1")));
+    assert!(gaps
+        .iter()
+        .any(|gap| gap.contains("[/b/]") && gap.ends_with("for R101")));
+}
+
+// M2: one cause is one gap. A child use that is not there is one gap however
+// many ports lead to it; each port's parent net is still an open boundary.
+#[test]
+fn cross_sheet_an_unavailable_child_is_one_gap_however_many_ports_lead_to_it() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "LEFT", "RIGHT")]),
+        &(hierarchy_sheet("child.kicad_sch", "a", &[("P1", 30.0), ("P2", 40.0)])
+            + "(label \"LEFT\" (at 60 30 0))(label \"RIGHT\" (at 60 40 0))"),
+    );
+    let c = joined_model(&[("root.kicad_sch", "/", root)], true);
+    assert_eq!(
+        c.connectivity_gaps.iter().collect::<Vec<_>>(),
+        ["unavailable or ambiguous child instance /a/"],
+    );
+    assert!(!c.inventory_complete);
+    for pin in ["1", "2"] {
+        assert!(c.net(pin_net(&c, "R1", pin)).unwrap().leaves_sheet);
+    }
+}
+
+// m4 (G2/G4): the use found at a child path must be the file the parent names.
+#[test]
+fn cross_sheet_a_use_loaded_from_another_file_than_the_parent_names_is_not_joined() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "INPUT", "RET")]),
+        &(hierarchy_sheet("child.kicad_sch", "a", &[("LINK", 30.0)])
+            + "(label \"INPUT\" (at 60 30 0))"),
+    );
+    let child = || {
+        schematic(&[res("R2", "1k", "LINK", "RET")]).replace(
+            "(label \"LINK\"",
+            "(hierarchical_label \"LINK\" (shape input)",
+        )
+    };
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root.clone()),
+            ("other.kicad_sch", "/a/", child()),
+        ],
+        true,
+    );
+    assert_ne!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    assert_eq!(
+        c.connectivity_gaps.iter().collect::<Vec<_>>(),
+        ["unavailable or ambiguous child instance /a/"],
+        "one cause: not the port, and not the stray use's own label"
+    );
+    assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+    assert!(!c.inventory_complete);
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("child.kicad_sch", "/a/", child()),
+        ],
+        true,
+    );
+    assert_eq!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+}
+
+// m4 (G1): a part dropped for ambiguous identity may sit on any observed net,
+// so no net of the design can prove an absence.
+#[test]
+fn cross_sheet_an_ambiguous_part_across_uses_leaves_every_net_uncertain() {
+    let c = joined_model(
+        &[
+            (
+                "root.kicad_sch",
+                "/",
+                schematic(&[res("R1", "1k", "A", "B"), res("R7", "1k", "QUIET", "ALONE")]),
+            ),
+            (
+                "child.kicad_sch",
+                "/a/",
+                schematic(&[res("R1", "1k", "A", "B")]),
+            ),
+        ],
+        true,
+    );
+    assert!(c.part("R1").is_none());
+    assert!(has_gap(
+        &c,
+        "ambiguous component identity across sheet uses: R1"
+    ));
+    assert!(
+        c.nets.values().all(|net| net.leaves_sheet),
+        "R7's nets are uncertain too: the dropped R1 pins may be on them"
+    );
+}
+
+// n1 (H06): identity does not depend on the order items are written in a file.
+#[test]
+fn cross_sheet_net_keys_do_not_depend_on_item_order_within_a_file() {
+    let parts = || {
+        vec![
+            res("R1", "1k", "g:A", "B"),
+            res("R2", "1k", "B", "g:C"),
+            res("R3", "1k", "g:C", "D"),
+        ]
+    };
+    let source = add_root_nodes(
+        schematic(&parts()),
+        "  (wire (pts (xy 20 97.46) (xy 50 100)) (stroke (width 0) (type default)))\n  (wire (pts (xy 50 97.46) (xy 80 100)) (stroke (width 0) (type default)))\n",
+    );
+    // Reverse every top-level item after `lib_symbols`: symbols, labels, wires.
+    let split = source.find("  (symbol (lib_id").unwrap();
+    let (head, body) = source.split_at(split);
+    let body = body.strip_suffix(")\n").unwrap();
+    let mut items: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if line.starts_with("  (") {
+            items.push(String::new());
+        }
+        let item = items.last_mut().unwrap();
+        item.push_str(line);
+        item.push('\n');
+    }
+    assert!(items.len() > 8);
+    items.reverse();
+    let reordered = format!("{head}{})\n", items.concat());
+    assert_ne!(source, reordered);
+    let a = joined_model(&[("root.kicad_sch", "/", source)], true);
+    let b = joined_model(&[("root.kicad_sch", "/", reordered)], true);
+    for reference in ["R1", "R2", "R3"] {
+        for pin in ["1", "2"] {
+            assert_eq!(pin_net(&a, reference, pin), pin_net(&b, reference, pin));
+        }
+    }
+    assert_eq!(
+        a.nets.keys().collect::<Vec<_>>(),
+        b.nets.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(pin_net(&a, "R1", "2"), pin_net(&a, "R2", "1"));
+    assert_ne!(pin_net(&a, "R1", "1"), pin_net(&a, "R3", "2"));
+}
+
+// n3: `(hide no)` is a visible pin.
+#[test]
+fn cross_sheet_a_power_input_pin_written_hide_no_is_visible() {
+    let source = schematic(&[p(
+        "U1",
+        "Fixture:Logic",
+        "74HC00",
+        vec![("1", "A", "input", "A"), ("14", "VCC", "power_in", "VCC")],
+    )])
+    .replace(
+        "(length 2.54) (name \"VCC\")",
+        "(length 2.54) (hide no) (name \"VCC\")",
+    );
+    assert!(source.contains("(hide no)"));
+    let c = joined_model(&[("root.kicad_sch", "/", source)], true);
+    assert!(c.inventory_complete, "{:?}", c.connectivity_gaps);
+}
+
+fn link_child() -> String {
+    schematic(&[res("R2", "1k", "LINK", "OTHER")])
+        .replace(
+            "(label \"LINK\"",
+            "(hierarchical_label \"LINK\" (shape input)",
+        )
+        .replace(
+            "(label \"OTHER\"",
+            "(hierarchical_label \"OTHER\" (shape input)",
+        )
+}
+
+fn root_with_link_ports(ports: &[(&str, f64)], labels: &str) -> String {
+    add_root_nodes(
+        schematic(&[res("R1", "1k", "INPUT", "RET")]),
+        &(hierarchy_sheet("child.kicad_sch", "a", ports) + labels),
+    )
+}
+
+// M2: two uses at one instance path are one cause, named once.
+#[test]
+fn cross_sheet_a_duplicated_instance_path_is_one_gap() {
+    let root = root_with_link_ports(&[("LINK", 30.0)], "(label \"INPUT\" (at 60 30 0))");
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("child.kicad_sch", "/a/", link_child()),
+            ("child.kicad_sch", "/a/", link_child()),
+        ],
+        true,
+    );
+    assert_eq!(c.connectivity_gaps.len(), 1, "{:?}", c.connectivity_gaps);
+    assert!(has_gap(&c, "use quarantined"));
+    assert!(c.part("R2").is_none());
+    assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+    assert!(!c.inventory_complete);
+}
+
+// M2: a use the caller reports is not recorded again, and neither is what
+// hangs below a missing use. Both still leave the model incomplete.
+#[test]
+fn cross_sheet_uses_below_a_missing_use_add_no_gap_of_their_own() {
+    let gaps = |c: &crate::tools::circuit_model::Circuit| {
+        c.connectivity_gaps.iter().cloned().collect::<Vec<_>>()
+    };
+    let sheets = || {
+        [
+            (
+                "root.kicad_sch",
+                "/",
+                root_with_link_ports(&[("LINK", 30.0)], "(label \"INPUT\" (at 60 30 0))"),
+            ),
+            ("leaf.kicad_sch", "/a/c/", link_child()),
+        ]
+    };
+    // The caller reports /a/ itself.
+    let c = joined_model_with(&sheets(), true, &["/a/"]);
+    assert!(c.connectivity_gaps.is_empty(), "{:?}", c.connectivity_gaps);
+    assert!(!c.inventory_complete, "a set-aside use is still missing");
+    assert!(c.net(pin_net(&c, "R1", "1")).unwrap().leaves_sheet);
+    assert!(c.net(pin_net(&c, "R2", "1")).unwrap().leaves_sheet);
+    // Nobody reports it: the missing use is the one gap.
+    let c = joined_model_with(&sheets(), true, &[]);
+    assert_eq!(gaps(&c), ["unavailable or ambiguous child instance /a/"]);
+    // Two levels set aside: the leaf's parent is on record though no use names it.
+    let leaf = || [("leaf.kicad_sch", "/a/b/c/", link_child())];
+    let c = joined_model_with(&leaf(), true, &["/a/", "/a/b/"]);
+    assert!(c.connectivity_gaps.is_empty(), "{:?}", c.connectivity_gaps);
+    assert!(!c.inventory_complete, "set-aside uses are still missing");
+    assert!(c.net(pin_net(&c, "R2", "1")).unwrap().leaves_sheet);
+    // No record of a parent anywhere: one gap for the use, not one per label.
+    let c = joined_model_with(&leaf(), true, &[]);
+    assert_eq!(
+        gaps(&c),
+        ["sheet use /a/b/c/ has hierarchical labels and no parent in this review"]
+    );
+    assert!(!c.inventory_complete);
+}
+
+// m3: the note is for pins that tie different parent nets, not for a repeat.
+#[test]
+fn cross_sheet_same_name_sheet_pins_note_only_a_tie_between_parent_nets() {
+    let model = |second: &str| {
+        joined_model(
+            &[
+                (
+                    "root.kicad_sch",
+                    "/",
+                    root_with_link_ports(
+                        &[("LINK", 30.0), ("LINK", 40.0), ("OTHER", 50.0)],
+                        &format!("(label \"INPUT\" (at 60 30 0))(label \"{second}\" (at 60 40 0))"),
+                    ),
+                ),
+                ("child.kicad_sch", "/a/", link_child()),
+            ],
+            true,
+        )
+    };
+    let repeat = model("INPUT");
+    assert!(
+        repeat.connectivity_notes.is_empty(),
+        "{:?}",
+        repeat.connectivity_notes
+    );
+    assert!(repeat.inventory_complete, "{:?}", repeat.connectivity_gaps);
+    assert_ne!(pin_net(&repeat, "R1", "1"), pin_net(&repeat, "R1", "2"));
+    let tie = model("RET");
+    assert_eq!(
+        tie.connectivity_notes.iter().collect::<Vec<_>>(),
+        ["sheet /a/ has more than one pin named LINK; their nets are one net through the child's label, as KiCad joins them"]
+    );
+    assert!(tie.inventory_complete, "{:?}", tie.connectivity_gaps);
+    assert_eq!(pin_net(&tie, "R1", "1"), pin_net(&tie, "R1", "2"));
+}
+
+// ─── Checkpoint A: what the first mutation run left uncaught ─────────────────
+
+// The sink current is the drop from the rail to the 0.4 V low level over the
+// pull-up: 2.9 V over 1 k is under the 3 mA limit, over 910 ohm it is not.
+#[test]
+fn cross_sheet_i2c_sink_current_is_the_drop_from_the_rail_to_the_low_level() {
+    let v = run(&fx(
+        &[i2c_dev(), res("R1", "1k", "SDA", "+3V3")],
+        None,
+        None,
+    ));
+    assert!(findings(&v, "i2c_pullup_value").is_empty(), "{v}");
+    assert_eq!(passed(&v, "i2c_pullup_value"), 1);
+    let v = run(&fx(
+        &[i2c_dev(), res("R1", "910", "SDA", "+3V3")],
+        None,
+        None,
+    ));
+    only(&v, "i2c_pullup_value");
+}
+
+// On a partial inventory only a current already over the limit is known: one
+// exactly at it, or a pull-up of no resistance, proves nothing.
+#[test]
+fn cross_sheet_incomplete_i2c_pull_up_at_the_limit_or_of_zero_ohm_is_withheld() {
+    let dev = || {
+        p(
+            "U1",
+            "Fixture:SENSOR",
+            "SENSOR",
+            vec![
+                ("1", "SDA", "bidirectional", "g:SDA"),
+                ("2", "SCL", "input", "SCL"),
+                ("3", "VDD", "power_in", "+3V4"),
+                ("4", "GND", "power_in", "GND"),
+            ],
+        )
+    };
+    // (3.4 - 0.4) V over 1 k is 3 mA exactly.
+    for value in ["1k", "0"] {
+        let v = run(&fx(&[dev(), res("R1", value, "g:SDA", "+3V4")], None, None));
+        let pull_ups = v["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["line"] == "SDA")
+            .unwrap()["pull_ups"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(pull_ups, 1, "{value}: the pull-up is seen: {v}");
+        assert!(findings(&v, "i2c_pullup_value").is_empty(), "{value}: {v}");
+        assert_eq!(passed(&v, "i2c_pullup_value"), 0, "{value}");
+        assert_eq!(unproven_for(&v, "i2c_pullup_value").len(), 1, "{value}");
+    }
+    // Over the limit on what is seen: more pull-ups only add to it.
+    let v = run(&fx(&[dev(), res("R1", "900", "g:SDA", "+3V4")], None, None));
+    assert_eq!(findings(&v, "i2c_pullup_value").len(), 1, "{v}");
+}
+
+#[test]
+fn cross_sheet_incomplete_uart_net_with_a_lone_receiver_is_withheld_and_other_nets_are_not() {
+    let v = run(&fx(&[uart_dev("U1", "TX_LOCAL", "g:LINK")], None, None));
+    let withheld = unproven_for(&v, "uart_tx_rx_crossed");
+    assert_eq!(withheld.len(), 1, "{v}");
+    assert_eq!(withheld[0]["net"], "LINK");
+    // A net that leaves the sheet with no UART pin on it is not a UART subject.
+    let v = run(&fx(&[res("R1", "1k", "g:ELSEWHERE", "GND")], None, None));
+    assert!(unproven_for(&v, "uart_tx_rx_crossed").is_empty(), "{v}");
+}
+
+#[test]
+fn cross_sheet_a_label_with_a_literal_slash_matches_written_either_way() {
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            schematic(&[res("R1", "1k", "A/B", "GND")]),
+        )],
+        true,
+    );
+    let net = c.net(pin_net(&c, "R1", "1")).unwrap();
+    assert!(net.matches_name("A/B"));
+    assert!(net.matches_name("A{slash}B"));
+    assert!(!net.matches_name("A"));
+}
+
+// A symbol is a power symbol, not a part, on any one of three signs.
+#[test]
+fn cross_sheet_a_power_library_symbol_is_not_a_part_whatever_its_designator() {
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "/",
+            schematic(&[
+                res("R1", "1k", "A", "B"),
+                p("P1", "power:Odd", "ODD", vec![("1", "ODD", "passive", "A")]),
+            ]),
+        )],
+        true,
+    );
+    assert!(c.part("P1").is_none());
+    assert!(c.part("R1").is_some());
+    assert_eq!(c.unresolved_symbols, 0);
+}
+
+#[test]
+fn cross_sheet_each_unfitted_part_is_listed_once() {
+    let v = run(&fx(
+        &[
+            mcu("U1", "SIG0"),
+            cap("C1", "100n", "+3V3", "GND").dnp(),
+            cap("C2", "100n", "+3V3", "GND").dnp(),
+        ],
+        None,
+        None,
+    ));
+    assert_eq!(v["coverage"]["unfitted_parts"], 2, "{v}");
+}
+
+#[test]
+fn cross_sheet_a_sheet_pin_with_no_name_is_a_named_gap() {
+    let c = joined_model(
+        &[
+            (
+                "root.kicad_sch",
+                "/",
+                root_with_link_ports(&[("", 30.0)], "(label \"INPUT\" (at 60 30 0))"),
+            ),
+            (
+                "child.kicad_sch",
+                "/a/",
+                schematic(&[res("R2", "1k", "X", "Y")]),
+            ),
+        ],
+        true,
+    );
+    assert!(
+        has_gap(&c, "unsupported hierarchical port name"),
+        "{:?}",
+        c.connectivity_gaps
+    );
+    assert!(!has_gap(&c, "unresolved hierarchical port"));
+}
+
+// What any sheet knows of a joined net holds for the whole net.
+#[test]
+fn cross_sheet_a_joined_net_keeps_what_each_sheet_knows_of_it() {
+    let root = add_root_nodes(
+        schematic(&[
+            res("R1", "1k", "INPUT", "FEED"),
+            p(
+                "#PWR01",
+                "power:VSRC",
+                "VSRC",
+                vec![("1", "VSRC", "power_in", "FEED")],
+            ),
+            res("R3", "1k", "g:SAME", "X3"),
+            res("R4", "1k", "g:SAME", "X4"),
+        ])
+        .replace(
+            "(symbol \"power:VSRC\"\n",
+            "(symbol \"power:VSRC\" (power)\n",
+        ),
+        &(hierarchy_sheet(
+            "child.kicad_sch",
+            "a",
+            &[("LINK", 30.0), ("OTHER", 50.0)],
+        ) + &hierarchy_sheet("gone.kicad_sch", "b", &[("P", 40.0)])
+            + "(label \"INPUT\" (at 60 30 0))(label \"INPUT\" (at 60 40 0))(label \"FEED\" (at 60 50 0))"),
+    );
+    assert!(root.contains("(power)"));
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("child.kicad_sch", "/a/", link_child()),
+        ],
+        true,
+    );
+    // INPUT also runs into the missing sheet b: the whole joined net is open.
+    let input = c.net(pin_net(&c, "R1", "1")).unwrap();
+    assert_eq!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    assert!(input.leaves_sheet);
+    assert!(input.sheet_path.is_none(), "it spans two sheets");
+    // FEED carries a power symbol on the root; the child's OTHER is the same net.
+    let feed = c.net(pin_net(&c, "R1", "2")).unwrap();
+    assert_eq!(pin_net(&c, "R1", "2"), pin_net(&c, "R2", "2"));
+    assert!(feed.power_symbol);
+    // Two global labels on one sheet are one net of that sheet.
+    let same = c.net(pin_net(&c, "R3", "1")).unwrap();
+    assert_eq!(pin_net(&c, "R3", "1"), pin_net(&c, "R4", "1"));
+    assert_eq!(same.sheet_path.as_deref(), Some("/"));
+}
+
+/// One unit of the two-unit part U1 alone on a sheet. Unit 1 has pin 1, unit
+/// 2 pin 2; both carry the shared pin 8.
+fn dual_unit_sheet(unit: u8, value: &'static str, shared_name: &'static str) -> String {
+    let (number, name) = if unit == 1 { ("1", "A") } else { ("2", "B") };
+    schematic(&[p(
+        "U1",
+        "Fixture:Dual",
+        value,
+        vec![
+            (number, name, "input", name),
+            ("8", shared_name, "power_in", "g:GND"),
+        ],
+    )])
+    .replace(
+        "(symbol \"Dual_1_1\"",
+        &format!("(symbol \"Dual_{unit}_1\""),
+    )
+    .replace("(unit 1) (in_bom", &format!("(unit {unit}) (in_bom"))
+}
+
+// Units of one part on different sheets are one part only when each sign of
+// identity agrees: the value, and the name of a pin both units carry.
+#[test]
+fn cross_sheet_units_on_different_sheets_merge_only_when_every_sign_of_identity_agrees() {
+    let model = |value: &'static str, shared: &'static str| {
+        joined_model(
+            &[
+                ("root.kicad_sch", "/", dual_unit_sheet(1, "DUAL", "GND")),
+                ("child.kicad_sch", "/a/", dual_unit_sheet(2, value, shared)),
+            ],
+            true,
+        )
+    };
+    let one = model("DUAL", "GND");
+    assert!(one.inventory_complete, "{:?}", one.connectivity_gaps);
+    assert_eq!(
+        one.part("U1")
+            .unwrap()
+            .pins
+            .iter()
+            .map(|p| p.number.as_str())
+            .collect::<Vec<_>>(),
+        ["1", "2", "8"]
+    );
+    for (value, shared) in [("OTHER", "GND"), ("DUAL", "VSS")] {
+        let c = model(value, shared);
+        assert!(c.part("U1").is_none(), "{value}/{shared}");
+        assert!(
+            has_gap(&c, "ambiguous component identity across sheet uses: U1"),
+            "{value}/{shared}: {:?}",
+            c.connectivity_gaps
+        );
+    }
+}
+
+// The divider's own resistors are known whatever else their far nets do; a
+// resistor from FB to a net that continues out of sight is not.
+#[test]
+fn cross_sheet_feedback_divider_stands_on_its_own_resistors_not_on_where_the_output_goes() {
+    let v = run(&fx(
+        &buck_on("g:+3V3", "31.6k", "10k"),
+        None,
+        Some(rails("U2", 3.3, &["+3V3"])),
+    ));
+    assert_eq!(
+        v["power_tree"]["rails"][0]["feedback"]["status"], "matches_record",
+        "{v}"
+    );
+    let mut parts = buck_on("+3V3", "31.6k", "10k");
+    parts.push(res("R3", "100k", "FB", "g:ELSEWHERE"));
+    let v = run(&fx(&parts, None, Some(rails("U2", 3.3, &["+3V3"]))));
+    assert_eq!(
+        v["power_tree"]["rails"][0]["feedback"]["status"], "unevaluated",
+        "{v}"
+    );
+}
+
+// A 100 nF reference capacitor exactly at its 2.5 mm limit is within every
+// family's limit, so the distance stands even on an incomplete net.
+#[test]
+fn cross_sheet_incomplete_reference_cap_exactly_at_the_tightest_limit_still_passes() {
+    let parts = vec![
+        p(
+            "U1",
+            "Fixture:ADC",
+            "ADC",
+            vec![
+                ("1", "VREF+", "input", "VREF"),
+                ("2", "GND", "power_in", "GND"),
+                ("3", "VDD", "power_in", "+3V3"),
+            ],
+        ),
+        cap("C1", "100n", "VREF", "GND"),
+    ];
+    let b = board(
+        &[
+            fp(
+                "U1",
+                10.0,
+                10.0,
+                &[
+                    ("1", 0.0, 0.0, "VREF"),
+                    ("2", 0.0, 2.0, "GND"),
+                    ("3", 2.0, 0.0, "+3V3"),
+                ],
+            ),
+            fp(
+                "C1",
+                12.5,
+                10.0,
+                &[("1", 0.0, 0.0, "VREF"), ("2", 0.0, 1.0, "GND")],
+            ),
+        ],
+        "",
+    );
+    let v = incomplete_labels(&fx(&parts, Some(b), None));
+    assert_eq!(passed(&v, "adc_ref_cap_far"), 1, "{v}");
+    assert!(unproven_for(&v, "adc_ref_cap_far").is_empty());
+    assert!(findings(&v, "adc_ref_cap_far").is_empty());
+}
+
+// ─── Independent review B (2026-11-12) ───────────────────────────────────────
+
+// R-B1: a split bank whose middle node is known bounds its bus end like a
+// direct resistor does, among several candidates too.
+#[test]
+fn cross_sheet_a_low_split_bank_among_several_candidates_is_a_finding_at_any_end_assignment() {
+    let run_with = |extra: Vec<P>| {
+        let mut parts = vec![can_xcvr(), can_conn()];
+        parts.extend(extra);
+        run(&fx(&parts, None, None))
+    };
+    let human = |v: &Value| {
+        v["needs_human"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["rule"] == "can_termination_value")
+            .count()
+    };
+    // 120 ohm direct, and 30 + 30 through a middle node of this sheet.
+    let v = run_with(vec![
+        res("R1", "120", "CANH", "CANL"),
+        res("R2", "30", "CANH", "MID"),
+        res("R3", "30", "CANL", "MID"),
+    ]);
+    let f = only(&v, "can_termination_value");
+    assert_eq!(f["evidence"]["kind"], "split", "{f}");
+    assert_eq!(f["evidence"]["low_bank"], json!(["R2", "R3"]));
+    assert_eq!(f["evidence"]["upper_bound_ohms"], 60.0);
+    assert_eq!(f["evidence"]["bank_assignment_requires_human"], true);
+    assert_eq!(human(&v), 0);
+    // Two split banks: the lower one is named.
+    let v = run_with(vec![
+        res("R2", "30", "CANH", "MID"),
+        res("R3", "30", "CANL", "MID"),
+        res("R4", "27", "CANH", "MID2"),
+        res("R5", "27", "CANL", "MID2"),
+    ]);
+    let f = only(&v, "can_termination_value");
+    assert_eq!(f["evidence"]["low_bank"], json!(["R4", "R5"]));
+    assert_eq!(f["evidence"]["upper_bound_ohms"], 54.0);
+    // Nothing below the band: which end holds which bank is a human's call.
+    let v = run_with(vec![
+        res("R1", "120", "CANH", "CANL"),
+        res("R2", "60", "CANH", "MID"),
+        res("R3", "60", "CANL", "MID"),
+    ]);
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(human(&v), 1);
+    // 57 + 57 is 114 ohm, the edge of the band and inside it.
+    let v = run_with(vec![
+        res("R1", "120", "CANH", "CANL"),
+        res("R2", "57", "CANH", "MID"),
+        res("R3", "57", "CANL", "MID"),
+    ]);
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(human(&v), 1);
+    // A middle node that continues out of sight may not be one node.
+    let v = run_with(vec![
+        res("R1", "120", "CANH", "CANL"),
+        res("R2", "30", "CANH", "g:MID"),
+        res("R3", "30", "CANL", "g:MID"),
+    ]);
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(human(&v), 1);
+    // A selectable bank may be open.
+    let v = run_with(vec![
+        res("R1", "120", "CANH", "CANL"),
+        res("R2", "60", "CANH", "X"),
+        p(
+            "JP1",
+            "Jumper:Jumper_2_Open",
+            "Jumper",
+            vec![("1", "A", "passive", "X"), ("2", "B", "passive", "CANL")],
+        ),
+    ]);
+    assert!(findings(&v, "can_termination_value").is_empty(), "{v}");
+    assert_eq!(human(&v), 1);
+}
+
+// R-M2b: a sheet symbol with no UUID is one cause. The hierarchy walker gives
+// its child the instance path `//`; that child's labels are where it bites.
+#[test]
+fn cross_sheet_a_sheet_symbol_with_no_uuid_is_one_gap_whatever_its_child_holds() {
+    let root = add_root_nodes(
+        schematic(&[res("R1", "1k", "INPUT", "RET")]),
+        "(sheet (at 20 20) (size 40 30) (property \"Sheetname\" \"a\" (at 20 19 0)) (property \"Sheetfile\" \"child.kicad_sch\" (at 20 51 0)) (pin \"LINK\" input (at 60 30 0) (effects (font (size 1.27 1.27)))))(label \"INPUT\" (at 60 30 0))",
+    );
+    let c = joined_model(
+        &[
+            ("root.kicad_sch", "/", root),
+            ("child.kicad_sch", "//", link_child()),
+        ],
+        true,
+    );
+    assert_eq!(c.connectivity_gaps.len(), 1, "{:?}", c.connectivity_gaps);
+    assert!(has_gap(&c, "sheet has no usable instance/file identity"));
+    assert!(!c.inventory_complete);
+    assert_ne!(pin_net(&c, "R1", "1"), pin_net(&c, "R2", "1"));
+    for (reference, pin) in [("R1", "1"), ("R2", "1"), ("R2", "2")] {
+        assert!(c.net(pin_net(&c, reference, pin)).unwrap().leaves_sheet);
+    }
+}
+
+// R-n2: no production path is empty (every one is `/…/`), but a caller of the
+// join could pass one. It is no identity, so the use is quarantined.
+#[test]
+fn cross_sheet_a_use_with_an_empty_instance_path_is_quarantined() {
+    let c = joined_model(
+        &[(
+            "root.kicad_sch",
+            "",
+            schematic(&[res("R1", "1k", "A", "B")]),
+        )],
+        true,
+    );
+    assert!(has_gap(&c, "use quarantined"), "{:?}", c.connectivity_gaps);
+    assert!(c.part("R1").is_none());
+    assert!(!c.inventory_complete);
 }

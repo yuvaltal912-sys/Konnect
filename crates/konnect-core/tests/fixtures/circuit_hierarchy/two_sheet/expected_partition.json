@@ -1,0 +1,78 @@
+{
+  "uses": [
+    {
+      "file": "cross_sheet.kicad_sch",
+      "instance_path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f",
+      "name_path": "/",
+      "parts": [
+        {
+          "reference": "U1",
+          "lib_id": "Timer:NE555D",
+          "value": "NE555",
+          "symbol_uuid": "f8fdfe90-fe0d-40ab-8bd8-5c3561fe7ef6"
+        }
+      ]
+    },
+    {
+      "file": "channel.kicad_sch",
+      "instance_path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f/3efd3880-a834-43ad-9d9e-8a2e1773fd98",
+      "name_path": "/Capacitor/",
+      "parts": [
+        {
+          "reference": "R2",
+          "lib_id": "Device:R",
+          "value": "10k",
+          "symbol_uuid": "acabcf9b-2d4d-47f6-8430-f8a99ce7cc2a"
+        },
+        {
+          "reference": "C1",
+          "lib_id": "Device:C",
+          "value": "100n",
+          "symbol_uuid": "eb14f1f6-3320-49c1-9e98-6cf4f49321e7"
+        },
+        {
+          "reference": "R1",
+          "lib_id": "Device:R",
+          "value": "1k",
+          "symbol_uuid": "f6750ab0-4052-4ca0-8763-69ea8d05706f"
+        }
+      ]
+    }
+  ],
+  "partition": [
+    [
+      "C1.1",
+      "U1.8"
+    ],
+    [
+      "C1.2",
+      "R1.2",
+      "R2.2",
+      "U1.1"
+    ],
+    [
+      "R1.1",
+      "U1.3"
+    ],
+    [
+      "R2.1"
+    ],
+    [
+      "U1.2"
+    ],
+    [
+      "U1.4"
+    ],
+    [
+      "U1.5"
+    ],
+    [
+      "U1.6"
+    ],
+    [
+      "U1.7"
+    ]
+  ],
+  "pin_count": 14,
+  "scope": "all fitted fixture pins; singleton pins included"
+}
