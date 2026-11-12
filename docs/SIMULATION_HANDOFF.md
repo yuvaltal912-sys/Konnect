@@ -4,6 +4,23 @@ The current state of the simulation work. Anyone picking this up, human or agent
 
 **Last updated:** 2026-11-08 (switches). Simulation v1, its follow-up fixes, the reliability repairs (#15), M1 (#16) and M2 (#18) are merged. The ngspice version-pin fix is merged as #23. M3's first part (op-amp, comparator, LDO, series reference) is in draft [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) on branch `feat/simulation-datasheet-models-m3`, approved by the owner on 2026-11-08; the rest, load switch, eFuse and ideal diode, is in draft [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54), stacked on #53, which merges first. With both, M3 is complete.
 
+## Resume #54 here (parked 2026-11-12)
+
+#54 is parked while creation work has priority (owner, 2026-11-09). Do the steps below in order before any other change to it.
+
+1. **Merge `main` into this branch first.** #53 merged with a review-fix commit (`cbdd2c9`, merge `f4dde06`) that this branch, cut at `cd264d4`, does not have. GitHub shows #54 as conflicting. Three files conflict:
+   - `crates/konnect-core/src/tools/simulation_models.rs` (the tool description)
+   - `crates/konnect/assets/skills/kicad-simulation/SKILL.md`
+   - this file
+
+   `switch.rs` does not conflict. After the merge, check that #53's fixes in `regulator.rs`, `amplifier.rs` and `fit.rs` still fit the helpers `switch.rs` imports from `regulator.rs`.
+2. **Fix the four verified review findings.** All are low severity, and are kept here because the review record under `target/` is local only:
+   - A defaulted input voltage (5 V, or one taken from the window) is never added to `assumed`.
+   - The ideal diode's on-resistance check refuses consistent data that sits below the regulation corner.
+   - `ideal_diode` ignores `input_voltage`. The "outside the window" refusal covers only Ron and ILIM.
+   - Iq is drawn while the part is off, and this is not disclosed.
+3. Run the whole gate under "Verify", including `simulation_live`, and the dogfood run. Update this file and the PR body, then ask the owner before merging.
+
 ## Start here
 
 1. Read `AGENTS.md` for the rules.
