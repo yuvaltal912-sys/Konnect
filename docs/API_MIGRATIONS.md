@@ -75,6 +75,101 @@ The detector binds board/project/rule files; it does not snapshot the KiCad
 version or global configuration.
 See [troubleshooting](TROUBLESHOOTING.md#suspected-zone-fill-defect).
 
+## Unreleased: hierarchy-joined circuit review
+
+Creation backlog B4, the #55 follow-up. No new tool or argument. Both
+`audit_circuit_design` and its `run_design_review` integration now evaluate one
+joined circuit across the reachable hierarchy instead of evaluating isolated
+sheet uses.
+
+- Public `scope` changes from `per_schematic_file` to `schematic_hierarchy`.
+  `schematic_files` still counts distinct audited files and `sheet_instances`
+  still counts audited uses; joining does not turn either count into one.
+  Repeated files retain their UUID paths and per-instance reference/unit
+  records. Compatible units of a physical component are evaluated together.
+- Connections join through supported global labels, global power symbols and
+  matching parent sheet pins/child hierarchical labels. Local labels and
+  local powers remain scoped to their sheet use. Net ties retain distinct
+  nets. Qualified intent names retain their source sheet and KiCad's literal
+  slash escaping; ambiguous aliases are not resolved arbitrarily.
+- New `connectivity` reports `status: complete | partial`, `gaps` and `notes`;
+  `coverage.connectivity_gaps` counts recorded gaps. Missing, unreadable,
+  cyclic or ambiguous hierarchy, unresolved symbols and unsupported
+  connectivity are partial, not passes. Bus/variable-label and hidden-power
+  or internal-jumper semantics that are not modeled remain explicit gaps.
+  A gap that belongs to one sheet use names it: `<file> [<instance path>]: ...`,
+  with that use's designator where its instance record gives one.
+- One cause is one gap. A child use that is missing, ambiguous or not the file
+  its parent names is one gap, however many sheet pins lead to it and whatever
+  sits below it; those pins and labels become open boundaries. On a child that
+  is there, each sheet pin or hierarchical label that joins nothing is its own
+  gap. A use listed under `unaudited_sheet_uses` is not also a gap. A sheet
+  symbol with no UUID is one gap, whatever its child holds. A use that has
+  hierarchical labels and no parent on record at all is one gap for the use
+  (`sheet use <path> has hierarchical labels and no parent in this review`),
+  not one per label.
+- `coverage.unevaluated_subjects` now includes the connectivity gaps: it is
+  unaudited uses, plus gaps, plus the subjects each rule could not evaluate.
+  The count in `run_design_review`'s `circuit_checks_unevaluated` diagnostic
+  is the same number. Any gap makes `run_design_review` INCOMPLETE.
+  `run_design_review` also adds a `circuit_review_partial` diagnostic when the
+  circuit audit is partial with nothing counted, so it never reads `complete`
+  over a partial circuit audit.
+- A root schematic with no UUID is one gap: instance records are keyed by it.
+  Such legacy files, including roots written by Konnect before it wrote root
+  UUIDs, now report `partial` / INCOMPLETE where the per-sheet audit reported
+  findings. Opening the root schematic in KiCad and saving it writes the UUID.
+- `connectivity.notes` lists joins that leave nothing unknown but are worth
+  seeing. One exists today: a sheet symbol with several pins of one name ties
+  their parent nets together through the child's label, as KiCad does.
+  `run_design_review` repeats them as `circuit.connectivity_notes`.
+- `unproven` now means an absence or exhaustive conclusion that unresolved
+  connectivity could change. Crossing a successfully joined sheet boundary
+  alone no longer causes it. Net-level entries can have `component: null`
+  plus `net`; pin-level entries can add `pin`. Known positive conflicts are
+  retained even when other connectivity is incomplete.
+- Findings, interfaces, crystals and withheld conclusions add `origins`, each
+  with `source`, `sheet_instance_path` and `sheet_name_path`. Singular subject
+  origins retain `source`/`sheet_instance_path`; multi-origin and design-level
+  results use the root source with `source_scope: hierarchy`. Net-level facts
+  retain all participating origins. `run_design_review` preserves circuit
+  findings' sources rather than replacing child sources with the root.
+  One exception: `usb_pair_impedance` judges the design-intent record, so its
+  findings carry the design-intent file as `source` and have no `origins`.
+- Incomplete termination and pull-up inventories no longer expose an observed
+  subset as a complete total. `total_ohms` / `effective_pull_up_ohms` become
+  null where appropriate, with `observed_resistance_ohms` /
+  `observed_effective_pull_up_ohms` and `connectivity_complete` describing the
+  evidence. Crystal `computed_load_capacitance_pf` is null when its inventory
+  is incomplete. Termination absence is `kind: none_observed`.
+- Termination results list `candidates` and `observed_resistors`. Multiple
+  direct or mixed/split candidates do not establish physical end assignment:
+  `bank_assignment_requires_human` is true and the value rule needs a human.
+  A single candidate's value is not presented as a mixed network's total.
+  Existing electrical thresholds and permitted component traversal are
+  unchanged; a known single invalid bank still produces its finding.
+- What is proven low stays a finding. With several candidates, one bank below
+  114 ohm makes its bus end too low whichever end that is. A bank here is a
+  resistor directly across the pair, or the two halves of a split termination
+  whose middle node is fully known. The finding carries `low_bank` (that
+  bank's resistors), `upper_bound_ohms` and
+  `bank_assignment_requires_human: true` in place of `total_ohms`. In this
+  finding `kind` is the low bank's kind (`direct` or `split`), and `resistors`
+  lists every observed candidate resistor, the other banks' included. Several
+  candidates with no such bank (120 + 120, say) still need a human. On an
+  incomplete bus, a single direct or split bank below 114 ohm is a finding
+  too, because unseen parallel paths cannot raise it; a split bank counts only
+  when its middle node is fully known. A selectable bank may be open, so it
+  never counts as proven low.
+- `power_tree.status` may be `partial` and adds `inventory_complete`.
+  `present_in_schematic` is null for an unproven absence; an unseen source
+  can have `source_kind: unproven`. Incomplete feedback topology produces
+  `feedback.status: unevaluated` instead of a divider calculation.
+
+Consumers must handle these nulls and partial states. Human review remains
+necessary for physical bus-end assignment, datasheet-dependent checks and the
+other existing `needs_human` items; the tool does not approve a board.
+
 ## Unreleased: pour widths and the measured routing preset
 
 Creation row S6, first half (`docs/CREATION_HANDOFF.md`). No new argument.

@@ -1,0 +1,10 @@
+{
+  "physical_pins": 22,
+  "sheet_files": 2,
+  "sheet_instances": 3,
+  "separate_same_name_supply_nets": 3,
+  "native_power_scope": "local",
+  "saved_power_instance_records": 2,
+  "pin_universe_equal": true,
+  "partitions_equal": true
+}
