@@ -3,6 +3,78 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: suspected zone-fill defect evidence
+
+Creation row S11 adds `zone_fill_check.suspected_fill_defects` to `run_drc`
+and `get_drc_violations`. DRC baselines carry the same diagnostic in
+`source_evidence.zone_fill.suspected_fill_defects`. No argument, tool, original
+DRC count, severity or violation changes.
+
+- `status` is `suspected`, `none_detected` or `incomplete`. A supported
+  candidate remains `suspected` when other evidence is incomplete. Inspect
+  the separate report coverage; none detected does not establish a clean board.
+- `primary_report` identifies saved fills, a CLI in-memory refill or saved IPC
+  refill. `comparison_report` describes the existing private-refill pass when
+  available. Each gives full `matching_entries`, `distinct_pairs` and
+  `unresolved_candidates` counts, or null when inspection was unavailable.
+- `newly_reported_after_refill` counts comparison-report entries belonging to
+  newly qualifying unordered UUID pairs. It requires stable original board,
+  project and rules snapshots, matching copied input, unchanged non-fill
+  design inputs, complete candidate inspection, no duplicate UUID and no
+  footprint copper zone on either board (rule areas do not count), neither
+  report at KiCad's per-rule limit or with a supported rule set to `ignore` in
+  the project, no project DRC exclusion of any rule naming either item of any
+  newly reported pair, and a changed implicated fill signature. Otherwise it is null with `attribution_reason`. A new rule,
+  severity, description, order, position or duplicate for an already qualifying
+  pair does not count as a new pair.
+- `findings` contains at most ten examples with report phase, rule, UUIDs,
+  reported item position, evidence basis and refill attribution. Newly
+  reported examples come first. Full counts precede truncation; external
+  strings are bounded and truncated identifiers are labelled. Item positions
+  are not independently measured overlap points.
+
+The detector recognizes resolved different-net zone/pad and zone/via pairs
+under `clearance`, `hole_clearance` (supported plated holes) and
+`shorting_items`. Clearance recognition uses the reported actual-zero suffix,
+not the required clearance; KiCad's `%.3e` spelling of a tiny nonzero value
+reads as nonzero.
+The diagnostic reports KiCad's formatted measurement; it does not independently prove physical overlap or an engine bug.
+Unknown prose, ambiguous identities, unsupported padstack/removal modes
+(including `start_end_only` vias) and unproven snapshots remain incomplete
+evidence. A report at KiCad's per-rule limit (499 `clearance`, 199
+`hole_clearance` or `shorting_items` entries, excluded markers included; the
+limits come from the KiCad 10.0.1 source, not a native run) is `partial`,
+and so is a report whose project sets a supported rule to `ignore`, which
+KiCad then never tests. A `.kicad_dru` per-rule `(severity ignore)` is not
+detected.
+Attribution normalization is conservative; unknown format conversions or
+topology-only fill changes may remain unproven.
+
+| Field | Values |
+|---|---|
+| `status` | `suspected`, `none_detected`, `incomplete` |
+| `primary_report.provenance` | `saved_fills`, `kicad_cli_refill`, `saved_ipc_refill` |
+| `comparison_report.provenance` | `private_copy_refill` |
+| report `inspected`, `coverage` | `true`/`false`; `complete`, `partial`, `unavailable` |
+| report counts | `matching_entries`, `distinct_pairs`, `unresolved_candidates`: numbers, or `null` when not inspected |
+| report `reason` (not inspected) | `not_compared`, `comparison_failed`, `source_changed_or_unavailable`, `board snapshot unavailable`, `project/rule snapshot unavailable`, `board_did_not_parse`, `board_root_unproven`, `ambiguous_net_table` |
+| report `unresolved_reasons` (entry counts) | `item_pair_unresolved`, `item_identity_unresolved`, `item_ownership_unsupported`, `actual_distance_unrecognized`, `net_identity_unresolved`, `net_identity_inconsistent`, `copper_layers_unresolved`, `copper_membership_unresolved`, `copper_membership_unsupported`, `pad_copper_unsupported`, `plated_hole_unproven` |
+| report `partial_reasons`, `rules_at_kicad_limit`, `rules_ignored_by_project` | `kicad_rule_ignored`, `kicad_rule_limit_reached`, `project_exclusions_unreadable`, `project_rule_severity_unreadable`; rule names; `project_exclusions_unreadable` means the whole `.kicad_pro` could not be read (not valid JSON, or an unreadable exclusion list), so neither its exclusions nor its rule severities were read |
+| `newly_reported_after_refill` | a number, or `null` |
+| `attribution_reason` | `null`, `not_compared`, `comparison_failed`, `primary_source_unproven`, `comparison_input_unavailable`, `comparison_output_unavailable`, `comparison_input_differs`, `kicad_rule_ignored`, `kicad_rule_limit_reached`, `project_exclusions_unreadable`, `project_rule_severity_unreadable`, `incomplete_report_evidence`, `project_or_rules_changed`, `board_did_not_parse`, `board_root_unproven`, `ambiguous_net_table`, `ambiguous_board_identity`, `footprint_zone_comparison_unsupported`, `zone_owner_unsupported`, `ambiguous_fill_state`, `non_fill_design_changed`, `zone_identity_changed`, `fill_geometry_unresolved`, `implicated_fill_change_unproven`, `drc_exclusion_names_pair` |
+| finding `report`, `basis` | `primary`, `comparison`; `reported_zero_clearance`, `reported_short` |
+| finding `refill_attribution` | `newly_reported_after_refill`, `already_reported`, `unproven` |
+| finding other fields | `rule`, `zone_uuid`, `other_uuid`, `other_kind` (`pad`, `via`), `identifiers_truncated`, `reported_item_position` |
+| `findings`, `truncated`, `hint` | at most ten examples; `true` when examples were left out; one of two fixed sentences, chosen by whether any candidate exists |
+
+There are no additional KiCad runs or automatic board/configuration edits.
+Caller-requested refills without a before report and `check_zone_fills: false`
+can still expose report-only candidates, with null refill attribution. The
+engine cause and routing correctness are not established by this diagnostic.
+The detector binds board/project/rule files; it does not snapshot the KiCad
+version or global configuration.
+See [troubleshooting](TROUBLESHOOTING.md#suspected-zone-fill-defect).
+
 ## Unreleased: pour widths and the measured routing preset
 
 Creation row S6, first half (`docs/CREATION_HANDOFF.md`). No new argument.

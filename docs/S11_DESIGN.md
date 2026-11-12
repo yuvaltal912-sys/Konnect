@@ -1,9 +1,11 @@
 # S11: suspected zone-fill defects
 
-Proposed contract, 2026-11-10. Branch `codex/creation-s11-zone-fill-defects`,
-base `f246e48dab3994de9a0a6fa97176ab8238ce1db9`. Preparation only: no product
-code, published claim or publication approval yet. The unchanged-source baseline
-has passed; see the S11 handoff and local baseline records.
+Reviewed contract, 2026-11-10. Branch `codex/creation-s11-zone-fill-defects`,
+base `f246e48dab3994de9a0a6fa97176ab8238ce1db9`. The exact claim was approved and published as draft PR #64 at `a423ec8`.
+Implemented. The findings of independent review rounds A, B and C
+(freezes A, B and C) are fixed or documented, and the round-D delta (three
+tests only) was re-reviewed. Current verification state is in the S11 handoff
+and the local evidence records.
 
 ## Purpose and boundary
 
@@ -43,7 +45,7 @@ Add `zone_fill_check.suspected_fill_defects`; the existing baseline
 source-evidence propagation will carry the diagnostic at
 `source_evidence.zone_fill.suspected_fill_defects`.
 
-- `status`: `suspected`, `none_detected`, `incomplete` or `not_checked`.
+- `status`: `suspected`, `none_detected` or `incomplete`.
   `none_detected` means no supported signature in the inspected reports; it
   never means the board is safe or all fill defects were excluded. A valid
   candidate takes precedence (`suspected`) even when coverage is partial.
@@ -63,7 +65,8 @@ source-evidence propagation will carry the diagnostic at
   item UUIDs/kinds, the reported position, evidence basis and attribution.
   All externally derived strings, including UUIDs and reasons, are bounded
   so ten pathological strings cannot defeat the existing response budget.
-  Original DRC output remains untouched.
+  The diagnostic has a 6,000-byte ceiling, shortening examples further when
+  needed. Original DRC output remains untouched.
 - One concise hint and explicit coverage/attribution reasons. An inspection
   failure must not hide DRC results or substitute a successful clean result.
 
@@ -95,9 +98,10 @@ disclosed. A fresh fill can still contain a suspected defect.
    compatible copper layers. Same-net pairs do not
    qualify. A hole-clearance candidate also needs a supported plated pad/via;
    a mechanical hole alone does not establish another net's copper.
-4. Keep `reported_zero_clearance` distinct from physical overlap. KiCad formats
-   the actual distance into prose; a small positive value can round to zero.
-   Do not derive a geometric overlap point from the first item's position.
+4. Keep `reported_zero_clearance` distinct from an independent physical-overlap
+   calculation. The detector uses KiCad's formatted clearance measurement as
+   reported; it does not recompute copper overlap. Do not derive an overlap
+   point from the first item's position.
 5. For `newly_reported_after_refill`, bind the initial report to an unchanged
    captured board/project/rules snapshot, capture the refilled scratch board
    before it is removed, and require unique matching identities, unchanged
@@ -158,7 +162,7 @@ simulation test is regression validation only; simulation code is out of scope.
 
 1. Unit matrix: pad/via, reversed item order, legacy/current net syntax,
    reported zero versus 0.15 mm, nonzero required versus zero actual, tiny
-   positive/rounded prose, same net, unassigned net, missing/duplicate UUID,
+   positive/formatted prose, same net, unassigned net, missing/duplicate UUID,
    rule area, track/pad, incompatible layer, malformed/translated text,
    unrelated rules, shorted pair, repeated entries, ten-item truncation and
    bounded strings. Every classification guard gets a deliberate source-break
@@ -207,8 +211,30 @@ Linux, GUI behavior and an upstream-confirmed root cause remain unverified.
 No owner requirement is currently missing. These technical uncertainties
 have bounded checks and explicit unknown outcomes.
 
-The supervisor reviewed this contract with no remaining design blocker and
-the baseline passed. Next: finish the local claim-only handoff commit; obtain
-approval for the exact claim push and draft PR title/body; publish the claim;
-only then implement. Final implementation/publication text will be reviewed
-separately. All S11 heavy commands have exited and the slot is released.
+The supervisor reviewed this contract, the baseline passed, and the approved
+claim is published as draft PR #64. The implementation, review rounds A, B
+and C with their fixes, the reviewed round-D test delta, native
+setting-associated runs and a matched native
+attribution case are done; direct boolean trace readback remains
+unavailable. Gate, coverage and mutation results are recorded in the S11
+handoff. Publication and serial integration remain supervised.
+
+Review A additions (2026-11-12):
+- A report at KiCad's per-rule limit (499 `clearance`, 199 `hole_clearance`
+  and `shorting_items`, excluded markers included; from the KiCad 10.0.1
+  source) is `partial` and refuses attribution.
+- A pair named by a project DRC exclusion refuses attribution.
+- `start_end_only` vias are unsupported copper membership.
+- A failed private refill is `comparison_failed`, not `not_compared`.
+- KiCad's `%.3e` spelling of a tiny nonzero distance reads as nonzero.
+- Newly reported examples are listed first.
+
+Review B additions (2026-11-12):
+- A project that sets a supported rule to `ignore` makes that report `partial`
+  (`kicad_rule_ignored`) and refuses attribution; a supported rule's severity
+  that is not a string is `project_rule_severity_unreadable`.
+- Rule areas (keepouts) do not block attribution, in a footprint or under any
+  other owner. A footprint copper zone is
+  `footprint_zone_comparison_unsupported`; a copper zone under any other
+  unsupported owner is `zone_owner_unsupported`.
+- Every report-level gap is a named attribution refusal.

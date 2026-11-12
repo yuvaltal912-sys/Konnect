@@ -1,7 +1,15 @@
 # S11 claim publication text
 
-Prepared 2026-11-10; not approved or published. This text is for the initial
+Approved and published 2026-11-10 as draft PR #64, claim `a423ec8`. This text is for the initial
 claim-only draft PR. Implementation and final publication text are still owed.
+
+The body below is kept byte for byte as the historical publication record
+(SHA-256 `8af4bf53ae9df21b7f84893a812c837ba40db19ca6d698825325f96cb29a6a07`). Its sentence
+"KiCad's reported zero can be a rounded distance." is superseded and must not
+be repeated: inspected KiCad source formats tiny nonzero measurements
+scientifically. The corrected wording, for all later text, is:
+
+The diagnostic reports KiCad's formatted measurement; it does not independently prove physical overlap or an engine bug.
 
 Push destination: `fork`, branch `codex/creation-s11-zone-fill-defects`.
 Base: `main`. Local claim commit subject:

@@ -6,6 +6,9 @@ use konnect_ipc::IpcFailure;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 
+#[path = "zone_fill_defects.rs"]
+mod zone_fill_defects;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Publish by sibling-file replacement, never by truncating a destination inode.
@@ -326,12 +329,13 @@ fn violation_json(violation: &cli::DrcViolation) -> Value {
 /// leaving out [`RULES_NOT_COMPARED`]. The comparison is a second,
 /// analysis-only DRC on a scratch copy of the board and its project rules;
 /// the board itself is never written.
-pub(crate) async fn zone_fill_check(
+async fn zone_fill_check(
     ctx: &ToolContext,
     board: &Path,
     refilled: bool,
     check: bool,
     report: &cli::DrcReport,
+    defect_comparison: &mut Option<Result<zone_fill_defects::Comparison, &'static str>>,
 ) -> Value {
     let unknown = |method: &str, zones: Option<usize>, reason: String| {
         json!({
@@ -403,7 +407,14 @@ pub(crate) async fn zone_fill_check(
                 tokio::fs::copy(&rules, copy.with_extension(extension)).await?;
             }
         }
+        let before = zone_fill_defects::Snapshot::capture(&copy).await;
         let refilled_report = cli::refill_drc_on_private_copy(&ctx.config.kicad_cli, &copy).await?;
+        let after = zone_fill_defects::Snapshot::capture(&copy).await;
+        *defect_comparison = Some(Ok(zone_fill_defects::Comparison {
+            before,
+            after,
+            report: refilled_report.clone(),
+        }));
         let refilled = copper_zone_fills(&tokio::fs::read_to_string(&copy).await?)?;
         anyhow::Ok((refilled_report, refilled))
     };
@@ -411,11 +422,14 @@ pub(crate) async fn zone_fill_check(
     let (refilled_report, refilled) = match comparison.await {
         Ok(result) => result,
         Err(error) => {
+            // Evidence captured before a later failure is kept; otherwise the
+            // diagnostic names the failed comparison (review A, F5).
+            defect_comparison.get_or_insert(Err("comparison_failed"));
             return unknown(
                 "check_failed",
                 Some(saved.len()),
                 format!("the refill comparison did not complete: {error:#}"),
-            )
+            );
         }
     };
     let refilled_board: Vec<&ZoneFill> =
@@ -651,6 +665,7 @@ pub(crate) async fn run(
     }
     // CLI refill is analysis-only. In synchronized mode the persisted IPC fill
     // is authoritative, so do not refill a second time in a different process.
+    let defect_source = zone_fill_defects::Snapshot::capture(board).await;
     let report = match cli::run_drc(&ctx.config.kicad_cli, board, refill && !sync).await {
         Ok(report) => report,
         Err(error) if sync => return Ok(Err(uncertain(board, "drc_after_save", error))),
@@ -669,7 +684,32 @@ pub(crate) async fn run(
             Err(error) => return Ok(Err(uncertain(board, "verify_drc_source", error))),
         }
     }
-    let zone_fill = zone_fill_check(ctx, board, refill, check_fills, &report).await;
+    let mut defect_comparison = None;
+    let mut zone_fill = zone_fill_check(
+        ctx,
+        board,
+        refill,
+        check_fills,
+        &report,
+        &mut defect_comparison,
+    )
+    .await;
+    zone_fill["suspected_fill_defects"] = zone_fill_defects::finish(
+        defect_source,
+        board,
+        &report,
+        if refill {
+            if sync {
+                "saved_ipc_refill"
+            } else {
+                "kicad_cli_refill"
+            }
+        } else {
+            "saved_fills"
+        },
+        defect_comparison,
+    )
+    .await;
     Ok(Ok((
         report,
         DrcSourceEvidence {
@@ -906,6 +946,12 @@ mod tests {
             assert_eq!(result["source"], "saved_file");
             assert_eq!(result["live_board_synced"], true);
             assert_eq!(result["zone_refill_source"], "ipc");
+            // Review A F7: the IPC-saved fill keeps its own provenance label.
+            assert_eq!(
+                result["zone_fill_check"]["suspected_fill_defects"]["primary_report"]["provenance"],
+                "saved_ipc_refill",
+                "{result}"
+            );
             assert_eq!(
                 std::fs::read_to_string(board.with_extension("kicad_pcb.observed")).unwrap(),
                 LIVE
@@ -1472,6 +1518,267 @@ mod zone_fill_tests {
                 panic!("expected text");
             };
             (result.is_error, serde_json::from_str(text).unwrap())
+        }
+    }
+
+    fn defect_board(fill: &str) -> String {
+        board(fill)
+            .replacen(
+                "(net 0",
+                "(layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal)) (net 0",
+                1,
+            )
+            .replacen(
+                "(net 1 \"GND\")",
+                r#"(net 1 "GND") (net 2 "SIGNAL")
+  (footprint "Test" (layer "F.Cu") (uuid "fp-test") (at 5 5)
+    (pad "1" thru_hole circle (at 0 0) (size 2 2) (drill 1)
+      (layers "*.Cu" "*.Mask") (net 2 "SIGNAL") (uuid "pad-test")))"#,
+                1,
+            )
+    }
+
+    fn defect_report() -> Value {
+        json!({
+            "violations": [{
+                "type": "clearance", "severity": "error",
+                "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.0000 mm)",
+                "items": [
+                    {"uuid": "z-pour", "description": "untrusted description", "pos": {"x": 5, "y": 5}},
+                    {"uuid": "pad-test", "description": "also untrusted", "pos": {"x": 5, "y": 5}}
+                ]
+            }],
+            "unconnected_items": [], "schematic_parity": []
+        })
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_preserve_the_primary_drc_and_do_not_add_a_run() {
+        // Removing the detector or trusting the report's prose instead of the
+        // board's net identities must break this observable result.
+        let saved = defect_board(FILL);
+        let report = defect_report();
+        for tool in ["run_drc", "get_drc_violations"] {
+            let scene = Scene::new(&saved, Some(&board(REFILL)));
+            std::fs::write(scene.dir.path().join("main.json"), report.to_string()).unwrap();
+            let (error, body) = scene.run(tool, json!({"check_zone_fills": false})).await;
+            assert!(!error, "{body}");
+            let diagnostic = &body["zone_fill_check"]["suspected_fill_defects"];
+            assert_eq!(diagnostic["status"], "suspected", "{tool}: {body}");
+            assert_eq!(diagnostic["primary_report"]["matching_entries"], 1);
+            assert_eq!(diagnostic["primary_report"]["distinct_pairs"], 1);
+            assert!(diagnostic["newly_reported_after_refill"].is_null());
+            assert_eq!(body["violations"].as_array().unwrap().len(), 1);
+            assert_eq!(body["violations"][0]["severity"], "error");
+            assert_eq!(scene.calls().len(), 1);
+            assert_eq!(std::fs::read_to_string(&scene.board).unwrap(), saved);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_attribute_only_a_new_pair_after_private_refill() {
+        let saved = defect_board(FILL);
+        let after = defect_board(REFILL);
+        for tool in ["run_drc", "get_drc_violations"] {
+            let scene =
+                Scene::new(&saved, Some(&after)).with_refill_report(&defect_report().to_string());
+            std::fs::write(
+                scene.dir.path().join("main.json"),
+                r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+            )
+            .unwrap();
+            let (error, body) = scene.run(tool, json!({})).await;
+            assert!(!error, "{body}");
+            let d = &body["zone_fill_check"]["suspected_fill_defects"];
+            assert_eq!(d["status"], "suspected", "{body}");
+            assert_eq!(d["primary_report"]["matching_entries"], 0);
+            assert_eq!(d["comparison_report"]["matching_entries"], 1);
+            assert_eq!(d["newly_reported_after_refill"], 1);
+            assert_eq!(body["violations"].as_array().unwrap().len(), 0);
+            assert_eq!(scene.calls().len(), 2);
+            assert_eq!(std::fs::read_to_string(&scene.board).unwrap(), saved);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_keep_provenance_when_refill_is_requested_or_fails() {
+        let saved = defect_board(FILL);
+        for refill in [false, true] {
+            let scene = Scene::new(&saved, None);
+            std::fs::write(
+                scene.dir.path().join("main.json"),
+                defect_report().to_string(),
+            )
+            .unwrap();
+            let (_, body) = scene.run("run_drc", json!({"refill_zones": refill})).await;
+            let d = &body["zone_fill_check"]["suspected_fill_defects"];
+            assert_eq!(d["status"], "suspected");
+            assert_eq!(d["primary_report"]["matching_entries"], 1);
+            assert_eq!(
+                d["primary_report"]["provenance"],
+                if refill {
+                    "kicad_cli_refill"
+                } else {
+                    "saved_fills"
+                }
+            );
+            assert!(d["comparison_report"]["matching_entries"].is_null());
+            assert!(d["newly_reported_after_refill"].is_null());
+            // A requested refill runs no comparison; a failed one is named.
+            let reason = if refill {
+                "not_compared"
+            } else {
+                "comparison_failed"
+            };
+            assert_eq!(d["comparison_report"]["reason"], reason, "{body}");
+            assert_eq!(d["attribution_reason"], reason);
+            assert_eq!(scene.calls().len(), if refill { 1 } else { 2 });
+            assert_eq!(body["errors"], 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_do_not_read_a_failed_private_refill_as_not_compared() {
+        // Review A F5: the --save-board run exits 3 in this scene.
+        let saved = defect_board(FILL);
+        let empty = r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#;
+        for tool in ["run_drc", "get_drc_violations"] {
+            let scene = Scene::new(&saved, None);
+            std::fs::write(scene.dir.path().join("main.json"), empty).unwrap();
+            let (error, body) = scene.run(tool, json!({})).await;
+            assert!(!error, "{body}");
+            assert_eq!(body["zone_fill_check"]["method"], "check_failed");
+            let d = &body["zone_fill_check"]["suspected_fill_defects"];
+            assert_eq!(d["status"], "incomplete", "{tool}: {body}");
+            assert_eq!(d["comparison_report"]["reason"], "comparison_failed");
+            assert_eq!(d["comparison_report"]["coverage"], "unavailable");
+            assert_eq!(d["attribution_reason"], "comparison_failed");
+            assert_eq!(scene.calls().len(), 2);
+            // A deliberate skip still reads as not compared, with nothing found.
+            let scene = Scene::new(&saved, None);
+            std::fs::write(scene.dir.path().join("main.json"), empty).unwrap();
+            let (_, body) = scene.run(tool, json!({"check_zone_fills": false})).await;
+            let d = &body["zone_fill_check"]["suspected_fill_defects"];
+            assert_eq!(d["status"], "none_detected", "{body}");
+            assert_eq!(d["comparison_report"]["reason"], "not_compared");
+            assert_eq!(scene.calls().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_refuse_attribution_beside_a_footprint_zone() {
+        // Review A F7: the served path, not only the pure comparison.
+        let with_footprint_zone = |fill: &str| {
+            defect_board(fill).replacen(
+                "(pad \"1\"",
+                "(zone (net 2) (net_name \"SIGNAL\") (layer \"F.Cu\") (uuid \"fp-zone\")\n      (polygon (pts (xy 4 4) (xy 6 4) (xy 6 6))))\n    (pad \"1\"",
+                1,
+            )
+        };
+        let saved = with_footprint_zone(FILL);
+        let scene = Scene::new(&saved, Some(&with_footprint_zone(REFILL)))
+            .with_refill_report(&defect_report().to_string());
+        std::fs::write(
+            scene.dir.path().join("main.json"),
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
+        let (error, body) = scene.run("run_drc", json!({})).await;
+        assert!(!error, "{body}");
+        let d = &body["zone_fill_check"]["suspected_fill_defects"];
+        assert_eq!(d["status"], "suspected", "{body}");
+        assert_eq!(d["comparison_report"]["matching_entries"], 1);
+        assert!(d["newly_reported_after_refill"].is_null());
+        assert_eq!(
+            d["attribution_reason"],
+            "footprint_zone_comparison_unsupported"
+        );
+        assert_eq!(scene.calls().len(), 2);
+        assert_eq!(std::fs::read_to_string(&scene.board).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_bind_before_the_primary_cli_and_reach_baselines() {
+        let saved = defect_board(FILL);
+        let scene = Scene::new(&saved, None);
+        std::fs::write(
+            scene.dir.path().join("main.json"),
+            defect_report().to_string(),
+        )
+        .unwrap();
+        let baseline = super::super::check_baselines::handle_save_check_baseline(
+            &json!({"board": scene.board.display().to_string(), "name": "defect", "check_zone_fills": false}),
+            &scene.ctx,
+        ).await.unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &baseline.content[0] else {
+            panic!("text")
+        };
+        assert!(!baseline.is_error, "{text}");
+        let baseline: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            baseline["source_evidence"]["zone_fill"]["suspected_fill_defects"]["primary_report"]
+                ["matching_entries"],
+            1
+        );
+        let script = std::fs::read_to_string(&scene.ctx.config.kicad_cli).unwrap();
+        std::fs::write(
+            &scene.ctx.config.kicad_cli,
+            script.replace(
+                "exit 0",
+                &format!(
+                    "printf ' ' >> '{}'\nexit 0",
+                    scene.board.with_extension("kicad_pro").display()
+                ),
+            ),
+        )
+        .unwrap();
+        let (_, body) = scene
+            .run("run_drc", json!({"check_zone_fills": false}))
+            .await;
+        let d = &body["zone_fill_check"]["suspected_fill_defects"];
+        assert_eq!(d["status"], "incomplete");
+        assert_eq!(
+            d["primary_report"]["reason"],
+            "source_changed_or_unavailable"
+        );
+        assert_eq!(body["errors"], 1);
+    }
+
+    #[tokio::test]
+    async fn suspected_fill_defects_do_not_drop_a_report_with_an_unreadable_refilled_board() {
+        let saved = defect_board(FILL);
+        for tool in ["run_drc", "get_drc_violations"] {
+            for primary_has_candidate in [false, true] {
+                let scene = Scene::new(&saved, Some("(kicad_pcb broken"))
+                    .with_refill_report(&defect_report().to_string());
+                let primary = if primary_has_candidate {
+                    defect_report()
+                } else {
+                    json!({"violations":[],"unconnected_items":[],"schematic_parity":[]})
+                };
+                std::fs::write(scene.dir.path().join("main.json"), primary.to_string()).unwrap();
+                let (error, body) = scene.run(tool, json!({})).await;
+                assert!(!error, "{body}");
+                let d = &body["zone_fill_check"]["suspected_fill_defects"];
+                assert_eq!(
+                    d["status"],
+                    if primary_has_candidate {
+                        "suspected"
+                    } else {
+                        "incomplete"
+                    }
+                );
+                assert_eq!(d["comparison_report"]["coverage"], "unavailable");
+                assert_eq!(d["comparison_report"]["reason"], "board_did_not_parse");
+                assert!(d["comparison_report"]["matching_entries"].is_null());
+                assert!(d["newly_reported_after_refill"].is_null());
+                assert_eq!(
+                    body["violations"].as_array().unwrap().len(),
+                    usize::from(primary_has_candidate)
+                );
+                assert_eq!(scene.calls().len(), 2);
+                assert_eq!(std::fs::read_to_string(&scene.board).unwrap(), saved);
+            }
         }
     }
 
