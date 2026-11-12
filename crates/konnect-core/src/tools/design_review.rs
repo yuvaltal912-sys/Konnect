@@ -173,10 +173,12 @@ pub fn tools() -> Vec<ToolDef> {
              against the output voltage. Every finding names its 'checklist' item and the 'rule' \
              that fired. 'checks' reports each rule as ran, needs_human, no_subjects or not_run, with counts; \
              'needs_human' lists what no tool here can judge, with each subject a rule met but \
-             could not judge; 'unproven' lists absences withheld because the net continues on \
-             another sheet; a sheet used twice is audited once per use ('unaudited_sheet_uses' \
-             lists any use that could not be read) and DNP or off-board parts are left out \
-             ('unfitted_parts'). Nothing here approves a board.",
+             could not judge; 'unproven' withholds absence/exhaustive conclusions at unresolved boundaries; \
+             supported hierarchy nets are joined once with per-instance reference/unit identities. \
+             'connectivity' reports complete/partial coverage and gaps, 'origins' retains sources, \
+             and 'unaudited_sheet_uses' lists quarantined uses. DNP/off-board parts remain excluded \
+             ('unfitted_parts'); incomplete totals are null with observed values retained. Multiple \
+             termination candidates need human physical-bank assignment. Nothing here approves a board.",
             json!({
                 "type": "object",
                 "properties": {
@@ -813,7 +815,9 @@ impl AuditAggregate {
                     self.findings
                         .extend(findings.into_iter().map(|mut finding| {
                             finding["audit"] = json!(self.name);
-                            finding["source"] = json!(source.display().to_string());
+                            if self.name != "circuit_design" || finding.get("source").is_none() {
+                                finding["source"] = json!(source.display().to_string());
+                            }
                             finding
                         }));
                 }
@@ -866,6 +870,38 @@ struct SchematicSheetInstance {
     instance_path: String,
     /// The sheets' names the way board nets are prefixed: `/` or `/Power/`.
     name_path: String,
+}
+
+/// The diagnostic that keeps `run_design_review` from speaking for more than
+/// the circuit audit could judge. Subjects it could not evaluate are counted;
+/// a circuit audit that is partial for any other reason is reported as well,
+/// so no cause can leave this review `complete` over a partial circuit audit.
+fn circuit_audit_gap_diagnostic(body: &Value, root_path: &Path) -> Option<Value> {
+    let gaps = body["coverage"]["unevaluated_subjects"]
+        .as_u64()
+        .unwrap_or(0);
+    if gaps > 0 {
+        return Some(json!({
+            "code": "circuit_checks_unevaluated",
+            "source": root_path.display().to_string(),
+            "message": format!(
+                "{gaps} subject(s) of the circuit-aware review could not be evaluated \
+                 (see audit_circuit_design 'checks' for each rule's reasons and \
+                 'unaudited_sheet_uses' for sheets it did not read), so this review \
+                 cannot speak for them"
+            )
+        }));
+    }
+    let partial = body["status"] != "checked" || body["connectivity"]["status"] == "partial";
+    partial.then(|| {
+        json!({
+            "code": "circuit_review_partial",
+            "source": root_path.display().to_string(),
+            "message": "the circuit-aware review is partial (see audit_circuit_design 'diagnostics' \
+                        and 'connectivity' for what it could not read or join), so this review \
+                        cannot speak for what it left out"
+        })
+    })
 }
 
 /// Every auditable use of a sheet, for the circuit-aware review.
@@ -952,7 +988,10 @@ fn collect_hierarchy(
             collect_hierarchy(
                 &parent.join(file),
                 &format!("{instance_path}{child_uuid}/"),
-                &format!("{name_path}{child_name}/"),
+                &format!(
+                    "{name_path}{}/",
+                    super::circuit_model::escape_net_segment(child_name)
+                ),
                 child,
                 traversal,
             );
@@ -1119,7 +1158,7 @@ async fn handle_scoped_schematic_audit(
     let traversal = inspect_hierarchy(&root_path)?;
     let sheet_instances = traversal.sheet_instances;
     let schematic_files = traversal.schematic_files.len();
-    let mut diagnostics = traversal.diagnostics;
+    let mut diagnostics = traversal.diagnostics.clone();
     let mut sheet_results = Vec::new();
     let mut findings = Vec::new();
     let mut symbol_instances = 0usize;
@@ -1270,7 +1309,7 @@ async fn handle_run_design_review(
 
     let root_path = get_path(args, "schematic")?;
     let traversal = inspect_hierarchy(&root_path)?;
-    let mut diagnostics = traversal.diagnostics;
+    let mut diagnostics = traversal.diagnostics.clone();
     let mut schematic_coverage = SchematicReviewCoverage {
         sheet_instances: traversal.sheet_instances,
         schematic_files: traversal.schematic_files.len(),
@@ -1314,7 +1353,7 @@ async fn handle_run_design_review(
             &root_path,
             &circuit_sheet_uses(&traversal.auditable_instances),
             args["board"].as_str().map(Path::new),
-            Vec::new(),
+            traversal.diagnostics.clone(),
         );
         let body = result
             .as_ref()
@@ -1326,22 +1365,11 @@ async fn handle_run_design_review(
         audits.push(circuit);
         body
     };
-    if let Some(body) = &circuit_body {
-        let gaps = body["coverage"]["unevaluated_subjects"]
-            .as_u64()
-            .unwrap_or(0);
-        if gaps > 0 {
-            diagnostics.push(json!({
-                "code": "circuit_checks_unevaluated",
-                "source": root_path.display().to_string(),
-                "message": format!(
-                    "{gaps} subject(s) of the circuit-aware review could not be evaluated \
-                     (see audit_circuit_design 'checks' for each rule's reasons and \
-                     'unaudited_sheet_uses' for sheets it did not read), so this review \
-                     cannot speak for them"
-                )
-            }));
-        }
+    if let Some(diagnostic) = circuit_body
+        .as_ref()
+        .and_then(|body| circuit_audit_gap_diagnostic(body, &root_path))
+    {
+        diagnostics.push(diagnostic);
     }
     let circuit_summary = match &circuit_body {
         Some(body) => json!({
@@ -1352,6 +1380,7 @@ async fn handle_run_design_review(
             "unevaluated_subjects": body["coverage"]["unevaluated_subjects"],
             "needs_human_subjects": body["coverage"]["needs_human_subjects"],
             "unaudited_sheet_uses": body["coverage"]["unaudited_sheet_uses"],
+            "connectivity_notes": body["connectivity"]["notes"],
             "unfitted_parts": body["coverage"]["unfitted_parts"],
             "unproven": body["unproven"].as_array().map(Vec::len),
             "needs_human": body["needs_human"],

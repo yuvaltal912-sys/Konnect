@@ -15,14 +15,13 @@
 //! Written from the checklist and the parts' pin names; no code is ported
 //! from another project.
 //!
-//! The model is one [`Circuit`] per use of a schematic file (a sheet used
-//! twice is two circuits, each read with its own designators), so a net that
-//! continues on another sheet is marked and absence-type findings about it
-//! are listed under `unproven` instead of being asserted. Distances are pad-anchor
+//! Known sheet uses are joined into one [`Circuit`] with scoped identities.
+//! Unresolved boundaries remain marked; absence-type and exhaustive findings
+//! about them are listed under `unproven` instead of being asserted. Distances are pad-anchor
 //! Euclidean, the metric `score_placement` uses for decoupling; they are not
 //! routed lengths.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use konnect_sexp::board_geometry::BoardGeometry;
@@ -512,6 +511,12 @@ pub(super) fn audit_files(
     audit_uses(root, &uses, board, diagnostics)
 }
 
+/// The gap recorded for a root schematic that carries no UUID. KiCad writes
+/// one on save, so the message says so.
+const ROOT_UUID_GAP: &str = "root schematic has no UUID, so no sheet use's designators or units \
+    can be read from its instance records; open the root schematic and save it in KiCad to \
+    write one, then run the review again";
+
 /// Audit every use of every sheet in `uses` and, when given, `board`. `Err`
 /// only when no schematic could be read at all.
 ///
@@ -545,9 +550,27 @@ pub(super) fn audit_uses(
         *times_used.entry(canonical(&u.file)).or_default() += 1;
     }
 
+    let mut instance_counts = BTreeMap::new();
+    for u in uses {
+        if let Some(path) = &u.instance_path {
+            *instance_counts.entry(path).or_insert(0usize) += 1;
+        }
+    }
     let mut circuits: Vec<Circuit> = Vec::new();
     let mut unaudited: Vec<Value> = Vec::new();
+    // Each unaudited use is one unevaluated subject. The join is told which
+    // they are, so it does not record the same use again as a missing child.
+    let mut set_aside: BTreeSet<String> = BTreeSet::new();
     for u in uses {
+        if u.instance_path
+            .as_ref()
+            .is_some_and(|path| instance_counts[path] > 1)
+        {
+            set_aside.extend(u.instance_path.clone());
+            unaudited.push(json!({"source": u.file, "sheet_instance_path": u.instance_path,
+                "sheet_name_path": u.name_path, "why": "ambiguous duplicate sheet-instance path; use quarantined before joining"}));
+            continue;
+        }
         let place = SheetPlace {
             symbol_path: root_uuid.as_ref().and_then(|r| {
                 u.instance_path
@@ -597,7 +620,7 @@ pub(super) fn audit_uses(
                         circuit
                             .parts
                             .iter()
-                            .find(|p| c.part(&p.reference).is_some())
+                            .find(|p| c.part(&p.reference).is_some() && !circuit.can_share_reference_with(c, &p.reference))
                             .map(|p| {
                                 format!(
                                     "the sheet is used more than once and {} has the same \
@@ -608,6 +631,7 @@ pub(super) fn audit_uses(
                     })
             };
             if let Some(why) = why {
+                set_aside.extend(u.instance_path.clone());
                 unaudited.push(json!({
                     "source": u.file.display().to_string(),
                     "sheet_instance_path": u.instance_path,
@@ -622,6 +646,36 @@ pub(super) fn audit_uses(
     if circuits.is_empty() && unaudited.is_empty() {
         anyhow::bail!("no schematic file could be read");
     }
+
+    let schematic_files = circuits
+        .iter()
+        .map(|c| c.file.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let sheet_instances = circuits.len();
+    let hierarchy_known = uses.iter().all(|u| u.instance_path.is_some()) && !circuits.is_empty();
+    if hierarchy_known {
+        let complete = diagnostics.is_empty() && unaudited.is_empty() && root_uuid.is_some();
+        let mut joined = Circuit::join(circuits, complete, &set_aside);
+        if root_uuid.is_none() {
+            // Instance records are keyed by the root UUID. Without it no use's
+            // designators or units are proven, so it is a gap like any other:
+            // listed, counted once, and enough to keep both entry points partial.
+            joined.connectivity_gaps.insert(ROOT_UUID_GAP.to_string());
+        }
+        circuits = vec![joined];
+    }
+    let connectivity_gaps: Vec<String> = circuits
+        .iter()
+        .flat_map(|c| c.connectivity_gaps.iter().cloned())
+        .collect();
+    for gap in &connectivity_gaps {
+        diagnostics.push(json!({"code": "circuit_connectivity_gap", "source": root.display().to_string(), "message": gap}));
+    }
+    let connectivity_notes: Vec<String> = circuits
+        .iter()
+        .flat_map(|c| c.connectivity_notes.iter().cloned())
+        .collect();
 
     let mut board_diag = None;
     let board_view = match board {
@@ -645,19 +699,12 @@ pub(super) fn audit_uses(
 
     let mut report = Report::default();
     for circuit in &circuits {
-        let source = circuit.file.display().to_string();
-        let sheet = circuit.sheet.instance_path.clone();
         let before = report.findings.len();
         let unproven_before = report.unproven.len();
         let interfaces_before = report.interfaces.len();
         let crystals_before = report.crystals.len();
         super::circuit_checks::run(circuit, board_view.as_ref(), intent.as_ref(), &mut report);
-        let tag = |v: &mut Value| {
-            v["source"] = json!(source);
-            if let Some(path) = &sheet {
-                v["sheet_instance_path"] = json!(path);
-            }
-        };
+        let tag = |v: &mut Value| tag_origin(circuit, v);
         report.findings[before..].iter_mut().for_each(tag);
         report.unproven[unproven_before..].iter_mut().for_each(tag);
         report.interfaces[interfaces_before..]
@@ -673,7 +720,17 @@ pub(super) fn audit_uses(
             f["source"] = json!(intent_path.display().to_string());
         }
     }
+    let power_before = report.findings.len();
+    let power_unproven_before = report.unproven.len();
     let power_tree = power_tree(&circuits, intent.as_ref(), &mut report);
+    if hierarchy_known {
+        for finding in &mut report.findings[power_before..] {
+            tag_origin(&circuits[0], finding);
+        }
+        for withheld in &mut report.unproven[power_unproven_before..] {
+            tag_origin(&circuits[0], withheld);
+        }
+    }
 
     // ── Account for every rule ─────────────────────────────────────────────
     let have_board = board_view.is_some();
@@ -682,7 +739,7 @@ pub(super) fn audit_uses(
     let mut ran = 0usize;
     let mut not_run = 0usize;
     // A sheet use that was not audited is a gap, not a pass.
-    let mut gaps = unaudited.len();
+    let mut gaps = unaudited.len() + connectivity_gaps.len();
     for r in RULES {
         let stat = report.stats.get(r.id);
         let blocked = match r.needs {
@@ -820,7 +877,7 @@ pub(super) fn audit_uses(
         .iter()
         .flat_map(|c| {
             c.unfitted.iter().map(move |u| {
-                json!({"reference": u.reference, "why": u.why, "source": c.file.display().to_string()})
+                json!({"reference": u.reference, "why": u.why, "source": u.origin.source, "sheet_instance_path": u.origin.sheet_instance_path})
             })
         })
         .collect();
@@ -843,15 +900,11 @@ pub(super) fn audit_uses(
     let body = json!({
         "audit": "circuit_design",
         "status": status,
-        "scope": "per_schematic_file",
+        "scope": if hierarchy_known { "schematic_hierarchy" } else { "per_schematic_file" },
         "standard": "owner's PCB layout checklist, sections 2, 6, 8 and 9 plus the design-intent power tree",
         "distance_metric": "pad_anchor_euclidean_xy",
-        "schematic_files": circuits
-            .iter()
-            .map(|c| c.file.as_path())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        "sheet_instances": circuits.len(),
+        "schematic_files": schematic_files,
+        "sheet_instances": sheet_instances,
         "board": have_board,
         "design_intent": match &intent_state {
             IntentState::Absent => json!({"status": "absent", "path": intent_path.display().to_string()}),
@@ -869,7 +922,9 @@ pub(super) fn audit_uses(
             "unaudited_sheet_uses": unaudited.len(),
             "unfitted_parts": unfitted.len(),
             "unresolved_symbols": unresolved_symbols,
+            "connectivity_gaps": connectivity_gaps.len(),
         },
+        "connectivity": { "status": if hierarchy_known && circuits.iter().all(|c| c.inventory_complete) { "complete" } else { "partial" }, "gaps": connectivity_gaps, "notes": connectivity_notes },
         "unaudited_sheet_uses": unaudited,
         "unfitted_parts": {
             "count": unfitted.len(),
@@ -885,6 +940,61 @@ pub(super) fn audit_uses(
         "summary": summary,
     });
     Ok(CallToolResult::text(serde_json::to_string(&body)?))
+}
+
+/// Keep the primary subject's source; net-level facts may have several origins.
+fn tag_origin(circuit: &Circuit, value: &mut Value) {
+    let reference = ["component", "transceiver", "crystal"]
+        .iter()
+        .find_map(|key| value[*key].as_str())
+        .map(|r| r.split('.').next().unwrap_or(r));
+    let mut origins = reference
+        .and_then(|r| circuit.origins.get(r))
+        .cloned()
+        .unwrap_or_default();
+    if origins.is_empty() {
+        if let Some(reference) = reference {
+            origins.extend(
+                circuit
+                    .unfitted
+                    .iter()
+                    .filter(|u| u.reference == reference)
+                    .map(|u| u.origin.clone()),
+            );
+        }
+    }
+    let net_key = value["net_key"]
+        .as_str()
+        .or_else(|| value["evidence"]["net_key"].as_str());
+    let net_subject = matches!(
+        value["rule"].as_str(),
+        Some("i2c_pullup_value" | "uart_tx_rx_crossed" | "usb_esd_missing" | "rail_name_voltage")
+    ) || value["interface"] == "i2c";
+    if net_subject {
+        origins.clear();
+    }
+    if origins.is_empty() {
+        if let Some(net) = net_key.and_then(|key| circuit.net(key)) {
+            origins.extend(net.origins.iter().cloned());
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("net_key");
+    }
+    if let Some(evidence) = value.get_mut("evidence").and_then(Value::as_object_mut) {
+        evidence.remove("net_key");
+    }
+    if origins.len() == 1 {
+        let origin = origins.iter().next().expect("one origin");
+        value["source"] = json!(origin.source);
+        if let Some(path) = &origin.sheet_instance_path {
+            value["sheet_instance_path"] = json!(path);
+        }
+    } else {
+        value["source"] = json!(circuit.file);
+        value["source_scope"] = json!("hierarchy");
+    }
+    value["origins"] = json!(origins);
 }
 
 // ─── Power tree and feedback dividers ────────────────────────────────────────
@@ -985,6 +1095,7 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
         return json!({"status": "not_run", "reason": "the record holds no rails", "rails": []});
     }
 
+    let inventory_complete = circuits.iter().all(|c| c.inventory_complete);
     // Every net of every sheet, by name, for rail lookups.
     let rail_net_names: Vec<(&str, &str)> = intent
         .rails
@@ -1010,16 +1121,23 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
                     present = true;
                     for n in &net.names {
                         if let Some(v) = rail_voltage_from_name(n) {
-                            named_voltages.push((n.clone(), v));
+                            named_voltages.push((n.clone(), v, net.key.clone()));
                         }
                     }
                 }
             }
         }
-        report.examine("rail_not_in_schematic");
-        if present {
+        if !present && !inventory_complete {
+            report.unproven(
+                "rail_not_in_schematic",
+                &rail.name,
+                "the hierarchy inventory is incomplete; the rail may be in an unread sheet".into(),
+            );
+        } else if present {
+            report.examine("rail_not_in_schematic");
             report.pass("rail_not_in_schematic");
         } else {
+            report.examine("rail_not_in_schematic");
             report.finding(
                 "rail_not_in_schematic",
                 "warning",
@@ -1036,7 +1154,7 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
         }
         named_voltages.sort_by(|a, b| a.0.cmp(&b.0));
         named_voltages.dedup();
-        for (name, v) in &named_voltages {
+        for (name, v, net_key) in &named_voltages {
             report.examine("rail_name_voltage");
             if (v - rail.voltage_v).abs() <= 0.05 * rail.voltage_v.abs().max(0.1) {
                 report.pass("rail_name_voltage");
@@ -1051,7 +1169,7 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
                     ),
                     "One of the two is wrong: rename the net or correct the record's voltage_v."
                         .into(),
-                    json!({"rail": rail.name, "net": name, "name_voltage_v": v, "recorded_voltage_v": rail.voltage_v}),
+                    json!({"rail": rail.name, "net": name, "net_key": net_key, "name_voltage_v": v, "recorded_voltage_v": rail.voltage_v}),
                 );
             }
         }
@@ -1061,14 +1179,26 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
             "rail": rail.name,
             "voltage_v": rail.voltage_v,
             "nets": rail.nets,
-            "present_in_schematic": present,
+            "present_in_schematic": if present || inventory_complete { Some(present) } else { None },
             "source_ref": rail.source_ref,
         });
         if let Some(src) = &rail.source_ref {
             recorded_sources.push(src.as_str());
             let found = find_part(circuits, src);
-            report.examine("rail_source_missing");
-            if found.is_empty() {
+            let known_unfitted = circuits
+                .iter()
+                .flat_map(|c| &c.unfitted)
+                .any(|u| u.reference == *src);
+            if found.is_empty() && !known_unfitted && !inventory_complete {
+                report.unproven(
+                    "rail_source_missing",
+                    src,
+                    "the hierarchy inventory is incomplete; the source may be in an unread sheet"
+                        .into(),
+                );
+                entry["source_kind"] = json!("unproven");
+            } else if found.is_empty() {
+                report.examine("rail_source_missing");
                 report.finding(
                     "rail_source_missing",
                     "warning",
@@ -1097,6 +1227,7 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
                 );
                 entry["source_kind"] = json!("missing");
             } else {
+                report.examine("rail_source_missing");
                 report.pass("rail_source_missing");
                 let loc = &found[0];
                 let kind = if is_regulator(loc.part) {
@@ -1115,16 +1246,15 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
                 if on_rail {
                     report.examine("rail_source_not_on_rail");
                     report.pass("rail_source_not_on_rail");
-                } else if found.iter().all(|l| {
-                    l.part.pins.iter().all(|p| {
-                        l.circuit.net(&p.net).is_some_and(|n| n.leaves_sheet)
-                            || l.circuit.net(&p.net).is_none()
-                    })
+                } else if found.iter().any(|l| {
+                    rail_frontier(l.circuit, l.part)
+                        .iter()
+                        .any(|key| l.circuit.net(key).is_none_or(|n| n.leaves_sheet))
                 }) {
                     report.unproven(
                         "rail_source_not_on_rail",
                         src,
-                        format!("every pin of {src} is on a net that continues on another sheet"),
+                        format!("the permitted source-to-rail search from {src} reaches unresolved connectivity"),
                     );
                 } else {
                     report.examine("rail_source_not_on_rail");
@@ -1173,10 +1303,11 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
     unrecorded.sort();
     unrecorded.dedup();
     json!({
-        "status": "checked",
+        "status": if inventory_complete { "checked" } else { "partial" },
         "rails": rails_json,
+        "inventory_complete": inventory_complete,
         "regulators_not_recorded_as_a_source": unrecorded,
-        "note": "inputs are resolved per sheet; a source whose input net continues on another sheet shows no input rail",
+        "note": "inputs use proved hierarchy connections; unresolved sources and divider topology are reported explicitly",
     })
 }
 
@@ -1187,12 +1318,7 @@ fn power_tree(circuits: &[Circuit], intent: Option<&DesignIntent>, report: &mut 
 /// (power-good, enable, soft-start, reset) links it to anything. Any pin of
 /// a part that is not a regulator, a connector say, may reach the rail through
 /// an inductor or ferrite, but never through a resistor.
-fn part_reaches_rail(circuit: &Circuit, part: &Part, rail_nets: &[String]) -> bool {
-    let on = |key: &str| {
-        circuit
-            .net(key)
-            .is_some_and(|n| rail_nets.iter().any(|r| n.matches_name(r)))
-    };
+fn rail_frontier<'a>(circuit: &'a Circuit, part: &'a Part) -> std::collections::BTreeSet<&'a str> {
     let regulator = is_regulator(part);
     let names = part.pin_names();
     let pin_names = component_class::PinNames::new(&names);
@@ -1200,19 +1326,32 @@ fn part_reaches_rail(circuit: &Circuit, part: &Part, rail_nets: &[String]) -> bo
     let switch_or_output = pin_names.all(&[
         "SW", "LX", "PH", "PHASE", "SWITCH", "VOUT", "OUT", "VO", "OUTPUT",
     ]);
-    part.pins.iter().enumerate().any(|(i, pin)| {
+    let mut frontier = std::collections::BTreeSet::new();
+    for (i, pin) in part.pins.iter().enumerate() {
+        frontier.insert(pin.net.as_str());
         let by_inductor =
             !regulator || switch_or_output.contains(&i) || pin.electrical_type == "power_out";
         let by_resistor = feedback.contains(&i);
-        on(&pin.net)
-            || circuit.on_net(&pin.net).iter().any(|(q, _)| {
-                q.reference != part.reference
-                    && q.is_two_terminal()
-                    && ((by_inductor
-                        && component_class::is_series_inductor(&q.lib_id, &q.reference))
-                        || (by_resistor && component_class::is_resistor(&q.lib_id, &q.reference)))
-                    && circuit.across(q, &pin.net).is_some_and(on)
-            })
+        for (q, _) in circuit.on_net(&pin.net) {
+            if q.reference != part.reference
+                && q.is_two_terminal()
+                && ((by_inductor && component_class::is_series_inductor(&q.lib_id, &q.reference))
+                    || (by_resistor && component_class::is_resistor(&q.lib_id, &q.reference)))
+            {
+                if let Some(other) = circuit.across(q, &pin.net) {
+                    frontier.insert(other);
+                }
+            }
+        }
+    }
+    frontier
+}
+
+fn part_reaches_rail(circuit: &Circuit, part: &Part, rail_nets: &[String]) -> bool {
+    rail_frontier(circuit, part).iter().any(|key| {
+        circuit
+            .net(key)
+            .is_some_and(|n| rail_nets.iter().any(|r| n.matches_name(r)))
     })
 }
 
@@ -1230,11 +1369,14 @@ fn feedback(
     let pins = component_class::PinNames::new(&names);
     let fb_pin = pins.find(FEEDBACK_PINS)?;
     let fb_net = part.pins[fb_pin].net.clone();
-    let out_net = rail
+    // A bare alias may name distinct local nets. Classify each resistor's
+    // actual other net; an unrelated first name match must not shadow it.
+    let out_nets: std::collections::BTreeSet<&str> = circuit
         .nets
-        .iter()
-        .find_map(|n| circuit.nets.values().find(|net| net.matches_name(n)))
-        .map(|n| n.key.clone());
+        .values()
+        .filter(|net| rail.nets.iter().any(|name| net.matches_name(name)))
+        .map(|net| net.key.as_str())
+        .collect();
 
     let mut top: Vec<(&Part, f64)> = Vec::new();
     let mut bottom: Vec<(&Part, f64)> = Vec::new();
@@ -1252,9 +1394,26 @@ fn feedback(
         };
         if circuit.net(other).is_some_and(|n| n.is_ground()) {
             bottom.push((p, ohms));
-        } else if Some(other) == out_net.as_deref() {
+        } else if out_nets.contains(other) {
             top.push((p, ohms));
         }
+    }
+    let incomplete = circuit.net(&fb_net).is_none_or(|n| n.leaves_sheet)
+        || circuit.on_net(&fb_net).iter().any(|(p, _)| {
+            component_class::is_resistor(&p.lib_id, &p.reference)
+                && circuit.across(p, &fb_net).is_some_and(|other| {
+                    circuit.net(other).is_none_or(|n| {
+                        !n.is_ground() && !out_nets.contains(other) && n.leaves_sheet
+                    })
+                })
+        });
+    if incomplete {
+        let why = format!(
+            "{}: unresolved connectivity can change the feedback divider topology",
+            part.reference
+        );
+        report.unevaluated("feedback_vout_mismatch", why.clone());
+        return Some(json!({"status": "unevaluated", "reason": why}));
     }
     let r = |v: &[(&Part, f64)]| -> Vec<Value> {
         v.iter()

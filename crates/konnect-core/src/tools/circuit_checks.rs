@@ -1,4 +1,4 @@
-//! The per-sheet checks of the circuit-aware review. Each function states the
+//! The checks of the circuit-aware review. Each function states the
 //! checklist item it serves in `circuit_review::RULES`; thresholds are named
 //! constants so a finding can quote the limit it used.
 
@@ -269,8 +269,48 @@ fn net_name(c: &Circuit, key: &str) -> String {
 }
 
 fn leaves(c: &Circuit, keys: &[&str]) -> bool {
-    keys.iter()
-        .any(|k| c.net(k).is_some_and(|n| n.leaves_sheet))
+    keys.iter().any(|k| c.net(k).is_none_or(|n| n.leaves_sheet))
+}
+
+/// An unseen capacitor, or an unresolved far-end ground connection, can
+/// change the capacitor inventory. A proved ground stays a proved ground.
+fn capacitor_search_incomplete(c: &Circuit, key: &str) -> bool {
+    leaves(c, &[key])
+        || c.on_net(key).into_iter().any(|(p, _)| {
+            is_cap(p)
+                && c.across(p, key).is_some_and(|other| {
+                    c.net(other)
+                        .is_none_or(|n| !n.is_ground() && n.leaves_sheet)
+                })
+        })
+}
+
+/// Use the rule's existing search radius; this does not add traversal hops.
+fn reach_incomplete(c: &Circuit, key: &str, hops: usize) -> bool {
+    series_reach(c, key, hops)
+        .keys()
+        .any(|net| leaves(c, &[net.as_str()]))
+}
+
+fn net_unproven(c: &Circuit, report: &mut Report, rule: &'static str, key: &str, why: &str) {
+    report.unproven(rule, &net_name(c, key), why.into());
+    if let Some(item) = report.unproven.last_mut() {
+        item["component"] = Value::Null;
+        item["net"] = json!(net_name(c, key));
+        item["net_key"] = json!(key);
+    }
+}
+
+fn pin_unproven(report: &mut Report, rule: &'static str, part: &Part, pin: &Pin, why: &str) {
+    report.unproven(
+        rule,
+        &part.reference,
+        format!("{}: {why}", pin_label(part, pin)),
+    );
+    if let Some(item) = report.unproven.last_mut() {
+        item["pin"] = json!(pin.number);
+        item["net_key"] = json!(pin.net);
+    }
 }
 
 fn intent_interface<'a>(cx: &'a Cx<'_>, net: &str) -> Option<&'a Interface> {
@@ -326,7 +366,18 @@ fn decoupling(cx: &Cx<'_>, report: &mut Report) {
                     Some((cap, limit))
                 })
                 .collect();
+            let incomplete = capacitor_search_incomplete(c, &pin.net);
             if family.is_empty() {
+                if incomplete {
+                    pin_unproven(
+                        report,
+                        "decoupling_supply_far",
+                        part,
+                        pin,
+                        "the capacitor inventory is incomplete",
+                    );
+                    continue;
+                }
                 if caps_to_ground(c, &pin.net).is_empty() {
                     report.skip(
                         "decoupling_supply_far",
@@ -376,6 +427,27 @@ fn decoupling(cx: &Cx<'_>, report: &mut Report) {
                 );
                 continue;
             };
+            // Only a nearby member of the smallest supported family is a
+            // sufficient witness without knowing every capacitor on the net.
+            let smallest_family = crate::tools::placement::decoupling_limit_mm("100n")
+                .is_some_and(|minimum| limit <= minimum);
+            if incomplete && (dist > limit || !smallest_family) {
+                pin_unproven(
+                    report,
+                    "decoupling_supply_far",
+                    part,
+                    pin,
+                    "unresolved connectivity may add a nearer or higher-frequency capacitor",
+                );
+                pin_unproven(
+                    report,
+                    "decoupling_ground_far",
+                    part,
+                    pin,
+                    "the nearest decoupling capacitor cannot be selected from an incomplete inventory",
+                );
+                continue;
+            }
             report.examine("decoupling_supply_far");
             let evidence = json!({
                 "ic": part.reference, "pin": pin.number, "capacitor": cap.part.reference,
@@ -459,6 +531,16 @@ fn decoupling(cx: &Cx<'_>, report: &mut Report) {
                 );
                 continue;
             };
+            if incomplete && nearest.0 > limit {
+                pin_unproven(
+                    report,
+                    "decoupling_ground_far",
+                    part,
+                    pin,
+                    "unresolved connectivity may add a nearer decoupling capacitor with a shorter ground leg",
+                );
+                continue;
+            }
             report.examine("decoupling_ground_far");
             if nearest.0 <= limit {
                 report.pass("decoupling_ground_far");
@@ -520,7 +602,18 @@ fn bulk(cx: &Cx<'_>, report: &mut Report) {
                 .into_iter()
                 .filter(|cap| cap.farads.is_some_and(cc::is_bulk_capacitance))
                 .collect();
+            let incomplete = capacitor_search_incomplete(c, &pin.net);
             if bulk.is_empty() {
+                if incomplete {
+                    pin_unproven(
+                        report,
+                        "bulk_cap_far",
+                        part,
+                        pin,
+                        "the bulk-capacitor inventory is incomplete",
+                    );
+                    continue;
+                }
                 report.skip(
                     "bulk_cap_far",
                     format!("{}: no bulk capacitor (10 uF or more) on {}; audit_power_rails reports missing ones", pin_label(part, pin), net.display()),
@@ -546,6 +639,16 @@ fn bulk(cx: &Cx<'_>, report: &mut Report) {
                 );
                 continue;
             };
+            if incomplete && dist > BULK_CAP_MAX_MM {
+                pin_unproven(
+                    report,
+                    "bulk_cap_far",
+                    part,
+                    pin,
+                    "unresolved connectivity may add a nearer bulk capacitor",
+                );
+                continue;
+            }
             report.examine("bulk_cap_far");
             if dist <= BULK_CAP_MAX_MM {
                 report.pass("bulk_cap_far");
@@ -585,6 +688,15 @@ fn connectors(cx: &Cx<'_>, report: &mut Report) {
                 .filter(|(p, _)| p.reference != conn.reference)
                 .collect();
             if others.is_empty() {
+                if net.leaves_sheet && !net.is_rail() {
+                    pin_unproven(
+                        report,
+                        "connector_signal_unprotected",
+                        conn,
+                        pin,
+                        "unresolved connectivity may contain the attached circuit and its protection",
+                    );
+                }
                 continue; // nothing attached: not a signal path
             }
             let prot = protection_on(c, &pin.net);
@@ -601,8 +713,25 @@ fn connectors(cx: &Cx<'_>, report: &mut Report) {
                             .map(move |(p, _, _)| (k.clone(), p))
                     })
                     .collect();
-                report.examine("protection_after_series_element");
+                if net.leaves_sheet {
+                    pin_unproven(
+                        report,
+                        "protection_after_series_element",
+                        conn,
+                        pin,
+                        "the connector net is incomplete, so direct protection cannot be ruled out",
+                    );
+                    pin_unproven(
+                        report,
+                        "connector_signal_unprotected",
+                        conn,
+                        pin,
+                        "the connector net is incomplete, so protection may be unobserved",
+                    );
+                    continue;
+                }
                 if let Some((_, p)) = behind.first() {
+                    report.examine("protection_after_series_element");
                     report.finding(
                         "protection_after_series_element",
                         "warning",
@@ -615,21 +744,21 @@ fn connectors(cx: &Cx<'_>, report: &mut Report) {
                         json!({"connector": conn.reference, "pin": pin.number, "net": net.display(), "protection": p.reference}),
                     );
                 } else {
-                    report.pass("protection_after_series_element");
-                    if net.leaves_sheet {
-                        report.unproven(
-                            "connector_signal_unprotected",
-                            &conn.reference,
-                            format!(
-                                "net {} continues on another sheet, where protection may sit",
-                                net.display()
-                            ),
+                    if reach.keys().any(|key| leaves(c, &[key.as_str()])) {
+                        pin_unproven(
+                            report,
+                            "protection_after_series_element",
+                            conn,
+                            pin,
+                            "the existing series search reaches unresolved connectivity",
                         );
                     } else {
-                        report.examine("connector_signal_unprotected");
-                        let recorded = intent_interface(cx, &pin.net).is_some();
-                        unprotected.push((net.display(), recorded));
+                        report.examine("protection_after_series_element");
+                        report.pass("protection_after_series_element");
                     }
+                    report.examine("connector_signal_unprotected");
+                    let recorded = intent_interface(cx, &pin.net).is_some();
+                    unprotected.push((net.display(), recorded));
                 }
                 continue;
             }
@@ -673,10 +802,19 @@ fn connectors(cx: &Cx<'_>, report: &mut Report) {
                 );
                 continue;
             };
-            report.examine("esd_far_from_connector");
-            if d_tvs <= ESD_MAX_MM {
+            if net.leaves_sheet && d_tvs > ESD_MAX_MM {
+                pin_unproven(
+                    report,
+                    "esd_far_from_connector",
+                    conn,
+                    pin,
+                    "unresolved connectivity may add nearer protection",
+                );
+            } else if d_tvs <= ESD_MAX_MM {
+                report.examine("esd_far_from_connector");
                 report.pass("esd_far_from_connector");
             } else {
+                report.examine("esd_far_from_connector");
                 report.finding(
                     "esd_far_from_connector",
                     "warning",
@@ -705,8 +843,16 @@ fn connectors(cx: &Cx<'_>, report: &mut Report) {
                     continue;
                 };
                 let d_ic = pad_distance(ic_pad, conn_pad);
-                report.examine("protection_beyond_circuit");
-                if d_ic + PROTECTION_ORDER_MARGIN_MM < d_tvs {
+                if net.leaves_sheet && d_ic + PROTECTION_ORDER_MARGIN_MM < d_tvs {
+                    pin_unproven(
+                        report,
+                        "protection_beyond_circuit",
+                        ic,
+                        ipin,
+                        "unresolved connectivity may add protection nearer the connector than this circuit",
+                    );
+                } else if d_ic + PROTECTION_ORDER_MARGIN_MM < d_tvs {
+                    report.examine("protection_beyond_circuit");
                     report.finding(
                         "protection_beyond_circuit",
                         "warning",
@@ -721,6 +867,7 @@ fn connectors(cx: &Cx<'_>, report: &mut Report) {
                                "metric": "pad_anchor_euclidean_xy", "note": "pad distances, not trace order"}),
                     );
                 } else {
+                    report.examine("protection_beyond_circuit");
                     report.pass("protection_beyond_circuit");
                 }
             }
@@ -807,13 +954,9 @@ fn connectors_reached<'a>(c: &'a Circuit, net: &str) -> Vec<(&'a Part, &'a Pin)>
     out
 }
 
-/// Whether any net a bus line reaches through two series parts continues on
-/// another sheet.
+/// Whether the existing two-series-part bus search reaches an unresolved net.
 fn bus_leaves(c: &Circuit, a: &str, b: &str) -> bool {
-    [a, b]
-        .iter()
-        .flat_map(|net| series_reach(c, net, 2).into_keys())
-        .any(|key| c.net(&key).is_some_and(|n| n.leaves_sheet))
+    reach_incomplete(c, a, 2) || reach_incomplete(c, b, 2)
 }
 
 /// A multi-pin choke or inductor on a net a bus line reaches, if any. A
@@ -848,7 +991,8 @@ struct Termination<'a> {
 
 /// The termination between two bus nets: a direct resistor, a split pair
 /// around a common node, or a resistor and a jumper/switch in series.
-fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> {
+fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Vec<Termination<'a>> {
+    let mut candidates = Vec::new();
     let direct = across_pair(c, a, b, is_res);
     if !direct.is_empty() {
         // Parallel resistors across the pair add up.
@@ -857,7 +1001,7 @@ fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> 
             .map(|r| cc::parse_si_value(&r.value))
             .collect::<Option<Vec<f64>>>()
             .map(|v| 1.0 / v.iter().map(|o| 1.0 / o).sum::<f64>());
-        return Some(Termination {
+        candidates.push(Termination {
             kind: "direct",
             resistors: direct,
             ohms,
@@ -884,7 +1028,7 @@ fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> 
                     (Some(x), Some(y)) => Some(x + y),
                     _ => None,
                 };
-                return Some(Termination {
+                candidates.push(Termination {
                     kind: "split",
                     resistors: vec![ra, rb],
                     ohms,
@@ -894,50 +1038,78 @@ fn termination<'a>(c: &'a Circuit, a: &str, b: &str) -> Option<Termination<'a>> 
         }
     }
     // Selectable: R from a to X, a jumper, switch or two-pin header from X to b.
-    for (ra, _) in c
-        .on_net(a)
-        .into_iter()
-        .filter(|(p, _)| is_res(p) && p.is_two_terminal())
-    {
-        let Some(x) = c.across(ra, a) else { continue };
-        if c.net(x).is_some_and(|n| n.is_ground() || n.is_rail()) {
-            continue;
-        }
-        for (sw, _) in c.on_net(x) {
-            let lib = sw.lib_id.to_uppercase();
-            let selector = lib.contains("SW_")
-                || lib.contains("SWITCH")
-                || cc::is_jumper(&sw.lib_id, &sw.reference)
-                || is_conn(sw);
-            if selector && sw.is_two_terminal() && c.across(sw, x) == Some(b) {
-                return Some(Termination {
-                    kind: "selectable",
-                    resistors: vec![ra],
-                    ohms: cc::parse_si_value(&ra.value),
-                    selector: Some(sw),
-                });
+    for (left, right) in [(a, b), (b, a)] {
+        for (ra, _) in c
+            .on_net(left)
+            .into_iter()
+            .filter(|(p, _)| is_res(p) && p.is_two_terminal())
+        {
+            let Some(x) = c.across(ra, left) else {
+                continue;
+            };
+            if c.net(x).is_some_and(|n| n.is_ground() || n.is_rail()) {
+                continue;
+            }
+            for (sw, _) in c.on_net(x) {
+                let lib = sw.lib_id.to_uppercase();
+                let selector = lib.contains("SW_")
+                    || lib.contains("SWITCH")
+                    || cc::is_jumper(&sw.lib_id, &sw.reference)
+                    || is_conn(sw);
+                if selector && sw.is_two_terminal() && c.across(sw, x) == Some(right) {
+                    candidates.push(Termination {
+                        kind: "selectable",
+                        resistors: vec![ra],
+                        ohms: cc::parse_si_value(&ra.value),
+                        selector: Some(sw),
+                    });
+                }
             }
         }
     }
-    None
+    // The same selectable branch can be reached from both directions in
+    // degenerate drawings; its physical resistor/selector identity is one.
+    let mut seen = BTreeSet::new();
+    candidates.retain(|t| {
+        seen.insert((
+            t.kind,
+            t.resistors
+                .iter()
+                .map(|r| r.reference.as_str())
+                .collect::<Vec<_>>(),
+            t.selector.map(|p| p.reference.as_str()),
+        ))
+    });
+    candidates
 }
 
 fn transceivers(cx: &Cx<'_>, report: &mut Report) {
     let c = cx.c;
-    for x in transceivers_of(c) {
+    let transceivers = transceivers_of(c);
+    let mut termination_placement_done = BTreeSet::new();
+    for x in &transceivers {
         let (ra, rb) = (x.a.net.as_str(), x.b.net.as_str());
+        let incomplete_bus = bus_leaves(c, ra, rb);
         let (value_rule, id) = if x.kind == "can" {
             ("can_termination_value", "CAN")
         } else {
             ("rs485_termination_value", "RS-485")
         };
-        let term = termination(c, ra, rb);
-        // A header that selects the termination is not a connector on the bus.
-        let selector = term.as_ref().and_then(|t| t.selector).map(|p| &p.reference);
+        let candidates = termination(c, ra, rb);
+        let term = candidates.first();
+        let observed_resistors: BTreeMap<&str, &Part> = candidates
+            .iter()
+            .flat_map(|t| t.resistors.iter().map(|r| (r.reference.as_str(), *r)))
+            .collect();
+        // All observed selectors belong to candidate terminations, not bus branches.
+        let selectors: BTreeSet<&str> = candidates
+            .iter()
+            .filter_map(|t| t.selector.map(|p| p.reference.as_str()))
+            .collect();
         let bus_connectors = |net: &str| -> Vec<(&Part, &Pin)> {
             connectors_reached(c, net)
                 .into_iter()
-                .filter(|(p, _)| Some(&p.reference) != selector)
+                .filter(|(p, _)| !selectors.contains(p.reference.as_str()))
                 .collect()
         };
         let conns_a = bus_connectors(ra);
@@ -945,7 +1117,9 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
         let mut block = json!({
             "interface": x.kind,
             "transceiver": x.part.reference,
+            "net_key": ra,
             "nets": {"a": net_name(c, ra), "b": net_name(c, rb)},
+            "connectivity_complete": !incomplete_bus,
             "connectors": conns_a.iter().map(|(p, pin)| pin_label(p, pin)).collect::<Vec<_>>(),
             "physical_ends": "needs_human: this audit sees one node, not the bus",
         });
@@ -953,26 +1127,122 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
         // Termination value.
         match &term {
             None => {
-                block["termination"] = json!({"kind": "none_on_this_sheet"});
-                if leaves(c, &[ra, rb]) {
+                block["termination"] = json!({"kind": "none_observed"});
+                if incomplete_bus {
                     block["termination"]["note"] =
-                        json!("a bus net continues on another sheet; a termination may be there");
+                        json!("the bus search reaches unresolved connectivity; termination may be unobserved");
+                    report.unproven(
+                        value_rule,
+                        &x.part.reference,
+                        "termination cannot be ruled out on an incomplete bus".into(),
+                    );
                 }
             }
             Some(t) => {
+                let incomplete_term = incomplete_bus
+                    || t.resistors
+                        .iter()
+                        .any(|r| r.pins.iter().any(|p| leaves(c, &[p.net.as_str()])));
+                // Electrical parallelism does not establish which physical
+                // bus end owns each direct resistor. Do not use sheet or
+                // drawing proximity as an invented bank assignment.
+                let bank_assignment_unknown =
+                    candidates.len() > 1 || (t.kind == "direct" && t.resistors.len() > 1);
                 block["termination"] = json!({
+                    "bank_assignment_requires_human": bank_assignment_unknown,
                     "kind": t.kind,
                     "resistors": t.resistors.iter().map(|r| json!({"reference": r.reference, "value": r.value})).collect::<Vec<_>>(),
-                    "total_ohms": t.ohms,
+                    "total_ohms": if incomplete_term || candidates.len() > 1 { None } else { t.ohms },
+                    "observed_resistance_ohms": if candidates.len() == 1 { t.ohms } else { None },
+                    "observed_resistors": observed_resistors.keys().collect::<Vec<_>>(),
+                    "candidates": candidates.iter().map(|candidate| json!({
+                        "kind": candidate.kind, "ohms": candidate.ohms,
+                        "selector": candidate.selector.map(|p| &p.reference),
+                        "resistors": candidate.resistors.iter().map(|r| &r.reference).collect::<Vec<_>>()
+                    })).collect::<Vec<_>>(),
+                    "connectivity_complete": !incomplete_term,
                     "selector": t.selector.map(|p| &p.reference),
                 });
-                match t.ohms {
+                let candidate_value = if candidates.iter().any(|c| c.ohms.is_none()) {
+                    None
+                } else {
+                    t.ohms
+                };
+                // More parallel paths only lower the resistance between two
+                // nodes. A fixed bank whose own nodes are all known is therefore
+                // an upper bound even when the bus continues out of sight. A
+                // selectable bank may be open, so it bounds nothing.
+                let positive =
+                    |r: &&Part| cc::parse_si_value(&r.value).filter(|v| v.is_finite() && *v > 0.0);
+                let nodes_known = |r: &&Part| {
+                    positive(r).is_some()
+                        && r.pins
+                            .iter()
+                            .all(|p| p.net == ra || p.net == rb || !leaves(c, &[p.net.as_str()]))
+                };
+                let bound_holds =
+                    matches!(t.kind, "direct" | "split") && t.resistors.iter().all(nodes_known);
+                // Among several candidates the end each bank sits at is not
+                // known, but a bank's own value is. Direct resistors may sit
+                // at different ends, so each is a bank of its own; the two
+                // halves of a split are one bank.
+                let low_bank = candidates
+                    .iter()
+                    .flat_map(|bank| match bank.kind {
+                        "direct" => bank
+                            .resistors
+                            .iter()
+                            .filter_map(|r| positive(r).map(|v| ("direct", vec![*r], v)))
+                            .collect(),
+                        "split" if bank.resistors.iter().all(nodes_known) => bank
+                            .ohms
+                            .map(|v| ("split", bank.resistors.clone(), v))
+                            .into_iter()
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .filter(|(_, _, ohms)| *ohms < 114.0)
+                    .min_by(|a, b| a.2.total_cmp(&b.2));
+                match candidate_value {
                     None => report.unevaluated(
                         value_rule,
                         format!(
                             "{}: a termination resistor value does not parse",
                             x.part.reference
                         ),
+                    ),
+                    Some(_) if bank_assignment_unknown => match low_bank {
+                        // Whichever physical end holds this bank is at most
+                        // its value, and nothing in parallel can raise that.
+                        Some((kind, bank, ohms)) => {
+                            let names: Vec<&str> =
+                                bank.iter().map(|r| r.reference.as_str()).collect();
+                            report.examine(value_rule);
+                            report.finding(
+                                value_rule,
+                                "warning",
+                                Some(&x.part.reference),
+                                format!(
+                                    "{id} termination at {}: {} ({kind}) puts {:.0} ohm across the pair, so the bus end that holds it is at most {:.0} ohm whichever end that is; the bus wants 120 ohm (114 to 126) at each end",
+                                    x.part.reference, names.join(" + "), ohms, ohms
+                                ),
+                                "Use 120 ohm across the pair (or two 60 ohm in a split termination) at each physical end of the bus".into(),
+                                json!({"transceiver": x.part.reference, "kind": kind,
+                                       "low_bank": names, "upper_bound_ohms": round3(ohms),
+                                       "bank_assignment_requires_human": true,
+                                       "resistors": observed_resistors.keys().collect::<Vec<_>>(),
+                                       "connectivity_complete": !incomplete_term}),
+                            );
+                        }
+                        None => report.needs_human(
+                            value_rule, &x.part.reference,
+                            "multiple termination candidates are observed, but their assignment to physical bus ends is not established",
+                        ),
+                    },
+                    Some(ohms) if incomplete_term && !(ohms < 114.0 && bound_holds) => report.unproven(
+                        value_rule,
+                        &x.part.reference,
+                        "unresolved bus or termination connectivity can change the equivalent resistance".into(),
                     ),
                     Some(ohms) => {
                         report.examine(value_rule);
@@ -992,12 +1262,15 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                                 "warning",
                                 Some(&x.part.reference),
                                 format!(
-                                    "{id} termination at {} totals {:.0} ohm ({}); the bus wants 120 ohm (114 to 126) at each end",
-                                    x.part.reference, ohms, t.kind
+                                    "{id} {}termination at {} gives {:.0} ohm ({}); the bus wants 120 ohm (114 to 126) at each end{}",
+                                    if incomplete_term { "observed " } else { "" },
+                                    x.part.reference, ohms, t.kind,
+                                    if incomplete_term { "; additional parallel resistors cannot raise this resistance" } else { "" }
                                 ),
                                 "Use 120 ohm across the pair (or two 60 ohm in a split termination) at each physical end of the bus".into(),
                                 json!({"transceiver": x.part.reference, "kind": t.kind, "total_ohms": round3(ohms),
-                                       "resistors": t.resistors.iter().map(|r| &r.reference).collect::<Vec<_>>()}),
+                                       "resistors": t.resistors.iter().map(|r| &r.reference).collect::<Vec<_>>(),
+                                       "connectivity_complete": !incomplete_term}),
                             );
                         }
                     }
@@ -1030,11 +1303,11 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                         "the bus passes through {choke}, a multi-pin choke whose winding pairs are not read, so the connectors behind it were not counted"
                     ),
                 );
-            } else if bus_leaves(c, ra, rb) {
+            } else if incomplete_bus {
                 report.unproven(
                     "can_bus_branches",
                     &x.part.reference,
-                    "a bus net continues on another sheet, where more connectors may hang".into(),
+                    "the bus search reaches unresolved connectivity, where more connectors may be attached".into(),
                 );
             } else if distinct.is_empty() {
                 report.unevaluated(
@@ -1071,11 +1344,26 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
             let up = bias(ra, true);
             let down = bias(rb, false);
             if up.is_empty() || down.is_empty() {
-                if leaves(c, &[ra, rb]) {
+                let bias_incomplete = |net: &str, to_rail: bool| {
+                    leaves(c, &[net])
+                        || c.on_net(net).into_iter().any(|(p, _)| {
+                            is_res(p)
+                                && c.across(p, net).is_some_and(|other| {
+                                    c.net(other).is_none_or(|n| {
+                                        !(if to_rail { n.is_rail() } else { n.is_ground() })
+                                            && n.leaves_sheet
+                                    })
+                                })
+                        })
+                };
+                if (up.is_empty() && bias_incomplete(ra, true))
+                    || (down.is_empty() && bias_incomplete(rb, false))
+                {
                     report.unproven(
                         "rs485_failsafe_bias",
                         &x.part.reference,
-                        "a bus net continues on another sheet".into(),
+                        "unresolved connectivity prevents a complete bias-resistor inventory"
+                            .into(),
                     );
                 } else {
                     report.examine("rs485_failsafe_bias");
@@ -1111,6 +1399,7 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
             let mut worst: Option<f64> = None;
             let mut gaps = Vec::new();
             let mut reached_any = false;
+            let mut both_sides_measured = true;
             for (pin, conns) in [(x.a, &conns_a), (x.b, &conns_b)] {
                 let mut nearest: Option<f64> = None;
                 for (cp, cpin) in conns {
@@ -1122,14 +1411,16 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                 }
                 if let Some(n) = nearest {
                     worst = Some(worst.map_or(n, |w: f64| w.max(n)));
+                } else {
+                    both_sides_measured = false;
                 }
             }
             if !reached_any {
-                if leaves(c, &[ra, rb]) {
+                if incomplete_bus {
                     report.unproven(
                         "transceiver_far_from_connector",
                         &x.part.reference,
-                        "the bus continues on another sheet".into(),
+                        "the bus search reaches unresolved connectivity".into(),
                     );
                 } else {
                     report.skip(
@@ -1141,20 +1432,28 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                     );
                 }
             } else if let Some(w) = worst {
-                report.examine("transceiver_far_from_connector");
-                block["connector_distance_mm"] = json!(round3(w));
-                if w <= TRANSCEIVER_MAX_MM {
-                    report.pass("transceiver_far_from_connector");
-                } else {
-                    report.finding(
+                if incomplete_bus && (w > TRANSCEIVER_MAX_MM || !both_sides_measured) {
+                    report.unproven(
                         "transceiver_far_from_connector",
-                        "warning",
-                        Some(&x.part.reference),
-                        format!("{} is {:.1} mm from its bus connector (limit {} mm)", x.part.reference, w, TRANSCEIVER_MAX_MM),
-                        "Place the transceiver (and its protection) near the bus connector; a long stub on the bus side reflects".into(),
-                        json!({"transceiver": x.part.reference, "distance_mm": round3(w), "limit_mm": TRANSCEIVER_MAX_MM,
-                               "metric": "pad_anchor_euclidean_xy"}),
+                        &x.part.reference,
+                        "the nearest connector on each bus line cannot be established from incomplete connectivity".into(),
                     );
+                } else {
+                    report.examine("transceiver_far_from_connector");
+                    block["connector_distance_mm"] = json!(round3(w));
+                    if w <= TRANSCEIVER_MAX_MM {
+                        report.pass("transceiver_far_from_connector");
+                    } else {
+                        report.finding(
+                            "transceiver_far_from_connector",
+                            "warning",
+                            Some(&x.part.reference),
+                            format!("{} is {:.1} mm from its bus connector (limit {} mm)", x.part.reference, w, TRANSCEIVER_MAX_MM),
+                            "Place the transceiver (and its protection) near the bus connector; a long stub on the bus side reflects".into(),
+                            json!({"transceiver": x.part.reference, "distance_mm": round3(w), "limit_mm": TRANSCEIVER_MAX_MM,
+                                   "metric": "pad_anchor_euclidean_xy"}),
+                        );
+                    }
                 }
             } else {
                 report.unevaluated(
@@ -1164,8 +1463,12 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
             }
 
             // Termination at the endpoint.
-            if let Some(t) = &term {
-                for r in &t.resistors {
+            if term.is_some() {
+                for r in observed_resistors.values() {
+                    let pair = if ra <= rb { (ra, rb) } else { (rb, ra) };
+                    if !termination_placement_done.insert((pair.0, pair.1, r.reference.as_str())) {
+                        continue;
+                    }
                     let mut nearest: Option<(f64, String)> = None;
                     let mut err = None;
                     for pin in &r.pins {
@@ -1173,7 +1476,17 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                             .iter()
                             .chain(conns_b.iter())
                             .copied()
-                            .chain([(x.part, x.a), (x.part, x.b)])
+                            .chain(
+                                transceivers
+                                    .iter()
+                                    .filter(|other| {
+                                        (other.a.net == ra && other.b.net == rb)
+                                            || (other.a.net == rb && other.b.net == ra)
+                                    })
+                                    .flat_map(|other| {
+                                        [(other.part, other.a), (other.part, other.b)]
+                                    }),
+                            )
                             .collect();
                         for (tp, tpin) in targets {
                             match pin_dist(board, r, pin, tp, tpin) {
@@ -1187,7 +1500,21 @@ fn transceivers(cx: &Cx<'_>, report: &mut Report) {
                         }
                     }
                     match (nearest, err) {
-                        (Some((d, to)), _) => {
+                        (Some((d, to)), measurement_error) => {
+                            if d > TERMINATION_MAX_MM {
+                                if let Some(why) = measurement_error {
+                                    report.unevaluated("termination_far_from_endpoint", format!("{}: an eligible endpoint cannot be measured ({why}); the nearest endpoint is unproven", r.reference));
+                                    continue;
+                                }
+                            }
+                            if incomplete_bus && d > TERMINATION_MAX_MM {
+                                report.unproven(
+                                    "termination_far_from_endpoint",
+                                    &r.reference,
+                                    "unresolved connectivity may add a nearer bus endpoint".into(),
+                                );
+                                continue;
+                            }
                             report.examine("termination_far_from_endpoint");
                             if d <= TERMINATION_MAX_MM {
                                 report.pass("termination_far_from_endpoint");
@@ -1240,6 +1567,14 @@ fn series_termination(cx: &Cx<'_>, report: &mut Report) {
         }
         let plain = |k: &str| c.net(k).is_some_and(|n| !n.is_ground() && !n.is_rail());
         if !(plain(n0) && plain(n1)) {
+            continue;
+        }
+        if leaves(c, &[n0, n1]) {
+            report.unproven(
+                "series_termination_far_from_driver",
+                &r.reference,
+                "unresolved connectivity prevents proving exactly one driver and the receiver-only side".into(),
+            );
             continue;
         }
         // Which side holds exactly one driver, and is the other side all receivers?
@@ -1464,12 +1799,12 @@ fn gate_drive(cx: &Cx<'_>, report: &mut Report) {
         if return_nets.contains(&d.source.net.as_str()) {
             report.examine("gate_drive_return_net");
             report.pass("gate_drive_return_net");
-        } else if leaves(c, &[d.source.net.as_str()]) && leaves(c, &return_nets) {
+        } else if leaves(c, &[d.source.net.as_str()]) || leaves(c, &return_nets) {
             report.unproven(
                 "gate_drive_return_net",
                 &d.driver.reference,
                 format!(
-                    "the return and the source of {} continue on other sheets",
+                    "the return or source connection of {} is unresolved",
                     d.mosfet.reference
                 ),
             );
@@ -1510,7 +1845,7 @@ fn gate_drive(cx: &Cx<'_>, report: &mut Report) {
                 report.unproven(
                     "bootstrap_cap_missing",
                     &driver.reference,
-                    "the boot or switch net continues on another sheet".into(),
+                    "the boot or switch net has unresolved connectivity".into(),
                 );
             } else {
                 report.examine("bootstrap_cap_missing");
@@ -1609,6 +1944,18 @@ fn current_sense(cx: &Cx<'_>, report: &mut Report) {
             }
         }
         let Some((shunt, np, nn)) = found else {
+            if reach_p
+                .keys()
+                .chain(reach_n.keys())
+                .any(|key| leaves(c, &[key.as_str()]))
+            {
+                report.unproven(
+                    "sense_amp_far_from_shunt",
+                    &amp.reference,
+                    "the existing one-hop sense search reaches unresolved connectivity".into(),
+                );
+                continue;
+            }
             report.skip(
                 "sense_amp_far_from_shunt",
                 format!(
@@ -1884,6 +2231,15 @@ fn crystals(cx: &Cx<'_>, report: &mut Report) {
             .filter(|p| c.net(&p.net).is_some_and(|n| !n.is_ground()))
             .collect();
         if signal.len() != 2 {
+            if xtal.pins.iter().any(|p| leaves(c, &[p.net.as_str()])) {
+                report.unproven(
+                    "crystal_load_cap_missing",
+                    &xtal.reference,
+                    "unresolved pin connectivity prevents identifying both crystal signal pins"
+                        .into(),
+                );
+                continue;
+            }
             report.skip(
                 "crystal_load_cap_missing",
                 format!(
@@ -1899,12 +2255,12 @@ fn crystals(cx: &Cx<'_>, report: &mut Report) {
         for pin in &signal {
             let caps = caps_to_ground(c, &pin.net);
             if caps.is_empty() {
-                if leaves(c, &[pin.net.as_str()]) {
+                if capacitor_search_incomplete(c, &pin.net) {
                     report.unproven(
                         "crystal_load_cap_missing",
                         &xtal.reference,
                         format!(
-                            "pin {} is on a net that continues on another sheet",
+                            "the load-capacitor inventory of pin {} is incomplete",
                             pin.number
                         ),
                     );
@@ -1978,13 +2334,17 @@ fn crystals(cx: &Cx<'_>, report: &mut Report) {
                 }
             }
         }
-        let cl = (caps_pf.len() == 2)
+        let incomplete = signal
+            .iter()
+            .any(|pin| capacitor_search_incomplete(c, &pin.net));
+        let cl = (caps_pf.len() == 2 && !incomplete)
             .then(|| caps_pf[0] * caps_pf[1] / (caps_pf[0] + caps_pf[1]) + CRYSTAL_STRAY_PF);
         report.crystals.push(json!({
             "crystal": xtal.reference,
             "value": xtal.value,
             "load_capacitors": cap_json,
             "computed_load_capacitance_pf": cl.map(round3),
+            "connectivity_complete": !incomplete,
             "stray_assumed_pf": CRYSTAL_STRAY_PF,
             "target_load_capacitance_pf": "needs_human: read it from the crystal's datasheet",
         }));
@@ -2005,7 +2365,18 @@ fn adc_refs(cx: &Cx<'_>, report: &mut Report) {
                 continue;
             }
             let caps = caps_to_ground(c, &pin.net);
+            let incomplete = capacitor_search_incomplete(c, &pin.net);
             if caps.is_empty() {
+                if incomplete {
+                    pin_unproven(
+                        report,
+                        "adc_ref_cap_far",
+                        part,
+                        pin,
+                        "the reference-capacitor inventory is incomplete",
+                    );
+                    continue;
+                }
                 report.skip(
                     "adc_ref_cap_far",
                     format!(
@@ -2037,6 +2408,18 @@ fn adc_refs(cx: &Cx<'_>, report: &mut Report) {
             };
             let limit = crate::tools::placement::decoupling_limit_mm(&cap.part.value)
                 .unwrap_or(ADC_REF_DEFAULT_MM);
+            let passes_every_family = crate::tools::placement::decoupling_limit_mm("100n")
+                .is_some_and(|minimum| d <= minimum);
+            if incomplete && (d > limit || !passes_every_family) {
+                pin_unproven(
+                    report,
+                    "adc_ref_cap_far",
+                    part,
+                    pin,
+                    "unresolved connectivity may change the nearest reference capacitor and its value family",
+                );
+                continue;
+            }
             report.examine("adc_ref_cap_far");
             if d <= limit {
                 report.pass("adc_ref_cap_far");
@@ -2086,6 +2469,15 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
             .map(|(p, pin)| pin_label(p, pin))
             .collect();
         if devices.is_empty() {
+            if leaves(c, &[net_key.as_str()]) {
+                net_unproven(
+                    c,
+                    report,
+                    "i2c_pullup_value",
+                    &net_key,
+                    "unresolved connectivity may contain I2C devices and pull-ups",
+                );
+            }
             continue;
         }
         let pullups: Vec<(&Part, f64, String)> = on
@@ -2099,13 +2491,23 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
             .collect();
         let r_eff = (!pullups.is_empty())
             .then(|| 1.0 / pullups.iter().map(|(_, o, _)| 1.0 / o).sum::<f64>());
+        let incomplete = leaves(c, &[net_key.as_str()])
+            || on.iter().any(|(p, _)| {
+                is_res(p)
+                    && c.across(p, &net_key).is_some_and(|other| {
+                        c.net(other).is_none_or(|n| !n.is_rail() && n.leaves_sheet)
+                    })
+            });
         report.interfaces.push(json!({
             "interface": "i2c",
             "line": line,
             "net": net_name(c, &net_key),
+            "net_key": net_key,
             "devices": devices.iter().map(|p| &p.reference).collect::<Vec<_>>(),
             "pull_ups": pullups.iter().map(|(p, o, rail)| json!({"reference": p.reference, "ohms": o, "rail": net_name(c, rail)})).collect::<Vec<_>>(),
-            "effective_pull_up_ohms": r_eff.map(round3),
+            "effective_pull_up_ohms": if incomplete { None } else { r_eff.map(round3) },
+            "observed_effective_pull_up_ohms": r_eff.map(round3),
+            "connectivity_complete": !incomplete,
             "off_board_connector_pins": connectors,
             "module_pull_ups": if connectors.is_empty() { Value::Null } else {
                 json!("not counted: an off-board module may add its own pull-ups in parallel; the total is a human check") },
@@ -2113,6 +2515,15 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
             "missing_pull_up": "reported by audit_connections, not repeated here",
         }));
         if pullups.is_empty() {
+            if incomplete {
+                net_unproven(
+                    c,
+                    report,
+                    "i2c_pullup_value",
+                    &net_key,
+                    "the pull-up inventory is incomplete",
+                );
+            }
             continue;
         }
         // The rail: every pulled-up rail against every device's supply.
@@ -2188,16 +2599,33 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
             .filter_map(|(_, _, rail)| net_voltage(cx, rail))
             .map(|(v, _)| v)
             .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |x| x.max(v))));
-        report.examine("i2c_pullup_value");
         let sink_ma = v.map(|v| (v - 0.4) / r * 1000.0);
+        // Additional positive parallel resistors can only increase this
+        // rule's sink-current estimate. Preserve an already exceeded limit,
+        // but do not pass or declare weak pull-ups from a partial inventory.
+        let known_overload = sink_ma.is_some_and(|i| i > 3.0)
+            && pullups
+                .iter()
+                .all(|(_, ohms, _)| ohms.is_finite() && *ohms > 0.0);
+        if incomplete && !known_overload {
+            net_unproven(
+                c,
+                report,
+                "i2c_pullup_value",
+                &net_key,
+                "unresolved connectivity can add parallel pull-ups and change the total resistance",
+            );
+            continue;
+        }
+        report.examine("i2c_pullup_value");
         if sink_ma.is_some_and(|i| i > 3.0) {
             report.finding(
                 "i2c_pullup_value",
                 "warning",
                 Some(&devices[0].reference),
-                format!("The pull-ups on {} total {:.0} ohm, which asks a device to sink {:.1} mA (standard-mode limit 3 mA)", net_name(c, &net_key), r, sink_ma.unwrap_or(0.0)),
+                format!("The observed pull-ups on {} give {:.0} ohm, which already asks a device to sink {:.1} mA (standard-mode limit 3 mA){}", net_name(c, &net_key), r, sink_ma.unwrap_or(0.0), if incomplete { "; further pull-ups may be unobserved" } else { "" }),
                 "Raise the pull-up resistance, or check that every device on the bus can sink more".into(),
-                json!({"net": net_name(c, &net_key), "effective_ohms": round3(r), "sink_ma": sink_ma.map(round3)}),
+                json!({"net": net_name(c, &net_key), "net_key": net_key, "effective_ohms": round3(r), "sink_ma": sink_ma.map(round3), "connectivity_complete": !incomplete}),
             );
         } else if r > 10_000.0 {
             report.finding(
@@ -2206,7 +2634,7 @@ fn i2c(cx: &Cx<'_>, report: &mut Report) {
                 Some(&devices[0].reference),
                 format!("The pull-ups on {} total {:.0} ohm; the rising edge will be slow", net_name(c, &net_key), r),
                 "Lower the pull-up resistance (typically 2.2k to 4.7k) after checking the bus capacitance".into(),
-                json!({"net": net_name(c, &net_key), "effective_ohms": round3(r)}),
+                json!({"net": net_name(c, &net_key), "net_key": net_key, "effective_ohms": round3(r)}),
             );
         } else {
             report.pass("i2c_pullup_value");
@@ -2239,10 +2667,19 @@ fn uart(cx: &Cx<'_>, report: &mut Report) {
                 .collect()
         };
         if tx.len() + rx.len() < 2 || parts_of(&tx).union(&parts_of(&rx)).count() < 2 {
+            if net.leaves_sheet && (!tx.is_empty() || !rx.is_empty()) {
+                net_unproven(
+                    c,
+                    report,
+                    "uart_tx_rx_crossed",
+                    &net.key,
+                    "the UART net is incomplete, so its other endpoints are unknown",
+                );
+            }
             continue;
         }
-        report.examine("uart_tx_rx_crossed");
         if parts_of(&tx).len() >= 2 {
+            report.examine("uart_tx_rx_crossed");
             report.finding(
                 "uart_tx_rx_crossed",
                 "error",
@@ -2253,9 +2690,18 @@ fn uart(cx: &Cx<'_>, report: &mut Report) {
                     tx.join(", ")
                 ),
                 "Cross the UART: one device's TX goes to the other's RX".into(),
-                json!({"net": net.display(), "tx_pins": tx, "rx_pins": rx}),
+                json!({"net": net.display(), "net_key": net.key, "tx_pins": tx, "rx_pins": rx}),
+            );
+        } else if net.leaves_sheet {
+            net_unproven(
+                c,
+                report,
+                "uart_tx_rx_crossed",
+                &net.key,
+                "unresolved connectivity prevents proving the complete transmitter/receiver inventory",
             );
         } else if tx.is_empty() && parts_of(&rx).len() >= 2 {
+            report.examine("uart_tx_rx_crossed");
             report.finding(
                 "uart_tx_rx_crossed",
                 "error",
@@ -2266,9 +2712,10 @@ fn uart(cx: &Cx<'_>, report: &mut Report) {
                     rx.join(", ")
                 ),
                 "Cross the UART: one device's TX goes to the other's RX".into(),
-                json!({"net": net.display(), "rx_pins": rx}),
+                json!({"net": net.display(), "net_key": net.key, "rx_pins": rx}),
             );
         } else {
+            report.examine("uart_tx_rx_crossed");
             report.pass("uart_tx_rx_crossed");
         }
     }
@@ -2294,6 +2741,16 @@ fn usb(cx: &Cx<'_>, report: &mut Report) {
     for (key, line) in &data {
         let at_connector = c.on_net(key).iter().any(|(p, _)| is_conn(p));
         if !at_connector {
+            if leaves(c, &[key.as_str()]) {
+                net_unproven(
+                    c,
+                    report,
+                    "usb_esd_missing",
+                    key,
+                    "the USB net is incomplete, so a connector may be unobserved",
+                );
+                continue;
+            }
             report.skip(
                 "usb_esd_missing",
                 format!("{}: {line} net is not at a connector", net_name(c, key)),
@@ -2303,10 +2760,12 @@ fn usb(cx: &Cx<'_>, report: &mut Report) {
         let prot = protection_on(c, key);
         if prot.is_empty() {
             if leaves(c, &[key.as_str()]) {
-                report.unproven(
+                net_unproven(
+                    c,
+                    report,
                     "usb_esd_missing",
-                    &net_name(c, key),
-                    "the net continues on another sheet".into(),
+                    key,
+                    "the USB net has unresolved connectivity",
                 );
             } else {
                 report.examine("usb_esd_missing");
@@ -2316,7 +2775,7 @@ fn usb(cx: &Cx<'_>, report: &mut Report) {
                     None,
                     format!("USB {line} net {} has no ESD protection at the connector", net_name(c, key)),
                     "Add a low-capacitance ESD array (for example a USBLC6 or TPD2E-class part) at the connector".into(),
-                    json!({"net": net_name(c, key), "line": line}),
+                    json!({"net": net_name(c, key), "net_key": key, "line": line}),
                 );
             }
             continue;
