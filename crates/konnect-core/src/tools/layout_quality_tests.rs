@@ -2120,3 +2120,24 @@ fn a_corner_at_a_via_centre_is_left_out_with_its_snapped_piece() {
         assert_eq!(m[metric], 1, "{angle} degrees without the via: {m}");
     }
 }
+
+/// The router's jog at a 135-degree bend: it turns 90 degrees, runs a short
+/// piece and turns 45 degrees back. Under 10 um the piece belongs to the
+/// junction and the bend reads as the 135 degrees it is; from 10 um the piece
+/// is a leg and its first end reads as a right angle. Neither is acute.
+#[test]
+fn a_jog_at_a_135_degree_bend_is_a_right_angle_only_from_ten_micrometres() {
+    for (length, right, bends) in [(0.00999, 0, 1), (0.01001, 1, 2)] {
+        let q = (JN.0, JN.1 + length);
+        let r = 45f64.to_radians();
+        let t = [
+            (leg_at(180., 3.), JN),
+            (JN, q),
+            (q, (q.0 + 3. * r.cos(), q.1 + 3. * r.sin())),
+        ];
+        let m = corner_metrics(&t);
+        assert_eq!(m["acute_corners"], 0, "jog of {length} mm: {m}");
+        assert_eq!(m["right_angle_corners"], right, "jog of {length} mm: {m}");
+        assert_eq!(m["bends"], bends, "jog of {length} mm: {m}");
+    }
+}
