@@ -489,6 +489,8 @@ fn a_piece_snapped_to_a_via_centre_is_read_inside_that_via() {
     assert_eq!(acid_traps(&t).0, 1);
     let report = check_board(&geometry(&with_via("OTHER")), &jlc());
     assert_eq!(issues_with(&report, "Acid trap").len(), 1);
+    // Nothing skipped, so no reason is given.
+    assert_eq!(report.checks["acid_trap"].reason, None);
 }
 
 /// Exactly 89 degrees is a right angle and not acute: the two readings split
