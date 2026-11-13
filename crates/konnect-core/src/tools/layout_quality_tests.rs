@@ -2013,3 +2013,33 @@ fn the_two_corner_readings_agree_at_eighty_nine_degrees() {
     assert_eq!(m["acute_found_by_this_scan"], 0, "{m}");
     assert_eq!(m["right_angle_corners"], 1, "{m}");
 }
+
+/// A right-angle bend whose 9-um track reaches within 0.01 mm of a pad of the
+/// net while the bend itself stays 15 um clear: the bend is counted. Only a
+/// junction whose legs all end near that copper is left out.
+#[test]
+fn a_bend_is_left_out_only_where_its_legs_meet_near_a_pad() {
+    let mut t = corner_legs(&[180., 270.]);
+    t.push((JN, (JN.0, JN.1 + 0.009)));
+    let pad = format!(
+        "(footprint \"Fixture:P\" (layer \"F.Cu\") (uuid \"fp\") (at {} {} 0) (property \"Reference\" \"P1\" (at 0 0 0) (layer \"F.SilkS\") (uuid \"fp-r\") (effects (font (size 1 1)))) (pad \"1\" smd circle (at 0 0 0) (size 0.8 0.8) (layers \"F.Cu\" \"F.Mask\") (net \"SIG\") (uuid \"pp\")))",
+        JN.0,
+        JN.1 + 0.415
+    );
+    let mut segs = String::new();
+    for (i, (a, b)) in t.iter().enumerate() {
+        segs += &format!(
+            "  (segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))\n",
+            a.0, a.1, b.0, b.1
+        );
+    }
+    let text = format!(
+        r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+  (gr_rect (start 0 0) (end 60 40) (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts") (uuid "e1"))
+{segs}{pad})"#
+    );
+    let r = run(&fx_text(&text, None));
+    let m = &check(&r, "5.3")["metrics"];
+    assert_eq!(m["right_angle_corners"], 1, "{m}");
+}

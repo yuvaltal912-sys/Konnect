@@ -387,3 +387,18 @@ fn a_junction_is_skipped_only_where_its_legs_meet_inside_copper() {
         .unwrap()
         .contains("1 acute junction"));
 }
+
+/// A real 45-degree V whose two legs end at keys 2 um apart, joined by a
+/// short track: one junction, one acid trap. Each key alone holds one end.
+#[test]
+fn a_short_track_joins_the_keys_of_one_junction() {
+    let j1 = (JN.0 + 0.002, JN.1);
+    let t = vec![
+        (JN, at(180., 3.)),
+        (JN, j1),
+        (j1, (j1.0 - 2.121320, j1.1 + 2.121320)),
+    ];
+    let (traps, cov) = acid_traps(&t);
+    assert_eq!(traps, 1, "{cov:?}");
+    assert_eq!(cov.checked, 1);
+}
