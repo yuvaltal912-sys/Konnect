@@ -1753,3 +1753,158 @@ fn findings_name_the_items_they_are_about() {
         cut[0]
     );
 }
+
+// Build the public layer-change fixture directly so cancellation exercises the analysis,
+// without running the unrelated audit checks first.
+fn with_stitching_model(test: impl FnOnce(&mut Model)) {
+    let tree =
+        parse_sexp(&std::fs::read_to_string(fixture_path("layer_change.kicad_pcb")).unwrap())
+            .unwrap();
+    let geometry = BoardGeometry::from_tree(&tree);
+    let params = Params::from_args(&json!({})).unwrap_or_else(|_| panic!("params"));
+    let (fills, unfilled) = read_fills(&tree, &geometry);
+    let mut tracks: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut vias: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut pads: HashMap<String, Vec<PadIx>> = HashMap::new();
+    for (i, e) in geometry.others.iter().enumerate() {
+        if let Some(net) = &e.net {
+            match e.kind {
+                Kind::Track => tracks.entry(net.clone()).or_default().push(i),
+                Kind::Via => vias.entry(net.clone()).or_default().push(i),
+                _ => {}
+            }
+        }
+    }
+    for (fi, f) in geometry.footprints.iter().enumerate() {
+        for (pi, p) in f.pads.iter().enumerate() {
+            if let Some(net) = &p.net {
+                pads.entry(net.clone()).or_default().push((fi, pi));
+            }
+        }
+    }
+    let mut roles = Roles::default();
+    roles.ground.insert("GND".into(), "fixture".into());
+    for net in tracks.keys().filter(|n| n.as_str() != "GND") {
+        roles.critical.insert(net.clone(), "fixture".into());
+    }
+    let intent = serde_json::from_value(json!({ "schema_version": SCHEMA_VERSION })).unwrap();
+    let mut model = Model {
+        geo: &geometry,
+        layers: copper_layers(&tree),
+        fills,
+        unfilled,
+        roles,
+        params: &params,
+        copper: trace_current::copper_for(&tree, &intent),
+        tracks,
+        vias,
+        pads,
+        conn: std::cell::OnceCell::new(),
+    };
+    test(&mut model);
+}
+
+#[test]
+fn planner_stitching_matches_existing_layer_change_audit() {
+    with_stitching_model(|m| {
+        let (checks, _) = planes::run(m);
+        let expected = checks.iter().find(|c| c.id == "3.2").unwrap();
+        let mut charged = 0;
+        let actual = planes::planner_stitching(m, &mut |n| {
+            charged += n;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(actual.metrics["layer_changes"], 4);
+        assert_eq!(actual.metrics["needing_stitch"], 4);
+        assert_eq!(actual.metrics["stitched"], 2);
+        assert_eq!(actual.score, Some(0.5));
+        assert_eq!(actual.to_json(), expected.to_json());
+        assert_eq!(
+            actual
+                .findings
+                .iter()
+                .map(Finding::to_json)
+                .collect::<Vec<_>>(),
+            expected
+                .findings
+                .iter()
+                .map(Finding::to_json)
+                .collect::<Vec<_>>()
+        );
+        assert!(charged > 100, "sample and ring work must be charged");
+    });
+}
+
+#[test]
+fn planner_stitching_propagates_cancellation_at_every_charge() {
+    with_stitching_model(|m| {
+        let mut checkpoints = 0;
+        planes::planner_stitching(m, &mut |_| {
+            checkpoints += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            checkpoints > 100,
+            "must check inside the reference analysis"
+        );
+        for stop in 1..=checkpoints {
+            let mut calls = 0;
+            let result = planes::planner_stitching(m, &mut |_| {
+                calls += 1;
+                if calls == stop {
+                    anyhow::bail!("reference analysis cancelled")
+                }
+                Ok(())
+            });
+            let error = result.err().expect("cancellation must abort analysis");
+            assert_eq!(error.to_string(), "reference analysis cancelled");
+            assert_eq!(calls, stop, "must stop immediately at charge {stop}");
+        }
+    });
+}
+
+#[test]
+fn planner_stitching_skips_reference_samples_without_signal_vias() {
+    with_stitching_model(|m| {
+        m.vias.retain(|net, _| net == "GND");
+        // Empty entries also mean no actual signal vias.
+        for net in m.roles.critical.keys() {
+            m.vias.insert(net.clone(), Vec::new());
+        }
+        let mut charges = 0;
+        let result = planes::planner_stitching(m, &mut |n| {
+            charges += n;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.status, "not_run");
+        assert!(
+            charges <= 20,
+            "no sample, fill or ground raster work: {charges}"
+        );
+    });
+}
+
+#[test]
+fn planner_stitching_charges_ring_edges_before_point_containment() {
+    with_stitching_model(|m| {
+        for fill in &mut m.fills {
+            for ring in &mut fill.rings {
+                // Keep each ring's original bounding box, but make edge work expensive.
+                ring.pts = ring.pts.iter().copied().cycle().take(10_000).collect();
+            }
+        }
+        let result = planes::planner_stitching(m, &mut |n| {
+            if n >= 10_000 {
+                anyhow::bail!("ring exceeds work budget")
+            }
+            Ok(())
+        });
+        let error = result
+            .err()
+            .expect("ring scan must be charged before it runs");
+        assert_eq!(error.to_string(), "ring exceeds work budget");
+    });
+}

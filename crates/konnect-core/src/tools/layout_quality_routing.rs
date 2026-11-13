@@ -641,21 +641,9 @@ fn point_to_line(p: Pt, origin: Pt, u: Pt) -> f64 {
 
 // ─── 5.3 corners ─────────────────────────────────────────────────────────────
 
-fn corners(m: &Model) -> CheckOut {
-    let id = "5.3";
-    let name = "acute_and_right_angle_corners";
-    if m.tracks.is_empty() {
-        return CheckOut::not_run(id, name, "no tracks");
-    }
-    // Acute corners: PR 11's acid-trap check, as is.
-    let limits = dfm::fab_limits(None, None);
-    let report = dfm::check_board(m.geo, &limits);
-    let acute: Vec<&dfm::DfmIssue> = report
-        .issues
-        .iter()
-        .filter(|i| i.issue.starts_with("Acid trap"))
-        .collect();
+pub(super) type CornerRow = (String, String, Pt, Vec<String>);
 
+pub(super) fn corner_junctions(m: &Model) -> (usize, usize, usize, Vec<CornerRow>) {
     // Right angles and total bends: two track ends of one net meeting, outside any pad or via.
     let mut ends: HashMap<EndKey, Vec<(Pt, String)>> = HashMap::new();
     for (net, idxs) in &m.tracks {
@@ -729,6 +717,25 @@ fn corners(m: &Model) -> CheckOut {
             }
         }
     }
+    (bends, right, acute_here, right_rows)
+}
+
+pub(super) fn corners(m: &Model) -> CheckOut {
+    let id = "5.3";
+    let name = "acute_and_right_angle_corners";
+    if m.tracks.is_empty() {
+        return CheckOut::not_run(id, name, "no tracks");
+    }
+    // Acute corners: PR 11's acid-trap check, as is.
+    let limits = dfm::fab_limits(None, None);
+    let report = dfm::check_board(m.geo, &limits);
+    let acute: Vec<&dfm::DfmIssue> = report
+        .issues
+        .iter()
+        .filter(|i| i.issue.starts_with("Acid trap"))
+        .collect();
+
+    let (bends, right, acute_here, mut right_rows) = corner_junctions(m);
     let mut out = CheckOut::checked(id, name);
     for i in &acute {
         // The tracks of the net that end at the corner (the acid-trap check gives only a position).

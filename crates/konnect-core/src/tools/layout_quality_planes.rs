@@ -10,9 +10,66 @@ use super::routing;
 use super::{dist, path_len, r2, r3, CheckOut, Finding, Model};
 
 pub(super) fn run(m: &Model) -> (Vec<CheckOut>, RefMap) {
-    let (reference, refs) = reference_continuity(m);
-    let stitching = stitching_vias(m, &refs);
+    let (reference, refs) =
+        reference_continuity(m, false, &mut |_| Ok(())).expect("unlimited reference analysis");
+    let stitching =
+        stitching_vias(m, &refs, &mut |_| Ok(())).expect("unlimited stitching analysis");
     (vec![reference, stitching, ground_connectivity(m)], refs)
+}
+
+/// Who pays for the plane analysis, and how one fill ring is tested. A plain
+/// charging closure scans each ring, as the audit does for free. A planner may
+/// answer from an index of its own, provided the answer is `point_in_ring`'s.
+pub(in crate::tools) trait Probe {
+    fn charge(&mut self, work: usize) -> anyhow::Result<()>;
+    fn ring_contains(
+        &mut self,
+        m: &Model,
+        fill: usize,
+        ring: usize,
+        p: Pt,
+    ) -> anyhow::Result<bool> {
+        let pts = &m.fills[fill].rings[ring].pts;
+        self.charge(pts.len())?;
+        Ok(super::point_in_ring(p, pts))
+    }
+}
+
+impl<F: FnMut(usize) -> anyhow::Result<()>> Probe for F {
+    fn charge(&mut self, work: usize) -> anyhow::Result<()> {
+        self(work)
+    }
+}
+
+/// Only checklist 3.2 is needed by the read-only planner. Reference choices are
+/// unchanged, but signals without vias cannot contribute a layer change and the
+/// ground-connectivity raster is unrelated. The caller owns work/time limits.
+pub(super) fn planner_stitching(m: &Model, probe: &mut impl Probe) -> anyhow::Result<CheckOut> {
+    let (_, refs) = reference_continuity(m, true, probe)?;
+    stitching_vias(m, &refs, probe)
+}
+
+/// Same first-fill/first-ring selection as Model::fill_at, with work charged
+/// before each ring test. Bounding-box misses do not test the ring.
+fn fill_at(m: &Model, layer: &str, p: Pt, probe: &mut impl Probe) -> anyhow::Result<Option<usize>> {
+    for (i, fill) in m.fills.iter().enumerate() {
+        probe.charge(1)?;
+        if fill.layer != layer {
+            continue;
+        }
+        for (k, ring) in fill.rings.iter().enumerate() {
+            probe.charge(1)?;
+            if p.0 >= ring.bbox.0
+                && p.0 <= ring.bbox.2
+                && p.1 >= ring.bbox.1
+                && p.1 <= ring.bbox.3
+                && probe.ring_contains(m, i, k, p)?
+            {
+                return Ok(Some(i));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// What lies on the reference layer under one sample of a track.
@@ -42,18 +99,27 @@ struct Run {
     other_net: Option<String>,
 }
 
-fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
+fn reference_continuity(
+    m: &Model,
+    vias_only: bool,
+    probe: &mut impl Probe,
+) -> anyhow::Result<(CheckOut, RefMap)> {
     let id = "3.1";
     let name = "reference_plane_continuity";
     let mut refs: RefMap = HashMap::new();
-    let nets: Vec<&String> = m
-        .roles
-        .critical
-        .keys()
-        .filter(|n| m.tracks.contains_key(*n) && !m.is_ground(n) && !m.is_power(n))
-        .collect();
+    let mut nets = Vec::new();
+    for net in m.roles.critical.keys() {
+        probe.charge(1)?;
+        if m.tracks.contains_key(net)
+            && !m.is_ground(net)
+            && !m.is_power(net)
+            && (!vias_only || m.vias.get(net).is_some_and(|v| !v.is_empty()))
+        {
+            nets.push(net);
+        }
+    }
     if nets.is_empty() {
-        return (
+        return Ok((
             CheckOut::not_run(
                 id,
                 name,
@@ -61,7 +127,7 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                  assign netclasses, or pass critical_nets / signal_scope)",
             ),
             refs,
-        );
+        ));
     }
     let sample = m.params.get("sample_mm");
     let min_cov = m.params.get("min_reference_coverage");
@@ -79,6 +145,7 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
         // Segments grouped by layer.
         let mut by_layer: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &i in idxs {
+            probe.charge(1)?;
             if let Some(l) = m.track(i).layers.first().and_then(|l| m.layer_ix(l)) {
                 by_layer.entry(l).or_default().push(i);
             }
@@ -94,13 +161,15 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 .flatten()
                 .filter(|a| *a < m.layers.len())
                 .collect();
-            let samples = |seg: usize| -> Vec<Pt> {
+            let mut samples = |seg: usize| -> anyhow::Result<Vec<Pt>> {
                 let pts = &m.track(seg).shape.pts;
                 let mut out = Vec::new();
                 for w in pts.windows(2) {
+                    probe.charge(1)?;
                     let len = dist(w[0], w[1]);
                     let n = ((len / sample).ceil() as usize).max(1);
                     for k in 0..n {
+                        probe.charge(1)?;
                         let t = (k as f64 + 0.5) / n as f64;
                         out.push((
                             w[0].0 + (w[1].0 - w[0].0) * t,
@@ -108,19 +177,21 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                         ));
                     }
                 }
-                out
+                Ok(out)
             };
             // Pick the adjacent layer with the most plane copper (ground or power: the checklist
             // asks for an uninterrupted adjacent reference plane, not for ground only) under
             // the net's tracks here; a tie goes to the layer with more ground.
             let mut best: Option<(usize, usize, usize)> = None; // (layer, hits, ground hits)
-            let all_samples: Vec<(usize, Vec<Pt>)> =
-                segs.iter().map(|&s| (s, samples(s))).collect();
+            let all_samples: Vec<(usize, Vec<Pt>)> = segs
+                .iter()
+                .map(|&s| Ok((s, samples(s)?)))
+                .collect::<anyhow::Result<_>>()?;
             for &a in &adj {
                 let (mut hits, mut ground_hits) = (0usize, 0usize);
                 for p in all_samples.iter().flat_map(|(_, pts)| pts) {
-                    let net_here = m
-                        .fill_at(&m.layers[a], *p)
+                    probe.charge(1)?;
+                    let net_here = fill_at(m, &m.layers[a], *p, probe)?
                         .and_then(|f| m.fills[f].net.as_deref());
                     if let Some(n) = net_here.filter(|n| m.is_ground(n) || m.is_power(n)) {
                         hits += 1;
@@ -135,11 +206,17 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                 continue;
             };
             // Zones that exist but carry no saved fill: the answer is unknown, not "void".
-            let unfilled_here = m.unfilled.iter().find(|z| {
-                z.layers
+            let mut unfilled_here = None;
+            for z in &m.unfilled {
+                probe.charge(1 + z.layers.len().saturating_mul(adj.len()))?;
+                if z.layers
                     .iter()
                     .any(|zl| adj.iter().any(|a| &m.layers[*a] == zl))
-            });
+                {
+                    unfilled_here = Some(z);
+                    break;
+                }
+            }
             if hits == 0 {
                 if let Some(z) = unfilled_here {
                     cannot.push(format!(
@@ -158,8 +235,8 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
             // plane for this purpose); a different power net, or a signal net, is a split.
             let mut by_net: BTreeMap<&str, usize> = BTreeMap::new();
             for p in all_samples.iter().flat_map(|(_, pts)| pts) {
-                if let Some(n) = m
-                    .fill_at(&ref_name, *p)
+                probe.charge(1)?;
+                if let Some(n) = fill_at(m, &ref_name, *p, probe)?
                     .and_then(|f| m.fills[f].net.as_deref())
                     .filter(|n| m.is_ground(n) || m.is_power(n))
                 {
@@ -210,7 +287,8 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
                     }
                 };
                 for p in pts {
-                    let under = match m.fill_at(&ref_name, *p) {
+                    probe.charge(1)?;
+                    let under = match fill_at(m, &ref_name, *p, probe)? {
                         Some(f) => match m.fills[f].net.clone() {
                             Some(n) if is_reference(&n) => Under::Reference(n),
                             Some(n) => Under::Other(n),
@@ -335,7 +413,7 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
             },
         );
         o.metrics = json!({ "cannot_judge": cannot });
-        return (o, refs);
+        return Ok((o, refs));
     }
     let coverage = if total_len > 0.0 {
         total_cov / total_len
@@ -371,23 +449,28 @@ fn reference_continuity(m: &Model) -> (CheckOut, RefMap) {
         "nets": per_net.into_iter().take(20).collect::<Vec<_>>(),
         "method": "tracks sampled every sample_mm; a sample counts as referenced when the saved zone fill of the net's reference plane covers it on the adjacent layer with the most plane copper (ground or power) under the net; the reference plane on that layer is the ground or power net with most samples, and a different net's copper is a split (fills are the real copper: voids, slots, antipads and splits are in them)",
     });
-    (out, refs)
+    Ok((out, refs))
 }
 
 // ─── 3.2 stitching vias ──────────────────────────────────────────────────────
 
-fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
+fn stitching_vias(m: &Model, refs: &RefMap, probe: &mut impl Probe) -> anyhow::Result<CheckOut> {
     let id = "3.2";
     let name = "stitching_via_at_reference_change";
     let max_d = m.params.get("stitch_via_max_mm");
-    let signal_nets: Vec<&String> = m
-        .roles
-        .critical
-        .keys()
-        .filter(|n| m.vias.contains_key(*n) && m.tracks.contains_key(*n))
-        .collect();
+    let mut signal_nets = Vec::new();
+    for net in m.roles.critical.keys() {
+        probe.charge(1)?;
+        if m.vias.contains_key(net) && m.tracks.contains_key(net) {
+            signal_nets.push(net);
+        }
+    }
     if signal_nets.is_empty() {
-        return CheckOut::not_run(id, name, "no critical net changes layer with a via");
+        return Ok(CheckOut::not_run(
+            id,
+            name,
+            "no critical net changes layer with a via",
+        ));
     }
     let mut out = CheckOut::checked(id, name);
     let (mut evaluated, mut needing, mut satisfied, mut unknown) = (0usize, 0usize, 0usize, 0usize);
@@ -395,11 +478,13 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
     let mut no_candidate = 0usize;
     for net in signal_nets {
         for &vi in &m.vias[net] {
+            probe.charge(1)?;
             let v = m.track(vi);
             let reach = v.shape.radius + 0.3;
             // The track layers that end at this via.
             let mut layers: BTreeSet<usize> = BTreeSet::new();
             for &ti in &m.tracks[net] {
+                probe.charge(1)?;
                 let t = m.track(ti);
                 let Some(l) = t.layers.first().and_then(|l| m.layer_ix(l)) else {
                     continue;
@@ -416,6 +501,7 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
             }
             // A pad under the via (via-in-pad) is the other layer of the change.
             for &pi in m.pads.get(net.as_str()).into_iter().flatten() {
+                probe.charge(1)?;
                 let pad = m.pad(pi).1;
                 if !pad.through_hole && dist(pad.at, v.at) <= pad.size.0.max(pad.size.1) / 2.0 + 0.1
                 {
@@ -453,6 +539,7 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
             let mut best: Option<(f64, String)> = None;
             for rn in &ref_nets {
                 for &gi in m.vias.get(*rn).into_iter().flatten() {
+                    probe.charge(1)?;
                     let g = m.track(gi);
                     if let Some((a, b)) = m.via_span(g) {
                         if a <= lo && b >= hi {
@@ -464,6 +551,7 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
                     }
                 }
                 for &pi in m.pads.get(*rn).into_iter().flatten() {
+                    probe.charge(1)?;
                     let (_, pad) = m.pad(pi);
                     if pad.through_hole {
                         let d = dist(pad.at, v.at);
@@ -477,13 +565,31 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
             if ref_nets.len() > 1 {
                 // Different planes: a capacitor between them is what carries the return.
                 let nets: Vec<&&str> = ref_nets.iter().collect();
-                tied_by_cap = m.geo.footprints.iter().any(|f| {
-                    super::is_cap(m.fp_ref(f))
-                        && nets
-                            .iter()
-                            .all(|n| f.pads.iter().any(|p| p.net.as_deref() == Some(**n)))
-                        && dist(f.at, v.at) <= max_d
-                });
+                for f in &m.geo.footprints {
+                    probe.charge(1)?;
+                    if !super::is_cap(m.fp_ref(f)) {
+                        continue;
+                    }
+                    let mut all_nets = true;
+                    for n in &nets {
+                        let mut found = false;
+                        for p in &f.pads {
+                            probe.charge(1)?;
+                            if p.net.as_deref() == Some(**n) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            all_nets = false;
+                            break;
+                        }
+                    }
+                    if all_nets && dist(f.at, v.at) <= max_d {
+                        tied_by_cap = true;
+                        break;
+                    }
+                }
             }
             let d = best.as_ref().map(|b| b.0);
             if (d.is_some_and(|d| d <= max_d) && ref_nets.len() == 1) || tied_by_cap {
@@ -528,11 +634,11 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
         }
     }
     if evaluated == 0 {
-        return CheckOut::not_run(
+        return Ok(CheckOut::not_run(
             id,
             name,
             "no via of a critical net joins tracks on two layers",
-        );
+        ));
     }
     out.score = (needing > 0)
         .then(|| satisfied as f64 / needing as f64)
@@ -555,7 +661,7 @@ fn stitching_vias(m: &Model, refs: &RefMap) -> CheckOut {
             .then_some("no ground via or through-hole pad spans the reference planes for any unstitched layer change, so there is no distance to report"),
         "unstitched_with_no_candidate_on_board": no_candidate,
     });
-    out
+    Ok(out)
 }
 
 // ─── 3.3 ground connectivity ─────────────────────────────────────────────────

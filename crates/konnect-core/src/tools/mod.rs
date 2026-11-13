@@ -51,6 +51,9 @@ pub(crate) mod response_budget;
 mod response_budget_tests;
 #[cfg(test)]
 mod route_obstacle_tests;
+mod route_refine;
+#[cfg(test)]
+mod route_refine_tests;
 #[cfg(test)]
 mod route_safety_tests;
 pub mod sch_analysis;

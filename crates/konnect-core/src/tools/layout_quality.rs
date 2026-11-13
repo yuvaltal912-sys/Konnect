@@ -90,7 +90,7 @@ impl Params {
         self.values.get(name).map(|v| v.0).unwrap_or(f64::NAN)
     }
 
-    fn from_args(args: &Value) -> Result<Params, CallToolResult> {
+    pub(super) fn from_args(args: &Value) -> Result<Params, CallToolResult> {
         let mut values = BTreeMap::new();
         for Knob(name, default, min, max, _) in KNOBS {
             let (v, given) = match args.get(*name) {
@@ -359,12 +359,14 @@ fn glob(pattern: &str, text: &str) -> bool {
 /// explicit assignment win over a pattern or the other way round: every explicit assignment and
 /// every matching pattern joins one composite netclass. So a net keeps all of them here.
 fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Vec<String>> {
+    std::fs::read_to_string(board.with_extension("kicad_pro"))
+        .map(|text| netclasses_from_source(&text, nets))
+        .unwrap_or_default()
+}
+
+fn netclasses_from_source(text: &str, nets: &BTreeSet<String>) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    let pro = board.with_extension("kicad_pro");
-    let Ok(text) = std::fs::read_to_string(pro) else {
-        return out;
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&text) else {
+    let Ok(json) = serde_json::from_str::<Value>(text) else {
         return out;
     };
     let settings = &json["net_settings"];
@@ -875,6 +877,7 @@ fn intent_roles(
     nets: &BTreeSet<String>,
     params: &Params,
     pairs_out: &mut Vec<(String, String, String)>,
+    captured: Option<&CapturedInputs<'_>>,
 ) -> (Option<DesignIntent>, Roles) {
     let mut roles = Roles {
         intent: "absent",
@@ -882,7 +885,22 @@ fn intent_roles(
     };
     let project_dir = board.parent().unwrap_or(Path::new("."));
     let mut intent = None;
-    match read_design_intent(&design_intent_path(project_dir)) {
+    let observed = match captured {
+        Some(c) => match c.intent {
+            None => IntentRead::Absent,
+            Some(text) => match serde_json::from_str::<DesignIntent>(text) {
+                Ok(intent) => IntentRead::Loaded {
+                    intent: Box::new(intent),
+                    text: text.to_string(),
+                },
+                Err(e) => IntentRead::Unusable {
+                    reason: e.to_string(),
+                },
+            },
+        },
+        None => read_design_intent(&design_intent_path(project_dir)),
+    };
+    match observed {
         IntentRead::Loaded { intent: i, .. } => {
             roles.intent = "loaded";
             intent = Some(*i);
@@ -890,7 +908,10 @@ fn intent_roles(
         IntentRead::Unusable { .. } => roles.intent = "unusable",
         IntentRead::Absent => {}
     }
-    roles.netclass = read_netclasses(board, nets);
+    roles.netclass = match captured {
+        Some(c) => netclasses_from_source(c.project.unwrap_or("{}"), nets),
+        None => read_netclasses(board, nets),
+    };
     let rise = params.get("default_temp_rise_c");
     if let Some(i) = &intent {
         for rail in &i.rails {
@@ -1019,7 +1040,46 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
             "reason": "the board file lists no copper layers",
         }))?));
     }
-    let (fills, unfilled) = read_fills(&tree, &geometry);
+    with_model(board, &tree, &geometry, params, |model| {
+        let mut checks: Vec<CheckOut> = Vec::new();
+        let (plane_checks, refs) = planes::run(model);
+        checks.extend(plane_checks);
+        checks.extend(power::run(model, board, &tree));
+        checks.extend(routing::run(model, &refs));
+        Ok(CallToolResult::text(serde_json::to_string(&assemble(
+            board, model, checks, &geometry,
+        ))?))
+    })
+}
+
+/// Already validated sidecar bytes belonging to a planner's captured revision.
+pub(super) struct CapturedInputs<'a> {
+    pub project: Option<&'a str>,
+    pub intent: Option<&'a str>,
+}
+
+/// Construct the common read-only audit model from one captured board snapshot.
+/// The caller owns the geometry and checks its sidecar revisions before accepting a result.
+pub(super) fn with_model<T>(
+    board: &Path,
+    tree: &SexpNode,
+    geometry: &BoardGeometry,
+    params: &Params,
+    visit: impl FnOnce(&Model<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_model_inputs(board, tree, geometry, params, None, visit)
+}
+
+pub(super) fn with_model_inputs<T>(
+    board: &Path,
+    tree: &SexpNode,
+    geometry: &BoardGeometry,
+    params: &Params,
+    captured: Option<&CapturedInputs<'_>>,
+    visit: impl FnOnce(&Model<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let layers = copper_layers(tree);
+    let (fills, unfilled) = read_fills(tree, geometry);
 
     let mut tracks: HashMap<String, Vec<usize>> = HashMap::new();
     let mut vias: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1049,10 +1109,10 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
         .collect();
 
     let mut pairs = Vec::new();
-    let (intent, mut roles) = intent_roles(board, &nets, params, &mut pairs);
+    let (intent, mut roles) = intent_roles(board, &nets, params, &mut pairs, captured);
     let empty_intent: DesignIntent =
         serde_json::from_value(json!({ "schema_version": SCHEMA_VERSION }))?;
-    let copper = trace_current::copper_for(&tree, intent.as_ref().unwrap_or(&empty_intent));
+    let copper = trace_current::copper_for(tree, intent.as_ref().unwrap_or(&empty_intent));
 
     // Critical signals: the record and netclasses first; failing that, every
     // signal net long enough to matter, and the result says so.
@@ -1121,7 +1181,7 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
     }
 
     let model = Model {
-        geo: &geometry,
+        geo: geometry,
         layers,
         fills,
         unfilled,
@@ -1134,15 +1194,25 @@ pub(super) fn audit(board: &Path, params: &Params) -> anyhow::Result<CallToolRes
         conn: std::cell::OnceCell::new(),
     };
 
-    let mut checks: Vec<CheckOut> = Vec::new();
-    let (plane_checks, refs) = planes::run(&model);
-    checks.extend(plane_checks);
-    checks.extend(power::run(&model, board, &tree));
-    checks.extend(routing::run(&model, &refs));
+    visit(&model)
+}
 
-    Ok(CallToolResult::text(serde_json::to_string(&assemble(
-        board, &model, checks, &geometry,
-    ))?))
+/// Complete geometry facts for read-only planners; display truncation is applied later.
+pub(super) fn planner_corners(m: &Model) -> CheckOut {
+    routing::corners(m)
+}
+
+pub(super) fn planner_junctions(m: &Model) -> Vec<(String, String, Pt, Vec<String>)> {
+    routing::corner_junctions(m).3
+}
+
+pub(super) use planes::Probe as PlaneProbe;
+
+pub(super) fn planner_planes(
+    m: &Model,
+    probe: &mut impl PlaneProbe,
+) -> anyhow::Result<Vec<CheckOut>> {
+    Ok(vec![planes::planner_stitching(m, probe)?])
 }
 
 /// Category weights of the overall score; a category with nothing measured is
