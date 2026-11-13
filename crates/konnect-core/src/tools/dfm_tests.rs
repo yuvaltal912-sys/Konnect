@@ -402,3 +402,91 @@ fn a_short_track_joins_the_keys_of_one_junction() {
     assert_eq!(traps, 1, "{cov:?}");
     assert_eq!(cov.checked, 1);
 }
+
+/// A real 45-degree V whose legs end at two keys 5 um apart, joined by a
+/// short track: a pad of the net holds one leg's end and not the other's.
+/// The wedge is not filled, so the trap is counted; with both ends inside
+/// the pad it is skipped.
+#[test]
+fn a_junction_is_skipped_only_when_every_leg_end_is_inside_copper() {
+    let j1 = (JN.0 + 0.005, JN.1);
+    let t = [
+        (JN, at(180., 3.)),
+        (JN, j1),
+        (j1, (j1.0 - 2.12132, j1.1 + 2.12132)),
+    ];
+    let segs: String = t
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| format!("(segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))", a.0, a.1, b.0, b.1))
+        .collect();
+    let pad_at = |x: f64| {
+        format!(
+        "(footprint \"Fixture:P\" (layer \"F.Cu\") (uuid \"fp\") (at {x} {} 0) (property \"Reference\" \"P1\" (at 0 0 0) (layer \"F.SilkS\") (uuid \"fp-r\") (effects (font (size 1 1)))) (pad \"1\" smd circle (at 0 0 0) (size 0.8 0.8) (layers \"F.Cu\" \"F.Mask\") (net \"SIG\") (uuid \"pp\")))",
+        JN.1
+    )
+    };
+    // Pad edge between the keys: the second leg's end 2 um inside, the first 3 um outside.
+    let one = trap_board(&[]).replace("\n)", &format!("\n{segs}\n{})", pad_at(j1.0 + 0.398)));
+    let report = check_board(&geometry(&one), &jlc());
+    assert_eq!(
+        issues_with(&report, "Acid trap").len(),
+        1,
+        "{:?}",
+        report.checks["acid_trap"]
+    );
+    // Both ends inside.
+    let both = trap_board(&[]).replace("\n)", &format!("\n{segs}\n{})", pad_at(JN.0 + 0.1)));
+    let report = check_board(&geometry(&both), &jlc());
+    assert_eq!(issues_with(&report, "Acid trap").len(), 0);
+}
+
+// The router leaves its tracks under 10 um while it routes: 45-degree corner
+// smoothing stops 0.1 um short of the next corner, and wire ends are snapped
+// to a via or pad centre. Diagonal pieces reach 6.8 x 6.8 um (9.6 um).
+
+/// A diagonal piece at the 135-degree bend, its direction 45 degrees from the
+/// first leg: 6.8 x 6.8 um and 7.07 x 7.07 um (just under 10 um) belong to
+/// the junction; 7.08 x 7.08 um (10.01 um) is a leg of its own.
+#[test]
+fn a_diagonal_piece_belongs_to_its_junction_below_ten_micrometres() {
+    for (side, expected) in [(0.0068, 0), (0.00707, 0), (0.00708, 1)] {
+        let mut t = legs(&[180., 45.]);
+        t.push((JN, (JN.0 - side, JN.1 + side)));
+        let (traps, cov) = acid_traps(&t);
+        assert_eq!(traps, expected, "diagonal piece of {side} mm: {cov:?}");
+        assert_eq!(cov.short_tracks, Some(1 - expected), "{cov:?}");
+    }
+}
+
+/// A real 45-degree V at a via of the net: one leg ends at the via centre,
+/// the other 2.8 um away, joined to the centre by the piece the router left
+/// when it snapped the wire end. Every leg end lies inside the via, so the
+/// junction is skipped; without the via, or with a via of another net, the
+/// V is one acid trap.
+#[test]
+fn a_piece_snapped_to_a_via_centre_is_read_inside_that_via() {
+    let q = (JN.0 + 0.0024, JN.1 + 0.0015);
+    let t = vec![
+        (JN, at(180., 3.)),
+        (q, JN),
+        (q, (q.0 - 2.12132, q.1 + 2.12132)),
+    ];
+    let with_via = |net: &str| {
+        trap_board(&t).replace(
+            "\n)",
+            &format!("\n  (via (at {} {}) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"{net}\") (uuid \"v1\"))\n)", JN.0, JN.1),
+        )
+    };
+    let report = check_board(&geometry(&with_via("SIG")), &jlc());
+    assert_eq!(issues_with(&report, "Acid trap").len(), 0);
+    assert!(report.checks["acid_trap"]
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("1 acute junction"));
+    assert_eq!(report.checks["acid_trap"].short_tracks, Some(1));
+    assert_eq!(acid_traps(&t).0, 1);
+    let report = check_board(&geometry(&with_via("OTHER")), &jlc());
+    assert_eq!(issues_with(&report, "Acid trap").len(), 1);
+}

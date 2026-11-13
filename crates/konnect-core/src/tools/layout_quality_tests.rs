@@ -2043,3 +2043,80 @@ fn a_bend_is_left_out_only_where_its_legs_meet_near_a_pad() {
     let m = &check(&r, "5.3")["metrics"];
     assert_eq!(m["right_angle_corners"], 1, "{m}");
 }
+
+/// A right-angle bend whose legs end at two keys 9 um apart, joined by a
+/// short track: leg A runs left from the first key, leg B up from the second.
+/// A pad of the net centred straight above has its edge 5 um from the second
+/// key and 14 um from the first: one leg end near the pad, so the bend is
+/// counted. With the edge at 0 and 9 um, both are near and it is left out.
+#[test]
+fn a_bend_is_left_out_only_when_every_leg_end_is_near_a_pad() {
+    let j1 = (JN.0, JN.1 + 0.009);
+    let t = [(JN, leg_at(180., 3.)), (JN, j1), (j1, (j1.0, j1.1 + 3.))];
+    let bend = |gap: f64| {
+        let pad = format!(
+            "(footprint \"Fixture:P\" (layer \"F.Cu\") (uuid \"fp\") (at {} {} 0) (property \"Reference\" \"P1\" (at 0 0 0) (layer \"F.SilkS\") (uuid \"fp-r\") (effects (font (size 1 1)))) (pad \"1\" smd circle (at 0 0 0) (size 0.8 0.8) (layers \"F.Cu\" \"F.Mask\") (net \"SIG\") (uuid \"pp\")))",
+            j1.0,
+            j1.1 + 0.4 + gap
+        );
+        let mut segs = String::new();
+        for (i, (a, b)) in t.iter().enumerate() {
+            segs += &format!(
+                "  (segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))\n",
+                a.0, a.1, b.0, b.1
+            );
+        }
+        let text = format!(
+            r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+  (gr_rect (start 0 0) (end 60 40) (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts") (uuid "e1"))
+{segs}{pad})"#
+        );
+        let r = run(&fx_text(&text, None));
+        check(&r, "5.3")["metrics"]["right_angle_corners"].clone()
+    };
+    assert_eq!(bend(0.005), 1);
+    assert_eq!(bend(0.0), 0);
+}
+
+/// The scan at a via where the router snapped a wire end to the centre and
+/// left a 2.8-um piece: a right-angle bend and a 45-degree V there lie inside
+/// the via and are left out; without the via each is counted.
+#[test]
+fn a_corner_at_a_via_centre_is_left_out_with_its_snapped_piece() {
+    let q = (JN.0 + 0.0024, JN.1 + 0.0015);
+    for (angle, metric) in [(90f64, "right_angle_corners"), (135f64, "acute_corners")] {
+        let r = angle.to_radians();
+        let t = [
+            (JN, leg_at(180., 3.)),
+            (q, JN),
+            (q, (q.0 + 3. * r.cos(), q.1 + 3. * r.sin())),
+        ];
+        let mut segs = String::new();
+        for (i, (a, b)) in t.iter().enumerate() {
+            segs += &format!(
+                "  (segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))\n",
+                a.0, a.1, b.0, b.1
+            );
+        }
+        let board = |via: &str| {
+            format!(
+                r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+  (gr_rect (start 0 0) (end 60 40) (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts") (uuid "e1"))
+{segs}{via})"#
+            )
+        };
+        let via = format!(
+            "  (via (at {} {}) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"SIG\") (uuid \"v1\"))\n",
+            JN.0, JN.1
+        );
+        let inside = run(&fx_text(&board(&via), None));
+        let m = &check(&inside, "5.3")["metrics"];
+        assert_eq!(m[metric], 0, "{angle} degrees at the via: {m}");
+        assert_eq!(m["junctions_with_short_tracks"], 1, "{m}");
+        let open = run(&fx_text(&board(""), None));
+        let m = &check(&open, "5.3")["metrics"];
+        assert_eq!(m[metric], 1, "{angle} degrees without the via: {m}");
+    }
+}
