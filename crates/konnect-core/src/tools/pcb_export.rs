@@ -281,9 +281,11 @@ fn export_tools() -> Vec<ToolDef> {
              net, become keepouts; pads with no copper and footprints with no pads are left \
              out. Copper graphics and text on the board or in footprints become keepouts that \
              cover them (text as a generous square, since glyphs are not measured). \
-             Copper pours become fixed planes of their net and rule areas \
-             that forbid tracks or vias become keepouts, taken from the zone outline (not the \
-             fill), so check DRC after a refill. Locked straight tracks and vias are fixed wiring; \
+             Each copper pour is written as a Specctra plane of its net (pours: fixed, the \
+             default) or left out (omit), for the whole board or zone by zone. The router counts \
+             a pad inside a plane's outline as connected and lets other nets cross the plane, so \
+             completion is judged by KiCad's DRC after a refill. Rule areas that forbid tracks or \
+             vias always become keepouts. Both come from the zone outline (not the fill). Locked straight tracks and vias are fixed wiring; \
              unlocked routing, routed arcs, custom pad shapes, local clearance overrides, \
              copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
@@ -304,10 +306,35 @@ fn export_tools() -> Vec<ToolDef> {
                         "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
                     },
                     "pours": {
-                        "type": "string",
-                        "enum": ["fixed", "omit"],
+                        "oneOf": [
+                            { "type": "string", "enum": ["fixed", "omit"] },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "default": { "type": "string", "enum": ["fixed", "omit"], "default": "fixed" },
+                                    "zones": {
+                                        "type": "array",
+                                        "maxItems": crate::specctra::MAX_POUR_RULES,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "uuid": { "type": "string", "minLength": 1 },
+                                                "name": { "type": "string", "minLength": 1 },
+                                                "net": { "type": "string", "minLength": 1 },
+                                                "layer": { "type": "string", "minLength": 1 },
+                                                "policy": { "type": "string", "enum": ["fixed", "omit"] }
+                                            },
+                                            "required": ["policy"],
+                                            "minProperties": 2,
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "additionalProperties": false
+                            }
+                        ],
                         "default": "fixed",
-                        "description": "'fixed' (default) gives the router every copper pour as fixed copper of its net, from the zone outline. 'omit' leaves pours out so the router can route through their area; refill zones and run DRC after apply_specctra_ses. Rule areas are always kept."
+                        "description": "What the router gets for each copper pour. 'fixed' (default) writes every pour as a Specctra plane of its net, from the zone outline: the router counts the net's pads inside the outline as connected and lets other nets' tracks cross it, so the real pour can be cut. 'omit' leaves every pour out, so the router routes the pour's net as track. Or choose zone by zone: {\"default\": \"fixed\"|\"omit\", \"zones\": [{\"uuid\"?, \"name\"?, \"net\"?, \"layer\"?, \"policy\": \"fixed\"|\"omit\"}]}; a rule picks every pour layer that matches all of its selectors, and pours no rule picks get 'default'. A rule that picks no pour (rule areas included), an unknown key, or two rules that give one pour layer different policies are refused. The manifest lists each pour layer with its policy and the rule that chose it (pours). Rule areas are always kept. Refill zones and run DRC after apply_specctra_ses."
                     },
                     "widths_from_intent": {
                         "type": "boolean",
@@ -758,10 +785,9 @@ async fn handle_export_specctra_dsn(
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
-    // A JSON null is an omitted argument, as before.
-    let pours = match crate::specctra::PourPolicy::from_argument(
-        args.get("pours").filter(|value| !value.is_null()),
-    ) {
+    // A non-string, non-object value (null included) is refused, as the
+    // schema already refuses it at dispatch; it used to be read as 'fixed'.
+    let pours = match crate::specctra::PourPolicy::from_argument(args.get("pours")) {
         Ok(pours) => pours,
         Err(reason) => return Ok(invalid_export_argument("pours", reason)),
     };
@@ -791,7 +817,7 @@ async fn handle_export_specctra_dsn(
     if omit_pours && native_bridge_mode == "require" {
         return Ok(invalid_export_argument(
             "pours",
-            "'omit' needs the Rust exporter: KiCad's native exporter always writes pours; use native_bridge_mode 'prefer' or 'disable'",
+            "leaving pours out ('omit', or a per-zone rule with policy 'omit') needs the Rust exporter: KiCad's native exporter always writes every pour; use native_bridge_mode 'prefer' or 'disable'",
         ));
     }
 
@@ -1379,6 +1405,62 @@ mod new_export_format_tests {
             text(&good)
         );
         assert!(!output.exists());
+    }
+
+    /// Behaviour change (S6 second half): the handler read any `pours` that
+    /// was not a string as 'fixed'. It now refuses it, null included, as the
+    /// schema already did at dispatch.
+    #[tokio::test]
+    async fn specctra_export_refuses_a_pours_value_that_is_not_a_string_or_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        let output = dir.path().join("board.dsn");
+        std::fs::write(&board, "(kicad_pcb)").expect("board fixture");
+        for pours in [json!(null), json!(5), json!(true), json!(["omit"])] {
+            let args = json!({ "board": board, "output": output, "pours": pours });
+            let result = handle_export_specctra_dsn(&args, &test_ctx())
+                .await
+                .expect("an MCP result");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{pours}"
+            );
+        }
+        assert!(!output.exists());
+    }
+
+    /// The schema the server enforces at dispatch takes the per-zone object
+    /// and still the two strings, and refuses what the handler refuses.
+    #[test]
+    fn the_dsn_export_schema_takes_the_per_zone_pours_object() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_specctra_dsn")
+            .expect("registered");
+        let with = |pours: serde_json::Value| json!({ "board": "b.kicad_pcb", "output": "o.dsn", "pours": pours });
+        for good in [
+            json!("fixed"),
+            json!("omit"),
+            json!({}),
+            json!({ "default": "omit", "zones": [] }),
+            json!({ "zones": [{ "uuid": "u", "name": "n", "net": "GND", "layer": "B.Cu", "policy": "fixed" }] }),
+        ] {
+            assert!(tool.input_validator.is_valid(&with(good.clone())), "{good}");
+        }
+        for bad in [
+            json!(null),
+            json!(5),
+            json!("plane"),
+            json!({ "mode": "omit" }),
+            json!({ "default": "plane" }),
+            json!({ "zones": [{ "net": "GND" }] }),
+            json!({ "zones": [{ "policy": "omit" }] }),
+            json!({ "zones": [{ "zone": "x", "policy": "omit" }] }),
+            json!({ "zones": [{ "net": "", "policy": "omit" }] }),
+        ] {
+            assert!(!tool.input_validator.is_valid(&with(bad.clone())), "{bad}");
+        }
     }
 
     #[tokio::test]

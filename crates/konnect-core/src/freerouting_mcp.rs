@@ -177,6 +177,10 @@ pub(crate) struct RouteEvidence {
     /// What the optimizer did, read from the job log; `None` when the log
     /// could not be read.
     pub optimizer: Option<OptimizerReport>,
+    /// Connections Freerouting's job log says it left unrouted at the end
+    /// (see [`router_unrouted`]); `None` when the log could not be read or
+    /// holds no summary.
+    pub router_unrouted: Option<u32>,
 }
 
 /// The optimizer's outcome, from Freerouting's job log.
@@ -427,7 +431,8 @@ fn check_effective_settings(
 
 /// The optimizer's outcome from Freerouting's job log: the passes that ran,
 /// whether a pass stopped early, and the optimizer score before and after.
-fn optimizer_report(log: &Value) -> OptimizerReport {
+/// The message lines of a Freerouting job log, in order.
+fn log_lines(log: &Value) -> Vec<String> {
     fn messages(value: &Value, out: &mut Vec<String>) {
         match value {
             Value::Object(map) => {
@@ -448,6 +453,12 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
             _ => {}
         }
     }
+    let mut lines = Vec::new();
+    messages(log, &mut lines);
+    lines
+}
+
+fn optimizer_report(log: &Value) -> OptimizerReport {
     fn number_after(line: &str, marker: &str) -> Option<f64> {
         let rest = &line[line.find(marker)? + marker.len()..];
         let end = rest
@@ -455,8 +466,7 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
             .unwrap_or(rest.len());
         rest[..end].parse().ok()
     }
-    let mut lines = Vec::new();
-    messages(log, &mut lines);
+    let lines = log_lines(log);
     let mut report = OptimizerReport::default();
     for line in lines.iter().filter(|line| line.contains("ptimiz")) {
         if let Some(pass) = line
@@ -525,9 +535,30 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
 /// log holds no such line. This is the router's own count: a pad inside a
 /// plane's outline counts as connected, so KiCad's DRC after a refill is the
 /// judge of completion.
-pub(crate) fn router_unrouted(_log: &Value) -> Option<u32> {
-    // S6 second half: not read yet.
-    None
+pub(crate) fn router_unrouted(log: &Value) -> Option<u32> {
+    // The number before " unrouted" in "(N unrouted and M violations)".
+    fn in_summary(line: &str) -> Option<u32> {
+        let at = line.rfind(" unrouted")?;
+        let open = line[..at].rfind('(')?;
+        line[open + 1..at].trim().parse().ok()
+    }
+    let mut last = None;
+    for line in log_lines(log) {
+        let count = if line.contains("Auto-routing stage completed")
+            || (line.contains("Optimizer pass #") && line.contains("was completed"))
+        {
+            in_summary(&line)
+        } else if let Some(at) = line.find("Skipping optimization stage: the board has ") {
+            let rest = &line[at + "Skipping optimization stage: the board has ".len()..];
+            rest.split_whitespace().next().and_then(|n| n.parse().ok())
+        } else {
+            None
+        };
+        if count.is_some() {
+            last = count;
+        }
+    }
+    last
 }
 
 pub(crate) async fn route_local(
@@ -767,15 +798,16 @@ async fn run_state_machine(
         )
         .await?;
     // Evidence only: a log that cannot be read leaves the route as it is.
-    let optimizer = if tools.contains_key("get_job_logs") {
+    let log = if tools.contains_key("get_job_logs") {
         client
             .call_tool("get_job_logs", json!({ "path": { "jobId": job_id } }))
             .await
             .ok()
-            .map(|log| optimizer_report(&log))
     } else {
         None
     };
+    let optimizer = log.as_ref().map(optimizer_report);
+    let router_unrouted = log.as_ref().and_then(router_unrouted);
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -787,6 +819,7 @@ async fn run_state_machine(
         diagnostics_path: None,
         effective_settings,
         optimizer,
+        router_unrouted,
     })
 }
 

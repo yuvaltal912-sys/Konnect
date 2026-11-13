@@ -509,13 +509,20 @@ fn the_manifest_states_what_was_done_with_each_pour() {
 
 #[test]
 fn the_importer_accepts_a_per_zone_manifest() {
+    // The rounded board's recorded session: the same parts and identifiers,
+    // with 0.2 mm tracks, so the classes here are 0.2 mm.
+    let ses = include_str!("../tests/fixtures/specctra_rounded_board.freerouting-2.3.0.ses");
+    let mut narrow = rules();
+    for rule in narrow.values_mut() {
+        rule.track_width_mm = Some(0.2);
+    }
     let temp = tempfile::tempdir().unwrap();
-    let board = temp.path().join("board.kicad_pcb");
+    let board = temp.path().join("specctra_rounded_board.kicad_pcb");
     std::fs::write(&board, POLICY).unwrap();
     let bundle = export_dsn_with_options(
         &board,
         POLICY,
-        &rules(),
+        &narrow,
         ExportOptions {
             pours: policy(json!({ "zones": [{ "name": "GND_TOP", "policy": "omit" }] })).unwrap(),
             ..Default::default()
@@ -523,9 +530,10 @@ fn the_importer_accepts_a_per_zone_manifest() {
     )
     .unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
-    assert!(manifest["pours"].is_array());
-    let ses = super::layers_tests::ses_for(&manifest);
-    crate::specctra_ses::parse_import_plan(&board, POLICY, &bundle.manifest, &ses).unwrap();
+    assert_eq!(manifest["pours"].as_array().unwrap().len(), 5);
+    let plan =
+        crate::specctra_ses::parse_import_plan(&board, POLICY, &bundle.manifest, ses).unwrap();
+    assert!(!plan.tracks.is_empty());
 }
 
 #[test]

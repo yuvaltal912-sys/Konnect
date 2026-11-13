@@ -233,13 +233,177 @@ fn route_settings(
 /// a plane's outline as connected, while the new tracks cut the real pour), or
 /// its count could not be read. A run with a plane is never `complete`; KiCad's
 /// DRC after a refill is the judge.
-#[cfg_attr(not(test), allow(dead_code))]
 fn routing_status(
-    _planes: &[crate::specctra::DsnPlane],
-    _router_unrouted: Option<u32>,
+    planes: &[crate::specctra::DsnPlane],
+    router_unrouted: Option<u32>,
 ) -> &'static str {
-    // S6 second half: not judged yet.
-    "complete"
+    match router_unrouted {
+        Some(left) if left > 0 => "incomplete",
+        Some(_) if planes.is_empty() => "complete",
+        _ => "unverified",
+    }
+}
+
+/// Above this many connections still open on plane nets after stitching, the
+/// steps fall back to leaving the pours out (S5's rule: "about 10").
+const PLANE_FALLBACK_OPEN: u32 = 10;
+/// Stitching rounds the steps ask for: S7's planner listed nothing more after
+/// four rounds on every board it was measured on.
+const STITCH_ROUNDS: u32 = 4;
+/// The planner's own default search radius, sent explicitly.
+const STITCH_RADIUS_MM: f64 = 3.0;
+
+/// `status` and `completion` of a routing result: what Freerouting's own
+/// count shows, which pours it was given as planes (from the DSN, named from
+/// the manifest beside it), what decides completion, and the exact calls
+/// still needed. Additive: `success` keeps meaning that the job ran and the
+/// SES was written.
+fn completion_report(
+    dsn: &Path,
+    ses: &Path,
+    planes: &anyhow::Result<Vec<crate::specctra::DsnPlane>>,
+    router_unrouted: Option<u32>,
+) -> (&'static str, serde_json::Value) {
+    let manifest = crate::specctra::manifest_beside(dsn);
+    let board = manifest
+        .as_ref()
+        .and_then(|manifest| manifest["board_path"].as_str())
+        .map(str::to_string);
+    let manifest_path = {
+        let mut name = dsn.as_os_str().to_os_string();
+        name.push(".konnect.json");
+        PathBuf::from(name)
+    };
+    let known: &[crate::specctra::DsnPlane] = planes.as_deref().unwrap_or(&[]);
+    let status = match planes {
+        Ok(planes) => routing_status(planes, router_unrouted),
+        Err(_) => "unverified",
+    };
+    let mut plane_nets: Vec<String> = known.iter().map(|plane| plane.net.clone()).collect();
+    plane_nets.dedup();
+    let plane_rows: Vec<serde_json::Value> = known
+        .iter()
+        .map(|plane| {
+            let zones: Vec<serde_json::Value> = manifest
+                .as_ref()
+                .and_then(|manifest| manifest["pours"].as_array())
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    row["policy"] == "fixed"
+                        && row["net"] == plane.net
+                        && row["layer"] == plane.layer
+                })
+                .map(|row| json!({ "uuid": row["uuid"], "name": row["name"] }))
+                .collect();
+            json!({ "net": plane.net, "layer": plane.layer, "zones": zones })
+        })
+        .collect();
+    let reason = match (planes, router_unrouted) {
+        (Err(error), _) => format!(
+            "The DSN's planes could not be read ({error:#}), so it is not known whether the router was given pours as planes."
+        ),
+        (_, Some(left)) if left > 0 => format!(
+            "Freerouting reports {left} connection(s) it could not route; the SES holds a partial routing."
+        ),
+        (Ok(planes), _) if !planes.is_empty() => format!(
+            "Freerouting was given pours as planes ({}). It counts every pad inside a plane's outline as connected and lets other nets' tracks cross the plane, so after a refill the real pour can be cut into pieces that leave pads open. Its own count cannot show that the plane nets are connected.",
+            planes
+                .iter()
+                .map(|plane| format!("{} on {}", plane.net, plane.layer))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (_, None) => "Freerouting's job log gave no unrouted count, so the router's own result is not known.".to_string(),
+        _ => "Freerouting reports 0 unrouted connections and was given no pour as a plane.".to_string(),
+    };
+    let nets_text = if plane_nets.is_empty() {
+        "every net".to_string()
+    } else {
+        format!(
+            "the plane nets ({}) and every other net",
+            plane_nets.join(", ")
+        )
+    };
+    let complete_when = format!(
+        "The routing is complete only when KiCad's DRC on the applied and refilled board reports 0 unconnected items, on {nets_text}. Freerouting's count, and this result's status, do not show that."
+    );
+    let mut steps = Vec::new();
+    let mut fallback = Vec::new();
+    if let Some(board) = &board {
+        let drc = json!({ "board": board, "sync_live_board": true, "refill_zones": true });
+        steps.push(json!({
+            "step": 1, "tool": "plan_specctra_ses_import",
+            "arguments": { "board": board, "ses_path": ses, "manifest_path": manifest_path },
+            "why": "Check the session against the manifest and the live board before anything is written."
+        }));
+        steps.push(json!({
+            "step": 2, "tool": "apply_specctra_ses",
+            "arguments": { "board": board, "ses_path": ses, "manifest_path": manifest_path,
+                           "candidate_output_path": ses.with_extension("candidate.kicad_pcb") },
+            "why": "Write the routing into the live board as one undo step."
+        }));
+        steps.push(json!({
+            "step": 3, "tool": "run_drc", "arguments": drc,
+            "why": "Refill the zones, save, and read KiCad's unconnected items: this, not the router's count, says what is still open."
+        }));
+        if !plane_nets.is_empty() {
+            steps.push(json!({
+                "step": 4, "tool": "plan_route_refinement",
+                "arguments": { "board": board, "kinds": ["stitching"], "nets": plane_nets,
+                               "search_radius_mm": STITCH_RADIUS_MM },
+                "why": "Ask the read-only planner for stitching vias that join the cut-off pieces of the plane nets' pours. Send the effort chosen for this task (the planner's default is standard)."
+            }));
+            steps.push(json!({
+                "step": 5, "tool": "route_batch",
+                "arguments": { "board": board },
+                "arguments_from_plan": ["vias"],
+                "why": "Adopt the stitching vias you support: each proposal's route_batch operation gives its vias."
+            }));
+            steps.push(json!({
+                "step": 6, "tool": "run_drc", "arguments": drc,
+                "why": "Refill, save and count the unconnected items again.",
+                "repeat": format!(
+                    "Repeat steps 4 to 6 until the planner lists no stitching proposal or DRC reports 0 unconnected items on the plane nets, at most {STITCH_ROUNDS} rounds."
+                )
+            }));
+            fallback.push(json!({
+                "tool": "export_specctra_dsn",
+                "arguments": { "board": board, "output": dsn.with_extension("pours-omitted.dsn"), "pours": "omit" },
+                "why": "Leave the pours out, so the router routes the plane nets as track."
+            }));
+            fallback.push(json!({
+                "tool": "route_specctra_dsn",
+                "arguments": { "dsn_path": dsn.with_extension("pours-omitted.dsn"),
+                               "ses_output_path": ses.with_extension("pours-omitted.ses") },
+                "why": "Route that DSN, then follow its own next steps."
+            }));
+        }
+    }
+    let mut completion = json!({
+        "router_unrouted": router_unrouted,
+        "router_unrouted_source": "Freerouting's job log (the last autorouter or optimizer summary)",
+        "planes": plane_rows,
+        "planes_source": if planes.is_ok() { "the DSN; zones named from the manifest beside it" } else { "unreadable DSN" },
+        "judge": "KiCad DRC after a refill (run_drc with sync_live_board and refill_zones)",
+        "complete_when": complete_when,
+        "reason": reason,
+        "next_steps": steps,
+    });
+    if board.is_none() {
+        completion["next_steps_missing"] = json!(
+            "No reverse manifest beside the DSN names the board, and apply_specctra_ses needs it: export the DSN with export_specctra_dsn."
+        );
+    }
+    if !plane_nets.is_empty() {
+        completion["if_still_open"] = json!({
+            "fallback_threshold": PLANE_FALLBACK_OPEN,
+            "one_to_ten": "If 1 to 10 connections on the plane nets are still open after the stitching rounds, report every one of them as open: the routing is not complete. Name each open pad and net.",
+            "more_than_ten": "If more than 10 are still open, fall back: run the steps in `fallback` and report that outcome, with the open count of this plane run beside it.",
+            "fallback": fallback,
+        });
+    }
+    (status, completion)
 }
 
 #[cfg(test)]
@@ -261,6 +425,245 @@ mod route_rule_tests {
         // An unreadable count is never read as complete.
         assert_eq!(routing_status(&[], None), "unverified");
         assert_eq!(routing_status(one, None), "unverified");
+    }
+
+    // ─── S6 second half: the completion report and its next steps ──────────
+
+    const POLICY: &str = include_str!("../../tests/fixtures/specctra_pours_policy.kicad_pcb");
+
+    fn rules() -> konnect_ipc::IpcEffectiveRoutingRules {
+        ["GND", "VCC"]
+            .into_iter()
+            .map(|net| {
+                (
+                    net.to_string(),
+                    konnect_ipc::IpcRoutingRules {
+                        class_name: "Default".into(),
+                        constituents: vec!["Default".into()],
+                        track_width_mm: Some(0.25),
+                        clearance_mm: Some(0.2),
+                        via_diameter_mm: Some(0.6),
+                        via_drill_mm: Some(0.3),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A real export of the pour fixture with `pours`, its DSN and manifest
+    /// side by side, as `export_specctra_dsn` leaves them.
+    fn exported(
+        dir: &std::path::Path,
+        pours: serde_json::Value,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let board = dir.join("board.kicad_pcb");
+        std::fs::write(&board, POLICY).unwrap();
+        let bundle = crate::specctra::export_dsn_with_options(
+            &board,
+            POLICY,
+            &rules(),
+            crate::specctra::ExportOptions {
+                pours: crate::specctra::PourPolicy::from_argument(Some(&pours)).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dsn = dir.join("board.dsn");
+        std::fs::write(&dsn, &bundle.dsn).unwrap();
+        std::fs::write(dir.join("board.dsn.konnect.json"), &bundle.manifest).unwrap();
+        (dsn, dir.join("board.ses"))
+    }
+
+    fn report(
+        dsn: &std::path::Path,
+        ses: &std::path::Path,
+        unrouted: Option<u32>,
+    ) -> (&'static str, serde_json::Value) {
+        let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(dsn).unwrap());
+        super::completion_report(dsn, ses, &planes, unrouted)
+    }
+
+    fn registered(name: &str) -> Option<crate::tools::ToolDef> {
+        crate::router::registry::ALL_TOOLSETS
+            .iter()
+            .filter_map(|toolset| crate::router::registry::tools_for(toolset.name))
+            .flatten()
+            .find(|tool| tool.name == name)
+    }
+
+    /// Every call the steps name is a registered tool, its arguments pass
+    /// that tool's own input schema, and every parameter they mention (the
+    /// ones filled from the plan too) is one the tool declares. A renamed
+    /// tool or parameter breaks this test, not a caller.
+    fn assert_calls_are_real(calls: &[serde_json::Value]) {
+        assert!(!calls.is_empty());
+        for call in calls {
+            let name = call["tool"].as_str().unwrap();
+            let tool =
+                registered(name).unwrap_or_else(|| panic!("{name} is not a registered tool"));
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            let arguments = &call["arguments"];
+            for key in arguments.as_object().unwrap().keys() {
+                assert!(properties.contains_key(key), "{name} declares no '{key}'");
+            }
+            for key in call["arguments_from_plan"].as_array().into_iter().flatten() {
+                let key = key.as_str().unwrap();
+                assert!(properties.contains_key(key), "{name} declares no '{key}'");
+            }
+            if call["arguments_from_plan"].is_null() {
+                assert!(
+                    tool.input_validator.is_valid(arguments),
+                    "{name} refuses {arguments}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_with_planes_lists_the_stitching_sequence_with_real_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(
+            dir.path(),
+            json!({ "zones": [{ "net": "GND", "layer": "F.Cu", "policy": "omit" }] }),
+        );
+        let (status, completion) = report(&dsn, &ses, Some(0));
+        assert_eq!(status, "unverified");
+        assert_eq!(completion["router_unrouted"], 0);
+        // The planes, named from the manifest.
+        let planes = completion["planes"].as_array().unwrap();
+        assert_eq!(planes.len(), 2);
+        assert_eq!(planes[0]["net"], "GND");
+        assert_eq!(planes[0]["layer"], "B.Cu");
+        let names: Vec<&str> = planes[0]["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|zone| zone["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["GND_BOTTOM", "GND_BOTH"]);
+        assert_eq!(planes[1]["net"], "VCC");
+        let steps = completion["next_steps"].as_array().unwrap();
+        let tools: Vec<&str> = steps.iter().map(|s| s["tool"].as_str().unwrap()).collect();
+        assert_eq!(
+            tools,
+            [
+                "plan_specctra_ses_import",
+                "apply_specctra_ses",
+                "run_drc",
+                "plan_route_refinement",
+                "route_batch",
+                "run_drc"
+            ]
+        );
+        assert_eq!(steps[3]["arguments"]["kinds"], json!(["stitching"]));
+        assert_eq!(steps[3]["arguments"]["nets"], json!(["GND", "VCC"]));
+        assert_eq!(steps[3]["arguments"]["search_radius_mm"], 3.0);
+        assert!(steps[5]["repeat"]
+            .as_str()
+            .unwrap()
+            .contains("at most 4 rounds"));
+        assert_calls_are_real(steps);
+        let open = &completion["if_still_open"];
+        assert_eq!(open["fallback_threshold"], 10);
+        assert_calls_are_real(open["fallback"].as_array().unwrap());
+        assert_eq!(open["fallback"][0]["arguments"]["pours"], "omit");
+    }
+
+    /// The words a caller acts on: complete only at 0 unconnected in KiCad's
+    /// DRC after the refill; 1 to 10 open is reported open; more than 10
+    /// falls back. Nothing that lets a caller stop at the router's count.
+    #[test]
+    fn the_steps_say_when_the_routing_is_complete_and_what_open_means() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        let (_, completion) = report(&dsn, &ses, Some(0));
+        let complete_when = completion["complete_when"].as_str().unwrap();
+        for needle in [
+            "complete only when",
+            "KiCad's DRC",
+            "refilled",
+            "0 unconnected items",
+            "plane nets (GND, VCC)",
+            "every other net",
+            "do not show",
+        ] {
+            assert!(complete_when.contains(needle), "{needle}: {complete_when}");
+        }
+        let open = &completion["if_still_open"];
+        let few = open["one_to_ten"].as_str().unwrap();
+        assert!(
+            few.contains("1 to 10") && few.contains("report every one of them as open"),
+            "{few}"
+        );
+        assert!(few.contains("not complete"), "{few}");
+        let many = open["more_than_ten"].as_str().unwrap();
+        assert!(
+            many.contains("more than 10") && many.contains("fall back"),
+            "{many}"
+        );
+        // The router's 0 is reported as what it is, with the reason.
+        assert!(completion["reason"]
+            .as_str()
+            .unwrap()
+            .contains("counts every pad inside a plane"));
+        for text in [
+            complete_when,
+            few,
+            many,
+            completion["reason"].as_str().unwrap(),
+        ] {
+            for loose in [
+                "probably",
+                "should be fine",
+                "likely complete",
+                "may be complete",
+            ] {
+                assert!(!text.contains(loose), "{loose}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_without_planes_still_names_the_check_that_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("omit"));
+        let (status, completion) = report(&dsn, &ses, Some(0));
+        assert_eq!(status, "complete");
+        assert_eq!(completion["planes"], json!([]));
+        assert!(completion["if_still_open"].is_null());
+        let steps = completion["next_steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 3, "apply, refill and DRC; no stitching");
+        assert_calls_are_real(steps);
+        assert!(completion["complete_when"]
+            .as_str()
+            .unwrap()
+            .contains("0 unconnected items, on every net"));
+        // A router that left connections is incomplete, planes or not.
+        assert_eq!(report(&dsn, &ses, Some(3)).0, "incomplete");
+        assert_eq!(report(&dsn, &ses, None).0, "unverified");
+    }
+
+    #[test]
+    fn a_dsn_with_no_manifest_or_unreadable_planes_is_never_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        std::fs::remove_file(dir.path().join("board.dsn.konnect.json")).unwrap();
+        let (status, completion) = report(&dsn, &ses, Some(0));
+        assert_eq!(status, "unverified", "the DSN alone still shows the planes");
+        assert_eq!(completion["planes"].as_array().unwrap().len(), 3);
+        assert_eq!(completion["next_steps"], json!([]));
+        assert!(completion["next_steps_missing"]
+            .as_str()
+            .unwrap()
+            .contains("export_specctra_dsn"));
+        let broken: anyhow::Result<Vec<crate::specctra::DsnPlane>> =
+            Err(anyhow::anyhow!("not a DSN"));
+        let (status, completion) = super::completion_report(&dsn, &ses, &broken, Some(0));
+        assert_eq!(status, "unverified");
+        assert!(completion["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read"));
     }
 
     #[test]
@@ -2705,11 +3108,24 @@ async fn handle_route_specctra_dsn(
     let edge_clearance = hints.copper_edge_clearance_um;
     let allow_neckdown = allow_neckdown(args);
     let settings = route_settings(args, &hints, java.command.clone())?;
+    // What the router is given as planes, from the DSN itself: the router
+    // counts a pad inside a plane as connected, so a run with one is never
+    // reported complete.
+    let planes = std::fs::read_to_string(&dsn)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| crate::specctra::dsn_planes(&text));
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
+    let (status, completion) =
+        completion_report(&dsn, &ses_output, &planes, evidence.router_unrouted);
     Ok(CallToolResult::json(&json!({
         "success": true,
+        // Additive (S6 second half): what completion can be claimed, and the
+        // calls still needed. `success` still means the job ran and the SES
+        // was written.
+        "status": status,
+        "completion": completion,
         "method": "local_freerouting_native_mcp",
         "engine": {
             "name": "Freerouting",
