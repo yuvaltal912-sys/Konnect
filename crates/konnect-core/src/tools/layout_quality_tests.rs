@@ -1908,3 +1908,192 @@ fn planner_stitching_charges_ring_edges_before_point_containment() {
         assert_eq!(error.to_string(), "ring exceeds work budget");
     });
 }
+
+// ─── Netclass pattern matcher (row A1) ───────────────────────────────────────
+
+/// The matcher this module used before row A1, kept here only as the oracle of the
+/// differential test below: for each `*` it tries every split of the rest of the name,
+/// so its cost is exponential in the number of `*`. Never call it on a long name.
+fn glob_recursive(pattern: &str, text: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
+            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && go(&p[1..], &t[1..]),
+        }
+    }
+    go(
+        &pattern.chars().collect::<Vec<_>>(),
+        &text.chars().collect::<Vec<_>>(),
+    )
+}
+
+/// Every string over `alphabet` with 0 to `max_len` characters, shortest first.
+fn strings_up_to(alphabet: &[char], max_len: usize) -> Vec<String> {
+    let mut all = vec![String::new()];
+    let mut layer = vec![String::new()];
+    for _ in 0..max_len {
+        layer = layer
+            .iter()
+            .flat_map(|s| {
+                alphabet.iter().map(move |c| {
+                    let mut longer = s.clone();
+                    longer.push(*c);
+                    longer
+                })
+            })
+            .collect();
+        all.extend(layer.iter().cloned());
+    }
+    all
+}
+
+/// Runs `work` on its own thread and returns its result, or `None` if it has not finished within
+/// `limit`. A matcher that is too slow therefore fails a test instead of hanging the run; the
+/// abandoned thread dies with the test process.
+fn finishes_within<T: Send + 'static>(
+    limit: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+/// The linear matcher gives the recursive matcher's answer for every input. Patterns and names
+/// are all strings up to a small length over an alphabet that holds the wildcards, a non-ASCII
+/// character, characters that are only literal, and (in the names) a literal `*`; that covers
+/// the empty pattern and name, leading, trailing, doubled and adjacent `*`, and `?` at both
+/// ends. A seeded pseudo-random set of longer pairs follows.
+#[test]
+fn glob_gives_the_same_answer_as_the_recursive_matcher() {
+    let patterns = strings_up_to(&['a', 'b', '*', '?', 'é'], 5);
+    let names = strings_up_to(&['a', 'b', 'é', '*'], 4);
+    let (mut matched, mut refused) = (0usize, 0usize);
+    for pattern in &patterns {
+        for name in &names {
+            let expected = glob_recursive(pattern, name);
+            assert_eq!(
+                glob(pattern, name),
+                expected,
+                "{pattern:?} against {name:?}"
+            );
+            if expected {
+                matched += 1;
+            } else {
+                refused += 1;
+            }
+        }
+    }
+    // The set is not one-sided: a matcher that always said yes, or always no, would fail it.
+    assert!(
+        matched > 10_000 && refused > 10_000,
+        "{matched} / {refused}"
+    );
+
+    // Longer pairs from a fixed generator (a 64-bit LCG), a few characters of alphabet so that
+    // matches stay common.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = |n: usize| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as usize) % n
+    };
+    // Upper case, a combining accent and a character outside the basic plane join the letters.
+    let pattern_alphabet = [
+        'a',
+        'A',
+        'b',
+        'é',
+        '\u{301}',
+        '\u{1d11e}',
+        '*',
+        '*',
+        '?',
+        '?',
+    ];
+    let name_alphabet = ['a', 'A', 'b', 'é', '\u{301}', '\u{1d11e}', '*', '?'];
+    let mut long_matched = 0usize;
+    for _ in 0..20_000 {
+        let pattern: String = (0..next(13))
+            .map(|_| pattern_alphabet[next(pattern_alphabet.len())])
+            .collect();
+        let name: String = (0..next(13))
+            .map(|_| name_alphabet[next(name_alphabet.len())])
+            .collect();
+        let expected = glob_recursive(&pattern, &name);
+        assert_eq!(
+            glob(&pattern, &name),
+            expected,
+            "{pattern:?} against {name:?}"
+        );
+        long_matched += usize::from(expected);
+    }
+    assert!(long_matched > 500, "{long_matched}");
+}
+
+/// Case counts, as in KiCad (its pattern is compiled without `wxRE_ICASE`): a matcher that folded
+/// case would classify `n_clean` into the class of `N_*`, and the differential test above cannot
+/// say so for a matcher that folds both sides the same way.
+#[test]
+fn glob_counts_case() {
+    assert!(glob("N_*", "N_CLEAN") && glob("n_*", "n_clean") && glob("A?c", "Abc"));
+    assert!(!glob("n_*", "N_CLEAN") && !glob("N_*", "n_clean"));
+    assert!(!glob("a", "A") && !glob("A", "a") && !glob("*a*", "XAX"));
+    assert!(!glob("É*", "école") && glob("é*", "école"));
+}
+
+/// The cost of a match is the pattern length times the name length. The recursive matcher needed
+/// a number of steps that grows exponentially with the `*` count, so twelve `*` against a 400
+/// character name never finished: this test catches any return to it. The bounds are generous
+/// (the linear matcher takes microseconds here) so a slow machine cannot fail it.
+#[test]
+fn glob_cost_does_not_grow_with_the_number_of_wildcards() {
+    let limit = std::time::Duration::from_secs(5);
+    let crafted = "*?".repeat(12) + "Q~";
+    let name = "a".repeat(400);
+    let answer = finishes_within(limit, move || glob(&crafted, &name));
+    assert_eq!(answer, Some(false), "many wildcards against a long name");
+
+    // Linear in both lengths, not just in the wildcard count: thousands of characters each way.
+    let long_pattern = "*a?".repeat(1_500) + "Q";
+    let long_name = "a".repeat(3_000);
+    let answer = finishes_within(limit, move || {
+        (
+            glob(&long_pattern, &long_name),
+            glob(&long_pattern, &(long_name.clone() + "Q")),
+        )
+    });
+    assert_eq!(
+        answer,
+        Some((false, true)),
+        "long pattern against long name"
+    );
+}
+
+/// The call site: `netclasses_from_source` runs every pattern against every net, so crafted
+/// patterns in a project file must not make it slow, and a real pattern beside them still
+/// classifies its nets.
+#[test]
+fn netclasses_from_source_survives_crafted_patterns() {
+    let crafted = "*?".repeat(12) + "Q~";
+    let mut patterns: Vec<Value> = (0..40)
+        .map(|i| json!({ "netclass": format!("Crafted{i}"), "pattern": crafted }))
+        .collect();
+    patterns.push(json!({ "netclass": "Clean", "pattern": "N_*" }));
+    let source = json!({ "net_settings": { "netclass_patterns": patterns } }).to_string();
+    let nets: BTreeSet<String> = (0..8)
+        .map(|i| format!("{}{i}", "a".repeat(300)))
+        .chain(["N_CLEAN".to_string()])
+        .collect();
+    let classes = finishes_within(std::time::Duration::from_secs(10), move || {
+        netclasses_from_source(&source, &nets)
+    })
+    .expect("the crafted patterns must not stall the audit model");
+    assert_eq!(classes.len(), 1, "{classes:?}");
+    assert_eq!(classes["N_CLEAN"], vec!["Clean".to_string()]);
+}
