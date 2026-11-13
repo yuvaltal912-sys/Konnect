@@ -208,3 +208,182 @@ fn project_rules_below_the_fab_capability_are_flagged() {
         .iter()
         .all(|i| !i.issue.contains("minimum clearance")));
 }
+
+// ─── S7b: the corrected acid-trap reading ────────────────────────────────────
+//
+// A track shorter than 10 um belongs to the junction it touches and gives no
+// direction; a corner is acute only below 89 degrees. Each half is tested on
+// its own: a short track at a 135-degree bend (only the first rule clears
+// it) and a junction at 89.97 degrees with no short track (only the second).
+
+const JN: (f64, f64) = (20.0, 20.0);
+
+/// A straight track from one point to another.
+type Track = ((f64, f64), (f64, f64));
+
+/// A point `length` mm from the junction at `degrees`, on the 1 nm grid.
+fn at(degrees: f64, length: f64) -> (f64, f64) {
+    let r = degrees.to_radians();
+    (
+        ((JN.0 + length * r.cos()) * 1e6).round() / 1e6,
+        ((JN.1 + length * r.sin()) * 1e6).round() / 1e6,
+    )
+}
+
+/// A board holding only the given SIG tracks on F.Cu, 0.2 mm wide.
+fn trap_board(tracks: &[Track]) -> String {
+    let mut segs = String::new();
+    for (i, (a, b)) in tracks.iter().enumerate() {
+        segs += &format!(
+            "  (segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))\n",
+            a.0, a.1, b.0, b.1
+        );
+    }
+    format!(
+        r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+  (gr_rect (start 0 0) (end 60 40) (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts") (uuid "e1"))
+{segs})"#
+    )
+}
+
+fn acid_traps(tracks: &[Track]) -> (usize, Coverage) {
+    let report = check_board(&geometry(&trap_board(tracks)), &jlc());
+    (
+        issues_with(&report, "Acid trap").len(),
+        report.checks["acid_trap"].clone(),
+    )
+}
+
+/// Legs from the junction at the given angles, 3 mm long.
+fn legs(angles: &[f64]) -> Vec<Track> {
+    angles.iter().map(|a| (JN, at(*a, 3.0))).collect()
+}
+
+/// A 0.1-um track at the junction, along +y: its two ends share one key.
+fn stub() -> Track {
+    (JN, (JN.0, JN.1 + 0.0001))
+}
+
+#[test]
+fn a_short_track_at_a_135_degree_bend_is_not_an_acid_trap() {
+    let mut t = legs(&[180., 45.]);
+    // Read as the audit read it before: the stub's two directions make 45 degrees.
+    t.push(stub());
+    let (traps, cov) = acid_traps(&t);
+    assert_eq!(traps, 0, "{cov:?}");
+    assert_eq!(cov.checked, 1, "one junction of two real legs: {cov:?}");
+    assert_eq!(cov.short_tracks, Some(1), "{cov:?}");
+}
+
+#[test]
+fn a_short_track_on_a_straight_run_is_not_an_acid_trap() {
+    let mut t = legs(&[180., 0.]);
+    t.push((JN, (JN.0 - 0.0002, JN.1 + 0.0002)));
+    assert_eq!(acid_traps(&t).0, 0);
+}
+
+#[test]
+fn a_short_track_at_a_right_angle_bend_is_not_an_acid_trap() {
+    let mut t = legs(&[180., 90.]);
+    t.push(stub());
+    assert_eq!(acid_traps(&t).0, 0);
+}
+
+/// A 2.8-um track bridging a trunk end to a perpendicular branch 2 um away:
+/// two keys, one junction.
+#[test]
+fn a_short_track_at_a_three_way_junction_is_not_an_acid_trap() {
+    let j1 = (JN.0 + 0.002, JN.1 + 0.002);
+    let t = vec![
+        (JN, at(90., 3.)),
+        (JN, at(270., 3.)),
+        (j1, (j1.0 + 3., j1.1)),
+        (JN, j1),
+    ];
+    let (traps, cov) = acid_traps(&t);
+    assert_eq!(traps, 0, "{cov:?}");
+    assert_eq!(cov.checked, 1, "{cov:?}");
+}
+
+#[test]
+fn a_junction_at_89_97_degrees_is_not_an_acid_trap() {
+    let (traps, cov) = acid_traps(&legs(&[0., 89.97, 180.]));
+    assert_eq!(traps, 0, "{cov:?}");
+    assert_eq!(cov.short_tracks, Some(0));
+}
+
+#[test]
+fn a_real_45_degree_v_stays_an_acid_trap_with_or_without_a_short_track() {
+    assert_eq!(acid_traps(&legs(&[180., 135.])).0, 1);
+    let mut t = legs(&[180., 135.]);
+    t.push(stub());
+    let report = check_board(&geometry(&trap_board(&t)), &jlc());
+    let traps = issues_with(&report, "Acid trap");
+    assert_eq!(traps.len(), 1);
+    assert!(traps[0].issue.contains("45°"), "{}", traps[0].issue);
+    assert_eq!(traps[0].at["x"], JN.0);
+    assert_eq!(traps[0].at["y"], JN.1);
+}
+
+/// 9.99 um still belongs to the junction; 10.01 um is a leg of its own,
+/// whose direction then makes a 45-degree corner with the bend's second leg.
+#[test]
+fn ten_micrometres_is_where_a_track_stops_belonging_to_its_junction() {
+    for (length, expected) in [(0.00999, 0), (0.01001, 1)] {
+        let mut t = legs(&[180., 45.]);
+        t.push((JN, (JN.0, JN.1 + length)));
+        assert_eq!(acid_traps(&t).0, expected, "track of {length} mm");
+    }
+}
+
+#[test]
+fn eighty_nine_degrees_is_where_a_corner_stops_being_acute() {
+    for (angle, expected) in [(88.99, 1), (89.01, 0)] {
+        assert_eq!(
+            acid_traps(&legs(&[0., angle])).0,
+            expected,
+            "{angle} degrees"
+        );
+    }
+}
+
+/// A pad of the net covers the far end of a 5-um track at a real 45-degree V,
+/// but not the point where the V's legs meet: the wedge is open, so the trap
+/// is counted. Only a junction whose legs all meet inside copper is skipped.
+#[test]
+fn a_junction_is_skipped_only_where_its_legs_meet_inside_copper() {
+    let mut t = legs(&[180., 225.]);
+    t.push((JN, (JN.0, JN.1 + 0.005)));
+    let segs: String = t
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| format!("(segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))", a.0, a.1, b.0, b.1))
+        .collect();
+    // The pad's edge passes 3 um above the junction, 2 um below the track's far end.
+    let pad = format!(
+        "(footprint \"Fixture:P\" (layer \"F.Cu\") (uuid \"fp\") (at {} {} 0) (property \"Reference\" \"P1\" (at 0 0 0) (layer \"F.SilkS\") (uuid \"fp-r\") (effects (font (size 1 1)))) (pad \"1\" smd circle (at 0 0 0) (size 0.8 0.8) (layers \"F.Cu\" \"F.Mask\") (net \"SIG\") (uuid \"pp\")))",
+        JN.0,
+        JN.1 + 0.403
+    );
+    let text = trap_board(&[]).replace("\n)", &format!("\n{segs}\n{pad})"));
+    let report = check_board(&geometry(&text), &jlc());
+    assert_eq!(
+        issues_with(&report, "Acid trap").len(),
+        1,
+        "{:?}",
+        report.checks["acid_trap"]
+    );
+    // Inside the pad at the junction itself: skipped, as before.
+    let inside = text.replace(
+        &format!("(at {} {} 0)", JN.0, JN.1 + 0.403),
+        &format!("(at {} {} 0)", JN.0, JN.1 + 0.1),
+    );
+    let report = check_board(&geometry(&inside), &jlc());
+    assert_eq!(issues_with(&report, "Acid trap").len(), 0);
+    assert!(report.checks["acid_trap"]
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("1 acute junction"));
+}

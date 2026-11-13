@@ -6,7 +6,7 @@
 //! delegated instead of re-implemented, and what nothing checks is named as
 //! not checked, so a clean result never claims more than it looked at.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use konnect_sexp::board_geometry::{BoardGeometry, Entry, Kind, Shape};
 use serde_json::{json, Value};
@@ -149,6 +149,10 @@ pub(crate) struct Coverage {
     pub failed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Acid-trap check only: tracks shorter than 10 um, read as part of the
+    /// junction they touch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_tracks: Option<usize>,
 }
 
 impl Coverage {
@@ -158,6 +162,7 @@ impl Coverage {
             checked,
             failed,
             reason: None,
+            short_tracks: None,
         }
     }
 
@@ -167,6 +172,7 @@ impl Coverage {
             checked: 0,
             failed: 0,
             reason: Some(reason.into()),
+            short_tracks: None,
         }
     }
 }
@@ -517,39 +523,207 @@ fn via_on_layer(via: &Entry, layer: &str) -> bool {
         || (via.layers.iter().any(|l| l == "F.Cu") && via.layers.iter().any(|l| l == "B.Cu"))
 }
 
-/// Acid traps: two tracks of one net on one layer that meet end to end at an
-/// interior angle under 90°. Junctions inside a pad or via of that net are
-/// skipped (the pad's copper fills the wedge), and a track meeting another
-/// mid-segment is not a shared endpoint and is not examined.
-/// (layer, net, x µm, y µm): where track ends meet.
-type JunctionKey = (String, String, i64, i64);
+// ─── Junctions and acid traps ───────────────────────────────────────────────
 
-fn check_acid_traps(geometry: &BoardGeometry, report: &mut DfmReport) {
-    // (layer, net, x µm, y µm) → unit directions leaving the junction
-    let mut ends: HashMap<JunctionKey, Vec<(f64, f64)>> = HashMap::new();
-    for t in geometry.others.iter().filter(|e| e.kind == Kind::Track) {
-        let pts = &t.shape.pts;
-        if pts.len() < 2 {
+/// Tracks shorter than this belong to the junction they touch and give no
+/// direction (S7b, owner decision 2026-11-13). Autorouters leave such tracks
+/// at bends and tees, 0.1 to 3 um long; their direction is rounding noise.
+/// 10 um is ten junction keys and lies inside the end cap of any track a fab
+/// can make.
+pub(crate) const SHORT_TRACK_MM: f64 = 0.01;
+
+/// A corner is acute below the lower edge of the audit's own right-angle
+/// band (S7b, owner decision 2026-11-13).
+pub(crate) const ACUTE_BELOW_DEG: f64 = 89.0;
+
+/// The one test of an acute corner, used by every caller.
+pub(crate) fn is_acute(degrees: f64) -> bool {
+    degrees < ACUTE_BELOW_DEG
+}
+
+/// The audit's right-angle band, 89 to 91 degrees.
+pub(crate) fn is_right_angle(degrees: f64) -> bool {
+    (ACUTE_BELOW_DEG..=91.0).contains(&degrees)
+}
+
+/// (x um, y um): where track ends meet, to the micrometre.
+pub(crate) type JunctionKey = (i64, i64);
+
+/// A unit direction leaving a junction, with the UUID of its track.
+pub(crate) type JunctionEnd = ((f64, f64), Option<String>);
+
+pub(crate) fn junction_key(p: (f64, f64)) -> JunctionKey {
+    ((p.0 * 1000.0).round() as i64, (p.1 * 1000.0).round() as i64)
+}
+
+/// Track ends of one net on one layer that meet. Ends that round to the same
+/// micrometre share a key; keys joined by a track shorter than
+/// [`SHORT_TRACK_MM`] are one junction, and that track adds no direction.
+pub(crate) struct Junction {
+    pub layer: String,
+    pub net: String,
+    /// The key with the most track ends (the smallest on a tie), as a point.
+    pub at: (f64, f64),
+    /// Unit directions leaving the junction, with the track's UUID: every end
+    /// of every track of 10 um or more at one of the keys.
+    pub ends: Vec<JunctionEnd>,
+    /// Tracks shorter than 10 um inside the junction.
+    pub short_tracks: usize,
+    /// The keys where a track of 10 um or more ends: where the legs meet.
+    pub end_keys: Vec<JunctionKey>,
+}
+
+impl Junction {
+    /// The sharpest angle between two of its directions, in degrees.
+    pub fn sharpest(&self) -> f64 {
+        let mut sharpest = 180.0f64;
+        for i in 0..self.ends.len() {
+            for j in (i + 1)..self.ends.len() {
+                let (a, b) = (self.ends[i].0, self.ends[j].0);
+                let dot = (a.0 * b.0 + a.1 * b.1).clamp(-1.0, 1.0);
+                sharpest = sharpest.min(dot.acos().to_degrees());
+            }
+        }
+        sharpest
+    }
+    /// The points where its legs meet. A junction lies inside copper when all
+    /// of them do: a short track reaching into a pad does not fill the wedge.
+    pub fn leg_points(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.end_keys
+            .iter()
+            .map(|k| (k.0 as f64 / 1000.0, k.1 as f64 / 1000.0))
+    }
+}
+
+fn track_length(pts: &[(f64, f64)]) -> f64 {
+    pts.windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum()
+}
+
+/// Whether a track counts as shorter than 10 um.
+pub(crate) fn is_short_track(t: &Entry) -> bool {
+    t.shape.pts.len() >= 2 && track_length(&t.shape.pts) < SHORT_TRACK_MM
+}
+
+/// Every junction of the given tracks, in (layer, net, key) order. A key
+/// with one track end and no short track is not returned.
+pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junction> {
+    type Group<'a> = Vec<&'a Entry>;
+    let mut groups: BTreeMap<(String, String), Group<'a>> = BTreeMap::new();
+    for t in tracks {
+        if t.shape.pts.len() < 2 {
             continue;
         }
-        let layer = t.layers.first().cloned().unwrap_or_default();
-        let net = t.net.clone().unwrap_or_default();
-        let n = pts.len();
-        for (end, next) in [(pts[0], pts[1]), (pts[n - 1], pts[n - 2])] {
-            let (dx, dy) = (next.0 - end.0, next.1 - end.1);
-            let len = (dx * dx + dy * dy).sqrt();
-            if len < 1e-9 {
+        groups
+            .entry((
+                t.layers.first().cloned().unwrap_or_default(),
+                t.net.clone().unwrap_or_default(),
+            ))
+            .or_default()
+            .push(t);
+    }
+    let mut out = Vec::new();
+    for ((layer, net), tracks) in groups {
+        let mut parent: BTreeMap<JunctionKey, JunctionKey> = BTreeMap::new();
+        fn root(parent: &mut BTreeMap<JunctionKey, JunctionKey>, k: JunctionKey) -> JunctionKey {
+            let mut r = k;
+            while parent[&r] != r {
+                r = parent[&r];
+            }
+            let mut k = k;
+            while parent[&k] != r {
+                let next = parent[&k];
+                parent.insert(k, r);
+                k = next;
+            }
+            r
+        }
+        let mut ends: BTreeMap<JunctionKey, Vec<JunctionEnd>> = BTreeMap::new();
+        let mut short: Vec<JunctionKey> = Vec::new();
+        for t in &tracks {
+            let pts = &t.shape.pts;
+            let n = pts.len();
+            let (ka, kb) = (junction_key(pts[0]), junction_key(pts[n - 1]));
+            parent.entry(ka).or_insert(ka);
+            parent.entry(kb).or_insert(kb);
+            if is_short_track(t) {
+                let (ra, rb) = (root(&mut parent, ka), root(&mut parent, kb));
+                if ra != rb {
+                    parent.insert(ra, rb);
+                }
+                short.push(ka);
                 continue;
             }
-            let key = (
-                layer.clone(),
-                net.clone(),
-                (end.0 * 1000.0).round() as i64,
-                (end.1 * 1000.0).round() as i64,
-            );
-            ends.entry(key).or_default().push((dx / len, dy / len));
+            for (end, next) in [(pts[0], pts[1]), (pts[n - 1], pts[n - 2])] {
+                let (dx, dy) = (next.0 - end.0, next.1 - end.1);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len < 1e-9 {
+                    continue;
+                }
+                ends.entry(junction_key(end))
+                    .or_default()
+                    .push(((dx / len, dy / len), t.uuid.clone()));
+            }
+        }
+        let mut members: BTreeMap<JunctionKey, Vec<JunctionKey>> = BTreeMap::new();
+        for k in parent.keys().copied().collect::<Vec<_>>() {
+            let r = root(&mut parent, k);
+            members.entry(r).or_default().push(k);
+        }
+        let mut shorts: BTreeMap<JunctionKey, usize> = BTreeMap::new();
+        for k in short {
+            *shorts.entry(root(&mut parent, k)).or_default() += 1;
+        }
+        for (r, keys) in members {
+            let short_tracks = shorts.get(&r).copied().unwrap_or(0);
+            let dirs: Vec<_> = keys
+                .iter()
+                .flat_map(|k| ends.get(k).into_iter().flatten().cloned())
+                .collect();
+            if dirs.len() < 2 && short_tracks == 0 {
+                continue;
+            }
+            let main = *keys
+                .iter()
+                .max_by(|a, b| {
+                    let (na, nb) = (
+                        ends.get(a).map_or(0, Vec::len),
+                        ends.get(b).map_or(0, Vec::len),
+                    );
+                    na.cmp(&nb).then(b.cmp(a))
+                })
+                .expect("a junction has a key");
+            let end_keys = keys
+                .iter()
+                .copied()
+                .filter(|k| ends.get(k).is_some_and(|e| !e.is_empty()))
+                .collect();
+            out.push(Junction {
+                layer: layer.clone(),
+                net: net.clone(),
+                at: (main.0 as f64 / 1000.0, main.1 as f64 / 1000.0),
+                ends: dirs,
+                short_tracks,
+                end_keys,
+            });
         }
     }
+    out
+}
+
+/// Acid traps: two tracks of one net on one layer that meet at an interior
+/// angle under 89 degrees, read at junctions as [`junctions`] groups them.
+/// Junctions inside a pad or via of that net are skipped (the pad's copper
+/// fills the wedge), and a track meeting another mid-segment is not a shared
+/// end and is not examined.
+fn check_acid_traps(geometry: &BoardGeometry, report: &mut DfmReport) {
+    let tracks: Vec<&Entry> = geometry
+        .others
+        .iter()
+        .filter(|e| e.kind == Kind::Track)
+        .collect();
+    let short_tracks = tracks.iter().filter(|t| is_short_track(t)).count();
 
     let copper_of_net = |net: &str, layer: &str, p: (f64, f64)| -> bool {
         let point = Shape::disc(p, 0.0);
@@ -563,51 +737,53 @@ fn check_acid_traps(geometry: &BoardGeometry, report: &mut DfmReport) {
         })
     };
 
-    let mut junctions = 0;
+    let mut checked = 0;
     let mut skipped = 0;
-    let mut traps: Vec<(JunctionKey, f64)> = Vec::new();
-    for (key, dirs) in &ends {
-        if dirs.len() < 2 {
+    let mut traps: Vec<(&Junction, f64)> = Vec::new();
+    let all = junctions(tracks.iter().copied());
+    for j in &all {
+        if j.ends.len() < 2 {
             continue;
         }
-        junctions += 1;
-        let mut sharpest = 180.0f64;
-        for i in 0..dirs.len() {
-            for j in (i + 1)..dirs.len() {
-                let dot = (dirs[i].0 * dirs[j].0 + dirs[i].1 * dirs[j].1).clamp(-1.0, 1.0);
-                sharpest = sharpest.min(dot.acos().to_degrees());
-            }
-        }
-        if sharpest < 90.0 - 1e-6 {
-            let p = (key.2 as f64 / 1000.0, key.3 as f64 / 1000.0);
-            if copper_of_net(&key.1, &key.0, p) {
+        checked += 1;
+        let sharpest = j.sharpest();
+        if is_acute(sharpest) {
+            if j.leg_points().all(|p| copper_of_net(&j.net, &j.layer, p)) {
                 skipped += 1;
                 continue;
             }
-            traps.push((key.clone(), sharpest));
+            traps.push((j, sharpest));
         }
     }
-    traps.sort_by(|a, b| a.0.cmp(&b.0));
-    for ((layer, net, x, y), angle) in &traps {
+    traps.sort_by(|a, b| {
+        (&a.0.layer, &a.0.net, junction_key(a.0.at)).cmp(&(
+            &b.0.layer,
+            &b.0.net,
+            junction_key(b.0.at),
+        ))
+    });
+    for (j, angle) in &traps {
         report.issues.push(DfmIssue {
             severity: "warning",
             component: None,
             issue: format!(
-                "Acid trap: tracks of net '{}' meet at {angle:.0}° on {layer}",
-                net_label(net)
+                "Acid trap: tracks of net '{}' meet at {angle:.0}° on {}",
+                net_label(&j.net),
+                j.layer
             ),
             fix: "Re-route the junction so the tracks meet at 90° or more (a 45° chamfer or a \
                   teardrop)"
                 .to_string(),
-            at: json!({ "net": net, "layer": layer, "x": *x as f64 / 1000.0, "y": *y as f64 / 1000.0 }),
+            at: json!({ "net": j.net, "layer": j.layer, "x": j.at.0, "y": j.at.1 }),
         });
     }
-    let mut coverage = Coverage::checked(junctions, traps.len());
+    let mut coverage = Coverage::checked(checked, traps.len());
     if skipped > 0 {
         coverage.reason = Some(format!(
             "{skipped} acute junction(s) inside a pad or via of the same net were not counted"
         ));
     }
+    coverage.short_tracks = Some(short_tracks);
     report.checks.insert("acid_trap", coverage);
 }
 

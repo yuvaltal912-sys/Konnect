@@ -3,6 +3,42 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: corrected acute-corner reading (row S7b)
+
+Behaviour change, by the owner's decision of 2026-11-13. The acid-trap check
+behind `audit_manufacturing` (`dfm::check_acid_traps`) and the corner scan of
+`audit_layout_quality` item 5.3 now read a junction the same way:
+
+- A track shorter than 10 um belongs to the junction it touches and gives no
+  direction. Junction keys (track ends within 1 um) joined by such a track are
+  one junction. Autorouters leave tracks of 0.1 to 3 um at bends and tees; the
+  audit used to read their direction, so a 135-degree bend with a 0.1-um track
+  at its vertex counted as a 45-degree acid trap.
+- A corner is acute only below 89 degrees, the lower edge of the audit's own
+  right-angle band (89 to 91 degrees). A junction at 89.97 degrees used to count
+  as acute and is now inside the band.
+- A junction inside a pad or via of its net is skipped only when every point
+  where its tracks of 10 um or more end lies inside that copper.
+
+Each caller and what changed for it:
+
+| Caller | Change |
+|---|---|
+| `audit_manufacturing` | Fewer acid-trap issues on boards with short tracks or near-square junctions. `checks.acid_trap.checked` counts junctions of two or more real legs. New `checks.acid_trap.short_tracks`: tracks shorter than 10 um on the board |
+| `audit_layout_quality` 5.3 | `acute_corners`, `right_angle_corners`, `bends` and `acute_found_by_this_scan` read the same junctions; a 90-degree bend carrying a short track now counts as a right angle, and a counted right angle that a short track joins to a third leg no longer does. New metrics `short_tracks` and `junctions_with_short_tracks` |
+| `run_design_review` | Its manufacturing part reads the acid-trap check above |
+| `plan_route_refinement` | `before.corners` is the corrected 5.3 count. `t_junction` lists only junctions the corrected check counts: a branch between 89 and 90 degrees from its trunk is no longer a target (before, one 0.17 degrees off square was repaired). Its 0.06-degree guard is unchanged and no longer reached. `chamfer` reads its right-angle rows from the corrected scan |
+
+What it does to existing boards (the seven routed boards PR #63 was measured
+on; counts only). Acute corners before #63: 11, 5, 5, 5, 5, 5, 5 read as 4, 0,
+0, 0, 2, 2, 2; after #63: 8, 5, 5, 5, 3, 3, 3 read as 1, 0, 0, 0, 0, 0, 0. Right
+angles after #63: 6, 6, 6, 6, 2, 1, 2 read as 6, 6, 6, 6, 1, 1, 1: one board
+gains one from a 90-degree bend with a short track and loses one to a joined
+third leg, and two boards each lose one that way; none rises. Short tracks: 15, 14, 14, 15, 13, 12, 13 per board, in 12, 6, 6, 7,
+9, 8, 9 junctions; PR #63 made none of them. Each half matters alone: the
+short-track rule alone leaves 2, 1, 1, 1, 1, 1, 1 after #63, the 89-degree line
+alone 7, 4, 4, 4, 2, 2, 2.
+
 ## Unreleased: read-only route-refinement plans
 
 Creation row S7. New `plan_route_refinement` in `pcb_routing` supplies a second

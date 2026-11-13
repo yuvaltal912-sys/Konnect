@@ -1908,3 +1908,108 @@ fn planner_stitching_charges_ring_edges_before_point_containment() {
         assert_eq!(error.to_string(), "ring exceeds work budget");
     });
 }
+
+// ─── S7b: corners read with the corrected definition ─────────────────────────
+
+const JN: (f64, f64) = (20.0, 20.0);
+
+/// A straight track from one point to another.
+type Track = ((f64, f64), (f64, f64));
+
+fn leg_at(degrees: f64, length: f64) -> (f64, f64) {
+    let r = degrees.to_radians();
+    (
+        ((JN.0 + length * r.cos()) * 1e6).round() / 1e6,
+        ((JN.1 + length * r.sin()) * 1e6).round() / 1e6,
+    )
+}
+
+/// A board holding only the given SIG tracks on F.Cu, 0.2 mm wide.
+fn corner_board(tracks: &[Track]) -> Fx {
+    let mut segs = String::new();
+    for (i, (a, b)) in tracks.iter().enumerate() {
+        segs += &format!(
+            "  (segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"t{i}\"))\n",
+            a.0, a.1, b.0, b.1
+        );
+    }
+    fx_text(
+        &format!(
+            r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+  (gr_rect (start 0 0) (end 60 40) (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts") (uuid "e1"))
+{segs})"#
+        ),
+        None,
+    )
+}
+
+fn corner_metrics(tracks: &[Track]) -> Value {
+    let r = run(&corner_board(tracks));
+    check(&r, "5.3")["metrics"].clone()
+}
+
+fn corner_legs(angles: &[f64]) -> Vec<Track> {
+    angles.iter().map(|a| (JN, leg_at(*a, 3.0))).collect()
+}
+
+/// A 0.1-um track at the junction: its two ends share one key.
+fn corner_stub() -> Track {
+    (JN, (JN.0, JN.1 + 0.0001))
+}
+
+/// The audit read four directions here and no bend; the real legs make a
+/// right angle, and it is counted as one. The short track is counted too.
+#[test]
+fn a_short_track_at_a_right_angle_bend_counts_as_that_right_angle() {
+    let mut t = corner_legs(&[180., 90.]);
+    t.push(corner_stub());
+    let m = corner_metrics(&t);
+    assert_eq!(m["acute_corners"], 0, "{m}");
+    assert_eq!(m["right_angle_corners"], 1, "{m}");
+    assert_eq!(m["acute_found_by_this_scan"], 0, "{m}");
+    assert_eq!(m["short_tracks"], 1, "{m}");
+    assert_eq!(m["junctions_with_short_tracks"], 1, "{m}");
+}
+
+#[test]
+fn the_corner_scan_reads_the_real_legs_of_a_junction() {
+    let mut bend = corner_legs(&[180., 45.]);
+    bend.push(corner_stub());
+    let m = corner_metrics(&bend);
+    assert_eq!(
+        (m["acute_corners"].as_u64(), m["bends"].as_u64()),
+        (Some(0), Some(1)),
+        "{m}"
+    );
+    assert_eq!(m["right_angle_corners"], 0, "{m}");
+    // Three real legs are a tee, not a bend.
+    let j1 = (JN.0 + 0.002, JN.1 + 0.002);
+    let tee = vec![
+        (JN, leg_at(90., 3.)),
+        (JN, leg_at(270., 3.)),
+        (j1, (j1.0 + 3., j1.1)),
+        (JN, j1),
+    ];
+    let m = corner_metrics(&tee);
+    assert_eq!(
+        (m["acute_corners"].as_u64(), m["bends"].as_u64()),
+        (Some(0), Some(0)),
+        "{m}"
+    );
+    assert_eq!(m["junctions_with_short_tracks"], 1, "{m}");
+}
+
+/// At the line both corner readings agree: 88.99 degrees is acute for the
+/// acid-trap check and for the scan, 89.5 degrees is a right angle for both.
+#[test]
+fn the_two_corner_readings_agree_at_eighty_nine_degrees() {
+    let m = corner_metrics(&corner_legs(&[0., 88.99]));
+    assert_eq!(m["acute_corners"], 1, "{m}");
+    assert_eq!(m["acute_found_by_this_scan"], 1, "{m}");
+    assert_eq!(m["right_angle_corners"], 0, "{m}");
+    let m = corner_metrics(&corner_legs(&[0., 89.5]));
+    assert_eq!(m["acute_corners"], 0, "{m}");
+    assert_eq!(m["acute_found_by_this_scan"], 0, "{m}");
+    assert_eq!(m["right_angle_corners"], 1, "{m}");
+}
