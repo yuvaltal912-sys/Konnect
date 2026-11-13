@@ -302,6 +302,34 @@ fn a_per_zone_policy_refuses_what_it_does_not_know() {
         .map(|i| json!({ "name": format!("Z{i}"), "policy": "omit" }))
         .collect();
     refused(json!({ "zones": many }), "256");
+    // Exactly the bound is allowed.
+    let most = &many[..MAX_POUR_RULES];
+    assert_eq!(
+        policy(json!({ "zones": most })).unwrap().zones.len(),
+        MAX_POUR_RULES
+    );
+}
+
+/// Only a policy that can leave a pour out needs the Rust exporter.
+#[test]
+fn only_a_policy_that_can_leave_a_pour_out_may_omit() {
+    assert!(!PourPolicy::default().may_omit());
+    assert!(PourPolicy::omit().may_omit());
+    assert!(
+        !policy(json!({ "zones": [{ "net": "GND", "policy": "fixed" }] }))
+            .unwrap()
+            .may_omit()
+    );
+    assert!(
+        policy(json!({ "zones": [{ "net": "GND", "policy": "omit" }] }))
+            .unwrap()
+            .may_omit()
+    );
+    assert!(
+        policy(json!({ "default": "omit", "zones": [{ "net": "GND", "policy": "fixed" }] }))
+            .unwrap()
+            .may_omit()
+    );
 }
 
 #[test]
@@ -421,7 +449,12 @@ fn rules_that_disagree_about_one_pour_are_refused() {
     )
     .unwrap_err()
     .to_string();
-    for needle in ["zones[0]", "zones[1]", "GND_BOTTOM", "B.Cu"] {
+    for needle in [
+        "zones[0] gives 'omit'",
+        "zones[1] gives 'fixed'",
+        "GND_BOTTOM",
+        "B.Cu",
+    ] {
         assert!(error.contains(needle), "{needle}: {error}");
     }
     // Rules that agree are fine.
@@ -445,6 +478,13 @@ fn a_rule_that_picks_no_pour_is_refused() {
         for needle in needles {
             assert!(error.contains(needle), "{rule}: {needle}: {error}");
         }
+        // A rule area is named only when the rule picked one.
+        let names_an_area = needles.contains(&"rule area");
+        assert_eq!(
+            error.contains("rule area"),
+            names_an_area,
+            "{rule}: {error}"
+        );
     };
     refused(
         json!({ "uuid": "00000000-0000-4000-8000-000000000000", "policy": "omit" }),

@@ -1514,6 +1514,9 @@ mod tests {
         // "149 unrouted nets" at the start of a stage is not a result.
         let started = log(&["Auto-routing stage started on board 'b1' with baseline score 259.56 for 149 unrouted items."]);
         assert_eq!(router_unrouted(&started), None);
+        // A pass that ended is not the end of the stage, even alone.
+        let pass_only = log(&["Auto-routing pass #3 on board 'b1' was completed in 1.99 seconds with score 912.57 (16 unrouted and 0 violations)"]);
+        assert_eq!(router_unrouted(&pass_only), None);
         assert_eq!(router_unrouted(&json!({ "body": [] })), None);
         assert_eq!(router_unrouted(&json!(null)), None);
     }

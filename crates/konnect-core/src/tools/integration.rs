@@ -542,6 +542,12 @@ mod route_rule_tests {
             .collect();
         assert_eq!(names, ["GND_BOTTOM", "GND_BOTH"]);
         assert_eq!(planes[1]["net"], "VCC");
+        // Only the zones that made this plane: not an omitted pour on the
+        // same layer, nor another net's.
+        assert_eq!(
+            planes[1]["zones"],
+            json!([{ "uuid": "55555555-5555-4555-8555-555555555502", "name": "VCC_REGION" }])
+        );
         let steps = completion["next_steps"].as_array().unwrap();
         let tools: Vec<&str> = steps.iter().map(|s| s["tool"].as_str().unwrap()).collect();
         assert_eq!(
@@ -638,9 +644,23 @@ mod route_rule_tests {
             .as_str()
             .unwrap()
             .contains("0 unconnected items, on every net"));
+        assert!(completion["reason"]
+            .as_str()
+            .unwrap()
+            .contains("was given no pour as a plane"));
         // A router that left connections is incomplete, planes or not.
-        assert_eq!(report(&dsn, &ses, Some(3)).0, "incomplete");
-        assert_eq!(report(&dsn, &ses, None).0, "unverified");
+        let (status, left) = report(&dsn, &ses, Some(3));
+        assert_eq!(status, "incomplete");
+        assert!(left["reason"]
+            .as_str()
+            .unwrap()
+            .contains("3 connection(s) it could not route"));
+        let (status, unknown) = report(&dsn, &ses, None);
+        assert_eq!(status, "unverified");
+        assert!(unknown["reason"]
+            .as_str()
+            .unwrap()
+            .contains("gave no unrouted count"));
     }
 
     #[test]
