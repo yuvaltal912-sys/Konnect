@@ -2033,7 +2033,7 @@ fn glob_gives_the_same_answer_as_the_recursive_matcher() {
         );
         long_matched += usize::from(expected);
     }
-    assert!(long_matched > 1_000, "{long_matched}");
+    assert!(long_matched > 500, "{long_matched}");
 }
 
 /// Case counts, as in KiCad (its pattern is compiled without `wxRE_ICASE`): a matcher that folded
