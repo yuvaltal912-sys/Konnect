@@ -51,10 +51,11 @@ of one board with one set of arguments; elapsed time is not.
 The response reports requested/effective `effort` and its limits, actual counters,
 `elapsed_ms` and `exhaustion` reasons. The time limit bounds the search, not the
 preparation before it or the mandatory final consistency checks. Preparation
-builds the audit model, whose netclass pattern matcher is not linear: a crafted
-project with tens of thousands of multi-wildcard netclass patterns can make a
-plan take minutes (`preparation_ms` shows it). Nothing is written and no wrong
-copper results; `audit_layout_quality` has the same cost. A completed checked prefix can survive search exhaustion,
+builds the audit model; its netclass pattern matcher is linear in pattern length
+times net-name length (it was exponential in the number of `*` until row A1), so
+a project file of tens of thousands of multi-wildcard patterns no longer stalls
+it; the cost is still patterns times nets, and `audit_layout_quality` shares it.
+A completed checked prefix can survive search exhaustion,
 but a candidate interrupted during validation is never returned. Output size,
 proposal count and copper-operation bounds remain independent of effort.
 
