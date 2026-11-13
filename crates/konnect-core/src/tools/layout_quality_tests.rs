@@ -2003,8 +2003,20 @@ fn glob_gives_the_same_answer_as_the_recursive_matcher() {
             .wrapping_add(1442695040888963407);
         ((state >> 33) as usize) % n
     };
-    let pattern_alphabet = ['a', 'b', 'é', '*', '*', '?', '?'];
-    let name_alphabet = ['a', 'b', 'é', '*', '?'];
+    // Upper case, a combining accent and a character outside the basic plane join the letters.
+    let pattern_alphabet = [
+        'a',
+        'A',
+        'b',
+        'é',
+        '\u{301}',
+        '\u{1d11e}',
+        '*',
+        '*',
+        '?',
+        '?',
+    ];
+    let name_alphabet = ['a', 'A', 'b', 'é', '\u{301}', '\u{1d11e}', '*', '?'];
     let mut long_matched = 0usize;
     for _ in 0..20_000 {
         let pattern: String = (0..next(13))
@@ -2022,6 +2034,17 @@ fn glob_gives_the_same_answer_as_the_recursive_matcher() {
         long_matched += usize::from(expected);
     }
     assert!(long_matched > 1_000, "{long_matched}");
+}
+
+/// Case counts, as in KiCad (its pattern is compiled without `wxRE_ICASE`): a matcher that folded
+/// case would classify `n_clean` into the class of `N_*`, and the differential test above cannot
+/// say so for a matcher that folds both sides the same way.
+#[test]
+fn glob_counts_case() {
+    assert!(glob("N_*", "N_CLEAN") && glob("n_*", "n_clean") && glob("A?c", "Abc"));
+    assert!(!glob("n_*", "N_CLEAN") && !glob("N_*", "n_clean"));
+    assert!(!glob("a", "A") && !glob("A", "a") && !glob("*a*", "XAX"));
+    assert!(!glob("É*", "école") && glob("é*", "école"));
 }
 
 /// The cost of a match is the pattern length times the name length. The recursive matcher needed
