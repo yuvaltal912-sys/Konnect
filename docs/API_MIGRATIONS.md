@@ -11,9 +11,11 @@ behind `audit_manufacturing` (`dfm::check_acid_traps`) and the corner scan of
 
 - A track shorter than 10 um belongs to the junction it touches and gives no
   direction. Junction keys (track ends within 1 um) joined by such a track are
-  one junction. Autorouters leave tracks of 0.1 to 3 um at bends and tees; the
-  audit used to read their direction, so a 135-degree bend with a 0.1-um track
-  at its vertex counted as a 45-degree acid trap.
+  one junction. Freerouting leaves such tracks while it routes, from 0.1 um up
+  to 9.6 um on a diagonal: its 45-degree corner smoothing stops 0.1 um short of
+  the next corner, and it snaps wire ends to via and pad centres. The audit
+  used to read their direction, so a 135-degree bend with a 0.1-um track at its
+  vertex counted as a 45-degree acid trap.
 - A corner is acute only below 89 degrees, the lower edge of the audit's own
   right-angle band (89 to 91 degrees). A junction at 89.97 degrees used to count
   as acute and is now inside the band.
