@@ -858,7 +858,11 @@ fn freerouting_routes_a_folder() {
                 .map(|mm| (mm * 1000.0).round() as i64)
         };
         let options = ExportOptions {
-            omit_pours: std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some(),
+            pours: if std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some() {
+                PourPolicy::omit()
+            } else {
+                PourPolicy::default()
+            },
             copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
             widths_from_intent: true,
             hole_clearance_um: project_um("min_hole_clearance"),
@@ -867,7 +871,7 @@ fn freerouting_routes_a_folder() {
             println!("ROUTE {name}: project rules could not be read");
             continue;
         };
-        let exported = export_dsn_with_context(&path, &source, &rules, &snapshot, options);
+        let exported = export_dsn_with_context(&path, &source, &rules, &snapshot, options.clone());
         if let Ok(bundle) = &exported {
             for w in bundle
                 .intent_widths
@@ -1081,7 +1085,7 @@ fn omitted_pours_leave_the_dsn_but_stay_in_the_inventory() {
     let board_path = temp.path().join("board.kicad_pcb");
     std::fs::write(&board_path, FOUR_LAYER).unwrap();
     let options = ExportOptions {
-        omit_pours: true,
+        pours: PourPolicy::omit(),
         ..Default::default()
     };
     let bundle = export_dsn_with_options(&board_path, FOUR_LAYER, &rules(), options).unwrap();

@@ -150,6 +150,10 @@ pub(crate) struct ZoneModel {
     layer: String,
     net: Option<String>,
     outline: Vec<(i64, i64)>,
+    /// The zone's `uuid` (or the older `tstamp`), shared by its layers.
+    uuid: Option<String>,
+    /// The zone's `name`, when it has a non-empty one.
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,6 +194,25 @@ struct Manifest {
     /// Nets widened to their design-intent current.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     intent_widths: Vec<serde_json::Value>,
+    /// Every copper pour, one row per pour and copper layer, with what the
+    /// export did with it and which rule chose that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pours: Vec<ManifestPour>,
+}
+
+/// One copper pour on one copper layer, as the export treated it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+struct ManifestPour {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    net: String,
+    layer: String,
+    /// `fixed` (written as a plane of its net) or `omit` (left out).
+    policy: PourMode,
+    /// `default`, or `zones[i]` for the rule that chose the policy.
+    chosen_by: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -476,12 +499,89 @@ pub(crate) fn widen_for_intent(
     Ok((out, report))
 }
 
+/// What the router is given for one copper pour on one copper layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PourMode {
+    /// A Specctra `plane` of the pour's net, from the zone outline (KiCad's
+    /// own exporter writes the same). Freerouting 2.5.0 reads it as a
+    /// conduction area that does not block other nets: it counts the net's
+    /// pads inside the outline as connected, and other nets' tracks may cross
+    /// it, which cuts the real pour.
+    #[default]
+    Fixed,
+    /// Left out of the DSN: the router may route anywhere in the pour's area,
+    /// and the pour's net is routed as track.
+    Omit,
+}
+
+/// Which pours one rule of a per-zone policy picks. Every given selector must
+/// match; a rule gives at least one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PourSelector {
+    /// The zone's `uuid` (or the older `tstamp`).
+    pub uuid: Option<String>,
+    /// The zone's `name`.
+    pub name: Option<String>,
+    /// The zone's net.
+    pub net: Option<String>,
+    /// One copper layer of the zone.
+    pub layer: Option<String>,
+}
+
+/// One rule of a per-zone policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PourRule {
+    pub select: PourSelector,
+    pub policy: PourMode,
+}
+
+/// The most rules one `pours` object may hold.
+pub(crate) const MAX_POUR_RULES: usize = 256;
+
+/// The caller's choice of what happens to each copper pour: `default` for
+/// every pour no rule picks, and the rules, which never disagree on a pour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PourPolicy {
+    pub default: PourMode,
+    pub zones: Vec<PourRule>,
+}
+
+impl PourPolicy {
+    /// Every pour left out (`pours: "omit"`).
+    pub(crate) fn omit() -> Self {
+        PourPolicy {
+            default: PourMode::Omit,
+            zones: Vec::new(),
+        }
+    }
+
+    /// Reads the `pours` argument: absent, `"fixed"`, `"omit"`, or an object
+    /// with an optional `default` and a `zones` list of rules.
+    pub(crate) fn from_argument(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        match value {
+            None => Ok(PourPolicy::default()),
+            Some(serde_json::Value::String(mode)) if mode == "fixed" => Ok(PourPolicy::default()),
+            Some(serde_json::Value::String(mode)) if mode == "omit" => Ok(PourPolicy::omit()),
+            // S6 second half: the per-zone object is not built yet.
+            Some(_) => Err("must be 'fixed' or 'omit'".to_string()),
+        }
+    }
+
+    /// Whether this policy can leave any pour out of the DSN.
+    pub(crate) fn may_omit(&self) -> bool {
+        self.default == PourMode::Omit
+            || self.zones.iter().any(|rule| rule.policy == PourMode::Omit)
+    }
+}
+
 /// Choices the caller makes about what the router is given.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ExportOptions {
-    /// Leave copper pours out of the DSN, so the router may route through
-    /// their area (refill them after the import). Rule areas stay.
-    pub omit_pours: bool,
+    /// What happens to each copper pour: written as a plane of its net
+    /// (`fixed`, the default) or left out so the router may route through
+    /// its area (refill after the import). Rule areas always stay.
+    pub pours: PourPolicy,
     /// The project's copper-to-board-edge clearance, recorded in the manifest
     /// for the router (the DSN has no place for it).
     pub copper_edge_clearance_um: Option<i64>,
@@ -554,9 +654,14 @@ pub(crate) fn export_dsn_with_options(
     // What the router is given: every rule area, and the pours unless the
     // caller left them out. The manifest still counts the board's pours, so
     // the importer can check the board kept them.
+    if !options.pours.zones.is_empty() {
+        // S6 second half: per-zone rules are not resolved yet.
+        bail!("per-zone pours are not supported yet");
+    }
+    let omit_pours = options.pours.default == PourMode::Omit;
     let routed_zones: Vec<ZoneModel> = zones
         .iter()
-        .filter(|zone| !(options.omit_pours && zone.kind == ZoneKind::Plane))
+        .filter(|zone| !(omit_pours && zone.kind == ZoneKind::Plane))
         .cloned()
         .collect();
     for zone in &routed_zones {
@@ -626,7 +731,7 @@ pub(crate) fn export_dsn_with_options(
         board_path,
         &source_sha256,
         &manifest_classes,
-        options,
+        &options,
         hole_keepout_growth_um,
         footprints_without_pads,
         board_keepouts.len(),
@@ -1786,12 +1891,22 @@ pub(crate) fn zones(
         };
         let outline = zone_outline(zone)
             .with_context(|| format!("unsupported first routing profile: zone '{name}'"))?;
+        let uuid = zone
+            .find_str("uuid")
+            .or_else(|| zone.find_str("tstamp"))
+            .map(str::to_string);
+        let zone_name = zone
+            .find_str("name")
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
         for layer in copper {
             out.push(ZoneModel {
                 kind,
                 layer,
                 net: net.clone(),
                 outline: outline.clone(),
+                uuid: uuid.clone(),
+                name: zone_name.clone(),
             });
         }
     }
@@ -1866,6 +1981,20 @@ pub(crate) fn zone_counts(board_source: &str) -> Result<(usize, usize)> {
         zones.iter().filter(|z| z.kind == ZoneKind::Plane).count(),
         zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
     ))
+}
+
+/// One `plane` in a DSN's structure: what the router was given as a pour.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DsnPlane {
+    pub net: String,
+    pub layer: String,
+}
+
+/// The planes a DSN gives the router, read from the DSN itself, so a DSN
+/// with no manifest beside it is judged the same way.
+pub(crate) fn dsn_planes(_dsn: &str) -> Result<Vec<DsnPlane>> {
+    // S6 second half: not read yet.
+    Ok(Vec::new())
 }
 
 /// A board file name as a DSN token: whitespace, quotes and parentheses
@@ -3035,7 +3164,7 @@ fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
     classes: &[ManifestClass],
-    options: ExportOptions,
+    options: &ExportOptions,
     hole_keepout_growth_um: Option<i64>,
     footprints_without_pads: usize,
     board_keepout_count: usize,
@@ -3126,7 +3255,7 @@ fn build_manifest(
             zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
             footprints_without_pads,
-            pours_omitted: options.omit_pours,
+            pours_omitted: options.pours.default == PourMode::Omit,
             copper_edge_clearance_um: options.copper_edge_clearance_um,
             hole_clearance_um: options.hole_clearance_um,
             hole_keepout_growth_um,
@@ -3154,6 +3283,8 @@ fn build_manifest(
         padstacks,
         classes: classes.to_vec(),
         intent_widths: Vec::new(),
+        // S6 second half: the per-pour rows are not written yet.
+        pours: Vec::new(),
     })
     .context("serialize routing manifest")
 }

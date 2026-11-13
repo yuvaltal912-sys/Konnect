@@ -519,6 +519,17 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
     report
 }
 
+/// How many connections Freerouting's job log says were left unrouted at the
+/// end of the job: the last "(N unrouted" summary of the autorouter or the
+/// optimizer, or the count in "Skipping optimization stage". `None` when the
+/// log holds no such line. This is the router's own count: a pad inside a
+/// plane's outline counts as connected, so KiCad's DRC after a refill is the
+/// judge of completion.
+pub(crate) fn router_unrouted(_log: &Value) -> Option<u32> {
+    // S6 second half: not read yet.
+    None
+}
+
 pub(crate) async fn route_local(
     jar: &Path,
     dsn: &Path,
@@ -1430,6 +1441,42 @@ mod tests {
             .stop_reason
             .unwrap()
             .starts_with("the board has 1 unrouted connection(s)"));
+    }
+
+    /// The router's own unrouted count comes from the job log's summaries:
+    /// the autorouter stage, then each optimizer pass, and the line that says
+    /// the optimizer was skipped because connections were left.
+    #[test]
+    fn the_routers_unrouted_count_is_read_from_the_job_log() {
+        let log = |messages: &[&str]| json!({ "body": messages.iter().map(|m| json!({ "type": "INFO", "message": m })).collect::<Vec<_>>() });
+        let routed = log(&[
+            "[1E3FC3] Auto-routing stage started on board 'b1' with baseline score 259.56 for 149 unrouted items.",
+            "[1E3FC3] Auto-routing pass #1 on board 'b1' was completed in 4.90 seconds with score 792.35 (38 unrouted and 0 violations), using 4.88 CPU seconds",
+            "[1E3FC3] Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations), using 19.88 total CPU seconds",
+            "[1E3FC3] Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (0 unrouted and 0 violations).",
+            "[1E3FC3] Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 576.05, final router score: 1000.00, final optimizer score: 579.82",
+        ]);
+        assert_eq!(router_unrouted(&routed), Some(0));
+        let left = log(&[
+            "[1E3FC3] Auto-routing pass #20 on board 'b1' was completed in 0.36 seconds with score 994.54 (12 unrouted and 0 violations)",
+            "[1E3FC3] Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 994.54 (12 unrouted and 0 violations)",
+            "[1DA299] Skipping optimization stage: the board has 12 unrouted connection(s) (optimizer only runs on completely routed boards).",
+        ]);
+        assert_eq!(router_unrouted(&left), Some(12));
+        // The skip line alone is enough.
+        let skipped = log(&["[1DA299] Skipping optimization stage: the board has 3 unrouted connection(s) (optimizer only runs on completely routed boards)."]);
+        assert_eq!(router_unrouted(&skipped), Some(3));
+        // A pass line is not the end of the job: the stage summary is.
+        let stage = log(&[
+            "Auto-routing pass #1 on board 'b1' was completed in 4.90 seconds with score 792.35 (38 unrouted and 0 violations)",
+            "Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+        ]);
+        assert_eq!(router_unrouted(&stage), Some(0));
+        // "149 unrouted nets" at the start of a stage is not a result.
+        let started = log(&["Auto-routing stage started on board 'b1' with baseline score 259.56 for 149 unrouted items."]);
+        assert_eq!(router_unrouted(&started), None);
+        assert_eq!(router_unrouted(&json!({ "body": [] })), None);
+        assert_eq!(router_unrouted(&json!(null)), None);
     }
 
     /// 2.5.0's BatchOptimizer also stops on its stage time limit and its item

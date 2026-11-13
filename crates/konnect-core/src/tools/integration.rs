@@ -226,10 +226,42 @@ fn route_settings(
     })
 }
 
+/// What a routing run can say about completion, from Freerouting's own
+/// unrouted count and the planes its DSN held. `complete`: the router left
+/// nothing and was given no plane. `incomplete`: it left connections.
+/// `unverified`: it left nothing but was given a plane (it counts a pad inside
+/// a plane's outline as connected, while the new tracks cut the real pour), or
+/// its count could not be read. A run with a plane is never `complete`; KiCad's
+/// DRC after a refill is the judge.
+#[cfg_attr(not(test), allow(dead_code))]
+fn routing_status(
+    _planes: &[crate::specctra::DsnPlane],
+    _router_unrouted: Option<u32>,
+) -> &'static str {
+    // S6 second half: not judged yet.
+    "complete"
+}
+
 #[cfg(test)]
 mod route_rule_tests {
-    use super::{allow_neckdown, route_settings};
+    use super::{allow_neckdown, route_settings, routing_status};
     use serde_json::json;
+
+    #[test]
+    fn a_run_with_planes_is_never_reported_complete() {
+        let plane = crate::specctra::DsnPlane {
+            net: "GND".into(),
+            layer: "B.Cu".into(),
+        };
+        let one = std::slice::from_ref(&plane);
+        assert_eq!(routing_status(&[], Some(0)), "complete");
+        assert_eq!(routing_status(one, Some(0)), "unverified");
+        assert_eq!(routing_status(one, Some(2)), "incomplete");
+        assert_eq!(routing_status(&[], Some(2)), "incomplete");
+        // An unreadable count is never read as complete.
+        assert_eq!(routing_status(&[], None), "unverified");
+        assert_eq!(routing_status(one, None), "unverified");
+    }
 
     #[test]
     fn measured_preset_is_sent_by_default_and_existing_overrides_survive() {

@@ -758,16 +758,15 @@ async fn handle_export_specctra_dsn(
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
-    let omit_pours = match args.get("pours").and_then(serde_json::Value::as_str) {
-        None | Some("fixed") => false,
-        Some("omit") => true,
-        Some(_) => {
-            return Ok(invalid_export_argument(
-                "pours",
-                "must be 'fixed' or 'omit'",
-            ))
-        }
+    // A JSON null is an omitted argument, as before.
+    let pours = match crate::specctra::PourPolicy::from_argument(
+        args.get("pours").filter(|value| !value.is_null()),
+    ) {
+        Ok(pours) => pours,
+        Err(reason) => return Ok(invalid_export_argument("pours", reason)),
     };
+    // Whether any pour can be left out, which only the Rust exporter does.
+    let omit_pours = pours.may_omit();
     let widths_from_intent = args["widths_from_intent"].as_bool().unwrap_or(true);
     // The project's copper-to-edge clearance (`min_copper_edge_clearance`),
     // which the DSN cannot hold; the manifest carries it to the router.
@@ -876,7 +875,7 @@ async fn handle_export_specctra_dsn(
             &rules,
             &snapshot_for_ipc,
             crate::specctra::ExportOptions {
-                omit_pours,
+                pours,
                 copper_edge_clearance_um,
                 widths_from_intent,
                 hole_clearance_um,
@@ -1322,6 +1321,64 @@ mod new_export_format_tests {
             Some("conflict")
         );
         assert_eq!(std::fs::read_to_string(output).unwrap(), "do not replace");
+    }
+
+    /// S6 second half: the per-zone `pours` object is read before anything
+    /// reaches KiCad. A malformed one is an invalid argument naming what is
+    /// wrong, and a policy that can leave a pour out still refuses `require`.
+    #[tokio::test]
+    async fn specctra_export_reads_a_per_zone_pours_object_before_ipc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        let output = dir.path().join("board.dsn");
+        std::fs::write(&board, "(kicad_pcb)").expect("board fixture");
+        let call = |pours: serde_json::Value, mode: &str| {
+            let args = json!({ "board": board, "output": output, "pours": pours, "native_bridge_mode": mode });
+            async move {
+                handle_export_specctra_dsn(&args, &test_ctx())
+                    .await
+                    .expect("an MCP result")
+            }
+        };
+        let text = |result: &CallToolResult| match result.content.first().unwrap() {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text result"),
+        };
+        let bad = call(
+            json!({ "zones": [{ "zone": "GND_TOP", "policy": "omit" }] }),
+            "disable",
+        )
+        .await;
+        assert!(bad.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&bad).as_deref(),
+            Some("invalid_argument")
+        );
+        assert!(text(&bad).contains("zone"), "{}", text(&bad));
+        let required = call(
+            json!({ "zones": [{ "net": "GND", "layer": "F.Cu", "policy": "omit" }] }),
+            "require",
+        )
+        .await;
+        assert!(required.is_error);
+        assert!(
+            text(&required).contains("Rust exporter"),
+            "{}",
+            text(&required)
+        );
+        // A well-formed object gets past argument checks (and then needs KiCad).
+        let good = call(
+            json!({ "default": "fixed", "zones": [{ "net": "GND", "policy": "omit" }] }),
+            "disable",
+        )
+        .await;
+        assert_ne!(
+            crate::mcp::error::extract_error_kind(&good).as_deref(),
+            Some("invalid_argument"),
+            "{}",
+            text(&good)
+        );
+        assert!(!output.exists());
     }
 
     #[tokio::test]
