@@ -490,3 +490,13 @@ fn a_piece_snapped_to_a_via_centre_is_read_inside_that_via() {
     let report = check_board(&geometry(&with_via("OTHER")), &jlc());
     assert_eq!(issues_with(&report, "Acid trap").len(), 1);
 }
+
+/// Exactly 89 degrees is a right angle and not acute: the two readings split
+/// the line without overlap or gap.
+#[test]
+fn exactly_eighty_nine_degrees_is_a_right_angle_not_an_acute_corner() {
+    assert!(!is_acute(89.0));
+    assert!(is_right_angle(89.0));
+    assert!(is_acute(89.0 - 1e-9));
+    assert!(!is_right_angle(89.0 - 1e-9));
+}
