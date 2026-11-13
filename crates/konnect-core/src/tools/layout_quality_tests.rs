@@ -2143,3 +2143,24 @@ fn a_jog_at_a_135_degree_bend_is_a_right_angle_only_from_ten_micrometres() {
         assert_eq!(m["junctions_with_short_tracks"], 1 - right, "{m}");
     }
 }
+
+/// An acute finding names the tracks that meet at its junction, at every key:
+/// a real 45-degree V whose legs end 9 um apart, joined by a short piece. A
+/// track of the same net and layer elsewhere on the board is not named.
+#[test]
+fn an_acute_finding_names_the_tracks_at_every_key_of_its_junction() {
+    let j1 = (JN.0 + 0.009, JN.1);
+    let t = [
+        (JN, leg_at(180., 3.)),
+        (JN, j1),
+        (j1, (j1.0 - 2.12132, j1.1 + 2.12132)),
+        ((40., 30.), (43., 30.)),
+    ];
+    let r = run(&corner_board(&t));
+    let fs: Vec<_> = findings(&r, "5.3")
+        .into_iter()
+        .filter(|f| f["severity"] == "warning")
+        .collect();
+    assert_eq!(fs.len(), 1, "{fs:?}");
+    assert_eq!(fs[0]["uuids"], json!(["t0", "t1", "t2"]), "{fs:?}");
+}
