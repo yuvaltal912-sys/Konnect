@@ -858,10 +858,17 @@ fn freerouting_routes_a_folder() {
                 .map(|mm| (mm * 1000.0).round() as i64)
         };
         let options = ExportOptions {
-            pours: if std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some() {
-                PourPolicy::omit()
-            } else {
-                PourPolicy::default()
+            // `KONNECT_PROBE_POURS=<pours JSON>` (a string or a per-zone
+            // object) wins over `KONNECT_PROBE_OMIT_POURS`.
+            pours: match std::env::var("KONNECT_PROBE_POURS") {
+                Ok(text) => PourPolicy::from_argument(Some(
+                    &serde_json::from_str(&text).expect("KONNECT_PROBE_POURS is JSON"),
+                ))
+                .expect("KONNECT_PROBE_POURS is a pours argument"),
+                Err(_) if std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some() => {
+                    PourPolicy::omit()
+                }
+                Err(_) => PourPolicy::default(),
             },
             copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
             widths_from_intent: true,
@@ -884,8 +891,12 @@ fn freerouting_routes_a_folder() {
                 );
             }
         }
-        let Ok(bundle) = exported else {
-            continue; // the export probe reports refusals
+        let bundle = match exported {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                println!("EXPORT {name}: refused: {error:#}");
+                continue;
+            }
         };
         let work = tempfile::tempdir().unwrap();
         // `KONNECT_PROBE_KEEP=<dir>` keeps each DSN and SES for inspection.

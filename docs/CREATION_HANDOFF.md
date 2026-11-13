@@ -43,6 +43,7 @@ Owner decisions (2026-11-06, research §5):
 | B4 pause (2026-11-10, newer) | Owner explicitly paused PR #65 before completion. Preserve the current dirty implementation and evidence; start no code, test/build/native/instrumentation/review work until the owner explicitly resumes. This supersedes finishing PR #65 before stopping. Astra remains High; S7 owns AGENTS.md |
 | B4 resume (2026-11-12) | Owner resumed PR #65 through a Claude supervisor session that directs one implementation worker in the cross-sheet worktree. This supersedes the pause row above. Scope is unchanged: finish PR #65 only, then stop; no new row starts from that branch. |
 | B4 same-name sheet pins (2026-11-12) | Owner approved on 2026-11-12 ("כן, להשאיר": yes, keep it). Several pins of one name on one sheet symbol tie their parent nets together through the child's hierarchical label. The review keeps that join, stays complete, and reports it as a note (`connectivity.notes`; `circuit.connectivity_notes` in `run_design_review`), with no gap and no diagnostic. Reason: KiCad joins them, so nothing is unknown, and a diagnostic would turn a known result into INCOMPLETE. KiCad 10.0.1, `eeschema/connection_graph.cpp`, `CONNECTION_GRAPH::propagateToNeighbors`, lines 2866 to 2948: each hierarchical label looks up every parent subgraph that holds a sheet pin of its name on the same sheet instance. This replaces the "named gap" wording of verification-plan row H04. |
+| S6 second half design (2026-11-13) | Creation supervisor, under the owner's delegation of 2026-11-13. (1) Per-zone `pours` values are `fixed` and `omit` only: `fixed` already writes a Specctra plane, which Freerouting 2.5.0 reads as a conduction area that other nets may cross, so "fixed copper" and "plane" are one DSN form; the public name `fixed` stays, and the docs now say what the router receives. (2) Stitching is a next-step instruction in the routing result (`completion.next_steps`) plus the same sequence in the `kicad-pcb` skill, not a step inside the tool: `route_specctra_dsn` works on files, while apply, refill and `route_batch` need the live board, and no hidden write path is allowed. Every tool and parameter the steps name is checked against the registry by a test. (3) `status` and `completion` are additive; `success` keeps its meaning. (4) A `pours` value that is not a string or an object is refused by the handler too (the schema already refused it at dispatch) |
 | S7 effort control (2026-11-10) | Owner explicitly requested configurable compute quota and a shipped-agent question about effort. Supervisor approved named quick/standard/deep levels plus a bounded custom budget with conflicting selectors refused; geometry/safety and response limits do not relax. Ask once if no effort choice/delegation exists, reuse it, ask before increasing. Backend defaults remain usable. Final numeric tiers require measured rationale; published timing guidance uses public fixtures/demos, private timings remain ignored. This does not add approval prompts to authorized validation runs |
 | S7 inherited clearance (2026-11-12) | Owner approved ("כן, בתנאי הזה") the planner rule that a corner repair may keep the saved clearance of the leg it shortens instead of the extra 0.01 mm margin: only against an exactly modelled obstacle, never closer than the replaced leg, never below the nominal clearance. Reason: autorouted copper already sits at exactly the nominal clearance, so the extra margin blocked most corner repairs. **Condition:** the native matrix shows no new DRC entry on any of the 11 cases. If one case shows one, the rule is not approved as it stands: stop and report, do not tune it to pass |
 | S7 inherited clearance, outcome (2026-11-13) | Owner kept the rule ("כן לפי ההמלצות שלך"), although his condition was not met as worded. What he was shown: 5 new DRC identities on 3 of the 11 cases; none involves copper the plan created or changed; no clearance, short, hole or edge entry on any case in any round; 3 are an `unconnected_items` relabel that KiCad also produces with no planner on byte-identical boards; 2 are a one-for-one exchange of a `solder_mask_bridge` entry, whose trigger was not reproduced; DRC totals on those cases fell from 167 to 152–153. No source change follows |
@@ -447,6 +448,39 @@ Their counts are in PR #64's body, and the evidence folders are
 
 **Next.** None on this branch once #64 is merged; the next creation row waits
 for the owner's word.
+
+## Row S6, second half: per-zone pours and stitching after refill (PR #66)
+
+**State.** Implemented on branch `claude/creation-s6b-pour-policy`, base `fork/main` `61b96dc`. The claim was published as draft [PR #66](https://github.com/yuvaltal912-sys/Konnect/pull/66). GitHub is the source of truth for this PR's state. The design rulings are in the decision table ("S6 second half design").
+
+**What it adds.**
+
+- **Per-zone `pours` in `export_specctra_dsn`.**
+  - Besides `"fixed"` and `"omit"`, `pours` takes an object: an optional `default`, and a `zones` list of rules. Each rule has `uuid`, `name`, `net` and `layer` selectors, all of which must match, plus a `policy` of `fixed` or `omit`.
+  - The unit is one pour on one copper layer, which is what the DSN writes, so `layer` can split a two-layer zone.
+  - Refused: unknown keys and values, a rule with no selector or no policy, an empty selector, more than 256 rules, a non-copper layer, a rule that picks no pour (a rule area is named), and rules that disagree about one pour layer.
+  - The manifest lists every pour layer with its policy and the rule that chose it (`pours`). The importer accepts that list and older manifests without it.
+  - Code: `PourPolicy`, `pour_decisions` and the manifest rows, all in `specctra.rs`; the schema and argument reading in `tools/pcb_export.rs`.
+- **Honest routing results in `route_specctra_dsn`.**
+  - `freerouting_mcp.rs` reads Freerouting's own unrouted count from the job log (`router_unrouted`, the last autorouter or optimizer summary).
+  - `tools/integration.rs` reads the planes from the DSN itself (`specctra::dsn_planes`) and names their zones from the manifest beside it.
+  - New `status`: `complete` only with 0 unrouted and no plane; `incomplete` when the router left connections; `unverified` otherwise.
+  - New `completion`: what decides (KiCad DRC after a refill), the exact `next_steps`, and, with planes, `if_still_open`. 1 to 10 open connections are reported as open; above 10, the steps fall back to `pours: "omit"`.
+  - Code: `routing_status` and `completion_report` in `tools/integration.rs`.
+- **Docs.** The `kicad-pcb` skill teaches the same sequence (Freerouting round trip, step 7). It, `tool-directory.md`, `DEV.md` and `docs/API_MIGRATIONS.md` now say what `fixed` really writes.
+
+**For S9, which edits the same two files next.**
+
+- `status` and `completion` are built in one function, `completion_report` in `tools/integration.rs`. Its unrouted count comes from `RouteEvidence.router_unrouted` in `freerouting_mcp.rs`.
+- S9's `complete_with_width_exceptions` and `stopped` can be added in `routing_status` without touching the rest.
+- One rule must stay: with any plane in the DSN, `status` is never `complete`, because Freerouting counts a pad inside a plane as connected.
+- When S9 runs several passes, the count to pass in is the last pass's.
+
+**Known limits.**
+
+- A pour form that blocks other nets has no per-zone switch in Freerouting 2.5.0: `plane_as_obstacle` is board-wide, and a DSN plane is read with `isObstacle = false`. Evidence: bytecode notes in the main checkout, `target/creation-research/resolution-evidence/notes/rank32-checks-backlog.md` §3 and `notes/routing-quality.md` (ignored files).
+- The steps cannot run inside the routing call. Apply, refill and `route_batch` need the live board.
+- The planner's stitching closes only the open connections it finds a safe via position for. On S5's plane boards, S7 measured 19 open falling to 4 or 5 at the default 3 mm radius.
 
 ## Row S6, first half: pour widths and measured preset (PR #62)
 

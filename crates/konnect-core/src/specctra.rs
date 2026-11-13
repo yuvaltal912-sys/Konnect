@@ -134,7 +134,8 @@ struct LockedViaModel {
 /// What a copper zone or rule area means to the router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZoneKind {
-    /// A net's copper pour: fixed copper of that net, a Specctra `plane`.
+    /// A net's copper pour, written as a Specctra `plane` of that net unless
+    /// the pour policy leaves it out.
     Plane,
     /// No tracks or vias.
     KeepoutAll,
@@ -226,7 +227,8 @@ struct SupportedProfile {
     #[serde(default)]
     locked_via_count: usize,
     copper_zones: bool,
-    /// Copper pours written as fixed planes, one per pour and layer.
+    /// The board's copper pours, one per pour and layer, whether written as
+    /// planes or left out (`pours` says which).
     #[serde(default)]
     zone_plane_count: usize,
     /// Rule areas that forbid tracks or vias, one per area and layer.
@@ -2037,8 +2039,10 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
 
 /// The board's copper zones and rule areas as the router sees them.
 ///
-/// A pour with a net is fixed copper of that net (a Specctra `plane`, which is
-/// how KiCad's own DSN export writes one). A rule area that forbids tracks or
+/// A pour with a net is a Specctra `plane` of that net (how KiCad's own DSN
+/// export writes one); Freerouting 2.5.0 reads a plane as a conduction area
+/// that does not block other nets, and counts the net's pads inside it as
+/// connected. A rule area that forbids tracks or
 /// vias is a keepout. The zone's outline is used, not its fill, so thermal
 /// reliefs and clearance gaps are not modelled: copper the fill will not reach
 /// can still look connected to the router, which is why DRC after a refill is

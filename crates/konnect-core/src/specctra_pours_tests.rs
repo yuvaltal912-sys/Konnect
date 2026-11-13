@@ -574,3 +574,44 @@ fn the_planes_a_dsn_gives_the_router_are_read_from_the_dsn() {
     assert!(dsn_planes(&none.dsn).unwrap().is_empty());
     assert!(dsn_planes("not a dsn").is_err());
 }
+
+/// The synthetic routing fixture exports in both shapes the measurement
+/// uses: every pour out, or the top pour out and the bottom one as a plane.
+#[test]
+fn the_pour_routing_fixture_exports_with_and_without_its_bottom_plane() {
+    let board = include_str!("../tests/fixtures/specctra_pours_routing.kicad_pcb");
+    let rules: IpcEffectiveRoutingRules = std::iter::once("GND".to_string())
+        .chain((1..=6).map(|k| format!("S{k}")))
+        .map(|net| {
+            (
+                net,
+                IpcRoutingRules {
+                    class_name: "Default".into(),
+                    constituents: vec!["Default".into()],
+                    track_width_mm: Some(0.25),
+                    clearance_mm: Some(0.2),
+                    via_diameter_mm: Some(0.6),
+                    via_drill_mm: Some(0.3),
+                },
+            )
+        })
+        .collect();
+    let export = |pours: serde_json::Value| {
+        export_dsn_with_options(
+            Path::new("specctra_pours_routing.kicad_pcb"),
+            board,
+            &rules,
+            ExportOptions {
+                pours: policy(pours).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    assert!(planes_of(&export(json!("omit")).dsn).is_empty());
+    let plane = export(json!({ "zones": [{ "name": "GND_TOP", "policy": "omit" }] }));
+    assert_eq!(planes_of(&plane.dsn), vec![pair("GND", "B.Cu")]);
+    let manifest: serde_json::Value = serde_json::from_str(&plane.manifest).unwrap();
+    assert_eq!(manifest["components"].as_array().unwrap().len(), 12);
+    assert_eq!(manifest["nets"].as_array().unwrap().len(), 7);
+}

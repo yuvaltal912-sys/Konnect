@@ -1496,6 +1496,12 @@ mod tests {
             "[1DA299] Skipping optimization stage: the board has 12 unrouted connection(s) (optimizer only runs on completely routed boards).",
         ]);
         assert_eq!(router_unrouted(&left), Some(12));
+        // The last summary wins: an optimizer pass after the stage counts.
+        let later = log(&[
+            "Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+            "Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (1 unrouted and 0 violations).",
+        ]);
+        assert_eq!(router_unrouted(&later), Some(1));
         // The skip line alone is enough.
         let skipped = log(&["[1DA299] Skipping optimization stage: the board has 3 unrouted connection(s) (optimizer only runs on completely routed boards)."]);
         assert_eq!(router_unrouted(&skipped), Some(3));

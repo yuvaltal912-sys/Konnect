@@ -3,6 +3,62 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: per-zone pours and an honest routing status
+
+Creation row S6, second half (`docs/CREATION_HANDOFF.md`). Additive, plus one
+narrowed input.
+
+- **What `pours: "fixed"` writes, stated correctly.** It writes each copper
+  pour as a Specctra `plane` of its net, from the zone outline. Freerouting
+  2.5.0 reads a plane as a conduction area that does not block other nets: it
+  counts the net's pads inside the outline as connected and lets other nets'
+  tracks cross it, which cuts the real pour. Earlier text called this "fixed
+  copper". The DSN is unchanged. There is no per-zone way to give the router
+  a pour that blocks other nets.
+- **`export_specctra_dsn.pours`** also takes an object:
+  `{"default": "fixed"|"omit", "zones": [{"uuid"?, "name"?, "net"?,
+  "layer"?, "policy": "fixed"|"omit"}]}`. `default` is optional (`fixed`).
+  A rule picks every pour layer that matches all of its selectors, and
+  needs at least one. A zone on two layers is two pour layers, so `layer`
+  can split it. Pours no rule picks get `default`. Refused: an unknown key
+  or policy; a rule with no selector or no policy; an empty selector; more
+  than 256 rules; a `layer` the board has no copper on; a rule that picks
+  no pour (one that picks only a rule area names it; rule areas always
+  stay); two rules that give one pour layer different policies (both rule
+  indexes and the pour are named). Rules that agree are accepted. An object
+  with no rules writes the same DSN and manifest as its string. If any pour
+  can be left out, `native_bridge_mode: "require"` is refused and
+  `"prefer"` uses the Rust exporter, as with `"omit"`.
+- **The reverse manifest** adds `pours`: one row per pour layer with
+  `uuid`, `name`, `net`, `layer`, `policy` and `chosen_by` (`"default"` or
+  `"zones[i]"`). `supported_profile.pours_omitted` keeps its meaning: true
+  when no pour reached the router, and the caller asked for that.
+  `plan_specctra_ses_import` and `apply_specctra_ses` accept the new rows
+  and older manifests without them.
+- **Behaviour change, `pours` that is not a string or an object.** Before,
+  the handler read any non-string `pours` (`null`, a number, a list) as
+  `"fixed"`. Through MCP the declared schema already refused such a value
+  at dispatch, so only in-process calls of the handler saw the silent
+  `fixed`. Now the handler refuses it too, with `invalid_argument` naming
+  the value, `null` included.
+- **`route_specctra_dsn`** adds `status` and `completion`. `success` keeps
+  its meaning (the job ran and the SES was written).
+  - `status`:
+    - `complete`: Freerouting's job log reports 0 unrouted and the DSN gave it no plane.
+    - `incomplete`: the log reports more than 0.
+    - `unverified`: the log reports 0 but a plane was given, or the count or the DSN's planes could not be read.
+
+    A run with a plane is never `complete`.
+  - `completion`:
+    - `router_unrouted`: the last autorouter or optimizer summary in the job log, else `null`.
+    - `planes`: net, layer, and the zones that made the plane (from the manifest beside the DSN).
+    - `judge` and `complete_when`: complete only when KiCad's DRC on the applied and refilled board reports 0 unconnected items.
+    - `reason`.
+    - `next_steps`: exact calls to `plan_specctra_ses_import`, `apply_specctra_ses` and `run_drc`. With planes, also `plan_route_refinement` with `kinds: ["stitching"]` and the plane nets, `route_batch` with the plan's `vias`, and `run_drc` again, repeated for at most 4 rounds.
+    - `if_still_open`, with planes: report 1 to 10 open connections as open, the routing not complete. Above 10, fall back: export again with `pours: "omit"` and route again.
+
+    With no manifest beside the DSN, `next_steps` is empty and `next_steps_missing` says why.
+
 ## Unreleased: read-only route-refinement plans
 
 Creation row S7. New `plan_route_refinement` in `pcb_routing` supplies a second

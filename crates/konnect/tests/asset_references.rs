@@ -1016,6 +1016,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_started",
         "depends_on",
         "saved_clearances_inherited",
+        // Result fields of `route_specctra_dsn` (`completion`).
+        "next_steps",
+        "complete_when",
     ];
 
     let mut phantom = Vec::new();
