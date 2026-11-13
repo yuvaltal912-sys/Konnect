@@ -1,8 +1,10 @@
 # Creation handoff
 
+**S11 resumed 2026-11-12; implemented, reviewed and gated 2026-11-13.** The owner resumed PRs #63, #64 and #65 under one supervisor session (decision row "Claude resume of three PRs"); the 2026-11-10 pause no longer applies to #64. S11 runs as Claude (`claude-opus-5-5`, `xhigh`). Current state: "Row S11: suspected zone-fill defects".
+
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-13 (Row S7). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 268 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged at `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Row S6, first half" retains the delivered runtime evidence.
+**Last updated:** 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 268 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
 
 ## Start here
 
@@ -24,9 +26,22 @@ Owner decisions (2026-11-06, research §5):
 | Q2 | Freerouting is the route path, after the core PRs (1 to 15). Widen the DSN profile (rank 32) first. Until then PR 5 documents it with its limits. **Amended 2026-11-06:** a focused part of rank 32 moves up as PR 2b, between PR 2 and PR 3, after a routing run on a real board went badly: the DSN export refused a rounded outline, Freerouting was not installed, and the AI hand-rolled its own router and left ground connections unrouted. PR 2b makes the DSN export accept rounded and arc outlines and roundrect pads, keep existing zones and pours as fixed copper, and gives an install path or clear setup guidance for Freerouting. More layers and back-side parts stay in rank 32 for later |
 | Q3 | One design-intent record per project (rails, currents, interfaces, fab target). Ranks 12, 29 and 38 read from it. It gets its own PR before PR 11; PR 11 may take a per-call currents argument as an interim |
 | Q4 | KiCad 10 variants and jobsets stay parked (`ROADMAP.md`) |
+| Cross-sheet review, B4 (2026-11-10) | Owner requested another independent creation session; the supervisor selected Step 13 item 4, the #55 follow-up, and confirmed the narrow review/diagnostics/check integration. Reason: its source ownership is separate from S7/S11, and the plan needs no extra owner design decision. Heavy checks are serialized. Owner subsequently delegated future approvals to supervisor judgment; the supervisor reviews this exact claim text. No independent merge, CI/Actions or auto-merge is authorized |
 | S6 first half (2026-11-10) | Owner approved keeping pour-owning nets at their effective class width and shipping S5’s measured router preset, as one PR. Reason: S5 supports these two changes; per-zone policy and stitching stay deferred. Run checks end to end, then show exact title/body before any push or PR |
 | S6 publication and merge (2026-11-10) | After seeing the exact title/body, the owner asked to merge this S6 work before switching sessions. This authorizes publishing and merging PR #62 with the shown text, using the noreply merge command; it does not start another row or authorize CI/auto-merge |
+| S11 parallel preparation (2026-11-10) | Owner authorized independent creation work alongside S7; supervisor selected S11 and later added separate cross-sheet review. Separate worktrees/source ownership; heavy slots are S7, S11, then cross-sheet. Exact claim publication text still needs approval; no merge, simulation implementation, CI or auto-merge is authorized |
+| S11 claim publication (2026-11-10) | Owner explicitly approved pushing `a423ec8` to `fork` and opening draft #64 with the title/body retained in `S11_PR_DRAFT.md` (body hash `8af4bf53ae9df21b7f84893a812c837ba40db19ca6d698825325f96cb29a6a07`). Readback matched. Implementation may proceed; changed public text and later pushes still need approval, with no merge/CI/auto-merge authorization |
+| Delegated creation supervision (2026-11-10) | Owner authorized the supervisor to approve creation actions by judgment; the later current-PR-only boundary below supersedes continued row reassignment. This supersedes owner-only per-row/exact-text approvals for creation; technical gates, independent review, negative controls, noreply commits, fork-only pushes and isolation stay mandatory. Supervisor controls serial integration; S11 does not independently merge or enable CI/auto-merge. S7 owns the canonical AGENTS.md edit |
+| Current-PR-only boundary (2026-11-10, latest) | Owner reduced this Astra chat to High reasoning and limited it to completing PR #64, including required checks, review and supervised publication/integration, then stopping. No next row or new feature assignment after completion. Prior keep-three-active direction is superseded; no checks are waived. New helpers must stay at High, not Ultra. S7 owns AGENTS.md |
+| Finish S11 only (2026-11-10, latest owner direction) | Let S11 complete PR #64 through remaining validation, exact source/binary-bound replay, served MCP checks, full gates and supervised publication/integration, then stop. S7 #63 and cross-sheet #65 were directed to checkpoint and pause; S11 does not depend on their completion or import unfinished code. Astra/High and all isolation/provenance rules remain |
+| STOP NOW (2026-11-10, latest owner direction) | Document and stop immediately, superseding the instruction to finish PR #64. PRs #63/#64/#65 are paused. No new work, validation, review, publication or integration without explicit owner resume. Preserve current dirty source and failed gates; remain Astra/High. AGENTS.md stays with S7 |
 | Claude resume of three PRs (2026-11-12) | The owner resumed #63, #64 and #65 under one supervisor session, one Claude worker per existing worktree; the old Codex sessions stay paused. The supervisor grants native, gate and instrumentation lanes, launches independent reviews, approves exact publication text and merges serially. Work stops after these three PRs |
+| Process-lookup sandbox profile (2026-11-12) | The macOS sandbox refuses any exec of a setuid binary (`forbidden-exec-sugid`), so `/bin/ps` failed under `protected-native.sb` and the unchanged bench test `a_resumed_run_stops_the_freerouting_its_folder_was_left_with` failed. The supervisor approved `protected-native-ps.sb`: the same profile plus `(allow process-exec (with no-sandbox) (literal "/bin/ps"))`; every write denial still holds for every other process. Use it for cargo and native parents; keep the original for negative controls |
+| Lane locks (2026-11-12) | `target/creation-research/supervision/lanes/README.md` in the main checkout: `instr.lock` for every multi-run batch (mutants, llvm-cov, guard controls); a full gate, a release/native check or anything starting real KiCad takes `native.lock` then `instr.lock`; while another worker holds `native.lock`, start no cargo run at all; a gate first waits for 20 s with no foreign cargo/rustc. Reason: gates went red on timing-sensitive tests when other cargo work overlapped them (see "Row S11", baseline observations) |
+| B4 completion boundary (2026-11-10) | Owner narrowed this session to completing only PR #65, then stopping; no new creation row or feature assignment follows it. Astra reasoning is High, superseding the earlier Ultra/keep-three-active direction. Required validation, independent review, protected-resource rules and supervisor approval still apply. S7 owns AGENTS.md |
+| B4 pause (2026-11-10, newer) | Owner explicitly paused PR #65 before completion. Preserve the current dirty implementation and evidence; start no code, test/build/native/instrumentation/review work until the owner explicitly resumes. This supersedes finishing PR #65 before stopping. Astra remains High; S7 owns AGENTS.md |
+| B4 resume (2026-11-12) | Owner resumed PR #65 through a Claude supervisor session that directs one implementation worker in the cross-sheet worktree. This supersedes the pause row above. Scope is unchanged: finish PR #65 only, then stop; no new row starts from that branch. |
+| B4 same-name sheet pins (2026-11-12) | Owner approved on 2026-11-12 ("כן, להשאיר": yes, keep it). Several pins of one name on one sheet symbol tie their parent nets together through the child's hierarchical label. The review keeps that join, stays complete, and reports it as a note (`connectivity.notes`; `circuit.connectivity_notes` in `run_design_review`), with no gap and no diagnostic. Reason: KiCad joins them, so nothing is unknown, and a diagnostic would turn a known result into INCOMPLETE. KiCad 10.0.1, `eeschema/connection_graph.cpp`, `CONNECTION_GRAPH::propagateToNeighbors`, lines 2866 to 2948: each hierarchical label looks up every parent subgraph that holds a sheet pin of its name on the same sheet instance. This replaces the "named gap" wording of verification-plan row H04. |
 | S7 effort control (2026-11-10) | Owner explicitly requested configurable compute quota and a shipped-agent question about effort. Supervisor approved named quick/standard/deep levels plus a bounded custom budget with conflicting selectors refused; geometry/safety and response limits do not relax. Ask once if no effort choice/delegation exists, reuse it, ask before increasing. Backend defaults remain usable. Final numeric tiers require measured rationale; published timing guidance uses public fixtures/demos, private timings remain ignored. This does not add approval prompts to authorized validation runs |
 | S7 inherited clearance (2026-11-12) | Owner approved ("כן, בתנאי הזה") the planner rule that a corner repair may keep the saved clearance of the leg it shortens instead of the extra 0.01 mm margin: only against an exactly modelled obstacle, never closer than the replaced leg, never below the nominal clearance. Reason: autorouted copper already sits at exactly the nominal clearance, so the extra margin blocked most corner repairs. **Condition:** the native matrix shows no new DRC entry on any of the 11 cases. If one case shows one, the rule is not approved as it stands: stop and report, do not tune it to pass |
 | S7 inherited clearance, outcome (2026-11-13) | Owner kept the rule ("כן לפי ההמלצות שלך"), although his condition was not met as worded. What he was shown: 5 new DRC identities on 3 of the 11 cases; none involves copper the plan created or changed; no clearance, short, hole or edge entry on any case in any round; 3 are an `unconnected_items` relabel that KiCad also produces with no planner on byte-identical boards; 2 are a one-for-one exchange of a `solder_mask_bridge` entry, whose trigger was not reproduced; DRC totals on those cases fell from 167 to 152–153. No source change follows |
@@ -75,6 +90,14 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 - **State:** see "Row S7" below for what was built, the decisions, the evidence and the limits.
 - **Next step:** none on this branch once #63 is merged; the next creation row waits for the owner's word.
 
+**Current S11 state (2026-11-13):** see "Row S11: suspected zone-fill defects"
+below. Implemented, reviewed and gated on `codex/creation-s11-zone-fill-defects`
+(2026-11-13); publication and merge go through PR #64, and GitHub is the source
+of truth for its state and merge commit. The following S6 instructions are
+historical.
+
+**Current B4 state: implemented, reviewed and gated on `codex/creation-cross-sheet-review` (2026-11-13).** This branch holds only cross-sheet circuit review. Its base is `fork/main` at `f246e48dab3994de9a0a6fa97176ab8238ce1db9` (merged #62). Publication and merge go through [PR #65](https://github.com/yuvaltal912-sys/Konnect/pull/65); GitHub is the source of truth for its state and merge commit. S7 and S11 are separately supervised; their states live in their own handoffs. The inherited S6 text below is historical. See "Backlog B4" for scope, evidence and the next step.
+
 ### S6 reconciliation retained for future agents
 
 PR #62 is merged at `f246e48dab3994de9a0a6fa97176ab8238ce1db9`. Fresh `git fetch fork main`, `gh pr view 62 --repo yuvaltal912-sys/Konnect` and `gh pr list --repo yuvaltal912-sys/Konnect --state open` confirmed the merge and only simulation #54 open. The merge has two parents, the required noreply author, and the same tree as PR head `aeac8d9c2d094e2f6eb6c5e5cd7a60a818ab3905`. Local main and its unrelated guidance edits/untracked `.serena/` were preserved.
@@ -92,11 +115,12 @@ The supervisor owns S6's completed worktree `/Users/yuvaltal/.codex/worktrees/ko
 | Row | Delivers | Depends on | Files it owns | State |
 |---|---|---|---|---|
 | S5 | Measure first: a settings and DSN-variant sweep on the reference board through #51's harness, each run scored with `audit_layout_quality` plus length by net category (ground, power, signals); picks one preset. No product code | merged | `xtask/src/freerouting_bench/` (`mod.rs`, `report.rs`, new `board_score.rs`), new `xtask/freerouting-bench/score_board.py` and `stage_merge.py`, `DEV.md` | Merged: [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60). 116 isolated jobs, preset chosen (section "Row S5" below) |
-| S6 | Ground through the pour: no intent widening for pour nets, a per-zone `pours` policy in the DSN, stitching after refill | S5's result | `specctra.rs`, `specctra_ses.rs`, `tools/pcb_export.rs`, `freerouting_mcp.rs`, `tools/integration.rs`, `specctra_pours_tests.rs`; later pour fixtures | First half merged: [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), `f246e48`. Per-zone policy remains deferred; stitching belongs to S7 |
+| S6 | Ground through the pour: no intent widening for pour nets, a per-zone `pours` policy in the DSN, stitching after refill | S5's result | `specctra.rs`, `specctra_ses.rs`, `tools/pcb_export.rs`, `freerouting_mcp.rs`, `tools/integration.rs`, `specctra_pours_tests.rs`; later pour fixtures | First half complete in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62); owner authorized merge on 2026-11-10 (verify PR state). Per-zone policy and stitching not started |
 | S7 | Stitching-via and corner clean-up planner, read-only (Q1: a second opinion, never the author) | merged | new `tools/route_refine.rs` with tests/fixtures; narrow `layout_quality*` reuse seams; routing registration/counts; `kicad-pcb` skill and API docs | Implemented, reviewed and gated on branch `codex/creation-s7-route-refine` (2026-11-13); publication and merge through [#63](https://github.com/yuvaltal912-sys/Konnect/pull/63), GitHub is the source of truth for its state. See "Row S7" |
 | S9 | Power and critical nets first, applied locked, then the rest | S5, S6, S7, the live apply check | `konnect-ipc/src/builders.rs`, `tools/pcb_routing.rs`, `freerouting_mcp.rs`, `tools/integration.rs` | Not started |
 | S10 | Only if signals stay above x1.03 after S6 and S9: re-route the worst nets | S9 | an evaluation script under `xtask/freerouting-bench/` first | Not started |
-| S11 | Detector for KiCad's fill defect ("Known traps"): zone copper a refill adds over another net's pad is reported as a suspected KiCad defect, not a routing error | merged | new `tools/zone_fill_defects.rs` and its tests, a few lines in `tools/drc.rs`, `TROUBLESHOOTING.md` | Owner-authorized independent supervised preparation; separate worktree and publication approval |
+| S11 | Report zone/pad or zone/via reported-zero/short candidates; distinguish newly qualifying pairs after a valid refill comparison without establishing engine cause or routing correctness | merged | new `tools/zone_fill_defects.rs` and its tests, a few lines in `tools/drc.rs`, `TROUBLESHOOTING.md` | Implemented, reviewed and gated on branch `codex/creation-s11-zone-fill-defects` (2026-11-13); publication and merge through [#64](https://github.com/yuvaltal912-sys/Konnect/pull/64), GitHub is the source of truth for its state. See "Row S11" |
+| B4 | Circuit review across sheets (#55/rank-29 follow-up): join supported hierarchy connectivity, retain instance identity and incomplete results for unresolved hierarchy | #55 and integration merged | `tools/circuit_model.rs`, `tools/circuit_review_tests.rs`, new hierarchy fixtures; narrow `tools/circuit_review.rs`, `tools/design_review.rs`, `tools/circuit_checks.rs`, `tools/design_review_circuit_tests.rs`; own shared-doc entries | Implemented on `codex/creation-cross-sheet-review` (2026-11-13): three review rounds, gate green. [#65](https://github.com/yuvaltal912-sys/Konnect/pull/65); GitHub is the source of truth for its merge state |
 | R2 | Rest of rank 32: custom and trapezoid pads, as a convex hull per layer | S6, S9 | `specctra.rs`, `specctra_ses.rs`, new `specctra_pads_tests.rs` | Not started |
 | R3b | Footprint rule areas (antenna keepouts), cut-outs and Edge.Cuts slots as real DSN keepouts, replacing today's refusal | S6, S9 | `specctra.rs`, `specctra_ses.rs`, new `specctra_geometry_tests.rs` | Not started. Goes first if a board with an RF module arrives |
 | R3a | Local clearance overrides, conservatively | S6, S9 | `specctra.rs`, `specctra_ses.rs`, new `specctra_clearance_tests.rs` | Not started |
@@ -107,6 +131,59 @@ The R rows all edit `specctra.rs` and `specctra_ses.rs`, so they go one at a tim
 **Current boundary:** creation work is PRs #63, #64 and #65 and then stops; no new row starts without the owner's word. S6's remaining plane policy and S9 are not authorized. S5's measurements change what each should be (section "Row S5", "What it means for the next rows"): S6's first half (stop widening the net that owns the pours, and send the measured settings) is supported as it stands; its second half (pours as planes) leaves ground connections open that S7's stitching proposals address only in part ("Row S7", native matrix); S9's design (power first, fixed) lost completion and did not help the widths, so it needs rethinking before it is built.
 
 **Backlog after these**, best first: the audit sees ground and the skills say when to run it; current capacity (IPC-2152 derating, voltage drop, pour and via capacity) inside `audit_trace_current`; net classes from the design intent, with a check that intent net names exist (rank 38); circuit review across sheets (#55's follow-up); footprint text placement on the board (rank 20); footprint drag with track stretch (rank 36); an impedance estimator and stackup writer (D18); a placement planner as a second opinion (Q1, D6); planned-copper clearance and a free-space finder (C15, C18).
+
+### Backlog B4: cross-sheet circuit review (PR #65), implemented
+
+**State, 2026-11-13.** Worktree `/Users/yuvaltal/.codex/worktrees/konnect-cross-sheet-review/Konnect`, branch `codex/creation-cross-sheet-review`. The implementation is the commit that carries this text, on top of the claim commit `ff66f25`, based on `fork/main` `f246e48`. The supervisor approves the exact title and body before the push and merges [PR #65](https://github.com/yuvaltal912-sys/Konnect/pull/65) with the noreply command under "Known traps"; GitHub is the source of truth for the push and merge state. The owner paused this work on 2026-11-10 and resumed it on 2026-11-12 through a Claude supervisor session; scope is PR #65 only, then stop. The state at the pause is preserved in `target/creation-research/cross-sheet/pause-2026-11-10/`.
+
+**What changed.** `audit_circuit_design` and the circuit part of `run_design_review` now judge one circuit joined across the hierarchy instead of each sheet alone.
+
+- Nets join through global labels, global power symbols and matching parent sheet pins and child hierarchical labels. Local labels and local power stay inside their sheet use. A sheet used several times keeps each use's own designators and units.
+- What cannot be read or joined is a named gap, never a pass: a missing or unreadable child, a sheet symbol with no UUID, a root with no UUID, an unresolved symbol, bus and variable names, hidden power pins. One cause is one gap. Every gap is counted in `coverage.unevaluated_subjects` and makes `run_design_review` INCOMPLETE.
+- A conclusion that an unseen connection could change is withheld as `unproven`. A conflict that is already proven stays a finding. For bus termination that means a bank below 114 ohm is reported even when the bus is incomplete or the end assignment is unknown.
+- Thresholds and the set of components a search may cross are unchanged.
+- `docs/API_MIGRATIONS.md` lists every output change.
+
+**Files.** `crates/konnect-core/src/tools/circuit_model.rs`, `circuit_review.rs`, `circuit_checks.rs`, `design_review.rs` (the review seam only), their tests `circuit_review_tests.rs` and `design_review_circuit_tests.rs`, the fixtures under `crates/konnect-core/tests/fixtures/circuit_hierarchy/`, and this branch's entries in this file, `docs/API_MIGRATIONS.md` and `tool-directory.md`. Not touched: `sch_connectivity.rs`, `sch_hierarchy.rs`, `konnect-sexp`, `xtask/`, `AGENTS.md`.
+
+**Owner decision to carry forward: same-name sheet pins are a note.** Several pins of one name on one sheet symbol tie their parent nets together through the child's label. The review keeps that join and reports it in `connectivity.notes`, with no gap and no diagnostic. KiCad joins them: KiCad 10.0.1, `eeschema/connection_graph.cpp`, `CONNECTION_GRAPH::propagateToNeighbors`, lines 2866 to 2948. The owner approved this on 2026-11-12. It replaces the "named gap" wording of verification-plan row H04; the plan carries an appended amendment (`target/creation-research/cross-sheet/preparation/VERIFICATION_PLAN.md`). The decision row is in the table near the top of this file.
+
+**Verified, 2026-11-12, on the source of this commit (review freeze `review-C`, tree `551c6ceddc4bc90c5ce747185cb116de262f6822`; the commit adds only this handoff text to that tree).** Every cargo parent ran under `/usr/bin/sandbox-exec -f /Users/yuvaltal/ClaudeCode/Konnect/target/creation-research/supervision/native-isolation/protected-native-ps.sb`, with a scratch `KICAD_CONFIG_HOME` and a signature of the installed Konnect and the KiCad preferences taken before and after.
+
+| Check | Command or record | Result |
+|---|---|---|
+| Focused tests | `cargo test -p konnect-core --locked --lib -- tools::circuit_review::tests tools::design_review::circuit_tests` | 202 passed, 0 failed |
+| Full gate | the nine commands under "Verify" in `docs/SIMULATION_HANDOFF.md`, under both lane locks with no other cargo or rustc process running; `resume-2026-11-12/native4b-review-C/` | green: fmt clean; workspace tests 4308 passed, 0 failed, 163 ignored; doctests 9 passed, 2 ignored; `simulation_live` 95 passed; Clippy `-D warnings` clean; licenses ok; `fix-doc-counts` no change; release build ok |
+| Earlier red gate, same source | `resume-2026-11-12/native4-review-C/` | red: workspace tests 4302 passed, 6 failed, 163 ignored, while another agent's cargo tests ran outside the locks; the other eight commands exited 0. The six tests are named below and passed alone before the rerun |
+| Guard controls | one guard removed or inverted per run, one named test each; `resume-2026-11-12/controls-C.json` | 100 controls in the final list, each killed by its named test in a recorded batch: 25 on the `review-C` source (the ones the last change touched), 75 on the `review-B` source. Not rerun as one batch on the final source |
+| Mutation | `cargo mutants --in-place --in-diff <patch>`, tests limited to the two modules | first freeze, whole diff: 364 mutants, 260 caught, 12 unviable, 92 not caught; of those 92, 55 are caught by tests added later, 31 got a new test with a killed control, 2 are equivalent, 1 never terminates, 1 sat in code since removed, 2 sat on a line since rewritten and were caught in the next pass. Change to the second freeze: 79 mutants, 74 caught, 4 unviable, 1 missed (the 114 ohm bound; a test and two controls were added). Change to the third freeze: 27 mutants, 25 caught, 2 unviable, 0 missed |
+| Coverage | `cargo llvm-cov` on the two modules; line and region, not branch coverage | every line changed since the first freeze executes. Across the whole PR 12 changed lines never execute (6 in `circuit_model.rs`, 2 in `circuit_review.rs`, 3 in `circuit_checks.rs`, 1 in `design_review.rs`): defensive branches and one scoped-audit line these two modules do not reach |
+| Reference replay | baseline `f246e48` and this candidate, each an identified release binary, on one frozen private snapshot; counts only | unproven subjects 12 to 0; all 9 earlier findings kept, 3 new; 2 unevaluated subjects kept; none unexplained |
+| KiCad fixtures | three synthetic hierarchies (14, 22 and 22 physical pins) exported by KiCad 10.0.8 on 2026-11-10; the model's pin partitions are compared with the exports in the focused tests | match |
+| Independent review | three rounds by an agent that did not write the code; reports under the main checkout's `target/creation-research/supervision/reviews/pr65-review-{A,B,C}.md` | round C: 0 blocker, 0 major, 0 minor |
+
+The checks that can only run on the commit itself (the gate on the committed source, and the release build's `get_installation_info` naming this fork's executable and the commit) are recorded in `implementation/reports/checkpoint-C.md` and in the PR body.
+
+Evidence is under `target/creation-research/cross-sheet/` in this worktree (ignored by git, do not delete): `implementation/PROGRESS.md` is the ledger, `implementation/reports/checkpoint-{A,B,C}.md` the reports, `implementation/resume-2026-11-12/` the run records. The frozen review candidates are in `/Users/yuvaltal/.codex/worktrees/konnect-pr65-claude-freeze/`.
+
+**Not verified.** Windows and Linux. A run in KiCad's GUI. Hosted CI. Branch coverage (the tooling gives line and region coverage only). The mutation runs cover the changed code of the four production files against the two test modules; they are not a sweep of the crate. No real-project result is in any tracked file, apart from the counts above.
+
+**Baseline observation: six timing-sensitive tests fail under concurrent load.** They are in files this PR does not touch, and no fix belongs in this PR.
+
+- `tools::integration::freerouting_setup_tests`: `a_banner_followed_by_a_startup_crash_is_not_available`, `a_java_that_cannot_start_the_jar_does_not_make_it_available`, `a_java_that_meets_the_jar_is_chosen_over_one_that_does_not`, `a_version_printed_before_a_nonzero_exit_counts_and_the_probe_is_quiet` (a stand-in `java` does not answer in time).
+- `tools::pcb_sync::tests`: `completion_unnetted_copper_is_not_complete_connectivity`, `completion_whole_net_reassignment_preserves_copper_and_counts_readback` (the mock KiCad IPC receive times out).
+- Red run: the first gate on this source, with another agent's cargo tests running at the same time. Green rerun: the six alone (6 passed), then the whole gate on a machine with no other cargo or rustc process, same source. A red gate on these tests is a reason to check for other cargo runs before reading it as a defect.
+
+**What another agent needs to know before running anything here.**
+
+- Lane locks: `/Users/yuvaltal/ClaudeCode/Konnect/target/creation-research/supervision/lanes/README.md`. A full gate takes `native.lock`, then `instr.lock`, waits for 20 s with no foreign cargo or rustc process, and runs alone; a mutation, coverage or guard-control batch takes `instr.lock`; no cargo run starts while another worker holds `native.lock`.
+- The sandbox profile is `protected-native-ps.sb` (SHA-256 `6e2798f115fe9233a71ef892af3965462af3fcfc44241820fb7a563c02917bac`). The older `protected-native.sb` refuses macOS's setuid `/bin/ps`, which one benchmark test needs.
+- `crates/konnect-core/build.rs` watches a git ref path that does not exist in a worktree, so the build script reruns on every build here and debug artifacts are not byte-identical between builds. Identify a binary from Cargo's JSON messages for that invocation and keep a copy of any binary used as evidence.
+- The retained baseline binary `implementation/baseline-bin/konnect` (SHA-256 `f451b2e15802546060989e309be91c0edbcab6db9a7721b2d841cb2fc1c3dd5c`) embeds `f246e48`. Product metadata does not record working-tree state, so a build from a dirty tree is identified by its recorded source hashes, not by HEAD.
+- The installed Konnect must stay at SHA-256 `3de188bb775ab4ce5748ea44b94cb098c86ed5d32135e70f4c2c3817c3a4ac65`. Do not restore the owner's KiCad preferences, even if they look changed: on 2026-11-10 the original baseline run saw two of his settings files saved during its interval, writer unproven, and they were left as found.
+
+**Next concrete step.** None on this branch once [PR #65](https://github.com/yuvaltal912-sys/Konnect/pull/65) is merged; check GitHub. Until then: the supervisor approves the exact PR title and body, the worker pushes with `git push fork HEAD:refs/heads/codex/creation-cross-sheet-review` and updates the PR text, and the supervisor merges with the noreply command under "Known traps". No new row starts from this branch; the next creation row waits for the owner's word.
+
 
 PR 13's rule editing, deletion and static expression workflow is complete within
 its documented limits. Wider custom-rule conversion into DSN remains part of the
@@ -217,7 +294,158 @@ Every run is wrapped in the supervisor's `protected-native-ps.sb` profile, with 
 
 The first gate is retained as initially red, with both successful retries; no simulation code was changed. Protected installed-binary/KiCad/Freerouting-setting hashes and mtimes are unchanged. The heavy processes finished before the slot was released to S11. Copies of the logs, independent review and private input inventory are retained under `target/creation-research/s7/preparation/` in the main checkout, apart from the worktree originals. Graphify query used a copied S6 graph, then decisive claims were checked against source; no source edit or graph rebuild was needed for this claim.
 
-## Row S6, first half: pour widths and measured preset (merged, PR #62)
+## Row S11: suspected zone-fill defects (implemented; PR #64)
+
+Implemented, reviewed and gated on branch `codex/creation-s11-zone-fill-defects`
+(2026-11-13): base `f246e48` (merged S6 #62), claim `a423ec8`, then the
+implementation commit (read it with
+`git log -1 --format=%H -- crates/konnect-core/src/tools/zone_fill_defects.rs`).
+Publication and merge go through
+[PR #64](https://github.com/yuvaltal912-sys/Konnect/pull/64); GitHub is the
+source of truth for its state and merge commit. Worktree
+`/Users/yuvaltal/.codex/worktrees/konnect-s11-zone-fill/Konnect`. Evidence is
+git-ignored under `target/creation-research/s11/implementation/` in that
+worktree: one folder per phase, `reports/checkpoint-*.md` for the checkpoint
+reports, and `PROGRESS.md` for the running log. Reviews are in the main
+checkout's `target/creation-research/supervision/reviews/pr64-review-*.md`.
+
+**Built.** `zone_fill_check.suspected_fill_defects` on `run_drc` and
+`get_drc_violations`, carried into DRC baselines at
+`source_evidence.zone_fill.suspected_fill_defects`. It flags resolved
+different-net zone/pad and zone/via pairs that KiCad reports at an actual zero
+under `clearance` or `hole_clearance` (supported plated holes), or as
+`shorting_items`. It counts newly qualifying pairs after refill only from a
+complete private-refill comparison: stable board, project and rules snapshots,
+matching copied input, unchanged non-fill design data and a changed fill in
+the implicated zone. Otherwise the count is null with a named
+`attribution_reason`. Original DRC results, severities, counts, the KiCad call
+count, tool arguments and the registry are unchanged. Contract
+`S11_DESIGN.md`; fields and every reason literal `API_MIGRATIONS.md`; user
+guidance `TROUBLESHOOTING.md`.
+
+**What the owner must know (limits).**
+- The diagnostic reports KiCad's formatted measurement; it does not
+  independently prove physical overlap or an engine bug.
+- Taken from the KiCad 10.0.1 source, not from a native run:
+  - KiCad stops a rule after 499 `clearance` or 199 `hole_clearance` or
+    `shorting_items` entries, excluded markers included. At that limit the
+    report is `partial`.
+  - A project that sets a supported rule to `ignore` means KiCad never tests
+    that rule. The report is `partial` (`kicad_rule_ignored`).
+  - Project DRC exclusions use up the limit, and a pair they name can resurface
+    after refill. So any exclusion naming either item of any newly reported
+    pair withholds the whole newly reported count.
+- Not detected: a per-rule `(severity ignore)` in `.kicad_dru`. Not supported:
+  copper zones inside footprints (attribution refused), teardrop entries (no
+  UUID, counted unresolved), `start_end_only` and other partial-layer padstacks.
+- The native refill associations are outcomes observed with KiCad's
+  iterative-refill setting on and off, not a readback of the setting.
+- Not verified: the KiCad GUI, Windows, Linux, other KiCad versions, and any
+  upstream engine cause. No branch coverage was measured.
+
+**Verified on macOS.**
+- Full gate on the frozen candidate `review-freeze-C`, run once under both lane
+  locks and the 20 s quiet rule, in `final-gate-4/`. Every step exited 0:
+
+  | Step | Result |
+  |---|---|
+  | `cargo fmt --all -- --check` | passed |
+  | `cargo test --workspace --locked --lib --tests --no-fail-fast` | 4,248 passed, 0 failed, 165 ignored |
+  | `cargo test --workspace --locked --doc` | 9 passed, 2 ignored |
+  | `cargo test -p konnect --locked --test simulation_live -- --ignored` | 95 passed |
+  | `cargo clippy --workspace --locked --all-targets -- -D warnings` | passed |
+  | `cargo deny check licenses` | passed |
+  | `cargo xtask fix-doc-counts` | no change |
+  | `cargo build --release --locked -p konnect` | passed |
+  | installed Konnect SHA-256 | unchanged |
+
+  Protected files were unchanged. Freeze D adds three tests only; the
+  post-commit gate covers it (`final-gate-5/`, recorded in the PR text).
+- Focused: `cargo test -p konnect-core --locked --lib --
+  zone_fill served_drc_synchronizes_exact_board_and_waits_before_save
+  --test-threads=1`. Result: 63 passed, 3 ignored opt-in replays.
+  - The second filter adds one served test,
+    `tools::drc::tests::served_drc_synchronizes_exact_board_and_waits_before_save`,
+    which checks the `saved_ipc_refill` provenance label.
+  - `zone_fill` alone gives 62 passed, 3 ignored.
+- Negative controls: every guard removal failed its test, and the restored
+  suite passed again. The latest rounds were `review-C/controls` (38) and
+  `review-D/controls` (3).
+- Instrumentation on freeze C (`instr-3/`, `--jobs 1`, line and function
+  coverage only):
+  - Detector coverage: 830 of 844 lines, 79 of 82 functions. Changed `drc.rs`
+    production lines: 32 of 33. The one left is the `saved_ipc_refill` label;
+    its served test runs outside the coverage filter.
+  - Mutants: 123 selected, 114 caught, 3 unviable, 0 timeout, 6 missed.
+  - Of the 6 missed:
+    - 2 are equivalent (`Index::layers` `<`→`<=`; a `diagnostic` match guard);
+    - 1 is the known qualified-equivalent digit counter in `reported_zero`;
+    - 1 is an exact-6,000-byte boundary in `diagnostic`;
+    - the other 2 were real test gaps in `Index::layers`. Freeze D added tests
+      for them, and a rerun caught both (`review-D/controls/results.json`).
+- Native scratch refills of a private board (counts only):
+  - with iterative refill on, 4 entries in 2 pairs in 3 of 3 runs;
+  - with it off, 0 in 3 of 3 runs;
+  - one matched refill of a candidate-free input gave 4 newly qualifying
+    entries.
+- `kicad-cli` 10.0.8 creates `board.kicad_prl` but no `.kicad_pro`, in both
+  primary and `--refill-zones --save-board` modes (`review-B/kicad-pro-probe/`).
+- Independent reviews: four rounds by one non-author agent
+  (`pr64-review-A.md` to `pr64-review-D.md`). A on freeze A found 1 major,
+  7 minor and 6 nit issues; B on freeze B found 2 minor and 3 nit; C on freeze
+  C found 1 nit (`project_exclusions_unreadable` covers the whole project
+  file, now documented); D on freeze D (three tests only) found none. All are
+  fixed or documented.
+
+**Harness facts for the next agent.**
+- Run every cargo or native parent under
+  `target/creation-research/supervision/native-isolation/protected-native-ps.sb`
+  in the main checkout, after checking its SHA-256 `6e2798f1…7bac`. The
+  wrapper is `implementation/harness-solution/guard-shared.sh`.
+- Use `/opt/homebrew/bin/python3.14 -I` and a scratch `KICAD_CONFIG_HOME`.
+  Never pipe `kicad-cli` into `head`.
+- `konnect-core`'s `build.rs` reruns on every build in a worktree. Identify
+  test and release executables per invocation from Cargo's JSON artifact
+  messages, never by path or mtime.
+- Lane locks: see the decision row "Lane locks". The S11 drivers that obey them
+  are `implementation/lane.sh` (owner-checked release) and
+  `implementation/lanes_s11.py`, which implements rules 4 and 5.
+
+**Baseline observations (not S11 items).** These timing-sensitive tests in
+unchanged code failed only while other cargo work overlapped a gate, and pass
+when run alone.
+- `final-gate-3/` ran during a concurrent mutation batch. 15 tests failed:
+  12 in `tools::pcb_sync::tests` and 3 in
+  `tools::pcb_routing::custom_rule_tests`. They were mock-IPC
+  `NNG recv failed after send: Timed out` failures and their follow-ons.
+  Alone, they passed 15 of 15, twice (`retry-15/`, `retry-15-C/`).
+- Cross-sheet's gate was overlapped by focused runs. 4 fake-java tests in
+  `freerouting_setup_tests` and 2 NNG timeouts in `pcb_sync` failed (reported
+  by the supervisor).
+- `every_simulation_demo_flattens_or_names_its_export_failure` failed once, in
+  the cancelled `final-gate-4-freezeB-cancelled/` run. The IBIS demo's deck
+  vetting refused with `model_library_missing`, "Cannot find U1.cache". It
+  passed in gates 2, 3 and 4. This is a possible intermittent in baseline
+  simulation code.
+
+**Post-commit checks.** The final branch head is the merge of the reviewed
+source commit `c76970f764d8c26729b8b958550bee1f1a43af1e` with `fork/main` at
+`ee64c5e22a6052702a2c84bb11b9c10fe7f87c84` (PR #65 merged). These checks ran
+once on that merge:
+- one full gate;
+- `final_replay.py`, which asserts 4 newly qualifying entries through the
+  committed test binary;
+- a fresh release build, identified from Cargo's JSON;
+- the served MCP checks over stdio;
+- `graphify update .` and the installed-hash check.
+
+Their counts are in PR #64's body, and the evidence folders are
+`final-gate-5/`, `final-replay/` and `served-mcp/`.
+
+**Next.** None on this branch once #64 is merged; the next creation row waits
+for the owner's word.
+
+## Row S6, first half: pour widths and measured preset (PR #62)
 
 2026-11-10. Branch `codex/creation-s6-pour-widths-preset`, base `7e9a174`, local claim `dace50b`. Implementation commit: `803ab9431cdfeeafb26c0b05b29a963175e83e8a`; the following docs-only commit records this revision. The owner explicitly authorized this row, including the pour-width default and all measurement runs; the owner subsequently approved publication and merge of [PR #62](https://github.com/yuvaltal912-sys/Konnect/pull/62), with the exact shown title/body.
 

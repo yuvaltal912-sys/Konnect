@@ -193,6 +193,173 @@ call, inspect the live board before any retry. After an adopted group, refill,
 save, run native DRC and repeat the audit with the same settings. Replan further
 work from that resulting state; predicted gains do not replace these measurements.
 
+## Unreleased: suspected zone-fill defect evidence
+
+Creation row S11 adds `zone_fill_check.suspected_fill_defects` to `run_drc`
+and `get_drc_violations`. DRC baselines carry the same diagnostic in
+`source_evidence.zone_fill.suspected_fill_defects`. No argument, tool, original
+DRC count, severity or violation changes.
+
+- `status` is `suspected`, `none_detected` or `incomplete`. A supported
+  candidate remains `suspected` when other evidence is incomplete. Inspect
+  the separate report coverage; none detected does not establish a clean board.
+- `primary_report` identifies saved fills, a CLI in-memory refill or saved IPC
+  refill. `comparison_report` describes the existing private-refill pass when
+  available. Each gives full `matching_entries`, `distinct_pairs` and
+  `unresolved_candidates` counts, or null when inspection was unavailable.
+- `newly_reported_after_refill` counts comparison-report entries belonging to
+  newly qualifying unordered UUID pairs. It requires stable original board,
+  project and rules snapshots, matching copied input, unchanged non-fill
+  design inputs, complete candidate inspection, no duplicate UUID and no
+  footprint copper zone on either board (rule areas do not count), neither
+  report at KiCad's per-rule limit or with a supported rule set to `ignore` in
+  the project, no project DRC exclusion of any rule naming either item of any
+  newly reported pair, and a changed implicated fill signature. Otherwise it is null with `attribution_reason`. A new rule,
+  severity, description, order, position or duplicate for an already qualifying
+  pair does not count as a new pair.
+- `findings` contains at most ten examples with report phase, rule, UUIDs,
+  reported item position, evidence basis and refill attribution. Newly
+  reported examples come first. Full counts precede truncation; external
+  strings are bounded and truncated identifiers are labelled. Item positions
+  are not independently measured overlap points.
+
+The detector recognizes resolved different-net zone/pad and zone/via pairs
+under `clearance`, `hole_clearance` (supported plated holes) and
+`shorting_items`. Clearance recognition uses the reported actual-zero suffix,
+not the required clearance; KiCad's `%.3e` spelling of a tiny nonzero value
+reads as nonzero.
+The diagnostic reports KiCad's formatted measurement; it does not independently prove physical overlap or an engine bug.
+Unknown prose, ambiguous identities, unsupported padstack/removal modes
+(including `start_end_only` vias) and unproven snapshots remain incomplete
+evidence. A report at KiCad's per-rule limit (499 `clearance`, 199
+`hole_clearance` or `shorting_items` entries, excluded markers included; the
+limits come from the KiCad 10.0.1 source, not a native run) is `partial`,
+and so is a report whose project sets a supported rule to `ignore`, which
+KiCad then never tests. A `.kicad_dru` per-rule `(severity ignore)` is not
+detected.
+Attribution normalization is conservative; unknown format conversions or
+topology-only fill changes may remain unproven.
+
+| Field | Values |
+|---|---|
+| `status` | `suspected`, `none_detected`, `incomplete` |
+| `primary_report.provenance` | `saved_fills`, `kicad_cli_refill`, `saved_ipc_refill` |
+| `comparison_report.provenance` | `private_copy_refill` |
+| report `inspected`, `coverage` | `true`/`false`; `complete`, `partial`, `unavailable` |
+| report counts | `matching_entries`, `distinct_pairs`, `unresolved_candidates`: numbers, or `null` when not inspected |
+| report `reason` (not inspected) | `not_compared`, `comparison_failed`, `source_changed_or_unavailable`, `board snapshot unavailable`, `project/rule snapshot unavailable`, `board_did_not_parse`, `board_root_unproven`, `ambiguous_net_table` |
+| report `unresolved_reasons` (entry counts) | `item_pair_unresolved`, `item_identity_unresolved`, `item_ownership_unsupported`, `actual_distance_unrecognized`, `net_identity_unresolved`, `net_identity_inconsistent`, `copper_layers_unresolved`, `copper_membership_unresolved`, `copper_membership_unsupported`, `pad_copper_unsupported`, `plated_hole_unproven` |
+| report `partial_reasons`, `rules_at_kicad_limit`, `rules_ignored_by_project` | `kicad_rule_ignored`, `kicad_rule_limit_reached`, `project_exclusions_unreadable`, `project_rule_severity_unreadable`; rule names; `project_exclusions_unreadable` means the whole `.kicad_pro` could not be read (not valid JSON, or an unreadable exclusion list), so neither its exclusions nor its rule severities were read |
+| `newly_reported_after_refill` | a number, or `null` |
+| `attribution_reason` | `null`, `not_compared`, `comparison_failed`, `primary_source_unproven`, `comparison_input_unavailable`, `comparison_output_unavailable`, `comparison_input_differs`, `kicad_rule_ignored`, `kicad_rule_limit_reached`, `project_exclusions_unreadable`, `project_rule_severity_unreadable`, `incomplete_report_evidence`, `project_or_rules_changed`, `board_did_not_parse`, `board_root_unproven`, `ambiguous_net_table`, `ambiguous_board_identity`, `footprint_zone_comparison_unsupported`, `zone_owner_unsupported`, `ambiguous_fill_state`, `non_fill_design_changed`, `zone_identity_changed`, `fill_geometry_unresolved`, `implicated_fill_change_unproven`, `drc_exclusion_names_pair` |
+| finding `report`, `basis` | `primary`, `comparison`; `reported_zero_clearance`, `reported_short` |
+| finding `refill_attribution` | `newly_reported_after_refill`, `already_reported`, `unproven` |
+| finding other fields | `rule`, `zone_uuid`, `other_uuid`, `other_kind` (`pad`, `via`), `identifiers_truncated`, `reported_item_position` |
+| `findings`, `truncated`, `hint` | at most ten examples; `true` when examples were left out; one of two fixed sentences, chosen by whether any candidate exists |
+
+There are no additional KiCad runs or automatic board/configuration edits.
+Caller-requested refills without a before report and `check_zone_fills: false`
+can still expose report-only candidates, with null refill attribution. The
+engine cause and routing correctness are not established by this diagnostic.
+The detector binds board/project/rule files; it does not snapshot the KiCad
+version or global configuration.
+See [troubleshooting](TROUBLESHOOTING.md#suspected-zone-fill-defect).
+
+## Unreleased: hierarchy-joined circuit review
+
+Creation backlog B4, the #55 follow-up. No new tool or argument. Both
+`audit_circuit_design` and its `run_design_review` integration now evaluate one
+joined circuit across the reachable hierarchy instead of evaluating isolated
+sheet uses.
+
+- Public `scope` changes from `per_schematic_file` to `schematic_hierarchy`.
+  `schematic_files` still counts distinct audited files and `sheet_instances`
+  still counts audited uses; joining does not turn either count into one.
+  Repeated files retain their UUID paths and per-instance reference/unit
+  records. Compatible units of a physical component are evaluated together.
+- Connections join through supported global labels, global power symbols and
+  matching parent sheet pins/child hierarchical labels. Local labels and
+  local powers remain scoped to their sheet use. Net ties retain distinct
+  nets. Qualified intent names retain their source sheet and KiCad's literal
+  slash escaping; ambiguous aliases are not resolved arbitrarily.
+- New `connectivity` reports `status: complete | partial`, `gaps` and `notes`;
+  `coverage.connectivity_gaps` counts recorded gaps. Missing, unreadable,
+  cyclic or ambiguous hierarchy, unresolved symbols and unsupported
+  connectivity are partial, not passes. Bus/variable-label and hidden-power
+  or internal-jumper semantics that are not modeled remain explicit gaps.
+  A gap that belongs to one sheet use names it: `<file> [<instance path>]: ...`,
+  with that use's designator where its instance record gives one.
+- One cause is one gap. A child use that is missing, ambiguous or not the file
+  its parent names is one gap, however many sheet pins lead to it and whatever
+  sits below it; those pins and labels become open boundaries. On a child that
+  is there, each sheet pin or hierarchical label that joins nothing is its own
+  gap. A use listed under `unaudited_sheet_uses` is not also a gap. A sheet
+  symbol with no UUID is one gap, whatever its child holds. A use that has
+  hierarchical labels and no parent on record at all is one gap for the use
+  (`sheet use <path> has hierarchical labels and no parent in this review`),
+  not one per label.
+- `coverage.unevaluated_subjects` now includes the connectivity gaps: it is
+  unaudited uses, plus gaps, plus the subjects each rule could not evaluate.
+  The count in `run_design_review`'s `circuit_checks_unevaluated` diagnostic
+  is the same number. Any gap makes `run_design_review` INCOMPLETE.
+  `run_design_review` also adds a `circuit_review_partial` diagnostic when the
+  circuit audit is partial with nothing counted, so it never reads `complete`
+  over a partial circuit audit.
+- A root schematic with no UUID is one gap: instance records are keyed by it.
+  Such legacy files, including roots written by Konnect before it wrote root
+  UUIDs, now report `partial` / INCOMPLETE where the per-sheet audit reported
+  findings. Opening the root schematic in KiCad and saving it writes the UUID.
+- `connectivity.notes` lists joins that leave nothing unknown but are worth
+  seeing. One exists today: a sheet symbol with several pins of one name ties
+  their parent nets together through the child's label, as KiCad does.
+  `run_design_review` repeats them as `circuit.connectivity_notes`.
+- `unproven` now means an absence or exhaustive conclusion that unresolved
+  connectivity could change. Crossing a successfully joined sheet boundary
+  alone no longer causes it. Net-level entries can have `component: null`
+  plus `net`; pin-level entries can add `pin`. Known positive conflicts are
+  retained even when other connectivity is incomplete.
+- Findings, interfaces, crystals and withheld conclusions add `origins`, each
+  with `source`, `sheet_instance_path` and `sheet_name_path`. Singular subject
+  origins retain `source`/`sheet_instance_path`; multi-origin and design-level
+  results use the root source with `source_scope: hierarchy`. Net-level facts
+  retain all participating origins. `run_design_review` preserves circuit
+  findings' sources rather than replacing child sources with the root.
+  One exception: `usb_pair_impedance` judges the design-intent record, so its
+  findings carry the design-intent file as `source` and have no `origins`.
+- Incomplete termination and pull-up inventories no longer expose an observed
+  subset as a complete total. `total_ohms` / `effective_pull_up_ohms` become
+  null where appropriate, with `observed_resistance_ohms` /
+  `observed_effective_pull_up_ohms` and `connectivity_complete` describing the
+  evidence. Crystal `computed_load_capacitance_pf` is null when its inventory
+  is incomplete. Termination absence is `kind: none_observed`.
+- Termination results list `candidates` and `observed_resistors`. Multiple
+  direct or mixed/split candidates do not establish physical end assignment:
+  `bank_assignment_requires_human` is true and the value rule needs a human.
+  A single candidate's value is not presented as a mixed network's total.
+  Existing electrical thresholds and permitted component traversal are
+  unchanged; a known single invalid bank still produces its finding.
+- What is proven low stays a finding. With several candidates, one bank below
+  114 ohm makes its bus end too low whichever end that is. A bank here is a
+  resistor directly across the pair, or the two halves of a split termination
+  whose middle node is fully known. The finding carries `low_bank` (that
+  bank's resistors), `upper_bound_ohms` and
+  `bank_assignment_requires_human: true` in place of `total_ohms`. In this
+  finding `kind` is the low bank's kind (`direct` or `split`), and `resistors`
+  lists every observed candidate resistor, the other banks' included. Several
+  candidates with no such bank (120 + 120, say) still need a human. On an
+  incomplete bus, a single direct or split bank below 114 ohm is a finding
+  too, because unseen parallel paths cannot raise it; a split bank counts only
+  when its middle node is fully known. A selectable bank may be open, so it
+  never counts as proven low.
+- `power_tree.status` may be `partial` and adds `inventory_complete`.
+  `present_in_schematic` is null for an unproven absence; an unseen source
+  can have `source_kind: unproven`. Incomplete feedback topology produces
+  `feedback.status: unevaluated` instead of a divider calculation.
+
+Consumers must handle these nulls and partial states. Human review remains
+necessary for physical bus-end assignment, datasheet-dependent checks and the
+other existing `needs_human` items; the tool does not approve a board.
+
 ## Unreleased: pour widths and the measured routing preset
 
 Creation row S6, first half (`docs/CREATION_HANDOFF.md`). No new argument.

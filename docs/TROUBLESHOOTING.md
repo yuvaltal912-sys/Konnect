@@ -1,5 +1,63 @@
 # Troubleshooting
 
+## Suspected zone-fill defect
+
+`run_drc` and `get_drc_violations` may return
+`zone_fill_check.suspected_fill_defects.status: "suspected"` when KiCad reports
+a copper zone against another net's pad or via at reported zero clearance or
+as a shorted pair. This is a reason to investigate the fill. It does not prove
+an engine bug, establish that routing is correct or waive the DRC finding.
+**Do not plot fabrication copper until DRC is clean.**
+
+Read the primary and comparison reports separately. A CLI analysis refill
+does not save its fill into the source board. `newly_reported_after_refill`
+counts report entries for newly qualifying pairs only when a controlled
+comparison establishes the required source evidence. Null means attribution
+was not established; zero means no new qualifying pair under that comparison.
+Two rules naming the same pad/zone pair count as two entries and one pair.
+The diagnostic reports KiCad's formatted measurement; it does not independently prove physical overlap or an engine bug.
+`reported_item_position` is the first report item that has a position
+(usually the pad or via), not an overlap coordinate. `zone_fill_state: "fresh"`
+describes fill currency, not electrical cleanliness.
+
+KiCad 10.0.8 has shown a suspected iterative-refill problem with overlapping
+same-net zones of different priorities. For that case, a manual workaround
+is setting `ZoneFillIterativeRefill=0` in the active KiCad configuration's
+`kicad_advanced` file, then refilling and running DRC again. On macOS the normal
+location is `~/Library/Preferences/kicad/10.0/kicad_advanced`; an explicit
+`KICAD_CONFIG_HOME` selects a separate base directory, with the active files
+under its `10.0` subfolder for KiCad 10.0. Preserve other settings,
+check the result, and do not assume the workaround fixes every zone/pad error.
+Standalone Python `pcbnew` filling does not establish that this configuration
+switch was honored. Konnect never changes this setting automatically.
+
+`incomplete` or partial report coverage names evidence the detector could not
+resolve. Unsupported report wording, source changes, ambiguous UUIDs or nets,
+footprint zones and unsupported copper-membership modes do not become a clean
+result. Keep the original DRC report and inspect the board in KiCad; the
+diagnostic does not replace normal review or the saved-versus-live distinction.
+
+- KiCad stops reporting a rule after 499 `clearance` or 199 `hole_clearance` or
+  `shorting_items` entries in one run, excluded markers included, and the report
+  does not say so. The limits come from the KiCad 10.0.1 source, not from a
+  native run. At or above them the report is `partial`
+  (`kicad_rule_limit_reached`) and no refill attribution is given.
+- A project that sets `clearance`, `hole_clearance` or `shorting_items` to
+  `ignore` makes KiCad skip that rule entirely, so the report is `partial`
+  (`kicad_rule_ignored`) and no refill attribution is given. A per-rule
+  `(severity ignore)` in a `.kicad_dru` custom rule is not detected.
+- A DRC exclusion in the project file can hide a pair from the first report,
+  and the pair can appear after refill under a moved position. So when either
+  item of any newly reported pair appears in any exclusion, of any rule, the
+  whole newly reported count is withheld (`drc_exclusion_names_pair`). Stale
+  exclusions still count toward the limit above.
+- Rule areas (keepouts), in a footprint or on the board, have no fill and do
+  not block attribution. A copper zone inside a footprint does
+  (`footprint_zone_comparison_unsupported`).
+- Any supported-rule entry whose items the board cannot resolve counts as
+  unresolved, even a track/track entry. KiCad 10 writes no UUID for teardrop
+  zones, so entries involving them always do.
+
 ## JLCPCB assembly cannot obtain native midpoint geometry
 
 Open the exact requested `.kicad_pcb` in PCB Editor and enable KiCad IPC.

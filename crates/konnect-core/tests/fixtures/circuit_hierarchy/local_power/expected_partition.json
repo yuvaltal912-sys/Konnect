@@ -1,0 +1,147 @@
+{
+  "local_power": {
+    "instances": [
+      {
+        "path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f/3efd3880-a834-43ad-9d9e-8a2e1773fd98",
+        "project": "cross_sheet",
+        "reference": "#PWR0901",
+        "unit": 1
+      },
+      {
+        "path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f/5199b5f2-c7d4-4bd7-abf3-01698f94cb19",
+        "project": "cross_sheet",
+        "reference": "#PWR0902",
+        "unit": 1
+      }
+    ],
+    "lib_id": "IBF_supply:+7V",
+    "pin_uuid": "a847fad2-7082-4d0f-93dd-2eb84e1e2b69",
+    "placed_value": "+3V3",
+    "power_scope": "local",
+    "symbol_uuid": "c5064b27-9d16-4077-aaf1-be12f81c5c65"
+  },
+  "partition": [
+    [
+      "C1.1"
+    ],
+    [
+      "C1.2",
+      "C2.2",
+      "R1.2",
+      "R2.2",
+      "R3.2",
+      "R4.2",
+      "R9.2",
+      "U1.1"
+    ],
+    [
+      "C2.1"
+    ],
+    [
+      "R1.1",
+      "U1.3"
+    ],
+    [
+      "R2.1"
+    ],
+    [
+      "R3.1",
+      "R9.1"
+    ],
+    [
+      "R4.1"
+    ],
+    [
+      "U1.2"
+    ],
+    [
+      "U1.4"
+    ],
+    [
+      "U1.5"
+    ],
+    [
+      "U1.6"
+    ],
+    [
+      "U1.7"
+    ],
+    [
+      "U1.8"
+    ]
+  ],
+  "pin_count": 22,
+  "scope": "all fitted fixture pins; singleton pins included",
+  "uses": [
+    {
+      "file": "cross_sheet.kicad_sch",
+      "instance_path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f",
+      "name_path": "/",
+      "parts": [
+        {
+          "lib_id": "Device:R",
+          "reference": "R9",
+          "symbol_uuid": "ec1d9e16-e59c-4d41-8f84-a9997e60ecc0",
+          "value": "1k"
+        },
+        {
+          "lib_id": "Timer:NE555D",
+          "reference": "U1",
+          "symbol_uuid": "f8fdfe90-fe0d-40ab-8bd8-5c3561fe7ef6",
+          "value": "NE555"
+        }
+      ]
+    },
+    {
+      "file": "channel.kicad_sch",
+      "instance_path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f/3efd3880-a834-43ad-9d9e-8a2e1773fd98",
+      "name_path": "/Capacitor/",
+      "parts": [
+        {
+          "lib_id": "Device:R",
+          "reference": "R2",
+          "symbol_uuid": "acabcf9b-2d4d-47f6-8430-f8a99ce7cc2a",
+          "value": "10k"
+        },
+        {
+          "lib_id": "Device:C",
+          "reference": "C1",
+          "symbol_uuid": "eb14f1f6-3320-49c1-9e98-6cf4f49321e7",
+          "value": "100n"
+        },
+        {
+          "lib_id": "Device:R",
+          "reference": "R1",
+          "symbol_uuid": "f6750ab0-4052-4ca0-8763-69ea8d05706f",
+          "value": "1k"
+        }
+      ]
+    },
+    {
+      "file": "channel.kicad_sch",
+      "instance_path": "/9b50253b-b9bb-4b65-83c1-c2600abcad0f/5199b5f2-c7d4-4bd7-abf3-01698f94cb19",
+      "name_path": "/Repeated/",
+      "parts": [
+        {
+          "lib_id": "Device:R",
+          "reference": "R4",
+          "symbol_uuid": "acabcf9b-2d4d-47f6-8430-f8a99ce7cc2a",
+          "value": "10k"
+        },
+        {
+          "lib_id": "Device:C",
+          "reference": "C2",
+          "symbol_uuid": "eb14f1f6-3320-49c1-9e98-6cf4f49321e7",
+          "value": "100n"
+        },
+        {
+          "lib_id": "Device:R",
+          "reference": "R3",
+          "symbol_uuid": "f6750ab0-4052-4ca0-8763-69ea8d05706f",
+          "value": "1k"
+        }
+      ]
+    }
+  ],
+  "variant": "two repeated local +3V3 powers and one root global +3V3 participant"
+}
