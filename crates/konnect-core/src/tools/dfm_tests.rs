@@ -500,3 +500,20 @@ fn exactly_eighty_nine_degrees_is_a_right_angle_not_an_acute_corner() {
     assert!(is_acute(89.0 - 1e-9));
     assert!(!is_right_angle(89.0 - 1e-9));
 }
+
+/// A track of exactly 10 um is a leg, not part of the junction: "shorter than
+/// 10 um" is strict. On the line y = 0 the track's length is the double 0.01
+/// itself, so the comparison is exact; its direction makes a 45-degree corner
+/// with the bend's second leg.
+#[test]
+fn a_track_of_exactly_ten_micrometres_is_a_leg() {
+    let j = (20.0, 0.0);
+    let t = [
+        (j, (17.0, 0.0)),
+        (j, (22.12132, 2.12132)),
+        (j, (20.0, SHORT_TRACK_MM)),
+    ];
+    let (traps, cov) = acid_traps(&t);
+    assert_eq!(traps, 1, "{cov:?}");
+    assert_eq!(cov.short_tracks, Some(0), "{cov:?}");
+}
