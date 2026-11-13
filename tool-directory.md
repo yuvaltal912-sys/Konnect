@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **268 registered tools** + **7 always-visible meta-tools** = **275 total**
+- **269 registered tools** + **7 always-visible meta-tools** = **276 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -292,7 +292,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the saved board with kicad-cli and return a PNG image block. Accepts `side` (`top` or `bottom`, default `top`) and positive `zoom` (default 1); width/height retain their 100–4000 pixel clamps. This is an orthographic 3D render; use `export_svg` for layer-aware 2D output. |
 
-### `pcb_routing` · 18 tools
+### `pcb_routing` · 19 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -310,6 +310,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Partially update an observed unlocked straight trace in place, preserving its KIID and omitted fields; verify actual geometry and net. |
 | `route_batch` | Create explicit polyline segments and through vias together (max 200 objects), with complete preflight, one live undo commit and verified readback IDs. |
+| `plan_route_refinement` | Read-only second opinion on the saved board: propose same-net through stitching vias, perpendicular acute-T repairs and 45-degree pad-exit chamfers within a conservative two/four-layer rule/geometry profile and a bounded effort (`quick`, `standard`, `deep` or a custom budget). Returns source hashes, object preimages, ordered ordinary-tool operations, dependencies and blocked/partial coverage; never applies, saves or refills. Refill/save first, compare independently, then selectively create with `route_batch` or update with `modify_trace`; adoption spans calls and requires fresh native DRC and layout audit. Saved fill freshness remains unestablished. |
 | `query_vias` | List live vias by net with KIIDs, positions, span and dimensions; paged and byte-bounded. |
 | `delete_via` | Delete an observed unlocked via by KIID and verify absence while preserving other routing objects. |
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |

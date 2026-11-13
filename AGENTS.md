@@ -9,11 +9,11 @@ Two tracks, two state files. Start with the one for your task; each says where t
 
 - Reply in the language the owner last used. Keep it short, with one clear recommendation.
 - Update the track's handoff file (`docs/SIMULATION_HANDOFF.md` or `docs/CREATION_HANDOFF.md`) in the same commit that changes where the work stands.
-- Work on one PR at a time, and ask before starting the next one.
+- Work on one PR at a time. **Creation delegation (owner, 2026-11-10):** for creation PRs #63, #64 and #65 only, the supervisor approves publication text and coordinates gate-qualified serial integration. Creation work stops after these three PRs: no new row, PR or session starts without the owner's instruction. Workers use separate worktrees and never merge independently. Everything else, simulation included, still needs the owner's approval before the next PR and before publication.
 - Commit only on a feature branch, and push only to the `fork` remote. `origin` is the archived upstream and is read-only.
-- Do not merge a PR, enable CI or Actions, or turn on auto-merge unless the owner asks. When he asks for a merge, use the noreply merge command under "Known traps" in `docs/CREATION_HANDOFF.md`; never fast-forward `main`.
-- Never send a message under the owner's name without showing the exact text and getting a yes. A push, a PR's title and body, and a PR comment all count. A general go-ahead approves the direction, not the text.
-- Each PR goes the same way: the baseline gate first; the change with tests and a negative control for each guard; a review of the diff by an agent that did not write it; the gate again; a noreply commit; then the exact PR title and body to the owner.
+- Do not merge a PR, enable CI or Actions, or turn on auto-merge unless the owner asks. The one exception is the delegation above: the supervisor merges the three delegated PRs after review and gates. Use the noreply merge command under "Known traps" in `docs/CREATION_HANDOFF.md`; never fast-forward `main`.
+- Never send a message under the owner's name without showing the exact text and getting a yes. A push, a PR's title and body, and a PR comment all count. For the three delegated PRs the creation supervisor gives that yes; a general go-ahead approves the direction, not the text.
+- Each PR goes the same way: the baseline gate first; the change with tests and a negative control for each guard; a review of the diff by an agent that did not write it; the gate again; a noreply commit; then the exact PR title and body to the owner, or to the creation supervisor for a delegated PR.
 - Inside a row the owner has started, measurement and check runs go end to end with no per-run OK (his instruction, 2026-11-10). Choose the matrix and thresholds yourself and record each choice with its reason. Stop once at the end, with the results and the exact PR title and body.
 - macOS comes first. Windows and Linux validation waits until the end of the series.
 - Report what was and was not verified. A red baseline is reported, not fixed inside a feature PR.
@@ -33,6 +33,7 @@ Two tracks, two state files. Start with the one for your task; each says where t
 
 - System `python3` is the wrong interpreter. Use `/opt/homebrew/bin/python3.14 -I`.
 - The toolchain comes from `rust-toolchain.toml`. Put Homebrew first on `PATH` so `cargo` resolves.
+- For substantive Rust changes, use `cargo llvm-cov` when coverage evidence helps; when changing validation, transaction recovery or safety guards, run targeted `cargo mutants` checks. Scope both to the affected code and run them in an isolated checkout, with build and report outputs outside the main checkout. Keep the existing verification gate and per-guard negative controls. Report commands, results, limits and reasons for skipped checks. Skip both tools for docs-only or formatting-only edits.
 - Commit with the noreply address, never a personal one:
 
   ```bash

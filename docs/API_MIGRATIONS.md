@@ -3,6 +3,196 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: read-only route-refinement plans
+
+Creation row S7. New `plan_route_refinement` in `pcb_routing` supplies a second
+opinion for selective adoption under Q1. It reads the saved board, sibling
+project/custom rules and design intent; unsaved editor changes are excluded.
+Refill and save before planning. The presence of saved filled polygons does not
+establish their freshness. The tool never applies edits, saves, refills or starts
+Freerouting, and has no apply argument.
+
+| Argument | Meaning and bounds |
+|---|---|
+| `board` | Required saved `.kicad_pcb` path |
+| `kinds` | Nonempty, unique array of `stitching`, `t_junction`, `chamfer`; omitted means all three |
+| `nets` | Optional unique exact net names; omitted or empty means no net filter; unknown names refuse |
+| `max_proposals` | Integer 1–200, default 50 |
+| `effort` | `quick`, `standard` or `deep`; backend default `standard`; mutually exclusive with `budget` |
+| `budget` | Explicit object with all four integer fields: `max_candidates` (1–2,000,000), `max_pair_checks` (1–20,000,000), `max_geometry_work` (1–2,000,000,000), `max_elapsed_ms` (1–120,000); no unknown fields. Each ceiling is the `deep` tier |
+| `search_radius_mm` | 0.1–20, default 3.0 |
+| `grid_step_mm` | 0.05–1.0, default 0.25 |
+| `chamfer_mm` | 0.01–5.0, default 0.5; corner candidates try this setback and three successive halvings |
+
+Unknown arguments refuse. `stitching` seeks through vias contained in the same
+net's actual saved fills on at least two layers, near disconnected ground copper
+or a same-net reference change. The net filter narrows those candidate nets;
+it does not make every named net a ground/reference candidate. A reference
+change between different nets is never bridged. `t_junction` reterminates a
+supported acute straight-segment T branch perpendicularly; `chamfer` replaces
+a supported right-angle pad-exit dogleg with a 45-degree connector. Existing
+track widths and attachments are checked before proposing a change; locked
+traces and unsupported junctions remain blocked.
+
+Effort changes computational limits, never geometry thresholds or safety checks.
+
+| Tier | `max_candidates` | `max_pair_checks` | `max_geometry_work` | `max_elapsed_ms` |
+|---|---|---|---|---|
+| `quick` | 20,000 | 200,000 | 20,000,000 | 5,000 |
+| `standard` | 200,000 | 2,000,000 | 200,000,000 | 30,000 |
+| `deep` | 2,000,000 | 20,000,000 | 2,000,000,000 | 120,000 |
+
+The tiers are one decade apart on the three deterministic counters. A search
+ends on the geometry-work limit or the candidate limit, whichever its mix of
+cheap and costly positions reaches first; `exhaustion` names it. The pair limit
+and the elapsed limit are safety nets. The counters are the same on every run
+of one board with one set of arguments; elapsed time is not.
+
+The response reports requested/effective `effort` and its limits, actual counters,
+`elapsed_ms` and `exhaustion` reasons. The time limit bounds the search, not the
+preparation before it or the mandatory final consistency checks. Preparation
+builds the audit model, whose netclass pattern matcher is not linear: a crafted
+project with tens of thousands of multi-wildcard netclass patterns can make a
+plan take minutes (`preparation_ms` shows it). Nothing is written and no wrong
+copper results; `audit_layout_quality` has the same cost. A completed checked prefix can survive search exhaustion,
+but a candidate interrupted during validation is never returned. Output size,
+proposal count and copper-operation bounds remain independent of effort.
+
+Interactive agents establish the effort choice once per board-refinement task,
+reuse an existing choice or explicit effort delegation, and ask before increasing
+it. This conversation belongs in the shipped PCB workflow. Direct API callers
+can use the backend default or supply their choice; no approval flag is required.
+
+The version-1 response identifies `planner: "route_refinement"` and
+`mutated: false`. A plan includes `source`, `parameters`, `before.corners`,
+`proposals`, `blocked`, `coverage`, `not_checked`, `truncated` and `adoption`.
+`source` records SHA-256 fingerprints for the saved board and available project,
+rules and intent, and says that live edits and fill freshness are unestablished.
+Inputs are rechecked before the plan returns. Proposals carry a stable `id`,
+`kind`, exact affected-object `preconditions`, ordinary-tool `operations`,
+`checks`, a predicted track-length delta and `depends_on`. The native result
+after refill remains unverified. These fingerprints/preconditions describe the
+plan's inputs; ordinary editing tools do not consume them as a plan revision.
+
+`coverage` describes the search itself. `phases` lists each requested kind in
+search order with a `state` (`complete`, `stopped` or `not_started`) and its own
+candidate, pair-check and geometry-work counts. The limits are shared, so every
+kind after a stopped one is `not_started` and was never searched.
+`candidates_considered` counts the candidates examined, `candidates_rejected`
+counts refusals by the guard that refused them, and `proposals_by_kind` counts
+the whole checked plan. `effort.used` repeats the counters with
+`preparation_ms` and `elapsed_ms`.
+
+`proposals_total` can exceed `proposals_listed`, and `blocked_total` can exceed
+`blocked_listed`: a response holds at most 48 KiB and 200 unresolved rows, and a
+plan changes at most 200 copper objects. The listed proposals are always an
+intact prefix of the checked plan. `exhaustion` names every limit that was
+reached: `candidate limit reached`, `proposal response limit reached`,
+`copper operation limit reached`, `geometry work budget exhausted`,
+`pair-check budget exhausted`, `elapsed search time limit reached`,
+`response size limit reached` and `blocked detail limit reached`. When any is
+present, adopt what is listed, refill and check, then plan again from the
+resulting board. A corner the planner cannot repair appears once in `blocked`
+with all its reasons; refused stitching positions are counted in
+`candidates_rejected` and not listed one by one.
+
+Proposals are checked cumulatively in their returned order; `depends_on` links
+each to its predecessor. A subset needs a fresh comparison and geometry check,
+especially when it omits a dependency. `status: "partial"`, `blocked` and
+`truncated` preserve unresolved work; read them together with the proposal
+counts and coverage. A handler-level refusal returns `status: "blocked"`,
+`mutated: false`, no proposals and incomplete coverage. A `planned` status or
+empty proposal list is not a routing-completion or DRC verdict. Work and response
+budgets can leave candidates unexplored, and the response can omit whole
+proposal groups.
+
+The conservative profile requires a saved project, two or four copper layers,
+a closed readable outline, known object identities, supported pad geometry,
+through vias with one copper size on every layer, and saved fills for copper
+zones. Clearance and via dimensions use conservative saved project/class
+maxima. A track's width floor is the board/custom minimum or, where wider, the
+widest class of its net. The classes of a net are those that name it in
+`netclass_assignments` and those whose pattern matches it under KiCad's wildcard
+reading: `*` is any run, `?` is any one character, every other character is
+literal, the whole name must match and case counts. A class that sets no width
+uses Default's, and a net that no class names uses Default. Two limits follow.
+KiCad also reads each pattern as an anchored regular expression, and gives a
+net that is named like a bus and has no class of its own the class its members
+share; neither is evaluated here. Where only one of those puts a net in a wider
+class, the planner can list a connector narrower than that class, and
+`route_batch` refuses it at adoption ("width is below the live netclass
+preferred width") and writes nothing. With several
+matching classes the planner uses the widest, which can be wider than KiCad's
+priority order gives; it then lists fewer repairs. Only unconditional numeric custom-rule
+clearance/width minima are supported. Checks use complete copper envelopes on
+all spanned layers, holes, rule areas and the outline, with an additional
+0.01 mm margin and 1 nm coordinate rounding. Unsupported rule forms, a local
+clearance, zone-connection or thermal override on a pad, a footprint or one
+layer of a padstack, any pad or via padstack that gives a layer its own copper
+(`front_inner_back`, `custom`, or layer entries with no mode), any item on the
+Margin layer, approximate pads,
+slotted/offset drills, copper text or footprint copper graphics,
+blind/microvias, safety-relevant Beziers and curves outside the bounded
+approximation profile refuse. Changed attachments to curved
+tracks are blocked unless their original attached segment is preserved. A new
+stitching via never lands on a pad of its own net, and its hole keeps the
+hole clearance to other-net copper and fills. The copper of an unplated-hole
+pad is an obstacle with no net. Every member of a locked group is locked,
+through nested groups too. A project that saves `null` class assignments or
+patterns has none. Planning takes lock files under Konnect's own state folder
+while it reads, and writes nothing else.
+
+One exception to the extra margin (owner decisions, 2026-11-12 and 2026-11-13). A corner repair
+shortens saved tracks and adds one connector. The shortened legs are saved
+copper and are not certified again. The connector may sit inside the 0.01 mm
+margin band only against an exactly modelled obstacle (a straight track, a via,
+a rectangular or trapezoid pad, a saved fill), only when it is no closer to that
+obstacle than the nearest saved track of the corner it repairs already is, and
+never below the nominal clearance.
+Curved copper, graphics, keep-outs, round and rounded pads, board edges and
+holes always keep the full margin. `checks.saved_clearances_inherited` counts
+the obstacles a proposal relied on this for. After every adopted group, run
+native DRC and compare it with the DRC before: undo and report a group when a
+new entry involves copper it created or changed, or is a clearance, short, hole
+or edge entry. Undo and report it too when the count of unconnected items on a
+net the group touched rises. A new `unconnected_items` or isolated-copper entry
+that names a touched net is a reason to undo only when that net's unconnected
+count did not fall: KiCad names the nearest open pair, so the connections that
+stay open after a group closes others can appear under new items. Compare the items of an
+entry, not only totals: KiCad can name an existing open connection or mask
+bridge by a different pair of items from one run to the next, with no change to
+the board, so a one-for-one exchange on an untouched net is not a new finding.
+
+What the planner does not achieve. On the boards it was measured on, repeated
+plan, adopt, refill and DRC rounds ended after four rounds with nothing more to
+propose. Right-angle corners fell to 1–6 per board, but 3–8 acute corners per
+board remained: an acute corner between two tracks, an acute T with no straight
+trunk, a branch shorter than the setback and a junction of four track ends are
+outside the three proposal kinds. A branch that already meets either leg of its
+trunk within 0.06 degrees of a right angle is left alone and reported, even where a slightly
+bent trunk makes the audit count the junction as acute. On three of the boards
+95–96 % of ground pads ended in the main ground group, not all: the rest had no
+safe stitching position within the search radius. Such findings stay in
+`blocked`. The audit's acid-trap check does not examine a track end that lands
+mid-segment on another track, so a corner repair is judged there by the
+planner's own geometry, not by the audit.
+A plan is a set of safe local repairs, not a guarantee of zero acute corners or
+of full ground connectivity. This
+does not reproduce KiCad's general rule engine or prove fill freshness, thermal
+relief, current capacity or connectivity after refill.
+
+Compare the suggestions independently with the AI's own design using
+`audit_layout_quality` under identical settings; the planner uses the audit's
+defaults and accepts no audit-threshold overrides. Select only justified
+groups, re-observe saved sources and affected objects, and replan if their
+fingerprints or preimages differ. Use `route_batch` only for creates and
+`modify_trace` for the listed in-place changes. Adoption spans ordinary calls
+and undo commits, with no atomic full-plan apply or rollback guarantee. Inspect
+each call's outcome and readback before continuing; after a partial or uncertain
+call, inspect the live board before any retry. After an adopted group, refill,
+save, run native DRC and repeat the audit with the same settings. Replan further
+work from that resulting state; predicted gains do not replace these measurements.
+
 ## Unreleased: suspected zone-fill defect evidence
 
 Creation row S11 adds `zone_fill_check.suspected_fill_defects` to `run_drc`

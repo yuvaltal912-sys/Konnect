@@ -628,6 +628,113 @@ refuse. Use `modify_trace` for partial in-place edits and `query_vias` /
 relevant clearance/connectivity checks; an uncertain result needs live-board
 inspection before retrying.
 
+### Route refinement: plan, compare, adopt (Q1)
+
+Establish computational effort once at the start of a board-refinement task,
+before calling `plan_route_refinement`:
+
+- If the user already named `quick`, `standard`, `deep`, or an explicit custom
+  budget, use that choice. If the user explicitly delegated the **effort
+  choice**, choose a bounded level within that delegation and state it.
+- Otherwise ask once: "How much computational effort should I use: Quick for
+  a smaller search, Standard for a broader search, or Deep for the largest
+  bounded search?" Wait for the answer before calling the planner; other
+  read-only preparation can continue. A general request to design, route or
+  refine a board does not specify effort, and the backend's standard default
+  is not a user choice.
+- Send the selected `effort` explicitly on related planner calls and reuse it
+  for this task. If a limit prevents useful progress, explain the reported
+  exhaustion reason and ask before increasing beyond the chosen effort.
+  Honor an explicit effort delegation instead of inventing another approval.
+
+Offer timing guidance only when supported by measured public fixture/demo
+results for the relevant release; otherwise describe search breadth without
+inventing durations. Supply either `effort` or the complete `budget` object,
+never both. Custom budgets bound candidates, pair checks, geometric work and
+elapsed search time. Quick, Standard and Deep are one decade apart in search
+work (20, 200 and 2,000 million geometry-work units). Safety checks, response limits and read-only behavior stay
+the same at every level. Direct explicit API callers can supply their level or
+budget without a conversational prompt; there is no backend approval flag or
+OS dialog.
+
+Use `plan_route_refinement` from `pcb_routing` as a second opinion on existing
+routing. The AI owns the design choice. The tool reads saved files only and
+never edits, saves or refills the board.
+
+1. Refill and save the named board using the synchronized DRC procedure above.
+   Record the native DRC baseline and your own `audit_layout_quality` assessment
+   before requesting suggestions. The planner uses the audit's default settings;
+   keep the settings identical for before/after comparisons.
+2. Call `plan_route_refinement(board, kinds?, nets?, max_proposals?,
+   effort?, budget?, search_radius_mm?, grid_step_mm?, chamfer_mm?)`.
+   `kinds` selects `stitching`, `t_junction` and/or `chamfer` (all by default).
+   It proposes same-net through stitches, perpendicular acute-T repairs and
+   45-degree pad-exit chamfers. Read `source`, `blocked`, `coverage`,
+   `not_checked` and `truncated` along with the proposals. Saved fill presence
+   does not prove freshness; `planned` does not mean the board is complete.
+   One response lists an intact prefix of the plan. When
+   `coverage.proposals_total` exceeds `proposals_listed`, or `exhaustion` names
+   a limit, more work remains: adopt, refill and check, then plan again from
+   the new board. A kind that `coverage.phases` marks `not_started` was never
+   searched.
+3. Compare the proposals with your own routing and audit findings. Choose only
+   the groups whose geometry and purpose you support. Read each `preconditions`,
+   `operations` and `depends_on`: the plan is cumulative, and skipping an
+   earlier group requires a fresh comparison and geometry check. If you cannot
+   establish a subset's validity, obtain a new plan instead of assuming that
+   every proposal is independently safe.
+4. Before adopting a group, re-observe the saved source fingerprints and exact
+   affected-object preimages, including KIIDs, nets, layers, points and widths.
+   Replan on a mismatch or unsaved live differences. Preserve operation order:
+   `route_batch` creates the proposed tracks/vias; `modify_trace` changes the
+   existing traces in place. The ordinary tools do not consume the planner's
+   fingerprints as a revision guard. Inspect each result and readback before
+   continuing. Calls span multiple undo commits; partial or uncertain results
+   require live-board inspection before retrying.
+5. After each adopted group, run the synchronized refill/save/DRC procedure,
+   then `audit_layout_quality` with the same settings as the baseline. Judge
+   connectivity, DRC and quality from that resulting state. Replan further work
+   from it. Report any blocked/unexplored work, remaining defects and unverified
+   checks; a predicted length reduction is not a measured improvement.
+
+The planner supports a conservative saved-rule/geometry profile: two or four
+copper layers, a closed readable outline, through vias and pads with one copper
+size on every layer, supported pad shapes and actual saved fills. Conditional
+rules, local clearance or zone-connection overrides on a pad, footprint or
+padstack layer, padstacks with different copper per layer, any item on the
+Margin layer,
+approximate pads, slotted/offset drills and unsupported copper geometry refuse.
+Clearance includes every spanned layer and an extra 0.01 mm margin; rule maxima
+can reject otherwise legal candidates. A corner repair may keep the saved
+clearance of the leg it shortens instead of the extra margin, never less than
+the nominal clearance; `checks.saved_clearances_inherited` counts where it did.
+A net's width floor follows the classes that name it exactly or by a wildcard
+pattern (`*`, `?`), the widest when several do, so the planner can list fewer
+repairs than KiCad's class priority would allow. KiCad also reads a pattern as
+a regular expression and lets a bus-named net inherit its members' class; the
+planner evaluates neither. If `route_batch` refuses a listed connector because
+its width is below the live netclass width, nothing was written; skip that
+group and report it.
+After refill, compare native DRC with the DRC before the group. Undo the group
+and report it when a new entry involves copper the group created or changed;
+when a new entry is a clearance, short, hole or edge entry; when the count of
+unconnected items on a net the group touched rises. A new `unconnected_items`
+or isolated-copper entry that names a touched net is a reason to undo only when
+that net's unconnected count did not fall.
+Compare the items of an entry, not only totals: KiCad can name an existing open
+connection or mask bridge by a different pair of items between runs, so a
+one-for-one exchange on an untouched net is not a new finding.
+
+Do not promise more than the planner does. It repairs pad-exit right angles and
+acute T-junctions with a straight trunk, and stitches where a safe position
+exists. Acute corners between two tracks, T-junctions with no straight trunk,
+a branch that already meets its trunk squarely (a slightly bent trunk can make
+the audit call that junction acute) and ground pads with no safe stitch
+position within the search radius stay in `blocked`; report them as remaining defects and fix them by ordinary routing if
+they matter. Treat these limits as blockers, not as
+permission to relax rules or direct-edit the file. This tool neither certifies
+current capacity/thermal relief nor replaces the Freerouting failure policy.
+
 ### Saved custom rules and routing
 
 Use `create_custom_drc_rule`, `edit_custom_drc_rule` and `delete_custom_drc_rule`

@@ -345,6 +345,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ];
     tools.extend(batch::tools());
+    tools.extend(super::route_refine::tools());
     tools
 }
 
