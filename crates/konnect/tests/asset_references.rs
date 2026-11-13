@@ -1009,6 +1009,13 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "signals_plotted",
         // Result field of `get_design_intent`.
         "missing_sections",
+        // A `kinds` value and result fields of `plan_route_refinement`.
+        "t_junction",
+        "proposals_total",
+        "proposals_listed",
+        "not_started",
+        "depends_on",
+        "saved_clearances_inherited",
     ];
 
     let mut phantom = Vec::new();

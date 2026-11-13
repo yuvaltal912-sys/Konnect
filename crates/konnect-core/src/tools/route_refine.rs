@@ -68,7 +68,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
             "grid_step_mm":{"type":"number","minimum":0.05,"maximum":1,"default":0.25},
             "chamfer_mm":{"type":"number","minimum":0.01,"maximum":5,"default":0.5}
         },"required":["board"],"additionalProperties":false
-    }), |args,ctx|async move { handle(args,ctx).await })]
+    }), |args,ctx|async move { handle_plan_route_refinement(args,ctx).await })]
 }
 
 #[derive(Clone)]
@@ -254,7 +254,7 @@ fn optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
-async fn handle(args: &Value, _ctx: &ToolContext) -> Result<CallToolResult> {
+async fn handle_plan_route_refinement(args: &Value, _ctx: &ToolContext) -> Result<CallToolResult> {
     let args = args.clone();
     let started = std::time::Instant::now();
     tokio::task::spawn_blocking(move||{
