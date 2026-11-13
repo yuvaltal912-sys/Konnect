@@ -2139,5 +2139,7 @@ fn a_jog_at_a_135_degree_bend_is_a_right_angle_only_from_ten_micrometres() {
         assert_eq!(m["acute_corners"], 0, "jog of {length} mm: {m}");
         assert_eq!(m["right_angle_corners"], right, "jog of {length} mm: {m}");
         assert_eq!(m["bends"], bends, "jog of {length} mm: {m}");
+        // Two junctions from 10 um, neither holding a short track.
+        assert_eq!(m["junctions_with_short_tracks"], 1 - right, "{m}");
     }
 }

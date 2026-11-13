@@ -651,7 +651,7 @@ pub(super) fn corner_junctions(m: &Model) -> (usize, usize, usize, Vec<CornerRow
     let (mut bends, mut right, mut acute_here, mut with_short) = (0usize, 0usize, 0usize, 0usize);
     let mut right_rows: Vec<(String, String, Pt, Vec<String>)> = Vec::new();
     for j in dfm::junctions(tracks) {
-        if j.ends.len() >= 2 && j.short_tracks > 0 {
+        if j.short_tracks > 0 {
             with_short += 1;
         }
         if j.ends.len() != 2 {

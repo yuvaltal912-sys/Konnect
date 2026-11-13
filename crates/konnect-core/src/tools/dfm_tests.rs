@@ -517,3 +517,19 @@ fn a_track_of_exactly_ten_micrometres_is_a_leg() {
     assert_eq!(traps, 1, "{cov:?}");
     assert_eq!(cov.short_tracks, Some(0), "{cov:?}");
 }
+
+/// An arc is a track: its end piece is a leg of the junction it ends at. An
+/// arc leaving the junction at 135 degrees (a radius of 1 mm, tangent 45
+/// degrees from the straight leg) is one acid trap.
+#[test]
+fn an_arc_is_a_leg_of_its_junction() {
+    let arc = format!(
+        "  (arc (start {} {}) (mid 19.707107 20.707107) (end 20 21.414214) (width 0.2) (layer \"F.Cu\") (net \"SIG\") (uuid \"a1\"))\n)",
+        JN.0, JN.1
+    );
+    let text = trap_board(&[(JN, at(180., 3.))]).replace("\n)", &format!("\n{arc}"));
+    let report = check_board(&geometry(&text), &jlc());
+    let traps = issues_with(&report, "Acid trap");
+    assert_eq!(traps.len(), 1, "{:?}", report.checks["acid_trap"]);
+    assert_eq!(report.checks["acid_trap"].checked, 1);
+}

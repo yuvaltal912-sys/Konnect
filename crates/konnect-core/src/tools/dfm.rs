@@ -526,10 +526,11 @@ fn via_on_layer(via: &Entry, layer: &str) -> bool {
 // ─── Junctions and acid traps ───────────────────────────────────────────────
 
 /// Tracks shorter than this belong to the junction they touch and give no
-/// direction (S7b, owner decision 2026-11-13). Autorouters leave such tracks
-/// at bends and tees, 0.1 to 3 um long; their direction is rounding noise.
-/// 10 um is ten junction keys and lies inside the end cap of any track a fab
-/// can make.
+/// direction (S7b, owner decision 2026-11-13). Freerouting leaves such tracks
+/// while it routes, 0.1 um up to 9.6 um on a diagonal: its 45-degree corner
+/// smoothing stops 0.1 um short of the next corner, and it snaps wire ends to
+/// via and pad centres. Their direction is an artifact, not a leg. 10 um is
+/// ten junction keys and lies inside the end cap of any track a fab can make.
 pub(crate) const SHORT_TRACK_MM: f64 = 0.01;
 
 /// A corner is acute below the lower edge of the audit's own right-angle
@@ -606,8 +607,8 @@ pub(crate) fn is_short_track(t: &Entry) -> bool {
     t.shape.pts.len() >= 2 && track_length(&t.shape.pts) < SHORT_TRACK_MM
 }
 
-/// Every junction of the given tracks, in (layer, net, key) order. A key
-/// with one track end and no short track is not returned.
+/// Every junction of two or more track ends of 10 um or more, in (layer,
+/// net, key) order; arcs count as tracks, read from their end pieces.
 pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junction> {
     type Group<'a> = Vec<&'a Entry>;
     let mut groups: BTreeMap<(String, String), Group<'a>> = BTreeMap::new();
@@ -681,7 +682,7 @@ pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junc
                 .iter()
                 .flat_map(|k| ends.get(k).into_iter().flatten().cloned())
                 .collect();
-            if dirs.len() < 2 && short_tracks == 0 {
+            if dirs.len() < 2 {
                 continue;
             }
             let main = *keys
@@ -737,15 +738,11 @@ fn check_acid_traps(geometry: &BoardGeometry, report: &mut DfmReport) {
         })
     };
 
-    let mut checked = 0;
     let mut skipped = 0;
     let mut traps: Vec<(&Junction, f64)> = Vec::new();
     let all = junctions(tracks.iter().copied());
+    let checked = all.len();
     for j in &all {
-        if j.ends.len() < 2 {
-            continue;
-        }
-        checked += 1;
         let sharpest = j.sharpest();
         if is_acute(sharpest) {
             if j.leg_points().all(|p| copper_of_net(&j.net, &j.layer, p)) {
