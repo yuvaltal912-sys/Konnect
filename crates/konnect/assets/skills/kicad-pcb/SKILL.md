@@ -346,7 +346,9 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    nothing and was given no pour as a plane; `unverified` means it was given a
    plane (or its count could not be read); `incomplete` means it left
    connections. `completion.next_steps` lists the exact calls still needed,
-   and `completion.complete_when` says what decides.
+   and `completion.complete_when` says what decides. With planes, those steps
+   start with `save_project` and `create_checkpoint(project)`: run them
+   before step 4 (step 7 says why).
 4. Review `plan_specctra_ses_import(board, ses_path, manifest_path)`. It is
    read-only and checks the SES against the revision-bound manifest and live
    board. A stale revision needs a new export and routing job.
@@ -358,17 +360,24 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
 6. Finish with the synchronized refill/DRC procedure below. The import's
    candidate check does not establish that existing zone fills are current.
 7. If any pour went to the router as a plane (`completion.planes` is not
-   empty), stitch after the refill. Call `plan_route_refinement(board,
-   kinds=['stitching'], nets=[the plane nets], search_radius_mm=3)` with the
-   effort chosen for this task, adopt the stitching vias you support with
-   `route_batch`, then refill and run DRC again. Repeat for at most 4 rounds,
-   until the planner lists no stitching proposal or DRC reports 0 unconnected
-   items on the plane nets. The routing is complete only when KiCad's DRC on
-   the refilled board reports 0 unconnected items. If 1 to 10 connections on
-   the plane nets are still open, report each one as open: the routing is not
-   complete. If more than 10 are open, fall back: export again with
-   `pours='omit'`, route again, and report that outcome beside the open count
-   of the plane run.
+   empty), follow `completion.next_steps`. The checkpoint taken before step 4
+   keeps the exported board: the fallback needs it back, because
+   `export_specctra_dsn` refuses a board that holds unlocked routing. After
+   the import, stitch.
+   Call `plan_route_refinement(board, kinds=['stitching'], nets=[the plane
+   nets], search_radius_mm=3)` with the effort chosen for this task, adopt the
+   stitching vias you support with `route_batch`, then refill and run DRC
+   again. Repeat for at most 4 rounds, until the planner lists no stitching
+   proposal or DRC reports 0 unconnected items on the plane nets. The routing
+   is complete only when KiCad's DRC on the refilled board reports 0
+   unconnected items. If 1 to 10 connections on the plane nets are still open,
+   report each one as open: the routing is not complete. If more than 10 are
+   open, fall back. First close the board and the project in KiCad, then
+   `restore_checkpoint(project, checkpoint_id)` (preview, then apply with
+   `dry_run=false` and its `expected_revision`), then reopen the project with
+   `launch_kicad_ui(project)` and open the board in the PCB editor. Then
+   export again with `pours='omit'` and the same other arguments, route
+   again, and report that outcome beside the open count of the plane run.
 
 **Current limits:** 2 to 32 copper layers (KiCad power layers stay off-limits
 to the router) and SMD or through-hole footprints on either side; circle,

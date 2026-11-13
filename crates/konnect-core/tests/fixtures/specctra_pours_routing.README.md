@@ -20,8 +20,9 @@ planning on it.
 
 ## Provenance
 
-Written on 2026-11-13 by `make_f1.py`, a plain Python script with no KiCad, kept
-with row S6's second-half evidence (`target/creation-research/s6b/f1/`,
-ignored). UUIDs are uuid5 values, so the script writes the same bytes every
-time. It is used by `specctra_pours_tests.rs`, and natively by that row's
-measurement (cells F1omit and F1plane).
+Written on 2026-11-13 by `specctra_pours_routing.make.py`, beside this file:
+plain Python with no KiCad, run as
+`/opt/homebrew/bin/python3.14 -I specctra_pours_routing.make.py <out-dir>`.
+UUIDs are uuid5 values, so the script writes the same bytes every time.
+`specctra_pours_tests.rs` uses the fixture. So did row S6's second-half
+measurement natively, in cells F1omit and F1plane.

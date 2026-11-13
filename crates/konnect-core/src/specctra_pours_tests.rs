@@ -655,3 +655,42 @@ fn the_pour_routing_fixture_exports_with_and_without_its_bottom_plane() {
     assert_eq!(manifest["components"].as_array().unwrap().len(), 12);
     assert_eq!(manifest["nets"].as_array().unwrap().len(), 7);
 }
+
+/// What the router reads as a conduction area is judged in every form a DSN
+/// can carry it, so a DSN that Konnect did not write cannot report a run
+/// complete (review S4, nit 6).
+#[test]
+fn every_conduction_area_form_of_a_dsn_counts_as_a_plane() {
+    let plane = |net: &str, layer: &str| DsnPlane {
+        net: net.into(),
+        layer: layer.into(),
+    };
+    // KiCad's own export of the rounded board: one GND plane on B.Cu.
+    let native = include_str!("../tests/fixtures/specctra_rounded_board.native-kicad-10.dsn");
+    assert_eq!(dsn_planes(native).unwrap(), vec![plane("GND", "B.Cu")]);
+    // A quoted net name, a rectangle, and keywords in capitals.
+    let forms = r#"(PCB board (STRUCTURE
+        (plane "GND RET" (rect F.Cu 0 0 10 10))
+        (Plane VCC (circle B.Cu 5 0 0))))"#;
+    assert_eq!(
+        dsn_planes(forms).unwrap(),
+        vec![plane("GND RET", "F.Cu"), plane("VCC", "B.Cu")]
+    );
+    // A wire with an area shape is a conduction area of its net; a path wire
+    // is a track, and an area with no net is an obstacle.
+    let wiring = r#"(pcb board (structure)
+        (wiring
+          (wire (polygon B.Cu 0 0 0 10 0 10 10) (net GND) (type fix))
+          (wire (path F.Cu 250 0 0 10 0) (net SIG) (type fix))
+          (wire (rect F.Cu 0 0 5 5))))"#;
+    assert_eq!(dsn_planes(wiring).unwrap(), vec![plane("GND", "B.Cu")]);
+    // A plane with no shape is an error, and a broken file names no content.
+    assert!(dsn_planes("(pcb board (structure (plane GND)))").is_err());
+    let broken = format!(
+        "(pcb board (structure (plane GND {}",
+        "(polygon B.Cu 0 1 2 ".repeat(1000)
+    );
+    let error = dsn_planes(&broken).unwrap_err().to_string();
+    assert!(error.len() < 80 && !error.contains("polygon"), "{error}");
+    assert!(dsn_planes("(session board)").is_err());
+}

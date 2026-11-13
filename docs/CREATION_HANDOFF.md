@@ -484,12 +484,22 @@ for the owner's word.
   - Code: `routing_status` and `completion_report` in `tools/integration.rs`.
 - **Docs.** The `kicad-pcb` skill teaches the same sequence (Freerouting round trip, step 7). It, `tool-directory.md`, `DEV.md` and `docs/API_MIGRATIONS.md` now say what `fixed` really writes.
 
-**For S9, which edits the same two files next.**
+**For S9, which edits the same two files next.** What this row changed there:
 
-- `status` and `completion` are built in one function, `completion_report` in `tools/integration.rs`. Its unrouted count comes from `RouteEvidence.router_unrouted` in `freerouting_mcp.rs`.
-- S9's `complete_with_width_exceptions` and `stopped` can be added in `routing_status` without touching the rest.
-- One rule must stay: with any plane in the DSN, `status` is never `complete`, because Freerouting counts a pad inside a plane as connected.
-- When S9 runs several passes, the count to pass in is the last pass's.
+- **`freerouting_mcp.rs`.**
+  - `log_lines` was pulled out of `optimizer_report`. It turns the job log into message lines.
+  - New `router_unrouted(log)` returns the last "(N unrouted" of an "Auto-routing stage completed" line or of an "Optimizer pass #k … was completed" line, or the N of "Skipping optimization stage: the board has N unrouted". It ignores pass lines and the line that starts a stage. It returns `None` when the log holds none of these.
+  - New field `RouteEvidence.router_unrouted`. `run_state_machine` fetches `get_job_logs` once, and feeds both `optimizer_report` and `router_unrouted` from it.
+  - Job settings, read-back and the isolation of the JAR are unchanged.
+- **`tools/integration.rs`.**
+  - New `routing_status(planes, router_unrouted)` and `completion_report(dsn, ses, planes, router_unrouted)`, which returns `status` and `completion`.
+  - The constants `PLANE_FALLBACK_OPEN` (10), `STITCH_ROUNDS` (4) and `STITCH_RADIUS_MM` (3.0, the planner's default).
+  - In `handle_route_specctra_dsn`: the planes are read from the DSN before routing (`specctra::dsn_planes`). `status` and `completion` are added after `success`. Every other field is unchanged.
+  - Tests: `route_rule_tests`, including `assert_calls_are_real`. That helper checks every tool and parameter in `next_steps` and `fallback` against the registry and the tool's own input schema.
+- **Where S9's statuses go.** Add `complete_with_width_exceptions` and `stopped` as arms of `routing_status`, ahead of `complete`.
+  - One rule must stay: with a plane in the DSN, no "complete" status is ever returned, because Freerouting counts a pad inside a plane as connected.
+  - Pass the last pass's unrouted count to `completion_report`. Per-pass detail belongs in S9's own `passes` field.
+  - `next_steps` stays the KiCad-side sequence after the call. S9 should not add router passes to it.
 
 **Known limits.**
 

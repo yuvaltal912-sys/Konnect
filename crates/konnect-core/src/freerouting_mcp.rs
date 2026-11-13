@@ -28,6 +28,46 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
+/// The largest DSN `route_specctra_dsn` reads or routes. Konnect's exports
+/// of real boards are well under a megabyte; the bound keeps a mistaken path
+/// (a huge file) from being read whole.
+pub(crate) const MAX_DSN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Refuses a `dsn_path` that is not an existing regular `.dsn` file of at
+/// most [`MAX_DSN_BYTES`], before anything reads it: a directory, a FIFO or
+/// a device is refused at once instead of blocking a read.
+pub(crate) fn check_dsn_input(dsn: &Path) -> Result<()> {
+    let regular = std::fs::metadata(dsn)
+        .ok()
+        .filter(std::fs::Metadata::is_file);
+    let Some(metadata) = regular.filter(|_| extension_is(dsn, "dsn")) else {
+        bail!("DSN input must be an existing .dsn file: {}", dsn.display());
+    };
+    if metadata.len() > MAX_DSN_BYTES {
+        bail!(
+            "DSN input is {} bytes, more than the {MAX_DSN_BYTES} this tool reads: {}",
+            metadata.len(),
+            dsn.display()
+        );
+    }
+    Ok(())
+}
+
+/// A checked DSN's text, read with a bound even if the file grows meanwhile.
+pub(crate) fn read_dsn(dsn: &Path) -> Result<String> {
+    use std::io::Read;
+    check_dsn_input(dsn)?;
+    let mut text = String::new();
+    std::fs::File::open(dsn)
+        .with_context(|| format!("open DSN {}", dsn.display()))?
+        .take(MAX_DSN_BYTES + 1)
+        .read_to_string(&mut text)
+        .context("the DSN is not UTF-8 text")?;
+    if text.len() as u64 > MAX_DSN_BYTES {
+        bail!("DSN input grew past {MAX_DSN_BYTES} bytes while it was read");
+    }
+    Ok(text)
+}
 
 fn server_arguments() -> &'static [&'static str] {
     &[
@@ -429,8 +469,6 @@ fn check_effective_settings(
     Ok(effective)
 }
 
-/// The optimizer's outcome from Freerouting's job log: the passes that ran,
-/// whether a pass stopped early, and the optimizer score before and after.
 /// The message lines of a Freerouting job log, in order.
 fn log_lines(log: &Value) -> Vec<String> {
     fn messages(value: &Value, out: &mut Vec<String>) {
@@ -458,6 +496,8 @@ fn log_lines(log: &Value) -> Vec<String> {
     lines
 }
 
+/// The optimizer's outcome from Freerouting's job log: the passes that ran,
+/// whether a pass stopped early, and the optimizer score before and after.
 fn optimizer_report(log: &Value) -> OptimizerReport {
     fn number_after(line: &str, marker: &str) -> Option<f64> {
         let rest = &line[line.find(marker)? + marker.len()..];
@@ -542,20 +582,17 @@ pub(crate) fn router_unrouted(log: &Value) -> Option<u32> {
         let open = line[..at].rfind('(')?;
         line[open + 1..at].trim().parse().ok()
     }
+    // Every summary line counts, so a last summary that cannot be read
+    // leaves the count unknown rather than an earlier one standing.
     let mut last = None;
     for line in log_lines(log) {
-        let count = if line.contains("Auto-routing stage completed")
+        if line.contains("Auto-routing stage completed:")
             || (line.contains("Optimizer pass #") && line.contains("was completed"))
         {
-            in_summary(&line)
+            last = in_summary(&line);
         } else if let Some(at) = line.find("Skipping optimization stage: the board has ") {
             let rest = &line[at + "Skipping optimization stage: the board has ".len()..];
-            rest.split_whitespace().next().and_then(|n| n.parse().ok())
-        } else {
-            None
-        };
-        if count.is_some() {
-            last = count;
+            last = rest.split_whitespace().next().and_then(|n| n.parse().ok());
         }
     }
     last
@@ -674,9 +711,7 @@ fn validate_inputs(
     if !jar.is_file() {
         bail!("Freerouting JAR does not exist: {}", jar.display());
     }
-    if !dsn.is_file() || !extension_is(dsn, "dsn") {
-        bail!("DSN input must be an existing .dsn file: {}", dsn.display());
-    }
+    check_dsn_input(dsn)?;
     if !extension_is(ses_output, "ses") {
         bail!("SES output must have the .ses extension");
     }
@@ -1502,6 +1537,13 @@ mod tests {
             "Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (1 unrouted and 0 violations).",
         ]);
         assert_eq!(router_unrouted(&later), Some(1));
+        // A last summary that cannot be read makes the count unknown: an
+        // earlier 0 must not stand (review S5).
+        let unreadable = log(&[
+            "Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+            "Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (1,024 unrouted and 0 violations).",
+        ]);
+        assert_eq!(router_unrouted(&unreadable), None);
         // The skip line alone is enough.
         let skipped = log(&["[1DA299] Skipping optimization stage: the board has 3 unrouted connection(s) (optimizer only runs on completely routed boards)."]);
         assert_eq!(router_unrouted(&skipped), Some(3));

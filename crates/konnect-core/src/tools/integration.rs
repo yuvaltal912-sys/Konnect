@@ -150,7 +150,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`.",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls.",
             json!({
                 "type": "object",
                 "properties": {
@@ -253,11 +253,20 @@ const STITCH_ROUNDS: u32 = 4;
 /// The planner's own default search radius, sent explicitly.
 const STITCH_RADIUS_MM: f64 = 3.0;
 
+/// The most of an error's text a completion report repeats: a parse error
+/// can carry the unparsed rest of the file, which must not come back whole.
+const MAX_REASON_DETAIL: usize = 160;
+
 /// `status` and `completion` of a routing result: what Freerouting's own
 /// count shows, which pours it was given as planes (from the DSN, named from
 /// the manifest beside it), what decides completion, and the exact calls
 /// still needed. Additive: `success` keeps meaning that the job ran and the
 /// SES was written.
+///
+/// With planes, the steps first keep the board as it was exported (save it,
+/// then `create_checkpoint`), because the fallback has to export it again and
+/// the exporter refuses a board that holds unlocked routing: after the import
+/// and the stitching rounds it does.
 fn completion_report(
     dsn: &Path,
     ses: &Path,
@@ -265,19 +274,24 @@ fn completion_report(
     router_unrouted: Option<u32>,
 ) -> (&'static str, serde_json::Value) {
     let manifest = crate::specctra::manifest_beside(dsn);
+    // The board the steps name: the manifest's, when it is an existing board
+    // file; anything else is not repeated into a call.
     let board = manifest
         .as_ref()
         .and_then(|manifest| manifest["board_path"].as_str())
-        .map(str::to_string);
+        .map(PathBuf::from)
+        .filter(|board| board.is_file() && board.extension().is_some_and(|e| e == "kicad_pcb"));
     let manifest_path = {
         let mut name = dsn.as_os_str().to_os_string();
         name.push(".konnect.json");
         PathBuf::from(name)
     };
     let known: &[crate::specctra::DsnPlane] = planes.as_deref().unwrap_or(&[]);
-    let status = match planes {
-        Ok(planes) => routing_status(planes, router_unrouted),
-        Err(_) => "unverified",
+    // A router that left connections is incomplete whatever else is known.
+    let status = match (planes, router_unrouted) {
+        (_, Some(left)) if left > 0 => "incomplete",
+        (Ok(planes), _) => routing_status(planes, router_unrouted),
+        (Err(_), _) => "unverified",
     };
     let mut plane_nets: Vec<String> = known.iter().map(|plane| plane.net.clone()).collect();
     plane_nets.dedup();
@@ -300,12 +314,15 @@ fn completion_report(
         })
         .collect();
     let reason = match (planes, router_unrouted) {
-        (Err(error), _) => format!(
-            "The DSN's planes could not be read ({error:#}), so it is not known whether the router was given pours as planes."
-        ),
         (_, Some(left)) if left > 0 => format!(
             "Freerouting reports {left} connection(s) it could not route; the SES holds a partial routing."
         ),
+        (Err(error), _) => {
+            let detail: String = format!("{error:#}").chars().take(MAX_REASON_DETAIL).collect();
+            format!(
+                "The DSN's planes could not be read ({detail}), so it is not known whether the router was given pours as planes."
+            )
+        }
         (Ok(planes), _) if !planes.is_empty() => format!(
             "Freerouting was given pours as planes ({}). It counts every pad inside a plane's outline as connected and lets other nets' tracks cross the plane, so after a refill the real pour can be cut into pieces that leave pads open. Its own count cannot show that the plane nets are connected.",
             planes
@@ -330,47 +347,114 @@ fn completion_report(
     );
     let mut steps = Vec::new();
     let mut fallback = Vec::new();
+    let with_planes = !plane_nets.is_empty();
     if let Some(board) = &board {
+        let project = board.with_extension("kicad_pro");
         let drc = json!({ "board": board, "sync_live_board": true, "refill_zones": true });
-        steps.push(json!({
-            "step": 1, "tool": "plan_specctra_ses_import",
-            "arguments": { "board": board, "ses_path": ses, "manifest_path": manifest_path },
-            "why": "Check the session against the manifest and the live board before anything is written."
-        }));
-        steps.push(json!({
-            "step": 2, "tool": "apply_specctra_ses",
-            "arguments": { "board": board, "ses_path": ses, "manifest_path": manifest_path,
-                           "candidate_output_path": ses.with_extension("candidate.kicad_pcb") },
-            "why": "Write the routing into the live board as one undo step."
-        }));
-        steps.push(json!({
-            "step": 3, "tool": "run_drc", "arguments": drc,
-            "why": "Refill the zones, save, and read KiCad's unconnected items: this, not the router's count, says what is still open."
-        }));
-        if !plane_nets.is_empty() {
-            steps.push(json!({
-                "step": 4, "tool": "plan_route_refinement",
-                "arguments": { "board": board, "kinds": ["stitching"], "nets": plane_nets,
-                               "search_radius_mm": STITCH_RADIUS_MM },
-                "why": "Ask the read-only planner for stitching vias that join the cut-off pieces of the plane nets' pours. Send the effort chosen for this task (the planner's default is standard)."
+        fn push(steps: &mut Vec<serde_json::Value>, mut call: serde_json::Value) -> usize {
+            call["step"] = json!(steps.len() + 1);
+            steps.push(call);
+            steps.len()
+        }
+        let mut checkpoint_step = None;
+        if with_planes {
+            push(
+                &mut steps,
+                json!({
+                    "tool": "save_project", "arguments": {},
+                    "why": "Save the open board, so the saved file is the revision the DSN was exported from."
+                }),
+            );
+            checkpoint_step = Some(push(
+                &mut steps,
+                json!({
+                    "tool": "create_checkpoint",
+                    "arguments": { "project": project, "label": "before importing the plane routing" },
+                    "why": "Keep the board as it was exported: the fallback needs it back, and only a checkpoint restores it. Keep the checkpoint_id it returns."
+                }),
+            ));
+        }
+        push(
+            &mut steps,
+            json!({
+                "tool": "plan_specctra_ses_import",
+                "arguments": { "board": board, "ses_path": ses, "manifest_path": manifest_path },
+                "why": "Check the session against the manifest and the live board before anything is written."
+            }),
+        );
+        push(
+            &mut steps,
+            json!({
+                "tool": "apply_specctra_ses",
+                "arguments": { "board": board, "ses_path": ses, "manifest_path": manifest_path,
+                               "candidate_output_path": ses.with_extension("candidate.kicad_pcb") },
+                "why": "Write the routing into the live board as one undo step."
+            }),
+        );
+        push(
+            &mut steps,
+            json!({
+                "tool": "run_drc", "arguments": drc,
+                "why": "Refill the zones, save, and read KiCad's unconnected items: this, not the router's count, says what is still open."
+            }),
+        );
+        if let Some(checkpoint) = checkpoint_step {
+            let plan = push(
+                &mut steps,
+                json!({
+                    "tool": "plan_route_refinement",
+                    "arguments": { "board": board, "kinds": ["stitching"], "nets": plane_nets,
+                                   "search_radius_mm": STITCH_RADIUS_MM },
+                    "why": "Ask the read-only planner for stitching vias that join the cut-off pieces of the plane nets' pours. Send the effort chosen for this task (the planner's default is standard)."
+                }),
+            );
+            push(
+                &mut steps,
+                json!({
+                    "tool": "route_batch",
+                    "arguments": { "board": board },
+                    "arguments_from": { "vias": "the route_batch operation of each stitching proposal you adopt" },
+                    "why": "Adopt the stitching vias you support."
+                }),
+            );
+            let check = push(
+                &mut steps,
+                json!({
+                    "tool": "run_drc", "arguments": drc,
+                    "why": "Refill, save and count the unconnected items again."
+                }),
+            );
+            steps.last_mut().unwrap()["repeat"] = json!(format!(
+                "Repeat steps {plan} to {check} until the planner lists no stitching proposal or DRC reports 0 unconnected items on the plane nets, at most {STITCH_ROUNDS} rounds."
+            ));
+            let from_checkpoint =
+                format!("the checkpoint_id create_checkpoint returned in step {checkpoint}");
+            fallback.push(json!({
+                "manual": "Close the board and the project in KiCad. The routed board is already saved (run_drc saved it); restore_checkpoint refuses while KiCad has the project open."
             }));
-            steps.push(json!({
-                "step": 5, "tool": "route_batch",
-                "arguments": { "board": board },
-                "arguments_from_plan": ["vias"],
-                "why": "Adopt the stitching vias you support: each proposal's route_batch operation gives its vias."
+            fallback.push(json!({
+                "tool": "restore_checkpoint",
+                "arguments": { "project": project, "dry_run": true },
+                "arguments_from": { "checkpoint_id": from_checkpoint },
+                "why": "Preview the restore of the board as it was exported."
             }));
-            steps.push(json!({
-                "step": 6, "tool": "run_drc", "arguments": drc,
-                "why": "Refill, save and count the unconnected items again.",
-                "repeat": format!(
-                    "Repeat steps 4 to 6 until the planner lists no stitching proposal or DRC reports 0 unconnected items on the plane nets, at most {STITCH_ROUNDS} rounds."
-                )
+            fallback.push(json!({
+                "tool": "restore_checkpoint",
+                "arguments": { "project": project, "dry_run": false },
+                "arguments_from": { "checkpoint_id": from_checkpoint, "expected_revision": "the revision the preview returned" },
+                "why": "Put that board back. It takes its own undo checkpoint first."
+            }));
+            fallback.push(json!({
+                "tool": "launch_kicad_ui", "arguments": { "project": project },
+                "why": "Open the project again."
+            }));
+            fallback.push(json!({
+                "manual": "Open the board in KiCad's PCB editor: export_specctra_dsn needs it open, and alone."
             }));
             fallback.push(json!({
                 "tool": "export_specctra_dsn",
                 "arguments": { "board": board, "output": dsn.with_extension("pours-omitted.dsn"), "pours": "omit" },
-                "why": "Leave the pours out, so the router routes the plane nets as track."
+                "why": "Leave the pours out, so the router routes the plane nets as track. Pass the same other arguments as the first export (widths_from_intent, native_bridge_mode)."
             }));
             fallback.push(json!({
                 "tool": "route_specctra_dsn",
@@ -391,15 +475,17 @@ fn completion_report(
         "next_steps": steps,
     });
     if board.is_none() {
-        completion["next_steps_missing"] = json!(
-            "No reverse manifest beside the DSN names the board, and apply_specctra_ses needs it: export the DSN with export_specctra_dsn."
-        );
+        completion["next_steps_missing"] = json!(format!(
+            "No reverse manifest naming an existing board sits at {}, and apply_specctra_ses needs one. Route a DSN whose manifest is beside it under that name (export_specctra_dsn writes it there unless manifest_output_path moved it).",
+            manifest_path.display()
+        ));
     }
-    if !plane_nets.is_empty() {
+    if with_planes && board.is_some() {
         completion["if_still_open"] = json!({
             "fallback_threshold": PLANE_FALLBACK_OPEN,
             "one_to_ten": "If 1 to 10 connections on the plane nets are still open after the stitching rounds, report every one of them as open: the routing is not complete. Name each open pad and net.",
             "more_than_ten": "If more than 10 are still open, fall back: run the steps in `fallback` and report that outcome, with the open count of this plane run beside it.",
+            "precondition": "The fallback exports the board again, and export_specctra_dsn refuses a board that holds unlocked routing, which this board does after the import and the stitching rounds. So the fallback first puts back the board from the checkpoint the steps took before the import (restore_checkpoint), with KiCad closed.",
             "fallback": fallback,
         });
     }
@@ -498,6 +584,15 @@ mod route_rule_tests {
     fn assert_calls_are_real(calls: &[serde_json::Value]) {
         assert!(!calls.is_empty());
         for call in calls {
+            // A step a person does in KiCad names no tool, and says what to do.
+            if let Some(manual) = call.get("manual") {
+                assert!(call.get("tool").is_none(), "{call}");
+                assert!(
+                    manual.as_str().is_some_and(|text| text.len() > 20),
+                    "{call}"
+                );
+                continue;
+            }
             let name = call["tool"].as_str().unwrap();
             let tool =
                 registered(name).unwrap_or_else(|| panic!("{name} is not a registered tool"));
@@ -506,14 +601,79 @@ mod route_rule_tests {
             for key in arguments.as_object().unwrap().keys() {
                 assert!(properties.contains_key(key), "{name} declares no '{key}'");
             }
-            for key in call["arguments_from_plan"].as_array().into_iter().flatten() {
-                let key = key.as_str().unwrap();
+            for key in call["arguments_from"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, _)| k)
+            {
                 assert!(properties.contains_key(key), "{name} declares no '{key}'");
             }
-            if call["arguments_from_plan"].is_null() {
+            if call["arguments_from"].is_null() {
                 assert!(
                     tool.input_validator.is_valid(arguments),
                     "{name} refuses {arguments}"
+                );
+            }
+        }
+    }
+
+    /// The snake_case words in the prose fields are registered tools, or
+    /// parameters of a registered tool, or fields of this result: a renamed
+    /// tool breaks this test, not a caller.
+    fn assert_prose_names_are_real(completion: &serde_json::Value) {
+        let tools: Vec<crate::tools::ToolDef> = crate::router::registry::ALL_TOOLSETS
+            .iter()
+            .filter_map(|toolset| crate::router::registry::tools_for(toolset.name))
+            .flatten()
+            .collect();
+        let known = |word: &str| {
+            tools.iter().any(|tool| {
+                tool.name == word
+                    || tool.input_schema["properties"]
+                        .as_object()
+                        .is_some_and(|p| p.contains_key(word))
+            }) || ["next_steps", "if_still_open", "fallback"].contains(&word)
+        };
+        let mut texts = vec![
+            completion["judge"].clone(),
+            completion["complete_when"].clone(),
+            completion["reason"].clone(),
+            completion["next_steps_missing"].clone(),
+        ];
+        if let Some(open) = completion["if_still_open"].as_object() {
+            texts.extend(open.values().filter(|v| v.is_string()).cloned());
+        }
+        for call in completion["next_steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                completion["if_still_open"]["fallback"]
+                    .as_array()
+                    .into_iter()
+                    .flatten(),
+            )
+        {
+            for key in ["why", "manual", "repeat"] {
+                texts.push(call[key].clone());
+            }
+            texts.extend(
+                call["arguments_from"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, v)| v.clone()),
+            );
+        }
+        for text in texts.iter().filter_map(serde_json::Value::as_str) {
+            for word in text
+                .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                .filter(|w| w.contains('_') && !w.starts_with('_') && !w.ends_with('_'))
+            {
+                assert!(
+                    known(word),
+                    "'{word}' is no registered tool or parameter: {text}"
                 );
             }
         }
@@ -542,8 +702,7 @@ mod route_rule_tests {
             .collect();
         assert_eq!(names, ["GND_BOTTOM", "GND_BOTH"]);
         assert_eq!(planes[1]["net"], "VCC");
-        // Only the zones that made this plane: not an omitted pour on the
-        // same layer, nor another net's.
+        // Only the zones that made this plane, not another net's.
         assert_eq!(
             planes[1]["zones"],
             json!([{ "uuid": "55555555-5555-4555-8555-555555555502", "name": "VCC_REGION" }])
@@ -553,6 +712,8 @@ mod route_rule_tests {
         assert_eq!(
             tools,
             [
+                "save_project",
+                "create_checkpoint",
                 "plan_specctra_ses_import",
                 "apply_specctra_ses",
                 "run_drc",
@@ -561,18 +722,95 @@ mod route_rule_tests {
                 "run_drc"
             ]
         );
-        assert_eq!(steps[3]["arguments"]["kinds"], json!(["stitching"]));
-        assert_eq!(steps[3]["arguments"]["nets"], json!(["GND", "VCC"]));
-        assert_eq!(steps[3]["arguments"]["search_radius_mm"], 3.0);
-        assert!(steps[5]["repeat"]
-            .as_str()
-            .unwrap()
-            .contains("at most 4 rounds"));
+        let numbers: Vec<u64> = steps.iter().map(|s| s["step"].as_u64().unwrap()).collect();
+        assert_eq!(numbers, (1..=8).collect::<Vec<_>>());
+        assert_eq!(steps[5]["arguments"]["kinds"], json!(["stitching"]));
+        assert_eq!(steps[5]["arguments"]["nets"], json!(["GND", "VCC"]));
+        assert_eq!(steps[5]["arguments"]["search_radius_mm"], 3.0);
+        let repeat = steps[7]["repeat"].as_str().unwrap();
+        assert!(
+            repeat.contains("steps 6 to 8") && repeat.contains("at most 4 rounds"),
+            "{repeat}"
+        );
         assert_calls_are_real(steps);
         let open = &completion["if_still_open"];
         assert_eq!(open["fallback_threshold"], 10);
         assert_calls_are_real(open["fallback"].as_array().unwrap());
-        assert_eq!(open["fallback"][0]["arguments"]["pours"], "omit");
+        assert_prose_names_are_real(&completion);
+    }
+
+    /// The fallback exports the board again, and the exporter refuses a board
+    /// holding unlocked routing, which it does after the import (review M1).
+    /// So the steps keep the exported board before the import, the fallback
+    /// puts it back before it exports, and both say why.
+    #[test]
+    fn the_fallback_puts_the_exported_board_back_before_it_exports_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        let (_, completion) = report(&dsn, &ses, Some(0));
+        let steps = completion["next_steps"].as_array().unwrap();
+        let position = |tool: &str| steps.iter().position(|s| s["tool"] == tool).unwrap();
+        // The board is saved and kept before anything is imported.
+        assert!(position("save_project") < position("create_checkpoint"));
+        assert!(position("create_checkpoint") < position("apply_specctra_ses"));
+        let checkpoint = steps[position("create_checkpoint")]["step"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            steps[position("create_checkpoint")]["arguments"]["project"],
+            json!(dir.path().join("board.kicad_pro"))
+        );
+        let open = &completion["if_still_open"];
+        let precondition = open["precondition"].as_str().unwrap();
+        for needle in [
+            "unlocked routing",
+            "restore_checkpoint",
+            "before the import",
+            "KiCad closed",
+        ] {
+            assert!(precondition.contains(needle), "{needle}: {precondition}");
+        }
+        let fallback = open["fallback"].as_array().unwrap();
+        let kinds: Vec<String> = fallback
+            .iter()
+            .map(|c| {
+                c["tool"]
+                    .as_str()
+                    .map_or("manual".to_string(), str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "manual",
+                "restore_checkpoint",
+                "restore_checkpoint",
+                "launch_kicad_ui",
+                "manual",
+                "export_specctra_dsn",
+                "route_specctra_dsn"
+            ]
+        );
+        // KiCad is closed first, then a preview, then the restore with its revision.
+        assert!(fallback[0]["manual"]
+            .as_str()
+            .unwrap()
+            .contains("Close the board and the project"));
+        assert_eq!(fallback[1]["arguments"]["dry_run"], true);
+        assert_eq!(fallback[2]["arguments"]["dry_run"], false);
+        let from = |i: usize, key: &str| {
+            fallback[i]["arguments_from"][key]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(from(1, "checkpoint_id").contains(&format!("step {checkpoint}")));
+        assert!(from(2, "expected_revision").contains("preview"));
+        assert_eq!(fallback[5]["arguments"]["pours"], "omit");
+        assert!(open["more_than_ten"]
+            .as_str()
+            .unwrap()
+            .contains("fall back"));
     }
 
     /// The words a caller acts on: complete only at 0 unconnected in KiCad's
@@ -676,6 +914,8 @@ mod route_rule_tests {
             .as_str()
             .unwrap()
             .contains("export_specctra_dsn"));
+        // Without a board to name, no fallback is offered either.
+        assert!(completion["if_still_open"].is_null());
         let broken: anyhow::Result<Vec<crate::specctra::DsnPlane>> =
             Err(anyhow::anyhow!("not a DSN"));
         let (status, completion) = super::completion_report(&dsn, &ses, &broken, Some(0));
@@ -684,6 +924,55 @@ mod route_rule_tests {
             .as_str()
             .unwrap()
             .contains("could not be read"));
+        // A router that left connections is incomplete even then.
+        assert_eq!(
+            super::completion_report(&dsn, &ses, &broken, Some(3)).0,
+            "incomplete"
+        );
+        // An error that carries the file is not repeated whole (review S3).
+        let long: anyhow::Result<Vec<crate::specctra::DsnPlane>> =
+            Err(anyhow::anyhow!("{}", "(pcb ".repeat(50_000)));
+        let (_, completion) = super::completion_report(&dsn, &ses, &long, Some(0));
+        assert!(completion["reason"].as_str().unwrap().len() < 400);
+    }
+
+    /// A manifest that names no existing board file is not repeated into calls.
+    #[test]
+    fn a_manifest_board_that_does_not_exist_is_not_named_in_the_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        std::fs::remove_file(dir.path().join("board.kicad_pcb")).unwrap();
+        let (status, completion) = report(&dsn, &ses, Some(0));
+        assert_eq!(status, "unverified");
+        assert_eq!(completion["next_steps"], json!([]));
+        assert!(completion["next_steps_missing"].is_string());
+        assert!(completion["if_still_open"].is_null());
+    }
+
+    /// Only the pours written as planes name a plane: an omitted pour of the
+    /// same net on the same layer is not one of its zones.
+    #[test]
+    fn a_plane_names_only_the_zones_that_made_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(
+            dir.path(),
+            json!({ "zones": [{ "name": "GND_TOP", "policy": "omit" }] }),
+        );
+        let (_, completion) = report(&dsn, &ses, Some(0));
+        let front = completion["planes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["net"] == "GND" && p["layer"] == "F.Cu")
+            .unwrap()
+            .clone();
+        let names: Vec<&str> = front["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|z| z["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["GND_BOTH"], "GND_TOP was omitted");
     }
 
     #[test]
@@ -3100,6 +3389,18 @@ async fn handle_route_specctra_dsn(
             )));
         }
     };
+    // Checked before anything reads it, or Java is looked for: a directory,
+    // FIFO, device or huge file is refused at once.
+    if let Err(error) = crate::freerouting_mcp::check_dsn_input(&dsn) {
+        let reason = format!("{error:#}");
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "dsn_path".to_string(),
+                reason: reason.clone(),
+            },
+            format!("Argument 'dsn_path' is invalid: {reason}"),
+        ));
+    }
     // The JAR names the Java it needs; refuse before starting anything that
     // would fail with a class-loading error that names no fix.
     let requirement = crate::freerouting_setup::jar_requirement(&jar);
@@ -3131,9 +3432,8 @@ async fn handle_route_specctra_dsn(
     // What the router is given as planes, from the DSN itself: the router
     // counts a pad inside a plane as connected, so a run with one is never
     // reported complete.
-    let planes = std::fs::read_to_string(&dsn)
-        .map_err(anyhow::Error::from)
-        .and_then(|text| crate::specctra::dsn_planes(&text));
+    let planes =
+        crate::freerouting_mcp::read_dsn(&dsn).and_then(|text| crate::specctra::dsn_planes(&text));
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
@@ -4613,6 +4913,138 @@ mod freerouting_setup_tests {
     use super::*;
     use crate::freerouting_setup::{tests::fake_jar, ONLY_EXPLICIT};
     use crate::tools::cli::test_support::write_script;
+
+    /// A `java` that reports Java 25 and otherwise plays Freerouting 2.5.0's
+    /// MCP server: it applies whatever settings it is sent, completes the
+    /// job at once, logs a stage summary with 0 unrouted, and writes a
+    /// one-line session.
+    fn routing_java(dir: &Path) -> PathBuf {
+        let object = r#"{"type":"object","properties":{"jobId":{"type":"string"},"filePath":{"type":"string"}},"required":["jobId","filePath"]}"#;
+        let with_path = r#"{"type":"object","properties":{"path":{"type":"object","properties":{"jobId":{"type":"string"}},"required":["jobId"]}},"required":["path"]}"#;
+        let enqueue = r#"{"type":"object","properties":{"body":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},"required":["body"]}"#;
+        let tool =
+            |name: &str, schema: &str| format!(r#"{{"name":"{name}","inputSchema":{schema}}}"#);
+        let tools = [
+            tool("create_session", r#"{"type":"object","properties":{}}"#),
+            tool("enqueue_job", enqueue),
+            tool("upload_job_input_from_local_file", object),
+            tool("update_job_settings", with_path),
+            tool("get_effective_settings", with_path),
+            tool("start_job", with_path),
+            tool("get_job_details", with_path),
+            tool("get_job_logs", with_path),
+            tool("download_job_output_to_local_file", object),
+        ]
+        .join(",");
+        let settings = r#"{"status":200,"body":{"automatic_neckdown":false,"autorouter":{"max_passes":20},"optimizer":{"enabled":true,"improvement_threshold":0.25,"max_consecutive_failures":1000000,"max_consecutive_failures_pass1":1000000},"scoring":{"via_costs":10,"default_undesired_direction_trace_cost":1.0},"fanout":{"enabled":false}}}"#;
+        let logs = r#"{"status":200,"body":[{"type":"INFO","message":"Auto-routing stage completed: started with 2 unrouted nets, completed in 0.10 seconds, final score: 1000.00 (0 unrouted and 0 violations)"}]}"#;
+        let body = format!(
+            r#"#!/bin/sh
+if [ "$1" = '-version' ]; then echo 'openjdk version "25.0.1" 2026-01-01' >&2; exit 0; fi
+reply() {{ printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$1" "$2"; }}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*) reply "$id" '{{"protocolVersion":"2024-11-05"}}' ;;
+    *'"method":"tools/list"'*) reply "$id" '{{"tools":[{tools}]}}' ;;
+    *'"name":"create_session"'*) reply "$id" '{{"session_id":"s1"}}' ;;
+    *'"name":"enqueue_job"'*) reply "$id" '{{"job_id":"j1"}}' ;;
+    *'"name":"get_effective_settings"'*) reply "$id" '{settings}' ;;
+    *'"name":"get_job_details"'*) reply "$id" '{{"state":"COMPLETED"}}' ;;
+    *'"name":"get_job_logs"'*) reply "$id" '{logs}' ;;
+    *'"name":"download_job_output_to_local_file"'*)
+      out=$(printf '%s' "$line" | grep -o '"filePath":"[^"]*"' | cut -d'"' -f4)
+      printf '(session "board")\n' > "$out"
+      reply "$id" '{{"message":"saved"}}' ;;
+    *) reply "$id" '{{}}' ;;
+  esac
+done
+"#
+        );
+        write_script(dir, "java25", &body, "")
+    }
+
+    /// The handler reads the planes from the DSN it routes and puts them into
+    /// `status`: with the same 0 unrouted from the router, a DSN with a plane
+    /// is `unverified` and one without is `complete` (review S2).
+    #[tokio::test]
+    async fn the_routing_result_judges_the_planes_of_the_dsn_it_routed() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.0.jar", 69);
+        let java = routing_java(dir.path());
+        let route = |name: &str, dsn_text: &str| {
+            let dsn = dir.path().join(format!("{name}.dsn"));
+            std::fs::write(&dsn, dsn_text).unwrap();
+            let args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join(format!("{name}.ses")),
+                               "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+            async move {
+                let result = handle_route_specctra_dsn(&args, &ctx()).await.unwrap();
+                assert!(!result.is_error, "{:?}", result.content);
+                body(&result)
+            }
+        };
+        let with_plane = route(
+            "plane",
+            "(pcb board (structure (plane GND (polygon B.Cu 0 0 0 1000 0 1000 1000))))",
+        )
+        .await;
+        assert_eq!(with_plane["success"], true);
+        assert_eq!(with_plane["completion"]["router_unrouted"], 0);
+        assert_eq!(with_plane["completion"]["planes"][0]["net"], "GND");
+        assert_eq!(with_plane["status"], "unverified", "{with_plane}");
+        let without = route("plain", "(pcb board (structure))").await;
+        assert_eq!(without["completion"]["planes"], json!([]));
+        assert_eq!(without["status"], "complete", "{without}");
+    }
+
+    /// A `dsn_path` that is not a regular `.dsn` file within the size bound is
+    /// refused before anything reads it or looks for Java (review S1).
+    #[tokio::test]
+    async fn a_dsn_path_that_is_not_a_bounded_regular_file_is_refused_before_it_is_read() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.0.jar", 69);
+        let folder = dir.path().join("folder.dsn");
+        std::fs::create_dir(&folder).unwrap();
+        let fifo = dir.path().join("pipe.dsn");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let huge = dir.path().join("huge.dsn");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(crate::freerouting_mcp::MAX_DSN_BYTES + 1)
+            .unwrap();
+        for (dsn, needle) in [
+            (&folder, "existing .dsn file"),
+            (&fifo, "existing .dsn file"),
+            (&huge, "bytes"),
+        ] {
+            let args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join("out.ses"), "jar_path": jar });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                handle_route_specctra_dsn(&args, &ctx()),
+            )
+            .await
+            .expect("refused at once, never blocked on the path")
+            .unwrap();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{}: {:?}",
+                dsn.display(),
+                result.content
+            );
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text");
+            };
+            assert!(text.contains(needle) && text.contains("dsn_path"), "{text}");
+        }
+    }
 
     fn ctx() -> ToolContext {
         ToolContext::new(

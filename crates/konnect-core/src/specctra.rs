@@ -2209,31 +2209,59 @@ pub(crate) struct DsnPlane {
     pub layer: String,
 }
 
-/// The planes a DSN gives the router, read from the DSN itself, so a DSN
-/// with no manifest beside it is judged the same way.
-/// One row per net and layer, sorted; a DSN with no plane gives none.
+/// The conduction areas a DSN gives the router, read from the DSN itself, so
+/// a DSN with no manifest beside it is judged the same way: every
+/// `(structure (plane NET shape))`, and every wire of the `wiring` whose shape
+/// is an area (`polygon`, `rect`, `circle`) rather than a path, which
+/// Freerouting also reads as a conduction area of its net. Keywords are
+/// matched in any letter case. One row per net and layer, sorted; a DSN with
+/// none gives none. A DSN that cannot be parsed is an error that names no
+/// part of the file.
 pub(crate) fn dsn_planes(dsn: &str) -> Result<Vec<DsnPlane>> {
-    let root = parse_dsn_sexp(dsn)?;
-    if root.head() != Some("pcb") {
-        bail!("the DSN's root is not 'pcb'");
+    fn is(node: &SexpNode, names: &[&str]) -> bool {
+        node.head()
+            .is_some_and(|head| names.iter().any(|name| head.eq_ignore_ascii_case(name)))
     }
-    let structure = root.find("structure").context("the DSN has no structure")?;
-    let mut planes = BTreeSet::new();
-    for plane in structure.find_all("plane") {
-        let net = dsn_atom(plane, 1, "plane net")?.to_string();
-        let shape = plane
-            .children()
+    fn children<'a>(
+        node: &'a SexpNode,
+        names: &'a [&'a str],
+    ) -> impl Iterator<Item = &'a SexpNode> {
+        node.children()
             .unwrap_or(&[])
             .iter()
-            .find(|child| {
-                matches!(
-                    child.head(),
-                    Some("polygon" | "rect" | "circle" | "path" | "polyline_path")
-                )
-            })
-            .with_context(|| format!("the plane of net '{net}' has no shape"))?;
-        let layer = dsn_atom(shape, 1, "plane layer")?.to_string();
-        planes.insert(DsnPlane { net, layer });
+            .filter(move |child| is(child, names))
+    }
+    const AREAS: &[&str] = &["polygon", "rect", "circle"];
+    const SHAPES: &[&str] = &["polygon", "rect", "circle", "path", "polyline_path"];
+    let root = parse_dsn_sexp(dsn)
+        .map_err(|_| anyhow::anyhow!("the DSN is not a readable S-expression"))?;
+    if !is(&root, &["pcb"]) {
+        bail!("the DSN's root is not 'pcb'");
+    }
+    let mut planes = BTreeSet::new();
+    for structure in children(&root, &["structure"]) {
+        for plane in children(structure, &["plane"]) {
+            let net = dsn_atom(plane, 1, "plane net")?.to_string();
+            let shape = children(plane, SHAPES)
+                .next()
+                .with_context(|| format!("the plane of net '{net}' has no shape"))?;
+            let layer = dsn_atom(shape, 1, "plane layer")?.to_string();
+            planes.insert(DsnPlane { net, layer });
+        }
+    }
+    for wiring in children(&root, &["wiring"]) {
+        for wire in children(wiring, &["wire"]) {
+            let Some(area) = children(wire, AREAS).next() else {
+                continue;
+            };
+            let Some(net) = children(wire, &["net"]).next() else {
+                continue; // no net: an obstacle, not a conduction area of a net
+            };
+            planes.insert(DsnPlane {
+                net: dsn_atom(net, 1, "wire net")?.to_string(),
+                layer: dsn_atom(area, 1, "wire area layer")?.to_string(),
+            });
+        }
     }
     Ok(planes.into_iter().collect())
 }

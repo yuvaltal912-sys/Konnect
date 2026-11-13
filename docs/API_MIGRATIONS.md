@@ -44,20 +44,26 @@ narrowed input.
 - **`route_specctra_dsn`** adds `status` and `completion`. `success` keeps
   its meaning (the job ran and the SES was written).
   - `status`:
-    - `complete`: Freerouting's job log reports 0 unrouted and the DSN gave it no plane.
+    - `complete`: Freerouting's job log reports 0 unrouted and the DSN gave it no conduction area.
     - `incomplete`: the log reports more than 0.
-    - `unverified`: the log reports 0 but a plane was given, or the count or the DSN's planes could not be read.
+    - `unverified`: the log reports 0 but a conduction area was given, or the count or the DSN's planes could not be read.
 
-    A run with a plane is never `complete`.
+    A run with a conduction area is never `complete`. A conduction area is a `(structure (plane …))`, or a `wiring` wire with an area shape (`polygon`, `rect`, `circle`) and a net, which Freerouting reads the same way. Keywords match in any letter case. The last summary in the log decides: if it cannot be read, the count is unknown.
   - `completion`:
     - `router_unrouted`: the last autorouter or optimizer summary in the job log, else `null`.
     - `planes`: net, layer, and the zones that made the plane (from the manifest beside the DSN).
     - `judge` and `complete_when`: complete only when KiCad's DRC on the applied and refilled board reports 0 unconnected items.
-    - `reason`.
-    - `next_steps`: exact calls to `plan_specctra_ses_import`, `apply_specctra_ses` and `run_drc`. With planes, also `plan_route_refinement` with `kinds: ["stitching"]` and the plane nets, `route_batch` with the plan's `vias`, and `run_drc` again, repeated for at most 4 rounds.
-    - `if_still_open`, with planes: report 1 to 10 open connections as open, the routing not complete. Above 10, fall back: export again with `pours: "omit"` and route again.
+    - `reason`: bounded; an error's detail is cut to 160 characters.
+    - `next_steps`, each with a `step` number, a `tool`, its `arguments`, and `arguments_from` for values an earlier call returns:
+      - Always: `plan_specctra_ses_import`, `apply_specctra_ses` and `run_drc`.
+      - With planes, first `save_project` and `create_checkpoint(project)`, which keep the board as it was exported.
+      - With planes, after the DRC: `plan_route_refinement` with `kinds: ["stitching"]` and the plane nets, `route_batch` with the plan's `vias`, and `run_drc` again, repeated for at most 4 rounds.
+    - `if_still_open`, with planes: report 1 to 10 open connections as open, the routing not complete. Above 10, fall back.
+      - `precondition`: the exporter refuses a board that holds unlocked routing, so the board from the checkpoint comes back first.
+      - `fallback`, in order: close the board and the project in KiCad (a manual step); `restore_checkpoint` as a preview, then applied with its revision; `launch_kicad_ui(project)`; open the board in the PCB editor (manual); `export_specctra_dsn` with `pours: "omit"`; `route_specctra_dsn`.
 
-    With no manifest beside the DSN, `next_steps` is empty and `next_steps_missing` says why.
+    With no reverse manifest beside the DSN that names an existing board, `next_steps` is empty, there is no `if_still_open`, and `next_steps_missing` says why.
+- **`route_specctra_dsn` checks `dsn_path` before anything reads it.** A path that is not an existing regular `.dsn` file is refused with `invalid_argument` on `dsn_path`, before Java is looked for. Before, a missing or wrong path was refused only when routing began, and with this change's plane read in front it could have blocked on a FIFO or a device. A DSN larger than 64 MiB is now refused too; real exports are well under 1 MiB.
 
 ## Unreleased: read-only route-refinement plans
 
