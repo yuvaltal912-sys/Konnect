@@ -143,7 +143,7 @@ fn wire_pieces(
             })
             .collect::<Result<_>>()?;
         if head == "path" {
-            if values.len() < 4 || values.len() % 2 != 0 {
+            if values.len() < 4 || !values.len().is_multiple_of(2) {
                 bail!("a session path does not hold complete point pairs");
             }
             let points: Vec<(f64, f64)> = values.chunks_exact(2).map(|p| (p[0], p[1])).collect();
@@ -236,7 +236,7 @@ fn session_pieces(
 
 /// Groups of pieces joined end to end, as lists of indexes into `pieces`.
 fn stretches(pieces: &[&Piece]) -> Vec<Vec<usize>> {
-    fn root(parent: &mut Vec<usize>, mut at: usize) -> usize {
+    fn root(parent: &mut [usize], mut at: usize) -> usize {
         while parent[at] != at {
             parent[at] = parent[parent[at]];
             at = parent[at];
@@ -392,7 +392,10 @@ mod tests {
 
     /// A session at `resolution` units per micrometre. Each wire is
     /// `(net, layer, width in um, points in um)`.
-    fn session(resolution: i64, wires: &[(&str, &str, f64, &[(f64, f64)])]) -> String {
+    /// A wire of a test session: net, layer, width and points, in micrometres.
+    type Wire<'a> = (&'a str, &'a str, f64, &'a [(f64, f64)]);
+
+    fn session(resolution: i64, wires: &[Wire]) -> String {
         let mut nets: BTreeMap<&str, String> = BTreeMap::new();
         for (net, layer, width, points) in wires {
             let coordinates: Vec<String> = points
@@ -543,8 +546,7 @@ mod tests {
 
     #[test]
     fn the_resolution_scales_widths_and_lengths() {
-        let wires: &[(&str, &str, f64, &[(f64, f64)])] =
-            &[("VBUS", "F.Cu", 200.0, &[(0.0, 0.0), (2500.0, 0.0)])];
+        let wires: &[Wire] = &[("VBUS", "F.Cu", 200.0, &[(0.0, 0.0), (2500.0, 0.0)])];
         let fine = intent_width_report(&manifest(), &session(10, wires)).unwrap();
         let coarse = intent_width_report(&manifest(), &session(1, wires)).unwrap();
         assert_eq!(fine, coarse);

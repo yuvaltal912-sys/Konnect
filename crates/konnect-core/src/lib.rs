@@ -16,6 +16,7 @@ pub(crate) mod routing_context;
 pub(crate) mod runtime_info;
 pub mod simulation;
 pub(crate) mod specctra;
+pub(crate) mod specctra_seed;
 pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;

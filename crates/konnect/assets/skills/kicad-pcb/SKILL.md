@@ -353,6 +353,16 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    import binds the project file as it was at export; the save in step 2 keeps
    this second save from changing it. If step 4 still reports a stale
    revision, export and route again.
+   When the board has recorded currents, also read `width_exceptions`: each
+   row is a stretch of track that ended below the width its net's current
+   needs (net, width, length, layers, ends). `status` is then
+   `complete_with_width_exceptions`. Report every row to the user; never
+   present such a routing as meeting the recorded currents. With the default
+   `width_policy: 'retry'`, Freerouting may narrow any part of such a net to
+   its base width. `width_policy: 'hold'` routes with that retry off and
+   narrows only connections that would otherwise stay open (`passes` lists
+   what ran; it takes up to three routing jobs, and
+   `overall_timeout_seconds` covers all of them).
 4. Review `plan_specctra_ses_import(board, ses_path, manifest_path)`. It is
    read-only and checks the SES against the revision-bound manifest and live
    board. A stale revision needs a new export and routing job.
@@ -403,7 +413,10 @@ pour are refused. A pour form that blocks other nets is not available.
 Track/via-blocking rule areas always become keepouts. Record the currents of
 the main power nets with `set_design_intent` before exporting: the export
 widens those nets to their IPC-2221 width (`intent_widths`), and
-`route_specctra_dsn` keeps Freerouting from narrowing any track below its class. Mounting
+`route_specctra_dsn` keeps Freerouting from narrowing any track below its class.
+A net widened this way keeps its base width as its floor, so part of it can
+still be routed narrower than its current needs; the routing result's
+`width_exceptions` names each such stretch (step 3). Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
 Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,

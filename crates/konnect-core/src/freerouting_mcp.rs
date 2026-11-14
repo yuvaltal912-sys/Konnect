@@ -221,6 +221,9 @@ pub(crate) struct RouteEvidence {
     /// (see [`router_unrouted`]); `None` when the log could not be read or
     /// holds no summary.
     pub router_unrouted: Option<u32>,
+    /// Connections the job log says the autorouter started with (see
+    /// [`router_unrouted_at_start`]); `None` when the log does not say.
+    pub unrouted_at_start: Option<u32>,
 }
 
 /// The optimizer's outcome, from Freerouting's job log.
@@ -598,6 +601,55 @@ pub(crate) fn router_unrouted(log: &Value) -> Option<u32> {
     last
 }
 
+/// How many unrouted items Freerouting's job log says the autorouter started
+/// with: the count in "Auto-routing stage started ... for N unrouted items".
+/// `None` when the log holds no such line, when it cannot be read, or when
+/// two such lines disagree. Row S9 compares it with the count the pass before
+/// ended with, to know that a seeded DSN was read as seeded.
+pub(crate) fn router_unrouted_at_start(log: &Value) -> Option<u32> {
+    const START: &str = "Auto-routing stage started";
+    let mut found: Option<u32> = None;
+    for line in log_lines(log) {
+        let Some(at) = line.find(START) else {
+            continue;
+        };
+        // The number between the last " for " and " unrouted".
+        let rest = &line[at..];
+        let count = rest
+            .rfind(" unrouted")
+            .and_then(|end| {
+                let head = &rest[..end];
+                head.rfind(" for ")
+                    .map(|start| &head[start + " for ".len()..])
+            })
+            .and_then(|text| text.trim().parse::<u32>().ok())?;
+        match found {
+            Some(earlier) if earlier != count => return None,
+            _ => found = Some(count),
+        }
+    }
+    found
+}
+
+/// The whole call's time ran out while a job was running. A typed error, so
+/// a caller that runs several jobs can tell it from a job that failed.
+#[derive(Debug)]
+pub(crate) struct OverallTimeout {
+    pub seconds: u64,
+}
+
+impl std::fmt::Display for OverallTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Freerouting MCP job exceeded the overall timeout of {} seconds",
+            self.seconds
+        )
+    }
+}
+
+impl std::error::Error for OverallTimeout {}
+
 pub(crate) async fn route_local(
     jar: &Path,
     dsn: &Path,
@@ -630,10 +682,9 @@ pub(crate) async fn route_local(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "Freerouting MCP job exceeded the overall timeout of {} seconds",
-            settings.overall_timeout.as_secs()
-        )),
+        Err(_) => Err(anyhow::Error::new(OverallTimeout {
+            seconds: settings.overall_timeout.as_secs(),
+        })),
     };
     let diagnostics = client.close().await;
     let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
@@ -843,6 +894,7 @@ async fn run_state_machine(
     };
     let optimizer = log.as_ref().map(optimizer_report);
     let router_unrouted = log.as_ref().and_then(router_unrouted);
+    let unrouted_at_start = log.as_ref().and_then(router_unrouted_at_start);
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -855,6 +907,7 @@ async fn run_state_machine(
         effective_settings,
         optimizer,
         router_unrouted,
+        unrouted_at_start,
     })
 }
 
@@ -1611,6 +1664,47 @@ mod tests {
         assert_eq!(router_unrouted(&pass_only), None);
         assert_eq!(router_unrouted(&json!({ "body": [] })), None);
         assert_eq!(router_unrouted(&json!(null)), None);
+    }
+
+    /// Row S9: the count the autorouter started with, which a seeded pass
+    /// must match exactly.
+    #[test]
+    fn the_count_the_autorouter_started_with_is_read_from_the_job_log() {
+        let log = |messages: &[&str]| json!({ "body": messages.iter().map(|m| json!({ "type": "INFO", "message": m })).collect::<Vec<_>>() });
+        let started = log(&[
+            "[8BB193\\ECED82] Auto-routing stage started on board 'c2' with baseline score 934.43 for 12 unrouted items.",
+            "[8BB193\\ECED82] Auto-routing pass #1 on board 'c2' was completed in 1.21 seconds with score 972.68 (5 unrouted and 0 violations)",
+            "[8BB193\\ECED82] Auto-routing stage completed: started with 12 unrouted nets, completed in 3.43 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+        ]);
+        assert_eq!(router_unrouted_at_start(&started), Some(12));
+        assert_eq!(router_unrouted(&started), Some(0));
+        // A board that starts complete says 0, which is a count, not nothing.
+        let nothing_open = log(&["Auto-routing stage started on board 'b' with baseline score 1000.00 for 0 unrouted items."]);
+        assert_eq!(router_unrouted_at_start(&nothing_open), Some(0));
+        // The stage's closing line is not the start: its wording counts nets.
+        let closing_only = log(&["Auto-routing stage completed: started with 12 unrouted nets, completed in 3.43 seconds, final score: 1000.00 (0 unrouted and 0 violations)"]);
+        assert_eq!(router_unrouted_at_start(&closing_only), None);
+        // A pass line and an optimizer line are not the start either.
+        let passes = log(&[
+            "Auto-routing pass #1 on board 'c2' was completed in 1.21 seconds with score 972.68 (5 unrouted and 0 violations)",
+            "Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (0 unrouted and 0 violations).",
+        ]);
+        assert_eq!(router_unrouted_at_start(&passes), None);
+        // A count that cannot be read, and two starts that disagree, are unknown.
+        let unreadable = log(&["Auto-routing stage started on board 'b' with baseline score 934.43 for 1,024 unrouted items."]);
+        assert_eq!(router_unrouted_at_start(&unreadable), None);
+        let twice = log(&[
+            "Auto-routing stage started on board 'b' with baseline score 934.43 for 12 unrouted items.",
+            "Auto-routing stage started on board 'b' with baseline score 934.43 for 1 unrouted items.",
+        ]);
+        assert_eq!(router_unrouted_at_start(&twice), None);
+        let same_twice = log(&[
+            "Auto-routing stage started on board 'b' with baseline score 934.43 for 12 unrouted items.",
+            "Auto-routing stage started on board 'b' with baseline score 934.43 for 12 unrouted items.",
+        ]);
+        assert_eq!(router_unrouted_at_start(&same_twice), Some(12));
+        assert_eq!(router_unrouted_at_start(&json!({ "body": [] })), None);
+        assert_eq!(router_unrouted_at_start(&json!(null)), None);
     }
 
     /// 2.5.0's BatchOptimizer also stops on its stage time limit and its item
