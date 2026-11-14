@@ -1926,28 +1926,38 @@ async fn route_refine_proposes_no_connector_for_a_branch_lying_on_the_trunk() {
     );
 }
 
-/// The right-angle band is narrow. A branch 0.17 degrees off square is outside
-/// it and is repaired; its foot is 1.5 um from the junction.
+/// An acute corner ends at 89 degrees, the lower edge of the audit's
+/// right-angle band (S7b). A branch 1.17 degrees off square meets one trunk
+/// leg at 88.83 degrees, is acute and is repaired. One 0.17 degrees off
+/// meets it at 89.83 degrees: a right angle, so not a target at all.
 #[tokio::test]
 async fn route_refine_repairs_a_branch_just_outside_the_right_angle_band() {
-    let items = [
-        pad(1, (4., 10.), 2, "F.Cu"),
-        pad(2, (16., 10.), 2, "F.Cu"),
-        pad(3, (10.008901, 7.000013), 2, "F.Cu"),
-        track(11, (4., 10.), (10., 10.), 2),
-        track(12, (10., 10.), (16., 10.), 2),
-        track(13, (10.008901, 7.000013), (10., 10.), 2),
-    ]
-    .concat();
-    let r = Fixture::new(&items)
+    let branch = |far: (f64, f64)| {
+        [
+            pad(1, (4., 10.), 2, "F.Cu"),
+            pad(2, (16., 10.), 2, "F.Cu"),
+            pad(3, far, 2, "F.Cu"),
+            track(11, (4., 10.), (10., 10.), 2),
+            track(12, (10., 10.), (16., 10.), 2),
+            track(13, far, (10., 10.), 2),
+        ]
+        .concat()
+    };
+    let r = Fixture::new(&branch((10.061257, 7.000625)))
         .run(json!({"kinds":["t_junction"]}))
         .await;
     assert_eq!(r["proposals"].as_array().unwrap().len(), 1, "{r}");
     assert_eq!(
         connector(&r["proposals"][0]),
-        &json!([{"x":10.001483,"y":9.500002},{"x":10.001483,"y":10.0}]),
+        &json!([{"x":10.010209,"y":9.500104},{"x":10.010209,"y":10.0}]),
         "{r}"
     );
+    let r = Fixture::new(&branch((10.008901, 7.000013)))
+        .run(json!({"kinds":["t_junction"]}))
+        .await;
+    assert_eq!(r["before"]["corners"]["acute_corners"], 0, "{r}");
+    assert!(r["proposals"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["coverage"]["blocked_total"], 0, "{r}");
 }
 
 /// The audit counts a corner between 89 and 91 degrees as a right angle. The
@@ -2026,24 +2036,17 @@ async fn route_refine_does_not_reterminate_a_branch_that_already_meets_the_trunk
         ]
         .concat()
     };
-    let r = Fixture::new(&junction(0.03))
-        .run(json!({"kinds":["t_junction"]}))
-        .await;
-    assert!(r["proposals"].as_array().unwrap().is_empty(), "{r}");
-    assert_eq!(r["coverage"]["blocked_total"], 1, "{r}");
-    assert_eq!(
-        r["blocked"][0]["reason"], "branch already meets the trunk at a right angle",
-        "{r}"
-    );
-    // Square to the second trunk leg only: 89.93 degrees to the first one.
-    let r = Fixture::new(&junction(0.07))
-        .run(json!({"kinds":["t_junction"]}))
-        .await;
-    assert!(r["proposals"].as_array().unwrap().is_empty(), "{r}");
-    assert_eq!(
-        r["blocked"][0]["reason"], "branch already meets the trunk at a right angle",
-        "{r}"
-    );
+    // Since S7b a corner is acute only below 89 degrees: a branch within a
+    // fraction of a degree of square is not an acute corner, so it is not a
+    // T row at all and the guard inside t_junction never sees it.
+    for bend in [0.03, 0.07] {
+        let r = Fixture::new(&junction(bend))
+            .run(json!({"kinds":["t_junction"]}))
+            .await;
+        assert_eq!(r["before"]["corners"]["acute_corners"], 0, "{r}");
+        assert!(r["proposals"].as_array().unwrap().is_empty(), "{r}");
+        assert_eq!(r["coverage"]["blocked_total"], 0, "{r}");
+    }
     // A branch that is really acute to its trunk is still repaired.
     let acute = [
         pad(1, (4., 10.), 2, "F.Cu"),
@@ -2058,4 +2061,34 @@ async fn route_refine_does_not_reterminate_a_branch_that_already_meets_the_trunk
         .run(json!({"kinds":["t_junction"]}))
         .await;
     assert_eq!(r["proposals"].as_array().unwrap().len(), 1, "{r}");
+}
+
+/// S7b review S5: a right-angle bend that holds a track shorter than 10 um is
+/// counted by 5.3, but `chamfer` is not given it: reading one key, it could
+/// only block it. With the piece on the bend's own key, and with the legs
+/// on two keys the piece joins.
+#[tokio::test]
+async fn route_refine_gives_chamfer_no_right_angle_that_holds_a_short_track() {
+    let same_key = [
+        pad(1, (4., 6.), 2, "F.Cu"),
+        pad(2, (6., 10.), 2, "F.Cu"),
+        track(11, (4., 6.), (6., 6.), 2),
+        track(12, (6., 6.), (6., 10.), 2),
+        track(13, (6., 6.), (6., 6.0001), 2),
+    ]
+    .concat();
+    let two_keys = [
+        pad(1, (4., 6.), 2, "F.Cu"),
+        pad(2, (6.002, 10.), 2, "F.Cu"),
+        track(11, (4., 6.), (6., 6.), 2),
+        track(13, (6., 6.), (6.002, 6.002), 2),
+        track(12, (6.002, 6.002), (6.002, 10.), 2),
+    ]
+    .concat();
+    for board in [same_key, two_keys] {
+        let r = Fixture::new(&board).run(json!({"kinds":["chamfer"]})).await;
+        assert_eq!(r["before"]["corners"]["right_angle_corners"], 1, "{r}");
+        assert!(r["proposals"].as_array().unwrap().is_empty(), "{r}");
+        assert_eq!(r["coverage"]["blocked_total"], 0, "{r}");
+    }
 }
