@@ -641,15 +641,24 @@ fn point_to_line(p: Pt, origin: Pt, u: Pt) -> f64 {
 
 pub(super) type CornerRow = (String, String, Pt, Vec<String>);
 
-/// Bends, right angles, acute bends this scan finds, right-angle rows, and
-/// junctions holding a track shorter than 10 um. Junctions are read as the
-/// acid-trap check reads them (`dfm::junctions`): a track shorter than 10 um
-/// belongs to the junction it touches and gives no direction. A bend is two
-/// real track ends of one net meeting, outside any pad or via of that net.
-pub(super) fn corner_junctions(m: &Model) -> (usize, usize, usize, Vec<CornerRow>, usize) {
+/// What the corner scan finds: bends, right angles, acute bends of its own,
+/// the right-angle rows the planner's `chamfer` kind may act on (bends of two
+/// tracks with no short track among them), junctions holding a track shorter
+/// than 10 um, and every right-angle row (for the findings).
+pub(super) type CornerScan = (usize, usize, usize, Vec<CornerRow>, usize, Vec<CornerRow>);
+
+/// The corner scan. Junctions are read as the acid-trap check reads them
+/// (`dfm::junctions`): a track shorter than 10 um belongs to the junction it
+/// touches and gives no direction while its run stays within the bound. A
+/// bend is two legs of one net meeting, outside any pad or via of that net.
+/// A right-angle bend that holds a short track is counted and listed in the
+/// findings but not given to `chamfer`: the planner reads one key and cannot
+/// chamfer a bend whose legs a short track joins (it could only block it).
+pub(super) fn corner_junctions(m: &Model) -> CornerScan {
     let tracks = m.tracks.values().flatten().map(|&i| m.track(i));
     let (mut bends, mut right, mut acute_here, mut with_short) = (0usize, 0usize, 0usize, 0usize);
-    let mut right_rows: Vec<(String, String, Pt, Vec<String>)> = Vec::new();
+    let (mut planner_rows, mut right_rows): (Vec<CornerRow>, Vec<CornerRow>) =
+        (Vec::new(), Vec::new());
     for j in dfm::junctions(tracks) {
         if j.short_tracks > 0 {
             with_short += 1;
@@ -682,7 +691,7 @@ pub(super) fn corner_junctions(m: &Model) -> (usize, usize, usize, Vec<CornerRow
                 acute_here += 1;
             } else if dfm::is_right_angle(angle) {
                 right += 1;
-                right_rows.push((
+                let row: CornerRow = (
                     j.net.clone(),
                     j.layer.clone(),
                     j.at,
@@ -690,11 +699,22 @@ pub(super) fn corner_junctions(m: &Model) -> (usize, usize, usize, Vec<CornerRow
                         .iter()
                         .map(|e| e.1.clone().unwrap_or_default())
                         .collect(),
-                ));
+                );
+                if j.short_tracks == 0 {
+                    planner_rows.push(row.clone());
+                }
+                right_rows.push(row);
             }
         }
     }
-    (bends, right, acute_here, right_rows, with_short)
+    (
+        bends,
+        right,
+        acute_here,
+        planner_rows,
+        with_short,
+        right_rows,
+    )
 }
 
 pub(super) fn corners(m: &Model) -> CheckOut {
@@ -712,7 +732,7 @@ pub(super) fn corners(m: &Model) -> CheckOut {
         .filter(|i| i.issue.starts_with("Acid trap"))
         .collect();
 
-    let (bends, right, acute_here, mut right_rows, with_short) = corner_junctions(m);
+    let (bends, right, acute_here, _, with_short, mut right_rows) = corner_junctions(m);
     let short_tracks = report
         .checks
         .get("acid_trap")

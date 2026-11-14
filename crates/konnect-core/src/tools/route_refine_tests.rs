@@ -2062,3 +2062,33 @@ async fn route_refine_does_not_reterminate_a_branch_that_already_meets_the_trunk
         .await;
     assert_eq!(r["proposals"].as_array().unwrap().len(), 1, "{r}");
 }
+
+/// S7b review S5: a right-angle bend that holds a track shorter than 10 um is
+/// counted by 5.3, but `chamfer` is not given it: reading one key, it could
+/// only block it. With the piece on the bend's own key, and with the legs
+/// on two keys the piece joins.
+#[tokio::test]
+async fn route_refine_gives_chamfer_no_right_angle_that_holds_a_short_track() {
+    let same_key = [
+        pad(1, (4., 6.), 2, "F.Cu"),
+        pad(2, (6., 10.), 2, "F.Cu"),
+        track(11, (4., 6.), (6., 6.), 2),
+        track(12, (6., 6.), (6., 10.), 2),
+        track(13, (6., 6.), (6., 6.0001), 2),
+    ]
+    .concat();
+    let two_keys = [
+        pad(1, (4., 6.), 2, "F.Cu"),
+        pad(2, (6.002, 10.), 2, "F.Cu"),
+        track(11, (4., 6.), (6., 6.), 2),
+        track(13, (6., 6.), (6.002, 6.002), 2),
+        track(12, (6.002, 6.002), (6.002, 10.), 2),
+    ]
+    .concat();
+    for board in [same_key, two_keys] {
+        let r = Fixture::new(&board).run(json!({"kinds":["chamfer"]})).await;
+        assert_eq!(r["before"]["corners"]["right_angle_corners"], 1, "{r}");
+        assert!(r["proposals"].as_array().unwrap().is_empty(), "{r}");
+        assert_eq!(r["coverage"]["blocked_total"], 0, "{r}");
+    }
+}
