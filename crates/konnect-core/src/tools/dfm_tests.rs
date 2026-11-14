@@ -739,3 +739,20 @@ fn the_junction_reader_skips_a_one_point_piece_and_reads_no_keys_as_small() {
         .all(|j| j.ends.iter().all(|e| e.1.as_deref() != Some("a"))));
     assert!(cluster_is_small(std::iter::empty()));
 }
+
+#[test]
+fn an_arc_is_short_by_the_sum_of_its_pieces() {
+    // No point or one point is no track, so not a short one.
+    assert!(!is_short_path(&[]));
+    assert!(!is_short_path(&[(1.0, 1.0)]));
+    // Pieces of 4 and 4 um make 8: short. 6 and 6 make 12: a leg, though each
+    // piece alone is short. 5 and 5 make exactly 10: a leg.
+    assert!(is_short_path(&[(1.0, 1.0), (1.004, 1.0), (1.004, 1.004)]));
+    assert!(!is_short_path(&[(1.0, 1.0), (1.006, 1.0), (1.006, 1.006)]));
+    assert!(!is_short_path(&[(1.0, 1.0), (1.005, 1.0), (1.005, 1.005)]));
+    assert!(is_short_path(&[
+        (1.0, 1.0),
+        (1.005, 1.0),
+        (1.005, 1.004_999)
+    ]));
+}
