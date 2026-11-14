@@ -756,3 +756,40 @@ fn an_arc_is_short_by_the_sum_of_its_pieces() {
         (1.005, 1.004_999)
     ]));
 }
+
+/// The run bound is a box diagonal: along either axis, on a diagonal and
+/// for keys that are not in a line.
+#[test]
+fn the_run_bound_is_the_diagonal_of_the_keys_box() {
+    for (keys, small) in [
+        (vec![(0, 0), (20, 0)], true),
+        (vec![(0, 0), (21, 0)], false),
+        (vec![(0, 0), (0, 20)], true),
+        (vec![(0, 0), (0, 21)], false),
+        (vec![(0, 0), (14, 14)], true),
+        (vec![(0, 0), (15, 15)], false),
+        (vec![(5, 0), (0, 12), (-7, 3)], true),
+        // A 16 by 12 box has a diagonal of exactly 20; 17 by 12 is over.
+        (vec![(5, 0), (0, 12), (-11, 3)], true),
+        (vec![(5, 0), (0, 12), (-12, 3)], false),
+    ] {
+        assert_eq!(cluster_is_small(&keys), small, "{keys:?}");
+    }
+}
+
+/// A piece of no length gives no direction: an arc whose end repeats its
+/// first point adds no leg there.
+#[test]
+fn a_piece_of_no_length_gives_no_direction() {
+    let arc = [(1.0, 1.0), (1.0, 1.0), (1.5, 1.0), (1.5, 1.5)];
+    let leg = [(1.0, 1.0), (1.0, 1.5)];
+    let pieces = [(&arc[..], "arc"), (&leg[..], "leg")].map(|(pts, id)| Piece {
+        layer: "F.Cu",
+        net: "SIG",
+        pts,
+        id: Some(id),
+    });
+    let found = read_junctions(pieces.into_iter());
+    let ends: Vec<_> = found.iter().map(|j| j.ends.clone()).collect();
+    assert!(found.is_empty(), "{ends:?}");
+}
