@@ -750,7 +750,7 @@ pub(super) fn corners(m: &Model) -> CheckOut {
             item: id,
             subject: i.at["net"].as_str().unwrap_or("").to_string(),
             measured: json!({ "at": i.at, "reused": "dfm acid_trap" }),
-            threshold: json!({ "minimum_interior_angle_deg": 90 }),
+            threshold: json!({ "minimum_interior_angle_deg": dfm::ACUTE_BELOW_DEG }),
             issue: i.issue.clone(),
             fix: i.fix.clone(),
             uuids,

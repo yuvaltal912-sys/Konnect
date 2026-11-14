@@ -526,51 +526,71 @@ fn via_on_layer(via: &Entry, layer: &str) -> bool {
 // ─── Junctions and acid traps ───────────────────────────────────────────────
 
 /// Tracks shorter than this belong to the junction they touch and give no
-/// direction (S7b, owner decision 2026-11-13). Freerouting leaves such tracks
-/// while it routes, 0.1 um up to 9.6 um on a diagonal: its 45-degree corner
-/// smoothing stops 0.1 um short of the next corner, and it snaps wire ends to
-/// via and pad centres. Their direction is an artifact, not a leg. 10 um is
-/// ten junction keys and lies inside the end cap of any track a fab can make.
-pub(crate) const SHORT_TRACK_MM: f64 = 0.01;
+/// direction, as long as the run they form stays small (see [`CLUSTER_SPAN_UM`];
+/// S7b, owner decision 2026-11-13). Freerouting leaves such tracks while it
+/// routes, 0.1 um up to 9.6 um on a diagonal: its 45-degree corner smoothing
+/// stops 0.1 um short of the next corner, and it snaps wire ends to via and
+/// pad centres. Their direction is an artifact, not a leg. 10 um is ten
+/// junction keys and lies inside the end cap of any track a fab can make. The
+/// pieces scale with the export's DSN resolution (0.1 um here): a coarser one
+/// makes them longer, and then some no longer fall under this line.
+pub const SHORT_TRACK_MM: f64 = 0.01;
+
+/// [`SHORT_TRACK_MM`] in nanometres: the line is decided in whole nanometres,
+/// so a track of exactly 10 um is a leg wherever it lies.
+pub const SHORT_TRACK_NM: i64 = 10_000;
+
+/// Keys joined by short tracks are read as one junction only while the box
+/// around them has a diagonal of at most this many micrometres. The router's
+/// pieces are isolated: on the measured boards a run spans at most 9 um and
+/// holds at most two pieces, and the longest piece seen is 9.6 um. 20 um holds two such pieces end to end, stays well
+/// inside the end cap of a 0.1-mm track (50 um) and far below the run a
+/// wedge needs to open (about 130 um for 0.1-mm tracks at 45 degrees). A run
+/// beyond it is real copper: a curve or a leg drawn in pieces, read piece by
+/// piece with its real directions.
+pub const CLUSTER_SPAN_UM: i64 = 20;
 
 /// A corner is acute below the lower edge of the audit's own right-angle
 /// band (S7b, owner decision 2026-11-13).
-pub(crate) const ACUTE_BELOW_DEG: f64 = 89.0;
+pub const ACUTE_BELOW_DEG: f64 = 89.0;
 
 /// The one test of an acute corner, used by every caller.
-pub(crate) fn is_acute(degrees: f64) -> bool {
+pub fn is_acute(degrees: f64) -> bool {
     degrees < ACUTE_BELOW_DEG
 }
 
 /// The audit's right-angle band, 89 to 91 degrees.
-pub(crate) fn is_right_angle(degrees: f64) -> bool {
+pub fn is_right_angle(degrees: f64) -> bool {
     (ACUTE_BELOW_DEG..=91.0).contains(&degrees)
 }
 
 /// (x um, y um): where track ends meet, to the micrometre.
-pub(crate) type JunctionKey = (i64, i64);
+pub type JunctionKey = (i64, i64);
 
 /// A unit direction leaving a junction, with the UUID of its track.
-pub(crate) type JunctionEnd = ((f64, f64), Option<String>);
+pub type JunctionEnd = ((f64, f64), Option<String>);
 
-pub(crate) fn junction_key(p: (f64, f64)) -> JunctionKey {
+pub fn junction_key(p: (f64, f64)) -> JunctionKey {
     ((p.0 * 1000.0).round() as i64, (p.1 * 1000.0).round() as i64)
 }
 
 /// Track ends of one net on one layer that meet. Ends that round to the same
-/// micrometre share a key; keys joined by a track shorter than
-/// [`SHORT_TRACK_MM`] are one junction, and that track adds no direction.
-pub(crate) struct Junction {
+/// micrometre share a key; keys joined by tracks shorter than
+/// [`SHORT_TRACK_MM`] are one junction, and those tracks add no direction,
+/// while the keys stay within [`CLUSTER_SPAN_UM`]. Beyond it each key is its
+/// own junction and every piece is a leg.
+pub struct Junction {
     pub layer: String,
     pub net: String,
     /// The key with the most track ends (the smallest on a tie), as a point.
     pub at: (f64, f64),
     /// Unit directions leaving the junction, with the track's UUID: every end
-    /// of every track of 10 um or more at one of the keys.
+    /// of every leg at one of the keys (a track of 10 um or more, or any track
+    /// of a run beyond the bound).
     pub ends: Vec<JunctionEnd>,
-    /// Tracks shorter than 10 um inside the junction.
+    /// Tracks shorter than 10 um read as part of the junction.
     pub short_tracks: usize,
-    /// The keys where a track of 10 um or more ends: where the legs meet.
+    /// The keys where a leg ends: where the legs meet.
     pub end_keys: Vec<JunctionKey>,
 }
 
@@ -596,31 +616,86 @@ impl Junction {
     }
 }
 
-fn track_length(pts: &[(f64, f64)]) -> f64 {
-    pts.windows(2)
-        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
-        .sum()
+/// A coordinate in mm as whole nanometres (board files hold six decimals).
+fn nm(v: f64) -> i64 {
+    (v * 1e6).round() as i64
+}
+
+/// Whether a straight piece from `a` to `b` is shorter than 10 um, compared
+/// as squared whole nanometres.
+pub fn is_short_segment(a: (f64, f64), b: (f64, f64)) -> bool {
+    let (dx, dy) = ((nm(b.0) - nm(a.0)) as i128, (nm(b.1) - nm(a.1)) as i128);
+    dx * dx + dy * dy < (SHORT_TRACK_NM as i128) * (SHORT_TRACK_NM as i128)
+}
+
+/// Whether a track (two points) or a tessellated arc (more) is shorter than
+/// 10 um; an arc's length is the sum of its pieces in nanometres.
+pub fn is_short_path(pts: &[(f64, f64)]) -> bool {
+    match pts {
+        [] | [_] => false,
+        [a, b] => is_short_segment(*a, *b),
+        _ => {
+            let length: f64 = pts
+                .windows(2)
+                .map(|w| ((nm(w[1].0) - nm(w[0].0)) as f64).hypot((nm(w[1].1) - nm(w[0].1)) as f64))
+                .sum();
+            length < SHORT_TRACK_NM as f64
+        }
+    }
 }
 
 /// Whether a track counts as shorter than 10 um.
 pub(crate) fn is_short_track(t: &Entry) -> bool {
-    t.shape.pts.len() >= 2 && track_length(&t.shape.pts) < SHORT_TRACK_MM
+    is_short_path(&t.shape.pts)
 }
 
-/// Every junction of two or more track ends of 10 um or more, in (layer,
-/// net, key) order; arcs count as tracks, read from their end pieces.
+/// Whether keys joined by short tracks are small enough to read as one point
+/// (box diagonal of at most [`CLUSTER_SPAN_UM`]), in whole micrometres.
+pub fn cluster_is_small<'a>(keys: impl IntoIterator<Item = &'a JunctionKey>) -> bool {
+    let mut keys = keys.into_iter();
+    let Some(&(x, y)) = keys.next() else {
+        return true;
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+    for &(x, y) in keys {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    let (w, h) = (x1 - x0, y1 - y0);
+    w * w + h * h <= CLUSTER_SPAN_UM * CLUSTER_SPAN_UM
+}
+
+/// One track as the junction reader sees it: its layer, net, points in mm
+/// (two for a segment, more for a tessellated arc) and id.
+pub struct Piece<'a> {
+    pub layer: &'a str,
+    pub net: &'a str,
+    pub pts: &'a [(f64, f64)],
+    pub id: Option<&'a str>,
+}
+
+/// Every junction of the board's tracks, as [`read_junctions`] reads them.
 pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junction> {
-    type Group<'a> = Vec<&'a Entry>;
-    let mut groups: BTreeMap<(String, String), Group<'a>> = BTreeMap::new();
-    for t in tracks {
-        if t.shape.pts.len() < 2 {
+    read_junctions(tracks.map(|t| Piece {
+        layer: t.layers.first().map_or("", String::as_str),
+        net: t.net.as_deref().unwrap_or(""),
+        pts: &t.shape.pts,
+        id: t.uuid.as_deref(),
+    }))
+}
+
+/// Every junction of two or more legs, grouped by (layer, net); within a
+/// group the order follows the keys' union and callers that need an order
+/// sort. Arcs count as tracks, read from their end pieces. The one reading
+/// of junctions for the acid-trap check, the layout audit's corners and the
+/// routing bench.
+pub fn read_junctions<'a>(pieces: impl Iterator<Item = Piece<'a>>) -> Vec<Junction> {
+    let mut groups: BTreeMap<(String, String), Vec<Piece<'a>>> = BTreeMap::new();
+    for t in pieces {
+        if t.pts.len() < 2 {
             continue;
         }
         groups
-            .entry((
-                t.layers.first().cloned().unwrap_or_default(),
-                t.net.clone().unwrap_or_default(),
-            ))
+            .entry((t.layer.to_string(), t.net.to_string()))
             .or_default()
             .push(t);
     }
@@ -640,21 +715,23 @@ pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junc
             }
             r
         }
-        let mut ends: BTreeMap<JunctionKey, Vec<JunctionEnd>> = BTreeMap::new();
+        // Every end's direction, the short tracks' too: a run beyond the bound
+        // is read piece by piece.
+        let mut ends: BTreeMap<JunctionKey, Vec<(JunctionEnd, bool)>> = BTreeMap::new();
         let mut short: Vec<JunctionKey> = Vec::new();
         for t in &tracks {
-            let pts = &t.shape.pts;
+            let pts = t.pts;
             let n = pts.len();
             let (ka, kb) = (junction_key(pts[0]), junction_key(pts[n - 1]));
             parent.entry(ka).or_insert(ka);
             parent.entry(kb).or_insert(kb);
-            if is_short_track(t) {
+            let is_short = is_short_path(pts);
+            if is_short {
                 let (ra, rb) = (root(&mut parent, ka), root(&mut parent, kb));
                 if ra != rb {
                     parent.insert(ra, rb);
                 }
                 short.push(ka);
-                continue;
             }
             for (end, next) in [(pts[0], pts[1]), (pts[n - 1], pts[n - 2])] {
                 let (dx, dy) = (next.0 - end.0, next.1 - end.1);
@@ -664,7 +741,7 @@ pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junc
                 }
                 ends.entry(junction_key(end))
                     .or_default()
-                    .push(((dx / len, dy / len), t.uuid.clone()));
+                    .push((((dx / len, dy / len), t.id.map(str::to_string)), is_short));
             }
         }
         let mut members: BTreeMap<JunctionKey, Vec<JunctionKey>> = BTreeMap::new();
@@ -676,29 +753,40 @@ pub(crate) fn junctions<'a>(tracks: impl Iterator<Item = &'a Entry>) -> Vec<Junc
         for k in short {
             *shorts.entry(root(&mut parent, k)).or_default() += 1;
         }
+        // A small run is one junction whose short tracks give no direction;
+        // a run beyond the bound is split back into its keys, every piece a leg.
+        let mut parts: Vec<(Vec<JunctionKey>, bool, usize)> = Vec::new();
         for (r, keys) in members {
-            let short_tracks = shorts.get(&r).copied().unwrap_or(0);
-            let dirs: Vec<_> = keys
-                .iter()
-                .flat_map(|k| ends.get(k).into_iter().flatten().cloned())
-                .collect();
+            if cluster_is_small(&keys) {
+                parts.push((keys, true, shorts.get(&r).copied().unwrap_or(0)));
+            } else {
+                parts.extend(keys.into_iter().map(|k| (vec![k], false, 0)));
+            }
+        }
+        let real = |k: &JunctionKey, absorb: bool| -> Vec<JunctionEnd> {
+            ends.get(k)
+                .into_iter()
+                .flatten()
+                .filter(|(_, short)| !(absorb && *short))
+                .map(|(e, _)| e.clone())
+                .collect()
+        };
+        for (keys, absorb, short_tracks) in parts {
+            let dirs: Vec<_> = keys.iter().flat_map(|k| real(k, absorb)).collect();
             if dirs.len() < 2 {
                 continue;
             }
             let main = *keys
                 .iter()
                 .max_by(|a, b| {
-                    let (na, nb) = (
-                        ends.get(a).map_or(0, Vec::len),
-                        ends.get(b).map_or(0, Vec::len),
-                    );
+                    let (na, nb) = (real(a, absorb).len(), real(b, absorb).len());
                     na.cmp(&nb).then(b.cmp(a))
                 })
                 .expect("a junction has a key");
             let end_keys = keys
                 .iter()
                 .copied()
-                .filter(|k| ends.get(k).is_some_and(|e| !e.is_empty()))
+                .filter(|k| !real(k, absorb).is_empty())
                 .collect();
             out.push(Junction {
                 layer: layer.clone(),

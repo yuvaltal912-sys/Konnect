@@ -552,3 +552,161 @@ fn a_chain_of_short_tracks_joins_its_keys_into_one_junction() {
     assert_eq!((traps, cov.checked), (1, 1), "{cov:?}");
     assert_eq!(cov.short_tracks, Some(2));
 }
+
+// ─── S7b review M1, S3: the cluster's bound and the 10 um line in nanometres ─
+
+/// A point on the 1 nm grid.
+fn on_nm(p: (f64, f64)) -> (f64, f64) {
+    ((p.0 * 1e6).round() / 1e6, (p.1 * 1e6).round() / 1e6)
+}
+
+/// A run of `n` pieces of `step` mm from `from` in direction `degrees`.
+fn chain(from: (f64, f64), degrees: f64, step: f64, n: usize) -> Vec<Track> {
+    let r = degrees.to_radians();
+    let p = |i: usize| {
+        on_nm((
+            from.0 + i as f64 * step * r.cos(),
+            from.1 + i as f64 * step * r.sin(),
+        ))
+    };
+    (0..n).map(|i| (p(i), p(i + 1))).collect()
+}
+
+/// A real 45-degree corner whose second leg is drawn as 40 pieces of 9 um
+/// (0.36 mm, far wider than any track's end cap): the run is real copper, so
+/// the corner is an acid trap, with or without a long track after the run.
+/// The tail turns 45 degrees to +y: read as one point, the run would leave
+/// the first leg and the tail at a right angle and hide the corner.
+#[test]
+fn a_corner_drawn_as_a_run_of_short_pieces_is_an_acid_trap() {
+    let run = chain(JN, 135., 0.009, 40);
+    let end = run[39].1;
+    let mut with_tail = vec![(JN, at(180., 3.))];
+    with_tail.extend(run.iter().copied());
+    with_tail.push((end, (end.0, end.1 + 3.)));
+    let (traps, cov) = acid_traps(&with_tail);
+    assert_eq!(traps, 1, "with a tail: {cov:?}");
+    let mut alone = vec![(JN, at(180., 3.))];
+    alone.extend(run);
+    let (traps, cov) = acid_traps(&alone);
+    assert_eq!(traps, 1, "the run alone: {cov:?}");
+}
+
+/// A 90-degree fillet of 0.25 mm radius drawn in 1-degree pieces (4.4 um)
+/// between two straight legs: every vertex turns by one degree. No acid trap.
+#[test]
+fn a_fillet_drawn_as_short_pieces_is_not_an_acid_trap() {
+    assert_eq!(acid_traps(&fillet_legs(0.25)).0, 0);
+}
+
+/// Leg A runs left from JN; a fillet of radius `r` turns from heading +x to
+/// +y; leg B leaves its far end heading +y.
+fn fillet_legs(r: f64) -> Vec<Track> {
+    let c = (JN.0, JN.1 + r);
+    let p = |deg: f64| {
+        let t = deg.to_radians();
+        on_nm((c.0 + r * t.sin(), c.1 - r * t.cos()))
+    };
+    let mut t = vec![(JN, at(180., 3.))];
+    t.extend((0..90).map(|i| (p(i as f64), p(i as f64 + 1.))));
+    let f = p(90.);
+    t.push((f, (f.0, f.1 + 3.)));
+    t
+}
+
+/// Short pieces collapse into one junction only while every key of the run
+/// lies within a 20-um box diagonal. Keys 0, 9, 18 and 20 um along +x collapse:
+/// the legs (45 and 225 degrees) are a straight line. At 21 um the run is read
+/// piece by piece: its first and last pieces each meet a leg at 45 degrees.
+#[test]
+fn twenty_micrometres_is_where_a_run_of_short_pieces_stops_being_a_point() {
+    for (last, expected) in [(0.020, 0), (0.021, 2)] {
+        let k = |x: f64| (JN.0 + x, JN.1);
+        let end = k(last);
+        let t = vec![
+            (JN, at(45., 3.)),
+            (k(0.), k(0.009)),
+            (k(0.009), k(0.018)),
+            (k(0.018), end),
+            (end, on_nm((end.0 - 2.12132, end.1 - 2.12132))),
+        ];
+        let (traps, cov) = acid_traps(&t);
+        assert_eq!(traps, expected, "run to {last} mm: {cov:?}");
+    }
+}
+
+/// Exactly 10 um is a leg and 1 nm less is short, decided in whole
+/// nanometres: at any position, along an axis or a diagonal. Each piece
+/// leaves JN between 90 and 143 degrees, so as a leg it makes an acute corner
+/// with one of the bend's legs (180 and 45 degrees).
+#[test]
+fn ten_micrometres_is_decided_in_whole_nanometres_at_any_position() {
+    for origin in [JN, (123.456789, 45.678901), (0.000001, 299.999999)] {
+        let legs_at = |deg: f64| {
+            let r = deg.to_radians();
+            (
+                origin,
+                on_nm((origin.0 + 3. * r.cos(), origin.1 + 3. * r.sin())),
+            )
+        };
+        for (dx, dy, expected) in [
+            (0, 10_000, 1),
+            (0, 9_999, 0),
+            (-6_000, 8_000, 1),
+            (-6_000, 7_999, 0),
+            (-8_000, 6_000, 1),
+            (-7_999, 6_000, 0),
+        ] {
+            let tip = on_nm((origin.0 + dx as f64 * 1e-6, origin.1 + dy as f64 * 1e-6));
+            let t = [legs_at(180.), legs_at(45.), (origin, tip)];
+            let (traps, cov) = acid_traps(&t);
+            assert_eq!(traps, expected, "({dx}, {dy}) nm at {origin:?}: {cov:?}");
+        }
+    }
+}
+
+/// A short track of another net, or on another layer, at the same point is
+/// neither joined to the junction nor read as part of it.
+#[test]
+fn a_short_track_of_another_net_or_layer_is_not_part_of_the_junction() {
+    let board = |extra: &str| {
+        let text = trap_board(&legs(&[180., 45.]));
+        text.replace("\n)", &format!("\n  {extra}\n)"))
+    };
+    for extra in [
+        format!("(segment (start {} {}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"OTHER\") (uuid \"o\"))", JN.0, JN.1, JN.0, JN.1 + 0.005),
+        format!("(segment (start {} {}) (end {} {}) (width 0.2) (layer \"B.Cu\") (net \"SIG\") (uuid \"b\"))", JN.0, JN.1, JN.0, JN.1 + 0.005),
+    ] {
+        let report = check_board(&geometry(&board(&extra)), &jlc());
+        assert_eq!(issues_with(&report, "Acid trap").len(), 0, "{extra}");
+        assert_eq!(report.checks["acid_trap"].checked, 1, "{extra}");
+    }
+}
+
+/// Four legs at the 89-degree line: 0, 88.99, 180 and 270 degrees hold one
+/// acute pair; at 89.01 none.
+#[test]
+fn a_four_way_junction_is_acute_only_below_eighty_nine_degrees() {
+    assert_eq!(acid_traps(&legs(&[0., 88.99, 180., 270.])).0, 1);
+    assert_eq!(acid_traps(&legs(&[0., 89.01, 180., 270.])).0, 0);
+}
+
+/// A junction is reported at its key with the most track ends: two legs at JN
+/// and one more 2 um away, joined by a short piece.
+#[test]
+fn an_acid_trap_is_reported_at_the_key_with_the_most_ends() {
+    let j1 = (JN.0 + 0.002, JN.1);
+    let t = vec![
+        (JN, at(180., 3.)),
+        (JN, at(135., 3.)),
+        (JN, j1),
+        (j1, (j1.0 + 3., j1.1)),
+    ];
+    let report = check_board(&geometry(&trap_board(&t)), &jlc());
+    let traps = issues_with(&report, "Acid trap");
+    assert_eq!(traps.len(), 1);
+    assert_eq!(
+        (traps[0].at["x"].as_f64(), traps[0].at["y"].as_f64()),
+        (Some(JN.0), Some(JN.1))
+    );
+}

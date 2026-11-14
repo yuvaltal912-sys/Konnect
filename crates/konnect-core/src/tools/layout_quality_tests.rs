@@ -2163,6 +2163,11 @@ fn an_acute_finding_names_the_tracks_at_every_key_of_its_junction() {
         .collect();
     assert_eq!(fs.len(), 1, "{fs:?}");
     assert_eq!(fs[0]["uuids"], json!(["t0", "t1", "t2"]), "{fs:?}");
+    // The stated threshold is the rule applied: acute below 89 degrees.
+    assert_eq!(
+        fs[0]["threshold"]["minimum_interior_angle_deg"], 89.0,
+        "{fs:?}"
+    );
 }
 
 /// The 5.3 score from the corrected counts: an acute corner costs a whole
@@ -2215,4 +2220,48 @@ fn the_corner_score_weighs_the_corrected_counts() {
         .map(|f| f["subject"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(right, ["SIG", "SIG"]);
+}
+
+// ─── S7b review M1: a run of short pieces is real copper beyond 20 um ──────
+
+fn on_nm(p: (f64, f64)) -> (f64, f64) {
+    ((p.0 * 1e6).round() / 1e6, (p.1 * 1e6).round() / 1e6)
+}
+
+/// A 90-degree fillet of 0.25 mm radius drawn in 1-degree pieces between two
+/// straight legs is a rounded corner: neither acute nor a right angle.
+#[test]
+fn a_fillet_drawn_as_short_pieces_is_neither_acute_nor_a_right_angle() {
+    let r = 0.25;
+    let c = (JN.0, JN.1 + r);
+    let p = |deg: f64| {
+        let t = deg.to_radians();
+        on_nm((c.0 + r * t.sin(), c.1 - r * t.cos()))
+    };
+    let mut t = vec![(JN, leg_at(180., 3.))];
+    t.extend((0..90).map(|i| (p(i as f64), p(i as f64 + 1.))));
+    let f = p(90.);
+    t.push((f, (f.0, f.1 + 3.)));
+    let m = corner_metrics(&t);
+    assert_eq!(m["acute_corners"], 0, "{m}");
+    assert_eq!(m["right_angle_corners"], 0, "{m}");
+    assert_eq!(m["junctions_with_short_tracks"], 0, "{m}");
+}
+
+/// A 45-degree corner whose second leg is a run of 40 pieces of 9 um is one
+/// acute corner for the scan too.
+#[test]
+fn a_corner_drawn_as_a_run_of_short_pieces_is_acute_for_the_scan() {
+    let r = 135f64.to_radians();
+    let p = |i: usize| {
+        on_nm((
+            JN.0 + i as f64 * 0.009 * r.cos(),
+            JN.1 + i as f64 * 0.009 * r.sin(),
+        ))
+    };
+    let mut t = vec![(JN, leg_at(180., 3.))];
+    t.extend((0..40).map(|i| (p(i), p(i + 1))));
+    let m = corner_metrics(&t);
+    assert_eq!(m["acute_corners"], 1, "{m}");
+    assert_eq!(m["acute_found_by_this_scan"], 1, "{m}");
 }
