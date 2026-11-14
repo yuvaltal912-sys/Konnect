@@ -247,10 +247,12 @@ and footprint containment. It checks track widths, via and hole sizes, annular
 rings, via-in-pad, track-to-track acid traps and the project's DRC minimums
 against `fab_limits`; read `checks` for what each covered. An acid trap is two
 tracks of one net meeting below 89 degrees, the lower edge of the audit's
-right-angle band. A track shorter than 10 um belongs to the junction it
-touches and gives no direction; the acid-trap check counts such tracks in its
-coverage, and `audit_layout_quality` reports them beside its corner counts, so
-they stay in view without reading as corners. What it lists under
+right-angle band. A track shorter than 10 um (an autorouter artifact)
+belongs to the junction it touches and gives no direction, as long as the
+pieces at one junction stay within 20 um; a longer run of short pieces is a
+curve or a leg drawn in pieces and is read piece by piece. The acid-trap check
+counts such tracks in its coverage, and `audit_layout_quality` reports them
+beside its corner counts, so they stay in view without reading as corners. What it lists under
 `delegated_to_drc` is proven only by `run_drc`, and `not_checked` is evidence
 nobody collected. It does not establish silkscreen readability, test-point
 access or assembly requirements. Collect those separately under the

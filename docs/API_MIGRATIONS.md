@@ -6,21 +6,28 @@ removals, default changes and the supported replacement workflow.
 ## Unreleased: corrected acute-corner reading (row S7b)
 
 Behaviour change, by the owner's decision of 2026-11-13. The acid-trap check
-behind `audit_manufacturing` (`dfm::check_acid_traps`) and the corner scan of
-`audit_layout_quality` item 5.3 now read a junction the same way:
+behind `audit_manufacturing` (`dfm::check_acid_traps`), the corner scan of
+`audit_layout_quality` item 5.3, the route-refinement planner's corner rows and
+the routing bench's corner counts read a junction the same way, through one
+function (`corner_reading::read_junctions`):
 
 - A track shorter than 10 um belongs to the junction it touches and gives no
-  direction. Junction keys (track ends within 1 um) joined by such a track are
-  one junction. Freerouting leaves such tracks while it routes, from 0.1 um up
-  to 9.6 um on a diagonal: its 45-degree corner smoothing stops 0.1 um short of
-  the next corner, and it snaps wire ends to via and pad centres. The audit
-  used to read their direction, so a 135-degree bend with a 0.1-um track at its
-  vertex counted as a 45-degree acid trap.
+  direction. Ends meet when they round to the same micrometre (a junction
+  key); keys joined by such tracks are one junction while the box around them
+  has a diagonal of at most 20 um. A longer run of short pieces (a curve or a
+  leg drawn in pieces) is real copper and is read piece by piece, every piece
+  a leg. Whether a track is shorter than 10 um is decided in whole nanometres,
+  so a track of exactly 10 um is a leg wherever it lies. Freerouting leaves
+  such tracks while it routes, from 0.1 um up to 9.6 um on a diagonal, each
+  run within 9 um on the measured boards: its 45-degree corner smoothing stops
+  0.1 um short of the next corner, and it snaps wire ends to via and pad
+  centres. The audit used to read their direction, so a 135-degree bend with a
+  0.1-um track at its vertex counted as a 45-degree acid trap.
 - A corner is acute only below 89 degrees, the lower edge of the audit's own
   right-angle band (89 to 91 degrees). A junction at 89.97 degrees used to count
   as acute and is now inside the band.
 - A junction inside a pad or via of its net is skipped only when every point
-  where its tracks of 10 um or more end lies inside that copper.
+  where its legs end lies inside that copper.
 
 Each caller and what changed for it:
 
@@ -29,7 +36,10 @@ Each caller and what changed for it:
 | `audit_manufacturing` | Fewer acid-trap issues on boards with short tracks or near-square junctions. `checks.acid_trap.checked` counts junctions of two or more real legs. New `checks.acid_trap.short_tracks`: tracks shorter than 10 um on the board |
 | `audit_layout_quality` 5.3 | `acute_corners`, `right_angle_corners`, `bends` and `acute_found_by_this_scan` read the same junctions; a 90-degree bend carrying a short track now counts as a right angle, and a counted right angle that a short track joins to a third leg no longer does. New metrics `short_tracks` and `junctions_with_short_tracks` |
 | `run_design_review` | Its manufacturing part reads the acid-trap check above |
-| `plan_route_refinement` | `before.corners` is the corrected 5.3 count. `t_junction` lists only junctions the corrected check counts: a branch between 89 and 90 degrees from its trunk is no longer a target (before, one 0.17 degrees off square was repaired). Its 0.06-degree guard is unchanged and no longer reached. `chamfer` reads its right-angle rows from the corrected scan |
+| `audit_layout_quality` 5.3 findings | An acute finding states `minimum_interior_angle_deg: 89`, the rule applied (it said 90) |
+| `audit_manufacturing` issue text | The angle is shown in whole degrees rounded down, so a trap at 88.99 degrees reads 88, not 89 |
+| `plan_route_refinement` | `before.corners` is the corrected 5.3 count. `t_junction` lists only junctions the corrected check counts: a branch between 89 and 90 degrees from its trunk is no longer a target (before, one 0.17 degrees off square was repaired). Its 0.06-degree guard is unchanged and no longer reached. `chamfer` reads its right-angle rows from the corrected scan, leaving out a right angle that holds a track under 10 um: it reads one key and could only block it, and 5.3 still counts it. On PR #63's 11 staged cases the three kinds plan the same repairs as before |
+| routing bench (`cargo xtask freerouting-bench`) | Its own acute and right-angle counts on the SES use the same function; before, it read every piece's direction, counted each gap of a junction and used 89.5 and 90 +/- 0.5 degrees, so its reports before and after this change are not comparable |
 
 What it does to existing boards (the seven routed boards PR #63 was measured
 on; counts only). Acute corners before #63: 11, 5, 5, 5, 5, 5, 5 read as 4, 0,
@@ -39,7 +49,8 @@ gains one from a 90-degree bend with a short track and loses one to a joined
 third leg, and two boards each lose one that way; none rises. Short tracks: 15, 14, 14, 15, 13, 12, 13 per board, in 12, 6, 6, 7,
 9, 8, 9 junctions; PR #63 made none of them. Each half matters alone: the
 short-track rule alone leaves 2, 1, 1, 1, 1, 1, 1 after #63, the 89-degree line
-alone 7, 4, 4, 4, 2, 2, 2.
+alone 7, 4, 4, 4, 2, 2, 2. No run of short pieces on these boards spans more
+than 9 um, so the 20-um bound changes none of these counts.
 
 ## Unreleased: per-zone pours and an honest routing status
 
@@ -269,7 +280,8 @@ the board, so a one-for-one exchange on an untouched net is not a new finding.
 What the planner does not achieve. On the boards it was measured on, repeated
 plan, adopt, refill and DRC rounds ended after four rounds with nothing more to
 propose. Right-angle corners fell to 1–6 per board, but 3–8 acute corners per
-board remained: an acute corner between two tracks, an acute T with no straight
+board remained by the audit's reading of that time (0–1 under the corrected
+reading of row S7b): an acute corner between two tracks, an acute T with no straight
 trunk, a branch shorter than the setback and a junction of four track ends are
 outside the three proposal kinds. A branch that already meets either leg of its
 trunk within 0.06 degrees of a right angle is left alone and reported, even where a slightly
