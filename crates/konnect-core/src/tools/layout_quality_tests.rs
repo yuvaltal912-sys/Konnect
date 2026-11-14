@@ -2164,3 +2164,55 @@ fn an_acute_finding_names_the_tracks_at_every_key_of_its_junction() {
     assert_eq!(fs.len(), 1, "{fs:?}");
     assert_eq!(fs[0]["uuids"], json!(["t0", "t1", "t2"]), "{fs:?}");
 }
+
+/// The 5.3 score from the corrected counts: an acute corner costs a whole
+/// bend, a right angle three tenths, out of every bend. Two right-angle
+/// bends of a signal net, one of the ground net and one acute V: 4 bends,
+/// 3 right angles, 1 acute corner, so 1 - (1 + 0.9) / 4. Right-angle
+/// findings name signal nets only.
+#[test]
+fn the_corner_score_weighs_the_corrected_counts() {
+    let bend = |at: (f64, f64), b: f64, net: &str, i: usize| {
+        let r = b.to_radians();
+        format!(
+            "  (segment (start {x} {y}) (end {} {y}) (width 0.2) (layer \"F.Cu\") (net \"{net}\") (uuid \"a{i}\"))\n  (segment (start {x} {y}) (end {} {}) (width 0.2) (layer \"F.Cu\") (net \"{net}\") (uuid \"b{i}\"))\n",
+            at.0 - 3.,
+            ((at.0 + 3. * r.cos()) * 1e6).round() / 1e6,
+            ((at.1 + 3. * r.sin()) * 1e6).round() / 1e6,
+            x = at.0,
+            y = at.1,
+        )
+    };
+    let segs = bend((10., 10.), 90., "SIG", 0)
+        + &bend((10., 25.), 90., "SIG", 1)
+        + &bend((30., 10.), 90., "GND", 2)
+        + &bend((30., 25.), 135., "SIG", 3);
+    let text = format!(
+        r#"(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+  (gr_rect (start 0 0) (end 60 40) (stroke (width 0.05) (type solid)) (fill no) (layer "Edge.Cuts") (uuid "e1"))
+{segs})"#
+    );
+    let r = run(&fx_text(&text, None));
+    let m = &check(&r, "5.3")["metrics"];
+    assert_eq!(
+        (
+            m["bends"].as_u64(),
+            m["right_angle_corners"].as_u64(),
+            m["acute_corners"].as_u64()
+        ),
+        (Some(4), Some(3), Some(1)),
+        "{m}"
+    );
+    assert!(
+        (score(&r, "5.3") - (1. - 1.9 / 4.)).abs() < 1e-9,
+        "{}",
+        score(&r, "5.3")
+    );
+    let right: Vec<_> = findings(&r, "5.3")
+        .into_iter()
+        .filter(|f| f["severity"] == "info")
+        .map(|f| f["subject"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(right, ["SIG", "SIG"]);
+}
