@@ -1511,6 +1511,56 @@ mod tests {
             .starts_with("the board has 1 unrouted connection(s)"));
     }
 
+    /// The DSN bound is 64 MiB, as documented: a file of exactly that size is
+    /// read, one byte more is refused, and so is anything not a `.dsn` file.
+    #[test]
+    fn a_dsn_of_up_to_64_mib_is_accepted_and_one_byte_more_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let sized = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+            path
+        };
+        let edge = sized("edge.dsn", 67_108_864);
+        assert!(check_dsn_input(&edge).is_ok());
+        // Read whole, never cut short at the bound.
+        assert_eq!(read_dsn(&edge).unwrap().len(), 67_108_864);
+        let error = check_dsn_input(&sized("over.dsn", 67_108_865))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("67108865 bytes"), "{error}");
+        assert!(check_dsn_input(&sized("board.txt", 10)).is_err());
+        assert!(check_dsn_input(&dir.path().join("missing.dsn")).is_err());
+    }
+
+    /// `route_local` refuses a DSN that is not a bounded regular `.dsn` file
+    /// before it starts anything, whoever calls it.
+    #[tokio::test]
+    async fn routing_refuses_a_dsn_that_is_not_a_bounded_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("freerouting.jar");
+        std::fs::write(&jar, b"not a jar").unwrap();
+        let folder = dir.path().join("folder.dsn");
+        std::fs::create_dir(&folder).unwrap();
+        let huge = dir.path().join("huge.dsn");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_DSN_BYTES + 1)
+            .unwrap();
+        // A Java that starts nothing, should the check ever be skipped.
+        let settings = RouteSettings {
+            java: Some(PathBuf::from("/usr/bin/false")),
+            ..all_settings()
+        };
+        for (dsn, needle) in [(&folder, "existing .dsn file"), (&huge, "bytes")] {
+            let error = route_local(&jar, dsn, &dir.path().join("out.ses"), &settings)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
     /// The router's own unrouted count comes from the job log's summaries:
     /// the autorouter stage, then each optimizer pass, and the line that says
     /// the optimizer was skipped because connections were left.
