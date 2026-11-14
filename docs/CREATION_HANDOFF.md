@@ -548,7 +548,7 @@ for the owner's word.
 
 - **Baseline:** not rerun. The base tree `e27bfb2` is the tree #66's final gate passed on 2026-11-14 (4,515 workspace tests passed, 0 failed, 166 ignored; `simulation_live` 95 of 95).
 - **Tests:** a failing run first for each behaviour (`build/runs/`), then:
-  - `cargo test -p konnect-core --locked --lib`: 3768 passed, 0 failed.
+  - `cargo test -p konnect-core --locked --lib`: 3769 passed, 0 failed.
   - `cargo test -p konnect --locked --tests`: 195 passed, 0 failed, in 16 binaries.
   - `cargo clippy --workspace --locked --all-targets -- -D warnings`: clean.
   - These are the focused runs on the branch after the first review's fixes; the full gate's totals are in the PR description.

@@ -5137,6 +5137,17 @@ mod hold_widths_tests {
                 "{end:?}"
             );
             assert_eq!(run.ok().result_pass, "full");
+            // The row says which of the two it was, in its own words.
+            let reason = run.pass("fallback")["reason"].as_str().unwrap();
+            let expected = match end {
+                Some(_) => "ended with 4 unrouted, more than the 3 it started with",
+                None => "gave no unrouted count",
+            };
+            assert!(reason.contains(expected), "{end:?}: {reason}");
+            assert!(
+                !reason.contains("closed no connection"),
+                "{end:?}: {reason}"
+            );
         }
     }
 
@@ -7816,6 +7827,36 @@ done
         assert!(folder.join("full.ses").is_file());
         assert!(dir.path().join("again.ses").is_file());
         assert!(aside(1).is_dir() && aside(2).is_dir() && !aside(3).exists());
+    }
+
+    /// The output may sit in a folder that is not there yet: a `hold` call
+    /// makes it, as the single run does.
+    #[tokio::test]
+    async fn a_hold_call_makes_the_folder_of_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = staged_java(
+            dir.path(),
+            "deep",
+            &[staged(0.0, true, 2, 0, hold_session(Some(10000), 50000))],
+        );
+        let output = dir.path().join("not/there/yet/deep.ses");
+        let result = body(
+            &route_hold(
+                dir.path(),
+                &java,
+                "deep",
+                hold_manifest(),
+                json!({ "width_policy": "hold", "ses_output_path": output }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["status"], "complete", "{result}");
+        assert!(output.is_file());
+        assert!(dir
+            .path()
+            .join("not/there/yet/deep.passes/full.ses")
+            .is_file());
     }
 
     #[test]

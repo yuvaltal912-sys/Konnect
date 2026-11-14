@@ -918,6 +918,17 @@ mod tests {
         let ses = one_net("(wire (path F.Cu 10000 0 0 10000 0) (net VBUS) (type route) (clearance_class default))");
         let report = intent_width_report(&manifest(), &ses).unwrap();
         assert_eq!(report.unmeasured_total, 0);
+        // A wire with no shape is named wherever it stands among the net's
+        // wires: after a measured one, and after another unmeasured one.
+        let ses = one_net("(wire (path F.Cu 10000 0 0 10000 0)) (wire) (wire (polygon F.Cu 0 0 0 10 10 0 10)) (wire (net VBUS)) (wire (path F.Cu 10000 0 0 0 10000)) (wire)");
+        let report = intent_width_report(&manifest(), &ses).unwrap();
+        let forms: Vec<&str> = report
+            .unmeasured
+            .iter()
+            .map(|row| row["form"].as_str().unwrap())
+            .collect();
+        assert_eq!(forms, ["none", "polygon", "none", "none"]);
+        assert_eq!(net_row(&report, "VBUS")["routed_mm"], 2.0);
         // A net that is not judged is not this report's.
         let other = "(session b (routes (resolution um 10) (network_out (net SIG (wire (polygon F.Cu 0 0 0 10 10 0 10))))))";
         let report = intent_width_report(&manifest(), other).unwrap();
