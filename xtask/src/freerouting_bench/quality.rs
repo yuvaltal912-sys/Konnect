@@ -11,6 +11,7 @@
 //! wiring. Nothing here needs Java.
 
 use super::parse::{parse_sexp, unit_mm, Sexp};
+use konnect_core::tools::corner_reading;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// What a DSN says about where pins are and how wide each net must be.
@@ -300,9 +301,11 @@ pub struct Quality {
     /// Vias where the net's wiring actually changes layer (wires on two or
     /// more layers end there). A via that only drops into a pour is not one.
     pub layer_changes: usize,
-    /// Corners of a trace, away from pads and vias, at 90°.
+    /// Right-angle corners as the layout audit reads them: two legs at 89 to
+    /// 91 degrees, away from pins and vias.
     pub right_corners: usize,
-    /// Corners under 90°: acid traps.
+    /// Acute junctions (acid traps) as the layout audit reads them: below 89
+    /// degrees, pieces under 10 um read as part of their junction.
     pub acute_corners: usize,
     /// Unique segments.
     pub segments: usize,
@@ -333,7 +336,6 @@ impl Quality {
 /// `(layer, a, b)` with `a <= b`, in SES units.
 type Segment = (String, (i64, i64), (i64, i64));
 
-const RIGHT_ANGLE_TOLERANCE_DEG: f64 = 0.5;
 /// A pin within this distance of a corner covers it with pad copper.
 const PIN_CAPTURE_MM: f64 = 0.01;
 
@@ -449,18 +451,14 @@ pub fn measure(board: &DsnBoard, ses: &str) -> Result<Quality, String> {
             quality.hpwl_mm += hpwl;
         }
 
-        // Directions leaving each node, per layer.
-        let mut nodes: HashMap<(String, (i64, i64)), Vec<f64>> = HashMap::new();
-        for (layer, a, b) in &segments {
-            let forward = ((b.1 - a.1) as f64).atan2((b.0 - a.0) as f64).to_degrees();
-            let backward = ((a.1 - b.1) as f64).atan2((a.0 - b.0) as f64).to_degrees();
-            nodes.entry((layer.clone(), *a)).or_default().push(forward);
-            nodes.entry((layer.clone(), *b)).or_default().push(backward);
-        }
-        let via_set: BTreeSet<(i64, i64)> = vias.iter().copied().collect();
+        // Segment ends, per layer.
+        let nodes: BTreeSet<(String, (i64, i64))> = segments
+            .iter()
+            .flat_map(|(layer, a, b)| [(layer.clone(), *a), (layer.clone(), *b)])
+            .collect();
         for via in &vias {
             let layers: BTreeSet<&String> = nodes
-                .keys()
+                .iter()
                 .filter(|(_, point)| point == via)
                 .map(|(layer, _)| layer)
                 .collect();
@@ -468,38 +466,42 @@ pub fn measure(board: &DsnBoard, ses: &str) -> Result<Quality, String> {
                 quality.layer_changes += 1;
             }
         }
-        for ((_, point), mut directions) in nodes {
-            if directions.len() < 2
-                || via_set.contains(&point)
-                || on_pin(point.0 as f64 * mm, point.1 as f64 * mm)
-            {
+        // Corners, read as the layout audit reads them (one reading, in
+        // konnect-core's `corner_reading`): pieces shorter than 10 um belong
+        // to the junction they touch while the run stays within 20 um; a
+        // junction is acute below 89 degrees; a right angle is two legs at 89
+        // to 91 degrees. A junction whose every leg ends on a pin or a via is
+        // left out.
+        let in_mm: Vec<(String, [(f64, f64); 2])> = segments
+            .iter()
+            .map(|(layer, a, b)| {
+                let p = |q: &(i64, i64)| (q.0 as f64 * mm, q.1 as f64 * mm);
+                (layer.clone(), [p(a), p(b)])
+            })
+            .collect();
+        let via_keys: BTreeSet<corner_reading::JunctionKey> = vias
+            .iter()
+            .map(|v| corner_reading::junction_key((v.0 as f64 * mm, v.1 as f64 * mm)))
+            .collect();
+        let pieces = in_mm.iter().map(|(layer, pts)| corner_reading::Piece {
+            layer,
+            net: name,
+            pts,
+            id: None,
+        });
+        for j in corner_reading::read_junctions(pieces) {
+            let on_copper = j
+                .end_keys
+                .iter()
+                .all(|k| via_keys.contains(k) || on_pin(k.0 as f64 / 1000.0, k.1 as f64 / 1000.0));
+            if on_copper {
                 continue;
             }
-            directions.sort_by(|a, b| a.total_cmp(b));
-            let gaps: Vec<f64> = (0..directions.len())
-                .map(|i| {
-                    let next = directions[(i + 1) % directions.len()];
-                    let gap = next - directions[i];
-                    if gap <= 0.0 {
-                        gap + 360.0
-                    } else {
-                        gap
-                    }
-                })
-                .collect();
-            // Two directions make one corner (the smaller gap); more make
-            // every gap a corner between neighbouring traces.
-            let corners: Vec<f64> = if gaps.len() == 2 {
-                vec![gaps[0].min(gaps[1])]
-            } else {
-                gaps
-            };
-            for angle in corners {
-                if (angle - 90.0).abs() <= RIGHT_ANGLE_TOLERANCE_DEG {
-                    quality.right_corners += 1;
-                } else if angle < 90.0 - RIGHT_ANGLE_TOLERANCE_DEG {
-                    quality.acute_corners += 1;
-                }
+            let angle = j.sharpest();
+            if corner_reading::is_acute(angle) {
+                quality.acute_corners += 1;
+            } else if j.ends.len() == 2 && corner_reading::is_right_angle(angle) {
+                quality.right_corners += 1;
             }
         }
 
@@ -700,15 +702,45 @@ mod tests {
     }
 
     #[test]
-    fn a_three_way_junction_counts_each_gap() {
+    fn a_three_way_junction_is_not_a_right_angle_corner() {
         let board = DsnBoard::parse(DSN).unwrap();
-        // A T away from any pad: two right angles and one straight (180°) gap.
+        // A T away from any pad: three legs, the sharpest pair at 90 degrees.
+        // As the layout audit reads it (S7b), a right-angle corner is two legs.
         let q = measure(
             &board,
             &ses("(net SIG (wire (path F.Cu 2000 20000 0 30000 0)) (wire (path F.Cu 2000 30000 0 40000 0)) (wire (path F.Cu 2000 30000 0 30000 10000)))"),
         )
         .unwrap();
-        assert_eq!((q.right_corners, q.acute_corners), (2, 0), "{q:?}");
+        assert_eq!((q.right_corners, q.acute_corners), (0, 0), "{q:?}");
+    }
+
+    #[test]
+    fn corners_are_read_as_the_layout_audit_reads_them() {
+        let board = DsnBoard::parse(DSN).unwrap();
+        let measured = |paths: &str| {
+            let q = measure(&board, &ses(&format!("(net SIG {paths})"))).unwrap();
+            (q.right_corners, q.acute_corners)
+        };
+        let unit = unit_mm("um").unwrap();
+        assert!(unit > 0.0);
+        // A 135-degree bend with a 1-unit (0.1 um) jog between its legs: the jog is
+        // under 10 um and gives no direction, so no corner is counted.
+        assert_eq!(
+            measured("(wire (path F.Cu 2000 20000 0 30000 0 30000 1 40000 10001))"),
+            (0, 0)
+        );
+        // 89.5 degrees is a right angle now (it was neither before), and 88.5
+        // is acute.
+        let at = |deg: f64| {
+            let r = deg.to_radians();
+            format!(
+                "(wire (path F.Cu 2000 20000 0 30000 0 {} {}))",
+                (30000.0 - 10000.0 * r.cos()).round(),
+                (10000.0 * r.sin()).round()
+            )
+        };
+        assert_eq!(measured(&at(89.5)), (1, 0));
+        assert_eq!(measured(&at(88.5)), (0, 1));
     }
 
     #[test]
