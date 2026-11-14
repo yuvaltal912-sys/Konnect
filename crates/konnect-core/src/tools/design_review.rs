@@ -100,7 +100,8 @@ pub fn tools() -> Vec<ToolDef> {
             "audit_manufacturing",
             "DFM checks of the saved board against a fab's limits: track widths, via drill, \
              diameter and annular ring, through-hole drills and pad rings, via-in-pad on SMD \
-             pads, track-to-track acid traps (under 90°), the project's own DRC minimums \
+             pads, track-to-track acid traps (below 89°; a track under 10 µm counts as part \
+             of its junction), the project's own DRC minimums \
              against the fab, and the board outline. The outline check reads the true \
              Edge.Cuts outline (rounded corners and cut-outs included) and reports each \
              footprint whose courtyard, pads or silkscreen field text cross or sit outside it, \

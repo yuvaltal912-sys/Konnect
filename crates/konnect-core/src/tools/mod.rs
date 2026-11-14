@@ -20,6 +20,15 @@ pub(crate) mod cross_probe;
 pub mod design_intent;
 pub mod design_review;
 pub(crate) mod dfm;
+/// The audit's one reading of track junctions (acid traps and corners: short
+/// tracks, the run bound, the 89-degree line), shared with the routing bench.
+pub mod corner_reading {
+    pub use super::dfm::{
+        cluster_is_small, is_acute, is_right_angle, is_short_path, is_short_segment, junction_key,
+        read_junctions, Junction, JunctionEnd, JunctionKey, Piece, ACUTE_BELOW_DEG,
+        CLUSTER_SPAN_UM, SHORT_TRACK_MM, SHORT_TRACK_NM,
+    };
+}
 pub(crate) mod drc;
 pub mod editor_navigation;
 mod footprint_graphics;

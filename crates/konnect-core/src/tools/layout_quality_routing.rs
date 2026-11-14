@@ -456,8 +456,6 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
 
 /// Total run, closest gap, example UUIDs and where, for two nets.
 type PairRun = (f64, f64, Vec<String>, Pt);
-/// Layer, net and the position of a track end in µm.
-type EndKey = (String, String, i64, i64);
 
 fn parallel_runs(m: &Model) -> CheckOut {
     let id = "5.2";
@@ -643,81 +641,80 @@ fn point_to_line(p: Pt, origin: Pt, u: Pt) -> f64 {
 
 pub(super) type CornerRow = (String, String, Pt, Vec<String>);
 
-pub(super) fn corner_junctions(m: &Model) -> (usize, usize, usize, Vec<CornerRow>) {
-    // Right angles and total bends: two track ends of one net meeting, outside any pad or via.
-    let mut ends: HashMap<EndKey, Vec<(Pt, String)>> = HashMap::new();
-    for (net, idxs) in &m.tracks {
-        for &i in idxs {
-            let t = m.track(i);
-            let layer = t.layers.first().cloned().unwrap_or_default();
-            let n = t.shape.pts.len();
-            if n < 2 {
-                continue;
-            }
-            // Bends inside a tessellated arc are not corners.
-            for (end, next) in [
-                (t.shape.pts[0], t.shape.pts[1]),
-                (t.shape.pts[n - 1], t.shape.pts[n - 2]),
-            ] {
-                let l = dist(end, next);
-                if l < 1e-9 {
-                    continue;
-                }
-                ends.entry((
-                    layer.clone(),
-                    net.clone(),
-                    (end.0 * 1000.0).round() as i64,
-                    (end.1 * 1000.0).round() as i64,
-                ))
-                .or_default()
-                .push((
-                    ((next.0 - end.0) / l, (next.1 - end.1) / l),
-                    t.uuid.clone().unwrap_or_default(),
-                ));
-            }
+/// What the corner scan finds: bends, right angles, acute bends of its own,
+/// the right-angle rows the planner's `chamfer` kind may act on (bends of two
+/// tracks with no short track among them), junctions holding a track shorter
+/// than 10 um, and every right-angle row (for the findings).
+pub(super) type CornerScan = (usize, usize, usize, Vec<CornerRow>, usize, Vec<CornerRow>);
+
+/// The corner scan. Junctions are read as the acid-trap check reads them
+/// (`dfm::junctions`): a track shorter than 10 um belongs to the junction it
+/// touches and gives no direction while its run stays within the bound. A
+/// bend is two legs of one net meeting, outside any pad or via of that net.
+/// A right-angle bend that holds a short track is counted and listed in the
+/// findings but not given to `chamfer`: the planner reads one key and cannot
+/// chamfer a bend whose legs a short track joins (it could only block it).
+pub(super) fn corner_junctions(m: &Model) -> CornerScan {
+    let tracks = m.tracks.values().flatten().map(|&i| m.track(i));
+    let (mut bends, mut right, mut acute_here, mut with_short) = (0usize, 0usize, 0usize, 0usize);
+    let (mut planner_rows, mut right_rows): (Vec<CornerRow>, Vec<CornerRow>) =
+        (Vec::new(), Vec::new());
+    for j in dfm::junctions(tracks) {
+        if j.short_tracks > 0 {
+            with_short += 1;
         }
-    }
-    let (mut bends, mut right, mut acute_here) = (0usize, 0usize, 0usize);
-    let mut right_rows: Vec<(String, String, Pt, Vec<String>)> = Vec::new();
-    for ((layer, net, x, y), dirs) in &ends {
-        if dirs.len() != 2 {
+        if j.ends.len() != 2 {
             continue;
         }
-        let p = (*x as f64 / 1000.0, *y as f64 / 1000.0);
-        let in_copper = m.pads.get(net).into_iter().flatten().any(|&pi| {
-            let pad = m.pad(pi).1;
-            pad.on_layer(layer)
-                && pad
-                    .shape
-                    .distance(&konnect_sexp::board_geometry::Shape::disc(p, 0.0))
-                    <= 0.01
-        }) || m
-            .vias
-            .get(net)
-            .into_iter()
-            .flatten()
-            .any(|&vi| dist(m.track(vi).at, p) <= m.track(vi).shape.radius);
+        let in_copper = j.leg_points().all(|p| {
+            m.pads.get(&j.net).into_iter().flatten().any(|&pi| {
+                let pad = m.pad(pi).1;
+                pad.on_layer(&j.layer)
+                    && pad
+                        .shape
+                        .distance(&konnect_sexp::board_geometry::Shape::disc(p, 0.0))
+                        <= 0.01
+            }) || m
+                .vias
+                .get(&j.net)
+                .into_iter()
+                .flatten()
+                .any(|&vi| dist(m.track(vi).at, p) <= m.track(vi).shape.radius)
+        });
         if in_copper {
             continue;
         }
-        let (a, b) = (dirs[0].0, dirs[1].0);
-        let angle = (a.0 * b.0 + a.1 * b.1).clamp(-1.0, 1.0).acos().to_degrees();
+        let angle = j.sharpest();
         if angle < 179.0 {
             bends += 1;
-            if angle < 89.0 {
+            if dfm::is_acute(angle) {
                 acute_here += 1;
-            } else if angle <= 91.0 {
+            } else if dfm::is_right_angle(angle) {
                 right += 1;
-                right_rows.push((
-                    net.clone(),
-                    layer.clone(),
-                    p,
-                    vec![dirs[0].1.clone(), dirs[1].1.clone()],
-                ));
+                let row: CornerRow = (
+                    j.net.clone(),
+                    j.layer.clone(),
+                    j.at,
+                    j.ends
+                        .iter()
+                        .map(|e| e.1.clone().unwrap_or_default())
+                        .collect(),
+                );
+                if j.short_tracks == 0 {
+                    planner_rows.push(row.clone());
+                }
+                right_rows.push(row);
             }
         }
     }
-    (bends, right, acute_here, right_rows)
+    (
+        bends,
+        right,
+        acute_here,
+        planner_rows,
+        with_short,
+        right_rows,
+    )
 }
 
 pub(super) fn corners(m: &Model) -> CheckOut {
@@ -735,7 +732,12 @@ pub(super) fn corners(m: &Model) -> CheckOut {
         .filter(|i| i.issue.starts_with("Acid trap"))
         .collect();
 
-    let (bends, right, acute_here, mut right_rows) = corner_junctions(m);
+    let (bends, right, acute_here, _, with_short, mut right_rows) = corner_junctions(m);
+    let short_tracks = report
+        .checks
+        .get("acid_trap")
+        .and_then(|c| c.short_tracks)
+        .unwrap_or(0);
     let mut out = CheckOut::checked(id, name);
     for i in &acute {
         // The tracks of the net that end at the corner (the acid-trap check gives only a position).
@@ -768,7 +770,7 @@ pub(super) fn corners(m: &Model) -> CheckOut {
             item: id,
             subject: i.at["net"].as_str().unwrap_or("").to_string(),
             measured: json!({ "at": i.at, "reused": "dfm acid_trap" }),
-            threshold: json!({ "minimum_interior_angle_deg": 90 }),
+            threshold: json!({ "minimum_interior_angle_deg": dfm::ACUTE_BELOW_DEG }),
             issue: i.issue.clone(),
             fix: i.fix.clone(),
             uuids,
@@ -808,8 +810,10 @@ pub(super) fn corners(m: &Model) -> CheckOut {
         "acute_corners": acute.len(),
         "right_angle_corners": right,
         "acute_found_by_this_scan": acute_here,
+        "short_tracks": short_tracks,
+        "junctions_with_short_tracks": with_short,
         "compare": { "acute_corners": acute.len(), "right_angle_corners": right, "bends": bends },
-        "method": "acute corners are audit_manufacturing's acid-trap check; right angles are track ends of one net meeting at 89–91° away from its pads and vias; arcs and 135° bends are fine",
+        "method": "acute corners are audit_manufacturing's acid-trap check, below 89°; a track shorter than 10 µm is read as part of the junction it touches and counted in short_tracks; right angles are two track ends of one net meeting at 89–91° away from its pads and vias; arcs and 135° bends are fine",
     });
     out
 }
