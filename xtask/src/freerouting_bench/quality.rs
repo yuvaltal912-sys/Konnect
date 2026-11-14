@@ -715,6 +715,42 @@ mod tests {
     }
 
     #[test]
+    fn a_corner_one_grid_cell_from_a_pin_is_on_it_and_two_cells_is_not() {
+        let board = DsnBoard::parse(DSN).unwrap();
+        // R1-2 is at (0.5, 0) mm and R2-1 at (10, 0.5) mm. A 45-degree turn
+        // 10 um from a pin (one 0.01-mm cell), in x or in y, is on the pin;
+        // 20 um from it (two cells) is a corner.
+        let acute = |x: i64, y: i64| {
+            let q = measure(
+                &board,
+                &ses(&format!(
+                    "(net SIG (wire (path F.Cu 2000 {} {} {x} {y} {} {y})))",
+                    x + 3000,
+                    y + 3000,
+                    x + 3000
+                )),
+            )
+            .unwrap();
+            q.acute_corners
+        };
+        assert_eq!(acute(5100, 0), 0);
+        assert_eq!(acute(5200, 0), 1);
+        assert_eq!(acute(100000, 5100), 0);
+        assert_eq!(acute(100000, 5200), 1);
+    }
+
+    #[test]
+    fn a_net_the_board_does_not_know_is_counted() {
+        let board = DsnBoard::parse(DSN).unwrap();
+        let q = measure(
+            &board,
+            &ses("(net GHOST (wire (path F.Cu 2000 20000 0 30000 0)))"),
+        )
+        .unwrap();
+        assert_eq!((q.nets_routed, q.unknown_nets), (1, 1), "{q:?}");
+    }
+
+    #[test]
     fn corners_are_read_as_the_layout_audit_reads_them() {
         let board = DsnBoard::parse(DSN).unwrap();
         let measured = |paths: &str| {
@@ -799,6 +835,7 @@ mod tests {
         assert!(DsnBoard::parse("(pcb x (unit parsec))").is_err());
         let board = DsnBoard::parse(DSN).unwrap();
         assert!(measure(&board, "(session s").is_err());
+        assert!(measure(&board, "(session s (routes (resolution um 0)))").is_err());
         assert_eq!(
             measure(&board, "(session s (routes (resolution um 10)))").unwrap(),
             Quality::default()
