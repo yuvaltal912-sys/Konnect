@@ -340,19 +340,36 @@ fn power_class(class: &str) -> bool {
         .any(|p| c.contains(p))
 }
 
+/// KiCad's wildcard reading of a netclass pattern: `*` is any run (the empty one too), `?` is
+/// exactly one character, every other character is literal; the whole name must match and case
+/// counts (KiCad 10.0.1 `common/eda_pattern_match.cpp:207-244`, compiled without `wxRE_ICASE`
+/// at `:105`, applied to net names at `common/project/net_settings.cpp:756-758`). KiCad's second,
+/// regular-expression reading of the same pattern (`:108-119`) is not evaluated here.
+///
+/// Linear: O(pattern * name) time, no recursion, no backtracking. A table of "does this much of
+/// the pattern match this much of the name" is kept one pattern character at a time, in two rows.
+/// The matcher this replaced tried every split of the name at each `*`, which is exponential in
+/// the number of `*`; a crafted project file could stall the audit for minutes with it (row A1).
+/// `route_refine_geometry.rs` has the same function, `glob`, for the planner's own class
+/// resolution; each module keeps a private copy, so keep the two in step.
 fn glob(pattern: &str, text: &str) -> bool {
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
-            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
-            Some(c) => t.first() == Some(c) && go(&p[1..], &t[1..]),
+    let text: Vec<char> = text.chars().collect();
+    // `prev[i]`: the pattern characters read so far match the first `i` characters of the name.
+    let mut prev = vec![false; text.len() + 1];
+    let mut next = vec![false; text.len() + 1];
+    prev[0] = true;
+    for p in pattern.chars() {
+        next[0] = p == '*' && prev[0];
+        for i in 1..=text.len() {
+            next[i] = if p == '*' {
+                prev[i] || next[i - 1]
+            } else {
+                (p == '?' || p == text[i - 1]) && prev[i - 1]
+            };
         }
+        std::mem::swap(&mut prev, &mut next);
     }
-    go(
-        &pattern.chars().collect::<Vec<_>>(),
-        &text.chars().collect::<Vec<_>>(),
-    )
+    prev[text.len()]
 }
 
 /// The netclasses of each net. KiCad 10 (`NET_SETTINGS::GetEffectiveNetClass`) does not let an

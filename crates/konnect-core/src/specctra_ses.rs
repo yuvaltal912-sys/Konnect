@@ -85,6 +85,13 @@ struct Manifest {
     #[serde(default)]
     #[allow(dead_code)]
     intent_widths: Vec<serde_json::Value>,
+    /// Informational: what the export did with each pour layer (`fixed` or
+    /// `omit`) and which rule chose it. The zone inventory in
+    /// `supported_profile` is what the import checks; `route_specctra_dsn`
+    /// reads these rows to name the planes it routed through.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pours: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

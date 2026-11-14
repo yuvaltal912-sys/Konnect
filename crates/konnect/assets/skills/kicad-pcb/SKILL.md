@@ -325,7 +325,7 @@ script that parses `.kicad_pcb`.
 ### Freerouting round trip
 
 For a supported board, use the local Freerouting path. Load `pcb_export`,
-`integration`, `pcb_routing`, and `verification` before starting:
+`integration`, `pcb_routing`, `verification`, and `project` before starting:
 
 1. Run `check_freerouting(jar_path?, java_path?)`. Inspect `available`,
    `native_mcp_available`, and `bridge_available`, plus `note` or `setup` when
@@ -334,7 +334,8 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    continue only after the installation or capability blocker is resolved.
    If its version policy carries a `warning`, tell the user which release
    is recommended and why; it does not block routing.
-2. With the exact named board open over IPC and placement/rules settled, call
+2. With the exact named board open over IPC and placement/rules settled, save
+   it with `save_project`, then call
    `export_specctra_dsn(board, output='new-job.dsn')`. Keep the returned DSN and
    reverse manifest together. Rust export is the default
    (`native_bridge_mode: 'disable'`); no native plugin is required. Existing
@@ -342,6 +343,16 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
 3. Call `route_specctra_dsn(dsn_path, ses_output_path='new-result.ses',
    jar_path?, java_path?)`. It runs the local JAR's native headless MCP server
    and writes a new SES; creating that file does not prove every net was routed.
+   Read `status` and `completion`: `complete` only means Freerouting left
+   nothing and was given no pour as a plane; `unverified` means it was given a
+   plane (or its count could not be read); `incomplete` means it left
+   connections. `completion.next_steps` lists the exact calls still needed,
+   and `completion.complete_when` says what decides. With planes, those steps
+   start with `save_project` and `create_checkpoint(project)`: run them
+   before step 4 (step 7 says why), and stop if the checkpoint fails. The
+   import binds the project file as it was at export; the save in step 2 keeps
+   this second save from changing it. If step 4 still reports a stale
+   revision, export and route again.
 4. Review `plan_specctra_ses_import(board, ses_path, manifest_path)`. It is
    read-only and checks the SES against the revision-bound manifest and live
    board. A stale revision needs a new export and routing job.
@@ -352,16 +363,44 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    can still report violations or unconnected items.
 6. Finish with the synchronized refill/DRC procedure below. The import's
    candidate check does not establish that existing zone fills are current.
+7. If any pour went to the router as a plane (`completion.planes` is not
+   empty), follow `completion.next_steps`. The checkpoint taken before step 4
+   keeps the exported board: the fallback needs it back, because
+   `export_specctra_dsn` refuses a board that holds unlocked routing. After
+   the import, stitch.
+   Call `plan_route_refinement(board, kinds=['stitching'], nets=[the plane
+   nets], search_radius_mm=3)` with the effort chosen for this task, adopt the
+   stitching vias you support with `route_batch`, then refill and run DRC
+   again. Repeat for at most 4 rounds, until the planner lists no stitching
+   proposal or DRC reports 0 unconnected items on the plane nets. The routing
+   is complete only when KiCad's DRC on the refilled board reports 0
+   unconnected items. If 1 to 10 connections on the plane nets are still open,
+   report each one as open: the routing is not complete. If more than 10 are
+   open, fall back. First close the board and the project in KiCad (by hand:
+   no tool closes them), then `restore_checkpoint(project, checkpoint_id)`
+   (preview, then apply with `dry_run=false` and its `expected_revision`; it
+   puts back every design file the checkpoint holds, the board among them),
+   then reopen the project with `launch_kicad_ui(project)` and open the board
+   in the PCB editor (by hand). Then
+   export again with `pours='omit'` and the same other arguments, route
+   again, and report that outcome beside the open count of the plane run.
 
 **Current limits:** 2 to 32 copper layers (KiCad power layers stay off-limits
 to the router) and SMD or through-hole footprints on either side; circle,
 rectangle, rounded-rectangle, and oval pads; one closed outline made from
 supported lines/arcs, rectangle, circle, or polygon. Outline arcs/circles become
-chords within 5 um, and rounded pads use their bounding rectangles. Existing
-pours become fixed planes and track/via-blocking rule areas become keepouts from
-zone outlines, not their fills; thermal reliefs are not modelled. A large pour
-then leaves the router little room: pass `pours="omit"` to route through pour
-areas, then refill zones and run DRC after the import. Record the currents of
+chords within 5 um, and rounded pads use their bounding rectangles. By
+default (`pours='fixed'`) every pour is written as a Specctra plane of its
+net, from the zone outline, not its fill; thermal reliefs are not modelled.
+Freerouting counts a pad inside a plane's outline as connected and lets other
+nets' tracks cross the plane, so the real pour can be cut into pieces it does
+not see: never judge completion by its count. `pours='omit'` leaves every pour
+out, and the router routes the pour's net as track. To choose zone by zone,
+pass an object: `pours={'default': 'omit', 'zones': [{'net': 'GND', 'layer':
+'B.Cu', 'policy': 'fixed'}]}`; a rule picks every pour layer that matches all
+of its `uuid`, `name`, `net` and `layer`, and rules that disagree about one
+pour are refused. A pour form that blocks other nets is not available.
+Track/via-blocking rule areas always become keepouts. Record the currents of
 the main power nets with `set_design_intent` before exporting: the export
 widens those nets to their IPC-2221 width (`intent_widths`), and
 `route_specctra_dsn` keeps Freerouting from narrowing any track below its class. Mounting

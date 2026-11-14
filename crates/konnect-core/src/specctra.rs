@@ -134,7 +134,8 @@ struct LockedViaModel {
 /// What a copper zone or rule area means to the router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZoneKind {
-    /// A net's copper pour: fixed copper of that net, a Specctra `plane`.
+    /// A net's copper pour, written as a Specctra `plane` of that net unless
+    /// the pour policy leaves it out.
     Plane,
     /// No tracks or vias.
     KeepoutAll,
@@ -150,6 +151,10 @@ pub(crate) struct ZoneModel {
     layer: String,
     net: Option<String>,
     outline: Vec<(i64, i64)>,
+    /// The zone's `uuid` (or the older `tstamp`), shared by its layers.
+    uuid: Option<String>,
+    /// The zone's `name`, when it has a non-empty one.
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,6 +195,25 @@ struct Manifest {
     /// Nets widened to their design-intent current.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     intent_widths: Vec<serde_json::Value>,
+    /// Every copper pour, one row per pour and copper layer, with what the
+    /// export did with it and which rule chose that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pours: Vec<ManifestPour>,
+}
+
+/// One copper pour on one copper layer, as the export treated it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+struct ManifestPour {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    net: String,
+    layer: String,
+    /// `fixed` (written as a plane of its net) or `omit` (left out).
+    policy: PourMode,
+    /// `default`, or `zones[i]` for the rule that chose the policy.
+    chosen_by: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -203,7 +227,8 @@ struct SupportedProfile {
     #[serde(default)]
     locked_via_count: usize,
     copper_zones: bool,
-    /// Copper pours written as fixed planes, one per pour and layer.
+    /// The board's copper pours, one per pour and layer, whether written as
+    /// planes or left out (`pours` says which).
     #[serde(default)]
     zone_plane_count: usize,
     /// Rule areas that forbid tracks or vias, one per area and layer.
@@ -350,12 +375,7 @@ pub(crate) fn manifest_net_floors(value: &serde_json::Value) -> Vec<i64> {
 }
 
 pub(crate) fn manifest_routing_hints(dsn: &Path) -> RoutingHints {
-    let mut name = dsn.as_os_str().to_os_string();
-    name.push(".konnect.json");
-    let Some(value) = std::fs::read_to_string(std::path::PathBuf::from(name))
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    else {
+    let Some(value) = manifest_beside(dsn) else {
         return RoutingHints::default();
     };
     let floors = manifest_net_floors(&value);
@@ -476,12 +496,301 @@ pub(crate) fn widen_for_intent(
     Ok((out, report))
 }
 
+/// What the router is given for one copper pour on one copper layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PourMode {
+    /// A Specctra `plane` of the pour's net, from the zone outline (KiCad's
+    /// own exporter writes the same). Freerouting 2.5.0 reads it as a
+    /// conduction area that does not block other nets: it counts the net's
+    /// pads inside the outline as connected, and other nets' tracks may cross
+    /// it, which cuts the real pour.
+    #[default]
+    Fixed,
+    /// Left out of the DSN: the router may route anywhere in the pour's area,
+    /// and the pour's net is routed as track.
+    Omit,
+}
+
+/// Which pours one rule of a per-zone policy picks. Every given selector must
+/// match; a rule gives at least one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PourSelector {
+    /// The zone's `uuid` (or the older `tstamp`).
+    pub uuid: Option<String>,
+    /// The zone's `name`.
+    pub name: Option<String>,
+    /// The zone's net.
+    pub net: Option<String>,
+    /// One copper layer of the zone.
+    pub layer: Option<String>,
+}
+
+/// One rule of a per-zone policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PourRule {
+    pub select: PourSelector,
+    pub policy: PourMode,
+}
+
+/// The most rules one `pours` object may hold.
+pub(crate) const MAX_POUR_RULES: usize = 256;
+
+/// The caller's choice of what happens to each copper pour: `default` for
+/// every pour no rule picks, and the rules, which never disagree on a pour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PourPolicy {
+    pub default: PourMode,
+    pub zones: Vec<PourRule>,
+}
+
+impl PourPolicy {
+    /// Every pour left out (`pours: "omit"`).
+    pub(crate) fn omit() -> Self {
+        PourPolicy {
+            default: PourMode::Omit,
+            zones: Vec::new(),
+        }
+    }
+
+    /// Reads the `pours` argument: absent, `"fixed"`, `"omit"`, or an object
+    /// with an optional `default` and a `zones` list of rules.
+    ///
+    /// Everything not understood is refused, naming it: an unknown key, a
+    /// policy other than `fixed` or `omit`, a rule with no selector or no
+    /// policy, a selector that is not a non-empty string, more than
+    /// [`MAX_POUR_RULES`] rules. Whether a rule picks a pour, and whether two
+    /// rules disagree, needs the board and is checked by the export.
+    pub(crate) fn from_argument(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        use serde_json::Value;
+        fn mode(value: &Value, at: &str) -> Result<PourMode, String> {
+            match value.as_str() {
+                Some("fixed") => Ok(PourMode::Fixed),
+                Some("omit") => Ok(PourMode::Omit),
+                _ => Err(format!("{at} must be 'fixed' or 'omit', not {value}")),
+            }
+        }
+        let object = match value {
+            None => return Ok(PourPolicy::default()),
+            Some(Value::Object(object)) => object,
+            Some(Value::String(text)) if text == "fixed" => return Ok(PourPolicy::default()),
+            Some(Value::String(text)) if text == "omit" => return Ok(PourPolicy::omit()),
+            Some(other) => {
+                return Err(format!(
+                    "must be 'fixed', 'omit' or a per-zone object with 'default' and 'zones', not {other}"
+                ))
+            }
+        };
+        if let Some(key) = object
+            .keys()
+            .find(|key| !["default", "zones"].contains(&key.as_str()))
+        {
+            return Err(format!(
+                "unknown key '{key}': a per-zone object has 'default' and 'zones'"
+            ));
+        }
+        let default = match object.get("default") {
+            None => PourMode::Fixed,
+            Some(value) => mode(value, "default")?,
+        };
+        let rules = match object.get("zones") {
+            None => &[][..],
+            Some(Value::Array(rules)) => rules.as_slice(),
+            Some(other) => return Err(format!("zones must be a list of rules, not {other}")),
+        };
+        if rules.len() > MAX_POUR_RULES {
+            return Err(format!(
+                "zones holds {} rules; at most {MAX_POUR_RULES} are allowed",
+                rules.len()
+            ));
+        }
+        let mut zones = Vec::with_capacity(rules.len());
+        for (index, rule) in rules.iter().enumerate() {
+            let at = format!("zones[{index}]");
+            let Some(rule) = rule.as_object() else {
+                return Err(format!(
+                    "{at} must be an object with selectors (uuid, name, net, layer) and a policy, not {rule}"
+                ));
+            };
+            if let Some(key) = rule
+                .keys()
+                .find(|key| !["uuid", "name", "net", "layer", "policy"].contains(&key.as_str()))
+            {
+                return Err(format!(
+                    "{at}: unknown key '{key}': a rule has 'uuid', 'name', 'net', 'layer' and 'policy'"
+                ));
+            }
+            let selector = |key: &str| -> Result<Option<String>, String> {
+                match rule.get(key) {
+                    None => Ok(None),
+                    Some(Value::String(text)) if !text.is_empty() => Ok(Some(text.clone())),
+                    Some(other) => Err(format!(
+                        "{at}.{key} must be a non-empty string, not {other}"
+                    )),
+                }
+            };
+            let select = PourSelector {
+                uuid: selector("uuid")?,
+                name: selector("name")?,
+                net: selector("net")?,
+                layer: selector("layer")?,
+            };
+            if select == PourSelector::default() {
+                return Err(format!(
+                    "{at} has no selector: give 'uuid', 'name', 'net' or 'layer' (the board-wide choice is 'default')"
+                ));
+            }
+            let policy = match rule.get("policy") {
+                None => return Err(format!("{at} has no policy: give 'fixed' or 'omit'")),
+                Some(value) => mode(value, &format!("{at}.policy"))?,
+            };
+            zones.push(PourRule { select, policy });
+        }
+        Ok(PourPolicy { default, zones })
+    }
+
+    /// Whether this policy can leave any pour out of the DSN.
+    pub(crate) fn may_omit(&self) -> bool {
+        self.default == PourMode::Omit
+            || self.zones.iter().any(|rule| rule.policy == PourMode::Omit)
+    }
+}
+
+impl PourMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PourMode::Fixed => "fixed",
+            PourMode::Omit => "omit",
+        }
+    }
+}
+
+/// What the export does with one pour on one layer, and which rule chose it
+/// (`None`: the policy's default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PourDecision {
+    mode: PourMode,
+    rule: Option<usize>,
+}
+
+/// A zone as a person can find it in KiCad: its name and UUID when it has
+/// them.
+fn zone_label(zone: &ZoneModel) -> String {
+    match (&zone.name, &zone.uuid) {
+        (Some(name), Some(uuid)) => format!("'{name}' (uuid {uuid})"),
+        (Some(name), None) => format!("'{name}'"),
+        (None, Some(uuid)) => format!("uuid {uuid}"),
+        (None, None) => match &zone.net {
+            Some(net) => format!("an unnamed zone of net '{net}'"),
+            None => "an unnamed rule area".to_string(),
+        },
+    }
+}
+
+/// Applies a pour policy to the board's zones: one decision per zone layer
+/// that is a pour, in `zones` order, and `None` for a rule area (rule areas
+/// always stay). Refuses a rule that names a layer the board has no copper
+/// on, a rule that picks no pour, and two rules that give one pour layer
+/// different policies, so no caller has to learn which rule would win.
+fn pour_decisions(
+    policy: &PourPolicy,
+    zones: &[ZoneModel],
+    copper_layers: &[String],
+) -> Result<Vec<Option<PourDecision>>> {
+    let picks = |rule: &PourRule, zone: &ZoneModel| {
+        let select = &rule.select;
+        select
+            .uuid
+            .as_ref()
+            .is_none_or(|uuid| zone.uuid.as_ref() == Some(uuid))
+            && select
+                .name
+                .as_ref()
+                .is_none_or(|name| zone.name.as_ref() == Some(name))
+            && select
+                .net
+                .as_ref()
+                .is_none_or(|net| zone.net.as_ref() == Some(net))
+            && select
+                .layer
+                .as_ref()
+                .is_none_or(|layer| &zone.layer == layer)
+    };
+    for (index, rule) in policy.zones.iter().enumerate() {
+        if let Some(layer) = &rule.select.layer {
+            if !copper_layers.contains(layer) {
+                bail!(
+                    "pours zones[{index}]: '{layer}' is not a copper layer of this board (its copper layers: {})",
+                    copper_layers.join(", ")
+                );
+            }
+        }
+        if zones
+            .iter()
+            .any(|zone| zone.kind == ZoneKind::Plane && picks(rule, zone))
+        {
+            continue;
+        }
+        let mut areas: Vec<String> = zones
+            .iter()
+            .filter(|zone| zone.kind != ZoneKind::Plane && picks(rule, zone))
+            .map(zone_label)
+            .collect();
+        areas.dedup();
+        if !areas.is_empty() {
+            bail!(
+                "pours zones[{index}] picks no pour, only the rule area {}: rule areas always stay in the DSN, so a rule must pick a copper pour",
+                areas.join(", ")
+            );
+        }
+        bail!(
+            "pours zones[{index}] picks no pour on this board: no copper pour matches all of its selectors"
+        );
+    }
+    let mut decisions = Vec::with_capacity(zones.len());
+    for zone in zones {
+        if zone.kind != ZoneKind::Plane {
+            decisions.push(None);
+            continue;
+        }
+        let mut chosen: Option<(usize, PourMode)> = None;
+        for (index, rule) in policy.zones.iter().enumerate() {
+            if !picks(rule, zone) {
+                continue;
+            }
+            match chosen {
+                None => chosen = Some((index, rule.policy)),
+                Some((first, mode)) if mode != rule.policy => bail!(
+                    "pours zones[{first}] gives '{}' and zones[{index}] gives '{}' to the pour {} on {}: make the rules agree, or narrow one with 'layer' or 'uuid'",
+                    mode.as_str(),
+                    rule.policy.as_str(),
+                    zone_label(zone),
+                    zone.layer
+                ),
+                Some(_) => {}
+            }
+        }
+        decisions.push(Some(match chosen {
+            Some((index, mode)) => PourDecision {
+                mode,
+                rule: Some(index),
+            },
+            None => PourDecision {
+                mode: policy.default,
+                rule: None,
+            },
+        }));
+    }
+    Ok(decisions)
+}
+
 /// Choices the caller makes about what the router is given.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ExportOptions {
-    /// Leave copper pours out of the DSN, so the router may route through
-    /// their area (refill them after the import). Rule areas stay.
-    pub omit_pours: bool,
+    /// What happens to each copper pour: written as a plane of its net
+    /// (`fixed`, the default) or left out so the router may route through
+    /// its area (refill after the import). Rule areas always stay.
+    pub pours: PourPolicy,
     /// The project's copper-to-board-edge clearance, recorded in the manifest
     /// for the router (the DSN has no place for it).
     pub copper_edge_clearance_um: Option<i64>,
@@ -551,13 +860,15 @@ pub(crate) fn export_dsn_with_options(
         pins.dedup();
     }
 
-    // What the router is given: every rule area, and the pours unless the
-    // caller left them out. The manifest still counts the board's pours, so
-    // the importer can check the board kept them.
+    // What the router is given: every rule area, and each pour the policy
+    // keeps. The manifest still counts the board's pours, so the importer can
+    // check the board kept them, and lists what was done with each.
+    let decisions = pour_decisions(&options.pours, &zones, &copper_layers)?;
     let routed_zones: Vec<ZoneModel> = zones
         .iter()
-        .filter(|zone| !(options.omit_pours && zone.kind == ZoneKind::Plane))
-        .cloned()
+        .zip(&decisions)
+        .filter(|(_, decision)| decision.is_none_or(|decision| decision.mode == PourMode::Fixed))
+        .map(|(zone, _)| zone.clone())
         .collect();
     for zone in &routed_zones {
         if let Some(net) = &zone.net {
@@ -626,7 +937,7 @@ pub(crate) fn export_dsn_with_options(
         board_path,
         &source_sha256,
         &manifest_classes,
-        options,
+        &options,
         hole_keepout_growth_um,
         footprints_without_pads,
         board_keepouts.len(),
@@ -638,6 +949,7 @@ pub(crate) fn export_dsn_with_options(
         &via_names,
         &locked_routing,
         &zones,
+        &decisions,
     )?;
 
     Ok(ExportBundle {
@@ -701,9 +1013,19 @@ pub(crate) fn adopt_native_dsn(
     {
         let manifest: Manifest =
             serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
+        let left_out = manifest
+            .pours
+            .iter()
+            .filter(|pour| pour.policy == PourMode::Omit)
+            .count();
         if manifest.supported_profile.pours_omitted {
             bail!(
                 "native DSN not adopted: the pours were left out, and KiCad's exporter always writes them"
+            );
+        }
+        if left_out > 0 {
+            bail!(
+                "native DSN not adopted: {left_out} pour layer(s) were left out by the per-zone policy, and KiCad's exporter always writes every pour"
             );
         }
         if let Some(back) = manifest.components.iter().find(|c| c.kicad_side == "back") {
@@ -1717,8 +2039,10 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
 
 /// The board's copper zones and rule areas as the router sees them.
 ///
-/// A pour with a net is fixed copper of that net (a Specctra `plane`, which is
-/// how KiCad's own DSN export writes one). A rule area that forbids tracks or
+/// A pour with a net is a Specctra `plane` of that net (how KiCad's own DSN
+/// export writes one); Freerouting 2.5.0 reads a plane as a conduction area
+/// that does not block other nets, and counts the net's pads inside it as
+/// connected. A rule area that forbids tracks or
 /// vias is a keepout. The zone's outline is used, not its fill, so thermal
 /// reliefs and clearance gaps are not modelled: copper the fill will not reach
 /// can still look connected to the router, which is why DRC after a refill is
@@ -1786,12 +2110,22 @@ pub(crate) fn zones(
         };
         let outline = zone_outline(zone)
             .with_context(|| format!("unsupported first routing profile: zone '{name}'"))?;
+        let uuid = zone
+            .find_str("uuid")
+            .or_else(|| zone.find_str("tstamp"))
+            .map(str::to_string);
+        let zone_name = zone
+            .find_str("name")
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
         for layer in copper {
             out.push(ZoneModel {
                 kind,
                 layer,
                 net: net.clone(),
                 outline: outline.clone(),
+                uuid: uuid.clone(),
+                name: zone_name.clone(),
             });
         }
     }
@@ -1866,6 +2200,80 @@ pub(crate) fn zone_counts(board_source: &str) -> Result<(usize, usize)> {
         zones.iter().filter(|z| z.kind == ZoneKind::Plane).count(),
         zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
     ))
+}
+
+/// One `plane` in a DSN's structure: what the router was given as a pour.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DsnPlane {
+    pub net: String,
+    pub layer: String,
+}
+
+/// The conduction areas a DSN gives the router, read from the DSN itself, so
+/// a DSN with no manifest beside it is judged the same way: every
+/// `(structure (plane NET shape))`, and every wire of the `wiring` whose shape
+/// is an area (`polygon`, `rect`, `circle`) rather than a path, which
+/// Freerouting also reads as a conduction area of its net. Keywords are
+/// matched in any letter case. One row per net and layer, sorted; a DSN with
+/// none gives none. A DSN that cannot be parsed is an error that names no
+/// part of the file.
+pub(crate) fn dsn_planes(dsn: &str) -> Result<Vec<DsnPlane>> {
+    fn is(node: &SexpNode, names: &[&str]) -> bool {
+        node.head()
+            .is_some_and(|head| names.iter().any(|name| head.eq_ignore_ascii_case(name)))
+    }
+    fn children<'a>(
+        node: &'a SexpNode,
+        names: &'a [&'a str],
+    ) -> impl Iterator<Item = &'a SexpNode> {
+        node.children()
+            .unwrap_or(&[])
+            .iter()
+            .filter(move |child| is(child, names))
+    }
+    const AREAS: &[&str] = &["polygon", "rect", "circle"];
+    const SHAPES: &[&str] = &["polygon", "rect", "circle", "path", "polyline_path"];
+    let root = parse_dsn_sexp(dsn)
+        .map_err(|_| anyhow::anyhow!("the DSN is not a readable S-expression"))?;
+    if !is(&root, &["pcb"]) {
+        bail!("the DSN's root is not 'pcb'");
+    }
+    let mut planes = BTreeSet::new();
+    for structure in children(&root, &["structure"]) {
+        for plane in children(structure, &["plane"]) {
+            let net = dsn_atom(plane, 1, "plane net")?.to_string();
+            let shape = children(plane, SHAPES)
+                .next()
+                .with_context(|| format!("the plane of net '{net}' has no shape"))?;
+            let layer = dsn_atom(shape, 1, "plane layer")?.to_string();
+            planes.insert(DsnPlane { net, layer });
+        }
+    }
+    for wiring in children(&root, &["wiring"]) {
+        for wire in children(wiring, &["wire"]) {
+            let Some(area) = children(wire, AREAS).next() else {
+                continue;
+            };
+            let Some(net) = children(wire, &["net"]).next() else {
+                continue; // no net: an obstacle, not a conduction area of a net
+            };
+            planes.insert(DsnPlane {
+                net: dsn_atom(net, 1, "wire net")?.to_string(),
+                layer: dsn_atom(area, 1, "wire area layer")?.to_string(),
+            });
+        }
+    }
+    Ok(planes.into_iter().collect())
+}
+
+/// The reverse manifest the export wrote beside `dsn` (`<dsn>.konnect.json`),
+/// when it is there and is JSON.
+pub(crate) fn manifest_beside(dsn: &Path) -> Option<serde_json::Value> {
+    let mut name = dsn.as_os_str().to_os_string();
+    name.push(".konnect.json");
+    std::fs::read_to_string(std::path::PathBuf::from(name))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
 }
 
 /// A board file name as a DSN token: whitespace, quotes and parentheses
@@ -3035,7 +3443,7 @@ fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
     classes: &[ManifestClass],
-    options: ExportOptions,
+    options: &ExportOptions,
     hole_keepout_growth_um: Option<i64>,
     footprints_without_pads: usize,
     board_keepout_count: usize,
@@ -3047,7 +3455,29 @@ fn build_manifest(
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
     zones: &[ZoneModel],
+    decisions: &[Option<PourDecision>],
 ) -> Result<String> {
+    let pours: Vec<ManifestPour> = zones
+        .iter()
+        .zip(decisions)
+        .filter_map(|(zone, decision)| {
+            let decision = (*decision)?;
+            Some(ManifestPour {
+                uuid: zone.uuid.clone(),
+                name: zone.name.clone(),
+                net: zone.net.clone()?,
+                layer: zone.layer.clone(),
+                policy: decision.mode,
+                chosen_by: decision
+                    .rule
+                    .map_or_else(|| "default".to_string(), |index| format!("zones[{index}]")),
+            })
+        })
+        .collect();
+    // Today's meaning, kept: no pour reached the router, and the caller asked
+    // for that (the board-wide default, or a rule that left a pour out).
+    let pours_omitted = pours.iter().all(|pour| pour.policy == PourMode::Omit)
+        && (options.pours.default == PourMode::Omit || !pours.is_empty());
     let components = footprints
         .iter()
         .map(|footprint| ManifestComponent {
@@ -3126,7 +3556,7 @@ fn build_manifest(
             zone_keepout_count: zones.iter().filter(|z| z.kind != ZoneKind::Plane).count(),
             custom_rules: false,
             footprints_without_pads,
-            pours_omitted: options.omit_pours,
+            pours_omitted,
             copper_edge_clearance_um: options.copper_edge_clearance_um,
             hole_clearance_um: options.hole_clearance_um,
             hole_keepout_growth_um,
@@ -3154,6 +3584,7 @@ fn build_manifest(
         padstacks,
         classes: classes.to_vec(),
         intent_widths: Vec::new(),
+        pours,
     })
     .context("serialize routing manifest")
 }
