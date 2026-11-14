@@ -221,8 +221,18 @@ fn guidance_tools_belong_to_the_toolsets_the_workflows_use() {
         ("pcb_export", &["export_specctra_dsn"][..]),
         (
             "pcb_routing",
-            &["plan_specctra_ses_import", "apply_specctra_ses"][..],
+            &[
+                "plan_specctra_ses_import",
+                "apply_specctra_ses",
+                "plan_route_refinement",
+                "route_batch",
+            ][..],
         ),
+        (
+            "project",
+            &["save_project", "create_checkpoint", "restore_checkpoint"][..],
+        ),
+        ("verification", &["run_drc", "launch_kicad_ui"][..]),
     ] {
         let tools = registry::tools_for(toolset).unwrap();
         for name in names {
@@ -232,4 +242,36 @@ fn guidance_tools_belong_to_the_toolsets_the_workflows_use() {
             );
         }
     }
+}
+
+#[test]
+fn the_freerouting_round_trip_saves_before_the_export_and_loads_every_toolset_it_uses() {
+    // The import binds the project file as it was at export, and the plane
+    // steps save the project again before the import. The skill must save
+    // before the export, say how a stale revision is recovered, load the
+    // toolset the checkpoint tools live in, and mark the steps no tool does.
+    let text = asset("skills/kicad-pcb/SKILL.md");
+    let round_trip = text
+        .split("### Freerouting round trip")
+        .nth(1)
+        .expect("missing Freerouting round trip")
+        .split("**Current limits:**")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    require(
+        &round_trip,
+        &[
+            "`verification`, and `project` before starting",
+            "save it with `save_project`, then call `export_specctra_dsn(",
+            "stop if the checkpoint fails",
+            "If step 4 still reports a stale revision, export and route again.",
+            "close the board and the project in KiCad (by hand",
+            "in the PCB editor (by hand)",
+            "every design file the checkpoint holds",
+        ],
+        "Freerouting round trip",
+    );
 }

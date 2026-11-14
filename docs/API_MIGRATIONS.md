@@ -3,6 +3,68 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: per-zone pours and an honest routing status
+
+Creation row S6, second half (`docs/CREATION_HANDOFF.md`). Additive, plus one
+narrowed input.
+
+- **What `pours: "fixed"` writes, stated correctly.** It writes each copper
+  pour as a Specctra `plane` of its net, from the zone outline. Freerouting
+  2.5.0 reads a plane as a conduction area that does not block other nets: it
+  counts the net's pads inside the outline as connected and lets other nets'
+  tracks cross it, which cuts the real pour. Earlier text called this "fixed
+  copper". The DSN is unchanged. There is no per-zone way to give the router
+  a pour that blocks other nets.
+- **`export_specctra_dsn.pours`** also takes an object:
+  `{"default": "fixed"|"omit", "zones": [{"uuid"?, "name"?, "net"?,
+  "layer"?, "policy": "fixed"|"omit"}]}`. `default` is optional (`fixed`).
+  A rule picks every pour layer that matches all of its selectors, and
+  needs at least one. A zone on two layers is two pour layers, so `layer`
+  can split it. Pours no rule picks get `default`. Refused: an unknown key
+  or policy; a rule with no selector or no policy; an empty selector; more
+  than 256 rules; a `layer` the board has no copper on; a rule that picks
+  no pour (one that picks only a rule area names it; rule areas always
+  stay); two rules that give one pour layer different policies (both rule
+  indexes and the pour are named). Rules that agree are accepted. An object
+  with no rules writes the same DSN and manifest as its string. If any pour
+  can be left out, `native_bridge_mode: "require"` is refused and
+  `"prefer"` uses the Rust exporter, as with `"omit"`.
+- **The reverse manifest** adds `pours`: one row per pour layer with
+  `uuid`, `name`, `net`, `layer`, `policy` and `chosen_by` (`"default"` or
+  `"zones[i]"`). `supported_profile.pours_omitted` keeps its meaning: true
+  when no pour reached the router, and the caller asked for that.
+  `plan_specctra_ses_import` and `apply_specctra_ses` accept the new rows
+  and older manifests without them.
+- **Behaviour change, `pours` that is not a string or an object.** Before,
+  the handler read any non-string `pours` (`null`, a number, a list) as
+  `"fixed"`. Through MCP the declared schema already refused such a value
+  at dispatch, so only in-process calls of the handler saw the silent
+  `fixed`. Now the handler refuses it too, with `invalid_argument` naming
+  the value, `null` included.
+- **`route_specctra_dsn`** adds `status` and `completion`. `success` keeps
+  its meaning (the job ran and the SES was written).
+  - `status`:
+    - `complete`: Freerouting's job log reports 0 unrouted and the DSN gave it no conduction area.
+    - `incomplete`: the log reports more than 0.
+    - `unverified`: the log reports 0 but a conduction area was given, or the count or the DSN's planes could not be read.
+
+    A run with a conduction area is never `complete`. A conduction area is a `(structure (plane …))`, or a `wiring` wire with an area shape (`polygon`, `rect`, `circle`) and a net, which Freerouting reads the same way. Keywords match in any letter case. The last summary in the log decides: if it cannot be read, the count is unknown.
+  - `completion`:
+    - `router_unrouted`: the last autorouter or optimizer summary in the job log, else `null`.
+    - `planes`: net, layer, and the zones that made the plane (from the manifest beside the DSN).
+    - `judge` and `complete_when`: complete only when KiCad's DRC on the applied and refilled board reports 0 unconnected items.
+    - `reason`: bounded; an error's detail is cut to 160 characters.
+    - `next_steps`, each with a `step` number, a `tool`, its `arguments`, and `arguments_from` for values an earlier call returns:
+      - Always: `plan_specctra_ses_import`, `apply_specctra_ses` and `run_drc`.
+      - With planes, first `save_project` and `create_checkpoint(project)`, which keep the board as it was exported. The import binds the project file by hash, and this save can make KiCad rewrite it; the save step says so, and that a stale revision at the import means exporting and routing again. The `kicad-pcb` skill saves the project before the export, so this save has nothing new to write.
+      - With planes, after the DRC: `plan_route_refinement` with `kinds: ["stitching"]` and the plane nets, `route_batch` with the plan's `vias`, and `run_drc` again, repeated for at most 4 rounds.
+    - `if_still_open`, with planes: report 1 to 10 open connections as open, the routing not complete. Above 10, fall back.
+      - `precondition`: the exporter refuses a board that holds unlocked routing, so the board from the checkpoint comes back first.
+      - `fallback`, in order: close the board and the project in KiCad (a manual step); `restore_checkpoint` as a preview, then applied with its revision; `launch_kicad_ui(project)`; open the board in the PCB editor (manual); `export_specctra_dsn` with `pours: "omit"`; `route_specctra_dsn`.
+
+    With no reverse manifest beside the DSN that names an existing board, `next_steps` is empty, there is no `if_still_open`, and `next_steps_missing` says why.
+- **`route_specctra_dsn` checks `dsn_path` before anything reads it.** A path that is not an existing regular `.dsn` file is refused with `invalid_argument` on `dsn_path`, before Java is looked for. Before, a missing or wrong path was refused only when routing began. A DSN larger than 64 MiB is now refused too; real exports are well under 1 MiB.
+
 ## Unreleased: read-only route-refinement plans
 
 Creation row S7. New `plan_route_refinement` in `pcb_routing` supplies a second

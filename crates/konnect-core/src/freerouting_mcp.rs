@@ -28,6 +28,46 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
+/// The largest DSN `route_specctra_dsn` reads or routes. Konnect's exports
+/// of real boards are well under a megabyte; the bound keeps a mistaken path
+/// (a huge file) from being read whole.
+pub(crate) const MAX_DSN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Refuses a `dsn_path` that is not an existing regular `.dsn` file of at
+/// most [`MAX_DSN_BYTES`], before anything reads it: a directory, a FIFO or
+/// a device is refused at once instead of blocking a read.
+pub(crate) fn check_dsn_input(dsn: &Path) -> Result<()> {
+    let regular = std::fs::metadata(dsn)
+        .ok()
+        .filter(std::fs::Metadata::is_file);
+    let Some(metadata) = regular.filter(|_| extension_is(dsn, "dsn")) else {
+        bail!("DSN input must be an existing .dsn file: {}", dsn.display());
+    };
+    if metadata.len() > MAX_DSN_BYTES {
+        bail!(
+            "DSN input is {} bytes, more than the {MAX_DSN_BYTES} this tool reads: {}",
+            metadata.len(),
+            dsn.display()
+        );
+    }
+    Ok(())
+}
+
+/// A checked DSN's text, read with a bound even if the file grows meanwhile.
+pub(crate) fn read_dsn(dsn: &Path) -> Result<String> {
+    use std::io::Read;
+    check_dsn_input(dsn)?;
+    let mut text = String::new();
+    std::fs::File::open(dsn)
+        .with_context(|| format!("open DSN {}", dsn.display()))?
+        .take(MAX_DSN_BYTES + 1)
+        .read_to_string(&mut text)
+        .context("the DSN is not UTF-8 text")?;
+    if text.len() as u64 > MAX_DSN_BYTES {
+        bail!("DSN input grew past {MAX_DSN_BYTES} bytes while it was read");
+    }
+    Ok(text)
+}
 
 fn server_arguments() -> &'static [&'static str] {
     &[
@@ -177,6 +217,10 @@ pub(crate) struct RouteEvidence {
     /// What the optimizer did, read from the job log; `None` when the log
     /// could not be read.
     pub optimizer: Option<OptimizerReport>,
+    /// Connections Freerouting's job log says it left unrouted at the end
+    /// (see [`router_unrouted`]); `None` when the log could not be read or
+    /// holds no summary.
+    pub router_unrouted: Option<u32>,
 }
 
 /// The optimizer's outcome, from Freerouting's job log.
@@ -425,9 +469,8 @@ fn check_effective_settings(
     Ok(effective)
 }
 
-/// The optimizer's outcome from Freerouting's job log: the passes that ran,
-/// whether a pass stopped early, and the optimizer score before and after.
-fn optimizer_report(log: &Value) -> OptimizerReport {
+/// The message lines of a Freerouting job log, in order.
+fn log_lines(log: &Value) -> Vec<String> {
     fn messages(value: &Value, out: &mut Vec<String>) {
         match value {
             Value::Object(map) => {
@@ -448,6 +491,14 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
             _ => {}
         }
     }
+    let mut lines = Vec::new();
+    messages(log, &mut lines);
+    lines
+}
+
+/// The optimizer's outcome from Freerouting's job log: the passes that ran,
+/// whether a pass stopped early, and the optimizer score before and after.
+fn optimizer_report(log: &Value) -> OptimizerReport {
     fn number_after(line: &str, marker: &str) -> Option<f64> {
         let rest = &line[line.find(marker)? + marker.len()..];
         let end = rest
@@ -455,8 +506,7 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
             .unwrap_or(rest.len());
         rest[..end].parse().ok()
     }
-    let mut lines = Vec::new();
-    messages(log, &mut lines);
+    let lines = log_lines(log);
     let mut report = OptimizerReport::default();
     for line in lines.iter().filter(|line| line.contains("ptimiz")) {
         if let Some(pass) = line
@@ -517,6 +567,35 @@ fn optimizer_report(log: &Value) -> OptimizerReport {
         }
     }
     report
+}
+
+/// How many connections Freerouting's job log says were left unrouted at the
+/// end of the job: the last "(N unrouted" summary of the autorouter or the
+/// optimizer, or the count in "Skipping optimization stage". `None` when the
+/// log holds no such line. This is the router's own count: a pad inside a
+/// plane's outline counts as connected, so KiCad's DRC after a refill is the
+/// judge of completion.
+pub(crate) fn router_unrouted(log: &Value) -> Option<u32> {
+    // The number before " unrouted" in "(N unrouted and M violations)".
+    fn in_summary(line: &str) -> Option<u32> {
+        let at = line.rfind(" unrouted")?;
+        let open = line[..at].rfind('(')?;
+        line[open + 1..at].trim().parse().ok()
+    }
+    // Every summary line counts, so a last summary that cannot be read
+    // leaves the count unknown rather than an earlier one standing.
+    let mut last = None;
+    for line in log_lines(log) {
+        if line.contains("Auto-routing stage completed:")
+            || (line.contains("Optimizer pass #") && line.contains("was completed"))
+        {
+            last = in_summary(&line);
+        } else if let Some(at) = line.find("Skipping optimization stage: the board has ") {
+            let rest = &line[at + "Skipping optimization stage: the board has ".len()..];
+            last = rest.split_whitespace().next().and_then(|n| n.parse().ok());
+        }
+    }
+    last
 }
 
 pub(crate) async fn route_local(
@@ -632,9 +711,7 @@ fn validate_inputs(
     if !jar.is_file() {
         bail!("Freerouting JAR does not exist: {}", jar.display());
     }
-    if !dsn.is_file() || !extension_is(dsn, "dsn") {
-        bail!("DSN input must be an existing .dsn file: {}", dsn.display());
-    }
+    check_dsn_input(dsn)?;
     if !extension_is(ses_output, "ses") {
         bail!("SES output must have the .ses extension");
     }
@@ -756,15 +833,16 @@ async fn run_state_machine(
         )
         .await?;
     // Evidence only: a log that cannot be read leaves the route as it is.
-    let optimizer = if tools.contains_key("get_job_logs") {
+    let log = if tools.contains_key("get_job_logs") {
         client
             .call_tool("get_job_logs", json!({ "path": { "jobId": job_id } }))
             .await
             .ok()
-            .map(|log| optimizer_report(&log))
     } else {
         None
     };
+    let optimizer = log.as_ref().map(optimizer_report);
+    let router_unrouted = log.as_ref().and_then(router_unrouted);
     Ok(RouteEvidence {
         session_id,
         job_id,
@@ -776,6 +854,7 @@ async fn run_state_machine(
         diagnostics_path: None,
         effective_settings,
         optimizer,
+        router_unrouted,
     })
 }
 
@@ -1430,6 +1509,108 @@ mod tests {
             .stop_reason
             .unwrap()
             .starts_with("the board has 1 unrouted connection(s)"));
+    }
+
+    /// The DSN bound is 64 MiB, as documented: a file of exactly that size is
+    /// read, one byte more is refused, and so is anything not a `.dsn` file.
+    #[test]
+    fn a_dsn_of_up_to_64_mib_is_accepted_and_one_byte_more_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let sized = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+            path
+        };
+        let edge = sized("edge.dsn", 67_108_864);
+        assert!(check_dsn_input(&edge).is_ok());
+        // Read whole, never cut short at the bound.
+        assert_eq!(read_dsn(&edge).unwrap().len(), 67_108_864);
+        let error = check_dsn_input(&sized("over.dsn", 67_108_865))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("67108865 bytes"), "{error}");
+        assert!(check_dsn_input(&sized("board.txt", 10)).is_err());
+        assert!(check_dsn_input(&dir.path().join("missing.dsn")).is_err());
+    }
+
+    /// `route_local` refuses a DSN that is not a bounded regular `.dsn` file
+    /// before it starts anything, whoever calls it.
+    #[tokio::test]
+    async fn routing_refuses_a_dsn_that_is_not_a_bounded_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("freerouting.jar");
+        std::fs::write(&jar, b"not a jar").unwrap();
+        let folder = dir.path().join("folder.dsn");
+        std::fs::create_dir(&folder).unwrap();
+        let huge = dir.path().join("huge.dsn");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_DSN_BYTES + 1)
+            .unwrap();
+        // A Java that starts nothing, should the check ever be skipped.
+        let settings = RouteSettings {
+            java: Some(PathBuf::from("/usr/bin/false")),
+            ..all_settings()
+        };
+        for (dsn, needle) in [(&folder, "existing .dsn file"), (&huge, "bytes")] {
+            let error = route_local(&jar, dsn, &dir.path().join("out.ses"), &settings)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    /// The router's own unrouted count comes from the job log's summaries:
+    /// the autorouter stage, then each optimizer pass, and the line that says
+    /// the optimizer was skipped because connections were left.
+    #[test]
+    fn the_routers_unrouted_count_is_read_from_the_job_log() {
+        let log = |messages: &[&str]| json!({ "body": messages.iter().map(|m| json!({ "type": "INFO", "message": m })).collect::<Vec<_>>() });
+        let routed = log(&[
+            "[1E3FC3] Auto-routing stage started on board 'b1' with baseline score 259.56 for 149 unrouted items.",
+            "[1E3FC3] Auto-routing pass #1 on board 'b1' was completed in 4.90 seconds with score 792.35 (38 unrouted and 0 violations), using 4.88 CPU seconds",
+            "[1E3FC3] Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations), using 19.88 total CPU seconds",
+            "[1E3FC3] Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (0 unrouted and 0 violations).",
+            "[1E3FC3] Optimization stage completed:. Baseline router score: 1000.00, baseline optimizer score: 576.05, final router score: 1000.00, final optimizer score: 579.82",
+        ]);
+        assert_eq!(router_unrouted(&routed), Some(0));
+        let left = log(&[
+            "[1E3FC3] Auto-routing pass #20 on board 'b1' was completed in 0.36 seconds with score 994.54 (12 unrouted and 0 violations)",
+            "[1E3FC3] Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 994.54 (12 unrouted and 0 violations)",
+            "[1DA299] Skipping optimization stage: the board has 12 unrouted connection(s) (optimizer only runs on completely routed boards).",
+        ]);
+        assert_eq!(router_unrouted(&left), Some(12));
+        // The last summary wins: an optimizer pass after the stage counts.
+        let later = log(&[
+            "Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+            "Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (1 unrouted and 0 violations).",
+        ]);
+        assert_eq!(router_unrouted(&later), Some(1));
+        // A last summary that cannot be read makes the count unknown: an
+        // earlier 0 must not stand (review S5).
+        let unreadable = log(&[
+            "Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+            "Optimizer pass #1 on board 'b2' was completed in 9.77 seconds with the score of 579.82 (1,024 unrouted and 0 violations).",
+        ]);
+        assert_eq!(router_unrouted(&unreadable), None);
+        // The skip line alone is enough.
+        let skipped = log(&["[1DA299] Skipping optimization stage: the board has 3 unrouted connection(s) (optimizer only runs on completely routed boards)."]);
+        assert_eq!(router_unrouted(&skipped), Some(3));
+        // A pass line is not the end of the job: the stage summary is.
+        let stage = log(&[
+            "Auto-routing pass #1 on board 'b1' was completed in 4.90 seconds with score 792.35 (38 unrouted and 0 violations)",
+            "Auto-routing stage completed: started with 149 unrouted nets, completed in 20.13 seconds, final score: 1000.00 (0 unrouted and 0 violations)",
+        ]);
+        assert_eq!(router_unrouted(&stage), Some(0));
+        // "149 unrouted nets" at the start of a stage is not a result.
+        let started = log(&["Auto-routing stage started on board 'b1' with baseline score 259.56 for 149 unrouted items."]);
+        assert_eq!(router_unrouted(&started), None);
+        // A pass that ended is not the end of the stage, even alone.
+        let pass_only = log(&["Auto-routing pass #3 on board 'b1' was completed in 1.99 seconds with score 912.57 (16 unrouted and 0 violations)"]);
+        assert_eq!(router_unrouted(&pass_only), None);
+        assert_eq!(router_unrouted(&json!({ "body": [] })), None);
+        assert_eq!(router_unrouted(&json!(null)), None);
     }
 
     /// 2.5.0's BatchOptimizer also stops on its stage time limit and its item

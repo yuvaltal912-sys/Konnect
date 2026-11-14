@@ -858,7 +858,18 @@ fn freerouting_routes_a_folder() {
                 .map(|mm| (mm * 1000.0).round() as i64)
         };
         let options = ExportOptions {
-            omit_pours: std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some(),
+            // `KONNECT_PROBE_POURS=<pours JSON>` (a string or a per-zone
+            // object) wins over `KONNECT_PROBE_OMIT_POURS`.
+            pours: match std::env::var("KONNECT_PROBE_POURS") {
+                Ok(text) => PourPolicy::from_argument(Some(
+                    &serde_json::from_str(&text).expect("KONNECT_PROBE_POURS is JSON"),
+                ))
+                .expect("KONNECT_PROBE_POURS is a pours argument"),
+                Err(_) if std::env::var_os("KONNECT_PROBE_OMIT_POURS").is_some() => {
+                    PourPolicy::omit()
+                }
+                Err(_) => PourPolicy::default(),
+            },
             copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
             widths_from_intent: true,
             hole_clearance_um: project_um("min_hole_clearance"),
@@ -867,7 +878,7 @@ fn freerouting_routes_a_folder() {
             println!("ROUTE {name}: project rules could not be read");
             continue;
         };
-        let exported = export_dsn_with_context(&path, &source, &rules, &snapshot, options);
+        let exported = export_dsn_with_context(&path, &source, &rules, &snapshot, options.clone());
         if let Ok(bundle) = &exported {
             for w in bundle
                 .intent_widths
@@ -880,8 +891,12 @@ fn freerouting_routes_a_folder() {
                 );
             }
         }
-        let Ok(bundle) = exported else {
-            continue; // the export probe reports refusals
+        let bundle = match exported {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                println!("EXPORT {name}: refused: {error:#}");
+                continue;
+            }
         };
         let work = tempfile::tempdir().unwrap();
         // `KONNECT_PROBE_KEEP=<dir>` keeps each DSN and SES for inspection.
@@ -1081,7 +1096,7 @@ fn omitted_pours_leave_the_dsn_but_stay_in_the_inventory() {
     let board_path = temp.path().join("board.kicad_pcb");
     std::fs::write(&board_path, FOUR_LAYER).unwrap();
     let options = ExportOptions {
-        omit_pours: true,
+        pours: PourPolicy::omit(),
         ..Default::default()
     };
     let bundle = export_dsn_with_options(&board_path, FOUR_LAYER, &rules(), options).unwrap();

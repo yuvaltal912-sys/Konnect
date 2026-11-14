@@ -461,8 +461,11 @@ cargo xtask freerouting-bench \
   xtask/freerouting-bench/export_kicad_dsn.py ~/ClaudeCode/kicad-10.0.1/demos target/freerouting-bench/corpus`.
   It copies each board into a scratch folder, strips tracks, arcs and vias, and
   exports `<board>.dsn`. Source boards are never written. KiCad's exporter
-  writes every pour as fixed copper, which blocks routing on boards with a
-  board-wide pour, so prefer Konnect's own exporter with pours omitted (PR 16):
+  writes every pour as a plane, which Freerouting counts as connecting every pad
+  inside it, so it routes almost no track on such a net (S5's plane runs: 5
+  vias and about 10 mm of track on the pour net). Prefer Konnect's own exporter
+  with pours omitted (PR 16), or chosen per zone with `KONNECT_PROBE_POURS=<the
+  pours JSON>` in place of `KONNECT_PROBE_OMIT_POURS=1`:
   write stripped boards with `export_kicad_dsn.py --stripped-boards <demos> <dir>`,
   then run PR 16's ignored test only for its DSNs:
   `KONNECT_DSN_PROBE_DIR=<dir> KONNECT_PROBE_KEEP=<out> KONNECT_PROBE_OMIT_POURS=1
