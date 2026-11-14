@@ -5,6 +5,7 @@ pub(crate) mod freerouting_mcp;
 pub(crate) mod freerouting_setup;
 pub mod gates;
 pub mod guidance;
+pub(crate) mod intent_width_report;
 pub mod kicad_install;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;

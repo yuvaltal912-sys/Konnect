@@ -226,6 +226,18 @@ fn route_settings(
     })
 }
 
+/// What width-first routing (row S9) adds to the status of a routing result:
+/// how many stretches of track in the final session are below their net's
+/// intent width, and the pass during which the time ran out, if one did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WidthOutcome {
+    pub exceptions: usize,
+    pub stopped_in: Option<&'static str>,
+    /// A net has a recorded width, but the session could not be read for
+    /// track widths: what is below intent width is then not known.
+    pub unread: bool,
+}
+
 /// What a routing run can say about completion, from Freerouting's own
 /// unrouted count and the planes its DSN held. `complete`: the router left
 /// nothing and was given no plane. `incomplete`: it left connections.
@@ -233,12 +245,25 @@ fn route_settings(
 /// a plane's outline as connected, while the new tracks cut the real pour), or
 /// its count could not be read. A run with a plane is never `complete`; KiCad's
 /// DRC after a refill is the judge.
+///
+/// Row S9 adds two: `stopped`, when the time ran out during a pass (it wins
+/// over everything, because the session is an earlier pass's), and
+/// `complete_with_width_exceptions`, when the router left nothing, was given
+/// no plane, and some track is below its net's intent width. With a plane the
+/// status stays `unverified` and the exceptions are listed beside it.
 fn routing_status(
     planes: &[crate::specctra::DsnPlane],
     router_unrouted: Option<u32>,
+    width: &WidthOutcome,
 ) -> &'static str {
+    if width.stopped_in.is_some() {
+        return "stopped";
+    }
     match router_unrouted {
         Some(left) if left > 0 => "incomplete",
+        // Widths that could not be read are not read as "nothing is narrow".
+        Some(_) if planes.is_empty() && width.unread => "unverified",
+        Some(_) if planes.is_empty() && width.exceptions > 0 => "complete_with_width_exceptions",
         Some(_) if planes.is_empty() => "complete",
         _ => "unverified",
     }
@@ -272,6 +297,7 @@ fn completion_report(
     ses: &Path,
     planes: &anyhow::Result<Vec<crate::specctra::DsnPlane>>,
     router_unrouted: Option<u32>,
+    width: &WidthOutcome,
 ) -> (&'static str, serde_json::Value) {
     let manifest = crate::specctra::manifest_beside(dsn);
     // The board the steps name: the manifest's, when it is an existing board
@@ -289,8 +315,9 @@ fn completion_report(
     let known: &[crate::specctra::DsnPlane] = planes.as_deref().unwrap_or(&[]);
     // A router that left connections is incomplete whatever else is known.
     let status = match (planes, router_unrouted) {
+        _ if width.stopped_in.is_some() => "stopped",
         (_, Some(left)) if left > 0 => "incomplete",
-        (Ok(planes), _) => routing_status(planes, router_unrouted),
+        (Ok(planes), _) => routing_status(planes, router_unrouted, width),
         (Err(_), _) => "unverified",
     };
     let mut plane_nets: Vec<String> = known.iter().map(|plane| plane.net.clone()).collect();
@@ -333,6 +360,26 @@ fn completion_report(
         ),
         (_, None) => "Freerouting's job log gave no unrouted count, so the router's own result is not known.".to_string(),
         _ => "Freerouting reports 0 unrouted connections and was given no pour as a plane.".to_string(),
+    };
+    // Row S9: a pass that ran out of time, and track below intent width, are
+    // said beside what the router's own count shows.
+    let reason = match width.stopped_in {
+        Some(pass) => format!(
+            "The time ran out during the {pass} pass, so the session is the one an earlier pass finished. {reason}"
+        ),
+        None => reason,
+    };
+    let reason = if width.exceptions > 0 {
+        format!(
+            "{reason} {} stretch(es) of track are below their net's intent width; `width_exceptions` lists each one.",
+            width.exceptions
+        )
+    } else if width.unread {
+        format!(
+            "{reason} The session could not be read for track widths, so track below a net's intent width is not known (`width_report_error`)."
+        )
+    } else {
+        reason
     };
     let nets_text = if plane_nets.is_empty() {
         "every net".to_string()
@@ -494,7 +541,7 @@ fn completion_report(
 
 #[cfg(test)]
 mod route_rule_tests {
-    use super::{allow_neckdown, route_settings, routing_status};
+    use super::{allow_neckdown, route_settings, routing_status, WidthOutcome};
     use serde_json::json;
 
     #[test]
@@ -504,13 +551,191 @@ mod route_rule_tests {
             layer: "B.Cu".into(),
         };
         let one = std::slice::from_ref(&plane);
-        assert_eq!(routing_status(&[], Some(0)), "complete");
-        assert_eq!(routing_status(one, Some(0)), "unverified");
-        assert_eq!(routing_status(one, Some(2)), "incomplete");
-        assert_eq!(routing_status(&[], Some(2)), "incomplete");
+        assert_eq!(
+            routing_status(&[], Some(0), &WidthOutcome::default()),
+            "complete"
+        );
+        assert_eq!(
+            routing_status(one, Some(0), &WidthOutcome::default()),
+            "unverified"
+        );
+        assert_eq!(
+            routing_status(one, Some(2), &WidthOutcome::default()),
+            "incomplete"
+        );
+        assert_eq!(
+            routing_status(&[], Some(2), &WidthOutcome::default()),
+            "incomplete"
+        );
         // An unreadable count is never read as complete.
-        assert_eq!(routing_status(&[], None), "unverified");
-        assert_eq!(routing_status(one, None), "unverified");
+        assert_eq!(
+            routing_status(&[], None, &WidthOutcome::default()),
+            "unverified"
+        );
+        assert_eq!(
+            routing_status(one, None, &WidthOutcome::default()),
+            "unverified"
+        );
+    }
+
+    // ─── S9: width exceptions and a stopped run in the status ──────────────
+
+    fn narrowed(exceptions: usize) -> WidthOutcome {
+        WidthOutcome {
+            exceptions,
+            ..Default::default()
+        }
+    }
+
+    fn gnd_plane() -> crate::specctra::DsnPlane {
+        crate::specctra::DsnPlane {
+            net: "GND".into(),
+            layer: "B.Cu".into(),
+        }
+    }
+
+    /// Track below a net's intent width is never hidden behind `complete`,
+    /// and S6's rule stays: with a plane no "complete" status is returned.
+    #[test]
+    fn a_run_with_width_exceptions_is_never_plainly_complete() {
+        let plane = gnd_plane();
+        let one = std::slice::from_ref(&plane);
+        assert_eq!(
+            routing_status(&[], Some(0), &narrowed(1)),
+            "complete_with_width_exceptions"
+        );
+        assert_eq!(
+            routing_status(&[], Some(0), &narrowed(7)),
+            "complete_with_width_exceptions"
+        );
+        assert_eq!(routing_status(&[], Some(0), &narrowed(0)), "complete");
+        assert_eq!(routing_status(one, Some(0), &narrowed(2)), "unverified");
+        assert_eq!(routing_status(&[], None, &narrowed(2)), "unverified");
+        assert_eq!(routing_status(&[], Some(3), &narrowed(2)), "incomplete");
+        assert_eq!(routing_status(one, Some(3), &narrowed(2)), "incomplete");
+    }
+
+    /// A call that ran out of time says so whatever else is known: the
+    /// session it returns is an earlier pass's.
+    #[test]
+    fn a_run_that_ran_out_of_time_is_stopped_whatever_else_is_known() {
+        let plane = gnd_plane();
+        let one = std::slice::from_ref(&plane);
+        let none: &[crate::specctra::DsnPlane] = &[];
+        for exceptions in [0, 2] {
+            let stopped = WidthOutcome {
+                exceptions,
+                stopped_in: Some("polish"),
+                unread: exceptions > 0,
+            };
+            for planes in [none, one] {
+                for unrouted in [Some(0), Some(3), None] {
+                    assert_eq!(
+                        routing_status(planes, unrouted, &stopped),
+                        "stopped",
+                        "{} plane(s), unrouted {unrouted:?}, {exceptions} exception(s)",
+                        planes.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Widths that could not be read are not read as "nothing is narrow".
+    #[test]
+    fn a_session_that_could_not_be_read_for_widths_is_never_complete() {
+        let unread = WidthOutcome {
+            unread: true,
+            ..Default::default()
+        };
+        assert_eq!(routing_status(&[], Some(0), &unread), "unverified");
+        assert_eq!(routing_status(&[], Some(2), &unread), "incomplete");
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("omit"));
+        let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(&dsn).unwrap());
+        let (status, completion) = super::completion_report(&dsn, &ses, &planes, Some(0), &unread);
+        assert_eq!(status, "unverified");
+        let reason = completion["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("could not be read for track widths"),
+            "{reason}"
+        );
+        assert!(reason.contains("width_report_error"), "{reason}");
+    }
+
+    #[test]
+    fn the_completion_report_names_width_exceptions_and_a_stopped_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("omit"));
+        let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(&dsn).unwrap());
+        let report = |unrouted, width: WidthOutcome| {
+            super::completion_report(&dsn, &ses, &planes, unrouted, &width)
+        };
+        let (status, plain) = report(Some(0), narrowed(0));
+        assert_eq!(status, "complete");
+        assert!(!plain["reason"].as_str().unwrap().contains("intent width"));
+
+        let (status, completion) = report(Some(0), narrowed(3));
+        assert_eq!(status, "complete_with_width_exceptions");
+        let reason = completion["reason"].as_str().unwrap();
+        assert!(reason.contains("0 unrouted connections"), "{reason}");
+        assert!(
+            reason.contains("3 stretch(es) of track are below their net's intent width"),
+            "{reason}"
+        );
+        assert!(reason.contains("width_exceptions"), "{reason}");
+        // What decides completion does not change.
+        assert_eq!(completion["complete_when"], plain["complete_when"]);
+        assert_eq!(completion["next_steps"], plain["next_steps"]);
+
+        // A router that left connections is incomplete; the exceptions are
+        // still named.
+        let (status, left) = report(Some(2), narrowed(3));
+        assert_eq!(status, "incomplete");
+        let reason = left["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("2 connection(s) it could not route"),
+            "{reason}"
+        );
+        assert!(reason.contains("3 stretch(es) of track"), "{reason}");
+
+        let stopped = WidthOutcome {
+            stopped_in: Some("polish"),
+            ..Default::default()
+        };
+        let (status, completion) = report(Some(0), stopped);
+        assert_eq!(status, "stopped");
+        let reason = completion["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("The time ran out during the polish pass"),
+            "{reason}"
+        );
+        assert!(reason.contains("an earlier pass"), "{reason}");
+    }
+
+    /// With a plane the status stays `unverified` and the plane reason stays;
+    /// the exceptions are named beside it.
+    #[test]
+    fn with_a_plane_the_exceptions_are_named_but_the_status_stays_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(&dsn).unwrap());
+        let (status, completion) =
+            super::completion_report(&dsn, &ses, &planes, Some(0), &narrowed(4));
+        assert_eq!(status, "unverified");
+        let reason = completion["reason"].as_str().unwrap();
+        assert!(reason.contains("was given pours as planes"), "{reason}");
+        assert!(reason.contains("4 stretch(es) of track"), "{reason}");
+        // Unreadable planes: the same.
+        let broken: anyhow::Result<Vec<crate::specctra::DsnPlane>> =
+            Err(anyhow::anyhow!("not a DSN"));
+        let (status, completion) =
+            super::completion_report(&dsn, &ses, &broken, Some(0), &narrowed(4));
+        assert_eq!(status, "unverified");
+        assert!(completion["reason"]
+            .as_str()
+            .unwrap()
+            .contains("4 stretch(es) of track"));
     }
 
     // ─── S6 second half: the completion report and its next steps ──────────
@@ -566,7 +791,7 @@ mod route_rule_tests {
         unrouted: Option<u32>,
     ) -> (&'static str, serde_json::Value) {
         let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(dsn).unwrap());
-        super::completion_report(dsn, ses, &planes, unrouted)
+        super::completion_report(dsn, ses, &planes, unrouted, &WidthOutcome::default())
     }
 
     fn registered(name: &str) -> Option<crate::tools::ToolDef> {
@@ -961,7 +1186,8 @@ mod route_rule_tests {
         assert!(completion["if_still_open"].is_null());
         let broken: anyhow::Result<Vec<crate::specctra::DsnPlane>> =
             Err(anyhow::anyhow!("not a DSN"));
-        let (status, completion) = super::completion_report(&dsn, &ses, &broken, Some(0));
+        let (status, completion) =
+            super::completion_report(&dsn, &ses, &broken, Some(0), &WidthOutcome::default());
         assert_eq!(status, "unverified");
         assert!(completion["reason"]
             .as_str()
@@ -969,13 +1195,14 @@ mod route_rule_tests {
             .contains("could not be read"));
         // A router that left connections is incomplete even then.
         assert_eq!(
-            super::completion_report(&dsn, &ses, &broken, Some(3)).0,
+            super::completion_report(&dsn, &ses, &broken, Some(3), &WidthOutcome::default()).0,
             "incomplete"
         );
         // An error that carries the file is not repeated whole (review S3).
         let long: anyhow::Result<Vec<crate::specctra::DsnPlane>> =
             Err(anyhow::anyhow!("{}", "(pcb ".repeat(50_000)));
-        let (_, completion) = super::completion_report(&dsn, &ses, &long, Some(0));
+        let (_, completion) =
+            super::completion_report(&dsn, &ses, &long, Some(0), &WidthOutcome::default());
         assert!(completion["reason"].as_str().unwrap().len() < 400);
     }
 
@@ -3480,9 +3707,15 @@ async fn handle_route_specctra_dsn(
     let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
         .await
         .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
+    let (width_report, width_error) = width_report(&dsn, &ses_output);
+    let width = WidthOutcome {
+        exceptions: width_report.exceptions_total,
+        stopped_in: None,
+        unread: width_error.is_some(),
+    };
     let (status, completion) =
-        completion_report(&dsn, &ses_output, &planes, evidence.router_unrouted);
-    Ok(CallToolResult::json(&json!({
+        completion_report(&dsn, &ses_output, &planes, evidence.router_unrouted, &width);
+    let mut result = json!({
         "success": true,
         // Additive (S6 second half): what completion can be claimed, and the
         // calls still needed. `success` still means the job ran and the SES
@@ -3526,8 +3759,46 @@ async fn handle_route_specctra_dsn(
         "final_state": evidence.final_state,
         "poll_count": evidence.poll_count,
         "elapsed_seconds": evidence.elapsed_seconds,
-        "ses_bytes": evidence.ses_bytes
-    })))
+        "ses_bytes": evidence.ses_bytes,
+        // Row S9, always on: what the session did to the nets that have a
+        // recorded width (the manifest's `intent_widths`). Empty when the
+        // manifest names none.
+        "intent_widths": width_report.nets,
+        "width_exceptions": width_report.exceptions,
+        "width_exceptions_total": width_report.exceptions_total,
+    });
+    if let Some(error) = width_error {
+        result["width_report_error"] = json!(error);
+    }
+    Ok(CallToolResult::json(&result))
+}
+
+/// The width report of the session at `ses`, against the manifest beside
+/// `dsn`. With no manifest, or one that names no net with a recorded width,
+/// the session is not read and the report is empty. A session that cannot be
+/// read for widths gives an empty report and the reason: the routing stands,
+/// and the status then never says `complete`.
+fn width_report(
+    dsn: &Path,
+    ses: &Path,
+) -> (crate::intent_width_report::WidthReport, Option<String>) {
+    use crate::intent_width_report::{has_judged_net, intent_width_report, WidthReport};
+    let Some(manifest) = crate::specctra::manifest_beside(dsn).filter(has_judged_net) else {
+        return (WidthReport::default(), None);
+    };
+    let read = std::fs::read_to_string(ses)
+        .map_err(|error| anyhow::anyhow!("the session could not be read: {error}"))
+        .and_then(|text| intent_width_report(&manifest, &text));
+    match read {
+        Ok(report) => (report, None),
+        Err(error) => {
+            let detail: String = format!("{error:#}")
+                .chars()
+                .take(MAX_REASON_DETAIL)
+                .collect();
+            (WidthReport::default(), Some(detail))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4962,6 +5233,13 @@ mod freerouting_setup_tests {
     /// job at once, logs a stage summary with 0 unrouted, and writes a
     /// one-line session.
     fn routing_java(dir: &Path) -> PathBuf {
+        routing_java_writing(dir, "java25", r#"(session "board")"#)
+    }
+
+    /// The same, writing `session` as the routed session. The text must hold
+    /// no single quote: it sits inside one in the script.
+    fn routing_java_writing(dir: &Path, name: &str, session: &str) -> PathBuf {
+        assert!(!session.contains('\''));
         let object = r#"{"type":"object","properties":{"jobId":{"type":"string"},"filePath":{"type":"string"}},"required":["jobId","filePath"]}"#;
         let with_path = r#"{"type":"object","properties":{"path":{"type":"object","properties":{"jobId":{"type":"string"}},"required":["jobId"]}},"required":["path"]}"#;
         let enqueue = r#"{"type":"object","properties":{"body":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},"required":["body"]}"#;
@@ -4998,14 +5276,222 @@ while IFS= read -r line; do
     *'"name":"get_job_logs"'*) reply "$id" '{logs}' ;;
     *'"name":"download_job_output_to_local_file"'*)
       out=$(printf '%s' "$line" | grep -o '"filePath":"[^"]*"' | cut -d'"' -f4)
-      printf '(session "board")\n' > "$out"
+      printf '%s\n' '{session}' > "$out"
       reply "$id" '{{"message":"saved"}}' ;;
     *) reply "$id" '{{}}' ;;
   esac
 done
 "#
         );
-        write_script(dir, "java25", &body, "")
+        write_script(dir, name, &body, "")
+    }
+
+    // ─── S9, step A: the width report in the routing result ────────────────
+
+    /// The keys of a routing result before row S9.
+    const KEYS_BEFORE_S9: [&str; 16] = [
+        "artifacts",
+        "bridge",
+        "completion",
+        "effective_settings",
+        "elapsed_seconds",
+        "engine",
+        "final_state",
+        "job_id",
+        "method",
+        "native_mcp",
+        "optimizer",
+        "poll_count",
+        "rules_applied",
+        "ses_bytes",
+        "session_id",
+        "status",
+    ];
+
+    const NARROW_SESSION: &str = "(session board (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 10000 0 0 30000 0)) (wire (path F.Cu 2000 30000 0 30000 25000))))))";
+
+    fn widened_manifest() -> serde_json::Value {
+        json!({
+            "layers": [{ "dsn_name": "F.Cu", "kicad_name": "F.Cu" }],
+            "intent_widths": [
+                { "net": "VBUS", "current_a": 2.0, "from_mm": 0.2, "to_mm": 1.0, "status": "widened" }
+            ]
+        })
+    }
+
+    /// Route `dsn_text` with the fake Freerouting `java`, with `manifest`
+    /// beside the DSN when one is given.
+    async fn route_with(
+        dir: &Path,
+        java: &Path,
+        name: &str,
+        dsn_text: &str,
+        manifest: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let jar = dir.join("freerouting-2.5.0.jar");
+        if !jar.exists() {
+            fake_jar(dir, "freerouting-2.5.0.jar", 69);
+        }
+        let dsn = dir.join(format!("{name}.dsn"));
+        std::fs::write(&dsn, dsn_text).unwrap();
+        if let Some(manifest) = manifest {
+            std::fs::write(
+                dir.join(format!("{name}.dsn.konnect.json")),
+                manifest.to_string(),
+            )
+            .unwrap();
+        }
+        let args = json!({ "dsn_path": dsn, "ses_output_path": dir.join(format!("{name}.ses")),
+                           "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+        let result = handle_route_specctra_dsn(&args, &ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        body(&result)
+    }
+
+    /// With no net that has a recorded width, the result is what it was
+    /// before row S9, plus three empty fields: no manifest, a manifest from
+    /// before intent widths, an empty list, and a pour net that kept its
+    /// class width all read the same.
+    #[tokio::test]
+    async fn with_no_recorded_width_the_result_only_gains_empty_width_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = routing_java(dir.path());
+        let manifests = [
+            None,
+            Some(json!({ "format_version": 1 })),
+            Some(json!({ "intent_widths": [] })),
+            Some(json!({ "intent_widths": [
+                { "net": "GND", "current_a": 2.0, "from_mm": 0.2, "to_mm": 0.2, "status": "not_widened" }
+            ] })),
+        ];
+        for (index, manifest) in manifests.into_iter().enumerate() {
+            let result = route_with(
+                dir.path(),
+                &java,
+                &format!("plain{index}"),
+                "(pcb board (structure))",
+                manifest,
+            )
+            .await;
+            let mut keys: Vec<&str> = result
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .filter(|key| *key != "success")
+                .collect();
+            keys.sort();
+            let mut expected: Vec<&str> = KEYS_BEFORE_S9.to_vec();
+            expected.extend([
+                "intent_widths",
+                "width_exceptions",
+                "width_exceptions_total",
+            ]);
+            expected.sort();
+            assert_eq!(keys, expected, "manifest {index}");
+            assert_eq!(result["success"], true);
+            assert_eq!(result["intent_widths"], json!([]), "manifest {index}");
+            assert_eq!(result["width_exceptions"], json!([]), "manifest {index}");
+            assert_eq!(result["width_exceptions_total"], 0, "manifest {index}");
+            // The session the fake writes holds no routes: it was not read.
+            assert_eq!(result["status"], "complete", "manifest {index}: {result}");
+            assert_eq!(
+                result["completion"]["reason"],
+                "Freerouting reports 0 unrouted connections and was given no pour as a plane."
+            );
+        }
+    }
+
+    /// Track below a widened net's intent width is listed, and the status
+    /// says so.
+    #[tokio::test]
+    async fn a_route_that_narrowed_a_widened_net_names_the_stretch() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = routing_java_writing(dir.path(), "narrow", NARROW_SESSION);
+        let result = route_with(
+            dir.path(),
+            &java,
+            "narrowed",
+            "(pcb board (structure))",
+            Some(widened_manifest()),
+        )
+        .await;
+        assert_eq!(result["success"], true);
+        assert_eq!(
+            result["status"], "complete_with_width_exceptions",
+            "{result}"
+        );
+        assert_eq!(result["width_exceptions_total"], 1);
+        assert_eq!(
+            result["width_exceptions"],
+            json!([{ "net": "VBUS", "intent_width_mm": 1.0, "width_mm": 0.2, "length_mm": 2.5,
+                     "layers": ["F.Cu"], "ends_mm": [[3.0, 0.0], [3.0, -2.5]] }])
+        );
+        let row = &result["intent_widths"][0];
+        assert_eq!(row["net"], "VBUS");
+        assert_eq!(row["routed_mm"], 5.5);
+        assert_eq!(row["below_intent_mm"], 2.5);
+        assert!(result["completion"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 stretch(es) of track"));
+        assert!(result["width_report_error"].is_null());
+
+        // With a plane the stretch is still listed; the status stays unverified.
+        let with_plane = route_with(
+            dir.path(),
+            &java,
+            "narrowed_plane",
+            "(pcb board (structure (plane GND (polygon B.Cu 0 0 0 1000 0 1000 1000))))",
+            Some(widened_manifest()),
+        )
+        .await;
+        assert_eq!(with_plane["status"], "unverified", "{with_plane}");
+        assert_eq!(with_plane["width_exceptions_total"], 1);
+
+        // The same session at full width: plainly complete.
+        let wide = routing_java_writing(
+            dir.path(),
+            "wide",
+            &NARROW_SESSION.replace("F.Cu 2000", "F.Cu 10000"),
+        );
+        let result = route_with(
+            dir.path(),
+            &wide,
+            "held",
+            "(pcb board (structure))",
+            Some(widened_manifest()),
+        )
+        .await;
+        assert_eq!(result["status"], "complete", "{result}");
+        assert_eq!(result["width_exceptions"], json!([]));
+        assert_eq!(result["intent_widths"][0]["below_intent_mm"], 0.0);
+    }
+
+    /// A session that cannot be read for widths, on a board with a recorded
+    /// width: the routing stands, the status is not `complete`, and the
+    /// result says why.
+    #[tokio::test]
+    async fn a_session_unreadable_for_widths_is_reported_and_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = routing_java(dir.path());
+        let result = route_with(
+            dir.path(),
+            &java,
+            "unread",
+            "(pcb board (structure))",
+            Some(widened_manifest()),
+        )
+        .await;
+        assert_eq!(result["success"], true);
+        assert_eq!(result["status"], "unverified", "{result}");
+        assert!(result["width_report_error"]
+            .as_str()
+            .unwrap()
+            .contains("no routes"));
+        assert_eq!(result["width_exceptions"], json!([]));
+        assert_eq!(result["width_exceptions_total"], 0);
     }
 
     /// The handler reads the planes from the DSN it routes and puts them into
