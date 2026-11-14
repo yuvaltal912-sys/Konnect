@@ -2189,33 +2189,38 @@ done
         let export = crate::specctra::export_dsn(&board, source, &routing_rules()).unwrap();
         std::fs::write(&dsn, export.dsn).unwrap();
 
-        let error = format!(
-            "{:#}",
-            route_local(
-                &jar,
-                &dsn,
-                &ses,
-                &RouteSettings {
-                    max_passes: Some(100),
-                    optimizer_enabled: Some(true),
-                    job_timeout_seconds: Some(300),
-                    poll_interval: Duration::from_secs(5),
-                    overall_timeout: Duration::from_millis(100),
-                    java: None,
-                    automatic_neckdown: None,
-                    copper_to_edge_clearance_um: None,
-                    retry_width_um: None,
-                    fanout_enabled: None,
-                    via_costs: None,
-                    default_undesired_direction_trace_cost: None,
-                    optimizer_improvement_threshold: None,
-                    optimizer_max_consecutive_failures_pass1: None,
-                    optimizer_max_consecutive_failures: None,
-                },
-            )
-            .await
-            .unwrap_err()
-        );
+        let failure = route_local(
+            &jar,
+            &dsn,
+            &ses,
+            &RouteSettings {
+                max_passes: Some(100),
+                optimizer_enabled: Some(true),
+                job_timeout_seconds: Some(300),
+                poll_interval: Duration::from_secs(5),
+                overall_timeout: Duration::from_millis(100),
+                java: None,
+                automatic_neckdown: None,
+                copper_to_edge_clearance_um: None,
+                retry_width_um: None,
+                fanout_enabled: None,
+                via_costs: None,
+                default_undesired_direction_trace_cost: None,
+                optimizer_improvement_threshold: None,
+                optimizer_max_consecutive_failures_pass1: None,
+                optimizer_max_consecutive_failures: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        // Row S9: the timeout is a typed error, also under the stderr
+        // context, so a caller that runs several jobs can tell it from a job
+        // that failed.
+        let typed = failure
+            .downcast_ref::<OverallTimeout>()
+            .expect("an overall timeout is a typed error");
+        assert_eq!(typed.seconds, 0, "100 ms, in whole seconds");
+        let error = format!("{failure:#}");
         assert!(error.contains("overall timeout"), "{error}");
         let pid = LAST_CHILD_PID.load(Ordering::SeqCst);
         assert!(

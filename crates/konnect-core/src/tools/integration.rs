@@ -7160,6 +7160,39 @@ done
         );
     }
 
+    /// One job that outlasts the call fails with the typed timeout, also
+    /// under the stderr context: that is how the pass engine tells "the time
+    /// ran out" from "the job failed".
+    #[tokio::test]
+    async fn a_job_that_outlasts_the_call_fails_with_the_typed_timeout() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.0.jar", 69);
+        let mut slow = staged(200.0, true, 2, 0, hold_session(None, 50000));
+        slow.run_seconds = 5;
+        let java = staged_java(dir.path(), "late", &[slow]);
+        let dsn = dir.path().join("late.dsn");
+        std::fs::write(&dsn, HOLD_DSN).unwrap();
+        let mut settings =
+            route_settings(&json!({}), &crate::specctra::RoutingHints::default(), java).unwrap();
+        settings.overall_timeout = std::time::Duration::from_millis(500);
+        let ses = dir.path().join("late.ses");
+        let error = crate::freerouting_mcp::route_local(&jar, &dsn, &ses, &settings)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::freerouting_mcp::OverallTimeout>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("overall timeout"),
+            "{error:#}"
+        );
+        assert!(!ses.exists());
+    }
+
     #[tokio::test]
     async fn bad_width_arguments_and_an_existing_passes_folder_are_refused_before_routing() {
         let dir = tempfile::tempdir().unwrap();

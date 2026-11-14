@@ -466,6 +466,57 @@ Their counts are in PR #64's body, and the evidence folders are
 **Next.** None on this branch once #64 is merged; the next creation row waits
 for the owner's word.
 
+## Row S9: width-first routing (PR #69)
+
+**State (2026-11-14).** Implemented on branch `claude/creation-s9-width-first`. Base: `fork/main` `89780cd` (the merge of #66). Publication and merge go through [PR #69](https://github.com/yuvaltal912-sys/Konnect/pull/69); GitHub is the source of truth for its state. The decisions are in the decision table ("S9 width-first design", "S9 pass list").
+
+**Next step.** The default: `width_policy` stays `"retry"` until the owner has seen this row's measurement and says to change it. Making `"hold"` the default for boards with recorded currents is then one line in `width_arguments` plus its test and docs. Raised for later, not built: widening a narrowed stretch in place, as a planner option.
+
+**What it adds to `route_specctra_dsn`.**
+
+- **A width report, always on.** After routing, the session is read against the manifest's `intent_widths`.
+  - `intent_widths`: per net with a recorded width, the routed length, the length and share below that width, the longest such stretch.
+  - `width_exceptions`: each stretch of track below its net's intent width (wires joined end to end), longest first, at most 100; `width_exceptions_total` counts all.
+  - A net is judged when the export widened it or found it wide enough. A net that owns a pour is not judged.
+  - With no such net the session is not read, and the result only gains the three fields, empty.
+  - Code: `intent_width_report.rs`; `width_report` in `tools/integration.rs`.
+- **Two statuses.** `complete_with_width_exceptions`: the router left nothing, no plane, and some track is below its intent width. `stopped`: the time ran out during a later pass. S6's rule stays: with a plane no "complete" status is returned. Both are added in `routing_status` and in `completion_report`, where S6's handoff said. A session that cannot be read for widths is never `complete` (`width_report_error`).
+- **`width_policy: "hold"`, opt-in.** The default `"retry"` is the single run as before.
+  - Full: every net, the retry off, the optimizer on.
+  - Fallback, only if Full leaves connections open: started from Full's session, the retry at the one floor width, the optimizer off. `width_fallback: "none"` skips it.
+  - Polish, only if the Fallback completes: started from its session, the retry off, the optimizer on.
+  - The retry is never sent with the optimizer on (`check_pass_rule`): the optimizer lays narrowed retries of its own on every net it touches.
+  - A later pass starts from a scratch copy of the DSN that holds the earlier session as ordinary wiring, never fixed (`specctra_seed.rs`; the DSN's own bytes are kept and the items are inserted into its `wiring` scope).
+  - A later pass's session becomes the result only if its log shows it started with exactly the unrouted count the pass before ended with, it holds every seeded net and no typed item, and it did not end worse. Otherwise the earlier session stays, and the pass's row in `passes` says why.
+  - `passes`, `result_pass`, `width_policy` and `artifacts.passes_folder` appear only when `hold` was asked for. The passes' files stay in `<output>.passes`.
+  - Code: `hold_widths`, `route_held` and `width_arguments` in `tools/integration.rs`; `router_unrouted_at_start` and the typed `OverallTimeout` in `freerouting_mcp.rs`.
+- **Docs.** `docs/API_MIGRATIONS.md` ("width-first routing"), `tool-directory.md`, and the `kicad-pcb` skill (step 3 reads `width_exceptions` and reports every row).
+
+**Choices made in the build, with reasons.**
+
+- The power-first pass of the redesign is not built (decision row "S9 pass list"). `ignore_net_classes` is not sent.
+- A later pass that fails, is discarded or runs out of time leaves the earlier full-board session as the result. The redesign said "no session". Reason: that session is whole and is already the honest answer.
+- Freerouting's "Necked retry" log lines are not read. They carry no job tag, so it is not known that the job log holds them. The exceptions come from the session's geometry only.
+- `route_local` already checks every DSN it is given, so each scratch DSN passes `check_dsn_input` there.
+- `specctra_ses.rs` was not touched: both new modules read sessions through `konnect_sexp`.
+- `konnect-ipc/src/builders.rs` and `tools/pcb_routing.rs`, named in the old row, are not needed: nothing is written to the live board inside the call.
+
+**Verified (macOS).** Every cargo, KiCad, Freerouting and `konnect` parent ran under `protected-native-ps.sb` with a scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`. Records are under `target/creation-research/s9/` in the main checkout (ignored).
+
+- **Baseline:** not rerun. The base tree `e27bfb2` is the tree #66's final gate passed on 2026-11-14 (4,515 workspace tests passed, 0 failed, 166 ignored; `simulation_live` 95 of 95).
+- **Tests:** a failing run first for each behaviour (`build/runs/`), then:
+  - `cargo test -p konnect-core --locked --lib`: 3696 passed, 0 failed.
+  - `cargo test -p konnect --locked --tests`: 195 passed, 0 failed, in 16 binaries.
+  - `cargo clippy -p konnect-core --locked --all-targets -- -D warnings`: clean.
+- **Negative controls, scoped mutants, independent review, measurement, the full gate:** recorded in the PR description.
+
+**Known limits.**
+
+- The Fallback narrows whole connections, as Freerouting's retry does. The Polish does not widen them again. What ends narrow is listed, not repaired.
+- The Fallback needs one floor width for every net. When the nets' floors differ it is skipped, as the single run's retry is, and open connections stay open.
+- A stretch is a geometric group of wires in the session, not a pad-to-pad connection.
+- `hold` takes up to three routing jobs; `overall_timeout_seconds` covers all of them.
+
 ## Row S6, second half: per-zone pours and stitching after refill (PR #66)
 
 **State (2026-11-14).** Implemented, reviewed and gated on branch `claude/creation-s6b-pour-policy`. Base: `fork/main` `61b96dc`, with `fork/main` `720d86b` (#67, row A1) merged in. Publication and merge go through [PR #66](https://github.com/yuvaltal912-sys/Konnect/pull/66); GitHub is the source of truth for its state, and the final gate's result is in the PR description. The design rulings are in the decision table ("S6 second half design").
