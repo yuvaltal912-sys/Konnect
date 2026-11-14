@@ -362,7 +362,7 @@ fn completion_report(
                 &mut steps,
                 json!({
                     "tool": "save_project", "arguments": {},
-                    "why": "Save the open board, so the saved file is the revision the DSN was exported from."
+                    "why": "Save the open board, so the saved file is the revision the DSN was exported from. KiCad may also rewrite the project file here, if it had not saved it itself before the export: plan_specctra_ses_import then reports a stale revision, and the recovery is to export and route again. Saving the project before export_specctra_dsn avoids that."
                 }),
             );
             checkpoint_step = Some(push(
@@ -370,7 +370,7 @@ fn completion_report(
                 json!({
                     "tool": "create_checkpoint",
                     "arguments": { "project": project, "label": "before importing the plane routing" },
-                    "why": "Keep the board as it was exported: the fallback needs it back, and only a checkpoint restores it. Keep the checkpoint_id it returns."
+                    "why": "Keep the board as it was exported: the fallback needs it back, and only a checkpoint restores it. Keep the checkpoint_id it returns. If it fails, stop here: without it the fallback cannot put the board back."
                 }),
             ));
         }
@@ -436,13 +436,13 @@ fn completion_report(
                 "tool": "restore_checkpoint",
                 "arguments": { "project": project, "dry_run": true },
                 "arguments_from": { "checkpoint_id": from_checkpoint },
-                "why": "Preview the restore of the board as it was exported."
+                "why": "Preview the restore. It lists every design file the checkpoint puts back, the board among them."
             }));
             fallback.push(json!({
                 "tool": "restore_checkpoint",
                 "arguments": { "project": project, "dry_run": false },
                 "arguments_from": { "checkpoint_id": from_checkpoint, "expected_revision": "the revision the preview returned" },
-                "why": "Put that board back. It takes its own undo checkpoint first."
+                "why": "Put those files back, the board as it was exported among them. It takes its own undo checkpoint first."
             }));
             fallback.push(json!({
                 "tool": "launch_kicad_ui", "arguments": { "project": project },
@@ -811,6 +811,49 @@ mod route_rule_tests {
             .as_str()
             .unwrap()
             .contains("fall back"));
+    }
+
+    /// The import binds the project file by hash, and `save_project` can make
+    /// KiCad rewrite it (review C, nit 1). A caller who follows the steps
+    /// literally must learn what that costs and how to recover; a failed
+    /// checkpoint must stop the sequence; the restore puts back every file
+    /// the checkpoint holds, not only the board (nits 4 and 5).
+    #[test]
+    fn the_save_and_checkpoint_steps_say_what_can_go_wrong_and_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        let (_, completion) = report(&dsn, &ses, Some(0));
+        let steps = completion["next_steps"].as_array().unwrap();
+        let why = |tool: &str| {
+            steps.iter().find(|s| s["tool"] == tool).unwrap()["why"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let save = why("save_project");
+        for needle in [
+            "project file",
+            "plan_specctra_ses_import then reports a stale revision",
+            "export and route again",
+            "Saving the project before export_specctra_dsn",
+        ] {
+            assert!(save.contains(needle), "{needle}: {save}");
+        }
+        let checkpoint = why("create_checkpoint");
+        assert!(checkpoint.contains("If it fails, stop"), "{checkpoint}");
+        let fallback = completion["if_still_open"]["fallback"].as_array().unwrap();
+        for call in &fallback[1..=2] {
+            let text = call["why"].as_str().unwrap();
+            assert!(
+                text.contains("the board") && text.contains("among them"),
+                "{text}"
+            );
+        }
+        assert!(fallback[1]["why"]
+            .as_str()
+            .unwrap()
+            .contains("every design file the checkpoint puts back"));
+        assert_prose_names_are_real(&completion);
     }
 
     /// The words a caller acts on: complete only at 0 unconnected in KiCad's

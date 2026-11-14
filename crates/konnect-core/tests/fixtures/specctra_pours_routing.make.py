@@ -1,6 +1,6 @@
 """Write the synthetic pour-routing fixture F1 for row S6's second half.
 
-    /opt/homebrew/bin/python3.14 -I make_f1.py <out-dir>
+    /opt/homebrew/bin/python3.14 -I specctra_pours_routing.make.py <out-dir>
 
 Writes <out-dir>/specctra_pours_routing.kicad_pcb and .kicad_pro: a 2-layer
 50 x 40 mm board with twelve SMD 0805 resistors in a 4 x 3 grid. Pad 2 of

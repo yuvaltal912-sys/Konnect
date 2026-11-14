@@ -325,7 +325,7 @@ script that parses `.kicad_pcb`.
 ### Freerouting round trip
 
 For a supported board, use the local Freerouting path. Load `pcb_export`,
-`integration`, `pcb_routing`, and `verification` before starting:
+`integration`, `pcb_routing`, `verification`, and `project` before starting:
 
 1. Run `check_freerouting(jar_path?, java_path?)`. Inspect `available`,
    `native_mcp_available`, and `bridge_available`, plus `note` or `setup` when
@@ -334,7 +334,8 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    continue only after the installation or capability blocker is resolved.
    If its version policy carries a `warning`, tell the user which release
    is recommended and why; it does not block routing.
-2. With the exact named board open over IPC and placement/rules settled, call
+2. With the exact named board open over IPC and placement/rules settled, save
+   it with `save_project`, then call
    `export_specctra_dsn(board, output='new-job.dsn')`. Keep the returned DSN and
    reverse manifest together. Rust export is the default
    (`native_bridge_mode: 'disable'`); no native plugin is required. Existing
@@ -348,7 +349,10 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    connections. `completion.next_steps` lists the exact calls still needed,
    and `completion.complete_when` says what decides. With planes, those steps
    start with `save_project` and `create_checkpoint(project)`: run them
-   before step 4 (step 7 says why).
+   before step 4 (step 7 says why), and stop if the checkpoint fails. The
+   import binds the project file as it was at export; the save in step 2 keeps
+   this second save from changing it. If step 4 still reports a stale
+   revision, export and route again.
 4. Review `plan_specctra_ses_import(board, ses_path, manifest_path)`. It is
    read-only and checks the SES against the revision-bound manifest and live
    board. A stale revision needs a new export and routing job.
@@ -372,10 +376,12 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    is complete only when KiCad's DRC on the refilled board reports 0
    unconnected items. If 1 to 10 connections on the plane nets are still open,
    report each one as open: the routing is not complete. If more than 10 are
-   open, fall back. First close the board and the project in KiCad, then
-   `restore_checkpoint(project, checkpoint_id)` (preview, then apply with
-   `dry_run=false` and its `expected_revision`), then reopen the project with
-   `launch_kicad_ui(project)` and open the board in the PCB editor. Then
+   open, fall back. First close the board and the project in KiCad (by hand:
+   no tool closes them), then `restore_checkpoint(project, checkpoint_id)`
+   (preview, then apply with `dry_run=false` and its `expected_revision`; it
+   puts back every design file the checkpoint holds, the board among them),
+   then reopen the project with `launch_kicad_ui(project)` and open the board
+   in the PCB editor (by hand). Then
    export again with `pours='omit'` and the same other arguments, route
    again, and report that outcome beside the open count of the plane run.
 

@@ -56,14 +56,14 @@ narrowed input.
     - `reason`: bounded; an error's detail is cut to 160 characters.
     - `next_steps`, each with a `step` number, a `tool`, its `arguments`, and `arguments_from` for values an earlier call returns:
       - Always: `plan_specctra_ses_import`, `apply_specctra_ses` and `run_drc`.
-      - With planes, first `save_project` and `create_checkpoint(project)`, which keep the board as it was exported.
+      - With planes, first `save_project` and `create_checkpoint(project)`, which keep the board as it was exported. The import binds the project file by hash, and this save can make KiCad rewrite it; the save step says so, and that a stale revision at the import means exporting and routing again. The `kicad-pcb` skill saves the project before the export, so this save has nothing new to write.
       - With planes, after the DRC: `plan_route_refinement` with `kinds: ["stitching"]` and the plane nets, `route_batch` with the plan's `vias`, and `run_drc` again, repeated for at most 4 rounds.
     - `if_still_open`, with planes: report 1 to 10 open connections as open, the routing not complete. Above 10, fall back.
       - `precondition`: the exporter refuses a board that holds unlocked routing, so the board from the checkpoint comes back first.
       - `fallback`, in order: close the board and the project in KiCad (a manual step); `restore_checkpoint` as a preview, then applied with its revision; `launch_kicad_ui(project)`; open the board in the PCB editor (manual); `export_specctra_dsn` with `pours: "omit"`; `route_specctra_dsn`.
 
     With no reverse manifest beside the DSN that names an existing board, `next_steps` is empty, there is no `if_still_open`, and `next_steps_missing` says why.
-- **`route_specctra_dsn` checks `dsn_path` before anything reads it.** A path that is not an existing regular `.dsn` file is refused with `invalid_argument` on `dsn_path`, before Java is looked for. Before, a missing or wrong path was refused only when routing began, and with this change's plane read in front it could have blocked on a FIFO or a device. A DSN larger than 64 MiB is now refused too; real exports are well under 1 MiB.
+- **`route_specctra_dsn` checks `dsn_path` before anything reads it.** A path that is not an existing regular `.dsn` file is refused with `invalid_argument` on `dsn_path`, before Java is looked for. Before, a missing or wrong path was refused only when routing began. A DSN larger than 64 MiB is now refused too; real exports are well under 1 MiB.
 
 ## Unreleased: read-only route-refinement plans
 

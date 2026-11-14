@@ -117,7 +117,7 @@ The supervisor owns S6's completed worktree `/Users/yuvaltal/.codex/worktrees/ko
 | Row | Delivers | Depends on | Files it owns | State |
 |---|---|---|---|---|
 | S5 | Measure first: a settings and DSN-variant sweep on the reference board through #51's harness, each run scored with `audit_layout_quality` plus length by net category (ground, power, signals); picks one preset. No product code | merged | `xtask/src/freerouting_bench/` (`mod.rs`, `report.rs`, new `board_score.rs`), new `xtask/freerouting-bench/score_board.py` and `stage_merge.py`, `DEV.md` | Merged: [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60). 116 isolated jobs, preset chosen (section "Row S5" below) |
-| S6 | Ground through the pour: no intent widening for pour nets, a per-zone `pours` policy in the DSN, stitching after refill | S5's result | `specctra.rs`, `specctra_ses.rs`, `tools/pcb_export.rs`, `freerouting_mcp.rs`, `tools/integration.rs`, `specctra_pours_tests.rs`; later pour fixtures | First half complete in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62); owner authorized merge on 2026-11-10 (verify PR state). Second half (per-zone policy, stitching after refill), started by the owner on 2026-11-13: implemented, reviewed and gated on branch `claude/creation-s6b-pour-policy` (2026-11-14); publication and merge through [#66](https://github.com/yuvaltal912-sys/Konnect/pull/66); GitHub is the source of truth for its state. One target unmet (0 unconnected after stitching on the main plane shape); see "Row S6, second half" |
+| S6 | Ground through the pour: no intent widening for pour nets, a per-zone `pours` policy in the DSN, stitching after refill | S5's result | `specctra.rs`, `specctra_ses.rs`, `tools/pcb_export.rs`, `freerouting_mcp.rs`, `tools/integration.rs`, `specctra_pours_tests.rs`; later pour fixtures | First half complete in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62); owner authorized merge on 2026-11-10 (verify PR state). Second half (per-zone policy, stitching after refill), started by the owner on 2026-11-13: implemented, reviewed and gated on branch `claude/creation-s6b-pour-policy` (2026-11-14); publication and merge through [#66](https://github.com/yuvaltal912-sys/Konnect/pull/66); GitHub is the source of truth for its state. Three targets unmet: 0 unconnected (on C1 and C2), power-net width shares no worse than C0 (on C1, C2 and C3), and at least 40 ground vias (on C2); see "Targets, by shape" under "Row S6, second half" |
 | S7 | Stitching-via and corner clean-up planner, read-only (Q1: a second opinion, never the author) | merged | new `tools/route_refine.rs` with tests/fixtures; narrow `layout_quality*` reuse seams; routing registration/counts; `kicad-pcb` skill and API docs | Implemented, reviewed and gated on branch `codex/creation-s7-route-refine` (2026-11-13); publication and merge through [#63](https://github.com/yuvaltal912-sys/Konnect/pull/63), GitHub is the source of truth for its state. See "Row S7" |
 | S7b | Acute-junction resolver: a further proposal kind for acute corners outside S7's three kinds | S7 | `tools/route_refine*.rs` | Authorized 2026-11-13; reserved for the creation supervisor's worker, not yet claimed |
 | A1 | Replace the audit's recursive netclass pattern matcher with a linear one | S7 | `tools/layout_quality.rs` | Implemented, reviewed and gated on branch `claude/creation-audit-pattern-matcher` (2026-11-13); publication and merge through that branch's PR; GitHub is the source of truth for its state. See "Row A1" |
@@ -468,7 +468,7 @@ for the owner's word.
 
 **State (2026-11-14).** Implemented, reviewed and gated on branch `claude/creation-s6b-pour-policy`. Base: `fork/main` `61b96dc`, with `fork/main` `720d86b` (#67, row A1) merged in. Publication and merge go through [PR #66](https://github.com/yuvaltal912-sys/Konnect/pull/66); GitHub is the source of truth for its state, and the final gate's result is in the PR description. The design rulings are in the decision table ("S6 second half design").
 
-**Next step.** None on this branch once #66 is merged. The unmet target below goes to the owner, with the measurement for each shape; no shape is recommended here. Row S9 (width-first routing) starts after this merge, and is measured on these DSN shapes.
+**Next step.** None on this branch once #66 is merged. The three unmet targets under "Targets, by shape" go to the owner, with the measurement for each shape; no shape is recommended here. Row S9 (width-first routing) starts after this merge, and is measured on these DSN shapes.
 
 **What it adds.**
 
@@ -484,7 +484,7 @@ for the owner's word.
   - New `completion`: Freerouting's own count, the planes with their zones, and what decides (KiCad DRC after a refill). It also gives the exact `next_steps`, and, with planes, `if_still_open`.
   - **With planes, the steps start by keeping the exported board** (`save_project`, `create_checkpoint`). The fallback above 10 open connections puts that board back first: close KiCad, `restore_checkpoint` (preview, then apply), `launch_kicad_ui`, open the board. Only then does it export again with `pours: "omit"`, because the exporter refuses a board that holds unlocked routing.
   - `dsn_path` is checked before anything reads it: a regular `.dsn` file of at most 64 MiB.
-- **Docs.** The `kicad-pcb` skill teaches the same sequence (Freerouting round trip, steps 3 and 7). It, `tool-directory.md`, `DEV.md` and `docs/API_MIGRATIONS.md` say what `fixed` really writes.
+- **Docs.** The `kicad-pcb` skill teaches the same sequence (Freerouting round trip, steps 3 and 7), saves the project before the export (step 2), and loads the `project` toolset the checkpoint tools are in. It, `tool-directory.md`, `DEV.md` and `docs/API_MIGRATIONS.md` say what `fixed` really writes.
 - **Fixtures.** `specctra_pours_policy.kicad_pcb` (five pour layers and a rule area) and `specctra_pours_routing.kicad_pcb` (synthetic, with its generator beside it).
 
 **Measurement (batches S6B-N1 and S6B-N2, 2026-11-13 and 14).**
@@ -494,7 +494,7 @@ for the owner's word.
 - **Each run:** the SES is applied and refilled. Then up to 4 stitching rounds: `plan_route_refinement` with the stitching kind over stdio, a `pcbnew` stand-in adopting every listed via, then refill and DRC. Scoring is S5's bench (`--rescore --score`).
 - 3 routings per cell.
 
-| Cell: DSN shape | Status (router unrouted) | Open on GND after refill | Open after stitching, R = 3 mm | GND vias at the end | Track on the GND pour net (existing 81.7 mm) | Signals | Power net A below its 0.5 mm intent width | Power net B below its 1.5 mm intent width | Starved thermals |
+| Cell: DSN shape | Status (router unrouted) | Open on GND after refill | Open after stitching, R = 3 mm | GND vias at the end | Track on the GND pour net (existing 81.7 mm) | Signals | Power net A below its intent width | Power net B below its intent width | Starved thermals |
 |---|---|---|---|---|---|---|---|---|---|
 | C0: every pour omitted (S5's preset shape) | `complete` (0), 3 of 3 | 0, 0, 0 | no stitching | 25 to 28 | 583 to 585 mm | x1.003 to x1.005 | 14 % | 0 % | 1 |
 | C1: top full pour omitted, region and bottom pours planes | `unverified` (0) | 17, 19, 19 | **5, 3, 3** (R = 6 mm: the same) | 58 to 65 (R = 6: 65 to 74) | 9.9 mm | x1.010 to x1.012 | 16 % | 0 % | 2 |
@@ -514,7 +514,7 @@ Power net B, the net 82 % below its width in C3, is the same net that is 82 to 8
   - Power-net width shares no worse than C0: **unmet by C1, C2 and C3.** On power net A, C1 is 2 points worse than C0 (16 % against 14 %), C2 reaches 28 to 36 % and C3 34 %. Power net B is 0 % in C0 and C1, but 82 to 84 % in C2 and 82 % in C3. The narrowing comes from Freerouting's single retry width, which is row S9's subject.
 - **This change does not make C0 worse.** Its DSN is byte-identical to S6's product export, and its numbers match S5's preset: 1 starved thermal, 14 %.
 - **What stays open on C1.** All of it is pieces of the F.Cu region pour cut off by tracks: 4 piece-to-piece links and 1 region-to-bottom link in run 1, and 2 and 1 in runs 2 and 3.
-  - Each open piece holds exactly one SMD GND pad, on 4.1 to 6.7 mm² of fill, with no via and no track.
+  - Each open piece holds exactly one SMD GND pad, with no via and no track.
   - In 4 of the 5 pieces, no position fits a 0.6 mm via wholly inside both the piece and the bottom ground fill. In the fifth, every position that fits lies on the pad.
   - The planner's only refusal is "via-in-pad overlap" (25 or 26 positions), and the 6 mm radius closes nothing more.
   - C3, which leaves that pour out of the router's view, has 0 open.
@@ -537,17 +537,18 @@ Power net B, the net 82 % below its width in C3, is the same net that is 82 to 8
   - One rule must stay: with a conduction area in the DSN, no "complete" status is ever returned.
   - Pass the last pass's unrouted count. Per-pass detail belongs in S9's own `passes` field. `next_steps` stays the KiCad-side sequence after the call.
 
-**Verified (macOS).** Every cargo, KiCad, Freerouting and `konnect` parent ran under `protected-native-ps.sb`, with a scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`. Records are under `target/creation-research/s6b/` (ignored).
+**Verified (macOS).** Every cargo, KiCad, Freerouting and `konnect` parent ran under `protected-native-ps.sb`, with a scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`, except one `cargo fmt --all` (formatting only, no KiCad), run outside it on 2026-11-14. Records are under `target/creation-research/s6b/` (ignored).
 
 - **Tests:**
-  - `cargo test -p konnect-core --locked --lib -- specctra:: freerouting_mcp::tests tools::integration::route_rule_tests tools::integration::freerouting_setup_tests tools::pcb_export::new_export_format_tests layout_quality`: 201 passed, 0 failed.
-  - `cargo test -p konnect --locked --tests`: all ok.
+  - `cargo test -p konnect-core --locked --lib -- specctra:: freerouting_mcp::tests tools::integration::route_rule_tests tools::integration::freerouting_setup_tests tools::pcb_export::new_export_format_tests layout_quality`: 202 passed, 0 failed.
+  - `cargo test -p konnect --locked --tests`: 195 passed, 0 failed, in 16 binaries.
   - The whole konnect-core lib on candidate B: 3633 passed, 0 failed.
-- **Negative controls:** one guard broken per run, its named test failing, the file restored byte for byte. Batches K1 (38 controls on the first candidate), K2 (the 12 surviving mutants of the first candidate), K3 (67 controls: every guard on the final source, 17 of them new for the review's findings) and K4 (the 7 killable survivors of the delta mutants). Every control is killed, and each file is restored. In K3 one control survived at first: the fixed parse-error message. Its test read only the top context of the error; it now reads the whole chain, as `completion.reason` shows it, and the control is killed (K3b).
+- **Negative controls:** one guard broken per run, its named test failing, the file restored byte for byte. Batches K1 (38 controls on the first candidate), K2 (the 12 surviving mutants of the first candidate), K3 (67 controls: every guard on the final source, 17 of them new for the review's findings) K4 (the 7 killable survivors of the delta mutants) and K5 (7 controls for the wording review C asked for: the save, checkpoint and restore steps, and the skill's round trip). Every control is killed, and each file is restored. In K3 one control survived at first: the fixed parse-error message. Its test read only the top context of the error; it now reads the whole chain, as `completion.reason` shows it, and the control is killed (K3b).
 - **`cargo mutants`** on the changed lines, in isolated copies:
   - First candidate: 122 mutants, 101 caught, 12 missed, 9 unviable. Each of the 12 now has a kill test, shown by re-applying it.
   - On the review fixes (the delta from B): 51 mutants, 38 caught, 8 missed, 5 unviable. 7 of the 8 now have kill tests, shown by re-applying them (K4). The eighth turns the bounded read's `take(MAX + 1)` into `take(MAX)`. It differs only for a file that grows while it is read, a race no test can produce, so it is recorded as equivalent.
-- **Independent review:** one round by an agent that did not write the code. Its 2 must-fix and 5 should-fix findings were fixed with tests.
+  - None on the changes for review C: they change strings and tests only.
+- **Independent review:** two rounds by an agent that did not write the code. Review B returned CHANGES REQUIRED; its 2 must-fix and 5 should-fix findings were fixed with tests, and 10 of its 11 nits (nit 7 left: KiCad's DRC is the judge, and a violation count would widen the contract). Review C, of the delta, returned CLEAN WITH NITS; its should-fix (this row's count of unmet targets) and its 10 nits were taken: nit 9 by dropping two kinds of board detail, and nit 4 in part, since a project file that does not exist is left to `create_checkpoint`, which refuses it, and the step now says to stop. Nit 1, below under "Known limits", is handled in the wording of the steps and the skill.
 - **The measurement above.**
 - **The full gate on the merged head:** recorded in the PR description.
 
@@ -556,8 +557,9 @@ Power net B, the net 82 % below its width in C3, is the same net that is 82 to 8
 - A pour form that blocks other nets has no per-zone switch in Freerouting 2.5.0: `plane_as_obstacle` is board-wide, and a DSN plane is read with `isObstacle = false`. Evidence: bytecode notes in the main checkout, `target/creation-research/resolution-evidence/notes/rank32-checks-backlog.md` §3 and `notes/routing-quality.md` (ignored files).
 - The steps cannot run inside the routing call: apply, refill and `route_batch` need the live board.
 - The fallback needs KiCad closed for `restore_checkpoint`, and reopening the board in the PCB editor is a manual step; no tool closes or opens a board.
+- The import binds the project file by hash, and the `save_project` step can make KiCad rewrite it when KiCad had not saved it itself. The import then reports a stale revision, and the recovery is a new export and routing run. The step says so, and the skill saves the project before the export so that this save has nothing new to write. Not run against a live KiCad.
 - The planner's stitching closes only the open pieces it finds a safe via position for. On C1, what stays open after the stitching rounds (5, 3 and 3 connections in the three runs, the same at a 6 mm radius) is all cut-off pieces of the F.Cu region pour.
-  - Each piece is 4.1 to 6.7 mm² and holds one SMD ground pad, with no via and no track.
+  - Each piece holds one SMD ground pad, with no via and no track.
   - In 4 of the 5 pieces, no 0.6 mm via fits wholly inside both the piece and the bottom ground fill.
   - In the fifth, every position that fits lies on the pad, and the planner refuses a via in a pad ("via-in-pad overlap", 25 or 26 positions).
 
@@ -568,7 +570,7 @@ Power net B, the net 82 % below its width in C3, is the same net that is 82 to 8
 - Windows and Linux.
 - Another real board.
 - The owner's real currents.
-- `cargo llvm-cov`: not run, with the supervisor's agreement. The diff-scoped mutants and the controls cover the changed branches.
+- `cargo llvm-cov`: not run. The diff-scoped mutants and the negative controls exercise every changed branch, and an instrumented build would hold a lane on a machine shared with other workers for little more evidence.
 - That Freerouting 2.5.0 reads an area-shaped wiring wire as a conduction area: this was not checked against 2.5.0's reader. Counting such wires as planes is the conservative reading.
 
 ## Row S6, first half: pour widths and measured preset (PR #62)
