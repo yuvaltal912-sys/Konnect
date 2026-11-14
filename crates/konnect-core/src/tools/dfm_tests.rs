@@ -720,3 +720,22 @@ fn an_acid_trap_just_below_the_line_reads_below_it() {
     assert_eq!(traps.len(), 1);
     assert!(traps[0].issue.contains("meet at 88°"), "{}", traps[0].issue);
 }
+
+/// The reader's two edges: a piece of one point is no track, and no keys at
+/// all are a small run.
+#[test]
+fn the_junction_reader_skips_a_one_point_piece_and_reads_no_keys_as_small() {
+    let one = [(1.0, 1.0)];
+    let two = [(1.0, 1.0), (2.0, 1.0)];
+    let pieces = [(&one[..], "a"), (&two[..], "b"), (&two[..], "c")].map(|(pts, id)| Piece {
+        layer: "F.Cu",
+        net: "SIG",
+        pts,
+        id: Some(id),
+    });
+    let found = read_junctions(pieces.into_iter());
+    assert!(found
+        .iter()
+        .all(|j| j.ends.iter().all(|e| e.1.as_deref() != Some("a"))));
+    assert!(cluster_is_small(std::iter::empty()));
+}
