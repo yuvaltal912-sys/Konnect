@@ -740,6 +740,34 @@ mod tests {
     }
 
     #[test]
+    fn wirelength_reads_both_axes_and_leaves_out_a_net_without_a_bound() {
+        // SAME's two pins are one point: its lower bound is 0, so its wiring is
+        // left out of the ratio.
+        let dsn = DSN.replace(
+            "(net PWR (pins R1-1 R2-2))",
+            "(net PWR (pins R1-1 R2-2))\n    (net SAME (pins R1-1 R1-1))",
+        );
+        let board = DsnBoard::parse(&dsn).unwrap();
+        assert_eq!(board.bound_mm("SAME"), Some(0.0));
+        let q = measure(
+            &board,
+            &ses("(net SIG (wire (path F.Cu 2000 20000 1000 20000 3000)))"),
+        )
+        .unwrap();
+        assert!((q.wirelength_mm - 0.2).abs() < 1e-9, "{q:?}");
+        let q = measure(
+            &board,
+            &ses("(net SAME (wire (path F.Cu 2000 20000 1000 20000 3000)))"),
+        )
+        .unwrap();
+        assert_eq!(
+            (q.nets_routed, q.wirelength_mm, q.bound_mm),
+            (1, 0.0, 0.0),
+            "{q:?}"
+        );
+    }
+
+    #[test]
     fn a_net_the_board_does_not_know_is_counted() {
         let board = DsnBoard::parse(DSN).unwrap();
         let q = measure(
