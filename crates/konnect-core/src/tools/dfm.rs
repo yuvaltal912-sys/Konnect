@@ -847,7 +847,10 @@ fn check_acid_traps(geometry: &BoardGeometry, report: &mut DfmReport) {
             junction_key(b.0.at),
         ))
     });
-    for (j, angle) in &traps {
+    for (j, sharpest) in &traps {
+        // Shown in whole degrees rounded down, so a trap at 88.99 degrees never
+        // reads as 89 (the tolerance keeps 45 degrees of float noise at 45).
+        let angle = (sharpest + 1e-6).floor();
         report.issues.push(DfmIssue {
             severity: "warning",
             component: None,

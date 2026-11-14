@@ -710,3 +710,13 @@ fn an_acid_trap_is_reported_at_the_key_with_the_most_ends() {
         (Some(JN.0), Some(JN.1))
     );
 }
+
+/// The issue text never rounds a trap up to the line: 88.99 degrees reads as
+/// 88, not 89.
+#[test]
+fn an_acid_trap_just_below_the_line_reads_below_it() {
+    let report = check_board(&geometry(&trap_board(&legs(&[0., 88.99]))), &jlc());
+    let traps = issues_with(&report, "Acid trap");
+    assert_eq!(traps.len(), 1);
+    assert!(traps[0].issue.contains("meet at 88°"), "{}", traps[0].issue);
+}
