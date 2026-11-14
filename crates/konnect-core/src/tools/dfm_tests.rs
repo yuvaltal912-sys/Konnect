@@ -535,3 +535,19 @@ fn an_arc_is_a_leg_of_its_junction() {
     assert_eq!(traps.len(), 1, "{:?}", report.checks["acid_trap"]);
     assert_eq!(report.checks["acid_trap"].checked, 1);
 }
+
+/// Keys joined by a chain of short tracks are one junction: a real 45-degree
+/// V whose legs end 8 um apart, joined by two 4-um pieces in series.
+#[test]
+fn a_chain_of_short_tracks_joins_its_keys_into_one_junction() {
+    let (j1, j2) = ((JN.0 + 0.004, JN.1), (JN.0 + 0.008, JN.1));
+    let t = [
+        (JN, at(180., 3.)),
+        (j1, j2),
+        (JN, j1),
+        (j2, (j2.0 - 2.12132, j2.1 + 2.12132)),
+    ];
+    let (traps, cov) = acid_traps(&t);
+    assert_eq!((traps, cov.checked), (1, 1), "{cov:?}");
+    assert_eq!(cov.short_tracks, Some(2));
+}
