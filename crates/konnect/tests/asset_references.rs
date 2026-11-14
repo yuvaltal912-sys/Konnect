@@ -1024,6 +1024,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "width_exceptions",
         "complete_with_width_exceptions",
         "width_policy",
+        "width_unmeasured",
     ];
 
     let mut phantom = Vec::new();

@@ -150,7 +150,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. `width_policy: \"hold\"` routes without narrowing them (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then `unverified`. `width_policy: \"hold\"` first routes with the retry off, so that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
             json!({
                 "type": "object",
                 "properties": {
@@ -169,13 +169,13 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["retry", "hold"],
                         "default": "retry",
-                        "description": "What to do about nets the export widened for their recorded current (the manifest's intent_widths). \"retry\": one run; a connection that fails at its width is retried at the nets' common floor width, and Freerouting's optimizer may re-lay others at it too. \"hold\": a Full pass with that retry off, so nothing is narrowed; only if it leaves connections open, a Fallback pass (retry at the floor, optimizer off) and then a Polish pass (retry off, optimizer on), each started from the pass before it. Either way width_exceptions lists every stretch that ended below its net's intent width. With no such net in the manifest, \"hold\" has nothing to hold and the single run is made."
+                        "description": "What to do about nets the export widened for their recorded current (the manifest's intent_widths). \"retry\": one run; a connection that fails at its width is retried at the nets' common floor width, and Freerouting's optimizer may re-lay others at it too. \"hold\": a Full pass with that retry off, which narrows nothing; only if it leaves connections open, a Fallback pass (retry at the floor, optimizer off), kept only if it closes at least one of them, and then, once nothing is open, a Polish pass (retry off, optimizer on), each started from the pass before it. The Fallback may narrow any track, not only the connections that were open. Either way width_exceptions lists every stretch that ended below its net's intent width. With no such net in the manifest, \"hold\" has nothing to hold and the single run is made."
                     },
                     "width_fallback": {
                         "type": "string",
                         "enum": ["floor", "none"],
                         "default": "floor",
-                        "description": "With width_policy \"hold\": what to do with connections the Full pass leaves open. \"floor\": finish them in a Fallback pass at the floor width and list them in width_exceptions. \"none\": leave them open (status incomplete)."
+                        "description": "With width_policy \"hold\": what to do with connections the Full pass leaves open. \"floor\": try them in a Fallback pass at the floor width; what ends narrow is listed in width_exceptions. \"none\": leave them open (status incomplete). Without \"hold\" it is not used, and the result says so."
                     },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
                     "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900, "description": "The whole call, every pass of it." }
@@ -248,6 +248,13 @@ pub(crate) struct WidthOutcome {
     /// A net has a recorded width, but the session could not be read for
     /// track widths: what is below intent width is then not known.
     pub unread: bool,
+    /// Wires of nets with a recorded width that could not be measured: what
+    /// is below intent width is then not fully known.
+    pub unmeasured: usize,
+    /// The caller's own `width_policy` and `width_fallback`, when given: every
+    /// step of the result that routes again repeats them.
+    pub policy: Option<&'static str>,
+    pub fallback: Option<&'static str>,
 }
 
 /// What a routing run can say about completion, from Freerouting's own
@@ -262,7 +269,10 @@ pub(crate) struct WidthOutcome {
 /// over everything, because the session is an earlier pass's), and
 /// `complete_with_width_exceptions`, when the router left nothing, was given
 /// no plane, and some track is below its net's intent width. With a plane the
-/// status stays `unverified` and the exceptions are listed beside it.
+/// status stays `unverified` and the exceptions are listed beside it. A
+/// session that could not be read for widths, or that holds a wire of such a
+/// net that could not be measured, is `unverified` too: never "complete" of
+/// either kind.
 fn routing_status(
     planes: &[crate::specctra::DsnPlane],
     router_unrouted: Option<u32>,
@@ -273,8 +283,9 @@ fn routing_status(
     }
     match router_unrouted {
         Some(left) if left > 0 => "incomplete",
-        // Widths that could not be read are not read as "nothing is narrow".
-        Some(_) if planes.is_empty() && width.unread => "unverified",
+        // Widths that could not be read, or a wire that could not be
+        // measured, are not read as "nothing is narrow".
+        Some(_) if planes.is_empty() && (width.unread || width.unmeasured > 0) => "unverified",
         Some(_) if planes.is_empty() && width.exceptions > 0 => "complete_with_width_exceptions",
         Some(_) if planes.is_empty() => "complete",
         _ => "unverified",
@@ -375,24 +386,27 @@ fn completion_report(
     };
     // Row S9: a pass that ran out of time, and track below intent width, are
     // said beside what the router's own count shows.
-    let reason = match width.stopped_in {
+    let mut reason = match width.stopped_in {
         Some(pass) => format!(
-            "The time ran out during the {pass} pass, so the session is the one an earlier pass finished. {reason}"
+            "The call's time ran out at the {pass} pass (before it started or while it ran: its row in `passes` says which), so the session is the one an earlier pass finished. {reason}"
         ),
         None => reason,
     };
-    let reason = if width.exceptions > 0 {
-        format!(
-            "{reason} {} stretch(es) of track are below their net's intent width; `width_exceptions` lists each one.",
+    if width.exceptions > 0 {
+        reason.push_str(&format!(
+            " {} stretch(es) of track are below their net's intent width; `width_exceptions` lists each one.",
             width.exceptions
-        )
-    } else if width.unread {
-        format!(
-            "{reason} The session could not be read for track widths, so track below a net's intent width is not known (`width_report_error`)."
-        )
-    } else {
-        reason
-    };
+        ));
+    }
+    if width.unread {
+        reason.push_str(" The session could not be read for track widths, so track below a net's intent width is not known (`width_report_error`).");
+    }
+    if width.unmeasured > 0 {
+        reason.push_str(&format!(
+            " {} wire(s) of nets with a recorded width could not be measured (`width_unmeasured`), so track below a net's intent width is not fully known.",
+            width.unmeasured
+        ));
+    }
     let nets_text = if plane_nets.is_empty() {
         "every net".to_string()
     } else {
@@ -515,11 +529,28 @@ fn completion_report(
                 "arguments": { "board": board, "output": dsn.with_extension("pours-omitted.dsn"), "pours": "omit" },
                 "why": "Leave the pours out, so the router routes the plane nets as track. Pass the same other arguments as the first export (widths_from_intent, native_bridge_mode)."
             }));
+            // The caller's own width arguments are repeated, so following
+            // the steps cannot bring back a default the caller did not choose.
+            let mut reroute = json!({ "dsn_path": dsn.with_extension("pours-omitted.dsn"),
+                                      "ses_output_path": ses.with_extension("pours-omitted.ses") });
+            let mut carried = false;
+            for (key, value) in [
+                ("width_policy", width.policy),
+                ("width_fallback", width.fallback),
+            ] {
+                if let Some(value) = value {
+                    reroute[key] = json!(value);
+                    carried = true;
+                }
+            }
             fallback.push(json!({
                 "tool": "route_specctra_dsn",
-                "arguments": { "dsn_path": dsn.with_extension("pours-omitted.dsn"),
-                               "ses_output_path": ses.with_extension("pours-omitted.ses") },
-                "why": "Route that DSN, then follow its own next steps."
+                "arguments": reroute,
+                "why": if carried {
+                    "Route that DSN with the width arguments this call was given (width_policy, width_fallback), then follow its own next steps."
+                } else {
+                    "Route that DSN, then follow its own next steps."
+                }
             }));
         }
     }
@@ -639,6 +670,8 @@ mod route_rule_tests {
                 exceptions,
                 stopped_in: Some("polish"),
                 unread: exceptions > 0,
+                unmeasured: exceptions,
+                ..Default::default()
             };
             for planes in [none, one] {
                 for unrouted in [Some(0), Some(3), None] {
@@ -719,7 +752,7 @@ mod route_rule_tests {
         assert_eq!(status, "stopped");
         let reason = completion["reason"].as_str().unwrap();
         assert!(
-            reason.contains("The time ran out during the polish pass"),
+            reason.contains("The call's time ran out at the polish pass"),
             "{reason}"
         );
         assert!(reason.contains("an earlier pass"), "{reason}");
@@ -748,6 +781,99 @@ mod route_rule_tests {
             .as_str()
             .unwrap()
             .contains("4 stretch(es) of track"));
+    }
+
+    /// Review A, S1: a wire of a net with a recorded width that could not be
+    /// measured is never behind a "complete" of either kind.
+    #[test]
+    fn a_run_with_an_unmeasured_wire_is_never_complete() {
+        let plane = gnd_plane();
+        let one = std::slice::from_ref(&plane);
+        for exceptions in [0, 3] {
+            let unmeasured = WidthOutcome {
+                exceptions,
+                unmeasured: 2,
+                ..Default::default()
+            };
+            assert_eq!(
+                routing_status(&[], Some(0), &unmeasured),
+                "unverified",
+                "{exceptions} exception(s)"
+            );
+            assert_eq!(routing_status(one, Some(0), &unmeasured), "unverified");
+            assert_eq!(routing_status(&[], Some(1), &unmeasured), "incomplete");
+            assert_eq!(routing_status(&[], None, &unmeasured), "unverified");
+        }
+        let stopped = WidthOutcome {
+            unmeasured: 2,
+            stopped_in: Some("polish"),
+            ..Default::default()
+        };
+        assert_eq!(routing_status(&[], Some(0), &stopped), "stopped");
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("omit"));
+        let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(&dsn).unwrap());
+        let width = WidthOutcome {
+            exceptions: 3,
+            unmeasured: 2,
+            ..Default::default()
+        };
+        let (status, completion) = super::completion_report(&dsn, &ses, &planes, Some(0), &width);
+        assert_eq!(status, "unverified");
+        let reason = completion["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("2 wire(s) of nets with a recorded width could not be measured"),
+            "{reason}"
+        );
+        assert!(reason.contains("width_unmeasured"), "{reason}");
+        assert!(reason.contains("3 stretch(es) of track"), "{reason}");
+    }
+
+    /// Review A, S3: every step that routes again repeats the caller's own
+    /// width arguments, so following the steps cannot bring a default back
+    /// that the caller did not choose. The arguments pass the tool's schema.
+    #[test]
+    fn a_step_that_routes_again_carries_the_callers_width_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, ses) = exported(dir.path(), json!("fixed"));
+        let planes = crate::specctra::dsn_planes(&std::fs::read_to_string(&dsn).unwrap());
+        let reroutes = |width: WidthOutcome| -> Vec<serde_json::Value> {
+            let (_, completion) = super::completion_report(&dsn, &ses, &planes, Some(0), &width);
+            let steps = completion["next_steps"].as_array().unwrap();
+            let fallback = completion["if_still_open"]["fallback"].as_array().unwrap();
+            assert_calls_are_real(steps);
+            assert_calls_are_real(fallback);
+            steps
+                .iter()
+                .chain(fallback)
+                .filter(|call| call["tool"] == "route_specctra_dsn")
+                .map(|call| call["arguments"].clone())
+                .collect()
+        };
+        let plain = reroutes(WidthOutcome::default());
+        assert_eq!(plain.len(), 1, "the plane fallback routes again");
+        assert_eq!(
+            plain[0].as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["dsn_path", "ses_output_path"]
+        );
+        for (policy, fallback) in [
+            (Some("hold"), Some("none")),
+            (Some("hold"), Some("floor")),
+            (Some("hold"), None),
+            (Some("retry"), None),
+            (None, Some("floor")),
+        ] {
+            let calls = reroutes(WidthOutcome {
+                policy,
+                fallback,
+                ..Default::default()
+            });
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["width_policy"].as_str(), policy);
+            assert_eq!(calls[0]["width_fallback"].as_str(), fallback);
+            assert_eq!(calls[0]["dsn_path"], plain[0]["dsn_path"]);
+            assert_eq!(calls[0]["ses_output_path"], plain[0]["ses_output_path"]);
+        }
     }
 
     // ─── S6 second half: the completion report and its next steps ──────────
@@ -3653,10 +3779,11 @@ async fn handle_route_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
-    let (hold_requested, width_fallback) = match width_arguments(args) {
+    let asked = match width_arguments(args) {
         Ok(found) => found,
         Err(refusal) => return Ok(refusal),
     };
+    let (hold_requested, width_fallback) = (asked.hold, asked.fallback);
     let jar = match resolve_freerouting_jar(args) {
         FreeroutingJar::Found(jar) => jar,
         FreeroutingJar::SuppliedPathIsNotAFile(path) => {
@@ -3748,6 +3875,9 @@ async fn handle_route_specctra_dsn(
         exceptions: width_report.exceptions_total,
         stopped_in: held.as_ref().and_then(|held| held.stopped_in),
         unread: width_error.is_some(),
+        unmeasured: width_report.unmeasured_total,
+        policy: asked.policy_given,
+        fallback: asked.fallback_given,
     };
     let (status, completion) =
         completion_report(&dsn, &ses_output, &planes, evidence.router_unrouted, &width);
@@ -3806,7 +3936,19 @@ async fn handle_route_specctra_dsn(
     if let Some(error) = width_error {
         result["width_report_error"] = json!(error);
     }
+    // Only a session that holds a wire the report could not measure carries
+    // these; the status is then never "complete".
+    if width_report.unmeasured_total > 0 {
+        result["width_unmeasured"] = json!(width_report.unmeasured);
+        result["width_unmeasured_total"] = json!(width_report.unmeasured_total);
+    }
     // Only a call that asked for `hold` carries these.
+    if !hold_requested && asked.fallback_given.is_some() {
+        result["width_policy"] = json!({
+            "requested": "retry", "applied": "retry", "fallback": "unused",
+            "reason": "width_fallback applies only with width_policy \"hold\"; it was not used",
+        });
+    }
     if hold_requested {
         let fallback = match width_fallback {
             WidthFallback::Floor => "floor",
@@ -3861,7 +4003,8 @@ pub(crate) struct HoldOutcome {
     pub result_pass: &'static str,
     pub ses: PathBuf,
     pub evidence: crate::freerouting_mcp::RouteEvidence,
-    /// The pass during which, or before which, the time ran out.
+    /// The pass at which the time ran out: before it started or while it
+    /// ran (its row in `passes` says which).
     pub stopped_in: Option<&'static str>,
     pub elapsed_seconds: f64,
 }
@@ -3882,10 +4025,19 @@ fn check_pass_rule(settings: &crate::freerouting_mcp::RouteSettings) -> anyhow::
     Ok(())
 }
 
-/// `width_policy` and `width_fallback` of a routing call: whether `hold` was
-/// asked for, and what to do with connections the Full pass leaves open.
-/// A value outside the two each takes is refused.
-fn width_arguments(args: &serde_json::Value) -> Result<(bool, WidthFallback), CallToolResult> {
+/// `width_policy` and `width_fallback` of a routing call.
+struct WidthArguments {
+    /// Whether `hold` was asked for.
+    hold: bool,
+    /// What to do with connections the Full pass leaves open.
+    fallback: WidthFallback,
+    /// The two arguments as the caller gave them, when given.
+    policy_given: Option<&'static str>,
+    fallback_given: Option<&'static str>,
+}
+
+/// Read them. A value outside the two each takes is refused.
+fn width_arguments(args: &serde_json::Value) -> Result<WidthArguments, CallToolResult> {
     let refuse = |field: &str, allowed: &str| {
         let reason = format!("must be {allowed}");
         CallToolResult::error_kind(
@@ -3896,23 +4048,32 @@ fn width_arguments(args: &serde_json::Value) -> Result<(bool, WidthFallback), Ca
             format!("Argument '{field}' is invalid: {reason}"),
         )
     };
-    let hold = match &args["width_policy"] {
-        serde_json::Value::Null => false,
+    let policy_given = match &args["width_policy"] {
+        serde_json::Value::Null => None,
         value => match value.as_str() {
-            Some("retry") => false,
-            Some("hold") => true,
+            Some("retry") => Some("retry"),
+            Some("hold") => Some("hold"),
             _ => return Err(refuse("width_policy", "\"retry\" or \"hold\"")),
         },
     };
-    let fallback = match &args["width_fallback"] {
-        serde_json::Value::Null => WidthFallback::Floor,
+    let fallback_given = match &args["width_fallback"] {
+        serde_json::Value::Null => None,
         value => match value.as_str() {
-            Some("floor") => WidthFallback::Floor,
-            Some("none") => WidthFallback::None,
+            Some("floor") => Some("floor"),
+            Some("none") => Some("none"),
             _ => return Err(refuse("width_fallback", "\"floor\" or \"none\"")),
         },
     };
-    Ok((hold, fallback))
+    Ok(WidthArguments {
+        hold: policy_given == Some("hold"),
+        fallback: if fallback_given == Some("none") {
+            WidthFallback::None
+        } else {
+            WidthFallback::Floor
+        },
+        policy_given,
+        fallback_given,
+    })
 }
 
 /// Where a width-first call keeps its passes' own files: beside the output,
@@ -3924,6 +4085,9 @@ fn passes_folder(ses_output: &Path) -> PathBuf {
 /// Run the pass list with real Freerouting jobs and write the result's
 /// session to `ses_output`. Refused before anything is routed: an output
 /// that is not a new `.ses` file, and a passes folder that already exists.
+/// A call that fails after that leaves no passes folder behind: what it
+/// wrote is moved aside ([`set_aside_failed_passes`]), so the same call can
+/// be made again.
 async fn route_held(
     jar: &Path,
     dsn: &Path,
@@ -3943,14 +4107,24 @@ async fn route_held(
         anyhow::bail!("SES output already exists: {}", ses_output.display());
     }
     let folder = passes_folder(ses_output);
-    if folder.exists() {
-        anyhow::bail!(
-            "the passes folder already exists: {} (a width-first call keeps each pass's files there and never replaces one)",
-            folder.display()
-        );
+    if let Some(parent) = folder
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!("create SES output directory {}: {error}", parent.display())
+        })?;
     }
-    std::fs::create_dir_all(&folder).map_err(|error| {
-        anyhow::anyhow!("create the passes folder {}: {error}", folder.display())
+    // `create_dir` refuses a folder that is there, in one step.
+    std::fs::create_dir(&folder).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "the passes folder already exists: {} (a width-first call keeps each pass's files there and never replaces one)",
+                folder.display()
+            )
+        } else {
+            anyhow::anyhow!("create the passes folder {}: {error}", folder.display())
+        }
     })?;
     let plan = HoldPlan {
         dsn: dsn.to_path_buf(),
@@ -3961,20 +4135,71 @@ async fn route_held(
         fallback,
         least_pass_time: LEAST_PASS_TIME,
     };
-    let outcome = hold_widths(
-        |dsn, ses, settings| {
-            let jar = jar.to_path_buf();
-            async move { crate::freerouting_mcp::route_local(&jar, &dsn, &ses, &settings).await }
-        },
-        &plan,
-    )
-    .await?;
-    let session = std::fs::read_to_string(&outcome.ses).map_err(|error| {
-        anyhow::anyhow!("read the {} pass's session: {error}", outcome.result_pass)
-    })?;
-    konnect_sexp::write_new_atomic(ses_output, &session)
-        .map_err(|error| anyhow::anyhow!("create SES output {}: {error}", ses_output.display()))?;
-    Ok(outcome)
+    let run = async {
+        let outcome = hold_widths(
+            |dsn, ses, settings| {
+                let jar = jar.to_path_buf();
+                async move {
+                    crate::freerouting_mcp::route_local(&jar, &dsn, &ses, &settings).await
+                }
+            },
+            &plan,
+        )
+        .await?;
+        let session = std::fs::read_to_string(&outcome.ses).map_err(|error| {
+            anyhow::anyhow!("read the {} pass's session: {error}", outcome.result_pass)
+        })?;
+        konnect_sexp::write_new_atomic(ses_output, &session).map_err(|error| {
+            anyhow::anyhow!("create SES output {}: {error}", ses_output.display())
+        })?;
+        anyhow::Ok(outcome)
+    };
+    match run.await {
+        Ok(outcome) => Ok(outcome),
+        // Whatever failed, the folder this call made must not block the
+        // same call made again.
+        Err(error) => {
+            let note = set_aside_failed_passes(&plan.folder);
+            Err(anyhow::anyhow!("{error:#} ({note})"))
+        }
+    }
+}
+
+/// The most failed calls' folders kept beside one output.
+const MAX_FAILED_PASSES_KEPT: u32 = 99;
+
+/// Take a failed width-first call's passes folder out of the way, so the
+/// same call can be made again, and say what was done. An empty folder is
+/// removed. One that holds files (a job's log, an earlier pass's session) is
+/// renamed to `<folder>.failed-N`, the first N from 1 that is free, beside
+/// the output where the call made it: a name that is taken is never
+/// replaced. Only when every name is taken is the folder removed with what
+/// it holds. Nothing outside the folder this call made is touched.
+fn set_aside_failed_passes(folder: &Path) -> String {
+    // `remove_dir` removes only an empty folder.
+    if std::fs::remove_dir(folder).is_ok() || !folder.exists() {
+        return "the failed call left no file of its own".to_string();
+    }
+    for n in 1..=MAX_FAILED_PASSES_KEPT {
+        let mut name = folder.as_os_str().to_os_string();
+        name.push(format!(".failed-{n}"));
+        let aside = PathBuf::from(name);
+        // Anything by that name, a broken link too, keeps the name.
+        if aside.symlink_metadata().is_ok() {
+            continue;
+        }
+        if std::fs::rename(folder, &aside).is_ok() {
+            return format!("the failed call's files are kept in {}", aside.display());
+        }
+        break;
+    }
+    match std::fs::remove_dir_all(folder) {
+        Ok(()) => "the failed call's passes folder was removed".to_string(),
+        Err(error) => format!(
+            "the failed call's passes folder {} could not be removed ({error}); remove it before calling again",
+            folder.display()
+        ),
+    }
 }
 
 /// One row of `passes`: what a pass was asked to do and what came of it.
@@ -4007,7 +4232,13 @@ fn job_row(
             "wires": seeded.wires, "vias": seeded.vias, "nets": seeded.nets.len(),
         });
     }
-    let mut artifacts = json!({ "dsn_path": dsn, "ses_path": ses });
+    // Only files that are there: a pass that never started wrote none.
+    let mut artifacts = json!({});
+    for (key, path) in [("dsn_path", dsn), ("ses_path", ses)] {
+        if path.is_file() {
+            artifacts[key] = json!(path);
+        }
+    }
     if let Some(evidence) = evidence {
         row["unrouted_at_start"] = json!(evidence.unrouted_at_start);
         row["router_unrouted"] = json!(evidence.router_unrouted);
@@ -4038,9 +4269,10 @@ enum Seeded {
 /// Each later pass starts from the session of the pass before it, written
 /// into a scratch copy of the DSN as ordinary wiring, and its own session is
 /// kept only if it started with exactly the unrouted count the pass before
-/// ended with, holds every seeded net and no typed item, and did not end
-/// worse. Anything else leaves the earlier session as the result: a later
-/// pass can only improve on a session that was already whole.
+/// ended with, holds every seeded net and no typed item, and ended as it
+/// must: the Fallback with fewer open connections than it started with, the
+/// Polish with none. Anything else leaves the earlier session as the result:
+/// a later pass can only improve on a session that was already whole.
 pub(crate) async fn hold_widths<R, F>(route: R, plan: &HoldPlan) -> anyhow::Result<HoldOutcome>
 where
     R: Fn(PathBuf, PathBuf, crate::freerouting_mcp::RouteSettings) -> F,
@@ -4177,7 +4409,7 @@ where
                 };
                 if wiring.typed > 0 {
                     return Some(format!(
-                        "the pass's session holds {} typed item(s), which the importer refuses",
+                        "the pass's session holds {} typed item(s), and the session of a seeded pass must hold none",
                         wiring.typed
                     ));
                 }
@@ -4189,8 +4421,11 @@ where
                 }
                 match evidence.router_unrouted {
                     Some(left) if left <= must_end_at_most => None,
+                    Some(left) if left == expect_start => Some(format!(
+                        "the pass closed no connection: it ended with {left} unrouted, as many as it started with, so the session of the pass before it stays"
+                    )),
                     Some(left) => Some(format!(
-                        "the pass ended with {left} unrouted, more than the {must_end_at_most} it may end with"
+                        "the pass ended with {left} unrouted, more than the {expect_start} it started with"
                     )),
                     None => Some("the pass's log gave no unrouted count".to_string()),
                 }
@@ -4259,8 +4494,18 @@ where
         }
     };
     if let Some((left, floor)) = fallback_from {
-        let (row, outcome, fallback_ses) =
-            seeded_pass("fallback", ses.clone(), floor, false, left, left).await;
+        // Kept only if it ends with fewer open connections than it started
+        // with: a Fallback has the retry on over movable wiring, so one that
+        // closes nothing could only have narrowed track for nothing.
+        let (row, outcome, fallback_ses) = seeded_pass(
+            "fallback",
+            ses.clone(),
+            floor,
+            false,
+            left,
+            left.saturating_sub(1),
+        )
+        .await;
         passes.push(row);
         match outcome {
             Seeded::Not { stopped } => {
@@ -4797,6 +5042,81 @@ mod hold_widths_tests {
             .contains("1 connection"));
         assert_eq!(run.ok().result_pass, "fallback");
         assert_eq!(run.ok().evidence.router_unrouted, Some(1));
+    }
+
+    /// Review A, S2: a Fallback is kept only if it closed a connection. One
+    /// that ends where it started may have re-laid track narrow for nothing.
+    #[tokio::test]
+    async fn a_fallback_that_closes_nothing_is_discarded_and_the_full_session_stays() {
+        let run = go(vec![
+            routed(session(10000, false), 5, 3),
+            // The same three open, and VBUS re-laid narrow on the way.
+            routed(session(2000, true), 3, 3),
+        ])
+        .await;
+        assert_eq!(
+            run.names(),
+            pairs(&[("full", "kept"), ("fallback", "discarded")])
+        );
+        assert_eq!(run.ok().result_pass, "full");
+        assert_eq!(run.ok().evidence.router_unrouted, Some(3));
+        assert_eq!(run.ok().evidence.job_id, "job1");
+        assert_eq!(run.result_text(), session(10000, false));
+        let reason = run.pass("fallback")["reason"].as_str().unwrap();
+        assert!(reason.contains("closed no connection"), "{reason}");
+        assert!(reason.contains("3 unrouted"), "{reason}");
+        // One fewer is enough.
+        let run = go(vec![
+            routed(session(10000, false), 5, 3),
+            routed(session(10000, true), 3, 2),
+        ])
+        .await;
+        assert_eq!(
+            run.names(),
+            pairs(&[
+                ("full", "kept"),
+                ("fallback", "kept"),
+                ("polish", "skipped")
+            ])
+        );
+        assert_eq!(run.ok().result_pass, "fallback");
+        assert_eq!(run.ok().evidence.router_unrouted, Some(2));
+    }
+
+    /// Review A, N5: a row names only files that are there.
+    #[tokio::test]
+    async fn a_pass_row_names_only_files_that_exist() {
+        // Never started: no file of its own.
+        let run = go_with(
+            |plan| plan.least_pass_time = std::time::Duration::from_secs(3600),
+            vec![routed(session(10000, false), 5, 3)],
+        )
+        .await;
+        let row = run.pass("fallback");
+        assert!(row["artifacts"].as_object().unwrap().is_empty(), "{row}");
+        // Seeded, and then the job failed: its DSN, and no session.
+        let run = go(vec![
+            routed(session(10000, false), 5, 3),
+            Reply::Fail("boom"),
+        ])
+        .await;
+        let row = run.pass("fallback");
+        assert!(row["artifacts"]["dsn_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("fallback.dsn"));
+        assert!(row["artifacts"]["ses_path"].is_null(), "{row}");
+        // Ran and was discarded: both, for whoever wants to look.
+        let run = go(vec![
+            routed(session(10000, false), 5, 3),
+            routed(session(10000, true), 3, 4),
+        ])
+        .await;
+        let row = run.pass("fallback");
+        assert_eq!(row["outcome"], "discarded");
+        for (key, name) in [("dsn_path", "fallback.dsn"), ("ses_path", "fallback.ses")] {
+            assert!(row["artifacts"][key].as_str().unwrap().ends_with(name));
+        }
     }
 
     #[tokio::test]
@@ -7163,9 +7483,9 @@ done
     #[tokio::test]
     async fn hold_that_runs_out_of_time_returns_the_earlier_session_as_stopped() {
         let dir = tempfile::tempdir().unwrap();
-        // The Full pass leaves less than the ten seconds a pass is worth
-        // starting with, so the Fallback, which would have completed, never
-        // starts.
+        // The call has ten seconds, the least the schema allows. The Full
+        // pass leaves less than the ten a pass is worth starting with, so the
+        // Fallback, which would have completed, never starts.
         let java = staged_java(
             dir.path(),
             "slow",
@@ -7180,7 +7500,7 @@ done
                 &java,
                 "slow",
                 hold_manifest(),
-                json!({ "width_policy": "hold", "overall_timeout_seconds": 8 }),
+                json!({ "width_policy": "hold", "overall_timeout_seconds": 10 }),
             )
             .await
             .unwrap(),
@@ -7196,7 +7516,7 @@ done
         assert!(result["completion"]["reason"]
             .as_str()
             .unwrap()
-            .contains("during the fallback pass"));
+            .contains("ran out at the fallback pass"));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("slow.ses")).unwrap(),
             hold_session(None, 50000)
@@ -7294,6 +7614,289 @@ done
             !dir.path().join("never.count").exists(),
             "nothing was routed"
         );
+    }
+
+    /// Review A, S1, through the handler: a wire the report cannot measure is
+    /// named in the result, and the run is not complete.
+    #[tokio::test]
+    async fn a_wire_that_cannot_be_measured_is_named_and_the_run_is_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = "(session board (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 10000 0 0 30000 0)) (wire (polygon F.Cu 0 0 0 10 10 0 10))))))";
+        let java = routing_java_writing(dir.path(), "java-odd", odd);
+        let result = route_with(
+            dir.path(),
+            &java,
+            "odd",
+            "(pcb board (structure))",
+            Some(widened_manifest()),
+        )
+        .await;
+        assert_eq!(result["success"], true);
+        assert_eq!(result["status"], "unverified", "{result}");
+        assert_eq!(result["width_unmeasured_total"], 1);
+        assert_eq!(result["width_unmeasured"][0]["net"], "VBUS");
+        assert_eq!(result["width_unmeasured"][0]["form"], "polygon");
+        assert_eq!(result["intent_widths"][0]["unmeasured_wires"], 1);
+        assert_eq!(result["intent_widths"][0]["routed_mm"], 3.0);
+        assert!(result["width_report_error"].is_null());
+        assert!(result["completion"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not be measured"));
+        // A session that is measured whole carries neither field.
+        let fine = "(session board (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 10000 0 0 30000 0))))))";
+        let java = routing_java_writing(dir.path(), "java-fine", fine);
+        let result = route_with(
+            dir.path(),
+            &java,
+            "fine",
+            "(pcb board (structure))",
+            Some(widened_manifest()),
+        )
+        .await;
+        assert_eq!(result["status"], "complete", "{result}");
+        let object = result.as_object().unwrap();
+        assert!(!object.contains_key("width_unmeasured"));
+        assert!(!object.contains_key("width_unmeasured_total"));
+        assert_eq!(result["intent_widths"][0]["unmeasured_wires"], 0);
+    }
+
+    /// Review A, S2, through the handler: a Fallback that closes nothing is
+    /// not the result.
+    #[tokio::test]
+    async fn a_fallback_that_closes_nothing_leaves_the_full_passs_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = staged_java(
+            dir.path(),
+            "same",
+            &[
+                staged(0.0, true, 2, 1, hold_session(None, 50000)),
+                // VBUS laid narrow, and still one connection open.
+                staged(200.0, false, 1, 1, hold_session(Some(2000), 50000)),
+            ],
+        );
+        let result = body(
+            &route_hold(
+                dir.path(),
+                &java,
+                "same",
+                hold_manifest(),
+                json!({ "width_policy": "hold" }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["result_pass"], "full", "{result}");
+        let passes = result["passes"].as_array().unwrap();
+        assert_eq!(passes.len(), 2, "no polish row");
+        assert_eq!(passes[1]["outcome"], "discarded");
+        assert!(passes[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("closed no connection"));
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["completion"]["router_unrouted"], 1);
+        assert_eq!(result["width_exceptions_total"], 0);
+        assert_eq!(result["job_id"], "j1");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("same.ses")).unwrap(),
+            hold_session(None, 50000)
+        );
+    }
+
+    /// Review A, S3, through the handler: the plane fallback's routing step
+    /// repeats the width arguments this call was given.
+    #[tokio::test]
+    async fn the_plane_fallback_step_repeats_this_calls_width_arguments() {
+        ONLY_EXPLICIT.with(|only| only.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let jar = fake_jar(dir.path(), "freerouting-2.5.0.jar", 69);
+        let java = routing_java(dir.path());
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let reroute = |name: &str, extra: serde_json::Value| {
+            let dsn = dir.path().join(format!("{name}.dsn"));
+            std::fs::write(
+                &dsn,
+                "(pcb board (structure (plane GND (polygon B.Cu 0 0 0 1000 0 1000 1000))))",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join(format!("{name}.dsn.konnect.json")),
+                json!({ "board_path": board }).to_string(),
+            )
+            .unwrap();
+            let mut args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join(format!("{name}.ses")),
+                                   "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            async move {
+                let result = handle_route_specctra_dsn(&args, &ctx()).await.unwrap();
+                assert!(!result.is_error, "{:?}", result.content);
+                let result = body(&result);
+                let calls: Vec<serde_json::Value> = result["completion"]["if_still_open"]
+                    ["fallback"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call["tool"] == "route_specctra_dsn")
+                    .map(|call| call["arguments"].clone())
+                    .collect();
+                assert_eq!(calls.len(), 1, "{result}");
+                calls[0].clone()
+            }
+        };
+        let held = reroute(
+            "held",
+            json!({ "width_policy": "hold", "width_fallback": "none" }),
+        )
+        .await;
+        assert_eq!(held["width_policy"], "hold", "{held}");
+        assert_eq!(held["width_fallback"], "none", "{held}");
+        let plain = reroute("plain", json!({})).await;
+        assert!(plain["width_policy"].is_null() && plain["width_fallback"].is_null());
+        let retry = reroute("retry", json!({ "width_policy": "retry" })).await;
+        assert_eq!(retry["width_policy"], "retry");
+        assert!(retry["width_fallback"].is_null());
+    }
+
+    /// Review A, S5: a failed `hold` call leaves nothing that blocks the same
+    /// call. What it wrote is moved aside, beside the output; an empty folder
+    /// is removed.
+    #[tokio::test]
+    async fn a_failed_hold_call_does_not_block_the_same_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let hold = || json!({ "width_policy": "hold" });
+        let folder = dir.path().join("again.passes");
+        let aside = |n: u32| dir.path().join(format!("again.passes.failed-{n}"));
+        // The Full job is refused before it starts: Freerouting reports a
+        // retry width in effect that was not sent. Nothing was written.
+        let refused = staged_java(
+            dir.path(),
+            "refused",
+            &[staged(200.0, true, 2, 0, hold_session(Some(10000), 50000))],
+        );
+        let error = route_hold(dir.path(), &refused, "again", hold_manifest(), hold())
+            .await
+            .unwrap_err();
+        assert!(!folder.exists(), "{error:#}");
+        assert!(!aside(1).exists(), "{error:#}");
+        assert!(!dir.path().join("again.ses").exists());
+        // A Freerouting that breaks with words on its error stream: the log
+        // of the failed call is kept, out of the way, twice over.
+        let broken = staged_java(dir.path(), "broken", &[]);
+        for n in 1..=2 {
+            let error = route_hold(dir.path(), &broken, "again", hold_manifest(), hold())
+                .await
+                .unwrap_err();
+            assert!(!folder.exists(), "{error:#}");
+            assert!(
+                aside(n).join("full.freerouting.log").is_file(),
+                "attempt {n}: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains(&format!("again.passes.failed-{n}")),
+                "{error:#}"
+            );
+            assert!(!dir.path().join("again.ses").exists());
+        }
+        // And then the same call, with a Freerouting that works.
+        let good = staged_java(
+            dir.path(),
+            "good",
+            &[staged(0.0, true, 2, 0, hold_session(Some(10000), 50000))],
+        );
+        let result = body(
+            &route_hold(dir.path(), &good, "again", hold_manifest(), hold())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["status"], "complete", "{result}");
+        assert!(folder.join("full.ses").is_file());
+        assert!(dir.path().join("again.ses").is_file());
+        assert!(aside(1).is_dir() && aside(2).is_dir() && !aside(3).exists());
+    }
+
+    #[test]
+    fn a_failed_calls_passes_folder_is_set_aside_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("b.passes");
+        let aside = |n: u32| dir.path().join(format!("b.passes.failed-{n}"));
+        // Empty: removed, and nothing is kept.
+        std::fs::create_dir(&folder).unwrap();
+        let note = set_aside_failed_passes(&folder);
+        assert!(!folder.exists() && !aside(1).exists(), "{note}");
+        assert!(note.contains("left no file"), "{note}");
+        // With files: moved to the first free name.
+        for n in 1..=2 {
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(folder.join("full.ses"), n.to_string()).unwrap();
+            let note = set_aside_failed_passes(&folder);
+            assert!(!folder.exists(), "{note}");
+            assert_eq!(
+                std::fs::read_to_string(aside(n).join("full.ses")).unwrap(),
+                n.to_string()
+            );
+            assert!(note.contains(&aside(n).display().to_string()), "{note}");
+        }
+        // A name that is taken by anything, a file too, is never replaced.
+        std::fs::write(aside(3), "mine").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("full.ses"), "4").unwrap();
+        let note = set_aside_failed_passes(&folder);
+        assert!(note.contains(&aside(4).display().to_string()), "{note}");
+        assert_eq!(std::fs::read_to_string(aside(3)).unwrap(), "mine");
+        // Every name taken: the folder is removed, and nothing else.
+        for n in 5..=99 {
+            std::fs::create_dir(aside(n)).unwrap();
+        }
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("full.ses"), "100").unwrap();
+        let note = set_aside_failed_passes(&folder);
+        assert!(!folder.exists(), "{note}");
+        assert!(note.contains("removed"), "{note}");
+        assert!(!aside(100).exists());
+        assert_eq!(
+            std::fs::read_to_string(aside(1).join("full.ses")).unwrap(),
+            "1"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 99);
+        // A folder that is not there: said, not a panic.
+        let note = set_aside_failed_passes(&folder);
+        assert!(note.contains("left no file"), "{note}");
+    }
+
+    /// Review A, N7: `width_fallback` without `hold` is said to be unused.
+    #[tokio::test]
+    async fn width_fallback_without_hold_is_said_to_be_unused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, extra) in [
+            ("alone", json!({ "width_fallback": "none" })),
+            (
+                "retry",
+                json!({ "width_policy": "retry", "width_fallback": "floor" }),
+            ),
+        ] {
+            let java = staged_java(
+                dir.path(),
+                name,
+                &[staged(200.0, true, 2, 0, hold_session(Some(10000), 50000))],
+            );
+            let result = body(
+                &route_hold(dir.path(), &java, name, hold_manifest(), extra)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result["width_policy"]["requested"], "retry", "{result}");
+            assert_eq!(result["width_policy"]["applied"], "retry");
+            assert_eq!(result["width_policy"]["fallback"], "unused");
+            assert!(result["width_policy"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("only with width_policy \"hold\""));
+            assert!(result["passes"].is_null());
+        }
     }
 
     /// The handler reads the planes from the DSN it routes and puts them into

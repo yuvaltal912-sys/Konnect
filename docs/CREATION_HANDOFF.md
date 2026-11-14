@@ -124,7 +124,7 @@ The supervisor owns S6's completed worktree `/Users/yuvaltal/.codex/worktrees/ko
 | S7 | Stitching-via and corner clean-up planner, read-only (Q1: a second opinion, never the author) | merged | new `tools/route_refine.rs` with tests/fixtures; narrow `layout_quality*` reuse seams; routing registration/counts; `kicad-pcb` skill and API docs | Implemented, reviewed and gated on branch `codex/creation-s7-route-refine` (2026-11-13); publication and merge through [#63](https://github.com/yuvaltal912-sys/Konnect/pull/63), GitHub is the source of truth for its state. See "Row S7" |
 | S7b | The audit's corrected acute-corner reading (owner decision 2026-11-13), one reading for the acid-trap check, the 5.3 scan, the planner's corner rows and the routing bench; then an acute-junction resolver, a fourth proposal kind | S7 | Reading: `tools/dfm.rs`, `tools/layout_quality_routing.rs`, the `corner_reading` module in `tools/mod.rs`, their tests, two of PR #63's tests in `tools/route_refine_tests.rs`, `xtask/src/freerouting_bench/quality.rs`, the acid-trap line of `tools/design_review.rs` and `tool-directory.md`, the migration note, the `kicad-review` skill, `DEV.md`'s bench line. Resolver: `tools/route_refine*.rs` | **Reading:** implemented, reviewed and gated on branch `claude/creation-s7b-junction-resolver` (2026-11-14); publication and merge through [#68](https://github.com/yuvaltal912-sys/Konnect/pull/68); GitHub is the source of truth for its state. **Resolver:** authorized by the owner on 2026-11-13, split out on his word of 2026-11-14 (decision row "S7b split"); reserved for the creation supervisor's worker, to be claimed on its own branch after #68 merges; its first build is kept on a local branch of the worker's worktree. Not in #68 because the review of candidate A found four must-fix findings in it. See "Row S7b" |
 | A1 | Replace the audit's recursive netclass pattern matcher with a linear one | S7 | `tools/layout_quality.rs` | Implemented, reviewed and gated on branch `claude/creation-audit-pattern-matcher` (2026-11-13); publication and merge through that branch's PR; GitHub is the source of truth for its state. See "Row A1" |
-| S9 | Width-first routing inside one `route_specctra_dsn` call: a net widened for its recorded current keeps that width (one full run with Freerouting's retry off; a fallback pass and a polish pass only when connections stay open), and every connection finished below its intent width is named in the result | S5, S6 (both halves), S7 | `freerouting_mcp.rs`, `tools/integration.rs`, new `specctra_seed.rs` and `intent_width_report.rs` with their tests and fixtures; own entries in `API_MIGRATIONS.md`, `tool-directory.md` and the `kicad-pcb` skill | In progress (branch `claude/creation-s9-width-first`), claimed 2026-11-14 from `fork/main` `89780cd` (the merge of #66). Redesigned 2026-11-13; see the decision rows "S9 width-first design" and "S9 pass list". Publication and merge go through this branch's PR; GitHub is the source of truth for its state |
+| S9 | Width-first routing inside one `route_specctra_dsn` call: a net widened for its recorded current keeps that width (one full run with Freerouting's retry off; a fallback pass and a polish pass only when connections stay open), and every connection finished below its intent width is named in the result | S5, S6 (both halves), S7 | `freerouting_mcp.rs`, `tools/integration.rs`, new `specctra_seed.rs` and `intent_width_report.rs` with their tests and fixtures; own entries in `API_MIGRATIONS.md`, `tool-directory.md` and the `kicad-pcb` skill | Implemented on branch `claude/creation-s9-width-first` (2026-11-14), opt-in: the default does not change. Redesigned 2026-11-13; see the decision rows "S9 width-first design" and "S9 pass list". Review, measurement and the gate are recorded in [#69](https://github.com/yuvaltal912-sys/Konnect/pull/69); publication and merge go through it, and GitHub is the source of truth for its state. See "Row S9" |
 | S10 | Only if signals stay above x1.03 after S6 and S9: re-route the worst nets | S9 | an evaluation script under `xtask/freerouting-bench/` first | Not started |
 | S11 | Report zone/pad or zone/via reported-zero/short candidates; distinguish newly qualifying pairs after a valid refill comparison without establishing engine cause or routing correctness | merged | new `tools/zone_fill_defects.rs` and its tests, a few lines in `tools/drc.rs`, `TROUBLESHOOTING.md` | Implemented, reviewed and gated on branch `codex/creation-s11-zone-fill-defects` (2026-11-13); publication and merge through [#64](https://github.com/yuvaltal912-sys/Konnect/pull/64), GitHub is the source of truth for its state. See "Row S11" |
 | B4 | Circuit review across sheets (#55/rank-29 follow-up): join supported hierarchy connectivity, retain instance identity and incomplete results for unresolved hierarchy | #55 and integration merged | `tools/circuit_model.rs`, `tools/circuit_review_tests.rs`, new hierarchy fixtures; narrow `tools/circuit_review.rs`, `tools/design_review.rs`, `tools/circuit_checks.rs`, `tools/design_review_circuit_tests.rs`; own shared-doc entries | Implemented on `codex/creation-cross-sheet-review` (2026-11-13): three review rounds, gate green. [#65](https://github.com/yuvaltal912-sys/Konnect/pull/65); GitHub is the source of truth for its merge state |
@@ -497,7 +497,14 @@ for the owner's word.
 
 ## Row S9: width-first routing (PR #69)
 
-**State (2026-11-14).** Implemented on branch `claude/creation-s9-width-first`. Base: `fork/main` `89780cd` (the merge of #66). Publication and merge go through [PR #69](https://github.com/yuvaltal912-sys/Konnect/pull/69); GitHub is the source of truth for its state. The decisions are in the decision table ("S9 width-first design", "S9 pass list").
+**State (2026-11-14).** Implemented on branch `claude/creation-s9-width-first`. The branch started from `fork/main` `89780cd` (the merge of #66) and has `fork/main` `6705cd2` (the merge of #68, row S7b's corrected corner reading) merged into it. Publication and merge go through [PR #69](https://github.com/yuvaltal912-sys/Konnect/pull/69); GitHub is the source of truth for its state, and the PR description holds the review, the measurement and the gate. The decisions are in the decision table ("S9 width-first design", "S9 pass list").
+
+**First review (2026-11-14).** One must-fix and five should-fix findings, all fixed on the branch before the second review.
+
+- Must-fix: seeding a later pass panicked on any character outside ASCII in a bare DSN token (a board file, net or pin named in Hebrew, or with `µ`), which would have ended the stdio server. The scan is now over bytes and every cut of input text is checked.
+- Should-fix: the width report skipped wire forms it did not measure; a Fallback that closed nothing was kept; the plane fallback's routing step dropped the width policy; two texts promised more than `hold` gives; a failed `hold` call blocked the same call. Each is described as it now behaves under "What it adds".
+- Owner's words on the scope (2026-11-14): first "תתקן בינתיים רק את מה שחובה ומה שבגדר ״כדאי״ תתעד" (fix only the must-fix for now and document the rest), then, on hearing that the other fixes were already written and tested, "Yes, include them".
+- Left from that review, with the reason for each, under "Known limits".
 
 **Next step.** The default: `width_policy` stays `"retry"` until the owner has seen this row's measurement and says to change it. Making `"hold"` the default for boards with recorded currents is then one line in `width_arguments` plus its test and docs. Raised for later, not built: widening a narrowed stretch in place, as a planner option.
 
@@ -505,19 +512,24 @@ for the owner's word.
 
 - **A width report, always on.** After routing, the session is read against the manifest's `intent_widths`.
   - `intent_widths`: per net with a recorded width, the routed length, the length and share below that width, the longest such stretch.
-  - `width_exceptions`: each stretch of track below its net's intent width (wires joined end to end), longest first, at most 100; `width_exceptions_total` counts all.
+  - `width_exceptions`: each stretch of track below its net's intent width (wires that share an end point), longest first, at most 100; `width_exceptions_total` counts all.
   - A net is judged when the export widened it or found it wide enough. A net that owns a pour is not judged.
   - With no such net the session is not read, and the result only gains the three fields, empty.
+  - Never silent: keywords are read in any letter case, and a wire is measured as a `path`, a `polyline_path` or a `qarc`. A wire of a judged net in any other form is listed in `width_unmeasured`, and the status is then `unverified`.
+  - A wire up to and including half a micrometre below the intent width is at width, compared in whole nanometres.
   - Code: `intent_width_report.rs`; `width_report` in `tools/integration.rs`.
-- **Two statuses.** `complete_with_width_exceptions`: the router left nothing, no plane, and some track is below its intent width. `stopped`: the time ran out during a later pass. S6's rule stays: with a plane no "complete" status is returned. Both are added in `routing_status` and in `completion_report`, where S6's handoff said. A session that cannot be read for widths is never `complete` (`width_report_error`).
+- **Two statuses.** `complete_with_width_exceptions`: the router left nothing, no plane, and some track is below its intent width. `stopped`: the time ran out before a later pass could start or while it ran. S6's rule stays: with a plane no "complete" status is returned. Both are added in `routing_status` and in `completion_report`, where S6's handoff said. A session that cannot be read for widths (`width_report_error`), or that holds a wire that cannot be measured (`width_unmeasured`), is never `complete` of either kind.
 - **`width_policy: "hold"`, opt-in.** The default `"retry"` is the single run as before.
   - Full: every net, the retry off, the optimizer on.
-  - Fallback, only if Full leaves connections open: started from Full's session, the retry at the one floor width, the optimizer off. `width_fallback: "none"` skips it.
+  - Fallback, only if Full leaves connections open: started from Full's session, the retry at the one floor width, the optimizer off. `width_fallback: "none"` skips it. It is kept only if it ends with fewer open connections than it started with.
+  - What `hold` guarantees: the Full pass narrows nothing. A Fallback may narrow any track, also track the Full pass laid at width; nothing checks which. `width_exceptions` is the authority on what ended narrow.
   - Polish, only if the Fallback completes: started from its session, the retry off, the optimizer on.
   - The retry is never sent with the optimizer on (`check_pass_rule`): the optimizer lays narrowed retries of its own on every net it touches.
   - A later pass starts from a scratch copy of the DSN that holds the earlier session as ordinary wiring, never fixed (`specctra_seed.rs`; the DSN's own bytes are kept and the items are inserted into its `wiring` scope).
-  - A later pass's session becomes the result only if its log shows it started with exactly the unrouted count the pass before ended with, it holds every seeded net and no typed item, and it did not end worse. Otherwise the earlier session stays, and the pass's row in `passes` says why.
+  - A later pass's session becomes the result only if its log shows it started with exactly the unrouted count the pass before ended with, it holds every seeded net and no typed item, and it ended as it must (the Fallback with fewer open connections, the Polish with none). Otherwise the earlier session stays, and the pass's row in `passes` says why.
   - `passes`, `result_pass`, `width_policy` and `artifacts.passes_folder` appear only when `hold` was asked for. The passes' files stay in `<output>.passes`.
+  - A call that fails leaves no `<output>.passes`: an empty folder is removed, one with files is moved to `<output>.passes.failed-N`, so the same call can be made again.
+  - The plane fallback's routing step in `completion` repeats the caller's `width_policy` and `width_fallback`.
   - Code: `hold_widths`, `route_held` and `width_arguments` in `tools/integration.rs`; `router_unrouted_at_start` and the typed `OverallTimeout` in `freerouting_mcp.rs`.
 - **Docs.** `docs/API_MIGRATIONS.md` ("width-first routing"), `tool-directory.md`, and the `kicad-pcb` skill (step 3 reads `width_exceptions` and reports every row).
 
@@ -528,23 +540,34 @@ for the owner's word.
 - Freerouting's "Necked retry" log lines are not read. They carry no job tag, so it is not known that the job log holds them. The exceptions come from the session's geometry only.
 - `route_local` already checks every DSN it is given, so each scratch DSN passes `check_dsn_input` there.
 - `specctra_ses.rs` was not touched: both new modules read sessions through `konnect_sexp`.
+- Both new modules scan text as bytes and check every cut, so a board, net or pin named in any script is read, and a file they cannot read is an error, never a panic (the first review found a panic here).
+- Seeding refuses what it cannot write back exactly: a wire that is not plain paths, a width of zero or less, a quoted name that holds a quote, a backslash or a control character.
 - `konnect-ipc/src/builders.rs` and `tools/pcb_routing.rs`, named in the old row, are not needed: nothing is written to the live board inside the call.
 
 **Verified (macOS).** Every cargo, KiCad, Freerouting and `konnect` parent ran under `protected-native-ps.sb` with a scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`. Records are under `target/creation-research/s9/` in the main checkout (ignored).
 
 - **Baseline:** not rerun. The base tree `e27bfb2` is the tree #66's final gate passed on 2026-11-14 (4,515 workspace tests passed, 0 failed, 166 ignored; `simulation_live` 95 of 95).
 - **Tests:** a failing run first for each behaviour (`build/runs/`), then:
-  - `cargo test -p konnect-core --locked --lib`: 3696 passed, 0 failed.
+  - `cargo test -p konnect-core --locked --lib`: 3768 passed, 0 failed.
   - `cargo test -p konnect --locked --tests`: 195 passed, 0 failed, in 16 binaries.
-  - `cargo clippy -p konnect-core --locked --all-targets -- -D warnings`: clean.
+  - `cargo clippy --workspace --locked --all-targets -- -D warnings`: clean.
+  - These are the focused runs on the branch after the first review's fixes; the full gate's totals are in the PR description.
 - **Negative controls, scoped mutants, independent review, measurement, the full gate:** recorded in the PR description.
 
 **Known limits.**
 
 - The Fallback narrows whole connections, as Freerouting's retry does. The Polish does not widen them again. What ends narrow is listed, not repaired.
 - The Fallback needs one floor width for every net. When the nets' floors differ it is skipped, as the single run's retry is, and open connections stay open.
-- A stretch is a geometric group of wires in the session, not a pad-to-pad connection.
+- A stretch is a geometric group of wires in the session, not a pad-to-pad connection. Wires join only at their end points: a narrow wire that ends in the middle of another one is a stretch of its own, so the longest stretch reported can be shorter than the narrow copper that hangs together there.
+- Copper the board already held locked is not in a session and is not judged.
 - `hold` takes up to three routing jobs; `overall_timeout_seconds` covers all of them.
+- Left from the first review:
+  - A narrow path of no length is listed as an exception of 0 mm. Reason: naming too much is the safe side.
+  - A DSN that already holds movable (untyped) wiring gets the seed on top of it. Reason: Konnect's export writes only fixed wiring, and a seed that Freerouting reads differently is caught by the start-count check.
+  - The DSN's bare `(string_quote ")` token is recognised in lower case only. Reason: in upper case the DSN does not read and the pass fails with an error; nothing is guessed.
+  - Net and layer names are compared as written, not folded to one case. Reason: KiCad's names are case-sensitive.
+  - `konnect_sexp::parse_sexp` has no nesting limit, so a file nested hundreds of thousands deep ends the process. Reason: not new (the caller's DSN went through it before this row) and the fix belongs in `konnect-sexp`, outside this row's files: a follow-up.
+  - A failure of the last step of a `hold` call (writing the output) goes through the same clean-up as a failed job, but only the failed-job case is run in a test.
 
 ## Row S6, second half: per-zone pours and stitching after refill (PR #66)
 

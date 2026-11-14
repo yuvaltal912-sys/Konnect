@@ -359,10 +359,14 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    `complete_with_width_exceptions`. Report every row to the user; never
    present such a routing as meeting the recorded currents. With the default
    `width_policy: 'retry'`, Freerouting may narrow any part of such a net to
-   its base width. `width_policy: 'hold'` routes with that retry off and
-   narrows only connections that would otherwise stay open (`passes` lists
-   what ran; it takes up to three routing jobs, and
-   `overall_timeout_seconds` covers all of them).
+   its base width. `width_policy: 'hold'` first routes with that retry off,
+   which narrows nothing; only if connections stay open does a second pass
+   retry at the base width, and that pass may narrow other track of such a
+   net too. Either way `width_exceptions` is what says what ended narrow
+   (`passes` lists what ran; it takes up to three routing jobs, and
+   `overall_timeout_seconds` covers all of them). If the result lists
+   `width_unmeasured`, some wire of such a net could not be measured: report
+   that too, and do not call the widths checked.
 4. Review `plan_specctra_ses_import(board, ses_path, manifest_path)`. It is
    read-only and checks the SES against the revision-bound manifest and live
    board. A stale revision needs a new export and routing job.

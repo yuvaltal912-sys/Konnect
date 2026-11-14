@@ -1705,6 +1705,23 @@ mod tests {
         assert_eq!(router_unrouted_at_start(&same_twice), Some(12));
         assert_eq!(router_unrouted_at_start(&json!({ "body": [] })), None);
         assert_eq!(router_unrouted_at_start(&json!(null)), None);
+        // Review A, M1: a board named outside ASCII, and odd lines, are read
+        // or passed over, never cut inside a character.
+        let world = log(&[
+            "\u{5dc}\u{5d5}\u{5d7} Auto-routing stage started on board '\u{dc}bung \u{1f600} for \u{b5}' with baseline score 934.43 for 7 unrouted items.\u{20ac}",
+        ]);
+        assert_eq!(router_unrouted_at_start(&world), Some(7));
+        for odd in [
+            "Auto-routing stage started",
+            "Auto-routing stage started\u{e9}",
+            "\u{e9}Auto-routing stage started unrouted",
+            "Auto-routing stage started for unrouted",
+            "Auto-routing stage started for \u{e9} unrouted",
+            "Auto-routing stage started unrouted for 3",
+            "Auto-routing stage started for 3 unrouted\u{1f600} for unrouted",
+        ] {
+            assert_eq!(router_unrouted_at_start(&log(&[odd])), None, "{odd}");
+        }
     }
 
     /// 2.5.0's BatchOptimizer also stops on its stage time limit and its item

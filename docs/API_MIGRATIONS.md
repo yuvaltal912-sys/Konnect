@@ -13,13 +13,28 @@ and a call that passes no new argument routes exactly as before.
     manifest's `intent_widths`, status `widened` or `already_wide_enough`):
     `net`, `intent_width_mm`, `basis`, `routed_mm`, `below_intent_mm`,
     `below_intent_share`, `longest_below_intent_mm`, `narrowest_width_mm`,
-    `stretches_below_intent`. A net that owns a pour and kept its class width
-    is not judged.
-  - `width_exceptions`: each stretch of track below its net's intent width
-    (wires joined end to end, across layers): `net`, `intent_width_mm`,
-    `width_mm` (the narrowest in the stretch), `length_mm`, `layers`,
-    `ends_mm` (board coordinates). Longest first, at most 100;
-    `width_exceptions_total` is the count of all of them.
+    `stretches_below_intent`, `unmeasured_wires`. A net that owns a pour and
+    kept its class width is not judged.
+  - `width_exceptions`: each stretch of track below its net's intent width:
+    `net`, `intent_width_mm`, `width_mm` (the narrowest in the stretch),
+    `length_mm`, `layers`, `ends_mm` (board coordinates). Longest first, at
+    most 100; `width_exceptions_total` is the count of all of them.
+  - What is measured: a wire given as a `path`, a `polyline_path` or a
+    `qarc`, with keywords in any letter case and the session in `um`, `mm`,
+    `mil` or `inch`. A wire up to and including half a micrometre below the
+    intent width is at width (the importer's own allowance); anything
+    narrower is listed.
+  - What a stretch is: narrow wires that share an end point, on any layer
+    (no via is looked for). A narrow wire that ends in the middle of another
+    one (a T) is a stretch of its own, so `longest_below_intent_mm` can be
+    shorter than the narrow copper that hangs together there. Copper the
+    board already held locked is not in a session and is not judged.
+  - `width_unmeasured` and `width_unmeasured_total`, present only when there
+    is one: each wire of such a net that could not be measured (an area
+    shape, a wire with no shape, a polyline whose lines do not meet): `net`,
+    `form`, `reason`, and `width_mm` when the wire states one. At most 100
+    rows. `status` is then `unverified`, never a "complete" one, because
+    what is below intent width is not fully known.
   - Both are read from the session's own geometry. With no manifest, or one
     that names no such net, the session is not read and the three fields are
     empty (`[]`, `[]`, `0`); nothing else in the result changes.
@@ -29,8 +44,9 @@ and a call that passes no new argument routes exactly as before.
 - **Two new `status` values.** `complete_with_width_exceptions`: Freerouting
   left nothing, was given no pour as a plane, and `width_exceptions` is not
   empty. `stopped`: under `width_policy: "hold"`, the call's time ran out
-  during a later pass; the session is the one an earlier pass finished, and
-  `completion.reason` names the pass. The existing values keep their meaning.
+  before a later pass could start or while it ran; the session is the one an
+  earlier pass finished, `completion.reason` names the pass and its row in
+  `passes` says which of the two. The existing values keep their meaning.
   With a plane the status is still never a "complete" one: it stays
   `unverified`, with the exceptions listed beside it. A caller that tested
   `status == "complete"` now sees `complete_with_width_exceptions` where a
@@ -45,33 +61,51 @@ and a call that passes no new argument routes exactly as before.
     the retry at the floor width, the optimizer off. Only if Fallback
     completes, Polish: started from Fallback's session, the retry off, the
     optimizer on. The retry is never sent with the optimizer on.
+  - What `"hold"` guarantees, and what it does not. The Full pass has the
+    retry off, so it narrows nothing. A Fallback has the retry on over wiring
+    Freerouting may move: it can re-lay at the floor width a connection the
+    Full pass had laid at width, not only the ones that were open. Nothing
+    checks which connections a Fallback narrowed; `width_exceptions`, read
+    from the final session, is the authority on what ended narrow.
   - A later pass starts from a scratch copy of the DSN that holds the
     earlier session as ordinary wiring (never fixed). Its session becomes the
     result only if its log shows it started with exactly the unrouted count
     the pass before ended with, it holds every seeded net and no typed item,
-    and it did not end worse (Polish must end complete). Otherwise the
-    earlier session stays the result and the pass's row says why
-    (`discarded`, `failed` or `stopped`).
+    and it ended as it must: the Fallback with fewer open connections than it
+    started with (one that closes nothing is discarded, since all it could
+    have done is narrow track), the Polish with none. Otherwise the earlier
+    session stays the result and the pass's row says why (`discarded`,
+    `failed` or `stopped`).
   - With no net with a recorded width in the manifest there is nothing to
     hold: the single run is made and `width_policy.applied` is `"retry"`.
 - **New argument `width_fallback`**: `"floor"` (default) or `"none"`. With
   `"hold"`, `"none"` skips the Fallback and leaves the open connections open
   (`incomplete`). The Fallback is also skipped when the nets' floors differ,
-  as the single run's retry is (`rules_applied.retry_off_reason`).
+  as the single run's retry is (`rules_applied.retry_off_reason`). Without
+  `"hold"` the argument is not used, and the result says so
+  (`width_policy.fallback` is `"unused"`).
 - **New result fields under `"hold"` only**: `width_policy` (`requested`,
   `applied`, `fallback`, and a `reason` when not applied); `passes` (per
   pass: `name`, `outcome` of `kept`, `discarded`, `failed`, `stopped` or
   `skipped`, a `reason`, `retry_width_um`, `optimizer_enabled`, `seeded`
   counts, `unrouted_at_start`, `router_unrouted`, `effective_settings`,
-  `optimizer`, `elapsed_seconds`, `job_id`, `artifacts`); `result_pass`;
+  `optimizer`, `elapsed_seconds`, `job_id`, `artifacts`, which names only
+  files that exist: a pass that never started wrote none); `result_pass`;
   `artifacts.passes_folder`. The top-level `effective_settings`, `optimizer`,
   `job_id` and `completion.router_unrouted` are those of the pass whose
   session is the result; `elapsed_seconds` is the whole call.
   `rules_applied.retry_width_um` stays the one floor width (what a Fallback
-  retries at).
+  retries at); what each pass was sent is in its row.
+- **The plane fallback routes with the same width arguments.** The
+  `route_specctra_dsn` step of `completion.if_still_open.fallback` repeats
+  the `width_policy` and `width_fallback` this call was given.
 - **Files.** Under `"hold"` each pass's DSN, session and Freerouting log are
   kept in `<ses_output_path without .ses>.passes/`. The call is refused
   before routing if that folder exists, as it is for an existing output.
+  A call that fails leaves no such folder, so the same call can be made
+  again: what the failed call wrote is moved to `<that folder>.failed-N`
+  (the first free N, beside the output; the error names it), and a folder
+  with nothing in it is removed.
 - **`overall_timeout_seconds` covers the whole call**, every pass of it. A
   pass is given only the time that is left.
 

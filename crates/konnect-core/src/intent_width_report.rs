@@ -12,19 +12,36 @@
 //! it was widened to) or found it wide enough (`already_wide_enough`: against
 //! the width its current needs). A net that owns a pour (`not_widened`) and a
 //! net the board does not route are not judged.
+//!
+//! The report is never silent about a judged net. Keywords are read in any
+//! letter case. A wire is measured when it is a `path`, a `polyline_path` or
+//! a `qarc`; a wire of a judged net in any other form, or with no shape, or a
+//! polyline whose lines do not meet, is listed as unmeasured, and the routing
+//! result is then never reported complete. A session that cannot be read at
+//! all is an error, with the same effect.
+//!
+//! What a stretch is: narrow pieces that share an end point, on any layer (no
+//! via is looked for). A narrow wire that ends in the middle of another one
+//! (a T) is a stretch of its own, so `longest_below_intent_mm` can be shorter
+//! than the narrow copper that really hangs together there. Copper the board
+//! already held locked is not in a session and is not judged.
 
+use crate::specctra_seed::{
+    lists, parse_specctra, session_routes, MAX_FORM_CHARS, WIRE_DESCRIPTORS,
+};
 use anyhow::{bail, Context, Result};
 use konnect_sexp::SexpNode;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The most stretches a result lists; the count of all of them is reported
-/// beside the list.
+/// The most stretches a result lists, and the most unmeasured wires; the
+/// count of all of them is reported beside each list.
 pub(crate) const MAX_WIDTH_EXCEPTIONS: usize = 100;
 
 /// A wire this far below its intent width, or less, is at width: the same
-/// half micrometre the importer allows below a net's floor.
-const WIDTH_TOLERANCE_MM: f64 = 0.0005;
+/// half micrometre the importer allows below a net's floor. In whole
+/// nanometres, so that the boundary is a rule and not rounding noise.
+const WIDTH_TOLERANCE_NM: i64 = 500;
 
 /// The per-net figures and the stretches below intent width of one session.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -36,6 +53,11 @@ pub(crate) struct WidthReport {
     pub exceptions: Vec<Value>,
     /// How many stretches there are in all.
     pub exceptions_total: usize,
+    /// Wires of judged nets that could not be measured, at most
+    /// [`MAX_WIDTH_EXCEPTIONS`]: a run with any is never reported complete.
+    pub unmeasured: Vec<Value>,
+    /// How many such wires there are in all.
+    pub unmeasured_total: usize,
 }
 
 struct Judged {
@@ -77,9 +99,25 @@ pub(crate) fn has_judged_net(manifest: &Value) -> bool {
 struct Piece {
     layer: String,
     width_mm: f64,
+    /// The width in whole nanometres, for the comparison with the intent.
+    width_nm: i64,
     length_mm: f64,
     /// Both ends in session units, for joining pieces end to end.
     ends: [(i64, i64); 2],
+}
+
+/// A wire of a judged net that could not be measured.
+struct Unmeasured {
+    form: String,
+    width_mm: Option<f64>,
+    reason: &'static str,
+}
+
+/// What a session holds of one judged net.
+#[derive(Default)]
+struct NetTrack {
+    pieces: Vec<Piece>,
+    unmeasured: Vec<Unmeasured>,
 }
 
 fn atom<'a>(node: &'a SexpNode, index: usize, what: &str) -> Result<&'a str> {
@@ -108,19 +146,58 @@ fn round3(value: f64) -> f64 {
     }
 }
 
-/// The pieces of one `wire` node. `resolution` is session units per
-/// micrometre.
+fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
+}
+
+/// The corners of a `polyline_path`: its values are lines, four numbers each
+/// (two points the line passes through), and the track runs between the
+/// points where each line meets the next. `None` when two lines that follow
+/// each other do not meet.
+fn polyline_corners(values: &[f64]) -> Option<Vec<(f64, f64)>> {
+    let lines: Vec<[(f64, f64); 2]> = values
+        .chunks_exact(4)
+        .map(|line| [(line[0], line[1]), (line[2], line[3])])
+        .collect();
+    lines
+        .windows(2)
+        .map(|pair| {
+            let ([a, b], [c, d]) = (pair[0], pair[1]);
+            let (along, other) = ((b.0 - a.0, b.1 - a.1), (d.0 - c.0, d.1 - c.1));
+            let cross = along.0 * other.1 - along.1 * other.0;
+            if cross == 0.0 {
+                return None;
+            }
+            let t = ((c.0 - a.0) * other.1 - (c.1 - a.1) * other.0) / cross;
+            Some((a.0 + t * along.0, a.1 + t * along.1))
+        })
+        .collect()
+}
+
+/// Read one `wire` node into `track`. `um_per_unit` is micrometres per
+/// session unit.
 fn wire_pieces(
     wire: &SexpNode,
-    resolution: f64,
+    um_per_unit: f64,
     layers: &BTreeMap<&str, &str>,
-) -> Result<Vec<Piece>> {
-    let mm = |units: f64| units / resolution / 1000.0;
-    let key = |x: f64, y: f64| (x.round() as i64, y.round() as i64);
-    let mut pieces = Vec::new();
+    track: &mut NetTrack,
+) -> Result<()> {
+    let mm = |units: f64| units * um_per_unit / 1000.0;
+    let key = |point: (f64, f64)| (point.0.round() as i64, point.1.round() as i64);
+    let found_before = track.pieces.len() + track.unmeasured.len();
     for shape in wire.children().unwrap_or(&[]) {
+        // An atom (the keyword itself) is not a shape.
         let Some(head) = shape.head() else { continue };
-        if head != "path" && head != "qarc" {
+        let form = head.to_ascii_lowercase();
+        if WIRE_DESCRIPTORS.contains(&form.as_str()) {
+            continue;
+        }
+        if !matches!(form.as_str(), "path" | "polyline_path" | "qarc") {
+            track.unmeasured.push(Unmeasured {
+                form: form.chars().take(MAX_FORM_CHARS).collect(),
+                width_mm: None,
+                reason: "a wire shape this report does not measure",
+            });
             continue;
         }
         let layer = atom(shape, 1, "wire layer")?;
@@ -143,96 +220,109 @@ fn wire_pieces(
                 )
             })
             .collect::<Result<_>>()?;
-        if head == "path" {
-            if values.len() < 4 || !values.len().is_multiple_of(2) {
-                bail!("a session path does not hold complete point pairs");
+        let (length, ends) = match form.as_str() {
+            "path" => {
+                if values.len() < 4 || !values.len().is_multiple_of(2) {
+                    bail!("a session path does not hold complete point pairs");
+                }
+                let points: Vec<(f64, f64)> =
+                    values.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+                let length: f64 = points
+                    .windows(2)
+                    .map(|pair| distance(pair[0], pair[1]))
+                    .sum();
+                (length, [points[0], points[points.len() - 1]])
             }
-            let points: Vec<(f64, f64)> = values.chunks_exact(2).map(|p| (p[0], p[1])).collect();
-            let length: f64 = points
-                .windows(2)
-                .map(|pair| {
-                    mm(((pair[1].0 - pair[0].0).powi(2) + (pair[1].1 - pair[0].1).powi(2)).sqrt())
-                })
-                .sum();
-            let (first, last) = (points[0], points[points.len() - 1]);
-            pieces.push(Piece {
-                layer,
-                width_mm,
-                length_mm: length,
-                ends: [key(first.0, first.1), key(last.0, last.1)],
-            });
-        } else {
-            // (qarc layer width x1 y1 x2 y2 cx cy): a quarter arc at most.
-            if values.len() != 6 {
-                bail!("a session arc does not hold a start, an end and a centre");
+            "polyline_path" => {
+                // Three lines meet in two points: the least that is a track.
+                if values.len() < 12 || !values.len().is_multiple_of(4) {
+                    bail!("a session polyline does not hold three whole lines or more");
+                }
+                let Some(corners) = polyline_corners(&values) else {
+                    track.unmeasured.push(Unmeasured {
+                        form,
+                        width_mm: Some(round3(width_mm)),
+                        reason: "two lines of the polyline that follow each other do not meet",
+                    });
+                    continue;
+                };
+                let length: f64 = corners
+                    .windows(2)
+                    .map(|pair| distance(pair[0], pair[1]))
+                    .sum();
+                (length, [corners[0], corners[corners.len() - 1]])
             }
-            let (start, end, centre) = (
-                (values[0], values[1]),
-                (values[2], values[3]),
-                (values[4], values[5]),
-            );
-            let radius = ((start.0 - centre.0).powi(2) + (start.1 - centre.1).powi(2)).sqrt();
-            let chord = ((end.0 - start.0).powi(2) + (end.1 - start.1).powi(2)).sqrt();
-            let length = if radius > 0.0 {
-                2.0 * radius * (chord / (2.0 * radius)).clamp(-1.0, 1.0).asin()
-            } else {
-                chord
-            };
-            pieces.push(Piece {
-                layer,
-                width_mm,
-                length_mm: mm(length),
-                ends: [key(start.0, start.1), key(end.0, end.1)],
-            });
+            _ => {
+                // (qarc layer width x1 y1 x2 y2 cx cy): a quarter arc at most.
+                if values.len() != 6 {
+                    bail!("a session arc does not hold a start, an end and a centre");
+                }
+                let (start, end, centre) = (
+                    (values[0], values[1]),
+                    (values[2], values[3]),
+                    (values[4], values[5]),
+                );
+                let radius = distance(centre, start);
+                let chord = distance(start, end);
+                let length = if radius > 0.0 {
+                    2.0 * radius * (chord / (2.0 * radius)).clamp(-1.0, 1.0).asin()
+                } else {
+                    chord
+                };
+                (length, [start, end])
+            }
+        };
+        let length_mm = mm(length);
+        if !length_mm.is_finite() || !width_mm.is_finite() {
+            bail!("the session holds a wire too large to measure");
         }
+        track.pieces.push(Piece {
+            layer,
+            width_mm,
+            width_nm: (width_mm * 1e6).round() as i64,
+            length_mm,
+            ends: [key(ends[0]), key(ends[1])],
+        });
     }
-    Ok(pieces)
+    if track.pieces.len() + track.unmeasured.len() == found_before {
+        track.unmeasured.push(Unmeasured {
+            form: "none".to_string(),
+            width_mm: None,
+            reason: "the wire holds no shape",
+        });
+    }
+    Ok(())
 }
 
-/// The judged nets' track in a session, by net name.
-fn session_pieces(
+/// The judged nets' track in a session, by net name, and micrometres per
+/// session unit.
+fn session_track(
     ses: &str,
     manifest: &Value,
     wanted: &BTreeSet<&str>,
-) -> Result<(BTreeMap<String, Vec<Piece>>, f64)> {
-    let root = konnect_sexp::parse_sexp(ses)
-        .map_err(|_| anyhow::anyhow!("the session is not a readable S-expression"))?;
-    if root.head() != Some("session") {
-        bail!("the file is not a Specctra session");
-    }
-    let routes = root.find("routes").context("the session has no routes")?;
-    let resolution_node = routes
-        .find("resolution")
-        .context("the session's routes have no resolution")?;
-    if atom(resolution_node, 1, "resolution unit")? != "um" {
-        bail!("only a session resolution in 'um' is supported");
-    }
-    let resolution = number(atom(resolution_node, 2, "resolution")?, "resolution")?;
-    if resolution <= 0.0 {
-        bail!("the session's resolution is not positive");
-    }
+) -> Result<(BTreeMap<String, NetTrack>, f64)> {
+    let root = parse_specctra(ses, "session")?;
+    let (routes, um_per_unit) = session_routes(&root)?;
     let layers: BTreeMap<&str, &str> = manifest["layers"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|layer| Some((layer["dsn_name"].as_str()?, layer["kicad_name"].as_str()?)))
         .collect();
-    let mut by_net: BTreeMap<String, Vec<Piece>> = BTreeMap::new();
-    for network in routes.find_all("network_out") {
-        for net in network.find_all("net") {
+    let mut by_net: BTreeMap<String, NetTrack> = BTreeMap::new();
+    for network in lists(routes, "network_out") {
+        for net in lists(network, "net") {
             let name = atom(net, 1, "net name")?;
             if !wanted.contains(name) {
                 continue;
             }
-            for wire in net.find_all("wire") {
-                by_net
-                    .entry(name.to_string())
-                    .or_default()
-                    .extend(wire_pieces(wire, resolution, &layers)?);
+            let track = by_net.entry(name.to_string()).or_default();
+            for wire in lists(net, "wire") {
+                wire_pieces(wire, um_per_unit, &layers, track)?;
             }
         }
     }
-    Ok((by_net, resolution))
+    Ok((by_net, um_per_unit))
 }
 
 /// Groups of pieces joined end to end, as lists of indexes into `pieces`.
@@ -275,27 +365,41 @@ pub(crate) fn intent_width_report(manifest: &Value, ses: &str) -> Result<WidthRe
         return Ok(WidthReport::default());
     }
     let wanted: BTreeSet<&str> = judged.iter().map(|(net, _)| net.as_str()).collect();
-    let (by_net, resolution) = session_pieces(ses, manifest, &wanted)?;
+    let (by_net, um_per_unit) = session_track(ses, manifest, &wanted)?;
     let point_mm = |point: (i64, i64)| {
         // Board coordinates: the session's y axis points up, KiCad's down.
         json!([
-            round3(point.0 as f64 / resolution / 1000.0),
-            round3(-(point.1 as f64) / resolution / 1000.0)
+            round3(point.0 as f64 * um_per_unit / 1000.0),
+            round3(-(point.1 as f64) * um_per_unit / 1000.0)
         ])
     };
     let mut report = WidthReport::default();
     let mut all: Vec<(f64, Value)> = Vec::new();
     let mut seen = BTreeSet::new();
+    let empty = NetTrack::default();
     for (net, rule) in &judged {
         if !seen.insert(net.as_str()) {
             continue; // a net named twice is judged once, by its first row
         }
-        let empty = Vec::new();
-        let pieces = by_net.get(net).unwrap_or(&empty);
+        let track = by_net.get(net).unwrap_or(&empty);
+        let pieces = &track.pieces;
+        for wire in &track.unmeasured {
+            report.unmeasured_total += 1;
+            if report.unmeasured.len() < MAX_WIDTH_EXCEPTIONS {
+                let mut row = json!({ "net": net, "form": wire.form, "reason": wire.reason });
+                if let Some(width) = wire.width_mm {
+                    row["width_mm"] = json!(width);
+                }
+                report.unmeasured.push(row);
+            }
+        }
         let routed: f64 = pieces.iter().map(|piece| piece.length_mm).sum();
+        // In whole nanometres: a wire exactly half a micrometre below the
+        // intent is at width, one nanometre more is not.
+        let least_nm = (rule.intent_mm * 1e6).round() as i64 - WIDTH_TOLERANCE_NM;
         let below: Vec<&Piece> = pieces
             .iter()
-            .filter(|piece| piece.width_mm < rule.intent_mm - WIDTH_TOLERANCE_MM)
+            .filter(|piece| piece.width_nm < least_nm)
             .collect();
         let below_mm: f64 = below.iter().map(|piece| piece.length_mm).sum();
         let groups = stretches(&below);
@@ -357,6 +461,7 @@ pub(crate) fn intent_width_report(manifest: &Value, ses: &str) -> Result<WidthRe
                 .fold(None, |least: Option<f64>, width| Some(least.map_or(width, |l| l.min(width))))
                 .map(round3),
             "stretches_below_intent": groups.len(),
+            "unmeasured_wires": track.unmeasured.len(),
         }));
     }
     report.exceptions_total = all.len();
@@ -628,7 +733,10 @@ mod tests {
             ("(pcb b)", "not a Specctra session"),
             ("(session b)", "no routes"),
             ("(session b (routes (network_out)))", "no resolution"),
-            ("(session b (routes (resolution mil 10) (network_out)))", "'um'"),
+            (
+                "(session b (routes (resolution furlong 10) (network_out)))",
+                "unit 'furlong' is not known",
+            ),
             ("(session b (routes (resolution um 0) (network_out)))", "not positive"),
             (
                 "(session b (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 2000 0 0 10))))))",
@@ -701,5 +809,247 @@ mod tests {
         );
         assert_eq!(report.exceptions_total, 1);
         assert_eq!(report.exceptions[0]["intent_width_mm"], 1.0);
+    }
+
+    // ─── Review A, S1: the report is never silent ──────────────────────────
+
+    /// A session at ten units per micrometre whose one net, VBUS, holds `body`.
+    fn one_net(body: &str) -> String {
+        format!("(session b (routes (resolution um 10) (network_out (net VBUS {body}))))")
+    }
+
+    #[test]
+    fn keywords_in_any_letter_case_are_measured() {
+        // Each of these read as no track at all, and so as nothing narrow.
+        for ses in [
+            one_net("(wire (PATH F.Cu 2000 0 0 10000 0))"),
+            one_net("(WIRE (path F.Cu 2000 0 0 10000 0))"),
+            "(session b (routes (resolution um 10) (network_out (NET VBUS (wire (path F.Cu 2000 0 0 10000 0))))))".to_string(),
+            "(SESSION b (ROUTES (RESOLUTION UM 10) (NETWORK_OUT (NET VBUS (WIRE (PATH F.Cu 2000 0 0 10000 0))))))".to_string(),
+            one_net("(Wire (Qarc F.Cu 2000 10000 0 0 10000 0 0))"),
+        ] {
+            let report = intent_width_report(&manifest(), &ses).unwrap();
+            assert_eq!(report.exceptions_total, 1, "{ses}");
+            assert!(
+                net_row(&report, "VBUS")["routed_mm"].as_f64().unwrap() >= 1.0,
+                "{ses}"
+            );
+            assert_eq!(report.unmeasured_total, 0, "{ses}");
+        }
+    }
+
+    #[test]
+    fn a_polyline_path_is_measured_between_the_points_where_its_lines_meet() {
+        // Four lines: x = 0, y = 0, x = 3 mm and y = 2.5 mm. They meet at
+        // (0, 0), (3, 0) and (3, 2.5) mm: 5.5 mm of track at 0.2 mm.
+        let ses = one_net("(wire (polyline_path F.Cu 2000 0 -100 0 100 0 0 30000 0 30000 0 30000 25000 0 25000 100 25000))");
+        let report = intent_width_report(&manifest(), &ses).unwrap();
+        assert_eq!(report.unmeasured_total, 0);
+        assert_eq!(report.exceptions_total, 1);
+        assert_eq!(report.exceptions[0]["length_mm"], 5.5);
+        assert_eq!(report.exceptions[0]["width_mm"], 0.2);
+        assert_eq!(
+            report.exceptions[0]["ends_mm"],
+            json!([[0.0, 0.0], [3.0, -2.5]])
+        );
+        assert_eq!(net_row(&report, "VBUS")["routed_mm"], 5.5);
+        // In upper case, sloped, and joined end to end with a plain path:
+        // x + y = 0, y = x, x = 3 mm and y = 6 mm meet at (0, 0), (3, 3) and
+        // (3, 6) mm.
+        let ses = one_net("(wire (POLYLINE_PATH F.Cu 2000 -100 100 100 -100 0 0 100 100 30000 0 30000 100 0 60000 100 60000)) (wire (path F.Cu 2000 30000 60000 40000 60000))");
+        let report = intent_width_report(&manifest(), &ses).unwrap();
+        assert_eq!(report.exceptions_total, 1, "one stretch");
+        // 3 * sqrt(2) + 3 + 1 mm.
+        assert_eq!(report.exceptions[0]["length_mm"], 8.243);
+        assert_eq!(
+            report.exceptions[0]["ends_mm"],
+            json!([[0.0, 0.0], [4.0, -6.0]])
+        );
+        // Lines that are not whole, or fewer than three, are not a polyline.
+        for values in ["0 0 0 10 0 0 10 0", "0 0 0 10 0 0 10 0 10 0 10", "0 0", ""] {
+            let ses = one_net(&format!("(wire (polyline_path F.Cu 2000 {values}))"));
+            let error = intent_width_report(&manifest(), &ses).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("three whole lines"),
+                "{values:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wire_that_cannot_be_measured_is_named_never_skipped() {
+        for (body, form, width) in [
+            ("(wire (polygon F.Cu 0 0 0 10 10 0 10))", "polygon", None),
+            ("(wire (rect F.Cu 0 0 10 10))", "rect", None),
+            ("(wire (circle F.Cu 100))", "circle", None),
+            ("(wire (POLYGON F.Cu 0 0 0 10 10 0 10))", "polygon", None),
+            ("(wire (blob 1 2))", "blob", None),
+            ("(wire)", "none", None),
+            ("(wire (net VBUS) (type route))", "none", None),
+            // The second and third lines never meet.
+            (
+                "(wire (polyline_path F.Cu 2000 0 0 0 10 0 0 10 0 0 5 10 5))",
+                "polyline_path",
+                Some(0.2),
+            ),
+        ] {
+            let report = intent_width_report(&manifest(), &one_net(body)).unwrap();
+            assert_eq!(report.unmeasured_total, 1, "{body}");
+            assert_eq!(report.unmeasured.len(), 1, "{body}");
+            let row = &report.unmeasured[0];
+            assert_eq!(row["net"], "VBUS", "{body}");
+            assert_eq!(row["form"], form, "{body}");
+            assert_eq!(row["width_mm"].as_f64(), width, "{body}");
+            assert!(row["reason"].as_str().unwrap().len() > 10, "{body}");
+            assert_eq!(net_row(&report, "VBUS")["unmeasured_wires"], 1, "{body}");
+            assert_eq!(net_row(&report, "VAUX")["unmeasured_wires"], 0, "{body}");
+            assert_eq!(report.exceptions_total, 0, "{body}");
+        }
+        // What can be measured beside it still is.
+        let ses = one_net("(wire (path F.Cu 2000 0 0 10000 0) (polygon F.Cu 0 0 0 10 10 0 10)) (wire (path F.Cu 10000 0 0 0 10000))");
+        let report = intent_width_report(&manifest(), &ses).unwrap();
+        assert_eq!(report.exceptions_total, 1);
+        assert_eq!(report.unmeasured_total, 1);
+        assert_eq!(report.unmeasured[0]["form"], "polygon");
+        let row = net_row(&report, "VBUS");
+        assert_eq!(row["routed_mm"], 2.0);
+        assert_eq!(row["unmeasured_wires"], 1);
+        // What a wire may carry beside its shape is not a shape.
+        let ses = one_net("(wire (path F.Cu 10000 0 0 10000 0) (net VBUS) (type route) (clearance_class default))");
+        let report = intent_width_report(&manifest(), &ses).unwrap();
+        assert_eq!(report.unmeasured_total, 0);
+        // A net that is not judged is not this report's.
+        let other = "(session b (routes (resolution um 10) (network_out (net SIG (wire (polygon F.Cu 0 0 0 10 10 0 10))))))";
+        let report = intent_width_report(&manifest(), other).unwrap();
+        assert_eq!(report.unmeasured_total, 0);
+        assert!(report.unmeasured.is_empty());
+    }
+
+    #[test]
+    fn the_unmeasured_list_is_capped_and_the_count_is_not() {
+        let body = "(wire (polygon F.Cu 0 0 0 10 10 0 10))".repeat(MAX_WIDTH_EXCEPTIONS + 5);
+        let report = intent_width_report(&manifest(), &one_net(&body)).unwrap();
+        assert_eq!(report.unmeasured_total, MAX_WIDTH_EXCEPTIONS + 5);
+        assert_eq!(report.unmeasured.len(), MAX_WIDTH_EXCEPTIONS);
+        assert_eq!(
+            net_row(&report, "VBUS")["unmeasured_wires"],
+            MAX_WIDTH_EXCEPTIONS + 5
+        );
+        // A shape's name comes back bounded.
+        let long = format!("(wire ({} 1 2))", "x".repeat(500));
+        let report = intent_width_report(&manifest(), &one_net(&long)).unwrap();
+        assert_eq!(report.unmeasured[0]["form"].as_str().unwrap().len(), 40);
+    }
+
+    /// Review A, N1: the half micrometre is a rule, not rounding noise. For
+    /// every whole-micrometre intent width from 0.1 to 3.0 mm, a wire exactly
+    /// half a micrometre below it is at width, and one a tenth of a
+    /// micrometre narrower is not.
+    #[test]
+    fn the_half_micrometre_holds_at_every_intent_width() {
+        for intent_um in 100..=3000i64 {
+            let manifest = json!({ "intent_widths": [
+                { "net": "VBUS", "from_mm": 0.1, "to_mm": intent_um as f64 / 1000.0, "status": "widened" }
+            ] });
+            for (units, listed) in [(intent_um * 10 - 5, 0), (intent_um * 10 - 6, 1)] {
+                let ses = one_net(&format!("(wire (path F.Cu {units} 0 0 10000 0))"));
+                let report = intent_width_report(&manifest, &ses).unwrap();
+                assert_eq!(
+                    report.exceptions_total, listed,
+                    "intent {intent_um} um, a wire of {units} tenths of a micrometre"
+                );
+            }
+        }
+    }
+
+    /// Review A, N3: a number too large to work with is an error (the status
+    /// is then `unverified`), never a `null` beside a "complete".
+    #[test]
+    fn numbers_too_large_to_measure_are_an_error() {
+        for body in [
+            "(wire (path F.Cu 2000 -1e308 0 1e308 0))",
+            "(wire (qarc F.Cu 2000 -1e308 0 1e308 0 0 1e308))",
+            "(wire (polyline_path F.Cu 2000 0 0 0 1 -1e308 0 1e308 1 1e308 0 1e308 1 -1e308 1e308 1e308 -1e308))",
+        ] {
+            let error = intent_width_report(&manifest(), &one_net(body)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("too large to measure"),
+                "{body}: {error:#}"
+            );
+        }
+        // A resolution that nothing can be scaled by.
+        let tiny = "(session b (routes (resolution um 1e-320) (network_out (net VBUS (wire (path F.Cu 2000 0 0 10 10))))))";
+        let error = intent_width_report(&manifest(), tiny).unwrap_err();
+        assert!(format!("{error:#}").contains("resolution"), "{error:#}");
+        // A narrow path of no length is still listed: naming too much is the
+        // safe side.
+        let dot = one_net("(wire (path F.Cu 2000 500 500 500 500))");
+        let report = intent_width_report(&manifest(), &dot).unwrap();
+        assert_eq!(report.exceptions_total, 1);
+        assert_eq!(report.exceptions[0]["length_mm"], 0.0);
+    }
+
+    #[test]
+    fn a_session_in_another_unit_is_measured_in_millimetres() {
+        // 1000 units per millimetre.
+        let mm = "(session b (routes (resolution mm 1000) (network_out (net VBUS (wire (path F.Cu 200 0 0 2500 0))))))";
+        let report = intent_width_report(&manifest(), mm).unwrap();
+        assert_eq!(report.exceptions[0]["width_mm"], 0.2);
+        assert_eq!(report.exceptions[0]["length_mm"], 2.5);
+        assert_eq!(
+            report.exceptions[0]["ends_mm"],
+            json!([[0.0, 0.0], [2.5, 0.0]])
+        );
+        // Ten units per mil: 8 mil wide, 100 mil long.
+        let mil = "(session b (routes (resolution MIL 10) (network_out (net VBUS (wire (path F.Cu 80 0 0 1000 0))))))";
+        let report = intent_width_report(&manifest(), mil).unwrap();
+        assert_eq!(report.exceptions[0]["width_mm"], 0.203);
+        assert_eq!(report.exceptions[0]["length_mm"], 2.54);
+    }
+
+    /// Review A, M1: a cut or odd session is an error, never a panic.
+    #[test]
+    fn a_cut_or_odd_session_is_an_error_never_a_panic() {
+        let whole = "(session \u{dc}bung (routes (resolution um 10) (network_out (net VBUS (wire (path \u{d6}.Cu 2000 0 0 10000 0)) (wire (polyline_path F.Cu 2000 0 -100 0 100 0 0 30000 0 30000 -100 30000 100)) (wire (qarc F.Cu 2000 10000 0 0 10000 0 0)) (wire (polygon F.Cu 0 0 0 10 10 0 10)) (via v 0 0)) (net \"\u{3a9} \u{5d0}\" (wire (path F.Cu 2000 0 0 10 10))))))";
+        assert!(intent_width_report(&manifest(), whole).is_ok());
+        for end in (0..whole.len()).filter(|end| whole.is_char_boundary(*end)) {
+            assert!(
+                intent_width_report(&manifest(), &whole[..end]).is_err(),
+                "{end}"
+            );
+        }
+        for odd in [
+            "",
+            "(",
+            ")",
+            "\"",
+            "\u{e9}",
+            "(session)",
+            "(session b (routes))",
+            "(session b (routes (resolution)))",
+            "(session b (routes (resolution um)))",
+            "(session b (routes (resolution um 10) (network_out (net))))",
+            "(session b (routes (resolution um 10) (network_out (net VBUS (wire (path))))))",
+            "(session b (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu))))))",
+            "(session b (routes (resolution um 10) (network_out (net VBUS (wire (qarc F.Cu 1))))))",
+            "(session b (routes (resolution um 10) (network_out (net VBUS (wire (polyline_path (x) 1))))))",
+            "(session b (routes (resolution um 10) (network_out (net VBUS (wire ((path) 1))))))",
+        ] {
+            let _ = intent_width_report(&manifest(), odd);
+        }
+        // And a manifest of any shape.
+        for manifest in [
+            json!(null),
+            json!([]),
+            json!({ "intent_widths": 3 }),
+            json!({ "intent_widths": [3, null, [], { "net": 3 }, { "net": "VBUS" },
+                { "net": "VBUS", "status": "widened" },
+                { "net": "VBUS", "status": "widened", "to_mm": "wide" },
+                { "net": "\u{e9}", "status": "widened", "to_mm": 1e308 }],
+                "layers": [3, { "dsn_name": 1 }, { "dsn_name": "F.Cu" }] }),
+        ] {
+            let _ = has_judged_net(&manifest);
+            let _ = intent_width_report(&manifest, whole);
+        }
     }
 }
