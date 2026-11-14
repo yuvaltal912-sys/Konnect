@@ -768,6 +768,18 @@ mod tests {
     }
 
     #[test]
+    fn a_corner_on_a_via_off_both_axes_is_left_out() {
+        let board = DsnBoard::parse(DSN).unwrap();
+        let corner = "(wire (path F.Cu 2000 60000 20000 70000 20000 70000 30000))";
+        let measured = |via: &str| {
+            let q = measure(&board, &ses(&format!("(net SIG {corner} {via})"))).unwrap();
+            (q.right_corners, q.acute_corners)
+        };
+        assert_eq!(measured("(via V 70000 20000)"), (0, 0));
+        assert_eq!(measured("(via V 70000 25000)"), (1, 0));
+    }
+
+    #[test]
     fn a_net_the_board_does_not_know_is_counted() {
         let board = DsnBoard::parse(DSN).unwrap();
         let q = measure(
