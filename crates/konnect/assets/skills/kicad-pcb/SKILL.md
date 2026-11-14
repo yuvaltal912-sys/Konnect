@@ -766,11 +766,14 @@ one-for-one exchange on an untouched net is not a new finding.
 
 Do not promise more than the planner does. It repairs pad-exit right angles and
 acute T-junctions with a straight trunk, and stitches where a safe position
-exists. Acute corners between two tracks, T-junctions with no straight trunk,
-a branch that already meets its trunk squarely (a slightly bent trunk can make
-the audit call that junction acute) and ground pads with no safe stitch
-position within the search radius stay in `blocked`; report them as remaining defects and fix them by ordinary routing if
-they matter. Treat these limits as blockers, not as
+exists. Acute corners between two tracks, T-junctions with no straight trunk
+and ground pads with no safe stitch position within the search radius stay in
+`blocked`; report them as remaining defects and fix them by ordinary routing if
+they matter. One leftover shows in neither the proposals nor `blocked`: a right
+angle that holds a track shorter than 10 µm is counted in `before.corners` but
+not proposed; report it as remaining too. A branch that meets its trunk squarely is not an acute corner,
+so the planner leaves it alone and reports nothing for it. Treat these limits
+as blockers, not as
 permission to relax rules or direct-edit the file. This tool neither certifies
 current capacity/thermal relief nor replaces the Freerouting failure policy.
 

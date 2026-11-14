@@ -525,7 +525,10 @@ cargo xtask freerouting-bench \
     audit reads them (konnect-core's `corner_reading`, row S7b): a piece
     shorter than 10 µm belongs to the junction it touches while the run stays
     within 20 µm, a junction is acute below 89°, and a right-angle corner is
-    two legs at 89° to 91°; junctions on pins and vias are left out. Before row
+    two legs at 89° to 91°. A junction is left out only when every leg ends at
+    a via's centre or within about 0.01 mm of a pin's centre; the audit uses
+    the pad and via copper itself, so a corner whose leg ends a few µm off a
+    via centre can count here and not in 5.3. Before row
     S7b the bench read every piece's direction, counted each gap of a junction,
     and used below 89.5° and 90 ± 0.5°, so its older reports are not comparable.
   - tracks (unique segments) and narrow segments (below their net class's

@@ -18,10 +18,10 @@ function (`corner_reading::read_junctions`):
   leg drawn in pieces) is real copper and is read piece by piece, every piece
   a leg. Whether a track is shorter than 10 um is decided in whole nanometres,
   so a track of exactly 10 um is a leg wherever it lies. Freerouting leaves
-  such tracks while it routes, from 0.1 um up to 9.6 um on a diagonal, each
-  run within 9 um on the measured boards: its 45-degree corner smoothing stops
-  0.1 um short of the next corner, and it snaps wire ends to via and pad
-  centres. The audit used to read their direction, so a 135-degree bend with a
+  such tracks while it routes: in a router trial they were 0.1 um up to 9.6 um
+  long (the longest on a diagonal), and on the seven measured boards each run
+  of them spans at most 9 um. Its 45-degree corner smoothing stops 0.1 um short
+  of the next corner, and it snaps wire ends to via and pad centres. The audit used to read their direction, so a 135-degree bend with a
   0.1-um track at its vertex counted as a 45-degree acid trap.
 - A corner is acute only below 89 degrees, the lower edge of the audit's own
   right-angle band (89 to 91 degrees). A junction at 89.97 degrees used to count
@@ -38,7 +38,7 @@ Each caller and what changed for it:
 | `run_design_review` | Its manufacturing part reads the acid-trap check above |
 | `audit_layout_quality` 5.3 findings | An acute finding states `minimum_interior_angle_deg: 89`, the rule applied (it said 90) |
 | `audit_manufacturing` issue text | The angle is shown in whole degrees rounded down, so a trap at 88.99 degrees reads 88, not 89 |
-| `plan_route_refinement` | `before.corners` is the corrected 5.3 count. `t_junction` lists only junctions the corrected check counts: a branch between 89 and 90 degrees from its trunk is no longer a target (before, one 0.17 degrees off square was repaired). Its 0.06-degree guard is unchanged and no longer reached. `chamfer` reads its right-angle rows from the corrected scan, leaving out a right angle that holds a track under 10 um: it reads one key and could only block it, and 5.3 still counts it. On PR #63's 11 staged cases the three kinds plan the same repairs as before |
+| `plan_route_refinement` | `before.corners` is the corrected 5.3 count. `t_junction` lists only junctions the corrected check counts: a branch between 89 and 90 degrees from its trunk is no longer a target (before, one 0.17 degrees off square was repaired). Its 0.06-degree guard is unchanged and no longer reached. `chamfer` reads its right-angle rows from the corrected scan, leaving out a right angle that holds a track under 10 um: it reads one key and could only block it. 5.3 still counts such a right angle, and it is neither proposed nor in `blocked`. On PR #63's 11 staged cases the three kinds plan the same repairs as before, and `coverage.blocked_total` is lower, because the corners only the old reading counted make no rows |
 | routing bench (`cargo xtask freerouting-bench`) | Its own acute and right-angle counts on the SES use the same function; before, it read every piece's direction, counted each gap of a junction and used 89.5 and 90 +/- 0.5 degrees, so its reports before and after this change are not comparable |
 
 What it does to existing boards (the seven routed boards PR #63 was measured
@@ -283,9 +283,11 @@ propose. Right-angle corners fell to 1–6 per board, but 3–8 acute corners pe
 board remained by the audit's reading of that time (0–1 under the corrected
 reading of row S7b): an acute corner between two tracks, an acute T with no straight
 trunk, a branch shorter than the setback and a junction of four track ends are
-outside the three proposal kinds. A branch that already meets either leg of its
-trunk within 0.06 degrees of a right angle is left alone and reported, even where a slightly
-bent trunk makes the audit count the junction as acute. On three of the boards
+outside the three proposal kinds. A branch that meets either leg of its trunk
+within 0.06 degrees of a right angle is not acute under the corrected reading
+(the trunk itself is straight within 0.1 degree), so `t_junction` makes no row
+for it and reports nothing; #63's 0.06-degree guard can no longer be reached.
+On three of the boards
 95–96 % of ground pads ended in the main ground group, not all: the rest had no
 safe stitching position within the search radius. Such findings stay in
 `blocked`. The audit's acid-trap check does not examine a track end that lands
