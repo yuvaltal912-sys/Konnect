@@ -690,7 +690,8 @@ fn every_conduction_area_form_of_a_dsn_counts_as_a_plane() {
         "(pcb board (structure (plane GND {}",
         "(polygon B.Cu 0 1 2 ".repeat(1000)
     );
-    let error = dsn_planes(&broken).unwrap_err().to_string();
+    // The whole error chain, as `completion.reason` shows it.
+    let error = format!("{:#}", dsn_planes(&broken).unwrap_err());
     assert!(error.len() < 80 && !error.contains("polygon"), "{error}");
     assert!(dsn_planes("(session board)").is_err());
 }
