@@ -56,7 +56,8 @@ fn judged_nets(manifest: &Value) -> Vec<(String, Judged)> {
                 "already_wide_enough" => (row["needed_mm"].as_f64()?, "already_wide_enough"),
                 _ => return None,
             };
-            (width.is_finite() && width > 0.0).then_some((
+            // A JSON number is always finite; a width of 0 or less is no width.
+            (width > 0.0).then_some((
                 net,
                 Judged {
                     intent_mm: width,
@@ -563,6 +564,47 @@ mod tests {
         let report = intent_width_report(&manifest, ses).unwrap();
         assert_eq!(report.exceptions[0]["layers"], json!(["In1.Cu"]));
         assert_eq!(report.exceptions[0]["length_mm"], 1.571);
+    }
+
+    #[test]
+    fn a_recorded_width_of_zero_or_less_is_no_width() {
+        for width in [0.0, -1.0] {
+            let manifest = json!({ "intent_widths": [
+                { "net": "VBUS", "from_mm": 0.2, "to_mm": width, "status": "widened" },
+                { "net": "VAUX", "width_mm": 0.5, "needed_mm": width, "status": "already_wide_enough" }
+            ] });
+            assert!(!has_judged_net(&manifest), "{width}");
+        }
+    }
+
+    #[test]
+    fn an_arc_is_measured_wherever_its_centre_is() {
+        // A quarter arc of radius 1 mm about (0.5, 0.5) mm, from a point off
+        // both axes: every term of the radius and of the chord counts.
+        let ses = "(session b (routes (resolution um 10) (network_out (net VBUS (wire (qarc F.Cu 2000 11000 13000 -3000 11000 5000 5000))))))";
+        let report = intent_width_report(&manifest(), ses).unwrap();
+        assert_eq!(report.exceptions[0]["length_mm"], 1.571);
+        // An arc whose start is its centre has no radius: its chord is its length.
+        let ses = "(session b (routes (resolution um 10) (network_out (net VBUS (wire (qarc F.Cu 2000 0 0 10000 0 0 0))))))";
+        let report = intent_width_report(&manifest(), ses).unwrap();
+        assert_eq!(report.exceptions[0]["length_mm"], 1.0);
+    }
+
+    #[test]
+    fn a_path_needs_two_whole_points() {
+        let path = |values: &str| {
+            format!("(session b (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 2000 {values}))))))")
+        };
+        // One point; two points and a half; no point at all.
+        for values in ["0 0", "0 0 10 10 20", "0", ""] {
+            let error = intent_width_report(&manifest(), &path(values)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("complete point pairs"),
+                "{values:?}: {error:#}"
+            );
+        }
+        assert!(intent_width_report(&manifest(), &path("0 0 10 10")).is_ok());
+        assert!(intent_width_report(&manifest(), &path("0 0 10 10 20 20")).is_ok());
     }
 
     #[test]

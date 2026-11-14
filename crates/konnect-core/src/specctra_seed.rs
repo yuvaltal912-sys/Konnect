@@ -83,7 +83,9 @@ fn token(node: &SexpNode) -> Result<String> {
 fn dsn_number(value: f64) -> String {
     let text = format!("{value:.4}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
-    if text.is_empty() || text == "-0" {
+    // "-0.0000" trims to "-0"; nothing trims to an empty text, because the
+    // digit before the point stays.
+    if text == "-0" {
         "0".to_string()
     } else {
         text.to_string()
@@ -279,7 +281,8 @@ pub(crate) fn seed_dsn(dsn: &str, ses: &str) -> Result<Seeded> {
                 }
                 for path in lists(wire, "path") {
                     let children = path.children().unwrap_or(&[]);
-                    if children.len() < 7 || (children.len() - 3) % 2 != 0 {
+                    // The head, a layer, a width and whole points: an odd count.
+                    if children.len() < 7 || children.len().is_multiple_of(2) {
                         bail!("a session path on net '{name}' does not hold complete point pairs");
                     }
                     let layer = atom(path, 1, "a session path's layer")?;
@@ -406,6 +409,8 @@ mod tests {
         assert!(seeded
             .dsn
             .ends_with("      (net \"A (odd) net\")\n    )\n  )\n)\n"));
+        // The seed went into the scope that was there, not into a second one.
+        assert_eq!(seeded.dsn.matches("(wiring").count(), 1, "{}", seeded.dsn);
     }
 
     #[test]
@@ -445,6 +450,28 @@ mod tests {
             "{}",
             seeded.dsn
         );
+        // Mils and inches: 25.4 um and 25400 um.
+        let ses = "(session b (routes (resolution mil 10) (network_out (net VBUS (wire (path F.Cu 100 0 0 1000 -500))))))";
+        assert!(seed_dsn(DSN, ses)
+            .unwrap()
+            .dsn
+            .contains("(path F.Cu 254 0 0 2540 -1270)"));
+        let ses = "(session b (routes (resolution inch 1000) (network_out (net VBUS (wire (path F.Cu 10 0 0 100 -50))))))";
+        assert!(seed_dsn(DSN, ses)
+            .unwrap()
+            .dsn
+            .contains("(path F.Cu 254 0 0 2540 -1270)"));
+        let inches = DSN.replace("(unit um)", "(unit inch)");
+        assert!(seed_dsn(&inches, ses)
+            .unwrap()
+            .dsn
+            .contains("(path F.Cu 0.01 0 0 0.1 -0.05)"));
+        // A value that rounds to nothing is written as 0, never "-0".
+        let ses = "(session b (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 2000 -0.0001 0 3000 -0))))))";
+        assert!(seed_dsn(DSN, ses)
+            .unwrap()
+            .dsn
+            .contains("(path F.Cu 200 0 0 300 0)"));
         // A session at one unit per micrometre is copied as it is.
         let ses = "(session b (routes (resolution um 1) (network_out (net VBUS (wire (path F.Cu 1000 0 0 3000 -2500))))))";
         assert!(seed_dsn(DSN, ses)
@@ -495,6 +522,10 @@ mod tests {
                 "complete point pairs",
             ),
             (
+                "(net VBUS (wire (path F.Cu 2000 0 0 10 10 20)))",
+                "complete point pairs",
+            ),
+            (
                 "(net VBUS (wire (path F.Cu wide 0 0 10 10)))",
                 "not a number",
             ),
@@ -531,6 +562,38 @@ mod tests {
             let error = seed_dsn(&dsn, SES).unwrap_err();
             assert!(format!("{error:#}").contains(needle), "{needle}: {error:#}");
         }
+    }
+
+    #[test]
+    fn a_name_that_holds_a_quote_is_refused_not_written() {
+        // A DSN has no escape inside a quoted token, so such a name cannot
+        // be written back.
+        let dsn = DSN.replace("\"A (odd) net\"", "\"A\\\"B\"");
+        let ses = SES.replace("\"A (odd) net\"", "\"A\\\"B\"");
+        let error = seed_dsn(&dsn, &ses).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("holds a quote character"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_wiring_scope_is_found_whatever_follows_its_name() {
+        for (text, close) in [
+            ("(pcb b (structure)(wiring(wire x)))", 33),
+            ("(pcb b (wiring))", 14),
+            ("(pcb b (wiring\n(wire x)))", 23),
+            ("(pcb b (wiring\t(wire x)))", 23),
+        ] {
+            let ends = dsn_ends(text).unwrap();
+            assert_eq!(ends.wiring_close, Some(close), "{text:?}");
+            assert_eq!(&text[close..close + 1], ")");
+        }
+        // A scope whose name only starts with the word is not the wiring.
+        assert_eq!(
+            dsn_ends("(pcb b (wiring_rules x))").unwrap().wiring_close,
+            None
+        );
     }
 
     #[test]

@@ -3850,6 +3850,8 @@ pub(crate) struct HoldPlan {
     /// Why there is no floor width, when there is none.
     pub no_floor_reason: Option<String>,
     pub fallback: WidthFallback,
+    /// No later pass starts with less of the call's time left than this.
+    pub least_pass_time: std::time::Duration,
 }
 
 /// The result of a width-first call: every pass that ran or was skipped, and
@@ -3866,13 +3868,7 @@ pub(crate) struct HoldOutcome {
 
 /// The shortest time worth starting a pass with: the least `route_local`
 /// accepts as its overall timeout.
-fn least_pass_time() -> std::time::Duration {
-    if cfg!(test) {
-        std::time::Duration::from_millis(1)
-    } else {
-        std::time::Duration::from_secs(10)
-    }
-}
+const LEAST_PASS_TIME: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The one rule of every pass list: Freerouting's retry is never on while
 /// its optimizer is on. The optimizer lays narrowed retries of its own on
@@ -3963,6 +3959,7 @@ async fn route_held(
         floor_retry_um: hints.retry_width_um.map(|um| um as f64),
         no_floor_reason: hints.retry_off_reason.map(str::to_string),
         fallback,
+        least_pass_time: LEAST_PASS_TIME,
     };
     let outcome = hold_widths(
         |dsn, ses, settings| {
@@ -4088,7 +4085,7 @@ where
                 .base
                 .overall_timeout
                 .checked_sub(started.elapsed())
-                .filter(|left| *left >= least_pass_time());
+                .filter(|left| *left >= plan.least_pass_time);
             if let Some(left) = left {
                 settings.overall_timeout = left;
             }
@@ -4488,6 +4485,7 @@ mod hold_widths_tests {
             floor_retry_um: Some(200.0),
             no_floor_reason: None,
             fallback: WidthFallback::Floor,
+            least_pass_time: std::time::Duration::from_millis(1),
         };
         plan_edit(&mut plan);
         let script = Arc::new(Script {
@@ -5029,6 +5027,30 @@ mod hold_widths_tests {
         let left = run.calls[1].settings.overall_timeout.as_millis();
         assert!(left <= 60_000 - 120 && left > 50_000, "{left}");
         assert!(run.ok().elapsed_seconds >= 0.12);
+        // Time is left, but less than a pass is worth starting with.
+        let run = go_with(
+            |plan| plan.least_pass_time = std::time::Duration::from_secs(3600),
+            vec![routed(session(10000, false), 5, 3)],
+        )
+        .await;
+        assert_eq!(run.calls.len(), 1);
+        assert_eq!(run.ok().stopped_in, Some("fallback"));
+        assert!(run.pass("fallback")["reason"]
+            .as_str()
+            .unwrap()
+            .contains("before this pass could start"));
+    }
+
+    #[test]
+    fn a_pass_rows_reason_is_bounded() {
+        let row = super::pass_row("fallback", "failed", Some("x".repeat(5000)));
+        assert_eq!(
+            row["reason"].as_str().unwrap().len(),
+            4 * super::MAX_REASON_DETAIL
+        );
+        let row = super::pass_row("fallback", "failed", Some("short".into()));
+        assert_eq!(row["reason"], "short");
+        assert!(super::pass_row("full", "kept", None)["reason"].is_null());
     }
 }
 
@@ -6906,7 +6928,7 @@ done
             &java,
             "held",
             hold_manifest(),
-            json!({ "width_policy": "hold" }),
+            json!({ "width_policy": "hold", "width_fallback": "floor" }),
         )
         .await
         .unwrap();
@@ -6991,6 +7013,18 @@ done
         }
         assert_eq!(passes[1]["seeded"]["wires"], 1);
         assert_eq!(passes[2]["seeded"]["wires"], 2);
+        // `elapsed_seconds` is the whole call, not the last job.
+        let jobs: f64 = passes
+            .iter()
+            .map(|pass| pass["elapsed_seconds"].as_f64().unwrap())
+            .sum();
+        assert!(passes
+            .iter()
+            .all(|pass| pass["elapsed_seconds"].as_f64().unwrap() > 0.0));
+        assert!(
+            result["elapsed_seconds"].as_f64().unwrap() >= jobs,
+            "{result}"
+        );
     }
 
     /// With the retry off the Full pass completes: one job, at full width.
@@ -7129,12 +7163,16 @@ done
     #[tokio::test]
     async fn hold_that_runs_out_of_time_returns_the_earlier_session_as_stopped() {
         let dir = tempfile::tempdir().unwrap();
-        let mut slow = staged(200.0, false, 1, 0, hold_session(Some(2000), 50000));
-        slow.run_seconds = 5;
+        // The Full pass leaves less than the ten seconds a pass is worth
+        // starting with, so the Fallback, which would have completed, never
+        // starts.
         let java = staged_java(
             dir.path(),
             "slow",
-            &[staged(0.0, true, 2, 1, hold_session(None, 50000)), slow],
+            &[
+                staged(0.0, true, 2, 1, hold_session(None, 50000)),
+                staged(200.0, false, 1, 0, hold_session(Some(2000), 50000)),
+            ],
         );
         let result = body(
             &route_hold(
@@ -7142,7 +7180,7 @@ done
                 &java,
                 "slow",
                 hold_manifest(),
-                json!({ "width_policy": "hold", "overall_timeout_seconds": 2 }),
+                json!({ "width_policy": "hold", "overall_timeout_seconds": 8 }),
             )
             .await
             .unwrap(),
@@ -7150,6 +7188,11 @@ done
         assert_eq!(result["status"], "stopped", "{result}");
         assert_eq!(result["result_pass"], "full");
         assert_eq!(result["passes"][1]["outcome"], "stopped");
+        assert!(result["passes"][1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("before this pass could start"));
+        assert!(!dir.path().join("slow.job2.sent").exists());
         assert!(result["completion"]["reason"]
             .as_str()
             .unwrap()
