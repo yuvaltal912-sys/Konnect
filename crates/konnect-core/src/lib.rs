@@ -5,6 +5,7 @@ pub(crate) mod freerouting_mcp;
 pub(crate) mod freerouting_setup;
 pub mod gates;
 pub mod guidance;
+pub(crate) mod intent_width_report;
 pub mod kicad_install;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;
@@ -15,6 +16,7 @@ pub(crate) mod routing_context;
 pub(crate) mod runtime_info;
 pub mod simulation;
 pub(crate) mod specctra;
+pub(crate) mod specctra_seed;
 pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;

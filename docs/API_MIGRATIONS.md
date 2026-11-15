@@ -3,6 +3,123 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: width-first routing
+
+Creation row S9 (`docs/CREATION_HANDOFF.md`). Additive: no default changes,
+and a call that passes no new argument routes exactly as before.
+
+- **`route_specctra_dsn` reports track below intent width.** Always on.
+  - `intent_widths`: one row per net the export recorded a width for (the
+    manifest's `intent_widths`, status `widened` or `already_wide_enough`):
+    `net`, `intent_width_mm`, `basis`, `routed_mm`, `below_intent_mm`,
+    `below_intent_share`, `longest_below_intent_mm`, `narrowest_width_mm`,
+    `stretches_below_intent`, `unmeasured_wires`. A net that owns a pour and
+    kept its class width is not judged.
+  - `width_exceptions`: each stretch of track below its net's intent width:
+    `net`, `intent_width_mm`, `width_mm` (the narrowest in the stretch),
+    `length_mm`, `layers`, `ends_mm` (board coordinates). Longest first, at
+    most 100; `width_exceptions_total` is the count of all of them.
+  - What is measured: a wire given as a `path`, a `polyline_path` or a
+    `qarc`, with keywords in any letter case and the session in `um`, `mm`,
+    `mil` or `inch`. A wire up to and including half a micrometre below the
+    intent width is at width (the importer's own allowance); anything
+    narrower is listed.
+  - What a stretch is: narrow wires that share an end point, on any layer
+    (no via is looked for). A narrow wire that ends in the middle of another
+    one (a T) is a stretch of its own, so `longest_below_intent_mm` can be
+    shorter than the narrow copper that hangs together there. Copper the
+    board already held locked is not in a session and is not judged.
+  - `width_unmeasured` and `width_unmeasured_total`, present only when there
+    is one: each wire of such a net that could not be measured (an area
+    shape, a wire with no shape, a polyline whose lines do not meet): `net`,
+    `form`, `reason`, and `width_mm` when the wire states one. At most 100
+    rows. `status` is then never a "complete" one, because what is below
+    intent width is not fully known: it is `unverified`, or `incomplete`
+    when connections are open, or `stopped` when the time ran out.
+  - Both are read from the session's own geometry. With no manifest, or one
+    that names no such net, the session is not read and the three fields are
+    empty (`[]`, `[]`, `0`); nothing else in the result changes.
+  - If such a net exists and the session cannot be read for widths, the
+    routing stands, `width_report_error` says why, and `status` is
+    `unverified`.
+- **Two new `status` values.** `complete_with_width_exceptions`: Freerouting
+  left nothing, was given no pour as a plane, and `width_exceptions` is not
+  empty. `stopped`: under `width_policy: "hold"`, the call's time ran out
+  before a later pass could start or while it ran; the session is the one an
+  earlier pass finished, `completion.reason` names the pass and its row in
+  `passes` says which of the two. The existing values keep their meaning.
+  With a plane the status is still never a "complete" one: it stays
+  `unverified`, with the exceptions listed beside it. A caller that tested
+  `status == "complete"` now sees `complete_with_width_exceptions` where a
+  net with a recorded current was narrowed; before, that was `complete`.
+- **New argument `width_policy`**: `"retry"` (default) or `"hold"`.
+  - `"retry"` is the single run as before: a connection that fails at its
+    width is retried at the nets' common floor width, and Freerouting's
+    optimizer may re-lay other connections at that width too.
+  - `"hold"` runs up to three Freerouting jobs. Full: every net, the retry
+    off (`neck_width_um` 0), the optimizer as `optimizer_enabled` says. Only
+    if Full leaves connections open, Fallback: started from Full's session,
+    the retry at the floor width, the optimizer off. Only if Fallback
+    completes, Polish: started from Fallback's session, the retry off, the
+    optimizer on. The retry is never sent with the optimizer on.
+  - What `"hold"` guarantees, and what it does not. The Full pass has the
+    retry off, so with `allow_neckdown` off (the default) it narrows nothing.
+    With `allow_neckdown` on, Freerouting may neck a track down at a pin in
+    that pass too, and `width_exceptions` lists such a stretch like any
+    other. A Fallback has the retry on over wiring
+    Freerouting may move: it can re-lay at the floor width a connection the
+    Full pass had laid at width, not only the ones that were open. Nothing
+    checks which connections a Fallback narrowed; `width_exceptions`, read
+    from the final session, is the authority on what ended narrow.
+  - A later pass starts from a scratch copy of the DSN that holds the
+    earlier session as ordinary wiring (never fixed). Its session becomes the
+    result only if its log shows it started with exactly the unrouted count
+    the pass before ended with, it holds every seeded net and no typed item,
+    and it ended as it must: the Fallback with fewer open connections than it
+    started with (one that closes nothing is discarded, since all it could
+    have done is narrow track), the Polish with none. Otherwise the earlier
+    session stays the result and the pass's row says why (`discarded`,
+    `failed` or `stopped`).
+  - With no net with a recorded width in the manifest there is nothing to
+    hold: the single run is made and `width_policy.applied` is `"retry"`.
+- **New argument `width_fallback`**: `"floor"` (default) or `"none"`. With
+  `"hold"`, `"none"` skips the Fallback and leaves the open connections open
+  (`incomplete`). The Fallback is also skipped when the nets' floors differ,
+  as the single run's retry is (`rules_applied.retry_off_reason`). Without
+  `"hold"` the argument is not used, and the result says so
+  (`width_policy.fallback` is `"unused"`).
+- **New result fields.** `width_policy` (`requested`, `applied`,
+  `fallback`, and a `reason` when not applied) is in the result when
+  `"hold"` was asked for, and also when `width_fallback` was given without
+  it (`applied` is then `"retry"` and `fallback` is `"unused"`). Under
+  `"hold"` only: `passes` (per
+  pass: `name`, `outcome` of `kept`, `discarded`, `failed`, `stopped` or
+  `skipped`, a `reason`, `retry_width_um`, `optimizer_enabled`, `seeded`
+  counts, `unrouted_at_start`, `router_unrouted`, `effective_settings`,
+  `optimizer`, `elapsed_seconds`, `job_id`, `artifacts`, which names only
+  files that exist: a pass that never started wrote none); `result_pass`;
+  `artifacts.passes_folder`. The top-level `effective_settings`, `optimizer`,
+  `job_id` and `completion.router_unrouted` are those of the pass whose
+  session is the result; `elapsed_seconds` is the whole call.
+  `rules_applied.retry_width_um` stays the one floor width (what a Fallback
+  retries at); what each pass was sent is in its row.
+- **The plane fallback routes with the same width arguments.** The
+  `route_specctra_dsn` step of `completion.if_still_open.fallback` repeats
+  the `width_policy` and `width_fallback` this call was given.
+- **Files.** Under `"hold"` each pass's DSN, session and Freerouting log are
+  kept in `<ses_output_path without .ses>.passes/`. The call is refused
+  before routing if that folder exists, as it is for an existing output.
+  A call that returns an error leaves no such folder, so the same call can
+  be made again: what the failed call wrote is moved to
+  `<that folder>.failed-N` (the first free N from 1 to 99, beside the
+  output; the error names it), and a folder with nothing in it is removed.
+  When all 99 names are taken, or the move itself fails, the folder is
+  removed with what it holds, and the error says so. A call that does not
+  return (the server is killed or crashes) leaves the folder: remove it
+  before calling again.
+- **`overall_timeout_seconds` covers the whole call**, every pass of it. A
+  pass is given only the time that is left.
+
 ## Unreleased: corrected acute-corner reading (row S7b)
 
 Behaviour change, by the owner's decision of 2026-11-13. The acid-trap check

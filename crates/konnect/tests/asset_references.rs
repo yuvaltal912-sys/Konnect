@@ -1019,6 +1019,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Result fields of `route_specctra_dsn` (`completion`).
         "next_steps",
         "complete_when",
+        // Result fields, a status and arguments of `route_specctra_dsn`
+        // (row S9, width-first routing).
+        "width_exceptions",
+        "complete_with_width_exceptions",
+        "width_policy",
+        "width_unmeasured",
     ];
 
     let mut phantom = Vec::new();
