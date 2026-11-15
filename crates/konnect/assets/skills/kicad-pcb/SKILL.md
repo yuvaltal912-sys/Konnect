@@ -360,7 +360,8 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    present such a routing as meeting the recorded currents. With the default
    `width_policy: 'retry'`, Freerouting may narrow any part of such a net to
    its base width. `width_policy: 'hold'` first routes with that retry off,
-   which narrows nothing; only if connections stay open does a second pass
+   which narrows nothing as long as `allow_neckdown` is off (the default);
+   only if connections stay open does a second pass
    retry at the base width, and that pass may narrow other track of such a
    net too. Either way `width_exceptions` is what says what ended narrow
    (`passes` lists what ran; it takes up to three routing jobs, and

@@ -497,14 +497,16 @@ for the owner's word.
 
 ## Row S9: width-first routing (PR #69)
 
-**State (2026-11-14).** Implemented on branch `claude/creation-s9-width-first`. The branch started from `fork/main` `89780cd` (the merge of #66) and has `fork/main` `6705cd2` (the merge of #68, row S7b's corrected corner reading) merged into it. Publication and merge go through [PR #69](https://github.com/yuvaltal912-sys/Konnect/pull/69); GitHub is the source of truth for its state, and the PR description holds the review, the measurement and the gate. The decisions are in the decision table ("S9 width-first design", "S9 pass list").
+**State (2026-11-15).** Implemented on branch `claude/creation-s9-width-first`. The branch started from `fork/main` `89780cd` (the merge of #66) and has `fork/main` `6705cd2` (the merge of #68, row S7b's corrected corner reading) merged into it. Publication and merge go through [PR #69](https://github.com/yuvaltal912-sys/Konnect/pull/69); GitHub is the source of truth for its state, and the PR description holds the review, the measurement and the gate. The decisions are in the decision table ("S9 width-first design", "S9 pass list").
 
-**First review (2026-11-14).** One must-fix and five should-fix findings, all fixed on the branch before the second review.
+**First review (2026-11-14).** One must-fix and six should-fix findings, all fixed on the branch before the second review.
 
 - Must-fix: seeding a later pass panicked on any character outside ASCII in a bare DSN token (a board file, net or pin named in Hebrew, or with `µ`), which would have ended the stdio server. The scan is now over bytes and every cut of input text is checked.
-- Should-fix: the width report skipped wire forms it did not measure; a Fallback that closed nothing was kept; the plane fallback's routing step dropped the width policy; two texts promised more than `hold` gives; a failed `hold` call blocked the same call. Each is described as it now behaves under "What it adds".
+- Should-fix: the width report skipped wire forms it did not measure; a Fallback that closed nothing was kept; the plane fallback's routing step dropped the width policy; two texts promised more than `hold` gives; a failed `hold` call blocked the same call; this handoff was stale. Each is described as it now behaves under "What it adds".
 - Owner's words on the scope (2026-11-14): first "תתקן בינתיים רק את מה שחובה ומה שבגדר ״כדאי״ תתעד" (fix only the must-fix for now and document the rest), then, on hearing that the other fixes were already written and tested, "Yes, include them".
 - Left from that review, with the reason for each, under "Known limits".
+
+**Second review (2026-11-15).** No must-fix; two should-fix findings and nine nits. The two findings and four of the nits were wrong or incomplete texts, corrected with no change to what the code does: when `width_policy` appears in a result; that "the Full pass narrows nothing" needs `allow_neckdown` off; what happens to a failed call's files; which statuses an unmeasured wire leaves; the count of the first review's findings. Two nits are reading limits, listed under "Known limits". Three concerned untracked records.
 
 **Next step.** The default: `width_policy` stays `"retry"` until the owner has seen this row's measurement and says to change it. Making `"hold"` the default for boards with recorded currents is then one line in `width_arguments` plus its test and docs. Raised for later, not built: widening a narrowed stretch in place, as a planner option.
 
@@ -515,20 +517,20 @@ for the owner's word.
   - `width_exceptions`: each stretch of track below its net's intent width (wires that share an end point), longest first, at most 100; `width_exceptions_total` counts all.
   - A net is judged when the export widened it or found it wide enough. A net that owns a pour is not judged.
   - With no such net the session is not read, and the result only gains the three fields, empty.
-  - Never silent: keywords are read in any letter case, and a wire is measured as a `path`, a `polyline_path` or a `qarc`. A wire of a judged net in any other form is listed in `width_unmeasured`, and the status is then `unverified`.
+  - Never silent: keywords are read in any letter case, and a wire is measured as a `path`, a `polyline_path` or a `qarc`. A wire of a judged net in any other form is listed in `width_unmeasured`, and the status is then never a `complete` one: `unverified`, or `incomplete` with open connections, or `stopped` when the time ran out.
   - A wire up to and including half a micrometre below the intent width is at width, compared in whole nanometres.
   - Code: `intent_width_report.rs`; `width_report` in `tools/integration.rs`.
 - **Two statuses.** `complete_with_width_exceptions`: the router left nothing, no plane, and some track is below its intent width. `stopped`: the time ran out before a later pass could start or while it ran. S6's rule stays: with a plane no "complete" status is returned. Both are added in `routing_status` and in `completion_report`, where S6's handoff said. A session that cannot be read for widths (`width_report_error`), or that holds a wire that cannot be measured (`width_unmeasured`), is never `complete` of either kind.
 - **`width_policy: "hold"`, opt-in.** The default `"retry"` is the single run as before.
   - Full: every net, the retry off, the optimizer on.
   - Fallback, only if Full leaves connections open: started from Full's session, the retry at the one floor width, the optimizer off. `width_fallback: "none"` skips it. It is kept only if it ends with fewer open connections than it started with.
-  - What `hold` guarantees: the Full pass narrows nothing. A Fallback may narrow any track, also track the Full pass laid at width; nothing checks which. `width_exceptions` is the authority on what ended narrow.
+  - What `hold` guarantees: with `allow_neckdown` off (the default), the Full pass narrows nothing. A Fallback may narrow any track, also track the Full pass laid at width; nothing checks which. `width_exceptions` is the authority on what ended narrow.
   - Polish, only if the Fallback completes: started from its session, the retry off, the optimizer on.
   - The retry is never sent with the optimizer on (`check_pass_rule`): the optimizer lays narrowed retries of its own on every net it touches.
   - A later pass starts from a scratch copy of the DSN that holds the earlier session as ordinary wiring, never fixed (`specctra_seed.rs`; the DSN's own bytes are kept and the items are inserted into its `wiring` scope).
   - A later pass's session becomes the result only if its log shows it started with exactly the unrouted count the pass before ended with, it holds every seeded net and no typed item, and it ended as it must (the Fallback with fewer open connections, the Polish with none). Otherwise the earlier session stays, and the pass's row in `passes` says why.
-  - `passes`, `result_pass`, `width_policy` and `artifacts.passes_folder` appear only when `hold` was asked for. The passes' files stay in `<output>.passes`.
-  - A call that fails leaves no `<output>.passes`: an empty folder is removed, one with files is moved to `<output>.passes.failed-N`, so the same call can be made again.
+  - `passes`, `result_pass` and `artifacts.passes_folder` appear only when `hold` was asked for. `width_policy` appears then, and also when `width_fallback` was given without `hold`, where it says the argument was not used. The passes' files stay in `<output>.passes`.
+  - A call that returns an error leaves no `<output>.passes`, so the same call can be made again: an empty folder is removed, one with files is moved to `<output>.passes.failed-N` (N from 1 to 99). When all 99 names are taken or the move fails, the folder is removed with its files, and the error says so. A call that is killed or crashes leaves the folder.
   - The plane fallback's routing step in `completion` repeats the caller's `width_policy` and `width_fallback`.
   - Code: `hold_widths`, `route_held` and `width_arguments` in `tools/integration.rs`; `router_unrouted_at_start` and the typed `OverallTimeout` in `freerouting_mcp.rs`.
 - **Docs.** `docs/API_MIGRATIONS.md` ("width-first routing"), `tool-directory.md`, and the `kicad-pcb` skill (step 3 reads `width_exceptions` and reports every row).
@@ -568,6 +570,9 @@ for the owner's word.
   - Net and layer names are compared as written, not folded to one case. Reason: KiCad's names are case-sensitive.
   - `konnect_sexp::parse_sexp` has no nesting limit, so a file nested hundreds of thousands deep ends the process. Reason: not new (the caller's DSN went through it before this row) and the fix belongs in `konnect-sexp`, outside this row's files: a follow-up.
   - A failure of the last step of a `hold` call (writing the output) goes through the same clean-up as a failed job, but only the failed-job case is run in a test.
+- Found by the second review, not changed:
+  - A session that holds a second `routes` or `resolution` scope is read by the first of each, with no error. Reason: Freerouting writes one of each and the SES importer refuses a second, so this needs a malformed file; refusing it is a logic change, left for a follow-up.
+  - In a session with coarse units (`mm`, `mil` or `inch` at a low resolution), a wire's ends are rounded to a whole session unit before wires are joined, so narrow wires that end within one unit of each other can be reported as one longer stretch. Reason: it errs toward a longer stretch, and Freerouting's own sessions (`um 10`) hold whole units and are not affected.
 
 ## Row S6, second half: per-zone pours and stitching after refill (PR #66)
 

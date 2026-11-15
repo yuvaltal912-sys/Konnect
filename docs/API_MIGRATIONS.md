@@ -33,8 +33,9 @@ and a call that passes no new argument routes exactly as before.
     is one: each wire of such a net that could not be measured (an area
     shape, a wire with no shape, a polyline whose lines do not meet): `net`,
     `form`, `reason`, and `width_mm` when the wire states one. At most 100
-    rows. `status` is then `unverified`, never a "complete" one, because
-    what is below intent width is not fully known.
+    rows. `status` is then never a "complete" one, because what is below
+    intent width is not fully known: it is `unverified`, or `incomplete`
+    when connections are open, or `stopped` when the time ran out.
   - Both are read from the session's own geometry. With no manifest, or one
     that names no such net, the session is not read and the three fields are
     empty (`[]`, `[]`, `0`); nothing else in the result changes.
@@ -62,7 +63,10 @@ and a call that passes no new argument routes exactly as before.
     completes, Polish: started from Fallback's session, the retry off, the
     optimizer on. The retry is never sent with the optimizer on.
   - What `"hold"` guarantees, and what it does not. The Full pass has the
-    retry off, so it narrows nothing. A Fallback has the retry on over wiring
+    retry off, so with `allow_neckdown` off (the default) it narrows nothing.
+    With `allow_neckdown` on, Freerouting may neck a track down at a pin in
+    that pass too, and `width_exceptions` lists such a stretch like any
+    other. A Fallback has the retry on over wiring
     Freerouting may move: it can re-lay at the floor width a connection the
     Full pass had laid at width, not only the ones that were open. Nothing
     checks which connections a Fallback narrowed; `width_exceptions`, read
@@ -84,8 +88,11 @@ and a call that passes no new argument routes exactly as before.
   as the single run's retry is (`rules_applied.retry_off_reason`). Without
   `"hold"` the argument is not used, and the result says so
   (`width_policy.fallback` is `"unused"`).
-- **New result fields under `"hold"` only**: `width_policy` (`requested`,
-  `applied`, `fallback`, and a `reason` when not applied); `passes` (per
+- **New result fields.** `width_policy` (`requested`, `applied`,
+  `fallback`, and a `reason` when not applied) is in the result when
+  `"hold"` was asked for, and also when `width_fallback` was given without
+  it (`applied` is then `"retry"` and `fallback` is `"unused"`). Under
+  `"hold"` only: `passes` (per
   pass: `name`, `outcome` of `kept`, `discarded`, `failed`, `stopped` or
   `skipped`, a `reason`, `retry_width_um`, `optimizer_enabled`, `seeded`
   counts, `unrouted_at_start`, `router_unrouted`, `effective_settings`,
@@ -102,10 +109,14 @@ and a call that passes no new argument routes exactly as before.
 - **Files.** Under `"hold"` each pass's DSN, session and Freerouting log are
   kept in `<ses_output_path without .ses>.passes/`. The call is refused
   before routing if that folder exists, as it is for an existing output.
-  A call that fails leaves no such folder, so the same call can be made
-  again: what the failed call wrote is moved to `<that folder>.failed-N`
-  (the first free N, beside the output; the error names it), and a folder
-  with nothing in it is removed.
+  A call that returns an error leaves no such folder, so the same call can
+  be made again: what the failed call wrote is moved to
+  `<that folder>.failed-N` (the first free N from 1 to 99, beside the
+  output; the error names it), and a folder with nothing in it is removed.
+  When all 99 names are taken, or the move itself fails, the folder is
+  removed with what it holds, and the error says so. A call that does not
+  return (the server is killed or crashes) leaves the folder: remove it
+  before calling again.
 - **`overall_timeout_seconds` covers the whole call**, every pass of it. A
   pass is given only the time that is left.
 

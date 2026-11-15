@@ -150,7 +150,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then `unverified`. `width_policy: \"hold\"` first routes with the retry off, so that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
             json!({
                 "type": "object",
                 "properties": {
@@ -169,7 +169,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["retry", "hold"],
                         "default": "retry",
-                        "description": "What to do about nets the export widened for their recorded current (the manifest's intent_widths). \"retry\": one run; a connection that fails at its width is retried at the nets' common floor width, and Freerouting's optimizer may re-lay others at it too. \"hold\": a Full pass with that retry off, which narrows nothing; only if it leaves connections open, a Fallback pass (retry at the floor, optimizer off), kept only if it closes at least one of them, and then, once nothing is open, a Polish pass (retry off, optimizer on), each started from the pass before it. The Fallback may narrow any track, not only the connections that were open. Either way width_exceptions lists every stretch that ended below its net's intent width. With no such net in the manifest, \"hold\" has nothing to hold and the single run is made."
+                        "description": "What to do about nets the export widened for their recorded current (the manifest's intent_widths). \"retry\": one run; a connection that fails at its width is retried at the nets' common floor width, and Freerouting's optimizer may re-lay others at it too. \"hold\": a Full pass with that retry off, which narrows nothing while allow_neckdown is off (the default); only if it leaves connections open, a Fallback pass (retry at the floor, optimizer off), kept only if it closes at least one of them, and then, once nothing is open, a Polish pass (retry off, optimizer on), each started from the pass before it. The Fallback may narrow any track, not only the connections that were open. Either way width_exceptions lists every stretch that ended below its net's intent width. With no such net in the manifest, \"hold\" has nothing to hold and the single run is made."
                     },
                     "width_fallback": {
                         "type": "string",
@@ -3942,7 +3942,9 @@ async fn handle_route_specctra_dsn(
         result["width_unmeasured"] = json!(width_report.unmeasured);
         result["width_unmeasured_total"] = json!(width_report.unmeasured_total);
     }
-    // Only a call that asked for `hold` carries these.
+    // `width_policy` is in the result when `hold` was asked for, and also when
+    // `width_fallback` was given without it, to say that it was not used.
+    // `passes`, `result_pass` and the passes folder come only with `hold`.
     if !hold_requested && asked.fallback_given.is_some() {
         result["width_policy"] = json!({
             "requested": "retry", "applied": "retry", "fallback": "unused",
@@ -4173,8 +4175,9 @@ const MAX_FAILED_PASSES_KEPT: u32 = 99;
 /// removed. One that holds files (a job's log, an earlier pass's session) is
 /// renamed to `<folder>.failed-N`, the first N from 1 that is free, beside
 /// the output where the call made it: a name that is taken is never
-/// replaced. Only when every name is taken is the folder removed with what
-/// it holds. Nothing outside the folder this call made is touched.
+/// replaced. In two cases the folder is removed with what it holds: every
+/// one of the names is taken, or the rename to a free name fails. Nothing
+/// outside the folder this call made is touched.
 fn set_aside_failed_passes(folder: &Path) -> String {
     // `remove_dir` removes only an empty folder.
     if std::fs::remove_dir(folder).is_ok() || !folder.exists() {
