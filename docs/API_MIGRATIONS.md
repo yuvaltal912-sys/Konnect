@@ -6,9 +6,9 @@ removals, default changes and the supported replacement workflow.
 ## Unreleased: board quirks KiCad accepts
 
 Row E1 (`docs/CREATION_HANDOFF.md`). Three refusals of boards that KiCad itself
-opens, checks and fills. Additive: no argument is removed and no default
-changes. A board whose outline ends are all more than 0.01 mm apart, with
-unique References, gives the same DSN as before.
+opens, checks and fills, and teardrops written as pours. No argument is removed
+and no default changes. A board whose outline ends are all more than 0.01 mm
+apart, with unique References and no teardrops, gives the same DSN as before.
 
 - **`export_specctra_dsn`, outline ends.** Edge.Cuts ends within 0.01 mm of
   each other are one corner, as KiCad chains them (KiCad 10.0.1
@@ -19,6 +19,21 @@ unique References, gives the same DSN as before.
   1 um grid, so the limit holds to within 1 um; a wider gap is still refused.
   A line shorter than 0.01 mm is dropped, and an arc whose ends lie within
   0.01 mm is refused as one that starts and ends at one point.
+- **`export_specctra_dsn`, teardrops.** A teardrop zone (`(attr (teardrop
+  ...))`) is left out of the DSN: it is neither a plane of its net nor a
+  keepout, and the importer's pour inventory does not count it. KiCad makes
+  teardrops where tracks meet pads and vias and rebuilds them from the tracks
+  when it refills, so they belong to the routing. Before, each was a plane of
+  its net, so the router took the pads under every teardrop as connected, and
+  the nets with one kept their class width instead of their intent width.
+  KiCad's native exporter writes them as planes too, so on a board with
+  teardrops `prefer` uses the Rust exporter and `require` is refused. The
+  response's new `teardrops_skipped` counts them. On a board with teardrops:
+  a `pours` zone rule that only a teardrop matched now picks no pour and is
+  refused, and a manifest exported by an earlier build no longer matches the
+  board's pour count, so export again before importing. Only the attribute
+  KiCad 7 and later write is recognised; a teardrop drawn as a plain zone
+  (KiCad's old teardrop plugin) is still a pour.
 - **`set_design_intent`, net names.** A net in `currents`, a rail's `nets` or
   an interface's `nets` may begin or end with spaces: KiCad keeps them, so
   `'+5V '` is a different net from `'+5V'`. The name is stored as written. An

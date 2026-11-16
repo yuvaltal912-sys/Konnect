@@ -285,7 +285,8 @@ fn export_tools() -> Vec<ToolDef> {
              default) or left out (omit), for the whole board or zone by zone. The router counts \
              a pad inside a plane's outline as connected and lets other nets cross the plane, so \
              completion is judged by KiCad's DRC after a refill. Rule areas that forbid tracks or \
-             vias always become keepouts. Both come from the zone outline (not the fill). Locked straight tracks and vias are fixed wiring; \
+             vias always become keepouts. Both come from the zone outline (not the fill). A \
+             teardrop zone belongs to the routing and is left out (teardrops_skipped). Locked straight tracks and vias are fixed wiring; \
              unlocked routing, routed arcs, custom pad shapes, local clearance overrides, \
              copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
@@ -350,7 +351,7 @@ fn export_tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
-                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback."
+                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback. A board with teardrops, or with references renamed by allow_duplicate_references, always gets the Rust export ('require' is refused), since KiCad's exporter writes teardrops as planes and cannot rename."
                     }
                 },
                 "required": ["board", "output"]
@@ -779,21 +780,32 @@ fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
     args["native_bridge_mode"].as_str().unwrap_or("disable")
 }
 
-/// Only the Rust exporter renames footprints that share a Reference
-/// (`allow_duplicate_references`), so when it renamed any, KiCad's native
-/// exporter must not replace its DSN. Returns whether the Rust export is kept
-/// for that reason and the note for 'prefer'; 'require' is refused.
-fn renamed_references_bridge(
+/// Board features only the Rust exporter writes as the router needs them:
+/// footprints that share a Reference, renamed (`allow_duplicate_references`),
+/// and teardrops, which KiCad's native exporter writes as planes of their net.
+/// When the board has any, the native exporter must not replace the Rust DSN.
+/// Returns whether the Rust export is kept for these reasons and the notes for
+/// 'prefer'; 'require' is refused.
+fn rust_only_bridge(
     native_bridge_mode: &str,
-    renamed: bool,
-) -> Result<(bool, Option<&'static str>), &'static str> {
-    if !renamed {
-        return Ok((false, None));
+    reasons: &[&str],
+) -> Result<(bool, Vec<String>), String> {
+    if reasons.is_empty() {
+        return Ok((false, Vec::new()));
     }
     match native_bridge_mode {
-        "require" => Err("KiCad native Specctra export was required, but footprints share a Reference and only the Rust exporter renames them; use prefer or disable"),
-        "prefer" => Ok((true, Some("footprints share a Reference, which only the Rust exporter renames; the native bridge was not used"))),
-        _ => Ok((true, None)),
+        "require" => Err(format!(
+            "KiCad native Specctra export was required, but {}, which only the Rust exporter handles; use prefer or disable",
+            reasons.join(", and ")
+        )),
+        "prefer" => Ok((
+            true,
+            reasons
+                .iter()
+                .map(|reason| format!("{reason}, which only the Rust exporter handles; the native bridge was not used"))
+                .collect(),
+        )),
+        _ => Ok((true, Vec::new())),
     }
 }
 
@@ -954,21 +966,23 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let (keep_rust_for_renames, rename_note) = match renamed_references_bridge(
-        native_bridge_mode,
-        !baseline.renamed_references.is_empty(),
-    ) {
+    let mut rust_only = Vec::new();
+    if !baseline.renamed_references.is_empty() {
+        rust_only.push("footprints share a Reference");
+    }
+    if baseline.teardrops_skipped > 0 {
+        rust_only.push("the board has teardrops");
+    }
+    let (keep_rust, rust_notes) = match rust_only_bridge(native_bridge_mode, &rust_only) {
         Ok(choice) => choice,
         Err(reason) => return Ok(CallToolResult::error(reason)),
     };
     let export = if native_bridge_mode == "disable"
         || snapshot.rules.is_some()
         || omit_pours
-        || keep_rust_for_renames
+        || keep_rust
     {
-        if let Some(note) = rename_note {
-            bridge_diagnostics.push(note.to_string());
-        }
+        bridge_diagnostics.extend(rust_notes);
         if omit_pours && native_bridge_mode == "prefer" {
             bridge_diagnostics.push(
                 "pours were left out, which only the Rust exporter does; the native bridge was not used"
@@ -1071,6 +1085,7 @@ async fn handle_export_specctra_dsn(
             "routing_class_count": export.class_count,
             "intent_widths": export.intent_widths,
             "renamed_references": export.renamed_references,
+            "teardrops_skipped": export.teardrops_skipped,
             "copper_edge_clearance_um": copper_edge_clearance_um,
             "hole_clearance_um": hole_clearance_um,
             "capabilities": {
@@ -1822,25 +1837,31 @@ mod fabrication_option_tests {
 }
 
 #[cfg(test)]
-mod renamed_reference_bridge_tests {
-    use super::renamed_references_bridge;
+mod rust_only_bridge_tests {
+    use super::rust_only_bridge;
 
-    /// A DSN with renamed references comes only from the Rust exporter:
-    /// 'require' is refused, 'prefer' keeps the Rust export with a note, and
-    /// 'disable' keeps it silently. Control: with no rename, every mode leaves
-    /// the bridge choice to the other conditions.
+    /// Renamed references and teardrops come right only from the Rust
+    /// exporter: 'require' is refused naming each, 'prefer' keeps the Rust
+    /// export with one note each, and 'disable' keeps it silently. Control:
+    /// with neither, every mode leaves the bridge choice to the other
+    /// conditions.
     #[test]
-    fn renamed_references_keep_the_rust_export() {
-        let refused = renamed_references_bridge("require", true).unwrap_err();
-        assert!(refused.contains("share a Reference"), "{refused}");
-        let (kept, note) = renamed_references_bridge("prefer", true).unwrap();
+    fn features_only_the_rust_exporter_handles_keep_it() {
+        let both = ["footprints share a Reference", "the board has teardrops"];
+        let refused = rust_only_bridge("require", &both).unwrap_err();
+        assert!(
+            refused.contains("share a Reference") && refused.contains("teardrops"),
+            "{refused}"
+        );
+        let (kept, notes) = rust_only_bridge("prefer", &both[1..]).unwrap();
         assert!(kept);
-        assert!(note.unwrap().contains("native bridge was not used"));
-        assert_eq!(renamed_references_bridge("disable", true), Ok((true, None)));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("teardrops") && notes[0].contains("native bridge was not used"));
+        assert_eq!(rust_only_bridge("disable", &both), Ok((true, Vec::new())));
         for mode in ["require", "prefer", "disable"] {
             assert_eq!(
-                renamed_references_bridge(mode, false),
-                Ok((false, None)),
+                rust_only_bridge(mode, &[]),
+                Ok((false, Vec::new())),
                 "{mode}"
             );
         }

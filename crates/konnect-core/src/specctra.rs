@@ -44,6 +44,8 @@ pub(crate) struct ExportBundle {
     /// under a unique DSN name (`allow_duplicate_references`): reference,
     /// DSN name, footprint UUID. Empty when every Reference is unique.
     pub renamed_references: Vec<serde_json::Value>,
+    /// Teardrop zones left out of the DSN (see [`is_teardrop`]).
+    pub teardrops_skipped: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -979,6 +981,11 @@ pub(crate) fn export_dsn_with_options(
         net_count: net_pins.len(),
         class_count: class_nets.len(),
         renamed_references,
+        teardrops_skipped: tree
+            .find_all("zone")
+            .into_iter()
+            .filter(|zone| is_teardrop(zone))
+            .count(),
     })
 }
 
@@ -1041,6 +1048,18 @@ pub(crate) fn adopt_native_dsn(
         if left_out > 0 {
             bail!(
                 "native DSN not adopted: {left_out} pour layer(s) were left out by the per-zone policy, and KiCad's exporter always writes every pour"
+            );
+        }
+        if baseline.teardrops_skipped > 0 {
+            bail!(
+                "native DSN not adopted: the board has {} teardrop zone(s), which KiCad's exporter writes as planes of their net and Konnect leaves out",
+                baseline.teardrops_skipped
+            );
+        }
+        if !baseline.renamed_references.is_empty() {
+            bail!(
+                "native DSN not adopted: {} footprint(s) sharing a Reference were renamed, which KiCad's exporter cannot do",
+                baseline.renamed_references.len()
             );
         }
         if let Some(back) = manifest.components.iter().find(|c| c.kicad_side == "back") {
@@ -2125,6 +2144,19 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
     Ok(ordered)
 }
 
+/// A teardrop zone (`(attr (teardrop ...))`) belongs to the routing, not to the
+/// pours: KiCad makes one where a track meets a pad or via, rebuilds them all
+/// from the tracks when it refills, and fills each around other-net copper. So
+/// it is neither a plane nor a keepout for the router. Only the attribute KiCad
+/// 7 and later write is recognised: a teardrop drawn as a plain zone (KiCad's
+/// old teardrop plugin) is still a pour. KiCad's own DSN export writes it as a plane of
+/// its net (KiCad 10.0.1 `specctra_export.cpp` has no teardrop case), which
+/// would tell the router that the pads under every teardrop are connected.
+fn is_teardrop(zone: &SexpNode) -> bool {
+    zone.find("attr")
+        .is_some_and(|attr| attr.find("teardrop").is_some())
+}
+
 /// The board's copper zones and rule areas as the router sees them.
 ///
 /// A pour with a net is a Specctra `plane` of that net (how KiCad's own DSN
@@ -2134,7 +2166,8 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
 /// vias is a keepout. The zone's outline is used, not its fill, so thermal
 /// reliefs and clearance gaps are not modelled: copper the fill will not reach
 /// can still look connected to the router, which is why DRC after a refill is
-/// the check. Anything else is refused rather than guessed at.
+/// the check. Anything else is refused rather than guessed at. A teardrop is
+/// left out (see [`is_teardrop`]).
 pub(crate) fn zones(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
@@ -2142,6 +2175,9 @@ pub(crate) fn zones(
 ) -> Result<Vec<ZoneModel>> {
     let mut out = Vec::new();
     for zone in tree.find_all("zone") {
+        if is_teardrop(zone) {
+            continue;
+        }
         let name = zone.find_str("name").unwrap_or("unnamed");
         let mut layers: Vec<String> = Vec::new();
         if let Some(single) = zone.find_str("layer") {
@@ -4486,6 +4522,59 @@ mod tests {
         assert_eq!(native.planes[0].net, "GND");
         assert_eq!(native.planes[0].polygon.layer, "B.Cu");
         assert_eq!(native.keepouts.0.len(), 1);
+    }
+
+    /// A teardrop, as KiCad writes one (no name or UUID), of either type, is
+    /// left out: not a plane of its net, not a keepout, not in the importer's
+    /// pour inventory, and its board is never handed to KiCad's exporter.
+    /// Controls: the real pour beside it stays the board's one plane, and a
+    /// zone whose `attr` holds no `teardrop` is still a pour.
+    #[test]
+    fn a_teardrop_zone_is_not_a_pour() {
+        let teardrop = |kind: &str| {
+            format!(
+                "\t(zone\n\t\t(net \"GND\")\n\t\t(layer \"F.Cu\")\n\t\t(hatch none 0.1)\n\t\t(priority 30000)\n\t\t(attr\n\t\t\t(teardrop\n\t\t\t\t(type {kind})\n\t\t\t)\n\t\t)\n\t\t(connect_pads yes\n\t\t\t(clearance 0)\n\t\t)\n\t\t(min_thickness 0.0254)\n\t\t(fill yes)\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 90 40) (xy 92 40) (xy 92 42) (xy 90 42)\n\t\t\t)\n\t\t)\n\t)\n"
+            )
+        };
+        let with = |zone: &str| {
+            let end = ROUNDED.rfind(')').unwrap();
+            format!("{}{zone}{}", &ROUNDED[..end], &ROUNDED[end..])
+        };
+        for kind in ["padvia", "track_end"] {
+            let board = with(&teardrop(kind));
+            let export = export_rounded(&board).unwrap();
+            let structure = parse_dsn(&export.dsn).pcb.structure;
+            let planes: Vec<_> = structure
+                .planes
+                .iter()
+                .map(|plane| (plane.net.as_str(), plane.polygon.layer.as_str()))
+                .collect();
+            assert_eq!(planes, [("GND", "B.Cu")], "{kind}: only the real pour");
+            assert_eq!(structure.keepouts.0.len(), 1, "{kind}: the rule area only");
+            assert_eq!(export.teardrops_skipped, 1, "{kind}");
+            let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+            assert_eq!(
+                manifest["supported_profile"]["zone_plane_count"], 1,
+                "{kind}"
+            );
+            assert_eq!(zone_counts(&board).unwrap(), (1, 1), "{kind}");
+            let refused = adopt_native_dsn(export.clone(), export.dsn.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("teardrop"), "{kind}: {refused}");
+        }
+        // control: the same zone with an `attr` that is not a teardrop is a pour
+        let plain = with(&teardrop("padvia").replace(
+            "\t\t(attr\n\t\t\t(teardrop\n\t\t\t\t(type padvia)\n\t\t\t)\n\t\t)\n",
+            "\t\t(attr)\n",
+        ));
+        let export = export_rounded(&plain).unwrap();
+        assert_eq!(parse_dsn(&export.dsn).pcb.structure.planes.len(), 2);
+        assert_eq!(export.teardrops_skipped, 0);
+        assert_eq!(zone_counts(&plain).unwrap(), (2, 1));
+        assert!(adopt_native_dsn(export.clone(), export.dsn.clone())
+            .err()
+            .is_none_or(|error| !error.to_string().contains("teardrop")));
     }
 
     #[test]

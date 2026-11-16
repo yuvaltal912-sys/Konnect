@@ -1187,6 +1187,13 @@ mod tests {
             "the repeat's pins carry its own name"
         );
         assert_eq!(export.component_count, 2, "both footprints are placed");
+        let refused = crate::specctra::adopt_native_dsn(export.clone(), export.dsn.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("renamed"),
+            "KiCad's DSN cannot replace it: {refused}"
+        );
         let session = sample_ses().replace(
             "konnect_image_R2 (place R2 ",
             "konnect_image_R1_DUP2 (place R1_DUP2 ",
