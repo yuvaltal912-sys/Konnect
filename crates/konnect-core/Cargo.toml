@@ -41,3 +41,5 @@ winreg.workspace = true
 # The pcb_components fallback tests spawn a mock KiCAD NNG endpoint to prove
 # a reachable-but-rejecting KiCAD never triggers the file-editing fallback.
 nng.workspace = true
+# Paused-clock scheduler tests (`#[tokio::test(start_paused = true)]`).
+tokio = { workspace = true, features = ["test-util"] }

@@ -39,6 +39,21 @@ const JLCPCB_MAX_DATABASE_BYTES: u64 = 8_589_934_592;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+/// `tool!` for a handler that takes the shared `Arc<ToolContext>` instead of
+/// `&ToolContext`: the fastroute engine of `route_specctra_dsn` calls other
+/// tools' handlers through it. The name ends in `tool` so that
+/// `schema_parameter_usage` finds this registration as it finds a `tool!` one.
+macro_rules! arc_tool {
+    ($name:expr, $desc:expr, $schema:expr, $handler:expr) => {{
+        let h: crate::tools::ToolHandlerFn = std::sync::Arc::new(move |args, ctx| {
+            let args = args.clone();
+            let ctx = ctx.clone();
+            Box::pin(async move { ($handler)(&args, ctx).await })
+        });
+        crate::tools::ToolDef::new($name, $desc, $schema, h)
+    }};
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -148,14 +163,29 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_check_freerouting(args, ctx).await }
         ),
-        tool!(
+        arc_tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
+            "Route an existing Specctra DSN and create a new SES file; an existing output is never replaced. The default engine is fastroute's best-of-N search: it routes variants of the DSN in parallel for the time `effort` allows (`fast` = 2 runs, `m` = 240 s, `h` = 720 s, `xh` = 2400 s), Konnect judges every run itself on scratch copies of the board (complete, KiCad DRC no worse than the unrouted board, track widths) and writes the best session; `search` lists every run, `completion.judged` the winner's verdict, and `status` is never `complete` of either kind unless the winner passes all three gates (`incomplete` when connections stay open after the refill and stitching, else `complete_with_gate_failures`). `engine: \"freerouting\"` routes with the local Freerouting JAR instead; the rest of this description is that engine. It uses the documented session/job state machine and never sends board data to a cloud service. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
             json!({
                 "type": "object",
                 "properties": {
                     "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["fastroute", "freerouting"],
+                        "default": "fastroute",
+                        "description": "Which router. \"fastroute\" (default) runs a timed best-of-N search judged by Konnect; it reads effort and fastroute_path, plus dsn_path, ses_output_path, width_policy \"hold\" and width_fallback, and refuses jar_path, java_path, max_passes, optimizer_enabled, job_timeout_seconds, overall_timeout_seconds, allow_neckdown true and width_policy \"retry\". \"freerouting\" runs the single job or the width_policy passes with the local Freerouting JAR; it reads jar_path, java_path, max_passes, optimizer_enabled, allow_neckdown, width_policy, width_fallback, job_timeout_seconds and overall_timeout_seconds, and refuses effort and fastroute_path."
+                    },
+                    "effort": {
+                        "type": "string",
+                        "enum": ["fast", "m", "h", "xh"],
+                        "description": "fastroute only. How long the search may run per board: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 2400 s. Default: the user config key routing.effort, else m."
+                    },
+                    "fastroute_path": {
+                        "type": "string",
+                        "description": "fastroute only. The fastroute binary. Default: the environment variable KONNECT_FASTROUTE, else the user config key routing.fastroute_path, else ~/.local/share/fastroute/candidate/fastroute. Konnect checks that it is the candidate build before routing."
+                    },
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "java_path": { "type": "string", "description": "Path to a Java executable to use (optional); see check_freerouting." },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
@@ -168,8 +198,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "width_policy": {
                         "type": "string",
                         "enum": ["retry", "hold"],
-                        "default": "retry",
-                        "description": "What to do about nets the export widened for their recorded current (the manifest's intent_widths). \"retry\": one run; a connection that fails at its width is retried at the nets' common floor width, and Freerouting's optimizer may re-lay others at it too. \"hold\": a Full pass with that retry off, which narrows nothing while allow_neckdown is off (the default); only if it leaves connections open, a Fallback pass (retry at the floor, optimizer off), kept only if it closes at least one of them, and then, once nothing is open, a Polish pass (retry off, optimizer on), each started from the pass before it. The Fallback may narrow any track, not only the connections that were open. Either way width_exceptions lists every stretch that ended below its net's intent width. With no such net in the manifest, \"hold\" has nothing to hold and the single run is made."
+                        "description": "Freerouting default \"retry\". With engine \"fastroute\" every run holds, so \"hold\" is accepted and \"retry\" is refused. What to do about nets the export widened for their recorded current (the manifest's intent_widths). \"retry\": one run; a connection that fails at its width is retried at the nets' common floor width, and Freerouting's optimizer may re-lay others at it too. \"hold\": a Full pass with that retry off, which narrows nothing while allow_neckdown is off (the default); only if it leaves connections open, a Fallback pass (retry at the floor, optimizer off), kept only if it closes at least one of them, and then, once nothing is open, a Polish pass (retry off, optimizer on), each started from the pass before it. The Fallback may narrow any track, not only the connections that were open. Either way width_exceptions lists every stretch that ended below its net's intent width. With no such net in the manifest, \"hold\" has nothing to hold and the single run is made."
                     },
                     "width_fallback": {
                         "type": "string",
@@ -315,7 +344,7 @@ const MAX_REASON_DETAIL: usize = 160;
 /// then `create_checkpoint`), because the fallback has to export it again and
 /// the exporter refuses a board that holds unlocked routing: after the import
 /// and the stitching rounds it does.
-fn completion_report(
+pub(crate) fn completion_report(
     dsn: &Path,
     ses: &Path,
     planes: &anyhow::Result<Vec<crate::specctra::DsnPlane>>,
@@ -3773,7 +3802,24 @@ async fn handle_check_freerouting(
     }
 }
 
-async fn handle_route_specctra_dsn(
+/// `route_specctra_dsn`: the engine the call names routes it. fastroute (the
+/// default) runs the timed best-of-N search of `route_fastroute`; Freerouting
+/// runs the single job or the `width_policy` passes below, unchanged.
+pub(crate) async fn handle_route_specctra_dsn(
+    args: &serde_json::Value,
+    ctx: std::sync::Arc<ToolContext>,
+) -> anyhow::Result<CallToolResult> {
+    match super::route_fastroute::route_engine(args) {
+        Err(refusal) => Ok(refusal),
+        Ok(super::route_fastroute::Engine::Freerouting) => route_with_freerouting(args, &ctx).await,
+        Ok(super::route_fastroute::Engine::Fastroute) => {
+            super::route_fastroute::route_with_fastroute(args, ctx).await
+        }
+    }
+}
+
+/// The Freerouting engine of `route_specctra_dsn`.
+async fn route_with_freerouting(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
@@ -4076,6 +4122,15 @@ fn width_arguments(args: &serde_json::Value) -> Result<WidthArguments, CallToolR
         policy_given,
         fallback_given,
     })
+}
+
+/// What `width_fallback` asks for, for the fastroute engine, which always holds
+/// (`width_policy` itself is settled by `route_fastroute::route_engine`): the
+/// floor unless the caller said `"none"`. A value outside the two is refused.
+pub(crate) fn width_fallback_argument(
+    args: &serde_json::Value,
+) -> Result<WidthFallback, CallToolResult> {
+    width_arguments(args).map(|asked| asked.fallback)
 }
 
 /// Where a width-first call keeps its passes' own files: beside the output,
@@ -4560,7 +4615,7 @@ where
 /// the session is not read and the report is empty. A session that cannot be
 /// read for widths gives an empty report and the reason: the routing stands,
 /// and the status then never says `complete`.
-fn width_report(
+pub(crate) fn width_report(
     dsn: &Path,
     ses: &Path,
 ) -> (crate::intent_width_report::WidthReport, Option<String>) {
@@ -5748,6 +5803,7 @@ mod freerouting_tests {
                     "arguments": {
                         "dsn_path": temp.path().join("board.dsn").display().to_string(),
                         "ses_output_path": temp.path().join("board.ses").display().to_string(),
+                        "engine": "freerouting",
                         "jar_path": missing.display().to_string()
                     }
                 }
@@ -6930,8 +6986,10 @@ done
             .unwrap();
         }
         let args = json!({ "dsn_path": dsn, "ses_output_path": dir.join(format!("{name}.ses")),
-                           "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
-        let result = handle_route_specctra_dsn(&args, &ctx()).await.unwrap();
+                           "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+        let result = handle_route_specctra_dsn(&args, std::sync::Arc::new(ctx()))
+            .await
+            .unwrap();
         assert!(!result.is_error, "{:?}", result.content);
         body(&result)
     }
@@ -7232,11 +7290,11 @@ done
         )
         .unwrap();
         let mut args = json!({ "dsn_path": dsn, "ses_output_path": dir.join(format!("{name}.ses")),
-                               "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+                               "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
         for (key, value) in extra.as_object().unwrap() {
             args[key] = value.clone();
         }
-        handle_route_specctra_dsn(&args, &ctx()).await
+        handle_route_specctra_dsn(&args, std::sync::Arc::new(ctx())).await
     }
 
     fn sent_settings(dir: &Path, name: &str, job: usize) -> String {
@@ -7741,12 +7799,14 @@ done
             )
             .unwrap();
             let mut args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join(format!("{name}.ses")),
-                                   "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+                                   "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
             for (key, value) in extra.as_object().unwrap() {
                 args[key] = value.clone();
             }
             async move {
-                let result = handle_route_specctra_dsn(&args, &ctx()).await.unwrap();
+                let result = handle_route_specctra_dsn(&args, std::sync::Arc::new(ctx()))
+                    .await
+                    .unwrap();
                 assert!(!result.is_error, "{:?}", result.content);
                 let result = body(&result);
                 let calls: Vec<serde_json::Value> = result["completion"]["if_still_open"]
@@ -7956,9 +8016,11 @@ done
             let dsn = dir.path().join(format!("{name}.dsn"));
             std::fs::write(&dsn, dsn_text).unwrap();
             let args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join(format!("{name}.ses")),
-                               "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+                               "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
             async move {
-                let result = handle_route_specctra_dsn(&args, &ctx()).await.unwrap();
+                let result = handle_route_specctra_dsn(&args, std::sync::Arc::new(ctx()))
+                    .await
+                    .unwrap();
                 assert!(!result.is_error, "{:?}", result.content);
                 body(&result)
             }
@@ -8002,10 +8064,10 @@ done
             (&fifo, "existing .dsn file"),
             (&huge, "bytes"),
         ] {
-            let args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join("out.ses"), "jar_path": jar });
+            let args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join("out.ses"), "engine": "freerouting", "jar_path": jar });
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                handle_route_specctra_dsn(&args, &ctx()),
+                handle_route_specctra_dsn(&args, std::sync::Arc::new(ctx())),
             )
             .await
             .expect("refused at once, never blocked on the path")
@@ -8161,8 +8223,8 @@ done
         std::fs::write(&dsn, "(pcb x)").unwrap();
         let ses = dir.path().join("board.ses");
         let result = handle_route_specctra_dsn(
-            &json!({ "dsn_path": dsn, "ses_output_path": ses, "jar_path": jar, "java_path": java }),
-            &ctx(),
+            &json!({ "dsn_path": dsn, "ses_output_path": ses, "engine": "freerouting", "jar_path": jar, "java_path": java }),
+            std::sync::Arc::new(ctx()),
         )
         .await
         .unwrap();

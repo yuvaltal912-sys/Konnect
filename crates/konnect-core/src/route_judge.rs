@@ -1,0 +1,886 @@
+//! The judge of a best-of-N search: Konnect judges every routed run itself, on
+//! scratch copies of the board, and ranks the runs by gates that need no human
+//! routing (docs/ROUTE_SEARCH_DESIGN.md, decisions 10 to 12; the research's
+//! "Konnect changes", item 7).
+//!
+//! Nothing here writes to the user's board or project: every board it writes is a
+//! copy under the search folder.
+
+use crate::route_search::Routed;
+use anyhow::{ensure, Context, Result};
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// The largest share of an intent-width net's length that may be below its intent
+/// width (the bench's `below_intent_share`).
+pub(crate) const BELOW_INTENT_SHARE: f64 = 0.05;
+/// The longest stretch of an intent-width net that may be below its intent width,
+/// in mm (the bench's `below_intent_section_mm`).
+pub(crate) const BELOW_INTENT_SECTION_MM: f64 = 2.0;
+/// Stitching rounds after the first refill (the research's `MAX_ROUNDS`).
+pub(crate) const STITCH_ROUNDS: usize = 4;
+/// The stitching planner's search radius, mm (the research's `STITCH_RADIUS`).
+pub(crate) const STITCH_RADIUS_MM: f64 = 3.0;
+/// The step in which the rank compares length ratios (the research key's 0.02).
+pub(crate) const LENGTH_STEP: f64 = 0.02;
+/// A segment this far below its net's floor, or less, is at the floor: the same
+/// half micrometre the importer allows.
+pub(crate) const FLOOR_TOLERANCE_MM: f64 = 0.0005;
+
+/// Why the judge cannot run, with the step that fixes it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Refusal {
+    pub reason: String,
+    pub next_step: String,
+}
+
+/// What every judge of one call needs, read once.
+#[derive(Debug, Clone)]
+pub(crate) struct JudgeContext {
+    /// The manifest's `board_path`, canonical: the board the DSN was exported from.
+    pub board: PathBuf,
+    /// The saved board's text; its SHA-256 is the manifest's `source_sha256`.
+    pub board_text: String,
+    pub manifest: Value,
+    pub manifest_text: String,
+    pub kicad_cli: String,
+    /// Nets of the manifest's `pours` rows.
+    pub pour_nets: BTreeSet<String>,
+    /// Nets of the manifest's `intent_widths` rows whose status is `widened` or
+    /// `already_wide_enough` and that are not pour nets.
+    pub power_nets: BTreeSet<String>,
+    /// Each net's floor in mm: its `min_track_width_um` when set, else its class's
+    /// `track_width_um`.
+    pub floors_mm: BTreeMap<String, f64>,
+    /// `<search folder>/judge`: every scratch board of this call is below it.
+    pub root: PathBuf,
+}
+
+/// The unrouted board, refilled and checked the same way every run is (G2's
+/// baseline).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Baseline {
+    /// KiCad's violations by type (rule key).
+    pub violations: BTreeMap<String, usize>,
+    pub unconnected: usize,
+}
+
+/// Everything the judge needs, checked before anything is routed. Each refusal
+/// says what to do:
+/// - no manifest beside the DSN (`<dsn>.konnect.json`): "export the DSN with
+///   export_specctra_dsn, which writes the manifest beside it";
+/// - the manifest names no board, or the board file is missing;
+/// - the saved board's SHA-256 is not the manifest's `source_sha256`: "save the
+///   board in KiCad, then export the DSN again";
+/// - `kicad_cli` is not an executable file.
+///
+/// `root` is created by the caller later; this only records it.
+pub(crate) fn prepare(
+    dsn: &Path,
+    root: &Path,
+    kicad_cli: &str,
+) -> std::result::Result<JudgeContext, Refusal> {
+    fn refuse(reason: String, next_step: &str) -> Refusal {
+        Refusal {
+            reason,
+            next_step: next_step.to_string(),
+        }
+    }
+    const EXPORT_AGAIN: &str =
+        "export the DSN with export_specctra_dsn, which writes the manifest beside it";
+
+    // `<dsn file name>.konnect.json`, as `specctra::manifest_beside` names it.
+    let mut manifest_name = dsn.as_os_str().to_os_string();
+    manifest_name.push(".konnect.json");
+    let manifest_path = PathBuf::from(manifest_name);
+    let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        refuse(
+            format!(
+                "no reverse manifest beside the DSN ('{}': {error})",
+                manifest_path.display()
+            ),
+            EXPORT_AGAIN,
+        )
+    })?;
+    let manifest: Value = serde_json::from_str(&manifest_text).map_err(|error| {
+        refuse(
+            format!(
+                "the manifest '{}' is not JSON ({error})",
+                manifest_path.display()
+            ),
+            EXPORT_AGAIN,
+        )
+    })?;
+
+    let board_name = manifest["board_path"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| refuse("the manifest names no board".to_string(), EXPORT_AGAIN))?;
+    let board = std::fs::canonicalize(board_name).map_err(|error| {
+        refuse(
+            format!("the manifest's board '{board_name}' is missing ({error})"),
+            "restore the board file, or export the DSN again from the board's current location",
+        )
+    })?;
+    let saved = std::fs::read(&board).map_err(|error| {
+        refuse(
+            format!("the board '{}' cannot be read ({error})", board.display()),
+            "check the board file, then export the DSN again",
+        )
+    })?;
+    let hash = format!("{:x}", Sha256::digest(&saved));
+    let recorded = manifest["source_sha256"].as_str().unwrap_or("");
+    if !recorded.eq_ignore_ascii_case(&hash) {
+        return Err(refuse(
+            format!(
+                "the saved board '{}' is not the board the DSN was exported from (its SHA-256 differs from the manifest's source_sha256)",
+                board.display()
+            ),
+            "save the board in KiCad, then export the DSN again",
+        ));
+    }
+    let board_text = String::from_utf8(saved).map_err(|_| {
+        refuse(
+            format!("the board '{}' is not UTF-8 text", board.display()),
+            "check the board file, then export the DSN again",
+        )
+    })?;
+
+    // Resolved as every other kicad-cli tool resolves it (`resolve_cli_executable`:
+    // a bare name is looked for on PATH, then in KiCad's install locations), so the
+    // judge runs the same kicad-cli `run_drc` would.
+    let Some(kicad_cli) = resolve_executable(kicad_cli) else {
+        return Err(refuse(
+            format!("kicad-cli '{kicad_cli}' is not an executable file"),
+            "install KiCad 10, or set the kicad-cli path in the Konnect config",
+        ));
+    };
+    let kicad_cli = kicad_cli.display().to_string();
+
+    let names = |rows: &Value, wanted: &dyn Fn(&Value) -> bool| -> BTreeSet<String> {
+        rows.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| wanted(row))
+            .filter_map(|row| row["net"].as_str().map(str::to_string))
+            .collect()
+    };
+    let pour_nets = names(&manifest["pours"], &|_| true);
+    let power_nets: BTreeSet<String> = names(&manifest["intent_widths"], &|row| {
+        matches!(
+            row["status"].as_str(),
+            Some("widened") | Some("already_wide_enough")
+        )
+    })
+    .into_iter()
+    .filter(|net| !pour_nets.contains(net))
+    .collect();
+
+    // `specctra::manifest_net_floors`' rule, kept per net.
+    let class_width_um: BTreeMap<&str, i64> = manifest["classes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|class| Some((class["name"].as_str()?, class["track_width_um"].as_i64()?)))
+        .collect();
+    let floors_mm: BTreeMap<String, f64> = manifest["nets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|net| {
+            let floor_um = net["min_track_width_um"]
+                .as_i64()
+                .or_else(|| class_width_um.get(net["class_name"].as_str()?).copied())?;
+            Some((net["name"].as_str()?.to_string(), floor_um as f64 / 1000.0))
+        })
+        .collect();
+
+    Ok(JudgeContext {
+        board,
+        board_text,
+        manifest,
+        manifest_text,
+        kicad_cli,
+        pour_nets,
+        power_nets,
+        floors_mm,
+        root: root.to_path_buf(),
+    })
+}
+
+/// An executable regular file: any execute bit on Unix. A name with no path
+/// separator is looked up on `PATH`.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_executable(cli: &str) -> Option<PathBuf> {
+    if cli.trim().is_empty() {
+        return None;
+    }
+    let resolved = crate::tools::cli::resolve_cli_executable(cli);
+    is_executable_file(&resolved).then_some(resolved)
+}
+
+/// KiCad's violations counted by rule key.
+fn violations_by_rule(drc: &crate::tools::cli::DrcReport) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for violation in &drc.violations {
+        *counts.entry(violation.rule.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// The unconnected items of a report; a report that has no such category is an
+/// error, never zero.
+fn unconnected_total(drc: &crate::tools::cli::DrcReport) -> Result<usize> {
+    drc.unconnected_items.as_ref().map(Vec::len).context(
+        "the DRC report has no unconnected-items category; an unrouted board cannot be told from a routed one",
+    )
+}
+
+/// A message cut to a readable length.
+fn clipped(text: &str) -> String {
+    const SHOWN: usize = 300;
+    match text.char_indices().nth(SHOWN) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// Removes a scratch board and its DRC report. A file that is not there is fine.
+fn remove_board(board: &Path) {
+    let _ = std::fs::remove_file(board);
+    let _ = std::fs::remove_file(board.with_extension("drc.json"));
+}
+
+/// A tool of the registry, in whichever toolset holds it.
+fn find_tool(name: &str) -> Option<crate::tools::ToolDef> {
+    crate::router::registry::ALL_TOOLSETS
+        .iter()
+        .find_map(|toolset| {
+            crate::router::registry::tools_for(toolset.name)?
+                .into_iter()
+                .find(|tool| tool.name == name)
+        })
+}
+
+/// Calls a registry tool in-process: whether it refused (`is_error`) and its first
+/// text content.
+async fn call_tool(
+    tools: &Arc<crate::tools::ToolContext>,
+    name: &str,
+    args: &Value,
+) -> Result<(bool, String)> {
+    let tool = find_tool(name).with_context(|| format!("tool '{name}' is not in the registry"))?;
+    let result = (tool.handler)(args, tools.clone()).await?;
+    let text = result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            crate::mcp::protocol::ToolContent::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    Ok((result.is_error, text))
+}
+
+/// G2's baseline: the saved board, unchanged, in `root/baseline`
+/// (`scratch_board::copy_project`, then the text written), refilled and checked by
+/// `tools::cli::refill_drc_on_private_copy`; violations counted by `rule`, and the
+/// unconnected items counted (a report with no unconnected category is an error,
+/// never zero).
+pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
+    let folder = ctx.root.join("baseline");
+    if folder.exists() {
+        std::fs::remove_dir_all(&folder)
+            .with_context(|| format!("clear the old baseline folder '{}'", folder.display()))?;
+    }
+    let board = crate::scratch_board::copy_project(&ctx.board, &folder)?;
+    write_board(&board, &ctx.board_text)?;
+    let report = crate::tools::cli::refill_drc_on_private_copy(&ctx.kicad_cli, &board)
+        .await
+        .context("the unrouted board's refill and DRC failed")?;
+    Ok(Baseline {
+        violations: violations_by_rule(&report),
+        unconnected: unconnected_total(&report)?,
+    })
+}
+
+/// Writes a new scratch board; the file must not exist yet.
+fn write_board(board: &Path, text: &str) -> Result<()> {
+    konnect_sexp::write_new_atomic(board, text)
+        .map_err(|error| anyhow::anyhow!("write scratch board '{}': {error}", board.display()))
+}
+
+/// The measures of one judged run.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Measures {
+    /// KiCad's count after the refill and the stitching.
+    pub unconnected: usize,
+    /// KiCad's violations by type, same board.
+    pub violations: BTreeMap<String, usize>,
+    /// The audit's `quality.routed_share`.
+    pub routed_share: Option<f64>,
+    /// The audit's `completion.complete`.
+    pub audit_complete: Option<bool>,
+    /// The audit's metrics `5.3.acute_corners` and `5.3.right_angle_corners`.
+    pub acute: Option<f64>,
+    pub right_angles: Option<f64>,
+    /// The audit's `quality.copper_quality`.
+    pub copper_quality: Option<f64>,
+    /// The audit's metrics `4.2.nets_undersized` and `4.3.narrow_paths`, when it ran
+    /// those checks.
+    pub nets_undersized: Option<f64>,
+    pub narrow_paths: Option<f64>,
+    /// Track length from the run's session, mm, by category: pour nets, power nets
+    /// (`JudgeContext::power_nets`), the rest.
+    pub signal_mm: f64,
+    pub power_mm: f64,
+    pub pour_track_mm: f64,
+    /// The session's vias on nets that are not pour nets.
+    pub vias_off_pour: usize,
+    /// The session's tracks and arcs below their net's floor (beyond
+    /// [`FLOOR_TOLERANCE_MM`]).
+    pub below_floor: usize,
+    /// `intent_width_report` rows of this session (one per judged net).
+    pub width_rows: Vec<Value>,
+    /// The longest stretch below intent width per net, mm, from the same report.
+    pub longest_below_mm: BTreeMap<String, f64>,
+    pub stitching_vias: usize,
+    /// The route's own time, seconds.
+    pub route_s: f64,
+}
+
+/// Each gate passes when its list is empty; each entry is one readable line.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Gates {
+    pub g1: Vec<String>,
+    pub g2: Vec<String>,
+    pub g3: Vec<String>,
+}
+
+impl Gates {
+    pub(crate) fn all_pass(&self) -> bool {
+        self.g1.is_empty() && self.g2.is_empty() && self.g3.is_empty()
+    }
+}
+
+/// One judged run.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Judged {
+    pub measures: Measures,
+    pub gates: Gates,
+    /// The last board the judge wrote: routed, refilled and stitched.
+    pub board: PathBuf,
+    /// One row per stitching round: `round`, `open_before`, `proposals`,
+    /// `written_vias`, `open_after`, or `planner_refused`.
+    pub rounds: Vec<Value>,
+}
+
+/// One run, judged by Konnect itself under `ctx.root/run-<index>`:
+/// 1. `specctra_ses::parse_import_plan(ctx.board, ctx.board_text, ctx.manifest_text,
+///    session)`: a session the importer would refuse fails the judge (an error,
+///    not a candidate).
+/// 2. `scratch_board::copy_project` into `r0`, then `scratch_board::write_routing`
+///    of the plan over the saved text, written as `r0/<board file name>`.
+/// 3. `tools::cli::refill_drc_on_private_copy` on that board.
+/// 4. Stitching, only for `routed.planes` nets, for at most [`STITCH_ROUNDS`] rounds
+///    while one of those nets has an unconnected item (an unconnected item that
+///    names `[<net>]` in an item description): `plan_route_refinement` through the
+///    tool registry (`board`, `kinds: ["stitching"]`, `nets`, `search_radius_mm`
+///    [`STITCH_RADIUS_MM`], `effort: "standard"`). A refusal or no proposal stops
+///    the rounds (recorded). Else `scratch_board::planned_items` +
+///    `scratch_board::write_planned` into `r<n>` (project copied the same way),
+///    refill and DRC; the round's row records the counts.
+/// 5. `audit_layout_quality` through the tool registry on the last board.
+/// 6. [`measure`], then [`gates`]. Boards of earlier rounds are removed; the last is
+///    kept, and named in `Judged::board`.
+pub(crate) async fn judge(
+    ctx: &JudgeContext,
+    routed: &Routed,
+    baseline: &Baseline,
+    tools: Arc<crate::tools::ToolContext>,
+) -> Result<Judged> {
+    // 1. The session, read by the importer's own checks: a session it would refuse
+    //    is a failed judge.
+    let ses_text = tokio::fs::read_to_string(&routed.held.ses)
+        .await
+        .with_context(|| format!("read the session '{}'", routed.held.ses.display()))?;
+    let plan = crate::specctra_ses::parse_import_plan(
+        &ctx.board,
+        &ctx.board_text,
+        &ctx.manifest_text,
+        &ses_text,
+    )
+    .context("the importer refuses the run's session")?;
+    let widths = crate::intent_width_report::intent_width_report(&ctx.manifest, &ses_text)
+        .context("the width report of the run's session")?;
+
+    // 2. The session written into a scratch copy of the saved board.
+    let run_dir = ctx.root.join(format!("run-{}", routed.index));
+    if run_dir.exists() {
+        std::fs::remove_dir_all(&run_dir)
+            .with_context(|| format!("clear the old run folder '{}'", run_dir.display()))?;
+    }
+    let mut board = crate::scratch_board::copy_project(&ctx.board, &run_dir.join("r0"))?;
+    let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan)?;
+    write_board(&board, &routed_text)?;
+
+    // 3. KiCad's refill and DRC.
+    let mut drc = crate::tools::cli::refill_drc_on_private_copy(&ctx.kicad_cli, &board)
+        .await
+        .context("refill and DRC of the routed board")?;
+
+    // 4. Stitching, for the nets the router got as planes.
+    let planes = &routed.planes;
+    let mut rounds: Vec<Value> = Vec::new();
+    let mut stitching_vias = 0usize;
+    if !planes.is_empty() {
+        for round in 1..=STITCH_ROUNDS {
+            let open_before = unconnected_on(&drc, planes);
+            if open_before == 0 {
+                break;
+            }
+            let stopped = |extra: Value| {
+                let mut row = json!({ "round": round, "open_before": open_before });
+                if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
+                    row.extend(extra.clone());
+                }
+                row
+            };
+            let args = json!({
+                "board": board.display().to_string(),
+                "kinds": ["stitching"],
+                "nets": planes,
+                "search_radius_mm": STITCH_RADIUS_MM,
+                "effort": "standard",
+            });
+            let plan_json = match call_tool(&tools, "plan_route_refinement", &args).await {
+                Err(error) => {
+                    rounds.push(stopped(json!({ "planner_refused": format!("{error:#}") })));
+                    break;
+                }
+                Ok((true, text)) => {
+                    let reason = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|body| body["blocked"][0]["reason"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| clipped(&text));
+                    rounds.push(stopped(json!({ "planner_refused": reason })));
+                    break;
+                }
+                Ok((false, text)) => match serde_json::from_str::<Value>(&text) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        rounds.push(stopped(
+                            json!({ "planner_refused": format!("unreadable planner result: {error}") }),
+                        ));
+                        break;
+                    }
+                },
+            };
+            let proposals = plan_json["proposals"].as_array().map_or(0, Vec::len);
+            if proposals == 0 {
+                rounds.push(stopped(json!({ "proposals": 0 })));
+                break;
+            }
+            // Every proposed item is written, as the research's `post` adopted
+            // every listed via.
+            let items = match crate::scratch_board::planned_items(&plan_json) {
+                Ok(items) => items,
+                Err(error) => {
+                    rounds.push(stopped(json!({
+                        "proposals": proposals,
+                        "planner_refused": format!("proposals not usable: {error:#}"),
+                    })));
+                    break;
+                }
+            };
+            if items.tracks.is_empty() && items.vias.is_empty() {
+                rounds.push(stopped(
+                    json!({ "proposals": proposals, "written_vias": 0 }),
+                ));
+                break;
+            }
+            let current_text = tokio::fs::read_to_string(&board)
+                .await
+                .with_context(|| format!("read the scratch board '{}'", board.display()))?;
+            let next_text = match crate::scratch_board::write_planned(&current_text, &items) {
+                Ok(text) => text,
+                Err(error) => {
+                    rounds.push(stopped(json!({
+                        "proposals": proposals,
+                        "planner_refused": format!("proposals not writable: {error:#}"),
+                    })));
+                    break;
+                }
+            };
+            let next_board =
+                crate::scratch_board::copy_project(&board, &run_dir.join(format!("r{round}")))?;
+            write_board(&next_board, &next_text)?;
+            let next_drc =
+                crate::tools::cli::refill_drc_on_private_copy(&ctx.kicad_cli, &next_board)
+                    .await
+                    .with_context(|| format!("refill and DRC after stitching round {round}"))?;
+            // The earlier round's board is no longer needed.
+            remove_board(&board);
+            board = next_board;
+            drc = next_drc;
+            stitching_vias += items.vias.len();
+            rounds.push(stopped(json!({
+                "proposals": proposals,
+                "written_vias": items.vias.len(),
+                "open_after": unconnected_on(&drc, planes),
+            })));
+        }
+    }
+
+    // 5. The layout audit on the last board: a refusal is a failed judge.
+    let (refused, text) = call_tool(
+        &tools,
+        "audit_layout_quality",
+        &json!({ "board": board.display().to_string() }),
+    )
+    .await
+    .context("the layout audit failed")?;
+    ensure!(!refused, "the layout audit refused: {}", clipped(&text));
+    let audit: Value =
+        serde_json::from_str(&text).context("the layout audit result is not JSON")?;
+
+    // 6. Measures and gates.
+    let measures = measure(
+        ctx,
+        &drc,
+        &audit,
+        &plan,
+        &widths,
+        stitching_vias,
+        routed.held.seconds,
+    )?;
+    let gates = gates(&measures, baseline);
+    Ok(Judged {
+        measures,
+        gates,
+        board,
+        rounds,
+    })
+}
+
+/// The measures of a run from its parts: KiCad's last report, the audit's JSON, the
+/// import plan of its session, the width report of its session, the stitching vias
+/// written, and the route time.
+pub(crate) fn measure(
+    ctx: &JudgeContext,
+    drc: &crate::tools::cli::DrcReport,
+    audit: &Value,
+    plan: &crate::specctra_ses::SesImportPlan,
+    widths: &crate::intent_width_report::WidthReport,
+    stitching_vias: usize,
+    route_s: f64,
+) -> Result<Measures> {
+    let unconnected = unconnected_total(drc)?;
+    let metric = |key: &str| audit["metrics"][key].as_f64();
+
+    let mut lengths = Category::default();
+    let mut below_floor = 0usize;
+    for track in &plan.tracks {
+        let length = (track.x2_mm - track.x1_mm).hypot(track.y2_mm - track.y1_mm);
+        lengths.add(ctx, &track.net_name, length);
+        if is_below_floor(ctx, &track.net_name, track.width_mm) {
+            below_floor += 1;
+        }
+    }
+    for arc in &plan.arcs {
+        let length = arc_length_mm(
+            [arc.start_x_mm, arc.start_y_mm],
+            [arc.mid_x_mm, arc.mid_y_mm],
+            [arc.end_x_mm, arc.end_y_mm],
+        );
+        lengths.add(ctx, &arc.net_name, length);
+        if is_below_floor(ctx, &arc.net_name, arc.width_mm) {
+            below_floor += 1;
+        }
+    }
+    let vias_off_pour = plan
+        .vias
+        .iter()
+        .filter(|via| !ctx.pour_nets.contains(&via.net_name))
+        .count();
+
+    let longest_below_mm: BTreeMap<String, f64> = widths
+        .nets
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row["net"].as_str()?.to_string(),
+                row["longest_below_intent_mm"].as_f64()?,
+            ))
+        })
+        .collect();
+
+    Ok(Measures {
+        unconnected,
+        violations: violations_by_rule(drc),
+        routed_share: audit["quality"]["routed_share"].as_f64(),
+        audit_complete: audit["completion"]["complete"].as_bool(),
+        acute: metric("5.3.acute_corners"),
+        right_angles: metric("5.3.right_angle_corners"),
+        copper_quality: audit["quality"]["copper_quality"].as_f64(),
+        nets_undersized: metric("4.2.nets_undersized"),
+        narrow_paths: metric("4.3.narrow_paths"),
+        signal_mm: lengths.signal,
+        power_mm: lengths.power,
+        pour_track_mm: lengths.pour,
+        vias_off_pour,
+        below_floor,
+        width_rows: widths.nets.clone(),
+        longest_below_mm,
+        stitching_vias,
+        route_s,
+    })
+}
+
+/// Track length by category (pour beats power beats signal).
+#[derive(Default)]
+struct Category {
+    signal: f64,
+    power: f64,
+    pour: f64,
+}
+
+impl Category {
+    fn add(&mut self, ctx: &JudgeContext, net: &str, length_mm: f64) {
+        if ctx.pour_nets.contains(net) {
+            self.pour += length_mm;
+        } else if ctx.power_nets.contains(net) {
+            self.power += length_mm;
+        } else {
+            self.signal += length_mm;
+        }
+    }
+}
+
+/// Whether a track of `net` and `width_mm` is below the net's floor by more than
+/// [`FLOOR_TOLERANCE_MM`]. Compared in whole nanometres, so that the boundary is a
+/// rule and not rounding noise. A net with no floor is never below one.
+fn is_below_floor(ctx: &JudgeContext, net: &str, width_mm: f64) -> bool {
+    let Some(floor_mm) = ctx.floors_mm.get(net) else {
+        return false;
+    };
+    let tolerance_nm = (FLOOR_TOLERANCE_MM * 1e6).round() as i64;
+    ((floor_mm - width_mm) * 1e6).round() as i64 > tolerance_nm
+}
+
+/// The length of the arc from `start` through `mid` to `end`, mm: the arc of the
+/// circle through the three points that passes through `mid`. Three points on a
+/// line have no circle: the length is then the chord.
+fn arc_length_mm(start: [f64; 2], mid: [f64; 2], end: [f64; 2]) -> f64 {
+    let chord = (end[0] - start[0]).hypot(end[1] - start[1]);
+    let [ax, ay] = start;
+    let [bx, by] = mid;
+    let [cx, cy] = end;
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if !d.is_finite() || d.abs() < 1e-12 {
+        return chord;
+    }
+    let (a2, b2, c2) = (ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy);
+    let centre_x = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+    let centre_y = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let radius = (ax - centre_x).hypot(ay - centre_y);
+    let angle = |x: f64, y: f64| (y - centre_y).atan2(x - centre_x);
+    let tau = std::f64::consts::TAU;
+    let (a_start, a_mid, a_end) = (angle(ax, ay), angle(bx, by), angle(cx, cy));
+    let to_mid = (a_mid - a_start).rem_euclid(tau);
+    let to_end = (a_end - a_start).rem_euclid(tau);
+    // Counter-clockwise from the start reaches the mid point before the end: the
+    // arc runs that way. Otherwise it runs the other way round.
+    let sweep = if to_mid <= to_end {
+        to_end
+    } else {
+        tau - to_end
+    };
+    let length = radius * sweep;
+    if length.is_finite() {
+        length
+    } else {
+        chord
+    }
+}
+
+/// The absolute gates (decision 10):
+/// - G1 complete: 0 unconnected; the audit's routed share is 1 (within 1e-9); the
+///   audit calls the routing complete. A missing audit value is a failure.
+/// - G2 DRC: every violation type at most the baseline's count of that type.
+/// - G3 width: no track below its floor; 0 `track_width` violations; each
+///   intent-width net with at most [`BELOW_INTENT_SHARE`] of its length and no
+///   stretch longer than [`BELOW_INTENT_SECTION_MM`] below its intent width; audit
+///   4.2 nets undersized 0 and 4.3 narrow paths 0 when the audit gave them.
+pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
+    let mut g1 = Vec::new();
+    if m.unconnected != 0 {
+        g1.push(format!(
+            "{} unconnected item(s) after the refill and stitching",
+            m.unconnected
+        ));
+    }
+    match m.routed_share {
+        None => g1.push("the audit gave no routed share".to_string()),
+        Some(share) if (share - 1.0).abs() > 1e-9 => {
+            g1.push(format!("the audit's routed share is {share}, not 1"))
+        }
+        Some(_) => {}
+    }
+    match m.audit_complete {
+        None => g1.push("the audit gave no completion verdict".to_string()),
+        Some(false) => g1.push("the audit calls the routing incomplete".to_string()),
+        Some(true) => {}
+    }
+
+    let mut g2 = Vec::new();
+    for (rule, count) in &m.violations {
+        let allowed = baseline.violations.get(rule).copied().unwrap_or(0);
+        if *count > allowed {
+            g2.push(format!(
+                "{rule}: {count} violation(s), the unrouted board has {allowed}"
+            ));
+        }
+    }
+
+    let mut g3 = Vec::new();
+    if m.below_floor > 0 {
+        g3.push(format!(
+            "{} track(s) below their net's floor width",
+            m.below_floor
+        ));
+    }
+    let track_width = m.violations.get("track_width").copied().unwrap_or(0);
+    if track_width > 0 {
+        g3.push(format!("{track_width} track_width violation(s)"));
+    }
+    for row in &m.width_rows {
+        let net = row["net"].as_str().unwrap_or("?");
+        let routed = row["routed_mm"].as_f64().unwrap_or(0.0);
+        let below = row["below_intent_mm"].as_f64().unwrap_or(0.0);
+        let share = row["below_intent_share"]
+            .as_f64()
+            .unwrap_or(if routed > 0.0 { below / routed } else { 0.0 });
+        if share > BELOW_INTENT_SHARE {
+            g3.push(format!(
+                "{net}: {:.1} % of its length is below its intent width (at most {:.0} %)",
+                share * 100.0,
+                BELOW_INTENT_SHARE * 100.0
+            ));
+        }
+        let longest = row["longest_below_intent_mm"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .max(m.longest_below_mm.get(net).copied().unwrap_or(0.0));
+        if longest > BELOW_INTENT_SECTION_MM {
+            g3.push(format!(
+                "{net}: a {longest:.2} mm stretch is below its intent width (at most {BELOW_INTENT_SECTION_MM} mm)"
+            ));
+        }
+    }
+    if let Some(undersized) = m.nets_undersized.filter(|count| *count > 0.0) {
+        g3.push(format!(
+            "the audit finds {undersized} net(s) undersized (4.2)"
+        ));
+    }
+    if let Some(narrow) = m.narrow_paths.filter(|count| *count > 0.0) {
+        g3.push(format!("the audit finds {narrow} narrow path(s) (4.3)"));
+    }
+
+    Gates { g1, g2, g3 }
+}
+
+/// A run's rank key; the least is the best.
+pub(crate) type Key = [i64; 10];
+
+/// The rank key of decision 12 for every judged run at once (the length steps need
+/// the shortest): G1, G2 and G3 failed (0 or 1 each); acute corners (whole);
+/// signal length over the shortest judged signal length, in steps of
+/// [`LENGTH_STEP`] (`round(ratio / step)`); power length the same; right angles
+/// (whole); vias off the pour nets; minus copper quality (rounded to whole points);
+/// route seconds (rounded down). A measure the audit did not give sorts last
+/// (`i64::MAX`). When every run's length of a category is 0, that step is 0 for all.
+pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
+    // The shortest judged length of a category, among runs that have any: a run with
+    // none of it is at least as short as the shortest, and its step is 0.
+    let shortest = |length: fn(&Measures) -> f64| -> Option<f64> {
+        judged
+            .iter()
+            .map(|run| length(&run.measures))
+            .filter(|mm| *mm > 0.0)
+            .fold(None, |least: Option<f64>, mm| {
+                Some(least.map_or(mm, |least| least.min(mm)))
+            })
+    };
+    let step = |mm: f64, shortest: Option<f64>| -> i64 {
+        match shortest {
+            Some(shortest) if mm > 0.0 => (mm / shortest / LENGTH_STEP).round() as i64,
+            _ => 0,
+        }
+    };
+    let shortest_signal = shortest(|m| m.signal_mm);
+    let shortest_power = shortest(|m| m.power_mm);
+    // A measure the audit did not give sorts last.
+    let whole = |value: Option<f64>| value.map_or(i64::MAX, |value| value.round() as i64);
+    judged
+        .iter()
+        .map(|run| {
+            let (m, g) = (&run.measures, &run.gates);
+            [
+                i64::from(!g.g1.is_empty()),
+                i64::from(!g.g2.is_empty()),
+                i64::from(!g.g3.is_empty()),
+                whole(m.acute),
+                step(m.signal_mm, shortest_signal),
+                step(m.power_mm, shortest_power),
+                whole(m.right_angles),
+                m.vias_off_pour as i64,
+                m.copper_quality
+                    .map_or(i64::MAX, |quality| -(quality.round() as i64)),
+                m.route_s.max(0.0).floor() as i64,
+            ]
+        })
+        .collect()
+}
+
+/// The unconnected items that name one of `nets` as `[<net>]` in an item's
+/// description, counted.
+pub(crate) fn unconnected_on(drc: &crate::tools::cli::DrcReport, nets: &[String]) -> usize {
+    let Some(open) = &drc.unconnected_items else {
+        return 0;
+    };
+    let tags: Vec<String> = nets.iter().map(|net| format!("[{net}]")).collect();
+    open.iter()
+        .filter(|violation| {
+            violation.items.iter().any(|item| {
+                tags.iter()
+                    .any(|tag| item.description.contains(tag.as_str()))
+            })
+        })
+        .count()
+}
+
+#[cfg(test)]
+#[path = "route_judge_tests.rs"]
+mod tests;
