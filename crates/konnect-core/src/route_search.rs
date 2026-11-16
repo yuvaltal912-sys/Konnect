@@ -536,32 +536,61 @@ impl SplitMix64 {
 /// Judge failures, with no judge success, after which nothing more launches.
 pub(crate) const JUDGE_FAILURES_BEFORE_STOP: usize = 3;
 
-/// The most runs one call starts (decision 9).
-pub(crate) const MAX_RUNS: usize = 240;
+/// Route failures in a row (errors, not the hang cap) after which nothing more
+/// launches until a route in flight succeeds.
+pub(crate) const ROUTE_FAILURES_IN_A_ROW: usize = 5;
+
+/// How many of the best judged runs keep their whole folders during the search
+/// (decision 19); every other finished run is released at once.
+pub(crate) const KEPT_WHOLE: usize = 8;
 
 /// The longest one run (every pass of it) may take before it is killed (decision 8).
 pub(crate) const HANG_CAP: Duration = Duration::from_secs(900);
 
-/// The order runs are launched in (decision 3): seed 1 in every shape (in the order
-/// given), then seed 2 in every shape, and so on; `limits.runs` entries when set,
-/// else [`MAX_RUNS`].
-pub(crate) fn launch_order(shapes: &[Shape], limits: Limits) -> Vec<(Shape, u64)> {
-    let wanted = limits.runs.unwrap_or(MAX_RUNS);
-    let mut order = Vec::with_capacity(wanted.min(MAX_RUNS));
-    if shapes.is_empty() {
-        return order;
-    }
-    let mut seed = 1u64;
-    while order.len() < wanted {
-        for shape in shapes {
-            if order.len() == wanted {
-                break;
+/// The runs a search may launch, in launch order (decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Order {
+    /// Exactly these runs (Fast's fixed count).
+    Fixed(Vec<(Shape, u64)>),
+    /// Seed 1 in every shape (in the order given), then seed 2 in every shape, and
+    /// so on, without end: the budget ends the search (decision 9).
+    Endless(Vec<Shape>),
+}
+
+impl Order {
+    /// Run `index`'s shape and seed; `None` past the end of a fixed order.
+    pub(crate) fn get(&self, index: usize) -> Option<(Shape, u64)> {
+        match self {
+            Order::Fixed(runs) => runs.get(index).copied(),
+            Order::Endless(shapes) if shapes.is_empty() => None,
+            Order::Endless(shapes) => {
+                let seed = u64::try_from(index / shapes.len()).ok()?.checked_add(1)?;
+                Some((shapes[index % shapes.len()], seed))
             }
-            order.push((*shape, seed));
         }
-        seed += 1;
     }
-    order
+
+    /// No run at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.get(0).is_none()
+    }
+}
+
+impl FromIterator<(Shape, u64)> for Order {
+    fn from_iter<I: IntoIterator<Item = (Shape, u64)>>(runs: I) -> Self {
+        Order::Fixed(runs.into_iter().collect())
+    }
+}
+
+/// The order runs are launched in (decision 3): seed 1 in every shape (in the order
+/// given), then seed 2 in every shape, and so on; the first `limits.runs` of them
+/// when that is set (Fast), else with no end (the budget ends the search).
+pub(crate) fn launch_order(shapes: &[Shape], limits: Limits) -> Order {
+    let endless = Order::Endless(shapes.to_vec());
+    match limits.runs {
+        Some(wanted) => (0..wanted).map_while(|index| endless.get(index)).collect(),
+        None => endless,
+    }
 }
 
 /// How many runs route at once, and how many are judged at once.
@@ -622,6 +651,14 @@ pub(crate) trait Runner: Send + Sync + 'static {
     /// Judge one routed run against the unrouted board's baseline.
     fn judge(&self, routed: Routed, baseline: Arc<Baseline>) -> BoxFuture<Result<Judged>>;
 
+    /// Run `index` has finished and is not among the [`KEPT_WHOLE`] best judged
+    /// runs (or did not get judged at all): its bulky files may go now. Its session
+    /// and its record must stay, since a released run can still win. Called at most
+    /// once a run, during the search; best effort, never fails the search.
+    fn release(&self, index: usize, shape: Shape, seed: u64) {
+        let _ = (index, shape, seed);
+    }
+
     /// The unrouted board's DRC, G2's baseline. Started at t0, beside the first
     /// wave; every judge waits for it.
     fn baseline(&self) -> BoxFuture<Result<Baseline>>;
@@ -655,7 +692,7 @@ pub(crate) struct RunRecord {
 pub(crate) struct SearchPlan {
     pub limits: Limits,
     pub lanes: Lanes,
-    pub order: Vec<(Shape, u64)>,
+    pub order: Order,
     pub hang_cap: Duration,
 }
 
@@ -672,14 +709,15 @@ pub(crate) struct SearchOutcome {
     /// When no run was judged by the budget: how far past it the first was (D7).
     pub budget_overrun: Option<Duration>,
     /// Why the last launch was the last: `order exhausted`, `the budget`,
-    /// `the launch rule`, `fixed run count`, or the MAX_RUNS cap.
+    /// `the launch rule`, `fixed run count`, or one of the two failure stops.
     pub stopped_launching: Option<String>,
     pub baseline: std::result::Result<Baseline, String>,
 }
 
 /// The timed search (decisions 6 to 9):
 /// - t0 = now. The baseline job starts at once. The first wave launches
-///   `min(lanes.routers, order.len())` runs at once (for Fast, its fixed count).
+///   `lanes.routers` runs at once, or fewer when the order is shorter (for Fast, its
+///   fixed count).
 /// - Each route gets `deadline = min(launch + hang_cap, the budget's cut instant)`;
 ///   the cut instant is `None` until the cut is decided (see below), so routes are
 ///   bounded by the hang cap until then. A route that returns `Killed` is `hung`
@@ -707,6 +745,15 @@ pub(crate) struct SearchOutcome {
 ///   resumes. Otherwise the search ends when the running work ends, with no cut, and
 ///   `stopped_launching` is `the judge failed on every run so far`. A failed baseline
 ///   counts as a failure for every run it fails.
+/// - Once [`ROUTE_FAILURES_IN_A_ROW`] (5) routes in a row have failed (an error, not
+///   the hang cap), nothing more launches until a route in flight succeeds;
+///   `stopped_launching` is then `5 routes in a row failed`. Without it an endless
+///   order whose routes all start failing (a full disk, say) would launch failing
+///   runs until the budget. (When no route has succeeded at all, the launch rule
+///   already stops after the first wave: it has no judge time to go by.)
+/// - Every run that finished without being judged is released at once
+///   ([`Runner::release`]); after every judge, the judged runs outside the
+///   [`KEPT_WHOLE`] best by the rank key so far are released too.
 /// - At the cut, jobs that have already finished are collected first, so a judge that
 ///   ended at the same instant as the budget is not lost.
 /// - The winner is the least [`crate::route_judge::rank`] key over the judged runs,
@@ -794,6 +841,13 @@ struct Sched<'a> {
     /// Set once `JUDGE_FAILURES_BEFORE_STOP` judges failed and none succeeded; a later
     /// success clears it.
     judge_halt: bool,
+    /// Route failures since the last route that succeeded.
+    route_failures_in_a_row: usize,
+    /// Set once `ROUTE_FAILURES_IN_A_ROW` routes failed in a row; a later route that
+    /// succeeds clears it.
+    route_halt: bool,
+    /// By run index: released already.
+    released: Vec<bool>,
 }
 
 impl<'a> Sched<'a> {
@@ -819,6 +873,45 @@ impl<'a> Sched<'a> {
             first_judged_at: None,
             judge_failures: 0,
             judge_halt: false,
+            route_failures_in_a_row: 0,
+            route_halt: false,
+            released: Vec::new(),
+        }
+    }
+
+    /// Releases run `index` once ([`Runner::release`]).
+    fn release(&mut self, index: usize) {
+        if self.released.get(index).copied().unwrap_or(true) {
+            return;
+        }
+        self.released[index] = true;
+        let record = &self.runs[index];
+        self.runner.release(index, record.shape, record.seed);
+    }
+
+    /// Releases every judged run outside the `KEPT_WHOLE` best by the rank key so
+    /// far (ties to the lower index), as the winner is chosen.
+    fn release_beyond_the_best(&mut self) {
+        let judged: Vec<(usize, &Judged)> = self
+            .runs
+            .iter()
+            .filter_map(|r| r.judged.as_ref().map(|j| (r.index, j)))
+            .collect();
+        if judged.len() <= KEPT_WHOLE {
+            return;
+        }
+        let refs: Vec<&Judged> = judged.iter().map(|(_, j)| *j).collect();
+        let mut ranked: Vec<(Key, usize)> = crate::route_judge::rank(&refs)
+            .into_iter()
+            .zip(judged.iter().map(|(index, _)| *index))
+            .collect();
+        ranked.sort();
+        let beyond: Vec<usize> = ranked[KEPT_WHOLE..]
+            .iter()
+            .map(|(_, index)| *index)
+            .collect();
+        for index in beyond {
+            self.release(index);
         }
     }
 
@@ -894,17 +987,26 @@ impl<'a> Sched<'a> {
                 record.routed = Some(routed.clone());
                 self.route_times.push(took);
                 self.queue.push_back((index, routed));
+                // A router that works again is not a deterministic failure.
+                self.route_failures_in_a_row = 0;
+                self.route_halt = false;
             }
             Err(RouteFailure::Failed(message)) => {
                 record.outcome = "route_failed";
                 record.reason = Some(message);
                 self.route_times.push(took);
+                self.route_failures_in_a_row += 1;
+                if self.route_failures_in_a_row >= ROUTE_FAILURES_IN_A_ROW {
+                    self.route_halt = true;
+                }
+                self.release(index);
             }
             Err(RouteFailure::Killed) => {
                 record.outcome = "hung";
                 record.reason = Some(format!(
                     "killed at the hang cap ({hang_cap_s} s); never retried"
                 ));
+                self.release(index);
             }
         }
     }
@@ -937,11 +1039,13 @@ impl<'a> Sched<'a> {
                 self.first_judged_at.get_or_insert(at);
                 // A judge that works on some runs is not a deterministic failure.
                 self.judge_halt = false;
+                self.release_beyond_the_best();
             }
             Err(e) => {
                 record.outcome = "judge_failed";
                 record.reason = Some(format!("{e:#}"));
                 self.note_judge_failure();
+                self.release(index);
             }
         }
     }
@@ -980,6 +1084,7 @@ impl<'a> Sched<'a> {
                     record.reason = Some(reason.clone());
                     record.judged_s = Some(judged_s);
                     self.note_judge_failure();
+                    self.release(index);
                 }
                 return;
             }
@@ -999,19 +1104,21 @@ impl<'a> Sched<'a> {
     /// The first wave (every router lane at once, or the fixed count), then, after
     /// each event, further runs while a lane is free and the launch rule allows.
     fn launch_ready(&mut self, now: Instant, passed: bool) {
-        let order_len = self.plan.order.len();
         let routers = self.plan.lanes.routers.max(1);
         if !self.started {
             self.started = true;
-            for _ in 0..routers.min(order_len) {
+            for _ in 0..routers {
+                if !self.has_next() {
+                    break;
+                }
                 self.launch_one(now);
             }
             return;
         }
-        if self.plan.limits.runs.is_some() || passed || self.judge_halt {
+        if self.plan.limits.runs.is_some() || passed || self.judge_halt || self.route_halt {
             return;
         }
-        while self.routes.len() < routers && self.runs.len() < order_len {
+        while self.routes.len() < routers && self.has_next() {
             let queued = self.runs.iter().filter(|r| r.outcome == "running").count();
             if !may_launch(
                 now.saturating_duration_since(self.t0),
@@ -1027,9 +1134,18 @@ impl<'a> Sched<'a> {
         }
     }
 
+    /// The order has a run left to launch.
+    fn has_next(&self) -> bool {
+        self.plan.order.get(self.runs.len()).is_some()
+    }
+
     fn launch_one(&mut self, now: Instant) {
         let index = self.runs.len();
-        let (shape, seed) = self.plan.order[index];
+        let (shape, seed) = self
+            .plan
+            .order
+            .get(index)
+            .expect("launch_one is only called while the order has a run left");
         let deadline = now + self.plan.hang_cap;
         let job = self.runner.route(index, shape, seed, deadline);
         let launched_s = self.since_t0(now);
@@ -1037,6 +1153,7 @@ impl<'a> Sched<'a> {
         self.route_ids.insert(handle.id(), index);
         self.launched_at.push(now);
         self.judge_started.push(None);
+        self.released.push(false);
         self.runs.push(RunRecord {
             index,
             shape,
@@ -1105,12 +1222,10 @@ impl<'a> Sched<'a> {
             None
         } else if self.plan.limits.runs.is_some() {
             Some("fixed run count".to_string())
-        } else if self.runs.len() >= self.plan.order.len() {
-            Some(if self.plan.order.len() >= MAX_RUNS {
-                format!("MAX_RUNS ({MAX_RUNS})")
-            } else {
-                "order exhausted".to_string()
-            })
+        } else if !self.has_next() {
+            Some("order exhausted".to_string())
+        } else if self.route_halt {
+            Some(format!("{ROUTE_FAILURES_IN_A_ROW} routes in a row failed"))
         } else if self.judge_halt {
             Some("the judge failed on every run so far".to_string())
         } else if self.budget_hit {

@@ -675,15 +675,18 @@ async fn search_and_write(
         tools: ctx,
     });
     let outcome = route_search::search(&plan, runner).await;
-    let mut search = search_json(&plan, &shapes, &outcome);
-    search["kicad_config_home"] = json!(text(&kicad_config_home));
-    if !kicad_config.skipped_links.is_empty() {
-        search["kicad_config_skipped_links"] = json!(kicad_config.skipped_links);
-    }
+    let settings = |search: &mut Value| {
+        search["kicad_config_home"] = json!(text(&kicad_config_home));
+        if !kicad_config.skipped_links.is_empty() {
+            search["kicad_config_skipped_links"] = json!(kicad_config.skipped_links);
+        }
+    };
+    let mut every_run = search_json(&plan, &shapes, &outcome, Listing::Every);
+    settings(&mut every_run);
     let search_file = call.folder.join("search.json");
     std::fs::write(
         &search_file,
-        serde_json::to_string_pretty(&search).unwrap_or_default(),
+        serde_json::to_string_pretty(&every_run).unwrap_or_default(),
     )
     .map_err(|error| anyhow::anyhow!("write {}: {error}", search_file.display()))?;
     let Some(winner) = outcome
@@ -691,6 +694,8 @@ async fn search_and_write(
         .and_then(|index| outcome.runs.get(index))
         .filter(|record| record.routed.is_some() && record.judged.is_some())
     else {
+        let mut search = search_json(&plan, &shapes, &outcome, Listing::Best);
+        settings(&mut search);
         return Ok(no_winner_result(call, &outcome, search));
     };
     let routed = winner.routed.as_ref().expect("filtered above");
@@ -714,10 +719,7 @@ async fn search_and_write(
         &shapes,
         &outcome,
     );
-    result["search"]["kicad_config_home"] = json!(text(&kicad_config_home));
-    if !kicad_config.skipped_links.is_empty() {
-        result["search"]["kicad_config_skipped_links"] = json!(kicad_config.skipped_links);
-    }
+    settings(&mut result["search"]);
     if let Err(error) = reduced {
         result["search"]["reduce_error"] = json!(format!("{error:#}"));
     }
@@ -749,7 +751,7 @@ fn no_winner_result(call: &Call, outcome: &SearchOutcome, mut search: Value) -> 
         ),
     };
     let message = format!(
-        "No run was routed and judged: {} run(s) launched ({}). Nothing was written to {}.{baseline} `search.runs` says why each run ended as it did; the runs' files are in the search folder. engine: \"freerouting\" routes with Freerouting instead.",
+        "No run was routed and judged: {} run(s) launched ({}). Nothing was written to {}.{baseline} `search.runs` says why runs ended as they did, and `search.json` in the search folder lists every run. engine: \"freerouting\" routes with Freerouting instead.",
         outcome.runs.len(),
         if counts.is_empty() {
             "none started".to_string()
@@ -920,6 +922,34 @@ impl Runner for FastrouteRunner {
         let judge = Arc::clone(&self.judge);
         Box::pin(async move { route_judge::baseline(&judge).await })
     }
+
+    /// Removes the run's judge folder (`judge/run-<i>`, its scratch boards) and, in
+    /// each pass folder, the sandbox's `home` and `tmp`, its profile and the
+    /// router's log. The variant, the sessions and the pass reports stay: a
+    /// released run can still win, and its record needs them. Best effort: a
+    /// failure is logged, never raised. Nothing outside the search folder is
+    /// touched, and no link is followed (`remove_tree`).
+    fn release(&self, index: usize, shape: Shape, seed: u64) {
+        release_run(&self.folder, &self.judge.root, index, shape, seed);
+    }
+}
+
+/// What [`FastrouteRunner::release`] does: removes `<judge root>/run-<i>` and, in
+/// each pass folder of run `i`, `home`, `tmp`, `profile.sb` and `fastroute.log`.
+/// A failure is logged, never raised; no link is followed (`remove_tree`).
+fn release_run(folder: &Path, judge_root: &Path, index: usize, shape: Shape, seed: u64) {
+    let run = folder.join(run_folder_name(index, shape, seed));
+    let mut paths = vec![judge_root.join(format!("run-{index}"))];
+    for pass in ["full", "fallback", "polish"] {
+        for name in ["home", "tmp", "profile.sb", "fastroute.log"] {
+            paths.push(run.join(pass).join(name));
+        }
+    }
+    for path in paths {
+        if let Err(error) = remove_tree(&path) {
+            tracing::warn!("releasing run {index}: remove {}: {error}", path.display());
+        }
+    }
 }
 
 // ─── After the search ────────────────────────────────────────────────────────
@@ -1042,8 +1072,8 @@ fn text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Every run's record as a JSON row, its seconds rounded to 0.1.
-fn run_rows(runs: &[RunRecord]) -> Vec<Value> {
+/// Each run's record as a JSON row, its seconds rounded to 0.1.
+fn run_rows(runs: &[&RunRecord]) -> Vec<Value> {
     runs.iter()
         .map(|record| {
             let mut row = serde_json::to_value(record).unwrap_or(Value::Null);
@@ -1061,6 +1091,63 @@ fn run_rows(runs: &[RunRecord]) -> Vec<Value> {
         .collect()
 }
 
+/// The judged board's path, or null when it is no longer there: a run outside the
+/// best `KEPT_WHOLE` when it was judged was released, and can still win later.
+fn judged_board(judged: &Judged) -> Value {
+    if judged.board.is_file() {
+        json!(text(&judged.board))
+    } else {
+        Value::Null
+    }
+}
+
+/// Why `judged_board` is null.
+const JUDGED_BOARD_RELEASED: &str = "The judged board was removed during the search: the run was not among the best runs when it was judged and only rose to win later. Its session is the result; apply it to see the board.";
+
+/// How many runs the result lists of each kind: the best judged runs by the rank
+/// key, then the runs that were not judged, in launch order. `search.json` lists
+/// every run.
+pub(crate) const LISTED_RUNS: usize = 20;
+
+/// Which runs `search.runs` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Listing {
+    /// Every run, in launch order (`search.json`).
+    Every,
+    /// The result's list: see [`LISTED_RUNS`].
+    Best,
+}
+
+/// The runs a listing holds.
+fn listed_runs(outcome: &SearchOutcome, listing: Listing) -> Vec<&RunRecord> {
+    if listing == Listing::Every {
+        return outcome.runs.iter().collect();
+    }
+    let mut judged: Vec<(crate::route_judge::Key, usize)> = outcome
+        .runs
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.outcome == "judged")
+        .filter_map(|(position, _)| {
+            Some((outcome.keys.get(position).copied().flatten()?, position))
+        })
+        .collect();
+    judged.sort();
+    let mut rows: Vec<&RunRecord> = judged
+        .iter()
+        .take(LISTED_RUNS)
+        .map(|(_, position)| &outcome.runs[*position])
+        .collect();
+    rows.extend(
+        outcome
+            .runs
+            .iter()
+            .filter(|record| record.outcome != "judged")
+            .take(LISTED_RUNS),
+    );
+    rows
+}
+
 /// The winner's own part of `search`: its identity, verdict and passes. `None`
 /// when no run won, or the winning record lacks what a result needs.
 fn winner_json(outcome: &SearchOutcome) -> Option<Value> {
@@ -1073,7 +1160,7 @@ fn winner_json(outcome: &SearchOutcome) -> Option<Value> {
         "seed": record.seed,
         "gates": judged.gates,
         "measures": judged.measures,
-        "judged_board": text(&judged.board),
+        "judged_board": judged_board(judged),
         "passes": routed.held.passes,
         "kept": routed.held.kept,
         "key": outcome.keys.get(position).copied().flatten(),
@@ -1092,21 +1179,41 @@ fn baseline_json(baseline: &std::result::Result<Baseline, String>) -> Value {
     }
 }
 
-/// `search` of the result and the whole of `search.json`: the lanes, the shapes,
-/// every run's record, the winner, how the search ended and the baseline.
-fn search_json(plan: &SearchPlan, shapes: &[Shape], outcome: &SearchOutcome) -> Value {
-    json!({
+/// `search` of the result (`Listing::Best`) and the whole of `search.json`
+/// (`Listing::Every`): the lanes, the shapes, the count of each outcome, the runs
+/// the listing holds, the winner, how the search ended and the baseline.
+fn search_json(
+    plan: &SearchPlan,
+    shapes: &[Shape],
+    outcome: &SearchOutcome,
+    listing: Listing,
+) -> Value {
+    let mut outcomes = std::collections::BTreeMap::new();
+    for record in &outcome.runs {
+        *outcomes.entry(record.outcome).or_insert(0usize) += 1;
+    }
+    let rows = listed_runs(outcome, listing);
+    let mut search = json!({
         "lanes": plan.lanes,
         "shapes": shapes,
         "launched": outcome.runs.len(),
         "judged": outcome.runs.iter().filter(|record| record.outcome == "judged").count(),
+        "outcomes": outcomes,
         "winner": winner_json(outcome),
-        "runs": run_rows(&outcome.runs),
+        "runs": run_rows(&rows),
         "elapsed_s": round1(outcome.elapsed.as_secs_f64()),
         "budget_overrun_s": outcome.budget_overrun.map(|over| round1(over.as_secs_f64())),
         "stopped_launching": outcome.stopped_launching,
         "baseline": baseline_json(&outcome.baseline),
-    })
+    });
+    if listing == Listing::Best && rows.len() < outcome.runs.len() {
+        search["runs_listed"] = json!(format!(
+            "{} of {} runs: the {LISTED_RUNS} best judged by the rank key, then up to {LISTED_RUNS} that were not judged; search.json in the search folder lists every run",
+            rows.len(),
+            outcome.runs.len()
+        ));
+    }
+    search
 }
 
 /// The `status` of a fastroute result. The router's own status (from its count and the
@@ -1153,7 +1260,7 @@ pub(crate) fn result_json(
     shapes: &[Shape],
     outcome: &crate::route_search::SearchOutcome,
 ) -> Value {
-    let search = search_json(plan, shapes, outcome);
+    let search = search_json(plan, shapes, outcome, Listing::Best);
     let winner = outcome
         .winner
         .and_then(|position| outcome.runs.get(position))
@@ -1202,8 +1309,11 @@ pub(crate) fn result_json(
         "unconnected": judged.measures.unconnected,
         "gates": judged.gates,
         "all_gates_pass": judged.gates.all_pass(),
-        "judged_board": text(&judged.board),
+        "judged_board": judged_board(judged),
     });
+    if completion["judged"]["judged_board"].is_null() {
+        completion["judged"]["judged_board_note"] = json!(JUDGED_BOARD_RELEASED);
+    }
     let status = judged_status(status, &judged.gates);
     let limits = effort.0.limits();
     let mut result = json!({
@@ -1233,7 +1343,7 @@ pub(crate) fn result_json(
             "dsn_path": text(dsn),
             "ses_output_path": text(ses_output),
             "search_folder": text(folder),
-            "judged_board": text(&judged.board),
+            "judged_board": judged_board(judged),
             "passes_folder": text(&routed.folder),
         },
         "passes": routed.held.passes,

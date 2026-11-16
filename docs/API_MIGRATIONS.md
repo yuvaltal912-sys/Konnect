@@ -14,7 +14,8 @@ candidate is the default of `route_specctra_dsn`, set by an effort level.
   best-of-N search with fastroute instead of one Freerouting job. To keep
   today's behaviour, pass `engine: "freerouting"`; that engine is unchanged.
 - **New `effort`** (fastroute only): `"fast"` (2 runs at once), `"m"` (240 s),
-  `"h"` (720 s), `"xh"` (2400 s) per board. Absent, the user config key
+  `"h"` (720 s), `"xh"` (2400 s) per board; under a budget, runs launch until
+  the budget, with no run cap. Absent, the user config key
   `routing.effort` decides, else `"m"`.
 - **New `fastroute_path`** (fastroute only). Absent, `KONNECT_FASTROUTE`, then
   the user config key `routing.fastroute_path`, then
@@ -31,8 +32,10 @@ candidate is the default of `route_specctra_dsn`, set by an effort level.
   Freerouting engine still runs `"retry"` when it is absent.
 - **Result (fastroute).** Today's fields for the winning run (`status`,
   `completion`, `intent_widths`, `width_exceptions`, `passes`,
-  `result_pass`), plus `engine`, `effort`, `search` (every run, the winner,
-  its gates and measures, the budget overrun) and `completion.judged`.
+  `result_pass`), plus `engine`, `effort`, `search` (the count of each outcome, the 20
+  best judged runs and the first 20 that were not, the winner, its gates and
+  measures, the budget overrun; `search.json` in the search folder lists every
+  run) and `completion.judged`.
   `status` is `complete` only when the winner passes all three gates of the
   judge; otherwise `incomplete` (connections open after refill and stitching)
   or the new `complete_with_gate_failures` (DRC or width gate failed). The

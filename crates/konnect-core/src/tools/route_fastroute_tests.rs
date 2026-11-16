@@ -884,7 +884,7 @@ fn plan() -> SearchPlan {
             routers: 2,
             judges: 1,
         },
-        order: vec![(Shape::AsExported, 1), (Shape::Omitted, 1)],
+        order: route_search::Order::Fixed(vec![(Shape::AsExported, 1), (Shape::Omitted, 1)]),
         hang_cap: route_search::HANG_CAP,
     }
 }
@@ -1312,7 +1312,7 @@ fn a_baseline_that_failed_is_reported_beside_the_runs() {
     let search = finished_search();
     let mut finished = outcome(search.outcome.runs, Some(0));
     finished.baseline = Err("kicad-cli exited 3".to_string());
-    let json = search_json(&plan(), &[Shape::AsExported], &finished);
+    let json = search_json(&plan(), &[Shape::AsExported], &finished, Listing::Best);
     assert_eq!(
         json["baseline"],
         json!({ "ok": false, "error": "kicad-cli exited 3" })
@@ -1337,7 +1337,12 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
     };
-    let search = search_json(&plan(), &[Shape::AsExported, Shape::Omitted], &finished);
+    let search = search_json(
+        &plan(),
+        &[Shape::AsExported, Shape::Omitted],
+        &finished,
+        Listing::Best,
+    );
     assert!(search["winner"].is_null());
     let result = no_winner_result(&call, &finished, search);
     assert!(result.is_error);
@@ -1381,7 +1386,7 @@ fn a_failed_search_keeps_its_records_and_not_its_boards() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
     };
-    let summary = search_json(&plan(), &[Shape::AsExported], &failed);
+    let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(&call, &failed, summary);
     assert!(result.is_error);
     assert!(body(&result)["search"].get("reduce_error").is_none());
@@ -1419,7 +1424,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
     };
-    let summary = search_json(&plan(), &[Shape::AsExported], &failed);
+    let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(&call, &failed, summary);
     assert!(result.is_error);
     assert!(
@@ -1437,7 +1442,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x15);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x17);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a
@@ -1589,4 +1594,155 @@ fn the_winners_width_report_sets_the_status_as_for_freerouting() {
     let wide = result_for("wide", &NARROW.replace("F.Cu 2000", "F.Cu 10000"));
     assert_eq!(wide["status"], "complete", "{wide}");
     assert_eq!(wide["width_exceptions_total"], 0);
+}
+
+/// A release removes the run's judge boards, the router's log, the sandbox's home
+/// and tmp and the profile, and keeps what a run that may still win needs: its
+/// variant, its sessions and its reports. Nothing of another run is touched.
+#[test]
+fn a_release_removes_the_bulky_files_and_keeps_the_sessions() {
+    let search = finished_search();
+    let run = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    for name in ["home/x", "tmp/y"] {
+        let path = run.join("full").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "z").unwrap();
+    }
+    std::fs::write(run.join("full/profile.sb"), "(version 1)").unwrap();
+    std::fs::write(run.join("full/full.json"), "{}").unwrap();
+    let judge = search.folder.join("judge");
+
+    release_run(&search.folder, &judge, 1, Shape::Omitted, 1);
+
+    assert!(!judge.join("run-1").exists(), "the judge's boards");
+    for gone in [
+        "full/home",
+        "full/tmp",
+        "full/profile.sb",
+        "full/fastroute.log",
+    ] {
+        assert!(!run.join(gone).exists(), "{gone}");
+    }
+    for kept in [
+        "variant.dsn",
+        "full/full.ses",
+        "full/full.json",
+        "polish/polish.ses",
+    ] {
+        assert!(run.join(kept).is_file(), "{kept}");
+    }
+    // The other runs are as they were.
+    assert!(judge.join("run-0/r0/board.kicad_pcb").is_file());
+    let other = search.folder.join(run_folder_name(0, Shape::AsExported, 1));
+    assert!(other.join("full/fastroute.log").is_file());
+    // A second release of the same run is harmless.
+    release_run(&search.folder, &judge, 1, Shape::Omitted, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_release_follows_no_link() {
+    let search = finished_search();
+    let outside = search.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), "mine").unwrap();
+    let judge = search.folder.join("judge");
+    std::fs::remove_dir_all(judge.join("run-1")).unwrap();
+    std::os::unix::fs::symlink(&outside, judge.join("run-1")).unwrap();
+    release_run(&search.folder, &judge, 1, Shape::Omitted, 1);
+    assert!(outside.join("keep.txt").is_file());
+}
+
+/// The result lists the 20 best judged runs by the rank key and the first 20 runs
+/// that were not judged, with every outcome counted; `search.json` lists all.
+#[test]
+fn the_result_lists_the_best_runs_and_counts_every_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runs = Vec::new();
+    for index in 0..30 {
+        runs.push(record(
+            index,
+            Shape::AsExported,
+            index as u64 + 1,
+            "judged",
+            Some(routed(
+                dir.path(),
+                index,
+                Shape::AsExported,
+                index as u64 + 1,
+                &[],
+            )),
+            Some(judged(dir.path().join("board.kicad_pcb"))),
+        ));
+    }
+    for index in 30..55 {
+        runs.push(record(
+            index,
+            Shape::Omitted,
+            index as u64,
+            "route_failed",
+            None,
+            None,
+        ));
+    }
+    let mut many = outcome(runs, Some(29));
+    // The later the run, the better its key.
+    for (index, key) in many.keys.iter_mut().enumerate().take(30) {
+        *key = Some([30 - index as i64, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    let best = search_json(&plan(), &[Shape::AsExported], &many, Listing::Best);
+    let indexes: Vec<u64> = best["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["index"].as_u64().unwrap())
+        .collect();
+    let mut expected: Vec<u64> = (10..30).rev().collect();
+    expected.extend(30..50);
+    assert_eq!(indexes, expected);
+    assert_eq!(
+        best["outcomes"],
+        json!({ "judged": 30, "route_failed": 25 })
+    );
+    assert_eq!(best["launched"], 55);
+    assert!(best["runs_listed"].as_str().unwrap().contains("40 of 55"));
+
+    let every = search_json(&plan(), &[Shape::AsExported], &many, Listing::Every);
+    assert_eq!(every["runs"].as_array().unwrap().len(), 55);
+    assert!(every.get("runs_listed").is_none());
+    // A search small enough is listed whole, with no note.
+    let small = finished_search();
+    let whole = search_json(&plan(), &[Shape::AsExported], &small.outcome, Listing::Best);
+    assert_eq!(whole["runs"].as_array().unwrap().len(), 3);
+    assert!(whole.get("runs_listed").is_none());
+}
+
+/// A winner that was released during the search (it rose to the top only later)
+/// has no judged board left: the result says so instead of naming a missing file.
+#[test]
+fn a_winner_released_during_the_search_has_no_judged_board_and_says_why() {
+    let search = finished_search();
+    let ses = search.root.join("out.ses");
+    std::fs::write(&ses, "(session board)").unwrap();
+    let dsn = search.root.join("board.dsn");
+    std::fs::write(&dsn, "(pcb board)").unwrap();
+    std::fs::remove_dir_all(search.folder.join("judge/run-0")).unwrap();
+    let result = result_json(
+        &dsn,
+        &ses,
+        &search.folder,
+        &candidate(),
+        (Effort::M, EffortSource::Default),
+        &plan(),
+        &[Shape::AsExported, Shape::Omitted],
+        &search.outcome,
+    );
+    assert_eq!(result["success"], true);
+    assert!(result["completion"]["judged"]["judged_board"].is_null());
+    assert!(result["completion"]["judged"]["judged_board_note"]
+        .as_str()
+        .unwrap()
+        .contains("session"));
+    assert!(result["artifacts"]["judged_board"].is_null());
+    assert!(result["search"]["winner"]["judged_board"].is_null());
 }

@@ -533,13 +533,18 @@ fn below_rejects_the_biased_draws() {
     );
 }
 
+/// The first `n` runs of an order.
+fn first(order: &Order, n: usize) -> Vec<(Shape, u64)> {
+    (0..n).map_while(|index| order.get(index)).collect()
+}
+
 #[test]
 fn launch_order_interleaves_seeds_over_shapes() {
     let both = [Shape::AsExported, Shape::Omitted];
     let order = launch_order(&both, Effort::M.limits());
     assert_eq!(
-        &order[..5],
-        &[
+        first(&order, 5),
+        vec![
             (Shape::AsExported, 1),
             (Shape::Omitted, 1),
             (Shape::AsExported, 2),
@@ -550,8 +555,8 @@ fn launch_order_interleaves_seeds_over_shapes() {
     // One shape: seeds in turn.
     let one = launch_order(&[Shape::AsExported], Effort::H.limits());
     assert_eq!(
-        &one[..3],
-        &[
+        first(&one, 3),
+        vec![
             (Shape::AsExported, 1),
             (Shape::AsExported, 2),
             (Shape::AsExported, 3)
@@ -559,30 +564,37 @@ fn launch_order_interleaves_seeds_over_shapes() {
     );
     // The shapes' own order is kept.
     let swapped = launch_order(&[Shape::Omitted, Shape::AsExported], Effort::M.limits());
-    assert_eq!(swapped[0], (Shape::Omitted, 1));
-    assert_eq!(swapped[1], (Shape::AsExported, 1));
+    assert_eq!(swapped.get(0), Some((Shape::Omitted, 1)));
+    assert_eq!(swapped.get(1), Some((Shape::AsExported, 1)));
     assert!(launch_order(&[], Effort::M.limits()).is_empty());
+    assert!(launch_order(&[], Effort::Fast.limits()).is_empty());
 }
 
 #[test]
-fn launch_order_gives_two_for_fast_and_is_capped_at_max_runs() {
+fn launch_order_gives_two_for_fast_and_has_no_end_under_a_budget() {
     let both = [Shape::AsExported, Shape::Omitted];
     assert_eq!(
         launch_order(&both, Effort::Fast.limits()),
-        vec![(Shape::AsExported, 1), (Shape::Omitted, 1)]
+        Order::Fixed(vec![(Shape::AsExported, 1), (Shape::Omitted, 1)])
     );
     assert_eq!(
         launch_order(&[Shape::AsExported], Effort::Fast.limits()),
-        vec![(Shape::AsExported, 1), (Shape::AsExported, 2)]
+        Order::Fixed(vec![(Shape::AsExported, 1), (Shape::AsExported, 2)])
     );
-    // The cap, for each budgeted effort, with one and two shapes.
+    assert_eq!(launch_order(&both, Effort::Fast.limits()).get(2), None);
+    // Under a budget there is no run cap (owner, 2026-11-16): the order goes on.
     for effort in [Effort::M, Effort::H, Effort::Xh] {
         let order = launch_order(&both, effort.limits());
-        assert_eq!(order.len(), MAX_RUNS, "{effort:?}");
-        assert_eq!(order[MAX_RUNS - 1], (Shape::Omitted, MAX_RUNS as u64 / 2));
+        assert_eq!(order, Order::Endless(both.to_vec()), "{effort:?}");
+        assert_eq!(order.get(239), Some((Shape::Omitted, 120)));
+        assert_eq!(
+            order.get(240),
+            Some((Shape::AsExported, 121)),
+            "past the old cap"
+        );
+        assert_eq!(order.get(99_999), Some((Shape::Omitted, 50_000)));
         let single = launch_order(&[Shape::AsExported], effort.limits());
-        assert_eq!(single.len(), MAX_RUNS);
-        assert_eq!(single[MAX_RUNS - 1], (Shape::AsExported, MAX_RUNS as u64));
+        assert_eq!(single.get(9_999), Some((Shape::AsExported, 10_000)));
     }
     // An odd count ends in the middle of a seed.
     let odd = launch_order(
@@ -592,8 +604,8 @@ fn launch_order_gives_two_for_fast_and_is_capped_at_max_runs() {
             runs: Some(5),
         },
     );
-    assert_eq!(odd.len(), 5);
-    assert_eq!(odd[4], (Shape::AsExported, 3));
+    assert_eq!(odd.get(4), Some((Shape::AsExported, 3)));
+    assert_eq!(odd.get(5), None);
 }
 
 #[test]
@@ -824,6 +836,7 @@ struct Shared {
     judges_at_once: Arc<Level>,
     deadlines: Mutex<Vec<(usize, Instant)>>,
     judge_starts: Mutex<Vec<(usize, Instant)>>,
+    released: Mutex<Vec<usize>>,
 }
 
 #[derive(Clone)]
@@ -848,6 +861,7 @@ fn fake_with_baseline(
         judges_at_once: level(),
         deadlines: Mutex::new(Vec::new()),
         judge_starts: Mutex::new(Vec::new()),
+        released: Mutex::new(Vec::new()),
     }))
 }
 
@@ -885,6 +899,13 @@ impl Fake {
 
     fn judge_calls(&self) -> usize {
         self.0.judge_starts.lock().unwrap().len()
+    }
+
+    /// The runs released, sorted.
+    fn released(&self) -> Vec<usize> {
+        let mut released = self.0.released.lock().unwrap().clone();
+        released.sort_unstable();
+        released
     }
 }
 
@@ -925,6 +946,12 @@ impl Runner for Fake {
             tokio::time::sleep(secs(seconds)).await;
             result.map_err(|message| anyhow!(message))
         })
+    }
+
+    fn release(&self, index: usize, _shape: Shape, _seed: u64) {
+        let mut released = self.0.released.lock().unwrap();
+        assert!(!released.contains(&index), "run {index} released twice");
+        released.push(index);
     }
 
     fn baseline(&self) -> BoxFuture<Result<Baseline>> {
@@ -1373,38 +1400,158 @@ async fn the_search_ends_when_the_order_is_exhausted_and_everything_is_judged() 
 }
 
 #[tokio::test(start_paused = true)]
-async fn at_most_max_runs_are_launched_and_the_cap_is_named() {
+async fn under_a_budget_runs_launch_past_the_old_cap_until_the_budget() {
+    // Routes of 1 s, judges of 1 s, 3 judge lanes: about 3 runs a second for 400 s.
+    // The old cap of 240 runs no longer stops the search; the budget does.
     let limits = Limits {
-        budget: Some(secs(100_000)),
+        budget: Some(secs(400)),
         runs: None,
     };
-    let order = launch_order(&[Shape::AsExported, Shape::Omitted], limits);
-    assert_eq!(order.len(), MAX_RUNS);
     let p = SearchPlan {
         limits,
         lanes: Lanes {
             routers: 7,
             judges: 3,
         },
-        order,
+        order: launch_order(&[Shape::AsExported, Shape::Omitted], limits),
         hang_cap: HANG_CAP,
     };
-    let fake = fake(|_| (10, None), |_| good(5));
+    let fake = fake(|_| (1, None), |_| good(1));
     let outcome = run(&p, &fake).await;
-    assert_eq!(outcome.runs.len(), MAX_RUNS);
-    assert!(outcome.runs.iter().all(|r| r.outcome == "judged"));
-    assert_eq!(
-        outcome.stopped_launching,
-        Some(format!("MAX_RUNS ({MAX_RUNS})"))
+    assert!(outcome.runs.len() > 1000, "{} runs", outcome.runs.len());
+    // The launch rule stops launching just before the budget (each run must still
+    // be judged in time), or the budget's cut does: never the order, never a cap.
+    assert!(
+        matches!(
+            outcome.stopped_launching.as_deref(),
+            Some("the budget" | "the launch rule")
+        ),
+        "{:?}",
+        outcome.stopped_launching
     );
+    let elapsed = outcome.elapsed.as_secs_f64();
+    assert!((390.0..=400.001).contains(&elapsed), "{elapsed}");
     assert!(fake.most_routes_at_once() <= 7);
     assert!(fake.most_judges_at_once() <= 3);
-    // Indexes are launch positions.
+    // Indexes are launch positions, seeds interleave over the shapes.
     for (i, record) in outcome.runs.iter().enumerate() {
         assert_eq!(record.index, i);
-        assert_eq!((record.shape, record.seed), p.order[i]);
+        assert_eq!(Some((record.shape, record.seed)), p.order.get(i));
     }
     assert_eq!(outcome.winner, Some(0));
+    // Every judged run but the best KEPT_WHOLE was released; the winner never was.
+    let judged: Vec<usize> = outcome
+        .runs
+        .iter()
+        .filter(|r| r.outcome == "judged")
+        .map(|r| r.index)
+        .collect();
+    let released = fake.released();
+    assert_eq!(released.len(), judged.len() - KEPT_WHOLE);
+    assert!(!released.contains(&0));
+}
+
+// The route-failure stop: an endless order whose routes all start failing would
+// otherwise launch failing runs until the budget.
+#[tokio::test(start_paused = true)]
+async fn five_route_failures_in_a_row_stop_launching() {
+    // One router lane. Run 0 routes (10 s) and is judged (15 s); from then on every
+    // route fails after 10 s: runs at 15, 25, 35, 45, 55, and the fifth failure in a
+    // row (at 65 s) stops launching; the search ends there.
+    let fake = fake(
+        |i| {
+            if i == 0 {
+                (10, None)
+            } else {
+                (10, Some("no space left on device"))
+            }
+        },
+        |_| good(5),
+    );
+    let p = SearchPlan {
+        order: launch_order(&[Shape::AsExported], Effort::M.limits()),
+        ..plan(1, 1, Some(100_000), 0)
+    };
+    let outcome = run(&p, &fake).await;
+    let mut expected = vec!["judged"];
+    expected.extend(["route_failed"; 5]);
+    assert_eq!(outcomes(&outcome), expected);
+    assert_launches(&outcome, &[0, 15, 25, 35, 45, 55]);
+    assert_eq!(
+        outcome.stopped_launching.as_deref(),
+        Some("5 routes in a row failed")
+    );
+    close_duration(outcome.elapsed, 65);
+    assert_eq!(outcome.winner, Some(0));
+    // Each failed run was released at once.
+    assert_eq!(fake.released(), vec![1, 2, 3, 4, 5]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failures_that_are_not_five_in_a_row_keep_launching() {
+    // The negative control: every fourth route succeeds, so at most three fail in
+    // a row, and the whole fixed order is launched.
+    let fake = fake(
+        |i| {
+            if i % 4 == 0 {
+                (10, None)
+            } else {
+                (10, Some("the router crashed"))
+            }
+        },
+        |_| good(5),
+    );
+    let outcome = run(&plan(1, 1, Some(100_000), 12), &fake).await;
+    assert_eq!(outcome.runs.len(), 12);
+    assert_eq!(
+        outcome.stopped_launching.as_deref(),
+        Some("order exhausted")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_route_in_flight_that_succeeds_lifts_the_stop() {
+    // Two router lanes. Run 1 routes for 100 s; meanwhile runs 2 to 6 fail in a row
+    // (the fifth at 65 s) and launching stops. Run 1 lands at 100 s, the stop is
+    // lifted, and the rest of the order launches from 100 s on.
+    let fake = fake(
+        |i| match i {
+            0 => (10, None),
+            1 => (100, None),
+            _ => (10, Some("the router crashed")),
+        },
+        |_| good(5),
+    );
+    let outcome = run(&plan(2, 1, Some(100_000), 12), &fake).await;
+    assert_eq!(outcome.runs.len(), 12);
+    for (at, expected) in launches(&outcome)[..8]
+        .iter()
+        .zip([0, 0, 15, 25, 35, 45, 55, 100])
+    {
+        close(Some(*at), expected as f64);
+    }
+    assert_eq!(outcome.runs[1].outcome, "judged");
+    assert_eq!(outcome.winner, Some(0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn runs_outside_the_best_are_released_and_the_best_are_kept() {
+    // Twelve runs judged one by one, each with more acute corners than the last but
+    // run 11, the best of all. The best KEPT_WHOLE (8) by the key so far keep their
+    // folders; a run pushed out of them is released then.
+    let fake = fake(
+        |_| (10, None),
+        |i| {
+            let acute = if i == 11 { 0.0 } else { 1.0 + i as f64 };
+            (5, Ok(judged(acute, false)))
+        },
+    );
+    let outcome = run(&plan(1, 1, Some(100_000), 12), &fake).await;
+    assert_eq!(outcomes(&outcome), vec!["judged"; 12]);
+    assert_eq!(outcome.winner, Some(11));
+    // Runs 0..=7 are the best eight until run 8 comes; then 8, 9 and 10 are
+    // released as they are judged, and run 11 pushes run 7 out.
+    assert_eq!(fake.released(), vec![7, 8, 9, 10]);
 }
 
 #[tokio::test(start_paused = true)]

@@ -349,8 +349,8 @@ placement orders, judges every run itself on scratch copies of the board
    passes all three of the judge's gates (`completion.judged.gates`: complete
    after refill and stitching, DRC no worse than the unrouted board, widths);
    `complete_with_gate_failures` and `incomplete` list what failed. Report
-   every failed gate line to the user. `search` lists every run and why the
-   winner won; `search.budget_overrun_s` says when the first judged run came
+   every failed gate line to the user. `search` lists the best runs and counts
+   every outcome (`search.json` in the search folder lists every run); `search.budget_overrun_s` says when the first judged run came
    after the budget.
 4. Continue from step 4 of the Freerouting round trip: the same import
    review, apply, refill, stitching (`completion.next_steps`) and DRC.
