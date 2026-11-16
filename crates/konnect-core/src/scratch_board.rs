@@ -86,7 +86,7 @@ pub(crate) fn copy_project(board: &Path, into: &Path) -> Result<PathBuf> {
 
 /// `from` and everything below it, copied to `to`. A symbolic link anywhere is
 /// refused, not followed.
-fn copy_folder(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_folder(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("create '{}'", to.display()))?;
     let mut entries: Vec<_> = std::fs::read_dir(from)
         .with_context(|| format!("read '{}'", from.display()))?

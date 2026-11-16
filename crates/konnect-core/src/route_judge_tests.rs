@@ -481,11 +481,17 @@ fn g3_share_below_intent_width_is_at_most_five_percent() {
     only(&g, 2);
     assert!(g.g3[0].contains("VBUS"), "{:?}", g.g3);
 
-    // A row with no share figure: the share is below over routed.
-    let mut row = width_row("VBUS", 10.0, 0.6, 0.0, 0.5);
-    row.as_object_mut().unwrap().remove("below_intent_share");
-    m.width_rows = vec![row];
+    // A row with no share figure: the share is below over routed. 0.6 of 10 mm
+    // fails; 1 of 100 mm passes (the pair pins the division, not just the order).
+    let without_share = |routed: f64, below: f64| {
+        let mut row = width_row("VBUS", routed, below, 0.0, 0.5);
+        row.as_object_mut().unwrap().remove("below_intent_share");
+        row
+    };
+    m.width_rows = vec![without_share(10.0, 0.6)];
     only(&gates(&m, &b), 2);
+    m.width_rows = vec![without_share(100.0, 1.0)];
+    assert!(gates(&m, &b).all_pass(), "1 % passes");
 }
 
 #[test]
@@ -780,6 +786,7 @@ fn context() -> JudgeContext {
             .map(|(net, mm)| (net.to_string(), *mm))
             .collect(),
         root: PathBuf::from("/r"),
+        kicad_config_home: None,
     }
 }
 
@@ -1131,43 +1138,23 @@ fn unconnected_on_counts_nothing_when_the_report_has_no_unconnected_category() {
 
 // ------------------------------------------------------------------ judge
 
-/// Judges the recorded session of the rounded two-resistor board on scratch copies,
-/// with the real kicad-cli. Not run in the ordinary gate.
-///
-/// LEAD: run it by hand, after it compiles:
-///
-/// ```text
-/// KICAD_CONFIG_HOME=<scratch folder> KONNECT_TEST_KICAD_CLI=<path to kicad-cli> \
-///   cargo test -p konnect-core --lib judges_a_recorded_session -- --ignored --nocapture
-/// ```
-///
-/// `KONNECT_TEST_KICAD_CLI` defaults to KiCad 10's path on macOS. The test builds its
-/// own DSN manifest from `specctra_pours_policy.kicad_pcb` (named as the recorded
-/// session's board), writes the recorded session beside it and has no router. Its
-/// pours are all left out, so there are no planes and no stitching rounds; judging a
-/// run with planes needs the pour-routing fixture and a planner-ready board and is
-/// left to the real measurement. It prints the measures and gates: the gates of a
-/// recorded session of this fixture are not asserted, only that the judge ran end to
-/// end, wrote its boards where documented and measured the session's copper.
-#[tokio::test]
-#[ignore = "needs kicad-cli (KICAD_CONFIG_HOME must name a scratch folder)"]
-async fn judges_a_recorded_session_on_scratch_copies() {
-    use crate::specctra::{export_dsn_with_options, ExportOptions, PourPolicy};
-    use crate::tools::ServerConfig;
-    use konnect_ipc::{IpcEffectiveRoutingRules, IpcRoutingRules};
+/// The files of a recorded export: a DSN with its manifest beside it, the saved
+/// board (named as the recorded session's design) and the session.
+struct Exported {
+    dsn: PathBuf,
+    ses: PathBuf,
+}
 
-    assert!(
-        std::env::var_os("KICAD_CONFIG_HOME").is_some(),
-        "LEAD: set KICAD_CONFIG_HOME to a scratch folder, or KiCad re-saves the real settings"
-    );
-    let cli = std::env::var("KONNECT_TEST_KICAD_CLI")
-        .unwrap_or_else(|_| "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".to_string());
+/// Exports `specctra_pours_policy.kicad_pcb` (written as `specctra_rounded_board`,
+/// the design the recorded session names) with the top pour left out, and writes the
+/// recorded Freerouting session of the rounded board beside it.
+fn exported(dir: &Path) -> Exported {
+    use crate::specctra::{export_dsn_with_options, ExportOptions, PourPolicy};
+    use konnect_ipc::{IpcEffectiveRoutingRules, IpcRoutingRules};
 
     let board_text = include_str!("../tests/fixtures/specctra_pours_policy.kicad_pcb");
     let ses_text = include_str!("../tests/fixtures/specctra_rounded_board.freerouting-2.3.0.ses");
-    let dir = tempfile::tempdir().unwrap();
-    // The recorded session names `specctra_rounded_board` as its design.
-    let board = dir.path().join("specctra_rounded_board.kicad_pcb");
+    let board = dir.join("specctra_rounded_board.kicad_pcb");
     std::fs::write(&board, board_text).unwrap();
 
     let rules: IpcEffectiveRoutingRules = ["GND", "VCC"]
@@ -1199,15 +1186,63 @@ async fn judges_a_recorded_session_on_scratch_copies() {
         },
     )
     .unwrap();
-    let dsn = dir.path().join("specctra_rounded_board.dsn");
+    let dsn = dir.join("specctra_rounded_board.dsn");
     std::fs::write(&dsn, &bundle.dsn).unwrap();
     std::fs::write(
-        dir.path().join("specctra_rounded_board.dsn.konnect.json"),
+        dir.join("specctra_rounded_board.dsn.konnect.json"),
         &bundle.manifest,
     )
     .unwrap();
-    let ses = dir.path().join("specctra_rounded_board.ses");
+    let ses = dir.join("specctra_rounded_board.ses");
     std::fs::write(&ses, ses_text).unwrap();
+    Exported { dsn, ses }
+}
+
+/// The tool context the judge's registry calls run in.
+fn tool_context(cli: &str) -> Arc<crate::tools::ToolContext> {
+    Arc::new(crate::tools::ToolContext::new(
+        crate::tools::ServerConfig {
+            kicad_cli: cli.to_string(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        },
+        Arc::new(crate::router::ToolRouter::new()),
+    ))
+}
+
+/// Judges the recorded session of the rounded two-resistor board on scratch copies,
+/// with the real kicad-cli. Not run in the ordinary gate.
+///
+/// LEAD: run it by hand, after it compiles:
+///
+/// ```text
+/// KICAD_CONFIG_HOME=<scratch folder> KONNECT_TEST_KICAD_CLI=<path to kicad-cli> \
+///   cargo test -p konnect-core --lib judges_a_recorded_session -- --ignored --nocapture
+/// ```
+///
+/// `KONNECT_TEST_KICAD_CLI` defaults to KiCad 10's path on macOS. The test builds its
+/// own DSN manifest from `specctra_pours_policy.kicad_pcb` (named as the recorded
+/// session's board), writes the recorded session beside it and has no router. Its
+/// pours are all left out, so there are no planes and no stitching rounds; judging a
+/// run with planes needs the pour-routing fixture and a planner-ready board and is
+/// left to the real measurement. It prints the measures and gates: the gates of a
+/// recorded session of this fixture are not asserted, only that the judge ran end to
+/// end, wrote its boards where documented and measured the session's copper.
+#[tokio::test]
+#[ignore = "needs kicad-cli (KICAD_CONFIG_HOME must name a scratch folder)"]
+async fn judges_a_recorded_session_on_scratch_copies() {
+    assert!(
+        std::env::var_os("KICAD_CONFIG_HOME").is_some(),
+        "LEAD: set KICAD_CONFIG_HOME to a scratch folder, or KiCad re-saves the real settings"
+    );
+    let cli = std::env::var("KONNECT_TEST_KICAD_CLI")
+        .unwrap_or_else(|_| "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let Exported { dsn, ses } = exported(dir.path());
 
     let root = dir.path().join("search").join("judge");
     let ctx = prepare(&dsn, &root, &cli).expect("preflight");
@@ -1230,18 +1265,7 @@ async fn judges_a_recorded_session_on_scratch_copies() {
         planes: vec![],
         folder: dir.path().to_path_buf(),
     };
-    let tools = Arc::new(crate::tools::ToolContext::new(
-        ServerConfig {
-            kicad_cli: cli.clone(),
-            kicad_binary: String::new(),
-            ipc_address: String::new(),
-            project_dir: None,
-            jlcpcb_db_path: None,
-            auto_load_toolsets: false,
-            eager_toolsets: false,
-        },
-        Arc::new(crate::router::ToolRouter::new()),
-    ));
+    let tools = tool_context(&cli);
     let judged = judge(&ctx, &routed, &base, tools).await.expect("judge");
     eprintln!(
         "measures: {:#?}\ngates: {:#?}",
@@ -1260,4 +1284,723 @@ async fn judges_a_recorded_session_on_scratch_copies() {
     assert!(copper > 0.0, "the session's copper was measured");
     assert!(judged.measures.routed_share.is_some(), "the audit ran");
     assert_eq!(judged.measures.route_s, 1.5);
+}
+
+// ------------------------------------------------- rank reference (G1-passing runs)
+
+#[test]
+fn a_run_that_fails_g1_does_not_set_the_length_reference() {
+    // Two complete runs whose signal lengths are inside one 2 % step: the vias decide.
+    let mut a = spec();
+    a.signal = 100.0;
+    a.vias = 1;
+    let mut b = spec();
+    b.signal = 100.5;
+    b.vias = 0;
+    // A degenerate run that is not complete, with almost no signal track. Were it the
+    // reference, every step would be fifty times finer and length would decide first.
+    let mut degenerate = spec();
+    degenerate.signal = 1.0;
+    degenerate.failed[0] = true;
+
+    let ks = keys(&[a.clone(), b.clone(), degenerate]);
+    assert_eq!(ks[0][4], 50, "stepped against the complete runs' shortest");
+    assert_eq!(ks[1][4], 50);
+    assert!(ks[1] < ks[0], "so the vias off the pour decide: {ks:?}");
+    // The two complete runs rank as they do without the degenerate one.
+    let alone = keys(&[a, b]);
+    assert_eq!(alone[0][4..], ks[0][4..]);
+    assert_eq!(alone[1][4..], ks[1][4..]);
+    // And the degenerate run is last, by G1.
+    assert!(ks[2] > ks[0] && ks[2] > ks[1]);
+}
+
+#[test]
+fn when_no_run_passes_g1_the_reference_is_the_shortest_of_all() {
+    let mut a = spec();
+    a.signal = 100.0;
+    a.failed[0] = true;
+    let mut b = spec();
+    b.signal = 200.0;
+    b.failed[0] = true;
+    let ks = keys(&[a, b]);
+    assert_eq!(ks[0][4], 50);
+    assert_eq!(ks[1][4], 100);
+}
+
+// ------------------------------------------------------- the private KiCad settings
+
+fn put(folder: &Path, relative: &str, text: &str) {
+    let path = folder.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+#[test]
+fn the_settings_version_under_kicad_config_home_is_the_highest_present() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(config_source_in(dir.path()), None);
+    // A file is not a settings folder.
+    put(dir.path(), "10.0", "not a folder");
+    assert_eq!(config_source_in(dir.path()), None);
+    std::fs::remove_file(dir.path().join("10.0")).unwrap();
+    for (version, expected) in [("8.0", "8.0"), ("9.0", "9.0"), ("10.0", "10.0")] {
+        std::fs::create_dir(dir.path().join(version)).unwrap();
+        assert_eq!(
+            config_source_in(dir.path()),
+            Some((dir.path().join(expected), expected.to_string()))
+        );
+    }
+}
+
+#[test]
+fn the_private_settings_copy_holds_the_version_folder_and_leaves_the_source_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("real").join("10.0");
+    put(&source, "kicad_common.json", "{\"a\": 1}");
+    put(&source, "colors/user.json", "{}");
+    let into = dir.path().join("private");
+
+    let config = copy_kicad_config(Some((source.clone(), "10.0".to_string())), &into).unwrap();
+    assert_eq!(config.home, into, "the value for KICAD_CONFIG_HOME");
+    assert!(config.skipped_links.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(into.join("10.0/kicad_common.json")).unwrap(),
+        "{\"a\": 1}"
+    );
+    assert!(into.join("10.0/colors/user.json").is_file());
+    // Nothing else is in the copy.
+    assert_eq!(std::fs::read_dir(&into).unwrap().count(), 1);
+    // Writing to the copy does not reach the source.
+    std::fs::write(into.join("10.0/kicad_common.json"), "changed").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(source.join("kicad_common.json")).unwrap(),
+        "{\"a\": 1}"
+    );
+}
+
+#[test]
+fn with_no_settings_to_copy_the_private_folder_is_empty_and_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let into = dir.path().join("private");
+    let config = copy_kicad_config(None, &into).unwrap();
+    assert_eq!(config.home, into);
+    assert!(config.skipped_links.is_empty());
+    assert!(into.is_dir());
+    assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_settings_is_left_out_and_reported_and_a_linked_version_folder_is_read() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    put(&outside, "secret.json", "{}");
+
+    // A link inside the version folder is left out of the copy and named; the
+    // rest is copied, and the call goes on.
+    let source = dir.path().join("real/10.0");
+    put(&source, "kicad_common.json", "{}");
+    symlink(outside.join("secret.json"), source.join("linked.json")).unwrap();
+    symlink(&outside, source.join("linked-folder")).unwrap();
+    let p1 = dir.path().join("p1");
+    let config = copy_kicad_config(Some((source.clone(), "10.0".into())), &p1).unwrap();
+    // The copy reads the resolved folder (on macOS the temp folder sits behind /var).
+    let read_from = std::fs::canonicalize(&source).unwrap();
+    assert_eq!(
+        config.skipped_links,
+        vec![
+            read_from.join("linked-folder").display().to_string(),
+            read_from.join("linked.json").display().to_string()
+        ]
+    );
+    assert!(p1.join("10.0/kicad_common.json").is_file());
+    for name in ["linked.json", "linked-folder"] {
+        assert!(
+            std::fs::symlink_metadata(p1.join("10.0").join(name)).is_err(),
+            "{name}"
+        );
+    }
+
+    // The version folder itself a link: read through it, copied as a real folder.
+    let real = dir.path().join("elsewhere");
+    put(&real, "kicad_common.json", "{\"b\": 2}");
+    std::fs::create_dir_all(dir.path().join("root2")).unwrap();
+    symlink(&real, dir.path().join("root2/10.0")).unwrap();
+    let p2 = dir.path().join("p2");
+    let config =
+        copy_kicad_config(Some((dir.path().join("root2/10.0"), "10.0".into())), &p2).unwrap();
+    assert!(config.skipped_links.is_empty());
+    let copied = std::fs::symlink_metadata(p2.join("10.0")).unwrap();
+    assert!(copied.is_dir() && !copied.file_type().is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(p2.join("10.0/kicad_common.json")).unwrap(),
+        "{\"b\": 2}"
+    );
+}
+
+// ------------------------------------------------------- removing an earlier round
+
+#[test]
+fn an_earlier_round_folder_is_removed_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("judge");
+    let round = root.join("run-3/r1");
+    put(&round, "board.kicad_pcb", "(kicad_pcb)");
+    put(&round, "board.drc.json", "{}");
+    put(&round, "lib.pretty/a.kicad_mod", "x");
+    put(&round, ".konnect/design_intent.json", "{}");
+    put(&root, "run-3/r2/board.kicad_pcb", "(kicad_pcb)");
+
+    remove_round_folder(&root, &round.join("board.kicad_pcb")).unwrap();
+    assert!(!round.exists());
+    assert!(
+        root.join("run-3/r2/board.kicad_pcb").is_file(),
+        "the other rounds stay"
+    );
+    // A folder that is already gone is fine.
+    remove_round_folder(&root, &round.join("board.kicad_pcb")).unwrap();
+}
+
+#[test]
+fn only_a_round_folder_below_the_root_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("judge");
+    put(&root, "run-0/r0/board.kicad_pcb", "x");
+    put(&root, "run-0/other/board.kicad_pcb", "x");
+    put(dir.path(), "outside/r0/board.kicad_pcb", "x");
+    put(&root, "board.kicad_pcb", "x");
+
+    // Not named r<number>, outside the root, or the root itself.
+    assert!(remove_round_folder(&root, &root.join("run-0/other/board.kicad_pcb")).is_err());
+    assert!(remove_round_folder(&root, &root.join("run-0/board.kicad_pcb")).is_err());
+    assert!(remove_round_folder(&root, &dir.path().join("outside/r0/board.kicad_pcb")).is_err());
+    assert!(remove_round_folder(&root, &root.join("board.kicad_pcb")).is_err());
+    assert!(root.join("run-0/other/board.kicad_pcb").is_file());
+    assert!(dir.path().join("outside/r0/board.kicad_pcb").is_file());
+    // The honest round folder is removed (the pair).
+    remove_round_folder(&root, &root.join("run-0/r0/board.kicad_pcb")).unwrap();
+    assert!(!root.join("run-0/r0").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_round_folder_that_is_a_link_is_not_followed_or_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("judge");
+    let outside = dir.path().join("outside");
+    put(&outside, "board.kicad_pcb", "precious");
+    std::fs::create_dir_all(root.join("run-0")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("run-0/r1")).unwrap();
+
+    let error = remove_round_folder(&root, &root.join("run-0/r1/board.kicad_pcb")).unwrap_err();
+    assert!(format!("{error:#}").contains("link"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("board.kicad_pcb")).unwrap(),
+        "precious"
+    );
+    assert!(std::fs::symlink_metadata(root.join("run-0/r1")).is_ok());
+}
+
+// -------------------------------- the round logic, with a fake kicad-cli (no KiCad)
+
+#[cfg(unix)]
+mod with_a_fake_kicad_cli {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Stands in for `kicad-cli pcb drc --output <json> --format json --refill-zones
+    /// --save-board <board>`: records `KICAD_CONFIG_HOME` and its arguments in
+    /// `calls.log`, counts its calls in `counter`, copies the call's canned report
+    /// (`drc.<n>.json`, else `drc.default.json`) to the `--output` path, and leaves
+    /// the board as it is.
+    const FAKE_CLI: &str = r#"#!/bin/sh
+dir="$(cd "$(dirname "$0")" && pwd)"
+echo "KICAD_CONFIG_HOME=${KICAD_CONFIG_HOME-unset} $*" >> "$dir/calls.log"
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output" ]; then out="$a"; fi
+  prev="$a"
+done
+n=$(cat "$dir/counter" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$dir/counter"
+if [ -f "$dir/drc.$n.json" ]; then cp "$dir/drc.$n.json" "$out"; else cp "$dir/drc.default.json" "$out"; fi
+exit 0
+"#;
+
+    /// A KiCad DRC report: one unconnected item per net in `open` (named as KiCad names
+    /// a pad item), and one violation per rule in `violations`.
+    fn drc_json(open: &[&str], violations: &[&str]) -> String {
+        json!({
+            "violations": violations
+                .iter()
+                .map(|rule| json!({
+                    "type": rule, "severity": "error", "description": "a violation", "items": []
+                }))
+                .collect::<Vec<_>>(),
+            "unconnected_items": open
+                .iter()
+                .map(|net| json!({
+                    "type": "unconnected_items",
+                    "severity": "error",
+                    "description": "Missing connection between items",
+                    "items": [{
+                        "description": format!("Pad 1 [{net}] of R1 on F.Cu"),
+                        "pos": {"x": 1.0, "y": 2.0}
+                    }]
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    struct Harness {
+        dir: tempfile::TempDir,
+        ctx: JudgeContext,
+        routed: Routed,
+        fake: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Harness {
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.fake.join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn run_dir(&self) -> PathBuf {
+            self.ctx.root.join("run-0")
+        }
+
+        /// The settings folder one kicad-cli user gets (`baseline`, `run-<index>`).
+        fn own_config(&self, name: &str) -> String {
+            self.ctx
+                .root
+                .join("kicad-config")
+                .join(name)
+                .display()
+                .to_string()
+        }
+
+        /// The names in the run folder: the round folders left.
+        fn rounds_left(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.run_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    /// A judge context over the exported rounded board, with the fake kicad-cli, a
+    /// private settings copy, a library folder beside the board, and `planes` as the
+    /// nets the run's router got as planes (the fake report decides what is open).
+    fn harness(planes: &[&str], default: String, canned: &[(usize, String)]) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let Exported { dsn, ses } = exported(dir.path());
+        put(dir.path(), "lib.pretty/a.kicad_mod", "(footprint \"a\")");
+
+        let fake = dir.path().join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        let cli = crate::tools::cli::test_support::write_script(&fake, "kicad-cli", FAKE_CLI, "");
+        std::fs::write(fake.join("drc.default.json"), default).unwrap();
+        for (call, report) in canned {
+            std::fs::write(fake.join(format!("drc.{call}.json")), report).unwrap();
+        }
+
+        let settings = dir.path().join("settings/10.0");
+        put(&settings, "kicad_common.json", "{}");
+        let config = copy_kicad_config(
+            Some((settings, "10.0".to_string())),
+            &dir.path().join("kicad-config"),
+        )
+        .unwrap()
+        .home;
+
+        let root = dir.path().join("search").join("judge");
+        let mut ctx = prepare(&dsn, &root, &cli.display().to_string()).expect("preflight");
+        std::fs::create_dir_all(&root).unwrap();
+        ctx.kicad_config_home = Some(config.clone());
+        let routed = Routed {
+            index: 0,
+            shape: crate::route_search::Shape::AsExported,
+            seed: 0,
+            dsn,
+            held: crate::fastroute::Held {
+                ses,
+                unrouted: 0,
+                kept: "full",
+                passes: vec![],
+                seconds: 2.5,
+            },
+            planes: planes.iter().map(|net| net.to_string()).collect(),
+            folder: dir.path().to_path_buf(),
+        };
+        Harness {
+            dir,
+            ctx,
+            routed,
+            fake,
+            config,
+        }
+    }
+
+    /// The registry's tools, except that `plan_route_refinement` answers from a
+    /// script: `plan(n)` for the n-th call (from 0). Every planner call's arguments
+    /// are kept.
+    struct Scripted {
+        real: RegistryTools,
+        plan: Box<dyn Fn(usize) -> (bool, String) + Send + Sync>,
+        seen: Mutex<Vec<Value>>,
+    }
+
+    impl Scripted {
+        fn new(
+            h: &Harness,
+            plan: impl Fn(usize) -> (bool, String) + Send + Sync + 'static,
+        ) -> Self {
+            Scripted {
+                real: RegistryTools(tool_context(&h.ctx.kicad_cli)),
+                plan: Box::new(plan),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn planner_calls(&self) -> Vec<Value> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl ToolCaller for Scripted {
+        fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> ToolCall<'a> {
+            Box::pin(async move {
+                if name == "plan_route_refinement" {
+                    let number = {
+                        let mut seen = self.seen.lock().unwrap();
+                        seen.push(args.clone());
+                        seen.len() - 1
+                    };
+                    return Ok((self.plan)(number));
+                }
+                self.real.call(name, args).await
+            })
+        }
+    }
+
+    /// A planner result that proposes one stitching via on `net`.
+    fn one_via(net: &str) -> (bool, String) {
+        (
+            false,
+            json!({
+                "proposals": [{
+                    "id": "p",
+                    "kind": "stitching",
+                    "operations": [{
+                        "tool": "route_batch",
+                        "arguments": {
+                            "board": "b",
+                            "tracks": [],
+                            "vias": [{"net_name": net, "x": 5.0, "y": 5.0, "drill": 0.3, "pad_size": 0.6}]
+                        }
+                    }]
+                }]
+            })
+            .to_string(),
+        )
+    }
+
+    fn board_name() -> &'static str {
+        "specctra_rounded_board.kicad_pcb"
+    }
+
+    #[tokio::test]
+    async fn baseline_counts_the_report_and_runs_on_the_private_settings() {
+        let h = harness(
+            &[],
+            drc_json(&["GND", "VCC"], &["clearance", "clearance", "silk_overlap"]),
+            &[],
+        );
+        let base = baseline(&h.ctx).await.unwrap();
+        assert_eq!(
+            base.violations,
+            rules(&[("clearance", 2), ("silk_overlap", 1)])
+        );
+        assert_eq!(base.unconnected, 2);
+
+        let calls = h.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let own = h.own_config("baseline");
+        assert!(
+            calls[0].starts_with(&format!("KICAD_CONFIG_HOME={own} pcb drc --output ")),
+            "the child sees the baseline's own copy: {}",
+            calls[0]
+        );
+        // That copy is gone once the baseline is done; the call's copy is untouched.
+        assert!(!h.ctx.root.join("kicad-config/baseline").exists());
+        assert!(
+            calls[0].contains(" --format json --refill-zones --save-board "),
+            "{}",
+            calls[0]
+        );
+        assert!(
+            calls[0].ends_with(&format!("baseline/{}", board_name())),
+            "{}",
+            calls[0]
+        );
+        // The saved board, unchanged, in a scratch project.
+        let written = h.ctx.root.join("baseline").join(board_name());
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), h.ctx.board_text);
+        assert!(h.ctx.root.join("baseline/lib.pretty/a.kicad_mod").is_file());
+        // The settings copy is the one made from the source.
+        assert!(h.config.join("10.0/kicad_common.json").is_file());
+
+        // A second call clears the first one's folder.
+        assert_eq!(baseline(&h.ctx).await.unwrap(), base);
+    }
+
+    #[tokio::test]
+    async fn baseline_refuses_a_report_with_no_unconnected_category() {
+        let h = harness(&[], json!({"violations": []}).to_string(), &[]);
+        let error = baseline(&h.ctx).await.unwrap_err();
+        assert!(format!("{error:#}").contains("unconnected"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn no_planes_no_rounds_whatever_is_open() {
+        let h = harness(&[], drc_json(&["GND"], &["clearance"]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("the planner must not be called"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+
+        assert!(judged.rounds.is_empty());
+        assert!(tools.planner_calls().is_empty());
+        assert_eq!(judged.board, h.run_dir().join("r0").join(board_name()));
+        assert!(judged.board.is_file());
+        assert_eq!(h.rounds_left(), vec!["r0"]);
+        // Baseline and the run's one refill, each on its own copy of the private
+        // settings (never the call's copy, and never the same folder).
+        let calls = h.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        for (call, name) in calls.iter().zip(["baseline", "run-0"]) {
+            let own = h.own_config(name);
+            assert!(
+                call.starts_with(&format!("KICAD_CONFIG_HOME={own} pcb drc ")),
+                "{calls:?}"
+            );
+        }
+        assert!(
+            !h.ctx.root.join("kicad-config/run-0").exists(),
+            "removed after the judge"
+        );
+        // KiCad's count is the last report's; the open item is still counted.
+        assert_eq!(judged.measures.unconnected, 1);
+        assert_eq!(judged.measures.stitching_vias, 0);
+        assert_eq!(judged.measures.route_s, 2.5);
+        assert!(
+            judged.measures.signal_mm + judged.measures.power_mm + judged.measures.pour_track_mm
+                > 0.0,
+            "the session's copper is measured"
+        );
+        // Same violations as the baseline: G2 is quiet.
+        assert!(judged.gates.g2.is_empty(), "{:?}", judged.gates);
+    }
+
+    #[tokio::test]
+    async fn an_open_plane_net_runs_a_round_and_records_its_row() {
+        // Call 1 is the baseline, 2 the routed board (GND open), 3 the stitched one.
+        let h = harness(
+            &["GND"],
+            drc_json(&["GND"], &[]),
+            &[(3, drc_json(&[], &[]))],
+        );
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| one_via("GND"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+
+        assert_eq!(
+            judged.rounds,
+            vec![json!({
+                "round": 1, "open_before": 1, "proposals": 1, "written_vias": 1, "open_after": 0
+            })]
+        );
+        assert_eq!(judged.measures.stitching_vias, 1);
+        assert_eq!(
+            judged.measures.unconnected, 0,
+            "the last report is round 1's"
+        );
+
+        // The planner was asked as documented, of the routed board.
+        let seen = tools.planner_calls();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]["board"],
+            json!(h
+                .run_dir()
+                .join("r0")
+                .join(board_name())
+                .display()
+                .to_string())
+        );
+        assert_eq!(seen[0]["kinds"], json!(["stitching"]));
+        assert_eq!(seen[0]["nets"], json!(["GND"]));
+        assert_eq!(seen[0]["search_radius_mm"], json!(STITCH_RADIUS_MM));
+        assert_eq!(seen[0]["effort"], json!("standard"));
+
+        // The earlier round's folder is gone whole; the last is kept, with its copied
+        // project, and is the judged board.
+        assert_eq!(h.rounds_left(), vec!["r1"]);
+        assert_eq!(judged.board, h.run_dir().join("r1").join(board_name()));
+        assert!(h.run_dir().join("r1/lib.pretty/a.kicad_mod").is_file());
+        let text = std::fs::read_to_string(&judged.board).unwrap();
+        assert!(
+            text.contains("(at 5 5)") && text.contains("(net \"GND\")"),
+            "the via is written"
+        );
+
+        // Baseline, routed board, round 1: three runs of kicad-cli, all private.
+        let calls = h.calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[0].starts_with(&format!("KICAD_CONFIG_HOME={} ", h.own_config("baseline"))));
+        let own = h.own_config("run-0");
+        assert!(calls[1..]
+            .iter()
+            .all(|call| call.starts_with(&format!("KICAD_CONFIG_HOME={own} "))));
+        assert!(
+            calls[2].ends_with(&format!("run-0/r1/{}", board_name())),
+            "{}",
+            calls[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rounds_stop_at_stitch_rounds_when_the_item_never_closes() {
+        // The default report keeps GND open for ever; the planner always proposes a via.
+        let h = harness(&["GND"], drc_json(&["GND"], &[]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| one_via("GND"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+
+        assert_eq!(judged.rounds.len(), STITCH_ROUNDS);
+        for (index, row) in judged.rounds.iter().enumerate() {
+            assert_eq!(row["round"], json!(index + 1));
+            assert_eq!(row["open_before"], json!(1));
+            assert_eq!(row["written_vias"], json!(1));
+            assert_eq!(row["open_after"], json!(1));
+        }
+        assert_eq!(tools.planner_calls().len(), STITCH_ROUNDS);
+        assert_eq!(judged.measures.stitching_vias, STITCH_ROUNDS);
+        // Baseline, the routed board and each round: nothing after the last round.
+        assert_eq!(h.calls().len(), 2 + STITCH_ROUNDS);
+        // Only the last round's folder is left.
+        let last = format!("r{STITCH_ROUNDS}");
+        assert_eq!(h.rounds_left(), vec![last.clone()]);
+        assert_eq!(judged.board, h.run_dir().join(&last).join(board_name()));
+        assert_eq!(judged.measures.unconnected, 1, "still open: G1 fails");
+        assert!(!judged.gates.g1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_planner_refusal_stops_the_rounds_and_keeps_the_routed_board() {
+        let h = harness(&["GND"], drc_json(&["GND"], &[]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let refusal = json!({"status": "blocked", "proposals": [], "blocked": [{"reason": "cannot plan here"}]});
+        let tools = Scripted::new(&h, move |_| (true, refusal.to_string()));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+
+        assert_eq!(
+            judged.rounds,
+            vec![json!({"round": 1, "open_before": 1, "planner_refused": "cannot plan here"})]
+        );
+        assert_eq!(h.rounds_left(), vec!["r0"]);
+        assert_eq!(judged.board, h.run_dir().join("r0").join(board_name()));
+        assert_eq!(h.calls().len(), 2, "no refill after a refusal");
+    }
+
+    #[tokio::test]
+    async fn no_proposal_stops_the_rounds_and_is_recorded() {
+        let h = harness(&["GND"], drc_json(&["GND"], &[]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| (false, json!({"proposals": []}).to_string()));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert_eq!(
+            judged.rounds,
+            vec![json!({"round": 1, "open_before": 1, "proposals": 0})]
+        );
+        assert_eq!(h.rounds_left(), vec!["r0"]);
+        assert_eq!(h.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_proposal_that_modifies_copper_stops_the_rounds_without_a_write() {
+        let h = harness(&["GND"], drc_json(&["GND"], &[]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let modify = json!({"proposals": [{"id": "p", "operations": [
+            {"tool": "modify_trace", "arguments": {"board": "b", "uuid": "u", "x1": 0, "y1": 0, "x2": 1, "y2": 1}}
+        ]}]});
+        let tools = Scripted::new(&h, move |_| (false, modify.to_string()));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert_eq!(judged.rounds.len(), 1);
+        let reason = judged.rounds[0]["planner_refused"].as_str().unwrap();
+        assert!(reason.contains("modify_trace"), "{reason}");
+        assert_eq!(h.rounds_left(), vec!["r0"]);
+        assert_eq!(h.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_net_that_is_not_a_plane_is_not_stitched_even_when_open() {
+        // GND is open but only VCC was given as a plane.
+        let h = harness(&["VCC"], drc_json(&["GND"], &[]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("the planner must not be called"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert!(judged.rounds.is_empty());
+    }
+
+    /// The registry's own planner and audit, in-process, on the routed scratch board.
+    /// What the planner proposes for this small board is not fixed here: the row it
+    /// leaves must be one of the documented shapes, and whatever the outcome only the
+    /// last round's folder is left.
+    #[tokio::test]
+    async fn the_real_planner_and_audit_run_in_the_loop() {
+        let h = harness(&["GND"], drc_json(&["GND"], &[]), &[]);
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = tool_context(&h.ctx.kicad_cli);
+        let judged = judge(&h.ctx, &h.routed, &base, tools).await.unwrap();
+        eprintln!("rounds: {:#?}", judged.rounds);
+
+        assert!(
+            !judged.rounds.is_empty(),
+            "GND is open on a plane net: a round is tried"
+        );
+        assert!(judged.rounds.len() <= STITCH_ROUNDS);
+        let first = &judged.rounds[0];
+        assert_eq!(first["round"], json!(1));
+        assert_eq!(first["open_before"], json!(1));
+        assert!(
+            first.get("planner_refused").is_some() || first.get("proposals").is_some(),
+            "{first}"
+        );
+        assert_eq!(
+            h.rounds_left().len(),
+            1,
+            "only the last round's folder is left"
+        );
+        assert_eq!(
+            judged.board.parent().unwrap().parent().unwrap(),
+            h.run_dir()
+        );
+        assert!(judged.board.is_file());
+        assert!(
+            judged.measures.routed_share.is_some(),
+            "the audit ran for real"
+        );
+        let _keep_dir_alive = &h.dir;
+    }
 }

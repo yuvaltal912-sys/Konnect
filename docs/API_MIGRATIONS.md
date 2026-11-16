@@ -3,6 +3,45 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: best-of-N routing with fastroute is the default
+
+Row "best-of-N" (`docs/CREATION_HANDOFF.md`, design `docs/ROUTE_SEARCH_DESIGN.md`).
+The owner's decision (2026-11-16): best-of-N routing with the fastroute
+candidate is the default of `route_specctra_dsn`, set by an effort level.
+
+- **`route_specctra_dsn`, default engine.** New `engine`: `"fastroute"` (the
+  default) or `"freerouting"`. A call with no `engine` now runs a timed
+  best-of-N search with fastroute instead of one Freerouting job. To keep
+  today's behaviour, pass `engine: "freerouting"`; that engine is unchanged.
+- **New `effort`** (fastroute only): `"fast"` (2 runs at once), `"m"` (240 s),
+  `"h"` (720 s), `"xh"` (2400 s) per board. Absent, the user config key
+  `routing.effort` decides, else `"m"`.
+- **New `fastroute_path`** (fastroute only). Absent, `KONNECT_FASTROUTE`, then
+  the user config key `routing.fastroute_path`, then
+  `~/.local/share/fastroute/candidate/fastroute`. The binary must be the
+  candidate build (a probe checks every candidate switch); nothing is
+  downloaded or built. With none, the call is refused with `setup`, never
+  routed with Freerouting instead. macOS only for now.
+- **Arguments per engine.** With fastroute, `jar_path`, `java_path`,
+  `max_passes`, `optimizer_enabled`, `job_timeout_seconds`,
+  `overall_timeout_seconds`, `allow_neckdown: true` and `width_policy: "retry"`
+  are refused by name (`width_policy: "hold"` and `width_fallback` are read:
+  every fastroute run holds). With Freerouting, `effort` and `fastroute_path`
+  are refused. The schema no longer gives `width_policy` a default; the
+  Freerouting engine still runs `"retry"` when it is absent.
+- **Result (fastroute).** Today's fields for the winning run (`status`,
+  `completion`, `intent_widths`, `width_exceptions`, `passes`,
+  `result_pass`), plus `engine`, `effort`, `search` (every run, the winner,
+  its gates and measures, the budget overrun) and `completion.judged`.
+  `status` is `complete` only when the winner passes all three gates of the
+  judge; otherwise `incomplete` (connections open after refill and stitching)
+  or the new `complete_with_gate_failures` (DRC or width gate failed). The
+  run files stay in `<ses_output_path>.search` (the winner's whole, the others
+  as their records).
+- **Preflight refusals (fastroute)**, before anything routes: no manifest
+  beside the DSN; the saved board is not the revision the export read (save,
+  export again); no kicad-cli; an existing `<ses_output_path>.search` folder.
+
 ## Unreleased: board quirks KiCad accepts
 
 Row E1 (`docs/CREATION_HANDOFF.md`). Three refusals of boards that KiCad itself

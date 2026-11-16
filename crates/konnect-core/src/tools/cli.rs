@@ -405,10 +405,25 @@ async fn run_cli_owned(
     timeout_dur: Duration,
     kill_on_timeout: bool,
 ) -> Result<CliOutput> {
+    run_cli_owned_with_env(cli, args, timeout_dur, kill_on_timeout, None).await
+}
+
+/// [`run_cli_owned`], with one environment variable set on the child when given
+/// (name, value). The only user is the judge's `KICAD_CONFIG_HOME`.
+async fn run_cli_owned_with_env(
+    cli: &str,
+    args: &[&str],
+    timeout_dur: Duration,
+    kill_on_timeout: bool,
+    env: Option<(&str, &Path)>,
+) -> Result<CliOutput> {
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
+    if let Some((name, value)) = env {
+        cmd.env(name, value);
+    }
     // Stdin is the MCP pipe in stdio mode; a child must not hold it.
     cmd.args(args)
         .stdin(Stdio::null())
@@ -1062,6 +1077,17 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
 /// private copy: `--save-board` rewrites the file, and a timeout kills the
 /// child. Schematic parity is not asked for; the copy has no schematic.
 pub async fn refill_drc_on_private_copy(cli: &str, copy: &Path) -> Result<DrcReport> {
+    refill_drc_on_private_copy_with_config(cli, copy, None).await
+}
+
+/// [`refill_drc_on_private_copy`], with `KICAD_CONFIG_HOME` set on the child to
+/// `config_home` when given, so that kicad-cli does not write to the user's own
+/// KiCad settings.
+pub async fn refill_drc_on_private_copy_with_config(
+    cli: &str,
+    copy: &Path,
+    config_home: Option<&Path>,
+) -> Result<DrcReport> {
     let out_path = copy.with_extension("drc.json");
     let out = out_path.to_str().context("scratch path is not UTF-8")?;
     let board = copy.to_str().context("scratch path is not UTF-8")?;
@@ -1076,7 +1102,14 @@ pub async fn refill_drc_on_private_copy(cli: &str, copy: &Path) -> Result<DrcRep
         "--save-board",
         board,
     ];
-    run_cli_owned(cli, &args, LONG_TIMEOUT, true).await?;
+    run_cli_owned_with_env(
+        cli,
+        &args,
+        LONG_TIMEOUT,
+        true,
+        config_home.map(|home| ("KICAD_CONFIG_HOME", home)),
+    )
+    .await?;
     let json_str = tokio::fs::read_to_string(&out_path)
         .await
         .context("DRC output file not found")?;

@@ -4,7 +4,7 @@
 //! parallel runs keep their memory apart (docs/ROUTE_SEARCH_DESIGN.md, decision 2).
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
-//! (C** + BR1 + W8P, build x14). [`locate`] finds it and [`probe`] proves that the
+//! (C** + BR1 + W8P, build x15). [`locate`] finds it and [`probe`] proves that the
 //! binary found is that build before anything is routed.
 
 use crate::specctra::RoutingHints;
@@ -580,8 +580,9 @@ pub(crate) struct Held {
     pub unrouted: usize,
     /// `full`, `fallback` or `polish`.
     pub kept: &'static str,
-    /// One row per pass: `name`, `outcome` (`kept`, `discarded` or `skipped`),
-    /// `unrouted`, `seconds`, and `reason` for a pass discarded or skipped.
+    /// One row per pass: `name`, `outcome` (`kept`, `discarded`, `skipped` or
+    /// `failed`), `unrouted`, `seconds`, and `reason` for a pass discarded, skipped
+    /// or failed (a failed pass's reason is its error, cut to 300 characters).
     pub passes: Vec<Value>,
     pub seconds: f64,
 }
@@ -602,7 +603,12 @@ pub(crate) struct Held {
 ///
 /// One `deadline` bounds every pass. A pass killed by it ends the run with
 /// `PassError::Killed`, whatever an earlier pass kept: a run cut short is never a
-/// candidate. A pass that fails ends the run with its `Failed`.
+/// candidate. Full failing ends the run with its `Failed`. A Fallback or Polish that
+/// fails (non-zero exit, no session, an unreadable report) does not: its row is
+/// `failed` with the error as the reason, and the run ends with the last kept
+/// session (Full's, or Fallback's when that was kept), as the product's sequence
+/// leaves the earlier session when a later pass cannot improve on it. A failed
+/// Fallback leaves Polish `skipped`.
 pub(crate) async fn route_held(
     binary: &Binary,
     folder: &Path,
@@ -686,7 +692,7 @@ pub(crate) async fn route_held(
                 ));
             }
             Ok(floor) => {
-                let outcome = run_pass(
+                let result = run_pass(
                     binary,
                     &pass_folder("fallback")?,
                     dsn,
@@ -700,33 +706,35 @@ pub(crate) async fn route_held(
                     },
                     deadline,
                 )
-                .await?;
-                seconds += outcome.seconds;
-                if outcome.unrouted < full.unrouted {
-                    passes.push(row(
-                        "fallback",
-                        "kept",
-                        Some(outcome.unrouted),
-                        Some(outcome.seconds),
-                        None,
-                    ));
-                    kept = "fallback";
-                    kept_ses = outcome.ses.clone();
-                    kept_unrouted = outcome.unrouted;
-                    fallback_kept = Some(outcome);
-                } else {
-                    let reason = if outcome.unrouted == full.unrouted {
-                        "closed none"
+                .await;
+                if let Some(outcome) = settle("fallback", result, &mut passes)? {
+                    seconds += outcome.seconds;
+                    if outcome.unrouted < full.unrouted {
+                        passes.push(row(
+                            "fallback",
+                            "kept",
+                            Some(outcome.unrouted),
+                            Some(outcome.seconds),
+                            None,
+                        ));
+                        kept = "fallback";
+                        kept_ses = outcome.ses.clone();
+                        kept_unrouted = outcome.unrouted;
+                        fallback_kept = Some(outcome);
                     } else {
-                        "left more open than Full"
-                    };
-                    passes.push(row(
-                        "fallback",
-                        "discarded",
-                        Some(outcome.unrouted),
-                        Some(outcome.seconds),
-                        Some(reason),
-                    ));
+                        let reason = if outcome.unrouted == full.unrouted {
+                            "closed none"
+                        } else {
+                            "left more open than Full"
+                        };
+                        passes.push(row(
+                            "fallback",
+                            "discarded",
+                            Some(outcome.unrouted),
+                            Some(outcome.seconds),
+                            Some(reason),
+                        ));
+                    }
                 }
             }
         }
@@ -735,7 +743,7 @@ pub(crate) async fn route_held(
     // Polish: only after a kept Fallback; the retry off, the optimizer on.
     match fallback_kept {
         Some(after_fallback) => {
-            let outcome = run_pass(
+            let result = run_pass(
                 binary,
                 &pass_folder("polish")?,
                 dsn,
@@ -749,27 +757,29 @@ pub(crate) async fn route_held(
                 },
                 deadline,
             )
-            .await?;
-            seconds += outcome.seconds;
-            if outcome.unrouted <= after_fallback.unrouted {
-                passes.push(row(
-                    "polish",
-                    "kept",
-                    Some(outcome.unrouted),
-                    Some(outcome.seconds),
-                    None,
-                ));
-                kept = "polish";
-                kept_ses = outcome.ses.clone();
-                kept_unrouted = outcome.unrouted;
-            } else {
-                passes.push(row(
-                    "polish",
-                    "discarded",
-                    Some(outcome.unrouted),
-                    Some(outcome.seconds),
-                    Some("left more open than Fallback"),
-                ));
+            .await;
+            if let Some(outcome) = settle("polish", result, &mut passes)? {
+                seconds += outcome.seconds;
+                if outcome.unrouted <= after_fallback.unrouted {
+                    passes.push(row(
+                        "polish",
+                        "kept",
+                        Some(outcome.unrouted),
+                        Some(outcome.seconds),
+                        None,
+                    ));
+                    kept = "polish";
+                    kept_ses = outcome.ses.clone();
+                    kept_unrouted = outcome.unrouted;
+                } else {
+                    passes.push(row(
+                        "polish",
+                        "discarded",
+                        Some(outcome.unrouted),
+                        Some(outcome.seconds),
+                        Some("left more open than Fallback"),
+                    ));
+                }
             }
         }
         None => {
@@ -789,6 +799,30 @@ pub(crate) async fn route_held(
         passes,
         seconds,
     })
+}
+
+/// What a later pass's result means for the run: its outcome, or `None` after a
+/// failure, which is recorded as a `failed` row (the run then keeps the earlier
+/// session). A pass killed by the deadline ends the run.
+fn settle(
+    name: &str,
+    result: std::result::Result<PassOutcome, PassError>,
+    passes: &mut Vec<Value>,
+) -> std::result::Result<Option<PassOutcome>, PassError> {
+    match result {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(PassError::Failed(error)) => {
+            passes.push(json!({
+                "name": name,
+                "outcome": "failed",
+                "unrouted": null,
+                "seconds": null,
+                "reason": tail(&format!("{error:#}"), QUOTE_CHARS),
+            }));
+            Ok(None)
+        }
+        Err(killed) => Err(killed),
+    }
 }
 
 /// A short, readable reason, for refusals and records.

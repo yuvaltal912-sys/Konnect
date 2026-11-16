@@ -1433,3 +1433,133 @@ async fn judge_lanes_are_never_exceeded() {
         close(Some(*at), 15.0 + 5.0 * i as f64);
     }
 }
+
+// The cut keeps jobs that finished at the very instant of the budget.
+#[tokio::test(start_paused = true)]
+async fn the_cut_keeps_a_judge_and_a_route_that_finished_at_the_budget_instant() {
+    // Run 0 is judged at 20 s. Runs 1 and 2 are judged from 10 s on, 90 s each, so
+    // both judges end at 100 s, the budget. Run 3 routes for exactly 100 s.
+    // Without collecting finished jobs before the abort, the judges that ended at
+    // the budget are recorded cut and their results are lost.
+    let fake = fake(
+        |i| if i == 3 { (100, None) } else { (10, None) },
+        |i| if i == 0 { good(10) } else { good(90) },
+    );
+    let outcome = run(&plan(4, 3, Some(100), 4), &fake).await;
+    assert_eq!(
+        outcomes(&outcome),
+        vec!["judged", "judged", "judged", "cut_at_budget"]
+    );
+    close_duration(outcome.elapsed, 100);
+    assert!(outcome.budget_overrun.is_none());
+    close(outcome.runs[1].judged_s, 100.0);
+    close(outcome.runs[2].judged_s, 100.0);
+    assert!(outcome.runs[1].judged.is_some() && outcome.runs[2].judged.is_some());
+    // The route that ended at the budget is kept as routed, then cut: no judge starts.
+    close(outcome.runs[3].routed_s, 100.0);
+    assert!(outcome.runs[3].routed.is_some());
+    assert!(outcome.runs[3].judged.is_none());
+    assert_eq!(outcome.winner, Some(0));
+    assert!(outcome.keys[..3].iter().all(Option::is_some));
+}
+
+// The judge that fails on every run.
+fn failing(seconds: u64) -> JudgeSpec {
+    (seconds, Err("the importer refused the session"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_judge_failures_and_no_success_stop_launching() {
+    // One lane each: route 10 s, judge 5 s. Run 1 waits for the first judge (15 s);
+    // run 2 starts when run 1's route ends (25 s), run 3 when run 2's does (35 s).
+    // The third failure comes at 40 s, so run 3, already routing, is the last.
+    let fake = fake(|_| (10, None), |_| failing(5));
+    let outcome = run(&plan(1, 1, Some(100_000), 10), &fake).await;
+    assert_eq!(outcomes(&outcome), vec!["judge_failed"; 4]);
+    assert_launches(&outcome, &[0, 15, 25, 35]);
+    assert_eq!(
+        outcome.stopped_launching.as_deref(),
+        Some("the judge failed on every run so far")
+    );
+    // No cut: the search simply ended with the last judge.
+    close_duration(outcome.elapsed, 50);
+    assert_eq!(outcome.winner, None);
+    for record in &outcome.runs {
+        assert!(record
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("importer refused"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_success_lifts_the_stop_and_launching_resumes() {
+    // Run 1 routes for 200 s and is judged well; the other runs fail their judges.
+    // The third failure (at 40 s) stops launching while run 1 is still routing; run
+    // 4, already routing, finishes. Run 1's success at 205 s lifts the stop, both
+    // router lanes fill at once, and the rest of the order is launched (failures
+    // after a success never stop it again).
+    let fake = fake(
+        |i| if i == 1 { (200, None) } else { (10, None) },
+        |i| if i == 1 { good(5) } else { failing(5) },
+    );
+    let outcome = run(&plan(2, 1, Some(100_000), 10), &fake).await;
+    assert_eq!(outcome.runs.len(), 10);
+    let launched = launches(&outcome);
+    // Nothing launched between the stop (40 s) and the success (205 s).
+    for (at, expected) in launched[..7].iter().zip([0, 0, 15, 25, 35, 205, 205]) {
+        close(Some(*at), expected as f64);
+    }
+    assert_eq!(outcome.runs[1].outcome, "judged");
+    assert!(outcome
+        .runs
+        .iter()
+        .enumerate()
+        .all(|(i, r)| i == 1 || r.outcome == "judge_failed"));
+    assert_eq!(
+        outcome.stopped_launching.as_deref(),
+        Some("order exhausted")
+    );
+    assert_eq!(outcome.winner, Some(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_failures_then_a_success_keep_launching() {
+    // The negative control: runs 0 and 1 fail, run 2 succeeds, so the rule never
+    // trips and the whole order is launched.
+    let fake = fake(|_| (10, None), |i| if i < 2 { failing(5) } else { good(5) });
+    let outcome = run(&plan(1, 1, Some(100_000), 6), &fake).await;
+    assert_eq!(outcome.runs.len(), 6);
+    assert_eq!(outcome.runs[0].outcome, "judge_failed");
+    assert_eq!(outcome.runs[1].outcome, "judge_failed");
+    assert!(outcome.runs[2..].iter().all(|r| r.outcome == "judged"));
+    assert_eq!(
+        outcome.stopped_launching.as_deref(),
+        Some("order exhausted")
+    );
+    assert_eq!(outcome.winner, Some(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn failures_after_a_success_do_not_stop_launching() {
+    // A success first, then three failures in a row: a judge that works on some
+    // runs is not a deterministic failure.
+    let fake = fake(
+        |_| (10, None),
+        |i| {
+            if i == 0 || i >= 4 {
+                good(5)
+            } else {
+                failing(5)
+            }
+        },
+    );
+    let outcome = run(&plan(1, 1, Some(100_000), 6), &fake).await;
+    assert_eq!(outcome.runs.len(), 6);
+    assert_eq!(
+        outcome.stopped_launching.as_deref(),
+        Some("order exhausted")
+    );
+    assert_eq!(outcome.winner, Some(0));
+}

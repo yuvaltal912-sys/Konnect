@@ -1452,13 +1452,112 @@ int main(int argc, char **argv) {
     }
 
     #[tokio::test]
-    async fn a_pass_that_fails_ends_the_run_with_its_failure() {
-        let fixture = Fixture::new("unrouted.full=3\nfail.fallback=1\n");
+    async fn a_failed_full_fails_the_run_and_a_failed_later_pass_keeps_the_earlier_session() {
+        // Full failing leaves nothing to keep.
+        let fixture = Fixture::new("fail.full=1\n");
         let text = failed_text(hold(&fixture, &floor_hints(), WidthFallback::Floor, 30).await);
-        assert!(text.contains("fake failure marker for fallback"), "{text}");
+        assert!(text.contains("fake failure marker for full"), "{text}");
 
+        // Fallback failing keeps Full; Polish is not run.
+        let fixture = Fixture::new("unrouted.full=3\nfail.fallback=1\n");
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 30)
+            .await
+            .unwrap();
+        assert_eq!((held.kept, held.unrouted), ("full", 3));
+        assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
+        assert_eq!(row(&held, 0), ("full", "kept", None));
+        assert_eq!(row(&held, 1).0, "fallback");
+        assert_eq!(row(&held, 1).1, "failed");
+        assert!(
+            row(&held, 1)
+                .2
+                .unwrap()
+                .contains("fake failure marker for fallback"),
+            "{:?}",
+            held.passes[1]
+        );
+        assert!(held.passes[1]["unrouted"].is_null());
+        assert_eq!(
+            row(&held, 2),
+            ("polish", "skipped", Some("no Fallback was kept"))
+        );
+        assert!(!ran(&fixture, "polish"));
+
+        // Polish failing keeps Fallback.
         let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nfail.polish=1\n");
-        let text = failed_text(hold(&fixture, &floor_hints(), WidthFallback::Floor, 30).await);
-        assert!(text.contains("fake failure marker for polish"), "{text}");
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 30)
+            .await
+            .unwrap();
+        assert_eq!((held.kept, held.unrouted), ("fallback", 1));
+        assert_eq!(held.ses, fixture.path().join("held/fallback/fallback.ses"));
+        assert_eq!(row(&held, 1), ("fallback", "kept", None));
+        assert_eq!(row(&held, 2).1, "failed");
+        assert!(row(&held, 2)
+            .2
+            .unwrap()
+            .contains("fake failure marker for polish"));
+        // The held time counts the passes that gave a time: Full and Fallback.
+        let sum: f64 = held.passes[..2]
+            .iter()
+            .map(|r| r["seconds"].as_f64().unwrap())
+            .sum();
+        assert!((held.seconds - sum).abs() < 1e-9);
+
+        // A failure reason is cut to 300 characters.
+        let fixture = Fixture::new("unrouted.full=3\nfail.fallback=1\n");
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 30)
+            .await
+            .unwrap();
+        assert!(held.passes[1]["reason"].as_str().unwrap().chars().count() <= 300);
+    }
+
+    #[tokio::test]
+    async fn a_killed_later_pass_still_ends_the_run_with_killed() {
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nsleep.polish=1\n");
+        let result = hold(&fixture, &floor_hints(), WidthFallback::Floor, 4).await;
+        assert!(
+            matches!(result, Err(PassError::Killed { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_works_under_a_hebrew_folder_name() {
+        // The owner's boards live under an iCloud folder with a Hebrew name, so the
+        // run folder can hold non-ASCII characters, and the profile's subpath must
+        // still match it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fixture = Fixture::new(&format!("escape=1\nport={port}\nunrouted=1\n"));
+        let parent = fixture.path().join("\u{5ea}\u{5d5}\u{5d0}\u{5e8}");
+        let folder = parent.join("run");
+        std::fs::create_dir_all(&parent).unwrap();
+        let outcome = run_pass(
+            &fixture.binary(),
+            &folder,
+            &fixture.dsn(),
+            &hints(Some(250), None),
+            None,
+            pass("full", 0.0, true, None),
+            soon(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.unrouted, 1);
+        assert_eq!(outcome.ses, folder.join("full.ses"));
+        assert!(std::fs::metadata(&outcome.ses).unwrap().len() > 0);
+        assert!(folder.join("full.json").is_file());
+        assert_eq!(
+            escape_results(&folder),
+            "write_outside=denied\nnetwork=denied\nexec=denied\n"
+        );
+        assert!(!parent.join("outside.txt").exists());
+        // The profile names the real path, Hebrew name included.
+        let profile = std::fs::read_to_string(folder.join("profile.sb")).unwrap();
+        assert!(
+            profile.contains("\u{5ea}\u{5d5}\u{5d0}\u{5e8}"),
+            "{profile}"
+        );
+        drop(listener);
     }
 }

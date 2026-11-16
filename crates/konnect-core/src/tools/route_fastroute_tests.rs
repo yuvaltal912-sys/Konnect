@@ -747,29 +747,51 @@ fn width_arguments_are_carried_into_the_reroute_steps_and_nothing_is_invented() 
         "completion": { "if_still_open": { "fallback": [
             { "manual": "close the board" },
             { "tool": "export_specctra_dsn", "arguments": {} },
-            { "tool": "route_specctra_dsn", "arguments": { "dsn_path": "x.dsn" } },
+            { "tool": "route_specctra_dsn",
+              "arguments": { "dsn_path": "x.dsn", "engine": "freerouting" } },
         ] } }
     });
     carry_arguments(
         &mut result,
         &json!({ "width_policy": "hold", "width_fallback": "none" }),
-        Effort::H,
+        (Effort::H, EffortSource::Argument),
     );
     let steps = &result["completion"]["if_still_open"]["fallback"];
     assert_eq!(steps[2]["arguments"]["effort"], "h");
+    // A fastroute result's step routes with the default engine.
+    assert!(steps[2]["arguments"].get("engine").is_none(), "{steps}");
+    assert_eq!(steps[2]["arguments"]["dsn_path"], "x.dsn");
     assert_eq!(steps[2]["arguments"]["width_policy"], "hold");
     assert_eq!(steps[2]["arguments"]["width_fallback"], "none");
     assert_eq!(steps[1]["arguments"], json!({}));
     // Arguments the caller did not give are not added.
-    carry_arguments(&mut result, &json!({}), Effort::M);
+    carry_arguments(&mut result, &json!({}), (Effort::M, EffortSource::Argument));
     assert_eq!(
         result["completion"]["if_still_open"]["fallback"][2]["arguments"]["width_policy"], "hold",
         "an earlier value is not erased"
     );
     // A result without the fallback is not changed.
     let mut plain = json!({ "completion": { "next_steps": [] } });
-    carry_arguments(&mut plain, &json!({ "width_policy": "hold" }), Effort::M);
+    carry_arguments(
+        &mut plain,
+        &json!({ "width_policy": "hold" }),
+        (Effort::M, EffortSource::Argument),
+    );
     assert_eq!(plain, json!({ "completion": { "next_steps": [] } }));
+}
+
+#[test]
+fn an_effort_the_caller_did_not_give_is_not_carried_into_the_reroute_step() {
+    for source in [EffortSource::UserConfig, EffortSource::Default] {
+        let mut result = json!({
+            "completion": { "if_still_open": { "fallback": [
+                { "tool": "route_specctra_dsn", "arguments": { "dsn_path": "x.dsn" } },
+            ] } }
+        });
+        carry_arguments(&mut result, &json!({}), (Effort::Xh, source));
+        let arguments = &result["completion"]["if_still_open"]["fallback"][0]["arguments"];
+        assert!(arguments.get("effort").is_none(), "{source:?}: {arguments}");
+    }
 }
 
 // ─── A finished search ───────────────────────────────────────────────────────
@@ -1344,6 +1366,69 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
     assert_eq!(none["success"], false);
 }
 
+#[test]
+fn a_failed_search_keeps_its_records_and_not_its_boards() {
+    let search = finished_search();
+    // No winner: every run, the judged ones too, is reduced.
+    let mut failed = outcome(Vec::new(), None);
+    failed.runs = search.outcome.runs;
+    failed.keys = vec![None, None, None];
+    failed.baseline = Err("no baseline".into());
+    let call = Call {
+        dsn: search.root.join("board.dsn"),
+        ses_output: search.root.join("out.ses"),
+        folder: search.folder.clone(),
+        effort: (Effort::M, EffortSource::Default),
+        fallback: WidthFallback::Floor,
+    };
+    let summary = search_json(&plan(), &[Shape::AsExported], &failed);
+    let result = no_winner_result(&call, &failed, summary);
+    assert!(result.is_error);
+    assert!(body(&result)["search"].get("reduce_error").is_none());
+    for (index, shape, seed) in [
+        (0, Shape::AsExported, 1),
+        (1, Shape::Omitted, 1),
+        (2, Shape::AsExported, 2),
+    ] {
+        let folder = search.folder.join(run_folder_name(index, shape, seed));
+        let mut left: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["run.json".to_string()], "run {index}");
+        assert!(
+            !search.folder.join(format!("judge/run-{index}")).exists(),
+            "run {index}'s judge boards"
+        );
+    }
+    assert!(!call.ses_output.exists());
+}
+
+#[test]
+fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
+    let search = finished_search();
+    let mut failed = outcome(Vec::new(), None);
+    failed.runs = search.outcome.runs;
+    failed.keys = vec![None, None, None];
+    // A search folder that is not there cannot be reduced.
+    let call = Call {
+        dsn: search.root.join("board.dsn"),
+        ses_output: search.root.join("out.ses"),
+        folder: search.root.join("absent.search"),
+        effort: (Effort::M, EffortSource::Default),
+        fallback: WidthFallback::Floor,
+    };
+    let summary = search_json(&plan(), &[Shape::AsExported], &failed);
+    let result = no_winner_result(&call, &failed, summary);
+    assert!(result.is_error);
+    assert!(
+        body(&result)["search"]["reduce_error"].is_string(),
+        "{}",
+        body(&result)
+    );
+}
+
 // ─── The whole thing, with real fastroute ────────────────────────────────────
 
 // LEAD: needs the real tools; run it with `cargo test -p konnect-core
@@ -1352,7 +1437,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x14);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x15);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a
@@ -1437,4 +1522,71 @@ fn the_status_is_the_routers_only_when_every_gate_passes() {
         "incomplete",
         "G1 outranks the other gates"
     );
+}
+
+/// The winner's width report sets `status` as it does for Freerouting: a stretch
+/// below intent width gives `complete_with_width_exceptions`, a wire that cannot be
+/// measured or a session that cannot be read for widths gives `unverified`, and
+/// the same session at full width is plainly `complete` (the negative control).
+#[test]
+fn the_winners_width_report_sets_the_status_as_for_freerouting() {
+    const NARROW: &str = "(session board (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 10000 0 0 30000 0)) (wire (path F.Cu 2000 30000 0 30000 25000))))))";
+    const ODD: &str = "(session board (routes (resolution um 10) (network_out (net VBUS (wire (path F.Cu 10000 0 0 30000 0)) (wire (polygon F.Cu 0 0 0 10 10 0 10))))))";
+    let mut search = finished_search();
+    // Run 1 wins: its variant gave the router no plane.
+    search.outcome.winner = Some(1);
+    std::fs::write(
+        search
+            .folder
+            .join(run_folder_name(1, Shape::Omitted, 1))
+            .join("variant.dsn"),
+        "(pcb board (structure))",
+    )
+    .unwrap();
+    let dsn = search.root.join("board.dsn");
+    std::fs::write(&dsn, "(pcb board (structure))").unwrap();
+    std::fs::write(
+        search.root.join("board.dsn.konnect.json"),
+        json!({
+            "layers": [{ "dsn_name": "F.Cu", "kicad_name": "F.Cu" }],
+            "intent_widths": [
+                { "net": "VBUS", "current_a": 2.0, "from_mm": 0.2, "to_mm": 1.0, "status": "widened" }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let result_for = |name: &str, session: &str| {
+        let ses = search.root.join(format!("{name}.ses"));
+        std::fs::write(&ses, session).unwrap();
+        result_json(
+            &dsn,
+            &ses,
+            &search.folder,
+            &candidate(),
+            (Effort::M, EffortSource::Default),
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+        )
+    };
+
+    let narrow = result_for("narrow", NARROW);
+    assert_eq!(
+        narrow["status"], "complete_with_width_exceptions",
+        "{narrow}"
+    );
+    assert_eq!(narrow["width_exceptions_total"], 1);
+
+    let odd = result_for("odd", ODD);
+    assert_eq!(odd["status"], "unverified", "{odd}");
+    assert_eq!(odd["width_unmeasured_total"], 1);
+
+    let unread = result_for("unread", "(session board)");
+    assert_eq!(unread["status"], "unverified", "{unread}");
+    assert!(unread["width_report_error"].is_string(), "{unread}");
+
+    let wide = result_for("wide", &NARROW.replace("F.Cu 2000", "F.Cu 10000"));
+    assert_eq!(wide["status"], "complete", "{wide}");
+    assert_eq!(wide["width_exceptions_total"], 0);
 }

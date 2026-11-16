@@ -533,6 +533,9 @@ impl SplitMix64 {
     }
 }
 
+/// Judge failures, with no judge success, after which nothing more launches.
+pub(crate) const JUDGE_FAILURES_BEFORE_STOP: usize = 3;
+
 /// The most runs one call starts (decision 9).
 pub(crate) const MAX_RUNS: usize = 240;
 
@@ -697,6 +700,15 @@ pub(crate) struct SearchOutcome {
 /// - Without a budget (Fast) the search ends when every run is routed and judged.
 /// - The search also ends when nothing runs, nothing waits for a judge and nothing
 ///   more may launch.
+/// - Once [`JUDGE_FAILURES_BEFORE_STOP`] (3) judges have failed and none has
+///   succeeded, nothing more launches (a judge that fails every time is deterministic,
+///   and failed judges are short, so the rule would launch until the budget). A judge
+///   that succeeds later, on a run already in flight, lifts the stop and launching
+///   resumes. Otherwise the search ends when the running work ends, with no cut, and
+///   `stopped_launching` is `the judge failed on every run so far`. A failed baseline
+///   counts as a failure for every run it fails.
+/// - At the cut, jobs that have already finished are collected first, so a judge that
+///   ended at the same instant as the budget is not lost.
 /// - The winner is the least [`crate::route_judge::rank`] key over the judged runs,
 ///   ties to the lower index.
 pub(crate) async fn search(plan: &SearchPlan, runner: Arc<dyn Runner>) -> SearchOutcome {
@@ -714,6 +726,10 @@ pub(crate) async fn search(plan: &SearchPlan, runner: Arc<dyn Runner>) -> Search
             sched.budget_hit = true;
             if sched.any_judged() {
                 ended = now;
+                // Let jobs that complete at this very instant finish, then keep
+                // what they produced before cutting the rest.
+                tokio::task::yield_now().await;
+                sched.drain_finished(now);
                 sched.cut();
                 sched.stop_tasks().await;
                 break;
@@ -774,6 +790,10 @@ struct Sched<'a> {
     started: bool,
     budget_hit: bool,
     first_judged_at: Option<Instant>,
+    judge_failures: usize,
+    /// Set once `JUDGE_FAILURES_BEFORE_STOP` judges failed and none succeeded; a later
+    /// success clears it.
+    judge_halt: bool,
 }
 
 impl<'a> Sched<'a> {
@@ -797,6 +817,8 @@ impl<'a> Sched<'a> {
             started: false,
             budget_hit: false,
             first_judged_at: None,
+            judge_failures: 0,
+            judge_halt: false,
         }
     }
 
@@ -913,11 +935,34 @@ impl<'a> Sched<'a> {
                 record.outcome = "judged";
                 record.judged = Some(judged);
                 self.first_judged_at.get_or_insert(at);
+                // A judge that works on some runs is not a deterministic failure.
+                self.judge_halt = false;
             }
             Err(e) => {
                 record.outcome = "judge_failed";
                 record.reason = Some(format!("{e:#}"));
+                self.note_judge_failure();
             }
+        }
+    }
+
+    /// Counts a failed judge; the third with no success stops launching until a judge
+    /// succeeds.
+    fn note_judge_failure(&mut self) {
+        self.judge_failures += 1;
+        if self.judge_failures >= JUDGE_FAILURES_BEFORE_STOP && !self.any_judged() {
+            self.judge_halt = true;
+        }
+    }
+
+    /// Collects every job that has already finished but was not yet joined, and
+    /// handles each as the main loop does.
+    fn drain_finished(&mut self, at: Instant) {
+        while let Some(result) = self.judges.try_join_next_with_id() {
+            self.on_judge(at, result);
+        }
+        while let Some(result) = self.routes.try_join_next_with_id() {
+            self.on_route(at, result);
         }
     }
 
@@ -934,6 +979,7 @@ impl<'a> Sched<'a> {
                     record.outcome = "judge_failed";
                     record.reason = Some(reason.clone());
                     record.judged_s = Some(judged_s);
+                    self.note_judge_failure();
                 }
                 return;
             }
@@ -962,7 +1008,7 @@ impl<'a> Sched<'a> {
             }
             return;
         }
-        if self.plan.limits.runs.is_some() || passed {
+        if self.plan.limits.runs.is_some() || passed || self.judge_halt {
             return;
         }
         while self.routes.len() < routers && self.runs.len() < order_len {
@@ -1065,6 +1111,8 @@ impl<'a> Sched<'a> {
             } else {
                 "order exhausted".to_string()
             })
+        } else if self.judge_halt {
+            Some("the judge failed on every run so far".to_string())
         } else if self.budget_hit {
             Some("the budget".to_string())
         } else {

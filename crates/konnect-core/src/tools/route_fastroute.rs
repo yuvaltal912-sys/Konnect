@@ -605,12 +605,29 @@ async fn search_and_write(
     binary: Binary,
 ) -> Result<CallToolResult> {
     let judge_root = call.folder.join("judge");
-    let judge = match route_judge::prepare(&call.dsn, &judge_root, &ctx.config.kicad_cli) {
+    let mut judge = match route_judge::prepare(&call.dsn, &judge_root, &ctx.config.kicad_cli) {
         Ok(judge) => judge,
         Err(refused) => return Ok(preflight_refusal(&refused)),
     };
     std::fs::create_dir_all(&judge_root)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", judge_root.display()))?;
+    // The judge's KiCad runs on a private copy of the KiCad settings, so that
+    // no run touches the user's own.
+    let kicad_config = match route_judge::private_kicad_config(&call.folder.join("kicad-config")) {
+        Ok(config) => config,
+        Err(error) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: format!("{error:#}"),
+                },
+                format!(
+                    "The private KiCad configuration the judge runs on could not be made ({error:#}). Nothing was routed."
+                ),
+            ));
+        }
+    };
+    let kicad_config_home = kicad_config.home.clone();
+    judge.kicad_config_home = Some(kicad_config_home.clone());
     let dsn_text = crate::freerouting_mcp::read_dsn(&call.dsn)?;
     let shapes = match route_search::shapes(&dsn_text)
         .and_then(|shapes| preflight_variants(&dsn_text, &shapes).map(|()| shapes))
@@ -658,7 +675,11 @@ async fn search_and_write(
         tools: ctx,
     });
     let outcome = route_search::search(&plan, runner).await;
-    let search = search_json(&plan, &shapes, &outcome);
+    let mut search = search_json(&plan, &shapes, &outcome);
+    search["kicad_config_home"] = json!(text(&kicad_config_home));
+    if !kicad_config.skipped_links.is_empty() {
+        search["kicad_config_skipped_links"] = json!(kicad_config.skipped_links);
+    }
     let search_file = call.folder.join("search.json");
     std::fs::write(
         &search_file,
@@ -693,15 +714,26 @@ async fn search_and_write(
         &shapes,
         &outcome,
     );
+    result["search"]["kicad_config_home"] = json!(text(&kicad_config_home));
+    if !kicad_config.skipped_links.is_empty() {
+        result["search"]["kicad_config_skipped_links"] = json!(kicad_config.skipped_links);
+    }
     if let Err(error) = reduced {
         result["search"]["reduce_error"] = json!(format!("{error:#}"));
     }
-    carry_arguments(&mut result, args, call.effort.0);
+    carry_arguments(&mut result, args, call.effort);
     Ok(CallToolResult::json(&result))
 }
 
 /// Step 7: nothing was routed and judged, so nothing is written to the output.
-fn no_winner_result(call: &Call, outcome: &SearchOutcome, search: Value) -> CallToolResult {
+///
+/// The failed call leaves its records, not its boards: every run folder is
+/// reduced to its `run.json` (`search.json` was written before this) and a
+/// reduce error is reported in `search.reduce_error`, never fatal.
+fn no_winner_result(call: &Call, outcome: &SearchOutcome, mut search: Value) -> CallToolResult {
+    if let Err(error) = reduce_run_folders(&call.folder, outcome) {
+        search["reduce_error"] = json!(format!("{error:#}"));
+    }
     let mut counts = std::collections::BTreeMap::new();
     for record in &outcome.runs {
         *counts.entry(record.outcome).or_insert(0usize) += 1;
@@ -737,10 +769,12 @@ fn no_winner_result(call: &Call, outcome: &SearchOutcome, search: Value) -> Call
     )
 }
 
-/// A following call's arguments: the effort and the width arguments this call
-/// was given are repeated into the `route_specctra_dsn` steps of its completion,
-/// so that following them does not bring back a default the caller did not choose.
-fn carry_arguments(result: &mut Value, args: &Value, effort: Effort) {
+/// A following call's arguments: the effort (when the caller gave it) and the
+/// width arguments this call was given are repeated into the
+/// `route_specctra_dsn` steps of its completion, so that following them does not
+/// bring back a default the caller did not choose. A step of a fastroute result
+/// never names `engine: "freerouting"`: it routes with the default engine.
+fn carry_arguments(result: &mut Value, args: &Value, effort: (Effort, EffortSource)) {
     let Some(steps) = result
         .pointer_mut("/completion/if_still_open/fallback")
         .and_then(Value::as_array_mut)
@@ -751,7 +785,12 @@ fn carry_arguments(result: &mut Value, args: &Value, effort: Effort) {
         .iter_mut()
         .filter(|step| step["tool"] == "route_specctra_dsn")
     {
-        step["arguments"]["effort"] = json!(effort.name());
+        if let Some(arguments) = step["arguments"].as_object_mut() {
+            arguments.remove("engine");
+        }
+        if effort.1 == EffortSource::Argument {
+            step["arguments"]["effort"] = json!(effort.0.name());
+        }
         for key in ["width_policy", "width_fallback"] {
             if let Some(value) = args[key].as_str() {
                 step["arguments"][key] = json!(value);

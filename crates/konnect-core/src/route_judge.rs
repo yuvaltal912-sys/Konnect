@@ -58,6 +58,11 @@ pub(crate) struct JudgeContext {
     pub floors_mm: BTreeMap<String, f64>,
     /// `<search folder>/judge`: every scratch board of this call is below it.
     pub root: PathBuf,
+    /// The private copy of KiCad's settings (`private_kicad_config`) that every
+    /// kicad-cli the judge starts runs with as `KICAD_CONFIG_HOME`, so that none of
+    /// them writes the owner's real settings. `prepare` sets `None`; the caller sets
+    /// it once the search folder exists.
+    pub kicad_config_home: Option<PathBuf>,
 }
 
 /// The unrouted board, refilled and checked the same way every run is (G2's
@@ -209,6 +214,7 @@ pub(crate) fn prepare(
         power_nets,
         floors_mm,
         root: root.to_path_buf(),
+        kicad_config_home: None,
     })
 }
 
@@ -266,10 +272,190 @@ fn clipped(text: &str) -> String {
     }
 }
 
-/// Removes a scratch board and its DRC report. A file that is not there is fine.
-fn remove_board(board: &Path) {
-    let _ = std::fs::remove_file(board);
-    let _ = std::fs::remove_file(board.with_extension("drc.json"));
+/// Removes the whole folder of an earlier stitching round (`<root>/run-<i>/r<k>`,
+/// made by this judge): the board named by `board`, its DRC report and the project
+/// files copied beside them. A folder that is already gone is fine. A link is never
+/// followed or removed, and nothing outside `root` or not named `r<number>` is.
+fn remove_round_folder(root: &Path, board: &Path) -> Result<()> {
+    let folder = board
+        .parent()
+        .with_context(|| format!("'{}' has no folder", board.display()))?;
+    ensure!(
+        folder != root && folder.starts_with(root),
+        "'{}' is not a folder below the judge's root '{}'",
+        folder.display(),
+        root.display()
+    );
+    let named_as_a_round = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix('r'))
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()));
+    ensure!(
+        named_as_a_round,
+        "'{}' is not a round folder (r<number>)",
+        folder.display()
+    );
+    let meta = match std::fs::symlink_metadata(folder) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect '{}'", folder.display())),
+    };
+    ensure!(
+        !meta.file_type().is_symlink(),
+        "'{}' is a symbolic link; it is not removed",
+        folder.display()
+    );
+    ensure!(meta.is_dir(), "'{}' is not a folder", folder.display());
+    std::fs::remove_dir_all(folder)
+        .with_context(|| format!("remove the earlier round folder '{}'", folder.display()))
+}
+
+/// Refill and DRC of a scratch board, with `config` as kicad-cli's settings folder.
+async fn refill(
+    ctx: &JudgeContext,
+    config: Option<&Path>,
+    board: &Path,
+) -> Result<crate::tools::cli::DrcReport> {
+    crate::tools::cli::refill_drc_on_private_copy_with_config(&ctx.kicad_cli, board, config).await
+}
+
+/// One kicad-cli user's own copy of the call's private settings (the baseline, or
+/// one run's judge), in `<root>/kicad-config/<name>`, removed again when it is
+/// dropped. The baseline and up to three judges run kicad-cli at once, and kicad-cli
+/// re-saves its settings on exit, so no two of them share a settings folder, and
+/// the call's copy itself is never written: every run starts from the same settings.
+struct OwnConfig(Option<PathBuf>);
+
+impl OwnConfig {
+    fn new(ctx: &JudgeContext, name: &str) -> Result<Self> {
+        let Some(master) = ctx.kicad_config_home.as_deref() else {
+            return Ok(Self(None));
+        };
+        let own = ctx.root.join("kicad-config").join(name);
+        if own.exists() {
+            std::fs::remove_dir_all(&own)
+                .with_context(|| format!("clear the old settings copy '{}'", own.display()))?;
+        }
+        crate::scratch_board::copy_folder(master, &own)?;
+        Ok(Self(Some(own)))
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for OwnConfig {
+    fn drop(&mut self) {
+        if let Some(own) = &self.0 {
+            let _ = std::fs::remove_dir_all(own);
+        }
+    }
+}
+
+/// The KiCad versions whose settings folder is looked for under `KICAD_CONFIG_HOME`,
+/// highest first.
+const CONFIG_VERSIONS: [&str; 3] = ["10.0", "9.0", "8.0"];
+
+/// The settings folder of the highest version present under `root`, with its name.
+fn config_source_in(root: &Path) -> Option<(PathBuf, String)> {
+    CONFIG_VERSIONS
+        .iter()
+        .find(|version| root.join(version).is_dir())
+        .map(|version| (root.join(version), version.to_string()))
+}
+
+/// KiCad's current settings folder: under `$KICAD_CONFIG_HOME` when that is set, else
+/// the one `tools::kicad_config_dir` names.
+fn config_source() -> Option<(PathBuf, String)> {
+    match std::env::var_os("KICAD_CONFIG_HOME").filter(|home| !home.is_empty()) {
+        Some(root) => config_source_in(Path::new(&root)),
+        None => {
+            let dir = crate::tools::kicad_config_dir();
+            let version = dir.file_name()?.to_str()?.to_string();
+            dir.is_dir().then_some((dir, version))
+        }
+    }
+}
+
+/// The call's private copy of KiCad's settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrivateConfig {
+    /// The folder every judge's own copy is made from (see [`OwnConfig`]).
+    pub home: PathBuf,
+    /// Links in the source settings, left out of the copy (reported, not fatal).
+    pub skipped_links: Vec<String>,
+}
+
+/// A private copy of KiCad's current settings, made once per call: the settings
+/// folder of the current version is copied into `into/<version>/`, and `into` is
+/// the value for `KICAD_CONFIG_HOME` the judges' own copies come from. kicad-cli
+/// writes to its settings when it runs; this keeps it off the owner's real ones.
+/// The version folder is read through a link to it; a link inside it is left out
+/// (a copied link would let kicad-cli write through it) and named in
+/// `skipped_links`, so a linked file never stops a call. When there is no settings
+/// folder to copy, `into` is left empty (KiCad then uses its defaults) and a log
+/// line says so.
+pub(crate) fn private_kicad_config(into: &Path) -> Result<PrivateConfig> {
+    copy_kicad_config(config_source(), into)
+}
+
+fn copy_kicad_config(source: Option<(PathBuf, String)>, into: &Path) -> Result<PrivateConfig> {
+    std::fs::create_dir_all(into).with_context(|| {
+        format!(
+            "create the private KiCad settings folder '{}'",
+            into.display()
+        )
+    })?;
+    let mut skipped_links = Vec::new();
+    match source {
+        None => tracing::warn!(
+            "no KiCad settings folder to copy; kicad-cli runs on '{}' with its defaults",
+            into.display()
+        ),
+        Some((folder, version)) => {
+            let real = std::fs::canonicalize(&folder)
+                .with_context(|| format!("resolve '{}'", folder.display()))?;
+            copy_settings(&real, &into.join(&version), &mut skipped_links)?;
+            for link in &skipped_links {
+                tracing::warn!("the KiCad settings link '{link}' is left out of the judge's copy");
+            }
+        }
+    }
+    Ok(PrivateConfig {
+        home: into.to_path_buf(),
+        skipped_links,
+    })
+}
+
+/// `from` and everything below it copied to `to` as regular files and folders; a
+/// link, or anything that is neither a file nor a folder, is left out and named in
+/// `skipped`.
+fn copy_settings(from: &Path, to: &Path, skipped: &mut Vec<String>) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("create '{}'", to.display()))?;
+    let mut entries: Vec<_> = std::fs::read_dir(from)
+        .with_context(|| format!("read '{}'", from.display()))?
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("read '{}'", from.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source = entry.path();
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("inspect '{}'", source.display()))?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_settings(&source, &target, skipped)?;
+        } else if kind.is_file() {
+            std::fs::copy(&source, &target).with_context(|| {
+                format!("copy '{}' to '{}'", source.display(), target.display())
+            })?;
+        } else {
+            skipped.push(source.display().to_string());
+        }
+    }
+    Ok(())
 }
 
 /// A tool of the registry, in whichever toolset holds it.
@@ -305,7 +491,8 @@ async fn call_tool(
 
 /// G2's baseline: the saved board, unchanged, in `root/baseline`
 /// (`scratch_board::copy_project`, then the text written), refilled and checked by
-/// `tools::cli::refill_drc_on_private_copy`; violations counted by `rule`, and the
+/// `tools::cli::refill_drc_on_private_copy_with_config` (with the context's private
+/// KiCad settings); violations counted by `rule`, and the
 /// unconnected items counted (a report with no unconnected category is an error,
 /// never zero).
 pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
@@ -316,7 +503,8 @@ pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
     }
     let board = crate::scratch_board::copy_project(&ctx.board, &folder)?;
     write_board(&board, &ctx.board_text)?;
-    let report = crate::tools::cli::refill_drc_on_private_copy(&ctx.kicad_cli, &board)
+    let config = OwnConfig::new(ctx, "baseline")?;
+    let report = refill(ctx, config.path(), &board)
         .await
         .context("the unrouted board's refill and DRC failed")?;
     Ok(Baseline {
@@ -402,7 +590,8 @@ pub(crate) struct Judged {
 ///    not a candidate).
 /// 2. `scratch_board::copy_project` into `r0`, then `scratch_board::write_routing`
 ///    of the plan over the saved text, written as `r0/<board file name>`.
-/// 3. `tools::cli::refill_drc_on_private_copy` on that board.
+/// 3. `tools::cli::refill_drc_on_private_copy_with_config` on that board (every
+///    kicad-cli of the judge runs with `ctx.kicad_config_home` as `KICAD_CONFIG_HOME`).
 /// 4. Stitching, only for `routed.planes` nets, for at most [`STITCH_ROUNDS`] rounds
 ///    while one of those nets has an unconnected item (an unconnected item that
 ///    names `[<net>]` in an item description): `plan_route_refinement` through the
@@ -412,13 +601,44 @@ pub(crate) struct Judged {
 ///    `scratch_board::write_planned` into `r<n>` (project copied the same way),
 ///    refill and DRC; the round's row records the counts.
 /// 5. `audit_layout_quality` through the tool registry on the last board.
-/// 6. [`measure`], then [`gates`]. Boards of earlier rounds are removed; the last is
-///    kept, and named in `Judged::board`.
+/// 6. [`measure`], then [`gates`]. The folders of earlier rounds are removed whole
+///    (board, report and copied project files), once the next round's board is
+///    written and checked; the last round's folder is kept, and its board is named in
+///    `Judged::board`.
 pub(crate) async fn judge(
     ctx: &JudgeContext,
     routed: &Routed,
     baseline: &Baseline,
     tools: Arc<crate::tools::ToolContext>,
+) -> Result<Judged> {
+    judge_with(ctx, routed, baseline, &RegistryTools(tools)).await
+}
+
+/// One registry tool call in flight: whether it refused, and its first text.
+type ToolCall<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(bool, String)>> + Send + 'a>>;
+
+/// How the judge calls the tools of the registry: whether the call refused
+/// (`is_error`) and its first text. The one implementation is [`RegistryTools`]; the
+/// tests of the round logic put a scripted planner in its place.
+trait ToolCaller: Send + Sync {
+    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> ToolCall<'a>;
+}
+
+struct RegistryTools(Arc<crate::tools::ToolContext>);
+
+impl ToolCaller for RegistryTools {
+    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> ToolCall<'a> {
+        Box::pin(async move { call_tool(&self.0, name, args).await })
+    }
+}
+
+/// [`judge`] with the tool calls behind [`ToolCaller`].
+async fn judge_with(
+    ctx: &JudgeContext,
+    routed: &Routed,
+    baseline: &Baseline,
+    tools: &dyn ToolCaller,
 ) -> Result<Judged> {
     // 1. The session, read by the importer's own checks: a session it would refuse
     //    is a failed judge.
@@ -445,8 +665,9 @@ pub(crate) async fn judge(
     let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan)?;
     write_board(&board, &routed_text)?;
 
-    // 3. KiCad's refill and DRC.
-    let mut drc = crate::tools::cli::refill_drc_on_private_copy(&ctx.kicad_cli, &board)
+    // 3. KiCad's refill and DRC, on this judge's own settings copy.
+    let config = OwnConfig::new(ctx, &format!("run-{}", routed.index))?;
+    let mut drc = refill(ctx, config.path(), &board)
         .await
         .context("refill and DRC of the routed board")?;
 
@@ -474,7 +695,7 @@ pub(crate) async fn judge(
                 "search_radius_mm": STITCH_RADIUS_MM,
                 "effort": "standard",
             });
-            let plan_json = match call_tool(&tools, "plan_route_refinement", &args).await {
+            let plan_json = match tools.call("plan_route_refinement", &args).await {
                 Err(error) => {
                     rounds.push(stopped(json!({ "planner_refused": format!("{error:#}") })));
                     break;
@@ -536,31 +757,35 @@ pub(crate) async fn judge(
             let next_board =
                 crate::scratch_board::copy_project(&board, &run_dir.join(format!("r{round}")))?;
             write_board(&next_board, &next_text)?;
-            let next_drc =
-                crate::tools::cli::refill_drc_on_private_copy(&ctx.kicad_cli, &next_board)
-                    .await
-                    .with_context(|| format!("refill and DRC after stitching round {round}"))?;
-            // The earlier round's board is no longer needed.
-            remove_board(&board);
+            let next_drc = refill(ctx, config.path(), &next_board)
+                .await
+                .with_context(|| format!("refill and DRC after stitching round {round}"))?;
+            // The earlier round's whole folder is no longer needed: its board, its
+            // report and the project files copied beside them.
+            let cleanup = remove_round_folder(&ctx.root, &board);
             board = next_board;
             drc = next_drc;
             stitching_vias += items.vias.len();
-            rounds.push(stopped(json!({
+            let mut row = stopped(json!({
                 "proposals": proposals,
                 "written_vias": items.vias.len(),
                 "open_after": unconnected_on(&drc, planes),
-            })));
+            }));
+            if let Err(error) = cleanup {
+                row["earlier_round_kept"] = json!(format!("{error:#}"));
+            }
+            rounds.push(row);
         }
     }
 
     // 5. The layout audit on the last board: a refusal is a failed judge.
-    let (refused, text) = call_tool(
-        &tools,
-        "audit_layout_quality",
-        &json!({ "board": board.display().to_string() }),
-    )
-    .await
-    .context("the layout audit failed")?;
+    let (refused, text) = tools
+        .call(
+            "audit_layout_quality",
+            &json!({ "board": board.display().to_string() }),
+        )
+        .await
+        .context("the layout audit failed")?;
     ensure!(!refused, "the layout audit refused: {}", clipped(&text));
     let audit: Value =
         serde_json::from_str(&text).context("the layout audit result is not JSON")?;
@@ -816,7 +1041,8 @@ pub(crate) type Key = [i64; 10];
 
 /// The rank key of decision 12 for every judged run at once (the length steps need
 /// the shortest): G1, G2 and G3 failed (0 or 1 each); acute corners (whole);
-/// signal length over the shortest judged signal length, in steps of
+/// signal length over the shortest signal length among the runs that pass G1 (among
+/// all judged runs when none does), in steps of
 /// [`LENGTH_STEP`] (`round(ratio / step)`); power length the same; right angles
 /// (whole); vias off the pour nets; minus copper quality (rounded to whole points);
 /// route seconds (rounded down). A measure the audit did not give sorts last
@@ -824,9 +1050,21 @@ pub(crate) type Key = [i64; 10];
 pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
     // The shortest judged length of a category, among runs that have any: a run with
     // none of it is at least as short as the shortest, and its step is 0.
-    let shortest = |length: fn(&Measures) -> f64| -> Option<f64> {
+    // The reference is the shortest among the runs that pass G1 (complete): a
+    // degenerate run that is not complete must not set the steps. When none passes,
+    // the shortest among all.
+    let complete: Vec<&Judged> = judged
+        .iter()
+        .copied()
+        .filter(|run| run.gates.g1.is_empty())
+        .collect();
+    let pool: &[&Judged] = if complete.is_empty() {
         judged
-            .iter()
+    } else {
+        &complete
+    };
+    let shortest = |length: fn(&Measures) -> f64| -> Option<f64> {
+        pool.iter()
             .map(|run| length(&run.measures))
             .filter(|mm| *mm > 0.0)
             .fold(None, |least: Option<f64>, mm| {

@@ -9,10 +9,12 @@ PR #71's export changes.
 ## What the owner asked for
 
 - Best-of-N routing is the default of `route_specctra_dsn` in this fork.
-- The engine is the fastroute candidate (C\*\* + BR1 + W8P, build x14).
+- The engine is the fastroute candidate (C\*\* + BR1 + W8P). Build x15 since 2026-11-16 (x14 plus
+  C1: wires and vias read back from a session keep their own net class's clearance; engine
+  commit 406884ab); the switches are unchanged from x14.
 - The user picks an effort level: Fast, M, H, XH. Budgets per board, runs in parallel:
   Fast = 2 runs at once, M = 4 min, H = 12 min, XH = 40 min (the owner's "double the first
-  proposal" of 1 run / 2 / 6 / 20 min; to be confirmed with him before the build).
+  proposal" of 1 run / 2 / 6 / 20 min; he confirmed this reading on 2026-11-16).
 - Konnect judges every run itself and keeps the best by gates that need no human routing.
 - Freerouting stays available as an engine.
 
@@ -51,18 +53,20 @@ next steps (`completion.next_steps`), as row S6 decided: no hidden write path.
 | D1 | The pour axis is "as exported" plus "every plane omitted", the second derived from the given DSN by removing its `(plane …)` entries. A DSN with no plane has one shape | Stage 3/5 of the research: the pour shape alone separates "no complete board" from "6 of 14 pass every gate" on one board. The export widens no pour net in either shape (row S6), so removing the planes is the omitted export; the importer checks the zone inventory against the board, not the DSN's planes |
 | D2 | Seeds reorder the `(component …)` blocks of `(placement …)`; every other byte is kept. A seeded SplitMix64 Fisher-Yates, not the research's Python orders | The research: 98 distinct routings from 98 orders, while thread count gives 3. The importer matches placement by reference, so order cannot change what is applied |
 | D3 | Launch order: seed 1 in every shape, then seed 2 in every shape, … | Both shapes are tried from the first wave |
-| D4 | Every run uses the research's hold sequence: Full (retry off, optimizer on); only if connections stay open and the manifest gives one floor width, Fallback (retry at the floor, optimizer off, from Full's session) kept only if it closes at least one; then Polish (retry off, optimizer on, from Fallback's session), kept when it leaves no more open than Fallback. Later passes start from `--initial-session` | The candidate was measured on this sequence with `--initial-session`; BR1 fires only on a session import. "Fallback kept only if it closes one" is the product's S9 rule and is stricter than the research driver, which kept a Fallback that closed nothing |
+| D4 | Every run uses the research's hold sequence: Full (retry off, optimizer on); only if connections stay open and the manifest gives one floor width, Fallback (retry at the floor, optimizer off, from Full's session) kept only if it closes at least one; then Polish (retry off, optimizer on, from Fallback's session), kept when it leaves no more open than Fallback. Later passes start from `--initial-session` | The candidate was measured on this sequence with `--initial-session`; BR1 fires only on a session import. "Fallback kept only if it closes one" is the product's S9 rule and is stricter than the research driver, which kept a Fallback that closed nothing. A Fallback or Polish that fails (an error, not the 900 s cap) is recorded `failed` and the run keeps the session it had; a failed Full fails the run | A later pass only ever improves on a session that already exists, so its failure must not throw that session away |
 | D5 | Router lanes = clamp(cores / 2, 1, 7), 2 threads each; judge lanes = clamp(cores / 4, 1, 3). Fast: its 2 runs at once | The research's throughput table: 7 x 2 was the best on 14 cores (5.78 routings a minute), with 3 judges; peak memory at most 571 MB a run |
 | D6 | The budget clock starts when the search starts (the unrouted board's DRC runs in it, beside the first wave). The first wave fills every router lane at once. After that a run starts only when a router lane is free and, by the medians so far, it could be routed and judged before the budget: `now + route + ceil(queued / judges) x judge + judge <= budget`, `queued` counting the runs routing or waiting for a judge. No run starts after the first wave until one route and one judge have finished (both medians are needed) | The task's rule ("a route starts only while its judge can still finish"), as stage 4 measured it, without the fixed first guesses that stopped stage 4's B3 early. Waiting for the first judge costs throughput (lanes idle for one judge's time), never quality |
-| D7 | At the budget: if a run is judged, every running route and judge is cut and recorded `cut_at_budget`. If none is judged yet, the search waits for the first judged run (no new launches) and reports the overrun | The owner's top value is quality, so a call never ends with nothing because one board routes slowly (one research run took 622 s); the overrun is reported as information |
-| D8 | A route that runs past 900 s is killed (its process group: SIGTERM, then SIGKILL 10 s later) and recorded `hung`, never retried. Fast has no budget, only this cap | The research's largest hang cap; its hangs were endless loops, and a killed run is never counted as a routing |
+| D7 | At the budget: if a run is judged, every running route and judge is cut and recorded `cut_at_budget`. If none is judged yet, the search waits for the first judged run (no new launches) and reports the overrun. Before the cut, every route and judge that has already finished is collected, so a run that ended at the budget instant is kept | The owner's top value is quality, so a call never ends with nothing because one board routes slowly (one research run took 622 s); the overrun is reported as information |
+| D8 | A route that runs past 900 s (all its passes together) is killed (SIGKILL to its process, then waited for) and recorded `hung`, never retried. `sandbox-exec` replaces itself with the binary and the profile lets no other program start, so that process is the whole run; dropping the call kills it the same way (`kill_on_drop`). Fast has no budget, only this cap | The research's largest hang cap; its hangs were endless loops, and a killed run is never counted as a routing |
 | D9 | At most 240 runs a call | The research: nothing improves between 50 and 98 judged runs; on a small board XH would otherwise judge thousands of runs and fill the disk. Reported as `stopped_launching` |
 | D10 | Absolute gates (research change 7), no baseline: G1 complete, G2 DRC, G3 width (section below). Audit 4.2's via need stays as the audit counts it today (a net's total vias against one layer change); "per layer change" is an audit change of its own and is not in this PR | 4.2 lives in `audit_trace_current`; changing what it counts changes every audit, and needs its own measurement |
 | D11 | T1 (spoke tracks for starved thermals, research change 1) is not in the judge | Not in the requested judge; it is its own Konnect change for either router. Without it some runs fail G2 by a starved thermal, which the rank still orders |
-| D12 | The rank key is the research's (`exp20.key`, which reproduces the bench's own order), with the lengths stepped against the shortest judged run instead of a human routing | Keeps the measured order; a product user has no baseline |
-| D13 | fastroute runs only on macOS for now, inside `sandbox-exec` with a profile written per run: no network, writes only to the run folder and the null devices, no process but the binary itself. On Windows and Linux the engine refuses and names `engine: "freerouting"` | The research's isolation rule; macOS first, other systems validated at the end of the series |
+| D12 | The rank key is the research's (`exp20.key`, which reproduces the bench's own order), with the lengths stepped against the shortest run that passes G1 (the shortest of all judged runs when none does) instead of a human routing, so that a degenerate run that is not complete cannot make the steps finer than the real runs | Keeps the measured order; a product user has no baseline |
+| D13 | fastroute runs only on macOS for now, inside `sandbox-exec` with a profile written per run: no network, writes only to the run folder and the null devices, no process but the binary itself, and an environment of `HOME`, `TMPDIR` and `PATH` only. Everything else stays allowed (`allow default`): reads anywhere, and Mach and XPC service lookups. It contains the network and writes; it is not a full jail. On Windows and Linux the engine refuses and names `engine: "freerouting"` | The research's isolation rule; macOS first, other systems validated at the end of the series. A deny-default profile would have to list every system service the binary needs, and would break on a macOS update |
 | D14 | Each run's folder is reduced to its record once the search ends; the winner's folder is kept whole, with its judged board | 240 runs of board copies would fill the disk |
-| D15 | `status` keeps today's meaning (from the router's count and the planes); the judge's verdict is added beside it (`completion.judged`, `search.winner.gates`) | `status` is additive since S6; changing its meaning would break callers |
+| D15 | `status` is the router's value (today's meaning, from its count and the planes) only when the winner passes all three gates. If G1 fails it is `incomplete`; if only G2 or G3 fails it is the new `complete_with_gate_failures`. The verdict itself is beside it (`completion.judged`, `search.winner.gates`) | A caller that checks `status == "complete"` must never accept a board the judge failed. On the owner's boards fastroute breaks a netclass clearance that Freerouting keeps (research session, 2026-11-16); G2 catches it, and this status makes it visible |
+| D16 | If 3 judges have failed (an error, not a gate) and none has succeeded, no further run starts; the runs in flight finish, and `stopped_launching` says "the judge failed on every run so far". A judge that then succeeds on a run in flight lifts the stop | A judge that fails on every run (a broken kicad-cli, a refused board) would otherwise spend the whole budget routing runs nobody can judge |
+| D17 | The judge's kicad-cli never runs on the user's KiCad settings. The call copies them once (`<search folder>/kicad-config`, from `$KICAD_CONFIG_HOME` or the user's KiCad settings folder; reported as `search.kicad_config_home`), and the baseline and each run's judge get their own copy of that, removed when they are done. A link inside the settings is left out of the copy and named in `search.kicad_config_skipped_links`; it never stops the call | The baseline and up to 3 judges run kicad-cli at once, and kicad-cli re-saves its settings on exit: one shared folder, the user's or the call's, would race. A copied link would let kicad-cli write through it |
 
 ## Decisions for the owner
 
@@ -72,7 +76,7 @@ next steps (`completion.next_steps`), as row S6 decided: no hidden write path.
    one fixed place, `~/.local/share/fastroute/candidate/fastroute`; the `fastroute_path`
    argument, the environment variable `KONNECT_FASTROUTE` and the user config key
    `routing.fastroute_path` override it, in that order. Before routing, a probe proves the
-   binary is the candidate build (every candidate switch is accepted). On this Mac the x14
+   binary is the candidate build (every candidate switch is accepted). On this Mac the x15
    build is copied once to that place (it lives in a research worktree today). fastroute
    still runs as its own process, for technical reasons only: a hung run (2 of 100 seeds in
    the research) can be killed only as a process, the no-network sandbox applies to a
@@ -111,8 +115,8 @@ Bodies say what they must do. `Result` is `anyhow::Result` unless named.
 //! killed, the run can be sandboxed off the network, and parallel runs keep their memory
 //! apart.
 
-/// The candidate the owner chose on 2026-11-16 (C** + BR1 + W8P, build x14, engine commit
-/// f401652). Sent on every pass, in this order.
+/// The candidate the owner chose on 2026-11-16 (C** + BR1 + W8P; build x15, engine commit
+/// 406884ab, the same switches as x14). Sent on every pass, in this order.
 pub(crate) const CANDIDATE_SWITCHES: &[&str] = &[
     "--no-time-limits", "--x.no_clock", "--x.par_vias=340", "--x.work_cap=2000000",
     "--x.par_vias_noacute", "--x.bridge_full_width", "--x.par_vias_net",
@@ -212,11 +216,11 @@ pub(crate) struct PassOutcome {
 }
 
 /// Runs one pass in its own folder: writes the profile, runs
-/// `/usr/bin/sandbox-exec -f profile binary args…` in a new process group with only
+/// `/usr/bin/sandbox-exec -f profile binary args…` with only
 /// HOME=folder/home, TMPDIR=folder/tmp, PATH=/usr/bin:/bin (no FASTROUTE_* or
 /// FREEROUTING__* variable), stdout and stderr to folder/fastroute.log. Killed at
-/// `deadline`: SIGTERM to the group, SIGKILL 10 s later, then `Err(Killed)`. Dropping the
-/// future does the same. Err on a non-zero exit, a missing or empty SES, or a report that
+/// `deadline` (SIGKILL to the child, then waited for), then `Err(Killed)`. Dropping the
+/// future kills it too (`kill_on_drop`). Err on a non-zero exit, a missing or empty SES, or a report that
 /// does not parse.
 pub(crate) async fn run_pass(binary: &Binary, folder: &Path, dsn: &Path, hints: &RoutingHints,
                              amps: Option<&Path>, pass: Pass, deadline: tokio::time::Instant)

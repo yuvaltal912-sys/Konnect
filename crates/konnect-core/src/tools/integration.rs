@@ -560,8 +560,12 @@ pub(crate) fn completion_report(
             }));
             // The caller's own width arguments are repeated, so following
             // the steps cannot bring back a default the caller did not choose.
+            // `engine` is named because fastroute is the default engine: this report
+            // is the Freerouting engine's, and its step must route the same way. The
+            // fastroute result drops the key again (`route_fastroute::carry_arguments`).
             let mut reroute = json!({ "dsn_path": dsn.with_extension("pours-omitted.dsn"),
-                                      "ses_output_path": ses.with_extension("pours-omitted.ses") });
+                                      "ses_output_path": ses.with_extension("pours-omitted.ses"),
+                                      "engine": "freerouting" });
             let mut carried = false;
             for (key, value) in [
                 ("width_policy", width.policy),
@@ -881,10 +885,12 @@ mod route_rule_tests {
         };
         let plain = reroutes(WidthOutcome::default());
         assert_eq!(plain.len(), 1, "the plane fallback routes again");
-        assert_eq!(
-            plain[0].as_object().unwrap().keys().collect::<Vec<_>>(),
-            ["dsn_path", "ses_output_path"]
-        );
+        // The report is the Freerouting engine's, so its step names that engine
+        // (fastroute is the default); nothing else is added.
+        let mut keys = plain[0].as_object().unwrap().keys().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["dsn_path", "engine", "ses_output_path"]);
+        assert_eq!(plain[0]["engine"], "freerouting");
         for (policy, fallback) in [
             (Some("hold"), Some("none")),
             (Some("hold"), Some("floor")),
@@ -902,6 +908,20 @@ mod route_rule_tests {
             assert_eq!(calls[0]["width_fallback"].as_str(), fallback);
             assert_eq!(calls[0]["dsn_path"], plain[0]["dsn_path"]);
             assert_eq!(calls[0]["ses_output_path"], plain[0]["ses_output_path"]);
+            // The step's arguments route with Freerouting, "retry" included; without
+            // `engine` they would resolve to fastroute (or be refused).
+            assert_eq!(
+                crate::tools::route_fastroute::route_engine(&calls[0]).ok(),
+                Some(crate::tools::route_fastroute::Engine::Freerouting),
+                "{:?}",
+                calls[0]
+            );
+            let mut without = calls[0].clone();
+            without.as_object_mut().unwrap().remove("engine");
+            assert_ne!(
+                crate::tools::route_fastroute::route_engine(&without).ok(),
+                Some(crate::tools::route_fastroute::Engine::Freerouting)
+            );
         }
     }
 
@@ -3925,8 +3945,9 @@ async fn route_with_freerouting(
         policy: asked.policy_given,
         fallback: asked.fallback_given,
     };
-    let (status, completion) =
+    let (status, mut completion) =
         completion_report(&dsn, &ses_output, &planes, evidence.router_unrouted, &width);
+    carry_freerouting_paths(&mut completion, args);
     let mut result = json!({
         "success": true,
         // Additive (S6 second half): what completion can be claimed, and the
@@ -4122,6 +4143,30 @@ fn width_arguments(args: &serde_json::Value) -> Result<WidthArguments, CallToolR
         policy_given,
         fallback_given,
     })
+}
+
+/// The JAR and Java the caller named are repeated into the `route_specctra_dsn`
+/// steps of a Freerouting result's completion, so that following a step routes
+/// with the same JAR.
+fn carry_freerouting_paths(completion: &mut serde_json::Value, args: &serde_json::Value) {
+    for pointer in ["/next_steps", "/if_still_open/fallback"] {
+        let Some(steps) = completion
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for step in steps
+            .iter_mut()
+            .filter(|step| step["tool"] == "route_specctra_dsn")
+        {
+            for key in ["jar_path", "java_path"] {
+                if let Some(value) = args[key].as_str() {
+                    step["arguments"][key] = json!(value);
+                }
+            }
+        }
+    }
 }
 
 /// What `width_fallback` asks for, for the fastroute engine, which always holds
@@ -7828,6 +7873,16 @@ done
         .await;
         assert_eq!(held["width_policy"], "hold", "{held}");
         assert_eq!(held["width_fallback"], "none", "{held}");
+        // The step routes with the engine and the JAR and Java of this call.
+        assert_eq!(held["engine"], "freerouting", "{held}");
+        assert!(
+            held["jar_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("freerouting-2.5.0.jar"),
+            "{held}"
+        );
+        assert!(held["java_path"].is_string(), "{held}");
         let plain = reroute("plain", json!({})).await;
         assert!(plain["width_policy"].is_null() && plain["width_fallback"].is_null());
         let retry = reroute("retry", json!({ "width_policy": "retry" })).await;

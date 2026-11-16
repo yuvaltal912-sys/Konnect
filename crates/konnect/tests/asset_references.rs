@@ -1025,6 +1025,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "complete_with_width_exceptions",
         "width_policy",
         "width_unmeasured",
+        // A status and a result field of `route_specctra_dsn`'s best-of-N
+        // search (fastroute engine).
+        "complete_with_gate_failures",
+        "budget_overrun_s",
     ];
 
     let mut phantom = Vec::new();
