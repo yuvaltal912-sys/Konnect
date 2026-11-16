@@ -285,7 +285,8 @@ fn export_tools() -> Vec<ToolDef> {
              default) or left out (omit), for the whole board or zone by zone. The router counts \
              a pad inside a plane's outline as connected and lets other nets cross the plane, so \
              completion is judged by KiCad's DRC after a refill. Rule areas that forbid tracks or \
-             vias always become keepouts. Both come from the zone outline (not the fill). Locked straight tracks and vias are fixed wiring; \
+             vias always become keepouts. Both come from the zone outline (not the fill). A \
+             teardrop zone belongs to the routing and is left out (teardrops_skipped). Locked straight tracks and vias are fixed wiring; \
              unlocked routing, routed arcs, custom pad shapes, local clearance overrides, \
              copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
@@ -341,11 +342,16 @@ fn export_tools() -> Vec<ToolDef> {
                         "default": true,
                         "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. A net owning a copper pour keeps its effective class width even when pours are omitted; this does not verify pour capacity. intent_widths reports the width decision and reason."
                     },
+                    "allow_duplicate_references": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Export footprints that share a Reference anyway. Off (default), a shared Reference is refused with every one listed: two pads would get one DSN pin name and the router would treat them as one pin. On, each later footprint that repeats a Reference is written as '<reference>_DUP<n>' so its pads keep their own pin names; renamed_references lists them (reference, dsn_name, uuid), and messages from the router name the DSN name. KiCad's native exporter cannot do this, so the Rust exporter is used. Re-annotating the schematic is the real fix."
+                    },
                     "native_bridge_mode": {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
-                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback."
+                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback. A board with teardrops, or with references renamed by allow_duplicate_references, always gets the Rust export ('require' is refused), since KiCad's exporter writes teardrops as planes and cannot rename."
                     }
                 },
                 "required": ["board", "output"]
@@ -774,6 +780,35 @@ fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
     args["native_bridge_mode"].as_str().unwrap_or("disable")
 }
 
+/// Board features only the Rust exporter writes as the router needs them:
+/// footprints that share a Reference, renamed (`allow_duplicate_references`),
+/// and teardrops, which KiCad's native exporter writes as planes of their net.
+/// When the board has any, the native exporter must not replace the Rust DSN.
+/// Returns whether the Rust export is kept for these reasons and the notes for
+/// 'prefer'; 'require' is refused.
+fn rust_only_bridge(
+    native_bridge_mode: &str,
+    reasons: &[&str],
+) -> Result<(bool, Vec<String>), String> {
+    if reasons.is_empty() {
+        return Ok((false, Vec::new()));
+    }
+    match native_bridge_mode {
+        "require" => Err(format!(
+            "KiCad native Specctra export was required, but {}, which only the Rust exporter handles; use prefer or disable",
+            reasons.join(", and ")
+        )),
+        "prefer" => Ok((
+            true,
+            reasons
+                .iter()
+                .map(|reason| format!("{reason}, which only the Rust exporter handles; the native bridge was not used"))
+                .collect(),
+        )),
+        _ => Ok((true, Vec::new())),
+    }
+}
+
 async fn handle_export_specctra_dsn(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -794,6 +829,9 @@ async fn handle_export_specctra_dsn(
     // Whether any pour can be left out, which only the Rust exporter does.
     let omit_pours = pours.may_omit();
     let widths_from_intent = args["widths_from_intent"].as_bool().unwrap_or(true);
+    let allow_duplicate_references = args["allow_duplicate_references"]
+        .as_bool()
+        .unwrap_or(false);
     // The project's copper-to-edge clearance (`min_copper_edge_clearance`),
     // which the DSN cannot hold; the manifest carries it to the router.
     let copper_edge_clearance_um = std::fs::read_to_string(board_path.with_extension("kicad_pro"))
@@ -905,6 +943,7 @@ async fn handle_export_specctra_dsn(
                 copper_edge_clearance_um,
                 widths_from_intent,
                 hole_clearance_um,
+                allow_duplicate_references,
             },
         )?;
         Ok((export, before))
@@ -927,7 +966,23 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() || omit_pours {
+    let mut rust_only = Vec::new();
+    if !baseline.renamed_references.is_empty() {
+        rust_only.push("footprints share a Reference");
+    }
+    if baseline.teardrops_skipped > 0 {
+        rust_only.push("the board has teardrops");
+    }
+    let (keep_rust, rust_notes) = match rust_only_bridge(native_bridge_mode, &rust_only) {
+        Ok(choice) => choice,
+        Err(reason) => return Ok(CallToolResult::error(reason)),
+    };
+    let export = if native_bridge_mode == "disable"
+        || snapshot.rules.is_some()
+        || omit_pours
+        || keep_rust
+    {
+        bridge_diagnostics.extend(rust_notes);
         if omit_pours && native_bridge_mode == "prefer" {
             bridge_diagnostics.push(
                 "pours were left out, which only the Rust exporter does; the native bridge was not used"
@@ -1029,6 +1084,8 @@ async fn handle_export_specctra_dsn(
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
             "intent_widths": export.intent_widths,
+            "renamed_references": export.renamed_references,
+            "teardrops_skipped": export.teardrops_skipped,
             "copper_edge_clearance_um": copper_edge_clearance_um,
             "hole_clearance_um": hole_clearance_um,
             "capabilities": {
@@ -1776,5 +1833,49 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+#[cfg(test)]
+mod rust_only_bridge_tests {
+    use super::rust_only_bridge;
+
+    /// Renamed references and teardrops come right only from the Rust
+    /// exporter: 'require' is refused naming each, 'prefer' keeps the Rust
+    /// export with one note each, and 'disable' keeps it silently. Control:
+    /// with neither, every mode leaves the bridge choice to the other
+    /// conditions.
+    #[test]
+    fn features_only_the_rust_exporter_handles_keep_it() {
+        let both = ["footprints share a Reference", "the board has teardrops"];
+        let refused = rust_only_bridge("require", &both).unwrap_err();
+        assert!(
+            refused.contains("share a Reference") && refused.contains("teardrops"),
+            "{refused}"
+        );
+        let (kept, notes) = rust_only_bridge("prefer", &both[1..]).unwrap();
+        assert!(kept);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("teardrops") && notes[0].contains("native bridge was not used"));
+        assert_eq!(rust_only_bridge("disable", &both), Ok((true, Vec::new())));
+        for mode in ["require", "prefer", "disable"] {
+            assert_eq!(
+                rust_only_bridge(mode, &[]),
+                Ok((false, Vec::new())),
+                "{mode}"
+            );
+        }
+    }
+
+    /// The option is public, boolean and off unless asked for.
+    #[test]
+    fn the_export_schema_offers_duplicate_references_off_by_default() {
+        let export = super::tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_specctra_dsn")
+            .unwrap();
+        let option = &export.input_schema["properties"]["allow_duplicate_references"];
+        assert_eq!(option["type"], "boolean", "{option}");
+        assert_eq!(option["default"], false, "{option}");
     }
 }

@@ -40,6 +40,12 @@ pub(crate) struct ExportBundle {
     pub pad_count: usize,
     pub net_count: usize,
     pub class_count: usize,
+    /// Footprints that share a Reference with an earlier one and were written
+    /// under a unique DSN name (`allow_duplicate_references`): reference,
+    /// DSN name, footprint UUID. Empty when every Reference is unique.
+    pub renamed_references: Vec<serde_json::Value>,
+    /// Teardrop zones left out of the DSN (see [`is_teardrop`]).
+    pub teardrops_skipped: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -800,6 +806,11 @@ pub(crate) struct ExportOptions {
     /// of their own, so the router keeps only its copper clearance from them;
     /// each is grown by the difference instead.
     pub hole_clearance_um: Option<i64>,
+    /// Export footprints that share a Reference anyway. Each later one is
+    /// written as `<reference>_DUP<n>`, so its pads keep DSN pin names of their
+    /// own; without this a shared Reference is refused, because two pads would
+    /// get one pin name and the router would treat them as one pin.
+    pub allow_duplicate_references: bool,
 }
 
 #[cfg(test)]
@@ -833,8 +844,13 @@ pub(crate) fn export_dsn_with_options(
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
     let mut board_keepouts = board_copper_keepouts(&tree, &copper_layers)?;
-    let (mut footprints, footprints_without_pads, padless_keepouts) =
-        footprints(&tree, &net_table, &copper_layers)?;
+    let (mut footprints, footprints_without_pads, padless_keepouts, renamed_references) =
+        footprints(
+            &tree,
+            &net_table,
+            &copper_layers,
+            options.allow_duplicate_references,
+        )?;
     board_keepouts.extend(padless_keepouts);
     let zones = zones(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
@@ -964,6 +980,12 @@ pub(crate) fn export_dsn_with_options(
             .sum(),
         net_count: net_pins.len(),
         class_count: class_nets.len(),
+        renamed_references,
+        teardrops_skipped: tree
+            .find_all("zone")
+            .into_iter()
+            .filter(|zone| is_teardrop(zone))
+            .count(),
     })
 }
 
@@ -1026,6 +1048,18 @@ pub(crate) fn adopt_native_dsn(
         if left_out > 0 {
             bail!(
                 "native DSN not adopted: {left_out} pour layer(s) were left out by the per-zone policy, and KiCad's exporter always writes every pour"
+            );
+        }
+        if baseline.teardrops_skipped > 0 {
+            bail!(
+                "native DSN not adopted: the board has {} teardrop zone(s), which KiCad's exporter writes as planes of their net and Konnect leaves out",
+                baseline.teardrops_skipped
+            );
+        }
+        if !baseline.renamed_references.is_empty() {
+            bail!(
+                "native DSN not adopted: {} footprint(s) sharing a Reference were renamed, which KiCad's exporter cannot do",
+                baseline.renamed_references.len()
             );
         }
         if let Some(back) = manifest.components.iter().find(|c| c.kicad_side == "back") {
@@ -1984,9 +2018,82 @@ fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
     Ok(ordered)
 }
 
+/// KiCad joins Edge.Cuts ends that lie within this distance of each other
+/// into one corner (`DEFAULT_CHAINING_EPSILON_MM`, 0.01 mm, KiCad 10.0.1
+/// `pcbnew/board.h:88`, Euclidean), so a board KiCad calls closed can have
+/// ends a fraction of a micrometre apart, which round to different DSN points.
+/// The distance is measured here between ends already on the DSN's 1 um grid,
+/// so the limit holds to within 1 um.
+const OUTLINE_CHAINING_EPSILON_UM: i64 = 10;
+
+/// Each end moved onto the nearest corner within KiCad's chaining distance
+/// (KiCad also takes the nearest; a tie goes to the corner made first). The
+/// corners are fixed first, in board order: an end becomes a corner unless one
+/// is already within the distance, so corners are more than the distance
+/// apart; then every end goes to its nearest corner, so equal ends always land
+/// on one point. A line whose two ends then meet is dropped (it is shorter
+/// than the distance); an arc whose ends meet is refused, as one that starts
+/// and ends at one point.
+fn snap_outline_ends(edges: &[OutlineEdge]) -> Result<Vec<OutlineEdge>> {
+    let reach = OUTLINE_CHAINING_EPSILON_UM;
+    let cell = |point: (i64, i64)| (point.0.div_euclid(reach), point.1.div_euclid(reach));
+    // Corners by grid cell of the chaining distance: a corner within reach of
+    // a point is in the point's cell or one of its eight neighbours.
+    let mut corners: Vec<(i64, i64)> = Vec::new();
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    let nearest = |corners: &[(i64, i64)],
+                   grid: &std::collections::HashMap<(i64, i64), Vec<usize>>,
+                   point: (i64, i64)|
+     -> Option<usize> {
+        let (cx, cy) = cell(point);
+        let mut best: Option<(f64, usize)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &index in grid.get(&(cx + dx, cy + dy)).into_iter().flatten() {
+                    let corner = corners[index];
+                    let distance = ((corner.0 - point.0) as f64).hypot((corner.1 - point.1) as f64);
+                    let better =
+                        best.is_none_or(|(d, i)| distance < d || (distance == d && index < i));
+                    if distance <= reach as f64 && better {
+                        best = Some((distance, index));
+                    }
+                }
+            }
+        }
+        best.map(|(_, index)| index)
+    };
+    for point in edges.iter().flat_map(|edge| [edge.start, edge.end]) {
+        if nearest(&corners, &grid, point).is_none() {
+            grid.entry(cell(point)).or_default().push(corners.len());
+            corners.push(point);
+        }
+    }
+    let snap =
+        |point: (i64, i64)| nearest(&corners, &grid, point).map_or(point, |index| corners[index]);
+    let mut snapped = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let (start, end) = (snap(edge.start), snap(edge.end));
+        if start == end {
+            if edge.inner.is_empty() {
+                continue;
+            }
+            bail!("unsupported outline: an Edge.Cuts arc starts and ends at one point");
+        }
+        snapped.push(OutlineEdge {
+            start,
+            end,
+            inner: edge.inner.clone(),
+        });
+    }
+    Ok(snapped)
+}
+
 /// Join open pieces end to end into one closed loop of points, the first point
-/// repeated at the end.
+/// repeated at the end. Ends within KiCad's chaining distance count as one.
 fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
+    let snapped = snap_outline_ends(edges)?;
+    let edges = snapped.as_slice();
     if edges.len() < 2 {
         bail!("unsupported outline: need at least three Edge.Cuts lines");
     }
@@ -2037,6 +2144,19 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
     Ok(ordered)
 }
 
+/// A teardrop zone (`(attr (teardrop ...))`) belongs to the routing, not to the
+/// pours: KiCad makes one where a track meets a pad or via, rebuilds them all
+/// from the tracks when it refills, and fills each around other-net copper. So
+/// it is neither a plane nor a keepout for the router. Only the attribute KiCad
+/// 7 and later write is recognised: a teardrop drawn as a plain zone (KiCad's
+/// old teardrop plugin) is still a pour. KiCad's own DSN export writes it as a plane of
+/// its net (KiCad 10.0.1 `specctra_export.cpp` has no teardrop case), which
+/// would tell the router that the pads under every teardrop are connected.
+pub(crate) fn is_teardrop(zone: &SexpNode) -> bool {
+    zone.find("attr")
+        .is_some_and(|attr| attr.find("teardrop").is_some())
+}
+
 /// The board's copper zones and rule areas as the router sees them.
 ///
 /// A pour with a net is a Specctra `plane` of that net (how KiCad's own DSN
@@ -2046,7 +2166,8 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
 /// vias is a keepout. The zone's outline is used, not its fill, so thermal
 /// reliefs and clearance gaps are not modelled: copper the fill will not reach
 /// can still look connected to the router, which is why DRC after a refill is
-/// the check. Anything else is refused rather than guessed at.
+/// the check. Anything else is refused rather than guessed at. A teardrop is
+/// left out (see [`is_teardrop`]).
 pub(crate) fn zones(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
@@ -2054,6 +2175,9 @@ pub(crate) fn zones(
 ) -> Result<Vec<ZoneModel>> {
     let mut out = Vec::new();
     for zone in tree.find_all("zone") {
+        if is_teardrop(zone) {
+            continue;
+        }
         let name = zone.find_str("name").unwrap_or("unnamed");
         let mut layers: Vec<String> = Vec::new();
         if let Some(single) = zone.find_str("layer") {
@@ -2722,20 +2846,86 @@ fn place_shape(
     })
 }
 
+/// The DSN name of every footprint with pads, in board order (None for one
+/// without pads or Reference). A Reference used once keeps its name; when
+/// `allow_duplicates` is set, each later footprint that repeats one is named
+/// `<reference>_DUP<n>` (the first `n` from 2 that no footprint uses). Without
+/// it, shared References are refused, all of them named in one message.
+fn dsn_component_names(tree: &SexpNode, allow_duplicates: bool) -> Result<Vec<Option<String>>> {
+    let references: Vec<Option<String>> = tree
+        .find_all("footprint")
+        .into_iter()
+        .map(|footprint| {
+            (!footprint.find_all("pad").is_empty())
+                .then(|| property_value(footprint, "Reference").filter(|value| !value.is_empty()))
+                .flatten()
+                .map(str::to_string)
+        })
+        .collect();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for reference in references.iter().flatten() {
+        *counts.entry(reference.as_str()).or_default() += 1;
+    }
+    let shared: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(reference, n)| format!("'{reference}' ({n} footprints)"))
+        .collect();
+    if !shared.is_empty() && !allow_duplicates {
+        bail!(
+            "duplicate footprint references: {}. Two pads would get one DSN pin name and the router would treat them as one pin. Re-annotate the schematic and update the PCB from it, or pass allow_duplicate_references: true to export each repeat under a unique DSN name (<reference>_DUP<n>)",
+            shared.join(", ")
+        );
+    }
+    let mut taken: BTreeSet<String> = counts
+        .keys()
+        .map(|reference| reference.to_string())
+        .collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    Ok(references
+        .iter()
+        .map(|reference| {
+            let reference = reference.as_deref()?;
+            if seen.insert(reference) {
+                return Some(reference.to_string());
+            }
+            let name = (2..)
+                .map(|n| format!("{reference}_DUP{n}"))
+                .find(|name| !taken.contains(name))
+                .expect("an unused name exists");
+            taken.insert(name.clone());
+            Some(name)
+        })
+        .collect())
+}
+
+/// What [`footprints`] gives: the placed footprints, how many have no pads,
+/// the board-level keepouts of those without pads, and the renamed ones.
+type FootprintsOut = (
+    Vec<FootprintModel>,
+    usize,
+    Vec<dsn::Shape>,
+    Vec<serde_json::Value>,
+);
+
 /// The footprints the router gets, how many footprints have no pads (a logo,
-/// an antenna keepout), and the copper keepouts of those that have none, which
-/// are written at board level in board coordinates: a footprint with nothing
-/// to connect is not placed, but its copper is still in the router's way.
+/// an antenna keepout), the copper keepouts of those that have none, which
+/// are written at board level in board coordinates (a footprint with nothing
+/// to connect is not placed, but its copper is still in the router's way),
+/// and the footprints written under a DSN name other than their Reference.
 fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
-) -> Result<(Vec<FootprintModel>, usize, Vec<dsn::Shape>)> {
+    allow_duplicates: bool,
+) -> Result<FootprintsOut> {
+    let names = dsn_component_names(tree, allow_duplicates)?;
+    let mut renamed = Vec::new();
     let mut output = Vec::new();
     let mut references = BTreeSet::new();
     let mut without_pads = 0;
     let mut padless_keepouts = Vec::new();
-    for footprint in tree.find_all("footprint") {
+    for (footprint, dsn_name) in tree.find_all("footprint").into_iter().zip(&names) {
         // Named by Reference in messages, else by UUID, so a footprint that
         // is refused can be found.
         let label = property_value(footprint, "Reference")
@@ -2774,10 +2964,12 @@ fn footprints(
         if footprint.find("clearance").is_some() {
             bail!("unsupported first routing profile: footprint has a local clearance override");
         }
-        let reference = property_value(footprint, "Reference")
+        let board_reference = property_value(footprint, "Reference")
             .filter(|value| !value.is_empty())
-            .context("footprint has no Reference property")?
-            .to_string();
+            .context("footprint has no Reference property")?;
+        let reference = dsn_name
+            .clone()
+            .context("footprint has no Reference property")?;
         if !references.insert(reference.clone()) {
             bail!("duplicate footprint reference '{reference}'");
         }
@@ -2785,6 +2977,13 @@ fn footprints(
             .find_str("uuid")
             .context("footprint has no UUID")?
             .to_string();
+        if reference != board_reference {
+            renamed.push(serde_json::json!({
+                "reference": board_reference,
+                "dsn_name": reference,
+                "uuid": kiid,
+            }));
+        }
         let at = footprint.find("at").context("footprint has no position")?;
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
@@ -3009,7 +3208,7 @@ fn footprints(
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
-    Ok((output, without_pads, padless_keepouts))
+    Ok((output, without_pads, padless_keepouts, renamed))
 }
 
 fn normalize_rules(
@@ -4110,6 +4309,118 @@ mod tests {
         assert!(error.contains("degree"), "{error}");
     }
 
+    /// KiCad joins outline ends within 0.01 mm (its chaining distance,
+    /// Euclidean), so a board can be closed for KiCad with two ends a fraction
+    /// of a micrometre apart that round to different DSN points. They are one
+    /// corner here too, up to that distance and not beyond.
+    #[test]
+    fn outline_ends_within_kicads_chaining_distance_are_one_corner() {
+        let moved = |x: &str, y: &str| {
+            let source = ROUNDED.replacen(
+                "\t(gr_line\n\t\t(start 80 67)",
+                &format!("\t(gr_line\n\t\t(start {x} {y})"),
+                1,
+            );
+            assert_ne!(source, ROUNDED);
+            source
+        };
+        let forward = boundary_points(&export_rounded(ROUNDED).unwrap());
+        // 0.6 um rounds to the next micrometre: the same loop, each point
+        // where it was, the joined corner within 1 um of the true one
+        let sub = boundary_points(&export_rounded(&moved("80", "67.0006")).unwrap());
+        assert_eq!(
+            sub.len(),
+            forward.len(),
+            "the same loop, one corner per join"
+        );
+        assert_eq!(sub.first(), sub.last(), "closed");
+        for (a, b) in sub.iter().zip(&forward) {
+            assert!((a.0 - b.0).hypot(a.1 - b.1) <= 1.0, "{a:?} against {b:?}");
+        }
+        // 9 um along the line, and 8.5 um across it: still within 10 um
+        assert!(export_rounded(&moved("80", "67.009")).is_ok());
+        assert!(export_rounded(&moved("80.006", "67.006")).is_ok());
+        // controls: 11 um along the line, and 11.3 um diagonally (8 um on each
+        // axis, so a per-axis test would join it), are gaps for KiCad too
+        for (x, y) in [("80", "67.011"), ("80.008", "67.008")] {
+            let error = export_rounded(&moved(x, y)).unwrap_err().to_string();
+            assert!(error.contains("degree"), "{x} {y}: {error}");
+        }
+    }
+
+    /// Each repeat of a Reference takes the first `_DUP<n>` no footprint uses,
+    /// in board order; footprints without pads are neither counted nor named.
+    #[test]
+    fn repeated_references_get_unused_names_in_board_order() {
+        let tree = parse_sexp(
+            r#"(kicad_pcb
+              (footprint "a" (property "Reference" "R1") (pad "1"))
+              (footprint "b" (property "Reference" "R1") (pad "1"))
+              (footprint "c" (property "Reference" "R1_DUP2") (pad "1"))
+              (footprint "d" (property "Reference" "R1") (pad "1"))
+              (footprint "logo" (property "Reference" "R1"))
+              (footprint "e" (property "Reference" "C1") (pad "1")))"#,
+        )
+        .unwrap();
+        let refused = dsn_component_names(&tree, false).unwrap_err().to_string();
+        assert!(refused.contains("'R1' (3 footprints)"), "{refused}");
+        assert!(
+            !refused.contains("R1_DUP2") && !refused.contains("C1"),
+            "{refused}"
+        );
+        let names = dsn_component_names(&tree, true).unwrap();
+        let expected = [
+            Some("R1"),
+            Some("R1_DUP3"),
+            Some("R1_DUP2"),
+            Some("R1_DUP4"),
+            None,
+            Some("C1"),
+        ];
+        assert_eq!(names, expected.map(|name| name.map(str::to_string)));
+    }
+
+    fn piece(start: (i64, i64), end: (i64, i64)) -> OutlineEdge {
+        OutlineEdge {
+            start,
+            end,
+            inner: Vec::new(),
+        }
+    }
+
+    /// An end goes to the nearest corner, as in KiCad, even when another is
+    /// also within reach and came first; equal ends land on one point; a line
+    /// shorter than the distance is dropped and such an arc is refused.
+    #[test]
+    fn outline_ends_join_the_nearest_corner() {
+        // corners (1000, 0) and (1015, 0) are 15 um apart; (1009, 0) is 9 um
+        // from the first and 6 um from the second
+        let snapped = snap_outline_ends(&[
+            piece((0, 0), (1000, 0)),
+            piece((1009, 0), (1009, 3000)),
+            piece((1015, 0), (2000, 0)),
+            piece((5000, 5000), (1009, 0)),
+        ])
+        .unwrap();
+        assert_eq!(
+            snapped[1].start,
+            (1015, 0),
+            "the nearer corner, not the first"
+        );
+        assert_eq!(snapped[3].end, snapped[1].start, "equal ends, one point");
+        assert_eq!(snapped[0].end, (1000, 0));
+        let short =
+            snap_outline_ends(&[piece((0, 0), (1000, 0)), piece((1000, 0), (1004, 0))]).unwrap();
+        assert_eq!(short.len(), 1, "a 4 um line is dropped");
+        let arc = OutlineEdge {
+            start: (0, 0),
+            end: (6, 0),
+            inner: vec![(3, 500)],
+        };
+        let error = snap_outline_ends(&[arc]).err().unwrap().to_string();
+        assert!(error.contains("starts and ends at one point"), "{error}");
+    }
+
     fn padstacks(export: &ExportBundle) -> Vec<dsn::Padstack> {
         parse_dsn(&export.dsn)
             .pcb
@@ -4211,6 +4522,59 @@ mod tests {
         assert_eq!(native.planes[0].net, "GND");
         assert_eq!(native.planes[0].polygon.layer, "B.Cu");
         assert_eq!(native.keepouts.0.len(), 1);
+    }
+
+    /// A teardrop, as KiCad writes one (no name or UUID), of either type, is
+    /// left out: not a plane of its net, not a keepout, not in the importer's
+    /// pour inventory, and its board is never handed to KiCad's exporter.
+    /// Controls: the real pour beside it stays the board's one plane, and a
+    /// zone whose `attr` holds no `teardrop` is still a pour.
+    #[test]
+    fn a_teardrop_zone_is_not_a_pour() {
+        let teardrop = |kind: &str| {
+            format!(
+                "\t(zone\n\t\t(net \"GND\")\n\t\t(layer \"F.Cu\")\n\t\t(hatch none 0.1)\n\t\t(priority 30000)\n\t\t(attr\n\t\t\t(teardrop\n\t\t\t\t(type {kind})\n\t\t\t)\n\t\t)\n\t\t(connect_pads yes\n\t\t\t(clearance 0)\n\t\t)\n\t\t(min_thickness 0.0254)\n\t\t(fill yes)\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 90 40) (xy 92 40) (xy 92 42) (xy 90 42)\n\t\t\t)\n\t\t)\n\t)\n"
+            )
+        };
+        let with = |zone: &str| {
+            let end = ROUNDED.rfind(')').unwrap();
+            format!("{}{zone}{}", &ROUNDED[..end], &ROUNDED[end..])
+        };
+        for kind in ["padvia", "track_end"] {
+            let board = with(&teardrop(kind));
+            let export = export_rounded(&board).unwrap();
+            let structure = parse_dsn(&export.dsn).pcb.structure;
+            let planes: Vec<_> = structure
+                .planes
+                .iter()
+                .map(|plane| (plane.net.as_str(), plane.polygon.layer.as_str()))
+                .collect();
+            assert_eq!(planes, [("GND", "B.Cu")], "{kind}: only the real pour");
+            assert_eq!(structure.keepouts.0.len(), 1, "{kind}: the rule area only");
+            assert_eq!(export.teardrops_skipped, 1, "{kind}");
+            let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+            assert_eq!(
+                manifest["supported_profile"]["zone_plane_count"], 1,
+                "{kind}"
+            );
+            assert_eq!(zone_counts(&board).unwrap(), (1, 1), "{kind}");
+            let refused = adopt_native_dsn(export.clone(), export.dsn.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("teardrop"), "{kind}: {refused}");
+        }
+        // control: the same zone with an `attr` that is not a teardrop is a pour
+        let plain = with(&teardrop("padvia").replace(
+            "\t\t(attr\n\t\t\t(teardrop\n\t\t\t\t(type padvia)\n\t\t\t)\n\t\t)\n",
+            "\t\t(attr)\n",
+        ));
+        let export = export_rounded(&plain).unwrap();
+        assert_eq!(parse_dsn(&export.dsn).pcb.structure.planes.len(), 2);
+        assert_eq!(export.teardrops_skipped, 0);
+        assert_eq!(zone_counts(&plain).unwrap(), (2, 1));
+        assert!(adopt_native_dsn(export.clone(), export.dsn.clone())
+            .err()
+            .is_none_or(|error| !error.to_string().contains("teardrop")));
     }
 
     #[test]

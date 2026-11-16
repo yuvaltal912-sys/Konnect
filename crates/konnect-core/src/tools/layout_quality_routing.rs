@@ -322,10 +322,11 @@ fn detours_vias_stubs(m: &Model) -> (CheckOut, HashMap<String, usize>) {
             ));
             continue;
         }
+        // A teardrop is routing copper, not a pour: its net is still judged.
         let has_pour = m
             .fills
             .iter()
-            .any(|f| f.net.as_deref() == Some(net.as_str()));
+            .any(|f| !f.teardrop && f.net.as_deref() == Some(net.as_str()));
         let routed: f64 = m.tracks[net]
             .iter()
             .map(|&i| path_len(&m.track(i).shape.pts))
