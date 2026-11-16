@@ -587,7 +587,7 @@ fn preflight_refusal(refusal: &Refusal) -> CallToolResult {
 
 /// Every shape's variant must be makeable from this DSN (seed 1 reorders, so it
 /// exercises the placement too): a DSN the variants cannot be made from would
-/// otherwise fail every one of up to 240 runs.
+/// otherwise fail every run until the budget.
 fn preflight_variants(dsn_text: &str, shapes: &[Shape]) -> Result<()> {
     for shape in shapes {
         route_search::variant_text(dsn_text, *shape, 1)
@@ -940,9 +940,18 @@ impl Runner for FastrouteRunner {
 fn release_run(folder: &Path, judge_root: &Path, index: usize, shape: Shape, seed: u64) {
     let run = folder.join(run_folder_name(index, shape, seed));
     let mut paths = vec![judge_root.join(format!("run-{index}"))];
-    for pass in ["full", "fallback", "polish"] {
-        for name in ["home", "tmp", "profile.sb", "fastroute.log"] {
-            paths.push(run.join(pass).join(name));
+    // A run or pass folder that is not a real folder (a link, a file) is not
+    // ours: `remove_tree` checks only the last part of a path, so a link here
+    // would be followed.
+    if is_real_folder(&run) {
+        for pass in ["full", "fallback", "polish"] {
+            let pass = run.join(pass);
+            if !is_real_folder(&pass) {
+                continue;
+            }
+            for name in ["home", "tmp", "profile.sb", "fastroute.log"] {
+                paths.push(pass.join(name));
+            }
         }
     }
     for path in paths {
@@ -950,6 +959,11 @@ fn release_run(folder: &Path, judge_root: &Path, index: usize, shape: Shape, see
             tracing::warn!("releasing run {index}: remove {}: {error}", path.display());
         }
     }
+}
+
+/// `path` is a folder itself, not a link to one.
+fn is_real_folder(path: &Path) -> bool {
+    path.symlink_metadata().is_ok_and(|meta| meta.is_dir())
 }
 
 // ─── After the search ────────────────────────────────────────────────────────

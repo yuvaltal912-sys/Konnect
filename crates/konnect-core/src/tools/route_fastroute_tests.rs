@@ -1653,6 +1653,112 @@ fn a_release_follows_no_link() {
     assert!(outside.join("keep.txt").is_file());
 }
 
+/// The production runner's release is `release_run` on its own search folder and
+/// judge root: the run's scratch boards and logs go, its session stays.
+#[test]
+fn the_runner_releases_a_run_in_its_own_search_folder() {
+    let search = finished_search();
+    let judge_root = search.folder.join("judge");
+    let judge = JudgeContext {
+        board: search.root.join("board.kicad_pcb"),
+        board_text: String::new(),
+        manifest: json!({}),
+        manifest_text: "{}".to_string(),
+        kicad_cli: String::new(),
+        pour_nets: Default::default(),
+        power_nets: Default::default(),
+        floors_mm: Default::default(),
+        root: judge_root.clone(),
+        kicad_config_home: None,
+    };
+    let runner = FastrouteRunner {
+        binary: fake_binary(&search.root),
+        dsn_text: Arc::new(String::new()),
+        hints: RoutingHints::default(),
+        amps: None,
+        fallback: WidthFallback::Floor,
+        folder: search.folder.clone(),
+        judge: Arc::new(judge),
+        tools: ctx(),
+    };
+    let run = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    runner.release(1, Shape::Omitted, 1);
+    assert!(!judge_root.join("run-1").exists());
+    assert!(!run.join("full/fastroute.log").exists());
+    assert!(run.join("full/full.ses").is_file());
+    // Control: run 0 was not released.
+    assert!(judge_root.join("run-0").is_dir());
+}
+
+/// `remove_tree` raises what it cannot read or remove: only a missing path, and a
+/// folder kept for a link inside it, are not errors.
+#[test]
+fn remove_tree_raises_a_path_it_cannot_read_or_remove() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let set = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    // A folder whose parent cannot be searched: its metadata cannot be read.
+    let closed = dir.path().join("closed");
+    std::fs::create_dir_all(closed.join("inside")).unwrap();
+    set(&closed, 0o000);
+    let unreadable = remove_tree(&closed.join("inside"));
+    set(&closed, 0o755);
+    assert!(unreadable.is_err());
+    assert!(closed.join("inside").is_dir());
+    // An empty folder in a parent that cannot be written: it cannot be removed.
+    let fixed = dir.path().join("fixed");
+    std::fs::create_dir_all(fixed.join("empty")).unwrap();
+    set(&fixed, 0o555);
+    let unremovable = remove_tree(&fixed.join("empty"));
+    set(&fixed, 0o755);
+    assert!(unremovable.is_err());
+    // Controls: a missing path is no error, and a removable folder goes.
+    assert!(remove_tree(&dir.path().join("missing")).is_ok());
+    assert!(remove_tree(&fixed.join("empty")).is_ok());
+    assert!(!fixed.join("empty").exists());
+}
+
+/// A pass folder or a run folder that is a link is not followed: what the link
+/// points at keeps its logs and sandbox folders.
+#[test]
+fn a_release_follows_no_linked_run_or_pass_folder() {
+    let search = finished_search();
+    let judge = search.folder.join("judge");
+    let outside = search.root.join("outside");
+    for name in ["pass", "run"] {
+        std::fs::create_dir_all(outside.join(name).join("home")).unwrap();
+        std::fs::write(outside.join(name).join("fastroute.log"), "mine").unwrap();
+    }
+    // Run 1's `full` is a link to a folder outside the search.
+    let run1 = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    std::fs::remove_dir_all(run1.join("full")).unwrap();
+    std::os::unix::fs::symlink(outside.join("pass"), run1.join("full")).unwrap();
+    release_run(&search.folder, &judge, 1, Shape::Omitted, 1);
+    assert!(outside.join("pass/home").is_dir());
+    assert!(outside.join("pass/fastroute.log").is_file());
+    // Run 2's folder itself is a link: inside its target `full` is a real folder.
+    let run2 = search.folder.join(run_folder_name(2, Shape::AsExported, 2));
+    std::fs::create_dir_all(outside.join("run/full")).unwrap();
+    std::fs::rename(outside.join("run/home"), outside.join("run/full/home")).unwrap();
+    std::fs::rename(
+        outside.join("run/fastroute.log"),
+        outside.join("run/full/fastroute.log"),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&run2).unwrap();
+    std::os::unix::fs::symlink(outside.join("run"), &run2).unwrap();
+    release_run(&search.folder, &judge, 2, Shape::AsExported, 2);
+    assert!(outside.join("run/full/home").is_dir());
+    assert!(outside.join("run/full/fastroute.log").is_file());
+    // Control: run 0's real folders are released.
+    let run0 = search.folder.join(run_folder_name(0, Shape::AsExported, 1));
+    release_run(&search.folder, &judge, 0, Shape::AsExported, 1);
+    assert!(!run0.join("full/fastroute.log").exists());
+    assert!(run0.join("full/full.ses").is_file());
+}
+
 /// The result lists the 20 best judged runs by the rank key and the first 20 runs
 /// that were not judged, with every outcome counted; `search.json` lists all.
 #[test]

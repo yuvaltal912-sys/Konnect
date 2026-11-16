@@ -335,6 +335,22 @@ fn a_clean_run_passes_every_gate() {
     assert!(g.all_pass());
 }
 
+/// A row with no share figure and no routed length has share 0, whatever its
+/// below-intent figure: nothing routed is below its width.
+#[test]
+fn a_row_with_no_routed_length_and_no_share_passes_g3() {
+    let mut m = measures();
+    let mut row = width_row("VBUS", 0.0, 1.0, 0.0, 0.5);
+    row.as_object_mut().unwrap().remove("below_intent_share");
+    m.width_rows = vec![row];
+    assert!(gates(&m, &base(&[])).g3.is_empty());
+    // Control: the same row with 1 mm routed is all below its width.
+    let mut row = width_row("VBUS", 1.0, 1.0, 0.0, 0.5);
+    row.as_object_mut().unwrap().remove("below_intent_share");
+    m.width_rows = vec![row];
+    assert_eq!(gates(&m, &base(&[])).g3.len(), 1);
+}
+
 #[test]
 fn all_pass_needs_all_three_lists_empty() {
     let pass = Gates {
