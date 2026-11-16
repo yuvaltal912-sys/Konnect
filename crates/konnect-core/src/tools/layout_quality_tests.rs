@@ -1564,6 +1564,85 @@ fn nets_left_out_of_5_1_are_named_and_a_short_tree_is_still_judged() {
     assert_eq!(m["nets_without_a_via_ratio"]["listed"][0]["net"], "GND");
 }
 
+/// A teardrop is routing copper, not a pour: its net keeps its detour and via
+/// judging. Control: the same zone without the teardrop attribute carries the
+/// net, which is then named as having no detour ratio.
+#[test]
+fn a_teardrop_does_not_make_its_net_a_pour() {
+    let report = |teardrop: bool| {
+        let mut b = Bd::new(&TWO);
+        b.part("P1", (10.0, 10.0), vec![pd("1", 0.0, 0.0, "SIG")]);
+        b.part("P2", (20.0, 10.0), vec![pd("1", 0.0, 0.0, "SIG")]);
+        b.seg("F.Cu", (10.0, 10.0), (20.0, 10.0), 0.2, "SIG");
+        b.zone("SIG", "F.Cu", (9.5, 9.5, 11.0, 10.5), true);
+        if teardrop {
+            b.body = b.body.replace(
+                "(zone (net \"SIG\")",
+                "(zone (net \"SIG\") (attr (teardrop (type padvia)))",
+            );
+        }
+        run(&b.fx(None))
+    };
+    let unjudged = |r: &Value| {
+        check(r, "5.1")["metrics"]["nets_without_a_detour_ratio"]["listed"]
+            .as_array()
+            .is_some_and(|listed| listed.iter().any(|entry| entry["net"] == "SIG"))
+    };
+    let with_teardrop = report(true);
+    assert!(
+        !unjudged(&with_teardrop),
+        "{}",
+        check(&with_teardrop, "5.1")
+    );
+    let with_pour = report(false);
+    assert!(unjudged(&with_pour), "{}", check(&with_pour, "5.1"));
+}
+
+/// A teardrop's fill is still copper: a track that ends inside a teardrop over
+/// the far pad completes the net, and an unfilled teardrop does not leave the
+/// net unjudged. Control: without the teardrop the net is open.
+#[test]
+fn a_teardrop_fill_still_joins_what_it_touches() {
+    let report = |zone: Option<bool>| {
+        let mut b = Bd::new(&TWO);
+        b.part("P1", (10.0, 10.0), vec![pd("1", 0.0, 0.0, "SIG")]);
+        b.part("P2", (20.0, 10.0), vec![pd("1", 0.0, 0.0, "SIG")]);
+        b.seg("F.Cu", (10.0, 10.0), (18.5, 10.0), 0.2, "SIG");
+        if let Some(filled) = zone {
+            b.zone("SIG", "F.Cu", (18.0, 9.5, 20.5, 10.5), filled);
+            b.body = b.body.replace(
+                "(zone (net \"SIG\")",
+                "(zone (net \"SIG\") (attr (teardrop (type padvia)))",
+            );
+        }
+        run(&b.fx(None))
+    };
+    let joined = report(Some(true));
+    assert_eq!(
+        joined["completion"]["unrouted_nets"], 0,
+        "{}",
+        joined["completion"]
+    );
+    let open = report(None);
+    assert_eq!(
+        open["completion"]["unrouted_nets"], 1,
+        "{}",
+        open["completion"]
+    );
+    // Unfilled, the teardrop joins nothing, and it is not an unfilled pour.
+    let unfilled = report(Some(false));
+    assert_eq!(
+        unfilled["completion"]["unrouted_nets"], 1,
+        "{}",
+        unfilled["completion"]
+    );
+    assert_eq!(
+        unfilled["completion"]["nets_not_judged"], 0,
+        "{}",
+        unfilled["completion"]
+    );
+}
+
 /// A source pad and `loads` load pads (one part each) on a 2 mm bar along `y`, net `net`.
 fn rail(b: &mut Bd, net: &str, y: f64, loads: usize) {
     b.part("J", (0.0, y), vec![pd("1", 0.0, 0.0, net).size(3.0, 3.0)]);

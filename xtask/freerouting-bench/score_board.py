@@ -15,8 +15,9 @@ its filler shows the 10.0.8 iterative-refill defect whatever the owner set.
 Refill with `kicad-cli pcb drc --refill-zones --save-board` instead.
 
 `measure` only reads. It writes one JSON file: every track segment and via
-with its net, the pads per net, the copper zones, and a fingerprint of the
-placement. The xtask does the arithmetic (categories, ratios, widths), so it
+with its net, the pads per net, the copper zones (each marked when it is a
+teardrop), and a fingerprint of the placement. The xtask does the arithmetic
+(categories, ratios, widths), so it
 is unit-tested without KiCad.
 
 One board per process: KiCad 10's Python bindings return a bare SWIG object
@@ -215,6 +216,8 @@ def measure(board_path, out_path):
                 "priority": zone.GetAssignedPriority(),
                 "outline_area_mm2": round(zone.Outline().Area() / 1e12, 3),
                 "filled": bool(zone.IsFilled()),
+                # KiCad rebuilds teardrops from the tracks at a refill: not a pour.
+                "teardrop": bool(zone.IsTeardropArea()),
             }
         )
     digest = hashlib.sha256(json.dumps(sorted(placement)).encode("utf-8")).hexdigest()
