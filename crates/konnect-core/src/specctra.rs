@@ -2152,7 +2152,7 @@ fn chain_edges(edges: &[OutlineEdge]) -> Result<Vec<(i64, i64)>> {
 /// old teardrop plugin) is still a pour. KiCad's own DSN export writes it as a plane of
 /// its net (KiCad 10.0.1 `specctra_export.cpp` has no teardrop case), which
 /// would tell the router that the pads under every teardrop are connected.
-fn is_teardrop(zone: &SexpNode) -> bool {
+pub(crate) fn is_teardrop(zone: &SexpNode) -> bool {
     zone.find("attr")
         .is_some_and(|attr| attr.find("teardrop").is_some())
 }

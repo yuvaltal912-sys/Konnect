@@ -34,6 +34,12 @@ apart, with unique References and no teardrops, gives the same DSN as before.
   board's pour count, so export again before importing. Only the attribute
   KiCad 7 and later write is recognised; a teardrop drawn as a plain zone
   (KiCad's old teardrop plugin) is still a pour.
+- **`audit_layout_quality`, teardrops.** A teardrop's fill no longer counts as
+  a pour carrying its net, so a net whose only zone copper is teardrops gets
+  its detour ratio and via-per-connection judging (5.1) like any routed net.
+  The fill still counts as copper for connectivity, but it is never the plane
+  under a track (reference continuity), and an unfilled teardrop is not an
+  unfilled pour.
 - **`set_design_intent`, net names.** A net in `currents`, a rail's `nets` or
   an interface's `nets` may begin or end with spaces: KiCad keeps them, so
   `'+5V '` is a different net from `'+5V'`. The name is stored as written. An

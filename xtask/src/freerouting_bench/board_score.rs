@@ -360,6 +360,11 @@ impl Measure {
             });
         }
         for zone in items(json.at("zones")) {
+            // A teardrop belongs to the routing: KiCad rebuilds teardrops from
+            // the tracks at every refill, so its net does not own a pour.
+            if matches!(zone.at("teardrop"), Some(Json::Bool(true))) {
+                continue;
+            }
             if let Some(net) = text(zone.at("net")).filter(|net| !net.is_empty()) {
                 measure.pour_nets.insert(net.to_string());
             }
@@ -1671,7 +1676,10 @@ mod tests {
             r#"{"placement":"abc","pads":{"GND":4,"A":2},
                 "tracks":[["A","F.Cu",200000,0,0,3000000,4000000,5000000]],
                 "vias":[["GND",1000000,2000000,600000,300000]],
-                "zones":[{"net":"GND","layers":["B.Cu"]},{"net":"","layers":["F.Cu"]}]}"#,
+                "zones":[{"net":"GND","layers":["B.Cu"]},{"net":"","layers":["F.Cu"]},
+                         {"net":"A","layers":["F.Cu"],"teardrop":true},
+                         {"net":"GND","layers":["F.Cu"],"teardrop":true},
+                         {"net":"B","layers":["F.Cu"],"teardrop":false}]}"#,
         ))
         .unwrap();
         assert_eq!(measure.placement, "abc");
@@ -1679,8 +1687,13 @@ mod tests {
         assert_eq!(measure.segments[0].b, (3_000_000, 4_000_000));
         assert_eq!(measure.segments[0].length_nm, 5_000_000);
         assert_eq!(measure.vias[0].at, (1_000_000, 2_000_000));
-        // A zone with no net is not a pour of any net.
-        assert_eq!(measure.pour_nets, ["GND".to_string()].into());
+        // A zone with no net is not a pour of any net, nor is a teardrop (a
+        // net with a real pour as well stays a pour); control: a zone marked
+        // as no teardrop is a pour.
+        assert_eq!(
+            measure.pour_nets,
+            ["B".to_string(), "GND".to_string()].into()
+        );
         assert!(
             Measure::from_json(&json(r#"{"placement":"x","tracks":[["A","F.Cu",1]]}"#)).is_err()
         );

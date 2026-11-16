@@ -433,6 +433,9 @@ pub(super) struct Fill {
     pub net: Option<String>,
     pub layer: String,
     pub rings: Vec<Ring>,
+    /// A teardrop's fill (KiCad rebuilds teardrops from the tracks): copper
+    /// that joins what it touches, but not a pour that carries its net.
+    pub teardrop: bool,
 }
 
 pub(super) struct Ring {
@@ -494,7 +497,10 @@ fn read_fills(tree: &SexpNode, geometry: &BoardGeometry) -> (Vec<Fill>, Vec<Unfi
                 }
             }
         }
-        if by_layer.is_empty() && !is_filled {
+        let teardrop = crate::specctra::is_teardrop(zone);
+        // An unfilled teardrop is not an unfilled pour: KiCad fills it with the
+        // routing.
+        if by_layer.is_empty() && !is_filled && !teardrop {
             unfilled.push(UnfilledZone {
                 uuid: uuid.clone(),
                 net: net.clone(),
@@ -507,6 +513,7 @@ fn read_fills(tree: &SexpNode, geometry: &BoardGeometry) -> (Vec<Fill>, Vec<Unfi
                 net: net.clone(),
                 layer,
                 rings,
+                teardrop,
             });
         }
     }
@@ -696,10 +703,12 @@ impl<'a> Model<'a> {
         g
     }
 
-    /// Which fill covers `p` on `layer`, as an index into `fills`.
+    /// Which fill covers `p` on `layer`, as an index into `fills`. A teardrop
+    /// is not a plane, so it is never the fill under a point.
     pub fn fill_at(&self, layer: &str, p: Pt) -> Option<usize> {
         self.fills.iter().position(|f| {
-            f.layer == layer
+            !f.teardrop
+                && f.layer == layer
                 && f.rings.iter().any(|r| {
                     p.0 >= r.bbox.0
                         && p.0 <= r.bbox.2

@@ -49,12 +49,13 @@ pub(super) fn planner_stitching(m: &Model, probe: &mut impl Probe) -> anyhow::Re
     stitching_vias(m, &refs, probe)
 }
 
-/// Same first-fill/first-ring selection as Model::fill_at, with work charged
-/// before each ring test. Bounding-box misses do not test the ring.
+/// Same first-fill/first-ring selection as Model::fill_at (teardrops skipped),
+/// with work charged before each ring test. Bounding-box misses do not test
+/// the ring.
 fn fill_at(m: &Model, layer: &str, p: Pt, probe: &mut impl Probe) -> anyhow::Result<Option<usize>> {
     for (i, fill) in m.fills.iter().enumerate() {
         probe.charge(1)?;
-        if fill.layer != layer {
+        if fill.layer != layer || fill.teardrop {
             continue;
         }
         for (k, ring) in fill.rings.iter().enumerate() {
