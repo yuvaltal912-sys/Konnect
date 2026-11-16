@@ -226,8 +226,18 @@ fn invalid_sections_are_refused_with_their_location() {
         ),
         (
             "rails",
-            json!([{ "name": "A", "nets": [" N"], "voltage_v": 1 }]),
+            json!([{ "name": " A", "nets": ["N"], "voltage_v": 1 }]),
             "leading or trailing whitespace",
+        ),
+        (
+            "rails",
+            json!([{ "name": "A", "nets": ["  "], "voltage_v": 1 }]),
+            "is only whitespace",
+        ),
+        (
+            "currents",
+            json!([{ "net": " ", "max_current_a": 1 }]),
+            "is only whitespace",
         ),
         (
             "rails",
@@ -482,4 +492,57 @@ fn a_write_that_does_not_read_back_as_sent_is_uncertain() {
         Ok(())
     });
     assert_eq!(kind(&result).as_deref(), Some("mutation_outcome_uncertain"));
+}
+
+/// KiCad keeps a net name's outer spaces, so a recorded net may carry them: a
+/// board can have `'+5V '` next to `'+5V'`, and the record must be able to name
+/// either. The name is stored and read back byte for byte. Negative control: a
+/// rail *name* (not a net) with an outer space is still refused.
+#[test]
+fn a_net_name_with_outer_spaces_is_kept_as_written() {
+    let dir = project();
+    let currents =
+        json!([{ "net": "+5V ", "max_current_a": 2.0 }, { "net": " SD", "max_current_a": 1.0 }]);
+    let result = set(dir.path(), "currents", currents, None);
+    assert!(!result.is_error, "{:?}", body(&result));
+    let read = body(&get_design_intent_at(dir.path()));
+    assert_eq!(read["intent"]["currents"][0]["net"], "+5V ", "{read}");
+    assert_eq!(read["intent"]["currents"][1]["net"], " SD", "{read}");
+    // A net may sit in a rail or in 'currents', not both, so the rail names another.
+    let rail = json!([{ "name": "12V", "nets": ["+12V "], "voltage_v": 12.0 }]);
+    let revision = current_revision(dir.path());
+    let set_rail = set(dir.path(), "rails", rail, Some(&revision));
+    assert!(
+        !set_rail.is_error,
+        "a rail net may carry outer spaces too: {:?}",
+        body(&set_rail)
+    );
+    let read = body(&get_design_intent_at(dir.path()));
+    assert_eq!(read["intent"]["rails"][0]["nets"][0], "+12V ", "{read}");
+    let interface = json!([{ "name": "I2C", "kind": "i2c", "nets": [" SDA", "SCL "] }]);
+    let revision = current_revision(dir.path());
+    let set_interface = set(dir.path(), "interfaces", interface, Some(&revision));
+    assert!(
+        !set_interface.is_error,
+        "an interface net too: {:?}",
+        body(&set_interface)
+    );
+    let read = body(&get_design_intent_at(dir.path()));
+    assert_eq!(
+        read["intent"]["interfaces"][0]["nets"],
+        json!([" SDA", "SCL "]),
+        "{read}"
+    );
+    let other = project();
+    let bad = set(
+        other.path(),
+        "rails",
+        json!([{ "name": "5V ", "nets": ["N"], "voltage_v": 5.0 }]),
+        None,
+    );
+    assert!(
+        bad.is_error,
+        "control: a rail name with an outer space is refused"
+    );
+    assert!(file_text(other.path()).is_none(), "and nothing is written");
 }

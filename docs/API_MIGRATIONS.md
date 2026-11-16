@@ -3,6 +3,40 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: board quirks KiCad accepts
+
+Row E1 (`docs/CREATION_HANDOFF.md`). Three refusals of boards that KiCad itself
+opens, checks and fills. Additive: no argument is removed and no default
+changes. A board whose outline ends are all more than 0.01 mm apart, with
+unique References, gives the same DSN as before.
+
+- **`export_specctra_dsn`, outline ends.** Edge.Cuts ends within 0.01 mm of
+  each other are one corner, as KiCad chains them (KiCad 10.0.1
+  `pcbnew/board.h:88`, `DEFAULT_CHAINING_EPSILON_MM`). Before, two ends a
+  fraction of a micrometre apart that rounded to different DSN points were
+  refused as "vertex ... has degree 1". An end joins the nearest corner, as in
+  KiCad. The distance is measured between ends already rounded to the DSN's
+  1 um grid, so the limit holds to within 1 um; a wider gap is still refused.
+  A line shorter than 0.01 mm is dropped, and an arc whose ends lie within
+  0.01 mm is refused as one that starts and ends at one point.
+- **`set_design_intent`, net names.** A net in `currents`, a rail's `nets` or
+  an interface's `nets` may begin or end with spaces: KiCad keeps them, so
+  `'+5V '` is a different net from `'+5V'`. The name is stored as written. An
+  empty or all-space net is refused. Names that are not nets (a rail's or an
+  interface's `name`, `kind`, `source_ref`, `fab_target.house`) still refuse
+  outer spaces.
+- **`export_specctra_dsn`, shared References.** The refusal now names every
+  shared Reference with its count and says how to fix it. New argument
+  `allow_duplicate_references` (default `false`): when `true`, each later
+  footprint that repeats a Reference is written as `<reference>_DUP<n>`, so
+  its pads keep pin names of their own, and the new response field
+  `renamed_references` lists `reference`, `dsn_name` and `uuid` for each.
+  The first footprint in board order keeps the Reference. The router, its
+  messages and the manifest's component names use the DSN name; the
+  manifest's footprint UUID, and `renamed_references`, lead back to the
+  footprint. The native bridge cannot rename, so `prefer` uses the Rust
+  exporter and `require` is refused.
+
 ## Unreleased: width-first routing
 
 Creation row S9 (`docs/CREATION_HANDOFF.md`). Additive: no default changes,

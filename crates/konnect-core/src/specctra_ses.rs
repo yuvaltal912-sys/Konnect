@@ -1124,6 +1124,85 @@ mod tests {
         (dir, board, source, export.manifest)
     }
 
+    /// Two footprints with one Reference would give two pads one DSN pin name.
+    /// By default the export is refused with every shared Reference named and
+    /// the way out given; with `allow_duplicate_references` the repeat is
+    /// written as `R1_DUP2`, the router's session for it imports, and the
+    /// rename is reported. Negative control: unique References rename nothing.
+    #[test]
+    fn shared_references_are_refused_or_exported_under_unique_names() {
+        let unique = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let source = unique.replace(
+            "(property \"Reference\" \"R2\"",
+            "(property \"Reference\" \"R1\"",
+        );
+        assert_ne!(source, unique);
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, &source).unwrap();
+
+        let error = export_dsn(&board, &source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("duplicate footprint references: 'R1' (2 footprints)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Re-annotate") && error.contains("allow_duplicate_references: true"),
+            "{error}"
+        );
+
+        let allowed = crate::specctra::ExportOptions {
+            allow_duplicate_references: true,
+            ..Default::default()
+        };
+        let export =
+            crate::specctra::export_dsn_with_options(&board, &source, &rules(), allowed.clone())
+                .unwrap();
+        assert_eq!(
+            export.renamed_references.len(),
+            1,
+            "{:?}",
+            export.renamed_references
+        );
+        assert_eq!(export.renamed_references[0]["reference"], "R1");
+        assert_eq!(export.renamed_references[0]["dsn_name"], "R1_DUP2");
+        // The later footprint in board order (the one that was R2) is renamed.
+        let tree = parse_sexp(unique).unwrap();
+        let second = tree
+            .find_all("footprint")
+            .into_iter()
+            .find(|footprint| {
+                footprint.find_all("property").into_iter().any(|property| {
+                    property.get(1).and_then(SexpNode::as_str) == Some("Reference")
+                        && property.get(2).and_then(SexpNode::as_str) == Some("R2")
+                })
+            })
+            .and_then(|footprint| footprint.find_str("uuid"))
+            .unwrap();
+        assert_eq!(export.renamed_references[0]["uuid"], second);
+        assert!(
+            export.dsn.contains("R1_DUP2-"),
+            "the repeat's pins carry its own name"
+        );
+        assert_eq!(export.component_count, 2, "both footprints are placed");
+        let session = sample_ses().replace(
+            "konnect_image_R2 (place R2 ",
+            "konnect_image_R1_DUP2 (place R1_DUP2 ",
+        );
+        assert_ne!(session, sample_ses());
+        let plan = parse_import_plan(&board, &source, &export.manifest, &session).unwrap();
+        assert!(!plan.tracks.is_empty(), "the session's track imports");
+
+        let plain =
+            crate::specctra::export_dsn_with_options(&board, unique, &rules(), allowed).unwrap();
+        assert!(
+            plain.renamed_references.is_empty(),
+            "control: unique References are not renamed"
+        );
+    }
+
     #[test]
     fn custom_minima_export_round_trip_binds_saved_files_and_enforces_width() {
         let (_dir, board, source, _) = fixture();

@@ -193,7 +193,7 @@ fn validate(intent: &DesignIntent) -> Vec<String> {
             problems.push(format!("{at}.nets: a rail needs at least one net"));
         }
         for (j, net) in rail.nets.iter().enumerate() {
-            name_ok(&mut problems, &format!("{at}.nets[{j}]"), net);
+            net_ok(&mut problems, &format!("{at}.nets[{j}]"), net);
             if !rail_nets.insert(net.as_str()) {
                 problems.push(format!("{at}.nets[{j}]: '{net}' already belongs to a rail"));
             }
@@ -221,7 +221,7 @@ fn validate(intent: &DesignIntent) -> Vec<String> {
     let mut current_nets = BTreeSet::new();
     for (i, current) in intent.currents.iter().enumerate() {
         let at = format!("currents[{i}]");
-        name_ok(&mut problems, &format!("{at}.net"), &current.net);
+        net_ok(&mut problems, &format!("{at}.net"), &current.net);
         if !current_nets.insert(current.net.as_str()) {
             problems.push(format!("{at}.net: '{}' is listed twice", current.net));
         }
@@ -256,7 +256,7 @@ fn validate(intent: &DesignIntent) -> Vec<String> {
         }
         let mut nets = BTreeSet::new();
         for (j, net) in interface.nets.iter().enumerate() {
-            name_ok(&mut problems, &format!("{at}.nets[{j}]"), net);
+            net_ok(&mut problems, &format!("{at}.nets[{j}]"), net);
             if !nets.insert(net.as_str()) {
                 problems.push(format!("{at}.nets[{j}]: '{net}' is listed twice"));
             }
@@ -337,8 +337,8 @@ fn validate(intent: &DesignIntent) -> Vec<String> {
     problems
 }
 
-/// A name or net must be non-empty and carry no surrounding whitespace, which
-/// would never match a KiCad name and would read as a different entry.
+/// A name must be non-empty and carry no surrounding whitespace, which would
+/// read as a different entry.
 fn name_ok(problems: &mut Vec<String>, at: &str, value: &str) {
     if value.is_empty() {
         problems.push(format!("{at}: is empty"));
@@ -346,6 +346,19 @@ fn name_ok(problems: &mut Vec<String>, at: &str, value: &str) {
         problems.push(format!(
             "{at}: '{value}' has leading or trailing whitespace"
         ));
+    }
+}
+
+/// A net is matched against the board's net names exactly. KiCad keeps a net
+/// name's leading and trailing spaces (a board can carry `'+5V '` next to
+/// `'+5V'`), so they are part of the name and are kept; only an empty or
+/// all-whitespace net is refused. A misspelt net is reported by the audits as
+/// a recorded net missing from the board.
+fn net_ok(problems: &mut Vec<String>, at: &str, value: &str) {
+    if value.is_empty() {
+        problems.push(format!("{at}: is empty"));
+    } else if value.trim().is_empty() {
+        problems.push(format!("{at}: '{value}' is only whitespace"));
     }
 }
 

@@ -341,6 +341,11 @@ fn export_tools() -> Vec<ToolDef> {
                         "default": true,
                         "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. A net owning a copper pour keeps its effective class width even when pours are omitted; this does not verify pour capacity. intent_widths reports the width decision and reason."
                     },
+                    "allow_duplicate_references": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Export footprints that share a Reference anyway. Off (default), a shared Reference is refused with every one listed: two pads would get one DSN pin name and the router would treat them as one pin. On, each later footprint that repeats a Reference is written as '<reference>_DUP<n>' so its pads keep their own pin names; renamed_references lists them (reference, dsn_name, uuid), and messages from the router name the DSN name. KiCad's native exporter cannot do this, so the Rust exporter is used. Re-annotating the schematic is the real fix."
+                    },
                     "native_bridge_mode": {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
@@ -774,6 +779,24 @@ fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
     args["native_bridge_mode"].as_str().unwrap_or("disable")
 }
 
+/// Only the Rust exporter renames footprints that share a Reference
+/// (`allow_duplicate_references`), so when it renamed any, KiCad's native
+/// exporter must not replace its DSN. Returns whether the Rust export is kept
+/// for that reason and the note for 'prefer'; 'require' is refused.
+fn renamed_references_bridge(
+    native_bridge_mode: &str,
+    renamed: bool,
+) -> Result<(bool, Option<&'static str>), &'static str> {
+    if !renamed {
+        return Ok((false, None));
+    }
+    match native_bridge_mode {
+        "require" => Err("KiCad native Specctra export was required, but footprints share a Reference and only the Rust exporter renames them; use prefer or disable"),
+        "prefer" => Ok((true, Some("footprints share a Reference, which only the Rust exporter renames; the native bridge was not used"))),
+        _ => Ok((true, None)),
+    }
+}
+
 async fn handle_export_specctra_dsn(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -794,6 +817,9 @@ async fn handle_export_specctra_dsn(
     // Whether any pour can be left out, which only the Rust exporter does.
     let omit_pours = pours.may_omit();
     let widths_from_intent = args["widths_from_intent"].as_bool().unwrap_or(true);
+    let allow_duplicate_references = args["allow_duplicate_references"]
+        .as_bool()
+        .unwrap_or(false);
     // The project's copper-to-edge clearance (`min_copper_edge_clearance`),
     // which the DSN cannot hold; the manifest carries it to the router.
     let copper_edge_clearance_um = std::fs::read_to_string(board_path.with_extension("kicad_pro"))
@@ -905,6 +931,7 @@ async fn handle_export_specctra_dsn(
                 copper_edge_clearance_um,
                 widths_from_intent,
                 hole_clearance_um,
+                allow_duplicate_references,
             },
         )?;
         Ok((export, before))
@@ -927,7 +954,21 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let export = if native_bridge_mode == "disable" || snapshot.rules.is_some() || omit_pours {
+    let (keep_rust_for_renames, rename_note) = match renamed_references_bridge(
+        native_bridge_mode,
+        !baseline.renamed_references.is_empty(),
+    ) {
+        Ok(choice) => choice,
+        Err(reason) => return Ok(CallToolResult::error(reason)),
+    };
+    let export = if native_bridge_mode == "disable"
+        || snapshot.rules.is_some()
+        || omit_pours
+        || keep_rust_for_renames
+    {
+        if let Some(note) = rename_note {
+            bridge_diagnostics.push(note.to_string());
+        }
         if omit_pours && native_bridge_mode == "prefer" {
             bridge_diagnostics.push(
                 "pours were left out, which only the Rust exporter does; the native bridge was not used"
@@ -1029,6 +1070,7 @@ async fn handle_export_specctra_dsn(
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
             "intent_widths": export.intent_widths,
+            "renamed_references": export.renamed_references,
             "copper_edge_clearance_um": copper_edge_clearance_um,
             "hole_clearance_um": hole_clearance_um,
             "capabilities": {
@@ -1776,5 +1818,43 @@ mod fabrication_option_tests {
         };
         let error: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(error["error"]["field"], "layers[1]");
+    }
+}
+
+#[cfg(test)]
+mod renamed_reference_bridge_tests {
+    use super::renamed_references_bridge;
+
+    /// A DSN with renamed references comes only from the Rust exporter:
+    /// 'require' is refused, 'prefer' keeps the Rust export with a note, and
+    /// 'disable' keeps it silently. Control: with no rename, every mode leaves
+    /// the bridge choice to the other conditions.
+    #[test]
+    fn renamed_references_keep_the_rust_export() {
+        let refused = renamed_references_bridge("require", true).unwrap_err();
+        assert!(refused.contains("share a Reference"), "{refused}");
+        let (kept, note) = renamed_references_bridge("prefer", true).unwrap();
+        assert!(kept);
+        assert!(note.unwrap().contains("native bridge was not used"));
+        assert_eq!(renamed_references_bridge("disable", true), Ok((true, None)));
+        for mode in ["require", "prefer", "disable"] {
+            assert_eq!(
+                renamed_references_bridge(mode, false),
+                Ok((false, None)),
+                "{mode}"
+            );
+        }
+    }
+
+    /// The option is public, boolean and off unless asked for.
+    #[test]
+    fn the_export_schema_offers_duplicate_references_off_by_default() {
+        let export = super::tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_specctra_dsn")
+            .unwrap();
+        let option = &export.input_schema["properties"]["allow_duplicate_references"];
+        assert_eq!(option["type"], "boolean", "{option}");
+        assert_eq!(option["default"], false, "{option}");
     }
 }

@@ -873,6 +873,12 @@ fn freerouting_routes_a_folder() {
             copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
             widths_from_intent: true,
             hole_clearance_um: project_um("min_hole_clearance"),
+            // `KONNECT_PROBE_ALLOW_DUPLICATE_REFERENCES` set: shared
+            // References are exported under unique DSN names.
+            allow_duplicate_references: std::env::var_os(
+                "KONNECT_PROBE_ALLOW_DUPLICATE_REFERENCES",
+            )
+            .is_some(),
         };
         let Ok(snapshot) = crate::routing_context::Snapshot::read(&path) else {
             println!("ROUTE {name}: project rules could not be read");
