@@ -274,7 +274,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Largest search folder at its peak: 200 MB (pic, XH). Largest response: 23 KB.
 - The `judge_failed` runs on pic are a fastroute defect, not a Konnect one. Some seeds (106, 280, 403, 466, 699, 1062, pours omitted) write a session whose path for one net has an odd coordinate count, and the importer refuses it. The same seeds fail at every level. The search goes on, and such a run can never win. Reported to the router research session.
 - On pours at M, H and XH, the winner keeps the pours. The judge reads 0 unconnected and every gate passes, but `status` is fastroute's own plane-mode value, `incomplete` (D15).
-- The final full gate on the branch head runs after this text is committed. Its result is recorded in the commit after it.
+- Final gate on `fe81a441` (2026-11-17): every step green. Tests 4864 passed, 0 failed, 168 ignored; doc tests 9 passed; `simulation_live` 95 passed; clippy, deny and fix-doc-counts clean; release build; protected files and the installed hash unchanged. fastroute's 31 sandboxed tests ran as a step of their own (31 passed) with the cargo parent outside the gate's write-protection profile: each test starts its own `sandbox-exec` with the fastroute profile, and macOS refuses a sandbox inside a sandbox (`sandbox_apply: Operation not permitted`), which is how the first gate run failed those 30 tests and nothing else. No served check was run.
 
 **Not covered.** Only the three public fixtures were measured, and only on macOS. No served test drives a real fastroute end to end: the router tests use a fake binary under the real sandbox.
 
