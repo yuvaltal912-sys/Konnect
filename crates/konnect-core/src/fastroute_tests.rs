@@ -334,7 +334,15 @@ fn tail_keeps_the_end() {
 #[tokio::test]
 async fn locate_is_unsupported_off_macos() {
     let scratch = tempfile::tempdir().unwrap();
-    let located = locate(Some(Path::new("/bin/ls")), None, None, None, scratch.path()).await;
+    let located = locate(
+        Some(Path::new("/bin/ls")),
+        None,
+        None,
+        None,
+        None,
+        scratch.path(),
+    )
+    .await;
     assert!(
         matches!(located, Located::Unsupported { .. }),
         "{located:?}"
@@ -804,6 +812,7 @@ int main(int argc, char **argv) {
             Some(&a.binary),
             Some(b.binary.to_str().unwrap()),
             Some(&c.binary),
+            None,
             Some(home.path()),
             &s("1"),
         )
@@ -817,6 +826,7 @@ int main(int argc, char **argv) {
                 None,
                 Some(b.binary.to_str().unwrap()),
                 Some(&c.binary),
+                None,
                 Some(home.path()),
                 &s("2"),
             )
@@ -825,11 +835,21 @@ int main(int argc, char **argv) {
         assert_eq!(binary.source, "environment");
         assert_eq!(binary.path, b.binary.canonicalize().unwrap());
 
-        let binary = found(locate(None, None, Some(&c.binary), Some(home.path()), &s("3")).await);
+        let binary = found(
+            locate(
+                None,
+                None,
+                Some(&c.binary),
+                None,
+                Some(home.path()),
+                &s("3"),
+            )
+            .await,
+        );
         assert_eq!(binary.source, "user_config");
         assert_eq!(binary.path, c.binary.canonicalize().unwrap());
 
-        let binary = found(locate(None, None, None, Some(home.path()), &s("4")).await);
+        let binary = found(locate(None, None, None, None, Some(home.path()), &s("4")).await);
         assert_eq!(binary.source, "default");
         assert_eq!(binary.path, default.canonicalize().unwrap());
         assert_eq!(binary.version, "fastroute 0.1.14");
@@ -854,6 +874,7 @@ int main(int argc, char **argv) {
                 Some(good.binary.to_str().unwrap()),
                 Some(&good.binary),
                 None,
+                None,
                 &s("1"),
             )
             .await,
@@ -868,6 +889,7 @@ int main(int argc, char **argv) {
                 Some(directory.to_str().unwrap()),
                 Some(&good.binary),
                 None,
+                None,
                 &s("2"),
             )
             .await,
@@ -876,17 +898,26 @@ int main(int argc, char **argv) {
         assert!(reason.contains("not a regular file"), "{reason}");
 
         let (_, source, _) =
-            refused(locate(None, None, Some(&not_executable), None, &s("3")).await);
+            refused(locate(None, None, Some(&not_executable), None, None, &s("3")).await);
         assert_eq!(source, "user_config");
 
-        let (_, source, reason) =
-            refused(locate(Some(&missing), None, Some(&good.binary), None, &s("4")).await);
+        let (_, source, reason) = refused(
+            locate(
+                Some(&missing),
+                None,
+                Some(&good.binary),
+                None,
+                None,
+                &s("4"),
+            )
+            .await,
+        );
         assert_eq!(source, "argument");
         assert!(reason.contains("cannot be read"), "{reason}");
 
         // The honest cases: each of these sources, alone, is accepted.
         assert_eq!(
-            found(locate(Some(&good.binary), None, None, None, &s("5")).await).source,
+            found(locate(Some(&good.binary), None, None, None, None, &s("5")).await).source,
             "argument"
         );
         assert_eq!(
@@ -894,6 +925,7 @@ int main(int argc, char **argv) {
                 locate(
                     None,
                     Some(good.binary.to_str().unwrap()),
+                    None,
                     None,
                     None,
                     &s("6")
@@ -904,7 +936,7 @@ int main(int argc, char **argv) {
             "environment"
         );
         assert_eq!(
-            found(locate(None, None, Some(&good.binary), None, &s("7")).await).source,
+            found(locate(None, None, Some(&good.binary), None, None, &s("7")).await).source,
             "user_config"
         );
     }
@@ -913,7 +945,17 @@ int main(int argc, char **argv) {
     async fn an_empty_environment_value_names_nothing() {
         let good = Fixture::new("mode=candidate\n");
         let scratch = tempfile::tempdir().unwrap();
-        let binary = found(locate(None, Some(""), Some(&good.binary), None, scratch.path()).await);
+        let binary = found(
+            locate(
+                None,
+                Some(""),
+                Some(&good.binary),
+                None,
+                None,
+                scratch.path(),
+            )
+            .await,
+        );
         assert_eq!(binary.source, "user_config");
     }
 
@@ -921,13 +963,13 @@ int main(int argc, char **argv) {
     async fn locate_reports_the_default_place_when_nothing_is_named() {
         let home = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        match locate(None, None, None, Some(home.path()), scratch.path()).await {
+        match locate(None, None, None, None, Some(home.path()), scratch.path()).await {
             Located::NotConfigured { default_path } => {
                 assert_eq!(default_path, home.path().join(DEFAULT_PATH));
             }
             other => panic!("expected NotConfigured, got {other:?}"),
         }
-        match locate(None, None, None, None, scratch.path()).await {
+        match locate(None, None, None, None, None, scratch.path()).await {
             Located::NotConfigured { default_path } => {
                 assert!(default_path.ends_with(DEFAULT_PATH), "{default_path:?}");
             }
@@ -938,14 +980,14 @@ int main(int argc, char **argv) {
         let default = home.path().join(DEFAULT_PATH);
         std::fs::create_dir_all(&default).unwrap();
         let (path, source, reason) =
-            refused(locate(None, None, None, Some(home.path()), scratch.path()).await);
+            refused(locate(None, None, None, None, Some(home.path()), scratch.path()).await);
         assert_eq!((path, source), (default.clone(), "default"));
         assert!(reason.contains("not a regular file"), "{reason}");
         std::fs::remove_dir_all(&default).unwrap();
         std::fs::write(&default, "x").unwrap();
         std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o600)).unwrap();
         let (_, source, reason) =
-            refused(locate(None, None, None, Some(home.path()), scratch.path()).await);
+            refused(locate(None, None, None, None, Some(home.path()), scratch.path()).await);
         assert_eq!(source, "default");
         assert!(reason.contains("not executable"), "{reason}");
     }
@@ -954,8 +996,17 @@ int main(int argc, char **argv) {
     async fn locate_refuses_a_build_that_fails_the_probe() {
         let fixture = Fixture::new("mode=ignore_experimental\n");
         let scratch = tempfile::tempdir().unwrap();
-        let (path, source, reason) =
-            refused(locate(Some(&fixture.binary), None, None, None, scratch.path()).await);
+        let (path, source, reason) = refused(
+            locate(
+                Some(&fixture.binary),
+                None,
+                None,
+                None,
+                None,
+                scratch.path(),
+            )
+            .await,
+        );
         assert_eq!(source, "argument");
         assert_eq!(path, fixture.binary.canonicalize().unwrap());
         assert!(reason.contains("probe step 2"), "{reason}");
@@ -968,8 +1019,81 @@ int main(int argc, char **argv) {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&fixture.binary, &link).unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        let binary = found(locate(Some(&link), None, None, None, scratch.path()).await);
+        let binary = found(locate(Some(&link), None, None, None, None, scratch.path()).await);
         assert_eq!(binary.path, fixture.binary.canonicalize().unwrap());
+    }
+
+    /// 1 Kopper: a binary packaged next to the Konnect executable comes after the
+    /// user config and before the default place. A broken one is refused, never
+    /// passed over for the default build; a missing one leaves it to the default.
+    #[tokio::test]
+    async fn locate_takes_a_bundled_binary_after_the_config_and_before_the_default() {
+        let bundled = Fixture::new("mode=candidate\n");
+        let config = Fixture::new("mode=candidate\n");
+        let home = tempfile::tempdir().unwrap();
+        let default = home.path().join(DEFAULT_PATH);
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::copy(&config.binary, &default).unwrap();
+        std::fs::copy(
+            config.binary.parent().unwrap().join("control.txt"),
+            default.parent().unwrap().join("control.txt"),
+        )
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let s = |name: &str| scratch.path().join(name);
+        let home = Some(home.path());
+
+        let binary = found(
+            locate(
+                None,
+                None,
+                Some(&config.binary),
+                Some(&bundled.binary),
+                home,
+                &s("1"),
+            )
+            .await,
+        );
+        assert_eq!(binary.source, "user_config");
+
+        // A good bundled build wins over a good default one.
+        let binary = found(locate(None, None, None, Some(&bundled.binary), home, &s("2")).await);
+        assert_eq!(binary.source, "bundled");
+        assert_eq!(binary.path, bundled.binary.canonicalize().unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(BUNDLED_NAME);
+        let binary = found(locate(None, None, None, Some(&missing), home, &s("3")).await);
+        assert_eq!(binary.source, "default");
+
+        let broken = plain_file(dir.path(), BUNDLED_NAME, 0o600);
+        let (path, source, reason) =
+            refused(locate(None, None, None, Some(&broken), home, &s("4")).await);
+        assert_eq!((path, source), (broken, "bundled"));
+        assert!(reason.contains("not executable"), "{reason}");
+    }
+
+    /// Only an executable inside a package (its manifest one folder up) has a
+    /// bundled place; a link finds the package it points into.
+    #[test]
+    fn the_bundled_place_is_beside_the_resolved_executable_of_a_package() {
+        let package = tempfile::tempdir().unwrap();
+        let bin = package.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = plain_file(&bin, "konnect", 0o755);
+        assert_eq!(bundled_path(&exe), None, "no manifest: not a package");
+        std::fs::write(package.path().join(PACKAGE_MANIFEST), "{}").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link = elsewhere.path().join("konnect");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let expected = bin.canonicalize().unwrap().join(BUNDLED_NAME);
+        assert_eq!(bundled_path(&exe), Some(expected.clone()));
+        assert_eq!(bundled_path(&link), Some(expected));
+        assert_eq!(bundled_path(&elsewhere.path().join("absent")), None);
+        // A folder named like the manifest is not one.
+        std::fs::remove_file(package.path().join(PACKAGE_MANIFEST)).unwrap();
+        std::fs::create_dir(package.path().join(PACKAGE_MANIFEST)).unwrap();
+        assert_eq!(bundled_path(&exe), None);
     }
 
     // ---- run_pass -----------------------------------------------------------

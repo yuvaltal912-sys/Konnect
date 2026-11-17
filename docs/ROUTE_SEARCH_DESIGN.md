@@ -30,8 +30,8 @@ repeats no board data.
 ```
 route_specctra_dsn(dsn_path, ses_output_path, effort?, engine? = "fastroute", fastroute_path?)
  1. arguments: engine, effort (argument, else user config routing.effort, else "m")
- 2. fastroute: locate (argument, env KONNECT_FASTROUTE, user config routing.fastroute_path),
-    then probe that it is the candidate build
+ 2. fastroute: locate (argument, env KONNECT_FASTROUTE, user config routing.fastroute_path,
+    a 1 Kopper package's own build next to the executable, the default place), then probe that it is the candidate build
  3. judge preflight: manifest beside the DSN, the saved board equals the export's snapshot,
     kicad-cli present
  4. variants: shapes {as exported, every plane omitted} x seeds 1, 2, 3, ...
@@ -81,7 +81,11 @@ next steps (`completion.next_steps`), as row S6 decided: no hidden write path.
    GPL is not a design constraint (owner, 2026-11-16). Konnect looks for the binary itself at
    one fixed place, `~/.local/share/fastroute/candidate/fastroute`; the `fastroute_path`
    argument, the environment variable `KONNECT_FASTROUTE` and the user config key
-   `routing.fastroute_path` override it, in that order. Before routing, a probe proves the
+   `routing.fastroute_path` override it, in that order. Since 1 Kopper K2 (2026-11-17), the
+   `fastroute` next to the `konnect` executable (its resolved path) comes after the user
+   config and before the fixed place, when that executable is inside a 1 Kopper package
+   (`1-kopper.json` one folder up), so a package finds its own build; when that file is
+   there but unusable, the call is refused rather than routed with another build. Before routing, a probe proves the
    binary is the candidate build (every candidate switch is accepted). On this Mac the x18
    build is copied once to that place (it lives in a research worktree today). fastroute
    still runs as its own process, for technical reasons only: a hung run (2 of 100 seeds in
@@ -170,7 +174,8 @@ pub(crate) enum Located {
 }
 
 /// The first of: `argument`, `KONNECT_FASTROUTE`, `config` (user config
-/// `routing.fastroute_path`), the default `~/.local/share/fastroute/candidate/fastroute`.
+/// `routing.fastroute_path`), `bundled` (next to the executable, since K2), the default
+/// `~/.local/share/fastroute/candidate/fastroute`.
 /// No other folder is searched, nothing is downloaded. Refuses off macOS and when
 /// `/usr/bin/sandbox-exec` is missing. Then `probe`.
 pub(crate) const DEFAULT_PATH: &str = ".local/share/fastroute/candidate/fastroute"; // under HOME

@@ -15,8 +15,16 @@
 //! Specctra DSN files with each JAR and records completion, vias, wirelength,
 //! runtime and determinism per board and version (see `freerouting_bench`).
 //! It needs Java and is opt-in: never part of CI or `cargo test`.
+//!
+//! `cargo xtask kopper-install` is 1 Kopper in one command: it packages Konnect
+//! with its pinned fastroute build into `~/.local/share/1-kopper` (never into the
+//! installed Konnect), installs that build's guidance and points the Claude and
+//! Codex `konnect` entries at it; `--rollback` puts the earlier entries back (see
+//! `kopper_install`). `cargo xtask kopper-package` only packages.
 
 mod freerouting_bench;
+mod kopper_install;
+mod kopper_package;
 
 use konnect_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
@@ -42,9 +50,25 @@ fn main() {
                 std::process::exit(2);
             }
         }
+        Some("kopper-install") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            if let Err(message) = kopper_install::run(&args, &repo_root()) {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
+        Some("kopper-package") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            if let Err(message) = kopper_package::run(&args, &repo_root()) {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
         other => {
             eprintln!("unknown task: {other:?}");
-            eprintln!("usage: cargo xtask fix-doc-counts | freerouting-bench --jar <jar> …");
+            eprintln!(
+                "usage: cargo xtask fix-doc-counts | freerouting-bench --jar <jar> … | kopper-install [--rollback] | kopper-package [--prefix <dir>]"
+            );
             std::process::exit(2);
         }
     }

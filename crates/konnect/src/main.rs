@@ -89,16 +89,22 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Cli::Subcommand("init") => {
-            let client = install::client_from_args(&args[2..])?;
-            return install::run_install(client);
+            let client = install::client_from_server_args(&args[2..])?;
+            return install::run_install(client, simulation_served(&args[2..])?);
         }
         Cli::Subcommand("uninstall") => {
             let client = install::client_from_args(&args[2..])?;
             return install::run_uninstall(client);
         }
         Cli::Subcommand("status") => {
-            let client = install::client_from_args(&args[2..])?;
-            return install::print_status(client);
+            let client = install::client_from_server_args(&args[2..])?;
+            // status is how a broken configuration gets diagnosed: it warns and
+            // checks every skill rather than refusing.
+            let simulation = simulation_served(&args[2..]).unwrap_or_else(|error| {
+                eprintln!("[konnect] {error:#}; checking every skill");
+                true
+            });
+            return install::print_status(client, simulation);
         }
         Cli::Subcommand("skill") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
@@ -119,7 +125,7 @@ async fn main() -> Result<()> {
     // If stdin is a terminal (user double-clicked the .exe), run friendly install.
     // If stdin is piped (Claude launched us as MCP server), start server.
     if std::io::stdin().is_terminal() {
-        return install::run_double_click_install();
+        return install::run_double_click_install(simulation_served(&[])?);
     }
 
     // Keep accepting the public `--client` option, but MCP startup is
@@ -193,7 +199,7 @@ async fn main() -> Result<()> {
         eager_toolsets: config.eager_toolsets,
     };
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
-    match install::InstalledGuidanceProbe::for_current_user() {
+    match install::InstalledGuidanceProbe::for_current_user(config.simulation_enabled) {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
     }
@@ -276,6 +282,22 @@ fn exec_reload(plan: konnect_core::router::meta_tools::ReloadPlan) -> Result<()>
     ))
 }
 
+/// Whether the configuration serves simulation (`simulation_enabled`), read the
+/// way the server reads it: the file `--config <path>` in `args` names, else the
+/// usual search (a `konnect.toml` in the current folder first). So `init` and
+/// `status` handle the guidance the server will check. A configuration that does
+/// not load is an error: the server would not start on it either.
+fn simulation_served(args: &[String]) -> Result<bool> {
+    let path = args
+        .iter()
+        .position(|arg| arg == "--config")
+        .and_then(|pos| args.get(pos + 1))
+        .map(std::path::PathBuf::from);
+    let (config, _, _) = Config::load_resolved(path.as_deref())
+        .map_err(|error| error.context("read the configuration to choose the simulation skill"))?;
+    Ok(config.simulation_enabled)
+}
+
 /// Help for one subcommand, or the whole program.
 fn print_help_for(subcommand: Option<&str>) {
     let clients = || {
@@ -285,9 +307,13 @@ fn print_help_for(subcommand: Option<&str>) {
     };
     match subcommand {
         Some("init") => {
-            println!("konnect init [--client <claude|codex>]\n");
+            println!("konnect init [--client <claude|codex>] [--config <file>]\n");
             println!("Install Konnect's skills and agents for an AI client.");
             println!("Writes to that client's configuration directory.");
+            println!("The simulation skill is installed only with simulation_enabled = true");
+            println!("in the configuration the server reads (--config, else a konnect.toml in");
+            println!("this folder, else the user config); without it, one an earlier install");
+            println!("left is removed.");
             clients();
         }
         Some("uninstall") => {
@@ -297,7 +323,7 @@ fn print_help_for(subcommand: Option<&str>) {
             clients();
         }
         Some("status") => {
-            println!("konnect status [--client <claude|codex>]\n");
+            println!("konnect status [--client <claude|codex>] [--config <file>]\n");
             println!("Report what is installed for a client. Writes nothing.");
             clients();
         }

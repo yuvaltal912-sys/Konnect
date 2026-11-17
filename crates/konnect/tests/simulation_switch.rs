@@ -208,3 +208,70 @@ fn simulation_is_served_when_turned_on() {
         r[6]
     );
 }
+
+/// `konnect init` in `dir` (also its `HOME`) with `config` as its `konnect.toml`;
+/// whether it installed the simulation skill for Claude.
+fn init_installs_simulation_skill(dir: &Path, config: &str) -> bool {
+    std::fs::write(dir.join("konnect.toml"), config).unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .arg("init")
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("KONNECT_STATE_DIR", dir.join("state"))
+        .env("XDG_CONFIG_HOME", dir.join(".config"))
+        .env("KONNECT_CALL_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("konnect init runs");
+    assert!(status.success(), "konnect init failed: {status}");
+    let skills = dir.join(".claude").join("skills");
+    assert!(skills.join("kicad-pcb").join("SKILL.md").is_file());
+    skills.join("kicad-simulation").exists()
+}
+
+/// 1 Kopper K2: `init` reads `simulation_enabled` the way the server does, and
+/// the server checks the guidance its own setting installs.
+#[test]
+fn init_installs_the_simulation_skill_only_when_simulation_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(init_installs_simulation_skill(
+        dir.path(),
+        "simulation_enabled = true\n"
+    ));
+    assert!(
+        !init_installs_simulation_skill(dir.path(), ""),
+        "off by default, and the copy the first init left is removed"
+    );
+    // The server, off as well, checks the guidance that init installed: current.
+    let r = session(dir.path(), "", &[("get_installation_info", json!({}))]);
+    let guidance = &body(&r[0])["guidance"]["claude"];
+    assert_eq!(guidance["state"], "current", "{guidance:#}");
+}
+
+/// `status` is how a broken configuration is diagnosed: it warns and reports
+/// rather than refusing, while `init` refuses to guess.
+#[test]
+fn status_reports_with_a_broken_configuration_and_init_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("konnect.toml"), "simulation_enabled = [\n").unwrap();
+    let run = |command: &str| {
+        Command::new(env!("CARGO_BIN_EXE_konnect"))
+            .arg(command)
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("KONNECT_STATE_DIR", dir.path().join("state"))
+            .env("XDG_CONFIG_HOME", dir.path().join(".config"))
+            .env("KONNECT_CALL_LOG", "off")
+            .stdin(Stdio::null())
+            .output()
+            .expect("konnect runs")
+    };
+    let status = run("status");
+    assert!(status.status.success(), "{status:?}");
+    assert!(String::from_utf8_lossy(&status.stderr).contains("checking every skill"));
+    let init = run("init");
+    assert!(!init.status.success(), "{init:?}");
+    assert!(!dir.path().join(".claude").exists(), "init wrote nothing");
+}

@@ -200,6 +200,7 @@ pub(crate) fn setup_guidance(located: &Located) -> Value {
             "the fastroute_path argument of route_specctra_dsn",
             format!("the environment variable {} of the Konnect server", fastroute::PATH_VARIABLE),
             "the user config key routing.fastroute_path (save_user_config)",
+            format!("a {} file next to the konnect executable of a 1 Kopper package (cargo xtask kopper-install)", fastroute::BUNDLED_NAME),
         ],
         "steps": [
             format!("Put the fastroute candidate build ({}) at {default_place} and make it executable.", fastroute::CANDIDATE_NAME),
@@ -342,7 +343,7 @@ fn prepare_call(args: &Value) -> Result<std::result::Result<Call, CallToolResult
 ///    (`<folder>.failed-N`, the first free N from 1), never deleted with what it
 ///    holds, so the same call can be made again.
 /// 3. `fastroute::locate(args["fastroute_path"], env KONNECT_FASTROUTE, user config,
-///    HOME, <folder>/probe)`; anything but `Found` is an error result carrying
+///    the packaged binary next to this executable, HOME, <folder>/probe)`; anything but `Found` is an error result carrying
 ///    [`setup_guidance`]. Nothing has been routed.
 /// 4. `route_judge::prepare(dsn, <folder>/judge, ctx.config.kicad_cli)`; a refusal is
 ///    an error result carrying its reason and next step.
@@ -392,6 +393,9 @@ async fn locate_binary(
             Err(error) => return Ok(Err(config_refusal(&error))),
         }
     };
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| fastroute::bundled_path(&exe));
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let scratch = call.folder.join("probe");
     std::fs::create_dir_all(&scratch)
@@ -400,6 +404,7 @@ async fn locate_binary(
         argument.as_deref(),
         environment.as_deref(),
         config.as_deref(),
+        bundled.as_deref(),
         home.as_deref(),
         &scratch,
     )
