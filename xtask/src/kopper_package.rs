@@ -188,7 +188,7 @@ pub fn report(packaged: &Packaged) {
 }
 
 /// The account's home folder from the user database, whatever `HOME` says.
-fn account_home() -> Option<PathBuf> {
+pub(crate) fn account_home() -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = vec![0 as libc::c_char; 16 * 1024];
@@ -526,7 +526,7 @@ fn executable_sha256(path: &Path, what: &str) -> Result<String, String> {
     sha256_of(path)
 }
 
-fn sha256_of(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256_of(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     Ok(Sha256::digest(&bytes)
         .iter()

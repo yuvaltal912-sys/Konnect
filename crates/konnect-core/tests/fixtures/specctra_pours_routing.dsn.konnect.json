@@ -1,0 +1,458 @@
+{
+  "board_path": "specctra_pours_routing.kicad_pcb",
+  "classes": [
+    {
+      "clearance_um": 200,
+      "name": "konnect_class_0001",
+      "track_width_um": 250
+    }
+  ],
+  "components": [
+    {
+      "image_name": "konnect_image_R1",
+      "kicad_side": "front",
+      "kiid": "ae6cfca7-03b7-5c6c-830d-5b3ae030c795",
+      "pads": [
+        {
+          "dsn_pin": "R1-1",
+          "net": "S1",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R1-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R1",
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "x_um": 108000,
+      "y_um": -108000
+    },
+    {
+      "image_name": "konnect_image_R10",
+      "kicad_side": "front",
+      "kiid": "56bb1990-fdf8-5783-a424-9a2814b01f74",
+      "pads": [
+        {
+          "dsn_pin": "R10-1",
+          "net": "S3",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R10-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R10",
+      "rotation_degrees": 90.0,
+      "side": "front",
+      "x_um": 119000,
+      "y_um": -132000
+    },
+    {
+      "image_name": "konnect_image_R11",
+      "kicad_side": "front",
+      "kiid": "d63f9f02-c018-5523-8243-944f2528f813",
+      "pads": [
+        {
+          "dsn_pin": "R11-1",
+          "net": "S2",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R11-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R11",
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "x_um": 130000,
+      "y_um": -132000
+    },
+    {
+      "image_name": "konnect_image_R12",
+      "kicad_side": "front",
+      "kiid": "53673da3-54c6-514d-9548-5f49a421081e",
+      "pads": [
+        {
+          "dsn_pin": "R12-1",
+          "net": "S1",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R12-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R12",
+      "rotation_degrees": 90.0,
+      "side": "front",
+      "x_um": 141000,
+      "y_um": -132000
+    },
+    {
+      "image_name": "konnect_image_R2",
+      "kicad_side": "front",
+      "kiid": "0dfd642f-799a-53d0-baab-3585c6e9ff9d",
+      "pads": [
+        {
+          "dsn_pin": "R2-1",
+          "net": "S2",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R2-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R2",
+      "rotation_degrees": 90.0,
+      "side": "front",
+      "x_um": 119000,
+      "y_um": -108000
+    },
+    {
+      "image_name": "konnect_image_R3",
+      "kicad_side": "front",
+      "kiid": "1a22c61a-936e-5f08-9b31-5f053bc989cd",
+      "pads": [
+        {
+          "dsn_pin": "R3-1",
+          "net": "S3",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R3-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R3",
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "x_um": 130000,
+      "y_um": -108000
+    },
+    {
+      "image_name": "konnect_image_R4",
+      "kicad_side": "front",
+      "kiid": "b57ee82c-ad0a-5d26-8685-bd35055f2ae1",
+      "pads": [
+        {
+          "dsn_pin": "R4-1",
+          "net": "S4",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R4-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R4",
+      "rotation_degrees": 90.0,
+      "side": "front",
+      "x_um": 141000,
+      "y_um": -108000
+    },
+    {
+      "image_name": "konnect_image_R5",
+      "kicad_side": "front",
+      "kiid": "ec796211-b6a8-51f8-a50a-d2e256e7dbf4",
+      "pads": [
+        {
+          "dsn_pin": "R5-1",
+          "net": "S5",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R5-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R5",
+      "rotation_degrees": 90.0,
+      "side": "front",
+      "x_um": 108000,
+      "y_um": -120000
+    },
+    {
+      "image_name": "konnect_image_R6",
+      "kicad_side": "front",
+      "kiid": "0a3dcc91-f698-5795-b479-bd1080f80b38",
+      "pads": [
+        {
+          "dsn_pin": "R6-1",
+          "net": "S6",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R6-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R6",
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "x_um": 119000,
+      "y_um": -120000
+    },
+    {
+      "image_name": "konnect_image_R7",
+      "kicad_side": "front",
+      "kiid": "be3e5415-312d-5cd1-baca-7d44ef11e111",
+      "pads": [
+        {
+          "dsn_pin": "R7-1",
+          "net": "S6",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R7-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R7",
+      "rotation_degrees": 90.0,
+      "side": "front",
+      "x_um": 130000,
+      "y_um": -120000
+    },
+    {
+      "image_name": "konnect_image_R8",
+      "kicad_side": "front",
+      "kiid": "152c2986-79e9-5b85-ac19-4340ae5acdc5",
+      "pads": [
+        {
+          "dsn_pin": "R8-1",
+          "net": "S5",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R8-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R8",
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "x_um": 141000,
+      "y_um": -120000
+    },
+    {
+      "image_name": "konnect_image_R9",
+      "kicad_side": "front",
+      "kiid": "282bac83-1d6d-59a7-94fc-2760a246ef5a",
+      "pads": [
+        {
+          "dsn_pin": "R9-1",
+          "net": "S4",
+          "pad_number": "1",
+          "padstack_name": "konnect_pad_0001"
+        },
+        {
+          "dsn_pin": "R9-2",
+          "net": "GND",
+          "pad_number": "2",
+          "padstack_name": "konnect_pad_0001"
+        }
+      ],
+      "reference": "R9",
+      "rotation_degrees": 0.0,
+      "side": "front",
+      "x_um": 108000,
+      "y_um": -132000
+    }
+  ],
+  "coordinate_unit": "um",
+  "layers": [
+    {
+      "dsn_name": "F.Cu",
+      "dsn_type": "signal",
+      "index": 0,
+      "kicad_name": "F.Cu"
+    },
+    {
+      "dsn_name": "B.Cu",
+      "dsn_type": "signal",
+      "index": 1,
+      "kicad_name": "B.Cu"
+    }
+  ],
+  "nets": [
+    {
+      "class_name": "konnect_class_0001",
+      "name": "GND",
+      "pins": [
+        "R1-2",
+        "R10-2",
+        "R11-2",
+        "R12-2",
+        "R2-2",
+        "R3-2",
+        "R4-2",
+        "R5-2",
+        "R6-2",
+        "R7-2",
+        "R8-2",
+        "R9-2"
+      ]
+    },
+    {
+      "class_name": "konnect_class_0001",
+      "name": "S1",
+      "pins": [
+        "R1-1",
+        "R12-1"
+      ]
+    },
+    {
+      "class_name": "konnect_class_0001",
+      "name": "S2",
+      "pins": [
+        "R11-1",
+        "R2-1"
+      ]
+    },
+    {
+      "class_name": "konnect_class_0001",
+      "name": "S3",
+      "pins": [
+        "R10-1",
+        "R3-1"
+      ]
+    },
+    {
+      "class_name": "konnect_class_0001",
+      "name": "S4",
+      "pins": [
+        "R4-1",
+        "R9-1"
+      ]
+    },
+    {
+      "class_name": "konnect_class_0001",
+      "name": "S5",
+      "pins": [
+        "R5-1",
+        "R8-1"
+      ]
+    },
+    {
+      "class_name": "konnect_class_0001",
+      "name": "S6",
+      "pins": [
+        "R6-1",
+        "R7-1"
+      ]
+    }
+  ],
+  "padstacks": [
+    {
+      "drill_um": null,
+      "layers": [
+        "F.Cu"
+      ],
+      "name": "konnect_pad_0001",
+      "purpose": "pad",
+      "shape": "roundrect",
+      "size_x_um": 1000,
+      "size_y_um": 1250
+    },
+    {
+      "drill_um": 300,
+      "layers": [
+        "F.Cu",
+        "B.Cu"
+      ],
+      "name": "konnect_via_0001",
+      "purpose": "via",
+      "shape": "circle",
+      "size_x_um": 600,
+      "size_y_um": 600
+    }
+  ],
+  "pours": [
+    {
+      "chosen_by": "default",
+      "layer": "F.Cu",
+      "name": "GND_TOP",
+      "net": "GND",
+      "policy": "fixed",
+      "uuid": "aa0c8bcc-d383-5a3b-bfd5-ffdc8c30d678"
+    },
+    {
+      "chosen_by": "default",
+      "layer": "B.Cu",
+      "name": "GND_BOTTOM",
+      "net": "GND",
+      "policy": "fixed",
+      "uuid": "e67b4499-14f0-52fa-8c00-ae1d40060956"
+    }
+  ],
+  "resolution": 10,
+  "routing_context": {
+    "custom_rules_sha256": null,
+    "effective_rules_sha256": "0240a5c37a8b0058a5db983e2cf354824a4acdbc98d3276352946cf8bc0e30da",
+    "project_sha256": "cfe41c910ca1dd811e52d1ec05aa3a2bb239cf3363b8aed8139cad4f36ebb13f"
+  },
+  "schema_version": 1,
+  "source_sha256": "0eeb2e919c89254f7610481c2e8e710256e4ae5f92544ae80753b14a3a609f88",
+  "supported_profile": {
+    "component_side": "front",
+    "copper_edge_clearance_um": 300,
+    "copper_graphic_keepout_count": 0,
+    "copper_layers": 2,
+    "copper_zones": true,
+    "custom_rules": false,
+    "existing_routing": false,
+    "footprints_without_pads": 0,
+    "hole_clearance_um": 250,
+    "hole_keepout_growth_um": 50,
+    "locked_track_count": 0,
+    "locked_via_count": 0,
+    "outline": "one closed loop of Edge.Cuts lines, arcs, a rectangle, a circle or a polygon, with arcs and circles as chords within 5 um",
+    "pad_shapes": [
+      "circle",
+      "rect",
+      "roundrect",
+      "oval"
+    ],
+    "pours_omitted": false,
+    "zone_keepout_count": 0,
+    "zone_plane_count": 2
+  }
+}

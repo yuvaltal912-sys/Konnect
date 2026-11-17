@@ -21,10 +21,13 @@
 //! installed Konnect), installs that build's guidance and points the Claude and
 //! Codex `konnect` entries at it; `--rollback` puts the earlier entries back (see
 //! `kopper_install`). `cargo xtask kopper-package` only packages.
+//! `cargo xtask kopper-smoke` proves an installed package routes a public board
+//! with its own fastroute and serves no simulation (see `kopper_smoke`).
 
 mod freerouting_bench;
 mod kopper_install;
 mod kopper_package;
+mod kopper_smoke;
 
 use konnect_core::router::{meta_tools, registry};
 use std::path::{Path, PathBuf};
@@ -57,6 +60,13 @@ fn main() {
                 std::process::exit(2);
             }
         }
+        Some("kopper-smoke") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            if let Err(message) = kopper_smoke::run(&args, &repo_root()) {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
         Some("kopper-package") => {
             let args: Vec<String> = std::env::args().skip(2).collect();
             if let Err(message) = kopper_package::run(&args, &repo_root()) {
@@ -67,7 +77,7 @@ fn main() {
         other => {
             eprintln!("unknown task: {other:?}");
             eprintln!(
-                "usage: cargo xtask fix-doc-counts | freerouting-bench --jar <jar> … | kopper-install [--rollback] | kopper-package [--prefix <dir>]"
+                "usage: cargo xtask fix-doc-counts | freerouting-bench --jar <jar> … | kopper-install [--rollback] | kopper-smoke | kopper-package [--prefix <dir>]"
             );
             std::process::exit(2);
         }
