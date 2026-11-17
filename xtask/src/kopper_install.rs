@@ -409,6 +409,14 @@ pub fn codex_command(text: &str) -> Result<Option<(usize, String)>, String> {
             seen |= inside || name.starts_with("mcp_servers.konnect.");
             continue;
         }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Some other header this reader does not parse (quoted keys, spaces):
+            // it still ends the konnect table, so a later table's command is never
+            // taken for it. An array line read this way only makes a konnect
+            // table without a readable command an error, never a wrong rewrite.
+            inside = false;
+            continue;
+        }
         if trimmed.contains("konnect") && trimmed.contains('{') && !inside {
             seen = true; // an inline table, such as `konnect = { command = … }`
         }
@@ -546,6 +554,9 @@ fn is_konnect(command: &str) -> bool {
 pub fn rollback(host: &mut dyn Host, prefix: &Path) -> Result<String, String> {
     let record_path = rollback_file(prefix);
     let record = read_record(&record_path)?;
+    if record.contains_key("claude") && host.var("CLAUDE_CONFIG_DIR").is_some() {
+        return Err("CLAUDE_CONFIG_DIR is set, and this rollback writes only ~/.claude.json; nothing was changed".into());
+    }
     if record.is_empty() {
         return Err(format!(
             "no record of the earlier entries at {}",

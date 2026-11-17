@@ -426,6 +426,28 @@ fn the_codex_reader_finds_only_the_konnect_command() {
         Some((1, "C:\\a \"b\"".to_string()))
     );
     assert!(codex_command("[mcp_servers.konnect]\ncommand = \"a\\nb\"\n").is_err());
+    // A header this reader does not parse still ends the konnect table: the next
+    // table's command is not taken for konnect's.
+    assert!(codex_command(
+        "[mcp_servers.konnect]\nargs = []\n[projects.\"/Users/x/dir\"]\ncommand = \"/not/konnect\"\n"
+    )
+    .is_err());
     assert_eq!(toml_quote("C:\\a \"b\""), "\"C:\\\\a \\\"b\\\"\"");
     assert_eq!(strip_comment("x = \"a#b\" # c"), "x = \"a#b\"");
+}
+
+#[test]
+fn rollback_refuses_a_claude_config_dir_it_would_not_write() {
+    let mut fake = Fake::new();
+    let prefix = fake.package();
+    std::fs::write(
+        rollback_file(&prefix),
+        json!({"claude": {"type": "stdio", "command": INSTALLED}}).to_string(),
+    )
+    .unwrap();
+    fake.vars
+        .insert("CLAUDE_CONFIG_DIR".into(), "/elsewhere".into());
+    let error = rollback(&mut fake, &prefix).unwrap_err();
+    assert!(error.contains("CLAUDE_CONFIG_DIR"), "{error}");
+    assert!(fake.calls.is_empty());
 }
