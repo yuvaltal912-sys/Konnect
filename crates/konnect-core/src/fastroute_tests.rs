@@ -1115,13 +1115,15 @@ int main(int argc, char **argv) {
     async fn a_pass_past_its_deadline_is_killed_and_waited_for() {
         let fixture = Fixture::new("sleep.full=1\n");
         let started = std::time::Instant::now();
-        let result = run_full(&fixture, &hints(None, None), 2).await;
+        // 6 s, not 2: the test reads the pid the fake writes once it has started, and
+        // under the full suite's load the sandboxed start alone took more than 2 s.
+        let result = run_full(&fixture, &hints(None, None), 6).await;
         let elapsed = started.elapsed();
         match result {
-            Err(PassError::Killed { seconds }) => assert!(seconds >= 1.5, "{seconds}"),
+            Err(PassError::Killed { seconds }) => assert!(seconds >= 5.5, "{seconds}"),
             other => panic!("expected Killed, got {other:?}"),
         }
-        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
         let pid = std::fs::read_to_string(fixture.run_dir().join("full.ses.pid"))
             .expect("the fake wrote its pid before it slept");
         assert!(!alive(&pid), "the child {pid} survived the kill");
