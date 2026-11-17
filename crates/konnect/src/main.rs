@@ -67,6 +67,12 @@ fn classify(args: &[String]) -> Cli<'_> {
     }
 }
 
+/// The toolset `simulation_enabled = false` hides, and what `load_toolset`
+/// answers for it then.
+const SIMULATION_TOOLSET: &str = "simulation";
+const SIMULATION_OFF_REASON: &str =
+    "simulation is off in this configuration (set simulation_enabled = true to serve it)";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ─── CLI argument parsing (minimal, no clap dependency) ─────────
@@ -191,16 +197,23 @@ async fn main() -> Result<()> {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
     }
-    match konnect_core::simulation::SimulationRuntime::for_current_executable(
-        konnect_core::simulation::SimulationSettings {
-            ngspice_library: config.ngspice_library.clone(),
-            ngspice_code_models_dir: config.ngspice_code_models_dir.clone(),
-            allow_digital_models: config.ngspice_allow_digital_models,
-            model_dirs: config.ngspice_model_dirs.clone(),
-        },
-    ) {
-        Ok(runtime) => handler.set_simulation_runtime(std::sync::Arc::new(runtime)),
-        Err(error) => tracing::warn!("simulation worker unavailable: {error:#}"),
+    if config.simulation_enabled {
+        match konnect_core::simulation::SimulationRuntime::for_current_executable(
+            konnect_core::simulation::SimulationSettings {
+                ngspice_library: config.ngspice_library.clone(),
+                ngspice_code_models_dir: config.ngspice_code_models_dir.clone(),
+                allow_digital_models: config.ngspice_allow_digital_models,
+                model_dirs: config.ngspice_model_dirs.clone(),
+            },
+        ) {
+            Ok(runtime) => handler.set_simulation_runtime(std::sync::Arc::new(runtime)),
+            Err(error) => tracing::warn!("simulation worker unavailable: {error:#}"),
+        }
+    } else {
+        handler
+            .hide_toolset(SIMULATION_TOOLSET, SIMULATION_OFF_REASON)
+            .await;
+        info!("simulation is off (simulation_enabled = false): its toolset is not served");
     }
 
     match config.transport {

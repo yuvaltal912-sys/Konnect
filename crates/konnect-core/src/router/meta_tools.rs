@@ -516,6 +516,15 @@ async fn handle_reload_server(args: &Value, reload: &ReloadControl) -> CallToolR
     }))
 }
 
+/// The error for a toolset name `load_toolset` cannot load: hidden by this
+/// server's configuration (with the reason), or not registered at all.
+fn not_loadable(ctx: &std::sync::Arc<ToolContext>, name: &str) -> String {
+    match ctx.router.hidden_reason(name) {
+        Some(reason) => format!("Toolset '{name}' is turned off in this server: {reason}"),
+        None => format!("Unknown toolset '{name}'. Call list_toolboxes() to see valid names."),
+    }
+}
+
 async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
     use std::collections::HashSet;
     let active: HashSet<String> = ctx.router.active_names().await.into_iter().collect();
@@ -598,10 +607,7 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
                         "tools": tool_list
                     }))
                 }
-                None => CallToolResult::error(format!(
-                    "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-                    name
-                )),
+                None => CallToolResult::error(not_loadable(ctx, name)),
             }
         }
         // New array form: one load, one tools/list_changed notification.
@@ -629,10 +635,7 @@ async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) ->
                             |t| json!({ "name": t.name, "description": describe(t.description, full) }),
                         ));
                     }
-                    None => errors.push(format!(
-                        "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-                        name
-                    )),
+                    None => errors.push(not_loadable(ctx, name)),
                 }
             }
 
@@ -674,7 +677,7 @@ async fn handle_unload_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) 
     if ctx.router.unload(name).await {
         CallToolResult::text(format!("Toolset '{}' unloaded.", name))
     } else {
-        CallToolResult::error(format!("Unknown toolset '{}'.", name))
+        CallToolResult::error(not_loadable(ctx, name))
     }
 }
 

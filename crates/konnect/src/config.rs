@@ -77,6 +77,12 @@ pub struct Config {
     /// cannot help because it only fires once a call is actually attempted.
     #[serde(default)]
     pub eager_toolsets: bool,
+
+    /// Serve the simulation toolset and start its worker. Off by default in
+    /// 1 Kopper, which ships without the simulation branch: the toolset is
+    /// then not listed, cannot be loaded, and no simulation runtime is made.
+    #[serde(default)]
+    pub simulation_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -283,6 +289,7 @@ impl Default for Config {
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,
+            simulation_enabled: false,
         }
     }
 }
@@ -379,6 +386,19 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// 1 Kopper K1: simulation is off unless a config file turns it on, both
+    /// with no file at all and with a file that does not name the key.
+    #[test]
+    fn simulation_is_off_unless_turned_on() {
+        assert!(!Config::default().simulation_enabled);
+        let empty = write_temp("toml", "");
+        assert!(!Config::load_from(empty.path()).unwrap().simulation_enabled);
+        let json = write_temp("json", "{}");
+        assert!(!Config::load_from(json.path()).unwrap().simulation_enabled);
+        let on = write_temp("toml", "simulation_enabled = true\n");
+        assert!(Config::load_from(on.path()).unwrap().simulation_enabled);
     }
 
     // Malformed input must produce Err, never a panic (the class of bug

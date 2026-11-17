@@ -382,6 +382,8 @@ The server does NOT expose all 269 tools (276 total with the 7 meta-tools) in `t
 
 - **`eager_toolsets` (config key, default `false`)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed` — for those, a tool absent from the first listing can never be called at all, because `load_toolset` reports the names it loaded but returns no schemas and the client has nothing to invoke (#134, #169). Note `auto_load_toolsets` does **not** cover this case: it fires on a tool *call*, so it only helps a caller that already knows the tool name. Costs ~25K tokens per listing against the ~2K baseline, which is the router's entire reason for existing — hence off by default.
 
+- **`simulation_enabled` (config key, default `false`)**: serve the simulation toolset and start its worker. Off (1 Kopper ships without the simulation branch), the server hides the toolset with `ToolRouter::hide`: `list_toolboxes` leaves it out, `load_toolset("simulation")` answers that it is turned off and names this key, its tools are unknown even with `auto_load_toolsets`, and no simulation runtime is made (`get_installation_info` reports `ngspice.probe_status` as `not_available`). Set `simulation_enabled = true` in `konnect.toml`/`settings.json` to serve it. Embedding `McpHandler` is unaffected: only the binary's `main.rs` hides it.
+
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
 ## Build Requirements
