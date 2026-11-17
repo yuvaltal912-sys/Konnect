@@ -262,7 +262,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
   - Round 2: 97 mutants, 84 caught, 7 missed.
   - After the new tests (`the_runner_releases_a_run_in_its_own_search_folder`, `remove_tree_raises_a_path_it_cannot_read_or_remove`, `a_row_with_no_routed_length_and_no_share_passes_g3`): 50 mutants, 48 caught, 1 missed.
   - Left, each equivalent or unreachable: `abs() > 1e-9` against `>=` in G1; the trait's default `release` (already a no-op); the fixed-count check in `launch_ready` (with no budget, `may_launch` is false anyway); `copy_project`'s empty-parent guard (a canonical board path always has a parent).
-- `fastroute::tests::sandboxed::a_pass_past_its_deadline_is_killed_and_waited_for` failed once right after a fresh build (the fake had not written its pid within its 2 s deadline) and passed 5 of 5 on its own. This row does not change it.
+- `fastroute::tests::sandboxed::a_pass_past_its_deadline_is_killed_and_waited_for` failed once right after a fresh build (the fake had not written its pid within its 2 s deadline) and passed 5 of 5 on its own. It failed the same way in the follow-up's first gate (2026-11-17, under the full suite's load) and passed on its retry; its deadline is now 6 s on `claude/route-best-of-n-x18`.
 - Measurement on the public fixtures (`pic`, `ecc`, `pours`): release binary of `bb904343`, each call in its own comparable lane hold. Every winner passed all three gates, no call ran past its budget, and the protected files and the installed Konnect were unchanged.
 
 | board | effort | wall s | runs judged | other outcomes |
@@ -272,7 +272,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 | pours | fast / m / h / xh | 1.9 / 240 / 720 / 2402 | 2 / 542 / 1749 / 5706 | cut_at_budget 0 / 1 / 0 / 20 |
 
 - Largest search folder at its peak: 200 MB (pic, XH). Largest response: 23 KB.
-- **Rerun on fastroute x18 (2026-11-17), pic only:** release binary of `64e89fd5` (branch `claude/route-best-of-n-x18`), same lane holds. x18 (W1) leaves out a wire that collapses to one point. No run failed its judge at any level; the six seeds above are now judged and fail G1 (1 connection open), so the winner is the same run as on x17 at M, H and XH (seed 71, pours omitted). Every winner passed all three gates, no call ran past its budget, and the protected files and the installed Konnect were unchanged.
+- **Rerun on fastroute x18 (2026-11-17), pic only:** release binary of `64e89fd5` (branch `claude/route-best-of-n-x18`), same lane holds. x18 (W1) leaves out a wire that collapses to one point. No run failed its judge at any level. The six seeds above are now judged (at XH): four fail G1 (1 connection open), one (466) fails G2 (`starved_thermal` 1, the unrouted board 0), and one (699) passes all three gates but ranks below the winner. The winner is the same run as on x17 at M, H and XH (seed 71, pours omitted). Every winner passed all three gates, no call ran past its budget, and the protected files and the installed Konnect were unchanged.
 
 | effort | wall s | runs judged | other outcomes | winner (shape, seed) |
 |---|---|---|---|---|
@@ -281,7 +281,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 | h | 712 | 598 | none | omitted, 71 |
 | xh | 2394 | 2127 | none | omitted, 71 |
 
-  Fewer runs than on x17 (187 against 216 at M, 598 against 631 at H, 2127 against 2290 at XH): the median route time was 7 to 16 % longer (8.0, 7.7 and 7.3 s against 6.9, 7.2 and 6.8 s). The host's load at the start was of the same order on both, so the cause is not established (x18 itself, or other load during the runs). Largest search folder at its peak: 184 MB (XH).
+  Fewer runs judged than on x17 (187 against 216 at M, 598 against 631 at H, 2127 against 2284 at XH): the median route time was 6 to 16 % longer (8.0, 7.65 and 7.3 s against 6.9, 7.2 and 6.8 s), and the host's 1-minute load at the start was higher on x18 at every level (3.5, 7.3 and 5.1 against 1.1, 5.1 and 3.9). Load is the likely cause; x18 itself is not ruled out. Largest search folder at its peak: 184 MB (XH).
 - The `judge_failed` runs on pic were a fastroute defect, fixed in x18 (below). On some seeds (106, 280, 403, 466, 699, 1062, pours omitted) x17 left a trace shorter than 0.1 µm whose corners round onto one point; the session then held a one-point wire, and the importer refuses any path of fewer than 2 points. The search went on, and such a run could never win.
 - On pours at M, H and XH, the winner keeps the pours. The judge reads 0 unconnected and every gate passes, but `status` is fastroute's own plane-mode value, `incomplete` (D15).
 - Final gate on `fe81a441` (2026-11-17): every step green. Tests 4864 passed, 0 failed, 168 ignored; doc tests 9 passed; `simulation_live` 95 passed; clippy, deny and fix-doc-counts clean; release build; protected files and the installed hash unchanged. fastroute's 31 sandboxed tests ran as a step of their own (31 passed) with the cargo parent outside the gate's write-protection profile: each test starts its own `sandbox-exec` with the fastroute profile, and macOS refuses a sandbox inside a sandbox (`sandbox_apply: Operation not permitted`), which is how the first gate run failed those 30 tests and nothing else. No served check was run.
