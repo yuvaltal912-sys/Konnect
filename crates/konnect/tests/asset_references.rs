@@ -1029,6 +1029,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // search (fastroute engine).
         "complete_with_gate_failures",
         "budget_overrun_s",
+        // Result fields of the fastroute `completion` (D21: the judged status).
+        "router_unrouted",
+        "stitching_vias",
     ];
 
     let mut phantom = Vec::new();

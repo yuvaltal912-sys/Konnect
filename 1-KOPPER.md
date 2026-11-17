@@ -43,7 +43,8 @@ That is all. `kopper-install` does these steps, in this order:
 checkout's `target/kopper-smoke/` and checks it end to end:
 - the package matches its manifest;
 - simulation is off;
-- a public board routes with the package's own fastroute and passes the judge;
+- a public board routes with the package's own fastroute, passes the judge and
+  reads `status: complete`;
 - the installed Konnect and your KiCad settings are unchanged. The check fails if
   the installed Konnect is missing.
 
@@ -120,10 +121,9 @@ its own PR, put that build at the default place, then run
 
 ## Known
 
-- A route's `status` can read `incomplete` while the judge found nothing
-  unconnected. It happens when a pour makes the connection that fastroute counts
-  as unrouted. Read `completion.judged` (`unconnected`, `all_gates_pass`); that is
-  the verdict on the board.
+- On a board where the judge had to add stitching vias to connect a pour,
+  `status` stays fastroute's own. Follow `completion.next_steps`; they include
+  the stitching.
 - Windows and Linux are not supported yet.
 
 Background and every decision: `docs/CREATION_HANDOFF.md`, rows K1 to K4.

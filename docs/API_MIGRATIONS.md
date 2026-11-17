@@ -40,7 +40,15 @@ candidate is the default of `route_specctra_dsn`, set by an effort level.
   run) and `completion.judged`.
   `status` is `complete` only when the winner passes all three gates of the
   judge; otherwise `incomplete` (connections open after refill and stitching)
-  or the new `complete_with_gate_failures` (DRC or width gate failed). The
+  or the new `complete_with_gate_failures` (DRC or width gate failed). When
+  every gate passes and the judge added no stitching via
+  (`completion.judged.stitching_vias`, new), `status` is the judge's, not the
+  router's count:
+  `complete`, or `complete_with_width_exceptions` or `unverified` from the
+  winner's width report. A winner whose pour makes a connection fastroute
+  counts as unrouted is then `complete`, not `incomplete`, and a winner given
+  a plane is no longer `unverified` for that alone. The router's count stays
+  in `completion.router_unrouted`. The
   run files stay in `<ses_output_path>.search` (the winner's whole, the others
   as their records).
 - **Preflight refusals (fastroute)**, before anything routes: no manifest

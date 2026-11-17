@@ -85,7 +85,7 @@ fn a_route_with_another_fastroute_or_a_failed_gate_fails() {
     let body = |source: &str, path: &Path, sha: &Value, gates: bool| {
         json!({
             "success": true,
-            "status": "complete",
+            "status": if gates { "complete" } else { "complete_with_gate_failures" },
             "engine": {"name": "fastroute", "source": source, "path": path, "sha256": sha},
             "completion": {"judged": {"all_gates_pass": gates, "unconnected": 0}},
         })
@@ -101,7 +101,7 @@ fn a_route_with_another_fastroute_or_a_failed_gate_fails() {
         &ses,
         wait,
     );
-    assert_eq!(passes(&good), [true, true, true, true]);
+    assert_eq!(passes(&good), [true, true, true, true, true]);
 
     let other = dir.path().join("other-fastroute");
     std::fs::write(&other, "x").unwrap();
@@ -120,7 +120,7 @@ fn a_route_with_another_fastroute_or_a_failed_gate_fails() {
         );
         assert_eq!(
             passes(&checks),
-            [true, false, true, true],
+            [true, false, true, true, true],
             "{source} {path:?}"
         );
     }
@@ -132,7 +132,13 @@ fn a_route_with_another_fastroute_or_a_failed_gate_fails() {
         &ses,
         wait,
     );
-    assert_eq!(passes(&failed_gate), [true, true, true, false]);
+    assert_eq!(passes(&failed_gate), [true, true, true, false, false]);
+    // Every gate passed, but the status is not `complete`: the router's count
+    // standing over the judge's verdict (fixed with D21) fails the smoke.
+    let mut counted = body("bundled", &bundled, sha, true);
+    counted["status"] = json!("incomplete");
+    let counted = route_checks(false, &counted, &prefix, &manifest, &ses, wait);
+    assert_eq!(passes(&counted), [true, true, true, true, false]);
     let error = route_checks(
         true,
         &body("bundled", &bundled, sha, true),
@@ -196,6 +202,7 @@ fn a_route_that_did_not_succeed_or_left_a_connection_open_fails() {
     let bundled = prefix.join("bin/fastroute");
     let base = json!({
         "success": true,
+        "status": "complete",
         "engine": {"name": "fastroute", "source": "bundled", "path": bundled,
                    "sha256": manifest["fastroute"]["sha256"]},
         "completion": {"judged": {"all_gates_pass": true, "unconnected": 0}},
