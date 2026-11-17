@@ -4,7 +4,7 @@
 //! parallel runs keep their memory apart (docs/ROUTE_SEARCH_DESIGN.md, decision 2).
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
-//! (C** + BR1 + W8P, build x17). [`locate`] finds it and [`probe`] proves that the
+//! (C** + BR1 + W8P, build x18). [`locate`] finds it and [`probe`] proves that the
 //! binary found is that build before anything is routed.
 
 use crate::specctra::RoutingHints;
