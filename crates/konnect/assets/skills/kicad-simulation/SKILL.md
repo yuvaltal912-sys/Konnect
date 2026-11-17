@@ -21,7 +21,8 @@ Simulation runs on the saved schematic, on a private copy, in a separate process
 ## Toolset Loading
 
 ```
-load_toolset('simulation')    # check_simulation_readiness, run_simulation, list_simulation_runs, measure_simulation_run, plot_simulation_run, create_simulation_model, assign_simulation_model
+load_toolset('simulation')    # if it answers "turned off", this server's configuration has simulation off: say so and stop
+                              # check_simulation_readiness, run_simulation, list_simulation_runs, measure_simulation_run, plot_simulation_run, create_simulation_model, assign_simulation_model
 ```
 
 ## Workflow

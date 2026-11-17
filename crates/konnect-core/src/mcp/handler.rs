@@ -138,6 +138,13 @@ impl McpHandler {
         let _ = self.ctx.simulation.set(runtime);
     }
 
+    /// Stop serving toolset `name` (see [`ToolRouter::hide`]); `reason` is
+    /// what `load_toolset` answers for it. Call before serving. `false` when
+    /// no registered toolset has that name.
+    pub async fn hide_toolset(&self, name: &str, reason: &str) -> bool {
+        self.ctx.router.hide(name, reason).await
+    }
+
     pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
         self.reload.take()
     }

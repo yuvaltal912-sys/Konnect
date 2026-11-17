@@ -13,6 +13,10 @@ pub struct ToolRouter {
     active: RwLock<HashSet<String>>,
     /// Flat map of tool_name → ToolDef for fast dispatch
     loaded_tools: RwLock<HashMap<String, ToolDef>>,
+    /// Toolsets this server does not serve, each with the reason it gives.
+    /// A hidden toolset is not listed, cannot be loaded, and its tools are
+    /// unknown, as if it were not registered (1 Kopper K1).
+    hidden: std::sync::RwLock<HashMap<&'static str, String>>,
 }
 
 /// Static metadata for a toolset (not the tools themselves).
@@ -30,14 +34,57 @@ impl ToolRouter {
             registry: registry::ALL_TOOLSETS,
             active: RwLock::new(HashSet::new()),
             loaded_tools: RwLock::new(HashMap::new()),
+            hidden: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn all_toolsets(&self) -> &'static [ToolsetMeta] {
+    /// The toolsets this server serves: the registry without the hidden ones.
+    pub fn all_toolsets(&self) -> Vec<&'static ToolsetMeta> {
+        let hidden = self.hidden_names();
         self.registry
+            .iter()
+            .filter(|meta| !hidden.contains(meta.name))
+            .collect()
+    }
+
+    fn hidden_names(&self) -> HashSet<&'static str> {
+        self.hidden
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Why toolset `name` is hidden, or `None` when it is served (or unknown).
+    pub fn hidden_reason(&self, name: &str) -> Option<String> {
+        self.hidden
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
+    }
+
+    /// Stop serving toolset `name`: unload it if it is loaded, and refuse to
+    /// list or load it from now on. `false` when no registered toolset has
+    /// that name (nothing changes).
+    pub async fn hide(&self, name: &str, reason: &str) -> bool {
+        let Some(meta) = self.registry.iter().find(|meta| meta.name == name) else {
+            return false;
+        };
+        // Unload first: once hidden, `unload` treats the name as unknown.
+        self.unload(meta.name).await;
+        self.hidden
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(meta.name, reason.to_string());
+        true
     }
 
     pub async fn load(&self, name: &str) -> Option<Vec<ToolDef>> {
+        if self.hidden_reason(name).is_some() {
+            return None;
+        }
         let defs = registry::tools_for(name)?;
         let mut active = self.active.write().await;
         let mut loaded = self.loaded_tools.write().await;
@@ -81,7 +128,7 @@ impl ToolRouter {
     /// is currently loaded. Used to give the LLM an actionable error when it
     /// calls a tool whose toolset hasn't been loaded yet.
     pub fn find_toolset_for_tool(&self, tool_name: &str) -> Option<&'static str> {
-        for ts in self.registry {
+        for ts in self.all_toolsets() {
             if let Some(defs) = registry::tools_for(ts.name) {
                 if defs.iter().any(|d| d.name == tool_name) {
                     return Some(ts.name);
@@ -92,6 +139,9 @@ impl ToolRouter {
     }
 
     pub async fn unload(&self, name: &str) -> bool {
+        if self.hidden_reason(name).is_some() {
+            return false;
+        }
         let defs = match registry::tools_for(name) {
             Some(d) => d,
             None => return false,
@@ -259,6 +309,57 @@ mod tests {
         for tool in meta_tools::meta_tool_descriptions_for(true) {
             visit(&tool.input_schema, &tool.name);
         }
+    }
+
+    /// 1 Kopper K1: a hidden toolset is unloaded, not listed, not loadable
+    /// (also through `load_all`) and its tools are unknown; the others are
+    /// untouched, and hiding an unregistered name changes nothing.
+    #[tokio::test]
+    async fn a_hidden_toolset_is_not_listed_loaded_or_found() {
+        let router = ToolRouter::new();
+        let simulation_tool = registry::tools_for("simulation").expect("registered")[0].name;
+        router.load("simulation").await.expect("loads while served");
+        assert_eq!(
+            router.find_toolset_for_tool(simulation_tool),
+            Some("simulation")
+        );
+
+        assert!(router.hide("simulation", "off for this test").await);
+        assert!(!router.hide("no_such_toolset", "ignored").await);
+
+        assert!(!router
+            .active_names()
+            .await
+            .contains(&"simulation".to_string()));
+        assert!(router.get_tool(simulation_tool).await.is_none());
+        assert!(router
+            .all_toolsets()
+            .iter()
+            .all(|meta| meta.name != "simulation"));
+        assert_eq!(
+            router.all_toolsets().len(),
+            registry::ALL_TOOLSETS.len() - 1
+        );
+        assert!(router.load("simulation").await.is_none());
+        assert!(
+            !router.unload("simulation").await,
+            "a hidden toolset is unknown to unload"
+        );
+        assert_eq!(router.find_toolset_for_tool(simulation_tool), None);
+        assert_eq!(
+            router.hidden_reason("simulation").as_deref(),
+            Some("off for this test")
+        );
+        assert_eq!(router.hidden_reason("project"), None);
+
+        router.load_all().await;
+        let active = router.active_names().await;
+        assert!(!active.contains(&"simulation".to_string()));
+        assert_eq!(active.len(), registry::ALL_TOOLSETS.len() - 1);
+        assert_eq!(
+            router.find_toolset_for_tool("place_component"),
+            Some("pcb_components")
+        );
     }
 
     #[tokio::test]

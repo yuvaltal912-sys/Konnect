@@ -162,14 +162,29 @@ fn call_with_config(tool: &str, arguments: Value, config: &str) -> Value {
     call_in_home(home.path(), tool, arguments, config)
 }
 
-/// The same call with the server's `HOME` and state folder given, so a test can
-/// read the run it left behind.
-fn call_in_home(home: &Path, tool: &str, arguments: Value, config: &str) -> Value {
+/// The user configuration of a server started with `HOME` = `home`: `config`
+/// with simulation served (it is off by default), in both places the server
+/// looks for it.
+fn write_home_config(home: &Path, config: &str) {
     for config_dir in [".config/konnect", "Library/Application Support/konnect"] {
         let config_dir = home.join(config_dir);
         std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join("config.toml"), config).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("{SIMULATION_ON}{config}"),
+        )
+        .unwrap();
     }
+}
+
+/// The configuration line every server these tests start needs, since
+/// simulation is off by default (1 Kopper K1).
+const SIMULATION_ON: &str = "simulation_enabled = true\n";
+
+/// The same call with the server's `HOME` and state folder given, so a test can
+/// read the run it left behind.
+fn call_in_home(home: &Path, tool: &str, arguments: Value, config: &str) -> Value {
+    write_home_config(home, config);
     let requests = [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18", "capabilities": {},
@@ -2754,6 +2769,7 @@ fn a_real_transient_an_ac_sweep_and_two_dc_sweeps_are_plotted_to_a_small_svg() {
 /// and makes the calls in order. Returns each call's JSON result. `HOME` is
 /// the server's own, so KiCad's user libraries are not the ones read.
 fn call_session(home: &Path, calls: &[(&str, Value)]) -> Vec<Value> {
+    write_home_config(home, "");
     let mut requests = vec![
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-06-18", "capabilities": {},
@@ -3534,7 +3550,10 @@ fn call_with_isolated_ibis_cache(
     let config = state.join("config.toml");
     std::fs::write(
         &config,
-        format!("kicad_cli = {}\ntransport = \"stdio\"\n", json!(cli)),
+        format!(
+            "{SIMULATION_ON}kicad_cli = {}\ntransport = \"stdio\"\n",
+            json!(cli)
+        ),
     )
     .unwrap();
     let requests = [

@@ -212,7 +212,8 @@ list above is not consulted, and `get_installation_info` reports
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
 `ngspice_library`, `ngspice_code_models_dir`, `ngspice_allow_digital_models`,
 `ngspice_model_dirs`,
-`log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
+`log_level`, `auto_load_toolsets`, `eager_toolsets`, and `simulation_enabled`
+(default `false`: the simulation toolset is not served until it is `true`). The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 
 `ngspice_model_dirs` lists extra folders a simulation model include may read
