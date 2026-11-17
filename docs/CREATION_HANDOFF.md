@@ -4,7 +4,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-17 (Row K3, 1 Kopper: the package smoke test; see its section). Before that 2026-11-17 (Row K2, one install command, merged as [#75](https://github.com/yuvaltal912-sys/Konnect/pull/75)), and Row K1, simulation off by default, merged as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74). Before that 2026-11-17 (Row BN merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72), fastroute x18 in [#73](https://github.com/yuvaltal912-sys/Konnect/pull/73); see its section). Before that 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 269 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
+**Last updated:** 2026-11-17 (Row K4, 1 Kopper: its user guide, [`1-KOPPER.md`](../1-KOPPER.md); see its section). Before that 2026-11-17: Row K3, the package smoke test, merged as [#76](https://github.com/yuvaltal912-sys/Konnect/pull/76); Row K2, one install command, merged as [#75](https://github.com/yuvaltal912-sys/Konnect/pull/75); and Row K1, simulation off by default, merged as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74). Before that 2026-11-17 (Row BN merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72), fastroute x18 in [#73](https://github.com/yuvaltal912-sys/Konnect/pull/73); see its section). Before that 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 269 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
 
 ## Start here
 
@@ -91,7 +91,9 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 
 ## Next: what to pick
 
-**Now (2026-11-17, Row K3).** 1 Kopper's third PR, on branch `claude/1kopper-k3-smoke`; see "Row K3". Its PR text waits for the owner's yes. K4 (docs) follows on the owner's word.
+**Now (2026-11-17, Row K4).** 1 Kopper's last PR, on branch `claude/1kopper-k4-docs`; see "Row K4". Its PR text waits for the owner's yes. Once it merges, the 1 Kopper series is done.
+
+**Row K3** merged on 2026-11-17 as [#76](https://github.com/yuvaltal912-sys/Konnect/pull/76) (main `f5c9c8ec`).
 
 **Row K2** merged on 2026-11-17 as [#75](https://github.com/yuvaltal912-sys/Konnect/pull/75) (main `bb4255ff`).
 
@@ -279,9 +281,31 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **Evidence.** Recorded in the PR description: the targeted tests, one negative control per guard, the independent review and the full gate.
 
+## Row K4, 1 Kopper: the user guide
+
+**State, 2026-11-17.** Branch `claude/1kopper-k4-docs`, worktree `/Users/yuvaltal/ClaudeCode/Konnect-k4`, base `fork/main` `f5c9c8ec` (#76). Not pushed; the PR text waits for the owner's yes. Docs only.
+
+**What K4 adds.** [`1-KOPPER.md`](../1-KOPPER.md) at the repository root is the owner's one page for 1 Kopper:
+- what it is;
+- install (`cargo xtask kopper-install`), check (`cargo xtask kopper-smoke`) and go back (`--rollback`);
+- update;
+- what it needs and what is where;
+- what it never touches;
+- how simulation stays off;
+- how to change the pinned fastroute build;
+- the known `status` reading.
+
+`DEV.md` links to it from the 1 Kopper install entry.
+
+**After the series.**
+- The open owner decisions are in `target/creation-research/1-kopper/PLAN.md`:
+  - backing up the fastroute source (recommended: a private repository, which needs his yes to the exact name);
+  - removing the merged worktrees (only after he sees the list in `worktrees-merged.txt`).
+- The `status` defect from Row K3 is a candidate for its own fix.
+
 ## Row K3, 1 Kopper: the package smoke test
 
-**State, 2026-11-17.** Branch `claude/1kopper-k3-smoke`, worktree `/Users/yuvaltal/ClaudeCode/Konnect-k3`, base `fork/main` `bb4255ff` (#75). Not pushed; the PR text waits for the owner's yes.
+**State, 2026-11-17.** Merged on the owner's word as [#76](https://github.com/yuvaltal912-sys/Konnect/pull/76): main `f5c9c8ec`, a noreply merge whose tree equals the PR head `4cdbf358` (branch `claude/1kopper-k3-smoke`, base `bb4255ff`).
 
 **What K3 adds.** `cargo xtask kopper-smoke [--prefix <dir>] [--kicad-cli <file>]` proves an installed package works. Run it after `kopper-install`.
 - It checks that the package is one and that both binaries match its manifest.
