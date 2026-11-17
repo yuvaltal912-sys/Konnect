@@ -98,7 +98,7 @@ fn user_config_dir() -> PathBuf {
     }
 }
 
-fn user_config_path() -> PathBuf {
+pub(crate) fn user_config_path() -> PathBuf {
     user_config_dir().join("config.json")
 }
 
@@ -146,6 +146,20 @@ fn read_config(path: &Path) -> ConfigRead {
         Err(error) => ConfigRead::Malformed {
             reason: error.to_string(),
         },
+    }
+}
+
+/// The configuration file at `path` as the JSON object it holds, for a reader
+/// that wants a value from it and nothing else: `Ok(None)` when there is no
+/// file, and an error (`malformed_json: …` or `unreadable: …`) when there is
+/// one that cannot be used. Defaults are never substituted for a file that
+/// exists, as `usable_config` refuses to.
+pub(crate) fn read_user_config_object(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    match read_config(path) {
+        ConfigRead::Absent => Ok(None),
+        ConfigRead::Loaded { value, .. } => Ok(Some(value)),
+        ConfigRead::Malformed { reason } => Err(format!("malformed_json: {reason}")),
+        ConfigRead::Unreadable { reason } => Err(format!("unreadable: {reason}")),
     }
 }
 

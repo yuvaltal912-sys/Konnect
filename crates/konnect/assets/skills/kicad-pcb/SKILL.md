@@ -322,9 +322,42 @@ graphics/text are excluded. Use `query_traces(board, touching_pad={reference, pa
 when only segments touching the pad's copper matter. Do not replace these reads with a
 script that parses `.kicad_pcb`.
 
+### Best-of-N routing (the default engine)
+
+`route_specctra_dsn` routes with fastroute by default: a timed best-of-N search
+that tries the DSN as exported and with every pour omitted, over several
+placement orders, judges every run itself on scratch copies of the board
+(refill, DRC, stitching, the layout audit) and writes the best session. Load
+`pcb_export`, `integration`, `pcb_routing`, `verification`, `project` and
+`config` before starting.
+
+1. Effort. Read `routing.effort` from the user config (`load_user_config`). If
+   it is not set and the user has not chosen in this conversation, ask once:
+   `fast` (2 runs at once), `m` (4 minutes), `h` (12 minutes) or `xh`
+   (40 minutes) per board. Save the answer with
+   `save_user_config(key_path='routing.effort', value=...)` and reuse it; ask
+   before raising it. Without a choice the tool uses `m`.
+2. Export as in step 2 of the Freerouting round trip below (`save_project`,
+   then `export_specctra_dsn`), with the default pours (`fixed`): the search
+   makes the pours-omitted variant itself. The judge needs the saved board to
+   be the exact revision the export read; if it refuses, save and export again.
+3. Call `route_specctra_dsn(dsn_path, ses_output_path='new-result.ses')`,
+   adding `effort` only when the user asked for a level other than the saved
+   one. If it refuses with `setup` (fastroute is not at its default place),
+   stop and report the steps; route with `engine: 'freerouting'` only if the
+   user says so. Read `status`: it is `complete` only when the winning run
+   passes all three of the judge's gates (`completion.judged.gates`: complete
+   after refill and stitching, DRC no worse than the unrouted board, widths);
+   `complete_with_gate_failures` and `incomplete` list what failed. Report
+   every failed gate line to the user. `search` lists the best runs and counts
+   every outcome (`search.json` in the search folder lists every run); `search.budget_overrun_s` says when the first judged run came
+   after the budget.
+4. Continue from step 4 of the Freerouting round trip: the same import
+   review, apply, refill, stitching (`completion.next_steps`) and DRC.
+
 ### Freerouting round trip
 
-For a supported board, use the local Freerouting path. Load `pcb_export`,
+When the user asks for Freerouting (`engine: 'freerouting'`), use the local Freerouting path. Load `pcb_export`,
 `integration`, `pcb_routing`, `verification`, and `project` before starting:
 
 1. Run `check_freerouting(jar_path?, java_path?)`. Inspect `available`,
@@ -341,7 +374,7 @@ For a supported board, use the local Freerouting path. Load `pcb_export`,
    (`native_bridge_mode: 'disable'`); no native plugin is required. Existing
    output files are refused. Do not change the board while routing this revision.
 3. Call `route_specctra_dsn(dsn_path, ses_output_path='new-result.ses',
-   jar_path?, java_path?)`. It runs the local JAR's native headless MCP server
+   engine='freerouting', jar_path?, java_path?)`. It runs the local JAR's native headless MCP server
    and writes a new SES; creating that file does not prove every net was routed.
    Read `status` and `completion`: `complete` only means Freerouting left
    nothing and was given no pour as a plane; `unverified` means it was given a

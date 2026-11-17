@@ -58,6 +58,7 @@ mod project_file_writer_tests;
 pub(crate) mod response_budget;
 #[cfg(test)]
 mod response_budget_tests;
+pub(crate) mod route_fastroute;
 #[cfg(test)]
 mod route_obstacle_tests;
 mod route_refine;
