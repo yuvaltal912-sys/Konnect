@@ -348,7 +348,10 @@ placement orders, judges every run itself on scratch copies of the board
    user says so. Read `status`: it is `complete` only when the winning run
    passes all three of the judge's gates (`completion.judged.gates`: complete
    after refill and stitching, DRC no worse than the unrouted board, widths);
-   `complete_with_gate_failures` and `incomplete` list what failed. Report
+   `complete_with_gate_failures` and `incomplete` list what failed. When
+   every gate passed, `status` is the judge's, not fastroute's own count
+   (`completion.router_unrouted`), unless the judge had to add stitching vias
+   (`completion.judged.stitching_vias`): then follow `next_steps`. Report
    every failed gate line to the user. `search` lists the best runs and counts
    every outcome (`search.json` in the search folder lists every run); `search.budget_overrun_s` says when the first judged run came
    after the budget.

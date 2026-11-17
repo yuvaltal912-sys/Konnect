@@ -289,12 +289,12 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **The defect (found in Row K3).** When the winner passed every judge gate, `judged_status` kept the router's own status. fastroute counts a connection a pour makes as one it left, so on the public `specctra_pours_routing` board 4 of the 6 recorded routes, and both 1 Kopper smoke runs, read `incomplete` while the judge found 0 unconnected. A winner given a plane read `unverified` for that alone.
 
-**The fix (D21 in `ROUTE_SEARCH_DESIGN.md`, amending D15).** With every gate passed, `status` is the judge's:
+**The fix (D21 in `ROUTE_SEARCH_DESIGN.md`, amending D15).** With every gate passed and no stitching via added by the judge, `status` is the judge's:
 - `complete`;
 - `complete_with_width_exceptions` or `unverified` from the winner's width report;
 - `stopped` when the run stopped.
 
-A failed gate decides it as before. The router's count stays in `completion.router_unrouted`, and `completion.reason` adds why the status differs (`JUDGED_STATUS_NOTE`). `cargo xtask kopper-smoke` now also checks that `status` is `complete`. `1-KOPPER.md` drops the "Known" line, and `API_MIGRATIONS.md` says what changed.
+When the judge needed stitching vias, those vias are not in the session, so the router's status stands; `completion.judged.stitching_vias` (new) gives the count and the reason says why. A failed gate decides it as before. The router's count stays in `completion.router_unrouted`, and `completion.reason` adds why the status differs (`JUDGED_STATUS_NOTE`). fastroute's `complete_when` no longer says the status cannot show completion. `cargo xtask kopper-smoke` now also checks that `status` is `complete`: on its fixture the judge adds no stitching via and the session has no width exception, so anything else is a regression. `1-KOPPER.md` drops the "Known" line, and `API_MIGRATIONS.md` says what changed.
 
 ## Row K4, 1 Kopper: the user guide
 

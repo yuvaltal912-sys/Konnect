@@ -1506,7 +1506,11 @@ fn the_status_is_the_judges_when_every_gate_passes() {
         "unverified",
         "incomplete",
     ] {
-        assert_eq!(judged_status(router, &pass, &full), "complete", "{router}");
+        assert_eq!(
+            judged_status(router, &pass, &full, 0),
+            "complete",
+            "{router}"
+        );
     }
     // What the judge does not settle stays: the width report, and a stopped run.
     let narrow = WidthOutcome {
@@ -1514,35 +1518,48 @@ fn the_status_is_the_judges_when_every_gate_passes() {
         ..WidthOutcome::default()
     };
     assert_eq!(
-        judged_status("incomplete", &pass, &narrow),
+        judged_status("incomplete", &pass, &narrow, 0),
         "complete_with_width_exceptions"
     );
     let unread = WidthOutcome {
         unread: true,
         ..WidthOutcome::default()
     };
-    assert_eq!(judged_status("incomplete", &pass, &unread), "unverified");
+    assert_eq!(judged_status("incomplete", &pass, &unread, 0), "unverified");
     let unmeasured = WidthOutcome {
         unmeasured: 1,
         ..WidthOutcome::default()
     };
-    assert_eq!(judged_status("complete", &pass, &unmeasured), "unverified");
-    assert_eq!(judged_status("stopped", &pass, &full), "stopped");
+    assert_eq!(
+        judged_status("complete", &pass, &unmeasured, 0),
+        "unverified"
+    );
+    assert_eq!(judged_status("stopped", &pass, &full, 0), "stopped");
     let stopped = WidthOutcome {
         stopped_in: Some("full"),
         ..WidthOutcome::default()
     };
-    assert_eq!(judged_status("complete", &pass, &stopped), "stopped");
+    assert_eq!(judged_status("complete", &pass, &stopped, 0), "stopped");
+    // Every gate passed, but only with stitching vias the judge added: they are
+    // not in the session, so the router's status stands.
+    assert_eq!(judged_status("incomplete", &pass, &full, 2), "incomplete");
+    assert_eq!(judged_status("unverified", &pass, &full, 1), "unverified");
+    assert_eq!(
+        judged_status("complete", &gates(&["1 unconnected"], &[], &[]), &full, 3),
+        "incomplete",
+        "a failed gate outranks the stitching rule"
+    );
     // A failed gate outranks everything.
     assert_eq!(
-        judged_status("complete", &gates(&["2 unconnected"], &[], &[]), &full),
+        judged_status("complete", &gates(&["2 unconnected"], &[], &[]), &full, 0),
         "incomplete"
     );
     assert_eq!(
         judged_status(
             "complete",
             &gates(&[], &["clearance: 3, unrouted board 0"], &[]),
-            &full
+            &full,
+            0
         ),
         "complete_with_gate_failures"
     );
@@ -1550,7 +1567,8 @@ fn the_status_is_the_judges_when_every_gate_passes() {
         judged_status(
             "complete",
             &gates(&[], &[], &["1 track below its floor"]),
-            &full
+            &full,
+            0
         ),
         "complete_with_gate_failures"
     );
@@ -1558,7 +1576,8 @@ fn the_status_is_the_judges_when_every_gate_passes() {
         judged_status(
             "unverified",
             &gates(&["1 unconnected"], &["clearance"], &[]),
-            &full
+            &full,
+            0
         ),
         "incomplete",
         "G1 outranks the other gates"
@@ -1569,8 +1588,9 @@ fn the_status_is_the_judges_when_every_gate_passes() {
 /// fastroute counted one connection it left (the one the pour makes), and the judge
 /// found nothing open with every gate passing. `status` is the judge's `complete`;
 /// the router's count stays in `completion`, and the reason says why they differ.
-/// The same winner with G1 failing is `incomplete`, and with only G2 failing
-/// `complete_with_gate_failures`; neither has the note (the controls).
+/// With a stitching via the judge added, the router's status stands (the via is not in
+/// the session). The same winner with G1 failing is `incomplete`, and with only G2
+/// failing `complete_with_gate_failures`; neither has a note (the controls).
 #[test]
 fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
     let mut search = finished_search();
@@ -1602,9 +1622,36 @@ fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
     assert_eq!(judged["completion"]["router_unrouted"], 1);
     assert_eq!(judged["completion"]["judged"]["unconnected"], 0);
     assert_eq!(judged["completion"]["judged"]["all_gates_pass"], true);
+    assert_eq!(judged["completion"]["judged"]["stitching_vias"], 0);
     let reason = judged["completion"]["reason"].as_str().unwrap();
     assert!(reason.contains("1 connection(s)"), "{reason}");
     assert!(reason.ends_with(JUDGED_STATUS_NOTE), "{reason}");
+    let complete_when = judged["completion"]["complete_when"].as_str().unwrap();
+    assert!(
+        complete_when.ends_with(JUDGED_COMPLETE_WHEN_END),
+        "{complete_when}"
+    );
+
+    // Every gate passed only with a stitching via the judge added: the via is not in
+    // the session, so the router's `incomplete` stands, and the reason says why.
+    search.outcome.runs[0]
+        .judged
+        .as_mut()
+        .unwrap()
+        .measures
+        .stitching_vias = 1;
+    let stitched = result_for(&search);
+    assert_eq!(stitched["status"], "incomplete", "{stitched}");
+    assert_eq!(stitched["completion"]["judged"]["stitching_vias"], 1);
+    let reason = stitched["completion"]["reason"].as_str().unwrap();
+    assert!(reason.ends_with(&judged_stitched_note(1)), "{reason}");
+    assert!(!reason.contains(JUDGED_STATUS_NOTE), "{reason}");
+    search.outcome.runs[0]
+        .judged
+        .as_mut()
+        .unwrap()
+        .measures
+        .stitching_vias = 0;
 
     search.outcome.runs[0].judged.as_mut().unwrap().gates.g1 =
         vec!["1 unconnected item(s) after the refill and stitching".to_string()];

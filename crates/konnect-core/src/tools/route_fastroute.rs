@@ -1238,14 +1238,16 @@ fn search_json(
 /// The `status` of a fastroute result, from the judge's gates first.
 /// - G1 failed (connections open after the refill and the stitching): `incomplete`.
 /// - G2 (DRC) or G3 (widths) failed: `complete_with_gate_failures`, never `complete`.
-/// - Every gate passed: the judge has applied the winner's session to a copy of the
-///   board, refilled it, stitched it and found nothing open, which is what the router's
-///   own count cannot show (D21). The router's `incomplete` (its count, which takes a
-///   connection a pour makes for one it left) and its plane `unverified` give way. What
-///   remains is the width report, as for a router that left nothing and had no plane:
-///   `unverified` when widths could not be read or a wire could not be measured,
+/// - Every gate passed and the judge added no stitching via: the winner's session alone,
+///   applied to a copy of the board and refilled, leaves nothing open, which is what the
+///   router's own count cannot show (D21). The router's `incomplete` (its count, which
+///   takes a connection a pour makes for one it left) and its plane `unverified` give way.
+///   What remains is the width report, as for a router that left nothing and had no
+///   plane: `unverified` when widths could not be read or a wire could not be measured,
 ///   `complete_with_width_exceptions` when a stretch is below intent width, else
 ///   `complete`. A `stopped` router status stands.
+/// - Every gate passed, but only with stitching vias the judge added: those vias are not
+///   in the session, so the router's status stands, as before D21.
 ///
 /// KiCad's DRC on the judged copy sees what the router's count cannot: on 2026-11-16 the
 /// router research found fastroute runs that break a net class's larger clearance on one of
@@ -1254,11 +1256,14 @@ pub(crate) fn judged_status(
     router_status: &'static str,
     gates: &crate::route_judge::Gates,
     width: &WidthOutcome,
+    stitching_vias: usize,
 ) -> &'static str {
     if !gates.g1.is_empty() {
         "incomplete"
     } else if !gates.g2.is_empty() || !gates.g3.is_empty() {
         "complete_with_gate_failures"
+    } else if stitching_vias > 0 {
+        router_status
     } else if router_status == "stopped" || width.stopped_in.is_some() {
         "stopped"
     } else if width.unread || width.unmeasured > 0 {
@@ -1273,12 +1278,24 @@ pub(crate) fn judged_status(
 /// What `completion.reason` adds when every gate passed and the status is not the
 /// router's own: the router's count stays in the reason, and this says why the status
 /// differs from it.
-pub(crate) const JUDGED_STATUS_NOTE: &str = " Every judge gate passed: the judge applied this session to a copy of the board, refilled and stitched it, and found 0 unconnected items, so `status` is the judge's (`completion.judged`), not the router's count.";
+pub(crate) const JUDGED_STATUS_NOTE: &str = " Every judge gate passed: the judge applied this session to a copy of the board, refilled it and found 0 unconnected items with no stitching via added, so `status` is the judge's (`completion.judged`), not the router's count.";
+
+/// What `completion.reason` adds when every gate passed only with stitching vias the
+/// judge added: why `status` is still the router's.
+pub(crate) fn judged_stitched_note(vias: usize) -> String {
+    format!(" Every judge gate passed, but only after the judge added {vias} stitching via(s) (`completion.judged.stitching_vias`), which are not in this session: `status` stays the router's. Follow `next_steps`; they include the stitching.")
+}
+
+/// fastroute's `completion.complete_when`: the shared sentence says the result's status
+/// cannot show completion, which the judge's status now can (D21).
+const SHARED_COMPLETE_WHEN_END: &str =
+    "fastroute's count, and this result's status, do not show that.";
+const JUDGED_COMPLETE_WHEN_END: &str = "fastroute's count does not show that. The judge's check on a copy of the board does: `status` follows it when every judge gate passed and the judge added no stitching via (`completion.judged`).";
 
 /// The success result. Today's fields, for the winner: `success: true`, `status` and
 /// `completion` from `integration::completion_report(dsn, ses_output, the winner's
 /// planes, the winner's unrouted, width)`, with `completion.judged` = { unconnected,
-/// gates, all_gates_pass, judged_board }; `intent_widths`, `width_exceptions`,
+/// gates, all_gates_pass, stitching_vias, judged_board }; `intent_widths`, `width_exceptions`,
 /// `width_exceptions_total` (and `width_unmeasured` when any) from
 /// `integration::width_report(dsn, ses_output)`; `method: "local_fastroute_best_of_n"`;
 /// `engine` { name: "fastroute", candidate, path, sha256, version, source, switches,
@@ -1343,21 +1360,37 @@ pub(crate) fn result_json(
     }
     completion["router_unrouted_source"] =
         json!("fastroute's report of the winning run's kept pass");
+    let complete_when = completion["complete_when"].as_str().map(str::to_owned);
+    if let Some(words) = complete_when {
+        completion["complete_when"] =
+            json!(words.replace(SHARED_COMPLETE_WHEN_END, JUDGED_COMPLETE_WHEN_END));
+    }
     completion["judged"] = json!({
         "unconnected": judged.measures.unconnected,
         "gates": judged.gates,
         "all_gates_pass": judged.gates.all_pass(),
+        "stitching_vias": judged.measures.stitching_vias,
         "judged_board": judged_board(judged),
     });
     if completion["judged"]["judged_board"].is_null() {
         completion["judged"]["judged_board_note"] = json!(JUDGED_BOARD_RELEASED);
     }
     let router_status = status;
-    let status = judged_status(router_status, &judged.gates, &width);
-    if judged.gates.all_pass() && status != router_status {
+    let stitching_vias = judged.measures.stitching_vias;
+    let status = judged_status(router_status, &judged.gates, &width, stitching_vias);
+    let note = if !judged.gates.all_pass() {
+        None
+    } else if stitching_vias > 0 {
+        Some(judged_stitched_note(stitching_vias))
+    } else if status != router_status {
+        Some(JUDGED_STATUS_NOTE.to_string())
+    } else {
+        None
+    };
+    if let Some(note) = note {
         let reason = completion["reason"].as_str().map(str::to_owned);
         if let Some(reason) = reason {
-            completion["reason"] = json!(format!("{reason}{JUDGED_STATUS_NOTE}"));
+            completion["reason"] = json!(format!("{reason}{note}"));
         }
     }
     let limits = effort.0.limits();
