@@ -1235,26 +1235,45 @@ fn search_json(
     search
 }
 
-/// The `status` of a fastroute result. The router's own status (from its count and the
-/// planes, as `completion_report` reads them) stands only when the winning run passes all
-/// three of the judge's gates. A winner the judge found with connections open after the
-/// refill and the stitching (G1) is `incomplete`; one that is complete but fails the DRC
-/// gate (G2) or the width gate (G3) is `complete_with_gate_failures`, never `complete`.
+/// The `status` of a fastroute result, from the judge's gates first.
+/// - G1 failed (connections open after the refill and the stitching): `incomplete`.
+/// - G2 (DRC) or G3 (widths) failed: `complete_with_gate_failures`, never `complete`.
+/// - Every gate passed: the judge has applied the winner's session to a copy of the
+///   board, refilled it, stitched it and found nothing open, which is what the router's
+///   own count cannot show (D21). The router's `incomplete` (its count, which takes a
+///   connection a pour makes for one it left) and its plane `unverified` give way. What
+///   remains is the width report, as for a router that left nothing and had no plane:
+///   `unverified` when widths could not be read or a wire could not be measured,
+///   `complete_with_width_exceptions` when a stretch is below intent width, else
+///   `complete`. A `stopped` router status stands.
+///
 /// KiCad's DRC on the judged copy sees what the router's count cannot: on 2026-11-16 the
 /// router research found fastroute runs that break a net class's larger clearance on one of
 /// the owner's boards while reporting nothing open.
 pub(crate) fn judged_status(
     router_status: &'static str,
     gates: &crate::route_judge::Gates,
+    width: &WidthOutcome,
 ) -> &'static str {
     if !gates.g1.is_empty() {
         "incomplete"
     } else if !gates.g2.is_empty() || !gates.g3.is_empty() {
         "complete_with_gate_failures"
+    } else if router_status == "stopped" || width.stopped_in.is_some() {
+        "stopped"
+    } else if width.unread || width.unmeasured > 0 {
+        "unverified"
+    } else if width.exceptions > 0 {
+        "complete_with_width_exceptions"
     } else {
-        router_status
+        "complete"
     }
 }
+
+/// What `completion.reason` adds when every gate passed and the status is not the
+/// router's own: the router's count stays in the reason, and this says why the status
+/// differs from it.
+pub(crate) const JUDGED_STATUS_NOTE: &str = " Every judge gate passed: the judge applied this session to a copy of the board, refilled and stitched it, and found 0 unconnected items, so `status` is the judge's (`completion.judged`), not the router's count.";
 
 /// The success result. Today's fields, for the winner: `success: true`, `status` and
 /// `completion` from `integration::completion_report(dsn, ses_output, the winner's
@@ -1333,7 +1352,14 @@ pub(crate) fn result_json(
     if completion["judged"]["judged_board"].is_null() {
         completion["judged"]["judged_board_note"] = json!(JUDGED_BOARD_RELEASED);
     }
-    let status = judged_status(status, &judged.gates);
+    let router_status = status;
+    let status = judged_status(router_status, &judged.gates, &width);
+    if judged.gates.all_pass() && status != router_status {
+        let reason = completion["reason"].as_str().map(str::to_owned);
+        if let Some(reason) = reason {
+            completion["reason"] = json!(format!("{reason}{JUDGED_STATUS_NOTE}"));
+        }
+    }
     let limits = effort.0.limits();
     let mut result = json!({
         "success": true,

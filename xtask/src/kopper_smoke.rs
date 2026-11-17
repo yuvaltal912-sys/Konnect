@@ -581,6 +581,11 @@ pub fn route_checks(
             *gates == json!(true) && *unconnected == json!(0),
             format!("all_gates_pass {gates}, unconnected {unconnected}"),
         ),
+        check(
+            "the status is complete",
+            body["status"] == "complete",
+            format!("status {}", body["status"].as_str().unwrap_or("(none)")),
+        ),
     ]
 }
 

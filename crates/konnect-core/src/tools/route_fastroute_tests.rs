@@ -1177,9 +1177,9 @@ fn the_result_has_every_documented_key() {
     );
     assert_eq!(result["success"], true, "{result}");
     assert_eq!(result["method"], "local_fastroute_best_of_n");
-    // Today's fields. The winner's variant held a plane, so the status is the
-    // plane rule's, whatever the router counted.
-    assert_eq!(result["status"], "unverified", "{result}");
+    // Today's fields. The winner's variant held a plane, which alone would leave
+    // the router's status `unverified`; every gate passed, so it is the judge's.
+    assert_eq!(result["status"], "complete", "{result}");
     assert!(
         result["completion"]["next_steps_missing"].is_string()
             || result["completion"]["next_steps"].is_array()
@@ -1485,10 +1485,11 @@ async fn best_of_n_routes_a_public_fixture_end_to_end() {
     assert!(parsed["completion"]["judged"]["gates"].is_object());
 }
 
-/// A winner's status follows the judge: the router's own status only when every gate
-/// passes. Each failing gate alone changes it, so removing any branch fails a case.
+/// A winner's status follows the judge (D21). A failed gate decides it; with every
+/// gate passed it is the judge's `complete` unless the width report or a stopped run
+/// says otherwise, whatever the router counted. Each branch has a case of its own.
 #[test]
-fn the_status_is_the_routers_only_when_every_gate_passes() {
+fn the_status_is_the_judges_when_every_gate_passes() {
     use crate::route_judge::Gates;
     let gates = |g1: &[&str], g2: &[&str], g3: &[&str]| Gates {
         g1: g1.iter().map(|s| s.to_string()).collect(),
@@ -1496,37 +1497,135 @@ fn the_status_is_the_routers_only_when_every_gate_passes() {
         g3: g3.iter().map(|s| s.to_string()).collect(),
     };
     let pass = gates(&[], &[], &[]);
+    let full = WidthOutcome::default();
+    // Every gate passed: the router's count (`incomplete`, when a pour makes a
+    // connection it left) and its plane rule (`unverified`) give way to the judge.
     for router in [
         "complete",
         "complete_with_width_exceptions",
         "unverified",
         "incomplete",
     ] {
-        assert_eq!(judged_status(router, &pass), router);
+        assert_eq!(judged_status(router, &pass, &full), "complete", "{router}");
     }
+    // What the judge does not settle stays: the width report, and a stopped run.
+    let narrow = WidthOutcome {
+        exceptions: 2,
+        ..WidthOutcome::default()
+    };
     assert_eq!(
-        judged_status("complete", &gates(&["2 unconnected"], &[], &[])),
+        judged_status("incomplete", &pass, &narrow),
+        "complete_with_width_exceptions"
+    );
+    let unread = WidthOutcome {
+        unread: true,
+        ..WidthOutcome::default()
+    };
+    assert_eq!(judged_status("incomplete", &pass, &unread), "unverified");
+    let unmeasured = WidthOutcome {
+        unmeasured: 1,
+        ..WidthOutcome::default()
+    };
+    assert_eq!(judged_status("complete", &pass, &unmeasured), "unverified");
+    assert_eq!(judged_status("stopped", &pass, &full), "stopped");
+    let stopped = WidthOutcome {
+        stopped_in: Some("full"),
+        ..WidthOutcome::default()
+    };
+    assert_eq!(judged_status("complete", &pass, &stopped), "stopped");
+    // A failed gate outranks everything.
+    assert_eq!(
+        judged_status("complete", &gates(&["2 unconnected"], &[], &[]), &full),
         "incomplete"
     );
     assert_eq!(
         judged_status(
             "complete",
-            &gates(&[], &["clearance: 3, unrouted board 0"], &[])
+            &gates(&[], &["clearance: 3, unrouted board 0"], &[]),
+            &full
         ),
         "complete_with_gate_failures"
     );
     assert_eq!(
-        judged_status("complete", &gates(&[], &[], &["1 track below its floor"])),
+        judged_status(
+            "complete",
+            &gates(&[], &[], &["1 track below its floor"]),
+            &full
+        ),
         "complete_with_gate_failures"
     );
     assert_eq!(
         judged_status(
             "unverified",
-            &gates(&["1 unconnected"], &["clearance"], &[])
+            &gates(&["1 unconnected"], &["clearance"], &[]),
+            &full
         ),
         "incomplete",
         "G1 outranks the other gates"
     );
+}
+
+/// The 1 Kopper smoke's case: the winner's variant held the GND pour as a plane,
+/// fastroute counted one connection it left (the one the pour makes), and the judge
+/// found nothing open with every gate passing. `status` is the judge's `complete`;
+/// the router's count stays in `completion`, and the reason says why they differ.
+/// The same winner with G1 failing is `incomplete`, and with only G2 failing
+/// `complete_with_gate_failures`; neither has the note (the controls).
+#[test]
+fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
+    let mut search = finished_search();
+    search.outcome.runs[0]
+        .routed
+        .as_mut()
+        .unwrap()
+        .held
+        .unrouted = 1;
+    let ses = search.root.join("out.ses");
+    std::fs::write(&ses, "(session board)").unwrap();
+    let dsn = search.root.join("board.dsn");
+    std::fs::write(&dsn, "(pcb board)").unwrap();
+    let result_for = |search: &Search| {
+        result_json(
+            &dsn,
+            &ses,
+            &search.folder,
+            &candidate(),
+            (Effort::Fast, EffortSource::Default),
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+        )
+    };
+
+    let judged = result_for(&search);
+    assert_eq!(judged["status"], "complete", "{judged}");
+    assert_eq!(judged["completion"]["router_unrouted"], 1);
+    assert_eq!(judged["completion"]["judged"]["unconnected"], 0);
+    assert_eq!(judged["completion"]["judged"]["all_gates_pass"], true);
+    let reason = judged["completion"]["reason"].as_str().unwrap();
+    assert!(reason.contains("1 connection(s)"), "{reason}");
+    assert!(reason.ends_with(JUDGED_STATUS_NOTE), "{reason}");
+
+    search.outcome.runs[0].judged.as_mut().unwrap().gates.g1 =
+        vec!["1 unconnected item(s) after the refill and stitching".to_string()];
+    let open = result_for(&search);
+    assert_eq!(open["status"], "incomplete", "{open}");
+    let reason = open["completion"]["reason"].as_str().unwrap();
+    assert!(!reason.contains(JUDGED_STATUS_NOTE), "{reason}");
+
+    // A failed DRC gate also changes the router's status (its plane `unverified`),
+    // but not every gate passed: no note that says so.
+    {
+        let winner = &mut search.outcome.runs[0];
+        winner.routed.as_mut().unwrap().held.unrouted = 0;
+        let gates = &mut winner.judged.as_mut().unwrap().gates;
+        gates.g1.clear();
+        gates.g2 = vec!["clearance: 3, unrouted board 0".to_string()];
+    }
+    let drc = result_for(&search);
+    assert_eq!(drc["status"], "complete_with_gate_failures", "{drc}");
+    let reason = drc["completion"]["reason"].as_str().unwrap();
+    assert!(!reason.contains(JUDGED_STATUS_NOTE), "{reason}");
 }
 
 /// The winner's width report sets `status` as it does for Freerouting: a stretch
