@@ -1,0 +1,174 @@
+(pcb specctra_pours_routing.kicad_pcb
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad Konnect)
+    (host_version 0.13.0)
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer B.Cu
+      (type signal)
+      (property
+        (index 1)
+      )
+    )
+    (boundary
+      (path pcb 0 100000 -100000 150000 -100000 150000 -140000 100000 -140000 100000 -100000)
+    )
+    (plane GND
+      (polygon F.Cu 0 101000 -101000 149000 -101000 149000 -139000 101000 -139000 101000 -101000)
+    )
+    (plane GND
+      (polygon B.Cu 0 101000 -101000 149000 -101000 149000 -139000 101000 -139000 101000 -101000)
+    )
+    (via konnect_via_0001)
+    (rule
+      (width 250)
+      (clearance 200)
+    )
+  )
+  (placement
+    (component konnect_image_R1
+      (place R1 108000 -108000 front 0)
+    )
+    (component konnect_image_R10
+      (place R10 119000 -132000 front 90)
+    )
+    (component konnect_image_R11
+      (place R11 130000 -132000 front 0)
+    )
+    (component konnect_image_R12
+      (place R12 141000 -132000 front 90)
+    )
+    (component konnect_image_R2
+      (place R2 119000 -108000 front 90)
+    )
+    (component konnect_image_R3
+      (place R3 130000 -108000 front 0)
+    )
+    (component konnect_image_R4
+      (place R4 141000 -108000 front 90)
+    )
+    (component konnect_image_R5
+      (place R5 108000 -120000 front 90)
+    )
+    (component konnect_image_R6
+      (place R6 119000 -120000 front 0)
+    )
+    (component konnect_image_R7
+      (place R7 130000 -120000 front 90)
+    )
+    (component konnect_image_R8
+      (place R8 141000 -120000 front 0)
+    )
+    (component konnect_image_R9
+      (place R9 108000 -132000 front 0)
+    )
+  )
+  (library
+    (image konnect_image_R1
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R10
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R11
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R12
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R2
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R3
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R4
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R5
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R6
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R7
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R8
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (image konnect_image_R9
+      (pin konnect_pad_0001 1 -950 0)
+      (pin konnect_pad_0001 2 950 0)
+    )
+    (padstack konnect_pad_0001
+      (shape
+        (rect F.Cu -500 -625 500 625)
+      )
+      (attach off)
+    )
+    (padstack konnect_via_0001
+      (shape
+        (circle F.Cu 600)
+      )
+      (shape
+        (circle B.Cu 600)
+      )
+      (attach off)
+    )
+  )
+  (network
+    (net GND
+      (pins R1-2 R10-2 R11-2 R12-2 R2-2 R3-2 R4-2 R5-2 R6-2 R7-2 R8-2 R9-2)
+    )
+    (net S1
+      (pins R1-1 R12-1)
+    )
+    (net S2
+      (pins R11-1 R2-1)
+    )
+    (net S3
+      (pins R10-1 R3-1)
+    )
+    (net S4
+      (pins R4-1 R9-1)
+    )
+    (net S5
+      (pins R5-1 R8-1)
+    )
+    (net S6
+      (pins R6-1 R7-1)
+    )
+    (class konnect_class_0001 GND S1 S2 S3 S4 S5 S6
+      (circuit
+        (use_via konnect_via_0001)
+      )
+      (rule
+        (width 250)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring)
+)

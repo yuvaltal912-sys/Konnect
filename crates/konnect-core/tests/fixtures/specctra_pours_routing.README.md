@@ -26,3 +26,16 @@ plain Python with no KiCad, run as
 UUIDs are uuid5 values, so the script writes the same bytes every time.
 `specctra_pours_tests.rs` uses the fixture. So did row S6's second-half
 measurement natively, in cells F1omit and F1plane.
+
+## Tracked export (1 Kopper smoke)
+
+`specctra_pours_routing.dsn` and `specctra_pours_routing.dsn.konnect.json` are this
+board through the Rust exporter with the options `export_specctra_dsn` gives it:
+pours fixed, widths from intent, and the project's copper-to-edge and hole
+clearances, under the project's Default class. They come from the saved file,
+not from a live KiCad's text and rules, and not from KiCad's native exporter. The manifest's `board_path` is reduced to the board's file name.
+`cargo xtask kopper-smoke` routes them through a packaged `konnect`, which needs
+them because the MCP export takes a live KiCad. It points the manifest at its
+own copy of the board first.
+`the_kopper_smoke_export_matches_a_fresh_export` (konnect-core) fails when a fresh
+export differs, and `KONNECT_REWRITE_KOPPER_SMOKE=1` rewrites both files.

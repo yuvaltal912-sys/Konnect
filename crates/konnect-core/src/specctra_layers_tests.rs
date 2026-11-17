@@ -1583,3 +1583,86 @@ fn a_net_with_no_track_width_is_not_widened_and_is_still_refused() {
         .to_string();
     assert!(!error.is_empty());
 }
+
+/// 1 Kopper K3: `cargo xtask kopper-smoke` routes the public pour fixture through a
+/// packaged `konnect`, and needs the fixture exported, which takes a live KiCad
+/// through `export_specctra_dsn`. So the export is tracked beside the board, as
+/// `specctra_pours_routing.dsn` and its `.konnect.json` manifest, with the
+/// manifest's `board_path` reduced to the board's file name (the smoke points it
+/// at its own copy). It is the Rust exporter with the options `export_specctra_dsn`
+/// gives it: pours fixed, widths from intent, and the project's copper-to-edge
+/// and hole clearances. It runs on the saved file under the project's Default
+/// class, not on a live KiCad's text and rules, and not through KiCad's native
+/// exporter. This test exports the board afresh that way and fails when the
+/// tracked pair differs; `KONNECT_REWRITE_KOPPER_SMOKE=1` rewrites it.
+#[test]
+fn the_kopper_smoke_export_matches_a_fresh_export() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let board = fixtures.join("specctra_pours_routing.kicad_pcb");
+    let source = std::fs::read_to_string(&board).unwrap();
+    let tree = parse_sexp(&source).unwrap();
+    let table = top_level_net_table(&tree);
+    let mut rules = IpcEffectiveRoutingRules::new();
+    for fp in tree.find_all("footprint") {
+        for pad in fp.find_all("pad") {
+            if let Some(net) = pad.find("net").and_then(|n| resolve_net(n, &table)) {
+                rules.insert(
+                    net,
+                    IpcRoutingRules {
+                        class_name: "Default".to_string(),
+                        constituents: vec!["Default".to_string()],
+                        track_width_mm: Some(0.25),
+                        clearance_mm: Some(0.2),
+                        via_diameter_mm: Some(0.6),
+                        via_drill_mm: Some(0.3),
+                    },
+                );
+            }
+        }
+    }
+    let project: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(board.with_extension("kicad_pro")).unwrap())
+            .unwrap();
+    let project_um = |key: &str| {
+        project["board"]["design_settings"]["rules"][key]
+            .as_f64()
+            .filter(|mm| mm.is_finite() && *mm > 0.0)
+            .map(|mm| (mm * 1000.0).round() as i64)
+    };
+    let options = ExportOptions {
+        copper_edge_clearance_um: project_um("min_copper_edge_clearance"),
+        hole_clearance_um: project_um("min_hole_clearance"),
+        widths_from_intent: true,
+        ..ExportOptions::default()
+    };
+    assert!(
+        options.copper_edge_clearance_um.is_some() && options.hole_clearance_um.is_some(),
+        "the project sets both clearances"
+    );
+    let snapshot = crate::routing_context::Snapshot::read(&board).unwrap();
+    let bundle = export_dsn_with_context(&board, &source, &rules, &snapshot, options).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
+    assert_eq!(
+        std::path::Path::new(manifest["board_path"].as_str().unwrap()),
+        board.as_path(),
+        "the manifest names the board it was exported from"
+    );
+    manifest["board_path"] = json!("specctra_pours_routing.kicad_pcb");
+    let manifest = serde_json::to_string_pretty(&manifest).unwrap() + "\n";
+    let dsn_path = fixtures.join("specctra_pours_routing.dsn");
+    let manifest_path = fixtures.join("specctra_pours_routing.dsn.konnect.json");
+    if std::env::var_os("KONNECT_REWRITE_KOPPER_SMOKE").is_some() {
+        std::fs::write(&dsn_path, &bundle.dsn).unwrap();
+        std::fs::write(&manifest_path, &manifest).unwrap();
+    }
+    assert!(
+        std::fs::read_to_string(&dsn_path).unwrap() == bundle.dsn,
+        "{} differs from a fresh export; rerun with KONNECT_REWRITE_KOPPER_SMOKE=1",
+        dsn_path.display()
+    );
+    assert!(
+        std::fs::read_to_string(&manifest_path).unwrap() == manifest,
+        "{} differs from a fresh export; rerun with KONNECT_REWRITE_KOPPER_SMOKE=1",
+        manifest_path.display()
+    );
+}
