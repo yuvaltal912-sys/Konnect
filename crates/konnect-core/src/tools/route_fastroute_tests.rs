@@ -1544,6 +1544,7 @@ fn the_status_is_the_judges_when_every_gate_passes() {
     // not in the session, so the router's status stands.
     assert_eq!(judged_status("incomplete", &pass, &full, 2), "incomplete");
     assert_eq!(judged_status("unverified", &pass, &full, 1), "unverified");
+    assert_eq!(judged_status("stopped", &pass, &full, 1), "stopped");
     assert_eq!(
         judged_status("complete", &gates(&["1 unconnected"], &[], &[]), &full, 3),
         "incomplete",
@@ -1673,6 +1674,21 @@ fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
     assert_eq!(drc["status"], "complete_with_gate_failures", "{drc}");
     let reason = drc["completion"]["reason"].as_str().unwrap();
     assert!(!reason.contains(JUDGED_STATUS_NOTE), "{reason}");
+
+    // A failed gate with stitching vias: the gate decides, and no stitching note.
+    search.outcome.runs[0]
+        .judged
+        .as_mut()
+        .unwrap()
+        .measures
+        .stitching_vias = 2;
+    let stitched_drc = result_for(&search);
+    assert_eq!(
+        stitched_drc["status"], "complete_with_gate_failures",
+        "{stitched_drc}"
+    );
+    let reason = stitched_drc["completion"]["reason"].as_str().unwrap();
+    assert!(!reason.contains(&judged_stitched_note(2)), "{reason}");
 }
 
 /// The winner's width report sets `status` as it does for Freerouting: a stretch

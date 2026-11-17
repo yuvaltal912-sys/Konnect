@@ -121,6 +121,9 @@ its own PR, put that build at the default place, then run
 
 ## Known
 
+- On a board where the judge had to add stitching vias to connect a pour,
+  `status` stays fastroute's own. Follow `completion.next_steps`; they include
+  the stitching.
 - Windows and Linux are not supported yet.
 
 Background and every decision: `docs/CREATION_HANDOFF.md`, rows K1 to K4.

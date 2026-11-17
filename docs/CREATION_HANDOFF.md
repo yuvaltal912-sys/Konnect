@@ -294,7 +294,7 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 - `complete_with_width_exceptions` or `unverified` from the winner's width report;
 - `stopped` when the run stopped.
 
-When the judge needed stitching vias, those vias are not in the session, so the router's status stands; `completion.judged.stitching_vias` (new) gives the count and the reason says why. A failed gate decides it as before. The router's count stays in `completion.router_unrouted`, and `completion.reason` adds why the status differs (`JUDGED_STATUS_NOTE`). fastroute's `complete_when` no longer says the status cannot show completion. `cargo xtask kopper-smoke` now also checks that `status` is `complete`: on its fixture the judge adds no stitching via and the session has no width exception, so anything else is a regression. `1-KOPPER.md` drops the "Known" line, and `API_MIGRATIONS.md` says what changed.
+When the judge needed stitching vias, those vias are not in the session, so the router's status stands; `completion.judged.stitching_vias` (new) gives the count and the reason says why. A failed gate decides it as before. The router's count stays in `completion.router_unrouted`, and `completion.reason` adds why the status differs (`JUDGED_STATUS_NOTE`). fastroute's `complete_when` no longer says the status cannot show completion. `cargo xtask kopper-smoke` now also checks that `status` is `complete`: on its fixture the judge added no stitching via and the session had no width exception in both real smoke runs on this branch (`stitching_vias` 0, 13 of 13 checks), so anything else is a regression. `1-KOPPER.md` drops the "Known" line, and `API_MIGRATIONS.md` says what changed.
 
 ## Row K4, 1 Kopper: the user guide
 
@@ -333,7 +333,7 @@ When the judge needed stitching vias, those vias are not in the session, so the 
   - the installed Konnect and the owner's KiCad settings are unchanged.
 - **The export is tracked.** `export_specctra_dsn` needs a live KiCad, so the fixture's export is tracked as `specctra_pours_routing.dsn` and `.dsn.konnect.json`, with `board_path` reduced to the file name; the smoke points it at its own copy. The export is the Rust exporter with the tool's options (widths from intent, the project's edge and hole clearances), run on the saved file under the project's Default class. It is not a live KiCad's text or rules, and not KiCad's native exporter. `the_kopper_smoke_export_matches_a_fresh_export` fails when a fresh export differs, and `KONNECT_REWRITE_KOPPER_SMOKE=1` rewrites the pair.
 
-**Found while running it (not K3's).** On the fixture, the winner passed every judge gate, with 0 unconnected after the refill. Even so, the result's `status` was `incomplete`. The router counts the GND connection the pour makes as unrouted, and `judged_status` keeps the router's status whenever the gates pass. It is recorded for its own fix.
+**Found while running it (not K3's).** On the fixture, the winner passed every judge gate, with 0 unconnected after the refill. Even so, the result's `status` was `incomplete`. The router counts the GND connection the pour makes as unrouted, and `judged_status` keeps the router's status whenever the gates pass. It is recorded for its own fix (fixed in Row JS, D21).
 
 ## Row K2, 1 Kopper: one install command
 
