@@ -50,6 +50,15 @@ pub(crate) const THREADS: u32 = 2;
 /// The default place of the binary, under `HOME` (decision 2).
 pub(crate) const DEFAULT_PATH: &str = ".local/share/fastroute/candidate/fastroute";
 
+/// The file name of a binary packaged next to the Konnect executable (1 Kopper:
+/// `<prefix>/bin/konnect` beside `<prefix>/bin/fastroute`).
+pub(crate) const BUNDLED_NAME: &str = "fastroute";
+
+/// The manifest a 1 Kopper package holds at `<prefix>/`, one folder above the
+/// executables (`cargo xtask kopper-package` writes it). Only an executable inside
+/// such a package looks for a bundled binary.
+pub(crate) const PACKAGE_MANIFEST: &str = "1-kopper.json";
+
 /// The environment variable that names the binary.
 pub(crate) const PATH_VARIABLE: &str = "KONNECT_FASTROUTE";
 
@@ -85,7 +94,7 @@ pub(crate) struct Binary {
     pub sha256: String,
     /// The first line `--version` printed, such as `fastroute 0.1.14`.
     pub version: String,
-    /// What named it: `argument`, `environment`, `user_config` or `default`.
+    /// What named it: `argument`, `environment`, `user_config`, `bundled` or `default`.
     pub source: &'static str,
 }
 
@@ -112,10 +121,13 @@ pub(crate) enum Located {
 
 /// The binary to run: the first of `argument`, the [`PATH_VARIABLE`] environment
 /// variable (`environment` is its value, passed in so tests do not touch the
-/// process environment), `config` (the user config's `routing.fastroute_path`) and
-/// `$HOME/` + [`DEFAULT_PATH`] (`home`). The first source that names a path decides:
-/// a later one is never tried after an earlier one is refused. No other folder is
-/// searched and nothing is downloaded or built.
+/// process environment), `config` (the user config's `routing.fastroute_path`),
+/// `bundled` (a [`BUNDLED_NAME`] file next to the Konnect executable, see
+/// [`bundled_path`]) and `$HOME/` + [`DEFAULT_PATH`] (`home`). `bundled` and the
+/// default place count only when something is there. The first source that names a
+/// path decides: a later one is never tried after an earlier one is refused, so a
+/// broken packaged binary is reported, never passed over for another build. No other
+/// folder is searched and nothing is downloaded or built.
 ///
 /// Refuses with `Unsupported` off macOS and when `/usr/bin/sandbox-exec` is not an
 /// executable file. A named path that is not a regular executable file is `Refused`.
@@ -125,6 +137,7 @@ pub(crate) async fn locate(
     argument: Option<&Path>,
     environment: Option<&str>,
     config: Option<&Path>,
+    bundled: Option<&Path>,
     home: Option<&Path>,
     scratch: &Path,
 ) -> Located {
@@ -148,6 +161,8 @@ pub(crate) async fn locate(
         (PathBuf::from(environment), "environment")
     } else if let Some(config) = config {
         (config.to_path_buf(), "user_config")
+    } else if let Some(bundled) = bundled.filter(|bundled| present(bundled)) {
+        (bundled.to_path_buf(), "bundled")
     } else {
         match std::fs::metadata(&default_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -181,6 +196,27 @@ pub(crate) async fn locate(
             reason: format!("{error:#}"),
         },
     }
+}
+
+/// Where a packaged binary would be for the Konnect executable `exe`: a
+/// [`BUNDLED_NAME`] file in the folder of `exe`'s resolved path, so a link to the
+/// executable finds the package it points into. `None` when `exe` cannot be resolved
+/// or is not inside a 1 Kopper package (no [`PACKAGE_MANIFEST`] one folder up), so an
+/// unrelated `fastroute` that shares a folder with `konnect` is never picked up.
+pub(crate) fn bundled_path(exe: &Path) -> Option<PathBuf> {
+    let bin = exe.canonicalize().ok()?.parent()?.to_path_buf();
+    bin.parent()?
+        .join(PACKAGE_MANIFEST)
+        .is_file()
+        .then(|| bin.join(BUNDLED_NAME))
+}
+
+/// Whether anything (a file, a folder or a link, even a broken one) is at `path`.
+fn present(path: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// Proves `path` is the candidate build. Each step runs sandboxed

@@ -18,7 +18,9 @@ candidate is the default of `route_specctra_dsn`, set by an effort level.
   the budget, with no run cap. Absent, the user config key
   `routing.effort` decides, else `"m"`.
 - **New `fastroute_path`** (fastroute only). Absent, `KONNECT_FASTROUTE`, then
-  the user config key `routing.fastroute_path`, then
+  the user config key `routing.fastroute_path`, then, when the `konnect`
+  executable is inside a 1 Kopper package (`1-kopper.json` one folder up), the
+  package's own `bin/fastroute`, then
   `~/.local/share/fastroute/candidate/fastroute`. The binary must be the
   candidate build (a probe checks every candidate switch); nothing is
   downloaded or built. With none, the call is refused with `setup`, never

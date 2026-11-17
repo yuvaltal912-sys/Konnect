@@ -4,7 +4,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-17 (Row K1, 1 Kopper: simulation off by default, open as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74); see its section). Before that 2026-11-17 (Row BN merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72), fastroute x18 in [#73](https://github.com/yuvaltal912-sys/Konnect/pull/73); see its section). Before that 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 269 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
+**Last updated:** 2026-11-17 (Row K2, 1 Kopper: one install command; see its section). Before that 2026-11-17 (Row K1, simulation off by default, merged as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74)). Before that 2026-11-17 (Row BN merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72), fastroute x18 in [#73](https://github.com/yuvaltal912-sys/Konnect/pull/73); see its section). Before that 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 269 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
 
 ## Start here
 
@@ -91,7 +91,9 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 
 ## Next: what to pick
 
-**Now (2026-11-17, Row K1).** 1 Kopper's first PR, open as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74) on branch `claude/1kopper-k1-hide-simulation`; see "Row K1". Its merge waits for the owner's word. K2 to K4 follow, one at a time, each on the owner's word.
+**Now (2026-11-17, Row K2).** 1 Kopper's second PR, on branch `claude/1kopper-k2-package`; see "Row K2". Its PR text waits for the owner's yes. K3 and K4 follow, one at a time, each on the owner's word.
+
+**Row K1** merged on 2026-11-17 as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74) (main `3d585574`).
 
 **Now (2026-11-17, Row BN).** Best-of-N routing with fastroute merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72) (`1c11922a`); the candidate is fastroute x18 since 2026-11-17 ([#73](https://github.com/yuvaltal912-sys/Konnect/pull/73), `6570e3d4`). See "Row BN".
 
@@ -262,7 +264,7 @@ The plan is four PRs:
 - **K3** is a smoke test of the package.
 - **K4** is the docs.
 
-**State, 2026-11-17.** Branch `claude/1kopper-k1-hide-simulation`, base `fork/main` `1c11922a` (#72), with main `6570e3d4` (#73) merged in. Open as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74); its merge waits for the owner's word.
+**State, 2026-11-17.** Merged on the owner's word as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74): main `3d585574`, a noreply merge whose tree equals the PR head `ed24beaa` (branch `claude/1kopper-k1-hide-simulation`, base `1c11922a`, with main `6570e3d4` (#73) merged in).
 
 **What K1 changes.** A config key `simulation_enabled`, default `false` (`crates/konnect/src/config.rs`). When it is off, `main.rs` calls `McpHandler::hide_toolset("simulation", …)`, which calls `ToolRouter::hide`. Then:
 - `list_toolboxes` leaves the toolset out, and `all_toolsets` is the filtered list.
@@ -275,12 +277,46 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **Evidence.** Recorded in the PR description: the targeted tests, one negative control per guard, the independent review and the full gate.
 
+## Row K2, 1 Kopper: one install command
+
+**State, 2026-11-17.** Branch `claude/1kopper-k2-package`, worktree `/Users/yuvaltal/ClaudeCode/Konnect-k2`, base `fork/main` `3d585574` (#74). Not pushed; the PR text waits for the owner's yes.
+
+**What K2 adds.**
+- **`cargo xtask kopper-install`**, the one command the owner asked for (2026-11-17, "תארוז את כולם בתוך פקודה אחת"). It runs these steps:
+  0. Before it writes anything, it refuses:
+     - a Claude entry that is not a stdio entry with a `command`;
+     - a Codex `konnect` table whose `command` is not one plain quoted string alone on its line;
+     - `CLAUDE_CONFIG_DIR` set;
+     - `claude` not on `PATH`;
+     - a way-back record that does not read.
+  1. It packages, as `kopper-package` below does.
+  2. It reads the entries again, then records the first original of each client: Claude's user entry in `~/.claude.json`, and Codex's `[mcp_servers.konnect]` command in `$CODEX_HOME/config.toml` (default `~/.codex`). The record is `<prefix>.rollback.json`, mode 0600, and an original is never overwritten. An entry that runs a 1 Kopper package, even one since removed, is never taken for an original.
+  3. It runs the package's `konnect init` for Claude, and for Codex when Codex has an entry.
+  4. It points both entries at `<prefix>/bin/konnect`:
+     - Claude goes through `claude mcp remove` and `claude mcp add-json`, keeping the entry's other fields. A failed add puts the earlier entry back.
+     - For Codex it rewrites that one `command` line in place. It keeps the line ending, the mode and any link to the file, and keeps the file as it was before the first switch as `config.toml.before-1-kopper`.
+- **`cargo xtask kopper-install --rollback [--prefix <dir>]`** puts every recorded entry back first, then runs each recorded `konnect` binary's `init`. A failure does not stop the rest, and it keeps the record for another try. A rollback that fully succeeds sets the record aside as `.rollback.json.used`. A new client session picks up either change.
+- **`cargo xtask kopper-package`** builds the release, then copies it and the fastroute build pinned in `packaging/1-kopper/fastroute.json` (x18, SHA-256 checked) to `~/.local/share/1-kopper/bin/`. It writes `1-kopper.json` with both hashes. A package already there is kept as `1-kopper.previous`. Before it writes anything, it refuses:
+  - any prefix in, over or holding the installed Konnect, under `HOME` and under the account's own home;
+  - a relative prefix, or one with `..`;
+  - a folder that is not an earlier package, at the prefix or at `.previous`;
+  - a `.new` or `.old` left from an interrupted run.
+  It never runs fastroute.
+- **Konnect** takes a `fastroute` next to its resolved executable only when the executable is inside a package (`1-kopper.json` one folder up). This source comes after the user config and before the default place. A broken bundled build is refused, never passed over for the default one.
+- **`konnect init` and `status`** read `simulation_enabled` the way the server does: `--config`, else the usual search. When simulation is off:
+  - `init` skips the `kicad-simulation` skill and removes a copy that an earlier install left;
+  - the server's guidance check leaves the skill out;
+  - `uninstall` still removes it.
+  `status` warns on a configuration that does not load and checks every skill, while `init` refuses one.
+
+**Evidence.** Recorded in the PR description: the targeted tests, a negative control per guard, the independent review and the full gate.
+
 ## Row BN, best-of-N routing with fastroute
 
 **State, 2026-11-17.** Merged on the owner's word as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72): main `1c11922a`, a noreply merge whose tree equals the PR head `d52026e7`. The branch was `claude/route-best-of-n`, from `fork/main` `40517d4c` with `6224b579` (#71) merged in: `ff7d9e3e` (feature), `ee146254` (merge), `9f70e67f` (first review round, fastroute x15), `bb904343` (no run cap, fastroute x17), `fe81a441` (second review round), `d52026e7` (gate record). The follow-up branch `claude/route-best-of-n-x18` names fastroute x18 and records the pic rerun on it (below). The design and every decision (D1 to D20) are in [`ROUTE_SEARCH_DESIGN.md`](ROUTE_SEARCH_DESIGN.md).
 
 - **What it does:** `route_specctra_dsn` routes with fastroute by default. One call runs many fastroute runs (seed variants of the placement order, and both pour shapes when the DSN has planes) in parallel within the effort level's budget (`effort`: `fast` 2 runs, `m` 240 s, `h` 720 s, `xh` 2400 s). Konnect judges each run itself on a scratch copy of the board (apply the session, refill, DRC, stitching rounds, layout audit) and picks the winner by three absolute gates (G1 complete, G2 no DRC rule worse than the unrouted board, G3 widths) and then a rank key. `engine: "freerouting"` keeps the old path.
-- **fastroute:** the candidate build x18 since 2026-11-17 (engine commit `1e94751`, SHA-256 `ea0334db…`; x17 was `5e7c0348`, `a3cf7852…`). Konnect pins no build: it finds the binary at `~/.local/share/fastroute/candidate/fastroute` unless `fastroute_path`, `KONNECT_FASTROUTE` or `routing.fastroute_path` names another. A probe proves it is the candidate before routing. It runs only as a separate process under `sandbox-exec` (no network, scratch home), never with `--live`.
+- **fastroute:** the candidate build x18 since 2026-11-17 (engine commit `1e94751`, SHA-256 `ea0334db…`; x17 was `5e7c0348`, `a3cf7852…`). Konnect pins no build: it finds the binary at `~/.local/share/fastroute/candidate/fastroute` unless `fastroute_path`, `KONNECT_FASTROUTE` or `routing.fastroute_path` names another, or (since Row K2) the executable is inside a 1 Kopper package, whose own `bin/fastroute` it takes. A probe proves it is the candidate before routing. It runs only as a separate process under `sandbox-exec` (no network, scratch home), never with `--live`.
 - **Safety:** the user's board and project are never written during the search; the judge's kicad-cli runs on a private copy of the KiCad settings, one per judge (D17); a hung run is killed at the hang cap and never wins; runs outside the 8 best are released during the search, and every run but the winner is reduced to its record at the end (D14, D19); the result lists the 20 best runs and counts every outcome, and `search.json` lists every run (D20).
 
 **Verified (2026-11-16).**

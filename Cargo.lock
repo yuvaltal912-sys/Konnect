@@ -5326,6 +5326,10 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "konnect-core",
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

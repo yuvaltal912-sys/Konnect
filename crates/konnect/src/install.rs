@@ -3,7 +3,7 @@
 //! Handles explicit client-scoped install, uninstall, status, and Claude hook
 //! integration without writing into another client's directories.
 
-use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
+use crate::manifest::{SkillManifest, AGENTS, HOOK_SKILLS, SKILLS};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -68,8 +68,8 @@ pub fn client_from_args(args: &[String]) -> Result<InstallClient> {
     client_from_args_allowing(args, &[])
 }
 
-/// As [`client_from_args`], for the server invocation — which also carries
-/// `--config <path>`, parsed elsewhere in `main`.
+/// As [`client_from_args`], for the server invocation, `init` and `status`,
+/// which also carry `--config <path>`, parsed elsewhere in `main`.
 pub fn client_from_server_args(args: &[String]) -> Result<InstallClient> {
     client_from_args_allowing(args, &["--config"])
 }
@@ -99,16 +99,24 @@ fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallCl
     Ok(selected.unwrap_or_default())
 }
 
-pub fn run_install(client: InstallClient) -> Result<()> {
-    run_install_at(client, &InstallPaths::for_current_user()?, true)
+/// The skill that teaches simulation. Konnect installs it only for a server that
+/// serves simulation (`simulation_enabled`, 1 Kopper K1 and K2).
+pub(crate) const SIMULATION_SKILL: &str = "kicad-simulation";
+
+/// `simulation` is the configuration's `simulation_enabled`: off, the simulation
+/// skill is not installed, and one an earlier install left is removed.
+pub fn run_install(client: InstallClient, simulation: bool) -> Result<()> {
+    run_install_at(client, &InstallPaths::for_current_user(simulation)?, true)
 }
 
+/// Removes every skill name Konnect owns, the simulation skill included, whatever
+/// the configuration says.
 pub fn run_uninstall(client: InstallClient) -> Result<()> {
-    run_uninstall_at(client, &InstallPaths::for_current_user()?, true)
+    run_uninstall_at(client, &InstallPaths::for_current_user(true)?, true)
 }
 
-pub fn print_status(client: InstallClient) -> Result<()> {
-    print_status_at(client, &InstallPaths::for_current_user()?)
+pub fn print_status(client: InstallClient, simulation: bool) -> Result<()> {
+    print_status_at(client, &InstallPaths::for_current_user(simulation)?)
 }
 
 /// Print bundled guidance for Claude hook integration.
@@ -211,12 +219,12 @@ fn legacy_hook_command_tail(hook_name: &str) -> String {
 }
 
 /// Double-click behavior remains Claude-focused for backward compatibility.
-pub fn run_double_click_install() -> Result<()> {
+pub fn run_double_click_install(simulation: bool) -> Result<()> {
     println!("===========================================");
     println!("  Konnect v{}", env!("CARGO_PKG_VERSION"));
     println!("  First-time Setup");
     println!("===========================================\n");
-    run_install(InstallClient::Claude)?;
+    run_install(InstallClient::Claude, simulation)?;
 
     let exe = std::env::current_exe()?;
     let exe_str = exe.to_string_lossy().replace('\\', "\\\\");
@@ -240,13 +248,25 @@ pub fn run_double_click_install() -> Result<()> {
 #[derive(Debug)]
 struct InstallPaths {
     home: PathBuf,
+    /// Whether the server serves simulation. Off, [`SIMULATION_SKILL`] is not one of
+    /// the files Konnect installs or checks.
+    simulation: bool,
 }
 
 impl InstallPaths {
-    fn for_current_user() -> Result<Self> {
+    fn for_current_user(simulation: bool) -> Result<Self> {
         Ok(Self {
             home: dirs::home_dir().context("could not locate home directory")?,
+            simulation,
         })
+    }
+
+    /// The skills this install owns: every bundled one, less the simulation skill
+    /// when simulation is off.
+    fn served_skills(&self) -> impl Iterator<Item = &'static SkillManifest> + '_ {
+        SKILLS
+            .iter()
+            .filter(|skill| self.simulation || skill.name != SIMULATION_SKILL)
     }
 
     fn data_dir(&self) -> PathBuf {
@@ -368,7 +388,7 @@ struct ManagedFile {
 fn managed_files(client: InstallClient, paths: &InstallPaths) -> Vec<ManagedFile> {
     let mut files = Vec::new();
     let skills_dir = paths.skills_dir(client);
-    for skill in SKILLS {
+    for skill in paths.served_skills() {
         let dir = skills_dir.join(skill.name);
         files.push(ManagedFile {
             kind: "skill",
@@ -414,11 +434,29 @@ fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
         }
     }
     if verbose {
-        for skill in SKILLS {
+        for skill in paths.served_skills() {
             println!("  [+] Skill: {}", skill.name);
         }
     }
-    Ok(SKILLS.len())
+    if !paths.simulation {
+        // The name is Konnect's (uninstall removes it the same way); an install made
+        // while simulation was served left it, and it would teach tools this server
+        // does not serve.
+        let retired = paths.skills_dir(client).join(SIMULATION_SKILL);
+        if let Ok(meta) = fs::symlink_metadata(&retired) {
+            if meta.is_dir() {
+                fs::remove_dir_all(&retired)
+            } else {
+                // a link is removed as a link, never followed
+                fs::remove_file(&retired)
+            }
+            .with_context(|| format!("remove {}", retired.display()))?;
+            if verbose {
+                println!("  [-] Skill: {SIMULATION_SKILL} removed (simulation is off)");
+            }
+        }
+    }
+    Ok(paths.served_skills().count())
 }
 
 fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
@@ -913,9 +951,11 @@ struct GuidanceReading {
 }
 
 impl InstalledGuidanceProbe {
-    pub fn for_current_user() -> Result<Self> {
+    /// `simulation` as for [`run_install`]: the guidance a server checks is the
+    /// guidance its own configuration installs.
+    pub fn for_current_user(simulation: bool) -> Result<Self> {
         Ok(Self::at(
-            InstallPaths::for_current_user()?,
+            InstallPaths::for_current_user(simulation)?,
             std::env::current_exe()?.to_string_lossy().into_owned(),
         ))
     }
@@ -1206,6 +1246,7 @@ mod tests {
     fn test_paths(temp: &TempDir) -> InstallPaths {
         InstallPaths {
             home: temp.path().to_path_buf(),
+            simulation: true,
         }
     }
 
@@ -1757,6 +1798,63 @@ mod tests {
 
         let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
         assert_eq!(codex.state().as_str(), "not_installed");
+    }
+
+    /// 1 Kopper K2: with simulation off, `init` installs every skill but the
+    /// simulation one and removes one an earlier install left, and the guidance
+    /// reads current without it. `uninstall` still removes the simulation skill.
+    #[test]
+    fn simulation_off_installs_and_checks_no_simulation_skill() {
+        let temp = TempDir::new().unwrap();
+        let on = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &on, false).unwrap();
+        let left = on.skills_dir(InstallClient::Claude).join(SIMULATION_SKILL);
+        assert!(left.join("SKILL.md").is_file(), "on, it is installed");
+
+        let off = InstallPaths {
+            simulation: false,
+            ..test_paths(&temp)
+        };
+        run_install_at(InstallClient::Claude, &off, false).unwrap();
+        assert!(!left.exists(), "off, the earlier install's copy is removed");
+        for skill in SKILLS.iter().filter(|skill| skill.name != SIMULATION_SKILL) {
+            let dir = off.skills_dir(InstallClient::Claude).join(skill.name);
+            assert!(dir.join("SKILL.md").is_file(), "{}", skill.name);
+        }
+        let guidance = inspect_guidance(InstallClient::Claude, &off, &this_exe());
+        assert!(guidance
+            .files
+            .iter()
+            .all(|file| !file.name.starts_with(SIMULATION_SKILL)));
+        assert_eq!(guidance.state().as_str(), "current");
+        assert_eq!(guidance.notice(), None);
+        // The same folder, read for a server that serves simulation, lacks it.
+        let served = inspect_guidance(InstallClient::Claude, &on, &this_exe());
+        assert_eq!(served.state().as_str(), "out_of_sync");
+
+        // A plain file or a link at the name is removed as itself.
+        fs::write(&left, "a file").unwrap();
+        run_install_at(InstallClient::Claude, &off, false).unwrap();
+        assert!(fs::symlink_metadata(&left).is_err(), "a file is removed");
+        let target = temp.path().join("kept");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &left).unwrap();
+        run_install_at(InstallClient::Claude, &off, false).unwrap();
+        assert!(fs::symlink_metadata(&left).is_err(), "a link is removed");
+        assert!(target.is_dir(), "never followed");
+
+        fs::create_dir_all(&left).unwrap();
+        fs::write(left.join("SKILL.md"), "left").unwrap();
+        run_uninstall_at(InstallClient::Claude, &off, false).unwrap();
+        assert!(
+            !left.exists(),
+            "uninstall removes it whatever the configuration"
+        );
+    }
+
+    #[test]
+    fn the_simulation_skill_is_bundled_under_its_name() {
+        assert!(SKILLS.iter().any(|skill| skill.name == SIMULATION_SKILL));
     }
 
     /// The machine #728 was measured on: a 0.2.2 legacy marker, a skill
