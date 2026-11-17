@@ -1442,7 +1442,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x17);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x18);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a

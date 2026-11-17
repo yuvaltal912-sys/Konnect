@@ -9,10 +9,12 @@ PR #71's export changes.
 ## What the owner asked for
 
 - Best-of-N routing is the default of `route_specctra_dsn` in this fork.
-- The engine is the fastroute candidate (C\*\* + BR1 + W8P). Build x17 since 2026-11-16 (x14 plus
+- The engine is the fastroute candidate (C\*\* + BR1 + W8P). Build x18 since 2026-11-17 (x14 plus
   C1: wires and vias read back from a session keep their own net class's clearance; C1b: an
   imported via takes its via rule's clearance class; C1c: with no or an empty via rule, class
-  1, as the autorouter does; engine commit 5e7c0348); the switches are unchanged from x14.
+  1, as the autorouter does; W1: a wire that collapses to one point is not written to the
+  session, which Konnect's importer refused; engine commit 1e94751); the switches are
+  unchanged from x14. x17 (engine commit 5e7c0348) was the build from 2026-11-16.
 - The user picks an effort level: Fast, M, H, XH. Budgets per board, runs in parallel:
   Fast = 2 runs at once, M = 4 min, H = 12 min, XH = 40 min (the owner's "double the first
   proposal" of 1 run / 2 / 6 / 20 min; he confirmed this reading on 2026-11-16).
@@ -80,7 +82,7 @@ next steps (`completion.next_steps`), as row S6 decided: no hidden write path.
    one fixed place, `~/.local/share/fastroute/candidate/fastroute`; the `fastroute_path`
    argument, the environment variable `KONNECT_FASTROUTE` and the user config key
    `routing.fastroute_path` override it, in that order. Before routing, a probe proves the
-   binary is the candidate build (every candidate switch is accepted). On this Mac the x17
+   binary is the candidate build (every candidate switch is accepted). On this Mac the x18
    build is copied once to that place (it lives in a research worktree today). fastroute
    still runs as its own process, for technical reasons only: a hung run (2 of 100 seeds in
    the research) can be killed only as a process, the no-network sandbox applies to a
@@ -119,8 +121,8 @@ Bodies say what they must do. `Result` is `anyhow::Result` unless named.
 //! killed, the run can be sandboxed off the network, and parallel runs keep their memory
 //! apart.
 
-/// The candidate the owner chose on 2026-11-16 (C** + BR1 + W8P; build x17, engine commit
-/// 5e7c0348, the same switches as x14). Sent on every pass, in this order.
+/// The candidate the owner chose on 2026-11-16 (C** + BR1 + W8P; build x18, engine commit
+/// 1e94751, the same switches as x14). Sent on every pass, in this order.
 pub(crate) const CANDIDATE_SWITCHES: &[&str] = &[
     "--no-time-limits", "--x.no_clock", "--x.par_vias=340", "--x.work_cap=2000000",
     "--x.par_vias_noacute", "--x.bridge_full_width", "--x.par_vias_net",
