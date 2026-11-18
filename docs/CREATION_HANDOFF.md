@@ -285,7 +285,7 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 ## Row KE, the `kopper` entry skill
 
-**State, 2026-11-18.** Branch `claude/kopper1-entry-skill`, worktree `/Users/yuvaltal/ClaudeCode/Konnect-plugin`, base `fork/main` `a0281a9a` (#82). Not pushed; the PR text waits for the owner's yes.
+**State, 2026-11-18.** Branch `claude/kopper1-entry-skill`, worktree `/Users/yuvaltal/ClaudeCode/Kopper1` (renamed from `Konnect-plugin` on the owner's word), base `fork/main` `a0281a9a` (#82). Not pushed; the PR text waits for the owner's yes.
 
 **Why.** In Codex, `@kopper1` calls the whole plugin. Claude has no command that loads a plugin at once, so the owner asked for one entry point there.
 
@@ -297,8 +297,9 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 **Verified, 2026-11-18.**
 - `cargo test -p konnect --locked --bin konnect`: 105 passed, 0 failed.
 - Negative controls: 5 of 5 caught. The five breaks were a dropped table row, a skill that is not bundled, the skill named `kopper1`, `konnect` not loaded first, and a `|` block description. The source was restored byte for byte.
-- Independent review: sound, with two notes, both fixed (README count, this record).
-- Gate on `200f0e47`: tests 4923 passed, 0 failed; sandboxed 33; fmt, doc tests, clippy, `deny`, `fix-doc-counts` and the release build green; installed hash and KiCad settings unchanged. `simulation_live` 94/95: the known `ibis` demo flake failed and passed alone.
+- Independent review: sound, with two notes, both fixed in `e30ddae6` (README count, this record).
+- Gate on `e30ddae6`: tests 4923 (the known IPC handshake flake failed once and passed alone); sandboxed 33; `simulation_live` 95/95; fmt, doc tests, clippy, `deny`, `fix-doc-counts` and the release build green; installed hash and KiCad settings unchanged.
+- `konnect init` and `init --client codex` on a scratch home holding a copy of the owner's plugins: `kopper` lands in both plugins and in Codex's installed copy, a file the owner put in the plugin folder stays, and `status` reads current for both.
 
 ## Row KP, the kopper1 plugin
 
