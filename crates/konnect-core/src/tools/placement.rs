@@ -4613,4 +4613,273 @@ mod tests {
         .unwrap();
         assert!(result.is_error);
     }
+
+    // ─── Goldens for the pull-out (Row PS, stage A) ──────────────────────────
+    //
+    // The force core and the score evaluation were pulled out of their handlers
+    // with no change to either tool's output. These tests hold the two handlers to
+    // the exact response text recorded from the code as it was before the pull-out
+    // (`fork/main` c79e1421). The outputs hold no temp path or other run-dependent
+    // value, so nothing is normalised: the text is compared byte for byte.
+    //
+    // To record again (only ever from code whose output is meant to be the new
+    // truth): `cargo test -p konnect-core --lib -- --ignored record_pull_out_goldens`.
+
+    const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/placement/fixtures");
+
+    fn golden_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(GOLDEN_DIR).join(format!("{name}.json"))
+    }
+
+    /// The tool's response text, which must be a success.
+    fn success_text(result: &CallToolResult) -> String {
+        assert!(!result.is_error, "the tool errored: {result:?}");
+        result_text(result).to_string()
+    }
+
+    /// `refine_placement_force_directed`'s response text for six cases, by name.
+    async fn force_directed_golden_cases() -> Vec<(&'static str, String)> {
+        let mut cases = Vec::new();
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let ctx = test_ctx();
+        let run = |name: &'static str, args: serde_json::Value| {
+            let ctx = &ctx;
+            async move {
+                (
+                    name,
+                    success_text(&handle_force_directed(&args, ctx).await.unwrap()),
+                )
+            }
+        };
+        cases.push(run("default", json!({ "board": board.to_string_lossy() })).await);
+        cases.push(
+            run(
+                "locked_u1",
+                json!({ "board": board.to_string_lossy(), "locked": ["U1"] }),
+            )
+            .await,
+        );
+        cases.push(
+            run(
+                "c1_only_max_displacement_50",
+                json!({
+                    "board": board.to_string_lossy(),
+                    "references": ["C1"],
+                    "max_displacement_mm": 50.0,
+                }),
+            )
+            .await,
+        );
+        cases.push(
+            run(
+                "iterations_50",
+                json!({ "board": board.to_string_lossy(), "iterations": 50 }),
+            )
+            .await,
+        );
+
+        let far_dir = tempfile::tempdir().unwrap();
+        let far_board = write_variant(
+            &far_dir,
+            "far_cap_refinement.kicad_pcb",
+            fixture_with_moved_root("(at 20 15)", "(at 50 40)"),
+        );
+        cases.push(
+            run(
+                "far_cap_dry_run",
+                json!({
+                    "board": far_board.to_string_lossy(),
+                    "references": ["C1"],
+                    "max_displacement_mm": 50.0,
+                }),
+            )
+            .await,
+        );
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        let locked_board = fixture_copy(&locked_dir);
+        lock_footprint(&locked_board, "U1");
+        cases.push(
+            run(
+                "kicad_locked_u1",
+                json!({ "board": locked_board.to_string_lossy() }),
+            )
+            .await,
+        );
+        cases
+    }
+
+    /// `score_placement`'s response text for every scoring fixture the tests above
+    /// build: the stock rectangle (also with a fanout limit of 2), the rounded board
+    /// with a cut-out (also with the connectors listed as edge mounts), the closed
+    /// polygon, the two-resistor board, a missing outline, an open outline, an
+    /// overlap, a part outside, a connector too far from every edge, and the decoupling
+    /// variants (ground only, interface filter, far from both, a foreign connector, both
+    /// faces of a through-hole and of a surface-mount connector, a connector cap on
+    /// ground only, an uncoupled connector cap, within both limits, the 1 uF family).
+    async fn score_golden_cases() -> Vec<(&'static str, String)> {
+        const TWO_R: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let dir = tempfile::tempdir().unwrap();
+        let stock = std::fs::read_to_string(FIXTURE).unwrap();
+        let moved_cap = fixture_with_moved_root("(at 20 15)", "(at 6.27 17.7)");
+        let in_dir = |name: &str, content: String| write_variant(&dir, name, content);
+
+        // (name, board, extra arguments)
+        let mut boards: Vec<(&'static str, std::path::PathBuf, serde_json::Value)> = vec![
+            ("rectangle", std::path::PathBuf::from(FIXTURE), json!({})),
+            (
+                "rectangle_fanout_2",
+                std::path::PathBuf::from(FIXTURE),
+                json!({ "max_net_references": 2 }),
+            ),
+            (
+                "rounded_cutout",
+                std::path::PathBuf::from(GEOMETRY_FIXTURE),
+                json!({}),
+            ),
+            (
+                "rounded_cutout_edge_mount",
+                std::path::PathBuf::from(GEOMETRY_FIXTURE),
+                json!({ "edge_mount_references": ["J*"] }),
+            ),
+            (
+                "closed_polygon",
+                std::path::PathBuf::from(GR_POLY_FIXTURE),
+                json!({}),
+            ),
+            (
+                "two_resistors",
+                in_dir("two_resistors.kicad_pcb", TWO_R.to_string()),
+                json!({}),
+            ),
+        ];
+        let variants: Vec<(&'static str, String)> = vec![
+            (
+                "missing_outline",
+                stock.replace("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")"),
+            ),
+            (
+                "open_outline",
+                stock.replacen("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")", 1),
+            ),
+            ("overlap", stock.replace("(at 30 15 90)", "(at 20 15 90)")),
+            ("outside", stock.replace("(at 20 15)", "(at 200 15)")),
+            (
+                "decoupling_ground_only",
+                rewrite_footprint_nets(&stock, "C1", &[("VCC", "/SIG_IN")]),
+            ),
+            (
+                "connector_far_from_every_edge",
+                fixture_with_moved_root("(at 5 20 90)", "(at 12 33 90)"),
+            ),
+            ("decoupling_interface_filter", moved_cap.clone()),
+            (
+                "decoupling_far_from_both",
+                fixture_with_moved_root("(at 20 15)", "(at 18 20)"),
+            ),
+            (
+                "decoupling_foreign_connector",
+                rewrite_footprint_nets(
+                    &moved_cap,
+                    "J1",
+                    &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
+                ),
+            ),
+            (
+                "decoupling_far_face_through_hole",
+                flip_footprint_to_back(&moved_cap, "C1"),
+            ),
+            (
+                "decoupling_far_face_surface_mount",
+                make_pads_surface_mount(&flip_footprint_to_back(&moved_cap, "C1"), "J1"),
+            ),
+            (
+                "decoupling_connector_ground_only",
+                rewrite_footprint_nets(&moved_cap, "J1", &[("VCC", "/SIG_IN")]),
+            ),
+            (
+                "decoupling_connector_cap_uncoupled",
+                rewrite_footprint_nets(
+                    &moved_cap,
+                    "C1",
+                    &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
+                ),
+            ),
+            ("decoupling_within_both_limits", {
+                let moved_ic = fixture_with_moved_root("(at 25 20)", "(at 9.975 14.095 180)");
+                moved_ic.replace("(at 20 15)", "(at 6.27 17.7)")
+            }),
+            (
+                "decoupling_bulk_family",
+                rewrite_footprint_value(
+                    &fixture_with_moved_root("(at 20 15)", "(at 6.27 16)"),
+                    "C1",
+                    "100nF",
+                    "1uF",
+                ),
+            ),
+        ];
+        for (name, content) in variants {
+            boards.push((
+                name,
+                in_dir(&format!("{name}.kicad_pcb"), content),
+                json!({}),
+            ));
+        }
+
+        let ctx = test_ctx();
+        let mut cases = Vec::new();
+        for (name, board, extra) in boards {
+            let mut args = json!({ "board": board.to_string_lossy() });
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            let result = handle_score_placement(&args, &ctx).await.unwrap();
+            cases.push((name, success_text(&result)));
+        }
+        cases
+    }
+
+    /// One-off recorder: writes the goldens below `GOLDEN_DIR` from the code as it
+    /// stands. Ignored, so a normal run never rewrites its own yardstick.
+    #[tokio::test]
+    #[ignore = "records the golden files; run once, on the code whose output is the truth"]
+    async fn record_pull_out_goldens() {
+        std::fs::create_dir_all(GOLDEN_DIR).unwrap();
+        for (name, text) in force_directed_golden_cases().await {
+            std::fs::write(golden_path(&format!("force_directed_{name}")), text).unwrap();
+        }
+        for (name, text) in score_golden_cases().await {
+            std::fs::write(golden_path(&format!("score_{name}")), text).unwrap();
+        }
+    }
+
+    fn assert_matches_golden(name: &str, text: &str) {
+        let path = golden_path(name);
+        let golden = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("golden {} unreadable: {error}", path.display()));
+        assert_eq!(
+            text, golden,
+            "{name}: the tool's output changed from the recorded golden"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_directed_output_is_unchanged_by_the_pull_out() {
+        let cases = force_directed_golden_cases().await;
+        assert_eq!(cases.len(), 6, "the six cases of the design");
+        for (name, text) in &cases {
+            assert_matches_golden(&format!("force_directed_{name}"), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn score_placement_output_is_unchanged_by_the_pull_out() {
+        let cases = score_golden_cases().await;
+        assert_eq!(cases.len(), 21, "every scoring fixture listed above");
+        for (name, text) in &cases {
+            assert_matches_golden(&format!("score_{name}"), text);
+        }
+    }
 }
