@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 3;
+pub(crate) const GENERATOR_VERSION: u32 = 4;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -141,6 +141,9 @@ pub(crate) struct BoardModel {
     /// sets it from the input board's score, so a model of another origin judges every
     /// failure as new.
     pub input_failures: Vec<FailureKey>,
+    /// The clearances `legalize` keeps beyond the courtyards; 0 from `board_model`, set by
+    /// `place_search::search` from its routing inputs.
+    pub clearances: Clearances,
 }
 
 /// Builds the model. Refuses a text whose SHA-256 is not `held.board_sha256`, a scan
@@ -246,7 +249,64 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
         footprint_ids,
         pad_counts,
         input_failures: Vec::new(),
+        clearances: Clearances::default(),
     })
+}
+
+/// The two clearances `legalize` keeps beyond the courtyards, set by the search from the
+/// project's rules (`Clearances::from_inputs`) and 0 where nobody set them (tests, a
+/// model of another origin).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub(crate) struct Clearances {
+    /// What a moved part keeps from a settled one when either box is not a real
+    /// courtyard (`CourtyardSource::Courtyard`): the largest `clearance_mm` of the
+    /// board's rules plus `SOLDER_MASK_MARGIN_MM`. Two real courtyards keep only
+    /// `MOVED_CLEARANCE_MM`: a courtyard already carries its pad clearance, and
+    /// courtyards are meant to touch.
+    pub part_gap_mm: f64,
+    /// How far inside the true outline a moved part's box must lie: the project's
+    /// copper-to-edge clearance.
+    pub edge_mm: f64,
+}
+
+/// Added to the largest clearance for the solder-mask bridge between pads of different
+/// nets.
+pub(crate) const SOLDER_MASK_MARGIN_MM: f64 = 0.1;
+
+impl Clearances {
+    /// From the routing inputs: `part_gap_mm` the largest `clearance_mm` of `rules` plus
+    /// `SOLDER_MASK_MARGIN_MM` (0 when no rule gives one), `edge_mm` the options'
+    /// `copper_edge_clearance_um` in mm (0 when absent).
+    pub(crate) fn from_inputs(
+        rules: &konnect_ipc::types::IpcEffectiveRoutingRules,
+        options: &crate::specctra::ExportOptions,
+    ) -> Self {
+        let largest = rules
+            .values()
+            .filter_map(|rule| rule.clearance_mm)
+            .filter(|mm| mm.is_finite() && *mm > 0.0)
+            .fold(None, |acc: Option<f64>, mm| {
+                Some(acc.map_or(mm, |a| a.max(mm)))
+            });
+        Clearances {
+            part_gap_mm: largest.map_or(0.0, |mm| mm + SOLDER_MASK_MARGIN_MM),
+            edge_mm: options
+                .copper_edge_clearance_um
+                .map_or(0.0, |um| (um as f64 / 1000.0).max(0.0)),
+        }
+    }
+
+    /// The gap a moved part `a` keeps from the settled part `b`.
+    fn gap_between(&self, a: &FootprintCourtyard, b: &FootprintCourtyard) -> f64 {
+        use konnect_sexp::board::CourtyardSource;
+        if a.bbox_source == CourtyardSource::Courtyard
+            && b.bbox_source == CourtyardSource::Courtyard
+        {
+            MOVED_CLEARANCE_MM
+        } else {
+            MOVED_CLEARANCE_MM.max(self.part_gap_mm)
+        }
+    }
 }
 
 /// One generated placement: an absolute anchor and rotation for every movable part that
@@ -933,9 +993,13 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 /// hard failures. All of them settle first, with the held parts. Only a part that
 /// moved or turned must be inside the true outline and clear of every settled part,
 /// moved or not, held or not, by 2 µm (`MOVED_CLEARANCE_MM`), so that rounding of the
-/// anchors to 1 µm in the written board cannot turn a touch into an overlap. Cells are
-/// ordered by distance, the ring's cells in a fixed order, so the result is the same on
-/// every run.
+/// anchors to 1 µm in the written board cannot turn a touch into an overlap, and by
+/// `part_gap_mm` when either of the two boxes is not a real courtyard (a footprint
+/// without one is bounded by its pads, which a 2 µm gap leaves touching: see
+/// `Clearances`). A moved part's box also lies `edge_mm` inside the true outline: the
+/// box grown by `edge_mm` on every side must have no overhang (a square growth, a little
+/// more than the Euclidean distance at a rounded corner). Cells are ordered by distance,
+/// the ring's cells in a fixed order, so the result is the same on every run.
 pub(crate) fn legalize(
     model: &BoardModel,
     sizes: &[(f64, f64)],
@@ -952,40 +1016,46 @@ pub(crate) fn legalize(
     let read_centres = as_read_centres(model);
     let read_sizes = as_read_sizes(model);
 
-    // `gate` is how much the two boxes must overlap, per axis, to count as overlapping:
-    // above minus `MOVED_CLEARANCE_MM` (touching, or nearer than 2 µm, is overlapping).
-    let legal_at =
-        |i: usize, at: (f64, f64), gate: f64, settled: &[usize], centres: &[(f64, f64)]| {
-            let (w, h) = sizes[i];
-            let (x0, y0, x1, y1) = (
-                at.0 - w / 2.0,
-                at.1 - h / 2.0,
-                at.0 + w / 2.0,
-                at.1 + h / 2.0,
-            );
-            if x0 < bx0 - threshold
-                || y0 < by0 - threshold
-                || x1 > bx1 + threshold
-                || y1 > by1 + threshold
-            {
-                return false;
+    // Two boxes overlap when, on both axes, they overlap by more than minus the gap
+    // they must keep (`Clearances::gap_between`: at least 2 µm, so touching is
+    // overlapping).
+    let edge = model.clearances.edge_mm;
+    let legal_at = |i: usize, at: (f64, f64), settled: &[usize], centres: &[(f64, f64)]| {
+        let (w, h) = sizes[i];
+        // The courtyard box grown by the copper-to-edge clearance on every side: it
+        // must be inside the outline, so the box itself is `edge_mm` inside.
+        let (x0, y0, x1, y1) = (
+            at.0 - w / 2.0 - edge,
+            at.1 - h / 2.0 - edge,
+            at.0 + w / 2.0 + edge,
+            at.1 + h / 2.0 + edge,
+        );
+        if x0 < bx0 - threshold
+            || y0 < by0 - threshold
+            || x1 > bx1 + threshold
+            || y1 > by1 + threshold
+        {
+            return false;
+        }
+        if model
+            .outline
+            .overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            .depth_mm
+            > threshold
+        {
+            return false;
+        }
+        !settled.iter().any(|&j| {
+            model.parts[j].layer_side == model.parts[i].layer_side && {
+                let ix = (w + sizes[j].0) / 2.0 - (at.0 - centres[j].0).abs();
+                let iy = (h + sizes[j].1) / 2.0 - (at.1 - centres[j].1).abs();
+                let gate = -model
+                    .clearances
+                    .gap_between(&model.parts[i], &model.parts[j]);
+                ix > gate && iy > gate
             }
-            if model
-                .outline
-                .overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-                .depth_mm
-                > threshold
-            {
-                return false;
-            }
-            !settled.iter().any(|&j| {
-                model.parts[j].layer_side == model.parts[i].layer_side && {
-                    let ix = (w + sizes[j].0) / 2.0 - (at.0 - centres[j].0).abs();
-                    let iy = (h + sizes[j].1) / 2.0 - (at.1 - centres[j].1).abs();
-                    ix > gate && iy > gate
-                }
-            })
-        };
+        })
+    };
 
     let unmoved = |i: usize, centres: &[(f64, f64)]| {
         centres[i] == read_centres[i] && sizes[i] == read_sizes[i]
@@ -999,14 +1069,13 @@ pub(crate) fn legalize(
         .collect();
     let mut failed: Vec<String> = Vec::new();
     for i in queue {
-        let strict = -MOVED_CLEARANCE_MM;
-        if !legal_at(i, centres[i], strict, &settled, centres) {
+        if !legal_at(i, centres[i], &settled, centres) {
             let base = (snap(centres[i].0), snap(centres[i].1));
             let mut found = None;
             'rings: for ring in 0..=LEGALIZE_RINGS as i64 {
                 for (di, dj) in ring_cells(ring) {
                     let cell = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
-                    if legal_at(i, cell, strict, &settled, centres) {
+                    if legal_at(i, cell, &settled, centres) {
                         found = Some(cell);
                         break 'rings;
                     }

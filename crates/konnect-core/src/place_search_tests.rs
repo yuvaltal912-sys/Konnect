@@ -176,10 +176,16 @@ fn routed(unconnected: usize, signal_mm: f64) -> RouteResult {
 /// What the fake router does on its n-th call (from 0).
 #[derive(Clone)]
 enum Step {
-    Routed { unconnected: usize, signal_mm: f64 },
+    Routed {
+        unconnected: usize,
+        signal_mm: f64,
+    },
     NoWinner,
     Export,
     Call,
+    /// Routed, with a G1 line that names a net and an unrouted check that has a
+    /// `clearance` entry.
+    Diagnosed,
 }
 
 struct Shared {
@@ -236,6 +242,17 @@ impl RouteCall for Fake {
                     unconnected,
                     signal_mm,
                 } => routed(unconnected, signal_mm),
+                Step::Diagnosed => RouteResult::Routed {
+                    gates: Gates {
+                        g1: vec!["net SECRETNET is not fully routed".to_string()],
+                        g2: Vec::new(),
+                        g3: Vec::new(),
+                    },
+                    measures: measures(0, 100.0),
+                    unrouted: BTreeMap::from([("clearance".to_string(), 3)]),
+                    status: "ok".into(),
+                    call: json!({"engine": {"name": "fake"}, "effort": "m"}),
+                },
                 Step::NoWinner => RouteResult::NoWinner {
                     unrouted: Some(BTreeMap::new()),
                     reason: "no run was routed and judged".into(),
@@ -354,6 +371,9 @@ fn rec(id: usize, origin: Origin, outcome: &'static str, key: Option<ScreenKey>)
         rank: None,
         timings: Timings::default(),
         route: None,
+        placement_gates: None,
+        unrouted: None,
+        route_gates: None,
         board_text: None,
         judged: None,
     }
@@ -1262,6 +1282,95 @@ async fn the_table_prints_a_code_for_a_stop_never_the_reason() {
     search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
     let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
     assert!(!table_text.contains("Routing stopped"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn records_carry_the_gate_lines_and_the_unrouted_counts_in_search_json_only() {
+    let setup = setup(100_000);
+    let outcome = search(&setup.plan, Arc::new(fake(10, |_, _| Step::Diagnosed)))
+        .await
+        .unwrap();
+    let routed: Vec<&Record> = outcome
+        .records
+        .iter()
+        .filter(|r| r.outcome == "routed")
+        .collect();
+    assert!(!routed.is_empty());
+    for record in &routed {
+        // The unrouted board has 3 `clearance` entries and the input none: P2 says so.
+        let gates = record.placement_gates.as_ref().expect("the P gates");
+        assert!(
+            gates.p2.iter().any(|line| line.starts_with("clearance: 3")),
+            "{gates:?}"
+        );
+        assert_eq!(
+            record.unrouted,
+            Some(BTreeMap::from([("clearance".to_string(), 3)]))
+        );
+        assert_eq!(
+            record.route_gates.as_ref().unwrap().g1,
+            vec!["net SECRETNET is not fully routed".to_string()]
+        );
+    }
+    // A record that was not routed has none of the three.
+    let screened = outcome
+        .records
+        .iter()
+        .find(|r| r.outcome == "screened_out")
+        .expect("a screened-out record");
+    assert!(screened.placement_gates.is_none() && screened.unrouted.is_none());
+    assert!(screened.route_gates.is_none());
+
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    let first = json["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outcome"] == "routed")
+        .unwrap();
+    assert_eq!(first["unrouted"]["clearance"], 3);
+    assert_eq!(
+        first["route_gates"]["g1"][0],
+        "net SECRETNET is not fully routed"
+    );
+    assert!(first["placement_gates"]["p2"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("clearance: 3"));
+    assert!(json["plan"]["clearances"]["part_gap_mm"].is_number());
+    assert!(json["plan"]["clearances"]["edge_mm"].is_number());
+    // Never in the table: the lines can name nets.
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(!table_text.contains("SECRETNET") && !table_text.contains("clearance"));
+}
+
+#[test]
+fn the_clearances_come_from_the_rules_and_the_export_options() {
+    let rule = |clearance: Option<f64>| konnect_ipc::types::IpcRoutingRules {
+        class_name: "Default".into(),
+        constituents: Vec::new(),
+        track_width_mm: None,
+        clearance_mm: clearance,
+        via_diameter_mm: None,
+        via_drill_mm: None,
+    };
+    let setup = setup(100);
+    let mut options = setup.plan.route.options.clone();
+    options.copper_edge_clearance_um = Some(500);
+    let rules = BTreeMap::from([
+        ("A".to_string(), rule(Some(0.2))),
+        ("B".to_string(), rule(Some(0.3))),
+        ("C".to_string(), rule(None)),
+    ]);
+    let found = Clearances::from_inputs(&rules, &options);
+    assert!((found.part_gap_mm - 0.4).abs() < 1e-12, "{found:?}");
+    assert!((found.edge_mm - 0.5).abs() < 1e-12);
+    options.copper_edge_clearance_um = None;
+    let found = Clearances::from_inputs(&BTreeMap::new(), &options);
+    assert_eq!(found, Clearances::default());
 }
 
 #[tokio::test(start_paused = true)]

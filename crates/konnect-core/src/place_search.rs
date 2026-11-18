@@ -11,8 +11,8 @@
 #![allow(dead_code)]
 
 use crate::place_generators::{
-    board_model, generate, neutral_start, recipes, BoardModel, Candidate, Family, GenerateFailure,
-    Matrix, Recipe, GENERATOR_VERSION,
+    board_model, generate, neutral_start, recipes, BoardModel, Candidate, Clearances, Family,
+    GenerateFailure, Matrix, Recipe, GENERATOR_VERSION,
 };
 use crate::place_held::{
     check_held, decoupling_pairs, groups, held_set, placements_of, same_board, sha256_hex, HeldSet,
@@ -20,9 +20,10 @@ use crate::place_held::{
 };
 use crate::place_judge::{
     movable_failure_keys, order as judged_order, pair_violations, placement_gates, rank, screen,
-    screen_key, Judged, Key, RouteResult, Screen, ScreenKey, SILK,
+    screen_key, Judged, Key, PlacementGates, RouteResult, Screen, ScreenKey, SILK,
 };
 use crate::place_route::{export_candidate, route_candidate, unrouted_check, RouteInputs};
+use crate::route_judge::Gates;
 use crate::route_search::{median, BoxFuture, Effort, SplitMix64, HANG_CAP};
 use crate::tools::pcb_components::{placements_applied_to, placements_moved_applied_to};
 use crate::tools::placement::evaluate::evaluate;
@@ -95,6 +96,13 @@ pub(crate) struct Record {
     /// effort, lanes, outcome counts, elapsed and overrun, the winner's shape and seed,
     /// the host's 1-minute load at its start.
     pub route: Option<serde_json::Value>,
+    /// P1 and P2 lines of the judged call (`placement_gates`). In `search.json` only:
+    /// the lines can name parts.
+    pub placement_gates: Option<PlacementGates>,
+    /// The candidate's unrouted check, counts by DRC type (`search.baseline`).
+    pub unrouted: Option<BTreeMap<String, usize>>,
+    /// The routing winner's G1 to G3 lines. In `search.json` only: they can name nets.
+    pub route_gates: Option<Gates>,
     #[serde(skip)]
     pub board_text: Option<String>,
     #[serde(skip)]
@@ -120,6 +128,9 @@ impl Record {
             rank: None,
             timings: Timings::default(),
             route: None,
+            placement_gates: None,
+            unrouted: None,
+            route_gates: None,
             board_text: None,
             judged: None,
         }
@@ -776,6 +787,11 @@ fn file_judgement(
             .map(|kind| counts.get(*kind).copied().unwrap_or(0))
             .sum()
     });
+    record.placement_gates = Some(placement.clone());
+    record.unrouted = unrouted.cloned();
+    if let RouteResult::Routed { gates, .. } = &route {
+        record.route_gates = Some(gates.clone());
+    }
     record.judged = Some(Judged {
         id: record.id,
         screen: screened,
@@ -883,6 +899,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     let input_failures = movable_failure_keys(&evaluated, &held)?;
     let mut model = board_model(&text, held, intent)?;
     model.input_failures = input_failures;
+    model.clearances = Clearances::from_inputs(&plan.route.rules, &plan.route.options);
     std::fs::create_dir_all(plan.folder.join("candidates"))?;
 
     // References: O, then A.
@@ -1139,6 +1156,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
             "drawn_per_family": plan.drawn_per_family,
             "draw_seed": plan.draw_seed,
             "time_limit_s": plan.time_limit.as_secs_f64(),
+            "clearances": Clearances::from_inputs(&plan.route.rules, &plan.route.options),
             "effort": plan.route.effort.name(),
             "fastroute": plan.route.fastroute.display().to_string(),
             "fastroute_sha256": fastroute_sha256,

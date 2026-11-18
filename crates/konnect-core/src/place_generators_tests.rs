@@ -1471,3 +1471,128 @@ fn shelves_keep_a_cluster_together_and_clamp_when_nothing_fits() {
         "{first_end} {second_start}"
     );
 }
+
+// ─── Clearances beyond the courtyards ────────────────────────────────────────
+
+fn with_clearances(mut model: BoardModel, part_gap_mm: f64, edge_mm: f64) -> BoardModel {
+    model.clearances = Clearances {
+        part_gap_mm,
+        edge_mm,
+    };
+    model
+}
+
+/// The larger of the two axis gaps between the boxes of parts `a` and `b`.
+fn gap_between_parts(sizes: &[(f64, f64)], centres: &[(f64, f64)], a: usize, b: usize) -> f64 {
+    let gap_x = (centres[a].0 - centres[b].0).abs() - (sizes[a].0 + sizes[b].0) / 2.0;
+    let gap_y = (centres[a].1 - centres[b].1).abs() - (sizes[a].1 + sizes[b].1) / 2.0;
+    gap_x.max(gap_y)
+}
+
+#[test]
+fn parts_without_a_courtyard_are_legalized_apart_by_the_part_gap() {
+    // Two pads-only footprints (no courtyard: the box is the pads', 1.6 x 0.5 mm). R2 is
+    // dropped on R1. Without a gap the nearest legal cell leaves 0.5 mm between them;
+    // with 0.7 mm it must leave at least that.
+    let parts = vec![
+        Fp::new("R1", 30.0, 20.0).no_court().two_pad("N1", "N2"),
+        Fp::new("R2", 10.0, 10.0).no_court().two_pad("N2", "N3"),
+    ];
+    let text = board(OUTLINE, &parts);
+    let place = |gap: f64| {
+        let model = with_clearances(model_of(&text, &[]), gap, 0.0);
+        assert_eq!(
+            model.parts[0].bbox_source,
+            konnect_sexp::board::CourtyardSource::PadsFallback
+        );
+        let sizes = as_read_sizes(&model);
+        let mut centres = as_read_centres(&model);
+        centres[1] = centres[0];
+        legalize(&model, &sizes, &mut centres).unwrap();
+        gap_between_parts(&sizes, &centres, 0, 1)
+    };
+    let none = place(0.0);
+    assert!((0.0..0.7).contains(&none), "{none}");
+    let kept = place(0.7);
+    assert!(kept >= 0.7 - 1e-9, "{kept}");
+}
+
+#[test]
+fn two_real_courtyards_may_still_touch_closely() {
+    // Real courtyards keep 2 µm, not the part gap: R2 at 3 µm from R1's courtyard stays.
+    // The same distance between a courtyard and a pads-only part is moved.
+    let courtyards = vec![
+        Fp::new("R1", 30.0, 20.0).two_pad("N1", "N2"),
+        Fp::new("R2", 10.0, 10.0).two_pad("N2", "N3"),
+    ];
+    let model = with_clearances(model_of(&board(OUTLINE, &courtyards), &[]), 0.7, 0.0);
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    centres[1] = (centres[0].0 + sizes[0].0 + 0.003, centres[0].1);
+    let proposed = centres[1];
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[1], proposed, "courtyards 3 µm apart are legal");
+    // Closer than 2 µm is not.
+    let mut centres = as_read_centres(&model);
+    centres[1] = (centres[0].0 + sizes[0].0 + 0.001, centres[0].1);
+    let proposed = centres[1];
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_ne!(centres[1], proposed);
+
+    let mixed = vec![
+        Fp::new("R1", 30.0, 20.0).two_pad("N1", "N2"),
+        Fp::new("R2", 10.0, 10.0).no_court().two_pad("N2", "N3"),
+    ];
+    let model = with_clearances(model_of(&board(OUTLINE, &mixed), &[]), 0.7, 0.0);
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    centres[1] = (
+        centres[0].0 + (sizes[0].0 + sizes[1].0) / 2.0 + 0.003,
+        centres[0].1,
+    );
+    let proposed = centres[1];
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_ne!(centres[1], proposed, "a pads-only part keeps the part gap");
+    assert!(gap_between_parts(&sizes, &centres, 0, 1) >= 0.7 - 1e-9);
+}
+
+#[test]
+fn a_moved_part_keeps_the_edge_clearance_inside_a_rounded_outline() {
+    let parts = vec![Fp::new("R1", 20.0, 20.0).two_pad("N1", "N2")];
+    let text = board(Shape::Rounded(0.0, 0.0, 60.0, 40.0, 10.0), &parts);
+    let threshold = model_of(&text, &[]).outline.containment_threshold_mm();
+    // R1 is 2 x 1 mm. Straight edge: its left side 0.3 mm from the edge. Corner: its
+    // top-left corner 0.2 mm inside the arc of radius 10 about (10, 10).
+    let straight = (1.3, 20.0);
+    let corner = (4.07, 3.57);
+    for at in [straight, corner] {
+        let model = with_clearances(model_of(&text, &[]), 0.0, 0.0);
+        let sizes = as_read_sizes(&model);
+        let mut centres = as_read_centres(&model);
+        centres[0] = at;
+        legalize(&model, &sizes, &mut centres).unwrap();
+        assert_eq!(
+            centres[0], at,
+            "inside the outline, so legal with no edge clearance"
+        );
+
+        let model = with_clearances(model_of(&text, &[]), 0.0, 0.5);
+        let mut centres = as_read_centres(&model);
+        centres[0] = at;
+        legalize(&model, &sizes, &mut centres).unwrap();
+        assert_ne!(centres[0], at, "{at:?} is within 0.5 mm of the edge");
+        let (w, h) = sizes[0];
+        let (x, y) = centres[0];
+        let grown = [
+            (x - w / 2.0 - 0.5, y - h / 2.0 - 0.5),
+            (x + w / 2.0 + 0.5, y - h / 2.0 - 0.5),
+            (x + w / 2.0 + 0.5, y + h / 2.0 + 0.5),
+            (x - w / 2.0 - 0.5, y + h / 2.0 + 0.5),
+        ];
+        assert!(
+            model.outline.overhang(&grown).depth_mm <= threshold,
+            "the grown box of {at:?} -> {:?} is not inside",
+            centres[0]
+        );
+    }
+}
