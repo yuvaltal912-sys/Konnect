@@ -245,6 +245,18 @@ pub fn run_double_click_install(simulation: bool) -> Result<()> {
     Ok(())
 }
 
+/// The plugin Claude's skills are installed as: `~/.claude/skills/kopper1/`, with
+/// `.claude-plugin/plugin.json` and `skills/<name>/`.
+const CLAUDE_PLUGIN: &str = "kopper1";
+
+/// The plugin's manifest. Its version is this build's, so `status` sees a manifest
+/// an older build wrote as changed.
+const CLAUDE_PLUGIN_MANIFEST: &str = concat!(
+    "{\n  \"name\": \"kopper1\",\n  \"version\": \"",
+    env!("CARGO_PKG_VERSION"),
+    "\",\n  \"description\": \"1 Kopper: the KiCad skills of Konnect (creation tools + fastroute best-of-N routing, no simulation). Installed by konnect init; a re-install overwrites it.\",\n  \"skills\": [\"./skills\"]\n}\n"
+);
+
 #[derive(Debug)]
 struct InstallPaths {
     home: PathBuf,
@@ -273,11 +285,24 @@ impl InstallPaths {
         self.home.join(".konnect")
     }
 
+    /// The folder that holds one sub-folder per skill. For Claude it is the
+    /// `skills/` folder of the [`CLAUDE_PLUGIN`] plugin, so the skills load (and
+    /// show in `/`) as one plugin; Codex keeps them loose in `~/.agents/skills`.
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
         match client {
-            InstallClient::Claude => self.home.join(".claude").join("skills"),
+            InstallClient::Claude => self.claude_plugin_dir().join("skills"),
             InstallClient::Codex => self.home.join(".agents").join("skills"),
         }
+    }
+
+    /// Claude's own skills folder, where earlier installs put each skill loose and
+    /// where Claude finds the plugin as `kopper1@skills-dir`.
+    fn claude_loose_skills_dir(&self) -> PathBuf {
+        self.home.join(".claude").join("skills")
+    }
+
+    fn claude_plugin_dir(&self) -> PathBuf {
+        self.claude_loose_skills_dir().join(CLAUDE_PLUGIN)
     }
 
     fn claude_agents_dir(&self) -> PathBuf {
@@ -388,6 +413,17 @@ struct ManagedFile {
 fn managed_files(client: InstallClient, paths: &InstallPaths) -> Vec<ManagedFile> {
     let mut files = Vec::new();
     let skills_dir = paths.skills_dir(client);
+    if client == InstallClient::Claude {
+        files.push(ManagedFile {
+            kind: "skill",
+            name: format!("{CLAUDE_PLUGIN}/.claude-plugin/plugin.json"),
+            path: paths
+                .claude_plugin_dir()
+                .join(".claude-plugin")
+                .join("plugin.json"),
+            content: CLAUDE_PLUGIN_MANIFEST,
+        });
+    }
     for skill in paths.served_skills() {
         let dir = skills_dir.join(skill.name);
         files.push(ManagedFile {
@@ -442,21 +478,42 @@ fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
         // The name is Konnect's (uninstall removes it the same way); an install made
         // while simulation was served left it, and it would teach tools this server
         // does not serve.
+        // (A loose Claude copy goes with the other loose names below.)
         let retired = paths.skills_dir(client).join(SIMULATION_SKILL);
-        if let Ok(meta) = fs::symlink_metadata(&retired) {
-            if meta.is_dir() {
-                fs::remove_dir_all(&retired)
-            } else {
-                // a link is removed as a link, never followed
-                fs::remove_file(&retired)
-            }
-            .with_context(|| format!("remove {}", retired.display()))?;
-            if verbose {
-                println!("  [-] Skill: {SIMULATION_SKILL} removed (simulation is off)");
+        if remove_entry(&retired)? && verbose {
+            println!("  [-] Skill: {SIMULATION_SKILL} removed (simulation is off)");
+        }
+    }
+    if client == InstallClient::Claude {
+        // Earlier installs put each skill loose in ~/.claude/skills. The names are
+        // Konnect's (uninstall removes them the same way); left there, every skill
+        // would load twice, once loose and once from the plugin.
+        for skill in SKILLS {
+            let loose = paths.claude_loose_skills_dir().join(skill.name);
+            if remove_entry(&loose)? && verbose {
+                println!(
+                    "  [-] Skill: {} moved into the {CLAUDE_PLUGIN} plugin",
+                    skill.name
+                );
             }
         }
     }
     Ok(paths.served_skills().count())
+}
+
+/// Removes a folder, file or link at `path` (a link as a link, never followed).
+/// Returns whether something was there.
+fn remove_entry(path: &Path) -> Result<bool> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if meta.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .with_context(|| format!("remove {}", path.display()))?;
+    Ok(true)
 }
 
 fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
@@ -472,6 +529,22 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
             if verbose {
                 println!("  [-] Removed skill: {}", skill.name);
             }
+        }
+    }
+    if client == InstallClient::Claude {
+        // A loose copy an earlier install left, then the plugin itself: its manifest
+        // and its skills folder are Konnect's, and nothing else is put there.
+        for skill in SKILLS {
+            remove_entry(&paths.claude_loose_skills_dir().join(skill.name))?;
+        }
+        let manifest = paths.claude_plugin_dir().join(".claude-plugin");
+        remove_entry(&manifest)?;
+        for folder in [paths.skills_dir(client), paths.claude_plugin_dir()] {
+            // only when empty: anything the owner added stays
+            let _ = fs::remove_dir(&folder);
+        }
+        if verbose {
+            println!("  [-] Removed the {CLAUDE_PLUGIN} plugin");
         }
     }
 
@@ -1250,6 +1323,142 @@ mod tests {
         }
     }
 
+    // ── The kopper1 plugin (Claude) ──────────────────────────────────────
+
+    /// Claude's skills install as one plugin: `~/.claude/skills/kopper1/` with its
+    /// manifest and `skills/<name>/`, and nothing loose beside it.
+    #[test]
+    fn claude_skills_install_as_the_kopper1_plugin() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let plugin = temp.path().join(".claude/skills/kopper1");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["name"], "kopper1");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["skills"], serde_json::json!(["./skills"]));
+        for skill in SKILLS {
+            assert!(
+                plugin
+                    .join("skills")
+                    .join(skill.name)
+                    .join("SKILL.md")
+                    .is_file(),
+                "{}",
+                skill.name
+            );
+            assert!(
+                !temp.path().join(".claude/skills").join(skill.name).exists(),
+                "{} also loose",
+                skill.name
+            );
+        }
+    }
+
+    /// An earlier install's loose copies move into the plugin: Konnect's names are
+    /// removed from `~/.claude/skills` (the simulation skill too, when it is off),
+    /// and a skill of the owner's own stays.
+    #[test]
+    fn an_earlier_loose_install_is_moved_into_the_plugin() {
+        let temp = TempDir::new().unwrap();
+        let loose = temp.path().join(".claude/skills");
+        for name in ["konnect", "kicad-pcb", SIMULATION_SKILL, "my-skill"] {
+            fs::create_dir_all(loose.join(name)).unwrap();
+            fs::write(loose.join(name).join("SKILL.md"), "old").unwrap();
+        }
+        // a loose link is removed as a link, and its target is kept
+        let target = temp.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, loose.join("kicad-review")).unwrap();
+        let paths = InstallPaths {
+            home: temp.path().to_path_buf(),
+            simulation: false,
+        };
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        for name in ["konnect", "kicad-pcb", "kicad-review", SIMULATION_SKILL] {
+            assert!(
+                fs::symlink_metadata(loose.join(name)).is_err(),
+                "{name} still loose"
+            );
+        }
+        assert!(target.is_dir(), "the link's target was followed");
+        assert_eq!(
+            fs::read_to_string(loose.join("my-skill/SKILL.md")).unwrap(),
+            "old"
+        );
+        assert!(loose.join("kopper1/skills/konnect/SKILL.md").is_file());
+        assert!(!loose.join("kopper1/skills").join(SIMULATION_SKILL).exists());
+    }
+
+    /// Uninstall removes the plugin's manifest and skills, and a loose copy; a file
+    /// the owner put in the plugin folder stays, with the folder.
+    #[test]
+    fn uninstall_removes_the_plugin_and_keeps_what_the_owner_added() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let plugin = temp.path().join(".claude/skills/kopper1");
+        let loose = temp.path().join(".claude/skills/konnect");
+        fs::create_dir_all(&loose).unwrap();
+        fs::write(plugin.join("notes.md"), "mine").unwrap();
+        run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(!plugin.join(".claude-plugin").exists());
+        assert!(!plugin.join("skills").exists());
+        assert!(!loose.exists());
+        assert_eq!(fs::read_to_string(plugin.join("notes.md")).unwrap(), "mine");
+
+        // With nothing of the owner's in it, the folder goes too.
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(!temp.path().join(".claude/skills/kopper1").exists());
+    }
+
+    /// Codex keeps its skills loose in `~/.agents/skills`, with no plugin.
+    #[test]
+    fn codex_skills_stay_loose() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+        let agents = temp.path().join(".agents/skills");
+        assert!(agents.join("kicad-pcb/SKILL.md").is_file());
+        assert!(!agents.join("kopper1").exists());
+        assert!(!temp.path().join(".claude").exists());
+    }
+
+    /// Every bundled skill's `description` is one quoted line: the `/` menus of
+    /// Claude and Codex left out the skills whose description was a `|` block.
+    #[test]
+    fn every_skill_description_is_one_line() {
+        for skill in SKILLS {
+            let front = skill
+                .content
+                .strip_prefix("---\n")
+                .and_then(|rest| rest.split_once("\n---\n"))
+                .map(|(front, _)| front)
+                .unwrap_or_else(|| panic!("{} has no frontmatter", skill.name));
+            let line = front
+                .lines()
+                .find(|line| line.starts_with("description:"))
+                .unwrap_or_else(|| panic!("{} has no description", skill.name));
+            let value = line["description:".len()..].trim();
+            assert!(
+                value.len() > 2 && value.starts_with('"') && value.ends_with('"'),
+                "{}: {line}",
+                skill.name
+            );
+            assert!(
+                !front.lines().any(|line| line.starts_with("  ")),
+                "{} has an indented frontmatter line",
+                skill.name
+            );
+        }
+    }
+
     #[test]
     fn client_argument_defaults_to_claude() {
         assert_eq!(client_from_args(&[]).unwrap(), InstallClient::Claude);
@@ -1780,9 +1989,10 @@ mod tests {
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
 
         let claude = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
-        // 7 SKILL.md + 10 reference files + 2 agents, and 4 hooks: the counts
-        // `konnect init` reports, restated rather than read from the manifest.
-        assert_eq!(claude.files.len(), 19);
+        // The kopper1 plugin manifest, 7 SKILL.md + 10 reference files + 2 agents,
+        // and 4 hooks: the counts `konnect init` reports, restated rather than read
+        // from the manifest.
+        assert_eq!(claude.files.len(), 20);
         assert_eq!(claude.hooks.len(), 4);
         for file in &claude.files {
             assert_eq!(file.status, ItemStatus::Current, "{}", file.name);

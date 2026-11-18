@@ -1,9 +1,6 @@
 ---
 name: kicad-review
-description: |
-  Design review and validation workflow for KiCAD projects via MCP tools. Triggers on: "review my design",
-  "check for errors", "audit", "DRC", "ERC", "find problems", "design review", "is this ready",
-  "validate", "check my schematic", "check my PCB", "what's wrong", "run checks", "pre-fab review".
+description: "Design review and validation workflow for KiCAD projects via MCP tools. Triggers on: \"review my design\", \"check for errors\", \"audit\", \"DRC\", \"ERC\", \"find problems\", \"design review\", \"is this ready\", \"validate\", \"check my schematic\", \"check my PCB\", \"what's wrong\", \"run checks\", \"pre-fab review\"."
 argument-hint: "[what to review]"
 ---
 

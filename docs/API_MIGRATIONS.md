@@ -3,6 +3,16 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: Claude's skills install as the plugin `kopper1`
+
+`konnect init` (Claude) writes the skills to `~/.claude/skills/kopper1/`
+(`.claude-plugin/plugin.json`, `skills/<name>/`) instead of
+`~/.claude/skills/<name>/`, and removes the loose copies of Konnect's skill names
+that an earlier install left. In Claude's `/` menu they read `kopper1:<name>`.
+`init --uninstall` removes the plugin's manifest and skills; a file the owner put
+in the plugin folder stays. Codex is unchanged (`~/.agents/skills/<name>/`). Every
+bundled skill's `description` is now one quoted line.
+
 ## Unreleased: best-of-N routing with fastroute is the default
 
 Row "best-of-N" (`docs/CREATION_HANDOFF.md`, design `docs/ROUTE_SEARCH_DESIGN.md`).

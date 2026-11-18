@@ -1,9 +1,6 @@
 ---
 name: kicad-manufacture
-description: |
-  Manufacturing and fabrication workflow for KiCAD projects via MCP tools. Triggers on: "send to fab",
-  "order boards", "gerbers", "JLCPCB", "manufacturing", "export for production", "pick and place",
-  "assembly files", "generate fabrication outputs", "BOM for fab", "production files", "fab house".
+description: "Manufacturing and fabrication workflow for KiCAD projects via MCP tools. Triggers on: \"send to fab\", \"order boards\", \"gerbers\", \"JLCPCB\", \"manufacturing\", \"export for production\", \"pick and place\", \"assembly files\", \"generate fabrication outputs\", \"BOM for fab\", \"production files\", \"fab house\"."
 argument-hint: "[fab house or export task]"
 ---
 

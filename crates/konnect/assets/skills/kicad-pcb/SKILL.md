@@ -1,9 +1,6 @@
 ---
 name: kicad-pcb
-description: |
-  Workflow skill for KiCAD PCB layout and routing via MCP tools. Triggers on: "layout the board",
-  "route traces", "PCB", "place footprints", "copper pour", "board outline", "differential pair",
-  "board setup", "track width", "via", "zone", "design rules", "stackup", "silkscreen".
+description: "Workflow skill for KiCAD PCB layout and routing via MCP tools. Triggers on: \"layout the board\", \"route traces\", \"PCB\", \"place footprints\", \"copper pour\", \"board outline\", \"differential pair\", \"board setup\", \"track width\", \"via\", \"zone\", \"design rules\", \"stackup\", \"silkscreen\"."
 argument-hint: "[layout task]"
 ---
 
