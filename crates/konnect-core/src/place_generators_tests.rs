@@ -1742,10 +1742,19 @@ fn a_moved_part_keeps_the_part_gap_from_copper() {
 
 #[test]
 fn a_copper_text_box_follows_its_size_lines_thickness_and_justification() {
-    // No effects at all: size 1, thickness 0.15.
+    // No effects at all: KiCad's default size 1.524, thickness 0.15.
     let bare = only_obstacle(&gr_text("ABCD", "40 40", "F.Cu", ""));
+    let (w, h) = (4.0 * 1.524 * 1.3 + 0.15, 1.524 * 1.7 + 0.15);
     assert!(
-        close(bare.bbox, (37.325, 39.075, 42.675, 40.925)),
+        close(
+            bare.bbox,
+            (
+                40.0 - w / 2.0,
+                40.0 - h / 2.0,
+                40.0 + w / 2.0,
+                40.0 + h / 2.0
+            )
+        ),
         "{bare:?}"
     );
     assert_eq!(bare.sides, Sides::TOP);
@@ -1875,8 +1884,8 @@ fn a_quarter_turned_copper_text_box_is_exact_to_the_last_digit() {
 
 #[test]
 fn unreadable_numbers_and_pens_do_not_make_a_box_smaller_or_unbounded() {
-    // A cache polygon with an infinite coordinate is unreadable and is left out; the other
-    // polygon gives the box.
+    // A cache polygon with an infinite coordinate is unreadable: the whole text takes the
+    // estimate (2 characters: 2.75 x 1.85), never the box of the polygon that was readable.
     let cache = "(render_cache \"AB\" 0 (polygon (pts (xy 38 39) (xy inf 39) (xy 41 41))) \
                  (polygon (pts (xy 36 40.5) (xy 37 42) (xy 39 40))))";
     let item = gr_text(
@@ -1885,7 +1894,10 @@ fn unreadable_numbers_and_pens_do_not_make_a_box_smaller_or_unbounded() {
         "F.Cu",
         &format!("(effects (font (size 1 1) (thickness 0.15))) {cache}"),
     );
-    assert!(close(only_obstacle(&item).bbox, (36.0, 40.0, 39.0, 42.0)));
+    assert!(close(
+        only_obstacle(&item).bbox,
+        (38.625, 39.075, 41.375, 40.925)
+    ));
     // A negative or infinite stroke width is no width.
     for width in ["-0.4", "inf", "nan"] {
         let item = format!(
@@ -1924,6 +1936,144 @@ fn a_text_box_takes_its_corners_over_its_start_and_end() {
     let empty =
         format!("(gr_text_box \"ab\" (start 60 30) (end 64 33) (pts) {stroke} (layer \"F.Cu\"))");
     assert!(close(only_obstacle(&empty).bbox, (59.9, 29.9, 64.1, 33.1)));
+}
+
+#[test]
+fn a_text_estimate_follows_line_spacing_a_default_size_and_knockout() {
+    let at = "0 0";
+    // Two lines at 1.5 spacing: 2 x 1.7 x 1.5 + 0.15 high, 2 x 1.3 + 0.15 wide. In the font
+    // or in the effects; below 1 is not trusted (the pitch is never tighter than the font's).
+    let tall = |spacing: &str| {
+        only_obstacle(&gr_text(
+            "AB\\nCD",
+            at,
+            "F.Cu",
+            &format!("(effects (font (size 1 1) (thickness 0.15) (line_spacing {spacing})))"),
+        ))
+        .bbox
+    };
+    let (w, h) = (2.0 * 1.3 + 0.15, 2.0 * 1.7 * 1.5 + 0.15);
+    assert_eq!(tall("1.5"), (-w / 2.0, -h / 2.0, w / 2.0, h / 2.0));
+    let plain_h = 2.0 * 1.7 + 0.15;
+    for ignored in ["0.5", "1", "inf", "nan"] {
+        assert_eq!(
+            tall(ignored),
+            (-w / 2.0, -plain_h / 2.0, w / 2.0, plain_h / 2.0),
+            "{ignored}"
+        );
+    }
+    let in_effects = only_obstacle(&gr_text(
+        "AB\\nCD",
+        at,
+        "F.Cu",
+        "(effects (font (size 1 1) (thickness 0.15)) (line_spacing 1.5))",
+    ));
+    assert_eq!(in_effects.bbox, (-w / 2.0, -h / 2.0, w / 2.0, h / 2.0));
+    // No readable size is 1.524 mm; a readable one is its own.
+    let no_size = only_obstacle(&gr_text(
+        "A",
+        at,
+        "F.Cu",
+        "(effects (font (thickness 0.15)))",
+    ));
+    let (uw, uh) = (1.524 * 1.3 + 0.15, 1.524 * 1.7 + 0.15);
+    assert!(close(
+        no_size.bbox,
+        (-uw / 2.0, -uh / 2.0, uw / 2.0, uh / 2.0)
+    ));
+    let broken = only_obstacle(&gr_text(
+        "A",
+        at,
+        "F.Cu",
+        "(effects (font (size x 1) (thickness 0.15)))",
+    ));
+    assert!(close(broken.bbox, no_size.bbox));
+    // Knockout grows the box by max(thickness, size_y / 4) on every side: 0.25 here (size 1),
+    // 0.5 with a pen of 0.5.
+    let knockout = |effects: &str| {
+        only_obstacle(&format!(
+            "(gr_text \"A\" (at 0 0) (layer \"F.Cu\" knockout) {effects})"
+        ))
+    };
+    let thin = knockout("(effects (font (size 1 1) (thickness 0.15)))");
+    let (kw, kh) = (1.3 + 0.15, 1.7 + 0.15);
+    assert!(close(
+        thin.bbox,
+        (
+            -kw / 2.0 - 0.25,
+            -kh / 2.0 - 0.25,
+            kw / 2.0 + 0.25,
+            kh / 2.0 + 0.25
+        )
+    ));
+    assert_eq!(thin.sides, Sides::TOP);
+    let thick = knockout("(effects (font (size 1 1) (thickness 0.5)))");
+    let (tw, th) = (1.3 + 0.5, 1.7 + 0.5);
+    assert!(close(
+        thick.bbox,
+        (
+            -tw / 2.0 - 0.5,
+            -th / 2.0 - 0.5,
+            tw / 2.0 + 0.5,
+            th / 2.0 + 0.5
+        )
+    ));
+    // Not knockout, no margin: the layer's other words do not count.
+    let other = only_obstacle(
+        "(gr_text \"A\" (at 0 0) (layer \"F.Cu\" mirror) (effects (font (size 1 1) (thickness 0.15))))",
+    );
+    assert!(close(
+        other.bbox,
+        (-kw / 2.0, -kh / 2.0, kw / 2.0, kh / 2.0)
+    ));
+}
+
+#[test]
+fn a_polygon_box_includes_the_extent_of_its_arcs() {
+    // The arc through (40, 30), (42, 35), (40, 40) about (35.25, 35) reaches x = 42, which
+    // none of the polygon's corners does.
+    let poly = |arc: &str| {
+        format!(
+            "(gr_poly (pts (xy 30 30) (xy 40 30) {arc} (xy 30 40)) (stroke (width 0.2) (type default)) (fill no) (layer \"F.Cu\"))"
+        )
+    };
+    let found = only_obstacle(&poly("(arc (start 40 30) (mid 42 35) (end 40 40))"));
+    assert!(
+        close(found.bbox, (29.9, 29.9, 42.1, 40.1)),
+        "{:?}",
+        found.bbox
+    );
+    // An arc that is missing a point is unreadable: no obstacle, nothing guessed.
+    let broken = copper_model(&poly("(arc (start 40 30) (end 40 40))"));
+    assert!(broken.copper.is_empty());
+    // The same arc in a rule area.
+    let zone = "(zone (net 0) (net_name \"\") (layers \"F.Cu\") (name \"ra\") (hatch edge 0.5) \
+                (keepout (tracks allowed) (vias allowed) (pads allowed) (copperpour allowed) (footprints not_allowed)) \
+                (polygon (pts (xy 30 30) (xy 40 30) (arc (start 40 30) (mid 42 35) (end 40 40)) (xy 30 40))))";
+    assert!(close(only_obstacle(zone).bbox, (30.0, 30.0, 42.0, 40.0)));
+}
+
+#[test]
+fn a_near_straight_arc_is_a_thin_box_and_does_not_block_a_part_beside_it() {
+    // 20 mm long and 0.01 mm high: the circle through its points is 5 m across, the arc is
+    // a hair.
+    let arc = "(gr_arc (start 30 40) (mid 40 40.01) (end 50 40) (stroke (width 0.1) (type default)) (layer \"F.Cu\"))";
+    let found = only_obstacle(arc);
+    assert!(
+        found.bbox.0 > 29.9 && found.bbox.2 < 50.1,
+        "{:?}",
+        found.bbox
+    );
+    assert!(
+        found.bbox.1 > 39.9 && found.bbox.3 < 40.1,
+        "{:?}",
+        found.bbox
+    );
+    let model = copper_model(arc);
+    // R1 beside it, 1 mm below, stays; on it, it moves.
+    assert_eq!(legalized_r1(&model, (40.0, 41.0)), (40.0, 41.0));
+    assert_eq!(legalized_r1(&model, (40.0, 39.0)), (40.0, 39.0));
+    assert_ne!(legalized_r1(&model, (40.0, 40.0)), (40.0, 40.0));
 }
 
 #[test]
@@ -2025,8 +2175,9 @@ fn an_arc_box_covers_the_bulge() {
     let found = only_obstacle(&arc);
     assert!(found.bbox.1 <= 30.0 - 0.05 + 1e-9, "{:?}", found.bbox);
     assert!(found.bbox.0 <= 30.0 - 0.05 + 1e-9 && found.bbox.2 >= 50.0 + 0.05 - 1e-9);
+    // The exact extent of the arc, not of its whole circle: it stays above y = 40.
     assert!(
-        close(found.bbox, (29.95, 29.95, 50.05, 50.05)),
+        close(found.bbox, (29.95, 29.95, 50.05, 40.05)),
         "{:?}",
         found.bbox
     );
@@ -2149,8 +2300,9 @@ fn a_rule_area_that_keeps_out_only_tracks_vias_or_pours_is_no_obstacle() {
 }
 
 #[test]
-fn a_rule_area_with_an_arc_is_boxed_by_the_arc_circle() {
-    // A square whose top edge bulges as an arc over a circle about (40, 40) of radius 10.
+fn a_rule_area_with_an_arc_is_boxed_by_the_arc_extent() {
+    // A shape whose top edge bulges as an arc over a circle about (40, 40) of radius 10:
+    // it reaches y = 30 but not y = 50.
     let mid = 40.0 + 10.0 * std::f64::consts::FRAC_1_SQRT_2;
     let zone = format!(
         "(zone (net 0) (net_name \"\") (layers \"F.Cu\") (name \"ra\") (hatch edge 0.5) \
@@ -2160,7 +2312,7 @@ fn a_rule_area_with_an_arc_is_boxed_by_the_arc_circle() {
     );
     let found = only_obstacle(&zone);
     assert!(
-        close(found.bbox, (30.0, 30.0, 50.0, 50.0)),
+        close(found.bbox, (30.0, 30.0, 50.0, 45.0)),
         "{:?}",
         found.bbox
     );
@@ -2270,12 +2422,15 @@ fn a_part_meets_copper_text_only_on_a_side_it_occupies() {
 #[test]
 fn an_unmoved_part_on_copper_text_stays_with_no_room_trouble() {
     // R1 sits on the text in the input and does not move: legal as it is. R2 moves from
-    // somewhere else onto the same text, and is moved off it.
+    // somewhere else onto the same text, and is moved off it. The text is 15.75 x 5.25 mm
+    // (size 3): without the obstacle test R2 would stop 3 steps above R1, still on the
+    // text; clear of the text it is 7 steps up.
     let parts = vec![
         Fp::new("R1", 40.0, 40.0).two_pad("N1", "N2"),
         Fp::new("R2", 20.0, 30.0).two_pad("N2", "N3"),
     ];
-    let model = copper_model_of(parts, &[], &gr_text("ABCD", "40 40", "F.Cu", PLAIN));
+    let big = "(effects (font (size 3 3) (thickness 0.15)))";
+    let model = copper_model_of(parts, &[], &gr_text("ABCD", "40 40", "F.Cu", big));
     let sizes = as_read_sizes(&model);
     let read = as_read_centres(&model);
     let mut centres = read.clone();
@@ -2286,7 +2441,7 @@ fn an_unmoved_part_on_copper_text_stays_with_no_room_trouble() {
     centres[1] = (40.0, 40.0);
     legalize(&model, &sizes, &mut centres).expect("R2 finds a cell");
     assert_eq!(centres[0], read[0], "R1 stays");
-    assert_ne!(centres[1], (40.0, 40.0));
+    assert_eq!(centres[1], (40.0, 36.5));
     assert!(gap_to_part(&model, &sizes, &centres) >= MOVED_CLEARANCE_MM - 1e-9);
     assert!(gap_to_text(&model, &sizes, centres[1]) >= MOVED_CLEARANCE_MM - 1e-9);
 }
@@ -2306,8 +2461,8 @@ fn gap_to_text(model: &BoardModel, sizes: &[(f64, f64)], at: (f64, f64)) -> f64 
 }
 
 #[test]
-fn the_generator_version_is_five() {
-    // The obstacles and the part sides change what every recipe gives, so a record of
-    // version 4 is not reproducible.
-    assert_eq!(GENERATOR_VERSION, 5);
+fn the_generator_version_is_six() {
+    // The obstacles, the part sides and the exact arc, text and path boxes change what
+    // every recipe gives, so a record of an earlier version is not reproducible.
+    assert_eq!(GENERATOR_VERSION, 6);
 }
