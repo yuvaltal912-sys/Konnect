@@ -1681,6 +1681,50 @@ fn a_moved_part_is_moved_off_copper_text_and_not_off_silkscreen_text() {
 }
 
 #[test]
+fn a_moved_part_keeps_two_micrometres_from_copper_on_every_side() {
+    // The text box is x 37.325..42.675, y 39.075..40.925 and R1 is 2 x 1 mm. At 3 µm from
+    // a side R1 is legal where dropped; at 1 µm it is moved. Beside the text, level with it
+    // or above and below it, at a distance, it stays: the axes are judged apart.
+    let model = copper_model(&gr_text("ABCD", "40 40", "F.Cu", PLAIN));
+    let (right, left, below, above) = (43.678, 36.322, 41.428, 38.572);
+    for (at, near) in [
+        ((right, 40.0), (right - 0.002, 40.0)),
+        ((left, 40.0), (left + 0.002, 40.0)),
+        ((40.0, below), (40.0, below - 0.002)),
+        ((40.0, above), (40.0, above + 0.002)),
+    ] {
+        assert_eq!(legalized_r1(&model, at), at, "{at:?} is 3 µm off");
+        assert_ne!(legalized_r1(&model, near), near, "{near:?} is 1 µm off");
+    }
+    for beside in [(46.0, 40.0), (34.0, 40.0), (40.0, 44.0), (40.0, 36.0)] {
+        assert_eq!(legalized_r1(&model, beside), beside, "{beside:?}");
+    }
+    // Clear in one axis and over the other's range: the corner cases of the product test.
+    for diagonal in [(46.0, 38.0), (34.0, 42.0), (45.0, 44.0), (35.0, 36.0)] {
+        assert_eq!(legalized_r1(&model, diagonal), diagonal, "{diagonal:?}");
+    }
+    // A text turned a quarter is as tall as it was wide: R1 beside it moves sideways.
+    let turned = copper_model(&gr_text("ABCD", "40 40 90", "F.Cu", PLAIN));
+    assert_eq!(legalized_r1(&turned, (40.0, 40.0)), (38.0, 40.0));
+}
+
+#[test]
+fn touching_the_part_gap_exactly_is_legal() {
+    // A bar from (30, 30) to (34, 30), no width: its box is x 30..34, y 30..30. With a part
+    // gap of 0.5 mm, R1 (2 x 1 mm) centred 3.5 mm from the bar's centre in x (a gap of
+    // exactly 0.5 mm) or 1 mm from it in y (the same) is legal as dropped; closer is not.
+    // Every number here is exact in binary, so "exactly" is exact.
+    let bar = "(gr_line (start 30 30) (end 34 30) (layer \"F.Cu\"))";
+    let model = with_clearances(copper_model(bar), 0.5, 0.0);
+    for exact in [(35.5, 30.0), (28.5, 30.0), (32.0, 31.0), (32.0, 29.0)] {
+        assert_eq!(legalized_r1(&model, exact), exact, "{exact:?}");
+    }
+    for closer in [(35.0, 30.0), (29.0, 30.0), (32.0, 30.5), (32.0, 29.5)] {
+        assert_ne!(legalized_r1(&model, closer), closer, "{closer:?}");
+    }
+}
+
+#[test]
 fn a_moved_part_keeps_the_part_gap_from_copper() {
     let model = with_clearances(
         copper_model(&gr_text("ABCD", "40 40", "F.Cu", PLAIN)),
@@ -1802,6 +1846,84 @@ fn a_turned_copper_text_box_is_turned_about_its_anchor() {
         close(justified.bbox, (39.075, 34.65, 40.925, 45.35)),
         "{justified:?}"
     );
+}
+
+#[test]
+fn a_quarter_turned_copper_text_box_is_exact_to_the_last_digit() {
+    // At the origin, where a residue of 1e-16 from cos 90 would still show: the cardinal
+    // angles swap the half extents, they do not multiply them by sines and cosines.
+    let width = 4.0 * TEXT_WIDTH_PER_CHAR + 0.15;
+    let height = TEXT_HEIGHT_PER_LINE + 0.15;
+    let (half_w, half_h) = (width / 2.0, height / 2.0);
+    for (angle, swapped) in [
+        ("90", true),
+        ("270", true),
+        ("-90", true),
+        ("-270", true),
+        ("180", false),
+        ("0", false),
+    ] {
+        let found = only_obstacle(&gr_text("ABCD", &format!("0 0 {angle}"), "F.Cu", PLAIN));
+        let expected = if swapped {
+            (-half_h, -half_w, half_h, half_w)
+        } else {
+            (-half_w, -half_h, half_w, half_h)
+        };
+        assert_eq!(found.bbox, expected, "{angle}");
+    }
+}
+
+#[test]
+fn unreadable_numbers_and_pens_do_not_make_a_box_smaller_or_unbounded() {
+    // A cache polygon with an infinite coordinate is unreadable and is left out; the other
+    // polygon gives the box.
+    let cache = "(render_cache \"AB\" 0 (polygon (pts (xy 38 39) (xy inf 39) (xy 41 41))) \
+                 (polygon (pts (xy 36 40.5) (xy 37 42) (xy 39 40))))";
+    let item = gr_text(
+        "AB",
+        "40 40",
+        "F.Cu",
+        &format!("(effects (font (size 1 1) (thickness 0.15))) {cache}"),
+    );
+    assert!(close(only_obstacle(&item).bbox, (36.0, 40.0, 39.0, 42.0)));
+    // A negative or infinite stroke width is no width.
+    for width in ["-0.4", "inf", "nan"] {
+        let item = format!(
+            "(gr_line (start 30 30) (end 34 32) (stroke (width {width}) (type default)) (layer \"F.Cu\"))"
+        );
+        assert!(
+            close(only_obstacle(&item).bbox, (30.0, 30.0, 34.0, 32.0)),
+            "{width}"
+        );
+    }
+    // A pen of 0, a negative or an infinite one is the default 0.15.
+    for thickness in ["0", "-1", "inf", "nan"] {
+        let found = only_obstacle(&gr_text(
+            "ABCD",
+            "40 40",
+            "F.Cu",
+            &format!("(effects (font (size 1 1) (thickness {thickness})))"),
+        ));
+        assert!(
+            close(found.bbox, (37.325, 39.075, 42.675, 40.925)),
+            "{thickness}: {:?}",
+            found.bbox
+        );
+    }
+}
+
+#[test]
+fn a_text_box_takes_its_corners_over_its_start_and_end() {
+    let stroke = "(stroke (width 0.2) (type default))";
+    // The corners are the box as turned; start and end are not.
+    let turned = format!(
+        "(gr_text_box \"ab\" (start 60 30) (end 64 33) (pts (xy 58 29) (xy 62 29) (xy 62 35) (xy 58 35)) {stroke} (layer \"F.Cu\"))"
+    );
+    assert!(close(only_obstacle(&turned).bbox, (57.9, 28.9, 62.1, 35.1)));
+    // No corners listed: start and end.
+    let empty =
+        format!("(gr_text_box \"ab\" (start 60 30) (end 64 33) (pts) {stroke} (layer \"F.Cu\"))");
+    assert!(close(only_obstacle(&empty).bbox, (59.9, 29.9, 64.1, 33.1)));
 }
 
 #[test]
