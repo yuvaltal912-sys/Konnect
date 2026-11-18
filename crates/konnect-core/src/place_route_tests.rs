@@ -268,8 +268,23 @@ fn an_exported_candidate_passes_the_judge_preflight() {
         300
     );
 
-    // One byte of the copy's board changed after the export: the preflight refuses.
+    // Only the copy's layout changed after the export: the same board as a tree, which
+    // the preflight accepts since Row RJ (`board_identity::canonical_sha256`).
     std::fs::write(&copy, format!("{text} ")).unwrap();
+    crate::route_judge::prepare(
+        &dsn,
+        &bench.root.join("judge-layout"),
+        &bench.inputs.kicad_cli,
+    )
+    .expect("a change of layout alone is the same board");
+
+    // One real change to the copy's board after the export: the preflight refuses.
+    let changed = text.replacen("(title \"Test Board\")", "(title \"Test Board 2\")", 1);
+    assert_ne!(
+        changed, text,
+        "the fixture's title is where the test expects it"
+    );
+    std::fs::write(&copy, changed).unwrap();
     let refusal = crate::route_judge::prepare(&dsn, &judge_root, &bench.inputs.kicad_cli)
         .expect_err("a board that is not the exported one is refused");
     assert!(refusal.reason.contains("SHA-256"), "{refusal:?}");
