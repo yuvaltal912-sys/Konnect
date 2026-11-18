@@ -596,18 +596,19 @@ fn spec_for(m: &Model, s: &Switcher) -> Result<LoopSpec, String> {
         })
     };
     let ground = |fp: usize, near: Pt| {
-        // Prefer a pin named PGND, else the nearest ground pad.
-        nearest_pad(m, fp, near, |p| {
+        // Prefer a pin named PGND, then the nearest ground pad that is not an input
+        // tied low (`is_signal_pin`), then the nearest ground pad.
+        let on_ground = |p: &konnect_sexp::board_geometry::PadGeom| {
             p.net.as_deref().is_some_and(|n| m.is_ground(n))
+        };
+        nearest_pad(m, fp, near, |p| {
+            on_ground(p)
                 && p.pin_function
                     .as_deref()
                     .is_some_and(|f| f.to_uppercase().starts_with("PGND"))
         })
-        .or_else(|| {
-            nearest_pad(m, fp, near, |p| {
-                p.net.as_deref().is_some_and(|n| m.is_ground(n))
-            })
-        })
+        .or_else(|| nearest_pad(m, fp, near, |p| on_ground(p) && !is_signal_pin(p)))
+        .or_else(|| nearest_pad(m, fp, near, on_ground))
     };
     let ics: Vec<usize> = s
         .parts
@@ -640,11 +641,14 @@ fn spec_for(m: &Model, s: &Switcher) -> Result<LoopSpec, String> {
                         || f == "OUT"
                 })
         });
-        named.or_else(|| {
-            nearest_pad(m, fp, near, |p| {
-                p.net.as_deref().is_some_and(|n| n != not && m.is_power(n))
-            })
-        })
+        // Else the nearest such power pad that is not an input tied to the rail
+        // (an enable), else the nearest such power pad.
+        let on_power = |p: &konnect_sexp::board_geometry::PadGeom| {
+            p.net.as_deref().is_some_and(|n| n != not && m.is_power(n))
+        };
+        named
+            .or_else(|| nearest_pad(m, fp, near, |p| on_power(p) && !is_signal_pin(p)))
+            .or_else(|| nearest_pad(m, fp, near, on_power))
     };
     let node_at = m.pad(s.inductor).1.at;
     if let Some(&ic) = ics.first() {
