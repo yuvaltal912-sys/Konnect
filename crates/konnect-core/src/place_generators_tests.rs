@@ -284,6 +284,13 @@ fn legalize_puts_every_part_inside_the_true_outline() {
     let model = model_of(&text, &[]);
     let sizes = as_read_sizes(&model);
     let mut centres = as_read_centres(&model);
+    // A recipe moved every movable part (by a micron: a part exactly where the input has
+    // it is legal as it is, whatever the outline says).
+    for (i, centre) in centres.iter_mut().enumerate() {
+        if model.movable[i] {
+            centre.0 += 1e-3;
+        }
+    }
     let threshold = model.outline.containment_threshold_mm();
     let box_of = |i: usize, centres: &[(f64, f64)]| {
         let (w, h) = sizes[i];
@@ -394,6 +401,10 @@ fn legalize_says_no_room_instead_of_guessing() {
     let model = model_of(&text, &[]);
     let sizes = as_read_sizes(&model);
     let mut centres = as_read_centres(&model);
+    // Every part moved (by a micron): a part left where the input has it is legal as is.
+    for centre in &mut centres {
+        centre.0 += 1e-3;
+    }
     let error = legalize(&model, &sizes, &mut centres).unwrap_err();
     let GenerateFailure::NoRoom(names) = error else {
         panic!("expected NoRoom, got {error:?}");
@@ -1214,4 +1225,137 @@ fn legalize_takes_equal_cells_in_a_fixed_order() {
         .pad(pad("1", 0.0, 0.0, Some("N1")));
     let model = square(vec![j1(), j2, j3]);
     assert_eq!(legalized_r1(&model, (40.0, 40.0)), (40.0, 42.5));
+}
+
+// ─── Unmoved parts are legal as they are ─────────────────────────────────────
+
+#[test]
+fn legalize_leaves_unmoved_parts_alone_even_where_the_input_overlaps_or_overhangs() {
+    // R1 and R2 overlap each other in the input, R3 hangs over the right edge, as a
+    // socket may on purpose. None of them moves in the recipe: all stay, no NoRoom.
+    // R4 is moved onto R1: it must land clear of all three and inside the outline.
+    let parts = vec![
+        Fp::new("R1", 20.0, 20.0).two_pad("N1", "N2"),
+        Fp::new("R2", 20.5, 20.0).two_pad("N2", "N3"),
+        Fp::new("R3", 59.8, 30.0).two_pad("N3", "N4"),
+        Fp::new("R4", 40.0, 10.0).two_pad("N4", "N5"),
+    ];
+    let model = model_of(&board(OUTLINE, &parts), &[]);
+    let sizes = as_read_sizes(&model);
+    let read = as_read_centres(&model);
+    let r4 = 3;
+    // Nothing moves.
+    let mut centres = read.clone();
+    legalize(&model, &sizes, &mut centres).expect("an input as it is needs no room");
+    assert_eq!(centres, read);
+    // R4 dropped on R1.
+    let mut centres = read.clone();
+    centres[r4] = read[0];
+    legalize(&model, &sizes, &mut centres).expect("R4 finds a cell");
+    assert_eq!(&centres[..3], &read[..3], "the unmoved parts stay");
+    assert_ne!(centres[r4], read[0]);
+    let (x, y) = centres[r4];
+    let (w, h) = sizes[r4];
+    for (k, other) in read.iter().enumerate().take(3) {
+        let ix = (w + sizes[k].0) / 2.0 - (x - other.0).abs();
+        let iy = (h + sizes[k].1) / 2.0 - (y - other.1).abs();
+        assert!(ix <= 0.0 || iy <= 0.0, "R4 overlaps R{}", k + 1);
+    }
+    let (bx0, by0, bx1, by1) = model.bounds;
+    assert!(x - w / 2.0 >= bx0 && x + w / 2.0 <= bx1 && y - h / 2.0 >= by0 && y + h / 2.0 <= by1);
+    // A moved part may not overhang either: R4 dropped over the right edge comes back in.
+    let mut centres = read.clone();
+    centres[r4] = (59.9, 10.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert!(centres[r4].0 + sizes[r4].0 / 2.0 <= bx1);
+    // And a part that turned is moved, not unmoved: R1 with its size swapped is judged.
+    let mut turned_sizes = sizes.clone();
+    turned_sizes[0] = (sizes[0].1, sizes[0].0);
+    let mut centres = read.clone();
+    legalize(&model, &turned_sizes, &mut centres).unwrap();
+    let (tw, th) = turned_sizes[0];
+    for (k, other) in read.iter().enumerate().skip(1).take(2) {
+        let ix = (tw + sizes[k].0) / 2.0 - (centres[0].0 - other.0).abs();
+        let iy = (th + sizes[k].1) / 2.0 - (centres[0].1 - other.1).abs();
+        assert!(ix <= 0.0 || iy <= 0.0, "turned R1 overlaps R{}", k + 1);
+    }
+}
+
+// ─── The schematic grid fits the board ───────────────────────────────────────
+
+#[test]
+fn the_schematic_grid_takes_a_smaller_margin_when_the_wide_one_overflows() {
+    // 30 parts of 2 x 1 mm, each alone in its cluster, on a 30 x 20 mm board. At a 2 mm
+    // margin the cells are 4 x 3 mm, six to a row, five rows: 25 mm of rows on a 20 mm
+    // board. At 1 mm they are 3 x 2, nine to a row, four rows: it fits.
+    let parts: Vec<Fp> = (0..30)
+        .map(|k| {
+            Fp::new(
+                &format!("R{k:02}"),
+                3.0 + (k % 9) as f64 * 3.0,
+                3.0 + (k / 9) as f64 * 3.0,
+            )
+            .two_pad(&format!("A{k}"), &format!("B{k}"))
+        })
+        .collect();
+    let model = model_of(&board(Shape::Rect(0.0, 0.0, 30.0, 20.0), &parts), &[]);
+    let sizes = as_read_sizes(&model);
+    let found = clusters(&model, 8);
+    assert_eq!(found.len(), 30);
+    let (_, wide_fits) = grid_with_margin(&model, &sizes, &found, 2.0);
+    assert!(!wide_fits, "the 2 mm grid must overflow in this fixture");
+    let (_, narrow_fits) = grid_with_margin(&model, &sizes, &found, 1.0);
+    assert!(narrow_fits);
+
+    let params = SchematicParams {
+        fanout_limit: 8,
+        polish: None,
+    };
+    let mut rng = SplitMix64(7);
+    let centres = schematic_grid(&model, &params, &mut rng);
+    let (bx0, by0, bx1, by1) = model.bounds;
+    for (i, (x, y)) in centres.iter().enumerate() {
+        let (w, h) = sizes[i];
+        assert!(
+            x - w / 2.0 >= bx0 && x + w / 2.0 <= bx1 && y - h / 2.0 >= by0 && y + h / 2.0 <= by1,
+            "{} is outside the bounds at ({x}, {y})",
+            model.references[i]
+        );
+    }
+    // And a recipe on it gives a candidate: no NoRoom.
+    for seed in 1..=8u64 {
+        let recipe = Recipe {
+            family: Family::Schematic,
+            seed,
+            params: Params::Schematic(params),
+        };
+        generate(&model, &recipe).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+    }
+    // A board the 2 mm grid fits keeps the legacy margin: same centres as before.
+    let roomy = demo_model();
+    let roomy_sizes = as_read_sizes(&roomy);
+    let roomy_clusters = clusters(&roomy, 8);
+    assert!(grid_with_margin(&roomy, &roomy_sizes, &roomy_clusters, 2.0).1);
+    let mut one = SplitMix64(3);
+    let mut two = SplitMix64(3);
+    let ordered_like_the_grid = {
+        let mut c = clusters(&roomy, 8);
+        for i in (1..c.len()).rev() {
+            let j = one.below(i as u64 + 1) as usize;
+            c.swap(i, j);
+        }
+        for members in &mut c {
+            members.sort_by(|&a, &b| {
+                let area = |i: usize| roomy_sizes[i].0 * roomy_sizes[i].1;
+                area(b)
+                    .total_cmp(&area(a))
+                    .then_with(|| roomy.references[a].cmp(&roomy.references[b]))
+            });
+        }
+        c
+    };
+    assert_eq!(
+        schematic_grid(&roomy, &params, &mut two),
+        grid_with_margin(&roomy, &roomy_sizes, &ordered_like_the_grid, 2.0).0
+    );
 }

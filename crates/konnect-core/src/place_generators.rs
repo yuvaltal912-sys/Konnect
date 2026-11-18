@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 1;
+pub(crate) const GENERATOR_VERSION: u32 = 2;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -30,12 +30,9 @@ pub(crate) const GRID_MM: f64 = 0.5;
 /// Rings legalize searches before it gives up on a part.
 pub(crate) const LEGALIZE_RINGS: usize = 400;
 
-/// The margin between cells of the schematic grid, mm (the legacy placer's).
-const CELL_MARGIN_MM: f64 = 2.0;
-
-/// A part that has not moved may touch a neighbour exactly, as it does in the input;
-/// only an overlap deeper than this counts against it (float noise is far below it).
-const UNMOVED_OVERLAP_MM: f64 = 1e-9;
+/// The margins between cells of the schematic grid, mm, in the order tried: the first is
+/// the legacy placer's. `schematic_grid` uses the first one whose rows fit the board.
+const CELL_MARGINS_MM: [f64; 4] = [2.0, 1.0, 0.5, 0.25];
 
 /// A part a generator placed must clear a neighbour by at least this, so that no
 /// rounding of the written board can turn "touching" into a courtyard overlap. Anchors
@@ -610,8 +607,12 @@ fn clusters(model: &BoardModel, fanout_limit: usize) -> Vec<Vec<usize>> {
 /// The schematic placer with the fanout filter: union-find over the nets with at most
 /// `fanout_limit` distinct references, clusters in a seeded order, members by courtyard
 /// area (ties by reference, as the legacy), near-square grids flowing left to right in
-/// `bounds` and wrapping into rows, cells of the largest member plus 2 mm (the legacy
-/// margin). Held parts at their own centres.
+/// `bounds` and wrapping into rows, cells of the largest member plus a margin. The
+/// margin is the first of `CELL_MARGINS_MM` (2, 1, 0.5, 0.25 mm; the legacy placer's
+/// is 2) whose rows fit inside `bounds`; when none does, 0.25 mm, and `legalize`
+/// does what it can (containment in the true outline is its job). The margin is a
+/// function of the board and the recipe, so a rerun finds the same one, and it is not
+/// recorded. Held parts at their own centres.
 fn schematic_grid(
     model: &BoardModel,
     params: &SchematicParams,
@@ -622,32 +623,61 @@ fn schematic_grid(
         let j = rng.below(i as u64 + 1) as usize;
         clusters.swap(i, j);
     }
-
     let sizes = as_read_sizes(model);
-    let (bx0, by0, bx1, _) = model.bounds;
+    let ordered: Vec<Vec<usize>> = clusters
+        .iter()
+        .map(|members| {
+            let mut ordered = members.clone();
+            ordered.sort_by(|&a, &b| {
+                let area = |i: usize| sizes[i].0 * sizes[i].1;
+                area(b)
+                    .total_cmp(&area(a))
+                    .then_with(|| model.references[a].cmp(&model.references[b]))
+            });
+            ordered
+        })
+        .collect();
+    let mut last = Vec::new();
+    for margin in CELL_MARGINS_MM {
+        let (centres, fits) = grid_with_margin(model, &sizes, &ordered, margin);
+        if fits {
+            return centres;
+        }
+        last = centres;
+    }
+    last
+}
+
+/// The grid of `schematic_grid` for one cell `margin`, and whether its rows fit inside
+/// `bounds`: no cluster wider than the board, and the last row ends above the bottom
+/// margin.
+fn grid_with_margin(
+    model: &BoardModel,
+    sizes: &[(f64, f64)],
+    clusters: &[Vec<usize>],
+    margin: f64,
+) -> (Vec<(f64, f64)>, bool) {
+    let (bx0, by0, bx1, by1) = model.bounds;
     let mut centres = as_read_centres(model);
-    let mut cursor_x = bx0 + CELL_MARGIN_MM;
-    let mut cursor_y = by0 + CELL_MARGIN_MM;
+    let mut cursor_x = bx0 + margin;
+    let mut cursor_y = by0 + margin;
     let mut row_height = 0.0f64;
-    for members in &clusters {
-        let mut ordered = members.clone();
-        ordered.sort_by(|&a, &b| {
-            let area = |i: usize| sizes[i].0 * sizes[i].1;
-            area(b)
-                .total_cmp(&area(a))
-                .then_with(|| model.references[a].cmp(&model.references[b]))
-        });
+    let mut fits = true;
+    for ordered in clusters {
         let n = ordered.len();
         let cols = (n as f64).sqrt().ceil() as usize;
         let rows = n.div_ceil(cols);
-        let cell_w = ordered.iter().map(|&i| sizes[i].0).fold(0.0, f64::max) + CELL_MARGIN_MM;
-        let cell_h = ordered.iter().map(|&i| sizes[i].1).fold(0.0, f64::max) + CELL_MARGIN_MM;
+        let cell_w = ordered.iter().map(|&i| sizes[i].0).fold(0.0, f64::max) + margin;
+        let cell_h = ordered.iter().map(|&i| sizes[i].1).fold(0.0, f64::max) + margin;
         let cluster_w = cell_w * cols as f64;
         let cluster_h = cell_h * rows as f64;
-        if cursor_x > bx0 + CELL_MARGIN_MM && cursor_x + cluster_w > bx1 - CELL_MARGIN_MM {
-            cursor_x = bx0 + CELL_MARGIN_MM;
-            cursor_y += row_height + CELL_MARGIN_MM;
+        if cursor_x > bx0 + margin && cursor_x + cluster_w > bx1 - margin {
+            cursor_x = bx0 + margin;
+            cursor_y += row_height + margin;
             row_height = 0.0;
+        }
+        if cursor_x + cluster_w > bx1 - margin {
+            fits = false;
         }
         row_height = row_height.max(cluster_h);
         for (slot, &i) in ordered.iter().enumerate() {
@@ -657,9 +687,12 @@ fn schematic_grid(
                 snap(cursor_y + cell_h * (row as f64 + 0.5)),
             );
         }
-        cursor_x += cluster_w + CELL_MARGIN_MM;
+        cursor_x += cluster_w + margin;
     }
-    centres
+    if cursor_y + row_height > by1 - margin {
+        fits = false;
+    }
+    (centres, fits)
 }
 
 /// `params.moves` seeded edits of the input placement, each one of: a shift by up to
@@ -877,12 +910,16 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 /// nearest legal cell, spiralling on `GRID_MM` for up to `LEGALIZE_RINGS` rings. Every
 /// part is placed, or the result is `NoRoom` naming the parts that were not.
 ///
-/// A part that has not moved at all (its centre and size are the ones read) settles
-/// before the parts that have, and is judged with the tolerance of the input: an exact
-/// touch, which the input may hold, is not an overlap. A part a generator placed must
-/// clear its neighbours by 2 µm (`MOVED_CLEARANCE_MM`), so that rounding of the anchors to
-/// 1 µm in the written board cannot turn a touch into an overlap. Cells are ordered by
-/// distance, the ring's cells in a fixed order, so the result is the same on every run.
+/// A part at exactly its input position and rotation (its centre and size are the ones
+/// read) is legal as it is: neither its containment nor its overlaps with other unmoved
+/// parts are checked, because the input may hold them on purpose (a socket over its
+/// neighbours, a part at the edge), and P1 judges a candidate against the input's own
+/// hard failures. All of them settle first, with the held parts. Only a part that
+/// moved or turned must be inside the true outline and clear of every settled part,
+/// moved or not, held or not, by 2 µm (`MOVED_CLEARANCE_MM`), so that rounding of the
+/// anchors to 1 µm in the written board cannot turn a touch into an overlap. Cells are
+/// ordered by distance, the ring's cells in a fixed order, so the result is the same on
+/// every run.
 pub(crate) fn legalize(
     model: &BoardModel,
     sizes: &[(f64, f64)],
@@ -900,8 +937,7 @@ pub(crate) fn legalize(
     let read_sizes = as_read_sizes(model);
 
     // `gate` is how much the two boxes must overlap, per axis, to count as overlapping:
-    // above `UNMOVED_OVERLAP_MM` for a part that did not move, above minus
-    // `MOVED_CLEARANCE_MM` (touching, or nearer than 2 µm, is overlapping) for one that did.
+    // above minus `MOVED_CLEARANCE_MM` (touching, or nearer than 2 µm, is overlapping).
     let legal_at =
         |i: usize, at: (f64, f64), gate: f64, settled: &[usize], centres: &[(f64, f64)]| {
             let (w, h) = sizes[i];
@@ -935,31 +971,20 @@ pub(crate) fn legalize(
             })
         };
 
-    let mut settled: Vec<usize> = (0..count).filter(|&i| !model.movable[i]).collect();
     let unmoved = |i: usize, centres: &[(f64, f64)]| {
         centres[i] == read_centres[i] && sizes[i] == read_sizes[i]
     };
-    // Parts that did not move and are fine where they are settle before the others.
-    let mut queue: Vec<usize> = Vec::new();
-    for i in 0..count {
-        if !model.movable[i] {
-            continue;
-        }
-        if unmoved(i, centres) && legal_at(i, centres[i], UNMOVED_OVERLAP_MM, &settled, centres) {
-            settled.push(i);
-        } else {
-            queue.push(i);
-        }
-    }
+    // The held parts and every part that stayed settle first, as they are.
+    let mut settled: Vec<usize> = (0..count)
+        .filter(|&i| !model.movable[i] || unmoved(i, centres))
+        .collect();
+    let queue: Vec<usize> = (0..count)
+        .filter(|&i| model.movable[i] && !unmoved(i, centres))
+        .collect();
     let mut failed: Vec<String> = Vec::new();
     for i in queue {
         let strict = -MOVED_CLEARANCE_MM;
-        let gate = if unmoved(i, centres) {
-            UNMOVED_OVERLAP_MM
-        } else {
-            strict
-        };
-        if !legal_at(i, centres[i], gate, &settled, centres) {
+        if !legal_at(i, centres[i], strict, &settled, centres) {
             let base = (snap(centres[i].0), snap(centres[i].1));
             let mut found = None;
             'rings: for ring in 0..=LEGALIZE_RINGS as i64 {
