@@ -1281,14 +1281,32 @@ fn legalize_leaves_unmoved_parts_alone_even_where_the_input_overlaps_or_overhang
     }
 }
 
-// ─── The schematic grid fits the board ───────────────────────────────────────
+// ─── The schematic shelves fit the board ─────────────────────────────────────
+
+/// The S recipe of `params` and `seed`.
+fn schematic_of(params: SchematicParams, seed: u64) -> Recipe {
+    Recipe {
+        family: Family::Schematic,
+        seed,
+        params: Params::Schematic(params),
+    }
+}
+
+/// Whether every part's courtyard (`centres`, `sizes`) lies inside `bounds`.
+fn all_inside(model: &BoardModel, sizes: &[(f64, f64)], centres: &[(f64, f64)]) -> bool {
+    let (bx0, by0, bx1, by1) = model.bounds;
+    centres.iter().zip(sizes).all(|((x, y), (w, h))| {
+        x - w / 2.0 >= bx0 && x + w / 2.0 <= bx1 && y - h / 2.0 >= by0 && y + h / 2.0 <= by1
+    })
+}
 
 #[test]
-fn the_schematic_grid_takes_a_smaller_margin_when_the_wide_one_overflows() {
-    // 30 parts of 2 x 1 mm, each alone in its cluster, on a 30 x 20 mm board. At a 2 mm
-    // margin the cells are 4 x 3 mm, six to a row, five rows: 25 mm of rows on a 20 mm
-    // board. At 1 mm they are 3 x 2, nine to a row, four rows: it fits.
-    let parts: Vec<Fp> = (0..30)
+fn the_schematic_shelves_take_a_smaller_margin_when_the_wide_one_overflows() {
+    // 40 parts of 2 x 1 mm, each alone in its cluster, on a 30 x 20 mm board. At a 2 mm
+    // margin a part takes 2 + 2 mm and a cluster 2 mm more: five to a shelf, eight shelves
+    // of 1 mm and 2 mm margins, 24 mm of shelves on a 20 mm board. At 1 mm: seven to a
+    // shelf, six shelves, 12 mm. It fits.
+    let parts: Vec<Fp> = (0..40)
         .map(|k| {
             Fp::new(
                 &format!("R{k:02}"),
@@ -1301,61 +1319,144 @@ fn the_schematic_grid_takes_a_smaller_margin_when_the_wide_one_overflows() {
     let model = model_of(&board(Shape::Rect(0.0, 0.0, 30.0, 20.0), &parts), &[]);
     let sizes = as_read_sizes(&model);
     let found = clusters(&model, 8);
-    assert_eq!(found.len(), 30);
-    let (_, wide_fits) = grid_with_margin(&model, &sizes, &found, 2.0);
-    assert!(!wide_fits, "the 2 mm grid must overflow in this fixture");
-    let (_, narrow_fits) = grid_with_margin(&model, &sizes, &found, 1.0);
-    assert!(narrow_fits);
+    assert_eq!(found.len(), 40);
+    assert!(
+        !grid_with_margin(&model, &sizes, &found, 2.0).1,
+        "2 mm overflows"
+    );
+    assert!(grid_with_margin(&model, &sizes, &found, 1.0).1);
 
     let params = SchematicParams {
         fanout_limit: 8,
         polish: None,
     };
-    let mut rng = SplitMix64(7);
-    let centres = schematic_grid(&model, &params, &mut rng);
-    let (bx0, by0, bx1, by1) = model.bounds;
-    for (i, (x, y)) in centres.iter().enumerate() {
-        let (w, h) = sizes[i];
-        assert!(
-            x - w / 2.0 >= bx0 && x + w / 2.0 <= bx1 && y - h / 2.0 >= by0 && y + h / 2.0 <= by1,
-            "{} is outside the bounds at ({x}, {y})",
-            model.references[i]
+    let centres = schematic_grid(&model, &params, &mut SplitMix64(7));
+    assert!(all_inside(&model, &sizes, &centres));
+    for seed in 1..=8u64 {
+        generate(&model, &schematic_of(params, seed))
+            .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+    }
+}
+
+#[test]
+fn a_cluster_with_one_large_part_fits_a_board_the_cell_grid_overflowed() {
+    // One chain of a 20 x 10 mm socket and 30 parts of 2 x 1 mm on a 40 x 30 mm board.
+    // Cells of the cluster's largest member (22 x 12 mm, six to a row) are 130 mm wide
+    // and overflow it; shelves with each part at its own size fit at the first margin.
+    let mut parts = vec![Fp::new("J9", 10.0, 10.0)
+        .court(10.0, 5.0)
+        .two_pad("N0", "N1")];
+    for k in 1..=30 {
+        parts.push(
+            Fp::new(
+                &format!("R{k:02}"),
+                2.0 + ((k - 1) % 12) as f64 * 3.0,
+                20.0 + ((k - 1) / 12) as f64 * 3.0,
+            )
+            .two_pad(&format!("N{k}"), &format!("N{}", k + 1)),
         );
     }
-    // And a recipe on it gives a candidate: no NoRoom.
-    for seed in 1..=8u64 {
-        let recipe = Recipe {
-            family: Family::Schematic,
-            seed,
-            params: Params::Schematic(params),
-        };
-        generate(&model, &recipe).unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
-    }
-    // A board the 2 mm grid fits keeps the legacy margin: same centres as before.
-    let roomy = demo_model();
-    let roomy_sizes = as_read_sizes(&roomy);
-    let roomy_clusters = clusters(&roomy, 8);
-    assert!(grid_with_margin(&roomy, &roomy_sizes, &roomy_clusters, 2.0).1);
-    let mut one = SplitMix64(3);
-    let mut two = SplitMix64(3);
-    let ordered_like_the_grid = {
-        let mut c = clusters(&roomy, 8);
-        for i in (1..c.len()).rev() {
-            let j = one.below(i as u64 + 1) as usize;
-            c.swap(i, j);
-        }
-        for members in &mut c {
-            members.sort_by(|&a, &b| {
-                let area = |i: usize| roomy_sizes[i].0 * roomy_sizes[i].1;
-                area(b)
-                    .total_cmp(&area(a))
-                    .then_with(|| roomy.references[a].cmp(&roomy.references[b]))
-            });
-        }
-        c
+    let rules = HoldRules {
+        connector_prefixes: Vec::new(),
+        ..HoldRules::default()
     };
-    assert_eq!(
-        schematic_grid(&roomy, &params, &mut two),
-        grid_with_margin(&roomy, &roomy_sizes, &ordered_like_the_grid, 2.0).0
+    let text = board(Shape::Rect(0.0, 0.0, 40.0, 30.0), &parts);
+    let set = held_set(&text, &BTreeSet::new(), &rules).expect("the held set");
+    let model = board_model(&text, set, Intent::default()).expect("the model");
+    assert_eq!(model.held.movable.len(), 31, "the socket is movable here");
+    let sizes = as_read_sizes(&model);
+    let found = clusters(&model, 8);
+    assert_eq!(found.len(), 1, "one chain, one cluster");
+    let (centres, fits) = grid_with_margin(&model, &sizes, &found, 2.0);
+    assert!(fits, "the shelves fit at the first margin");
+    assert!(all_inside(&model, &sizes, &centres));
+
+    let params = SchematicParams {
+        fanout_limit: 8,
+        polish: None,
+    };
+    for seed in 1..=4u64 {
+        let candidate = generate(&model, &schematic_of(params, seed))
+            .unwrap_or_else(|e| panic!("seed {seed}: no room? {e:?}"));
+        let written = placements_applied_to(&model.text, &candidate.placements).unwrap();
+        let evaluated = evaluate_text(&written, &[]);
+        assert_eq!(evaluated["hard_failures"].as_array().unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn shelves_keep_a_cluster_together_and_clamp_when_nothing_fits() {
+    // A board too small for the parts at any margin: the layout of the last margin has
+    // every part's centre clamped so that its courtyard is inside the bounds.
+    let parts: Vec<Fp> = (0..12)
+        .map(|k| {
+            Fp::new(&format!("R{k:02}"), 3.0 + k as f64, 5.0)
+                .court(2.0, 1.5)
+                .two_pad(&format!("A{k}"), &format!("B{k}"))
+        })
+        .collect();
+    let model = model_of(&board(Shape::Rect(0.0, 0.0, 12.0, 8.0), &parts), &[]);
+    let sizes = as_read_sizes(&model);
+    let found = clusters(&model, 8);
+    for margin in CELL_MARGINS_MM {
+        assert!(
+            !grid_with_margin(&model, &sizes, &found, margin).1,
+            "{margin}"
+        );
+    }
+    let params = SchematicParams {
+        fanout_limit: 8,
+        polish: None,
+    };
+    let centres = schematic_grid(&model, &params, &mut SplitMix64(1));
+    assert!(all_inside(&model, &sizes, &centres));
+
+    // The members of a cluster follow each other in area order on the shelves, and the
+    // next cluster starts after them: two chains of three parts on a roomy board.
+    let mut chained = Vec::new();
+    for (chain, base) in [("X", 0), ("Y", 10)] {
+        for k in 0..3 {
+            chained.push(
+                Fp::new(
+                    &format!("{chain}{k}"),
+                    5.0 + 5.0 * k as f64,
+                    5.0 + base as f64,
+                )
+                .two_pad(&format!("{chain}{k}"), &format!("{chain}{}", k + 1)),
+            );
+        }
+    }
+    let model = model_of(&board(OUTLINE, &chained), &[]);
+    let sizes = as_read_sizes(&model);
+    let found = clusters(&model, 8);
+    assert_eq!(found.len(), 2);
+    let (centres, fits) = grid_with_margin(&model, &sizes, &found, 2.0);
+    assert!(fits);
+    for members in &found {
+        let xs: Vec<f64> = members.iter().map(|&i| centres[i].0).collect();
+        let ys: Vec<f64> = members.iter().map(|&i| centres[i].1).collect();
+        // One shelf (the board is wide), each part a part-width and a margin from the last.
+        assert!(ys.iter().all(|y| *y == ys[0]), "{ys:?}");
+        let mut sorted = xs.clone();
+        sorted.sort_by(f64::total_cmp);
+        assert!(
+            sorted.windows(2).all(|w| (w[1] - w[0] - 4.0).abs() < 1e-9),
+            "{sorted:?}"
+        );
+    }
+    // The second cluster starts a part width, the margin and one more margin after the first.
+    let first_end = found[0]
+        .iter()
+        .map(|&i| centres[i].0)
+        .fold(f64::MIN, f64::max)
+        + 1.0;
+    let second_start = found[1]
+        .iter()
+        .map(|&i| centres[i].0)
+        .fold(f64::MAX, f64::min)
+        - 1.0;
+    assert!(
+        (second_start - first_end - 4.0).abs() < 1e-9,
+        "{first_end} {second_start}"
     );
 }

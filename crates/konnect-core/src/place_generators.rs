@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 2;
+pub(crate) const GENERATOR_VERSION: u32 = 3;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -30,8 +30,8 @@ pub(crate) const GRID_MM: f64 = 0.5;
 /// Rings legalize searches before it gives up on a part.
 pub(crate) const LEGALIZE_RINGS: usize = 400;
 
-/// The margins between cells of the schematic grid, mm, in the order tried: the first is
-/// the legacy placer's. `schematic_grid` uses the first one whose rows fit the board.
+/// The margins between parts of the schematic shelves, mm, in the order tried: the first
+/// is the legacy placer's cell margin. `schematic_grid` uses the first whose shelves fit.
 const CELL_MARGINS_MM: [f64; 4] = [2.0, 1.0, 0.5, 0.25];
 
 /// A part a generator placed must clear a neighbour by at least this, so that no
@@ -52,7 +52,7 @@ pub(crate) enum Family {
     /// F: the force core from a seeded scatter. Like S, it takes from O only what S0
     /// keeps: the held parts, every side and rotation, and the brief.
     Force,
-    /// S: the schematic placer's clusters as grids, optionally polished by the core.
+    /// S: the schematic placer's clusters as shelf-packed rows, optionally polished by the core.
     Schematic,
     /// P: seeded perturbations of the input placement (start O).
     Perturb,
@@ -605,14 +605,18 @@ fn clusters(model: &BoardModel, fanout_limit: usize) -> Vec<Vec<usize>> {
 }
 
 /// The schematic placer with the fanout filter: union-find over the nets with at most
-/// `fanout_limit` distinct references, clusters in a seeded order, members by courtyard
-/// area (ties by reference, as the legacy), near-square grids flowing left to right in
-/// `bounds` and wrapping into rows, cells of the largest member plus a margin. The
-/// margin is the first of `CELL_MARGINS_MM` (2, 1, 0.5, 0.25 mm; the legacy placer's
-/// is 2) whose rows fit inside `bounds`; when none does, 0.25 mm, and `legalize`
-/// does what it can (containment in the true outline is its job). The margin is a
-/// function of the board and the recipe, so a rerun finds the same one, and it is not
-/// recorded. Held parts at their own centres.
+/// `fanout_limit` distinct references, clusters in a seeded order, each cluster's
+/// members by courtyard area descending (ties by reference, as the legacy), packed in
+/// shelves: parts go left to right inside `bounds`, each at its own width plus a
+/// margin, a new shelf opens below (as tall as its tallest part plus the margin) when
+/// the next part does not fit the row, and a cluster may continue onto the next shelf.
+/// Clusters follow each other in order with one more margin between them. The margin is
+/// the first of `CELL_MARGINS_MM` (2, 1, 0.5, 0.25 mm) whose shelves fit inside
+/// `bounds`; when none does, the 0.25 mm layout with every centre clamped into `bounds`
+/// (inset by half the part's size), so that `legalize` starts on the board and does
+/// what it can (containment in the true outline is its job). The margin is a function
+/// of the board and the recipe, so a rerun finds the same one, and it is not recorded.
+/// Held parts at their own centres.
 fn schematic_grid(
     model: &BoardModel,
     params: &SchematicParams,
@@ -645,12 +649,32 @@ fn schematic_grid(
         }
         last = centres;
     }
+    let (bx0, by0, bx1, by1) = model.bounds;
+    for members in &ordered {
+        for &i in members {
+            let (w, h) = sizes[i];
+            last[i] = (
+                clamp_inside(last[i].0, bx0 + w / 2.0, bx1 - w / 2.0),
+                clamp_inside(last[i].1, by0 + h / 2.0, by1 - h / 2.0),
+            );
+        }
+    }
     last
 }
 
-/// The grid of `schematic_grid` for one cell `margin`, and whether its rows fit inside
-/// `bounds`: no cluster wider than the board, and the last row ends above the bottom
-/// margin.
+/// `value` within `low..=high`; the midpoint when the range is empty (a part larger
+/// than the bounds).
+fn clamp_inside(value: f64, low: f64, high: f64) -> f64 {
+    if low > high {
+        (low + high) / 2.0
+    } else {
+        value.clamp(low, high)
+    }
+}
+
+/// The shelves of `schematic_grid` for one `margin`, and whether they fit inside
+/// `bounds`: no part wider than the usable width, and the last shelf ends above the
+/// bottom margin.
 fn grid_with_margin(
     model: &BoardModel,
     sizes: &[(f64, f64)],
@@ -661,35 +685,27 @@ fn grid_with_margin(
     let mut centres = as_read_centres(model);
     let mut cursor_x = bx0 + margin;
     let mut cursor_y = by0 + margin;
-    let mut row_height = 0.0f64;
+    let mut shelf_height = 0.0f64;
     let mut fits = true;
     for ordered in clusters {
-        let n = ordered.len();
-        let cols = (n as f64).sqrt().ceil() as usize;
-        let rows = n.div_ceil(cols);
-        let cell_w = ordered.iter().map(|&i| sizes[i].0).fold(0.0, f64::max) + margin;
-        let cell_h = ordered.iter().map(|&i| sizes[i].1).fold(0.0, f64::max) + margin;
-        let cluster_w = cell_w * cols as f64;
-        let cluster_h = cell_h * rows as f64;
-        if cursor_x > bx0 + margin && cursor_x + cluster_w > bx1 - margin {
-            cursor_x = bx0 + margin;
-            cursor_y += row_height + margin;
-            row_height = 0.0;
+        for &i in ordered {
+            let (w, h) = sizes[i];
+            if cursor_x > bx0 + margin && cursor_x + w > bx1 - margin {
+                cursor_x = bx0 + margin;
+                cursor_y += shelf_height + margin;
+                shelf_height = 0.0;
+            }
+            if cursor_x + w > bx1 - margin {
+                fits = false;
+            }
+            centres[i] = (cursor_x + w / 2.0, cursor_y + h / 2.0);
+            cursor_x += w + margin;
+            shelf_height = shelf_height.max(h);
         }
-        if cursor_x + cluster_w > bx1 - margin {
-            fits = false;
-        }
-        row_height = row_height.max(cluster_h);
-        for (slot, &i) in ordered.iter().enumerate() {
-            let (col, row) = (slot % cols, slot / cols);
-            centres[i] = (
-                snap(cursor_x + cell_w * (col as f64 + 0.5)),
-                snap(cursor_y + cell_h * (row as f64 + 0.5)),
-            );
-        }
-        cursor_x += cluster_w + margin;
+        // One more margin between clusters.
+        cursor_x += margin;
     }
-    if cursor_y + row_height > by1 - margin {
+    if cursor_y + shelf_height > by1 - margin {
         fits = false;
     }
     (centres, fits)

@@ -103,7 +103,7 @@ product does (sandboxed, never `--live`). The search applies nothing.
 | D11 | `pcb_components::placements_applied_to` is the loop of `update_closed_board_footprints` without the file. A generator lists only the parts it moved or turned: a part that stayed is not listed, because a set re-spells its text and pad angles even by 0 degrees. `placements_moved_applied_to` is the same loop that only moves a footprint whose rotation is already the placement's, as the move tool does, and sets a turned one: `admit_ai` rebuilds A with it | A candidate's board is written by the same transform as a real move (the reason `apply_placements_to_content` exists), and in memory, so the pool needs no temp files. A candidate must equal the input in everything it did not change, and an AI that moves parts one by one with the move tool leaves the angles of the parts it did not turn as spelled; a set of every part would not reproduce its board |
 | D12 | Phase 1 (generate, write, check the held set, evaluate, screen) runs on a bounded pool of scoped threads, one per core, before any routing. Routing calls then run one at a time, and each uses the routing search's own lanes on the whole machine. Both phases fall under the board's one time limit (D15) | Generation is CPU-only and takes seconds. The routing search's lanes (route design D5) are tuned for one search per machine. Row BN's rerun saw host load change routing throughput by 6 to 16 %, so two searches at once would make candidates' routing incomparable |
 | D13 | Every routed candidate is routed at effort M. Each reference (O, A) is routed 3 times; each selected generated candidate once | Equal routing effort is what makes the routed measures a placement comparison. Fast (2 runs) is too noisy: on B4 with pours fixed, stage 7 left 2 to 10 unconnected across 7 seeds. H or XH would make the bench 3 to 10 times longer. A family gets the best of 4 calls; a reference's own 3 calls show the routing noise its best must clear (D18) |
-| D14 | The matrix is 288 recipes. F: seeds 1 to 32 x rail weight {0, 0.5, 3} on nets with more than 8 references. S: seeds 1 to 32 x {raw, polished}. P: seeds 1 to 64 x {4 edits within 2 mm, 12 edits within 5 mm}. A board that repeats an earlier one is a duplicate and is never routed. Per family, the screen's 3 best and 1 drawn candidate among those that pass P1 are routed | Generating and screening cost seconds; routing costs minutes. So many candidates are made and few are routed. The drawn one shows whether the screen picks well: if drawn candidates beat the screen's best, the screen is wrong. Fixed slots give every family an answer. 8 is `score_placement`'s own fanout limit; 3 is the legacy weight of a power name. Small edits and screen ties can repeat a board, which would waste a call. S's grid takes the first of the cell margins 2, 1, 0.5 and 0.25 mm whose rows fit the bounds (0.25 if none does), because a grid that overflows the board leaves `legalize` no room for 27 to 35 parts |
+| D14 | The matrix is 288 recipes. F: seeds 1 to 32 x rail weight {0, 0.5, 3} on nets with more than 8 references. S: seeds 1 to 32 x {raw, polished}. P: seeds 1 to 64 x {4 edits within 2 mm, 12 edits within 5 mm}. A board that repeats an earlier one is a duplicate and is never routed. Per family, the screen's 3 best and 1 drawn candidate among those that pass P1 are routed | Generating and screening cost seconds; routing costs minutes. So many candidates are made and few are routed. The drawn one shows whether the screen picks well: if drawn candidates beat the screen's best, the screen is wrong. Fixed slots give every family an answer. 8 is `score_placement`'s own fanout limit; 3 is the legacy weight of a power name. Small edits and screen ties can repeat a board, which would waste a call. S's shelves take the first of the margins 2, 1, 0.5 and 0.25 mm that fit the bounds (0.25 mm, clamped into the bounds, if none does). Each part has its own width: cells of a cluster's largest member (a ZIF socket) overflowed the board far beyond `legalize`'s reach, 28 to 35 parts failed in the smoke runs |
 | D15 | The time limit is 100 minutes per board (18 calls of about 5 minutes, plus phase 1). A routing call starts only when the median wall time of the calls that routed a candidate so far still fits before the limit; before any such call has ended, the estimate is the budget plus 60 s, a margin this design chooses. A started call is never cut; its own budget ends it. The rounds go F, S, P; S, P, F; P, F, S; and so on (round r starts at family r mod 3) | Route design D6's launch rule, applied to whole calls. Route design D7 lets a call that has no judged run yet wait past its budget without a bound, so a call that judged no run (no winner) says nothing about how long the next one takes and stays out of the median, which replaces the first estimate as soon as a call routes one. The drawn candidates come second in each family's turn, so a short limit does not cut the screen's check first. The family order rotates so that the same family (P, last in a fixed order) is not the one that loses its last call whenever the limit cuts a round |
 | D16 | Every stage failure becomes a record, and the search goes on. A generator panic is caught. Three routing calls in a row that gave no routed candidate (a refused export, a failed call, or a call with no winner), with none routed yet, stop the routing phase; a routed candidate resets the count, and after the first one the phase does not stop this way. `table.md` names a stop by a fixed word (`time_limit`, `input_check_failed`, `calls_failed_in_a_row`); the full reason, which can hold a path or a tool's output, is in `search.json` only | Route design D16 and D18: a broken export or binary fails every call the same way, and a call costs minutes. A call with no winner after the budget is the same signal when nothing has routed yet. The table is a document that leaves the folder, so it carries counts and codes, not text of errors |
 | D17 | The gates are P1 (no hard failure of the placement score that names a movable part and is not among the input board's own, compared by kind and sorted references, and the outline is closed), P2 (no physical DRC type worse than on the input board, both unrouted), and G1 to G3 of the routing call's winner. The score runs with every held part as `edge_mount_references`. Decoupling, connectors, the routing tail, silk and the score only order | P1 and P2 are buildability, judged on what a candidate changed: a held connector that crosses the edge on purpose, an overlap between two held parts, or a fault the owner's board has between movable parts, is the same on every candidate, O included, and must not fail them all (O never fails P1 on its own faults, and a candidate that does not mend one is not punished for it). G1 to G3 are the routing judge's absolute gates (route design D10). They are relative to the candidate's own unrouted board, and P2 ties that board to the input. Silk is a label fix, not a fault |
@@ -622,7 +622,7 @@ use serde::Serialize;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 2;
+pub(crate) const GENERATOR_VERSION: u32 = 3;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -637,7 +637,7 @@ pub(crate) enum Family {
     /// F: the force core from a seeded scatter. Like S, it takes from O only what S0
     /// keeps: the held parts, every side and rotation, and the brief.
     Force,
-    /// S: the schematic placer's clusters as grids, optionally polished by the core.
+    /// S: the schematic placer's clusters as shelf-packed rows, optionally polished by the core.
     Schematic,
     /// P: seeded perturbations of the input placement (start O).
     Perturb,
@@ -771,12 +771,16 @@ fn scatter(model: &BoardModel, rng: &mut SplitMix64) -> Vec<(f64, f64)> {
 }
 
 /// The schematic placer with the fanout filter: union-find over the nets with at most
-/// `fanout_limit` distinct references, clusters in a seeded order, members by courtyard
-/// area (ties by reference, as the legacy), near-square grids flowing left to right in
-/// `bounds` and wrapping into rows, cells of the largest member plus a margin: the first
-/// of 2, 1, 0.5 and 0.25 mm (2 is the legacy's) whose rows fit inside `bounds`, else
-/// 0.25 mm, and `legalize` does what it can. The margin is a function of the board and
-/// the recipe and is not recorded. Held parts at their own centres.
+/// `fanout_limit` distinct references, clusters in a seeded order, each cluster's
+/// members by courtyard area descending (ties by reference, as the legacy), packed in
+/// shelves: parts go left to right inside `bounds`, each at its own width plus a
+/// margin, a new shelf opens below (as tall as its tallest part plus the margin) when
+/// the next part does not fit the row, and a cluster may continue onto the next shelf.
+/// Clusters follow each other in order with one more margin between them. The margin is
+/// the first of 2, 1, 0.5 and 0.25 mm whose shelves fit inside `bounds`; when none does,
+/// the 0.25 mm layout with every centre clamped into `bounds` (inset by half the part's
+/// size), so that `legalize` starts on the board. The margin is a function of the board
+/// and the recipe and is not recorded. Held parts at their own centres.
 fn schematic_grid(model: &BoardModel, params: &SchematicParams, rng: &mut SplitMix64) -> Vec<(f64, f64)> {
     todo!()
 }
@@ -1508,7 +1512,7 @@ fn place_bench() {
 | Containment in the true outline | `legalize_puts_every_part_inside_the_true_outline`: a rounded-corner fixture with parts scattered into the corners | Without legalize at least one part overhangs an arc (the fixture tests the arcs) |
 | No guess when there is no room | `legalize_says_no_room_instead_of_guessing`: an over-full board gives `NoRoom` naming the parts | — |
 | Unmoved parts are legal as they are | `legalize_leaves_unmoved_parts_alone_even_where_the_input_overlaps_or_overhangs`: two unmoved parts that overlap and one over the edge stay, with no `NoRoom`; a moved part still lands clear of them and inside | Repairing unmoved parts moves them, or fails with `NoRoom` |
-| The grid fits the board | `the_schematic_grid_takes_a_smaller_margin_when_the_wide_one_overflows`: 30 parts whose 2 mm grid is 25 mm of rows on a 20 mm board get the 1 mm grid, and a board the 2 mm grid fits keeps it | A single 2 mm margin leaves parts outside the bounds |
+| The shelves fit the board | `the_schematic_shelves_take_a_smaller_margin_when_the_wide_one_overflows`: 40 parts whose 2 mm shelves are 24 mm on a 20 mm board get the 1 mm shelves; `a_cluster_with_one_large_part_fits_a_board_the_cell_grid_overflowed`: a socket and 30 small parts in one cluster, no `NoRoom`; `shelves_keep_a_cluster_together_and_clamp_when_nothing_fits` | A single 2 mm margin leaves parts outside the bounds; cells of the cluster's largest size overflow the second fixture |
 | The fanout filter | `the_schematic_grid_does_not_join_over_a_rail`: GND on every part; fanout 8 gives several clusters | Fanout `usize::MAX` gives one cluster, as the legacy does |
 | The legacy graph is one setting | `the_legacy_graph_is_rail_weight_three_without_a_limit` | — |
 | Turns | `turned_bbox_matches_the_scan_of_a_turned_footprint`: turn a fixture footprint with the writer, scan again | The opposite sense of rotation fails it |
