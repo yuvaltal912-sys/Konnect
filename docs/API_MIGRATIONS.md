@@ -12,8 +12,10 @@ is no longer measured as a supply pin. The loop of a real supply pin now closes 
 the IC's nearest ground pad that is not typed that way, when there is one, rather
 than at an input tied to ground. A pad with no type, or any other type
 (`power_in`, `passive`, `bidirectional`, ...), is measured as before. New metric:
-`signal_pins_on_power_nets` (count and the first ten pins). Scores and findings of
-4.1 change on boards whose ICs have inputs tied to a rail.
+`signal_pins_on_power_nets` (count and the first ten pins). An input left out whose
+pin function reads like a supply (`VDD`, `VREF`, `AVCC`, ...) is named in
+`needs_human`. Scores and findings of 4.1 change on boards whose ICs have inputs
+tied to a rail.
 
 ## Unreleased: the route judge accepts the saved form of a live board
 

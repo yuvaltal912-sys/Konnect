@@ -412,7 +412,7 @@ fn a_tight_decoupling_loop_passes_and_a_large_one_is_measured_on_both_sides() {
 /// A pad on a power net typed as an input (a timer's RESET tied to the rail) or as
 /// no-connect draws no supply current: it is not measured and not a
 /// finding, and the audit names it. A `power_in` pad is measured as before.
-/// Found on the owner's board, where the audit reported such a RESET as a
+/// Found on a real board, where the audit reported such a RESET as a
 /// decoupling loop error (2026-11-18).
 #[test]
 fn a_pin_typed_as_an_input_is_not_a_supply_pin() {
@@ -422,7 +422,12 @@ fn a_pin_typed_as_an_input_is_not_a_supply_pin() {
     assert_eq!(base.matches(u2_pin).count(), 1, "fixture shape changed");
     let typed = |kind: &str| base.replacen(u2_pin, &format!("(pintype \"{kind}\") {u2_pin}"), 1);
 
-    for kind in ["input", "bidirectional+no_connect", "input+no_connect"] {
+    for kind in [
+        "input",
+        "no_connect",
+        "bidirectional+no_connect",
+        "input+no_connect",
+    ] {
         let r = run(&fx_text(&typed(kind), None));
         let c = check(&r, "4.1");
         let pins = c["metrics"]["pins"].as_array().unwrap();
@@ -434,7 +439,31 @@ fn a_pin_typed_as_an_input_is_not_a_supply_pin() {
             "{kind}"
         );
         assert_eq!(c["metrics"]["signal_pins_on_power_nets"]["pins"][0], "U2.1");
+        // U2.1's pin function is VDD: a person is asked to confirm it.
+        assert!(
+            r["needs_human"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["item"] == "4.1" && n["why"].as_str().unwrap().contains("U2.1")),
+            "{kind}: {}",
+            r["needs_human"]
+        );
     }
+
+    // The same input named like a logic pin (RESET) is left out without a question.
+    let reset = typed("input").replacen("(pinfunction \"VDD\")", "(pinfunction \"RESET\")", 1);
+    assert_ne!(reset, typed("input"), "fixture shape changed");
+    let r = run(&fx_text(&reset, None));
+    assert_eq!(
+        check(&r, "4.1")["metrics"]["signal_pins_on_power_nets"]["count"],
+        1
+    );
+    assert!(!r["needs_human"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["why"].as_str().unwrap().contains("U2.1")));
 
     // Supply types are measured: U2.1 stays the loose loop's error.
     // `bidirectional` too: libraries type some supply pins so (a transceiver's VIO).

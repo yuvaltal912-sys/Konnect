@@ -29,6 +29,20 @@ fn is_signal_pin(pad: &konnect_sexp::board_geometry::PadGeom) -> bool {
     })
 }
 
+/// Whether a pad's pin function reads like a supply (`VDD`, `VCC`, `VREF`, `AVCC`,
+/// `VDDIO_3`, ...). Libraries sometimes type such a pin `input`; the audit then
+/// leaves it out as a logic input and asks a person to confirm it.
+fn named_like_supply(pad: &konnect_sexp::board_geometry::PadGeom) -> bool {
+    pad.pin_function.as_deref().is_some_and(|name| {
+        let name = name.to_ascii_uppercase();
+        name.starts_with('V')
+            || name.starts_with("AV")
+            || name.starts_with("DV")
+            || name.contains("VCC")
+            || name.contains("VDD")
+    })
+}
+
 pub(super) fn run(m: &Model, board: &std::path::Path, _tree: &SexpNode) -> Vec<CheckOut> {
     let (decoupling, loops) = decoupling_and_hot_loops(m);
     let mut out = vec![decoupling, current_sizing(m, board)];
@@ -270,6 +284,7 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
     let mut pins = 0usize;
     let mut switch_pins_left: Vec<String> = Vec::new();
     let mut signal_pins: Vec<String> = Vec::new();
+    let mut supply_named_inputs: Vec<String> = Vec::new();
     'ics: for (fi, f) in m.geo.footprints.iter().enumerate() {
         if !is_ic(m.fp_ref(f)) {
             continue;
@@ -284,6 +299,9 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             if is_signal_pin(pad) {
                 // Tied to the rail for its logic level, not a supply pin.
                 signal_pins.push(pad_label(m, (fi, pi)));
+                if named_like_supply(pad) {
+                    supply_named_inputs.push(pad_label(m, (fi, pi)));
+                }
                 continue;
             }
             if switch_nets.contains(&net) {
@@ -425,6 +443,15 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             "pins": rows.into_iter().take(25).collect::<Vec<_>>(),
             "method": "shortest copper path (tracks, vias, pours) from the capacitor pad to the pin, plus from the IC's nearest ground pad to the capacitor's ground pad; the loop area is the plan-view polygon of both paths. Up to the 3 nearest capacitors are tried and the shortest loop kept. A pad whose KiCad pin type is input or no-connect is tied to the rail for its logic level and is not measured; when the IC has a ground pad of another type, the loop closes there",
         });
+    }
+    if !supply_named_inputs.is_empty() {
+        dec.needs_human.push((
+            id,
+            format!(
+                "Pins typed as inputs on a power net but named like a supply ({}): left out of the decoupling check as logic inputs; confirm each is not a supply pin the library mistyped",
+                supply_named_inputs.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+            ),
+        ));
     }
     hot.extend(switching_loops(m, &switchers));
     (dec, hot)

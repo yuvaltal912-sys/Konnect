@@ -287,15 +287,32 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **State, 2026-11-18.** Branch `claude/audit-supply-pin-type`, worktree `/Users/yuvaltal/ClaudeCode/Kopper1`, base `fork/main` `df707dbf` (#85). Not pushed; the PR text waits for the owner's yes.
 
-**Why.** On the owner's board, `audit_layout_quality` reported a timer IC's RESET input, tied to its supply rail, as a decoupling-loop error. Check 4.1 took every IC pad on a power net as a supply pin. It also closed loops at the nearest ground pad even when that was an input tied low (an unused or enable input), so real loops read short. The owner's other session had reported this as the audit measuring U1 with C11 instead of C2. That did not reproduce: on the board after the import and after the refill, the audit measured the timer with its nearest capacitor.
+**Why.** On a real board, `audit_layout_quality` reported an IC's reset input, tied to its supply rail, as a decoupling-loop error. Check 4.1 took every IC pad on a power net as a supply pin. It also closed loops at the nearest ground pad even when that was an input tied low (an unused or enable input), so real loops read short. The owner's other session had reported this as the audit measuring U1 with C11 instead of C2. That did not reproduce: on the board after the import and after the refill, the audit measured that IC with its nearest capacitor.
 
 **The fix.**
 - `PadGeom` reads KiCad's `pintype`.
 - A pad typed `input`, or any type with `no_connect`, on a power net is not a supply pin. The audit names it in `signal_pins_on_power_nets`.
 - The loop closes at the nearest ground pad of another type when the IC has one, else at any ground pad, as before.
-- Every other type is measured: libraries type supply pins `passive`, and a transceiver on the owner's board types its VIO supply `bidirectional`. A first version that also skipped `bidirectional` and `output` pins was narrowed for that reason.
+- Every other type is measured: libraries type supply pins `passive`, and some `bidirectional`. A first version that also skipped `bidirectional` and `output` pins was narrowed for that reason.
+- An input left out whose pin function reads like a supply (`V…`, `AV…`, `DV…`, or containing `VCC` or `VDD`) is listed in `needs_human`, so a supply pin a library mistyped as `input` is not dropped silently.
+- **Follow-up, not in this row:** the switching hot loops (8.1, 8.2) still close at the nearest ground pad, and pick a power pad, without reading the pin type.
 
-**On a scratch copy of the owner's board** (counts only): 1 pin left out of 12. Two loops now close at the real ground pin instead of an input tied low. Both read longer, as the copper is.
+**On a scratch copy of the owner's board** (counts only): 1 pin left out of 12, with no `needs_human` question. Two loops now close at the real ground pin instead of an input tied low. Both read longer, as the copper is.
+
+**Verified, 2026-11-18.**
+- `cargo test -p konnect-core --lib -- layout_quality`: 74 passed, 0 failed.
+- Negative controls: 9 of 9 caught, run on the final code, and the source was restored byte for byte. The nine breaks:
+  - no pin is a signal pin;
+  - a combined type is not split;
+  - `bidirectional` counts as a signal;
+  - the ground pad ignores the type;
+  - no fallback to an input-typed ground;
+  - `pintype` is not read;
+  - a supply-named input is not asked about;
+  - every input is asked about;
+  - skipped pins are not reported.
+- Independent review: sound, with five notes, all applied (the `needs_human` question, the controls rerun, the 8.x follow-up, generic wording, a bare `no_connect` case).
+- Gate on `dd983806` (before the review fixes): tests 4931, sandboxed 33, `simulation_live` 95/95, every step green. The final gate is in the PR text.
 
 ## Row RJ, the route judge and live boards
 
