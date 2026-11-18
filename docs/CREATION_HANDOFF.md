@@ -294,6 +294,12 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 - It is not named `kopper1`. A skill of that name shares the plugin folder's path, `~/.claude/skills/kopper1`, so removing its loose copy would remove the plugin. A test now refuses any skill named like the plugin.
 - A test holds the table to one row per other bundled skill and to bundled names only, and holds `konnect` as the first load.
 
+**Verified, 2026-11-18.**
+- `cargo test -p konnect --locked --bin konnect`: 105 passed, 0 failed.
+- Negative controls: 5 of 5 caught. The five breaks were a dropped table row, a skill that is not bundled, the skill named `kopper1`, `konnect` not loaded first, and a `|` block description. The source was restored byte for byte.
+- Independent review: sound, with two notes, both fixed (README count, this record).
+- Gate on `200f0e47`: tests 4923 passed, 0 failed; sandboxed 33; fmt, doc tests, clippy, `deny`, `fix-doc-counts` and the release build green; installed hash and KiCad settings unchanged. `simulation_live` 94/95: the known `ibis` demo flake failed and passed alone.
+
 ## Row KP, the kopper1 plugin
 
 **State, 2026-11-18.** Merged on the owner's word as [#81](https://github.com/yuvaltal912-sys/Konnect/pull/81): main `cdb00e7c`, a noreply merge whose tree equals the PR head `9c272ef8` (branch `claude/kopper1-plugin`, base `748faeb9`). The same day, `cargo xtask kopper-install` from main installed it on the owner's machine.
