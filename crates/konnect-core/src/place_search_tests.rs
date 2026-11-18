@@ -1347,6 +1347,31 @@ async fn records_carry_the_gate_lines_and_the_unrouted_counts_in_search_json_onl
     assert!(!table_text.contains("SECRETNET") && !table_text.contains("clearance"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_search_sets_the_clearances_from_its_routing_inputs() {
+    let mut setup = setup(100_000);
+    setup.plan.route.options.copper_edge_clearance_um = Some(500);
+    setup.plan.route.rules = BTreeMap::from([(
+        "N".to_string(),
+        konnect_ipc::types::IpcRoutingRules {
+            class_name: "Default".into(),
+            constituents: Vec::new(),
+            track_width_mm: None,
+            clearance_mm: Some(0.25),
+            via_diameter_mm: None,
+            via_drill_mm: None,
+        },
+    )]);
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    assert!((outcome.clearances.part_gap_mm - 0.35).abs() < 1e-12);
+    assert!((outcome.clearances.edge_mm - 0.5).abs() < 1e-12);
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["plan"]["clearances"]["edge_mm"], 0.5);
+}
+
 #[test]
 fn the_clearances_come_from_the_rules_and_the_export_options() {
     let rule = |clearance: Option<f64>| konnect_ipc::types::IpcRoutingRules {
