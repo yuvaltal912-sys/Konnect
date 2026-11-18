@@ -12,16 +12,19 @@ use crate::tools::placement::force_core::{
 use crate::tools::placement::net_weight;
 use konnect_ipc::types::IpcFootprintPlacement;
 use konnect_sexp::board::{
-    footprint_courtyards, footprints, FootprintCourtyard, PcbConnectivityIndex,
+    footprint_courtyards, footprints, FootprintCourtyard, PcbConnectivityIndex, Side,
 };
+use konnect_sexp::layers::is_copper_name;
 use konnect_sexp::outline::{Outline, OutlineStatus};
+use konnect_sexp::parser::SexpNode;
+use konnect_sexp::planar::{bbox_of, circumcircle, dist};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 4;
+pub(crate) const GENERATOR_VERSION: u32 = 5;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -144,6 +147,12 @@ pub(crate) struct BoardModel {
     /// The clearances `legalize` keeps beyond the courtyards; 0 from `board_model`, set by
     /// `place_search::search` from its routing inputs.
     pub clearances: Clearances,
+    /// The copper sides each part occupies (`part_sides_of`), by part index.
+    pub part_sides: Vec<Sides>,
+    /// The boxes of the board's own fixed copper (`copper_obstacles`): copper text and
+    /// graphics, and rule areas that keep footprints or pads out. A moved part stays
+    /// clear of the ones on its sides.
+    pub copper: Vec<CopperObstacle>,
 }
 
 /// Builds the model. Refuses a text whose SHA-256 is not `held.board_sha256`, a scan
@@ -184,7 +193,7 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
     let raw_references: Vec<Option<&str>> =
         scan.items.iter().map(|c| c.reference.as_deref()).collect();
     let keys = crate::place_held::footprint_keys(&raw_references);
-    let mut rows: Vec<(String, FootprintCourtyard, String, usize)> = Vec::new();
+    let mut rows: Vec<(String, FootprintCourtyard, String, usize, Sides)> = Vec::new();
     for ((node, courtyard), key) in nodes.iter().zip(scan.items.iter()).zip(keys) {
         let reference = key.ok_or_else(|| anyhow::anyhow!("a footprint has no reference"))?;
         let library_id = node
@@ -197,6 +206,7 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
             courtyard.clone(),
             library_id,
             node.find_all("pad").len(),
+            part_sides_of(node, courtyard.layer_side),
         ));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -212,7 +222,8 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
     let mut footprint_ids = Vec::with_capacity(rows.len());
     let mut pad_counts = Vec::with_capacity(rows.len());
     let mut movable = Vec::with_capacity(rows.len());
-    for (reference, courtyard, library_id, pads) in rows {
+    let mut part_sides = Vec::with_capacity(rows.len());
+    for (reference, courtyard, library_id, pads, sides) in rows {
         let is_movable = held.movable.contains(&reference);
         anyhow::ensure!(
             is_movable || held.held.contains_key(&reference),
@@ -223,6 +234,7 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
         parts.push(courtyard);
         footprint_ids.push(library_id);
         pad_counts.push(pads);
+        part_sides.push(sides);
     }
 
     let index = PcbConnectivityIndex::build(&tree);
@@ -250,7 +262,319 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
         pad_counts,
         input_failures: Vec::new(),
         clearances: Clearances::default(),
+        part_sides,
+        copper: copper_obstacles(&tree),
     })
+}
+
+/// The copper sides of the board an item occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct Sides {
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl Sides {
+    const NONE: Sides = Sides {
+        top: false,
+        bottom: false,
+    };
+    const TOP: Sides = Sides {
+        top: true,
+        bottom: false,
+    };
+    const BOTTOM: Sides = Sides {
+        top: false,
+        bottom: true,
+    };
+    const BOTH: Sides = Sides {
+        top: true,
+        bottom: true,
+    };
+
+    fn of(side: Side) -> Sides {
+        match side {
+            Side::Front => Sides::TOP,
+            Side::Back => Sides::BOTTOM,
+        }
+    }
+
+    fn union(self, other: Sides) -> Sides {
+        Sides {
+            top: self.top || other.top,
+            bottom: self.bottom || other.bottom,
+        }
+    }
+
+    pub(crate) fn intersects(self, other: Sides) -> bool {
+        (self.top && other.top) || (self.bottom && other.bottom)
+    }
+
+    fn is_empty(self) -> bool {
+        self == Sides::NONE
+    }
+}
+
+/// The sides a footprint occupies: a footprint with a `thru_hole` or `np_thru_hole` pad
+/// has copper (or a drilled hole through the copper) on every layer, so it occupies both
+/// sides; any other footprint occupies its own.
+fn part_sides_of(footprint: &SexpNode, own: Side) -> Sides {
+    let through = footprint.find_all("pad").iter().any(|pad| {
+        matches!(
+            pad.get(2).and_then(SexpNode::as_str),
+            Some("thru_hole" | "np_thru_hole")
+        )
+    });
+    if through {
+        Sides::BOTH
+    } else {
+        Sides::of(own)
+    }
+}
+
+/// A box of the board's fixed copper that a moved part must keep clear of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CopperObstacle {
+    /// A superset of the item's copper, never a subset.
+    pub bbox: Rect,
+    pub sides: Sides,
+}
+
+/// The sides of the copper layers an item names, by `(layer …)` and `(layers …)`: `F.Cu`
+/// the top, `B.Cu` the bottom, any other copper layer (an inner one, `*.Cu`, `F&B.Cu`)
+/// both. A layer that is not copper adds nothing.
+fn copper_sides(item: &SexpNode) -> Sides {
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(name) = item.find_str("layer") {
+        names.push(name);
+    }
+    if let Some(list) = item.find("layers").and_then(SexpNode::children) {
+        names.extend(list.iter().skip(1).filter_map(SexpNode::as_str));
+    }
+    names.into_iter().fold(Sides::NONE, |sides, name| {
+        sides.union(match name {
+            "F.Cu" => Sides::TOP,
+            "B.Cu" => Sides::BOTTOM,
+            other if is_copper_name(other) => Sides::BOTH,
+            _ => Sides::NONE,
+        })
+    })
+}
+
+fn xy(node: &SexpNode) -> Option<(f64, f64)> {
+    let (x, y) = (node.get_f64(1)?, node.get_f64(2)?);
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+fn xy_of(item: &SexpNode, tag: &str) -> Option<(f64, f64)> {
+    xy(item.find(tag)?)
+}
+
+/// Every `(xy …)` of the `(pts …)` of `node` (a polygon or a curve); `None` when one is
+/// unreadable.
+fn pts_of(node: &SexpNode) -> Option<Vec<(f64, f64)>> {
+    node.find("pts")?
+        .find_all("xy")
+        .into_iter()
+        .map(xy)
+        .collect()
+}
+
+/// The box of the circle through a three-point arc: it covers the bulge at any sweep. Three
+/// collinear points give the box of the points.
+fn arc_box(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> Option<Rect> {
+    match circumcircle(start, mid, end) {
+        Some(((cx, cy), r)) => Some((cx - r, cy - r, cx + r, cy + r)),
+        None => bbox_of(&[start, mid, end]),
+    }
+}
+
+fn grow((x0, y0, x1, y1): Rect, by: f64) -> Rect {
+    (x0 - by, y0 - by, x1 + by, y1 + by)
+}
+
+/// The stroke's half width, as `(stroke (width w))` or the legacy `(width w)`; 0 when
+/// absent or unreadable.
+fn half_stroke(item: &SexpNode) -> f64 {
+    item.find("stroke")
+        .and_then(|stroke| stroke.find_f64("width"))
+        .or_else(|| item.find_f64("width"))
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .map_or(0.0, |width| width / 2.0)
+}
+
+/// The box of a board graphic's copper: its geometry grown by half the stroke.
+fn graphic_box(item: &SexpNode, head: &str) -> Option<Rect> {
+    let geometry = match head {
+        "gr_line" | "gr_rect" => bbox_of(&[xy_of(item, "start")?, xy_of(item, "end")?])?,
+        "gr_circle" => {
+            let (centre, edge) = (xy_of(item, "center")?, xy_of(item, "end")?);
+            let r = dist(centre, edge);
+            (centre.0 - r, centre.1 - r, centre.0 + r, centre.1 + r)
+        }
+        "gr_arc" => arc_box(
+            xy_of(item, "start")?,
+            xy_of(item, "mid")?,
+            xy_of(item, "end")?,
+        )?,
+        // A curve stays inside the hull of its control points.
+        "gr_poly" | "gr_curve" => bbox_of(&pts_of(item)?)?,
+        "gr_text_box" => match pts_of(item) {
+            Some(corners) if !corners.is_empty() => bbox_of(&corners)?,
+            _ => bbox_of(&[xy_of(item, "start")?, xy_of(item, "end")?])?,
+        },
+        _ => return None,
+    };
+    Some(grow(geometry, half_stroke(item)))
+}
+
+/// The stroke font's width of one character per unit of size, as a ceiling: KiCad's own
+/// boxes of the demo's 19 copper texts gave at most 1.22 (width less thickness, over
+/// characters times `size_x`).
+const TEXT_WIDTH_PER_CHAR: f64 = 1.3;
+
+/// The stroke font's height of one line per unit of size: KiCad's boxes gave 1.70
+/// including the thickness, so 1.7 plus the thickness again is a ceiling.
+const TEXT_HEIGHT_PER_LINE: f64 = 1.7;
+
+/// The pen width of a text that gives none, mm.
+const DEFAULT_TEXT_THICKNESS_MM: f64 = 0.15;
+
+/// The box of a board text's copper. With a `render_cache`, the box of its polygons.
+/// Without, the stroke-font estimate: width the longest line's characters times
+/// `size_x` times `TEXT_WIDTH_PER_CHAR` plus the thickness, height the lines times `size_y`
+/// times `TEXT_HEIGHT_PER_LINE` plus the thickness, centred on `at`; a `justify` side
+/// makes the box span the anchor by the whole extent on that axis, a superset whichever
+/// way the text is mirrored. Turned by `at`'s angle about the anchor: exact for a
+/// cardinal angle, the axis-aligned hull otherwise.
+fn text_box(item: &SexpNode) -> Option<Rect> {
+    let cached: Vec<(f64, f64)> = item
+        .find("render_cache")
+        .map(|cache| {
+            cache
+                .find_all("polygon")
+                .into_iter()
+                .filter_map(pts_of)
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(bbox) = bbox_of(&cached) {
+        return Some(bbox);
+    }
+
+    let text = item.get(1)?.as_str()?;
+    if text.is_empty() {
+        return None;
+    }
+    let at = item.find("at")?;
+    let (x, y) = xy(at)?;
+    let rotation = at.get_f64(3).filter(|r| r.is_finite()).unwrap_or(0.0);
+    let effects = item.find("effects");
+    let font = effects.and_then(|e| e.find("font"));
+    let (size_x, size_y) = font
+        .and_then(|f| f.find("size"))
+        .and_then(xy)
+        .map_or((1.0, 1.0), |(w, h)| (w.abs(), h.abs()));
+    let thickness = font
+        .and_then(|f| f.find_f64("thickness"))
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .unwrap_or(DEFAULT_TEXT_THICKNESS_MM);
+    let (mut anchored_x, mut anchored_y) = (false, false);
+    if let Some(justify) = effects.and_then(|e| e.find("justify")) {
+        for word in justify
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(SexpNode::as_str)
+        {
+            match word {
+                "left" | "right" => anchored_x = true,
+                "top" | "bottom" => anchored_y = true,
+                _ => {}
+            }
+        }
+    }
+
+    let lines = text.split('\n').count() as f64;
+    let longest = text
+        .split('\n')
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as f64;
+    let width = longest * size_x * TEXT_WIDTH_PER_CHAR + thickness;
+    let height = lines * size_y * TEXT_HEIGHT_PER_LINE + thickness;
+    let half_w = if anchored_x { width } else { width / 2.0 };
+    let half_h = if anchored_y { height } else { height / 2.0 };
+
+    let quarter = (rotation / 90.0).round();
+    let (half_w, half_h) = if (rotation - quarter * 90.0).abs() < 1e-9 {
+        if quarter.rem_euclid(2.0) == 1.0 {
+            (half_h, half_w)
+        } else {
+            (half_w, half_h)
+        }
+    } else {
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        (
+            half_w * cos.abs() + half_h * sin.abs(),
+            half_w * sin.abs() + half_h * cos.abs(),
+        )
+    };
+    Some((x - half_w, y - half_h, x + half_w, y + half_h))
+}
+
+/// The box of a rule area that keeps footprints or pads out (`(footprints not_allowed)`
+/// or `(pads not_allowed)` in its `keepout`): its polygon's box, a three-point arc by its
+/// circle. A keepout that forbids only tracks, vias or pours is no obstacle to a part.
+fn keepout_box(zone: &SexpNode) -> Option<Rect> {
+    let keepout = zone.find("keepout")?;
+    let forbids = |what: &str| keepout.find_str(what) == Some("not_allowed");
+    if !forbids("footprints") && !forbids("pads") {
+        return None;
+    }
+    let mut corners: Vec<(f64, f64)> = Vec::new();
+    for polygon in zone.find_all("polygon") {
+        for item in polygon.find("pts")?.children()?.iter().skip(1) {
+            match item.head()? {
+                "xy" => corners.push(xy(item)?),
+                "arc" => {
+                    let (x0, y0, x1, y1) = arc_box(
+                        xy_of(item, "start")?,
+                        xy_of(item, "mid")?,
+                        xy_of(item, "end")?,
+                    )?;
+                    corners.extend([(x0, y0), (x1, y1)]);
+                }
+                _ => return None,
+            }
+        }
+    }
+    bbox_of(&corners)
+}
+
+/// The boxes of the board's fixed copper, from its top-level items, each with the sides
+/// it is on: graphics and texts on a copper layer, and rule areas that keep footprints or
+/// pads out. Silkscreen, fabrication and `Edge.Cuts` items, tracks, vias and pours are
+/// not listed, and neither is an item that cannot be read (nothing is guessed).
+fn copper_obstacles(tree: &SexpNode) -> Vec<CopperObstacle> {
+    let mut found = Vec::new();
+    for item in tree.children().unwrap_or(&[]) {
+        let Some(head) = item.head() else { continue };
+        let sides = copper_sides(item);
+        if sides.is_empty() {
+            continue;
+        }
+        let bbox = match head {
+            "gr_text" => text_box(item),
+            "zone" => keepout_box(item),
+            _ => graphic_box(item, head),
+        };
+        if let Some(bbox) = bbox.filter(|b| [b.0, b.1, b.2, b.3].iter().all(|v| v.is_finite())) {
+            found.push(CopperObstacle { bbox, sides });
+        }
+    }
+    found
 }
 
 /// The two clearances `legalize` keeps beyond the courtyards, set by the search from the
@@ -982,7 +1306,9 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 /// Containment and overlap repair against the true outline. Held parts settle first.
 /// Then each movable part in reference order: when its courtyard bbox (`sizes[i]` at
 /// `centres[i]`) overhangs the outline (`Outline::overhang` deeper than
-/// `containment_threshold_mm`) or overlaps a settled part on its side, it moves to the
+/// `containment_threshold_mm`) or overlaps a settled part that shares a side with it
+/// (`BoardModel::part_sides`: a through-hole part is on both) or a copper obstacle on its
+/// sides (`BoardModel::copper`), it moves to the
 /// nearest legal cell, spiralling on `GRID_MM` for up to `LEGALIZE_RINGS` rings. Every
 /// part is placed, or the result is `NoRoom` naming the parts that were not.
 ///
@@ -996,7 +1322,10 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 /// anchors to 1 µm in the written board cannot turn a touch into an overlap, and by
 /// `part_gap_mm` when either of the two boxes is not a real courtyard (a footprint
 /// without one is bounded by its pads, which a 2 µm gap leaves touching: see
-/// `Clearances`). A moved part's box also lies `edge_mm` inside the true outline: the
+/// `Clearances`). A moved part's box also keeps the larger of 2 µm and `part_gap_mm` from
+/// every copper obstacle on its sides (the board's own copper text and graphics, and
+/// rule areas that keep footprints or pads out); an unmoved part is not tested against
+/// them, like the rest. A moved part's box also lies `edge_mm` inside the true outline: the
 /// box grown by `edge_mm` on every side must have no overhang (a square growth, a little
 /// more than the Euclidean distance at a rounded corner). Cells are ordered by distance,
 /// the ring's cells in a fixed order, so the result is the same on every run.
@@ -1045,8 +1374,9 @@ pub(crate) fn legalize(
         {
             return false;
         }
-        !settled.iter().any(|&j| {
-            model.parts[j].layer_side == model.parts[i].layer_side && {
+        let sides = model.part_sides[i];
+        let hits_part = settled.iter().any(|&j| {
+            sides.intersects(model.part_sides[j]) && {
                 let ix = (w + sizes[j].0) / 2.0 - (at.0 - centres[j].0).abs();
                 let iy = (h + sizes[j].1) / 2.0 - (at.1 - centres[j].1).abs();
                 let gate = -model
@@ -1054,7 +1384,17 @@ pub(crate) fn legalize(
                     .gap_between(&model.parts[i], &model.parts[j]);
                 ix > gate && iy > gate
             }
-        })
+        });
+        let hits_copper = model.copper.iter().any(|obstacle| {
+            sides.intersects(obstacle.sides) && {
+                let (ox0, oy0, ox1, oy1) = obstacle.bbox;
+                let ix = (w + (ox1 - ox0)) / 2.0 - (at.0 - (ox0 + ox1) / 2.0).abs();
+                let iy = (h + (oy1 - oy0)) / 2.0 - (at.1 - (oy0 + oy1) / 2.0).abs();
+                let gate = -MOVED_CLEARANCE_MM.max(model.clearances.part_gap_mm);
+                ix > gate && iy > gate
+            }
+        });
+        !(hits_part || hits_copper)
     };
 
     let unmoved = |i: usize, centres: &[(f64, f64)]| {
