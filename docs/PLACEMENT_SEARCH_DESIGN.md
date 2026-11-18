@@ -1,8 +1,9 @@
 # Best-of-N placement search: design
 
-Status: design only, not yet approved. Claude Opus 5.5 designed it down to the skeletons on
-2026-11-18, on branch `claude/placement-search-design` from `fork/main` `d5588205`. Sonnet 5.5
-agents write the bodies once the owner approves. Nothing is built, and no board was written.
+Status: design only. Claude Opus 5.5 designed it down to the skeletons on 2026-11-18, on branch
+`claude/placement-search-design` from `fork/main` `d5588205`. The owner approved its three
+decisions as recommended the same day ("Yes, as recommended"). Sonnet 5.5 agents write the bodies
+when he starts the build. Nothing is built, and no board was written.
 
 ## What the owner asked for
 
@@ -112,6 +113,8 @@ product does (sandboxed, never `--live`). The search applies nothing.
 | D22 | Documents report counts only. The tables and `search.json` stay in `target/creation-research/placement-search/`, which git ignores | `AGENTS.md`: real-project results stay out of documents, apart from counts |
 
 ## Decisions for the owner
+
+Approved as recommended by the owner on 2026-11-18 ("Yes, as recommended").
 
 1. **May a winning candidate ever be applied, and how?** Q1 says a planner never writes, and this
    design applies nothing. Recommendation: not before the bench answers. If it answers yes, a later
