@@ -1108,6 +1108,68 @@ pub(crate) fn placements_applied_to(
     Ok(updated)
 }
 
+/// The root rotation of the footprint `reference` on `content`, as spelled; `None` when
+/// the board has no such footprint (or one that cannot be read).
+fn footprint_root_rotation(content: &str, reference: &str) -> Option<f64> {
+    find_direct_child_blocks(content, "kicad_pcb")
+        .into_iter()
+        .filter_map(|(start, end)| konnect_sexp::parse_sexp(&content[start..end]).ok())
+        .filter(|node| node.head() == Some("footprint"))
+        .find(|node| footprint_reference(node).as_deref() == Some(reference))
+        .and_then(|node| node.find("at")?.get_f64(3).or(Some(0.0)))
+}
+
+/// `placements` applied to `content` in order, as `placements_applied_to` does, except
+/// that a footprint which already has the placement's rotation (compared as KiCad spells
+/// it, in (-180, 180]) is only moved, exactly as the move tool moves it
+/// (`FootprintPlacementUpdate::Move`): its pads' and texts' angles stay as spelled. A
+/// `Set` rewrites them even by 0 degrees, and not every angle is its own rewrite (a text
+/// at 100 degrees becomes -80, and then 280), so a board an AI moved part by part is the
+/// same board as this one only when the parts it did not turn are moved, not set. A
+/// turned footprint is set, as `placements_applied_to` sets it.
+pub(crate) fn placements_moved_applied_to(
+    content: &str,
+    placements: &[konnect_ipc::types::IpcFootprintPlacement],
+) -> Result<String, ClosedBoardError> {
+    let mut updated = content.to_string();
+    for placement in placements {
+        let unturned = footprint_root_rotation(&updated, &placement.reference).is_some_and(|old| {
+            normalize_root_angle(old) == normalize_root_angle(placement.rotation)
+        });
+        let update = if unturned {
+            FootprintPlacementUpdate::Move {
+                x: placement.x,
+                y: placement.y,
+            }
+        } else {
+            FootprintPlacementUpdate::Set {
+                x: placement.x,
+                y: placement.y,
+                rotation: placement.rotation,
+            }
+        };
+        updated = prepare_closed_board_footprint_update(&updated, &placement.reference, update)?;
+    }
+    Ok(updated)
+}
+
+/// The move tool's closed-board write of one footprint, in memory
+/// (`FootprintPlacementUpdate::Move`), for the tests of what a part-by-part AI session
+/// writes.
+#[cfg(test)]
+pub(crate) fn footprint_moved_in(
+    content: &str,
+    reference: &str,
+    x: f64,
+    y: f64,
+) -> Result<String, ClosedBoardError> {
+    prepare_closed_board_footprint_update(
+        content,
+        reference,
+        FootprintPlacementUpdate::Move { x, y },
+    )
+}
+
 pub(crate) fn update_closed_board_footprints(
     board_path: &Path,
     placements: &[konnect_ipc::types::IpcFootprintPlacement],
@@ -7657,6 +7719,46 @@ mod placements_applied_to_tests {
                 placement("ZZ9", 1.0, 1.0, 0.0),
             ],
         );
+        assert!(
+            matches!(&result, Err(ClosedBoardError::ReferenceNotFound(reference)) if reference == "ZZ9"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn placements_moved_applied_to_moves_what_is_not_turned_and_sets_what_is() {
+        let original = std::fs::read_to_string(FIXTURE).unwrap();
+        // C1 (rotation 0) and C2 (90) keep their turn: the move tool's write, byte for
+        // byte, and not what a set writes. 450 is 90 as KiCad spells it. U1 is turned:
+        // the set's write, as the move-then-rotate pair gives it.
+        let unturned = [
+            placement("C1", 21.5, 16.0, 0.0),
+            placement("C2", 31.0, 15.5, 450.0),
+        ];
+        let moved = placements_moved_applied_to(&original, &unturned).unwrap();
+        let by_the_move_writer = the_one_at_a_time_writers(
+            &original,
+            &[
+                ("C1", FootprintPlacementUpdate::Move { x: 21.5, y: 16.0 }),
+                ("C2", FootprintPlacementUpdate::Move { x: 31.0, y: 15.5 }),
+            ],
+        );
+        assert_eq!(moved, by_the_move_writer);
+        assert_ne!(
+            moved,
+            placements_applied_to(&original, &unturned).unwrap(),
+            "a set re-spells the children of a part it did not turn; this fixture shows it"
+        );
+        let turned = [placement("U1", 40.0, 30.0, 90.0)];
+        assert_eq!(
+            placements_moved_applied_to(&original, &turned).unwrap(),
+            placements_applied_to(&original, &turned).unwrap()
+        );
+        assert_eq!(
+            placements_moved_applied_to(&original, &[]).unwrap(),
+            original
+        );
+        let result = placements_moved_applied_to(&original, &[placement("ZZ9", 1.0, 1.0, 0.0)]);
         assert!(
             matches!(&result, Err(ClosedBoardError::ReferenceNotFound(reference)) if reference == "ZZ9"),
             "{result:?}"

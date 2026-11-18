@@ -20,6 +20,10 @@ pub(crate) struct Screen {
     /// Hard failures that name at least one movable part. A failure among held parts
     /// alone is the same on every candidate, O included, and is no candidate's fault.
     pub movable_hard_failures: usize,
+    /// Those of them that are not among the input board's own (`FailureKey`: kind and
+    /// sorted references), so a fault the owner's board already has is no candidate's
+    /// fault either, and O never fails P1 on its own faults. P1 reads this count.
+    pub new_movable_hard_failures: usize,
     /// `outline_missing` or `outline_unproven`.
     pub outline_unproven: bool,
     /// The intent's decoupling pairs (taken from O) that this board breaks
@@ -37,12 +41,54 @@ pub(crate) struct Screen {
     pub group_spread: Option<f64>,
 }
 
-/// The screen of one candidate: `evaluated` read, its hard failures split by `held`,
-/// `decoupling_violations` as given. Errs on a field the score always gives that is
-/// missing.
+/// A hard failure as P1 compares it with the input board's: its kind and its sorted
+/// references.
+pub(crate) type FailureKey = (String, Vec<String>);
+
+/// The hard failures of `evaluated` that name at least one movable part of `held`, as
+/// keys, sorted and without repeats. A failure counts as movable when any reference it
+/// names is a movable part. Errs on a failure without a kind.
+pub(crate) fn movable_failure_keys(
+    evaluated: &serde_json::Value,
+    held: &HeldSet,
+) -> anyhow::Result<Vec<FailureKey>> {
+    let failures = evaluated["hard_failures"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("the evaluation has no `hard_failures`"))?;
+    let mut keys = std::collections::BTreeSet::new();
+    for failure in failures {
+        let mut references: Vec<String> = failure["references"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !references
+            .iter()
+            .any(|reference| held.movable.contains(reference))
+        {
+            continue;
+        }
+        let kind = failure["kind"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("a hard failure has no `kind`"))?;
+        references.sort();
+        keys.insert((kind.to_string(), references));
+    }
+    Ok(keys.into_iter().collect())
+}
+
+/// The screen of one candidate: `evaluated` read, its hard failures split by `held` and
+/// by `baseline` (the input board's movable failures, `movable_failure_keys` of its own
+/// evaluation; empty judges every failure as new), `decoupling_violations` as given.
+/// Errs on a field the score always gives that is missing.
 pub(crate) fn screen(
     evaluated: &serde_json::Value,
     held: &HeldSet,
+    baseline: &[FailureKey],
     decoupling_violations: usize,
     group_spread: Option<f64>,
 ) -> anyhow::Result<Screen> {
@@ -60,7 +106,8 @@ pub(crate) fn screen(
     let hard_failures = evaluated["hard_failures"]
         .as_array()
         .ok_or_else(|| missing("hard_failures"))?;
-    // A failure counts as movable when any reference it names is a movable part.
+    // A failure counts as movable when any reference it names is a movable part, and as
+    // new when the input board does not have one of its kind and references.
     let movable_hard_failures = hard_failures
         .iter()
         .filter(|failure| {
@@ -71,6 +118,10 @@ pub(crate) fn screen(
                     .any(|reference| held.movable.contains(reference))
             })
         })
+        .count();
+    let new_movable_hard_failures = movable_failure_keys(evaluated, held)?
+        .iter()
+        .filter(|key| !baseline.contains(key))
         .count();
     let outline_unproven = evaluated["outline_missing"]
         .as_bool()
@@ -95,6 +146,7 @@ pub(crate) fn screen(
         score_incomplete,
         hard_failures: hard_failures.len(),
         movable_hard_failures,
+        new_movable_hard_failures,
         outline_unproven,
         decoupling_violations,
         connector_violations,
@@ -145,7 +197,7 @@ pub(crate) fn pair_violations(board: &SexpNode, pairs: &[DecouplingPair]) -> usi
         .count()
 }
 
-/// Least is best: P1 failed (`movable_hard_failures` above 0 or the outline unproven),
+/// Least is best: P1 failed (`new_movable_hard_failures` above 0 or the outline unproven),
 /// score incomplete, decoupling violations, connector violations, crossings,
 /// wirelength in 0.1 mm steps. A measure the score did not give sorts last
 /// (`i64::MAX`).
@@ -153,7 +205,7 @@ pub(crate) type ScreenKey = [i64; 6];
 
 pub(crate) fn screen_key(screen: &Screen) -> ScreenKey {
     [
-        i64::from(screen.movable_hard_failures > 0 || screen.outline_unproven),
+        i64::from(screen.new_movable_hard_failures > 0 || screen.outline_unproven),
         i64::from(screen.score_incomplete),
         screen.decoupling_violations as i64,
         screen.connector_violations as i64,
@@ -191,7 +243,8 @@ pub(crate) const SILK: &[&str] = &["silk_overlap", "silk_over_copper", "silk_edg
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct PlacementGates {
     /// P1: no hard failure of the placement score (a courtyard overlap, a part
-    /// outside the true outline) names a movable part, and the outline is closed.
+    /// outside the true outline) names a movable part unless the input board has the
+    /// same one (kind and references), and the outline is closed.
     pub p1: Vec<String>,
     /// P2: no physical DRC type worse than on the input board, both unrouted.
     pub p2: Vec<String>,
@@ -213,10 +266,10 @@ pub(crate) fn placement_gates(
     input_unrouted: &BTreeMap<String, usize>,
 ) -> PlacementGates {
     let mut p1 = Vec::new();
-    if screen.movable_hard_failures > 0 {
+    if screen.new_movable_hard_failures > 0 {
         p1.push(format!(
-            "{} hard failure(s) of the placement score name a movable part",
-            screen.movable_hard_failures
+            "{} hard failure(s) of the placement score name a movable part and are not on the input board",
+            screen.new_movable_hard_failures
         ));
     }
     if screen.outline_unproven {

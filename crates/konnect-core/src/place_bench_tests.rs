@@ -131,6 +131,14 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// The real settings folders of KiCad and Konnect, below the home folder.
+const REAL_FOLDERS: [&str; 4] = [
+    "Library/Preferences/kicad",
+    ".local/share/konnect",
+    ".config/kicad",
+    "Library/Application Support/konnect",
+];
+
 /// A scratch setting: set, absolute, strictly below a scratch root, and neither inside
 /// nor above a real KiCad or Konnect folder.
 fn check_scratch(
@@ -221,6 +229,24 @@ fn check_board_inputs(bench: &Path, board: &BenchBoard) -> anyhow::Result<()> {
             real.display()
         );
     }
+    // The folders the run writes (the board's own, `candidates` and `isolation` below it)
+    // must be real folders: a link there would send the run's writes wherever it points,
+    // even to a place inside the bench folder that another board owns.
+    for name in [None, Some("candidates"), Some("isolation")] {
+        // No trailing slash for the folder itself: a path ending in one is followed.
+        let path = match name {
+            Some(name) => bench.join(folder).join(name),
+            None => bench.join(folder),
+        };
+        ensure!(
+            !path
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink()),
+            "board {}: '{}' is a link; the run writes there, so it must be a real folder",
+            board.name,
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -245,15 +271,13 @@ pub(crate) fn check_environment(raw: &RawEnv) -> anyhow::Result<BenchEnv> {
     let temp = resolve(&raw.temp)?;
 
     // The real settings of KiCad and Konnect: the bench must never use or reach them.
+    // Without the home folder they cannot be named, and so cannot be excluded: refuse.
+    let home = raw.home.as_ref().context(
+        "the home folder is not known, so the real KiCad and Konnect folders cannot be excluded",
+    )?;
     let mut real: Vec<PathBuf> = Vec::new();
-    if let Some(home) = &raw.home {
-        for tail in [
-            "Library/Preferences/kicad",
-            ".local/share/konnect",
-            ".config/kicad",
-        ] {
-            real.push(resolve(&home.join(tail))?);
-        }
+    for tail in REAL_FOLDERS {
+        real.push(resolve(&home.join(tail))?);
     }
     let roots = [bench.clone(), temp];
     let kicad_config_home =
@@ -305,10 +329,13 @@ pub(crate) fn check_environment(raw: &RawEnv) -> anyhow::Result<BenchEnv> {
 /// The bench's guards, before anything runs. Refuses when: `KONNECT_PLACE_BENCH` is
 /// unset or not an absolute folder; `KICAD_CONFIG_HOME` or `KONNECT_STATE_DIR` is
 /// unset, or is KiCad's or Konnect's real folder (`~/Library/Preferences/kicad`,
-/// `~/.local/share/konnect`), or is not below a scratch root (the bench folder or the
-/// system temp folder); `KONNECT_FASTROUTE` is not an executable file; any input board
-/// named in `bench.json` resolves (links followed) to a path outside the bench
-/// folder; kicad-cli is missing.
+/// `~/.config/kicad`, `~/.local/share/konnect`,
+/// `~/Library/Application Support/konnect`), or is not below a scratch root (the bench
+/// folder or the system temp folder), or the home folder is not known (the real folders
+/// could not be excluded); `KONNECT_FASTROUTE` is not an executable file; any input
+/// board named in `bench.json` resolves (links followed) to a path outside the bench
+/// folder, or a board's folder, its `candidates` or its `isolation` is a link;
+/// kicad-cli is missing.
 pub(crate) fn bench_environment() -> anyhow::Result<BenchEnv> {
     let var = |name: &str| std::env::var(name).ok();
     check_environment(&RawEnv {
@@ -467,6 +494,7 @@ fn scene() -> Scene {
     let home = root.join("home");
     std::fs::create_dir_all(home.join("Library/Preferences/kicad")).unwrap();
     std::fs::create_dir_all(home.join(".local/share/konnect")).unwrap();
+    std::fs::create_dir_all(home.join("Library/Application Support/konnect")).unwrap();
     let fastroute = root.join("fastroute");
     std::fs::write(&fastroute, "#!/bin/sh\n").unwrap();
     #[cfg(unix)]
@@ -545,11 +573,22 @@ fn bench_environment_refuses_real_settings_and_foreign_inputs() {
         raw.kicad_config_home = s(&value);
         assert!(refusal(&raw).contains("real folder"), "{}", value.display());
     }
-    for value in [real_konnect.clone(), real_konnect.join("state")] {
+    let real_support = scene.home.join("Library/Application Support/konnect");
+    for value in [
+        real_konnect.clone(),
+        real_konnect.join("state"),
+        real_support.clone(),
+        real_support.join("state"),
+        scene.home.join("Library/Application Support"),
+    ] {
         let mut raw = scene.raw();
         raw.state_dir = s(&value);
         assert!(refusal(&raw).contains("real folder"), "{}", value.display());
     }
+    // Without the home folder the real ones cannot be excluded: refused, not skipped.
+    let mut raw = scene.raw();
+    raw.home = None;
+    assert!(refusal(&raw).contains("home folder is not known"));
     // Unset, empty, relative, and outside every scratch root.
     let mut raw = scene.raw();
     raw.kicad_config_home = None;
@@ -619,6 +658,50 @@ fn bench_environment_refuses_real_settings_and_foreign_inputs() {
         std::os::unix::fs::symlink(&outside, scene.bench.join("B1/ai/board.kicad_pcb")).unwrap();
         assert!(refusal(&scene.raw()).contains("outside the bench folder"));
         std::fs::remove_file(scene.bench.join("B1/ai/board.kicad_pcb")).unwrap();
+        assert!(check_environment(&scene.raw()).is_ok());
+    }
+
+    // The folders the run writes must not be links, even to somewhere inside the bench.
+    #[cfg(unix)]
+    {
+        let inside = scene.bench.join("elsewhere-in-bench");
+        std::fs::create_dir_all(&inside).unwrap();
+        for name in ["candidates", "isolation"] {
+            let link = scene.bench.join("B1").join(name);
+            std::os::unix::fs::symlink(&inside, &link).unwrap();
+            let message = refusal(&scene.raw());
+            assert!(
+                message.contains("is a link") && message.contains(name),
+                "{message}"
+            );
+            std::fs::remove_file(&link).unwrap();
+            assert!(check_environment(&scene.raw()).is_ok());
+        }
+        // A link that points nowhere is a link all the same.
+        let dangling = scene.bench.join("B1/candidates");
+        std::os::unix::fs::symlink(scene.bench.join("nowhere-at-all"), &dangling).unwrap();
+        assert!(refusal(&scene.raw()).contains("is a link"));
+        std::fs::remove_file(&dangling).unwrap();
+        // The board's own folder, linked to another folder of the bench.
+        std::fs::create_dir_all(scene.bench.join("B7/input")).unwrap();
+        write_board(&scene.bench.join("B7/input"), "b7.kicad_pcb");
+        std::os::unix::fs::symlink(scene.bench.join("B7"), scene.bench.join("B8")).unwrap();
+        std::fs::write(
+            scene.bench.join("bench.json"),
+            r#"{"boards":[{"name":"B1","folder":"B1"},{"name":"B8","folder":"B8"}]}"#,
+        )
+        .unwrap();
+        let message = refusal(&scene.raw());
+        assert!(
+            message.contains("is a link") && message.contains("B8"),
+            "{message}"
+        );
+        std::fs::remove_file(scene.bench.join("B8")).unwrap();
+        std::fs::write(
+            scene.bench.join("bench.json"),
+            r#"{"boards":[{"name":"B1","folder":"B1"}]}"#,
+        )
+        .unwrap();
         assert!(check_environment(&scene.raw()).is_ok());
     }
 

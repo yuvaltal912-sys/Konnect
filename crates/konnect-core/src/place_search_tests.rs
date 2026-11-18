@@ -7,6 +7,7 @@ use crate::place_generators::{ForceParams, Params, PerturbParams, SchematicParam
 use crate::place_held::tests::{board, board_with_groups, pad, parse, Fp, Shape};
 use crate::place_route::export_options;
 use crate::route_judge::{Gates, Measures};
+use crate::tools::pcb_components::footprint_moved_in;
 use konnect_ipc::types::IpcFootprintPlacement;
 
 const OUTLINE: Shape = Shape::Rect(0.0, 0.0, 60.0, 40.0);
@@ -183,7 +184,8 @@ enum Step {
 
 struct Shared {
     steps: Box<dyn Fn(usize, usize) -> Step + Send + Sync>,
-    wall: Duration,
+    /// How long the n-th call lasts, on tokio's clock.
+    wall: Box<dyn Fn(usize) -> Duration + Send + Sync>,
     calls: AtomicUsize,
     active: AtomicUsize,
     max_active: AtomicUsize,
@@ -195,9 +197,17 @@ struct Shared {
 struct Fake(Arc<Shared>);
 
 fn fake(wall_s: u64, steps: impl Fn(usize, usize) -> Step + Send + Sync + 'static) -> Fake {
+    fake_walls(move |_| wall_s, steps)
+}
+
+/// A fake router whose n-th call lasts `wall_s(n)` seconds.
+fn fake_walls(
+    wall_s: impl Fn(usize) -> u64 + Send + Sync + 'static,
+    steps: impl Fn(usize, usize) -> Step + Send + Sync + 'static,
+) -> Fake {
     Fake(Arc::new(Shared {
         steps: Box::new(steps),
-        wall: Duration::from_secs(wall_s),
+        wall: Box::new(move |n| Duration::from_secs(wall_s(n))),
         calls: AtomicUsize::new(0),
         active: AtomicUsize::new(0),
         max_active: AtomicUsize::new(0),
@@ -219,7 +229,7 @@ impl RouteCall for Fake {
             shared.starts.lock().unwrap().push((id, Instant::now()));
             let now = shared.active.fetch_add(1, Ordering::SeqCst) + 1;
             shared.max_active.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(shared.wall).await;
+            tokio::time::sleep((shared.wall)(n)).await;
             shared.active.fetch_sub(1, Ordering::SeqCst);
             let result = match (shared.steps)(n, id) {
                 Step::Routed {
@@ -511,6 +521,59 @@ fn a_repeated_board_is_a_duplicate_and_never_routed() {
 }
 
 #[test]
+fn a_perturbation_that_ends_where_it_began_is_a_duplicate_of_the_input() {
+    // One movable part, at 180 degrees with a text at 100 degrees (a set would re-spell
+    // it). Two edits that undo each other (two half turns) leave it where it was: the
+    // candidate lists nothing, and its board is the input board byte for byte.
+    let all = vec![
+        Fp::new("J1", 58.0, 20.0)
+            .court(1.5, 3.0)
+            .pad(pad("1", 0.0, 0.0, Some("SIG0"))),
+        Fp::new("R1", 20.0, 20.0).two_pad("SIG0", "SIG1").rot(180.0),
+    ];
+    let input = board(OUTLINE, &all).replacen(
+        "(property \"Reference\" \"R1\" (at 0 -1.5 0)",
+        "(property \"Reference\" \"R1\" (at 0 -1.5 100)",
+        1,
+    );
+    let model = model_of(&input);
+    let recipe = |seed: u64| Recipe {
+        family: Family::Perturb,
+        seed,
+        params: Params::Perturb(PerturbParams {
+            moves: 2,
+            radius_mm: 1.0,
+            swaps: false,
+            turns: true,
+        }),
+    };
+    let unchanged: Vec<Recipe> = (1..=300)
+        .map(recipe)
+        .filter(|r| generate(&model, r).is_ok_and(|c| c.placements.is_empty()))
+        .collect();
+    assert!(!unchanged.is_empty(), "no seed of 300 undoes itself");
+    let records = generate_all(&model, &unchanged, 2, 0);
+    for record in &records {
+        assert_eq!(record.outcome, "duplicate", "{record:?}");
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("same board as the input board")
+        );
+        assert_eq!(
+            record.board_sha256.as_deref(),
+            Some(model.held.board_sha256.as_str())
+        );
+    }
+    // Where it did move, the board differs from the input and is kept.
+    let moved_recipe = (1..=300)
+        .map(recipe)
+        .find(|r| generate(&model, r).is_ok_and(|c| !c.placements.is_empty()))
+        .expect("some seed moves the part");
+    let moved = generate_all(&model, &[moved_recipe], 1, 0);
+    assert_eq!(moved[0].outcome, "generated");
+}
+
+#[test]
 fn the_edge_mount_list_holds_real_references_only() {
     let model = model();
     assert!(
@@ -519,6 +582,22 @@ fn the_edge_mount_list_holds_real_references_only() {
     );
     let real = real_held_references(&model.held);
     assert_eq!(real, vec!["H1".to_string(), "J1".to_string()]);
+}
+
+#[test]
+fn a_reference_with_a_hash_in_it_is_still_a_real_reference() {
+    // Only `<reference>#<digits>` is a shared key; a real reference that happens to hold a
+    // `#` (`TP#a`, `TP#`) names a footprint and is an edge mount like any other.
+    let mut set = model().held;
+    let part = set.held["J1"].clone();
+    for key in ["TP#a", "TP#", "TP#1x"] {
+        set.held.insert(key.to_string(), part.clone());
+    }
+    let real = real_held_references(&set);
+    for key in ["TP#a", "TP#", "TP#1x", "J1", "H1"] {
+        assert!(real.contains(&key.to_string()), "{key} in {real:?}");
+    }
+    assert!(!real.iter().any(|key| key.starts_with("LOGO#")), "{real:?}");
 }
 
 #[test]
@@ -584,14 +663,40 @@ fn routing_order_takes_the_references_then_the_families_interleaved() {
         let rest = [base, base + 2, base + 5];
         drawn.push(rest[rng.below(3) as usize]);
     }
+    // Round r starts at family r mod 3: F, S, P; then S, P, F; then P, F, S; then F, S, P.
     let expected = vec![
         0, 1, 2, 3, 4, 5, // O three times, A three times
         13, 23, 33, // each family's best
-        drawn[0], drawn[1], drawn[2], // each family's drawn
-        11, 21, 31, // second best
+        drawn[1], drawn[2], drawn[0], // each family's drawn
+        31, 11, 21, // second best
         14, 24, 34, // third best
     ];
     assert_eq!(order, expected);
+}
+
+#[test]
+fn the_round_robin_starts_each_round_at_another_family() {
+    // One best and one drawn per family: two rounds. Without the rotation P's drawn
+    // candidate would always be the last call, and the first one a time limit cuts.
+    let records = selection_records();
+    let order = routing_order(&records, 1, 1, 7);
+    let routed: Vec<usize> = order.into_iter().skip(6).collect();
+    assert_eq!(routed.len(), 6);
+    assert_eq!(routed[..3], [13, 23, 33], "round 0 is F, S, P");
+    let family_of = |id: usize| id / 10;
+    assert_eq!(
+        routed[3..]
+            .iter()
+            .map(|&id| family_of(id))
+            .collect::<Vec<_>>(),
+        vec![2, 3, 1],
+        "round 1 is S, P, F"
+    );
+    assert_eq!(
+        family_of(*routed.last().unwrap()),
+        1,
+        "F's drawn candidate is last"
+    );
 }
 
 #[test]
@@ -655,10 +760,43 @@ fn the_draw_is_fixed_and_never_draws_a_p1_failure() {
     for id in [13, 11, 14] {
         assert!(order.contains(&id));
     }
-    // A family with fewer candidates than slots gives what it has.
+    // A family with fewer candidates than slots gives what it has: of F's ids 10 and 11,
+    // 10 fails P1 here, so only 11 is routed.
     let few: Vec<Record> = records.into_iter().filter(|r| r.id < 12).collect();
     let order = routing_order(&few, 3, 1, 7);
-    assert_eq!(order.iter().filter(|id| **id >= 10).count(), 2);
+    assert_eq!(order.iter().filter(|id| **id >= 10).count(), 1);
+    assert!(order.contains(&11));
+}
+
+#[test]
+fn a_candidate_that_fails_p1_is_never_the_best_of_its_family() {
+    // F's best by the screen key is a P1 failure: its key's first slot is 1, but the
+    // other slots are the lowest of the family, so a sort that ignored P1 would take it.
+    let mut records = selection_records();
+    records[6 + 3].screen_key = Some([1, 0, 0, 0, 0, 0]);
+    records[6].screen_key = Some([1, 0, 0, 0, 0, 0]);
+    let order = routing_order(&records, 3, 1, 7);
+    assert!(
+        !order.contains(&13) && !order.contains(&10),
+        "a P1 failure is not routed: {order:?}"
+    );
+    // The best three are the best three that pass P1: crossings 1, 2, 3 are ids 11, 14, 12;
+    // the rest of the pool that passes P1 is crossings 4: id 15, which the draw takes.
+    let f: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|id| (10..16).contains(id))
+        .collect();
+    assert_eq!(f.len(), 4, "{f:?}");
+    for id in [11, 14, 12, 15] {
+        assert!(f.contains(&id), "{id} in {f:?}");
+    }
+    // Where every candidate of a family fails P1, the family gets no call at all.
+    for k in 0..6 {
+        records[6 + k].screen_key = Some([1, 0, 0, 0, 0, 0]);
+    }
+    let order = routing_order(&records, 3, 1, 7);
+    assert!(order.iter().all(|id| !(10..16).contains(id)), "{order:?}");
 }
 
 // ─── The launch rule ─────────────────────────────────────────────────────────
@@ -785,11 +923,14 @@ async fn routing_failures_are_records_and_three_in_a_row_stop() {
 
 #[tokio::test(start_paused = true)]
 async fn a_success_between_the_failures_keeps_the_phase_going() {
-    // F F N F F: five failures in all, never three in a row.
+    // F F R F F: four failures in all, never three in a row.
     let setup = setup(100_000);
     let router = fake(10, |n, _| match n {
         0 | 1 | 3 | 4 => Step::Export,
-        2 => Step::NoWinner,
+        2 => Step::Routed {
+            unconnected: 0,
+            signal_mm: 50.0,
+        },
         _ => Step::Routed {
             unconnected: 0,
             signal_mm: 50.0,
@@ -804,8 +945,91 @@ async fn a_success_between_the_failures_keeps_the_phase_going() {
     );
     assert!(outcome.stopped_routing.is_none());
     assert_eq!(count(&outcome, "export_refused"), 4);
+    assert_eq!(count(&outcome, "routed"), selected(&outcome) - 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn calls_with_no_winner_count_toward_the_stop_like_failures() {
+    // No winner, a refused export, no winner: three misses in a row, no routed
+    // candidate yet. The first call may be any of them, and a mix counts.
+    let setup = setup(100_000);
+    let router = fake(10, |n, _| match n {
+        0 | 2 => Step::NoWinner,
+        1 => Step::Export,
+        _ => Step::Routed {
+            unconnected: 0,
+            signal_mm: 50.0,
+        },
+    });
+    let shared = Arc::clone(&router.0);
+    let outcome = search(&setup.plan, Arc::new(router)).await.unwrap();
+    assert_eq!(
+        shared.calls.load(Ordering::SeqCst),
+        ROUTE_FAILURES_BEFORE_STOP
+    );
+    assert_eq!(count(&outcome, "no_winner"), 2);
+    assert_eq!(count(&outcome, "export_refused"), 1);
+    assert_eq!(count(&outcome, "routed"), 0);
+    assert_eq!(
+        count(&outcome, "not_routed_stopped"),
+        selected(&outcome) - 3
+    );
+    assert!(outcome
+        .stopped_routing
+        .as_deref()
+        .unwrap()
+        .contains("in a row"));
+
+    // A routed call between them resets the count, and after one the phase never stops
+    // this way: no winner, no winner, routed, then no winner after no winner after no winner.
+    let setup = self::setup(100_000);
+    let router = fake(10, |n, _| match n {
+        0 | 1 | 3 | 4 | 5 => Step::NoWinner,
+        _ => Step::Routed {
+            unconnected: 0,
+            signal_mm: 50.0,
+        },
+    });
+    let shared = Arc::clone(&router.0);
+    let outcome = search(&setup.plan, Arc::new(router)).await.unwrap();
+    assert_eq!(shared.calls.load(Ordering::SeqCst), selected(&outcome));
+    assert!(outcome.stopped_routing.is_none());
+    assert_eq!(count(&outcome, "no_winner"), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_with_no_winner_does_not_set_the_launch_rules_median() {
+    // The first call judges nothing and lasts 600 s; the others route in 100 s. Limit 1000 s.
+    // The median of the routed calls only: before one has routed, the estimate is 300 s,
+    // and 600 + 300 fits, so the second call starts at 600 s. With the no-winner call in
+    // the median it would be 600 s, 600 + 600 does not fit, and the search would end there.
+    let setup = setup(1000);
+    let router = fake_walls(
+        |n| if n == 0 { 600 } else { 100 },
+        |n, _| {
+            if n == 0 {
+                Step::NoWinner
+            } else {
+                Step::Routed {
+                    unconnected: 0,
+                    signal_mm: 50.0,
+                }
+            }
+        },
+    );
+    let shared = Arc::clone(&router.0);
+    let outcome = search(&setup.plan, Arc::new(router)).await.unwrap();
+    let starts = shared.starts.lock().unwrap();
+    assert!(starts.len() >= 2, "{} call(s) started", starts.len());
+    assert_eq!(starts[1].1.duration_since(starts[0].1), secs(600));
+    // After one routed call (100 s) the median is 100 s: the next starts at 700 s, and the
+    // calls go on until 900 s.
+    assert_eq!(
+        starts.last().unwrap().1.duration_since(starts[0].1),
+        secs(900)
+    );
     assert_eq!(count(&outcome, "no_winner"), 1);
-    assert_eq!(count(&outcome, "routed"), selected(&outcome) - 5);
+    assert_eq!(count(&outcome, "routed"), 4);
 }
 
 #[tokio::test(start_paused = true)]
@@ -964,6 +1188,105 @@ async fn the_table_names_no_net_and_no_part() {
     assert!(table_text.contains("| O call 1 |") || table_text.contains("O call 1"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_reference_call_with_no_winner_is_the_references_worst_rank() {
+    // O's calls: routed, no winner, routed. Every generated candidate routes but leaves one
+    // connection open, so each ranks below O's two routed calls and above its no-winner
+    // call. A family's best is then inside O's own spread (it matches); counting O's
+    // routed calls only would put it below all of them.
+    let setup = setup(100_000);
+    let router = fake(10, |_, id| match id {
+        1 => Step::NoWinner,
+        0 | 2 => Step::Routed {
+            unconnected: 0,
+            signal_mm: 100.0,
+        },
+        _ => Step::Routed {
+            unconnected: 1,
+            signal_mm: 100.0,
+        },
+    });
+    let outcome = search(&setup.plan, Arc::new(router)).await.unwrap();
+    let ranks: Vec<usize> = outcome.records[..3]
+        .iter()
+        .map(|r| r.rank.unwrap())
+        .collect();
+    let judged = outcome.records.iter().filter(|r| r.rank.is_some()).count();
+    assert_eq!(ranks, vec![1, judged, 2], "the no-winner call ranks last");
+    let table_text = table(&setup.plan, &outcome);
+    for family in ["F", "S", "P"] {
+        assert!(
+            table_text.contains(&format!("| {family} | matches | unknown |")),
+            "{table_text}"
+        );
+    }
+    assert!(table_text.contains("no-winner call ranks as the reference's worst"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_table_prints_a_code_for_a_stop_never_the_reason() {
+    // The input check fails with a message that names a path and a tool's output.
+    let setup = setup(100_000);
+    let mut router = fake(10, good);
+    Arc::get_mut(&mut router.0).unwrap().unrouted =
+        Err("/Users/owner/boards/secret.kicad_pcb: kicad-cli said: boom".into());
+    let outcome = search(&setup.plan, Arc::new(router)).await.unwrap();
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(
+        table_text.contains("Routing stopped early: input_check_failed."),
+        "{table_text}"
+    );
+    for leaked in ["secret", "kicad-cli", "/Users", "boom"] {
+        assert!(!table_text.contains(leaked), "`{leaked}` in table.md");
+    }
+    // The full reason is kept in search.json.
+    let json = std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap();
+    assert!(json.contains("secret.kicad_pcb") && json.contains("input_check_failed"));
+    assert!(outcome.stopped_routing.as_deref().unwrap().contains("boom"));
+
+    // The other two stops have their own codes.
+    let setup = self::setup(100_000);
+    let router = fake(10, |_, _| Step::Export);
+    search(&setup.plan, Arc::new(router)).await.unwrap();
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(table_text.contains("Routing stopped early: calls_failed_in_a_row."));
+    assert!(!table_text.contains("the export refused"));
+    let setup = self::setup(1000);
+    search(&setup.plan, Arc::new(fake(100, good)))
+        .await
+        .unwrap();
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(table_text.contains("Routing stopped early: time_limit."));
+    // No stop, no line.
+    let setup = self::setup(100_000);
+    search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(!table_text.contains("Routing stopped"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_the_boards_that_are_routed_keep_their_text() {
+    // 288 copies of a 2 MB board would be held to the end: after the selection, only the
+    // candidates in the routing order keep theirs.
+    let setup = setup(100_000);
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let with_text = outcome
+        .records
+        .iter()
+        .filter(|r| r.board_text.is_some())
+        .count();
+    assert!(
+        count(&outcome, "screened_out") > 0,
+        "the fixture screens some out"
+    );
+    assert_eq!(with_text, selected(&outcome));
+    for record in &outcome.records {
+        if matches!(record.outcome, "screened_out" | "duplicate") {
+            assert!(record.board_text.is_none(), "{}", record.id);
+        }
+    }
+}
+
 // ─── The references ──────────────────────────────────────────────────────────
 
 fn edit_footprint(text: &str, reference: &str, edit: impl Fn(&str) -> String) -> String {
@@ -985,14 +1308,19 @@ fn admit_ai_refuses_any_edit_but_placement() {
     let model = model();
     let s0 = s0_text(&model).unwrap();
     let movable = &model.held.movable;
-    // Movable parts moved and turned: admitted, and what is judged is the rebuilt text.
-    let mut placements = placements_of(&parse(&s0), movable).unwrap();
-    for (k, p) in placements.iter_mut().enumerate() {
-        p.x = 10.0 + 3.0 * k as f64;
-        p.y = 15.0 + k as f64;
-        p.rotation = if k % 2 == 0 { 90.0 } else { 0.0 };
+    // Movable parts moved and turned part by part, as an AI session writes them: a move
+    // by the move tool's own writer, a turn by a set (what the move and rotate tools
+    // write together). Admitted, and what is judged is the rebuilt text.
+    let placements = placements_of(&parse(&s0), movable).unwrap();
+    let mut ai = s0.clone();
+    for (k, p) in placements.iter().enumerate() {
+        let (x, y) = (10.0 + 3.0 * k as f64, 15.0 + k as f64);
+        ai = if k % 2 == 0 {
+            placements_applied_to(&ai, &[placement(&p.reference, x, y, 90.0)]).unwrap()
+        } else {
+            footprint_moved_in(&ai, &p.reference, x, y).unwrap()
+        };
     }
-    let ai = placements_applied_to(&s0, &placements).unwrap();
     let rebuilt = admit_ai(&s0, &ai, movable).expect("a placement is admitted");
     assert_eq!(same_board(&parse(&rebuilt), &parse(&ai)), Ok(()));
     // S0 itself is admitted too.
@@ -1038,6 +1366,45 @@ fn admit_ai_refuses_any_edit_but_placement() {
     assert!(admit_ai(&s0, "(kicad_pcb", movable).is_err());
     let missing = edit_footprint(&ai, "R3", |_| String::new());
     assert!(admit_ai(&s0, &missing, movable).is_err());
+}
+
+/// The board's text with R9 at 180 degrees and its texts at angles a set does not keep:
+/// 100 degrees becomes -80, which a second set makes 280.
+fn text_with_a_turned_part_and_angled_text() -> String {
+    let mut all = parts();
+    all.push(
+        Fp::new("R9", 40.0, 8.0)
+            .lib("Test:R")
+            .two_pad("SIG8", "SIG9")
+            .rot(180.0),
+    );
+    edit_footprint(&board(OUTLINE, &all), "R9", |fp| {
+        fp.replace("(at 0 -1.5 0)", "(at 0 -1.5 100)")
+            .replace("(at 0 1.5 0)", "(at 0 1.5 180)")
+    })
+}
+
+#[test]
+fn a_board_written_by_the_move_writer_is_admitted() {
+    // An AI session moves R9 (at 180 degrees, with texts) and C1 with the move tool's
+    // writer: both keep their children's angles as spelled.
+    let model = model_of(&text_with_a_turned_part_and_angled_text());
+    let s0 = s0_text(&model).unwrap();
+    let mut ai = footprint_moved_in(&s0, "R9", 44.0, 9.0).unwrap();
+    ai = footprint_moved_in(&ai, "C1", 20.0, 12.0).unwrap();
+    // Setting every part the AI left turned would re-spell R9's texts: the board the AI
+    // wrote is then no longer the board rebuilt from its anchors.
+    let placements = placements_of(&parse(&ai), &model.held.movable).unwrap();
+    let set_everything = placements_applied_to(&s0, &placements).unwrap();
+    assert!(
+        same_board(&parse(&set_everything), &parse(&ai)).is_err(),
+        "the fixture must show that a set changes what a move leaves"
+    );
+    let rebuilt = admit_ai(&s0, &ai, &model.held.movable).expect("the move writer's board");
+    assert_eq!(same_board(&parse(&rebuilt), &parse(&ai)), Ok(()));
+    // A turn is still a set: R9 turned to 270 degrees by a set is admitted too.
+    let turned = placements_applied_to(&ai, &[placement("R9", 44.0, 9.0, 270.0)]).unwrap();
+    assert!(admit_ai(&s0, &turned, &model.held.movable).is_ok());
 }
 
 #[test]

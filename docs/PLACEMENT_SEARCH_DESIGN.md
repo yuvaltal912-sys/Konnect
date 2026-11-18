@@ -73,7 +73,8 @@ place_search(plan)        one board; everything is written below plan.folder
     -> board text -> held check -> evaluate -> decoupling pairs -> screen;
     then boards that repeat an earlier one are marked duplicates
  5. phase 2, selection: O 3 times, A 3 times, then per family its 3 best by the
-    screen and 1 drawn, the families interleaved (best, drawn, second, third)
+    screen and 1 drawn (only candidates that pass P1), the families interleaved (best,
+    drawn, second, third), round r starting at family r mod 3
  6. phase 3, 18 routing calls, one at a time while the launch rule allows:
     candidate project -> file-based DSN -> route_specctra_dsn (fastroute, best-of-N,
     effort M) -> its winner's gates and measures, and its unrouted baseline
@@ -99,16 +100,16 @@ product does (sandboxed, never `--live`). The search applies nothing.
 | D8 | Decoupling pairs come from `score_placement`'s `decoupling_associations` on the input board (every entry, whatever its status), never from a shared net. In F and in S's polish they are pad-to-pad springs of weight 10. Each candidate is measured against that same fixed list (`pair_violations`: a pair whose two pads are farther apart than its limit, or cannot be found, is a violation), and in the rank the violations are an ordering term right after the gates. The candidate's own associations are not used: a capacitor moved away from every IC drops out of them, which would read as no violation. Groups (the caller's, KiCad groups, schematic sheet instances) are centre springs of weight 0.5; their spread is recorded, not ranked | Hard constraints would make legalize fail on a dense board. Ranking this requirement before every routing preference keeps the checklist's "beside its supply pin" first without hiding a candidate that misses it. Weight 10 is twice the strongest legacy spring (5, differential pairs); 0.5 is half a signal net, a nudge. Whether grouping helps beyond what the router rewards is for the bench to show, from the recorded spread. Taking pairs from the input board uses the owner's placement as evidence of which capacitor serves which IC. This is disclosed, and every arm gets the same list |
 | D9 | The force core boundary. `force_core.rs` holds the constants, the spring graph, the cooling loop (`relax`) and the collision pass (`resolve_collisions`). The handler keeps the arguments, the board read, the rectangle check and its refusal, the part list and its movable rule, the legacy weights (`net_weight`), anchors and displacements, the score before and after, the applicability gates and the apply path. Its output stays byte-identical (golden test) | Everything the search varies (start, weights, extra springs, bounds) is an input of the core. Everything the tool must keep (its refusals, gates and apply path) stays in the tool |
 | D10 | `evaluate.rs` holds what `handle_score_placement` does after parsing. The handler reads the board (live or saved), calls it and adds `source` | A candidate must be scored on a thread, with no async runtime, no temp file and no question to KiCad. Tool and search share one evaluation, so they cannot drift apart |
-| D11 | `pcb_components::placements_applied_to` is the loop of `update_closed_board_footprints` without the file | A candidate's board is written by the same transform as a real move (the reason `apply_placements_to_content` exists), and in memory, so the pool needs no temp files |
+| D11 | `pcb_components::placements_applied_to` is the loop of `update_closed_board_footprints` without the file. A generator lists only the parts it moved or turned: a part that stayed is not listed, because a set re-spells its text and pad angles even by 0 degrees. `placements_moved_applied_to` is the same loop that only moves a footprint whose rotation is already the placement's, as the move tool does, and sets a turned one: `admit_ai` rebuilds A with it | A candidate's board is written by the same transform as a real move (the reason `apply_placements_to_content` exists), and in memory, so the pool needs no temp files. A candidate must equal the input in everything it did not change, and an AI that moves parts one by one with the move tool leaves the angles of the parts it did not turn as spelled; a set of every part would not reproduce its board |
 | D12 | Phase 1 (generate, write, check the held set, evaluate, screen) runs on a bounded pool of scoped threads, one per core, before any routing. Routing calls then run one at a time, and each uses the routing search's own lanes on the whole machine. Both phases fall under the board's one time limit (D15) | Generation is CPU-only and takes seconds. The routing search's lanes (route design D5) are tuned for one search per machine. Row BN's rerun saw host load change routing throughput by 6 to 16 %, so two searches at once would make candidates' routing incomparable |
 | D13 | Every routed candidate is routed at effort M. Each reference (O, A) is routed 3 times; each selected generated candidate once | Equal routing effort is what makes the routed measures a placement comparison. Fast (2 runs) is too noisy: on B4 with pours fixed, stage 7 left 2 to 10 unconnected across 7 seeds. H or XH would make the bench 3 to 10 times longer. A family gets the best of 4 calls; a reference's own 3 calls show the routing noise its best must clear (D18) |
-| D14 | The matrix is 288 recipes. F: seeds 1 to 32 x rail weight {0, 0.5, 3} on nets with more than 8 references. S: seeds 1 to 32 x {raw, polished}. P: seeds 1 to 64 x {4 edits within 2 mm, 12 edits within 5 mm}. A board that repeats an earlier one is a duplicate and is never routed. Per family, the screen's 3 best and 1 drawn candidate are routed | Generating and screening cost seconds; routing costs minutes. So many candidates are made and few are routed. The drawn one shows whether the screen picks well: if drawn candidates beat the screen's best, the screen is wrong. Fixed slots give every family an answer. 8 is `score_placement`'s own fanout limit; 3 is the legacy weight of a power name. Small edits and screen ties can repeat a board, which would waste a call |
-| D15 | The time limit is 100 minutes per board (18 calls of about 5 minutes, plus phase 1). A routing call starts only when the median wall time of the calls so far still fits before the limit; before any call has ended, the estimate is the budget plus 60 s, a margin this design chooses. A started call is never cut; its own budget ends it | Route design D6's launch rule, applied to whole calls. Route design D7 lets a call that has no judged run yet wait past its budget without a bound, so the median replaces the first estimate as soon as one call ends. The drawn candidates come second in each family's turn, so a short limit does not cut the screen's check first |
-| D16 | Every stage failure becomes a record, and the search goes on. A generator panic is caught. Three routing-stage failures in a row, with no success yet, stop the routing phase; a success resets the count | Route design D16 and D18: a broken export or binary fails every call the same way, and a call costs minutes |
-| D17 | The gates are P1 (no hard failure of the placement score names a movable part, and the outline is closed), P2 (no physical DRC type worse than on the input board, both unrouted), and G1 to G3 of the routing call's winner. The score runs with every held part as `edge_mount_references`. Decoupling, connectors, the routing tail, silk and the score only order | P1 and P2 are buildability, judged on what a candidate changed: a held connector that crosses the edge on purpose, or an overlap between two held parts, is the same on every candidate, O included, and must not fail them all. G1 to G3 are the routing judge's absolute gates (route design D10). They are relative to the candidate's own unrouted board, and P2 ties that board to the input. Silk is a label fix, not a fault |
-| D18 | The key (`place_judge::rank`) puts the unconnected count before any length. Length steps come only from candidates that pass P1, P2 and G1. Ties go to the lower id: O, then A, then recipe order. A family's verdict against a reference: it beats the reference when its best ranks above all 3 of the reference's calls, matches it when its best ranks among them, and is below it otherwise (`verdict`) | Stage 7's B6: when every run failed every gate, the order fell to length, and the run that routed least came first. A candidate with an illegal placement must not set the steps either. A family's best is a best of 4 calls, so a "beats" must clear the reference's own routing noise, not one lucky call |
+| D14 | The matrix is 288 recipes. F: seeds 1 to 32 x rail weight {0, 0.5, 3} on nets with more than 8 references. S: seeds 1 to 32 x {raw, polished}. P: seeds 1 to 64 x {4 edits within 2 mm, 12 edits within 5 mm}. A board that repeats an earlier one is a duplicate and is never routed. Per family, the screen's 3 best and 1 drawn candidate among those that pass P1 are routed | Generating and screening cost seconds; routing costs minutes. So many candidates are made and few are routed. The drawn one shows whether the screen picks well: if drawn candidates beat the screen's best, the screen is wrong. Fixed slots give every family an answer. 8 is `score_placement`'s own fanout limit; 3 is the legacy weight of a power name. Small edits and screen ties can repeat a board, which would waste a call |
+| D15 | The time limit is 100 minutes per board (18 calls of about 5 minutes, plus phase 1). A routing call starts only when the median wall time of the calls that routed a candidate so far still fits before the limit; before any such call has ended, the estimate is the budget plus 60 s, a margin this design chooses. A started call is never cut; its own budget ends it. The rounds go F, S, P; S, P, F; P, F, S; and so on (round r starts at family r mod 3) | Route design D6's launch rule, applied to whole calls. Route design D7 lets a call that has no judged run yet wait past its budget without a bound, so a call that judged no run (no winner) says nothing about how long the next one takes and stays out of the median, which replaces the first estimate as soon as a call routes one. The drawn candidates come second in each family's turn, so a short limit does not cut the screen's check first. The family order rotates so that the same family (P, last in a fixed order) is not the one that loses its last call whenever the limit cuts a round |
+| D16 | Every stage failure becomes a record, and the search goes on. A generator panic is caught. Three routing calls in a row that gave no routed candidate (a refused export, a failed call, or a call with no winner), with none routed yet, stop the routing phase; a routed candidate resets the count, and after the first one the phase does not stop this way. `table.md` names a stop by a fixed word (`time_limit`, `input_check_failed`, `calls_failed_in_a_row`); the full reason, which can hold a path or a tool's output, is in `search.json` only | Route design D16 and D18: a broken export or binary fails every call the same way, and a call costs minutes. A call with no winner after the budget is the same signal when nothing has routed yet. The table is a document that leaves the folder, so it carries counts and codes, not text of errors |
+| D17 | The gates are P1 (no hard failure of the placement score that names a movable part and is not among the input board's own, compared by kind and sorted references, and the outline is closed), P2 (no physical DRC type worse than on the input board, both unrouted), and G1 to G3 of the routing call's winner. The score runs with every held part as `edge_mount_references`. Decoupling, connectors, the routing tail, silk and the score only order | P1 and P2 are buildability, judged on what a candidate changed: a held connector that crosses the edge on purpose, an overlap between two held parts, or a fault the owner's board has between movable parts, is the same on every candidate, O included, and must not fail them all (O never fails P1 on its own faults, and a candidate that does not mend one is not punished for it). G1 to G3 are the routing judge's absolute gates (route design D10). They are relative to the candidate's own unrouted board, and P2 ties that board to the input. Silk is a label fix, not a fault |
+| D18 | The key (`place_judge::rank`) puts the unconnected count before any length. Length steps come only from candidates that pass P1, P2 and G1. Ties go to the lower id: O, then A, then recipe order. A family's verdict against a reference: it beats the reference when its best ranks above all of the reference's judged calls, matches it when its best ranks among them, and is below it otherwise (`verdict`). A reference's judged calls are its routed calls and its calls with no winner (both carry a key): a no-winner call is the reference's worst rank, and the table's legend says so | Stage 7's B6: when every run failed every gate, the order fell to length, and the run that routed least came first. A candidate with an illegal placement must not set the steps either. A family's best is a best of 4 calls, so a "beats" must clear the reference's own routing noise, not one lucky call |
 | D19 | Each net's routing rules are read once per board from KiCad's own resolution: headless KiCad Python with a scratch `KICAD_CONFIG_HOME`, as the router research's `net_rules.py` did. Every candidate is exported with `specctra::export_dsn_with_context` | `export_specctra_dsn` reads the rules from the live editor, and the bench never uses one. Net classes follow net names and patterns, not placement. The probe's flat 0.2 mm was harness defect 3 |
-| D20 | Isolation. Every tool call runs with an `ipc_address` inside the bench folder, where nothing listens. `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR` must be scratch folders. Input boards must lie inside the bench folder, links followed. fastroute runs only through `route_with_fastroute` (`sandbox-exec`, never `--live`). Each board's run holds the lane locks (native, then instr), because it starts kicad-cli. The A session runs with `KICAD_API_SOCKET` set to a dead path inside its own folder, scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`, and a working folder that holds only its S0 copy and its brief. A is admitted only if it differs from S0 in nothing but where movable parts sit and how they turn (`admit_ai`) | This is the never-touch list. The judge calls tools that ask IPC first, and a running KiCad of the owner must never be asked. An empty `ipc_address` falls back to `KICAD_API_SOCKET`, and the release binary finds a live socket on its own, so the A session needs the dead path too. Without the admission check, an AI session could change a net, a zone, the outline or a rule, or flip a part, and still be compared as a placement |
+| D20 | Isolation. Every tool call runs with an `ipc_address` inside the bench folder, where nothing listens. `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR` must be scratch folders. Input boards must lie inside the bench folder, links followed, and a board's folder, its `candidates` and its `isolation` must not be links. An unknown home folder is refused (the real KiCad and Konnect folders, `~/Library/Preferences/kicad`, `~/.config/kicad`, `~/.local/share/konnect` and `~/Library/Application Support/konnect`, cannot then be excluded). fastroute runs only through `route_with_fastroute` (`sandbox-exec`, never `--live`). Each board's run holds the lane locks (native, then instr), because it starts kicad-cli. The A session runs with `KICAD_API_SOCKET` set to a dead path inside its own folder, scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`, and a working folder that holds only its S0 copy and its brief. A is admitted only if it differs from S0 in nothing but where movable parts sit and how they turn (`admit_ai`) | This is the never-touch list. The judge calls tools that ask IPC first, and a running KiCad of the owner must never be asked. An empty `ipc_address` falls back to `KICAD_API_SOCKET`, and the release binary finds a live socket on its own, so the A session needs the dead path too. Without the admission check, an AI session could change a net, a zone, the outline or a rule, or flip a part, and still be compared as a placement |
 | D21 | Every candidate records its origin, generator version, recipe (family, seed, parameters), the SHA-256s of the input, the held list, the intent and its own board, its timings, and its routing call (folder, fastroute SHA-256, effort, winner shape and seed, elapsed, overrun, host load at start). `rerun` rebuilds a generated board byte for byte from its record | Route design D20. A routing call is a timed search, so its winner can differ on a rerun. Its search folder keeps the winner's variant and session, so the routed board can be rebuilt without routing again |
 | D22 | Documents report counts only. The tables and `search.json` stay in `target/creation-research/placement-search/`, which git ignores | `AGENTS.md`: real-project results stay out of documents, apart from counts |
 
@@ -749,7 +750,8 @@ pub(crate) enum GenerateFailure {
 /// - Perturb: `perturb` of the input, then `legalize`.
 ///
 /// Centres become anchors by each part's own offset (anchor minus courtyard centre,
-/// turned with the part), rounded to 1 µm as the legacy handler rounds them. Pure.
+/// turned with the part), rounded to 1 µm as the legacy handler rounds them. A part that
+/// neither moved nor turned is not listed. Pure.
 pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate, GenerateFailure> {
     todo!()
 }
@@ -885,6 +887,9 @@ pub(crate) struct Screen {
     /// Hard failures that name at least one movable part. A failure among held parts
     /// alone is the same on every candidate, O included, and is no candidate's fault.
     pub movable_hard_failures: usize,
+    /// Those of them that are not among the input board's own (kind and sorted
+    /// references). P1 reads this count, so O never fails P1 on its own faults.
+    pub new_movable_hard_failures: usize,
     /// `outline_missing` or `outline_unproven`.
     pub outline_unproven: bool,
     /// The intent's decoupling pairs (taken from O) that this board breaks
@@ -902,12 +907,26 @@ pub(crate) struct Screen {
     pub group_spread: Option<f64>,
 }
 
-/// The screen of one candidate: `evaluated` read, its hard failures split by `held`,
-/// `decoupling_violations` as given. Errs on a field the score always gives that is
-/// missing.
+/// A hard failure as P1 compares it with the input board's: its kind and its sorted
+/// references.
+pub(crate) type FailureKey = (String, Vec<String>);
+
+/// The hard failures of `evaluated` that name at least one movable part, as keys.
+pub(crate) fn movable_failure_keys(
+    evaluated: &serde_json::Value,
+    held: &HeldSet,
+) -> anyhow::Result<Vec<FailureKey>> {
+    todo!()
+}
+
+/// The screen of one candidate: `evaluated` read, its hard failures split by `held` and
+/// by `baseline` (the input board's `movable_failure_keys`; empty judges every failure
+/// as new), `decoupling_violations` as given. Errs on a field the score always gives
+/// that is missing.
 pub(crate) fn screen(
     evaluated: &serde_json::Value,
     held: &HeldSet,
+    baseline: &[FailureKey],
     decoupling_violations: usize,
     group_spread: Option<f64>,
 ) -> anyhow::Result<Screen> {
@@ -922,7 +941,7 @@ pub(crate) fn pair_violations(board: &SexpNode, pairs: &[DecouplingPair]) -> usi
     todo!()
 }
 
-/// Least is best: P1 failed (`movable_hard_failures` above 0 or the outline unproven),
+/// Least is best: P1 failed (`new_movable_hard_failures` above 0 or the outline unproven),
 /// score incomplete, decoupling violations, connector violations, crossings,
 /// wirelength in 0.1 mm steps. A measure the score did not give sorts last
 /// (`i64::MAX`).
@@ -957,7 +976,8 @@ pub(crate) const SILK: &[&str] = &["silk_overlap", "silk_over_copper", "silk_edg
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct PlacementGates {
     /// P1: no hard failure of the placement score (a courtyard overlap, a part
-    /// outside the true outline) names a movable part, and the outline is closed.
+    /// outside the true outline) names a movable part unless the input board has the
+    /// same one (kind and references), and the outline is closed.
     pub p1: Vec<String>,
     /// P2: no physical DRC type worse than on the input board, both unrouted.
     pub p2: Vec<String>,
@@ -1267,8 +1287,11 @@ pub(crate) struct Plan {
 pub(crate) struct Outcome {
     pub records: Vec<Record>,
     pub elapsed: Duration,
-    /// Why the routing phase stopped early, when it did.
+    /// Why the routing phase stopped early, when it did, in full: `search.json` only.
     pub stopped_routing: Option<String>,
+    /// The same as one fixed word, the only form `table.md` prints: `time_limit`,
+    /// `input_check_failed` or `calls_failed_in_a_row`.
+    pub stopped_code: Option<&'static str>,
     /// P2's yardstick: the input board's unrouted check.
     pub input_unrouted: BTreeMap<String, usize>,
 }
@@ -1297,12 +1320,14 @@ pub(crate) fn generate_all(model: &BoardModel, recipes: &[Recipe], threads: usiz
 }
 
 /// Phase 2, selection, as candidate ids in routing order: O's calls, then A's; then,
-/// per family, its `best` best by the screen key (ties to the lower id) and `drawn`
-/// drawn uniformly with `SplitMix64(draw_seed)` from its other candidates that pass P1.
+/// per family, among the candidates that pass P1 (one that fails it is never routed),
+/// its `best` best by the screen key (ties to the lower id) and `drawn` drawn uniformly
+/// with `SplitMix64(draw_seed)` from its other candidates that pass P1.
 /// The families are interleaved round by round: each family's best, then each
-/// family's drawn one, then the second best, then the rest (F1, S1, P1, Fd, Sd, Pd,
-/// F2, …), so a time limit cuts every family alike and the screen's check is not
-/// the first thing cut. A candidate whose board equals an earlier one's
+/// family's drawn one, then the second best, then the rest, and round r starts at
+/// family r mod 3 (F1, S1, P1; Sd, Pd, Fd; P2, F2, S2; …), so a time limit cuts every
+/// family alike over the rounds and the screen's check is not the first thing cut.
+/// A candidate whose board equals an earlier one's
 /// (`board_sha256`) was recorded `duplicate` in phase 1 and is never selected; nor is a
 /// record that failed before the screen.
 pub(crate) fn routing_order(records: &[Record], best: usize, drawn: usize, draw_seed: u64) -> Vec<usize> {
@@ -1320,14 +1345,16 @@ pub(crate) fn first_call_estimate(effort: Effort) -> Duration {
 
 /// The launch rule: a routing call started at `elapsed` is expected to end by
 /// `limit`: `elapsed + expected <= limit`, `expected` the median wall time of the calls
-/// finished so far, or `first_call_estimate` before any. A call is never cut once
+/// that routed a candidate so far (a call with no winner is not one), or
+/// `first_call_estimate` before any. A call is never cut once
 /// started: its own budget ends it (route design D7).
 pub(crate) fn may_route(elapsed: Duration, limit: Duration, call_walls: &[Duration], effort: Effort) -> bool {
     todo!()
 }
 
-/// Routing-stage failures in a row (`export_refused`, `route_failed`), with no
-/// routed candidate yet, that stop the routing phase. A success resets the count.
+/// Calls in a row that gave no routed candidate (`export_refused`, `route_failed` and
+/// `no_winner`), with no routed candidate yet, that stop the routing phase. A routed
+/// candidate resets the count, and after the first one the phase never stops this way.
 pub(crate) const ROUTE_FAILURES_BEFORE_STOP: usize = 3;
 
 /// The whole search of one board (flow steps 1 to 8): the held set and the intent,
@@ -1342,8 +1369,9 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
 
 /// A's board admitted as a reference: the anchors and rotations of the movable parts
 /// read from `ai_text` (`place_held::placements_of`), applied to S0's text with
-/// `pcb_components::placements_applied_to`, and the result must be the same board as
-/// `ai_text` (`place_held::same_board`). So A differs from S0 only in where movable
+/// `pcb_components::placements_moved_applied_to` (a part whose rotation is S0's is
+/// moved, as the move tool moves it; only a turned part is set), and the result must be
+/// the same board as `ai_text` (`place_held::same_board`). So A differs from S0 only in where movable
 /// parts are and how they turn: a flip, a changed held part, net, zone, outline or rule
 /// is refused, and the refusal (`ai_refused`, with the first difference) is a record.
 /// Returns the rebuilt text, which is what is judged.
@@ -1371,7 +1399,10 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
 /// copper quality, silk, placement score), then one row per family and reference (best
 /// rank, median rank of its routed candidates, how many pass every gate, how many were
 /// generated, failed, duplicates and screened out), then each family's verdict against
-/// O and against A (`verdict`).
+/// O and against A (`verdict`; a family's best is its best routed candidate, a
+/// reference's calls are its routed calls and its calls with no winner, and a no-winner
+/// call is the reference's worst rank: the table's legend says so). A stop is named by
+/// its fixed code only, never by the reason's text.
 pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
     todo!()
 }
@@ -1479,7 +1510,7 @@ fn place_bench() {
 | The matrix | `the_bench_matrix_has_288_recipes_in_a_fixed_order` | — |
 | P2 gates physical types only | `p2_gates_physical_types_only` (`place_judge_tests.rs`): one more `courtyards_overlap` than the input fails; five more `silk_overlap` pass; one more of an unknown type fails | The input's own counts pass |
 | No check is no pass | `p2_without_an_unrouted_check_fails` | — |
-| P1 judges what a candidate changed | `a_held_part_over_the_edge_or_on_another_held_part_fails_no_candidate` | The same overhang on a movable part fails P1 |
+| P1 judges what a candidate changed | `a_held_part_over_the_edge_or_on_another_held_part_fails_no_candidate`; `p1_fails_only_on_a_hard_failure_the_input_board_does_not_have`: the input's own movable faults fail neither O nor a candidate that keeps them, a new one fails it | The same overhang on a movable part fails P1; counting every movable failure as new fails the second |
 | Decoupling is measured on the fixed list | `moving_a_capacitor_away_is_a_decoupling_violation`: a pair's capacitor moved far from every IC counts, though the candidate's own associations drop it | The capacitor at its pad's side counts nothing |
 | A pair is never unmeasured | `a_pair_whose_pads_are_missing_is_a_violation` | — |
 | Routing less cannot win by being shorter | `a_shorter_candidate_with_an_open_connection_ranks_below_a_complete_one` | Swapping key fields 3 and 9 (length before unconnected) fails it |
@@ -1496,16 +1527,22 @@ fn place_bench() {
 | Writes stay in the folder | `export_candidate_writes_only_inside_its_folder`: the parent folder's listing and hashes are unchanged | — |
 | A panic is a record | `a_panicking_generator_is_a_record_not_the_end` (`place_search_tests.rs`): a test-only recipe that panics is `generate_failed` with its message; the others are generated | — |
 | The pool is bounded | `the_pool_never_runs_more_jobs_than_threads` (a counter) | — |
-| Routing order | `routing_order_takes_the_references_then_the_families_interleaved`: O 3 times, A 3 times, then best, drawn, second and third per family | — |
+| Routing order | `routing_order_takes_the_references_then_the_families_interleaved`: O 3 times, A 3 times, then best, drawn, second and third per family, round r starting at family r mod 3 (`the_round_robin_starts_each_round_at_another_family`); `a_candidate_that_fails_p1_is_never_the_best_of_its_family` | Without the rotation P's drawn candidate is always last |
 | Duplicates | `a_repeated_board_is_a_duplicate_and_never_routed` | Two boards that differ by 1 µm are both kept |
-| A is a placement only | `admit_ai_refuses_any_edit_but_placement`: a flip, a moved held part, a changed net, zone, outline or rule | S0 with movable parts moved and turned is admitted |
+| A is a placement only | `admit_ai_refuses_any_edit_but_placement`: a flip, a moved held part, a changed net, zone, outline or rule | S0 with movable parts moved (by the move writer) and turned (by a set) is admitted |
+| A moved part is not re-spelled | `a_board_written_by_the_move_writer_is_admitted` (`place_search_tests.rs`): a part at 180 degrees with texts at 100 and 180 degrees, moved by the move tool's own writer; and `placements_moved_applied_to_moves_what_is_not_turned_and_sets_what_is` (`tools/pcb_components.rs`) | Rebuilding with a set of every part refuses a board the AI wrote correctly |
+| A part that stays stays | `a_part_that_did_not_move_keeps_its_footprint_block_byte_for_byte` (`place_generators_tests.rs`); `a_perturbation_that_ends_where_it_began_is_a_duplicate_of_the_input` | Listing the unmoved parts re-spells the text of the one at 180 degrees |
+| Clearance survives rounding | `legalized_parts_do_not_overlap_once_their_anchors_are_rounded_and_written`: two parts 0.1 to 1 µm from touching, anchors off the micron grid, written and scanned again | A clearance of 1 nm leaves a 0.3 µm overlap in the written board |
 | The verdict clears the noise | `verdict_needs_to_clear_every_reference_call`: beats, matches, below, unknown | A family best between two reference calls is `Matches`, not `Beats` |
 | The draw | `the_draw_is_fixed_and_never_draws_a_p1_failure` | — |
 | The time limit | `no_call_starts_that_cannot_end_by_the_limit`: `may_route` table, and a fake router with fixed wall times on a paused clock | Without the check, calls run past the limit |
-| Failures are records | `routing_failures_are_records_and_three_in_a_row_stop` | A success between the failures keeps the phase going |
+| Failures are records | `routing_failures_are_records_and_three_in_a_row_stop`; `calls_with_no_winner_count_toward_the_stop_like_failures` | A routed candidate between the failures keeps the phase going |
+| A call with no winner is no timing | `a_call_with_no_winner_does_not_set_the_launch_rules_median` | The median of every call ends the search at the first slow no-winner call |
+| A no-winner reference call ranks last | `a_reference_call_with_no_winner_is_the_references_worst_rank` | Counting routed calls only reads "matches" as "below" |
+| Only routed boards keep their text | `only_the_boards_that_are_routed_keep_their_text` | Keeping every text holds 288 copies of the board |
 | Rerun | `rerun_rebuilds_the_recorded_board` | A changed generator version or input SHA-256 is refused |
-| Counts only | `the_table_names_no_net_and_no_part`: no reference or net name of the fixture appears in `table.md` | — |
-| Bench environment | `bench_environment_refuses_real_settings_and_foreign_inputs` (`place_bench_tests.rs`, not ignored): the real KiCad and Konnect folders, an input outside the bench folder, an input reached through a link | A scratch setup passes |
+| Counts only | `the_table_names_no_net_and_no_part`: no reference or net name of the fixture appears in `table.md`; `the_table_prints_a_code_for_a_stop_never_the_reason`: a failure's path and tool output stay in `search.json` | — |
+| Bench environment | `bench_environment_refuses_real_settings_and_foreign_inputs` (`place_bench_tests.rs`, not ignored): the real KiCad and Konnect folders (`Library/Application Support/konnect` too), an unknown home folder, an input outside the bench folder, an input reached through a link, a board folder, `candidates` or `isolation` that is a link | A scratch setup passes |
 | End to end | `place_bench` (ignored): the bench itself | — |
 
 Scoped `cargo llvm-cov` on the new modules, and targeted `cargo mutants` on the guards

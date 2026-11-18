@@ -525,6 +525,65 @@ fn held_set_refuses_what_it_cannot_prove() {
 }
 
 #[test]
+fn a_refusal_names_the_rule_that_refused() {
+    // Another refusal may come later for the same board, so each case says which one it
+    // is: a blank reference is "no reference" (a reference of spaces is blank too), and
+    // an unreadable courtyard is the scan's skip, not the list disagreeing afterwards.
+    let rules = HoldRules::default();
+    for blank in ["", "   "] {
+        let mut parts = clean_parts();
+        parts.push(Fp::new(blank, 40.0, 30.0).two_pad("VCC", "SIG"));
+        let refusal = held_set(&board(OUTLINE, &parts), &no_caller(), &rules)
+            .expect_err("a blank reference is refused");
+        assert!(
+            refusal.reason.contains("1 footprint(s) have no reference"),
+            "reference {blank:?}: {refusal:?}"
+        );
+    }
+    let mut skipped = clean_parts();
+    skipped.push(
+        Fp::new("R2", 40.0, 30.0)
+            .two_pad("VCC", "SIG")
+            .broken_courtyard(),
+    );
+    let refusal = held_set(&board(OUTLINE, &skipped), &no_caller(), &rules).unwrap_err();
+    assert!(
+        refusal
+            .reason
+            .contains("courtyard scan skipped 1 footprint(s)"),
+        "{refusal:?}"
+    );
+}
+
+#[test]
+fn check_held_reports_an_unreadable_footprint_and_only_that() {
+    let set = set_of(&clean_parts());
+    let mut parts = clean_parts();
+    parts.push(
+        Fp::new("R2", 40.0, 30.0)
+            .two_pad("VCC", "SIG")
+            .broken_courtyard(),
+    );
+    let lines = check_held(&set, &parse(&board(OUTLINE, &parts))).unwrap_err();
+    assert_eq!(
+        lines,
+        vec!["1 footprint(s) of the candidate could not be read".to_string()],
+        "the scan's count and the footprint list agree, so nothing else is said"
+    );
+    // Two of them are counted as two.
+    parts.push(
+        Fp::new("R3", 45.0, 30.0)
+            .two_pad("VCC", "SIG")
+            .broken_courtyard(),
+    );
+    let lines = check_held(&set, &parse(&board(OUTLINE, &parts))).unwrap_err();
+    assert_eq!(
+        lines,
+        vec!["2 footprint(s) of the candidate could not be read".to_string()]
+    );
+}
+
+#[test]
 fn pad_less_footprints_may_share_a_reference_and_are_held() {
     // Three logo footprints share one reference, two more share another: none has a pad.
     let mut parts = clean_parts();

@@ -215,10 +215,11 @@ fn generators_never_list_a_held_part() {
             "{:?} lists a held part: {listed:?}",
             recipe.family
         );
-        assert_eq!(
-            listed.len(),
-            model.held.movable.len(),
-            "every movable part is listed once"
+        let count = candidate.placements.len();
+        assert_eq!(listed.len(), count, "no part is listed twice");
+        assert!(
+            count > 0 && count <= model.held.movable.len(),
+            "a part that moved or turned is listed once"
         );
         let in_order: Vec<&str> = candidate
             .placements
@@ -696,7 +697,11 @@ fn a_turned_part_is_written_turned_and_its_courtyard_follows() {
             .iter()
             .find(|c| c.reference.as_deref() == Some("R1"))
             .unwrap();
-        let placement = &candidate.placements[0];
+        // R1 neither moved nor turned: it is not listed, and the board is the input.
+        let Some(placement) = candidate.placements.first() else {
+            assert_eq!(written, model.text);
+            continue;
+        };
         assert_eq!(
             r1.rotation_deg, placement.rotation,
             "the rotation is written"
@@ -931,4 +936,282 @@ fn unit_is_in_the_half_open_unit_interval() {
         assert!((0.0..1.0).contains(&value));
     }
     assert_eq!(unit(&mut SplitMix64(7)), unit(&mut SplitMix64(7)));
+}
+
+// ─── A part that stays stays byte for byte ───────────────────────────────────
+
+/// The text of the footprint of `reference`, from its `(footprint` to its closing line.
+fn block_of(text: &str, reference: &str) -> String {
+    let at = text
+        .find(&format!("(property \"Reference\" \"{reference}\""))
+        .unwrap_or_else(|| panic!("{reference} is not on the board"));
+    let start = text[..at].rfind("(footprint \"").unwrap();
+    let end = start + text[start..].find("\n)\n").unwrap() + 3;
+    text[start..end].to_string()
+}
+
+#[test]
+fn a_part_that_did_not_move_keeps_its_footprint_block_byte_for_byte() {
+    // R9 sits at 180 degrees with texts at angles a set would re-spell (100 degrees
+    // becomes -80). A candidate that moves one part must leave R9 exactly as it was.
+    let mut parts = demo_parts();
+    parts.push(
+        Fp::new("R9", 50.0, 30.0)
+            .lib("Test:R")
+            .two_pad("SIG8", "SIG9")
+            .rot(180.0),
+    );
+    let input = board(OUTLINE, &parts);
+    let input = input.replacen(
+        "(property \"Reference\" \"R9\" (at 0 -1.5 0)",
+        "(property \"Reference\" \"R9\" (at 0 -1.5 100)",
+        1,
+    );
+    let model = model_of(&input, &[]);
+    let one_move = |seed: u64| Recipe {
+        family: Family::Perturb,
+        seed,
+        params: Params::Perturb(PerturbParams {
+            moves: 1,
+            radius_mm: 2.0,
+            swaps: false,
+            turns: false,
+        }),
+    };
+    let mut left_alone = 0;
+    for seed in 1..=40u64 {
+        let candidate = generate(&model, &one_move(seed)).unwrap();
+        assert_eq!(candidate.placements.len(), 1, "seed {seed}: one part moved");
+        let written = placements_applied_to(&model.text, &candidate.placements).unwrap();
+        let moved = &candidate.placements[0].reference;
+        for reference in &model.references {
+            if reference == moved {
+                continue;
+            }
+            assert_eq!(
+                block_of(&written, reference),
+                block_of(&input, reference),
+                "seed {seed}: {reference} was not touched and must not change"
+            );
+        }
+        if moved != "R9" {
+            left_alone += 1;
+        }
+    }
+    assert!(left_alone > 20, "R9 was left alone in {left_alone} of 40");
+    // R9 itself, when it is the one that moves, is written.
+    let moved_r9 = (1..=200u64).find_map(|seed| {
+        let candidate = generate(&model, &one_move(seed)).unwrap();
+        (candidate.placements[0].reference == "R9").then_some(candidate)
+    });
+    let written = placements_applied_to(&model.text, &moved_r9.unwrap().placements).unwrap();
+    assert_ne!(block_of(&written, "R9"), block_of(&input, "R9"));
+}
+
+// ─── Clearance after the anchors are rounded ─────────────────────────────────
+
+#[test]
+fn legalized_parts_do_not_overlap_once_their_anchors_are_rounded_and_written() {
+    // R1 and R2 have courtyards a hair under 1.5 mm wide, centred a fraction of a micron
+    // off their anchors, so that after `round_um` R1's courtyard moves toward R2 and R2's
+    // toward R1. Legalize puts R2 on the grid next to R1, 0.1 to 1 µm from touching: a
+    // clearance of 1 nm would call that legal, and the written board would overlap.
+    for (width, off) in [
+        (1.4995, 0.0004),
+        (1.4995, 0.00033),
+        (1.4999, 0.0002),
+        (1.4999, 0.00045),
+        (1.4998, 0.00035),
+        (1.4990, 0.00049),
+    ] {
+        let rect = |centre: f64| (centre - width / 2.0, -0.5, centre + width / 2.0, 0.5);
+        let (a0, a1, a2, a3) = rect(off);
+        let (b0, b1, b2, b3) = rect(-off);
+        let parts = vec![
+            Fp::new("R1", 20.0, 20.0)
+                .court_rect(a0, a1, a2, a3)
+                .two_pad("N1", "N2"),
+            Fp::new("R2", 40.0, 20.0)
+                .court_rect(b0, b1, b2, b3)
+                .two_pad("N1", "N2"),
+        ];
+        let model = model_of(&board(OUTLINE, &parts), &[]);
+        let sizes = as_read_sizes(&model);
+        let read = as_read_centres(&model);
+        let mut centres = read.clone();
+        // R2 proposed right up against R1: the centre distance of exactly the width.
+        centres[1] = (read[0].0 + width, read[0].1);
+        legalize(&model, &sizes, &mut centres).unwrap();
+        assert_ne!(centres[1], read[1], "R2 moved");
+        // The anchors exactly as `generate` writes them.
+        let mut placements = Vec::new();
+        for i in 0..2 {
+            if centres[i] == read[i] {
+                continue;
+            }
+            let part = &model.parts[i];
+            let offset = (part.at.0 - read[i].0, part.at.1 - read[i].1);
+            placements.push(IpcFootprintPlacement {
+                reference: model.references[i].clone(),
+                x: round_um(centres[i].0 + offset.0),
+                y: round_um(centres[i].1 + offset.1),
+                rotation: part.rotation_deg,
+            });
+        }
+        let written = placements_applied_to(&model.text, &placements).unwrap();
+        let evaluated = evaluate_text(&written, &[]);
+        assert_eq!(
+            evaluated["hard_failures"].as_array().unwrap().len(),
+            0,
+            "width {width}, offset {off}: {:?}",
+            evaluated["hard_failures"]
+        );
+        let scan = konnect_sexp::board::footprint_courtyards(&parse(&written));
+        let (a, b) = (&scan.items[0], &scan.items[1]);
+        let gap = b.bbox.0 - a.bbox.2;
+        assert!(gap >= 0.0, "width {width}, offset {off}: gap {gap}");
+    }
+}
+
+// ─── Legalize, pinned ────────────────────────────────────────────────────────
+
+/// A board with an outline whose corner is not at the origin (x 10..70, y 20..60), one
+/// movable resistor of 2 x 1 mm (`R1`, read far from the place the tests drop it) and
+/// the held `extra`.
+fn pinned_model(extra: Vec<Fp>) -> BoardModel {
+    pinned_model_of(extra, (1.0, 0.5))
+}
+
+/// [`pinned_model`] with R1's courtyard half-width and half-height given.
+fn pinned_model_of(extra: Vec<Fp>, half: (f64, f64)) -> BoardModel {
+    let mut parts = extra;
+    parts.push(
+        Fp::new("R1", 20.0, 30.0)
+            .court(half.0, half.1)
+            .two_pad("N1", "N2"),
+    );
+    model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &parts), &[])
+}
+
+fn legalized_r1(model: &BoardModel, at: (f64, f64)) -> (f64, f64) {
+    let sizes = as_read_sizes(model);
+    let mut centres = as_read_centres(model);
+    let r1 = model.references.binary_search(&"R1".to_string()).unwrap();
+    centres[r1] = at;
+    legalize(model, &sizes, &mut centres).unwrap();
+    centres[r1]
+}
+
+#[test]
+fn legalize_needs_one_size_and_one_centre_per_part() {
+    let model = pinned_model(Vec::new());
+    let sizes = as_read_sizes(&model);
+    let centres = as_read_centres(&model);
+    assert_eq!(sizes.len(), 1);
+    let mut longer = centres.clone();
+    longer.push((0.0, 0.0));
+    // Either list alone with the wrong length is refused (both wrong is not the only case).
+    let mut too_many_centres = longer.clone();
+    assert!(matches!(
+        legalize(&model, &sizes, &mut too_many_centres),
+        Err(GenerateFailure::Invalid(_))
+    ));
+    let mut too_many_sizes = sizes.clone();
+    too_many_sizes.push((1.0, 1.0));
+    let mut ok_centres = centres.clone();
+    assert!(matches!(
+        legalize(&model, &too_many_sizes, &mut ok_centres),
+        Err(GenerateFailure::Invalid(_))
+    ));
+    let mut ok_centres = centres.clone();
+    assert!(legalize(&model, &sizes, &mut ok_centres).is_ok());
+}
+
+#[test]
+fn legalize_keeps_a_part_flush_with_the_outline_and_moves_one_that_sticks_out() {
+    let model = pinned_model(Vec::new());
+    // R1 is 2 x 1 mm; the outline is x 10..70, y 20..60. Flush on each side: legal as
+    // it is, to the last digit.
+    for flush in [(11.0, 40.0), (69.0, 40.0), (40.0, 20.5), (40.0, 59.5)] {
+        assert_eq!(legalized_r1(&model, flush), flush, "flush at {flush:?}");
+    }
+    // Past the outline's bounding box by 0.05 mm on one side: nearer the edge than the
+    // outline's own "on the edge" distance (0.1 µm) is not, but 50 nm is, so the
+    // containment check below the bbox check lets these through, and the bbox check
+    // is what moves them back to the flush cell.
+    for (past, flush) in [
+        ((10.99995, 40.0), (11.0, 40.0)),
+        ((69.00005, 40.0), (69.0, 40.0)),
+        ((40.0, 20.49995), (40.0, 20.5)),
+        ((40.0, 59.50005), (40.0, 59.5)),
+    ] {
+        assert_eq!(
+            legalized_r1(&model, past),
+            flush,
+            "past by 50 nm at {past:?}"
+        );
+    }
+    // Well outside: the nearest legal cell.
+    assert_eq!(legalized_r1(&model, (10.5, 40.0)), (11.0, 40.0));
+    assert_eq!(legalized_r1(&model, (69.5, 40.0)), (69.0, 40.0));
+    assert_eq!(legalized_r1(&model, (40.0, 20.0)), (40.0, 20.5));
+    assert_eq!(legalized_r1(&model, (40.0, 60.0)), (40.0, 59.5));
+}
+
+#[test]
+fn legalize_measures_overlap_by_both_sizes_on_both_axes() {
+    // J1, 2 x 2 mm, held at (40, 40); R1 is 1 x 1 here, so half the two sizes together is
+    // 1.5 mm on each axis (their product over two would be 1.0, and their sum times two 6).
+    let model = pinned_model_of(
+        vec![Fp::new("J1", 40.0, 40.0)
+            .court(1.0, 1.0)
+            .pad(pad("1", 0.0, 0.0, Some("N1")))],
+        (0.5, 0.5),
+    );
+    // Clear in y only (|dy| 1.6 > 1.5), clear in x only (|dx| 1.6 > 1.5): both stay.
+    assert_eq!(legalized_r1(&model, (40.0, 41.6)), (40.0, 41.6));
+    assert_eq!(legalized_r1(&model, (41.6, 40.0)), (41.6, 40.0));
+    assert_eq!(legalized_r1(&model, (38.4, 40.0)), (38.4, 40.0));
+    assert_eq!(legalized_r1(&model, (40.0, 38.4)), (40.0, 38.4));
+    // On top of J1: 3 steps of 0.5 mm leave R1 touching it (1.5 mm), so the nearest
+    // clear cells are 4 steps (2.0 mm) away, and of the four, the left one comes first.
+    assert_eq!(legalized_r1(&model, (40.0, 40.0)), (38.0, 40.0));
+}
+
+#[test]
+fn legalize_takes_equal_cells_in_a_fixed_order() {
+    // Two parts of 2 x 2 mm: R1 dropped on J1 must clear it by 2.002 mm, so the nearest
+    // cells are 2.5 mm away, four of them equally near: left first (smaller step in x),
+    // then above, below and right.
+    let square = |model_parts: Vec<Fp>| {
+        let mut parts = model_parts;
+        parts.push(
+            Fp::new("R1", 20.0, 30.0)
+                .court(1.0, 1.0)
+                .two_pad("N1", "N2"),
+        );
+        model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &parts), &[])
+    };
+    let j1 = || {
+        Fp::new("J1", 40.0, 40.0)
+            .court(1.0, 1.0)
+            .pad(pad("1", 0.0, 0.0, Some("N1")))
+    };
+    let model = square(vec![j1()]);
+    assert_eq!(legalized_r1(&model, (40.0, 40.0)), (37.5, 40.0));
+    // With the left cell taken, above comes next.
+    let j2 = Fp::new("J2", 37.5, 40.0)
+        .court(1.0, 1.0)
+        .pad(pad("1", 0.0, 0.0, Some("N1")));
+    let model = square(vec![j1(), j2]);
+    assert_eq!(legalized_r1(&model, (40.0, 40.0)), (40.0, 37.5));
+    // And below when above is taken too.
+    let j3 = Fp::new("J3", 40.0, 37.5)
+        .court(1.0, 1.0)
+        .pad(pad("1", 0.0, 0.0, Some("N1")));
+    let j2 = Fp::new("J2", 37.5, 40.0)
+        .court(1.0, 1.0)
+        .pad(pad("1", 0.0, 0.0, Some("N1")));
+    let model = square(vec![j1(), j2, j3]);
+    assert_eq!(legalized_r1(&model, (40.0, 40.0)), (40.0, 42.5));
 }

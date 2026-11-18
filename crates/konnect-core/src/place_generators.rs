@@ -4,6 +4,7 @@
 //! `route_search::SplitMix64`, seeded by the recipe alone.
 
 use crate::place_held::{HeldSet, Intent};
+use crate::place_judge::FailureKey;
 use crate::route_search::SplitMix64;
 use crate::tools::placement::force_core::{
     self, FdExtras, FdParams, FdPart, GroupSpring, PadSpring, Rect, Relaxed, Springs,
@@ -37,8 +38,10 @@ const CELL_MARGIN_MM: f64 = 2.0;
 const UNMOVED_OVERLAP_MM: f64 = 1e-9;
 
 /// A part a generator placed must clear a neighbour by at least this, so that no
-/// rounding of the written board can turn "touching" into a courtyard overlap.
-const MOVED_CLEARANCE_MM: f64 = 1e-6;
+/// rounding of the written board can turn "touching" into a courtyard overlap. Anchors
+/// are rounded to 1 µm (`round_um`), so each part's courtyard moves by at most 0.5 µm
+/// on an axis, and two parts close the gap by at most 1 µm; 2 µm keeps a margin.
+const MOVED_CLEARANCE_MM: f64 = 2e-3;
 
 /// How far to the right of the board S0's rows start, mm.
 const NEUTRAL_GAP_MM: f64 = 5.0;
@@ -135,6 +138,12 @@ pub(crate) struct BoardModel {
     /// Each part's pad count (a turn needs exactly 2). Added to the skeleton for the
     /// same reason.
     pub pad_counts: Vec<usize>,
+    /// The input board's own hard failures that name a movable part (kind and sorted
+    /// references), P1's yardstick: a candidate fails P1 only on one that is not among
+    /// them. Empty from `board_model`, which does not evaluate; `place_search::search`
+    /// sets it from the input board's score, so a model of another origin judges every
+    /// failure as new.
+    pub input_failures: Vec<FailureKey>,
 }
 
 /// Builds the model. Refuses a text whose SHA-256 is not `held.board_sha256`, a scan
@@ -239,11 +248,13 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
         intent,
         footprint_ids,
         pad_counts,
+        input_failures: Vec::new(),
     })
 }
 
-/// One generated placement: an absolute anchor and rotation for every movable part, in
-/// reference order. Held parts are never listed.
+/// One generated placement: an absolute anchor and rotation for every movable part that
+/// moved or turned, in reference order. Held parts are never listed, and neither is a
+/// movable part that stayed as it was (its footprint block stays byte for byte).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Candidate {
     pub placements: Vec<IpcFootprintPlacement>,
@@ -383,7 +394,8 @@ fn ensure_parts_fit(model: &BoardModel) -> Result<(), GenerateFailure> {
 /// - Perturb: `perturb` of the input, then `legalize`.
 ///
 /// Centres become anchors by each part's own offset (anchor minus courtyard centre,
-/// turned with the part), rounded to 1 µm as the legacy handler rounds them. Pure.
+/// turned with the part), rounded to 1 µm as the legacy handler rounds them. A part that
+/// neither moved nor turned is not listed. Pure.
 pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate, GenerateFailure> {
     let mut rng = SplitMix64(recipe.seed);
     let read_sizes = as_read_sizes(model);
@@ -456,30 +468,25 @@ pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate,
         if !model.movable[i] {
             continue;
         }
-        let unchanged = centres[i] == read_centres[i] && turns[i] == 0;
-        let (x, y, rotation) = if unchanged {
-            // A part that stayed keeps its text exactly, with no rounding.
-            (part.at.0, part.at.1, part.rotation_deg)
+        // A part that stayed is not listed at all: a placement would re-spell its text
+        // and pad angles (`Set` rewrites them even by 0 degrees), and the candidate
+        // would no longer be the input in everything it did not change.
+        if centres[i] == read_centres[i] && turns[i] == 0 {
+            continue;
+        }
+        let offset = turn_vector(
+            (part.at.0 - read_centres[i].0, part.at.1 - read_centres[i].1),
+            turns[i],
+        );
+        let rotation = if turns[i] == 0 {
+            part.rotation_deg
         } else {
-            let offset = turn_vector(
-                (part.at.0 - read_centres[i].0, part.at.1 - read_centres[i].1),
-                turns[i],
-            );
-            let rotation = if turns[i] == 0 {
-                part.rotation_deg
-            } else {
-                normalised_angle(part.rotation_deg + 90.0 * f64::from(turns[i]))
-            };
-            (
-                round_um(centres[i].0 + offset.0),
-                round_um(centres[i].1 + offset.1),
-                rotation,
-            )
+            normalised_angle(part.rotation_deg + 90.0 * f64::from(turns[i]))
         };
         placements.push(IpcFootprintPlacement {
             reference: model.references[i].clone(),
-            x,
-            y,
+            x: round_um(centres[i].0 + offset.0),
+            y: round_um(centres[i].1 + offset.1),
             rotation,
         });
     }
@@ -873,9 +880,9 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 /// A part that has not moved at all (its centre and size are the ones read) settles
 /// before the parts that have, and is judged with the tolerance of the input: an exact
 /// touch, which the input may hold, is not an overlap. A part a generator placed must
-/// clear its neighbours by 1 µm, so that rounding in the written board cannot turn a
-/// touch into an overlap. Cells are ordered by distance, the ring's cells in a fixed
-/// order, so the result is the same on every run.
+/// clear its neighbours by 2 µm (`MOVED_CLEARANCE_MM`), so that rounding of the anchors to
+/// 1 µm in the written board cannot turn a touch into an overlap. Cells are ordered by
+/// distance, the ring's cells in a fixed order, so the result is the same on every run.
 pub(crate) fn legalize(
     model: &BoardModel,
     sizes: &[(f64, f64)],
@@ -894,7 +901,7 @@ pub(crate) fn legalize(
 
     // `gate` is how much the two boxes must overlap, per axis, to count as overlapping:
     // above `UNMOVED_OVERLAP_MM` for a part that did not move, above minus
-    // `MOVED_CLEARANCE_MM` (touching, or nearer than 1 µm, is overlapping) for one that did.
+    // `MOVED_CLEARANCE_MM` (touching, or nearer than 2 µm, is overlapping) for one that did.
     let legal_at =
         |i: usize, at: (f64, f64), gate: f64, settled: &[usize], centres: &[(f64, f64)]| {
             let (w, h) = sizes[i];

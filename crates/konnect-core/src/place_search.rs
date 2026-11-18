@@ -19,12 +19,12 @@ use crate::place_held::{
     HoldRules, Intent,
 };
 use crate::place_judge::{
-    order as judged_order, pair_violations, placement_gates, rank, screen, screen_key, Judged, Key,
-    RouteResult, Screen, ScreenKey, SILK,
+    movable_failure_keys, order as judged_order, pair_violations, placement_gates, rank, screen,
+    screen_key, Judged, Key, RouteResult, Screen, ScreenKey, SILK,
 };
 use crate::place_route::{export_candidate, route_candidate, unrouted_check, RouteInputs};
 use crate::route_search::{median, BoxFuture, Effort, SplitMix64, HANG_CAP};
-use crate::tools::pcb_components::placements_applied_to;
+use crate::tools::pcb_components::{placements_applied_to, placements_moved_applied_to};
 use crate::tools::placement::evaluate::evaluate;
 use crate::tools::ToolContext;
 use konnect_sexp::board::footprint_courtyards;
@@ -184,8 +184,12 @@ pub(crate) struct Plan {
 pub(crate) struct Outcome {
     pub records: Vec<Record>,
     pub elapsed: Duration,
-    /// Why the routing phase stopped early, when it did.
+    /// Why the routing phase stopped early, when it did, in full (it can hold a path or a
+    /// tool's own output): `search.json` only.
     pub stopped_routing: Option<String>,
+    /// The same as one fixed word, the only form `table.md` prints: `time_limit`,
+    /// `input_check_failed` or `calls_failed_in_a_row`.
+    pub stopped_code: Option<&'static str>,
     /// P2's yardstick: the input board's unrouted check.
     pub input_unrouted: BTreeMap<String, usize>,
 }
@@ -394,6 +398,7 @@ fn screen_text(model: &BoardModel, text: &str) -> Result<(Screen, f64), (&'stati
     let screened = screen(
         &evaluated,
         &model.held,
+        &model.input_failures,
         violations,
         group_spread(model, &tree),
     )
@@ -587,14 +592,16 @@ pub(crate) fn generate_all_with(
 // ─── Phase 2: selection ──────────────────────────────────────────────────────
 
 /// Phase 2, selection, as candidate ids in routing order: O's calls, then A's; then,
-/// per family, its `best` best by the screen key (ties to the lower id) and `drawn`
+/// per family, among the candidates that pass P1 (a candidate that fails it is never
+/// routed), its `best` best by the screen key (ties to the lower id) and `drawn`
 /// drawn uniformly with `SplitMix64(draw_seed)` from its other candidates that pass P1.
 /// The families are interleaved round by round: each family's best, then each
-/// family's drawn one, then the second best, then the rest (F1, S1, P1, Fd, Sd, Pd,
-/// F2, …), so a time limit cuts every family alike and the screen's check is not
-/// the first thing cut. A candidate whose board equals an earlier one's
-/// (`board_sha256`) was recorded `duplicate` in phase 1 and is never selected; nor is a
-/// record that failed before the screen.
+/// family's drawn one, then the second best, then the rest, and round r starts at
+/// family r mod 3 (round 0: F, S, P; round 1: S, P, F; round 2: P, F, S; ...), so a time
+/// limit cuts every family alike over the rounds, and neither the last family nor the
+/// screen's check is always the first thing cut. A candidate whose board equals an
+/// earlier one's (`board_sha256`) was recorded `duplicate` in phase 1 and is never
+/// selected; nor is a record that failed before the screen.
 pub(crate) fn routing_order(
     records: &[Record],
     best: usize,
@@ -613,20 +620,22 @@ pub(crate) fn routing_order(
     let mut rng = SplitMix64(draw_seed);
     let mut sequences: Vec<Vec<usize>> = Vec::new();
     for family in ["F", "S", "P"] {
+        // Only a candidate that passes P1 is a candidate for a routing call: the best
+        // of a pool that held the ones that fail it would be a call spent on an
+        // illegal placement.
         let mut pool: Vec<&Record> = records
             .iter()
-            .filter(|r| r.group() == family && r.outcome == "generated" && r.screen_key.is_some())
+            .filter(|r| {
+                r.group() == family
+                    && r.outcome == "generated"
+                    && r.screen_key.is_some_and(|key| key[0] == 0)
+            })
             .collect();
         pool.sort_by(|a, b| a.screen_key.cmp(&b.screen_key).then(a.id.cmp(&b.id)));
         let picked: Vec<usize> = pool.iter().take(best).map(|r| r.id).collect();
-        // The rest that passes P1, in id order, so the draw is a function of the seed
-        // and the records alone.
-        let mut rest: Vec<usize> = pool
-            .iter()
-            .skip(best)
-            .filter(|r| r.screen_key.is_some_and(|key| key[0] == 0))
-            .map(|r| r.id)
-            .collect();
+        // The rest, in id order, so the draw is a function of the seed and the records
+        // alone.
+        let mut rest: Vec<usize> = pool.iter().skip(best).map(|r| r.id).collect();
         rest.sort_unstable();
         let mut lucky = Vec::new();
         for _ in 0..drawn {
@@ -644,8 +653,12 @@ pub(crate) fn routing_order(
     }
     let longest = sequences.iter().map(Vec::len).max().unwrap_or(0);
     for round in 0..longest {
-        for sequence in &sequences {
-            order.extend(sequence.get(round).copied());
+        for step in 0..sequences.len() {
+            order.extend(
+                sequences[(round + step) % sequences.len()]
+                    .get(round)
+                    .copied(),
+            );
         }
     }
     order
@@ -676,8 +689,9 @@ pub(crate) fn may_route(
     elapsed.saturating_add(expected) <= limit
 }
 
-/// Routing-stage failures in a row (`export_refused`, `route_failed`), with no
-/// routed candidate yet, that stop the routing phase. A success resets the count.
+/// Calls in a row that gave no routed candidate (`export_refused`, `route_failed` and
+/// `no_winner`), with no routed candidate yet, that stop the routing phase. A routed
+/// candidate resets the count, and after the first one the phase never stops this way.
 pub(crate) const ROUTE_FAILURES_BEFORE_STOP: usize = 3;
 
 // ─── The search ──────────────────────────────────────────────────────────────
@@ -690,11 +704,13 @@ pub(crate) fn s0_text(model: &BoardModel) -> anyhow::Result<String> {
 
 /// A's board admitted as a reference: the anchors and rotations of the movable parts
 /// read from `ai_text` (`place_held::placements_of`), applied to S0's text with
-/// `pcb_components::placements_applied_to`, and the result must be the same board as
-/// `ai_text` (`place_held::same_board`). So A differs from S0 only in where movable
-/// parts are and how they turn: a flip, a changed held part, net, zone, outline or rule
-/// is refused, and the refusal (`ai_refused`, with the first difference) is a record.
-/// Returns the rebuilt text, which is what is judged.
+/// `pcb_components::placements_moved_applied_to` (a part whose rotation is S0's is moved,
+/// as the move tool moves it, and only a turned part is set; a set would re-spell the
+/// text and pad angles of a part the AI only moved), and the result must be the same
+/// board as `ai_text` (`place_held::same_board`). So A differs from S0 only in where
+/// movable parts are and how they turn: a flip, a changed held part, net, zone, outline
+/// or rule is refused, and the refusal (`ai_refused`, with the first difference) is a
+/// record. Returns the rebuilt text, which is what is judged.
 pub(crate) fn admit_ai(
     s0_text: &str,
     ai_text: &str,
@@ -704,7 +720,7 @@ pub(crate) fn admit_ai(
         .map_err(|error| format!("the AI's board does not parse: {error}"))?;
     let placements = placements_of(&ai_tree, movable)
         .map_err(|error| format!("the AI's movable parts cannot be read: {error:#}"))?;
-    let rebuilt = placements_applied_to(s0_text, &placements)
+    let rebuilt = placements_moved_applied_to(s0_text, &placements)
         .map_err(|error| format!("the AI's placements do not apply to S0: {error:?}"))?;
     let rebuilt_tree = konnect_sexp::parse_sexp(&rebuilt)
         .map_err(|error| format!("the rebuilt board does not parse: {error}"))?;
@@ -790,8 +806,10 @@ fn assign_ranks(records: &mut [Record]) {
 }
 
 /// Files a finished call on its record: the outcome, the reason, the route summary and
-/// the timings. Returns whether the call counts as a routing-stage failure and whether
-/// it ran the search (its wall time then tells the launch rule something).
+/// the timings. Returns whether the call gave no routed candidate (a failure or no
+/// winner: it counts toward `ROUTE_FAILURES_BEFORE_STOP`) and whether it routed one (its
+/// wall time then tells the launch rule something; a call that judged no run waited
+/// out its own limits and says nothing about the next call).
 fn file_call(
     record: &mut Record,
     result: &RouteResult,
@@ -817,7 +835,7 @@ fn file_call(
             record.outcome = "no_winner";
             record.reason = Some(reason.clone());
             record.route = Some(json!({ "folder": folder_text, "reason": reason }));
-            (false, true)
+            (true, false)
         }
         RouteResult::Failed { stage, reason } => {
             record.outcome = if *stage == "export" {
@@ -862,7 +880,9 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     let evaluated = evaluate(&tree, &edge_mount, MAX_NET_REFERENCES)?;
     let pairs = decoupling_pairs(&evaluated)?;
     let intent = Intent::new(groups(&tree, &held, &[]), pairs);
-    let model = board_model(&text, held, intent)?;
+    let input_failures = movable_failure_keys(&evaluated, &held)?;
+    let mut model = board_model(&text, held, intent)?;
+    model.input_failures = input_failures;
     std::fs::create_dir_all(plan.folder.join("candidates"))?;
 
     // References: O, then A.
@@ -944,10 +964,17 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
         if record.outcome == "generated" && !chosen.contains(&record.id) {
             record.outcome = "screened_out";
         }
+        // A board nobody will route is never read again (`rerun` rebuilds a generated
+        // one from its recipe): keeping the text of every candidate would hold a copy
+        // of the board per recipe, 288 of them, for the rest of the search.
+        if !chosen.contains(&record.id) {
+            record.board_text = None;
+        }
     }
 
     // Phase 3.
     let mut stopped_routing: Option<String> = None;
+    let mut stopped_code: Option<&'static str> = None;
     let mut input_unrouted = BTreeMap::new();
     match routing
         .unrouted(text.clone(), plan.folder.join("input-check"))
@@ -958,10 +985,11 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             stopped_routing = Some(format!(
                 "the input board's unrouted check failed, so no candidate's P2 can be judged: {error:#}"
             ));
+            stopped_code = Some("input_check_failed");
         }
     }
     let mut walls: Vec<Duration> = Vec::new();
-    let mut failures_in_a_row = 0usize;
+    let mut misses_in_a_row = 0usize;
     let mut any_routed = false;
     let mut out_of_time = false;
     let mut halted = stopped_routing.is_some();
@@ -986,6 +1014,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             out_of_time = true;
             stopped_routing =
                 Some("the launch rule: the next call would not end by the time limit".to_string());
+            stopped_code = Some("time_limit");
             records[at].outcome = "not_routed_time_limit";
             continue;
         }
@@ -997,22 +1026,22 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
         let call_started = Instant::now();
         let (result, timings) = routing.route(id, board_text, folder.clone()).await;
         let wall = call_started.elapsed();
-        let (failed, ran) = file_call(&mut records[at], &result, timings, &folder);
-        if ran {
+        let (missed, routed) = file_call(&mut records[at], &result, timings, &folder);
+        if routed {
+            // Only a call that routed says how long the next one takes.
             walls.push(wall);
+            misses_in_a_row = 0;
+            any_routed = true;
+        } else if missed {
+            misses_in_a_row += 1;
         }
-        if failed {
-            failures_in_a_row += 1;
-        } else {
-            failures_in_a_row = 0;
-        }
-        any_routed |= matches!(result, RouteResult::Routed { .. });
         file_judgement(&mut records[at], result, &input_unrouted);
-        if failures_in_a_row >= ROUTE_FAILURES_BEFORE_STOP && !any_routed {
+        if misses_in_a_row >= ROUTE_FAILURES_BEFORE_STOP && !any_routed {
             halted = true;
             stopped_routing = Some(format!(
-                "{ROUTE_FAILURES_BEFORE_STOP} routing-stage failures in a row with no routed candidate"
+                "{ROUTE_FAILURES_BEFORE_STOP} routing calls in a row ended in a failure or with no winner, and none had routed a candidate"
             ));
+            stopped_code = Some("calls_failed_in_a_row");
         }
     }
     assign_ranks(&mut records);
@@ -1021,6 +1050,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
         records,
         elapsed: started.elapsed(),
         stopped_routing,
+        stopped_code,
         input_unrouted,
     };
     std::fs::write(
@@ -1118,6 +1148,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
         "input_unrouted": outcome.input_unrouted,
         "elapsed_s": outcome.elapsed.as_secs_f64(),
         "stopped_routing": outcome.stopped_routing,
+        "stopped_code": outcome.stopped_code,
     })
 }
 
@@ -1192,8 +1223,10 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
         outcome.records.len(),
         outcome.elapsed.as_secs_f64()
     ));
-    if let Some(why) = &outcome.stopped_routing {
-        text.push_str(&format!(" Routing stopped early: {why}."));
+    // A fixed word only: the full reason can hold a path or a tool's own output, and
+    // lives in `search.json`.
+    if let Some(code) = outcome.stopped_code {
+        text.push_str(&format!(" Routing stopped early: {code}."));
     }
     text.push_str("\n\n## Routed candidates, best first\n\n");
     text.push_str("| rank | origin | P1 | P2 | G1 | unconnected | G2 | G3 | decoupling | connector | acute | signal mm | power mm | vias off pours | copper quality | silk | score |\n");
@@ -1241,6 +1274,10 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
     text.push_str("|---|---|---|---|---|---|---|---|---|\n");
     let groups = ["O", "A", "F", "S", "P"];
     let mut ranks_of: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    // The ranks of every judged call of a reference, a routed one or one with no winner:
+    // both carry a key, and a no-winner call is the reference's worst rank, not a call
+    // that did not happen.
+    let mut reference_ranks: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for group in groups {
         let members: Vec<&Record> = outcome
             .records
@@ -1253,6 +1290,13 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             .filter_map(|r| r.rank)
             .collect();
         ranks.sort_unstable();
+        let mut judged_calls: Vec<usize> = members
+            .iter()
+            .filter(|r| r.outcome == "routed" || r.outcome == "no_winner")
+            .filter_map(|r| r.rank)
+            .collect();
+        judged_calls.sort_unstable();
+        reference_ranks.insert(group, judged_calls);
         let all_pass = members
             .iter()
             .filter(|r| r.outcome == "routed")
@@ -1292,13 +1336,23 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
     }
 
     text.push_str("\n## Verdicts\n\n");
+    text.push_str(
+        "A family's best is its best routed candidate. A reference's calls are all its judged \
+         calls, routed or with no winner; a no-winner call ranks as the reference's worst.\n\n",
+    );
     text.push_str("| family | against O | against A |\n|---|---|---|\n");
     for family in ["F", "S", "P"] {
         let best = ranks_of
             .get(family)
             .and_then(|ranks| ranks.first().copied());
         let against = |reference: &str| {
-            verdict(best, ranks_of.get(reference).map_or(&[][..], Vec::as_slice)).label()
+            verdict(
+                best,
+                reference_ranks
+                    .get(reference)
+                    .map_or(&[][..], Vec::as_slice),
+            )
+            .label()
         };
         text.push_str(&format!(
             "| {family} | {} | {} |\n",

@@ -16,7 +16,7 @@ fn screen_of(text: &str, decoupling_violations: usize) -> (Screen, serde_json::V
     let set = held_of(text);
     let held: Vec<&str> = set.held.keys().map(String::as_str).collect();
     let evaluated = evaluate_text(text, &held);
-    let screen = screen(&evaluated, &set, decoupling_violations, None).expect("a screen");
+    let screen = screen(&evaluated, &set, &[], decoupling_violations, None).expect("a screen");
     (screen, evaluated, set)
 }
 
@@ -31,6 +31,7 @@ fn plain_screen() -> Screen {
         score_incomplete: false,
         hard_failures: 0,
         movable_hard_failures: 0,
+        new_movable_hard_failures: 0,
         outline_unproven: false,
         decoupling_violations: 0,
         connector_violations: 0,
@@ -147,7 +148,7 @@ fn the_screen_reads_the_evaluation() {
     let no_outline = board(OUTLINE, &parts).replace("Edge.Cuts", "Dwgs.User");
     let set = held_of(&board(OUTLINE, &parts));
     let evaluated = evaluate_text(&no_outline, &[]);
-    let unproven = super::screen(&evaluated, &set, 0, Some(0.25)).unwrap();
+    let unproven = super::screen(&evaluated, &set, &[], 0, Some(0.25)).unwrap();
     assert!(unproven.outline_unproven);
     assert_eq!(unproven.group_spread, Some(0.25));
 }
@@ -158,7 +159,7 @@ fn a_missing_field_is_an_error() {
     let text = board(OUTLINE, &parts);
     let set = held_of(&text);
     let good = evaluate_text(&text, &[]);
-    assert!(screen(&good, &set, 0, None).is_ok());
+    assert!(screen(&good, &set, &[], 0, None).is_ok());
     for field in [
         "verdict",
         "score",
@@ -171,7 +172,7 @@ fn a_missing_field_is_an_error() {
     ] {
         let mut broken = good.clone();
         broken.as_object_mut().unwrap().remove(field);
-        let error = screen(&broken, &set, 0, None).unwrap_err().to_string();
+        let error = screen(&broken, &set, &[], 0, None).unwrap_err().to_string();
         assert!(error.contains(field), "{field}: {error}");
     }
 }
@@ -196,6 +197,7 @@ fn screen_key_orders_verdict_completeness_requirements_then_airwires() {
     let base = plain_screen();
     let p1_failed = Screen {
         movable_hard_failures: 1,
+        new_movable_hard_failures: 1,
         ..base.clone()
     };
     let unproven = Screen {
@@ -351,6 +353,96 @@ fn a_held_part_over_the_edge_or_on_another_held_part_fails_no_candidate() {
     assert!(gates.p2.is_empty());
 }
 
+/// The screen of `text` judged against `baseline` (the movable failures of the input).
+fn screen_against(text: &str, baseline: &[FailureKey]) -> Screen {
+    let set = held_of(text);
+    let held: Vec<&str> = set.held.keys().map(String::as_str).collect();
+    screen(&evaluate_text(text, &held), &set, baseline, 0, None).expect("a screen")
+}
+
+#[test]
+fn p1_fails_only_on_a_hard_failure_the_input_board_does_not_have() {
+    // The owner's board has two faults of its own that name movable parts: R1 and R2
+    // overlap, and R3 hangs over the right edge.
+    let input_parts = vec![
+        Fp::new("R1", 10.0, 10.0).two_pad("A", "B"),
+        Fp::new("R2", 10.5, 10.0).two_pad("B", "C"),
+        Fp::new("R3", 59.9, 30.0).two_pad("C", "D"),
+        Fp::new("R4", 30.0, 10.0).two_pad("D", "E"),
+        Fp::new("R5", 40.0, 10.0).two_pad("E", "F"),
+    ];
+    let input = board(OUTLINE, &input_parts);
+    let set = held_of(&input);
+    let held: Vec<&str> = set.held.keys().map(String::as_str).collect();
+    let baseline = movable_failure_keys(&evaluate_text(&input, &held), &set).unwrap();
+    assert_eq!(
+        baseline,
+        vec![
+            (
+                "courtyard_overlap".to_string(),
+                vec!["R1".to_string(), "R2".to_string()]
+            ),
+            ("outside_outline".to_string(), vec!["R3".to_string()]),
+        ]
+    );
+
+    // O, judged against itself, fails nothing; judged with no baseline, both faults are
+    // new, and the screen key and the gates fail it.
+    let own = screen_against(&input, &baseline);
+    assert_eq!(
+        (own.movable_hard_failures, own.new_movable_hard_failures),
+        (2, 0)
+    );
+    assert_eq!(screen_key(&own)[0], 0);
+    assert!(placement_gates(&own, Some(&BTreeMap::new()), &BTreeMap::new()).pass());
+    let absolute = screen_against(&input, &[]);
+    assert_eq!(absolute.new_movable_hard_failures, 2);
+    assert_eq!(screen_key(&absolute)[0], 1);
+    let gates = placement_gates(&absolute, Some(&BTreeMap::new()), &BTreeMap::new());
+    assert!(!gates.pass() && gates.p1.len() == 1, "{gates:?}");
+
+    // A candidate that mends one fault and keeps the other still passes.
+    let mut mended = input_parts.clone();
+    mended[0] = Fp::new("R1", 20.0, 20.0).two_pad("A", "B");
+    let mended = screen_against(&board(OUTLINE, &mended), &baseline);
+    assert_eq!(
+        (
+            mended.movable_hard_failures,
+            mended.new_movable_hard_failures
+        ),
+        (1, 0)
+    );
+    assert_eq!(screen_key(&mended)[0], 0);
+
+    // A new overlap fails it, whether the failure is of a new kind, of the same kind on
+    // other references, or of the same kind on a pair that includes one of the old ones.
+    for (name, moved) in [
+        ("a new overlap of two parts", ("R5", (30.5, 10.0))),
+        ("a new part over the edge", ("R5", (0.1, 30.0))),
+        ("an old pair gains a third part", ("R4", (10.2, 10.0))),
+    ] {
+        let mut parts = input_parts.clone();
+        let at = parts.iter().position(|p| p.reference == moved.0).unwrap();
+        parts[at] = Fp::new(moved.0, (moved.1).0, (moved.1).1).two_pad("X", "Y");
+        let screen = screen_against(&board(OUTLINE, &parts), &baseline);
+        assert!(screen.new_movable_hard_failures >= 1, "{name}: {screen:?}");
+        assert_eq!(screen_key(&screen)[0], 1, "{name}");
+        let gates = placement_gates(&screen, Some(&BTreeMap::new()), &BTreeMap::new());
+        assert!(!gates.pass(), "{name}");
+    }
+
+    // The same overlap with the references in the other order is the same failure.
+    let swapped = vec![
+        Fp::new("R2", 10.0, 10.0).two_pad("B", "C"),
+        Fp::new("R1", 10.5, 10.0).two_pad("A", "B"),
+        Fp::new("R3", 59.9, 30.0).two_pad("C", "D"),
+        Fp::new("R4", 30.0, 10.0).two_pad("D", "E"),
+        Fp::new("R5", 40.0, 10.0).two_pad("E", "F"),
+    ];
+    let screen = screen_against(&board(OUTLINE, &swapped), &baseline);
+    assert_eq!(screen.new_movable_hard_failures, 0, "{screen:?}");
+}
+
 #[test]
 fn an_unclosed_outline_fails_p1() {
     let screen = Screen {
@@ -426,6 +518,18 @@ fn moving_a_capacitor_away_is_a_decoupling_violation() {
 }
 
 #[test]
+fn a_pair_exactly_at_its_limit_is_not_a_violation() {
+    // C1's VCC pad is at (26.5, 19.5) and U1's at (28.5, 19.5): exactly 2 mm apart.
+    let text = decoupling_board((27.0, 19.5));
+    let tree = parse(&text);
+    let mut pair = pairs_of(&text)[0].clone();
+    pair.limit_mm = 2.0;
+    assert_eq!(pair_violations(&tree, &[pair.clone()]), 0);
+    pair.limit_mm = 1.999;
+    assert_eq!(pair_violations(&tree, &[pair]), 1);
+}
+
+#[test]
 fn a_pair_whose_pads_are_missing_is_a_violation() {
     let text = decoupling_board((27.0, 19.5));
     let tree = parse(&text);
@@ -486,6 +590,49 @@ fn a_shorter_candidate_with_an_open_connection_ranks_below_a_complete_one() {
 }
 
 #[test]
+fn each_gate_has_its_own_slot_in_the_key() {
+    let failing = |g1: bool, g2: bool, g3: bool| {
+        let line = |failed: bool| {
+            if failed {
+                vec!["failed".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        judged(
+            2,
+            plain_screen(),
+            passing(),
+            routed(
+                measures(0, 100.0),
+                Gates {
+                    g1: line(g1),
+                    g2: line(g2),
+                    g3: line(g3),
+                },
+            ),
+        )
+    };
+    let clean = complete(1, 100.0);
+    let keys = rank(&[&clean, &failing(false, false, false)]);
+    assert_eq!((keys[0][2], keys[0][4], keys[0][5]), (0, 0, 0));
+    assert_eq!((keys[1][2], keys[1][4], keys[1][5]), (0, 0, 0));
+    for (g1, g2, g3, slots) in [
+        (true, false, false, (1, 0, 0)),
+        (false, true, false, (0, 1, 0)),
+        (false, false, true, (0, 0, 1)),
+    ] {
+        let keys = rank(&[&clean, &failing(g1, g2, g3)]);
+        assert_eq!(
+            (keys[1][2], keys[1][4], keys[1][5]),
+            slots,
+            "g1 {g1}, g2 {g2}, g3 {g3}"
+        );
+        assert_eq!((keys[0][2], keys[0][4], keys[0][5]), (0, 0, 0));
+    }
+}
+
+#[test]
 fn an_illegal_placement_does_not_set_the_length_steps() {
     let a = complete(1, 100.0);
     let b = complete(2, 120.0);
@@ -493,6 +640,7 @@ fn an_illegal_placement_does_not_set_the_length_steps() {
         3,
         Screen {
             movable_hard_failures: 2,
+            new_movable_hard_failures: 2,
             ..plain_screen()
         },
         PlacementGates {
