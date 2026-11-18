@@ -1084,13 +1084,16 @@ fn update_closed_board_footprint(
     Ok(())
 }
 
-pub(crate) fn update_closed_board_footprints(
-    board_path: &Path,
+/// `placements` applied to `content` in order, each exactly as
+/// `update_closed_board_footprints` applies it (`prepare_closed_board_footprint_update`
+/// with `FootprintPlacementUpdate::Set`), with no file: the same transform, so a
+/// candidate's board and a real apply cannot disagree. Errs on the first placement that
+/// does not apply. `update_closed_board_footprints` is: read, this, persist.
+pub(crate) fn placements_applied_to(
+    content: &str,
     placements: &[konnect_ipc::types::IpcFootprintPlacement],
-) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, ClosedBoardError> {
-    let content =
-        read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
-    let mut updated = content.clone();
+) -> Result<String, ClosedBoardError> {
+    let mut updated = content.to_string();
     for placement in placements {
         updated = prepare_closed_board_footprint_update(
             &updated,
@@ -1102,6 +1105,16 @@ pub(crate) fn update_closed_board_footprints(
             },
         )?;
     }
+    Ok(updated)
+}
+
+pub(crate) fn update_closed_board_footprints(
+    board_path: &Path,
+    placements: &[konnect_ipc::types::IpcFootprintPlacement],
+) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, ClosedBoardError> {
+    let content =
+        read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
+    let updated = placements_applied_to(&content, placements)?;
     persist_board_replacement(board_path, &content, &updated)
         .map_err(|error| ClosedBoardError::Io(error.into()))?;
     // Report what was written, not what was asked: the file path normalizes
@@ -7485,5 +7498,168 @@ mod component_list_budget_tests {
         assert_eq!(body["offset_past_end"], true, "{body}");
         assert_eq!(body["count"], 3);
         assert!(body["hint"].as_str().unwrap().contains("past the end"));
+    }
+}
+
+#[cfg(test)]
+mod placements_applied_to_tests {
+    use super::*;
+    use konnect_ipc::types::IpcFootprintPlacement;
+
+    /// KiCad-authored fixture: U1 (25 20), C1 (20 15), C2 (30 15 90), R1, J1, U2
+    /// (45 20), TP1 and TP2 (50 38).
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../konnect-sexp/tests/fixtures/placement/placement_fixture.kicad_pcb"
+    );
+    const REFERENCES: [&str; 8] = ["U1", "C1", "C2", "R1", "J1", "U2", "TP1", "TP2"];
+
+    fn placement(reference: &str, x: f64, y: f64, rotation: f64) -> IpcFootprintPlacement {
+        IpcFootprintPlacement {
+            reference: reference.to_string(),
+            x,
+            y,
+            rotation,
+        }
+    }
+
+    /// The root `(at x y rotation)` of one footprint, read back from the text.
+    fn root_at(content: &str, reference: &str) -> (f64, f64, f64) {
+        find_direct_child_blocks(content, "kicad_pcb")
+            .into_iter()
+            .filter_map(|(start, end)| konnect_sexp::parse_sexp(&content[start..end]).ok())
+            .filter(|node| node.head() == Some("footprint"))
+            .find(|node| footprint_reference(node).as_deref() == Some(reference))
+            .and_then(|node| {
+                let at = node.find("at")?;
+                Some((at.get_f64(1)?, at.get_f64(2)?, at.get_f64(3).unwrap_or(0.0)))
+            })
+            .unwrap_or_else(|| panic!("{reference} not on the board"))
+    }
+
+    /// What `update_closed_board_footprints` writes for `placements`, read back.
+    fn the_file_write(original: &str, placements: &[IpcFootprintPlacement]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, original).unwrap();
+        update_closed_board_footprints(&board, placements).unwrap();
+        std::fs::read_to_string(&board).unwrap()
+    }
+
+    /// The single-footprint writers the move and rotate tools use on a closed board,
+    /// applied one after the other: an oracle that shares no code with the loop in
+    /// `placements_applied_to`.
+    fn the_one_at_a_time_writers(
+        original: &str,
+        steps: &[(&str, FootprintPlacementUpdate)],
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, original).unwrap();
+        for (reference, update) in steps {
+            update_closed_board_footprint(&board, reference, *update).unwrap();
+        }
+        std::fs::read_to_string(&board).unwrap()
+    }
+
+    #[test]
+    fn placements_applied_to_equals_the_closed_board_write() {
+        let original = std::fs::read_to_string(FIXTURE).unwrap();
+        // (name, placements, the oracle's steps where the single writers can say it,
+        //  the root `at` each placed reference must end with: 270 is stored as -90).
+        // A set always rewrites the children's angles, even by 0 degrees, as a move
+        // followed by a turn to the same angle does; a bare move leaves them as spelled.
+        type Case = (
+            &'static str,
+            Vec<IpcFootprintPlacement>,
+            Vec<(&'static str, FootprintPlacementUpdate)>,
+            Vec<(&'static str, (f64, f64, f64))>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "set: a new position and a new turn at once",
+                vec![placement("U1", 40.0, 30.0, 90.0)],
+                vec![
+                    ("U1", FootprintPlacementUpdate::Move { x: 40.0, y: 30.0 }),
+                    ("U1", FootprintPlacementUpdate::Rotate { rotation: 90.0 }),
+                ],
+                vec![("U1", (40.0, 30.0, 90.0))],
+            ),
+            (
+                "move: a new position, the turn as it was",
+                vec![placement("C1", 21.5, 16.0, 0.0)],
+                vec![
+                    ("C1", FootprintPlacementUpdate::Move { x: 21.5, y: 16.0 }),
+                    ("C1", FootprintPlacementUpdate::Rotate { rotation: 0.0 }),
+                ],
+                vec![("C1", (21.5, 16.0, 0.0))],
+            ),
+            (
+                "turn: the position as it was, a new turn",
+                vec![placement("C2", 30.0, 15.0, 270.0)],
+                vec![("C2", FootprintPlacementUpdate::Rotate { rotation: 270.0 })],
+                vec![("C2", (30.0, 15.0, -90.0))],
+            ),
+            (
+                "three footprints in one call",
+                vec![
+                    placement("U1", 40.0, 30.0, 90.0),
+                    placement("C1", 21.5, 16.0, 0.0),
+                    placement("C2", 30.0, 15.0, 270.0),
+                ],
+                vec![
+                    ("U1", FootprintPlacementUpdate::Move { x: 40.0, y: 30.0 }),
+                    ("U1", FootprintPlacementUpdate::Rotate { rotation: 90.0 }),
+                    ("C1", FootprintPlacementUpdate::Move { x: 21.5, y: 16.0 }),
+                    ("C1", FootprintPlacementUpdate::Rotate { rotation: 0.0 }),
+                    ("C2", FootprintPlacementUpdate::Rotate { rotation: 270.0 }),
+                ],
+                vec![
+                    ("U1", (40.0, 30.0, 90.0)),
+                    ("C1", (21.5, 16.0, 0.0)),
+                    ("C2", (30.0, 15.0, -90.0)),
+                ],
+            ),
+        ];
+        for (name, placements, steps, expected) in cases {
+            let in_memory = placements_applied_to(&original, &placements).unwrap();
+            assert_eq!(in_memory, the_file_write(&original, &placements), "{name}");
+            assert_eq!(
+                in_memory,
+                the_one_at_a_time_writers(&original, &steps),
+                "{name}: not what the single-footprint writers write"
+            );
+            assert_ne!(in_memory, original, "{name}: nothing changed");
+            for (reference, at) in &expected {
+                assert_eq!(root_at(&in_memory, reference), *at, "{name}: {reference}");
+            }
+            // Every footprint nobody placed keeps its root placement.
+            for reference in REFERENCES {
+                if !expected.iter().any(|(placed, _)| *placed == reference) {
+                    assert_eq!(
+                        root_at(&in_memory, reference),
+                        root_at(&original, reference),
+                        "{name}: {reference} moved"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placements_applied_to_with_nothing_to_apply_is_the_input_and_a_bad_reference_errs() {
+        let original = std::fs::read_to_string(FIXTURE).unwrap();
+        assert_eq!(placements_applied_to(&original, &[]).unwrap(), original);
+        let result = placements_applied_to(
+            &original,
+            &[
+                placement("C1", 21.5, 16.0, 0.0),
+                placement("ZZ9", 1.0, 1.0, 0.0),
+            ],
+        );
+        assert!(
+            matches!(&result, Err(ClosedBoardError::ReferenceNotFound(reference)) if reference == "ZZ9"),
+            "{result:?}"
+        );
     }
 }

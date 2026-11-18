@@ -8,7 +8,7 @@
 
 use crate::route_search::Routed;
 use anyhow::{ensure, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -520,7 +520,7 @@ fn write_board(board: &Path, text: &str) -> Result<()> {
 }
 
 /// The measures of one judged run.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Measures {
     /// KiCad's count after the refill and the stitching.
     pub unconnected: usize,
@@ -559,7 +559,7 @@ pub(crate) struct Measures {
 }
 
 /// Each gate passes when its list is empty; each entry is one readable line.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Gates {
     pub g1: Vec<String>,
     pub g2: Vec<String>,
@@ -1048,24 +1048,41 @@ pub(crate) type Key = [i64; 10];
 /// route seconds (rounded down). A measure the audit did not give sorts last
 /// (`i64::MAX`). When every run's length of a category is 0, that step is 0 for all.
 pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
+    let runs: Vec<(&Measures, &Gates, bool)> = judged
+        .iter()
+        .map(|run| (&run.measures, &run.gates, true))
+        .collect();
+    rank_measures(&runs)
+}
+
+/// [`rank`]'s key for each run, with the length steps taken against the shortest of
+/// the runs that are in the pool (the `bool`) and pass G1; against all runs in the pool
+/// when none of them passes; against every run when none is in the pool. `rank(judged)`
+/// is this with every run in the pool, so its keys do not change. A run outside the
+/// pool still gets a key, stepped against the pool's shortest, but never sets a step
+/// (a candidate with an illegal placement ranks, and does not move the others).
+pub(crate) fn rank_measures(runs: &[(&Measures, &Gates, bool)]) -> Vec<Key> {
     // The shortest judged length of a category, among runs that have any: a run with
     // none of it is at least as short as the shortest, and its step is 0.
-    // The reference is the shortest among the runs that pass G1 (complete): a
+    // The reference is the shortest among the pool's runs that pass G1 (complete): a
     // degenerate run that is not complete must not set the steps. When none passes,
-    // the shortest among all.
-    let complete: Vec<&Judged> = judged
+    // the shortest among the pool; when the pool is empty, among all runs.
+    let in_pool: Vec<&(&Measures, &Gates, bool)> = runs.iter().filter(|run| run.2).collect();
+    let complete: Vec<&(&Measures, &Gates, bool)> = in_pool
         .iter()
         .copied()
-        .filter(|run| run.gates.g1.is_empty())
+        .filter(|run| run.1.g1.is_empty())
         .collect();
-    let pool: &[&Judged] = if complete.is_empty() {
-        judged
+    let pool: Vec<&(&Measures, &Gates, bool)> = if !complete.is_empty() {
+        complete
+    } else if !in_pool.is_empty() {
+        in_pool
     } else {
-        &complete
+        runs.iter().collect()
     };
     let shortest = |length: fn(&Measures) -> f64| -> Option<f64> {
         pool.iter()
-            .map(|run| length(&run.measures))
+            .map(|run| length(run.0))
             .filter(|mm| *mm > 0.0)
             .fold(None, |least: Option<f64>, mm| {
                 Some(least.map_or(mm, |least| least.min(mm)))
@@ -1081,10 +1098,8 @@ pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
     let shortest_power = shortest(|m| m.power_mm);
     // A measure the audit did not give sorts last.
     let whole = |value: Option<f64>| value.map_or(i64::MAX, |value| value.round() as i64);
-    judged
-        .iter()
-        .map(|run| {
-            let (m, g) = (&run.measures, &run.gates);
+    runs.iter()
+        .map(|&(m, g, _)| {
             [
                 i64::from(!g.g1.is_empty()),
                 i64::from(!g.g2.is_empty()),
