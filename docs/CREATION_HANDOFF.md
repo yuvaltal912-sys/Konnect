@@ -294,6 +294,21 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 - The judge accepts the saved board when its bytes match `source_sha256` or its tree matches `source_canonical_sha256`. Any other change still refuses. An older manifest gets the byte check only.
 - DRC's live-to-saved check and the judge now share one normalization rule.
 
+**Verified, 2026-11-18.**
+- `cargo test -p konnect-core --lib -- board_identity route_judge specctra drc::`: 262 passed, 0 failed.
+- Negative controls: 8 of 8 caught, and the source was restored byte for byte. The eight breaks:
+  - the judge checks bytes only;
+  - the judge trusts the field without comparing;
+  - metadata is dropped from every list, not just footprints;
+  - metadata is not dropped;
+  - no length framing;
+  - an atom and a string share a tag;
+  - the export omits the field;
+  - the importer lacks the field.
+- Independent review: sound, with two notes. This record is one. The other is the next bullet.
+- Gate on `7b618aa2`: tests 4929, sandboxed 33, `simulation_live` 95/95; fmt, doc tests, clippy, `deny`, `fix-doc-counts` and the release build green; installed hash and KiCad settings unchanged.
+- **Not verified:** a run on a real live board. The tests model KiCad's IPC text (one line, footprint metadata added); they did not capture it. DRC's live-to-saved check rests on the same rule. The first `route_specctra_dsn` after the next install, from a fresh export of a live board, is the check.
+
 ## Row KE, the `kopper` entry skill
 
 **State, 2026-11-18.** Merged on the owner's word as [#83](https://github.com/yuvaltal912-sys/Konnect/pull/83): main `9f92ab39`, a noreply merge whose tree equals the PR head `1b6b3c0c` (branch `claude/kopper1-entry-skill`, base `a0281a9a`). The same day, `cargo xtask kopper-install` from main installed it on the owner's machine. The work happened in the worktree `/Users/yuvaltal/ClaudeCode/Kopper1`, renamed from `Konnect-plugin` on the owner's word.
