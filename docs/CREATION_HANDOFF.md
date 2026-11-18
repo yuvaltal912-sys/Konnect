@@ -4,7 +4,7 @@
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
 
-**Last updated:** 2026-11-18 (Row PS, the best-of-N placement search, designed on `claude/placement-search-design`; the owner approved its three decisions; see its section). Before that 2026-11-18 (Row KE, the `kopper` entry skill, merged as [#83](https://github.com/yuvaltal912-sys/Konnect/pull/83); see its section). Before that 2026-11-18 (Row KP, the kopper1 plugin, merged as [#81](https://github.com/yuvaltal912-sys/Konnect/pull/81); see its section). Before that 2026-11-17 (Row JS, the judged route status, merged as [#79](https://github.com/yuvaltal912-sys/Konnect/pull/79); see its section). Before that 2026-11-17 (Row K4, 1 Kopper: its user guide, [`1-KOPPER.md`](../1-KOPPER.md), merged as [#77](https://github.com/yuvaltal912-sys/Konnect/pull/77); the 1 Kopper series is done; see its section). Before that 2026-11-17: Row K3, the package smoke test, merged as [#76](https://github.com/yuvaltal912-sys/Konnect/pull/76); Row K2, one install command, merged as [#75](https://github.com/yuvaltal912-sys/Konnect/pull/75); and Row K1, simulation off by default, merged as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74). Before that 2026-11-17 (Row BN merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72), fastroute x18 in [#73](https://github.com/yuvaltal912-sys/Konnect/pull/73); see its section). Before that 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 269 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
+**Last updated:** 2026-11-19 (Row PS, the placement-search bench, built on `claude/placement-search-design`; see its section). Before that 2026-11-18 (Row AH, the switching loops and pin types, merged as [#88](https://github.com/yuvaltal912-sys/Konnect/pull/88); see its section). Before that 2026-11-18 (Row AP, the decoupling check and pin types, merged as [#86](https://github.com/yuvaltal912-sys/Konnect/pull/86); see its section). Before that 2026-11-18 (Row RJ, the route judge and live boards, merged as [#85](https://github.com/yuvaltal912-sys/Konnect/pull/85); see its section). Before that 2026-11-18 (Row KE, the `kopper` entry skill, merged as [#83](https://github.com/yuvaltal912-sys/Konnect/pull/83); see its section). Before that 2026-11-18 (Row KP, the kopper1 plugin, merged as [#81](https://github.com/yuvaltal912-sys/Konnect/pull/81); see its section). Before that 2026-11-17 (Row JS, the judged route status, merged as [#79](https://github.com/yuvaltal912-sys/Konnect/pull/79); see its section). Before that 2026-11-17 (Row K4, 1 Kopper: its user guide, [`1-KOPPER.md`](../1-KOPPER.md), merged as [#77](https://github.com/yuvaltal912-sys/Konnect/pull/77); the 1 Kopper series is done; see its section). Before that 2026-11-17: Row K3, the package smoke test, merged as [#76](https://github.com/yuvaltal912-sys/Konnect/pull/76); Row K2, one install command, merged as [#75](https://github.com/yuvaltal912-sys/Konnect/pull/75); and Row K1, simulation off by default, merged as [#74](https://github.com/yuvaltal912-sys/Konnect/pull/74). Before that 2026-11-17 (Row BN merged as [#72](https://github.com/yuvaltal912-sys/Konnect/pull/72), fastroute x18 in [#73](https://github.com/yuvaltal912-sys/Konnect/pull/73); see its section). Before that 2026-11-13 (Rows S7 and S11). On 2026-11-09 ten PRs merged into main (`a8df6ba`), in this order: [#57](https://github.com/yuvaltal912-sys/Konnect/pull/57), [#58](https://github.com/yuvaltal912-sys/Konnect/pull/58), [#56](https://github.com/yuvaltal912-sys/Konnect/pull/56), [#51](https://github.com/yuvaltal912-sys/Konnect/pull/51), [#55](https://github.com/yuvaltal912-sys/Konnect/pull/55), [#53](https://github.com/yuvaltal912-sys/Konnect/pull/53) (simulation), [#49](https://github.com/yuvaltal912-sys/Konnect/pull/49), [#48](https://github.com/yuvaltal912-sys/Konnect/pull/48), [#50](https://github.com/yuvaltal912-sys/Konnect/pull/50), [#52](https://github.com/yuvaltal912-sys/Konnect/pull/52). Each first had an independent review, with every verified finding fixed and tested in its own PR, and all ten were merged through one gated trial integration (4,153 tests, `simulation_live` 95/95, release build); every main tree after a merge matched its trial step. Freerouting now starts without telemetry, outside the home folder and off the network. Open: [#54](https://github.com/yuvaltal912-sys/Konnect/pull/54) (simulation, see `SIMULATION_HANDOFF.md`). The owner's direction: routing quality on boards like his, measured against [`LAYOUT_CHECKLIST.md`](LAYOUT_CHECKLIST.md). Catalogue on main: 269 registered tools plus 7 meta-tools; `library`, `pcb_components` and `sch_wiring` are at the router's 20-tool cap. Row S5 (routing measurement on the reference board) merged on 2026-11-10 as [#60](https://github.com/yuvaltal912-sys/Konnect/pull/60); its section below has the numbers and the preset. S6's first half merged as `f246e48` on 2026-11-10 in [#62](https://github.com/yuvaltal912-sys/Konnect/pull/62), from `codex/creation-s6-pour-widths-preset` and main `7e9a174`; the owner authorized its publication and merge on 2026-11-10. Row S7, the read-only route-refinement planner, is implemented, reviewed and gated on `codex/creation-s7-route-refine` (2026-11-13); publication and merge go through [PR #63](https://github.com/yuvaltal912-sys/Konnect/pull/63), and GitHub is the source of truth for its state ("Row S7" below). "Now" gives the fresh-session step, and "Row S6, first half" records the evidence.
 
 ## Start here
 
@@ -54,7 +54,7 @@ Owner decisions (2026-11-06, research §5):
 | Rust validation (2026-11-10) | Follow the owner's current local AGENTS guidance: scoped llvm-cov where useful and targeted cargo-mutants for validation/safety guards, in isolated worktrees and outputs; preserve the gate and source-mutation negative controls. Skip these tools for this docs-only claim, apply them to S7 implementation |
 | Row E1 (2026-11-16) | The owner, on three export refusals the router research found on his boards: "fix them"; for shared References, "clearer refusal but with an option to run it anyway". Reason: KiCad opens, checks and fills all three boards; a shared Reference stays refused by default because two pads would get one DSN pin name |
 | Row BN (2026-11-16) | The owner chose best-of-N routing with the fastroute candidate as the default `route_specctra_dsn` engine, by effort level: Fast = 2 runs at once, M = 240 s, H = 720 s, XH = 2400 s per board. On the run cap he chose "הזמן קובע, בלי תקרה" (time decides, no cap): every budgeted level runs its whole time. He asked for XH to be measured on 2 boards ("שנה ל2"); the session chose pic and pours. Freerouting stays available as `engine: "freerouting"`. Reason: result quality is his top value, and run time is information, not a decision for him. The fork is for his personal use only, so the GPL is not a design constraint |
-| Row PS (2026-11-18) | The owner approved the placement-search design's three decisions as recommended ("Yes, as recommended"). (1) No winning candidate is applied now. If the bench says the search is worth it, a later read-only planner returns the winner as `set_component_placements` batches, one functional group at a time, for the AI to compare and adopt through the normal tools (Q1); the planner never writes. (2) The AI reference A is one Sonnet 5.5 (high) session per board with the kopper1 skills, served by the fork's release binary by pipe, isolated from KiCad and from the owner's placement, placing S0 in closed-board mode. (3) Every connector and every mounting hole and fiducial is held; the owner confirms or edits each board's list once, from the counts, before the run. Reason: the design's recommendations; building the bench still waits for his word |
+| Row PS (2026-11-18) | The owner approved the placement-search design's three decisions as recommended ("Yes, as recommended"). (1) No winning candidate is applied now. If the bench says the search is worth it, a later read-only planner returns the winner as `set_component_placements` batches, one functional group at a time, for the AI to compare and adopt through the normal tools (Q1); the planner never writes. (2) The AI reference A is one Sonnet 5.5 (high) session per board with the kopper1 skills, served by the fork's release binary by pipe, isolated from KiCad and from the owner's placement, placing S0 in closed-board mode. (3) Every connector and every mounting hole and fiducial is held; the owner confirms or edits each board's list once, from the counts, before the run. Reason: the design's recommendations. He started the build on 2026-11-18 ("Yes, start the build") |
 | Scope | macOS first. Windows and Linux are validated at the end of the series |
 
 ## PR sequence
@@ -92,9 +92,9 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 
 ## Next: what to pick
 
-**Now (2026-11-18, Row PS).** The best-of-N placement search is designed down to function skeletons on `claude/placement-search-design` (from `fork/main` `d5588205`, not pushed): [`PLACEMENT_SEARCH_DESIGN.md`](PLACEMENT_SEARCH_DESIGN.md). The owner approved its three decisions as recommended on 2026-11-18. Nothing is built. The next step waits for his word to start the build: the bench, written by Sonnet agents from the skeletons. See "Row PS".
+**Now (2026-11-19, Row PS).** The placement-search bench is built on `claude/placement-search-design` (design [`PLACEMENT_SEARCH_DESIGN.md`](PLACEMENT_SEARCH_DESIGN.md), fork main merged in, not pushed, no PR). It ran end to end on the public demo board; no owner board has run. The PR text waits for the owner's yes. After the merge, the next step is the bench preparation on B4, B5 and B6: the owner confirms each board's held list from the counts, then one A session per board, then the run. See "Row PS".
 
-**Before Row PS (2026-11-18).** No row was in progress. Row KE, the `kopper` entry skill, merged as [#83](https://github.com/yuvaltal912-sys/Konnect/pull/83) (main `9f92ab39`); see "Row KE". Before that, Row KP, the kopper1 plugin, merged as [#81](https://github.com/yuvaltal912-sys/Konnect/pull/81) (main `cdb00e7c`); see "Row KP". Before that (2026-11-17), Row JS, the judged route status, merged as [#79](https://github.com/yuvaltal912-sys/Konnect/pull/79) (main `edf31590`); see "Row JS".
+**Before Row PS (2026-11-18).** No row was in progress. Row AH, the switching loops and pin types, merged as [#88](https://github.com/yuvaltal912-sys/Konnect/pull/88) (main `d8f91867`) and is installed on the owner's machine with Rows AP and RJ. Still open: Row RJ's first live run.
 
 **The 1 Kopper series** is done: Row K4 merged as [#77](https://github.com/yuvaltal912-sys/Konnect/pull/77) (main `25ea6fe1`). The fastroute source is backed up and the merged worktrees are removed (owner's yes, 2026-11-17).
 
@@ -286,20 +286,143 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **Evidence.** Recorded in the PR description: the targeted tests, one negative control per guard, the independent review and the full gate.
 
-## Row PS, the best-of-N placement search (design)
+## Row PS, the best-of-N placement search (bench)
 
-**State, 2026-11-18.** Designed by Claude Opus 5.5 on `claude/placement-search-design`, from `fork/main` `d5588205`. It is local and not pushed, with no PR. The deliverable is [`PLACEMENT_SEARCH_DESIGN.md`](PLACEMENT_SEARCH_DESIGN.md): decisions D1 to D22, three decisions for the owner, the modules, compiled skeletons, the test list and the bench plan. The owner approved the three decisions as recommended the same day (decision row "Row PS"). Nothing is built, and no board was written.
+**State, 2026-11-19.** Built on `claude/placement-search-design`. Design commits are `894fa4a1` and `c79e1421`, from `fork/main` `d5588205`. The build commits run from stage A to `8465b08a`, and then `fork/main` `4a638a1d` was merged in. It is local and not pushed, with no PR. The owner started the build on 2026-11-18 ("Yes, start the build"). The bodies were written by Sonnet 5.5 (high) agents from the design's skeletons: [`PLACEMENT_SEARCH_DESIGN.md`](PLACEMENT_SEARCH_DESIGN.md). It adds no tool and has no apply path (Q1). No owner board has run.
 
-**What it is.** The first build is a bench, an ignored test in `konnect-core`, that runs on copies of B4, B5 and B6. On each board it makes 288 placement candidates (F: force core from a seeded scatter; S: the schematic placer with a fanout filter; P: seeded edits of the owner's placement). It routes the owner's placement (O) and the AI's placement (A) 3 times each, and 4 candidates per family once each, every time by one `route_specctra_dsn` best-of-N call at effort M. It ranks them all with one key, and a family "beats" a reference only when its best ranks above all 3 of that reference's calls. It adds no tool and has no apply path (Q1).
+**What it is.** The bench is an ignored test, `place_bench`, in `konnect-core`. It runs on board copies named in a bench folder's `bench.json`. On each board it does the following:
+- It makes 288 candidates: F, the force core from a seeded scatter; S, schematic clusters shelf-packed; P, seeded edits of the owner's placement.
+- It screens them.
+- It routes the owner's placement (O) and the AI's (A) 3 times each, and 4 candidates per family once each. Each routing is one best-of-N fastroute call.
+- It ranks everything under one key and writes `search.json` (every candidate, rebuildable) and `table.md` (counts only).
+
+The code is in these places:
+- the modules `place_held`, `place_generators`, `place_judge`, `place_route`, `place_search` and `place_bench_tests`;
+- `tools/placement/force_core.rs` and `evaluate.rs`, taken out of `tools/placement.rs`. 27 golden fixtures prove the existing placement tools unchanged;
+- `pcb_components::placements_applied_to` and `route_judge::rank_measures`;
+- `xtask/placement-bench/net_rules.py` and the bench `README.md`.
+
+**Choices made during the build**, each with its reason:
+- **Unmoved parts.** `legalize` leaves a part that did not move as it is. Reason: an input's own intended overlap is not a candidate's fault.
+- **The S grid.** It is shelf-packed, each part at its own width. Reason: the square grid overflowed the demo board.
+- **Gaps.** A moved part keeps the largest rule clearance plus 0.1 mm (solder mask) from any box that is not a real courtyard. It also keeps the copper-to-edge clearance inside the outline. Reason: smoke 3's P2 failures were `clearance`, `copper_edge_clearance` and `solder_mask_bridge`.
+- **Copper obstacles.** A moved part keeps that gap from the board's fixed copper: text, graphics, and rule areas that keep parts out. A part with through-hole pads occupies both sides. Copper text without a render cache is estimated:
+  - width = characters × size × 1.3 + thickness;
+  - height = lines × size × 1.7 + thickness.
+
+  KiCad's own boxes for the demo's 19 copper texts were at most 1.22 and 1.70. Reason: in smoke 4, every routed F and S candidate failed P2. They had 12–24 `clearance` and 11–20 `solder_mask_bridge` each, all pads on copper text, plus one through-hole pad on a bottom-side pad. Known limits, which P2 still catches: copper inside footprints, text with `${…}`, and text overflowing a text box.
+- **The smoke board.** The smoke uses the routing row's prepared copy of the public demo board, and holds P1 (terminal block) and P3 (ZIF socket) as connectors under decision 3. Reason: the J-prefix rule misses this demo's P-named connectors. Without the hold, P3 (34 × 82.5 mm) fits nowhere once copper text is an obstacle.
+
+**Verified, 2026-11-18 to 2026-11-19.**
+- **Baseline gate** on `c79e1421`, which passed. Tests: 4923 passed, sandboxed 33, doc tests 9, `simulation_live` 95/95. Clippy, `deny`, `fix-doc-counts`, the release build and the installed hash all passed.
+- **Unit tests.** `cargo test -p konnect-core --lib place_` on `8465b08a`: 201 passed, 0 failed, 1 ignored (the bench).
+- **`cargo mutants`**, 4 rounds on the new and changed code, caught/missed:
+  - 175/45;
+  - 248/33;
+  - 134/4;
+  - 98/2.
+
+  Every miss is killed by a test or named equivalent. The survivors are 2 equivalent mutants in the obstacle readers, and 2 at the exact 2 µm gap in `hits_part`, which no float position reaches.
+- **Two independent reviews** (Sonnet 5.5). The first had 10 findings, fixed in `3d552232`. The second had 6, on the obstacle code, fixed in `4b27ce6c` to `8465b08a`.
+- **Smoke** on the public demo board, at effort fast with a 20-minute limit, in 6 runs. The last run (generator 6, `8465b08a`) gave:
+  - 291 candidates in 154 s, with no generation failure;
+  - 15 routed (O 3, 4 per family), and every one passes P2;
+  - best ranks: P 1, S 7, F 8. One S candidate passes every gate. P beats O: its best ranks above all 3 of O's calls. F and S are below O.
+- **Gate after the merge:** not yet run (this record is updated when it is).
+
+**Incident.** In stage A, one agent started a focused cargo run while another session's gate held `native.lock`. Since then, every cargo command of this row goes through `chunk.sh`, which waits for the locks. That other gate's result was not checked by this row.
+
+**Not verified.**
+- Any run on B4, B5 or B6.
+- The A arm: no AI session has run.
+- Effort M; the smoke used fast.
+- The bench time, about 5.5 hours, which is still an estimate.
+- The text estimate on fonts other than the demo's.
+
+**Board counts for the preparation** (read-only copies, counts only):
+- copper text: 0 on each board;
+- copper graphics: B4 0, B5 0, B6 19 filled 4.6 × 4.7 mm rectangles, each inside one J connector;
+- connector-like footprints without a J reference: B6 has 4, to show the owner when he confirms the held lists.
+
+**Next:**
+1. The owner's yes on the PR text, then the push and the PR.
+2. Bench preparation as the bench README says: stripped copies, `rules.json`, `held.json` from the rule. The owner confirms each board's list from the counts.
+3. One A session per board (decision 2).
+4. The run at effort M.
+
+Done when each board's `table.md` gives a verdict per family against O and A.
+
+## Row AH, the switching loops and pin types
+
+**State, 2026-11-18.** Merged on the owner's word as [#88](https://github.com/yuvaltal912-sys/Konnect/pull/88): main `d8f91867`, a noreply merge whose tree equals the PR head `3f619e3f` (branch `claude/audit-hot-loop-pin-type`, base `3c7858ea`). The same day, `cargo xtask kopper-install` from main installed it on the owner's machine (smoke 13 of 13).
+
+**Why.** Row AP's follow-up. Checks 8.1 and 8.2 find a converter's input pad by name (`VIN`, `PVIN`, `VOUT`, `IN`, `OUT`) and its ground pad by `PGND`, and failing a name took the nearest pad on the net. That could be an enable tied to VIN or a mode input tied to ground, which carry none of the loop's current.
+
+**The fix.** After the name, the nearest pad on the net that `is_signal_pin` does not mark (`input`, `no_connect`); then, as before, the nearest pad on the net. Discrete stages (MOSFETs, diodes) are unchanged.
 
 **Verified, 2026-11-18.**
-- The skeletons compile: pasted into the branch, `cargo check -p konnect-core --tests` finished with no error (only unused and dead-code warnings), then they were removed.
-- The design's facts about the code were checked in `d5588205`; its section "What the code says today" lists them.
-- An independent review (Sonnet 5.5) found 4 must-fix and 6 should-fix points; all are fixed in the design (P1 judged on movable parts only, decoupling measured on a fixed pair list, the no-winner result read right, A admitted only as a placement, A's session isolated, 3 calls per reference, a 100-minute limit, every connector and mounting hole held, the effort named in lower case, duplicates never routed).
-- Board counts come from read-only scratch copies of the three originals.
-- Not verified: any body, any test, any run. The bench's time (about 5.5 hours) is an estimate from Row BN's per-call times.
+- `cargo test -p konnect-core --lib -- layout_quality`: 75 passed, 0 failed. The new test: on the buck fixture with U1's pin names removed, the loop closes at the real input and ground pins; it still does with an enable and a mode input placed nearer the switch pad; with only inputs to choose from, it falls back to them; and a named `VIN` or `PGND` typed `input` is still found by its name.
+- Negative controls: 5 of 5 caught, run on the final code (ground and power each ignore the type; the name match checks the type; each has no fallback), and the source was restored byte for byte.
+- The owner's board has no switch node (8.1 and 8.2 do not run there), so it does not exercise this change.
+- Independent review: sound, with three notes, all applied (a name-over-type test case, the one case that can read worse in `API_MIGRATIONS.md`, a variable name).
+- Gate on `4d222f26` (before the review notes): tests 4932, sandboxed 33, `simulation_live` 95/95, every step green. The final gate, on `3f619e3f`: tests 4932, sandboxed 33, `simulation_live` 95/95, every main step green; the owner's `kicad_common.json` changed during it, written by the KiCad the owner had open (the gate's sandbox denies writes there).
 
-**Next:** on the owner's word, the build: Sonnet agents write the bodies from the skeletons, in their own worktree, the baseline gate first. Before the bench runs, he confirms each board's held list (decision 3).
+## Row AP, the decoupling check and pin types
+
+**State, 2026-11-18.** Merged on the owner's word as [#86](https://github.com/yuvaltal912-sys/Konnect/pull/86): main `e49bc3c3`, a noreply merge whose tree equals the PR head `e122ee14` (branch `claude/audit-supply-pin-type`, base `df707dbf`). The same day, `cargo xtask kopper-install` from main installed it on the owner's machine (smoke 13 of 13).
+
+**Why.** On a real board, `audit_layout_quality` reported an IC's reset input, tied to its supply rail, as a decoupling-loop error. Check 4.1 took every IC pad on a power net as a supply pin. It also closed loops at the nearest ground pad even when that was an input tied low (an unused or enable input), so real loops read short. The owner's other session had reported this as the audit measuring U1 with C11 instead of C2. That did not reproduce: on the board after the import and after the refill, the audit measured that IC with its nearest capacitor.
+
+**The fix.**
+- `PadGeom` reads KiCad's `pintype`.
+- A pad typed `input`, or any type with `no_connect`, on a power net is not a supply pin. The audit names it in `signal_pins_on_power_nets`.
+- The loop closes at the nearest ground pad of another type when the IC has one, else at any ground pad, as before.
+- Every other type is measured: libraries type supply pins `passive`, and some `bidirectional`. A first version that also skipped `bidirectional` and `output` pins was narrowed for that reason.
+- An input left out whose pin function reads like a supply (`V…`, `AV…`, `DV…`, or containing `VCC` or `VDD`) is listed in `needs_human`, so a supply pin a library mistyped as `input` is not dropped silently.
+- **Follow-up, not in this row:** the switching hot loops (8.1, 8.2) still close at the nearest ground pad, and pick a power pad, without reading the pin type. Taken up in Row AH.
+
+**On a scratch copy of the owner's board** (counts only): 1 pin left out of 12, with no `needs_human` question. Two loops now close at the real ground pin instead of an input tied low. Both read longer, as the copper is.
+
+**Verified, 2026-11-18.**
+- `cargo test -p konnect-core --lib -- layout_quality`: 74 passed, 0 failed.
+- Negative controls: 9 of 9 caught, run on the final code, and the source was restored byte for byte. The nine breaks:
+  - no pin is a signal pin;
+  - a combined type is not split;
+  - `bidirectional` counts as a signal;
+  - the ground pad ignores the type;
+  - no fallback to an input-typed ground;
+  - `pintype` is not read;
+  - a supply-named input is not asked about;
+  - every input is asked about;
+  - skipped pins are not reported.
+- Independent review: sound, with five notes, all applied (the `needs_human` question, the controls rerun, the 8.x follow-up, generic wording, a bare `no_connect` case).
+- Gate on `dd983806` (before the review fixes): tests 4931, sandboxed 33, `simulation_live` 95/95, every step green. The final gate, on `e122ee14`: tests 4931, sandboxed 33, `simulation_live` 95/95, every step green.
+
+## Row RJ, the route judge and live boards
+
+**State, 2026-11-18.** Merged on the owner's word as [#85](https://github.com/yuvaltal912-sys/Konnect/pull/85): main `df707dbf`, a noreply merge whose tree equals the PR head `07e4fb8c` (branch `claude/route-judge-board-identity`, base `d5588205`). Installed on the owner's machine with #86 (main `e49bc3c3`). Its live check, the first `route_specctra_dsn` on a live board from a fresh export, is still to run.
+
+**The defect (found on the owner's board, 2026-11-18).** `export_specctra_dsn` hashes KiCad's in-memory text of the board (IPC) into `source_sha256`. The best-of-N judge compared that with the saved file's bytes. KiCad saves the board in another layout and without each footprint's `version`, `generator` and `generator_version`, so the two never matched, and `route_specctra_dsn` refused every board exported from live KiCad, however often it was saved. The fixtures never showed it: their text and their file are the same bytes. The SES importer compares against the IPC text, so it was not affected.
+
+**The fix (D22 in `ROUTE_SEARCH_DESIGN.md`).**
+- The export also writes `source_canonical_sha256`: the board as a parsed tree, with that footprint metadata dropped, hashed with lengths and atom/string tags (`board_identity.rs`).
+- The judge accepts the saved board when its bytes match `source_sha256` or its tree matches `source_canonical_sha256`. Any other change still refuses. An older manifest gets the byte check only.
+- DRC's live-to-saved check and the judge now share one normalization rule.
+
+**Verified, 2026-11-18.**
+- `cargo test -p konnect-core --lib -- board_identity route_judge specctra drc::`: 262 passed, 0 failed.
+- Negative controls: 8 of 8 caught, and the source was restored byte for byte. The eight breaks:
+  - the judge checks bytes only;
+  - the judge trusts the field without comparing;
+  - metadata is dropped from every list, not just footprints;
+  - metadata is not dropped;
+  - no length framing;
+  - an atom and a string share a tag;
+  - the export omits the field;
+  - the importer lacks the field.
+- Independent review: sound, with two notes. This record is one. The other is the next bullet.
+- Gate on `7b618aa2`: tests 4929, sandboxed 33, `simulation_live` 95/95; fmt, doc tests, clippy, `deny`, `fix-doc-counts` and the release build green; installed hash and KiCad settings unchanged.
+- **Not verified:** a run on a real live board. The tests model KiCad's IPC text (one line, footprint metadata added); they did not capture it. DRC's live-to-saved check rests on the same rule. The first `route_specctra_dsn` after the next install, from a fresh export of a live board, is the check.
 
 ## Row KE, the `kopper` entry skill
 
@@ -1062,7 +1185,7 @@ Review follow-up verified on macOS (2026-11-09): fmt; 3797 lib and integration t
 | 3.2 | Signal vias that change reference plane, and the nearest ground via spanning both planes (or a capacitor between two different planes) |
 | 3.3 | Ground pad groups (cut-off pads, from the real shapes) and floating islands (copper that touches no pad) |
 | 3.4 / 4.3 | Narrowest section on the best copper path from each rail's source to its loads, and on the ground return, against the IPC-2221 width for the recorded current |
-| 4.1 | Per IC supply pin: capacitor → pin → ground → capacitor copper path length and plan-view area, ground side included |
+| 4.1 | Per IC supply pin: capacitor → pin → ground → capacitor copper path length and plan-view area, ground side included. A pad typed `input` or `no_connect` (KiCad's `pintype`) is tied to the rail for its logic level and is not a supply pin; the loop closes at a ground pad of another type when the IC has one (Row AP) |
 | 4.2 | `audit_trace_current` reused as is; its findings are re-emitted under 4.2 |
 | 5.1 | Routed length over the pin-to-pin spanning tree (HPWL also reported; a tree under 1 mm is judged against 1 mm), vias per connection on signal nets, dangling track ends; nets carried by a pour have no ratio, and ground, power and pour nets no via ratio; those nets are named |
 | 5.2 | Same-layer parallel runs of unrelated signals (tighter around critical nets and switch nodes) |

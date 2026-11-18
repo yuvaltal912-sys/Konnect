@@ -75,6 +75,8 @@ next steps (`completion.next_steps`), as row S6 decided: no hidden write path.
 | D20 | The result's `search.runs` lists the 20 best judged runs by the rank key and the first 20 runs that were not judged; `search.outcomes` counts every outcome, and `search.json` in the search folder lists every run | Thousands of rows would not fit a tool response |
 | D21 | When the winner passes all three gates and the judge added no stitching via, `status` is the judge's, not the router's count (amends D15): `complete`, or `complete_with_width_exceptions` or `unverified` from the winner's width report, or `stopped`. The router's `incomplete` and its plane `unverified` give way. When the judge needed stitching vias, those vias are not in the session, so the router's status stands. The router's count stays in `completion.router_unrouted`, the via count in `completion.judged.stitching_vias`, and `completion.reason` says why the status differs from the count, or why it stands | The router counts a connection a pour makes as one it left. On the public `specctra_pours_routing` board, 4 of the 6 recorded routes, and both 1 Kopper smoke runs, read `incomplete` while the judge found 0 unconnected with every gate passing (2026-11-17). G1 is KiCad's own count after the refill and the stitching, which is what the router's count cannot show |
 
+- **D22 (2026-11-18): the judge checks the saved board as a tree, not only as bytes.** The export hashes KiCad's in-memory text of the board (IPC). KiCad saves that board in another layout and without each footprint's `version`, `generator` and `generator_version`, so the saved bytes never hashed to `source_sha256`, and the judge refused every live board. The export now also writes `source_canonical_sha256`: the board as a parsed tree, with that footprint metadata dropped (the rule DRC's live-to-saved check already used), hashed with lengths and atom/string tags. The judge accepts the saved board when its bytes match `source_sha256` or its tree matches `source_canonical_sha256`. Any other change to the board still refuses. A manifest from before D22 gets the byte check only.
+
 ## Decisions for the owner
 
 1. **The budget reading**: Fast = 2 runs at once, M = 240 s, H = 720 s, XH = 2400 s per board.
@@ -392,7 +394,7 @@ pub(crate) fn may_launch(now: Duration, budget: Option<Duration>, route_median: 
 /// What the judge needs, read once per call.
 pub(crate) struct JudgeContext {
     pub board: PathBuf,              // manifest board_path, canonical
-    pub board_text: String,          // the saved board; sha256 == manifest source_sha256
+    pub board_text: String,          // the saved board: same bytes or same canonical tree (D22)
     pub manifest: serde_json::Value,
     pub manifest_text: String,
     pub kicad_cli: String,
@@ -406,8 +408,9 @@ pub(crate) struct JudgeContext {
 pub(crate) struct Baseline { pub violations: BTreeMap<String, usize>, pub unconnected: usize }
 
 /// Refusals, each with the next step, before anything routes: no manifest beside the DSN;
-/// the manifest's board is missing; the saved board's sha256 is not the manifest's
-/// `source_sha256` ("save the board in KiCad, export the DSN again"); no kicad-cli.
+/// the manifest's board is missing; the saved board is not the exported one, by bytes
+/// (`source_sha256`) or as a tree (`source_canonical_sha256`, D22) ("save the board in
+/// KiCad, export the DSN again"); no kicad-cli.
 pub(crate) fn prepare(dsn: &Path, root: &Path, kicad_cli: &str) -> Result<JudgeContext, Refusal>;
 
 /// G2's baseline: the unrouted board (the saved text, unchanged) in a scratch project,

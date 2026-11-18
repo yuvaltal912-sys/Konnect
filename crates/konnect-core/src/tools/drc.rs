@@ -1,6 +1,7 @@
 //! One ordering and source-evidence contract for both CLI DRC surfaces.
 
 use super::{cli, ipc_target_error_result, with_board_ipc_classified, ToolContext};
+use crate::board_identity::normalize_snapshot_metadata;
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use konnect_ipc::IpcFailure;
 use serde_json::{json, Value};
@@ -724,27 +725,6 @@ pub(crate) async fn run(
             zone_fill,
         },
     )))
-}
-
-// IPC serializes embedded footprints with standalone library format metadata;
-// SaveDocument omits that metadata in a board. Never discard geometry, models,
-// connectivity, UUIDs, or arbitrary unknown fields to make a comparison pass.
-fn normalize_snapshot_metadata(node: &mut konnect_sexp::SexpNode) {
-    use konnect_sexp::SexpNode;
-    let footprint = node.head() == Some("footprint");
-    if let SexpNode::List(children) = node {
-        if footprint {
-            children.retain(|child| {
-                !matches!(
-                    child.head(),
-                    Some("version" | "generator" | "generator_version")
-                )
-            });
-        }
-        for child in children {
-            normalize_snapshot_metadata(child);
-        }
-    }
 }
 
 #[cfg(test)]

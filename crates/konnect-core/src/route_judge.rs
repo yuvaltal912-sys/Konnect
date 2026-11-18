@@ -6,6 +6,7 @@
 //! Nothing here writes to the user's board or project: every board it writes is a
 //! copy under the search folder.
 
+use crate::board_identity;
 use crate::route_search::Routed;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,8 @@ pub(crate) struct Refusal {
 pub(crate) struct JudgeContext {
     /// The manifest's `board_path`, canonical: the board the DSN was exported from.
     pub board: PathBuf,
-    /// The saved board's text; its SHA-256 is the manifest's `source_sha256`.
+    /// The saved board's text: the board the DSN was exported from (see
+    /// [`saved_board_matches`]).
     pub board_text: String,
     pub manifest: Value,
     pub manifest_text: String,
@@ -74,13 +76,43 @@ pub(crate) struct Baseline {
     pub unconnected: usize,
 }
 
+/// Whether the saved board is the board the DSN was exported from.
+///
+/// The export hashes KiCad's in-memory text of the board (IPC), and KiCad saves
+/// that board in a different layout and without each footprint's library
+/// metadata, so the saved bytes almost never hash to `source_sha256`. True when:
+/// - the saved bytes' SHA-256 is the manifest's `source_sha256` (a board exported
+///   from a file, or text that happens to match), or
+/// - the manifest has `source_canonical_sha256` and the saved text's
+///   [`board_identity::canonical_sha256`] equals it: the same board as a tree.
+///
+/// A manifest without `source_canonical_sha256` (an export before it was written)
+/// gets the byte check only. A saved file that does not parse matches only by
+/// bytes.
+pub(crate) fn saved_board_matches(saved: &[u8], manifest: &Value) -> bool {
+    let bytes = format!("{:x}", Sha256::digest(saved));
+    if manifest["source_sha256"]
+        .as_str()
+        .is_some_and(|recorded| recorded.eq_ignore_ascii_case(&bytes))
+    {
+        return true;
+    }
+    let Some(recorded) = manifest["source_canonical_sha256"].as_str() else {
+        return false;
+    };
+    std::str::from_utf8(saved)
+        .ok()
+        .and_then(|text| board_identity::canonical_sha256(text).ok())
+        .is_some_and(|canonical| recorded.eq_ignore_ascii_case(&canonical))
+}
+
 /// Everything the judge needs, checked before anything is routed. Each refusal
 /// says what to do:
 /// - no manifest beside the DSN (`<dsn>.konnect.json`): "export the DSN with
 ///   export_specctra_dsn, which writes the manifest beside it";
 /// - the manifest names no board, or the board file is missing;
-/// - the saved board's SHA-256 is not the manifest's `source_sha256`: "save the
-///   board in KiCad, then export the DSN again";
+/// - the saved board is not the exported board ([`saved_board_matches`]): "save
+///   the board in KiCad, then export the DSN again";
 /// - `kicad_cli` is not an executable file.
 ///
 /// `root` is created by the caller later; this only records it.
@@ -137,12 +169,10 @@ pub(crate) fn prepare(
             "check the board file, then export the DSN again",
         )
     })?;
-    let hash = format!("{:x}", Sha256::digest(&saved));
-    let recorded = manifest["source_sha256"].as_str().unwrap_or("");
-    if !recorded.eq_ignore_ascii_case(&hash) {
+    if !saved_board_matches(&saved, &manifest) {
         return Err(refuse(
             format!(
-                "the saved board '{}' is not the board the DSN was exported from (its SHA-256 differs from the manifest's source_sha256)",
+                "the saved board '{}' is not the board the DSN was exported from (neither its SHA-256 nor its canonical SHA-256 is the manifest's)",
                 board.display()
             ),
             "save the board in KiCad, then export the DSN again",

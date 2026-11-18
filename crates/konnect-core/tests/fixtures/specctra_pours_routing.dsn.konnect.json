@@ -430,6 +430,7 @@
     "project_sha256": "cfe41c910ca1dd811e52d1ec05aa3a2bb239cf3363b8aed8139cad4f36ebb13f"
   },
   "schema_version": 1,
+  "source_canonical_sha256": "db67ea4eb584da6021f534e25baea1efa358a75b25919eae2467afcbb2acb532",
   "source_sha256": "0eeb2e919c89254f7610481c2e8e710256e4ae5f92544ae80753b14a3a609f88",
   "supported_profile": {
     "component_side": "front",

@@ -3,6 +3,44 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the switching hot loops read pin types too
+
+`audit_layout_quality` checks 8.1 and 8.2 find a converter's input and ground
+pads by name (`VIN`, `PVIN`, `VOUT`, `IN`, `OUT`; `PGND`), then by net. The net
+step now prefers a pad that is not typed `input` or `no_connect` (an enable tied
+to VIN, a mode input tied to ground), and falls back to any such pad, as before,
+when the IC has no other. Loops of converters whose enable or mode pin sits
+nearer the switch pad than the real input or ground pin change. One case can
+read worse: an input pin a library types `input` and names neither `VIN` nor the
+like loses to a farther power pad of another type; a named pin is found by its
+name whatever its type.
+
+## Unreleased: the layout audit's decoupling check reads pin types
+
+`audit_layout_quality` check 4.1 (decoupling loop) reads each pad's KiCad pin type
+(`pintype`). A pad typed `input`, or any type with `no_connect`, on a power net is
+tied to the rail for its logic level (a timer's RESET, an enable or unused input) and
+is no longer measured as a supply pin. The loop of a real supply pin now closes at
+the IC's nearest ground pad that is not typed that way, when there is one, rather
+than at an input tied to ground. A pad with no type, or any other type
+(`power_in`, `passive`, `bidirectional`, ...), is measured as before. New metric:
+`signal_pins_on_power_nets` (count and the first ten pins). An input left out whose
+pin function reads like a supply (`VDD`, `VREF`, `AVCC`, ...) is named in
+`needs_human`. Scores and findings of 4.1 change on boards whose ICs have inputs
+tied to a rail.
+
+## Unreleased: the route judge accepts the saved form of a live board
+
+`export_specctra_dsn` writes one more manifest field, `source_canonical_sha256`:
+the exported board's identity as a tree, without the footprint library metadata
+that KiCad's in-memory text carries and its saved file omits. The best-of-N route
+judge accepts the saved board when its bytes match `source_sha256` (as before) or
+its tree matches `source_canonical_sha256`. Before this, every DSN exported from a
+live board was refused with "save the board in KiCad, then export the DSN again",
+which saving did not fix. Export the DSN again to get the new field; a manifest
+without it keeps the byte check. The SES importer accepts the field and still checks
+the live board against `source_sha256`.
+
 ## Unreleased: one entry skill, `kopper`
 
 A new bundled skill, `kopper` (`/kopper1:kopper` in Claude's `/` menu), loads the
