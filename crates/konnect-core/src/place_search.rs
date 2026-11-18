@@ -201,6 +201,8 @@ pub(crate) struct Outcome {
     /// The same as one fixed word, the only form `table.md` prints: `time_limit`,
     /// `input_check_failed` or `calls_failed_in_a_row`.
     pub stopped_code: Option<&'static str>,
+    /// The clearances the generators kept (`BoardModel::clearances`).
+    pub clearances: Clearances,
     /// P2's yardstick: the input board's unrouted check.
     pub input_unrouted: BTreeMap<String, usize>,
 }
@@ -1068,6 +1070,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
         elapsed: started.elapsed(),
         stopped_routing,
         stopped_code,
+        clearances: model.clearances,
         input_unrouted,
     };
     std::fs::write(
@@ -1156,7 +1159,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
             "drawn_per_family": plan.drawn_per_family,
             "draw_seed": plan.draw_seed,
             "time_limit_s": plan.time_limit.as_secs_f64(),
-            "clearances": Clearances::from_inputs(&plan.route.rules, &plan.route.options),
+            "clearances": outcome.clearances,
             "effort": plan.route.effort.name(),
             "fastroute": plan.route.fastroute.display().to_string(),
             "fastroute_sha256": fastroute_sha256,
