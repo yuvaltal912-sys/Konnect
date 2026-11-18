@@ -1578,8 +1578,11 @@ mod tests {
             "[plugins.\"kopper1@personal\"]\nenabled = true\n\n[plugins.\"kopper1@other\"]\nenabled = false\n",
         )
         .unwrap();
-        // A skill of the owner's own in the installed copy stays through uninstall.
+        // A skill of the owner's own in the installed copy, and the disabled
+        // copy's own skills, stay through uninstall.
         fs::create_dir_all(cache.join("skills/my-skill")).unwrap();
+        fs::create_dir_all(foreign.join("skills/kicad-pcb")).unwrap();
+        fs::write(foreign.join("skills/kicad-pcb/SKILL.md"), "theirs").unwrap();
         let loose = home.join(".agents/skills");
         for name in ["kicad-pcb", "my-skill"] {
             fs::create_dir_all(loose.join(name)).unwrap();
@@ -1608,8 +1611,9 @@ mod tests {
         let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
         assert_eq!(codex.state().as_str(), "current");
 
-        assert!(
-            !foreign.join("skills").exists(),
+        assert_eq!(
+            fs::read_to_string(foreign.join("skills/kicad-pcb/SKILL.md")).unwrap(),
+            "theirs",
             "a disabled marketplace's copy"
         );
 
@@ -1620,6 +1624,7 @@ mod tests {
             assert!(dir.join("plugin.json").is_file());
         }
         assert!(cache.join("skills/my-skill").is_dir());
+        assert!(foreign.join("skills/kicad-pcb/SKILL.md").is_file());
     }
 
     /// A Codex plugin `kopper1` that Codex does not have enabled (or whose
