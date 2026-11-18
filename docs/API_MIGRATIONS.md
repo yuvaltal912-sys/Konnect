@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the layout audit's decoupling check reads pin types
+
+`audit_layout_quality` check 4.1 (decoupling loop) reads each pad's KiCad pin type
+(`pintype`). A pad typed `input`, or any type with `no_connect`, on a power net is
+tied to the rail for its logic level (a timer's RESET, an enable or unused input) and
+is no longer measured as a supply pin. The loop of a real supply pin now closes at
+the IC's nearest ground pad that is not typed that way, when there is one, rather
+than at an input tied to ground. A pad with no type, or any other type
+(`power_in`, `passive`, `bidirectional`, ...), is measured as before. New metric:
+`signal_pins_on_power_nets` (count and the first ten pins). Scores and findings of
+4.1 change on boards whose ICs have inputs tied to a rail.
+
 ## Unreleased: the route judge accepts the saved form of a live board
 
 `export_specctra_dsn` writes one more manifest field, `source_canonical_sha256`:

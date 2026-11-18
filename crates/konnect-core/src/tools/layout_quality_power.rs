@@ -15,6 +15,20 @@ use super::{
 };
 use crate::tools::trace_current;
 
+/// Whether a pad's KiCad pin type (`pintype`) says it is a logic input, not a
+/// supply pin: `input`, or any type with `no_connect`. Such a pad on a power net
+/// is tied to the rail for its logic level (a timer's RESET, an enable or an unused
+/// input tied high or low) and draws no supply current, so it has no decoupling
+/// loop and returns none. Every other type is measured: libraries type supply
+/// pins `passive`, and sometimes `bidirectional` (a transceiver's VIO), and an output
+/// is never tied straight to a rail.
+fn is_signal_pin(pad: &konnect_sexp::board_geometry::PadGeom) -> bool {
+    pad.pin_type.as_deref().is_some_and(|kind| {
+        kind.split('+')
+            .any(|part| matches!(part, "input" | "no_connect"))
+    })
+}
+
 pub(super) fn run(m: &Model, board: &std::path::Path, _tree: &SexpNode) -> Vec<CheckOut> {
     let (decoupling, loops) = decoupling_and_hot_loops(m);
     let mut out = vec![decoupling, current_sizing(m, board)];
@@ -255,6 +269,7 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
     let (mut areas, mut no_cap, mut cannot) = (Vec::new(), 0usize, Vec::new());
     let mut pins = 0usize;
     let mut switch_pins_left: Vec<String> = Vec::new();
+    let mut signal_pins: Vec<String> = Vec::new();
     'ics: for (fi, f) in m.geo.footprints.iter().enumerate() {
         if !is_ic(m.fp_ref(f)) {
             continue;
@@ -266,6 +281,11 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             if !m.is_power(net) {
                 continue;
             }
+            if is_signal_pin(pad) {
+                // Tied to the rail for its logic level, not a supply pin.
+                signal_pins.push(pad_label(m, (fi, pi)));
+                continue;
+            }
             if switch_nets.contains(&net) {
                 // Named as a switch node by the caller: judged by 8.1 and 8.2, not here.
                 switch_pins_left.push(pad_label(m, (fi, pi)));
@@ -275,17 +295,31 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
                 cannot.push("stopped after 300 supply pins".to_string());
                 break 'ics;
             }
-            // The ground pad of the same IC closest to this pin.
-            let ground = f
+            // The ground pad of the same IC closest to this pin: a supply ground
+            // pad when the IC has one, else any ground pad (a pin typed as an
+            // input and tied low returns no supply current).
+            let grounds: Vec<(usize, &konnect_sexp::board_geometry::PadGeom)> = f
                 .pads
                 .iter()
                 .enumerate()
                 .filter(|(_, g)| g.net.as_deref().is_some_and(|n| m.is_ground(n)))
-                .min_by(|a, b| {
-                    dist(a.1.at, pad.at)
-                        .partial_cmp(&dist(b.1.at, pad.at))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                .collect();
+            let supply_grounds: Vec<(usize, &konnect_sexp::board_geometry::PadGeom)> = grounds
+                .iter()
+                .copied()
+                .filter(|(_, g)| !is_signal_pin(g))
+                .collect();
+            let ground = if supply_grounds.is_empty() {
+                grounds
+            } else {
+                supply_grounds
+            }
+            .into_iter()
+            .min_by(|a, b| {
+                dist(a.1.at, pad.at)
+                    .partial_cmp(&dist(b.1.at, pad.at))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let Some((gi, _)) = ground else {
                 cannot.push(format!("{} has no ground pad", m.fp_ref(f)));
                 continue;
@@ -350,8 +384,10 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
         dec = CheckOut::not_run(
             id,
             name,
-            if switch_pins_left.is_empty() {
+            if switch_pins_left.is_empty() && signal_pins.is_empty() {
                 "no IC (reference U…/IC…) has a pad on a power net; record rails in the design intent or pass power_nets".to_string()
+            } else if switch_pins_left.is_empty() {
+                format!("the only IC pads on power nets ({}) are typed as inputs, tied to the rail for their logic level", signal_pins.join(", "))
             } else {
                 format!("the only IC pads on power nets ({}) are on switch nodes named in switching_regulators, which 8.1 and 8.2 judge", switch_pins_left.join(", "))
             },
@@ -379,6 +415,7 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
             "measured": lens.len(),
             "pins_without_capacitor": no_cap,
             "switch_node_pins_left_to_8_1_8_2": { "count": switch_pins_left.len(), "pins": switch_pins_left.iter().take(10).collect::<Vec<_>>() },
+            "signal_pins_on_power_nets": { "count": signal_pins.len(), "pins": signal_pins.iter().take(10).collect::<Vec<_>>() },
             "compare": {
                 "worst_loop_mm": lens.last().map(|v| r2(*v)),
                 "median_loop_mm": median.map(r2),
@@ -386,7 +423,7 @@ fn decoupling_and_hot_loops(m: &Model) -> (CheckOut, Vec<CheckOut>) {
                 "pins_without_capacitor": no_cap,
             },
             "pins": rows.into_iter().take(25).collect::<Vec<_>>(),
-            "method": "shortest copper path (tracks, vias, pours) from the capacitor pad to the pin, plus from the IC's nearest ground pad to the capacitor's ground pad; the loop area is the plan-view polygon of both paths. Up to the 3 nearest capacitors are tried and the shortest loop kept",
+            "method": "shortest copper path (tracks, vias, pours) from the capacitor pad to the pin, plus from the IC's nearest ground pad to the capacitor's ground pad; the loop area is the plan-view polygon of both paths. Up to the 3 nearest capacitors are tried and the shortest loop kept. A pad whose KiCad pin type is input or no-connect is tied to the rail for its logic level and is not measured; when the IC has a ground pad of another type, the loop closes there",
         });
     }
     hot.extend(switching_loops(m, &switchers));
