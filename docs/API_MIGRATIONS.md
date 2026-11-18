@@ -11,8 +11,9 @@ removals, default changes and the supported replacement workflow.
 that an earlier install left. In Claude's `/` menu they read `kopper1:<name>`.
 `init --uninstall` removes the plugin's manifest and skills; a file the owner put
 in the plugin folder stays. Codex: when the owner's Codex plugin `kopper1` exists
-(`~/.agents/plugins/kopper1/plugin.json`), the skills go into it and into its
-installed copies under `~/.codex/plugins/cache/`, and loose copies in
+(`~/.agents/plugins/kopper1/plugin.json`) and Codex has it enabled in
+`~/.codex/config.toml`, the skills go into it and into its installed copies
+under `~/.codex/plugins/cache/<marketplace>/kopper1/`, and loose copies in
 `~/.agents/skills` are removed; otherwise Codex is unchanged. Every
 bundled skill's `description` is now one quoted line.
 

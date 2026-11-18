@@ -328,22 +328,60 @@ impl InstallPaths {
             .join(CLAUDE_PLUGIN)
     }
 
+    /// The owner's Codex plugin is used only when its manifest is there and Codex
+    /// has it enabled (`[plugins."kopper1@<marketplace>"] enabled = true` in
+    /// `~/.codex/config.toml`): a plugin Codex does not load must not take the
+    /// skills away from their loose place.
     fn codex_has_plugin(&self) -> bool {
         self.codex_plugin_dir().join("plugin.json").is_file()
+            && !self.codex_plugin_marketplaces().is_empty()
     }
 
-    /// The installed copies Codex loads the plugin from:
-    /// `~/.codex/plugins/cache/<marketplace>/kopper1/<version>/`, each with its
-    /// `plugin.json`. Written with the plugin, so an update takes effect without
-    /// reinstalling the plugin in Codex.
+    /// The marketplaces whose `kopper1` Codex has enabled.
+    fn codex_plugin_marketplaces(&self) -> Vec<String> {
+        let path = self.home.join(".codex").join("config.toml");
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Ok(config) = text.parse::<toml::Table>() else {
+            return Vec::new();
+        };
+        let prefix = format!("{CLAUDE_PLUGIN}@");
+        let mut found: Vec<String> = config
+            .get("plugins")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter(|(_, entry)| entry.get("enabled").and_then(toml::Value::as_bool) == Some(true))
+            .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
+            .filter(|marketplace| {
+                !marketplace.is_empty()
+                    && !marketplace.contains(['/', '\\'])
+                    && marketplace != "."
+                    && marketplace != ".."
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The installed copies Codex loads the plugin from, for the marketplaces
+    /// that have it enabled: `~/.codex/plugins/cache/<marketplace>/kopper1/<version>/`,
+    /// each with a `plugin.json` named `kopper1`. Written with the plugin, so an
+    /// update takes effect without reinstalling the plugin in Codex. (How Codex
+    /// refreshes these copies is its own, and not verified here.)
     fn codex_plugin_caches(&self) -> Vec<PathBuf> {
         let cache = self.home.join(".codex").join("plugins").join("cache");
         let mut found = Vec::new();
-        for marketplace in fs::read_dir(&cache).into_iter().flatten().flatten() {
-            let versions = marketplace.path().join(CLAUDE_PLUGIN);
+        for marketplace in self.codex_plugin_marketplaces() {
+            let versions = cache.join(&marketplace).join(CLAUDE_PLUGIN);
             for version in fs::read_dir(&versions).into_iter().flatten().flatten() {
                 let dir = version.path();
-                if dir.join("plugin.json").is_file() {
+                let named = fs::read_to_string(dir.join("plugin.json"))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .is_some_and(|manifest| manifest["name"] == CLAUDE_PLUGIN);
+                if named && dir.is_dir() {
                     found.push(dir);
                 }
             }
@@ -611,7 +649,7 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
             remove_entry(&paths.loose_skills_dir(client).join(skill.name))?;
         }
     }
-    if client == InstallClient::Codex && paths.codex_has_plugin() {
+    if client == InstallClient::Codex {
         // The skills in each copy Codex installed; the plugin and its manifest are
         // Codex's and stay.
         for cache in paths.codex_plugin_caches() {
@@ -1528,10 +1566,20 @@ mod tests {
         let home = temp.path();
         let source = home.join(".agents/plugins/kopper1");
         let cache = home.join(".codex/plugins/cache/personal/kopper1/0.1.0");
-        for dir in [&source, &cache] {
+        // A plugin of the same name in another marketplace, not enabled: never
+        // touched.
+        let foreign = home.join(".codex/plugins/cache/other/kopper1/9.9.9");
+        for dir in [&source, &cache, &foreign] {
             fs::create_dir_all(dir).unwrap();
             fs::write(dir.join("plugin.json"), "{\"name\": \"kopper1\"}").unwrap();
         }
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"kopper1@personal\"]\nenabled = true\n\n[plugins.\"kopper1@other\"]\nenabled = false\n",
+        )
+        .unwrap();
+        // A skill of the owner's own in the installed copy stays through uninstall.
+        fs::create_dir_all(cache.join("skills/my-skill")).unwrap();
         let loose = home.join(".agents/skills");
         for name in ["kicad-pcb", "my-skill"] {
             fs::create_dir_all(loose.join(name)).unwrap();
@@ -1560,12 +1608,63 @@ mod tests {
         let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
         assert_eq!(codex.state().as_str(), "current");
 
+        assert!(
+            !foreign.join("skills").exists(),
+            "a disabled marketplace's copy"
+        );
+
         // Uninstall takes the skills out of both and leaves the manifests.
         run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
         for dir in [&source, &cache] {
             assert!(!dir.join("skills/kicad-pcb").exists(), "{}", dir.display());
             assert!(dir.join("plugin.json").is_file());
         }
+        assert!(cache.join("skills/my-skill").is_dir());
+    }
+
+    /// A Codex plugin `kopper1` that Codex does not have enabled (or whose
+    /// installed copy is another plugin) does not take the skills: they stay loose.
+    #[test]
+    fn a_codex_plugin_codex_does_not_load_leaves_the_skills_loose() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let source = home.join(".agents/plugins/kopper1");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("plugin.json"), "{\"name\": \"kopper1\"}").unwrap();
+        let paths = test_paths(&temp);
+        for config in [
+            None,
+            Some("[plugins.\"kopper1@personal\"]\nenabled = false\n"),
+            Some("[plugins.\"other@personal\"]\nenabled = true\n"),
+            Some("not toml ["),
+        ] {
+            fs::create_dir_all(home.join(".codex")).unwrap();
+            match config {
+                Some(text) => fs::write(home.join(".codex/config.toml"), text).unwrap(),
+                None => {
+                    let _ = fs::remove_file(home.join(".codex/config.toml"));
+                }
+            }
+            run_install_at(InstallClient::Codex, &paths, false).unwrap();
+            assert!(
+                home.join(".agents/skills/kicad-pcb/SKILL.md").is_file(),
+                "{config:?}"
+            );
+            assert!(!source.join("skills").exists(), "{config:?}");
+        }
+        // Enabled, but the installed copy names another plugin: the source takes
+        // the skills, the foreign copy does not.
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"kopper1@personal\"]\nenabled = true\n",
+        )
+        .unwrap();
+        let cache = home.join(".codex/plugins/cache/personal/kopper1/0.1.0");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("plugin.json"), "{\"name\": \"someone-else\"}").unwrap();
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+        assert!(source.join("skills/kicad-pcb/SKILL.md").is_file());
+        assert!(!cache.join("skills").exists());
     }
 
     /// Uninstall removes only the manifest Konnect wrote from `.claude-plugin`;
