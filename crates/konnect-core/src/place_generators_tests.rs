@@ -1332,6 +1332,17 @@ fn the_schematic_shelves_take_a_smaller_margin_when_the_wide_one_overflows() {
     };
     let centres = schematic_grid(&model, &params, &mut SplitMix64(7));
     assert!(all_inside(&model, &sizes, &centres));
+    // The shelves are the 1 mm ones, not a clamped heap: every two parts are at least 1 mm apart.
+    for i in 0..centres.len() {
+        for j in (i + 1)..centres.len() {
+            let gap_x = (centres[i].0 - centres[j].0).abs() - (sizes[i].0 + sizes[j].0) / 2.0;
+            let gap_y = (centres[i].1 - centres[j].1).abs() - (sizes[i].1 + sizes[j].1) / 2.0;
+            assert!(
+                gap_x.max(gap_y) >= 1.0 - 1e-9,
+                "parts {i} and {j} are too close"
+            );
+        }
+    }
     for seed in 1..=8u64 {
         generate(&model, &schematic_of(params, seed))
             .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
