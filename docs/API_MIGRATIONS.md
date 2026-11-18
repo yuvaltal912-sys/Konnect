@@ -10,7 +10,10 @@ pads by name (`VIN`, `PVIN`, `VOUT`, `IN`, `OUT`; `PGND`), then by net. The net
 step now prefers a pad that is not typed `input` or `no_connect` (an enable tied
 to VIN, a mode input tied to ground), and falls back to any such pad, as before,
 when the IC has no other. Loops of converters whose enable or mode pin sits
-nearer the switch pad than the real input or ground pin change.
+nearer the switch pad than the real input or ground pin change. One case can
+read worse: an input pin a library types `input` and names neither `VIN` nor the
+like loses to a farther power pad of another type; a named pin is found by its
+name whatever its type.
 
 ## Unreleased: the layout audit's decoupling check reads pin types
 

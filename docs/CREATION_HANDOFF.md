@@ -292,9 +292,11 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 **The fix.** After the name, the nearest pad on the net that `is_signal_pin` does not mark (`input`, `no_connect`); then, as before, the nearest pad on the net. Discrete stages (MOSFETs, diodes) are unchanged.
 
 **Verified, 2026-11-18.**
-- `cargo test -p konnect-core --lib -- layout_quality`: 75 passed, 0 failed. The new test: on the buck fixture with U1's pin names removed, the loop closes at the real input and ground pins; it still does with an enable and a mode input placed nearer the switch pad; and with only inputs to choose from, it falls back to them.
-- Negative controls: 4 of 4 caught (ground and power each ignore the type; each has no fallback), and the source was restored byte for byte.
+- `cargo test -p konnect-core --lib -- layout_quality`: 75 passed, 0 failed. The new test: on the buck fixture with U1's pin names removed, the loop closes at the real input and ground pins; it still does with an enable and a mode input placed nearer the switch pad; with only inputs to choose from, it falls back to them; and a named `VIN` or `PGND` typed `input` is still found by its name.
+- Negative controls: 5 of 5 caught, run on the final code (ground and power each ignore the type; the name match checks the type; each has no fallback), and the source was restored byte for byte.
 - The owner's board has no switch node (8.1 and 8.2 do not run there), so it does not exercise this change.
+- Independent review: sound, with three notes, all applied (a name-over-type test case, the one case that can read worse in `API_MIGRATIONS.md`, a variable name).
+- Gate on `4d222f26` (before the review notes): tests 4932, sandboxed 33, `simulation_live` 95/95, every step green. The final gate is in the PR text.
 
 ## Row AP, the decoupling check and pin types
 

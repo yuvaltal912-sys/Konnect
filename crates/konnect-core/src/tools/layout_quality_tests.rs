@@ -695,12 +695,41 @@ fn a_switching_loop_skips_inputs_tied_to_a_rail() {
     // inputs), the loop still closes at them, as before.
     let all_inputs = edit_footprint(&buck_unnamed(), "U1", |block| {
         let mut out = block.to_string();
-        for uuid_start in ["(pinfunction \"P1\")", "(pinfunction \"P3\")"] {
-            out = out.replacen(uuid_start, &format!("{uuid_start} (pintype \"input\")"), 1);
+        for pin_function in ["(pinfunction \"P1\")", "(pinfunction \"P3\")"] {
+            out = out.replacen(
+                pin_function,
+                &format!("{pin_function} (pintype \"input\")"),
+                1,
+            );
         }
         out
     });
     let r = run(&fx_text(&all_inputs, Some(buck_intent())));
+    let n1 = sw1_loop(&r);
+    assert_eq!(n1["loop"]["legs"][0]["to"], "U1.1", "{n1}");
+    assert_eq!(
+        n1["loop"]["legs"].as_array().unwrap().last().unwrap()["from"],
+        "U1.3",
+        "{n1}"
+    );
+
+    // A name still wins over the type: VIN and PGND typed as inputs, with the
+    // enable and mode inputs nearer, still close the loop.
+    let named_inputs = edit_footprint(&with_inputs, "U1", |block| {
+        block
+            .replacen(
+                "(pinfunction \"P1\")",
+                "(pinfunction \"VIN\") (pintype \"input\")",
+                1,
+            )
+            .replacen(
+                "(pinfunction \"P3\")",
+                "(pinfunction \"PGND\") (pintype \"input\")",
+                1,
+            )
+    });
+    assert_ne!(named_inputs, with_inputs);
+    let r = run(&fx_text(&named_inputs, Some(buck_intent())));
     let n1 = sw1_loop(&r);
     assert_eq!(n1["loop"]["legs"][0]["to"], "U1.1", "{n1}");
     assert_eq!(
