@@ -173,12 +173,15 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
         nodes.len() == scan.items.len(),
         "the footprint scan and the footprint list disagree"
     );
+    // A reference shared by pad-less footprints (the logos) is keyed `<reference>#<n>`
+    // (`place_held::shared_key`); those parts are held, so the key is only ever an
+    // identity here, never written to a board.
+    let raw_references: Vec<Option<&str>> =
+        scan.items.iter().map(|c| c.reference.as_deref()).collect();
+    let keys = crate::place_held::footprint_keys(&raw_references);
     let mut rows: Vec<(String, FootprintCourtyard, String, usize)> = Vec::new();
-    for (node, courtyard) in nodes.iter().zip(scan.items.iter()) {
-        let reference = courtyard
-            .reference
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("a footprint has no reference"))?;
+    for ((node, courtyard), key) in nodes.iter().zip(scan.items.iter()).zip(keys) {
+        let reference = key.ok_or_else(|| anyhow::anyhow!("a footprint has no reference"))?;
         let library_id = node
             .get(1)
             .and_then(konnect_sexp::parser::SexpNode::as_str)

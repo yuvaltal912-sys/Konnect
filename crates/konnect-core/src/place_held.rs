@@ -129,6 +129,39 @@ fn reference_of(fp: &SexpNode) -> Option<String> {
     None
 }
 
+/// The key of a shared reference's n-th footprint: `<reference>#<n>`, n from 1 in file
+/// order. Only pad-less footprints may share a reference (`held_set`), and they are
+/// all held, so the key never reaches a generator's output. The order, not the uuid,
+/// is the identity: the writer that makes a candidate keeps the footprints' file order,
+/// and a uuid may be missing or repeated in a hand-edited board.
+pub(crate) fn shared_key(reference: &str, n: usize) -> String {
+    format!("{reference}#{n}")
+}
+
+/// The key of every footprint of `references` (one entry per footprint, in file
+/// order): the reference itself when it is on the board once, `shared_key` of its
+/// order among the footprints with that reference when it is shared.
+pub(crate) fn footprint_keys(references: &[Option<&str>]) -> Vec<Option<String>> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for reference in references.iter().flatten() {
+        *counts.entry(reference).or_default() += 1;
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    references
+        .iter()
+        .map(|reference| {
+            let reference = (*reference)?;
+            if counts[reference] > 1 {
+                let n = seen.entry(reference).or_default();
+                *n += 1;
+                Some(shared_key(reference, *n))
+            } else {
+                Some(reference.to_string())
+            }
+        })
+        .collect()
+}
+
 fn side_word(side: Side) -> &'static str {
     match side {
         Side::Front => "front",
@@ -162,8 +195,12 @@ fn held_list_sha256(held: &BTreeMap<String, HeldPart>) -> String {
 /// - the outline is not closed (`Outline::status` is not `Closed`): no candidate's
 ///   containment could be judged or repaired;
 /// - a reference in `caller` names no footprint, or more than one;
-/// - a footprint has no reference, or two footprints with pads share one (the rule
-///   of `score_placement`'s `ambiguous_pad_references`);
+/// - a footprint has no reference, or a reference is shared by footprints of which any
+///   has a pad (the rule of `score_placement`'s `ambiguous_pad_references`). A reference
+///   shared only by footprints with no pad at all (the logo footprints of the owner's
+///   boards) is allowed: each of them is held (`Mechanical`) under the key
+///   `<reference>#<n>` (`shared_key`), n being its order among the footprints with that
+///   reference in file order, from 1;
 /// - the courtyard scan skipped a footprint (unreadable geometry): where it is cannot
 ///   be proved;
 /// - nothing is left to move.
@@ -201,14 +238,17 @@ pub(crate) fn held_set(
         ));
     }
 
-    // Identity: every footprint has a reference, and each reference is on the board once.
+    // Identity: every footprint has a reference, and a reference is on the board once,
+    // or shared only by footprints that have no pad at all (logos).
     let nodes = footprints(&tree);
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: BTreeMap<String, (usize, bool)> = BTreeMap::new();
     let mut nameless = 0usize;
     for fp in &nodes {
         match reference_of(fp) {
             Some(reference) if !reference.trim().is_empty() => {
-                *seen.entry(reference).or_default() += 1;
+                let entry = seen.entry(reference).or_default();
+                entry.0 += 1;
+                entry.1 |= !fp.find_all("pad").is_empty();
             }
             _ => nameless += 1,
         }
@@ -221,17 +261,17 @@ pub(crate) fn held_set(
     }
     let shared: Vec<&str> = seen
         .iter()
-        .filter(|(_, count)| **count > 1)
+        .filter(|(_, (count, has_pad))| *count > 1 && *has_pad)
         .map(|(reference, _)| reference.as_str())
         .collect();
     if !shared.is_empty() {
         return Err(refuse(
             format!(
-                "{} reference(s) are shared by more than one footprint: {}",
+                "{} reference(s) are shared by more than one footprint, and a pad is on at least one of them: {}",
                 shared.len(),
                 shared.join(", ")
             ),
-            "rename the duplicate references in KiCad (Tools > Annotate), save the board, then run the search again",
+            "give those parts unique references in the copy (the bench's preparation does that: it renames them in its scratch copy, never in the original), save the copy, then run the search again",
         ));
     }
 
@@ -245,11 +285,25 @@ pub(crate) fn held_set(
             "open the board in KiCad, repair or delete the footprints it flags, save, then run the search again",
         ));
     }
-    let courtyards: BTreeMap<&str, &FootprintCourtyard> = scan
-        .items
-        .iter()
-        .filter_map(|c| c.reference.as_deref().map(|r| (r, c)))
-        .collect();
+    // With nothing skipped the scan and the footprint list are the same footprints in
+    // file order, so a courtyard and its node are the same position, and so is its key.
+    if nodes.len() != scan.items.len() {
+        return Err(refuse(
+            "the footprint scan and the footprint list disagree",
+            "give the search a saved .kicad_pcb that KiCad can open",
+        ));
+    }
+    let references: Vec<Option<&str>> = scan.items.iter().map(|c| c.reference.as_deref()).collect();
+    let keys = footprint_keys(&references);
+    let mut courtyards: BTreeMap<String, &FootprintCourtyard> = BTreeMap::new();
+    let mut library_ids: BTreeMap<String, String> = BTreeMap::new();
+    for ((key, courtyard), node) in keys.iter().zip(scan.items.iter()).zip(nodes.iter()) {
+        let Some(key) = key else { continue };
+        courtyards.insert(key.clone(), courtyard);
+        if let Some(id) = node.get(1).and_then(SexpNode::as_str) {
+            library_ids.insert(key.clone(), id.to_string());
+        }
+    }
 
     let unknown: Vec<&str> = caller
         .iter()
@@ -259,7 +313,7 @@ pub(crate) fn held_set(
     if !unknown.is_empty() {
         return Err(refuse(
             format!(
-                "the caller's list names {} reference(s) that are not on the board: {}",
+                "the caller's list names {} reference(s) that are not on the board, or are shared by pad-less footprints (those are held already, by their keys): {}",
                 unknown.len(),
                 unknown.join(", ")
             ),
@@ -275,15 +329,6 @@ pub(crate) fn held_set(
             has_netted_pad.insert(pad.reference.as_str());
         }
     }
-    let library_ids: BTreeMap<String, String> = nodes
-        .iter()
-        .filter_map(|fp| {
-            Some((
-                reference_of(fp)?,
-                fp.get(1).and_then(SexpNode::as_str)?.to_string(),
-            ))
-        })
-        .collect();
 
     let mut held: BTreeMap<String, HeldPart> = BTreeMap::new();
     let mut movable: BTreeSet<String> = BTreeSet::new();
@@ -292,18 +337,18 @@ pub(crate) fn held_set(
         if courtyard.locked {
             reasons.insert(HoldReason::KicadLock);
         }
-        if caller.contains(*reference) {
+        if caller.contains(reference) {
             reasons.insert(HoldReason::Caller);
         }
-        let prefix = prefix_of(reference);
+        let prefix = prefix_of(reference.as_str());
         if rules.connector_prefixes.iter().any(|p| p == prefix) {
             reasons.insert(HoldReason::Connector);
         }
         let library_id = library_ids
-            .get(*reference)
+            .get(reference)
             .map(|id| id.to_ascii_lowercase())
             .unwrap_or_default();
-        if !has_netted_pad.contains(reference)
+        if !has_netted_pad.contains(reference.as_str())
             || rules.mechanical_prefixes.iter().any(|p| p == prefix)
             || rules
                 .mechanical_footprint_words
@@ -313,10 +358,10 @@ pub(crate) fn held_set(
             reasons.insert(HoldReason::Mechanical);
         }
         if reasons.is_empty() {
-            movable.insert((*reference).to_string());
+            movable.insert(reference.clone());
         } else {
             held.insert(
-                (*reference).to_string(),
+                reference.clone(),
                 HeldPart {
                     reasons,
                     at: courtyard.at,
@@ -343,7 +388,10 @@ pub(crate) fn held_set(
 
 /// Proves that `candidate` keeps every held part exactly (`at`, rotation and side
 /// compared as read, with no tolerance) and has the same footprint references as the
-/// set's board, each once. Each difference is one line.
+/// set's board, each once. A footprint of a shared reference is found by its key
+/// (`<reference>#<n>`, its order among the footprints with that reference), so the
+/// logo footprints are proved unchanged too, and reordering them counts as moving
+/// them. Each difference is one line.
 pub(crate) fn check_held(set: &HeldSet, candidate: &SexpNode) -> Result<(), Vec<String>> {
     let mut lines: Vec<String> = Vec::new();
     let scan = footprint_courtyards(candidate);
@@ -357,12 +405,24 @@ pub(crate) fn check_held(set: &HeldSet, candidate: &SexpNode) -> Result<(), Vec<
     if total_nodes != scan.items.len() + scan.skipped {
         lines.push("the footprint count of the candidate is inconsistent".to_string());
     }
-    let mut by_reference: BTreeMap<&str, Vec<&FootprintCourtyard>> = BTreeMap::new();
-    for item in &scan.items {
-        match item.reference.as_deref() {
-            Some(reference) => by_reference.entry(reference).or_default().push(item),
-            None => lines.push("a footprint of the candidate has no reference".to_string()),
-        }
+    // A reference the set holds as shared (`<reference>#1` is a key of the set) is keyed
+    // by its order in the candidate too. Any other reference that is on the candidate
+    // more than once is one the board did not repeat: it is reported as such.
+    let references: Vec<Option<&str>> = scan.items.iter().map(|c| c.reference.as_deref()).collect();
+    let keys = footprint_keys(&references);
+    let mut by_reference: BTreeMap<String, Vec<&FootprintCourtyard>> = BTreeMap::new();
+    for (item, key) in scan.items.iter().zip(keys.iter()) {
+        let (Some(reference), Some(key)) = (item.reference.as_deref(), key) else {
+            lines.push("a footprint of the candidate has no reference".to_string());
+            continue;
+        };
+        let expected_shared = set.held.contains_key(&shared_key(reference, 1));
+        let key = if key == reference || expected_shared {
+            key.clone()
+        } else {
+            reference.to_string()
+        };
+        by_reference.entry(key).or_default().push(item);
     }
     for (reference, items) in &by_reference {
         if items.len() > 1 {
@@ -371,7 +431,7 @@ pub(crate) fn check_held(set: &HeldSet, candidate: &SexpNode) -> Result<(), Vec<
                 items.len()
             ));
         }
-        if !set.held.contains_key(*reference) && !set.movable.contains(*reference) {
+        if !set.held.contains_key(reference) && !set.movable.contains(reference) {
             lines.push(format!("{reference} is a footprint the board did not have"));
         }
     }

@@ -525,6 +525,134 @@ fn held_set_refuses_what_it_cannot_prove() {
 }
 
 #[test]
+fn pad_less_footprints_may_share_a_reference_and_are_held() {
+    // Three logo footprints share one reference, two more share another: none has a pad.
+    let mut parts = clean_parts();
+    parts.push(Fp::new("G***", 5.0, 5.0));
+    parts.push(Fp::new("G***", 10.0, 35.0));
+    parts.push(Fp::new("LOGO", 50.0, 5.0));
+    parts.push(Fp::new("G***", 55.0, 35.0));
+    parts.push(Fp::new("LOGO", 45.0, 35.0));
+    let text = board(OUTLINE, &parts);
+    let set = held_set(&text, &no_caller(), &HoldRules::default()).expect("the set holds");
+
+    // Each one is held as a mechanical part under `<reference>#<n>`, n in file order.
+    for key in ["G***#1", "G***#2", "G***#3", "LOGO#1", "LOGO#2"] {
+        assert_eq!(
+            set.held[key].reasons.iter().copied().collect::<Vec<_>>(),
+            vec![HoldReason::Mechanical],
+            "{key}"
+        );
+    }
+    assert_eq!(set.held["G***#1"].at, (5.0, 5.0));
+    assert_eq!(set.held["G***#2"].at, (10.0, 35.0));
+    assert_eq!(set.held["G***#3"].at, (55.0, 35.0));
+    assert_eq!(set.held["LOGO#2"].at, (45.0, 35.0));
+    // The bare shared reference is neither held nor movable; the others are as before.
+    assert!(!set.held.contains_key("G***") && !set.movable.contains("G***"));
+    let movable: Vec<&str> = set.movable.iter().map(String::as_str).collect();
+    assert_eq!(movable, vec!["C1", "R1", "U1"]);
+
+    // The proof: the unchanged text passes, and so does moving a movable part.
+    assert_eq!(check_held(&set, &parse(&text)), Ok(()));
+    let mut moved_movable = parts.clone();
+    moved_movable[1].x += 3.0;
+    assert_eq!(
+        check_held(&set, &parse(&board(OUTLINE, &moved_movable))),
+        Ok(())
+    );
+    // A 1 µm shift of the second logo is named by its key, and by that one alone.
+    let mut shifted = parts.clone();
+    shifted[5].x += 0.001;
+    let lines = check_held(&set, &parse(&board(OUTLINE, &shifted))).unwrap_err();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("G***#2") && lines[0].contains("moved"),
+        "{lines:?}"
+    );
+    // Swapping two logos' places is moving both: the order is the identity.
+    let mut swapped = parts.clone();
+    (swapped[4].x, swapped[4].y) = (parts[5].x, parts[5].y);
+    (swapped[5].x, swapped[5].y) = (parts[4].x, parts[4].y);
+    let lines = check_held(&set, &parse(&board(OUTLINE, &swapped))).unwrap_err();
+    assert!(
+        lines.iter().any(|l| l.contains("G***#1")) && lines.iter().any(|l| l.contains("G***#2")),
+        "{lines:?}"
+    );
+    // A logo dropped, and a logo added.
+    let mut dropped = parts.clone();
+    dropped.remove(6);
+    let lines = check_held(&set, &parse(&board(OUTLINE, &dropped))).unwrap_err();
+    assert!(lines.iter().any(|l| l.contains("is missing")), "{lines:?}");
+    let mut added = parts.clone();
+    added.push(Fp::new("G***", 20.0, 5.0));
+    let lines = check_held(&set, &parse(&board(OUTLINE, &added))).unwrap_err();
+    assert!(
+        lines.iter().any(|l| l.contains("G***#4")),
+        "an added logo is a footprint the board did not have: {lines:?}"
+    );
+
+    // The model of the search accepts the keys and never lists a logo as movable.
+    let model =
+        crate::place_generators::board_model(&text, set.clone(), Intent::default()).unwrap();
+    for key in ["G***#1", "G***#2", "G***#3", "LOGO#1", "LOGO#2"] {
+        let i = model.references.iter().position(|r| r == key).expect(key);
+        assert!(!model.movable[i], "{key} must not be movable");
+    }
+
+    // A caller naming the shared reference is refused: its footprints are held by key.
+    let caller: BTreeSet<String> = ["G***".to_string()].into();
+    let refusal = held_set(&text, &caller, &HoldRules::default()).unwrap_err();
+    assert!(refusal.reason.contains("G***"), "{refusal:?}");
+}
+
+#[test]
+fn a_shared_reference_with_pads_is_still_refused() {
+    let rules = HoldRules::default();
+    // Three references, each shared by four two-pad parts (one board of the owner's).
+    let mut parts = clean_parts();
+    for reference in ["C7", "C8", "C9"] {
+        for k in 0..4 {
+            parts.push(Fp::new(reference, 5.0 + 3.0 * k as f64, 30.0).two_pad("VCC", "GND"));
+        }
+    }
+    let refusal = held_set(&board(OUTLINE, &parts), &no_caller(), &rules).unwrap_err();
+    for reference in ["C7", "C8", "C9"] {
+        assert!(refusal.reason.contains(reference), "{refusal:?}");
+    }
+    assert!(
+        refusal.next_step.contains("unique references"),
+        "{refusal:?}"
+    );
+
+    // A logo that shares its reference with a part that has a pad is refused too.
+    let mut mixed = clean_parts();
+    mixed.push(Fp::new("C1", 40.0, 30.0));
+    let refusal = held_set(&board(OUTLINE, &mixed), &no_caller(), &rules).unwrap_err();
+    assert!(refusal.reason.contains("C1"), "{refusal:?}");
+    assert!(
+        refusal.next_step.contains("unique references"),
+        "{refusal:?}"
+    );
+
+    // Control: the same board with every shared reference made unique is accepted.
+    let mut unique = clean_parts();
+    for (n, reference) in ["C7", "C8", "C9"].iter().enumerate() {
+        for k in 0..4 {
+            unique.push(
+                Fp::new(
+                    &format!("{reference}{k}"),
+                    5.0 + 3.0 * k as f64,
+                    30.0 + n as f64,
+                )
+                .two_pad("VCC", "GND"),
+            );
+        }
+    }
+    assert!(held_set(&board(OUTLINE, &unique), &no_caller(), &rules).is_ok());
+}
+
+#[test]
 fn a_candidate_that_moves_a_held_part_is_refused() {
     let parts = clean_parts();
     let set = set_of(&parts);
