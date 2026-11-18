@@ -1596,3 +1596,596 @@ fn a_moved_part_keeps_the_edge_clearance_inside_a_rounded_outline() {
         );
     }
 }
+
+// ─── Copper obstacles and the sides a part occupies ──────────────────────────
+
+/// `text` with `items` added before its closing parenthesis.
+fn with_items(text: &str, items: &str) -> String {
+    let end = text.rfind(')').expect("a board ends with a parenthesis");
+    format!("{}{items}\n)\n", &text[..end])
+}
+
+/// A board text, an `(at …)`, a layer and effects, as a board-level `gr_text`.
+fn gr_text(text: &str, at: &str, layer: &str, effects: &str) -> String {
+    format!("(gr_text \"{text}\" (at {at}) (layer \"{layer}\") {effects})\n")
+}
+
+const PLAIN: &str = "(effects (font (size 1 1) (thickness 0.15)))";
+
+/// The pinned board (x 10..70, y 20..60) with R1 (2 x 1 mm, on top) and `items` of copper.
+fn copper_model(items: &str) -> BoardModel {
+    copper_model_of(
+        vec![Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2")],
+        &[],
+        items,
+    )
+}
+
+/// A board of `parts` in the pinned outline and `items`, with the footprints named in
+/// `through_hole` given a `thru_hole` pad.
+fn copper_model_of(parts: Vec<Fp>, through_hole: &[&str], items: &str) -> BoardModel {
+    let mut text = board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &parts);
+    for reference in through_hole {
+        let block = block_of(&text, reference);
+        text = text.replace(&block, &block.replace(" smd rect", " thru_hole circle"));
+    }
+    model_of(&with_items(&text, items), &[])
+}
+
+fn r1_of(model: &BoardModel) -> usize {
+    model.references.binary_search(&"R1".to_string()).unwrap()
+}
+
+fn close(a: Rect, b: Rect) -> bool {
+    [a.0 - b.0, a.1 - b.1, a.2 - b.2, a.3 - b.3]
+        .iter()
+        .all(|d| d.abs() < 1e-6)
+}
+
+/// The only obstacle of `items` (one copper item), asserting there is exactly one.
+fn only_obstacle(items: &str) -> CopperObstacle {
+    let model = copper_model(items);
+    assert_eq!(model.copper.len(), 1, "{items}: {:?}", model.copper);
+    model.copper[0]
+}
+
+/// The gap between R1's box at `at` and `bbox`: the larger of the two axis gaps.
+fn gap_to(model: &BoardModel, at: (f64, f64), bbox: Rect) -> f64 {
+    let (w, h) = as_read_sizes(model)[r1_of(model)];
+    let gap_x = (at.0 - (bbox.0 + bbox.2) / 2.0).abs() - (w + bbox.2 - bbox.0) / 2.0;
+    let gap_y = (at.1 - (bbox.1 + bbox.3) / 2.0).abs() - (h + bbox.3 - bbox.1) / 2.0;
+    gap_x.max(gap_y)
+}
+
+#[test]
+fn a_moved_part_is_moved_off_copper_text_and_not_off_silkscreen_text() {
+    // "ABCD", size 1, thickness 0.15: 4 x 1.3 + 0.15 = 5.35 wide, 1.7 + 0.15 = 1.85 high,
+    // centred on (40, 40): x 37.325..42.675, y 39.075..40.925.
+    let on_copper = copper_model(&gr_text("ABCD", "40 40", "F.Cu", PLAIN));
+    let moved = legalized_r1(&on_copper, (40.0, 40.0));
+    // R1 is 2 x 1 mm: the nearest cells clear of the box are 1.5 mm up or down (3 steps),
+    // and of the two, above comes first.
+    assert_eq!(moved, (40.0, 38.5));
+    assert!(gap_to(&on_copper, moved, on_copper.copper[0].bbox) >= MOVED_CLEARANCE_MM);
+    // The same text on the silkscreen, the fabrication layer or the back silkscreen is no
+    // obstacle.
+    for layer in ["F.SilkS", "F.Fab", "B.SilkS", "Cmts.User"] {
+        let model = copper_model(&gr_text("ABCD", "40 40", layer, PLAIN));
+        assert!(model.copper.is_empty(), "{layer}");
+        assert_eq!(legalized_r1(&model, (40.0, 40.0)), (40.0, 40.0), "{layer}");
+    }
+    // A text that is no obstacle is the only difference: the copper text on a far corner
+    // does not move R1 either.
+    let far = copper_model(&gr_text("ABCD", "60 55", "F.Cu", PLAIN));
+    assert_eq!(legalized_r1(&far, (40.0, 40.0)), (40.0, 40.0));
+}
+
+#[test]
+fn a_moved_part_keeps_the_part_gap_from_copper() {
+    let model = with_clearances(
+        copper_model(&gr_text("ABCD", "40 40", "F.Cu", PLAIN)),
+        0.7,
+        0.0,
+    );
+    let moved = legalized_r1(&model, (40.0, 40.0));
+    let gap = gap_to(&model, moved, model.copper[0].bbox);
+    assert!(gap >= 0.7 - 1e-9, "{gap}");
+    // With no gap a cell 0.575 mm from the text is legal; with 0.7 mm it is not.
+    let none = copper_model(&gr_text("ABCD", "40 40", "F.Cu", PLAIN));
+    assert_eq!(legalized_r1(&none, (40.0, 38.0)), (40.0, 38.0));
+    assert_ne!(legalized_r1(&model, (40.0, 38.0)), (40.0, 38.0));
+}
+
+#[test]
+fn a_copper_text_box_follows_its_size_lines_thickness_and_justification() {
+    // No effects at all: size 1, thickness 0.15.
+    let bare = only_obstacle(&gr_text("ABCD", "40 40", "F.Cu", ""));
+    assert!(
+        close(bare.bbox, (37.325, 39.075, 42.675, 40.925)),
+        "{bare:?}"
+    );
+    assert_eq!(bare.sides, Sides::TOP);
+    // Size 2 x 3, thickness 0.3: width 2 x 2 x 1.3 + 0.3 = 5.5, height 3 x 1.7 + 0.3 = 5.4.
+    let sized = only_obstacle(&gr_text(
+        "AB",
+        "40 40",
+        "F.Cu",
+        "(effects (font (size 2 3) (thickness 0.3)))",
+    ));
+    assert!(close(sized.bbox, (37.25, 37.3, 42.75, 42.7)), "{sized:?}");
+    // Two lines, the longer of four characters: 4 x 1.3 + 0.15 wide, 2 x 1.7 + 0.15 high.
+    let lines = only_obstacle(&gr_text("AB\\nCDEF", "40 40", "F.Cu", PLAIN));
+    assert!(
+        close(lines.bbox, (37.325, 38.225, 42.675, 41.775)),
+        "{lines:?}"
+    );
+    // The longest line counts, not the last or the first: "ABCDE\nA".
+    let first_longer = only_obstacle(&gr_text("ABCDE\\nA", "40 40", "F.Cu", PLAIN));
+    assert!(
+        close(first_longer.bbox, (36.675, 38.225, 43.325, 41.775)),
+        "{first_longer:?}"
+    );
+    // Justified left: the box spans the anchor by the whole width in x, and is centred in y.
+    let left = only_obstacle(&gr_text(
+        "ABCD",
+        "40 40",
+        "F.Cu",
+        "(effects (font (size 1 1) (thickness 0.15)) (justify left))",
+    ));
+    assert!(close(left.bbox, (34.65, 39.075, 45.35, 40.925)), "{left:?}");
+    // Justified top: the whole height in y, centred in x. Mirrored right bottom: both.
+    let top = only_obstacle(&gr_text(
+        "ABCD",
+        "40 40",
+        "F.Cu",
+        "(effects (font (size 1 1) (thickness 0.15)) (justify top))",
+    ));
+    assert!(close(top.bbox, (37.325, 38.15, 42.675, 41.85)), "{top:?}");
+    let both = only_obstacle(&gr_text(
+        "ABCD",
+        "40 40",
+        "B.Cu",
+        "(effects (font (size 1 1) (thickness 0.15)) (justify right bottom mirror))",
+    ));
+    assert!(close(both.bbox, (34.65, 38.15, 45.35, 41.85)), "{both:?}");
+    assert_eq!(both.sides, Sides::BOTTOM);
+    // Empty text has no copper.
+    assert!(copper_model(&gr_text("", "40 40", "F.Cu", PLAIN))
+        .copper
+        .is_empty());
+}
+
+#[test]
+fn a_turned_copper_text_box_is_turned_about_its_anchor() {
+    // A quarter turn swaps the half extents: 0.925 wide each side, 2.675 high.
+    let quarter = only_obstacle(&gr_text("ABCD", "40 40 90", "F.Cu", PLAIN));
+    assert!(
+        close(quarter.bbox, (39.075, 37.325, 40.925, 42.675)),
+        "{quarter:?}"
+    );
+    // A three-quarter turn, and a negative one, the same; a half turn leaves it.
+    for angle in ["270", "-90"] {
+        let turned = only_obstacle(&gr_text("ABCD", &format!("40 40 {angle}"), "F.Cu", PLAIN));
+        assert!(close(turned.bbox, quarter.bbox), "{angle}: {turned:?}");
+    }
+    let half = only_obstacle(&gr_text("ABCD", "40 40 180", "F.Cu", PLAIN));
+    assert!(
+        close(half.bbox, (37.325, 39.075, 42.675, 40.925)),
+        "{half:?}"
+    );
+    // 45 degrees: the hull of the turned box, (2.675 + 0.925) x sin 45 = 2.5456 each way.
+    let slanted = only_obstacle(&gr_text("ABCD", "40 40 45", "F.Cu", PLAIN));
+    let reach = (2.675 + 0.925) * std::f64::consts::FRAC_1_SQRT_2;
+    assert!(
+        close(
+            slanted.bbox,
+            (40.0 - reach, 40.0 - reach, 40.0 + reach, 40.0 + reach)
+        ),
+        "{slanted:?}"
+    );
+    // 30 degrees: 2.675 cos 30 + 0.925 sin 30 across, 2.675 sin 30 + 0.925 cos 30 high.
+    let thirty = only_obstacle(&gr_text("ABCD", "40 40 30", "F.Cu", PLAIN));
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    let (rw, rh) = (2.675 * cos + 0.925 * sin, 2.675 * sin + 0.925 * cos);
+    assert!(
+        close(thirty.bbox, (40.0 - rw, 40.0 - rh, 40.0 + rw, 40.0 + rh)),
+        "{thirty:?}"
+    );
+    // A justified, turned text turns the whole span: left, 90 degrees is 5.35 up and down.
+    let justified = only_obstacle(&gr_text(
+        "ABCD",
+        "40 40 90",
+        "F.Cu",
+        "(effects (font (size 1 1) (thickness 0.15)) (justify left))",
+    ));
+    assert!(
+        close(justified.bbox, (39.075, 34.65, 40.925, 45.35)),
+        "{justified:?}"
+    );
+}
+
+#[test]
+fn a_copper_text_with_a_render_cache_is_boxed_by_the_cache() {
+    // The estimate would be 37.325..42.675; the cache's two polygons say otherwise.
+    let cache = "(render_cache \"ABCD\" 0 (polygon (pts (xy 38 39) (xy 41 39) (xy 41 41))) \
+                 (polygon (pts (xy 36 40.5) (xy 37 42) (xy 39 40))))";
+    let item = gr_text(
+        "ABCD",
+        "40 40",
+        "F.Cu",
+        &format!("(effects (font (size 1 1) (thickness 0.15))) {cache}"),
+    );
+    let cached = only_obstacle(&item);
+    assert!(close(cached.bbox, (36.0, 39.0, 41.0, 42.0)), "{cached:?}");
+    // A cache with no points falls back to the estimate.
+    let empty = only_obstacle(&gr_text(
+        "ABCD",
+        "40 40",
+        "F.Cu",
+        &format!("{PLAIN} (render_cache \"ABCD\" 0)"),
+    ));
+    assert!(
+        close(empty.bbox, (37.325, 39.075, 42.675, 40.925)),
+        "{empty:?}"
+    );
+}
+
+#[test]
+fn copper_graphics_are_boxed_by_their_geometry_grown_by_half_the_stroke() {
+    let stroke = |width: f64| format!("(stroke (width {width}) (type default))");
+    let cases: Vec<(String, Rect)> = vec![
+        (
+            format!("(gr_line (start 30 30) (end 34 32) {} (layer \"F.Cu\"))", stroke(0.4)),
+            (29.8, 29.8, 34.2, 32.2),
+        ),
+        (
+            // The corners are given in the other order.
+            format!("(gr_rect (start 24 28) (end 20 25) {} (fill no) (layer \"F.Cu\"))", stroke(0.2)),
+            (19.9, 24.9, 24.1, 28.1),
+        ),
+        (
+            format!("(gr_circle (center 50 40) (end 53 40) {} (fill no) (layer \"F.Cu\"))", stroke(0.2)),
+            (46.9, 36.9, 53.1, 43.1),
+        ),
+        (
+            format!(
+                "(gr_poly (pts (xy 30 30) (xy 35 31) (xy 33 36)) {} (fill no) (layer \"F.Cu\"))",
+                stroke(0.2)
+            ),
+            (29.9, 29.9, 35.1, 36.1),
+        ),
+        (
+            format!(
+                "(gr_curve (pts (xy 20 30) (xy 22 25) (xy 26 35) (xy 28 30)) {} (layer \"F.Cu\"))",
+                stroke(0.2)
+            ),
+            (19.9, 24.9, 28.1, 35.1),
+        ),
+        (
+            // The legacy spelling of the width.
+            "(gr_line (start 30 30) (end 34 32) (width 0.4) (layer \"F.Cu\"))".to_string(),
+            (29.8, 29.8, 34.2, 32.2),
+        ),
+        (
+            // No width: the geometry itself.
+            "(gr_line (start 30 30) (end 34 32) (layer \"F.Cu\"))".to_string(),
+            (30.0, 30.0, 34.0, 32.0),
+        ),
+        (
+            format!(
+                "(gr_text_box \"ab\" (start 60 30) (end 64 33) (pts (xy 60 30) (xy 64 30) (xy 64 33) (xy 60 33)) {} (layer \"F.Cu\"))",
+                stroke(0.2)
+            ),
+            (59.9, 29.9, 64.1, 33.1),
+        ),
+        (
+            format!("(gr_text_box \"ab\" (start 60 30) (end 64 33) {} (layer \"F.Cu\"))", stroke(0.2)),
+            (59.9, 29.9, 64.1, 33.1),
+        ),
+    ];
+    for (item, expected) in cases {
+        let found = only_obstacle(&item);
+        assert!(close(found.bbox, expected), "{item}: {:?}", found.bbox);
+        assert_eq!(found.sides, Sides::TOP, "{item}");
+    }
+}
+
+#[test]
+fn an_arc_box_covers_the_bulge() {
+    // The circle about (40, 40) of radius 10; the arc runs from (50, 40) through
+    // (47.071, 32.929) to (30, 40), over the top, so it reaches y = 30, which none of its
+    // three points does.
+    let mid = 40.0 + 10.0 * std::f64::consts::FRAC_1_SQRT_2;
+    let arc = format!(
+        "(gr_arc (start 50 40) (mid {mid} {}) (end 30 40) (stroke (width 0.1) (type default)) (layer \"F.Cu\"))",
+        80.0 - mid
+    );
+    let found = only_obstacle(&arc);
+    assert!(found.bbox.1 <= 30.0 - 0.05 + 1e-9, "{:?}", found.bbox);
+    assert!(found.bbox.0 <= 30.0 - 0.05 + 1e-9 && found.bbox.2 >= 50.0 + 0.05 - 1e-9);
+    assert!(
+        close(found.bbox, (29.95, 29.95, 50.05, 50.05)),
+        "{:?}",
+        found.bbox
+    );
+    // Collinear points: the box of the points.
+    let straight = only_obstacle(
+        "(gr_arc (start 30 30) (mid 32 31) (end 34 32) (stroke (width 0.2) (type default)) (layer \"F.Cu\"))",
+    );
+    assert!(
+        close(straight.bbox, (29.9, 29.9, 34.1, 32.1)),
+        "{:?}",
+        straight.bbox
+    );
+}
+
+#[test]
+fn copper_items_take_the_sides_of_their_layers() {
+    let line = |layers: &str| format!("(gr_line (start 30 30) (end 34 30) {layers})");
+    // The tree alone, so that a line on `Edge.Cuts` does not open the outline.
+    let sides = |layers: &str| {
+        let tree = parse(&format!("(kicad_pcb {})", line(layers)));
+        copper_obstacles(&tree).first().map(|o| o.sides)
+    };
+    assert_eq!(sides("(layer \"F.Cu\")"), Some(Sides::TOP));
+    assert_eq!(sides("(layer \"B.Cu\")"), Some(Sides::BOTTOM));
+    assert_eq!(sides("(layer \"In1.Cu\")"), Some(Sides::BOTH));
+    assert_eq!(sides("(layers \"F.Cu\" \"B.Cu\")"), Some(Sides::BOTH));
+    assert_eq!(sides("(layers \"F&B.Cu\")"), Some(Sides::BOTH));
+    assert_eq!(sides("(layers \"*.Cu\")"), Some(Sides::BOTH));
+    assert_eq!(sides("(layers \"F.Cu\" \"F.Mask\")"), Some(Sides::TOP));
+    assert_eq!(sides("(layers \"B.Cu\" \"B.Mask\")"), Some(Sides::BOTTOM));
+    // Not copper: never an obstacle.
+    for layer in [
+        "F.SilkS",
+        "F.Fab",
+        "Edge.Cuts",
+        "F.Mask",
+        "F.CrtYd",
+        "User.1",
+    ] {
+        assert_eq!(sides(&format!("(layer \"{layer}\")")), None, "{layer}");
+    }
+    assert_eq!(sides("(layers \"F.Mask\" \"F.Paste\")"), None);
+}
+
+#[test]
+fn a_part_is_moved_off_copper_graphics_on_its_side() {
+    // A bar of F.Cu line 0.4 wide across (40, 40): y 39.8..40.2, x 36..44.
+    let bar =
+        "(gr_line (start 36 40) (end 44 40) (stroke (width 0.4) (type default)) (layer \"F.Cu\"))";
+    let model = copper_model(bar);
+    let moved = legalized_r1(&model, (40.0, 40.0));
+    assert_ne!(moved, (40.0, 40.0));
+    assert!(gap_to(&model, moved, model.copper[0].bbox) >= MOVED_CLEARANCE_MM);
+    // The same bar on the back does not touch a top part.
+    let back = bar.replace("F.Cu", "B.Cu");
+    assert_eq!(
+        legalized_r1(&copper_model(&back), (40.0, 40.0)),
+        (40.0, 40.0)
+    );
+}
+
+fn keepout(layers: &str, forbids: &str) -> String {
+    // `forbids` names the one kind the rule area keeps out; the others are allowed.
+    let rule = |kind: &str| {
+        format!(
+            "({kind} {})",
+            if kind == forbids {
+                "not_allowed"
+            } else {
+                "allowed"
+            }
+        )
+    };
+    format!(
+        "(zone (net 0) (net_name \"\") {layers} (name \"ra\") (hatch edge 0.5) \
+         (keepout {} {} {} {} {}) (fill (thermal_gap 0.5) (thermal_bridge_width 0.5)) \
+         (polygon (pts (xy 35 35) (xy 45 35) (xy 45 45) (xy 35 45))))",
+        rule("tracks"),
+        rule("vias"),
+        rule("pads"),
+        rule("copperpour"),
+        rule("footprints")
+    )
+}
+
+#[test]
+fn a_rule_area_that_keeps_parts_out_blocks_a_moved_part() {
+    for kind in ["footprints", "pads"] {
+        let model = copper_model(&keepout("(layers \"F.Cu\")", kind));
+        assert_eq!(model.copper.len(), 1, "{kind}");
+        assert!(close(model.copper[0].bbox, (35.0, 35.0, 45.0, 45.0)));
+        assert_eq!(model.copper[0].sides, Sides::TOP);
+        let moved = legalized_r1(&model, (40.0, 40.0));
+        // The edge is 5 mm above the centre; R1's box is 0.5 mm half high, so the first
+        // cell above that clears it by 2 µm is 12 steps up (a cell at 34.5 would touch).
+        assert_eq!(moved, (40.0, 34.0), "{kind}");
+        // The same rule area on the back leaves a top part alone.
+        let back = copper_model(&keepout("(layers \"B.Cu\")", kind));
+        assert_eq!(legalized_r1(&back, (40.0, 40.0)), (40.0, 40.0), "{kind}");
+        // The legacy single layer.
+        let single = copper_model(&keepout("(layer \"F.Cu\")", kind));
+        assert_eq!(single.copper.len(), 1, "{kind}");
+    }
+    // A rule area on both layers blocks a part on either.
+    let both = copper_model(&keepout("(layers \"F&B.Cu\")", "footprints"));
+    assert_eq!(both.copper[0].sides, Sides::BOTH);
+}
+
+#[test]
+fn a_rule_area_that_keeps_out_only_tracks_vias_or_pours_is_no_obstacle() {
+    for kind in ["tracks", "vias", "copperpour"] {
+        let model = copper_model(&keepout("(layers \"F.Cu\")", kind));
+        assert!(model.copper.is_empty(), "{kind}");
+        assert_eq!(legalized_r1(&model, (40.0, 40.0)), (40.0, 40.0), "{kind}");
+    }
+    // A pour is no obstacle either: a zone without a keepout.
+    let pour = "(zone (net 1) (net_name \"N1\") (layers \"F.Cu\") (name \"\") (hatch edge 0.5) \
+                (fill yes) (polygon (pts (xy 35 35) (xy 45 35) (xy 45 45) (xy 35 45))))";
+    assert!(copper_model(pour).copper.is_empty());
+}
+
+#[test]
+fn a_rule_area_with_an_arc_is_boxed_by_the_arc_circle() {
+    // A square whose top edge bulges as an arc over a circle about (40, 40) of radius 10.
+    let mid = 40.0 + 10.0 * std::f64::consts::FRAC_1_SQRT_2;
+    let zone = format!(
+        "(zone (net 0) (net_name \"\") (layers \"F.Cu\") (name \"ra\") (hatch edge 0.5) \
+         (keepout (tracks allowed) (vias allowed) (pads allowed) (copperpour allowed) (footprints not_allowed)) \
+         (polygon (pts (xy 50 40) (arc (start 50 40) (mid {mid} {}) (end 30 40)) (xy 30 45) (xy 50 45))))",
+        80.0 - mid
+    );
+    let found = only_obstacle(&zone);
+    assert!(
+        close(found.bbox, (30.0, 30.0, 50.0, 50.0)),
+        "{:?}",
+        found.bbox
+    );
+}
+
+#[test]
+fn a_through_hole_part_occupies_both_sides_and_another_its_own() {
+    let parts = vec![
+        Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2"),
+        Fp::new("R2", 25.0, 30.0).two_pad("N1", "N2").back(),
+        Fp::new("R3", 30.0, 30.0).two_pad("N1", "N2"),
+        Fp::new("R4", 35.0, 30.0).two_pad("N1", "N2").back(),
+        Fp::new("R5", 40.0, 30.0).two_pad("N1", "N2"),
+    ];
+    let model = copper_model_of(parts, &["R3", "R4"], "");
+    let sides = |reference: &str| {
+        model.part_sides[model
+            .references
+            .binary_search(&reference.to_string())
+            .unwrap()]
+    };
+    assert_eq!(sides("R1"), Sides::TOP);
+    assert_eq!(sides("R2"), Sides::BOTTOM);
+    assert_eq!(sides("R3"), Sides::BOTH);
+    assert_eq!(sides("R4"), Sides::BOTH);
+    assert_eq!(sides("R5"), Sides::TOP);
+    // An unplated hole goes through the board as well.
+    let text = board(
+        Shape::Rect(10.0, 20.0, 70.0, 60.0),
+        &[Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2")],
+    );
+    let punched = text.replace(" smd rect", " np_thru_hole circle");
+    assert_eq!(model_of(&punched, &[]).part_sides[0], Sides::BOTH);
+}
+
+#[test]
+fn a_through_hole_part_and_a_bottom_part_that_overlap_are_not_both_legal() {
+    // B1 on the back at (40, 40), 2 x 1 mm. R1 on top over it is fine, as two SMD parts
+    // on opposite sides may overlap.
+    let back = || Fp::new("B1", 40.0, 40.0).two_pad("N3", "N4").back();
+    let smd = copper_model_of(
+        vec![back(), Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2")],
+        &[],
+        "",
+    );
+    assert_eq!(legalized_r1(&smd, (40.0, 40.0)), (40.0, 40.0));
+    // R1 through-hole is on the back too: it is moved.
+    let tht = copper_model_of(
+        vec![back(), Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2")],
+        &["R1"],
+        "",
+    );
+    let moved = legalized_r1(&tht, (40.0, 40.0));
+    assert_ne!(moved, (40.0, 40.0));
+    // A moved bottom part over a settled through-hole part is moved as well.
+    let settled = copper_model_of(
+        vec![
+            Fp::new("T1", 40.0, 40.0).two_pad("N3", "N4"),
+            Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2").back(),
+        ],
+        &["T1"],
+        "",
+    );
+    assert_ne!(legalized_r1(&settled, (40.0, 40.0)), (40.0, 40.0));
+    // And two parts on the same side overlapping are still moved.
+    let same = copper_model_of(
+        vec![
+            Fp::new("T1", 40.0, 40.0).two_pad("N3", "N4"),
+            Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2"),
+        ],
+        &[],
+        "",
+    );
+    assert_ne!(legalized_r1(&same, (40.0, 40.0)), (40.0, 40.0));
+}
+
+#[test]
+fn a_part_meets_copper_text_only_on_a_side_it_occupies() {
+    let top_text = |layer: &str| gr_text("ABCD", "40 40", layer, PLAIN);
+    // A top SMD part over B.Cu text: allowed.
+    let model = copper_model(&top_text("B.Cu"));
+    assert_eq!(legalized_r1(&model, (40.0, 40.0)), (40.0, 40.0));
+    // A through-hole part over B.Cu text: blocked, and over F.Cu text too.
+    for layer in ["B.Cu", "F.Cu", "In1.Cu"] {
+        let model = copper_model_of(
+            vec![Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2")],
+            &["R1"],
+            &top_text(layer),
+        );
+        assert_ne!(legalized_r1(&model, (40.0, 40.0)), (40.0, 40.0), "{layer}");
+    }
+    // A bottom part: blocked by B.Cu, not by F.Cu; an inner layer blocks both.
+    for (layer, blocked) in [("B.Cu", true), ("F.Cu", false), ("In1.Cu", true)] {
+        let model = copper_model_of(
+            vec![Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2").back()],
+            &[],
+            &top_text(layer),
+        );
+        let stays = legalized_r1(&model, (40.0, 40.0)) == (40.0, 40.0);
+        assert_eq!(stays, !blocked, "{layer}");
+    }
+    // A top part under an inner-layer text is blocked.
+    let inner = copper_model(&top_text("In2.Cu"));
+    assert_ne!(legalized_r1(&inner, (40.0, 40.0)), (40.0, 40.0));
+}
+
+#[test]
+fn an_unmoved_part_on_copper_text_stays_with_no_room_trouble() {
+    // R1 sits on the text in the input and does not move: legal as it is. R2 moves from
+    // somewhere else onto the same text, and is moved off it.
+    let parts = vec![
+        Fp::new("R1", 40.0, 40.0).two_pad("N1", "N2"),
+        Fp::new("R2", 20.0, 30.0).two_pad("N2", "N3"),
+    ];
+    let model = copper_model_of(parts, &[], &gr_text("ABCD", "40 40", "F.Cu", PLAIN));
+    let sizes = as_read_sizes(&model);
+    let read = as_read_centres(&model);
+    let mut centres = read.clone();
+    legalize(&model, &sizes, &mut centres).expect("an input as it is needs no room");
+    assert_eq!(centres, read);
+    // R2 dropped on the text and on R1 lands off both.
+    let mut centres = read.clone();
+    centres[1] = (40.0, 40.0);
+    legalize(&model, &sizes, &mut centres).expect("R2 finds a cell");
+    assert_eq!(centres[0], read[0], "R1 stays");
+    assert_ne!(centres[1], (40.0, 40.0));
+    assert!(gap_to_part(&model, &sizes, &centres) >= MOVED_CLEARANCE_MM - 1e-9);
+    assert!(gap_to_text(&model, &sizes, centres[1]) >= MOVED_CLEARANCE_MM - 1e-9);
+}
+
+/// The gap between R2's box and R1's, from `centres`.
+fn gap_to_part(_model: &BoardModel, sizes: &[(f64, f64)], centres: &[(f64, f64)]) -> f64 {
+    gap_between_parts(sizes, centres, 0, 1)
+}
+
+/// The gap between a part of the size of R2's and the first obstacle's box.
+fn gap_to_text(model: &BoardModel, sizes: &[(f64, f64)], at: (f64, f64)) -> f64 {
+    let bbox = model.copper[0].bbox;
+    let (w, h) = sizes[1];
+    let gap_x = (at.0 - (bbox.0 + bbox.2) / 2.0).abs() - (w + bbox.2 - bbox.0) / 2.0;
+    let gap_y = (at.1 - (bbox.1 + bbox.3) / 2.0).abs() - (h + bbox.3 - bbox.1) / 2.0;
+    gap_x.max(gap_y)
+}
+
+#[test]
+fn the_generator_version_is_five() {
+    // The obstacles and the part sides change what every recipe gives, so a record of
+    // version 4 is not reproducible.
+    assert_eq!(GENERATOR_VERSION, 5);
+}
