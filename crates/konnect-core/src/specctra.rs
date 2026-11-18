@@ -187,6 +187,11 @@ struct Manifest {
     schema_version: u32,
     board_path: String,
     source_sha256: String,
+    /// [`crate::board_identity::canonical_sha256`] of the exported board text: the
+    /// identity the route judge checks the saved board against, since KiCad's
+    /// in-memory text and its saved file never match byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_canonical_sha256: Option<String>,
     coordinate_unit: String,
     resolution: u32,
     supported_profile: SupportedProfile,
@@ -949,9 +954,11 @@ pub(crate) fn export_dsn_with_options(
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
+    let source_canonical_sha256 = crate::board_identity::canonical_sha256(board_source)?;
     let manifest = build_manifest(
         board_path,
         &source_sha256,
+        &source_canonical_sha256,
         &manifest_classes,
         &options,
         hole_keepout_growth_um,
@@ -3641,6 +3648,7 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
 fn build_manifest(
     board_path: &Path,
     source_sha256: &str,
+    source_canonical_sha256: &str,
     classes: &[ManifestClass],
     options: &ExportOptions,
     hole_keepout_growth_um: Option<i64>,
@@ -3739,6 +3747,7 @@ fn build_manifest(
         schema_version: 1,
         board_path: board_path.display().to_string(),
         source_sha256: source_sha256.to_string(),
+        source_canonical_sha256: Some(source_canonical_sha256.to_string()),
         coordinate_unit: "um".to_string(),
         resolution: DSN_RESOLUTION as u32,
         supported_profile: SupportedProfile {

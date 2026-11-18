@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the route judge accepts the saved form of a live board
+
+`export_specctra_dsn` writes one more manifest field, `source_canonical_sha256`:
+the exported board's identity as a tree, without the footprint library metadata
+that KiCad's in-memory text carries and its saved file omits. The best-of-N route
+judge accepts the saved board when its bytes match `source_sha256` (as before) or
+its tree matches `source_canonical_sha256`. Before this, every DSN exported from a
+live board was refused with "save the board in KiCad, then export the DSN again",
+which saving did not fix. Export the DSN again to get the new field; a manifest
+without it keeps the byte check. The SES importer accepts the field and still checks
+the live board against `source_sha256`.
+
 ## Unreleased: one entry skill, `kopper`
 
 A new bundled skill, `kopper` (`/kopper1:kopper` in Claude's `/` menu), loads the

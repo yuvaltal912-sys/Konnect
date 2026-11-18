@@ -1,3 +1,4 @@
+pub(crate) mod board_identity;
 pub mod config_resolution;
 pub(crate) mod custom_rules;
 pub mod design_hash;
