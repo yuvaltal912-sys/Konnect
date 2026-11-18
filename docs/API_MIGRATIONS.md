@@ -3,6 +3,15 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: one entry skill, `kopper`
+
+A new bundled skill, `kopper` (`/kopper1:kopper` in Claude's `/` menu), loads the
+`konnect` rules and then the workflow skills a task needs. It adds no rules of its
+own. Claude has no command that loads a whole plugin, as `@kopper1` does in Codex,
+so this is the one entry point there. It is not named `kopper1`: a skill named
+like the plugin would share the plugin folder's path, and removing its loose copy
+would remove the plugin.
+
 ## Unreleased: Claude's skills install as the plugin `kopper1`
 
 `konnect init` (Claude) writes the skills to `~/.claude/skills/kopper1/`
