@@ -91,7 +91,7 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 
 ## Next: what to pick
 
-**Now (2026-11-18).** No row is in progress. Row KP, the kopper1 plugin, merged as [#81](https://github.com/yuvaltal912-sys/Konnect/pull/81) (main `cdb00e7c`); see "Row KP". The next row waits for the owner's word. Before that (2026-11-17), Row JS, the judged route status, merged as [#79](https://github.com/yuvaltal912-sys/Konnect/pull/79) (main `edf31590`); see "Row JS". The next row waits for the owner's word.
+**Now (2026-11-18).** No row is in progress. Row KP, the kopper1 plugin, merged as [#81](https://github.com/yuvaltal912-sys/Konnect/pull/81) (main `cdb00e7c`); see "Row KP". The next row waits for the owner's word. Before that (2026-11-17), Row JS, the judged route status, merged as [#79](https://github.com/yuvaltal912-sys/Konnect/pull/79) (main `edf31590`); see "Row JS".
 
 **The 1 Kopper series** is done: Row K4 merged as [#77](https://github.com/yuvaltal912-sys/Konnect/pull/77) (main `25ea6fe1`). The fastroute source is backed up and the merged worktrees are removed (owner's yes, 2026-11-17).
 
