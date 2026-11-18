@@ -91,7 +91,7 @@ Pull `main` and run `cargo xtask kopper-install` again.
 | `~/.local/share/1-kopper.previous/` | the package before the last install |
 | `~/.local/share/1-kopper.rollback.json` | the original `konnect` entries (mode 0600) |
 | `$CODEX_HOME/config.toml.before-1-kopper` | Codex's config before the first switch |
-| `~/.claude/skills/kopper1/` | Claude's KiCad skills, as the plugin `kopper1` (`/kopper1:kicad-pcb` and the rest in the `/` menu) |
+| `~/.claude/skills/kopper1/` | Claude's KiCad skills, as the plugin `kopper1` (`/kopper1:kicad-pcb` and the rest in the `/` menu; `/kopper1:kopper` loads the ones a task needs) |
 | `~/.agents/plugins/kopper1/` | Codex's KiCad skills, when Codex has the plugin `kopper1` (else loose in `~/.agents/skills/`) |
 
 ## What it never touches

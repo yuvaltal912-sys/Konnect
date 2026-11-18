@@ -1735,6 +1735,64 @@ mod tests {
         }
     }
 
+    /// The `kopper` entry skill loads the others by name, so it must name every
+    /// other bundled skill, and only bundled ones: a skill added without a row
+    /// there would never be loaded through it.
+    #[test]
+    fn the_kopper_skill_names_every_other_skill() {
+        let entry = SKILLS
+            .iter()
+            .find(|skill| skill.name == "kopper")
+            .expect("the kopper entry skill is bundled");
+        // The skill each table row loads: the backticked name in its last cell.
+        let rows: Vec<&str> = entry
+            .content
+            .lines()
+            .filter_map(|line| line.strip_suffix("` |"))
+            .filter_map(|line| line.rsplit_once("| `").map(|(_, name)| name))
+            .collect();
+        assert!(
+            entry.content.contains("**Load `konnect` first, always.**"),
+            "the kopper skill does not load the operating rules first"
+        );
+        for skill in SKILLS
+            .iter()
+            .filter(|skill| !matches!(skill.name, "kopper" | "konnect"))
+        {
+            assert!(
+                rows.contains(&skill.name),
+                "no row of the kopper skill loads `{}`",
+                skill.name
+            );
+        }
+        let names: Vec<&str> = SKILLS.iter().map(|skill| skill.name).collect();
+        for named in entry
+            .content
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| word.starts_with("kicad-"))
+        {
+            assert!(
+                names.contains(&named),
+                "the kopper skill names `{named}`, which is not bundled"
+            );
+        }
+    }
+
+    /// A skill named like the plugin would share its loose path,
+    /// `~/.claude/skills/kopper1`, with the plugin folder itself, so removing the
+    /// loose copy would remove the plugin and everything the owner put in it.
+    #[test]
+    fn no_skill_is_named_like_the_plugin() {
+        for skill in SKILLS {
+            assert_ne!(
+                skill.name, CLAUDE_PLUGIN,
+                "a skill is named like the plugin"
+            );
+        }
+    }
+
     #[test]
     fn client_argument_defaults_to_claude() {
         assert_eq!(client_from_args(&[]).unwrap(), InstallClient::Claude);
@@ -2265,10 +2323,10 @@ mod tests {
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
 
         let claude = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
-        // The kopper1 plugin manifest, 7 SKILL.md + 10 reference files + 2 agents,
+        // The kopper1 plugin manifest, 8 SKILL.md + 10 reference files + 2 agents,
         // and 4 hooks: the counts `konnect init` reports, restated rather than read
         // from the manifest.
-        assert_eq!(claude.files.len(), 20);
+        assert_eq!(claude.files.len(), 21);
         assert_eq!(claude.hooks.len(), 4);
         for file in &claude.files {
             assert_eq!(file.status, ItemStatus::Current, "{}", file.name);
@@ -2674,7 +2732,7 @@ mod tests {
         .unwrap();
         let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
         assert!(codex.hooks.is_empty());
-        assert_eq!(codex.files.len(), 17);
+        assert_eq!(codex.files.len(), 18);
         assert_eq!(file_status(&codex, "kicad-library/SKILL.md"), "missing");
         let notice = codex.notice().unwrap();
         assert!(notice.starts_with("Konnect Codex guidance"), "{notice}");

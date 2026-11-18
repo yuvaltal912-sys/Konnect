@@ -41,6 +41,11 @@ pub const SKILLS: &[SkillManifest] = &[
         )],
     },
     SkillManifest {
+        name: "kopper",
+        content: include_str!("../assets/skills/kopper/SKILL.md"),
+        references: &[],
+    },
+    SkillManifest {
         name: "kicad-schematic",
         content: include_str!("../assets/skills/kicad-schematic/SKILL.md"),
         references: &[
