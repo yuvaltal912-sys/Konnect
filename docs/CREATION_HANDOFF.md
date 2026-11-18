@@ -294,7 +294,8 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 - It removes the loose `~/.claude/skills/<name>` copies of Konnect's names, a link as a link. Any other skill stays.
 - `init --uninstall` removes the plugin's manifest and skills, and the folder only when empty.
 - `status` and the server's guidance check cover the manifest.
-- Codex keeps loose skills in `~/.agents/skills`.
+- Codex: when the owner's Codex plugin `kopper1` exists (`~/.agents/plugins/kopper1/plugin.json`; Codex registers and enables it), the skills go into it and into its installed copies under `~/.codex/plugins/cache/<marketplace>/kopper1/<version>/`, and loose copies in `~/.agents/skills` are removed. Its manifests are never touched. Without it, Codex stays loose.
+- On install, the loose copies are removed before the plugin is written; uninstall removes only the `plugin.json` Konnect wrote, then empty folders.
 - Every bundled skill's `description` is one quoted line.
 
 ## Row JS, the judged route status

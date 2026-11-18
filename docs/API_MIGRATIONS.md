@@ -10,7 +10,10 @@ removals, default changes and the supported replacement workflow.
 `~/.claude/skills/<name>/`, and removes the loose copies of Konnect's skill names
 that an earlier install left. In Claude's `/` menu they read `kopper1:<name>`.
 `init --uninstall` removes the plugin's manifest and skills; a file the owner put
-in the plugin folder stays. Codex is unchanged (`~/.agents/skills/<name>/`). Every
+in the plugin folder stays. Codex: when the owner's Codex plugin `kopper1` exists
+(`~/.agents/plugins/kopper1/plugin.json`), the skills go into it and into its
+installed copies under `~/.codex/plugins/cache/`, and loose copies in
+`~/.agents/skills` are removed; otherwise Codex is unchanged. Every
 bundled skill's `description` is now one quoted line.
 
 ## Unreleased: best-of-N routing with fastroute is the default
