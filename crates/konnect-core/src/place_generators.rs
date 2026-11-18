@@ -3,10 +3,6 @@
 //! thread, in any order, in any run of the same build. Randomness is
 //! `route_search::SplitMix64`, seeded by the recipe alone.
 
-// Nothing consumes this module until `place_search` lands (the next stage); the allowance
-// goes with that change.
-#![allow(dead_code)]
-
 use crate::place_held::{HeldSet, Intent};
 use crate::route_search::SplitMix64;
 use crate::tools::placement::force_core::{
@@ -264,6 +260,8 @@ pub(crate) enum GenerateFailure {
     /// The recipe does not fit the model: a parameter out of range, say.
     Invalid(String),
     /// The generator panicked; its message. Set by the pool, never by a generator.
+    // Set by the search's pool, which no product code runs (see `place_search`).
+    #[allow(dead_code)]
     Panicked(String),
 }
 
@@ -301,6 +299,8 @@ fn turn_vector((x, y): (f64, f64), quarter_turns: i32) -> (f64, f64) {
 /// A courtyard bbox turned by `quarter_turns` x 90° about `anchor`, in KiCad's
 /// Y-down, counter-clockwise-on-screen sense (`konnect_sexp::geometry`'s). Exact for a
 /// bbox the scan made at a cardinal angle; a superset otherwise, as the scan's own is.
+// Used only by tests.
+#[allow(dead_code)]
 pub(crate) fn turned_bbox(bbox: Rect, anchor: (f64, f64), quarter_turns: i32) -> Rect {
     let (x0, y0, x1, y1) = bbox;
     let mut hull: Option<Rect> = None;
@@ -995,6 +995,8 @@ impl Matrix {
     /// iterations);
     /// S seeds 1..=32 x {raw, polished with rail weight 0.5}; P seeds 1..=64 x
     /// {4 edits within 2 mm, 12 edits within 5 mm}, swaps and turns on. 288 recipes.
+    // Used only by the bench (an ignored test): no product code calls the search.
+    #[allow(dead_code)]
     pub(crate) fn bench() -> Self {
         let force = |rail_weight: f64| ForceParams {
             rail_weight,

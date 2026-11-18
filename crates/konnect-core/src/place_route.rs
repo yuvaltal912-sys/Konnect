@@ -3,10 +3,6 @@
 //! Nothing here writes outside the folder it is given, and nothing talks to a running
 //! KiCad.
 
-// Nothing consumes this module until `place_search` lands (the next stage); the allowance
-// goes with that change.
-#![allow(dead_code)]
-
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::place_judge::RouteResult;
 use crate::route_judge::{Gates, Measures};
@@ -48,6 +44,8 @@ pub(crate) struct RouteInputs {
 /// `GetEffectiveNetClass`; the bench's `xtask/placement-bench/net_rules.py` does too).
 /// Refuses a net with a pad on `board_text` that has no entry. The refusal's text
 /// names the first few nets: it is an error for the bench's log, not a document.
+// Used only by the bench (an ignored test): no product code calls the search.
+#[allow(dead_code)]
 pub(crate) fn rules_from_json(
     text: &str,
     board_text: &str,
@@ -91,6 +89,8 @@ fn project_clearance_um(board: &Path, key: &str) -> Option<i64> {
 /// The options `export_specctra_dsn` builds for `board` with its defaults: pours
 /// `fixed`, `min_copper_edge_clearance` and `min_hole_clearance` from the
 /// `.kicad_pro` beside it, widths from intent on, duplicate references refused.
+// Used only by the bench (an ignored test): no product code calls the search.
+#[allow(dead_code)]
 pub(crate) fn export_options(board: &Path) -> ExportOptions {
     ExportOptions {
         // The handler's `PourPolicy::from_argument(None)`.
@@ -158,6 +158,8 @@ fn block_head(block: &str) -> &str {
 /// The input board with every top-level `(segment …)`, `(arc …)` and `(via …)` and
 /// every teardrop zone removed, each with the whitespace before it; every other byte
 /// kept. Quote-aware block scanning. Errs on text that does not parse as a board.
+// Used only by the bench (an ignored test): no product code calls the search.
+#[allow(dead_code)]
 pub(crate) fn strip_routing(text: &str) -> anyhow::Result<String> {
     let tree = konnect_sexp::parse_sexp(text).context("the board text does not parse")?;
     anyhow::ensure!(
@@ -427,6 +429,8 @@ pub(crate) async fn unrouted_check(
 ///
 /// The router is `ToolRouter::new()`: the judge resolves its tools in the static
 /// registry (`route_judge`'s `find_tool`), so no toolset has to be loaded.
+// Used only by the bench (an ignored test): no product code calls the search.
+#[allow(dead_code)]
 pub(crate) fn isolated_context(folder: &Path, kicad_cli: &str) -> anyhow::Result<Arc<ToolContext>> {
     anyhow::ensure!(
         folder.is_absolute(),

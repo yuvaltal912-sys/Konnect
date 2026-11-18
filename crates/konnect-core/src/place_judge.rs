@@ -1,10 +1,6 @@
 //! One judge for every candidate, references included: the placement's own checks,
 //! then what the product's best-of-N routing call makes of it, then one rank key.
 
-// Nothing consumes this module until `place_search` lands (the next stage); the allowance
-// goes with that change.
-#![allow(dead_code)]
-
 use crate::place_held::{DecouplingPair, HeldSet};
 use crate::route_judge::{rank_measures, Gates, Measures};
 use konnect_sexp::board::PcbConnectivityIndex;
@@ -272,6 +268,8 @@ pub(crate) enum RouteResult {
     /// erred).
     Failed { stage: &'static str, reason: String },
     /// Not routed: `screened_out`, `time_limit` or `stopped`.
+    // Never made by the search: a candidate not routed is a record outcome, not a result.
+    #[allow(dead_code)]
     NotRouted { why: &'static str },
 }
 

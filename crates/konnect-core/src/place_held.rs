@@ -4,10 +4,6 @@
 //! editor: the text is the evidence, and what it cannot prove is refused, as the
 //! `kicad-pcb` skill's bounded placement loop reports `BLOCKED` instead of guessing.
 
-// Nothing consumes this module until `place_search` lands (the next stage); the allowance
-// goes with that change.
-#![allow(dead_code)]
-
 use konnect_sexp::board::{
     footprint_courtyards, footprints, FootprintCourtyard, PcbConnectivityIndex, Side,
 };
@@ -571,6 +567,8 @@ pub(crate) fn same_board(a: &SexpNode, b: &SexpNode) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GroupSource {
+    // Named by a caller; the search passes no caller groups.
+    #[allow(dead_code)]
     Caller,
     /// A KiCad `(group …)` on the board that holds footprints.
     KicadGroup,
