@@ -614,6 +614,24 @@ fn routing_order_never_selects_a_candidate_that_has_no_screen() {
 }
 
 #[test]
+fn screen_ties_go_to_the_lower_id() {
+    // Six candidates of one family with the same key: the best two are the two lowest ids.
+    let records: Vec<Record> = (0..6)
+        .rev()
+        .map(|k| {
+            rec(
+                20 + k,
+                generated_origin(Family::Force, k as u64),
+                "generated",
+                Some(key_with_crossings(1)),
+            )
+        })
+        .collect();
+    let order = routing_order(&records, 2, 0, 1);
+    assert_eq!(order, vec![20, 21]);
+}
+
+#[test]
 fn the_draw_is_fixed_and_never_draws_a_p1_failure() {
     let mut records = selection_records();
     let first = routing_order(&records, 3, 1, 7);

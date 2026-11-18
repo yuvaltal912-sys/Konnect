@@ -1,7 +1,7 @@
 # Placement bench: folder layout and preparation
 
 The bench (`place_bench` in `crates/konnect-core/src/place_bench_tests.rs`, a later stage)
-runs the best-of-N placement search on copies of boards. Design:
+runs the best-of-N placement search on copies of boards (an ignored test). Design:
 `docs/PLACEMENT_SEARCH_DESIGN.md`. Nothing here touches an original board, a live KiCad or
 the installed Konnect. Documents get counts only: the bench folder is git-ignored.
 
@@ -40,3 +40,46 @@ hold the lane locks (native, then instr) while a board runs.
    says, saved as `ai/board.kicad_pcb`.
 
 The original boards are private: no net, part or board name goes into a document.
+
+## Running the bench
+
+`bench.json` sits in the bench folder (`target/creation-research/placement-search/bench/`):
+
+```json
+{ "boards": [
+  { "name": "B4", "folder": "B4" },
+  { "name": "smoke", "folder": "smoke", "board": "pic.kicad_pcb",
+    "time_limit_minutes": 20, "effort": "fast" }
+] }
+```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `name` | the board's bench name; titles its table, must be unique | required |
+| `folder` | its folder below the bench folder (a plain relative path) | required |
+| `board` | the board file in `<folder>/input/` | the only `.kicad_pcb` there |
+| `time_limit_minutes` | the whole board's limit, generation included | 100 |
+| `effort` | `fast`, `m`, `h` or `xh` | `m` |
+
+Per board the folder holds `input/`, `rules.json`, `held.json` (a JSON array of the
+references to hold besides the rules: `["J1", "H3"]`) and optionally `ai/board.kicad_pcb`.
+A folder that already holds a `search.json` or `candidates/` is refused: move them away
+first.
+
+```text
+KONNECT_PLACE_BENCH=<bench folder> KONNECT_FASTROUTE=<candidate fastroute> \
+KICAD_CONFIG_HOME=<bench folder>/scratch/kicad-config \
+KONNECT_STATE_DIR=<bench folder>/scratch/state \
+cargo test -p konnect-core --release place_bench -- --ignored --nocapture
+```
+
+Before anything runs the bench refuses: an unset or relative `KONNECT_PLACE_BENCH`;
+`KICAD_CONFIG_HOME` or `KONNECT_STATE_DIR` unset, at or around KiCad's or Konnect's real
+folder, or not below the bench folder or the system temp folder; a `KONNECT_FASTROUTE`
+that is not an executable file; an input or AI board that resolves (links followed)
+outside the bench folder; no kicad-cli (`KONNECT_KICAD_CLI`, else the usual search). It
+writes `candidates/`, `search.json`, `table.md` and an empty `isolation/` below each
+board's folder, and prints one line per board.
+
+The bench does not take the lane locks (native, then instr): the driver that starts it
+holds them for each board's run.
