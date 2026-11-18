@@ -14,17 +14,18 @@ use konnect_ipc::types::IpcFootprintPlacement;
 use konnect_sexp::board::{
     footprint_courtyards, footprints, FootprintCourtyard, PcbConnectivityIndex, Side,
 };
+use konnect_sexp::geometry::arc_bbox;
 use konnect_sexp::layers::is_copper_name;
 use konnect_sexp::outline::{Outline, OutlineStatus};
 use konnect_sexp::parser::SexpNode;
-use konnect_sexp::planar::{bbox_of, circumcircle, dist};
+use konnect_sexp::planar::{bbox_of, dist};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 5;
+pub(crate) const GENERATOR_VERSION: u32 = 6;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -370,23 +371,43 @@ fn xy_of(item: &SexpNode, tag: &str) -> Option<(f64, f64)> {
     xy(item.find(tag)?)
 }
 
-/// Every `(xy …)` of the `(pts …)` of `node` (a polygon or a curve); `None` when one is
-/// unreadable.
-fn pts_of(node: &SexpNode) -> Option<Vec<(f64, f64)>> {
-    node.find("pts")?
-        .find_all("xy")
-        .into_iter()
-        .map(xy)
-        .collect()
+/// The exact box of a three-point arc, bulge included (`konnect_sexp::geometry::arc_bbox`,
+/// which falls back to the box of the three points when they are collinear); `None` when a
+/// coordinate is not finite.
+fn arc_box(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> Option<Rect> {
+    let (x0, y0, x1, y1) = arc_bbox(start, mid, end);
+    [x0, y0, x1, y1]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some((x0, y0, x1, y1))
 }
 
-/// The box of the circle through a three-point arc: it covers the bulge at any sweep. Three
-/// collinear points give the box of the points.
-fn arc_box(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> Option<Rect> {
-    match circumcircle(start, mid, end) {
-        Some(((cx, cy), r)) => Some((cx - r, cy - r, cx + r, cy + r)),
-        None => bbox_of(&[start, mid, end]),
+/// The points that bound a `(pts …)` path: each `(xy …)`, and each `(arc (start …) (mid …)
+/// (end …))` by the two corners of its exact box. `None` when an element is unreadable
+/// or of another kind.
+fn path_points(pts: &SexpNode) -> Option<Vec<(f64, f64)>> {
+    let mut points = Vec::new();
+    for item in pts.children()?.iter().skip(1) {
+        match item.head()? {
+            "xy" => points.push(xy(item)?),
+            "arc" => {
+                let (x0, y0, x1, y1) = arc_box(
+                    xy_of(item, "start")?,
+                    xy_of(item, "mid")?,
+                    xy_of(item, "end")?,
+                )?;
+                points.extend([(x0, y0), (x1, y1)]);
+            }
+            _ => return None,
+        }
     }
+    Some(points)
+}
+
+/// The bounding points of the `(pts …)` of `node` (a polygon or a curve); `None` when one
+/// is unreadable.
+fn pts_of(node: &SexpNode) -> Option<Vec<(f64, f64)>> {
+    path_points(node.find("pts")?)
 }
 
 fn grow((x0, y0, x1, y1): Rect, by: f64) -> Rect {
@@ -437,6 +458,9 @@ const TEXT_WIDTH_PER_CHAR: f64 = 1.3;
 /// including the thickness, so 1.7 plus the thickness again is a ceiling.
 const TEXT_HEIGHT_PER_LINE: f64 = 1.7;
 
+/// The size of a text that gives none readable, mm: KiCad's default text size.
+const DEFAULT_TEXT_SIZE_MM: f64 = 1.524;
+
 /// The pen width of a text that gives none, mm.
 const DEFAULT_TEXT_THICKNESS_MM: f64 = 0.15;
 
@@ -448,19 +472,14 @@ const DEFAULT_TEXT_THICKNESS_MM: f64 = 0.15;
 /// way the text is mirrored. Turned by `at`'s angle about the anchor: exact for a
 /// cardinal angle, the axis-aligned hull otherwise.
 fn text_box(item: &SexpNode) -> Option<Rect> {
-    let cached: Vec<(f64, f64)> = item
-        .find("render_cache")
-        .map(|cache| {
-            cache
-                .find_all("polygon")
-                .into_iter()
-                .filter_map(pts_of)
-                .flatten()
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(bbox) = bbox_of(&cached) {
-        return Some(bbox);
+    // The cache gives the box only when every one of its polygons is readable: a partial
+    // box would be a subset, so any unreadable polygon sends the whole text to the estimate.
+    if let Some(cache) = item.find("render_cache") {
+        let polygons: Option<Vec<Vec<(f64, f64)>>> =
+            cache.find_all("polygon").into_iter().map(pts_of).collect();
+        if let Some(bbox) = polygons.and_then(|all| bbox_of(&all.concat())) {
+            return Some(bbox);
+        }
     }
 
     let text = item.get(1)?.as_str()?;
@@ -475,7 +494,9 @@ fn text_box(item: &SexpNode) -> Option<Rect> {
     let (size_x, size_y) = font
         .and_then(|f| f.find("size"))
         .and_then(xy)
-        .map_or((1.0, 1.0), |(w, h)| (w.abs(), h.abs()));
+        .map_or((DEFAULT_TEXT_SIZE_MM, DEFAULT_TEXT_SIZE_MM), |(w, h)| {
+            (w.abs(), h.abs())
+        });
     let thickness = font
         .and_then(|f| f.find_f64("thickness"))
         .filter(|t| t.is_finite() && *t > 0.0)
@@ -496,6 +517,13 @@ fn text_box(item: &SexpNode) -> Option<Rect> {
         }
     }
 
+    // `(line_spacing s)` stretches the pitch of the lines; a value below 1 is not trusted.
+    let spacing = [font, effects, Some(item)]
+        .into_iter()
+        .flatten()
+        .find_map(|node| node.find_f64("line_spacing"))
+        .filter(|s| s.is_finite())
+        .map_or(1.0, |s| s.max(1.0));
     let lines = text.split('\n').count() as f64;
     let longest = text
         .split('\n')
@@ -503,7 +531,7 @@ fn text_box(item: &SexpNode) -> Option<Rect> {
         .max()
         .unwrap_or(0) as f64;
     let width = longest * size_x * TEXT_WIDTH_PER_CHAR + thickness;
-    let height = lines * size_y * TEXT_HEIGHT_PER_LINE + thickness;
+    let height = lines * size_y * TEXT_HEIGHT_PER_LINE * spacing + thickness;
     let half_w = if anchored_x { width } else { width / 2.0 };
     let half_h = if anchored_y { height } else { height / 2.0 };
 
@@ -521,12 +549,28 @@ fn text_box(item: &SexpNode) -> Option<Rect> {
             half_w * sin.abs() + half_h * cos.abs(),
         )
     };
-    Some((x - half_w, y - half_h, x + half_w, y + half_h))
+    // Knockout text is copper around the glyphs, inside a margin KiCad sets to at most
+    // max(thickness / 2, size_y / 9); the box grows by max(thickness, size_y / 4).
+    let knockout = item
+        .find("layer")
+        .and_then(SexpNode::children)
+        .is_some_and(|words| words.iter().any(|w| w.as_str() == Some("knockout")));
+    let margin = if knockout {
+        thickness.max(size_y / 4.0)
+    } else {
+        0.0
+    };
+    Some((
+        x - half_w - margin,
+        y - half_h - margin,
+        x + half_w + margin,
+        y + half_h + margin,
+    ))
 }
 
 /// The box of a rule area that keeps footprints or pads out (`(footprints not_allowed)`
 /// or `(pads not_allowed)` in its `keepout`): its polygon's box, a three-point arc by its
-/// circle. A keepout that forbids only tracks, vias or pours is no obstacle to a part.
+/// exact extent. A keepout that forbids only tracks, vias or pours is no obstacle to a part.
 fn keepout_box(zone: &SexpNode) -> Option<Rect> {
     let keepout = zone.find("keepout")?;
     let forbids = |what: &str| keepout.find_str(what) == Some("not_allowed");
@@ -535,20 +579,7 @@ fn keepout_box(zone: &SexpNode) -> Option<Rect> {
     }
     let mut corners: Vec<(f64, f64)> = Vec::new();
     for polygon in zone.find_all("polygon") {
-        for item in polygon.find("pts")?.children()?.iter().skip(1) {
-            match item.head()? {
-                "xy" => corners.push(xy(item)?),
-                "arc" => {
-                    let (x0, y0, x1, y1) = arc_box(
-                        xy_of(item, "start")?,
-                        xy_of(item, "mid")?,
-                        xy_of(item, "end")?,
-                    )?;
-                    corners.extend([(x0, y0), (x1, y1)]);
-                }
-                _ => return None,
-            }
-        }
+        corners.extend(pts_of(polygon)?);
     }
     bbox_of(&corners)
 }
