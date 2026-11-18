@@ -14,6 +14,7 @@ pub mod observability;
 pub mod outcome;
 pub(crate) mod place_generators;
 pub(crate) mod place_held;
+pub(crate) mod place_judge;
 pub(crate) mod route_judge;
 pub(crate) mod route_search;
 pub mod router;
