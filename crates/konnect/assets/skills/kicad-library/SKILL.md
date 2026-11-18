@@ -1,10 +1,6 @@
 ---
 name: kicad-library
-description: |
-  Library management workflow for KiCAD — creating symbols, footprints, and managing libraries
-  via MCP tools. Triggers on: "create a symbol", "make a footprint", "custom component",
-  "register library", "find a part", "pin numbering", "new symbol", "new footprint",
-  "add to library", "library path", "pad layout".
+description: "Library management workflow for KiCAD — creating symbols, footprints, and managing libraries via MCP tools. Triggers on: \"create a symbol\", \"make a footprint\", \"custom component\", \"register library\", \"find a part\", \"pin numbering\", \"new symbol\", \"new footprint\", \"add to library\", \"library path\", \"pad layout\"."
 argument-hint: "[component or library task]"
 ---
 

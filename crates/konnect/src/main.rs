@@ -302,8 +302,8 @@ fn simulation_served(args: &[String]) -> Result<bool> {
 fn print_help_for(subcommand: Option<&str>) {
     let clients = || {
         println!("\nCLIENTS:");
-        println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
-        println!("  codex                    Skills under ~/.agents/skills");
+        println!("  claude (default)         Skills (as the plugin kopper1), agents, and hooks under ~/.claude");
+        println!("  codex                    Skills under ~/.agents/skills, or in the Codex plugin kopper1");
     };
     match subcommand {
         Some("init") => {
@@ -363,8 +363,10 @@ fn print_help() {
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");
     println!("\nCLIENTS:");
-    println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
-    println!("  codex                    Skills under ~/.agents/skills");
+    println!("  claude (default)         Skills (as the plugin kopper1), agents, and hooks under ~/.claude");
+    println!(
+        "  codex                    Skills under ~/.agents/skills, or in the Codex plugin kopper1"
+    );
 }
 
 #[cfg(test)]

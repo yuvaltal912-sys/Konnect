@@ -4,8 +4,9 @@
 //! Claude-specific agents and hooks remain scoped to Claude's directories.
 //! Hook skills are also patched into `~/.claude/settings.json`.
 
-/// A skill to install to `~/.claude/skills/<name>/SKILL.md`.
-/// Optional reference files go into `~/.claude/skills/<name>/references/`.
+/// A skill to install to `<skills>/<name>/SKILL.md`, with optional reference files in
+/// `<skills>/<name>/references/`. For Claude `<skills>` is the `kopper1` plugin's
+/// `~/.claude/skills/kopper1/skills`; for Codex it is `~/.agents/skills`.
 pub struct SkillManifest {
     pub name: &'static str,
     pub content: &'static str,

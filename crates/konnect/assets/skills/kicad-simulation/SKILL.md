@@ -1,14 +1,6 @@
 ---
 name: kicad-simulation
-description: |
-  SPICE simulation workflow for KiCAD schematics via MCP tools. Triggers on: "simulate", "SPICE",
-  "ngspice", "operating point", "bias point", "what voltage is on this net", "does this circuit work",
-  "check the DC levels", "run a simulation", "transient", "inrush", "load step", "droop", "overshoot",
-  "settling time", "rise time", "soft start", "short circuit", "fuse", "eFuse", "current limit",
-  "undervoltage lockout", "UVLO", "reverse polarity", "reversed battery", "protection",
-  "AC analysis", "frequency response", "bode", "bandwidth", "phase margin", "gain margin",
-  "stability", "loop gain", "DC sweep", "transfer curve", "sweep", "plot", "graph", "waveform",
-  "show me the curve".
+description: "SPICE simulation workflow for KiCAD schematics via MCP tools. Triggers on: \"simulate\", \"SPICE\", \"ngspice\", \"operating point\", \"bias point\", \"what voltage is on this net\", \"does this circuit work\", \"check the DC levels\", \"run a simulation\", \"transient\", \"inrush\", \"load step\", \"droop\", \"overshoot\", \"settling time\", \"rise time\", \"soft start\", \"short circuit\", \"fuse\", \"eFuse\", \"current limit\", \"undervoltage lockout\", \"UVLO\", \"reverse polarity\", \"reversed battery\", \"protection\", \"AC analysis\", \"frequency response\", \"bode\", \"bandwidth\", \"phase margin\", \"gain margin\", \"stability\", \"loop gain\", \"DC sweep\", \"transfer curve\", \"sweep\", \"plot\", \"graph\", \"waveform\", \"show me the curve\"."
 argument-hint: "[circuit or question]"
 ---
 

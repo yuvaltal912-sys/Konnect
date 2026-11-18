@@ -245,6 +245,18 @@ pub fn run_double_click_install(simulation: bool) -> Result<()> {
     Ok(())
 }
 
+/// The plugin Claude's skills are installed as: `~/.claude/skills/kopper1/`, with
+/// `.claude-plugin/plugin.json` and `skills/<name>/`.
+const CLAUDE_PLUGIN: &str = "kopper1";
+
+/// The plugin's manifest. Its version is this build's, so `status` sees a manifest
+/// an older build wrote as changed.
+const CLAUDE_PLUGIN_MANIFEST: &str = concat!(
+    "{\n  \"name\": \"kopper1\",\n  \"version\": \"",
+    env!("CARGO_PKG_VERSION"),
+    "\",\n  \"description\": \"1 Kopper: the KiCad skills of Konnect (creation tools + fastroute best-of-N routing, no simulation). Installed by konnect init; a re-install overwrites it.\",\n  \"skills\": [\"./skills\"]\n}\n"
+);
+
 #[derive(Debug)]
 struct InstallPaths {
     home: PathBuf,
@@ -273,11 +285,113 @@ impl InstallPaths {
         self.home.join(".konnect")
     }
 
+    /// The folder that holds one sub-folder per skill. For Claude it is the
+    /// `skills/` folder of the [`CLAUDE_PLUGIN`] plugin, so the skills load (and
+    /// show in `/`) as one plugin. For Codex it is the `skills/` folder of the
+    /// owner's Codex plugin of the same name when there is one, else the loose
+    /// `~/.agents/skills`.
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
+        match client {
+            InstallClient::Claude => self.claude_plugin_dir().join("skills"),
+            InstallClient::Codex if self.codex_has_plugin() => {
+                self.codex_plugin_dir().join("skills")
+            }
+            InstallClient::Codex => self.loose_skills_dir(InstallClient::Codex),
+        }
+    }
+
+    /// Where each skill sat loose: Claude's own skills folder (where Claude also
+    /// finds the plugin as `kopper1@skills-dir`), and Codex's `~/.agents/skills`.
+    fn loose_skills_dir(&self, client: InstallClient) -> PathBuf {
         match client {
             InstallClient::Claude => self.home.join(".claude").join("skills"),
             InstallClient::Codex => self.home.join(".agents").join("skills"),
         }
+    }
+
+    fn claude_loose_skills_dir(&self) -> PathBuf {
+        self.loose_skills_dir(InstallClient::Claude)
+    }
+
+    /// Whether the skills go into a plugin rather than loose.
+    fn uses_plugin(&self, client: InstallClient) -> bool {
+        client == InstallClient::Claude || self.codex_has_plugin()
+    }
+
+    /// The owner's Codex plugin `kopper1`, as Codex's personal marketplace holds it
+    /// (`~/.agents/plugins/kopper1/plugin.json`). Konnect never creates it: Codex
+    /// registers and enables a plugin itself.
+    fn codex_plugin_dir(&self) -> PathBuf {
+        self.home
+            .join(".agents")
+            .join("plugins")
+            .join(CLAUDE_PLUGIN)
+    }
+
+    /// The owner's Codex plugin is used only when its manifest is there and Codex
+    /// has it enabled (`[plugins."kopper1@<marketplace>"] enabled = true` in
+    /// `~/.codex/config.toml`): a plugin Codex does not load must not take the
+    /// skills away from their loose place.
+    fn codex_has_plugin(&self) -> bool {
+        self.codex_plugin_dir().join("plugin.json").is_file()
+            && !self.codex_plugin_marketplaces().is_empty()
+    }
+
+    /// The marketplaces whose `kopper1` Codex has enabled.
+    fn codex_plugin_marketplaces(&self) -> Vec<String> {
+        let path = self.home.join(".codex").join("config.toml");
+        let Ok(text) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Ok(config) = text.parse::<toml::Table>() else {
+            return Vec::new();
+        };
+        let prefix = format!("{CLAUDE_PLUGIN}@");
+        let mut found: Vec<String> = config
+            .get("plugins")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter(|(_, entry)| entry.get("enabled").and_then(toml::Value::as_bool) == Some(true))
+            .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
+            .filter(|marketplace| {
+                !marketplace.is_empty()
+                    && !marketplace.contains(['/', '\\'])
+                    && marketplace != "."
+                    && marketplace != ".."
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The installed copies Codex loads the plugin from, for the marketplaces
+    /// that have it enabled: `~/.codex/plugins/cache/<marketplace>/kopper1/<version>/`,
+    /// each with a `plugin.json` named `kopper1`. Written with the plugin, so an
+    /// update takes effect without reinstalling the plugin in Codex. (How Codex
+    /// refreshes these copies is its own, and not verified here.)
+    fn codex_plugin_caches(&self) -> Vec<PathBuf> {
+        let cache = self.home.join(".codex").join("plugins").join("cache");
+        let mut found = Vec::new();
+        for marketplace in self.codex_plugin_marketplaces() {
+            let versions = cache.join(&marketplace).join(CLAUDE_PLUGIN);
+            for version in fs::read_dir(&versions).into_iter().flatten().flatten() {
+                let dir = version.path();
+                let named = fs::read_to_string(dir.join("plugin.json"))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .is_some_and(|manifest| manifest["name"] == CLAUDE_PLUGIN);
+                if named && dir.is_dir() {
+                    found.push(dir);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn claude_plugin_dir(&self) -> PathBuf {
+        self.claude_loose_skills_dir().join(CLAUDE_PLUGIN)
     }
 
     fn claude_agents_dir(&self) -> PathBuf {
@@ -388,6 +502,17 @@ struct ManagedFile {
 fn managed_files(client: InstallClient, paths: &InstallPaths) -> Vec<ManagedFile> {
     let mut files = Vec::new();
     let skills_dir = paths.skills_dir(client);
+    if client == InstallClient::Claude {
+        files.push(ManagedFile {
+            kind: "skill",
+            name: format!("{CLAUDE_PLUGIN}/.claude-plugin/plugin.json"),
+            path: paths
+                .claude_plugin_dir()
+                .join(".claude-plugin")
+                .join("plugin.json"),
+            content: CLAUDE_PLUGIN_MANIFEST,
+        });
+    }
     for skill in paths.served_skills() {
         let dir = skills_dir.join(skill.name);
         files.push(ManagedFile {
@@ -428,9 +553,39 @@ fn write_managed_file(file: &ManagedFile) -> Result<()> {
 }
 
 fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<usize> {
+    if paths.uses_plugin(client) {
+        // Loose copies an earlier install left, removed first, so a failure leaves
+        // nothing loaded twice. The names are Konnect's (uninstall removes them the
+        // same way); any other skill stays.
+        for skill in SKILLS {
+            let loose = paths.loose_skills_dir(client).join(skill.name);
+            if remove_entry(&loose)? && verbose {
+                println!(
+                    "  [-] Skill: {} moved into the {CLAUDE_PLUGIN} plugin",
+                    skill.name
+                );
+            }
+        }
+    }
+    let skills_dir = paths.skills_dir(client);
+    let caches = match client {
+        InstallClient::Codex if paths.codex_has_plugin() => paths.codex_plugin_caches(),
+        _ => Vec::new(),
+    };
     for file in managed_files(client, paths) {
         if file.kind == "skill" {
             write_managed_file(&file)?;
+            // The same file in each copy Codex installed the plugin to.
+            if let Ok(relative) = file.path.strip_prefix(&skills_dir) {
+                for cache in &caches {
+                    write_managed_file(&ManagedFile {
+                        kind: file.kind,
+                        name: file.name.clone(),
+                        path: cache.join("skills").join(relative),
+                        content: file.content,
+                    })?;
+                }
+            }
         }
     }
     if verbose {
@@ -442,21 +597,35 @@ fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
         // The name is Konnect's (uninstall removes it the same way); an install made
         // while simulation was served left it, and it would teach tools this server
         // does not serve.
-        let retired = paths.skills_dir(client).join(SIMULATION_SKILL);
-        if let Ok(meta) = fs::symlink_metadata(&retired) {
-            if meta.is_dir() {
-                fs::remove_dir_all(&retired)
-            } else {
-                // a link is removed as a link, never followed
-                fs::remove_file(&retired)
-            }
-            .with_context(|| format!("remove {}", retired.display()))?;
-            if verbose {
+        // (A loose copy went with the other loose names above.)
+        let mut retired = vec![skills_dir.join(SIMULATION_SKILL)];
+        retired.extend(
+            caches
+                .iter()
+                .map(|cache| cache.join("skills").join(SIMULATION_SKILL)),
+        );
+        for path in retired {
+            if remove_entry(&path)? && verbose {
                 println!("  [-] Skill: {SIMULATION_SKILL} removed (simulation is off)");
             }
         }
     }
     Ok(paths.served_skills().count())
+}
+
+/// Removes a folder, file or link at `path` (a link as a link, never followed).
+/// Returns whether something was there.
+fn remove_entry(path: &Path) -> Result<bool> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if meta.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .with_context(|| format!("remove {}", path.display()))?;
+    Ok(true)
 }
 
 fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
@@ -472,6 +641,37 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
             if verbose {
                 println!("  [-] Removed skill: {}", skill.name);
             }
+        }
+    }
+    if paths.uses_plugin(client) {
+        // A loose copy an earlier install left.
+        for skill in SKILLS {
+            remove_entry(&paths.loose_skills_dir(client).join(skill.name))?;
+        }
+    }
+    if client == InstallClient::Codex {
+        // The skills in each copy Codex installed; the plugin and its manifest are
+        // Codex's and stay.
+        for cache in paths.codex_plugin_caches() {
+            for skill in SKILLS {
+                remove_entry(&cache.join("skills").join(skill.name))?;
+            }
+        }
+    }
+    if client == InstallClient::Claude {
+        // The plugin's manifest, which Konnect wrote, then its folders only when
+        // empty: anything the owner added stays.
+        let manifest = paths.claude_plugin_dir().join(".claude-plugin");
+        remove_entry(&manifest.join("plugin.json"))?;
+        for folder in [
+            manifest,
+            paths.skills_dir(client),
+            paths.claude_plugin_dir(),
+        ] {
+            let _ = fs::remove_dir(&folder);
+        }
+        if verbose {
+            println!("  [-] Removed the {CLAUDE_PLUGIN} plugin");
         }
     }
 
@@ -1250,6 +1450,291 @@ mod tests {
         }
     }
 
+    // ── The kopper1 plugin (Claude) ──────────────────────────────────────
+
+    /// Claude's skills install as one plugin: `~/.claude/skills/kopper1/` with its
+    /// manifest and `skills/<name>/`, and nothing loose beside it.
+    #[test]
+    fn claude_skills_install_as_the_kopper1_plugin() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let plugin = temp.path().join(".claude/skills/kopper1");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["name"], "kopper1");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["skills"], serde_json::json!(["./skills"]));
+        for skill in SKILLS {
+            assert!(
+                plugin
+                    .join("skills")
+                    .join(skill.name)
+                    .join("SKILL.md")
+                    .is_file(),
+                "{}",
+                skill.name
+            );
+            assert!(
+                !temp.path().join(".claude/skills").join(skill.name).exists(),
+                "{} also loose",
+                skill.name
+            );
+        }
+    }
+
+    /// An earlier install's loose copies move into the plugin: Konnect's names are
+    /// removed from `~/.claude/skills` (the simulation skill too, when it is off),
+    /// and a skill of the owner's own stays.
+    #[test]
+    fn an_earlier_loose_install_is_moved_into_the_plugin() {
+        let temp = TempDir::new().unwrap();
+        let loose = temp.path().join(".claude/skills");
+        for name in ["konnect", "kicad-pcb", SIMULATION_SKILL, "my-skill"] {
+            fs::create_dir_all(loose.join(name)).unwrap();
+            fs::write(loose.join(name).join("SKILL.md"), "old").unwrap();
+        }
+        // a loose link is removed as a link, and its target is kept
+        let target = temp.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, loose.join("kicad-review")).unwrap();
+        let paths = InstallPaths {
+            home: temp.path().to_path_buf(),
+            simulation: false,
+        };
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        for name in ["konnect", "kicad-pcb", "kicad-review", SIMULATION_SKILL] {
+            assert!(
+                fs::symlink_metadata(loose.join(name)).is_err(),
+                "{name} still loose"
+            );
+        }
+        assert!(target.is_dir(), "the link's target was followed");
+        assert_eq!(
+            fs::read_to_string(loose.join("my-skill/SKILL.md")).unwrap(),
+            "old"
+        );
+        assert!(loose.join("kopper1/skills/konnect/SKILL.md").is_file());
+        assert!(!loose.join("kopper1/skills").join(SIMULATION_SKILL).exists());
+    }
+
+    /// Uninstall removes the plugin's manifest and skills, and a loose copy; a file
+    /// the owner put in the plugin folder stays, with the folder.
+    #[test]
+    fn uninstall_removes_the_plugin_and_keeps_what_the_owner_added() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let plugin = temp.path().join(".claude/skills/kopper1");
+        let loose = temp.path().join(".claude/skills/konnect");
+        fs::create_dir_all(&loose).unwrap();
+        fs::write(plugin.join("notes.md"), "mine").unwrap();
+        run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(!plugin.join(".claude-plugin").exists());
+        assert!(!plugin.join("skills").exists());
+        assert!(!loose.exists());
+        assert_eq!(fs::read_to_string(plugin.join("notes.md")).unwrap(), "mine");
+
+        // With nothing of the owner's in it, the folder goes too.
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(!temp.path().join(".claude/skills/kopper1").exists());
+    }
+
+    /// Codex keeps its skills loose in `~/.agents/skills`, with no plugin.
+    #[test]
+    fn codex_skills_stay_loose() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+        let agents = temp.path().join(".agents/skills");
+        assert!(agents.join("kicad-pcb/SKILL.md").is_file());
+        assert!(!agents.join("kopper1").exists());
+        assert!(!temp.path().join(".claude").exists());
+    }
+
+    /// With the owner's Codex plugin `kopper1` in place, Codex's skills go into it
+    /// and into each copy Codex installed it to; loose copies of Konnect's names
+    /// are removed, and the plugin's manifests and the owner's own skill stay.
+    #[test]
+    fn codex_skills_go_into_the_owners_plugin_and_its_installed_copy() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let source = home.join(".agents/plugins/kopper1");
+        let cache = home.join(".codex/plugins/cache/personal/kopper1/0.1.0");
+        // A plugin of the same name in another marketplace, not enabled: never
+        // touched.
+        let foreign = home.join(".codex/plugins/cache/other/kopper1/9.9.9");
+        for dir in [&source, &cache, &foreign] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("plugin.json"), "{\"name\": \"kopper1\"}").unwrap();
+        }
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"kopper1@personal\"]\nenabled = true\n\n[plugins.\"kopper1@other\"]\nenabled = false\n",
+        )
+        .unwrap();
+        // A skill of the owner's own in the installed copy, and the disabled
+        // copy's own skills, stay through uninstall.
+        fs::create_dir_all(cache.join("skills/my-skill")).unwrap();
+        fs::create_dir_all(foreign.join("skills/kicad-pcb")).unwrap();
+        fs::write(foreign.join("skills/kicad-pcb/SKILL.md"), "theirs").unwrap();
+        let loose = home.join(".agents/skills");
+        for name in ["kicad-pcb", "my-skill"] {
+            fs::create_dir_all(loose.join(name)).unwrap();
+        }
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+        for dir in [&source, &cache] {
+            for skill in SKILLS {
+                assert!(
+                    dir.join("skills")
+                        .join(skill.name)
+                        .join("SKILL.md")
+                        .is_file(),
+                    "{} in {}",
+                    skill.name,
+                    dir.display()
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(dir.join("plugin.json")).unwrap(),
+                "{\"name\": \"kopper1\"}"
+            );
+        }
+        assert!(!loose.join("kicad-pcb").exists());
+        assert!(loose.join("my-skill").is_dir());
+        let codex = inspect_guidance(InstallClient::Codex, &paths, &this_exe());
+        assert_eq!(codex.state().as_str(), "current");
+
+        assert_eq!(
+            fs::read_to_string(foreign.join("skills/kicad-pcb/SKILL.md")).unwrap(),
+            "theirs",
+            "a disabled marketplace's copy"
+        );
+
+        // Uninstall takes the skills out of both and leaves the manifests.
+        run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
+        for dir in [&source, &cache] {
+            assert!(!dir.join("skills/kicad-pcb").exists(), "{}", dir.display());
+            assert!(dir.join("plugin.json").is_file());
+        }
+        assert!(cache.join("skills/my-skill").is_dir());
+        assert!(foreign.join("skills/kicad-pcb/SKILL.md").is_file());
+    }
+
+    /// A Codex plugin `kopper1` that Codex does not have enabled (or whose
+    /// installed copy is another plugin) does not take the skills: they stay loose.
+    #[test]
+    fn a_codex_plugin_codex_does_not_load_leaves_the_skills_loose() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let source = home.join(".agents/plugins/kopper1");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("plugin.json"), "{\"name\": \"kopper1\"}").unwrap();
+        let paths = test_paths(&temp);
+        for config in [
+            None,
+            Some("[plugins.\"kopper1@personal\"]\nenabled = false\n"),
+            Some("[plugins.\"other@personal\"]\nenabled = true\n"),
+            Some("not toml ["),
+        ] {
+            fs::create_dir_all(home.join(".codex")).unwrap();
+            match config {
+                Some(text) => fs::write(home.join(".codex/config.toml"), text).unwrap(),
+                None => {
+                    let _ = fs::remove_file(home.join(".codex/config.toml"));
+                }
+            }
+            run_install_at(InstallClient::Codex, &paths, false).unwrap();
+            assert!(
+                home.join(".agents/skills/kicad-pcb/SKILL.md").is_file(),
+                "{config:?}"
+            );
+            assert!(!source.join("skills").exists(), "{config:?}");
+        }
+        // Enabled, but the installed copy names another plugin: the source takes
+        // the skills, the foreign copy does not.
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"kopper1@personal\"]\nenabled = true\n",
+        )
+        .unwrap();
+        let cache = home.join(".codex/plugins/cache/personal/kopper1/0.1.0");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("plugin.json"), "{\"name\": \"someone-else\"}").unwrap();
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+        assert!(source.join("skills/kicad-pcb/SKILL.md").is_file());
+        assert!(!cache.join("skills").exists());
+    }
+
+    /// Uninstall removes only the manifest Konnect wrote from `.claude-plugin`;
+    /// another file there stays.
+    #[test]
+    fn uninstall_keeps_other_files_in_the_claude_plugin_folder() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        let meta = temp.path().join(".claude/skills/kopper1/.claude-plugin");
+        fs::write(meta.join("marketplace.json"), "{}").unwrap();
+        run_uninstall_at(InstallClient::Claude, &paths, false).unwrap();
+        assert!(!meta.join("plugin.json").exists());
+        assert!(meta.join("marketplace.json").is_file());
+    }
+
+    /// A machine with an earlier, loose install reads as out of date, so the
+    /// server's notice asks for `konnect init`, which moves it into the plugin.
+    #[test]
+    fn an_earlier_loose_install_reads_out_of_sync() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+        // As an earlier build left it: every skill loose, and no plugin.
+        let plugin = paths.claude_plugin_dir();
+        let loose = paths.claude_loose_skills_dir();
+        for entry in fs::read_dir(plugin.join("skills")).unwrap() {
+            let entry = entry.unwrap();
+            fs::rename(entry.path(), loose.join(entry.file_name())).unwrap();
+        }
+        fs::remove_dir_all(&plugin).unwrap();
+        let claude = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
+        assert_eq!(claude.state().as_str(), "out_of_sync");
+        assert!(claude.notice().is_some());
+    }
+
+    /// Every bundled skill's `description` is one quoted line: the `/` menus of
+    /// Claude and Codex left out the skills whose description was a `|` block.
+    #[test]
+    fn every_skill_description_is_one_line() {
+        for skill in SKILLS {
+            let front = skill
+                .content
+                .strip_prefix("---\n")
+                .and_then(|rest| rest.split_once("\n---\n"))
+                .map(|(front, _)| front)
+                .unwrap_or_else(|| panic!("{} has no frontmatter", skill.name));
+            let line = front
+                .lines()
+                .find(|line| line.starts_with("description:"))
+                .unwrap_or_else(|| panic!("{} has no description", skill.name));
+            let value = line["description:".len()..].trim();
+            assert!(
+                value.len() > 2 && value.starts_with('"') && value.ends_with('"'),
+                "{}: {line}",
+                skill.name
+            );
+            assert!(
+                !front.lines().any(|line| line.starts_with("  ")),
+                "{} has an indented frontmatter line",
+                skill.name
+            );
+        }
+    }
+
     #[test]
     fn client_argument_defaults_to_claude() {
         assert_eq!(client_from_args(&[]).unwrap(), InstallClient::Claude);
@@ -1780,9 +2265,10 @@ mod tests {
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
 
         let claude = inspect_guidance(InstallClient::Claude, &paths, &this_exe());
-        // 7 SKILL.md + 10 reference files + 2 agents, and 4 hooks: the counts
-        // `konnect init` reports, restated rather than read from the manifest.
-        assert_eq!(claude.files.len(), 19);
+        // The kopper1 plugin manifest, 7 SKILL.md + 10 reference files + 2 agents,
+        // and 4 hooks: the counts `konnect init` reports, restated rather than read
+        // from the manifest.
+        assert_eq!(claude.files.len(), 20);
         assert_eq!(claude.hooks.len(), 4);
         for file in &claude.files {
             assert_eq!(file.status, ItemStatus::Current, "{}", file.name);

@@ -226,7 +226,8 @@ fn init_installs_simulation_skill(dir: &Path, config: &str) -> bool {
         .status()
         .expect("konnect init runs");
     assert!(status.success(), "konnect init failed: {status}");
-    let skills = dir.join(".claude").join("skills");
+    // Claude's skills are the kopper1 plugin's.
+    let skills = dir.join(".claude/skills/kopper1/skills");
     assert!(skills.join("kicad-pcb").join("SKILL.md").is_file());
     skills.join("kicad-simulation").exists()
 }

@@ -35,7 +35,8 @@ That is all. `kopper-install` does these steps, in this order:
    kept and never overwritten. An entry that already runs a package is not
    recorded.
 4. **Installs the guidance** (skills, agents, hooks) of this build, without the
-   simulation skill.
+   simulation skill. Claude gets the skills as the plugin `kopper1`; Codex gets
+   them in its own plugin `kopper1` when it has one, else loose.
 5. **Switches** Claude's and Codex's `konnect` entry to
    `~/.local/share/1-kopper/bin/konnect`.
 
@@ -90,6 +91,8 @@ Pull `main` and run `cargo xtask kopper-install` again.
 | `~/.local/share/1-kopper.previous/` | the package before the last install |
 | `~/.local/share/1-kopper.rollback.json` | the original `konnect` entries (mode 0600) |
 | `$CODEX_HOME/config.toml.before-1-kopper` | Codex's config before the first switch |
+| `~/.claude/skills/kopper1/` | Claude's KiCad skills, as the plugin `kopper1` (`/kopper1:kicad-pcb` and the rest in the `/` menu) |
+| `~/.agents/plugins/kopper1/` | Codex's KiCad skills, when Codex has the plugin `kopper1` (else loose in `~/.agents/skills/`) |
 
 ## What it never touches
 
