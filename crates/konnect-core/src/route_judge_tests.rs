@@ -225,6 +225,45 @@ fn prepare_reads_the_hash_in_either_letter_case() {
     assert!(prepare(&s.dsn, &s.root, &s.cli).is_ok());
 }
 
+/// The export hashes KiCad's in-memory text of a board (IPC); KiCad saves the
+/// same board in another layout and without each footprint's library metadata.
+/// The judge refused every such board until it compared the canonical identity
+/// too (found on a live board, 2026-11-18). A board that really changed is still
+/// refused, and so is one whose manifest predates the canonical identity.
+#[test]
+fn prepare_accepts_the_saved_file_of_a_board_exported_from_kicads_memory() {
+    use crate::board_identity::tests::{ipc_form, SAVED};
+    let live = ipc_form(SAVED);
+    let s = setup();
+    std::fs::write(&s.board, SAVED).unwrap();
+
+    // A manifest from before the canonical identity: bytes only, refused.
+    let mut manifest = manifest_for(&s.board, &live);
+    std::fs::write(&s.manifest, manifest.to_string()).unwrap();
+    let refused = refusal(prepare(&s.dsn, &s.root, &s.cli));
+    assert!(refused.reason.contains("SHA-256"), "{refused:?}");
+
+    // With it, the saved file of the exported board is accepted, and the judge
+    // reads the saved text.
+    manifest["source_canonical_sha256"] =
+        json!(crate::board_identity::canonical_sha256(&live).unwrap());
+    std::fs::write(&s.manifest, manifest.to_string()).unwrap();
+    let ctx = prepare(&s.dsn, &s.root, &s.cli).expect("the same board, saved");
+    assert_eq!(ctx.board_text, SAVED);
+
+    // A board edited after the export is refused, with the same next step.
+    std::fs::write(&s.board, SAVED.replacen("(at ", "(at 1", 1)).unwrap();
+    let refused = refusal(prepare(&s.dsn, &s.root, &s.cli));
+    assert!(
+        refused.next_step.contains("save the board in KiCad"),
+        "{refused:?}"
+    );
+
+    // So is a saved file that does not parse.
+    std::fs::write(&s.board, "(kicad_pcb (unclosed").unwrap();
+    assert!(prepare(&s.dsn, &s.root, &s.cli).is_err());
+}
+
 /// The configured default is the bare name `kicad-cli`, which KiCad's installer does not
 /// put on PATH: the judge must find it as every other kicad-cli tool does
 /// (`resolve_cli_executable`), not refuse it (the first end-to-end call did, 2026-11-16).

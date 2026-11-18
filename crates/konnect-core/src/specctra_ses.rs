@@ -72,6 +72,11 @@ struct Manifest {
     schema_version: u32,
     board_path: String,
     source_sha256: String,
+    /// Written by the export for the route judge; the importer checks the live
+    /// board against `source_sha256` and does not read this.
+    #[serde(default)]
+    #[allow(dead_code)]
+    source_canonical_sha256: Option<String>,
     coordinate_unit: String,
     resolution: u32,
     supported_profile: SupportedProfile,
