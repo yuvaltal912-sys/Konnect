@@ -12,6 +12,7 @@ pub mod mcp;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod outcome;
+pub(crate) mod place_generators;
 pub(crate) mod place_held;
 pub(crate) mod route_judge;
 pub(crate) mod route_search;

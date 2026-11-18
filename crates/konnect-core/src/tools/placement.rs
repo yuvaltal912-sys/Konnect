@@ -1166,7 +1166,7 @@ async fn handle_auto_place(
 
 // ─── refine_placement_force_directed ─────────────────────────────────────────
 
-fn net_weight(net: &str) -> f64 {
+pub(crate) fn net_weight(net: &str) -> f64 {
     let upper = net.to_ascii_uppercase();
     if upper.is_empty() || upper == "NC" || upper.starts_with("UNCONNECTED") {
         0.0

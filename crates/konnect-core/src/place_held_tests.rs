@@ -38,6 +38,8 @@ pub(crate) struct Fp {
     locked: bool,
     /// Half-width and half-height of a courtyard rectangle centred on the anchor.
     court: Option<(f64, f64)>,
+    /// An off-centre courtyard rectangle `(x0, y0, x1, y1)`, local, instead of `court`.
+    court_rect: Option<(f64, f64, f64, f64)>,
     pads: Vec<Pad>,
     path: Option<String>,
     broken_courtyard: bool,
@@ -55,6 +57,7 @@ impl Fp {
             back: false,
             locked: false,
             court: Some((1.0, 0.5)),
+            court_rect: None,
             pads: Vec::new(),
             path: None,
             broken_courtyard: false,
@@ -82,6 +85,10 @@ impl Fp {
     }
     pub(crate) fn court(mut self, half_w: f64, half_h: f64) -> Self {
         self.court = Some((half_w, half_h));
+        self
+    }
+    pub(crate) fn court_rect(mut self, x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
+        self.court_rect = Some((x0, y0, x1, y1));
         self
     }
     pub(crate) fn no_court(mut self) -> Self {
@@ -204,6 +211,10 @@ fn footprint_text(n: usize, fp: &Fp) -> String {
     if fp.broken_courtyard {
         text.push_str(&format!(
             "(fp_line (start 1) (end 2 3) (stroke (width 0.05) (type default)) (layer \"{court_layer}\"))\n"
+        ));
+    } else if let Some((x0, y0, x1, y1)) = fp.court_rect {
+        text.push_str(&format!(
+            "(fp_rect (start {x0} {y0}) (end {x1} {y1}) (stroke (width 0.05) (type default)) (fill no) (layer \"{court_layer}\") (uuid \"44444444-0000-4000-8000-{n:012}\"))\n"
         ));
     } else if let Some((hw, hh)) = fp.court {
         text.push_str(&format!(
