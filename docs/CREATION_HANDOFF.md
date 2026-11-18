@@ -328,7 +328,10 @@ The code is in these places:
   - 291 candidates in 154 s, with no generation failure;
   - 15 routed (O 3, 4 per family), and every one passes P2;
   - best ranks: P 1, S 7, F 8. One S candidate passes every gate. P beats O: its best ranks above all 3 of O's calls. F and S are below O.
-- **Gate after the merge:** not yet run (this record is updated when it is).
+- **After merging `fork/main` `4a638a1d`:**
+  - The first gate, on `5c05000d`, failed one test: `an_exported_candidate_passes_the_judge_preflight`. Since Row RJ, the judge accepts a board whose canonical SHA-256 matches. The test's control changed only a space, so it was the same board. `73a44b1d` makes it expect that and refuse a real change instead.
+  - Gate on `73a44b1d`: tests 5103, sandboxed 33, doc tests 9, `simulation_live` 95/95. Fmt, clippy, `deny`, `fix-doc-counts` and the release build are green, and the installed hash and the protected files are unchanged.
+  - The smoke on `73a44b1d` gave the same counts and verdicts as before the merge: 291 candidates in 153 s, 15 routed, all passing P2, and P beats O.
 
 **Incident.** In stage A, one agent started a focused cargo run while another session's gate held `native.lock`. Since then, every cargo command of this row goes through `chunk.sh`, which waits for the locks. That other gate's result was not checked by this row.
 
