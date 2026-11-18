@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the switching hot loops read pin types too
+
+`audit_layout_quality` checks 8.1 and 8.2 find a converter's input and ground
+pads by name (`VIN`, `PVIN`, `VOUT`, `IN`, `OUT`; `PGND`), then by net. The net
+step now prefers a pad that is not typed `input` or `no_connect` (an enable tied
+to VIN, a mode input tied to ground), and falls back to any such pad, as before,
+when the IC has no other. Loops of converters whose enable or mode pin sits
+nearer the switch pad than the real input or ground pin change. One case can
+read worse: an input pin a library types `input` and names neither `VIN` nor the
+like loses to a farther power pad of another type; a named pin is found by its
+name whatever its type.
+
 ## Unreleased: the layout audit's decoupling check reads pin types
 
 `audit_layout_quality` check 4.1 (decoupling loop) reads each pad's KiCad pin type

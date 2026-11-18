@@ -614,6 +614,131 @@ fn without_a_record_the_current_checks_say_why_they_did_not_run() {
 
 // ─── §8 switching regulators ─────────────────────────────────────────────────
 
+/// `text` with the footprint whose Reference is `reference` passed through `edit`.
+fn edit_footprint(text: &str, reference: &str, edit: impl Fn(&str) -> String) -> String {
+    let at = text
+        .find(&format!("\"Reference\" \"{reference}\""))
+        .unwrap_or_else(|| panic!("no {reference}"));
+    let start = text[..at].rfind("\t(footprint").unwrap();
+    let end = at + text[at..].find("\n\t(footprint").unwrap_or(text.len() - at);
+    format!(
+        "{}{}{}",
+        &text[..start],
+        edit(&text[start..end]),
+        &text[end..]
+    )
+}
+
+/// U1's 8.1 loop with its VIN and PGND names removed, so the loop is found by net
+/// alone.
+fn buck_unnamed() -> String {
+    let base = std::fs::read_to_string(fixture_path("buck.kicad_pcb")).unwrap();
+    let edited = edit_footprint(&base, "U1", |block| {
+        let block = block
+            .replacen("(pinfunction \"VIN\")", "(pinfunction \"P1\")", 1)
+            .replacen("(pinfunction \"PGND\")", "(pinfunction \"P3\")", 1);
+        assert!(!block.contains("\"VIN\"") && !block.contains("\"PGND\""));
+        block
+    });
+    assert_ne!(edited, base);
+    edited
+}
+
+fn sw1_loop(r: &Value) -> Value {
+    let c = check(r, "8.1");
+    c["metrics"]["switch_nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["switch_net"] == "SW1")
+        .cloned()
+        .unwrap_or_else(|| panic!("{c}"))
+}
+
+/// The switching loop closes at the converter's real input and ground pins, not
+/// at an enable tied to VIN or a mode input tied to ground that sits nearer the
+/// switch pad (Row AP's follow-up, 2026-11-18).
+#[test]
+fn a_switching_loop_skips_inputs_tied_to_a_rail() {
+    // Unnamed, the loop still closes at U1.1 (VIN) and U1.3 (ground).
+    let r = run(&fx_text(&buck_unnamed(), Some(buck_intent())));
+    let n1 = sw1_loop(&r);
+    assert_eq!(n1["loop"]["legs"][0]["to"], "U1.1", "{n1}");
+    assert_eq!(
+        n1["loop"]["legs"].as_array().unwrap().last().unwrap()["from"],
+        "U1.3",
+        "{n1}"
+    );
+
+    // An enable on VIN1 and a mode input on GND, each 1 mm from the switch pad
+    // (the real pins are 2 and 2.8 mm away), with no copper.
+    let with_inputs = edit_footprint(&buck_unnamed(), "U1", |block| {
+        let anchor = "\t\t(embedded_fonts";
+        assert!(block.contains(anchor), "fixture shape changed");
+        block.replacen(
+            anchor,
+            "\t\t(pad \"5\" smd rect (at 0 -1) (size 0.4 0.4) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"VIN1\") (pinfunction \"EN\") (pintype \"input\") (uuid \"5e5e5e5e-0000-4000-8000-000000000005\"))\n\t\t(pad \"6\" smd rect (at 0 1) (size 0.4 0.4) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"GND\") (pinfunction \"MODE\") (pintype \"input\") (uuid \"6e6e6e6e-0000-4000-8000-000000000006\"))\n\t\t(embedded_fonts",
+            1,
+        )
+    });
+    let r = run(&fx_text(&with_inputs, Some(buck_intent())));
+    let n1 = sw1_loop(&r);
+    assert_eq!(n1["loop"]["capacitor"], "C11", "{n1}");
+    assert_eq!(n1["loop"]["legs"][0]["to"], "U1.1", "{n1}");
+    assert_eq!(
+        n1["loop"]["legs"].as_array().unwrap().last().unwrap()["from"],
+        "U1.3",
+        "{n1}"
+    );
+
+    // With only inputs to choose from (a library that types VIN and ground as
+    // inputs), the loop still closes at them, as before.
+    let all_inputs = edit_footprint(&buck_unnamed(), "U1", |block| {
+        let mut out = block.to_string();
+        for pin_function in ["(pinfunction \"P1\")", "(pinfunction \"P3\")"] {
+            out = out.replacen(
+                pin_function,
+                &format!("{pin_function} (pintype \"input\")"),
+                1,
+            );
+        }
+        out
+    });
+    let r = run(&fx_text(&all_inputs, Some(buck_intent())));
+    let n1 = sw1_loop(&r);
+    assert_eq!(n1["loop"]["legs"][0]["to"], "U1.1", "{n1}");
+    assert_eq!(
+        n1["loop"]["legs"].as_array().unwrap().last().unwrap()["from"],
+        "U1.3",
+        "{n1}"
+    );
+
+    // A name still wins over the type: VIN and PGND typed as inputs, with the
+    // enable and mode inputs nearer, still close the loop.
+    let named_inputs = edit_footprint(&with_inputs, "U1", |block| {
+        block
+            .replacen(
+                "(pinfunction \"P1\")",
+                "(pinfunction \"VIN\") (pintype \"input\")",
+                1,
+            )
+            .replacen(
+                "(pinfunction \"P3\")",
+                "(pinfunction \"PGND\") (pintype \"input\")",
+                1,
+            )
+    });
+    assert_ne!(named_inputs, with_inputs);
+    let r = run(&fx_text(&named_inputs, Some(buck_intent())));
+    let n1 = sw1_loop(&r);
+    assert_eq!(n1["loop"]["legs"][0]["to"], "U1.1", "{n1}");
+    assert_eq!(
+        n1["loop"]["legs"].as_array().unwrap().last().unwrap()["from"],
+        "U1.3",
+        "{n1}"
+    );
+}
+
 #[test]
 fn a_bucks_input_loop_is_measured_and_the_far_capacitor_is_flagged() {
     let r = run(&fx("buck.kicad_pcb", Some(buck_intent()), None));
