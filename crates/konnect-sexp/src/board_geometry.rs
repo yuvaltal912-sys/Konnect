@@ -245,6 +245,10 @@ pub struct PadGeom {
     pub uuid: Option<String>,
     pub at: Pt,
     pub pin_function: Option<String>,
+    /// The symbol pin's electrical type, as KiCad copies it onto the pad
+    /// (`pintype`): `power_in`, `input`, `passive`, ... or a `+no_connect`
+    /// combination. `None` when the board does not say.
+    pub pin_type: Option<String>,
     pub through_hole: bool,
     /// KiCad's pad type: `smd`, `thru_hole`, `np_thru_hole` or `connect`.
     pub kind: String,
@@ -678,6 +682,7 @@ fn read_pad(
         uuid: pad.find_str("uuid").map(str::to_string),
         at: (cx, cy),
         pin_function: pad.find_str("pinfunction").map(str::to_string),
+        pin_type: pad.find_str("pintype").map(str::to_string),
         through_hole: matches!(kind, "thru_hole" | "np_thru_hole"),
         kind: kind.to_string(),
         size: (w, h),

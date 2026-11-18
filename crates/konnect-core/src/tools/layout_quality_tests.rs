@@ -409,6 +409,128 @@ fn a_tight_decoupling_loop_passes_and_a_large_one_is_measured_on_both_sides() {
     assert_eq!(score(&r, "4.1"), (1.0 + 0.0) / 2.0);
 }
 
+/// A pad on a power net typed as an input (a timer's RESET tied to the rail) or as
+/// no-connect draws no supply current: it is not measured and not a
+/// finding, and the audit names it. A `power_in` pad is measured as before.
+/// Found on a real board, where the audit reported such a RESET as a
+/// decoupling loop error (2026-11-18).
+#[test]
+fn a_pin_typed_as_an_input_is_not_a_supply_pin() {
+    let base = std::fs::read_to_string(fixture_path("decoupling.kicad_pcb")).unwrap();
+    // U2.1 is the fixture's loose loop; U1.1 its tight one.
+    let u2_pin = "(uuid \"a41e9054-14e5-4b56-b829-d04b018eefc3\")";
+    assert_eq!(base.matches(u2_pin).count(), 1, "fixture shape changed");
+    let typed = |kind: &str| base.replacen(u2_pin, &format!("(pintype \"{kind}\") {u2_pin}"), 1);
+
+    for kind in [
+        "input",
+        "no_connect",
+        "bidirectional+no_connect",
+        "input+no_connect",
+    ] {
+        let r = run(&fx_text(&typed(kind), None));
+        let c = check(&r, "4.1");
+        let pins = c["metrics"]["pins"].as_array().unwrap();
+        assert!(pins.iter().any(|p| p["pin"] == "U1.1"), "{kind}: {c}");
+        assert!(!pins.iter().any(|p| p["pin"] == "U2.1"), "{kind}: {c}");
+        assert!(findings(&r, "4.1").is_empty(), "{kind}");
+        assert_eq!(
+            c["metrics"]["signal_pins_on_power_nets"]["count"], 1,
+            "{kind}"
+        );
+        assert_eq!(c["metrics"]["signal_pins_on_power_nets"]["pins"][0], "U2.1");
+        // U2.1's pin function is VDD: a person is asked to confirm it.
+        assert!(
+            r["needs_human"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["item"] == "4.1" && n["why"].as_str().unwrap().contains("U2.1")),
+            "{kind}: {}",
+            r["needs_human"]
+        );
+    }
+
+    // The same input named like a logic pin (RESET) is left out without a question.
+    let reset = typed("input").replacen("(pinfunction \"VDD\")", "(pinfunction \"RESET\")", 1);
+    assert_ne!(reset, typed("input"), "fixture shape changed");
+    let r = run(&fx_text(&reset, None));
+    assert_eq!(
+        check(&r, "4.1")["metrics"]["signal_pins_on_power_nets"]["count"],
+        1
+    );
+    assert!(!r["needs_human"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["why"].as_str().unwrap().contains("U2.1")));
+
+    // Supply types are measured: U2.1 stays the loose loop's error.
+    // `bidirectional` too: libraries type some supply pins so (a transceiver's VIO).
+    for kind in [
+        "power_in",
+        "power_out",
+        "passive",
+        "unspecified",
+        "bidirectional",
+        "output",
+    ] {
+        let r = run(&fx_text(&typed(kind), None));
+        let fs = findings(&r, "4.1");
+        assert_eq!(fs.len(), 1, "{kind}: {fs:?}");
+        assert!(
+            fs[0]["subject"].as_str().unwrap().starts_with("U2.1"),
+            "{kind}"
+        );
+        assert_eq!(
+            check(&r, "4.1")["metrics"]["signal_pins_on_power_nets"]["count"],
+            0
+        );
+    }
+}
+
+/// The loop closes at the IC's supply ground pad, not at a nearer ground pad typed
+/// as a signal (an input tied low). With only signal-typed ground pads, the
+/// nearest one still closes it, as before.
+#[test]
+fn the_loop_closes_at_a_supply_ground_pad() {
+    let base = std::fs::read_to_string(fixture_path("decoupling.kicad_pcb")).unwrap();
+    let u2_ground = "(uuid \"fa1ae532-ad53-497e-bdcf-ec22bab50aa6\")";
+    assert_eq!(base.matches(u2_ground).count(), 1, "fixture shape changed");
+    // U2's only ground pad typed as an input: the fallback keeps it.
+    let only_signal = base.replacen(u2_ground, &format!("(pintype \"input\") {u2_ground}"), 1);
+    let r = run(&fx_text(&only_signal, None));
+    let c = check(&r, "4.1");
+    let u2 = c["metrics"]["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pin"] == "U2.1")
+        .cloned()
+        .unwrap_or_else(|| panic!("{c}"));
+    assert_eq!(u2["loop"]["legs"][1]["from"], "U2.2", "{u2}");
+
+    // A nearer ground pad typed as an input (U2.3, 1 mm from U2.1 against U2.2's
+    // 2 mm, with no copper): the loop still closes at the supply ground pad.
+    let pad_end = format!("{u2_ground}\n\t\t)");
+    assert_eq!(base.matches(&pad_end).count(), 1, "fixture shape changed");
+    let with_signal_ground = base.replacen(
+        &pad_end,
+        &format!("{pad_end}\n\t\t(pad \"3\" smd rect (at -1 1) (size 0.8 0.8) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\") (net \"GND\") (pinfunction \"EN\") (pintype \"input\") (uuid \"3d0c4b1e-0000-4000-8000-000000000003\"))"),
+        1,
+    );
+    let r = run(&fx_text(&with_signal_ground, None));
+    let c = check(&r, "4.1");
+    let u2 = c["metrics"]["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pin"] == "U2.1")
+        .cloned()
+        .unwrap_or_else(|| panic!("{c}"));
+    assert_eq!(u2["loop"]["legs"][1]["from"], "U2.2", "{u2}");
+}
+
 #[test]
 fn a_pin_with_no_capacitor_in_range_is_named() {
     let r = run_with(
