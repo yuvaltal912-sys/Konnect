@@ -19,6 +19,7 @@ pub(crate) mod place_generators;
 pub(crate) mod place_held;
 pub(crate) mod place_judge;
 pub(crate) mod place_route;
+pub(crate) mod place_schematic;
 pub(crate) mod place_search;
 pub(crate) mod route_judge;
 pub(crate) mod route_search;

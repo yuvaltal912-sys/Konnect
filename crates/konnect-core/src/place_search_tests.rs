@@ -375,6 +375,8 @@ fn rec(id: usize, origin: Origin, outcome: &'static str, key: Option<ScreenKey>)
         placement_gates: None,
         unrouted: None,
         route_gates: None,
+        schematic_neighbours: None,
+        schematic_neighbours_reason: None,
         board_text: None,
         judged: None,
     }
@@ -1738,4 +1740,180 @@ fn the_search_never_writes_the_input_board() {
         .block_on(search(&setup.plan, Arc::new(fake(10, good))))
         .unwrap();
     assert_eq!(before, std::fs::read(&setup.plan.route.board).unwrap());
+}
+
+// ─── The schematic-neighbour measure (D23) ───────────────────────────────────
+
+/// Writes the schematic of the fixture board next to it (`input/board.kicad_sch`): a flat
+/// sheet, U1 with its capacitors close together, the resistors in a chain, J1 and H1 apart.
+/// The fixture's footprints carry no path, so they match by reference.
+fn write_schematic(setup: &Setup) {
+    let at = [
+        ("U1", 0.0, 0.0),
+        ("C1", 5.0, 0.0),
+        ("C2", -5.0, 0.0),
+        ("C3", 0.0, 5.0),
+        ("C4", 0.0, -5.0),
+        ("R1", 30.0, 0.0),
+        ("R2", 35.0, 0.0),
+        ("R3", 40.0, 0.0),
+        ("J1", 60.0, 0.0),
+        ("H1", 90.0, 0.0),
+    ];
+    let mut text = String::from(
+        "(kicad_sch (version 20260101) (generator \"test\") (uuid \"root\") (paper \"A4\")\n(lib_symbols)\n",
+    );
+    for (n, (reference, x, y)) in at.iter().enumerate() {
+        text.push_str(&format!(
+            "(symbol (lib_id \"Dev:Part\") (at {x} {y} 0) (unit 1) (uuid \"u{n}\") (property \"Reference\" \"{reference}\" (at 0 0 0)))\n"
+        ));
+    }
+    text.push_str(")\n");
+    std::fs::write(setup.root.join("input").join("board.kicad_sch"), text).unwrap();
+}
+
+/// Ids, keys and ranks of every record, the three things the rank is.
+fn ranking(outcome: &Outcome) -> Vec<(usize, Option<Key>, Option<usize>)> {
+    outcome
+        .records
+        .iter()
+        .map(|r| (r.id, r.key, r.rank))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_schematic_is_a_reason_on_every_board_and_the_search_goes_on() {
+    // `setup` writes no schematic.
+    let setup = setup(100_000);
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    assert!(count(&outcome, "routed") > 0, "the search completed");
+    let with_board: Vec<&Record> = outcome
+        .records
+        .iter()
+        .filter(|r| r.board_sha256.is_some() && r.outcome != "write_failed")
+        .collect();
+    assert!(!with_board.is_empty());
+    for record in &with_board {
+        assert!(record.schematic_neighbours.is_none());
+        let reason = record.schematic_neighbours_reason.as_deref().unwrap();
+        assert!(reason.contains("board.kicad_sch"), "{reason}");
+    }
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    let first = json["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outcome"] == "routed")
+        .unwrap();
+    assert!(first["schematic_neighbours"].is_null());
+    assert!(first["schematic_neighbours_reason"].is_string());
+    // The table prints a dash in both columns.
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(table_text.contains("| - | - |\n"), "{table_text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_measure_reaches_search_json_and_the_table_and_the_input_measures_one() {
+    let setup = setup(100_000);
+    write_schematic(&setup);
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let routed: Vec<&Record> = outcome
+        .records
+        .iter()
+        .filter(|r| r.outcome == "routed")
+        .collect();
+    assert!(routed.len() > 10);
+    for record in &routed {
+        assert!(record.schematic_neighbours_reason.is_none());
+        let measure = record.schematic_neighbours.as_ref().expect("a measure");
+        assert_eq!((measure.parts_measured, measure.parts_unmatched), (10, 0));
+        // The two pad-less logos are skipped, not unmatched.
+        assert_eq!(measure.parts_alone, 0);
+    }
+    // O's calls are the input board: ratio 1, nobody pulled.
+    for record in outcome.records.iter().filter(|r| r.group() == "O") {
+        let measure = record.schematic_neighbours.as_ref().unwrap();
+        assert_eq!(measure.ratio_to_input, Some(1.0));
+        assert_eq!(measure.parts_pulled_away, 0);
+    }
+    // Generated placements move parts, so some candidate measures differently.
+    assert!(
+        routed
+            .iter()
+            .any(|r| r.schematic_neighbours.as_ref().unwrap().ratio_to_input != Some(1.0)),
+        "no generated candidate differs from the input"
+    );
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    let generated = json["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outcome"] == "routed" && r["origin"]["kind"] == "generated")
+        .unwrap();
+    let measure = &generated["schematic_neighbours"];
+    for field in [
+        "mean_mm",
+        "ratio_to_input",
+        "parts_pulled_away",
+        "parts_measured",
+        "parts_unmatched",
+    ] {
+        assert!(!measure[field].is_null(), "{field}: {measure}");
+    }
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert!(
+        table_text.contains("| score | sch. nbr mm | pulled away |"),
+        "{table_text}"
+    );
+    assert!(table_text.contains("are reported only; they do not rank."));
+    // A routed row ends in the two numbers, not dashes.
+    let row = table_text
+        .lines()
+        .find(|line| line.starts_with("| 1 |"))
+        .unwrap();
+    assert!(!row.ends_with("| - | - |"), "{row}");
+    // Counts only: the table names no part.
+    for name in model().references {
+        assert!(!table_text.contains(&format!(" {name} ")), "`{name}`");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_measure_does_not_change_a_key_or_a_rank() {
+    // The same search, with the schematic and without: every key and rank is the same,
+    // although the records differ in the measure.
+    let with = setup(100_000);
+    write_schematic(&with);
+    let without = setup(100_000);
+    let router = |_: usize, id: usize| Step::Routed {
+        unconnected: id % 3,
+        signal_mm: 100.0 + id as f64,
+    };
+    let a = search(&with.plan, Arc::new(fake(10, router)))
+        .await
+        .unwrap();
+    let b = search(&without.plan, Arc::new(fake(10, router)))
+        .await
+        .unwrap();
+    assert!(a.records.iter().any(|r| r.schematic_neighbours.is_some()));
+    assert!(b.records.iter().all(|r| r.schematic_neighbours.is_none()));
+    assert_eq!(ranking(&a), ranking(&b));
+    assert!(a.records.iter().any(|r| r.rank.is_some()));
+    // The verdicts are the table's rows after the routed ones.
+    let verdicts = |text: String| {
+        text.split("## Per family and reference")
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        verdicts(table(&with.plan, &a)),
+        verdicts(table(&without.plan, &b))
+    );
 }
