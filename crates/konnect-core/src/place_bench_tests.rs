@@ -10,10 +10,12 @@
 //!
 //! `bench.json` names, per board: its folder below the bench folder (holding
 //! `input/` with the stripped project copy, `rules.json`, `held.json` and optionally
-//! `ai/board.kicad_pcb`), its time limit and the effort. The bench writes only below
+//! `ai/board.kicad_pcb`), its time limit, the effort, `hold` (`locks` or `rules`) and
+//! `families`. The bench writes only below
 //! the bench folder. The format is in `xtask/placement-bench/README.md`.
 
-use crate::place_generators::Matrix;
+use crate::place_generators::{Family, Matrix};
+use crate::place_held::HoldRules;
 use crate::place_route::{export_options, isolated_context, rules_from_json, RouteInputs};
 use crate::place_search::{search, PlaceRouteCall, Plan};
 use crate::route_search::Effort;
@@ -40,6 +42,62 @@ pub(crate) struct BenchBoard {
     /// `fast`, `m`, `h` or `xh` (default `m`).
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// Which parts the search holds: `locks` (default) or `rules`.
+    #[serde(default)]
+    pub hold: HoldMode,
+    /// The families of the matrix: any of `force`, `schematic` and `perturb` (default
+    /// `force` and `schematic`). O and A are references whatever is named.
+    #[serde(default = "default_families")]
+    pub families: Vec<BenchFamily>,
+}
+
+/// The bench's `hold` option, the owner's flow of 2026-11-19 or the earlier rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum HoldMode {
+    /// Held: KiCad's locks, `held.json`'s list, and the parts with no pad on a net.
+    /// The owner locks the parts he wants fixed and the search places the rest.
+    #[default]
+    Locks,
+    /// `HoldRules::default()` too: connectors, mechanical prefixes and footprint words.
+    Rules,
+}
+
+/// A family of `bench.json`'s `families` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BenchFamily {
+    Force,
+    Schematic,
+    Perturb,
+}
+
+fn default_families() -> Vec<BenchFamily> {
+    vec![BenchFamily::Force, BenchFamily::Schematic]
+}
+
+impl BenchBoard {
+    /// The hold rules the board's `hold` option names.
+    pub(crate) fn hold_rules(&self) -> HoldRules {
+        match self.hold {
+            HoldMode::Locks => HoldRules::locks_only(),
+            HoldMode::Rules => HoldRules::default(),
+        }
+    }
+
+    /// `Matrix::bench` with only the board's `families`.
+    pub(crate) fn matrix(&self) -> Matrix {
+        let families: Vec<Family> = self
+            .families
+            .iter()
+            .map(|family| match family {
+                BenchFamily::Force => Family::Force,
+                BenchFamily::Schematic => Family::Schematic,
+                BenchFamily::Perturb => Family::Perturb,
+            })
+            .collect();
+        Matrix::bench().only(&families)
+    }
 }
 
 fn default_minutes() -> u64 {
@@ -178,6 +236,11 @@ fn check_scratch(
 /// The input board of `board`: `<folder>/input/<file>`, links followed, which must lie
 /// inside `bench`. Also the AI board when the folder has one.
 fn check_board_inputs(bench: &Path, board: &BenchBoard) -> anyhow::Result<()> {
+    ensure!(
+        !board.families.is_empty(),
+        "board {}: families names no family (use force, schematic, perturb)",
+        board.name
+    );
     let folder = Path::new(&board.folder);
     ensure!(
         folder.is_relative()
@@ -401,7 +464,7 @@ fn run_board(
     let plan = Plan {
         name: board.name.clone(),
         folder: folder.clone(),
-        matrix: Matrix::bench(),
+        matrix: board.matrix(),
         threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         reference_calls: 3,
         best_per_family: 3,
@@ -411,6 +474,7 @@ fn run_board(
         route: inputs.clone(),
         ai_board: ai.is_file().then_some(ai),
         caller_held: read_held(&folder.join("held.json"))?,
+        hold: board.hold_rules(),
     };
     let outcome = runtime.block_on(search(&plan, Arc::new(PlaceRouteCall { inputs, ctx })))?;
     let mut counts = std::collections::BTreeMap::new();
@@ -426,7 +490,8 @@ fn run_board(
     ))
 }
 
-/// Every board of `bench.json`: the plan (`Matrix::bench`, 3 calls per reference, 3
+/// Every board of `bench.json`: the plan (`Matrix::bench` of the board's families, its
+/// hold rules, 3 calls per reference, 3
 /// best and 1 drawn per family, draw seed 1, the board's time limit, effort M), the
 /// production `RouteCall`
 /// with `place_route::isolated_context`, then `place_search::search`. A board that
@@ -717,6 +782,107 @@ fn bench_environment_refuses_real_settings_and_foreign_inputs() {
         std::fs::write(scene.bench.join("bench.json"), bad).unwrap();
         assert!(check_environment(&scene.raw()).is_err(), "{bad}");
     }
+}
+
+/// The bench's matrix of a board whose `bench.json` entry is `entry`.
+fn board_of(entry: &str) -> BenchBoard {
+    let file: BenchFile =
+        serde_json::from_str(&format!(r#"{{"boards":[{entry}]}}"#)).expect("a bench.json");
+    file.boards.into_iter().next().unwrap()
+}
+
+fn count_of(recipes: &[crate::place_generators::Recipe], family: Family) -> usize {
+    recipes.iter().filter(|r| r.family == family).count()
+}
+
+#[test]
+fn hold_defaults_to_locks_and_rules_keeps_the_old_rules() {
+    let plain = board_of(r#"{"name":"B4","folder":"B4"}"#);
+    assert_eq!(plain.hold, HoldMode::Locks);
+    assert_eq!(plain.hold_rules(), HoldRules::locks_only());
+    let locks = board_of(r#"{"name":"B4","folder":"B4","hold":"locks"}"#);
+    assert_eq!(locks.hold_rules(), HoldRules::locks_only());
+    // Negative control: `rules` is today's behaviour.
+    let rules = board_of(r#"{"name":"B4","folder":"B4","hold":"rules"}"#);
+    assert_eq!(rules.hold_rules(), HoldRules::default());
+    assert_ne!(rules.hold_rules(), locks.hold_rules());
+}
+
+#[test]
+fn families_default_to_force_and_schematic_and_perturb_brings_p_back() {
+    let all = crate::place_generators::recipes(&Matrix::bench());
+    let default = board_of(r#"{"name":"B4","folder":"B4"}"#);
+    assert_eq!(
+        default.families,
+        vec![BenchFamily::Force, BenchFamily::Schematic]
+    );
+    let default_recipes = crate::place_generators::recipes(&default.matrix());
+    assert_eq!(count_of(&default_recipes, Family::Perturb), 0);
+    // The F and S recipes are the same as in the whole matrix.
+    let without_p: Vec<_> = all
+        .iter()
+        .filter(|r| r.family != Family::Perturb)
+        .cloned()
+        .collect();
+    assert_eq!(default_recipes, without_p);
+    assert_eq!(default_recipes.len(), 96 + 64);
+    // Naming the two by hand gives the same as leaving the key out.
+    let named = board_of(r#"{"name":"B4","folder":"B4","families":["force","schematic"]}"#);
+    assert_eq!(
+        crate::place_generators::recipes(&named.matrix()),
+        default_recipes
+    );
+    // Negative control: naming `perturb` brings P back, and the whole matrix is 288.
+    let with_p =
+        board_of(r#"{"name":"B4","folder":"B4","families":["force","schematic","perturb"]}"#);
+    let with_p_recipes = crate::place_generators::recipes(&with_p.matrix());
+    assert_eq!(with_p_recipes, all);
+    assert_eq!(count_of(&with_p_recipes, Family::Perturb), 128);
+    // One family alone keeps only that family.
+    let only_s = board_of(r#"{"name":"B4","folder":"B4","families":["schematic"]}"#);
+    let only_s = crate::place_generators::recipes(&only_s.matrix());
+    assert_eq!(count_of(&only_s, Family::Force), 0);
+    assert_eq!(count_of(&only_s, Family::Perturb), 0);
+    assert_eq!(count_of(&only_s, Family::Schematic), 64);
+}
+
+#[test]
+fn an_unknown_hold_or_family_or_an_empty_list_is_refused() {
+    let scene = scene();
+    for (bad, word) in [
+        (
+            r#"{"name":"B1","folder":"B1","hold":"everything"}"#,
+            "everything",
+        ),
+        (r#"{"name":"B1","folder":"B1","hold":"Locks"}"#, "Locks"),
+        (
+            r#"{"name":"B1","folder":"B1","families":["force","chaos"]}"#,
+            "chaos",
+        ),
+        (
+            r#"{"name":"B1","folder":"B1","families":["F"]}"#,
+            "unknown variant",
+        ),
+        (
+            r#"{"name":"B1","folder":"B1","families":[]}"#,
+            "names no family",
+        ),
+    ] {
+        std::fs::write(
+            scene.bench.join("bench.json"),
+            format!(r#"{{"boards":[{bad}]}}"#),
+        )
+        .unwrap();
+        let message = refusal(&scene.raw());
+        assert!(message.contains(word), "{bad}: {message}");
+    }
+    // Negative control: the same entries with valid values pass.
+    std::fs::write(
+        scene.bench.join("bench.json"),
+        r#"{"boards":[{"name":"B1","folder":"B1","hold":"rules","families":["perturb"]}]}"#,
+    )
+    .unwrap();
+    assert!(check_environment(&scene.raw()).is_ok());
 }
 
 #[test]

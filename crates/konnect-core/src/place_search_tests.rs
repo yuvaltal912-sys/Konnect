@@ -314,6 +314,7 @@ fn setup(time_limit_s: u64) -> Setup {
         },
         ai_board: None,
         caller_held: BTreeSet::new(),
+        hold: HoldRules::default(),
     };
     std::fs::create_dir_all(&plan.folder).unwrap();
     Setup {

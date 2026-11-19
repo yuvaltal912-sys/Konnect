@@ -43,7 +43,7 @@ pub(crate) struct HeldPart {
 }
 
 /// The rules that hold a part besides KiCad's lock and the caller's list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct HoldRules {
     /// Reference prefixes (the letters before the number) that name connectors.
     /// Default `["J"]`, as `score_placement`'s connector check reads them.
@@ -53,6 +53,23 @@ pub(crate) struct HoldRules {
     /// Words in a footprint's library ID that mark it mechanical, matched without
     /// case. Default `["MountingHole", "Fiducial"]`.
     pub mechanical_footprint_words: Vec<String>,
+}
+
+impl HoldRules {
+    /// No rule at all: a part is held only by KiCad's lock, the caller's list, or having
+    /// no pad on any net (that last one is not a rule of this struct: such a part plays no
+    /// part in routing, so it is always held). The owner's flow of 2026-11-19: he locks
+    /// the parts he wants fixed in KiCad and the search places the rest around them, a
+    /// connector included.
+    // Used only by the bench (an ignored test): no product code calls the search.
+    #[allow(dead_code)]
+    pub(crate) fn locks_only() -> Self {
+        Self {
+            connector_prefixes: Vec::new(),
+            mechanical_prefixes: Vec::new(),
+            mechanical_footprint_words: Vec::new(),
+        }
+    }
 }
 
 impl Default for HoldRules {

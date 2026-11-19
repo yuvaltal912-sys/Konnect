@@ -188,6 +188,9 @@ pub(crate) struct Plan {
     /// rules. Added to the skeleton: `held_set` takes it and the plan is the only
     /// place the bench can put it.
     pub caller_held: BTreeSet<String>,
+    /// The rules that hold a part besides KiCad's lock and the caller's list
+    /// (`HoldRules::default()`, or `HoldRules::locks_only()` in the owner's flow).
+    pub hold: HoldRules,
 }
 
 /// How one board's search ended.
@@ -890,7 +893,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             plan.route.board.display()
         )
     })?;
-    let held = held_set(&text, &plan.caller_held, &HoldRules::default()).map_err(|refusal| {
+    let held = held_set(&text, &plan.caller_held, &plan.hold).map_err(|refusal| {
         anyhow::anyhow!("{} Next step: {}", refusal.reason, refusal.next_step)
     })?;
     let tree = konnect_sexp::parse_sexp(&text)?;
@@ -1152,6 +1155,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
                 "perturb": matrix.perturb,
             },
             "recipes": recipes(matrix).len(),
+            "hold_rules": plan.hold,
             "threads": plan.threads,
             "host_cores": std::thread::available_parallelism().map(|n| n.get()).ok(),
             "reference_calls": plan.reference_calls,
