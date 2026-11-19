@@ -242,13 +242,9 @@ fn match_part(
                 .iter()
                 .find(|symbol| symbol.uuid.as_deref() == Some(uuid))
                 .map(|symbol| symbol.reference.clone());
-            let found = by_uuid.or_else(|| {
-                sheets[at]
-                    .symbols
-                    .iter()
-                    .any(|symbol| symbol.reference == reference)
-                    .then(|| reference.to_string())
-            })?;
+            // No symbol with that uuid: the reference itself; with no symbol of that
+            // reference on the instance, the points below are empty and the part unmatched.
+            let found = by_uuid.unwrap_or_else(|| reference.to_string());
             (at, found)
         }
         None => {
