@@ -1,0 +1,1 @@
+{"blocking_reasons":[],"converged":true,"dry_run":true,"iterations_run":270,"plan_status":"applicable","planned_moves":[{"displacement_mm":36.62,"from":{"x":50.0,"y":40.0},"reference":"C1","to":{"x":20.0,"y":19.0}}],"score_after_incomplete":false,"score_after_plan":63,"score_before":61,"score_before_incomplete":false,"verdict_after_plan":"pass"}

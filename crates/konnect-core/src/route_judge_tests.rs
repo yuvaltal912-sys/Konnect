@@ -1383,6 +1383,245 @@ fn when_no_run_passes_g1_the_reference_is_the_shortest_of_all() {
     assert_eq!(ks[1][4], 100);
 }
 
+// ------------------------------------------------- rank_measures (the pool)
+
+/// `rank_measures` over specs, each with its pool flag.
+fn pooled(specs: &[(Spec, bool)]) -> Vec<Key> {
+    let judged: Vec<Judged> = specs.iter().map(|(s, _)| run(s)).collect();
+    let runs: Vec<(&Measures, &Gates, bool)> = judged
+        .iter()
+        .zip(specs)
+        .map(|(j, (_, in_pool))| (&j.measures, &j.gates, *in_pool))
+        .collect();
+    rank_measures(&runs)
+}
+
+/// `rank` exactly as it was before `rank_measures` was pulled out of it: the oracle
+/// the pulled-out version is held to, since `rank` now calls `rank_measures` and a
+/// change inside it would otherwise change both sides of a comparison alike.
+fn rank_before_the_pull_out(judged: &[&Judged]) -> Vec<Key> {
+    let complete: Vec<&Judged> = judged
+        .iter()
+        .copied()
+        .filter(|run| run.gates.g1.is_empty())
+        .collect();
+    let pool: &[&Judged] = if complete.is_empty() {
+        judged
+    } else {
+        &complete
+    };
+    let shortest = |length: fn(&Measures) -> f64| -> Option<f64> {
+        pool.iter()
+            .map(|run| length(&run.measures))
+            .filter(|mm| *mm > 0.0)
+            .fold(None, |least: Option<f64>, mm| {
+                Some(least.map_or(mm, |least| least.min(mm)))
+            })
+    };
+    let step = |mm: f64, shortest: Option<f64>| -> i64 {
+        match shortest {
+            Some(shortest) if mm > 0.0 => (mm / shortest / LENGTH_STEP).round() as i64,
+            _ => 0,
+        }
+    };
+    let shortest_signal = shortest(|m| m.signal_mm);
+    let shortest_power = shortest(|m| m.power_mm);
+    let whole = |value: Option<f64>| value.map_or(i64::MAX, |value| value.round() as i64);
+    judged
+        .iter()
+        .map(|run| {
+            let (m, g) = (&run.measures, &run.gates);
+            [
+                i64::from(!g.g1.is_empty()),
+                i64::from(!g.g2.is_empty()),
+                i64::from(!g.g3.is_empty()),
+                whole(m.acute),
+                step(m.signal_mm, shortest_signal),
+                step(m.power_mm, shortest_power),
+                whole(m.right_angles),
+                m.vias_off_pour as i64,
+                m.copper_quality
+                    .map_or(i64::MAX, |quality| -(quality.round() as i64)),
+                m.route_s.max(0.0).floor() as i64,
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn rank_is_rank_measures_with_every_run_in_the_pool() {
+    let mut degenerate = spec();
+    degenerate.signal = 1.0;
+    degenerate.power = 0.5;
+    degenerate.failed[0] = true;
+    let mut long = spec();
+    long.signal = 150.0;
+    long.vias = 2;
+    let mut far = spec();
+    far.signal = 102.0;
+    far.acute = Some(4.0);
+    far.seconds = 33.7;
+    let mut failed_g2 = spec();
+    failed_g2.failed[1] = true;
+    failed_g2.signal = 80.0;
+    let mut failed_g1_short = spec();
+    failed_g1_short.failed[0] = true;
+    failed_g1_short.signal = 40.0;
+    let mut unknown = spec();
+    unknown.acute = None;
+    unknown.quality = None;
+    let mut no_power = spec();
+    no_power.power = 0.0;
+
+    let sets: Vec<Vec<Spec>> = vec![
+        vec![],
+        vec![spec()],
+        // A short run that fails G1 beside complete runs: it must not set the steps.
+        vec![spec(), long.clone(), degenerate.clone(), far.clone()],
+        // No run passes G1: the steps are against the shortest of all.
+        vec![degenerate.clone(), failed_g1_short.clone()],
+        vec![
+            spec(),
+            long,
+            far,
+            failed_g2,
+            degenerate,
+            failed_g1_short,
+            unknown,
+            no_power,
+        ],
+    ];
+    for specs in sets {
+        let marked: Vec<(Spec, bool)> = specs.iter().cloned().map(|s| (s, true)).collect();
+        let judged: Vec<Judged> = specs.iter().map(run).collect();
+        let refs: Vec<&Judged> = judged.iter().collect();
+        let before = rank_before_the_pull_out(&refs);
+        assert_eq!(keys(&specs), before, "{} run(s): rank", specs.len());
+        assert_eq!(
+            pooled(&marked),
+            before,
+            "{} run(s): rank_measures",
+            specs.len()
+        );
+    }
+}
+
+#[test]
+fn a_short_run_that_fails_g1_does_not_set_the_steps_of_rank_measures() {
+    let mut short_failed = spec();
+    short_failed.signal = 1.0;
+    short_failed.failed[0] = true;
+    let ks = pooled(&[(spec(), true), (short_failed, true)]);
+    assert_eq!(
+        ks[0][4], 50,
+        "stepped against the complete run's own length"
+    );
+    assert_eq!(ks[1][4], 1, "1 / 100 is a step of 0.5, which rounds to 1");
+    assert_eq!(ks[1][0], 1, "and it fails G1");
+}
+
+#[test]
+fn a_short_run_outside_the_pool_does_not_set_the_length_steps() {
+    // The short run passes every gate, so only the pool flag keeps it from the steps.
+    let mut short = spec();
+    short.signal = 10.0;
+    short.power = 1.0;
+    let outside = pooled(&[(spec(), true), (short.clone(), false)]);
+    let inside = pooled(&[(spec(), true), (short, true)]);
+    assert_eq!(
+        outside[0][4..6],
+        [50, 50],
+        "the pool's run is its own reference"
+    );
+    assert_eq!(
+        inside[0][4..6],
+        [500, 500],
+        "in the pool, the short run is the reference"
+    );
+    // The run outside the pool still has a key, stepped against the pool: below 50.
+    assert_eq!(outside[1][4..6], [5, 5]);
+    assert!(
+        outside[1] < outside[0],
+        "shorter, so it ranks above, and sets nothing"
+    );
+}
+
+#[test]
+fn rank_measures_falls_back_by_the_pool_then_to_every_run() {
+    let mut short_ok = spec();
+    short_ok.signal = 50.0;
+    let mut mid_failed = spec();
+    mid_failed.signal = 100.0;
+    mid_failed.failed[0] = true;
+    let mut long_failed = spec();
+    long_failed.signal = 200.0;
+    long_failed.failed[0] = true;
+
+    // The pool holds only runs that fail G1: the shortest of the pool (100), though a
+    // run outside it passes G1 with 50.
+    let ks = pooled(&[
+        (short_ok.clone(), false),
+        (mid_failed.clone(), true),
+        (long_failed.clone(), true),
+    ]);
+    assert_eq!(ks[1][4], 50);
+    assert_eq!(ks[2][4], 100);
+    assert_eq!(ks[0][4], 25, "50 / 100 / 0.02");
+
+    // Nothing is in the pool: the shortest of every run (50).
+    let ks = pooled(&[(short_ok, false), (mid_failed, false), (long_failed, false)]);
+    assert_eq!(ks[0][4], 50);
+    assert_eq!(ks[1][4], 100);
+    assert_eq!(ks[2][4], 200);
+
+    assert!(rank_measures(&[]).is_empty());
+}
+
+#[test]
+fn measures_and_gates_survive_a_round_trip() {
+    let mut m = measures();
+    m.unconnected = 3;
+    m.violations = BTreeMap::from([
+        ("clearance".to_string(), 2),
+        ("shorting_items".to_string(), 1),
+    ]);
+    m.routed_share = Some(0.987_654_321);
+    m.audit_complete = Some(false);
+    m.acute = None;
+    m.right_angles = Some(12.0);
+    m.copper_quality = None;
+    m.nets_undersized = Some(1.0);
+    m.narrow_paths = None;
+    m.signal_mm = 1_234.567_890_123;
+    m.power_mm = 0.0;
+    m.pour_track_mm = 55.5;
+    m.vias_off_pour = 7;
+    m.below_floor = 2;
+    m.width_rows = vec![
+        width_row("VCC", 40.0, 2.0, 0.05, 1.5),
+        width_row("/SIG", 10.0, 0.0, 0.0, 0.0),
+    ];
+    m.longest_below_mm = BTreeMap::from([("VCC".to_string(), 1.5)]);
+    m.stitching_vias = 4;
+    m.route_s = 12.25;
+    let g = Gates {
+        g1: vec!["3 unconnected item(s)".to_string()],
+        g2: vec![],
+        g3: vec!["VCC: a 1.50 mm stretch".to_string(), "another".to_string()],
+    };
+
+    let text = serde_json::to_string(&json!({ "measures": m, "gates": g })).unwrap();
+    let back: Value = serde_json::from_str(&text).unwrap();
+    let m_back: Measures = serde_json::from_value(back["measures"].clone()).unwrap();
+    let g_back: Gates = serde_json::from_value(back["gates"].clone()).unwrap();
+    assert_eq!(m_back, m);
+    assert_eq!(g_back, g);
+    // An unset measure stays unset, and does not become 0.
+    assert_eq!(m_back.acute, None);
+    assert_eq!(m_back.copper_quality, None);
+    assert_eq!(m_back.narrow_paths, None);
+}
+
 // ------------------------------------------------------- the private KiCad settings
 
 fn put(folder: &Path, relative: &str, text: &str) {

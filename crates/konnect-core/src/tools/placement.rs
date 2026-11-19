@@ -33,6 +33,10 @@
 //! the request (the recurring defect class this repo pins tests against).
 
 mod decoupling;
+pub(crate) mod evaluate;
+pub(crate) mod force_core;
+#[cfg(test)]
+mod force_core_tests;
 mod objectives;
 mod plan_status;
 #[cfg(test)]
@@ -45,10 +49,9 @@ use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolCo
 #[cfg(test)]
 use konnect_sexp::board::board_outline_bbox;
 use konnect_sexp::board::{
-    board_outline_shape, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
-    OutlineShape, PcbConnectivityIndex, Side,
+    board_outline_shape, footprint_courtyards, footprints, FootprintCourtyard, OutlineShape,
+    PcbConnectivityIndex, Side,
 };
-use konnect_sexp::outline::{Outline, OutlineStatus};
 use konnect_sexp::parser::SexpNode;
 use plan_status::PlanApplicability;
 use serde_json::json;
@@ -332,320 +335,9 @@ async fn handle_score_placement(
         }
     };
     let tree = konnect_sexp::parse_sexp(&content)?;
-
-    let scan = footprint_courtyards(&tree);
-    let outline_shape = board_outline_shape(&tree);
-    // Containment is judged against the true Edge.Cuts outline: its lines,
-    // arcs, circles and polygons joined into rings, cut-outs included. That
-    // replaces the #594 rule that only a provably axis-aligned rectangle could
-    // be checked. The outline is usable when it closes; an open or unreadable
-    // one proves nothing and the verdict says so instead of passing.
-    let true_outline = Outline::from_tree(&tree);
-    let outline_status = true_outline.status();
-    let outline_closed = outline_status == OutlineStatus::Closed;
-    let threshold = true_outline.containment_threshold_mm();
-    let index = PcbConnectivityIndex::build(&tree);
-    let values = footprint_values(&tree);
-
-    // ── Hard failure (a): same-side courtyard-bbox overlaps ─────────────────
-    // Opposite sides never collide (a Front part and a Back part share x/y but
-    // not space), and AnchorOnly bboxes are position-only stand-ins with zero
-    // area — a pair involving one is skipped, not scored as touching.
-    let mut hard_failures: Vec<serde_json::Value> = Vec::new();
-    let mut overlap_refs: BTreeSet<String> = BTreeSet::new();
-    let mut overlap_pairs = 0usize;
-    for (i, a) in scan.items.iter().enumerate() {
-        for b in &scan.items[i + 1..] {
-            if a.bbox_source == CourtyardSource::AnchorOnly
-                || b.bbox_source == CourtyardSource::AnchorOnly
-                || a.layer_side != b.layer_side
-            {
-                continue;
-            }
-            let ix = a.bbox.2.min(b.bbox.2) - a.bbox.0.max(b.bbox.0);
-            let iy = a.bbox.3.min(b.bbox.3) - a.bbox.1.max(b.bbox.1);
-            if ix > 0.0 && iy > 0.0 {
-                overlap_pairs += 1;
-                let (ra, rb) = (courtyard_reference(a), courtyard_reference(b));
-                overlap_refs.insert(ra.to_string());
-                overlap_refs.insert(rb.to_string());
-                hard_failures.push(json!({
-                    "kind": "courtyard_overlap",
-                    "references": [ra, rb],
-                    "detail": format!(
-                        "{ra} and {rb} courtyard bboxes overlap by {} mm² on the {} side",
-                        round3(ix * iy),
-                        side_name(a.layer_side),
-                    ),
-                }));
-            }
-        }
-    }
-
-    // ── Hard failure (b): parts outside the board outline ───────────────────
-    // No usable outline means this check is blocked, not passed: the response
-    // carries `outline_missing` or `outline_unproven` and the verdict can never
-    // be "pass". A part named in `edge_mount_references` is reported, not
-    // failed.
-    let mut outside_refs: Vec<String> = Vec::new();
-    let mut edge_mount_listed: Vec<serde_json::Value> = Vec::new();
-    if outline_closed {
-        for c in &scan.items {
-            let (x0, y0, x1, y1) = c.bbox;
-            let over = true_outline.overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]);
-            if over.depth_mm <= threshold {
-                continue;
-            }
-            let reference = courtyard_reference(c);
-            if edge_mount.allows(reference) {
-                edge_mount_listed.push(json!({
-                    "reference": reference,
-                    "overhang_mm": round3(over.depth_mm),
-                }));
-                continue;
-            }
-            outside_refs.push(reference.to_string());
-            hard_failures.push(json!({
-                "kind": "outside_outline",
-                "references": [reference],
-                "overhang_mm": round3(over.depth_mm),
-                "relation": if over.touches_board { "straddles" } else { "outside" },
-                "detail": format!(
-                    "{reference} courtyard bbox ({}, {})..({}, {}) is not fully inside \
-                     the board outline: it overhangs it by {} mm",
-                    round3(x0), round3(y0), round3(x1), round3(y1), round3(over.depth_mm),
-                ),
-            }));
-        }
-    }
-
-    // ── Connector-edge check (J*) ───────────────────────────────────────────
-    // A connector whose bbox center is further than the limit from *every*
-    // outline edge cannot be reached by a cable without a tunnel. Blocked
-    // without an outline, like the outside check.
-    let mut connector_edges: Vec<serde_json::Value> = Vec::new();
-    let mut connector_violations: Vec<(String, f64)> = Vec::new();
-    if outline_closed {
-        for c in &scan.items {
-            let Some(reference) = c.reference.as_deref() else {
-                continue;
-            };
-            if ref_prefix(reference) != "J" {
-                continue;
-            }
-            let centre = bbox_center(c.bbox);
-            // Distance to the nearest edge of the true outline (a cut-out's
-            // edge counts), negative when the centre is off the board.
-            let edge_distance = if true_outline.contains(centre) {
-                true_outline.boundary_distance(centre)
-            } else {
-                -true_outline.boundary_distance(centre)
-            };
-            connector_edges.push(json!({
-                "reference": reference,
-                "edge_distance_mm": round3(edge_distance),
-            }));
-            if edge_distance > CONNECTOR_EDGE_LIMIT_MM {
-                connector_violations.push((reference.to_string(), edge_distance));
-            }
-        }
-    }
-
-    // ── Decoupling check (C* near a shared-net U*) ──────────────────────────
-    let ambiguous_references = ambiguous_pad_references(&tree);
-    let board_diagonal = true_outline
-        .bbox()
-        .filter(|_| outline_closed)
-        .map(|(x0, y0, x1, y1)| (x1 - x0).hypot(y1 - y0));
-    let routing = objectives::assess(
-        &index,
-        max_net_references,
-        board_diagonal,
-        &ambiguous_references,
-    );
-    let decoupling = decoupling::check(
-        &scan.items,
-        &index,
-        &values,
-        max_net_references,
-        &ambiguous_references,
-    );
-    let decoupling_coverage = serde_json::to_value(&decoupling.coverage)?;
-    let decoupling::Check {
-        violations: decoupling_violations,
-        uncoupled_caps,
-        interface_filter_caps,
-        associations: decoupling_associations,
-        unproven_caps: unproven_decoupling_caps,
-        ..
-    } = decoupling;
-    let score_incomplete = !routing.complete
-        || routing.wire_deduction.is_none()
-        || routing.crossing_deduction.is_none()
-        || decoupling_coverage["status"] != "complete"
-        || !unproven_decoupling_caps.is_empty()
-        || scan.skipped > 0;
-
-    // ── Soft score (ported weight table — see the module docs) ──────────────
-    let overlap_deduction = (overlap_pairs as i64 * OVERLAP_POINTS).min(OVERLAP_CAP);
-    let outside_deduction = (outside_refs.len() as i64 * OUTSIDE_POINTS).min(OUTSIDE_CAP);
-    let connector_deduction =
-        (connector_violations.len() as i64 * CONNECTOR_POINTS).min(CONNECTOR_CAP);
-    let decoupling_deduction =
-        (decoupling_violations.len() as i64 * DECOUPLING_POINTS).min(DECOUPLING_CAP);
-    let score = (100
-        - overlap_deduction
-        - outside_deduction
-        - connector_deduction
-        - decoupling_deduction
-        - routing.wire_deduction.unwrap_or(0)
-        - routing.crossing_deduction.unwrap_or(0))
-    .max(0);
-
-    let mut deductions: Vec<serde_json::Value> = Vec::new();
-    if overlap_deduction > 0 {
-        deductions.push(json!({
-            "kind": "courtyard_overlap",
-            "points": overlap_deduction,
-            "references": overlap_refs.iter().collect::<Vec<_>>(),
-            "detail": format!(
-                "{overlap_pairs} same-side courtyard overlap pair(s) — also a hard failure"
-            ),
-        }));
-    }
-    if outside_deduction > 0 {
-        deductions.push(json!({
-            "kind": "outside_outline",
-            "points": outside_deduction,
-            "references": outside_refs,
-            "detail": format!(
-                "{} part(s) not fully inside the board outline — also a hard failure",
-                hard_failures.iter().filter(|f| f["kind"] == "outside_outline").count(),
-            ),
-        }));
-    }
-    if connector_deduction > 0 {
-        deductions.push(json!({
-            "kind": "connector_edge",
-            "points": connector_deduction,
-            "references": connector_violations.iter().map(|(r, _)| r).collect::<Vec<_>>(),
-            "detail": connector_violations
-                .iter()
-                .map(|(r, d)| format!(
-                    "{r} center is {} mm from the nearest board edge (limit {CONNECTOR_EDGE_LIMIT_MM} mm)",
-                    round3(*d),
-                ))
-                .collect::<Vec<_>>()
-                .join("; "),
-        }));
-    }
-    if decoupling_deduction > 0 {
-        deductions.push(json!({
-            "kind": "decoupling",
-            "points": decoupling_deduction,
-            "references": decoupling_violations.iter().map(|v| &v.cap).collect::<Vec<_>>(),
-            "detail": decoupling_violations
-                .iter()
-                .map(|v| format!(
-                    "{} ({}, limit {} mm) is {} mm from IC {} via {} ({} references)",
-                    v.cap,
-                    v.value,
-                    v.limit_mm,
-                    round3(v.distance_mm),
-                    v.ic,
-                    v.qualifying_net,
-                    v.net_reference_count,
-                ))
-                .collect::<Vec<_>>()
-                .join("; "),
-        }));
-    }
-
-    if let Some(points) = routing.wire_deduction.filter(|points| *points > 0) {
-        deductions.push(json!({"kind":"wirelength", "points":points, "detail":"Advisory mean Euclidean MST edge length / board diagonal, scaled by20 and rounded up (cap20); not routed copper length"}));
-    }
-    if let Some(points) = routing.crossing_deduction.filter(|points| *points > 0) {
-        deductions.push(json!({"kind":"airwire_crossings", "points":points, "detail":"Projected proper crossings of different-net straight MST edges, 2 points each (cap20); not shorts or DRC"}));
-    }
-
-    // The verdict derives ONLY from hard failures and outline shape — the
-    // numeric score never decides it. Precedence: hard failures →
-    // outline_missing → outline_unproven → pass.
-    let verdict = if !hard_failures.is_empty() {
-        "hard_fail"
-    } else if outline_status == OutlineStatus::Missing {
-        "outline_missing"
-    } else if !outline_closed {
-        "outline_unproven"
-    } else {
-        "pass"
-    };
-
-    Ok(CallToolResult::json(&json!({
-        "verdict": verdict,
-        "score": score,
-        "score_incomplete": score_incomplete,
-        "routing_metrics": routing.to_json(),
-        "decoupling_coverage": decoupling_coverage,
-        "outline_missing": outline_status == OutlineStatus::Missing,
-        "outline_unproven": !outline_closed && outline_status != OutlineStatus::Missing,
-        "outline_shape": match (outline_status, outline_shape) {
-            (OutlineStatus::Missing, _) => "missing",
-            (OutlineStatus::Closed, OutlineShape::Rectangular { .. }) => "rectangular",
-            (OutlineStatus::Closed, _) => "closed",
-            _ => "unproven",
-        },
-        "outline": crate::tools::board_geometry::outline_json(&true_outline),
-        "edge_mount_listed": edge_mount_listed,
-        "hard_failures": hard_failures,
-        "deductions": deductions,
-        "connector_edges": connector_edges,
-        "uncoupled_caps": uncoupled_caps,
-        "unproven_decoupling_caps": unproven_decoupling_caps
-            .iter()
-            .map(|cap| json!({
-                "reference": cap.cap,
-                "value": cap.value,
-                "reason": cap.reason,
-            }))
-            .collect::<Vec<_>>(),
-        "decoupling_associations": decoupling_associations
-            .iter()
-            .map(|association| json!({
-                "reference": association.cap,
-                "value": association.value,
-                "ic": association.ic,
-                "qualifying_net": association.qualifying_net,
-                "net_reference_count": association.net_reference_count,
-                "distance_mm": round3(association.distance_mm),
-                "limit_mm": association.limit_mm,
-                "status": association.status,
-                "association_basis": association.association_basis,
-                "metric": "pad_anchor_euclidean_xy",
-                "cap_pad": association.cap_pad,
-                "ic_pad": association.ic_pad,
-                "cap_position": {"x":association.cap_at.0,"y":association.cap_at.1},
-                "ic_position": {"x":association.ic_at.0,"y":association.ic_at.1},
-            }))
-            .collect::<Vec<_>>(),
-        "interface_filter_caps": interface_filter_caps
-            .iter()
-            .map(|f| json!({
-                "reference": f.cap,
-                "value": f.value,
-                "connector": f.connector,
-                "connector_distance_mm": round3(f.distance_mm),
-                "metric": "worst_nearest_terminal_pad_euclidean_xy",
-                "matched_pairs": f.matched_pairs,
-                "matched_pair_count": f.matched_pair_count,
-                "matched_pairs_truncated": f.matched_pairs_truncated,
-                "limit_mm": f.limit_mm,
-            }))
-            .collect::<Vec<_>>(),
-        "footprints_scored": scan.items.len(),
-        "footprints_skipped": scan.skipped,
-        "source": source,
-    })))
+    let mut result = evaluate::evaluate(&tree, &edge_mount, max_net_references)?;
+    result["source"] = json!(source);
+    Ok(CallToolResult::json(&result))
 }
 
 // ─── Shared plumbing for the placers ─────────────────────────────────────────
@@ -1474,16 +1166,7 @@ async fn handle_auto_place(
 
 // ─── refine_placement_force_directed ─────────────────────────────────────────
 
-/// Ported spring-embedder constants (attributed in THIRD_PARTY.md).
-const FD_K_SPRING: f64 = 0.4;
-const FD_K_REPEL: f64 = 80.0;
-const FD_K_WALL: f64 = 5.0;
-const FD_DAMPING: f64 = 0.85;
-const FD_MIN_DIST: f64 = 0.5;
-const FD_GRID_MM: f64 = 0.5;
-const FD_PATIENCE: usize = 4;
-
-fn net_weight(net: &str) -> f64 {
+pub(crate) fn net_weight(net: &str) -> f64 {
     let upper = net.to_ascii_uppercase();
     if upper.is_empty() || upper == "NC" || upper.starts_with("UNCONNECTED") {
         0.0
@@ -1598,7 +1281,6 @@ async fn handle_force_directed(
             ));
         }
     };
-    let (board_w, board_h) = (ox1 - ox0, oy1 - oy0);
 
     // Deterministic ordering is the whole determinism story: parts sorted by
     // reference, nets walked in the index's sorted order, no RNG, no clocks.
@@ -1619,173 +1301,43 @@ async fn handle_force_directed(
             && selected.as_ref().map(|s| s.contains(name)).unwrap_or(true)
     };
 
-    // Spring graph: accumulated weight per part pair sharing nets.
-    let ref_index: HashMap<&str, usize> = parts
+    // Spring graph: accumulated weight per part pair sharing nets. The parts are
+    // sorted by reference, so a reference's position is its part index.
+    let references: Vec<&str> = parts
         .iter()
-        .enumerate()
-        .map(|(i, c)| (c.reference.as_deref().expect("filtered"), i))
+        .map(|c| c.reference.as_deref().expect("filtered"))
         .collect();
-    let mut springs: HashMap<(usize, usize), f64> = HashMap::new();
-    for net in index.nets() {
-        let weight = net_weight(net);
-        if weight == 0.0 {
-            continue;
-        }
-        let members: Vec<usize> = index
-            .pads_of_net(net)
-            .iter()
-            .filter_map(|p| ref_index.get(p.reference.as_str()).copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        for (ai, &a) in members.iter().enumerate() {
-            for &b in &members[ai + 1..] {
-                *springs.entry((a.min(b), a.max(b))).or_insert(0.0) += weight;
-            }
-        }
-    }
-
-    let mut pos: Vec<(f64, f64)> = parts.iter().map(|c| bbox_center(c.bbox)).collect();
     let sizes: Vec<(f64, f64)> = parts
         .iter()
         .map(|c| (c.bbox.2 - c.bbox.0, c.bbox.3 - c.bbox.1))
         .collect();
-    let mut vel: Vec<(f64, f64)> = vec![(0.0, 0.0); parts.len()];
-    let step = board_w.min(board_h) * 0.05;
-    let snap = |v: f64| (v / FD_GRID_MM).round() * FD_GRID_MM;
+    let core_parts: Vec<force_core::FdPart> = (0..parts.len())
+        .map(|i| force_core::FdPart {
+            size: sizes[i],
+            side: parts[i].layer_side,
+            movable: movable(i),
+        })
+        .collect();
+    let springs = force_core::springs(&index, &references, &net_weight);
+    let start: Vec<(f64, f64)> = parts.iter().map(|c| bbox_center(c.bbox)).collect();
+    let params = force_core::FdParams::legacy(iterations);
+    let bounds = (ox0, oy0, ox1, oy1);
+    let snap = |v: f64| (v / params.grid_mm).round() * params.grid_mm;
 
-    let mut last_snapshot: Vec<(f64, f64)> = Vec::new();
-    let mut stable = 0usize;
-    let mut iterations_run = 0usize;
-    let mut converged = false;
-    for iteration in 0..iterations {
-        iterations_run = iteration + 1;
-        let temperature = step * (1.0 - iteration as f64 / iterations as f64) + 0.1;
-        let mut force: Vec<(f64, f64)> = vec![(0.0, 0.0); parts.len()];
-
-        // Pairwise repulsion, boosted sharply inside the clearance ring.
-        for i in 0..parts.len() {
-            for j in (i + 1)..parts.len() {
-                let dx = pos[i].0 - pos[j].0;
-                let dy = pos[i].1 - pos[j].1;
-                let dist = dx.hypot(dy).max(FD_MIN_DIST);
-                let min_clear = (sizes[i].0 + sizes[j].0) * 0.5 + 1.0;
-                let mut k = FD_K_REPEL;
-                if dist < min_clear {
-                    k *= (min_clear / dist).powi(2);
-                }
-                let magnitude = k / (dist * dist);
-                let (ux, uy) = (dx / dist, dy / dist);
-                force[i].0 += ux * magnitude;
-                force[i].1 += uy * magnitude;
-                force[j].0 -= ux * magnitude;
-                force[j].1 -= uy * magnitude;
-            }
-        }
-        // Spring attraction along shared nets.
-        for (&(a, b), &weight) in springs.iter().collect::<std::collections::BTreeMap<_, _>>() {
-            let dx = pos[b].0 - pos[a].0;
-            let dy = pos[b].1 - pos[a].1;
-            let dist = dx.hypot(dy).max(FD_MIN_DIST);
-            let magnitude = FD_K_SPRING * weight * dist;
-            let (ux, uy) = (dx / dist, dy / dist);
-            force[a].0 += ux * magnitude;
-            force[a].1 += uy * magnitude;
-            force[b].0 -= ux * magnitude;
-            force[b].1 -= uy * magnitude;
-        }
-        // Walls push inward.
-        for i in 0..parts.len() {
-            force[i].0 += FD_K_WALL / (pos[i].0 - ox0).max(0.01);
-            force[i].0 -= FD_K_WALL / (ox1 - pos[i].0).max(0.01);
-            force[i].1 += FD_K_WALL / (pos[i].1 - oy0).max(0.01);
-            force[i].1 -= FD_K_WALL / (oy1 - pos[i].1).max(0.01);
-        }
-
-        // Integrate: damped velocity clamped to the cooling temperature;
-        // locked/unselected parts exert force but never move.
-        for i in 0..parts.len() {
-            if !movable(i) {
-                vel[i] = (0.0, 0.0);
-                continue;
-            }
-            vel[i].0 = (vel[i].0 + force[i].0) * FD_DAMPING;
-            vel[i].1 = (vel[i].1 + force[i].1) * FD_DAMPING;
-            let speed = vel[i].0.hypot(vel[i].1);
-            if speed > temperature {
-                let scale = temperature / speed;
-                vel[i].0 *= scale;
-                vel[i].1 *= scale;
-            }
-            pos[i].0 = (pos[i].0 + vel[i].0).clamp(ox0 + sizes[i].0 / 2.0, ox1 - sizes[i].0 / 2.0);
-            pos[i].1 = (pos[i].1 + vel[i].1).clamp(oy0 + sizes[i].1 / 2.0, oy1 - sizes[i].1 / 2.0);
-        }
-
-        // Convergence: the SNAPPED layout unchanged for `patience` rounds.
-        let snapshot: Vec<(f64, f64)> = pos.iter().map(|p| (snap(p.0), snap(p.1))).collect();
-        if snapshot == last_snapshot {
-            stable += 1;
-            if stable >= FD_PATIENCE {
-                converged = true;
-                break;
-            }
-        } else {
-            stable = 0;
-            last_snapshot = snapshot;
-        }
-    }
-
-    // Collision resolution: forces cluster connected parts, but nothing in
-    // the physics forbids courtyard overlap — the reference resolved
-    // candidate positions against collisions every step, and without that
-    // pass the springs simply crush a net's members into one spot. Walk the
-    // parts in sorted order; any part overlapping an already-settled one
-    // spirals outward on the snap grid to the nearest free cell —
-    // deterministic by construction.
-    let overlaps = |a: (f64, f64), sa: (f64, f64), b: (f64, f64), sb: (f64, f64)| {
-        (a.0 - b.0).abs() < (sa.0 + sb.0) * 0.5 && (a.1 - b.1).abs() < (sa.1 + sb.1) * 0.5
-    };
-    // Immovable parts are obstacles from the start — settle them all before
-    // any movable part looks for a free cell, or a cap processed earlier in
-    // reference order would never see the locked IC it is about to overlap.
-    let mut settled: Vec<usize> = (0..parts.len()).filter(|&i| !movable(i)).collect();
-    for i in 0..parts.len() {
-        if !movable(i) {
-            continue;
-        }
-        pos[i] = (snap(pos[i].0), snap(pos[i].1));
-        let collides = |p: (f64, f64), settled: &[usize], pos: &[(f64, f64)]| {
-            settled.iter().any(|&j| {
-                parts[j].layer_side == parts[i].layer_side
-                    && overlaps(p, sizes[i], pos[j], sizes[j])
-            })
-        };
-        if collides(pos[i], &settled, &pos) {
-            'search: for ring in 1..200 {
-                let r = ring as f64 * FD_GRID_MM;
-                for (dx, dy) in [
-                    (r, 0.0),
-                    (0.0, r),
-                    (-r, 0.0),
-                    (0.0, -r),
-                    (r, r),
-                    (-r, r),
-                    (r, -r),
-                    (-r, -r),
-                ] {
-                    let candidate = (
-                        (pos[i].0 + dx).clamp(ox0 + sizes[i].0 / 2.0, ox1 - sizes[i].0 / 2.0),
-                        (pos[i].1 + dy).clamp(oy0 + sizes[i].1 / 2.0, oy1 - sizes[i].1 / 2.0),
-                    );
-                    if !collides(candidate, &settled, &pos) {
-                        pos[i] = candidate;
-                        break 'search;
-                    }
-                }
-            }
-        }
-        settled.push(i);
-    }
+    let relaxed = force_core::relax(
+        &core_parts,
+        &springs,
+        &force_core::FdExtras::default(),
+        bounds,
+        &start,
+        &params,
+    );
+    let (iterations_run, converged) = (relaxed.iterations_run, relaxed.converged);
+    let mut pos = relaxed.centres;
+    // Collision resolution: forces cluster connected parts, but nothing in the physics
+    // forbids courtyard overlap, so the core settles every part on the grid and moves
+    // any that overlap a settled one to the nearest free cell.
+    force_core::resolve_collisions(&core_parts, bounds, &mut pos, &params);
 
     // Final positions: snapped centers, translated back to root anchors.
     let mut placements = Vec::new();
@@ -4612,5 +4164,274 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error);
+    }
+
+    // ─── Goldens for the pull-out (Row PS, stage A) ──────────────────────────
+    //
+    // The force core and the score evaluation were pulled out of their handlers
+    // with no change to either tool's output. These tests hold the two handlers to
+    // the exact response text recorded from the code as it was before the pull-out
+    // (`fork/main` c79e1421). The outputs hold no temp path or other run-dependent
+    // value, so nothing is normalised: the text is compared byte for byte.
+    //
+    // To record again (only ever from code whose output is meant to be the new
+    // truth): `cargo test -p konnect-core --lib -- --ignored record_pull_out_goldens`.
+
+    const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/placement/fixtures");
+
+    fn golden_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(GOLDEN_DIR).join(format!("{name}.json"))
+    }
+
+    /// The tool's response text, which must be a success.
+    fn success_text(result: &CallToolResult) -> String {
+        assert!(!result.is_error, "the tool errored: {result:?}");
+        result_text(result).to_string()
+    }
+
+    /// `refine_placement_force_directed`'s response text for six cases, by name.
+    async fn force_directed_golden_cases() -> Vec<(&'static str, String)> {
+        let mut cases = Vec::new();
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let ctx = test_ctx();
+        let run = |name: &'static str, args: serde_json::Value| {
+            let ctx = &ctx;
+            async move {
+                (
+                    name,
+                    success_text(&handle_force_directed(&args, ctx).await.unwrap()),
+                )
+            }
+        };
+        cases.push(run("default", json!({ "board": board.to_string_lossy() })).await);
+        cases.push(
+            run(
+                "locked_u1",
+                json!({ "board": board.to_string_lossy(), "locked": ["U1"] }),
+            )
+            .await,
+        );
+        cases.push(
+            run(
+                "c1_only_max_displacement_50",
+                json!({
+                    "board": board.to_string_lossy(),
+                    "references": ["C1"],
+                    "max_displacement_mm": 50.0,
+                }),
+            )
+            .await,
+        );
+        cases.push(
+            run(
+                "iterations_50",
+                json!({ "board": board.to_string_lossy(), "iterations": 50 }),
+            )
+            .await,
+        );
+
+        let far_dir = tempfile::tempdir().unwrap();
+        let far_board = write_variant(
+            &far_dir,
+            "far_cap_refinement.kicad_pcb",
+            fixture_with_moved_root("(at 20 15)", "(at 50 40)"),
+        );
+        cases.push(
+            run(
+                "far_cap_dry_run",
+                json!({
+                    "board": far_board.to_string_lossy(),
+                    "references": ["C1"],
+                    "max_displacement_mm": 50.0,
+                }),
+            )
+            .await,
+        );
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        let locked_board = fixture_copy(&locked_dir);
+        lock_footprint(&locked_board, "U1");
+        cases.push(
+            run(
+                "kicad_locked_u1",
+                json!({ "board": locked_board.to_string_lossy() }),
+            )
+            .await,
+        );
+        cases
+    }
+
+    /// `score_placement`'s response text for every scoring fixture the tests above
+    /// build: the stock rectangle (also with a fanout limit of 2), the rounded board
+    /// with a cut-out (also with the connectors listed as edge mounts), the closed
+    /// polygon, the two-resistor board, a missing outline, an open outline, an
+    /// overlap, a part outside, a connector too far from every edge, and the decoupling
+    /// variants (ground only, interface filter, far from both, a foreign connector, both
+    /// faces of a through-hole and of a surface-mount connector, a connector cap on
+    /// ground only, an uncoupled connector cap, within both limits, the 1 uF family).
+    async fn score_golden_cases() -> Vec<(&'static str, String)> {
+        const TWO_R: &str = include_str!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let dir = tempfile::tempdir().unwrap();
+        let stock = std::fs::read_to_string(FIXTURE).unwrap();
+        let moved_cap = fixture_with_moved_root("(at 20 15)", "(at 6.27 17.7)");
+        let in_dir = |name: &str, content: String| write_variant(&dir, name, content);
+
+        // (name, board, extra arguments)
+        let mut boards: Vec<(&'static str, std::path::PathBuf, serde_json::Value)> = vec![
+            ("rectangle", std::path::PathBuf::from(FIXTURE), json!({})),
+            (
+                "rectangle_fanout_2",
+                std::path::PathBuf::from(FIXTURE),
+                json!({ "max_net_references": 2 }),
+            ),
+            (
+                "rounded_cutout",
+                std::path::PathBuf::from(GEOMETRY_FIXTURE),
+                json!({}),
+            ),
+            (
+                "rounded_cutout_edge_mount",
+                std::path::PathBuf::from(GEOMETRY_FIXTURE),
+                json!({ "edge_mount_references": ["J*"] }),
+            ),
+            (
+                "closed_polygon",
+                std::path::PathBuf::from(GR_POLY_FIXTURE),
+                json!({}),
+            ),
+            (
+                "two_resistors",
+                in_dir("two_resistors.kicad_pcb", TWO_R.to_string()),
+                json!({}),
+            ),
+        ];
+        let variants: Vec<(&'static str, String)> = vec![
+            (
+                "missing_outline",
+                stock.replace("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")"),
+            ),
+            (
+                "open_outline",
+                stock.replacen("(layer \"Edge.Cuts\")", "(layer \"Dwgs.User\")", 1),
+            ),
+            ("overlap", stock.replace("(at 30 15 90)", "(at 20 15 90)")),
+            ("outside", stock.replace("(at 20 15)", "(at 200 15)")),
+            (
+                "decoupling_ground_only",
+                rewrite_footprint_nets(&stock, "C1", &[("VCC", "/SIG_IN")]),
+            ),
+            (
+                "connector_far_from_every_edge",
+                fixture_with_moved_root("(at 5 20 90)", "(at 12 33 90)"),
+            ),
+            ("decoupling_interface_filter", moved_cap.clone()),
+            (
+                "decoupling_far_from_both",
+                fixture_with_moved_root("(at 20 15)", "(at 18 20)"),
+            ),
+            (
+                "decoupling_foreign_connector",
+                rewrite_footprint_nets(
+                    &moved_cap,
+                    "J1",
+                    &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
+                ),
+            ),
+            (
+                "decoupling_far_face_through_hole",
+                flip_footprint_to_back(&moved_cap, "C1"),
+            ),
+            (
+                "decoupling_far_face_surface_mount",
+                make_pads_surface_mount(&flip_footprint_to_back(&moved_cap, "C1"), "J1"),
+            ),
+            (
+                "decoupling_connector_ground_only",
+                rewrite_footprint_nets(&moved_cap, "J1", &[("VCC", "/SIG_IN")]),
+            ),
+            (
+                "decoupling_connector_cap_uncoupled",
+                rewrite_footprint_nets(
+                    &moved_cap,
+                    "C1",
+                    &[("VCC", "/SIG_IN"), ("GND", "unconnected-(J1-Pin_4-Pad4)")],
+                ),
+            ),
+            ("decoupling_within_both_limits", {
+                let moved_ic = fixture_with_moved_root("(at 25 20)", "(at 9.975 14.095 180)");
+                moved_ic.replace("(at 20 15)", "(at 6.27 17.7)")
+            }),
+            (
+                "decoupling_bulk_family",
+                rewrite_footprint_value(
+                    &fixture_with_moved_root("(at 20 15)", "(at 6.27 16)"),
+                    "C1",
+                    "100nF",
+                    "1uF",
+                ),
+            ),
+        ];
+        for (name, content) in variants {
+            boards.push((
+                name,
+                in_dir(&format!("{name}.kicad_pcb"), content),
+                json!({}),
+            ));
+        }
+
+        let ctx = test_ctx();
+        let mut cases = Vec::new();
+        for (name, board, extra) in boards {
+            let mut args = json!({ "board": board.to_string_lossy() });
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            let result = handle_score_placement(&args, &ctx).await.unwrap();
+            cases.push((name, success_text(&result)));
+        }
+        cases
+    }
+
+    /// One-off recorder: writes the goldens below `GOLDEN_DIR` from the code as it
+    /// stands. Ignored, so a normal run never rewrites its own yardstick.
+    #[tokio::test]
+    #[ignore = "records the golden files; run once, on the code whose output is the truth"]
+    async fn record_pull_out_goldens() {
+        std::fs::create_dir_all(GOLDEN_DIR).unwrap();
+        for (name, text) in force_directed_golden_cases().await {
+            std::fs::write(golden_path(&format!("force_directed_{name}")), text).unwrap();
+        }
+        for (name, text) in score_golden_cases().await {
+            std::fs::write(golden_path(&format!("score_{name}")), text).unwrap();
+        }
+    }
+
+    fn assert_matches_golden(name: &str, text: &str) {
+        let path = golden_path(name);
+        let golden = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("golden {} unreadable: {error}", path.display()));
+        assert_eq!(
+            text, golden,
+            "{name}: the tool's output changed from the recorded golden"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_directed_output_is_unchanged_by_the_pull_out() {
+        let cases = force_directed_golden_cases().await;
+        assert_eq!(cases.len(), 6, "the six cases of the design");
+        for (name, text) in &cases {
+            assert_matches_golden(&format!("force_directed_{name}"), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn score_placement_output_is_unchanged_by_the_pull_out() {
+        let cases = score_golden_cases().await;
+        assert_eq!(cases.len(), 21, "every scoring fixture listed above");
+        for (name, text) in &cases {
+            assert_matches_golden(&format!("score_{name}"), text);
+        }
     }
 }

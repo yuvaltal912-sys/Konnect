@@ -215,7 +215,7 @@ pub(crate) fn setup_guidance(located: &Located) -> Value {
 // ─── The call ────────────────────────────────────────────────────────────────
 
 /// What the arguments of a call settle before anything is located or routed.
-struct Call {
+pub(crate) struct Call {
     dsn: PathBuf,
     ses_output: PathBuf,
     /// `<ses_output with extension "search">`, created by [`prepare_call`].
@@ -243,7 +243,7 @@ fn config_refusal(error: &anyhow::Error) -> CallToolResult {
 /// Steps 1 and 2 of [`route_with_fastroute`]: the effort, the DSN, the output and
 /// the search folder. Everything that can be refused is refused here, before the
 /// folder is created; a returned `Ok(Ok(call))` has created it (empty).
-fn prepare_call(args: &Value) -> Result<std::result::Result<Call, CallToolResult>> {
+pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, CallToolResult>> {
     // The user config is read only when the call leaves a value to it.
     let effort = {
         let argument = Some(&args["effort"]).filter(|value| !value.is_null());
@@ -737,7 +737,11 @@ async fn search_and_write(
 /// The failed call leaves its records, not its boards: every run folder is
 /// reduced to its `run.json` (`search.json` was written before this) and a
 /// reduce error is reported in `search.reduce_error`, never fatal.
-fn no_winner_result(call: &Call, outcome: &SearchOutcome, mut search: Value) -> CallToolResult {
+pub(crate) fn no_winner_result(
+    call: &Call,
+    outcome: &SearchOutcome,
+    mut search: Value,
+) -> CallToolResult {
     if let Err(error) = reduce_run_folders(&call.folder, outcome) {
         search["reduce_error"] = json!(format!("{error:#}"));
     }
