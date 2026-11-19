@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 6;
+pub(crate) const GENERATOR_VERSION: u32 = 7;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -1335,7 +1335,9 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 }
 
 /// Containment and overlap repair against the true outline. Held parts settle first.
-/// Then each movable part in reference order: when its courtyard bbox (`sizes[i]` at
+/// Then each moved part, the largest courtyard box first (`sizes[i]`, width times height;
+/// equal areas by reference): a big part needs a free strip that the small ones, settled
+/// first, would have scattered across the board. When its courtyard bbox (`sizes[i]` at
 /// `centres[i]`) overhangs the outline (`Outline::overhang` deeper than
 /// `containment_threshold_mm`) or overlaps a settled part that shares a side with it
 /// (`BoardModel::part_sides`: a through-hole part is on both) or a copper obstacle on its
@@ -1435,9 +1437,14 @@ pub(crate) fn legalize(
     let mut settled: Vec<usize> = (0..count)
         .filter(|&i| !model.movable[i] || unmoved(i, centres))
         .collect();
-    let queue: Vec<usize> = (0..count)
+    let mut queue: Vec<usize> = (0..count)
         .filter(|&i| model.movable[i] && !unmoved(i, centres))
         .collect();
+    // Largest first, as greedy legalization does; the part index is the reference order.
+    queue.sort_unstable_by(|&a, &b| {
+        let area = |i: usize| sizes[i].0 * sizes[i].1;
+        area(b).total_cmp(&area(a)).then(a.cmp(&b))
+    });
     let mut failed: Vec<String> = Vec::new();
     for i in queue {
         if !legal_at(i, centres[i], &settled, centres) {
