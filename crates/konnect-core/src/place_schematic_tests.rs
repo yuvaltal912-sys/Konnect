@@ -457,6 +457,74 @@ fn a_schematic_that_cannot_be_read_is_an_error_with_a_reason() {
     assert_eq!(read_sheets(&root).unwrap().len(), 2);
 }
 
+#[test]
+fn the_schematic_distance_uses_both_axes() {
+    // P and Q are 4 mm apart, P and R 5 mm; all three sit well off the y axis, so a sum of
+    // the y offsets in place of their difference would put R first.
+    let sheets = flat(&[
+        ("P", "up", 0.0, 10.0),
+        ("Q", "uq", 0.0, 14.0),
+        ("R", "ur", 5.0, 10.0),
+    ]);
+    let board = board_of(&[
+        part("P", 10.0, 10.0).path("/up"),
+        part("Q", 20.0, 10.0).path("/uq"),
+        part("R", 30.0, 10.0).path("/ur"),
+    ]);
+    let hoods = neighbourhoods(&board, &sheets).unwrap();
+    assert_eq!(list(&hoods, "P"), ["Q", "R"]);
+}
+
+#[test]
+fn a_board_whose_courtyard_scan_skips_a_footprint_is_a_reason() {
+    let sheets = flat(&[("P", "up", 0.0, 0.0), ("Q", "uq", 5.0, 0.0)]);
+    let good = board_of(&[
+        part("P", 10.0, 10.0).path("/up"),
+        part("Q", 20.0, 10.0).path("/uq"),
+    ]);
+    let broken = board_of(&[
+        part("P", 10.0, 10.0).path("/up"),
+        part("Q", 20.0, 10.0).path("/uq"),
+        part("Z", 30.0, 10.0).broken_courtyard(),
+    ]);
+    let error = neighbourhoods(&broken, &sheets).unwrap_err();
+    assert!(error.contains("skipped 1"), "{error}");
+    let base = SchematicBaseline::from_sheets(&sheets, &good).unwrap();
+    let error = base.measure(&broken).unwrap_err();
+    assert!(error.contains("skipped 1"), "{error}");
+    // Negative control: the good board measures.
+    assert!(base.measure(&good).is_ok());
+}
+
+#[test]
+fn sheets_nest_to_a_bounded_depth() {
+    // `n` files below the root, each including the next.
+    let nested = |n: usize| {
+        let dir = tempfile::tempdir().unwrap();
+        let name = |k: usize| format!("f{k}.kicad_sch");
+        let root = write(
+            dir.path(),
+            "p.kicad_sch",
+            &schematic_text("root", &[], &[("s0", &name(1))]),
+        );
+        for k in 1..=n {
+            let child = if k < n {
+                vec![("sx", name(k + 1))]
+            } else {
+                Vec::new()
+            };
+            let refs: Vec<(&str, &str)> = child.iter().map(|(u, f)| (*u, f.as_str())).collect();
+            write(dir.path(), &name(k), &schematic_text("f", &[], &refs));
+        }
+        (dir, read_sheets(&root))
+    };
+    // 31 files below the root is 32 files in all: the deepest allowed.
+    let (_keep, ok) = nested(MAX_DEPTH - 1);
+    assert_eq!(ok.unwrap().len(), MAX_DEPTH);
+    let (_keep, deep) = nested(MAX_DEPTH);
+    assert!(deep.unwrap_err().contains("deeper"));
+}
+
 // ─── The measure ─────────────────────────────────────────────────────────────
 
 /// Three parts that are each other's neighbours (A, B, C), one alone on another sheet

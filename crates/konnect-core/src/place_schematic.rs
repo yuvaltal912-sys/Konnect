@@ -289,7 +289,7 @@ pub(crate) fn neighbourhoods(
 ) -> Result<Neighbourhoods, String> {
     let nodes = footprints(board);
     let scan = footprint_courtyards(board);
-    if scan.skipped > 0 || scan.items.len() != nodes.len() {
+    if scan.skipped > 0 {
         return Err(format!(
             "the courtyard scan skipped {} footprint(s)",
             scan.skipped
