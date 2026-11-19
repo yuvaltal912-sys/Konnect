@@ -2586,3 +2586,15 @@ fn held_and_unmoved_parts_still_settle_first_whatever_their_size() {
     );
     assert!(gap_between_parts(&sizes, &centres, z1, a1) >= MOVED_CLEARANCE_MM - 1e-9);
 }
+
+#[test]
+fn the_order_is_by_area_not_by_perimeter() {
+    // P1 is 10 x 1 mm (area 10, sides sum 11), Q1 is 4 x 4 mm (area 16, sides sum 8). Both
+    // are dropped on one cell: the larger area, Q1, keeps it, though P1 is first by
+    // reference and by the sum of its sides.
+    let (model, mut centres) = dropped_parts(&[("P1", 5.0, 0.5), ("Q1", 2.0, 2.0)], (40.0, 40.0));
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[index_of(&model, "Q1")], (40.0, 40.0));
+    assert_ne!(centres[index_of(&model, "P1")], (40.0, 40.0));
+}
