@@ -38,7 +38,8 @@ hold the lane locks (native, then instr) while a board runs.
    KiCad, on a copy, only the parts he wants fixed (outline drawn, parts imported and dumped
    anywhere): `target/creation-research/placement-search/lock-copies/<board>/board.kicad_pcb`.
    Make `orig/` and `input/` from that copy. Write `held.json` as `[]`, unless he names more
-   references to hold. Nothing else is held (see `hold` below), so the list is his locks.
+   references to hold. The held set is then his locks plus the parts with no pad on a net
+   (see `hold` below); nothing else is held.
 6. Make S0 (`neutral_start`), then A: one AI session on a copy of S0, isolated as design D20
    says, saved as `ai/board.kicad_pcb`.
 

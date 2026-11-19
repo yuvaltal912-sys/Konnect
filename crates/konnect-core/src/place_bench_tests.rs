@@ -421,6 +421,34 @@ fn read_held(path: &Path) -> anyhow::Result<BTreeSet<String>> {
     Ok(list.into_iter().collect())
 }
 
+/// The plan of one board: the bench's fixed numbers (3 calls per reference, 3 best and 1
+/// drawn per family, draw seed 1), and the board's own matrix, hold rules and time limit.
+/// Apart from `run_board` so that the wiring of `bench.json`'s options is tested without
+/// KiCad.
+fn board_plan(
+    board: &BenchBoard,
+    folder: PathBuf,
+    route: RouteInputs,
+    ai_board: Option<PathBuf>,
+    caller_held: BTreeSet<String>,
+) -> Plan {
+    Plan {
+        name: board.name.clone(),
+        folder,
+        matrix: board.matrix(),
+        threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        reference_calls: 3,
+        best_per_family: 3,
+        drawn_per_family: 1,
+        draw_seed: 1,
+        time_limit: Duration::from_secs(board.time_limit_minutes * 60),
+        route,
+        ai_board,
+        caller_held,
+        hold: board.hold_rules(),
+    }
+}
+
 /// One board's search; returns the line to print.
 fn run_board(
     env: &BenchEnv,
@@ -461,21 +489,13 @@ fn run_board(
         kicad_config_home: env.kicad_config_home.clone(),
     };
     let ctx = isolated_context(&folder.join("isolation"), &env.kicad_cli)?;
-    let plan = Plan {
-        name: board.name.clone(),
-        folder: folder.clone(),
-        matrix: board.matrix(),
-        threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
-        reference_calls: 3,
-        best_per_family: 3,
-        drawn_per_family: 1,
-        draw_seed: 1,
-        time_limit: Duration::from_secs(board.time_limit_minutes * 60),
-        route: inputs.clone(),
-        ai_board: ai.is_file().then_some(ai),
-        caller_held: read_held(&folder.join("held.json"))?,
-        hold: board.hold_rules(),
-    };
+    let plan = board_plan(
+        board,
+        folder.clone(),
+        inputs.clone(),
+        ai.is_file().then_some(ai),
+        read_held(&folder.join("held.json"))?,
+    );
     let outcome = runtime.block_on(search(&plan, Arc::new(PlaceRouteCall { inputs, ctx })))?;
     let mut counts = std::collections::BTreeMap::new();
     for record in &outcome.records {
@@ -844,6 +864,39 @@ fn families_default_to_force_and_schematic_and_perturb_brings_p_back() {
     assert_eq!(count_of(&only_s, Family::Force), 0);
     assert_eq!(count_of(&only_s, Family::Perturb), 0);
     assert_eq!(count_of(&only_s, Family::Schematic), 64);
+}
+
+#[test]
+fn the_boards_options_reach_its_plan() {
+    let route = || RouteInputs {
+        rules: Default::default(),
+        options: export_options(Path::new("b.kicad_pcb")),
+        board: PathBuf::from("b.kicad_pcb"),
+        effort: Effort::Fast,
+        fastroute: PathBuf::from("fastroute"),
+        kicad_cli: "kicad-cli".into(),
+        kicad_config_home: PathBuf::from("cfg"),
+    };
+    let plan_of = |entry: &str| {
+        board_plan(
+            &board_of(entry),
+            PathBuf::from("run"),
+            route(),
+            None,
+            BTreeSet::new(),
+        )
+    };
+    // The defaults: his locks only, F and S.
+    let plan = plan_of(r#"{"name":"B4","folder":"B4","time_limit_minutes":7}"#);
+    assert_eq!(plan.hold, HoldRules::locks_only());
+    assert_eq!(crate::place_generators::recipes(&plan.matrix).len(), 160);
+    assert_eq!(plan.time_limit, Duration::from_secs(7 * 60));
+    // Negative control: the other options reach the plan too.
+    let plan = plan_of(
+        r#"{"name":"B4","folder":"B4","hold":"rules","families":["force","schematic","perturb"]}"#,
+    );
+    assert_eq!(plan.hold, HoldRules::default());
+    assert_eq!(crate::place_generators::recipes(&plan.matrix).len(), 288);
 }
 
 #[test]

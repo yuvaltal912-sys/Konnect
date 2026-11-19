@@ -1170,6 +1170,89 @@ async fn a_refused_ai_board_is_one_record_after_the_owners() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_search_holds_what_the_plans_rules_say() {
+    // The fixture's J1 is an unlocked connector with a netted pad: `HoldRules::default()`
+    // holds it, `locks_only()` does not.
+    let text = text();
+    let none = BTreeSet::new();
+    let locks = held_set(&text, &none, &HoldRules::locks_only()).unwrap();
+    let rules = held_set(&text, &none, &HoldRules::default()).unwrap();
+    assert!(locks.movable.contains("J1") && rules.held.contains_key("J1"));
+    assert_ne!(locks.held_sha256, rules.held_sha256);
+
+    let mut setup = setup(100_000);
+    setup.plan.hold = HoldRules::locks_only();
+    setup.plan.ai_board = None;
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    // Every record was made against the locks-only held list, and J1 moved in a routed
+    // candidate (the routed ones keep their board text).
+    assert!(outcome
+        .records
+        .iter()
+        .all(|r| r.held_sha256 == locks.held_sha256));
+    let mut j1_moved = false;
+    for record in outcome.records.iter().filter(|r| r.board_text.is_some()) {
+        let tree = parse(record.board_text.as_deref().unwrap());
+        let placements = placements_of(&tree, &locks.movable).unwrap();
+        let j1 = placements.iter().find(|p| p.reference == "J1").unwrap();
+        j1_moved |= (j1.x, j1.y) != (58.0, 20.0);
+    }
+    assert!(j1_moved, "no candidate moved the unlocked connector");
+    // search.json records the rules the search ran with.
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["plan"]["hold_rules"],
+        serde_json::to_value(HoldRules::locks_only()).unwrap()
+    );
+
+    // Negative control: with the default rules J1 is held, and the list is the other one.
+    let mut setup = self::setup(100_000);
+    setup.plan.ai_board = None;
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    assert!(outcome
+        .records
+        .iter()
+        .all(|r| r.held_sha256 == rules.held_sha256));
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["plan"]["hold_rules"],
+        serde_json::to_value(HoldRules::default()).unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_family_the_matrix_leaves_out_has_no_row_and_no_verdict() {
+    let mut setup = setup(100_000);
+    setup.plan.ai_board = None;
+    setup.plan.matrix = setup
+        .plan
+        .matrix
+        .clone()
+        .only(&[Family::Force, Family::Schematic]);
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
+    assert_eq!(table_text, table(&setup.plan, &outcome));
+    assert!(table_text.contains("(families F, S)"), "{table_text}");
+    for left_in in ["| F |", "| S |", "| O |", "| A |"] {
+        assert!(table_text.contains(left_in), "{left_in}: {table_text}");
+    }
+    assert!(!table_text.contains("| P |"), "{table_text}");
+    // Negative control: with P in the matrix the same table has its row and verdict.
+    let mut setup = self::setup(100_000);
+    setup.plan.ai_board = None;
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let table_text = table(&setup.plan, &outcome);
+    assert!(table_text.contains("(families F, S, P)"), "{table_text}");
+    assert_eq!(table_text.matches("| P |").count(), 2, "{table_text}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_held_list_that_cannot_be_proved_is_an_error_before_phase_one() {
     let mut setup = setup(100_000);
     setup.plan.caller_held.insert("NOPE".into());
