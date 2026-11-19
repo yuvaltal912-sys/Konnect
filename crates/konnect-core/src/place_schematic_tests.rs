@@ -264,6 +264,15 @@ fn one_sheet_file_used_twice_is_two_instances_with_no_neighbours_across() {
     assert_eq!(list(&hoods, "R20"), ["R21"]);
     assert_eq!(list(&hoods, "R21"), ["R20"]);
     assert_eq!((hoods.measured, hoods.unmatched), (4, 0));
+    // A path that names no sheet instance falls back to the reference on the instance: R20
+    // is a reference of the second instance only, and the file's own property says R10.
+    let board = board_of(&[
+        part("R20", 14.0, 10.0).path("/gone/up"),
+        part("R21", 16.0, 10.0).path("/s2/uq"),
+    ]);
+    let hoods = neighbourhoods(&board, &sheets).unwrap();
+    assert_eq!(list(&hoods, "R20"), ["R21"], "{hoods:?}");
+    assert_eq!(hoods.unmatched, 0);
 }
 
 #[test]
@@ -562,6 +571,24 @@ fn a_part_is_pulled_away_only_when_both_the_factor_and_the_distance_are_exceeded
     // The predicate alone, with an input of 0 (everything above 10 mm is 'more than 2x').
     assert!(!is_pulled_away(0.0, 10.0));
     assert!(is_pulled_away(0.0, 10.5));
+}
+
+#[test]
+fn distances_run_between_courtyard_centres_not_anchors() {
+    let sheets = flat(&[("P", "up", 0.0, 0.0), ("Q", "uq", 5.0, 0.0)]);
+    // P's courtyard is off-centre: its box (9, 9) to (15, 13) has its centre at (12, 11),
+    // 2 mm right of and 1 mm below the anchor (10, 10). Q's centre is its anchor.
+    let board = board_of(&[
+        Fp::new("P", 10.0, 10.0)
+            .court_rect(-1.0, -1.0, 5.0, 3.0)
+            .two_pad("A", "B")
+            .path("/up"),
+        part("Q", 20.0, 10.0).path("/uq"),
+    ]);
+    let hoods = neighbourhoods(&board, &sheets).unwrap();
+    let own = part_distances(&board, &hoods).unwrap();
+    assert!(near(own["P"], 8.0f64.hypot(1.0)), "{own:?}");
+    assert!(near(own["Q"], 8.0f64.hypot(1.0)));
 }
 
 #[test]

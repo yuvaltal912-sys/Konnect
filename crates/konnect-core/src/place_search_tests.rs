@@ -1877,7 +1877,12 @@ async fn the_measure_reaches_search_json_and_the_table_and_the_input_measures_on
         .lines()
         .find(|line| line.starts_with("| 1 |"))
         .unwrap();
-    assert!(!row.ends_with("| - | - |"), "{row}");
+    let cells: Vec<&str> = row.trim_end_matches('|').rsplit('|').take(2).collect();
+    assert!(
+        cells[0].trim().parse::<usize>().is_ok(),
+        "pulled away: {row}"
+    );
+    assert!(cells[1].trim().parse::<f64>().is_ok(), "sch. nbr mm: {row}");
     // Counts only: the table names no part.
     for name in model().references {
         assert!(!table_text.contains(&format!(" {name} ")), "`{name}`");

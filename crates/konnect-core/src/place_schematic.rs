@@ -210,6 +210,13 @@ pub(crate) struct Neighbourhoods {
     pub alone: usize,
 }
 
+/// A matched part: its board reference, its sheet instance and its schematic points.
+struct Matched {
+    reference: String,
+    sheet: usize,
+    points: Vec<(f64, f64)>,
+}
+
 /// The sheet instance and the schematic points of the part that footprint `node`
 /// (reference `reference`) stands for, or `None`. The footprint's `(path "/<sheets>/<uuid>")`
 /// names its sheet instance and its symbol; where no symbol of that instance has that uuid
@@ -289,32 +296,38 @@ pub(crate) fn neighbourhoods(
         ));
     }
     let mut unmatched = 0usize;
-    // (reference, sheet instance, schematic points)
-    let mut parts: Vec<(String, usize, Vec<(f64, f64)>)> = Vec::new();
+    let mut parts: Vec<Matched> = Vec::new();
     for (node, courtyard) in nodes.iter().zip(&scan.items) {
         if node.find_all("pad").is_empty() {
             continue;
         }
         let reference = courtyard.reference.as_deref().filter(|r| !r.is_empty());
         match reference.and_then(|r| match_part(node, r, sheets).map(|m| (r, m))) {
-            Some((reference, (sheet, points))) => {
-                parts.push((reference.to_string(), sheet, points));
-            }
+            Some((reference, (sheet, points))) => parts.push(Matched {
+                reference: reference.to_string(),
+                sheet,
+                points,
+            }),
             None => unmatched += 1,
         }
     }
     let mut neighbours = BTreeMap::new();
-    for (reference, sheet, points) in &parts {
+    for part in &parts {
         let mut others: Vec<(f64, &str)> = parts
             .iter()
-            .filter(|(other, other_sheet, _)| other_sheet == sheet && other != reference)
-            .map(|(other, _, other_points)| (least_distance(points, other_points), other.as_str()))
+            .filter(|other| other.sheet == part.sheet && other.reference != part.reference)
+            .map(|other| {
+                (
+                    least_distance(&part.points, &other.points),
+                    other.reference.as_str(),
+                )
+            })
             .collect();
         others.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         others.truncate(NEIGHBOURS);
         if !others.is_empty() {
             neighbours.insert(
-                reference.clone(),
+                part.reference.clone(),
                 others.into_iter().map(|(_, r)| r.to_string()).collect(),
             );
         }
