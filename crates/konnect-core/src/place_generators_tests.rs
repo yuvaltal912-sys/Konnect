@@ -2461,8 +2461,128 @@ fn gap_to_text(model: &BoardModel, sizes: &[(f64, f64)], at: (f64, f64)) -> f64 
 }
 
 #[test]
-fn the_generator_version_is_six() {
-    // The obstacles, the part sides and the exact arc, text and path boxes change what
+fn the_generator_version_is_seven() {
+    // The obstacles, the part sides, the exact boxes and the largest-first order change what
     // every recipe gives, so a record of an earlier version is not reproducible.
-    assert_eq!(GENERATOR_VERSION, 6);
+    assert_eq!(GENERATOR_VERSION, 7);
+}
+
+// ─── Largest first ───────────────────────────────────────────────────────────
+
+/// The pinned outline (x 10..70, y 20..60) with `parts`, each `(reference, half width, half
+/// height)` read far from (40, 40); the centres of all of them are then put at `at`.
+fn dropped_parts(parts: &[(&str, f64, f64)], at: (f64, f64)) -> (BoardModel, Vec<(f64, f64)>) {
+    let fps: Vec<Fp> = parts
+        .iter()
+        .enumerate()
+        .map(|(k, (reference, hw, hh))| {
+            Fp::new(reference, 12.0 + 3.0 * k as f64, 22.0)
+                .court(*hw, *hh)
+                .two_pad("N1", "N2")
+        })
+        .collect();
+    let model = model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &fps), &[]);
+    let centres = vec![at; model.parts.len()];
+    (model, centres)
+}
+
+fn index_of(model: &BoardModel, reference: &str) -> usize {
+    model
+        .references
+        .binary_search(&reference.to_string())
+        .unwrap()
+}
+
+#[test]
+fn a_big_part_fits_because_it_settles_before_the_small_one() {
+    // The board is 60 x 40 mm. Z1's courtyard is 38 x 38: it fits only where nothing small
+    // sits in the middle. A1 (2 x 1 mm) is first by reference, and both are dropped on the
+    // centre. In reference order A1 would stay there and Z1 would find no room at all.
+    let (model, mut centres) = dropped_parts(&[("A1", 1.0, 0.5), ("Z1", 19.0, 19.0)], (40.0, 40.0));
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).expect("the big part settles first");
+    let (a1, z1) = (index_of(&model, "A1"), index_of(&model, "Z1"));
+    assert_eq!(centres[z1], (40.0, 40.0), "the big part keeps the centre");
+    // The small one goes to the nearest free cell: 20.5 mm to the left (41 steps), the
+    // left cell before the right one.
+    assert_eq!(centres[a1], (19.5, 40.0));
+    assert!(gap_between_parts(&sizes, &centres, a1, z1) >= MOVED_CLEARANCE_MM - 1e-9);
+}
+
+#[test]
+fn parts_settle_by_decreasing_area_and_equal_areas_by_reference() {
+    // Three parts dropped on one cell. The largest keeps it, the next takes the nearest
+    // cell that is free of it, the smallest the nearest free of both: not in reference order.
+    let (model, mut centres) = dropped_parts(
+        &[("A1", 1.0, 0.5), ("B1", 2.0, 1.0), ("C1", 3.0, 1.5)],
+        (40.0, 40.0),
+    );
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    let at = |r: &str| centres[index_of(&model, r)];
+    assert_eq!(at("C1"), (40.0, 40.0), "the largest settles first");
+    // B1 (4 x 2) clears C1 (6 x 3) by 2.502 mm in y: 3 mm, up before down.
+    assert_eq!(at("B1"), (40.0, 37.0));
+    for (a, b) in [("A1", "B1"), ("A1", "C1"), ("B1", "C1")] {
+        let gap = gap_between_parts(&sizes, &centres, index_of(&model, a), index_of(&model, b));
+        assert!(gap >= MOVED_CLEARANCE_MM - 1e-9, "{a} {b} {gap}");
+    }
+    // Equal areas, different shapes: the smaller reference first. B1 4 x 2 and C1 2 x 4 both
+    // 8 mm2; B1 keeps the cell.
+    let (model, mut centres) = dropped_parts(&[("B1", 2.0, 1.0), ("C1", 1.0, 2.0)], (40.0, 40.0));
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[index_of(&model, "B1")], (40.0, 40.0));
+    assert_ne!(centres[index_of(&model, "C1")], (40.0, 40.0));
+}
+
+#[test]
+fn held_and_unmoved_parts_still_settle_first_whatever_their_size() {
+    // J1 is held (a connector) and 2 x 1 mm; A1 is movable and does not move, 2 x 1 mm.
+    // Z1 is moved onto each of them and is the largest part: it moves off them, they stay.
+    let parts = vec![
+        Fp::new("J1", 30.0, 30.0)
+            .court(1.0, 0.5)
+            .pad(pad("1", 0.0, 0.0, Some("N1"))),
+        Fp::new("A1", 50.0, 30.0)
+            .court(1.0, 0.5)
+            .two_pad("N1", "N2"),
+        Fp::new("Z1", 15.0, 50.0)
+            .court(4.0, 3.0)
+            .two_pad("N2", "N3"),
+    ];
+    let model = model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &parts), &[]);
+    let (j1, a1, z1) = (
+        index_of(&model, "J1"),
+        index_of(&model, "A1"),
+        index_of(&model, "Z1"),
+    );
+    assert!(!model.movable[j1] && model.movable[a1]);
+    let sizes = as_read_sizes(&model);
+    let read = as_read_centres(&model);
+    // Z1 dropped between them, overlapping both.
+    let mut centres = read.clone();
+    centres[z1] = (40.0, 30.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[j1], read[j1]);
+    assert_eq!(centres[a1], read[a1]);
+    assert_eq!(centres[z1], (40.0, 30.0), "clear of both, so it stays");
+    centres[z1] = (30.0, 30.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!((centres[j1], centres[a1]), (read[j1], read[a1]));
+    assert_ne!(
+        centres[z1],
+        (30.0, 30.0),
+        "dropped on the held J1, Z1 moves"
+    );
+    assert!(gap_between_parts(&sizes, &centres, z1, j1) >= MOVED_CLEARANCE_MM - 1e-9);
+    centres[z1] = (50.0, 30.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!((centres[j1], centres[a1]), (read[j1], read[a1]));
+    assert_ne!(
+        centres[z1],
+        (50.0, 30.0),
+        "dropped on the unmoved A1, Z1 moves"
+    );
+    assert!(gap_between_parts(&sizes, &centres, z1, a1) >= MOVED_CLEARANCE_MM - 1e-9);
 }
