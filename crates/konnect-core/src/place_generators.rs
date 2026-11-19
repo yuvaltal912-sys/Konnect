@@ -1526,6 +1526,26 @@ impl Matrix {
     }
 }
 
+impl Matrix {
+    /// This matrix with only the recipes of `families` left: the others get no seed, so
+    /// `recipes` makes none of them. What is kept is unchanged, so the F and S recipes
+    /// are the same ones with or without P.
+    // Used only by the bench (an ignored test): no product code calls the search.
+    #[allow(dead_code)]
+    pub(crate) fn only(mut self, families: &[Family]) -> Self {
+        if !families.contains(&Family::Force) {
+            self.force_seeds.clear();
+        }
+        if !families.contains(&Family::Schematic) {
+            self.schematic_seeds.clear();
+        }
+        if !families.contains(&Family::Perturb) {
+            self.perturb_seeds.clear();
+        }
+        self
+    }
+}
+
 /// Every recipe of `matrix`, in a fixed order: F, then S, then P; within a family,
 /// seed-major, then the parameter sets in the order given.
 pub(crate) fn recipes(matrix: &Matrix) -> Vec<Recipe> {

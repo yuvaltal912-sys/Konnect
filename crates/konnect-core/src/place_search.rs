@@ -188,6 +188,9 @@ pub(crate) struct Plan {
     /// rules. Added to the skeleton: `held_set` takes it and the plan is the only
     /// place the bench can put it.
     pub caller_held: BTreeSet<String>,
+    /// The rules that hold a part besides KiCad's lock and the caller's list
+    /// (`HoldRules::default()`, or `HoldRules::locks_only()` in the owner's flow).
+    pub hold: HoldRules,
 }
 
 /// How one board's search ended.
@@ -890,7 +893,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             plan.route.board.display()
         )
     })?;
-    let held = held_set(&text, &plan.caller_held, &HoldRules::default()).map_err(|refusal| {
+    let held = held_set(&text, &plan.caller_held, &plan.hold).map_err(|refusal| {
         anyhow::anyhow!("{} Next step: {}", refusal.reason, refusal.next_step)
     })?;
     let tree = konnect_sexp::parse_sexp(&text)?;
@@ -1152,6 +1155,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
                 "perturb": matrix.perturb,
             },
             "recipes": recipes(matrix).len(),
+            "hold_rules": plan.hold,
             "threads": plan.threads,
             "host_cores": std::thread::available_parallelism().map(|n| n.get()).ok(),
             "reference_calls": plan.reference_calls,
@@ -1236,11 +1240,24 @@ fn number(value: Option<f64>) -> String {
 /// generated, failed, duplicates and screened out), then each family's verdict against
 /// O and against A (`verdict`).
 pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
+    // Only the families the matrix makes recipes for: a family the bench left out
+    // (`families` in `bench.json`) has no row and no verdict.
+    let all_recipes = recipes(&plan.matrix);
+    let families: Vec<&str> = [
+        (Family::Force, "F"),
+        (Family::Schematic, "S"),
+        (Family::Perturb, "P"),
+    ]
+    .into_iter()
+    .filter(|(family, _)| all_recipes.iter().any(|r| r.family == *family))
+    .map(|(_, letter)| letter)
+    .collect();
     let mut text = format!("# Placement search: {}\n\n", plan.name);
     text.push_str(&format!(
-        "Effort {}, {} recipes, {} candidates, {:.0} s elapsed.",
+        "Effort {}, {} recipes (families {}), {} candidates, {:.0} s elapsed.",
         plan.route.effort.name(),
-        recipes(&plan.matrix).len(),
+        all_recipes.len(),
+        families.join(", "),
         outcome.records.len(),
         outcome.elapsed.as_secs_f64()
     ));
@@ -1293,7 +1310,10 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
     text.push_str("\n## Per family and reference\n\n");
     text.push_str("| group | best rank | median rank | pass every gate | made | failed | duplicates | screened out | routed |\n");
     text.push_str("|---|---|---|---|---|---|---|---|---|\n");
-    let groups = ["O", "A", "F", "S", "P"];
+    let groups: Vec<&str> = ["O", "A"]
+        .into_iter()
+        .chain(families.iter().copied())
+        .collect();
     let mut ranks_of: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     // The ranks of every judged call of a reference, a routed one or one with no winner:
     // both carry a key, and a no-winner call is the reference's worst rank, not a call
@@ -1362,7 +1382,7 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
          calls, routed or with no winner; a no-winner call ranks as the reference's worst.\n\n",
     );
     text.push_str("| family | against O | against A |\n|---|---|---|\n");
-    for family in ["F", "S", "P"] {
+    for &family in &families {
         let best = ranks_of
             .get(family)
             .and_then(|ranks| ranks.first().copied());

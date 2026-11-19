@@ -393,6 +393,88 @@ fn lock_caller_connector_and_mechanical_parts_are_held() {
 }
 
 #[test]
+fn locks_only_holds_the_locked_parts_and_frees_the_connector() {
+    let parts = vec![
+        Fp::new("U1", 20.0, 20.0)
+            .court(3.0, 3.0)
+            .pad(pad("1", -2.0, 0.0, Some("VCC")))
+            .pad(pad("2", 2.0, 0.0, Some("GND"))),
+        Fp::new("R1", 30.0, 20.0).two_pad("VCC", "SIG"),
+        // A connector that is not locked, a mounting hole by prefix and a fiducial by
+        // footprint name, all with a netted pad.
+        Fp::new("J1", 35.0, 10.0).pad(pad("1", 0.0, 0.0, Some("SIG"))),
+        Fp::new("H1", 5.0, 5.0).pad(pad("1", 0.0, 0.0, Some("GND"))),
+        Fp::new("X2", 55.0, 35.0)
+            .lib("Misc:fiducial_1mm")
+            .pad(pad("1", 0.0, 0.0, Some("GND"))),
+        // The owner's lock, on a connector and on a passive.
+        Fp::new("J2", 56.0, 20.0)
+            .pad(pad("1", 0.0, 0.0, Some("SIG")))
+            .locked(),
+        Fp::new("L1", 45.0, 10.0).two_pad("VCC", "SIG").locked(),
+        Fp::new("C1", 15.0, 30.0).two_pad("VCC", "GND"),
+    ];
+    let text = board(OUTLINE, &parts);
+    let caller: BTreeSet<String> = ["C1".to_string()].into();
+    let reasons = |set: &HeldSet, reference: &str| {
+        set.held[reference]
+            .reasons
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+
+    let locks = held_set(&text, &caller, &HoldRules::locks_only()).unwrap();
+    let held: Vec<&str> = locks.held.keys().map(String::as_str).collect();
+    assert_eq!(held, vec!["C1", "J2", "L1"]);
+    assert_eq!(reasons(&locks, "J2"), vec![HoldReason::KicadLock]);
+    assert_eq!(reasons(&locks, "L1"), vec![HoldReason::KicadLock]);
+    assert_eq!(reasons(&locks, "C1"), vec![HoldReason::Caller]);
+    // The unlocked connector, the hole and the fiducial are not held: they move.
+    let movable: Vec<&str> = locks.movable.iter().map(String::as_str).collect();
+    assert_eq!(movable, vec!["H1", "J1", "R1", "U1", "X2"]);
+
+    // Negative control: under the rules the same J1, H1 and X2 are held.
+    let rules = held_set(&text, &caller, &HoldRules::default()).unwrap();
+    assert_eq!(reasons(&rules, "J1"), vec![HoldReason::Connector]);
+    assert_eq!(reasons(&rules, "H1"), vec![HoldReason::Mechanical]);
+    assert_eq!(reasons(&rules, "X2"), vec![HoldReason::Mechanical]);
+    assert!(!rules.movable.contains("J1"));
+    assert_ne!(rules.held_sha256, locks.held_sha256);
+}
+
+#[test]
+fn locks_only_still_holds_parts_with_no_pad_on_a_net() {
+    let mut parts = clean_parts();
+    // A test point whose pad is on no net, and logo footprints with no pad at all, two
+    // of them sharing a reference.
+    parts.push(Fp::new("TP9", 40.0, 30.0).pad(pad("1", 0.0, 0.0, None)));
+    parts.push(Fp::new("G***", 5.0, 5.0));
+    parts.push(Fp::new("G***", 10.0, 35.0));
+    let set = held_set(
+        &board(OUTLINE, &parts),
+        &no_caller(),
+        &HoldRules::locks_only(),
+    )
+    .expect("the set holds");
+    for key in ["TP9", "G***#1", "G***#2"] {
+        assert_eq!(
+            set.held[key].reasons.iter().copied().collect::<Vec<_>>(),
+            vec![HoldReason::Mechanical],
+            "{key}"
+        );
+        assert!(!set.movable.contains(key));
+    }
+    // The connector of `clean_parts` is not held here: only the three above are.
+    assert_eq!(set.held.len(), 3);
+    assert!(set.movable.contains("J1"));
+    // And the same board with no lock and no caller has the same held list under the
+    // rules plus J1.
+    let rules = held_set(&board(OUTLINE, &parts), &no_caller(), &HoldRules::default()).unwrap();
+    assert_eq!(rules.held.len(), 4);
+}
+
+#[test]
 fn the_prefix_is_the_letters_before_the_number() {
     // `JP1` (a jumper) is not a `J` connector, and `HS1` (a heatsink) is not `H`.
     let parts = vec![
