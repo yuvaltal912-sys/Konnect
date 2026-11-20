@@ -597,6 +597,13 @@ int main(int argc, char **argv) {
         if (in) fclose(in);
     }
 
+    if (cfg_int("echo_pairs", 0)) {
+        // Say what this pass was given, then fail: the failure reason keeps the
+        // end of the log, so a call that fails every run still shows the switch.
+        fprintf(stderr, "PAIRS_ARG=%s\n", pairs ? pairs : "none");
+        return 3;
+    }
+
     char key[300], val[1100];
     snprintf(key, sizeof key, "sleep.%s", pass);
     if (cfg(key, val, sizeof val)) {
@@ -1775,6 +1782,174 @@ int main(int argc, char **argv) {
                     .unwrap();
             assert!(!args.contains("--pairs"), "{name}: {args}");
         }
+    }
+
+    /// One call of `route_specctra_dsn`'s fastroute engine through its real path
+    /// (`route_located`, so `search_and_write` and `conclude`), with a fake fastroute
+    /// that echoes its `--pairs` argument and fails, and a fake kicad-cli. The board
+    /// is in `project/`, the DSN and its manifest in `exported/`; `project_intent`
+    /// and `exported_intent` are the design intent files of the two folders.
+    /// Returns the error result's body and the folder the failed call set aside.
+    async fn failed_call(
+        project_intent: Option<Value>,
+        exported_intent: Option<Value>,
+    ) -> (Value, PathBuf, tempfile::TempDir) {
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::{prepare_call, route_located};
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("echo_pairs=1\n");
+        let root = fixture.path().to_path_buf();
+        let project = root.join("project");
+        let exported = root.join("exported");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&exported).unwrap();
+        let board_text = "(kicad_pcb (version 20260206))\n";
+        let board = project.join("b.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        // /CAN_H sits in a class with a diff pair gap of 0.2 mm.
+        std::fs::write(
+            project.join("b.kicad_pro"),
+            json!({ "net_settings": {
+                "classes": [{ "name": "PAIR", "priority": 0, "diff_pair_gap": 0.2 }],
+                "netclass_assignments": { "/CAN_H": ["PAIR"] } } })
+            .to_string(),
+        )
+        .unwrap();
+        for (folder, intent) in [(&project, project_intent), (&exported, exported_intent)] {
+            if let Some(intent) = intent {
+                std::fs::create_dir_all(folder.join(".konnect")).unwrap();
+                std::fs::write(
+                    folder.join(".konnect/design_intent.json"),
+                    intent.to_string(),
+                )
+                .unwrap();
+            }
+        }
+        let dsn = exported.join("board.dsn");
+        std::fs::write(&dsn, RUNNER_DSN).unwrap();
+        std::fs::write(
+            exported.join("board.dsn.konnect.json"),
+            json!({
+                "schema_version": 1,
+                "board_path": board.display().to_string(),
+                "source_sha256": format!("{:x}", Sha256::digest(board_text.as_bytes())),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cli = root.join("kicad-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let args = json!({
+            "dsn_path": dsn,
+            "ses_output_path": exported.join("out.ses"),
+            "effort": "fast",
+        });
+        let call = prepare_call(&args).unwrap().expect("good arguments");
+        let result = route_located(&args, ctx, call, Located::Found(fixture.binary()))
+            .await
+            .unwrap();
+        assert!(result.is_error, "every fake pass fails");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        // The folder the failed call set aside is where its files went.
+        let kept = exported.join("out.search.failed-1");
+        assert!(kept.is_dir(), "{body}");
+        (body, kept, fixture.dir)
+    }
+
+    fn run_reasons(body: &Value) -> Vec<String> {
+        body["search"]["runs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no runs: {body}"))
+            .iter()
+            .map(|run| run["reason"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn can_intent() -> Value {
+        json!({ "schema_version": 1, "rails": [], "currents": [],
+            "interfaces": [{ "name": "CAN", "kind": "can", "nets": ["CAN_H", "CAN_L"],
+                "differential_pairs": [{ "positive": "CAN_H", "negative": "CAN_L" }] }] })
+    }
+
+    /// The real call path: the pair of the intent in the board's own folder is
+    /// resolved against the DSN, its file is written into the call's folder, every
+    /// run gets `--pairs=<that file>`, and the result reports the pair. A different
+    /// intent beside the DSN is not the board's and is not read.
+    #[tokio::test]
+    async fn a_call_gives_every_run_the_boards_pairs_and_reports_them() {
+        let decoy = json!({ "schema_version": 1, "rails": [], "currents": [],
+            "interfaces": [{ "name": "OTHER", "kind": "x", "nets": ["DECOY_P", "DECOY_N"],
+                "differential_pairs": [{ "positive": "DECOY_P", "negative": "DECOY_N" }] }] });
+        let (body, kept, _keep) = failed_call(Some(can_intent()), Some(decoy)).await;
+        // The file, in the call's own folder, with the gap of the positive net's class.
+        assert_eq!(
+            std::fs::read_to_string(kept.join("pairs.txt")).unwrap(),
+            "pair /CAN_H /CAN_L gap=0.2\n"
+        );
+        // Every run was given it, by its path in the search folder (the folder was
+        // set aside afterwards).
+        let reasons = run_reasons(&body);
+        assert_eq!(reasons.len(), 2, "{body}");
+        let given = format!(
+            "PAIRS_ARG={}",
+            kept.to_string_lossy()
+                .replace("out.search.failed-1", "out.search")
+        );
+        let given = format!("{given}/pairs.txt");
+        for reason in &reasons {
+            assert!(reason.contains(&given), "{reason} lacks {given}");
+        }
+        // The result.
+        assert_eq!(
+            body["differential_pairs"],
+            json!([{ "positive": "CAN_H", "negative": "CAN_L", "dsn_positive": "/CAN_H",
+                     "dsn_negative": "/CAN_L", "gap_mm": 0.2 }])
+        );
+        assert_eq!(body["differential_pairs_unresolved"], json!([]));
+        assert!(body.get("differential_pairs_note").is_none());
+    }
+
+    /// Control: with no design intent in the board's folder, no pairs file is made,
+    /// no run gets `--pairs`, and both result lists are empty. A call with an intent
+    /// that names a net the DSN lacks reports the pair and sends nothing either.
+    #[tokio::test]
+    async fn a_call_without_pairs_sends_nothing_and_reports_empty_lists() {
+        let (body, kept, _keep) = failed_call(None, None).await;
+        assert!(!kept.join("pairs.txt").exists());
+        let reasons = run_reasons(&body);
+        assert_eq!(reasons.len(), 2, "{body}");
+        for reason in &reasons {
+            assert!(reason.contains("PAIRS_ARG=none"), "{reason}");
+        }
+        assert_eq!(body["differential_pairs"], json!([]));
+        assert_eq!(body["differential_pairs_unresolved"], json!([]));
+
+        let missing = json!({ "schema_version": 1, "rails": [], "currents": [],
+            "interfaces": [{ "name": "X", "kind": "x", "nets": ["CAN_H", "NOT_THERE"],
+                "differential_pairs": [{ "positive": "CAN_H", "negative": "NOT_THERE" }] }] });
+        let (body, kept, _keep) = failed_call(Some(missing), None).await;
+        assert!(!kept.join("pairs.txt").exists());
+        for reason in run_reasons(&body) {
+            assert!(reason.contains("PAIRS_ARG=none"), "{reason}");
+        }
+        assert_eq!(body["differential_pairs"], json!([]));
+        assert_eq!(
+            body["differential_pairs_unresolved"][0]["negative"],
+            "NOT_THERE"
+        );
     }
 
     /// Control: a call without a pairs file sends no `--pairs` on any pass.

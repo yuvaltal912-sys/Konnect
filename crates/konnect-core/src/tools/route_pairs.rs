@@ -167,8 +167,9 @@ pub(crate) fn resolve_name(name: &str, nets: &[String]) -> Result<String, String
 /// `diff_pair_gap` (mm) of the netclass of `net`, as KiCad resolves it: the classes
 /// that name the net (an assignment or a pattern) in the order of their `priority`
 /// (the lowest number first, equal priorities by name), then `Default`; the first
-/// that sets the value decides (`NET_SETTINGS::makeEffectiveNetclass`). `None` when
-/// that value is 0 (KiCad's "not set") or no class sets one.
+/// that sets a value decides (`NET_SETTINGS::makeEffectiveNetclass`). A value of 0
+/// counts as not set, so the next class in that order decides. `None` when no class
+/// sets a value above 0.
 pub(crate) fn gap_mm(project_text: &str, net: &str) -> Option<f64> {
     let project: Value = serde_json::from_str(project_text).ok()?;
     let classes = project["net_settings"]["classes"].as_array()?;
@@ -192,8 +193,8 @@ pub(crate) fn gap_mm(project_text: &str, net: &str) -> Option<f64> {
         else {
             continue;
         };
-        if let Some(gap) = class["diff_pair_gap"].as_f64() {
-            return (gap > 0.0).then_some(gap);
+        if let Some(gap) = class["diff_pair_gap"].as_f64().filter(|gap| *gap > 0.0) {
+            return Some(gap);
         }
     }
     None
