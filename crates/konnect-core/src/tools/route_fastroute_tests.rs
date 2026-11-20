@@ -817,6 +817,7 @@ fn measures() -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 12.34,
+        lengths: None,
     }
 }
 
@@ -827,6 +828,7 @@ fn judged(board: PathBuf) -> Judged {
             g1: vec![],
             g2: vec![],
             g3: vec![],
+            g4: vec![],
         },
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
@@ -893,7 +895,7 @@ fn plan() -> SearchPlan {
 fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
     let keys = runs
         .iter()
-        .map(|record| record.judged.as_ref().map(|_| [0; 10]))
+        .map(|record| record.judged.as_ref().map(|_| [0; 13]))
         .collect();
     SearchOutcome {
         runs,
@@ -1486,7 +1488,7 @@ fn a_fast_result_has_runs_and_no_budget_and_an_overrun_is_reported() {
     let mut finished = outcome(Vec::new(), None);
     finished.runs = search.outcome.runs;
     finished.winner = Some(1);
-    finished.keys = vec![Some([0; 10]), Some([0; 10]), None];
+    finished.keys = vec![Some([0; 13]), Some([0; 13]), None];
     finished.budget_overrun = Some(Duration::from_millis(33_333));
     let result = result_json(
         &dsn,
@@ -1698,6 +1700,7 @@ fn the_status_is_the_judges_when_every_gate_passes() {
         g1: g1.iter().map(|s| s.to_string()).collect(),
         g2: g2.iter().map(|s| s.to_string()).collect(),
         g3: g3.iter().map(|s| s.to_string()).collect(),
+        g4: Vec::new(),
     };
     let pass = gates(&[], &[], &[]);
     let full = WidthOutcome::default();
@@ -2037,6 +2040,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         floors_mm: Default::default(),
         root: judge_root.clone(),
         kicad_config_home: None,
+        lengths: None,
     };
     let runner = FastrouteRunner {
         binary: fake_binary(&search.root),
@@ -2162,7 +2166,7 @@ fn the_result_lists_the_best_runs_and_counts_every_outcome() {
     let mut many = outcome(runs, Some(29));
     // The later the run, the better its key.
     for (index, key) in many.keys.iter_mut().enumerate().take(30) {
-        *key = Some([30 - index as i64, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        *key = Some([30 - index as i64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
     let best = search_json(&plan(), &[Shape::AsExported], &many, Listing::Best);
     let indexes: Vec<u64> = best["runs"]

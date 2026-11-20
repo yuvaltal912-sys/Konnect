@@ -156,6 +156,7 @@ fn measures(unconnected: usize, signal_mm: f64) -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 10.0,
+        lengths: None,
     }
 }
 
@@ -165,6 +166,7 @@ fn routed(unconnected: usize, signal_mm: f64) -> RouteResult {
             g1: Vec::new(),
             g2: Vec::new(),
             g3: Vec::new(),
+            g4: Vec::new(),
         },
         measures: measures(unconnected, signal_mm),
         unrouted: BTreeMap::new(),
@@ -247,6 +249,7 @@ impl RouteCall for Fake {
                         g1: vec!["net SECRETNET is not fully routed".to_string()],
                         g2: Vec::new(),
                         g3: Vec::new(),
+                        g4: Vec::new(),
                     },
                     measures: measures(0, 100.0),
                     unrouted: BTreeMap::from([("clearance".to_string(), 3)]),

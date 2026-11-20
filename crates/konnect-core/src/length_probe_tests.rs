@@ -96,7 +96,11 @@ fn the_probe_rules_are_one_numbered_length_rule_per_net() {
     let found: Vec<&str> = rules.iter().map(|rule| rule.name.as_str()).collect();
     assert_eq!(
         found,
-        ["__konnect_len_0001", "__konnect_len_0002", "__konnect_len_0003"]
+        [
+            "__konnect_len_0001",
+            "__konnect_len_0002",
+            "__konnect_len_0003"
+        ]
     );
     // No net, no rule.
     assert_eq!(probe_rules_text(&[]), "(version 1)\n");
@@ -146,7 +150,10 @@ fn the_probe_project_ignores_every_listed_check_and_keeps_the_rest() {
         probe["board"]["design_settings"]["rules"]["use_height_for_length_calcs"],
         false
     );
-    assert_eq!(probe["board"]["design_settings"]["rules"]["min_clearance"], 0.2);
+    assert_eq!(
+        probe["board"]["design_settings"]["rules"]["min_clearance"],
+        0.2
+    );
     assert_eq!(probe["net_settings"]["classes"][0]["name"], "Default");
 }
 
@@ -200,7 +207,10 @@ fn a_project_without_severities_still_gets_the_one_the_probe_needs() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(probe["board"]["design_settings"]["rules"]["min_clearance"], 0.2);
+    assert_eq!(
+        probe["board"]["design_settings"]["rules"]["min_clearance"],
+        0.2
+    );
 }
 
 #[test]
@@ -357,7 +367,10 @@ fn the_net_is_cross_checked_through_the_items() {
     let second = report_of(vec![entry(
         1,
         10.0,
-        &["Pad 1 [S9] of R1 on F.Cu", "Track [S1] on F.Cu, length 4 mm"],
+        &[
+            "Pad 1 [S9] of R1 on F.Cu",
+            "Track [S1] on F.Cu, length 4 mm",
+        ],
     )]);
     assert!(parse_probe(&second, &names(&["S1"])).is_ok());
 
@@ -434,7 +447,11 @@ fn miss_of(measures: &LengthMeasures, net: &str) -> f64 {
 #[test]
 fn a_skew_group_is_checked_against_its_longest_net() {
     let checks = checks_of(
-        vec![group("dq", &["a", "b", "c"], Window::Skew { tolerance_mm: 0.5 })],
+        vec![group(
+            "dq",
+            &["a", "b", "c"],
+            Window::Skew { tolerance_mm: 0.5 },
+        )],
         vec![],
     );
     // Longest 42.00: the window is 41.50 to 42.00.
@@ -458,7 +475,14 @@ fn a_skew_group_is_checked_against_its_longest_net() {
 #[test]
 fn the_bound_passes_within_half_a_printed_digit_and_one_step_past_it_fails() {
     let checks = checks_of(
-        vec![group("t", &["a"], Window::Target { target_mm: 42.0, tolerance_mm: 0.5 })],
+        vec![group(
+            "t",
+            &["a"],
+            Window::Target {
+                target_mm: 42.0,
+                tolerance_mm: 0.5,
+            },
+        )],
         vec![],
     );
     let miss = |mm: f64| miss_of(&check(&checks, &lengths_of(&[("a", mm)]), vec![], 0.0), "a");
@@ -481,7 +505,10 @@ fn a_target_group_checks_every_net_against_the_same_window() {
         vec![group(
             "dq",
             &["a", "b", "c"],
-            Window::Target { target_mm: 42.07, tolerance_mm: 0.25 },
+            Window::Target {
+                target_mm: 42.07,
+                tolerance_mm: 0.25,
+            },
         )],
         vec![],
     );
@@ -494,7 +521,10 @@ fn a_target_group_checks_every_net_against_the_same_window() {
     assert_eq!(miss_of(&measures, "a"), 0.0);
     assert!((miss_of(&measures, "b") - 0.62).abs() < 1e-9, "below 41.82");
     assert!((miss_of(&measures, "c") - 0.28).abs() < 1e-9, "above 42.32");
-    assert!((measures.miss_mm - 0.90).abs() < 1e-9, "the misses are summed");
+    assert!(
+        (measures.miss_mm - 0.90).abs() < 1e-9,
+        "the misses are summed"
+    );
 }
 
 #[test]
@@ -535,8 +565,19 @@ fn a_pair_is_checked_for_its_skew() {
 #[test]
 fn group_and_pair_misses_are_summed_and_unmeasured_nets_are_listed() {
     let checks = checks_of(
-        vec![group("t", &["a", "b", "c"], Window::Target { target_mm: 10.0, tolerance_mm: 1.0 })],
-        vec![CheckedPair { positive: "a".into(), negative: "b".into(), max_skew_mm: 0.5 }],
+        vec![group(
+            "t",
+            &["a", "b", "c"],
+            Window::Target {
+                target_mm: 10.0,
+                tolerance_mm: 1.0,
+            },
+        )],
+        vec![CheckedPair {
+            positive: "a".into(),
+            negative: "b".into(),
+            max_skew_mm: 0.5,
+        }],
     );
     // a is 0.5 above its window, b 0.25 below it, and the pair is 2.75 apart (2.25
     // over); c has no length.
@@ -547,7 +588,11 @@ fn group_and_pair_misses_are_summed_and_unmeasured_nets_are_listed() {
         0.0,
     );
     assert_eq!(measures.unmeasured, names(&["c"]));
-    assert!((measures.miss_mm - (0.5 + 0.25 + 2.25)).abs() < 1e-9, "{}", measures.miss_mm);
+    assert!(
+        (measures.miss_mm - (0.5 + 0.25 + 2.25)).abs() < 1e-9,
+        "{}",
+        measures.miss_mm
+    );
     // A net the caller listed stays listed once, even when it has a length.
     let measures = check(
         &checks,
@@ -575,12 +620,27 @@ fn the_check_of_the_real_probe_reads_its_numbers() {
     let (lengths, unmeasured) = parse_probe(&report(REPORT), &fixture_nets()).unwrap();
     // The two nets whose lengths are 52.2760 and 54.2499 are 1.9739 apart.
     let checks = checks_of(
-        vec![group("s", &["S1", "S4"], Window::Skew { tolerance_mm: 2.0 })],
-        vec![CheckedPair { positive: "S1".into(), negative: "S4".into(), max_skew_mm: 1.9 }],
+        vec![group(
+            "s",
+            &["S1", "S4"],
+            Window::Skew { tolerance_mm: 2.0 },
+        )],
+        vec![CheckedPair {
+            positive: "S1".into(),
+            negative: "S4".into(),
+            max_skew_mm: 1.9,
+        }],
     );
     let measures = check(&checks, &lengths, unmeasured, 0.2);
     assert_eq!(measures.groups[0].longest_mm, Some(54.2499));
-    assert_eq!(measures.groups[0].nets.iter().map(|n| n.miss_mm).sum::<f64>(), 0.0);
+    assert_eq!(
+        measures.groups[0]
+            .nets
+            .iter()
+            .map(|n| n.miss_mm)
+            .sum::<f64>(),
+        0.0
+    );
     assert!((measures.pairs[0].skew_mm.unwrap() - 1.9739).abs() < 1e-9);
     assert!((measures.pairs[0].miss_mm - 0.0739).abs() < 1e-9);
 }
@@ -591,7 +651,13 @@ fn the_check_of_the_real_probe_reads_its_numbers() {
 fn only_the_two_length_keys_leave_g2() {
     assert!(!counts_in_g2("length_out_of_range"));
     assert!(!counts_in_g2("skew_out_of_range"));
-    for key in ["clearance", "track_width", "diff_pair_gap_out_of_range", "unconnected_items", ""] {
+    for key in [
+        "clearance",
+        "track_width",
+        "diff_pair_gap_out_of_range",
+        "unconnected_items",
+        "",
+    ] {
         assert!(counts_in_g2(key), "{key}");
     }
 }
@@ -716,7 +782,14 @@ fn a_miss_that_rounds_to_zero_is_shown_with_the_digits_kicad_prints() {
 #[test]
 fn g4_lines_follow_a_real_check_and_flip_with_a_hundredth_of_a_millimetre() {
     let checks = checks_of(
-        vec![group("t", &["a"], Window::Target { target_mm: 42.0, tolerance_mm: 0.5 })],
+        vec![group(
+            "t",
+            &["a"],
+            Window::Target {
+                target_mm: 42.0,
+                tolerance_mm: 0.5,
+            },
+        )],
         vec![],
     );
     let lines = |mm: f64| {
@@ -734,24 +807,49 @@ fn g4_lines_follow_a_real_check_and_flip_with_a_hundredth_of_a_millimetre() {
 fn the_key_part_is_g4_then_the_miss_in_hundredths_then_kicads_violations() {
     let measures = measures_with(vec![], vec![], 0.624);
     assert_eq!(
-        key_part(true, Some(&measures), &counts(&[("length_out_of_range", 2)])),
+        key_part(
+            true,
+            Some(&measures),
+            &counts(&[("length_out_of_range", 2)])
+        ),
         [1, 62, 2]
     );
     // The miss rounds to the nearest hundredth.
-    assert_eq!(key_part(true, Some(&measures_with(vec![], vec![], 0.626)), &BTreeMap::new())[1], 63);
-    assert_eq!(key_part(true, Some(&measures_with(vec![], vec![], 0.004)), &BTreeMap::new())[1], 0);
+    assert_eq!(
+        key_part(
+            true,
+            Some(&measures_with(vec![], vec![], 0.626)),
+            &BTreeMap::new()
+        )[1],
+        63
+    );
+    assert_eq!(
+        key_part(
+            true,
+            Some(&measures_with(vec![], vec![], 0.004)),
+            &BTreeMap::new()
+        )[1],
+        0
+    );
     // Nothing checked: zeros, whatever KiCad's own rules say elsewhere.
     assert_eq!(key_part(false, None, &BTreeMap::new()), [0, 0, 0]);
     // A net with no length sorts last, however small the rest of the miss.
     let mut unmeasured = measures_with(vec![], vec![], 0.0);
     unmeasured.unmeasured = names(&["a"]);
-    assert_eq!(key_part(true, Some(&unmeasured), &BTreeMap::new())[1], i64::MAX);
+    assert_eq!(
+        key_part(true, Some(&unmeasured), &BTreeMap::new())[1],
+        i64::MAX
+    );
     // KiCad's two keys are summed.
     assert_eq!(
         key_part(
             true,
             None,
-            &counts(&[("length_out_of_range", 1), ("skew_out_of_range", 4), ("clearance", 9)])
+            &counts(&[
+                ("length_out_of_range", 1),
+                ("skew_out_of_range", 4),
+                ("clearance", 9)
+            ])
         ),
         [1, 0, 5]
     );
@@ -820,7 +918,11 @@ exit 0
             "(version 1)\n(rule \"board_own\" (constraint skew (max 1mm)) (condition \"A.NetName == 'x'\"))\n",
         )
         .unwrap();
-        std::fs::write(judged_dir.join("lib.pretty/a.kicad_mod"), "(footprint \"a\")").unwrap();
+        std::fs::write(
+            judged_dir.join("lib.pretty/a.kicad_mod"),
+            "(footprint \"a\")",
+        )
+        .unwrap();
         let config = dir.path().join("kicad-config");
         std::fs::create_dir_all(&config).unwrap();
         Setup {
@@ -865,18 +967,24 @@ exit 0
             std::fs::read_to_string(s.folder.join("board.kicad_dru")).unwrap(),
             probe_rules_text(&nets)
         );
-        let listed = severities(&std::fs::read_to_string(s.folder.join("board.kicad_pro")).unwrap());
+        let listed =
+            severities(&std::fs::read_to_string(s.folder.join("board.kicad_pro")).unwrap());
         assert_eq!(listed["clearance"], "ignore");
-        assert_eq!(listed["length_out_of_range"], "error", "the project's ignore is undone");
+        assert_eq!(
+            listed["length_out_of_range"], "error",
+            "the project's ignore is undone"
+        );
         assert!(s.folder.join("lib.pretty/a.kicad_mod").is_file());
         assert!(!s.folder.join("stale.txt").exists());
 
         // The judged board's own files are as they were.
         let own = std::fs::read_to_string(s.judged.with_extension("kicad_pro")).unwrap();
         assert_eq!(severities(&own)["length_out_of_range"], "ignore");
-        assert!(std::fs::read_to_string(s.judged.with_extension("kicad_dru"))
-            .unwrap()
-            .contains("board_own"));
+        assert!(
+            std::fs::read_to_string(s.judged.with_extension("kicad_dru"))
+                .unwrap()
+                .contains("board_own")
+        );
 
         // One kicad-cli run, on the given settings, as the probe's arguments say.
         let calls = calls(&s);
@@ -916,9 +1024,11 @@ exit 0
 
         // A report that is not JSON.
         let s = setup("this is not a report");
-        assert!(probe_lengths(&s.cli, None, &s.judged, &s.folder, &fixture_nets())
-            .await
-            .is_err());
+        assert!(
+            probe_lengths(&s.cli, None, &s.judged, &s.folder, &fixture_nets())
+                .await
+                .is_err()
+        );
 
         // A probe that cannot be trusted: two entries for one net.
         let twice = json!({

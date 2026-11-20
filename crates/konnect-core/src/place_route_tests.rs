@@ -392,6 +392,7 @@ fn measures() -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 12.34,
+        lengths: None,
     }
 }
 
@@ -452,7 +453,7 @@ fn baseline() -> Baseline {
 fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
     let keys = runs
         .iter()
-        .map(|record| record.judged.as_ref().map(|_| [0; 10]))
+        .map(|record| record.judged.as_ref().map(|_| [0; 13]))
         .collect();
     SearchOutcome {
         runs,
@@ -531,6 +532,7 @@ fn no_gate_failures() -> Gates {
         g1: vec![],
         g2: vec![],
         g3: vec![],
+        g4: vec![],
     }
 }
 
@@ -666,6 +668,7 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         g1: vec!["3 connections open".into()],
         g2: vec![],
         g3: vec!["a width".into()],
+        g4: vec![],
     });
     let RouteResult::Routed { gates, .. } = read_route_result(&success_result(&failing)) else {
         panic!("a winner with failed gates is still routed");

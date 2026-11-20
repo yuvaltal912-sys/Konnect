@@ -1739,6 +1739,7 @@ int main(int argc, char **argv) {
                 floors_mm: Default::default(),
                 root: search.join("judge"),
                 kicad_config_home: None,
+                lengths: None,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),

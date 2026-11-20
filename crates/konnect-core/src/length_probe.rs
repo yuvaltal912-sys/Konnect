@@ -8,9 +8,6 @@
 //! board's own rules are checked by the judge's ordinary DRC (G4(c)), never here: a
 //! probe rule would override a board rule for the same net.
 
-// The judge uses these from the next commit on.
-#![allow(dead_code)]
-
 use crate::tools::cli::DrcReport;
 use crate::tools::route_lengths::Window;
 use anyhow::{bail, ensure, Context, Result};
@@ -208,9 +205,7 @@ pub(crate) fn actual_mm(description: &str) -> Option<f64> {
         while at < chars.len() && chars[at].is_ascii_digit() {
             at += 1;
         }
-        if at + 1 < chars.len()
-            && matches!(chars[at], '.' | ',')
-            && chars[at + 1].is_ascii_digit()
+        if at + 1 < chars.len() && matches!(chars[at], '.' | ',') && chars[at + 1].is_ascii_digit()
         {
             at += 1;
             while at < chars.len() && chars[at].is_ascii_digit() {
@@ -349,8 +344,9 @@ pub(crate) async fn probe_lengths(
     if project.is_file() {
         let own = std::fs::read_to_string(&project)
             .with_context(|| format!("read the project file '{}'", project.display()))?;
-        let probe = probe_project_text(&own)
-            .with_context(|| format!("the project file '{}' cannot be probed", project.display()))?;
+        let probe = probe_project_text(&own).with_context(|| {
+            format!("the project file '{}' cannot be probed", project.display())
+        })?;
         std::fs::write(&project, probe).context("write the probe's project file")?;
     }
 
@@ -396,7 +392,9 @@ pub(crate) fn check(
             .nets
             .iter()
             .filter_map(|net| lengths.get(net).copied())
-            .fold(None, |most: Option<f64>, mm| Some(most.map_or(mm, |m| m.max(mm))));
+            .fold(None, |most: Option<f64>, mm| {
+                Some(most.map_or(mm, |m| m.max(mm)))
+            });
         let (low_mm, high_mm) = group.window.range_mm(longest_mm.unwrap_or(0.0));
         let nets = group
             .nets
