@@ -1247,7 +1247,7 @@ int main(int argc, char **argv) {
         sleep(30);
         return 0;
     }
-    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL, *tune = NULL;
+    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL, *tune = NULL, *heights = NULL;
     int version = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) version = 1;
@@ -1256,6 +1256,7 @@ int main(int argc, char **argv) {
         else if (strncmp(argv[i], "--report=", 9) == 0) report = argv[i] + 9;
         else if (strncmp(argv[i], "--pairs=", 8) == 0) pairs = argv[i] + 8;
         else if (strncmp(argv[i], "--tune=", 7) == 0) tune = argv[i] + 7;
+        else if (strncmp(argv[i], "--layer-heights=", 16) == 0) heights = argv[i] + 16;
     }
     if (version) {
         char text[256] = "fastroute 0.1.14";
@@ -1339,6 +1340,8 @@ int main(int argc, char **argv) {
         // Say what this pass was given, then fail: the failure reason keeps the
         // end of the log, so a call that fails every run still shows the switch.
         fprintf(stderr, "PAIRS_ARG=%s\n", pairs ? pairs : "none");
+        fprintf(stderr, "TUNE_ARG=%s\n", tune ? tune : "none");
+        fprintf(stderr, "HEIGHTS_ARG=%s\n", heights ? heights : "none");
         return 3;
     }
 
@@ -2495,6 +2498,8 @@ int main(int argc, char **argv) {
             hints: floor_hints(),
             amps: None,
             pairs,
+            routing_heights: None,
+            tune: None,
             fallback: WidthFallback::Floor,
             folder: search.clone(),
             judge: Arc::new(JudgeContext {
@@ -2720,6 +2725,380 @@ int main(int argc, char **argv) {
             body["differential_pairs_unresolved"][0]["negative"],
             "NOT_THERE"
         );
+    }
+
+    // ─── Row LT: the length plan through the real call path ──────────────────
+
+    const POURS_BOARD: &str = include_str!("../tests/fixtures/specctra_pours_routing.kicad_pcb");
+    const POURS_PRO: &str = include_str!("../tests/fixtures/specctra_pours_routing.kicad_pro");
+    const POURS_DSN: &str = include_str!("../tests/fixtures/specctra_pours_routing.dsn");
+    const POURS_MANIFEST: &str =
+        include_str!("../tests/fixtures/specctra_pours_routing.dsn.konnect.json");
+
+    /// One call through `route_located` on the public pours fixture (six signals
+    /// `S1` to `S6`, two copper layers) with a fake fastroute that echoes its
+    /// switches and fails every pass, and a fake kicad-cli. The board, its project,
+    /// its design intent and its rules file are in `project/`, the DSN and its
+    /// manifest in `exported/`.
+    struct PoursCall {
+        result: crate::mcp::protocol::CallToolResult,
+        body: Value,
+        exported: PathBuf,
+        _keep: tempfile::TempDir,
+    }
+
+    impl PoursCall {
+        /// Where the call's search folder is, or where a failed call's files went.
+        fn search(&self) -> PathBuf {
+            self.exported.join("out.search")
+        }
+        fn kept(&self) -> PathBuf {
+            self.exported.join("out.search.failed-1")
+        }
+        /// Nothing of the call is left: no search folder, none set aside, no output.
+        fn assert_nothing_routed(&self) {
+            assert!(self.result.is_error);
+            assert!(!self.search().exists(), "a search folder was left");
+            assert!(
+                self.kept().symlink_metadata().is_err(),
+                "a search folder was set aside: a run started"
+            );
+            assert!(!self.exported.join("out.ses").exists());
+        }
+        fn reasons(&self) -> Vec<String> {
+            run_reasons(&self.body)
+        }
+    }
+
+    /// `intent` is the design intent's text, `dru` the board's rules file; the edits
+    /// change the DSN or the board before the call (the manifest is re-pinned to the
+    /// edited board).
+    async fn pours_call(
+        intent: Option<&str>,
+        dru: Option<&str>,
+        dsn_edit: &dyn Fn(&str) -> String,
+        board_edit: &dyn Fn(&str) -> String,
+    ) -> PoursCall {
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::{prepare_call, route_located};
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("echo_pairs=1\n");
+        let root = fixture.path().to_path_buf();
+        let project = root.join("project");
+        let exported = root.join("exported");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&exported).unwrap();
+        let board_text = board_edit(POURS_BOARD);
+        let board = project.join("b.kicad_pcb");
+        std::fs::write(&board, &board_text).unwrap();
+        std::fs::write(project.join("b.kicad_pro"), POURS_PRO).unwrap();
+        if let Some(intent) = intent {
+            std::fs::create_dir_all(project.join(".konnect")).unwrap();
+            std::fs::write(project.join(".konnect/design_intent.json"), intent).unwrap();
+        }
+        if let Some(dru) = dru {
+            std::fs::write(project.join("b.kicad_dru"), dru).unwrap();
+        }
+        let dsn = exported.join("board.dsn");
+        std::fs::write(&dsn, dsn_edit(POURS_DSN)).unwrap();
+        let mut manifest: Value = serde_json::from_str(POURS_MANIFEST).unwrap();
+        manifest["board_path"] = json!(board.display().to_string());
+        manifest["source_sha256"] = json!(format!("{:x}", Sha256::digest(board_text.as_bytes())));
+        std::fs::write(
+            exported.join("board.dsn.konnect.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+        let cli = root.join("kicad-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let args = json!({
+            "dsn_path": dsn,
+            "ses_output_path": exported.join("out.ses"),
+            "effort": "fast",
+        });
+        let call = prepare_call(&args).unwrap().expect("good arguments");
+        let result = route_located(&args, ctx, call, Located::Found(fixture.binary()))
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        PoursCall {
+            result,
+            body,
+            exported,
+            _keep: fixture.dir,
+        }
+    }
+
+    fn unchanged(text: &str) -> String {
+        text.to_string()
+    }
+
+    /// The fixture's interface `bus` (its six signals) with extra keys.
+    fn bus_intent(extra: Value) -> String {
+        let mut interface = json!({ "name": "bus", "kind": "bus",
+            "nets": ["S1", "S2", "S3", "S4", "S5", "S6"] });
+        for (key, value) in extra.as_object().unwrap() {
+            interface[key] = value.clone();
+        }
+        json!({ "schema_version": 1, "rails": [], "currents": [], "interfaces": [interface] })
+            .to_string()
+    }
+
+    fn group_intent() -> String {
+        bus_intent(json!({ "length_groups": [
+            { "name": "g", "nets": ["S1", "S2", "S3", "S4"], "tolerance_mm": 0.5 }] }))
+    }
+
+    /// Row LT, L4: a group or skew that cannot be applied refuses the call before
+    /// anything is routed, and the search folder holds no run.
+    #[tokio::test]
+    async fn a_length_group_that_cannot_be_applied_refuses_before_anything_is_routed() {
+        let rename = |from: &'static str, to: &'static str| move |dsn: &str| dsn.replace(from, to);
+        let target = |target: f64| {
+            bus_intent(json!({ "length_groups": [
+                { "name": "g", "nets": ["S1", "S2"], "tolerance_mm": 0.5, "target_mm": target }] }))
+        };
+        let skew_on_a_lost_pair = bus_intent(json!({ "nets": ["S1", "S9"],
+            "differential_pairs": [{ "positive": "S1", "negative": "S9", "max_skew_mm": 0.2 }] }));
+        let unresolved = bus_intent(json!({ "nets": ["S1", "S9"], "length_groups": [
+            { "name": "g", "nets": ["S1", "S9"], "tolerance_mm": 0.5 }] }));
+        let unusable = json!({ "schema_version": 99, "rails": [], "currents": [], "interfaces": [
+            { "name": "bus", "kind": "bus", "nets": ["S1", "S2"],
+              "length_groups": [{ "name": "g", "nets": ["S1", "S2"], "tolerance_mm": 0.5 }] }] })
+        .to_string();
+        let cases: Vec<(
+            &str,
+            String,
+            Box<dyn Fn(&str) -> String>,
+            Box<dyn Fn(&str) -> String>,
+            &str,
+        )> = vec![
+            (
+                "an unresolved name",
+                unresolved,
+                Box::new(unchanged),
+                Box::new(unchanged),
+                "'S9'",
+            ),
+            (
+                "an ambiguous name",
+                group_intent(),
+                Box::new(|dsn: &str| {
+                    dsn.replace("(net S2", "(net /a/S2").replace(
+                        "(network\n",
+                        "(network\n    (net /b/S2\n      (pins R1-1)\n    )\n",
+                    )
+                }),
+                Box::new(unchanged),
+                "'S2'",
+            ),
+            (
+                "a name the tune file cannot carry",
+                group_intent(),
+                Box::new(rename("(net S2", "(net /x*/S2")),
+                Box::new(unchanged),
+                "/x*/S2",
+            ),
+            (
+                "a DSN net that is not a net of the board",
+                group_intent(),
+                Box::new(rename("(net S2", "(net /a/S2")),
+                Box::new(unchanged),
+                "/a/S2",
+            ),
+            (
+                "a checked net equal to another board net ignoring case",
+                group_intent(),
+                Box::new(unchanged),
+                Box::new(|board: &str| {
+                    let end = board.rfind(')').unwrap();
+                    format!(
+                        "{}(zone (net \"s1\") (layer \"F.Cu\") (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10))))\n)\n",
+                        &board[..end]
+                    )
+                }),
+                "'S1'",
+            ),
+            (
+                "a skew on a pair the pairs plan left out",
+                skew_on_a_lost_pair,
+                Box::new(unchanged),
+                Box::new(unchanged),
+                "'S9'",
+            ),
+            (
+                "a target no net can meet",
+                target(1.0),
+                Box::new(unchanged),
+                Box::new(unchanged),
+                "cannot be that short",
+            ),
+            (
+                "an unusable intent that declares lengths",
+                unusable,
+                Box::new(unchanged),
+                Box::new(unchanged),
+                "length_groups or max_skew_mm",
+            ),
+        ];
+        for (what, intent, dsn_edit, board_edit, mentions) in cases {
+            let call = pours_call(Some(&intent), None, &*dsn_edit, &*board_edit).await;
+            call.assert_nothing_routed();
+            assert_eq!(
+                call.body["error"]["kind"], "invalid_configuration",
+                "{what}: {}",
+                call.body
+            );
+            let message = call.body["message"].as_str().unwrap_or_default();
+            assert!(message.contains("Nothing was routed."), "{what}: {message}");
+            assert!(message.contains(mentions), "{what}: {message}");
+        }
+    }
+
+    /// The negative controls of the refusals above: the same board with names that
+    /// resolve plans and routes (every fake pass fails, so the call ends with the
+    /// runs it launched and the set-aside folder); an intent that cannot be used and
+    /// does not declare lengths routes with D23's note, as before Row LT.
+    #[tokio::test]
+    async fn a_resolvable_group_routes_and_an_unusable_intent_without_lengths_routes_with_a_note() {
+        let call = pours_call(Some(&group_intent()), None, &unchanged, &unchanged).await;
+        assert!(call.result.is_error, "every fake pass fails");
+        assert!(call.kept().is_dir(), "{}", call.body);
+        assert_eq!(call.reasons().len(), 2, "{}", call.body);
+        let tune = std::fs::read_to_string(call.kept().join("tune.txt")).unwrap();
+        assert!(
+            tune.contains("group lt1 tolerance=0.25\n  S1\n  S2\n  S3\n  S4\n"),
+            "{tune}"
+        );
+
+        let unusable = json!({ "schema_version": 99, "rails": [] }).to_string();
+        let call = pours_call(Some(&unusable), None, &unchanged, &unchanged).await;
+        assert!(call.kept().is_dir(), "{}", call.body);
+        assert_eq!(call.reasons().len(), 2, "{}", call.body);
+        assert!(!call.kept().join("tune.txt").exists());
+        let note = call.body["length_matching"]["note"]
+            .as_str()
+            .expect("a note");
+        assert!(note.contains("cannot be used"), "{note}");
+        assert!(
+            call.body["differential_pairs_note"].is_string(),
+            "{}",
+            call.body
+        );
+    }
+
+    /// L6 and L7: a call with a group writes `tune.txt` and reports the plan, but no
+    /// routing pass gets `--tune`, and `--layer-heights` goes to the routing passes
+    /// only with a resolved pair; a call with neither gets DP's command lines.
+    #[tokio::test]
+    async fn routing_passes_never_get_tune_and_get_heights_only_with_a_pair() {
+        let grouped = pours_call(Some(&group_intent()), None, &unchanged, &unchanged).await;
+        assert!(grouped.kept().join("tune.txt").is_file());
+        assert_eq!(grouped.reasons().len(), 2);
+        for reason in grouped.reasons() {
+            assert!(reason.contains("TUNE_ARG=none"), "{reason}");
+            assert!(reason.contains("HEIGHTS_ARG=none"), "{reason}");
+        }
+        let matching = &grouped.body["length_matching"];
+        assert_eq!(matching["groups"][0]["file_name"], "lt1");
+        assert_eq!(matching["layer_heights"]["sent"], true, "{matching}");
+        assert_eq!(matching["groups"][0]["pass"], Value::Null);
+
+        // A resolved pair: the routing passes get the heights, still no --tune.
+        let paired = pours_call(
+            Some(&bus_intent(json!({
+                "differential_pairs": [{ "positive": "S1", "negative": "S2", "max_skew_mm": 0.2 }],
+                "length_groups": [{ "name": "g", "nets": ["S1", "S2"], "tolerance_mm": 0.5 }] }))),
+            None,
+            &unchanged,
+            &unchanged,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(paired.kept().join("pairs.txt")).unwrap(),
+            "pair S1 S2 skew=0.1\n"
+        );
+        let heights = paired.body["length_matching"]["layer_heights"]["heights_mm"].clone();
+        let wanted = format!(
+            "HEIGHTS_ARG={}",
+            heights
+                .as_array()
+                .expect("heights")
+                .iter()
+                .map(|height| height.as_f64().unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for reason in paired.reasons() {
+            assert!(reason.contains(&wanted), "{reason} lacks {wanted}");
+            assert!(reason.contains("TUNE_ARG=none"), "{reason}");
+        }
+
+        // Control: neither group nor pair, DP's exact lines.
+        let plain = pours_call(None, None, &unchanged, &unchanged).await;
+        for reason in plain.reasons() {
+            assert!(
+                reason.contains("TUNE_ARG=none") && reason.contains("HEIGHTS_ARG=none"),
+                "{reason}"
+            );
+            assert!(reason.contains("PAIRS_ARG=none"), "{reason}");
+        }
+    }
+
+    /// L18: a call without a group or a skew has no tune file and no
+    /// `length_matching`, and a rules file without length rules adds none; the same
+    /// board with one group gets the file and the field.
+    #[tokio::test]
+    async fn a_call_without_groups_has_no_tune_file_and_no_length_matching() {
+        let plain_dru = "(version 1)\n(rule \"wide\" (constraint track_width (min 0.2mm)))\n";
+        for (what, intent, dru) in [
+            ("no intent", None, None),
+            (
+                "a pair without a skew",
+                Some(bus_intent(json!({
+                "differential_pairs": [{ "positive": "S1", "negative": "S2" }] }))),
+                None,
+            ),
+            ("a rules file without length rules", None, Some(plain_dru)),
+        ] {
+            let call = pours_call(intent.as_deref(), dru, &unchanged, &unchanged).await;
+            assert!(call.kept().is_dir(), "{what}: {}", call.body);
+            assert!(!call.kept().join("tune.txt").exists(), "{what}");
+            assert!(
+                call.body.get("length_matching").is_none(),
+                "{what}: {}",
+                call.body
+            );
+            for reason in call.reasons() {
+                assert!(reason.contains("TUNE_ARG=none"), "{what}: {reason}");
+            }
+        }
+        // Control: one group gives the file and the field.
+        let call = pours_call(Some(&group_intent()), None, &unchanged, &unchanged).await;
+        assert!(call.kept().join("tune.txt").is_file());
+        assert!(call.body["length_matching"].is_object(), "{}", call.body);
+        // A KiCad length rule alone is reported (listed, not evaluated), still without
+        // a tune file.
+        let length_dru = "(version 1)\n(rule \"len\" (constraint length (max 60mm)) (condition \"A.NetName == 'S1'\"))\n";
+        let call = pours_call(None, Some(length_dru), &unchanged, &unchanged).await;
+        assert!(!call.kept().join("tune.txt").exists());
+        let rules = &call.body["length_matching"]["kicad_rules"];
+        assert_eq!(rules[0]["name"], "len", "{}", call.body);
+        assert_eq!(rules[0]["evaluated"], false);
+        assert_eq!(call.body["length_matching"]["groups"], json!([]));
     }
 
     /// Control: a call without a pairs file sends no `--pairs` on any pass.

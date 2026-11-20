@@ -2503,7 +2503,6 @@ pub(crate) fn dsn_layer_names(dsn: &str) -> Result<Vec<String>> {
 /// `--router.autorouter.ignore_net_classes`. A class name holding a comma cannot be
 /// listed (fastroute splits the value at commas); it is left out, and the Tune
 /// pass's other-net check (L6) still guards its nets.
-#[allow(dead_code)] // Row LT: the Tune pass uses it from Stage 4 on
 pub(crate) fn dsn_class_names(dsn: &str) -> Result<Vec<String>> {
     let root = pcb_root(dsn)?;
     let mut seen = BTreeSet::new();

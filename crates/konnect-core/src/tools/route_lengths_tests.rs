@@ -111,18 +111,6 @@ fn group(
     }
 }
 
-/// A DSN with two layers and the given nets in its network.
-fn dsn_with(nets: &[&str]) -> String {
-    let mut text = String::from(
-        "(pcb board.kicad_pcb\n  (structure\n    (layer F.Cu (type signal) (property (index 0)))\n    (layer B.Cu (type signal) (property (index 1)))\n  )\n  (network\n",
-    );
-    for net in nets {
-        text.push_str(&format!("    (net {net}\n      (pins C1-1)\n    )\n"));
-    }
-    text.push_str("    (class k1 GND\n      (rule (width 250))\n    )\n  )\n)\n");
-    text
-}
-
 /// A board of footprints and zones, as KiCad 10 writes nets (named in place).
 fn board_of(parts: &[String]) -> String {
     format!(

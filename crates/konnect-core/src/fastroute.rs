@@ -905,7 +905,6 @@ const MAX_NAMED_NETS: usize = 5;
 
 /// What the Tune pass needs beyond a routing pass.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // Row LT: Stage 4b builds it in the runner
 pub(crate) struct TuneInputs<'a> {
     /// The call's `--tune` file (`tools/route_lengths.rs`).
     pub tune: &'a Path,

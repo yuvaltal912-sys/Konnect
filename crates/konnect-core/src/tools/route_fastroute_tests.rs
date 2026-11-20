@@ -1178,6 +1178,7 @@ fn the_result_has_every_documented_key() {
         &[Shape::AsExported, Shape::Omitted],
         &search.outcome,
         &PairsPlan::default(),
+        &LengthPlan::default(),
     );
     assert_eq!(result["success"], true, "{result}");
     assert_eq!(result["method"], "local_fastroute_best_of_n");
@@ -1299,6 +1300,7 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
             &[Shape::AsExported, Shape::Omitted],
             &search.outcome,
             pairs,
+            &LengthPlan::default(),
         )
     };
     let none = result_with(&PairsPlan::default());
@@ -1360,7 +1362,13 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
         fallback: WidthFallback::Floor,
     };
     let finished = outcome(Vec::new(), None);
-    let error = no_winner_result(&call, &finished, json!({ "runs": [] }), &plan_with_pairs);
+    let error = no_winner_result(
+        &call,
+        &finished,
+        json!({ "runs": [] }),
+        &plan_with_pairs,
+        &LengthPlan::default(),
+    );
     assert!(error.is_error);
     assert_eq!(
         body(&error)["differential_pairs"][0]["dsn_positive"],
@@ -1370,7 +1378,13 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
         body(&error)["differential_pairs_unresolved"][0]["positive"],
         "USB_DP"
     );
-    let error = no_winner_result(&call, &finished, json!({}), &PairsPlan::default());
+    let error = no_winner_result(
+        &call,
+        &finished,
+        json!({}),
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+    );
     assert_eq!(body(&error)["differential_pairs"], json!([]));
     assert_eq!(body(&error)["differential_pairs_unresolved"], json!([]));
     // The summary form of a result without a winner carries them as well.
@@ -1384,6 +1398,7 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
         &[Shape::AsExported],
         &finished,
         &plan_with_pairs,
+        &LengthPlan::default(),
     );
     assert_eq!(failed["success"], false);
     assert_eq!(failed["differential_pairs"][0]["gap_mm"], 0.2);
@@ -1441,6 +1456,7 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
             &outcome,
             &kicad,
             pairs,
+            &LengthPlan::default(),
         )
         .unwrap();
         (result, call, _dir)
@@ -1500,6 +1516,7 @@ fn a_fast_result_has_runs_and_no_budget_and_an_overrun_is_reported() {
         &[Shape::AsExported],
         &finished,
         &PairsPlan::default(),
+        &LengthPlan::default(),
     );
     assert_eq!(result["effort"]["level"], "fast");
     assert_eq!(result["effort"]["source"], "default");
@@ -1548,7 +1565,13 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         Listing::Best,
     );
     assert!(search["winner"].is_null());
-    let result = no_winner_result(&call, &finished, search, &PairsPlan::default());
+    let result = no_winner_result(
+        &call,
+        &finished,
+        search,
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+    );
     assert!(result.is_error);
     assert_eq!(kind(&result), "handler_error");
     let text = message(&result);
@@ -1572,6 +1595,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         &[Shape::AsExported],
         &finished,
         &PairsPlan::default(),
+        &LengthPlan::default(),
     );
     assert_eq!(none["success"], false);
 }
@@ -1592,7 +1616,13 @@ fn a_failed_search_keeps_its_records_and_not_its_boards() {
         fallback: WidthFallback::Floor,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
-    let result = no_winner_result(&call, &failed, summary, &PairsPlan::default());
+    let result = no_winner_result(
+        &call,
+        &failed,
+        summary,
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+    );
     assert!(result.is_error);
     assert!(body(&result)["search"].get("reduce_error").is_none());
     for (index, shape, seed) in [
@@ -1630,7 +1660,13 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
         fallback: WidthFallback::Floor,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
-    let result = no_winner_result(&call, &failed, summary, &PairsPlan::default());
+    let result = no_winner_result(
+        &call,
+        &failed,
+        summary,
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+    );
     assert!(result.is_error);
     assert!(
         body(&result)["search"]["reduce_error"].is_string(),
@@ -1688,6 +1724,227 @@ async fn best_of_n_routes_a_public_fixture_end_to_end() {
     assert!(parsed["search"]["winner"].is_object(), "{parsed}");
     assert!(dir.path().join("routed.search/search.json").is_file());
     assert!(parsed["completion"]["judged"]["gates"].is_object());
+}
+
+// ─── Row LT: the end-to-end tests (real fastroute and kicad-cli, ignored) ───
+
+/// What the two end-to-end length tests share: a scratch copy of the public pours
+/// fixture (six signals `S1` to `S6`, two copper layers) with the interface `bus` of
+/// `S1` to `S4` and the given length groups in its design intent, routed at effort
+/// `fast` through the real call (the real fastroute under Konnect's sandbox, never
+/// `--live`, and the real kicad-cli). Needs the environment of
+/// `best_of_n_routes_a_public_fixture_end_to_end`, and `KONNECT_STATE_DIR` set to a
+/// scratch folder.
+async fn route_pours_with_groups(groups: Value) -> (Value, tempfile::TempDir) {
+    let fastroute = std::env::var("FASTROUTE").expect("set FASTROUTE");
+    let kicad_cli = std::env::var("KICAD_CLI").expect("set KICAD_CLI");
+    std::env::var("KICAD_CONFIG_HOME").expect("set KICAD_CONFIG_HOME to a scratch folder");
+    std::env::var("KONNECT_STATE_DIR").expect("set KONNECT_STATE_DIR to a scratch folder");
+    let dir = tempfile::tempdir().unwrap();
+    // The judge canonicalises the manifest's board path: stage it spelled that way.
+    std::fs::create_dir_all(dir.path().join("board/.konnect")).unwrap();
+    let board_folder = dir.path().join("board").canonicalize().unwrap();
+    for suffix in [".kicad_pcb", ".kicad_pro", ".dsn", ".dsn.konnect.json"] {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("specctra_pours_routing{suffix}"));
+        std::fs::copy(
+            &from,
+            board_folder.join(format!("specctra_pours_routing{suffix}")),
+        )
+        .unwrap();
+    }
+    let board = board_folder.join("specctra_pours_routing.kicad_pcb");
+    let manifest_path = board_folder.join("specctra_pours_routing.dsn.konnect.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["board_path"] = json!(board.display().to_string());
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    std::fs::write(
+        board_folder.join(".konnect/design_intent.json"),
+        json!({ "schema_version": 1, "rails": [], "currents": [], "interfaces": [{
+            "name": "bus", "kind": "bus", "nets": ["S1", "S2", "S3", "S4"],
+            "length_groups": groups }] })
+        .to_string(),
+    )
+    .unwrap();
+    let ctx = Arc::new(ToolContext::new(
+        ServerConfig {
+            kicad_cli,
+            ..ServerConfig::default()
+        },
+        Arc::new(ToolRouter::new()),
+    ));
+    let args = json!({
+        "dsn_path": board_folder.join("specctra_pours_routing.dsn"),
+        "ses_output_path": board_folder.join("routed.ses"),
+        "effort": "fast",
+        "fastroute_path": fastroute,
+    });
+    let result = handle_route_specctra_dsn(&args, ctx).await.unwrap();
+    let parsed = body(&result);
+    assert!(!result.is_error, "{parsed}");
+    (parsed, dir)
+}
+
+/// KiCad's DRC on a copy of `board`'s folder with `rule` as its only custom rule: the
+/// number of `skew_out_of_range` violations. The copy is a scratch folder; the
+/// board is never touched.
+fn skew_violations_with_rule(board: &Path, rule: &str) -> usize {
+    let kicad_cli = std::env::var("KICAD_CLI").expect("set KICAD_CLI");
+    let config = std::env::var("KICAD_CONFIG_HOME").expect("set KICAD_CONFIG_HOME");
+    let scratch = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(board.parent().unwrap())
+        .unwrap()
+        .flatten()
+    {
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), scratch.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let copy = scratch.path().join(board.file_name().unwrap());
+    std::fs::write(
+        copy.with_extension("kicad_dru"),
+        format!("(version 1)\n{rule}\n"),
+    )
+    .unwrap();
+    let report = scratch.path().join("drc.json");
+    let status = std::process::Command::new(kicad_cli)
+        .env("KICAD_CONFIG_HOME", config)
+        .args([
+            "pcb", "drc", "--format", "json", "--units", "mm", "--output",
+        ])
+        .arg(&report)
+        .arg(&copy)
+        .status()
+        .expect("kicad-cli starts");
+    assert!(status.success(), "kicad-cli pcb drc failed: {status}");
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    report["violations"]
+        .as_array()
+        .expect("violations")
+        .iter()
+        .filter(|violation| violation["type"] == "skew_out_of_range")
+        .count()
+}
+
+/// The KiCad rule the result's next steps suggest for the group (L16).
+fn suggested_rule(result: &Value) -> String {
+    result["completion"]["next_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step["manual"].as_str())
+        .find(|text| text.contains("create_custom_drc_rule"))
+        .and_then(|text| text.split(" and rule ").nth(1))
+        .and_then(|rest| rest.split(" once apply_specctra_ses").next())
+        .unwrap_or_else(|| panic!("no suggested rule in {result}"))
+        .to_string()
+}
+
+/// Row LT, the end to end: a 4-net bus at effort Fast. The winner passes G4, each net
+/// is inside the window in KiCad's own measure, and KiCad's DRC with the rule the
+/// result suggests reports 0 skew violations. Control: a skew rule far tighter than
+/// the tolerance is broken, so the DRC does check the rule it is given.
+///
+///   FASTROUTE, KICAD_CLI, KICAD_CONFIG_HOME (scratch), KONNECT_STATE_DIR (scratch)
+#[tokio::test]
+#[ignore = "needs fastroute, kicad-cli and scratch KICAD_CONFIG_HOME and KONNECT_STATE_DIR"]
+async fn a_bus_is_tuned_to_its_window_and_kicad_agrees() {
+    let started = std::time::Instant::now();
+    let (result, _dir) = route_pours_with_groups(json!([
+        { "name": "bus", "nets": ["S1", "S2", "S3", "S4"], "tolerance_mm": 0.5 }
+    ]))
+    .await;
+    let seconds = started.elapsed().as_secs_f64();
+    let matching = &result["length_matching"];
+    let gates = &result["completion"]["judged"]["gates"];
+    let runs = result["search"]["runs"].as_array().unwrap();
+    let group = &matching["groups"][0];
+    eprintln!(
+        "E2E bus: {seconds:.1} s, runs {}, G4 {}, status {}, miss {}, tune {}, nets {}",
+        runs.len(),
+        gates["g4"],
+        result["status"],
+        runs.iter()
+            .map(|run| run["length_miss_mm"].to_string())
+            .collect::<Vec<_>>()
+            .join("/"),
+        matching["tune_pass"]["outcome"],
+        group["nets"]
+    );
+    assert_eq!(gates["g4"], json!([]), "{result}");
+    assert_eq!(group["pass"], true, "{group}");
+    assert_eq!(matching["tune_pass"]["outcome"], "kept", "{matching}");
+    assert_ne!(result["status"], "complete_with_gate_failures");
+    for net in group["nets"].as_array().unwrap() {
+        assert_eq!(net["miss_mm"], 0.0, "{net}");
+    }
+    // KiCad's own DRC, with the suggested rule, on the judged board.
+    let judged = PathBuf::from(
+        result["search"]["winner"]["judged_board"]
+            .as_str()
+            .expect("the winner's judged board is kept"),
+    );
+    let rule = suggested_rule(&result);
+    let violations = skew_violations_with_rule(&judged, &rule);
+    eprintln!("E2E bus: KiCad skew violations with the suggested rule: {violations} ({rule})");
+    assert_eq!(violations, 0, "{rule}");
+    // Control: the same rule at a thousandth of the tolerance is broken.
+    let tight = rule.replace("max 0.5mm", "max 0.0001mm");
+    assert_ne!(tight, rule, "{rule}");
+    assert!(skew_violations_with_rule(&judged, &tight) > 0, "{tight}");
+}
+
+/// The negative control of the end to end: a target no free space can reach (L12
+/// refuses a target that is too short, never one that is too long). Every judged
+/// run fails G4, the status is `complete_with_gate_failures`, and the result names
+/// each net's miss.
+#[tokio::test]
+#[ignore = "needs fastroute, kicad-cli and scratch KICAD_CONFIG_HOME and KONNECT_STATE_DIR"]
+async fn a_target_no_run_can_reach_fails_g4_on_every_run() {
+    let started = std::time::Instant::now();
+    let (result, _dir) = route_pours_with_groups(json!([
+        { "name": "bus", "nets": ["S1", "S2", "S3", "S4"], "tolerance_mm": 0.5, "target_mm": 400.0 }
+    ]))
+    .await;
+    let runs = result["search"]["runs"].as_array().unwrap();
+    let judged: Vec<&Value> = runs
+        .iter()
+        .filter(|run| run["outcome"] == "judged")
+        .collect();
+    eprintln!(
+        "E2E impossible target: {:.1} s, runs {}, judged {}, status {}, misses {}",
+        started.elapsed().as_secs_f64(),
+        runs.len(),
+        judged.len(),
+        result["status"],
+        judged
+            .iter()
+            .map(|run| run["length_miss_mm"].to_string())
+            .collect::<Vec<_>>()
+            .join("/"),
+    );
+    assert!(!judged.is_empty());
+    for run in &judged {
+        assert_eq!(run["g4_failed"], true, "{run}");
+        assert!(run["length_miss_mm"].as_f64().unwrap() > 0.0, "{run}");
+    }
+    assert_eq!(result["status"], "complete_with_gate_failures", "{result}");
+    assert!(
+        !result["completion"]["judged"]["gates"]["g4"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{result}"
+    );
+    assert_eq!(result["length_matching"]["groups"][0]["pass"], false);
+    for net in result["length_matching"]["groups"][0]["nets"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(net["miss_mm"].as_f64().unwrap() > 0.0, "{net}");
+    }
 }
 
 /// A winner's status follows the judge (D21). A failed gate decides it; with every
@@ -1791,6 +2048,357 @@ fn the_status_is_the_judges_when_every_gate_passes() {
     );
 }
 
+// ─── Row LT: the length plan in the result ──────────────────────────────────
+
+/// A group of two nets in skew mode, as the plan resolves it.
+fn length_plan() -> LengthPlan {
+    use crate::tools::route_lengths::{GroupNet, ResolvedGroup, Window};
+    LengthPlan {
+        groups: vec![ResolvedGroup {
+            interface: "bus".to_string(),
+            name: "g".to_string(),
+            file_name: "lt1".to_string(),
+            nets: ["S1", "S2"]
+                .iter()
+                .map(|net| GroupNet {
+                    intent: net.to_string(),
+                    dsn: net.to_string(),
+                })
+                .collect(),
+            window: Window::Skew { tolerance_mm: 0.5 },
+            pairs: Vec::new(),
+        }],
+        ..LengthPlan::default()
+    }
+}
+
+/// What the length probe found on a run whose `S2` is `short_by` mm below its window.
+fn length_measures(short_by: f64) -> crate::length_probe::LengthMeasures {
+    use crate::length_probe::{GroupLengths, LengthMeasures, NetLength};
+    let net = |name: &str, length: f64, miss: f64| NetLength {
+        net: name.to_string(),
+        kicad_mm: Some(length),
+        low_mm: 51.5,
+        high_mm: 52.0,
+        miss_mm: miss,
+    };
+    LengthMeasures {
+        groups: vec![GroupLengths {
+            interface: "bus".to_string(),
+            name: "g".to_string(),
+            longest_mm: Some(52.0),
+            nets: vec![net("S1", 52.0, 0.0), net("S2", 51.5 - short_by, short_by)],
+        }],
+        pairs: Vec::new(),
+        unmeasured: Vec::new(),
+        miss_mm: short_by,
+        probe_s: 0.2,
+    }
+}
+
+/// A finished search whose winner (run 0) was checked for length: its Tune pass kept,
+/// its G4 failing when it is short.
+fn checked_search(short_by: f64) -> Search {
+    let mut search = finished_search();
+    let record = &mut search.outcome.runs[0];
+    record
+        .routed
+        .as_mut()
+        .unwrap()
+        .held
+        .passes
+        .push(json!({ "name": "tune", "outcome": "kept", "unrouted": 0, "seconds": 0.1 }));
+    let judged = record.judged.as_mut().unwrap();
+    judged.measures.lengths = Some(length_measures(short_by));
+    if short_by > 0.0 {
+        judged.gates.g4 = vec![format!(
+            "group 'g' (bus): S2 is {:.2} mm, {short_by:.2} mm below its window 51.50 to 52.00 mm",
+            51.5 - short_by
+        )];
+    }
+    search
+}
+
+fn result_with(search: &Search, lengths: &LengthPlan) -> Value {
+    result_json(
+        &search.root.join("board.dsn"),
+        &search.root.join("out.ses"),
+        &search.folder,
+        &candidate(),
+        (Effort::M, EffortSource::Argument),
+        &plan(),
+        &[Shape::AsExported, Shape::Omitted],
+        &search.outcome,
+        &PairsPlan::default(),
+        lengths,
+    )
+}
+
+/// L11: G4 joins D15 and D21. A failed G4 (with G1 passing) is
+/// `complete_with_gate_failures`, and the judged `complete` needs all four gates.
+#[test]
+fn a_failed_length_gate_is_never_complete() {
+    let gates = |g1: &[&str], g4: &[&str]| Gates {
+        g1: g1.iter().map(|s| s.to_string()).collect(),
+        g2: Vec::new(),
+        g3: Vec::new(),
+        g4: g4.iter().map(|s| s.to_string()).collect(),
+    };
+    let full = WidthOutcome::default();
+    for router in ["complete", "incomplete", "unverified"] {
+        assert_eq!(
+            judged_status(router, &gates(&[], &["S2 is short"]), &full, 0),
+            "complete_with_gate_failures",
+            "{router}"
+        );
+        // Control: the same gates with G4 passing are the judge's `complete`.
+        assert_eq!(
+            judged_status(router, &gates(&[], &[]), &full, 0),
+            "complete"
+        );
+    }
+    // G1 outranks G4, and a failed G4 outranks the stitching rule.
+    assert_eq!(
+        judged_status(
+            "complete",
+            &gates(&["1 unconnected"], &["S2 is short"]),
+            &full,
+            0
+        ),
+        "incomplete"
+    );
+    assert_eq!(
+        judged_status("complete", &gates(&[], &["S2 is short"]), &full, 3),
+        "complete_with_gate_failures"
+    );
+}
+
+/// L15 and L16: a winner checked for length has `length_matching` (what it measured,
+/// the Tune pass's row), rows that carry G4 and the miss, and next steps with the
+/// KiCad rule of the group. A winner that misses its window has the status of a
+/// failed gate and a step that says what can change it.
+#[test]
+fn the_result_carries_length_matching_the_tune_row_and_the_rule_steps() {
+    let search = checked_search(0.3);
+    let result = result_with(&search, &length_plan());
+    assert_eq!(result["status"], "complete_with_gate_failures", "{result}");
+    assert_eq!(result["completion"]["judged"]["all_gates_pass"], false);
+    let matching = &result["length_matching"];
+    assert_eq!(matching["tune_pass"]["outcome"], "kept", "{matching}");
+    assert_eq!(matching["groups"][0]["file_name"], "lt1");
+    assert_eq!(matching["groups"][0]["pass"], false);
+    assert_eq!(matching["groups"][0]["nets"][1]["miss_mm"], 0.3);
+    assert_eq!(matching["groups"][0]["nets"][0]["kicad_mm"], 52.0);
+    assert_eq!(matching["kicad_violations"]["length_out_of_range"], 0);
+    let steps = result["completion"]["next_steps"].as_array().unwrap();
+    let advice: Vec<&str> = steps
+        .iter()
+        .filter_map(|step| step["manual"].as_str())
+        .collect();
+    assert_eq!(advice.len(), 2, "{steps:?}");
+    assert!(
+        advice[0].contains("A length window was missed"),
+        "{}",
+        advice[0]
+    );
+    assert!(
+        advice[1].contains("create_custom_drc_rule") && advice[1].contains("1kopper_len_lt1"),
+        "{}",
+        advice[1]
+    );
+    // The steps are numbered after the router's own.
+    let numbers: Vec<u64> = steps
+        .iter()
+        .map(|step| step["step"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, (1..=steps.len() as u64).collect::<Vec<_>>());
+    // The run rows: the checked run says G4 failed and by how much; run 1, which
+    // was judged without a length check, says nothing of lengths.
+    let rows = result["search"]["runs"].as_array().unwrap();
+    let row = |index: u64| rows.iter().find(|row| row["index"] == index).unwrap();
+    assert_eq!(row(0)["g4_failed"], true, "{rows:?}");
+    assert_eq!(row(0)["length_miss_mm"], 0.3);
+    assert!(row(1).get("g4_failed").is_none() && row(1).get("length_miss_mm").is_none());
+    assert!(row(2).get("g4_failed").is_none());
+
+    // A winner inside its window: the field, the rule step, no miss step, and the
+    // judge's `complete`.
+    let search = checked_search(0.0);
+    let result = result_with(&search, &length_plan());
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["length_matching"]["groups"][0]["pass"], true);
+    let advice: Vec<String> = result["completion"]["next_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step["manual"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(advice.len(), 1, "{advice:?}");
+    assert!(advice[0].contains("create_custom_drc_rule"));
+    let rows = result["search"]["runs"].as_array().unwrap();
+    let checked = rows.iter().find(|row| row["index"] == 0).unwrap();
+    assert_eq!(checked["g4_failed"], false);
+    assert_eq!(checked["length_miss_mm"], 0.0);
+
+    // The same finished search read without a length plan (a call without groups):
+    // nothing of Row LT in the result.
+    let result = result_with(&search, &LengthPlan::default());
+    assert!(result.get("length_matching").is_none(), "{result}");
+    let steps = result["completion"]["next_steps"].as_array().unwrap();
+    assert!(
+        steps.iter().all(|step| step.get("manual").is_none()),
+        "{steps:?}"
+    );
+}
+
+/// A search that judged nothing still tells what was asked, with nothing measured.
+#[test]
+fn a_search_with_no_winner_reports_the_length_plan_unmeasured() {
+    let search = finished_search();
+    let call = Call {
+        dsn: search.root.join("board.dsn"),
+        ses_output: search.root.join("out.ses"),
+        folder: search.folder.clone(),
+        effort: (Effort::M, EffortSource::Default),
+        fallback: WidthFallback::Floor,
+    };
+    let mut outcome = outcome(Vec::new(), None);
+    outcome.baseline = Err("kicad-cli failed".to_string());
+    let error = no_winner_result(
+        &call,
+        &outcome,
+        json!({}),
+        &PairsPlan::default(),
+        &length_plan(),
+    );
+    let found = body(&error);
+    assert_eq!(
+        found["length_matching"]["groups"][0]["pass"],
+        Value::Null,
+        "{found}"
+    );
+    assert_eq!(
+        found["length_matching"]["groups"][0]["nets"][0]["kicad_mm"],
+        Value::Null
+    );
+    // Control: without a plan, no field.
+    let error = no_winner_result(
+        &call,
+        &outcome,
+        json!({}),
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+    );
+    assert!(body(&error).get("length_matching").is_none());
+}
+
+/// What the judge checks and what the routing passes get follow the plan: nothing
+/// without a group or a gated pair (L18), heights only with a resolved pair (L7).
+#[test]
+fn the_judge_checks_the_plan_and_routing_passes_get_heights_only_with_a_pair() {
+    use crate::layer_heights::{HeightSource, LayerHeights};
+    use crate::tools::route_lengths::GatedPair;
+    // Judge: nothing declared, nothing checked.
+    assert!(judge_checks(&LengthPlan::default()).is_none());
+    let checks = judge_checks(&length_plan()).expect("a group is checked");
+    assert_eq!(checks.groups.len(), 1);
+    assert_eq!(checks.nets(), vec!["S1".to_string(), "S2".to_string()]);
+    // A KiCad rule listed and no group: still nothing for the judge to probe.
+    let listed = LengthPlan {
+        kicad_rules: vec![crate::tools::route_lengths::KicadLengthRule {
+            name: "len".to_string(),
+            constraints: vec!["(constraint length (max 60mm))".to_string()],
+            condition: None,
+        }],
+        ..LengthPlan::default()
+    };
+    assert!(judge_checks(&listed).is_none());
+    // A gated pair alone is checked.
+    let skew_only = LengthPlan {
+        pairs: vec![GatedPair {
+            positive: "S1".into(),
+            negative: "S2".into(),
+            dsn_positive: "S1".into(),
+            dsn_negative: "S2".into(),
+            max_skew_mm: 0.2,
+            group: None,
+        }],
+        ..LengthPlan::default()
+    };
+    assert_eq!(judge_checks(&skew_only).unwrap().pairs.len(), 1);
+
+    // Heights.
+    let with_heights = LengthPlan {
+        heights: LayerHeights {
+            heights_mm: Some(vec![0.0, 1.58]),
+            source: Some(HeightSource::KicadDefault),
+            note: None,
+        },
+        ..length_plan()
+    };
+    let pair = ResolvedPair {
+        positive: "S1".into(),
+        negative: "S2".into(),
+        dsn_positive: "S1".into(),
+        dsn_negative: "S2".into(),
+        gap_mm: None,
+        max_skew_mm: None,
+    };
+    let one_pair = PairsPlan {
+        resolved: vec![pair],
+        ..PairsPlan::default()
+    };
+    assert_eq!(
+        routing_layer_heights(&with_heights, &one_pair).as_deref(),
+        Some("0,1.58")
+    );
+    // Control: a call without a resolved pair keeps DP's command lines, whatever
+    // heights the plan holds for the Tune pass.
+    assert_eq!(
+        routing_layer_heights(&with_heights, &PairsPlan::default()),
+        None
+    );
+    // And a pair with no heights to send sends none.
+    assert_eq!(routing_layer_heights(&length_plan(), &one_pair), None);
+}
+
+/// The Tune pass's folder is released and reduced like the other passes' (L6).
+#[test]
+fn the_tune_pass_folder_is_released_and_reduced_like_the_others() {
+    let search = finished_search();
+    for index in [0, 1] {
+        let shape = if index == 0 {
+            Shape::AsExported
+        } else {
+            Shape::Omitted
+        };
+        let run = search.folder.join(run_folder_name(index, shape, 1));
+        for name in ["home/x", "tmp/y"] {
+            let path = run.join("tune").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "z").unwrap();
+        }
+        std::fs::write(run.join("tune/profile.sb"), "(version 1)").unwrap();
+        std::fs::write(run.join("tune/tune.ses"), "(session board)").unwrap();
+    }
+    let judge = search.folder.join("judge");
+    let winner = search.folder.join(run_folder_name(0, Shape::AsExported, 1));
+    let loser = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    release_run(&search.folder, &judge, 1, Shape::Omitted, 1);
+    assert!(!loser.join("tune/home").exists());
+    assert!(!loser.join("tune/profile.sb").exists());
+    assert!(loser.join("tune/tune.ses").is_file(), "the session stays");
+    assert!(
+        winner.join("tune/home").exists(),
+        "another run is untouched"
+    );
+    // A reduced run keeps only its record; the winner's folder stays whole.
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    assert!(!loser.join("tune").exists());
+    assert!(loser.join("run.json").is_file());
+    assert!(winner.join("tune/tune.ses").is_file());
+}
+
 /// The 1 Kopper smoke's case: the winner's variant held the GND pour as a plane,
 /// fastroute counted one connection it left (the one the pour makes), and the judge
 /// found nothing open with every gate passing. `status` is the judge's `complete`;
@@ -1822,6 +2430,7 @@ fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
             &[Shape::AsExported, Shape::Omitted],
             &search.outcome,
             &PairsPlan::default(),
+            &LengthPlan::default(),
         )
     };
 
@@ -1943,6 +2552,7 @@ fn the_winners_width_report_sets_the_status_as_for_freerouting() {
             &[Shape::AsExported, Shape::Omitted],
             &search.outcome,
             &PairsPlan::default(),
+            &LengthPlan::default(),
         )
     };
 
@@ -2048,6 +2658,8 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         hints: RoutingHints::default(),
         amps: None,
         pairs: None,
+        routing_heights: None,
+        tune: None,
         fallback: WidthFallback::Floor,
         folder: search.folder.clone(),
         judge: Arc::new(judge),
@@ -2215,6 +2827,7 @@ fn a_winner_released_during_the_search_has_no_judged_board_and_says_why() {
         &[Shape::AsExported, Shape::Omitted],
         &search.outcome,
         &PairsPlan::default(),
+        &LengthPlan::default(),
     );
     assert_eq!(result["success"], true);
     assert!(result["completion"]["judged"]["judged_board"].is_null());

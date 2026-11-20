@@ -8,9 +8,6 @@
 //! writes the `--tune` file (L5), carries the layer heights (L7), and gives the
 //! judge what it checks (`length_probe::LengthChecks`).
 
-// Stage 2 of Row LT builds this module; `route_fastroute.rs` calls it from Stage 4 on.
-#![allow(dead_code)]
-
 use crate::custom_rules;
 use crate::layer_heights::{self, LayerHeights};
 use crate::length_probe::{
