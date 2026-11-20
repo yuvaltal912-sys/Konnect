@@ -1386,6 +1386,96 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
     assert_eq!(failed["differential_pairs"][0]["gap_mm"], 0.2);
 }
 
+/// The end of a call, `conclude`, reports the call's pairs whichever way the search
+/// ended: the success result and the no-winner error. (The call path above it is
+/// tested in `fastroute_tests.rs`, with a fake fastroute.)
+#[test]
+fn a_finished_search_reports_the_pairs_in_either_ending() {
+    let pairs = PairsPlan {
+        resolved: vec![ResolvedPair {
+            positive: "CAN_H".into(),
+            negative: "CAN_L".into(),
+            dsn_positive: "/CAN_H".into(),
+            dsn_negative: "/CAN_L".into(),
+            gap_mm: Some(0.2),
+        }],
+        unresolved: vec![UnresolvedPair {
+            positive: "USB_DP".into(),
+            negative: "USB_DN".into(),
+            reason: "no net of the DSN is named 'USB_DN'".into(),
+        }],
+        note: None,
+    };
+    let kicad = route_judge::PrivateConfig {
+        home: PathBuf::from("/x/kicad-config"),
+        skipped_links: Vec::new(),
+    };
+    let shapes = [Shape::AsExported, Shape::Omitted];
+    let ended = |winner: bool, pairs: &PairsPlan| {
+        let search = finished_search();
+        let dsn = search.root.join("board.dsn");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let call = Call {
+            dsn,
+            ses_output: search.root.join("out.ses"),
+            folder: search.folder.clone(),
+            effort: (Effort::M, EffortSource::Default),
+            fallback: WidthFallback::Floor,
+        };
+        let Search {
+            _dir,
+            outcome: mut outcome,
+            ..
+        } = search;
+        if !winner {
+            outcome.winner = None;
+        }
+        let result = conclude(
+            &json!({}),
+            &call,
+            &candidate(),
+            &plan(),
+            &shapes,
+            &outcome,
+            &kicad,
+            pairs,
+        )
+        .unwrap();
+        (result, call, _dir)
+    };
+
+    // A winner: the success result, the session written, the search file kept.
+    let (result, call, _root) = ended(true, &pairs);
+    assert!(!result.is_error);
+    let found = body(&result);
+    assert_eq!(found["success"], true);
+    assert_eq!(found["differential_pairs"][0]["dsn_positive"], "/CAN_H");
+    assert_eq!(found["differential_pairs"][0]["gap_mm"], 0.2);
+    assert_eq!(
+        found["differential_pairs_unresolved"][0]["positive"],
+        "USB_DP"
+    );
+    assert!(call.ses_output.is_file());
+    assert!(call.folder.join("search.json").is_file());
+    // No winner: the error, nothing written, the same fields.
+    let (result, call, _root) = ended(false, &pairs);
+    assert!(result.is_error);
+    let found = body(&result);
+    assert_eq!(found["differential_pairs"][0]["dsn_negative"], "/CAN_L");
+    assert_eq!(
+        found["differential_pairs_unresolved"][0]["negative"],
+        "USB_DN"
+    );
+    assert!(!call.ses_output.exists());
+    // Control: without pairs both endings carry empty lists.
+    for winner in [true, false] {
+        let (result, _call, _root) = ended(winner, &PairsPlan::default());
+        let found = body(&result);
+        assert_eq!(found["differential_pairs"], json!([]), "winner {winner}");
+        assert_eq!(found["differential_pairs_unresolved"], json!([]));
+    }
+}
+
 #[test]
 fn a_fast_result_has_runs_and_no_budget_and_an_overrun_is_reported() {
     let search = finished_search();

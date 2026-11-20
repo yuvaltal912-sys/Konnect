@@ -419,7 +419,7 @@ async fn locate_binary(
 
 /// Steps 3 to 9 once the binary has been looked for: the part of a call that
 /// every test below can drive without a fastroute installed.
-async fn route_located(
+pub(crate) async fn route_located(
     args: &Value,
     ctx: Arc<ToolContext>,
     call: Call,
@@ -688,13 +688,40 @@ async fn search_and_write(
         tools: ctx,
     });
     let outcome = route_search::search(&plan, runner).await;
+    conclude(
+        args,
+        call,
+        &binary,
+        &plan,
+        &shapes,
+        &outcome,
+        &kicad_config,
+        &pairs_plan,
+    )
+}
+
+/// Steps 7 to 9 once the search has run: `search.json`, then either the no-winner
+/// error ([`no_winner_result`]) or the winner's session at `ses_output_path`, the
+/// reduced run folders and the result ([`result_json`]). `pairs_plan` is the call's
+/// differential pairs plan, reported in both results.
+#[allow(clippy::too_many_arguments)] // the parts of one finished search, each read once
+pub(crate) fn conclude(
+    args: &Value,
+    call: &Call,
+    binary: &Binary,
+    plan: &SearchPlan,
+    shapes: &[Shape],
+    outcome: &SearchOutcome,
+    kicad_config: &route_judge::PrivateConfig,
+    pairs_plan: &route_pairs::PairsPlan,
+) -> Result<CallToolResult> {
     let settings = |search: &mut Value| {
-        search["kicad_config_home"] = json!(text(&kicad_config_home));
+        search["kicad_config_home"] = json!(text(&kicad_config.home));
         if !kicad_config.skipped_links.is_empty() {
             search["kicad_config_skipped_links"] = json!(kicad_config.skipped_links);
         }
     };
-    let mut every_run = search_json(&plan, &shapes, &outcome, Listing::Every);
+    let mut every_run = search_json(plan, shapes, outcome, Listing::Every);
     settings(&mut every_run);
     let search_file = call.folder.join("search.json");
     std::fs::write(
@@ -707,9 +734,9 @@ async fn search_and_write(
         .and_then(|index| outcome.runs.get(index))
         .filter(|record| record.routed.is_some() && record.judged.is_some())
     else {
-        let mut search = search_json(&plan, &shapes, &outcome, Listing::Best);
+        let mut search = search_json(plan, shapes, outcome, Listing::Best);
         settings(&mut search);
-        return Ok(no_winner_result(call, &outcome, search, &pairs_plan));
+        return Ok(no_winner_result(call, outcome, search, pairs_plan));
     };
     let routed = winner.routed.as_ref().expect("filtered above");
     let session = std::fs::read_to_string(&routed.held.ses).map_err(|error| {
@@ -721,17 +748,17 @@ async fn search_and_write(
     konnect_sexp::write_new_atomic(&call.ses_output, &session).map_err(|error| {
         anyhow::anyhow!("create SES output {}: {error}", call.ses_output.display())
     })?;
-    let reduced = reduce_run_folders(&call.folder, &outcome);
+    let reduced = reduce_run_folders(&call.folder, outcome);
     let mut result = result_json(
         &call.dsn,
         &call.ses_output,
         &call.folder,
-        &binary,
+        binary,
         call.effort,
-        &plan,
-        &shapes,
-        &outcome,
-        &pairs_plan,
+        plan,
+        shapes,
+        outcome,
+        pairs_plan,
     );
     settings(&mut result["search"]);
     if let Err(error) = reduced {
