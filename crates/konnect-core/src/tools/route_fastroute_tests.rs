@@ -1311,6 +1311,7 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
             dsn_positive: "/CAN_H".into(),
             dsn_negative: "/CAN_L".into(),
             gap_mm: Some(0.2),
+            max_skew_mm: None,
         }],
         unresolved: vec![UnresolvedPair {
             positive: "USB_DP".into(),
@@ -1398,6 +1399,7 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
             dsn_positive: "/CAN_H".into(),
             dsn_negative: "/CAN_L".into(),
             gap_mm: Some(0.2),
+            max_skew_mm: None,
         }],
         unresolved: vec![UnresolvedPair {
             positive: "USB_DP".into(),

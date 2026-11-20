@@ -11,6 +11,7 @@ use crate::tools::design_intent::{
     design_intent_path, read_design_intent, DesignIntent, IntentRead,
 };
 use crate::tools::layout_quality::netclasses_from_source;
+use crate::tools::route_lengths;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,8 @@ const LISTED_MATCHES: usize = 3;
 pub(crate) struct DeclaredPair {
     pub positive: String,
     pub negative: String,
+    /// Row LT: the largest length difference the intent allows (`max_skew_mm`).
+    pub max_skew_mm: Option<f64>,
 }
 
 /// A pair that fastroute routes coupled.
@@ -39,6 +42,10 @@ pub(crate) struct ResolvedPair {
     /// The copper gap in mm, none when the netclass sets none (fastroute then uses
     /// the clearance).
     pub gap_mm: Option<f64>,
+    /// Row LT: the intent's `max_skew_mm`. fastroute is sent half of it as `skew=`
+    /// (`route_lengths::fastroute_skew_mm`); a pair without one keeps fastroute's own
+    /// default.
+    pub max_skew_mm: Option<f64>,
 }
 
 /// A pair left out, and why it is routed as two ordinary nets.
@@ -60,7 +67,9 @@ pub(crate) struct PairsPlan {
 
 impl PairsPlan {
     /// The `--pairs` file's text, one line per resolved pair in the intent's order,
-    /// or `None` without a pair (then no switch is sent).
+    /// or `None` without a pair (then no switch is sent). A pair's line ends with
+    /// ` gap=` when its netclass sets one, then ` skew=` (Row LT, L13: half of its
+    /// `max_skew_mm`) when the intent declares one.
     pub(crate) fn file_text(&self) -> Option<String> {
         if self.resolved.is_empty() {
             return None;
@@ -70,6 +79,12 @@ impl PairsPlan {
             text.push_str(&format!("pair {} {}", pair.dsn_positive, pair.dsn_negative));
             if let Some(gap) = pair.gap_mm {
                 text.push_str(&format!(" gap={gap}"));
+            }
+            if let Some(max_skew) = pair.max_skew_mm {
+                text.push_str(&format!(
+                    " skew={}",
+                    route_lengths::fastroute_skew_mm(max_skew)
+                ));
             }
             text.push('\n');
         }
@@ -124,6 +139,7 @@ pub(crate) fn declared_pairs(intent: &DesignIntent) -> Vec<DeclaredPair> {
         .map(|pair| DeclaredPair {
             positive: pair.positive.clone(),
             negative: pair.negative.clone(),
+            max_skew_mm: pair.max_skew_mm,
         })
         .collect()
 }
@@ -269,6 +285,7 @@ pub(crate) fn resolve_pairs(
             dsn_positive,
             dsn_negative,
             gap_mm,
+            max_skew_mm: pair.max_skew_mm,
         });
     }
     plan
