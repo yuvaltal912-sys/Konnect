@@ -303,11 +303,13 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 5. An independent review of the diff and its fixes; scoped coverage and mutants on the guards; the gate.
 6. The measurement of the design's "Measurement" section, steps 1 to 4.
 
-**Verified.** Nothing yet.
+**Verified.**
+- **Baseline gate** on `ff01d66e` (the design commit), 2026-11-21, green: workspace tests 5183 passed, 0 failed, 170 ignored; sandboxed fastroute 38; doc tests 9; `simulation_live` 95 of 95; fmt, `clippy -D warnings`, `deny`, `fix-doc-counts` changing nothing, the release build, protected files unchanged, the installed binary's SHA-256 starting `3de188bb775ab4ce`. Record: `target/creation-research/convergent-placement/gate/baseline`.
+- **Stage 1** (an Opus 5.5 agent, 2026-11-21): fmt and `clippy -p konnect-core --all-targets -D warnings` clean; `cargo test -p konnect-core --lib place_generators` 79 passed, 0 failed, 1 ignored (the goldens' recorder), 70 before the stage. 80 boards of F and S (seeds 1 to 8, every parameter set, the demo board as built and with a 0.7 mm part gap) equal SHA-256 goldens recorded before the change. 12 negative controls, each seen to fail its test: the gap rule in both arms, the part sides, the edge clearance, the copper obstacles, the start's family, C off unless named, the recipe's tag, the version, `Record::group`, `rerun`'s refusal. Not yet run on the stage: the whole `place_` run and the placement tools' goldens (the heavy lane was held by another session); they run on the stage's commit.
 
 **Records.** `target/creation-research/convergent-placement/`: the lane driver `chunk.sh` (every cargo command of this row goes through it), the gate, `PROGRESS.md` and the agents' reports. The experiment behind the design is in `target/creation-research/convergence-study/`.
 
-**Next:** the baseline gate, then stage 1. The row is done when the table "The answers, fixed in advance" of the design is filled for every board and the exact PR title and body are with the owner.
+**Next:** stage 2. Stage 1 left these for stage 4, each refusing or leaving out family C until then: `Record` has no `converge` field, `rerun` refuses a C record, `search` sets no `model.hoods` and calls no `converge_all`, `routing_order`, `search_json` and `table` know F, S and P only, and the bench has no `converge` option. The row is done when the table "The answers, fixed in advance" of the design is filled for every board and the exact PR title and body are with the owner.
 
 ## Row PS, the best-of-N placement search (bench)
 

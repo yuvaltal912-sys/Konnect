@@ -103,6 +103,7 @@ fn small_matrix() -> Matrix {
             swaps: true,
             turns: true,
         }],
+        converge: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn candidate(placements: Vec<IpcFootprintPlacement>) -> Result<Candidate, Genera
         placements,
         converged: None,
         iterations_run: None,
+        trace: None,
     })
 }
 
@@ -1681,6 +1683,42 @@ fn rerun_rebuilds_the_recorded_board() {
         edit(&mut changed);
         assert!(rerun(&model, &changed).is_err());
     }
+}
+
+/// A generated record of `small_matrix`'s F seed 1 turned into a record of family C that
+/// starts from that recipe, as `converge_all` will file one.
+fn family_c_record(model: &BoardModel) -> Record {
+    let records = generate_all(model, &recipes(&small_matrix()), 1, 6);
+    let mut record = records
+        .into_iter()
+        .find(|r| r.outcome == "generated" && r.group() == "F")
+        .expect("a generated F candidate");
+    let Origin::Generated { recipe, .. } = &record.origin else {
+        unreachable!("a generated record")
+    };
+    record.origin = Origin::Generated {
+        recipe: crate::place_generators::tests::converge_recipe(recipe.clone()),
+        generator_version: GENERATOR_VERSION,
+    };
+    record
+}
+
+#[test]
+fn a_record_of_family_c_is_group_c() {
+    let record = family_c_record(&model());
+    assert_eq!(record.group(), "C");
+    assert!(record.label().starts_with("C seed "), "{}", record.label());
+}
+
+#[test]
+fn the_rerun_of_a_family_c_record_is_refused_until_its_trace_is_recorded() {
+    // Refused before anything is generated: the run's body does not exist yet, and a
+    // rerun of C must prove the neighbourhoods its trace names (design C11).
+    let model = model();
+    let refused = rerun(&model, &family_c_record(&model))
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("family C"), "{refused}");
 }
 
 // ─── The production RouteCall ────────────────────────────────────────────────

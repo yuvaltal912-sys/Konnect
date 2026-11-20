@@ -163,7 +163,7 @@ impl Record {
         }
     }
 
-    /// The family letter of the record's group: `O`, `A`, `F`, `S` or `P`.
+    /// The family letter of the record's group: `O`, `A`, `F`, `S`, `P` or `C`.
     fn group(&self) -> &'static str {
         match &self.origin {
             Origin::Owner { .. } => "O",
@@ -172,6 +172,7 @@ impl Record {
                 Family::Force => "F",
                 Family::Schematic => "S",
                 Family::Perturb => "P",
+                Family::Converge => "C",
             },
         }
     }
@@ -1133,6 +1134,14 @@ pub(crate) fn rerun(model: &BoardModel, record: &Record) -> anyhow::Result<Strin
     anyhow::ensure!(
         *generator_version == GENERATOR_VERSION,
         "candidate {} was made by generator version {generator_version}, this build is {GENERATOR_VERSION}",
+        record.id
+    );
+    // Family C's rerun also proves the schematic neighbourhoods its trace names (design
+    // C11), and the record does not carry the trace yet: refused until it does, so a C
+    // board is never rebuilt from a model it was not made with.
+    anyhow::ensure!(
+        recipe.family != Family::Converge,
+        "candidate {} is of family C, whose rerun is not built yet",
         record.id
     );
     anyhow::ensure!(

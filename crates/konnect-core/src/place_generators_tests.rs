@@ -2461,10 +2461,12 @@ fn gap_to_text(model: &BoardModel, sizes: &[(f64, f64)], at: (f64, f64)) -> f64 
 }
 
 #[test]
-fn the_generator_version_is_eight() {
-    // The obstacles, the part sides, the exact boxes and the largest-first order change what
-    // every recipe gives, so a record of an earlier version is not reproducible.
-    assert_eq!(GENERATOR_VERSION, 8);
+fn the_generator_version_is_nine() {
+    // Version 8: the obstacles, the part sides, the exact boxes and the largest-first order
+    // changed what every recipe gives. Version 9 (design C14): family C's recipes, which a
+    // build of version 8 cannot rebuild; F and S give the boards they gave
+    // (`legality_is_the_closure_legalize_had`).
+    assert_eq!(GENERATOR_VERSION, 9);
 }
 
 // ─── Largest first ───────────────────────────────────────────────────────────
@@ -3032,4 +3034,471 @@ fn a_pair_of_a_part_with_itself_is_ignored() {
     centres[c1] = (60.0, 51.0);
     legalize(&model, &sizes, &mut centres).unwrap();
     assert_eq!(centres[c1], (60.0, 51.0));
+}
+
+// ─── Goldens for the pull-out of `Legality` (Row CP, stage 1) ────────────────
+//
+// `legalize_turned`'s legality closure became `Legality::legal_at` under
+// `GapRule::CourtyardsMayTouch`, with no change to any board F or S makes. These goldens
+// hold every F and S recipe of seeds 1 to 8 of the bench matrix, on the demo board as
+// built and on the same board with clearances set, to the SHA-256 of the board text each
+// one writes, recorded from the code as it was before the pull-out (`ff01d66e`). A board
+// text carries no generator version, so the version's change leaves them as they are.
+// With the clearances, some boards keep two real courtyards closer than the part gap,
+// which only `CourtyardsMayTouch` allows: so the goldens also guard which rule `legalize`
+// keeps.
+//
+// To record again (only ever from code whose boards are meant to be the new truth):
+// `cargo test -p konnect-core --lib -- --ignored record_legality_goldens`.
+
+const LEGALITY_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/tools/placement/fixtures/generators_legality_boards.json"
+);
+
+/// The part gap of the goldens' second model: above the 0.5 mm grid step, so that two
+/// real courtyards one grid step apart are legal under `CourtyardsMayTouch` only.
+const GOLDEN_PART_GAP_MM: f64 = 0.7;
+
+/// The board text of every recipe of the goldens, by name: `<model> <family> seed <s>
+/// set <k>`, `k` the recipe's parameter set in matrix order. A recipe that fails gives
+/// its failure's text, as `bytes_of` does.
+fn legality_golden_cases() -> BTreeMap<String, String> {
+    let models = [
+        ("demo", demo_model()),
+        (
+            "demo_gap",
+            with_clearances(demo_model(), GOLDEN_PART_GAP_MM, 0.5),
+        ),
+    ];
+    let all = recipes(&Matrix::bench());
+    let mut cases = BTreeMap::new();
+    for (name, model) in &models {
+        for (family, letter) in [(Family::Force, "F"), (Family::Schematic, "S")] {
+            for seed in 1..=8 {
+                let sets = all.iter().filter(|r| r.family == family && r.seed == seed);
+                for (k, recipe) in sets.enumerate() {
+                    cases.insert(
+                        format!("{name} {letter} seed {seed} set {k}"),
+                        bytes_of(model, recipe),
+                    );
+                }
+            }
+        }
+    }
+    cases
+}
+
+fn legality_golden_hashes(cases: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    cases
+        .iter()
+        .map(|(name, text)| (name.clone(), place_held::sha256_hex(text.as_bytes())))
+        .collect()
+}
+
+/// Whether the board `text` has two real courtyards on one side that are closer than
+/// `gap_mm` on both axes' larger gap.
+fn has_real_courtyards_closer_than(text: &str, gap_mm: f64) -> bool {
+    use konnect_sexp::board::CourtyardSource;
+    let scan = footprint_courtyards(&parse(text));
+    let real: Vec<&FootprintCourtyard> = scan
+        .items
+        .iter()
+        .filter(|c| c.bbox_source == CourtyardSource::Courtyard)
+        .collect();
+    real.iter().enumerate().any(|(n, a)| {
+        real[n + 1..].iter().any(|b| {
+            let (sa, sb) = (bbox_size(a.bbox), bbox_size(b.bbox));
+            let (ca, cb) = (bbox_centre(a.bbox), bbox_centre(b.bbox));
+            let gap_x = (ca.0 - cb.0).abs() - (sa.0 + sb.0) / 2.0;
+            let gap_y = (ca.1 - cb.1).abs() - (sa.1 + sb.1) / 2.0;
+            a.layer_side == b.layer_side && gap_x.max(gap_y) < gap_mm
+        })
+    })
+}
+
+/// One-off recorder: writes the goldens from the code as it stands. Ignored, so a normal
+/// run never rewrites its own yardstick.
+#[test]
+#[ignore = "records the golden file; run once, on the code whose boards are the truth"]
+fn record_legality_goldens() {
+    let hashes = legality_golden_hashes(&legality_golden_cases());
+    let text = serde_json::to_string_pretty(&hashes).unwrap() + "\n";
+    std::fs::write(LEGALITY_GOLDEN, text).unwrap();
+}
+
+#[test]
+fn legality_is_the_closure_legalize_had() {
+    let golden: BTreeMap<String, String> = serde_json::from_str(
+        &std::fs::read_to_string(LEGALITY_GOLDEN)
+            .unwrap_or_else(|error| panic!("golden {LEGALITY_GOLDEN} unreadable: {error}")),
+    )
+    .unwrap();
+    let cases = legality_golden_cases();
+    // 2 models x 8 seeds x (3 F sets + 2 S sets).
+    assert_eq!(cases.len(), 80);
+    assert!(
+        cases.values().all(|text| !text.starts_with("failure")),
+        "every recipe gives a board on the demo board"
+    );
+    let hashes = legality_golden_hashes(&cases);
+    assert_eq!(
+        hashes.keys().collect::<Vec<_>>(),
+        golden.keys().collect::<Vec<_>>(),
+        "the same cases as recorded"
+    );
+    for (name, sha) in &hashes {
+        assert_eq!(
+            sha, &golden[name],
+            "{name}: the board changed from the recorded golden"
+        );
+    }
+    // The goldens guard the gap rule: with the clearances set, some board keeps two real
+    // courtyards closer than the part gap, which `GapRule::Everywhere` would not allow.
+    assert!(
+        cases
+            .iter()
+            .filter(|(name, _)| name.starts_with("demo_gap "))
+            .any(|(_, text)| has_real_courtyards_closer_than(text, GOLDEN_PART_GAP_MM)),
+        "no golden board has two real courtyards closer than the part gap"
+    );
+}
+
+// ─── `Legality`, under both gap rules ────────────────────────────────────────
+
+/// R1 and R2, two real courtyards of 2 x 1 mm on the top, with the part gap given.
+fn two_courtyards(part_gap_mm: f64) -> BoardModel {
+    let parts = vec![
+        Fp::new("R1", 30.0, 20.0).two_pad("N1", "N2"),
+        Fp::new("R2", 10.0, 10.0).two_pad("N2", "N3"),
+    ];
+    with_clearances(model_of(&board(OUTLINE, &parts), &[]), part_gap_mm, 0.0)
+}
+
+#[test]
+fn legality_lets_real_courtyards_touch_only_under_courtyards_may_touch() {
+    // R2 to the right of R1 with `gap` mm between the two boxes, and below it the same.
+    // 3 µm stands for "2 µm apart": the 2 µm boundary itself is not exact in binary.
+    let model = two_courtyards(0.3);
+    assert_eq!(
+        model.parts[0].bbox_source,
+        konnect_sexp::board::CourtyardSource::Courtyard
+    );
+    let sizes = as_read_sizes(&model);
+    let centres = as_read_centres(&model);
+    let (r1, r2) = (0, 1);
+    let beside = |gap: f64| {
+        (
+            centres[r1].0 + (sizes[r1].0 + sizes[r2].0) / 2.0 + gap,
+            centres[r1].1,
+        )
+    };
+    let below = |gap: f64| {
+        (
+            centres[r1].0,
+            centres[r1].1 + (sizes[r1].1 + sizes[r2].1) / 2.0 + gap,
+        )
+    };
+    let touch = Legality::new(&model, GapRule::CourtyardsMayTouch);
+    let everywhere = Legality::new(&model, GapRule::Everywhere);
+    // (gap, legal under CourtyardsMayTouch, legal under Everywhere)
+    for (gap, touch_legal, everywhere_legal) in [
+        (0.003, true, false),
+        (0.2, true, false),
+        (0.303, true, true),
+        (0.001, false, false),
+        (-0.5, false, false),
+    ] {
+        for at in [beside(gap), below(gap)] {
+            for (legality, legal, rule) in [
+                (&touch, touch_legal, "CourtyardsMayTouch"),
+                (&everywhere, everywhere_legal, "Everywhere"),
+            ] {
+                assert_eq!(
+                    legality.legal_at(r2, at, sizes[r2], [r1], &centres, &sizes),
+                    legal,
+                    "{rule}: legal_at with a gap of {gap} mm at {at:?}"
+                );
+                assert_eq!(
+                    legality.clear_of(r2, at, sizes[r2], r1, centres[r1], sizes[r1]),
+                    legal,
+                    "{rule}: clear_of with a gap of {gap} mm at {at:?}"
+                );
+                // The two parts of a swap are tested against each other either way round.
+                assert_eq!(
+                    legality.clear_of(r1, centres[r1], sizes[r1], r2, at, sizes[r2]),
+                    legal,
+                    "{rule}: clear_of turned round with a gap of {gap} mm"
+                );
+            }
+        }
+    }
+    // Only the parts of `others` are tested: R2 right on R1 is legal against no part.
+    assert!(everywhere.legal_at(r2, centres[r1], sizes[r2], [], &centres, &sizes));
+    // With no part gap both rules keep 2 µm, so 3 µm is legal under both.
+    let gapless = two_courtyards(0.0);
+    let everywhere = Legality::new(&gapless, GapRule::Everywhere);
+    assert!(everywhere.legal_at(r2, beside(0.003), sizes[r2], [r1], &centres, &sizes));
+    assert!(!everywhere.legal_at(r2, beside(0.001), sizes[r2], [r1], &centres, &sizes));
+}
+
+#[test]
+fn parts_that_share_no_side_are_always_clear() {
+    // R1 on the top, R2 on the back, R3 a through-hole part (both sides): R2 right on R1
+    // is clear under both rules, R2 right on R3 is not.
+    let parts = vec![
+        Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2"),
+        Fp::new("R2", 40.0, 40.0).back().two_pad("N2", "N3"),
+        Fp::new("R3", 60.0, 50.0).two_pad("N3", "N4"),
+    ];
+    let model = with_clearances(copper_model_of(parts, &["R3"], ""), 0.3, 0.0);
+    let (r1, r2, r3) = (
+        index_of(&model, "R1"),
+        index_of(&model, "R2"),
+        index_of(&model, "R3"),
+    );
+    let sizes = as_read_sizes(&model);
+    let centres = as_read_centres(&model);
+    for rule in [GapRule::CourtyardsMayTouch, GapRule::Everywhere] {
+        let legality = Legality::new(&model, rule);
+        assert!(
+            legality.clear_of(r2, centres[r1], sizes[r2], r1, centres[r1], sizes[r1]),
+            "{rule:?}: a back part over a top part"
+        );
+        assert!(legality.legal_at(r2, centres[r1], sizes[r2], [r1], &centres, &sizes));
+        assert!(
+            !legality.clear_of(r2, centres[r3], sizes[r2], r3, centres[r3], sizes[r3]),
+            "{rule:?}: a back part over a through-hole part"
+        );
+        assert!(!legality.legal_at(r2, centres[r3], sizes[r2], [r1, r3], &centres, &sizes));
+    }
+}
+
+#[test]
+fn legality_keeps_a_part_inside_the_outline_by_the_edge_clearance() {
+    // R1 (2 x 1 mm) with its left side 0.3 mm from the straight edge, and with its
+    // top-left corner 0.2 mm inside the arc of a rounded corner: legal with no edge
+    // clearance, not with 0.5 mm, under both rules. A box inside the outline's bbox but
+    // outside the arc, or across the edge, is never legal.
+    let parts = vec![Fp::new("R1", 20.0, 20.0).two_pad("N1", "N2")];
+    let text = board(Shape::Rounded(0.0, 0.0, 60.0, 40.0, 10.0), &parts);
+    for rule in [GapRule::CourtyardsMayTouch, GapRule::Everywhere] {
+        for (edge, legal) in [(0.0, true), (0.5, false)] {
+            let model = with_clearances(model_of(&text, &[]), 0.0, edge);
+            let sizes = as_read_sizes(&model);
+            let centres = as_read_centres(&model);
+            let legality = Legality::new(&model, rule);
+            for at in [(1.3, 20.0), (58.7, 20.0), (4.07, 3.57)] {
+                assert_eq!(
+                    legality.legal_at(0, at, sizes[0], [], &centres, &sizes),
+                    legal,
+                    "{rule:?}, edge {edge} mm, at {at:?}"
+                );
+            }
+            for outside in [(1.5, 1.0), (0.5, 20.0), (30.0, 40.2)] {
+                assert!(
+                    !legality.legal_at(0, outside, sizes[0], [], &centres, &sizes),
+                    "{rule:?}, edge {edge} mm, at {outside:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn legality_keeps_a_part_off_copper_on_its_side() {
+    // The text box is x 37.325..42.675, y 39.075..40.925 and R1 is 2 x 1 mm: on it R1 is
+    // not legal, 3 µm above it R1 is. With a part gap of 0.7 mm a cell 0.575 mm above it is
+    // not legal either. The same text on the back copper is no obstacle to R1 on the top.
+    // Copper is judged alike under both rules.
+    for rule in [GapRule::CourtyardsMayTouch, GapRule::Everywhere] {
+        let on_top = copper_model(&gr_text("ABCD", "40 40", "F.Cu", PLAIN));
+        let r1 = r1_of(&on_top);
+        let sizes = as_read_sizes(&on_top);
+        let centres = as_read_centres(&on_top);
+        let legal = |model: &BoardModel, at: (f64, f64)| {
+            Legality::new(model, rule).legal_at(r1, at, sizes[r1], [], &centres, &sizes)
+        };
+        assert!(!legal(&on_top, (40.0, 40.0)), "{rule:?}: on the text");
+        assert!(legal(&on_top, (40.0, 38.572)), "{rule:?}: 3 µm above it");
+        assert!(legal(&on_top, (40.0, 38.0)), "{rule:?}: no part gap");
+        let gapped = with_clearances(on_top.clone(), 0.7, 0.0);
+        assert!(
+            !legal(&gapped, (40.0, 38.0)),
+            "{rule:?}: within the part gap"
+        );
+        let on_back = copper_model(&gr_text("ABCD", "40 40", "B.Cu", PLAIN));
+        assert!(legal(&on_back, (40.0, 40.0)), "{rule:?}: the other side");
+    }
+}
+
+// ─── Family C's seams (Row CP, stage 1) ──────────────────────────────────────
+
+/// The values `ConvergeParams::measured(0)` is to return (design C2, C5, C6), written
+/// out: its body is a later stage's. Nothing in these tests runs a search with them.
+pub(crate) fn converge_params() -> ConvergeParams {
+    ConvergeParams {
+        crossing_mm: 4.0,
+        fanout_limit: 8,
+        rail_weight: 0.3,
+        requirement_mm: 1000.0,
+        requirement_slope: 50.0,
+        neighbour_weight: 0.1,
+        label_mm: 0.2,
+        turn_parts: true,
+        level: 0,
+        stage_per_part: 200,
+        cooling: 0.95,
+        radius_exponent: 0.594,
+        quiet_gain: 0.001,
+        quiet_stages: 5,
+        uphill_floor: 0.01,
+        quiet_sweeps: 3,
+        max_stages: 2000,
+        max_sweeps: 200,
+    }
+}
+
+/// The values `OuterRule::measured` is to return (design C7), written out.
+fn outer_rule() -> OuterRule {
+    OuterRule {
+        gain: 0.01,
+        window: 3,
+        max_starts: 64,
+        max_level: 5,
+    }
+}
+
+/// A recipe of family C from `start`, with the start's seed.
+pub(crate) fn converge_recipe(start: Recipe) -> Recipe {
+    Recipe {
+        family: Family::Converge,
+        seed: start.seed,
+        params: Params::Converge(ConvergeRecipe {
+            start: Box::new(start),
+            params: converge_params(),
+        }),
+    }
+}
+
+#[test]
+fn a_run_of_family_c_starts_only_from_f_or_s() {
+    // A start of family C itself, or of P, is refused before anything runs; so are a
+    // family and parameters of different kinds.
+    let model = demo_model();
+    for start in [converge_recipe(force_recipe(1)), perturb_recipe(1, false)] {
+        let family = start.family;
+        assert!(
+            matches!(
+                generate(&model, &converge_recipe(start)),
+                Err(GenerateFailure::Invalid(_))
+            ),
+            "a start of {family:?}"
+        );
+    }
+    let mut kinds_differ = converge_recipe(force_recipe(1));
+    kinds_differ.family = Family::Force;
+    assert!(matches!(
+        generate(&model, &kinds_differ),
+        Err(GenerateFailure::Invalid(_))
+    ));
+    let mut kinds_differ = force_recipe(1);
+    kinds_differ.family = Family::Converge;
+    assert!(matches!(
+        generate(&model, &kinds_differ),
+        Err(GenerateFailure::Invalid(_))
+    ));
+}
+
+#[test]
+fn f_s_and_p_carry_no_trace_and_the_model_no_neighbourhoods() {
+    let model = demo_model();
+    assert!(model.hoods.is_none(), "board_model sets no neighbourhoods");
+    for recipe in [
+        force_recipe(1),
+        schematic_recipe(1, true),
+        perturb_recipe(1, false),
+    ] {
+        let candidate = generate(&model, &recipe).expect("a roomy board");
+        assert!(candidate.trace.is_none(), "{:?}", recipe.family);
+    }
+}
+
+#[test]
+fn family_c_is_off_in_every_matrix_and_recipes_never_list_it() {
+    assert_eq!(Matrix::bench().converge, None);
+    let all = recipes(&Matrix::bench());
+    assert!(all.iter().all(|r| r.family != Family::Converge));
+    // Even with C on, `recipes` lists no recipe of it: `converge_all` makes them.
+    let mut on = Matrix::bench();
+    on.converge = Some((converge_params(), outer_rule()));
+    assert_eq!(recipes(&on), all);
+    // `only` keeps C only when it is named.
+    assert_eq!(
+        on.clone()
+            .only(&[Family::Force, Family::Schematic])
+            .converge,
+        None
+    );
+    assert_eq!(
+        on.clone().only(&[Family::Force, Family::Converge]).converge,
+        on.converge
+    );
+}
+
+#[test]
+fn a_converge_recipe_serializes_like_the_other_params() {
+    // F, S and P serialize as they did: the family, the seed, and the parameters tagged by
+    // `kind`.
+    let force = serde_json::to_value(force_recipe(1)).unwrap();
+    assert_eq!(
+        force,
+        serde_json::json!({
+            "family": "force",
+            "seed": 1,
+            "params": {
+                "kind": "force",
+                "rail_weight": 0.0,
+                "fanout_limit": 8,
+                "pair_weight": 10.0,
+                "group_weight": 0.5,
+                "iterations": 600,
+            },
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(schematic_recipe(2, false)).unwrap(),
+        serde_json::json!({
+            "family": "schematic",
+            "seed": 2,
+            "params": { "kind": "schematic", "fanout_limit": 8, "polish": null },
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(perturb_recipe(3, false)).unwrap(),
+        serde_json::json!({
+            "family": "perturb",
+            "seed": 3,
+            "params": {
+                "kind": "perturb",
+                "moves": 4,
+                "radius_mm": 2.0,
+                "swaps": true,
+                "turns": true,
+            },
+        })
+    );
+    // C the same way: its start recipe whole, and its parameters.
+    let run = serde_json::to_value(converge_recipe(force_recipe(1))).unwrap();
+    assert_eq!(run["family"], "converge");
+    assert_eq!(run["seed"], 1);
+    let params = run["params"].as_object().unwrap();
+    assert_eq!(params.len(), 3, "{params:?}");
+    assert_eq!(params["kind"], "converge");
+    assert_eq!(params["start"], force);
+    assert_eq!(
+        params["params"],
+        serde_json::to_value(converge_params()).unwrap()
+    );
+    assert_eq!(params["params"]["turn_parts"], true);
 }

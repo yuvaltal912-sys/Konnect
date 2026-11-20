@@ -3,8 +3,10 @@
 //! thread, in any order, in any run of the same build. Randomness is
 //! `route_search::SplitMix64`, seeded by the recipe alone.
 
+use crate::place_converge::{converge, ConvergeParams, OuterRule, Trace};
 use crate::place_held::{HeldSet, Intent};
 use crate::place_judge::FailureKey;
+use crate::place_schematic::Neighbourhoods;
 use crate::route_search::SplitMix64;
 use crate::tools::placement::force_core::{
     self, FdExtras, FdParams, FdPart, GroupSpring, PadSpring, Rect, Relaxed, Springs,
@@ -25,7 +27,7 @@ use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 8;
+pub(crate) const GENERATOR_VERSION: u32 = 9;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -60,6 +62,8 @@ pub(crate) enum Family {
     Schematic,
     /// P: seeded perturbations of the input placement (start O).
     Perturb,
+    /// C: the convergent search (`place_converge`), one run per start and level.
+    Converge,
 }
 
 /// One candidate's full description: with the model's input, enough to rebuild it.
@@ -76,6 +80,18 @@ pub(crate) enum Params {
     Force(ForceParams),
     Schematic(SchematicParams),
     Perturb(PerturbParams),
+    // Made by `place_search::converge_all` (the bench alone reaches it) and by tests.
+    #[allow(dead_code)]
+    Converge(ConvergeRecipe),
+}
+
+/// A run of family C, enough to rebuild it: the recipe of the candidate it starts from
+/// (family F or S, never C) and its parameters, the level among them. The run's seed is
+/// the start recipe's.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ConvergeRecipe {
+    pub start: Box<Recipe>,
+    pub params: ConvergeParams,
 }
 
 /// The force core's spring graph and run for one recipe.
@@ -154,6 +170,11 @@ pub(crate) struct BoardModel {
     /// graphics, and rule areas that keep footprints or pads out. A moved part stays
     /// clear of the ones on its sides.
     pub copper: Vec<CopperObstacle>,
+    /// The schematic neighbourhoods (`place_schematic::Neighbourhoods`). `None` from
+    /// `board_model`; `place_search::search` sets it from its `SchematicBaseline`. `None`
+    /// when the schematic cannot be read: family C then runs without the term N, and
+    /// its trace has `neighbour_mm: null`.
+    pub hoods: Option<Neighbourhoods>,
 }
 
 /// Builds the model. Refuses a text whose SHA-256 is not `held.board_sha256`, a scan
@@ -265,6 +286,7 @@ pub(crate) fn board_model(text: &str, held: HeldSet, intent: Intent) -> anyhow::
         clearances: Clearances::default(),
         part_sides,
         copper: copper_obstacles(&tree),
+        hoods: None,
     })
 }
 
@@ -471,7 +493,7 @@ const DEFAULT_TEXT_THICKNESS_MM: f64 = 0.15;
 /// makes the box span the anchor by the whole extent on that axis, a superset whichever
 /// way the text is mirrored. Turned by `at`'s angle about the anchor: exact for a
 /// cardinal angle, the axis-aligned hull otherwise.
-fn text_box(item: &SexpNode) -> Option<Rect> {
+pub(crate) fn text_box(item: &SexpNode) -> Option<Rect> {
     // The cache gives the box only when every one of its polygons is readable: a partial
     // box would be a subset, so any unreadable polygon sends the whole text to the estimate.
     if let Some(cache) = item.find("render_cache") {
@@ -673,6 +695,8 @@ pub(crate) struct Candidate {
     /// The force core's, when the recipe ran it.
     pub converged: Option<bool>,
     pub iterations_run: Option<usize>,
+    /// Family C's run; `None` for the other families.
+    pub trace: Option<Trace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -710,7 +734,7 @@ fn round_um(value: f64) -> f64 {
 /// A vector turned by `quarter_turns` x 90° in KiCad's Y-down, counter-clockwise-on-
 /// screen sense (`konnect_sexp::geometry::rotate_about`: `x' = x cos + y sin`,
 /// `y' = -x sin + y cos`), exactly.
-fn turn_vector((x, y): (f64, f64), quarter_turns: i32) -> (f64, f64) {
+pub(crate) fn turn_vector((x, y): (f64, f64), quarter_turns: i32) -> (f64, f64) {
     match quarter_turns.rem_euclid(4) {
         0 => (x, y),
         1 => (y, -x),
@@ -804,10 +828,13 @@ fn ensure_parts_fit(model: &BoardModel) -> Result<(), GenerateFailure> {
 /// - Force: `scatter`, then `force`, then `legalize`.
 /// - Schematic: `schematic_grid`, then `force` when `polish` is set, then `legalize`.
 /// - Perturb: `perturb` of the input, then `legalize`.
+/// - Converge: the start recipe's candidate (family F or S, else `Invalid`), then
+///   `place_converge::converge` from it with `model.hoods`; the candidate carries the
+///   run's trace.
 ///
 /// Centres become anchors by each part's own offset (anchor minus courtyard centre,
-/// turned with the part), rounded to 1 µm as the legacy handler rounds them. A part that
-/// neither moved nor turned is not listed. Pure.
+/// turned with the part), rounded to 1 µm as the legacy handler rounds them
+/// (`placements_from`). A part that neither moved nor turned is not listed. Pure.
 pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate, GenerateFailure> {
     let mut rng = SplitMix64(recipe.seed);
     let read_sizes = as_read_sizes(model);
@@ -857,6 +884,25 @@ pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate,
             }
             perturb(model, params, &mut rng)
         }
+        (Family::Converge, Params::Converge(run)) => {
+            // Family C refines a candidate of F or S (design C8); a start of P or of C
+            // itself is no start.
+            if !matches!(run.start.family, Family::Force | Family::Schematic) {
+                return Err(GenerateFailure::Invalid(
+                    "a run of family C starts from a recipe of family F or S".to_string(),
+                ));
+            }
+            let start = generate(model, &run.start)?;
+            let (mut candidate, trace) = converge(
+                model,
+                model.hoods.as_ref(),
+                &start.placements,
+                recipe.seed,
+                &run.params,
+            )?;
+            candidate.trace = Some(trace);
+            return Ok(candidate);
+        }
         _ => {
             return Err(GenerateFailure::Invalid(
                 "the recipe's family and its parameters are of different kinds".to_string(),
@@ -873,7 +919,22 @@ pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate,
         .map(|(size, q)| if q % 2 == 0 { *size } else { (size.1, size.0) })
         .collect();
     legalize_turned(model, &sizes, &turns, &mut centres)?;
+    Ok(Candidate {
+        placements: placements_from(model, &centres, &turns),
+        converged,
+        iterations_run,
+        trace: None,
+    })
+}
 
+/// The absolute anchor and rotation of every movable part that is not exactly where and
+/// as it was read: the tail of `generate`, for `converge` too. A part that stayed is not
+/// listed (D11).
+pub(crate) fn placements_from(
+    model: &BoardModel,
+    centres: &[(f64, f64)],
+    turns: &[i32],
+) -> Vec<IpcFootprintPlacement> {
     let read_centres = as_read_centres(model);
     let mut placements = Vec::new();
     for (i, part) in model.parts.iter().enumerate() {
@@ -902,11 +963,7 @@ pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate,
             rotation,
         });
     }
-    Ok(Candidate {
-        placements,
-        converged,
-        iterations_run,
-    })
+    placements
 }
 
 /// S0, the AI arm's start: every movable part in rows to the right of `bounds`, outside
@@ -1461,67 +1518,31 @@ pub(crate) fn legalize_turned(
     turns: &[i32],
     centres: &mut [(f64, f64)],
 ) -> Result<(), GenerateFailure> {
+    legalize_with(model, sizes, turns, centres, GapRule::CourtyardsMayTouch)
+}
+
+/// `legalize_turned` with the gap rule given: `GapRule::CourtyardsMayTouch` is
+/// `legalize_turned` itself, and family C makes its starts legal with
+/// `GapRule::Everywhere` (design C3, C8). The settling order and the ring search are the
+/// same under both; only the gap a moved part keeps from another part's box differs.
+pub(crate) fn legalize_with(
+    model: &BoardModel,
+    sizes: &[(f64, f64)],
+    turns: &[i32],
+    centres: &mut [(f64, f64)],
+    rule: GapRule,
+) -> Result<(), GenerateFailure> {
     let count = model.parts.len();
     if sizes.len() != count || centres.len() != count || turns.len() != count {
         return Err(GenerateFailure::Invalid(
             "legalize needs one size, one turn and one centre per part".to_string(),
         ));
     }
-    let threshold = model.outline.containment_threshold_mm();
-    let (bx0, by0, bx1, by1) = model.bounds;
     let read_centres = as_read_centres(model);
     let read_sizes = as_read_sizes(model);
-
-    // Two boxes overlap when, on both axes, they overlap by more than minus the gap
-    // they must keep (`Clearances::gap_between`: at least 2 µm, so touching is
-    // overlapping).
-    let edge = model.clearances.edge_mm;
+    let legality = Legality::new(model, rule);
     let legal_at = |i: usize, at: (f64, f64), settled: &[usize], centres: &[(f64, f64)]| {
-        let (w, h) = sizes[i];
-        // The courtyard box grown by the copper-to-edge clearance on every side: it
-        // must be inside the outline, so the box itself is `edge_mm` inside.
-        let (x0, y0, x1, y1) = (
-            at.0 - w / 2.0 - edge,
-            at.1 - h / 2.0 - edge,
-            at.0 + w / 2.0 + edge,
-            at.1 + h / 2.0 + edge,
-        );
-        if x0 < bx0 - threshold
-            || y0 < by0 - threshold
-            || x1 > bx1 + threshold
-            || y1 > by1 + threshold
-        {
-            return false;
-        }
-        if model
-            .outline
-            .overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-            .depth_mm
-            > threshold
-        {
-            return false;
-        }
-        let sides = model.part_sides[i];
-        let hits_part = settled.iter().any(|&j| {
-            sides.intersects(model.part_sides[j]) && {
-                let ix = (w + sizes[j].0) / 2.0 - (at.0 - centres[j].0).abs();
-                let iy = (h + sizes[j].1) / 2.0 - (at.1 - centres[j].1).abs();
-                let gate = -model
-                    .clearances
-                    .gap_between(&model.parts[i], &model.parts[j]);
-                ix > gate && iy > gate
-            }
-        });
-        let hits_copper = model.copper.iter().any(|obstacle| {
-            sides.intersects(obstacle.sides) && {
-                let (ox0, oy0, ox1, oy1) = obstacle.bbox;
-                let ix = (w + (ox1 - ox0)) / 2.0 - (at.0 - (ox0 + ox1) / 2.0).abs();
-                let iy = (h + (oy1 - oy0)) / 2.0 - (at.1 - (oy0 + oy1) / 2.0).abs();
-                let gate = -MOVED_CLEARANCE_MM.max(model.clearances.part_gap_mm);
-                ix > gate && iy > gate
-            }
-        });
-        !(hits_part || hits_copper)
+        legality.legal_at(i, at, sizes[i], settled.iter().copied(), centres, sizes)
     };
 
     let unmoved = |i: usize, centres: &[(f64, f64)]| {
@@ -1594,6 +1615,135 @@ pub(crate) fn legalize_turned(
     }
 }
 
+// ─── The legality of one moved part ──────────────────────────────────────────
+
+/// Which gap a moved part keeps from another part's box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GapRule {
+    /// `legalize` as it is: 2 µm between two real courtyards, and the larger of 2 µm and
+    /// `part_gap_mm` when either box is not one (`Clearances::gap_between`).
+    CourtyardsMayTouch,
+    /// Family C: the larger of 2 µm and `part_gap_mm` between any two boxes.
+    // Made by family C (`place_converge`, which the bench alone reaches) and by tests.
+    #[allow(dead_code)]
+    Everywhere,
+}
+
+/// The legality test of one moved part: `legalize_turned`'s `legal_at`, pulled out so that
+/// family C tests a move by the same rule that legalizes F and S (the outline, the edge
+/// clearance, the part sides, the copper obstacles), with its own gap rule.
+pub(crate) struct Legality<'a> {
+    model: &'a BoardModel,
+    rule: GapRule,
+    /// `Outline::containment_threshold_mm`, read once.
+    threshold_mm: f64,
+}
+
+impl<'a> Legality<'a> {
+    pub(crate) fn new(model: &'a BoardModel, rule: GapRule) -> Self {
+        Legality {
+            model,
+            rule,
+            threshold_mm: model.outline.containment_threshold_mm(),
+        }
+    }
+
+    /// Whether part `i`, its box of `size` centred at `at`, is legal there: the box grown
+    /// by `edge_mm` on every side lies inside the true outline (first its bbox, then
+    /// `Outline::overhang` against the containment threshold); it is clear of every part
+    /// of `others` whose sides intersect its own (`clear_of`), each at `centres[j]` with
+    /// `sizes[j]`; and it keeps the larger of 2 µm and `part_gap_mm` from every copper
+    /// obstacle on its sides. With `GapRule::CourtyardsMayTouch` this is the closure
+    /// `legalize_turned` has today, term for term.
+    pub(crate) fn legal_at(
+        &self,
+        i: usize,
+        at: (f64, f64),
+        size: (f64, f64),
+        others: impl IntoIterator<Item = usize>,
+        centres: &[(f64, f64)],
+        sizes: &[(f64, f64)],
+    ) -> bool {
+        let model = self.model;
+        let threshold = self.threshold_mm;
+        let (bx0, by0, bx1, by1) = model.bounds;
+        let edge = model.clearances.edge_mm;
+        let (w, h) = size;
+        // The courtyard box grown by the copper-to-edge clearance on every side: it must
+        // be inside the outline, so the box itself is `edge_mm` inside.
+        let (x0, y0, x1, y1) = (
+            at.0 - w / 2.0 - edge,
+            at.1 - h / 2.0 - edge,
+            at.0 + w / 2.0 + edge,
+            at.1 + h / 2.0 + edge,
+        );
+        if x0 < bx0 - threshold
+            || y0 < by0 - threshold
+            || x1 > bx1 + threshold
+            || y1 > by1 + threshold
+        {
+            return false;
+        }
+        if model
+            .outline
+            .overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            .depth_mm
+            > threshold
+        {
+            return false;
+        }
+        let hits_part = others
+            .into_iter()
+            .any(|j| !self.clear_of(i, at, size, j, centres[j], sizes[j]));
+        let sides = model.part_sides[i];
+        let hits_copper = model.copper.iter().any(|obstacle| {
+            sides.intersects(obstacle.sides) && {
+                let (ox0, oy0, ox1, oy1) = obstacle.bbox;
+                let ix = (w + (ox1 - ox0)) / 2.0 - (at.0 - (ox0 + ox1) / 2.0).abs();
+                let iy = (h + (oy1 - oy0)) / 2.0 - (at.1 - (oy0 + oy1) / 2.0).abs();
+                let gate = -MOVED_CLEARANCE_MM.max(model.clearances.part_gap_mm);
+                ix > gate && iy > gate
+            }
+        });
+        !(hits_part || hits_copper)
+    }
+
+    /// Whether parts `i` and `j`, at the given centres and sizes, keep the rule's gap, or
+    /// share no side. The two parts of a swap are tested against each other with it.
+    pub(crate) fn clear_of(
+        &self,
+        i: usize,
+        at_i: (f64, f64),
+        size_i: (f64, f64),
+        j: usize,
+        at_j: (f64, f64),
+        size_j: (f64, f64),
+    ) -> bool {
+        let model = self.model;
+        if !model.part_sides[i].intersects(model.part_sides[j]) {
+            return true;
+        }
+        // Two boxes overlap when, on both axes, they overlap by more than minus the gap
+        // they must keep (at least 2 µm, so touching is overlapping).
+        let ix = (size_i.0 + size_j.0) / 2.0 - (at_i.0 - at_j.0).abs();
+        let iy = (size_i.1 + size_j.1) / 2.0 - (at_i.1 - at_j.1).abs();
+        let gate = -self.gap(i, j);
+        !(ix > gate && iy > gate)
+    }
+
+    /// The gap the rule asks between the boxes of parts `i` and `j`.
+    fn gap(&self, i: usize, j: usize) -> f64 {
+        let clearances = &self.model.clearances;
+        match self.rule {
+            GapRule::CourtyardsMayTouch => {
+                clearances.gap_between(&self.model.parts[i], &self.model.parts[j])
+            }
+            GapRule::Everywhere => MOVED_CLEARANCE_MM.max(clearances.part_gap_mm),
+        }
+    }
+}
+
 /// The fixed recipe matrix of one board.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Matrix {
@@ -1603,6 +1753,10 @@ pub(crate) struct Matrix {
     pub schematic: Vec<SchematicParams>,
     pub perturb_seeds: Vec<u64>,
     pub perturb: Vec<PerturbParams>,
+    /// Family C: its level-0 parameters and its outer rules. `None`: the family is off.
+    /// C has no fixed list of recipes, so `recipes` does not list it; `converge_all`
+    /// makes them.
+    pub converge: Option<(ConvergeParams, OuterRule)>,
 }
 
 impl Matrix {
@@ -1650,14 +1804,15 @@ impl Matrix {
                     turns: true,
                 },
             ],
+            converge: None,
         }
     }
 }
 
 impl Matrix {
     /// This matrix with only the recipes of `families` left: the others get no seed, so
-    /// `recipes` makes none of them. What is kept is unchanged, so the F and S recipes
-    /// are the same ones with or without P.
+    /// `recipes` makes none of them, and family C is off unless it is named. What is kept
+    /// is unchanged, so the F and S recipes are the same ones with or without P or C.
     // Used only by the bench (an ignored test): no product code calls the search.
     #[allow(dead_code)]
     pub(crate) fn only(mut self, families: &[Family]) -> Self {
@@ -1670,12 +1825,16 @@ impl Matrix {
         if !families.contains(&Family::Perturb) {
             self.perturb_seeds.clear();
         }
+        if !families.contains(&Family::Converge) {
+            self.converge = None;
+        }
         self
     }
 }
 
 /// Every recipe of `matrix`, in a fixed order: F, then S, then P; within a family,
-/// seed-major, then the parameter sets in the order given.
+/// seed-major, then the parameter sets in the order given. Family C has no fixed recipes
+/// (its starts are F's and S's candidates), so none is listed whatever `converge` holds.
 pub(crate) fn recipes(matrix: &Matrix) -> Vec<Recipe> {
     let mut out = Vec::new();
     for &seed in &matrix.force_seeds {
@@ -1710,4 +1869,4 @@ pub(crate) fn recipes(matrix: &Matrix) -> Vec<Recipe> {
 
 #[cfg(test)]
 #[path = "place_generators_tests.rs"]
-mod tests;
+pub(crate) mod tests;
