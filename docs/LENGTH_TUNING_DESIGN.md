@@ -3,8 +3,10 @@
 Status: design only. Claude Opus 5.5 (xhigh) designed it down to the skeletons on 2026-11-20,
 on branch `claude/length-tuning-design-674041` from `fork/main` `8795de82`. It builds on Row DP
 (differential pairs to fastroute, branch `claude/fastroute-pairs` at `5448e46d`, whose code is
-that of `98d1f837`; not merged yet) as if DP were merged. Sonnet 5.5 (high) agents write the bodies on the owner's word. Nothing is
-built, and no board was written.
+that of `98d1f837`; not merged yet) as if DP were merged. The owner approved its three
+decisions as recommended on 2026-11-20 ("Yes, as recommended"). Sonnet 5.5 (high) agents
+write the bodies when he starts the build, after DP is merged. Nothing is built, and no board
+was written.
 
 ## What the owner asked for
 
