@@ -350,7 +350,9 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 ///    an error result carrying its reason and next step.
 /// 5. The DSN text, `route_search::shapes`, the manifest's hints
 ///    (`specctra::manifest_routing_hints`), the amps file
-///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), `width_fallback`
+///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), the design intent's
+///    differential pairs (`route_pairs::plan`, written to `<folder>/pairs.txt` and sent
+///    as `--pairs=<file>` on every pass of every run), `width_fallback`
 ///    (default floor, as `integration::width_arguments` reads it), the plan
 ///    (`launch_order`, `lanes(available cores, effort)`, `HANG_CAP`).
 /// 6. `route_search::search` with a [`FastrouteRunner`].
