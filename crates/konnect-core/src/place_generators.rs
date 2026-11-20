@@ -1416,8 +1416,8 @@ fn settling_order(largest: &[usize], pairs: &[MeasuredPair]) -> Vec<(usize, Opti
 /// equal areas by reference): a big part needs a free strip that the small ones, settled
 /// first, would have scattered across the board. A decoupling cap is the exception: it
 /// settles right after its IC (before the other moved parts when the IC is held or
-/// unmoved, see `settling_order`), and its search starts at the IC pad, not at the cap's
-/// own centre, taking among the cells of a ring the one that puts the cap's pad nearest the
+/// unmoved, see `settling_order`). Its search starts at the IC pad, not at the cap's own
+/// centre, and takes among the cells of a ring the one that puts the cap's pad nearest the
 /// IC pad (`MeasuredPair`). When its courtyard bbox (`sizes[i]` at
 /// `centres[i]`) overhangs the outline (`Outline::overhang` deeper than
 /// `containment_threshold_mm`) or overlaps a settled part that shares a side with it
