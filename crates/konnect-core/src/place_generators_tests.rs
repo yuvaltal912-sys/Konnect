@@ -2924,3 +2924,53 @@ fn the_settling_order_puts_a_cap_after_its_ic_and_the_caps_of_a_fixed_ic_first()
         vec![4, 1, 2, 3]
     );
 }
+
+#[test]
+fn a_cap_is_placed_by_pads_that_are_off_the_axes() {
+    let lone = |u1: Fp, c1: Fp| {
+        let model = decoupling_model(vec![u1, c1], vec![pair_of("C1", "2", "U1", "1", 2.0)]);
+        let sizes = as_read_sizes(&model);
+        let mut centres = as_read_centres(&model);
+        let c1 = index_of(&model, "C1");
+        centres[c1] = (60.0, 51.0);
+        legalize(&model, &sizes, &mut centres).unwrap();
+        centres[c1]
+    };
+    // A cap with its pad 2 off the axis: (0.5, 0.3). U1's pin is 0.6 mm below its middle,
+    // on the left: at (38.2, 40.6). The cap goes 1.5 mm left, on the row that puts the pad
+    // nearest: 40.5 (pad at 40.8); the row 40 (pad 40.3) and 41 (pad 41.3) are farther.
+    let offset_cap = |reference: &str| {
+        Fp::new(reference, 60.0, 50.0)
+            .pad(pad("1", -0.5, -0.3, Some("VCC")))
+            .pad(pad("2", 0.5, 0.3, Some("GND")))
+    };
+    let low_pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", -1.8, 0.6, Some("VCC")));
+    assert_eq!(lone(low_pin, offset_cap("C1")), (36.5, 40.5));
+    // The same pin 0.6 mm above the middle, at 39.4: the row 39 puts the pad at 39.3.
+    let high_pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", -1.8, -0.6, Some("VCC")));
+    assert_eq!(lone(high_pin, offset_cap("C1")), (36.5, 39.0));
+    // A pin on the top edge, 0.8 mm right of the middle: (40.8, 38.2). The cap goes above
+    // it, 1 mm up (a cell 0.5 mm up would touch U1), at the column whose right pad (0.5 mm
+    // from its centre) is nearest: 40.5.
+    let top_pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", 0.8, -1.8, Some("VCC")));
+    assert_eq!(lone(top_pin, cap("C1", (60.0, 50.0))), (40.5, 37.0));
+    // And 0.8 mm left of the middle: (39.2, 38.2): the cell 39.0.
+    let top_left =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", -0.8, -1.8, Some("VCC")));
+    assert_eq!(lone(top_left, cap("C1", (60.0, 50.0))), (38.5, 37.0));
+}
