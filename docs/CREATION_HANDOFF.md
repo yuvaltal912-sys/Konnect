@@ -295,6 +295,25 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **Schematic-neighbour measure, 2026-11-19 (branch `claude/ps-schematic-neighbours`, from `fork/main` `8795de82`, not merged).** The owner asked for it: a circuit tied to a board interface should sit near it (the "12 V present" LED and its resistor next to the 12 V connector), and nothing measured that, because both nets are board-wide power nets. The schematic encodes the intent, so the new module `place_schematic.rs` reads the project's schematic from the bench's `input/` (the root named like the board, hierarchical sheets followed, a sheet file used twice being two instances), fixes once each part's 3 nearest schematic neighbours on the same sheet instance, and measures every candidate against them (mean distance between courtyard centres, the ratio to the input's, and the parts pulled away: more than 2x and more than 10 mm above the input's). It is **reported only**: `search.json` has `schematic_neighbours` per candidate (`null` with a reason when the schematic is missing), `table.md` two columns, and the rank key and the verdicts are unchanged. Design: D23 in [`PLACEMENT_SEARCH_DESIGN.md`](PLACEMENT_SEARCH_DESIGN.md). Its tests have negative controls (every guard's line was reverted and its test failed). The bench and the gate were not run on this branch; the measure has not run on an owner board.
 
+**Built since #92 (branch `claude/ps-schematic-neighbours`, not merged, not published; 2026-11-20).**
+- The schematic-neighbour measure (D23), reported only.
+- Largest-first `legalize` (generator 7): the moved parts settle by decreasing courtyard-box area, ties by reference, after the held and unmoved parts. Reason: generation failed for a 19 × 50.8 mm module on a 100.5 × 60.5 mm board, 160 of 160 recipes.
+- Decoupling caps after their IC, searching from its pad (generator 8): a moved cap settles right after its IC, or first among the moved parts when the IC is held or unmoved, and its spiral starts at the IC pad. Reason: with largest-first alone the best routed F candidates had 5 to 7 decoupling violations, and the owner's own placement has 0.
+- The routing record's pair fields: each candidate's `route` record in `search.json` carries the call's `differential_pairs`, `differential_pairs_unresolved` and, when present, `differential_pairs_note`, so a run shows whether a pair was passed.
+- Row DP merged in (see "Row DP").
+
+**Verified, the owner's new board "dash", 2026-11-20** (101 parts; 4 locked, then 12: 4 mounting holes plus 8 connectors; GND pours on both layers; effort m, 100 min; families F and S):
+- Generation failed 160 of 160 before largest-first, and 0 after.
+- With 4 locks, the hand placement ranked 1 to 3 and the best F ranked 4 (decoupling 4, connector 5).
+- With 12 locks, the best F ranked 4 (decoupling 5, connector 0).
+- With generator 8 and the CAN pair, the best F ranked 4 and the best S ranked 5, both passing every gate, with decoupling 2 against 0 for the hand placement.
+- With the pair passed, the hand placement's CAN pair routed at equal lengths (42.3 / 42.3 mm, against 36.7 / 41.1 without) and 13.6 mm coupled within 0.5 mm (against 0.7).
+- Unit tests on this branch: `cargo test -p konnect-core --lib place_` 247 passed, 0 failed, 1 ignored (the bench); `route_pairs` 29 passed; the konnect crate's `asset_references` 12 and `schema_parameter_usage` 5 passed; fmt and `clippy --workspace --all-targets -D warnings` clean. `cargo mutants` on the new `legalize` code: every miss killed by a test or named; the survivors are the old outline-containment and equal-gap comparisons.
+
+**Not verified (this branch):** the A arm, and B4 to B6.
+
+**Next:** publish this PR after Row DP's PR merges, on the owner's word.
+
 **What it is.** The bench is an ignored test, `place_bench`, in `konnect-core`. It runs on board copies named in a bench folder's `bench.json`. On each board it does the following:
 - It makes 288 candidates with all three families, 160 by default since 2026-11-19: F, the force core from a seeded scatter; S, schematic clusters shelf-packed; P, seeded edits of the owner's placement (off unless `bench.json` names `"perturb"`).
 - It screens them.
