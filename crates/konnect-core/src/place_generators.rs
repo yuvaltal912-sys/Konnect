@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
 /// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 6;
+pub(crate) const GENERATOR_VERSION: u32 = 8;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).
@@ -872,7 +872,7 @@ pub(crate) fn generate(model: &BoardModel, recipe: &Recipe) -> Result<Candidate,
         .zip(&turns)
         .map(|(size, q)| if q % 2 == 0 { *size } else { (size.1, size.0) })
         .collect();
-    legalize(model, &sizes, &mut centres)?;
+    legalize_turned(model, &sizes, &turns, &mut centres)?;
 
     let read_centres = as_read_centres(model);
     let mut placements = Vec::new();
@@ -1231,54 +1231,79 @@ fn spring_graph(model: &BoardModel, params: &ForceParams) -> Springs {
     force_core::springs(&model.index, &references, &weight)
 }
 
+/// A decoupling pair whose two parts are on the board and whose two pads were found once
+/// each: part indices, and each pad's offset from its part's courtyard centre as read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeasuredPair {
+    cap: usize,
+    ic: usize,
+    cap_offset: (f64, f64),
+    ic_offset: (f64, f64),
+}
+
+/// The pairs of `model.intent` that can be measured, in `intent.pairs` order. A pair whose
+/// part is not on the board, or whose pad is missing or found twice, is left out.
+fn measured_pairs(model: &BoardModel) -> Vec<MeasuredPair> {
+    // Every pad site of the pairs' references, by (reference, pad number).
+    let mut sites: BTreeMap<(&str, &str), Vec<(f64, f64)>> = BTreeMap::new();
+    let wanted: std::collections::BTreeSet<&str> = model
+        .intent
+        .pairs
+        .iter()
+        .flat_map(|pair| [pair.cap.as_str(), pair.ic.as_str()])
+        .collect();
+    let netted = model
+        .index
+        .nets()
+        .into_iter()
+        .flat_map(|net| model.index.pads_of_net(net).iter());
+    for pad in netted.chain(model.index.pads_without_net()) {
+        if wanted.contains(pad.reference.as_str()) {
+            sites
+                .entry((pad.reference.as_str(), pad.pad_number.as_str()))
+                .or_default()
+                .push(pad.at);
+        }
+    }
+    let centres = as_read_centres(model);
+    let mut measured = Vec::new();
+    for pair in &model.intent.pairs {
+        let (Ok(cap), Ok(ic)) = (
+            model.references.binary_search(&pair.cap),
+            model.references.binary_search(&pair.ic),
+        ) else {
+            continue;
+        };
+        let found = |reference: &str, pad: &str| match sites.get(&(reference, pad)) {
+            Some(at) if at.len() == 1 => Some(at[0]),
+            _ => None,
+        };
+        let (Some(cap_at), Some(ic_at)) = (
+            found(pair.cap.as_str(), pair.cap_pad.as_str()),
+            found(pair.ic.as_str(), pair.ic_pad.as_str()),
+        ) else {
+            continue;
+        };
+        measured.push(MeasuredPair {
+            cap,
+            ic,
+            cap_offset: (cap_at.0 - centres[cap].0, cap_at.1 - centres[cap].1),
+            ic_offset: (ic_at.0 - centres[ic].0, ic_at.1 - centres[ic].1),
+        });
+    }
+    measured
+}
+
 /// The pairs' pad springs and the groups' centre springs, with the recipe's weights.
 fn extras(model: &BoardModel, params: &ForceParams) -> FdExtras {
     let mut extras = FdExtras::default();
-    let centres = as_read_centres(model);
     if params.pair_weight > 0.0 {
-        // Every pad site of the pairs' references, by (reference, pad number).
-        let mut sites: BTreeMap<(&str, &str), Vec<(f64, f64)>> = BTreeMap::new();
-        let wanted: std::collections::BTreeSet<&str> = model
-            .intent
-            .pairs
-            .iter()
-            .flat_map(|pair| [pair.cap.as_str(), pair.ic.as_str()])
-            .collect();
-        let netted = model
-            .index
-            .nets()
-            .into_iter()
-            .flat_map(|net| model.index.pads_of_net(net).iter());
-        for pad in netted.chain(model.index.pads_without_net()) {
-            if wanted.contains(pad.reference.as_str()) {
-                sites
-                    .entry((pad.reference.as_str(), pad.pad_number.as_str()))
-                    .or_default()
-                    .push(pad.at);
-            }
-        }
-        for pair in &model.intent.pairs {
-            let (Ok(a), Ok(b)) = (
-                model.references.binary_search(&pair.cap),
-                model.references.binary_search(&pair.ic),
-            ) else {
-                continue;
-            };
-            let found = |reference: &str, pad: &str| match sites.get(&(reference, pad)) {
-                Some(at) if at.len() == 1 => Some(at[0]),
-                _ => None,
-            };
-            let (Some(cap_at), Some(ic_at)) = (
-                found(pair.cap.as_str(), pair.cap_pad.as_str()),
-                found(pair.ic.as_str(), pair.ic_pad.as_str()),
-            ) else {
-                continue;
-            };
+        for pair in measured_pairs(model) {
             extras.pads.push(PadSpring {
-                a,
-                b,
-                a_offset: (cap_at.0 - centres[a].0, cap_at.1 - centres[a].1),
-                b_offset: (ic_at.0 - centres[b].0, ic_at.1 - centres[b].1),
+                a: pair.cap,
+                b: pair.ic,
+                a_offset: pair.cap_offset,
+                b_offset: pair.ic_offset,
                 weight: params.pair_weight,
             });
         }
@@ -1334,8 +1359,66 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
     cells
 }
 
+/// The order the moved parts settle in, each with the index of its decoupling pair when it
+/// is a decoupling cap. `largest` is the moved parts largest first. A moved cap with a
+/// measured pair leaves that list and settles right after its IC, as a designer places it;
+/// a cap with several pairs uses the first in `pairs` order, and several caps of one IC
+/// follow `pairs` order. The caps of an IC that does not move (held or unmoved) come
+/// first. A cap whose IC is not a measured part (it is in no pair) keeps its place.
+fn settling_order(largest: &[usize], pairs: &[MeasuredPair]) -> Vec<(usize, Option<usize>)> {
+    let queued: std::collections::BTreeSet<usize> = largest.iter().copied().collect();
+    // Each moved cap's first pair.
+    let mut pair_of: BTreeMap<usize, usize> = BTreeMap::new();
+    for (k, pair) in pairs.iter().enumerate() {
+        if queued.contains(&pair.cap) {
+            pair_of.entry(pair.cap).or_insert(k);
+        }
+    }
+    let mut order: Vec<(usize, Option<usize>)> = Vec::with_capacity(largest.len());
+    let mut done = std::collections::BTreeSet::new();
+    // Place `part`, then the caps whose first pair is with it.
+    fn emit(
+        part: usize,
+        pairs: &[MeasuredPair],
+        pair_of: &BTreeMap<usize, usize>,
+        done: &mut std::collections::BTreeSet<usize>,
+        order: &mut Vec<(usize, Option<usize>)>,
+    ) {
+        if !done.insert(part) {
+            return;
+        }
+        order.push((part, pair_of.get(&part).copied()));
+        for (k, pair) in pairs.iter().enumerate() {
+            if pair.ic == part && pair_of.get(&pair.cap) == Some(&k) {
+                emit(pair.cap, pairs, pair_of, done, order);
+            }
+        }
+    }
+    for (k, pair) in pairs.iter().enumerate() {
+        if pair_of.get(&pair.cap) == Some(&k) && !queued.contains(&pair.ic) {
+            emit(pair.cap, pairs, &pair_of, &mut done, &mut order);
+        }
+    }
+    for &part in largest {
+        if !pair_of.contains_key(&part) {
+            emit(part, pairs, &pair_of, &mut done, &mut order);
+        }
+    }
+    // A cap whose IC is itself a cap in a loop of pairs: nothing is left out.
+    for &part in largest {
+        emit(part, pairs, &pair_of, &mut done, &mut order);
+    }
+    order
+}
+
 /// Containment and overlap repair against the true outline. Held parts settle first.
-/// Then each movable part in reference order: when its courtyard bbox (`sizes[i]` at
+/// Then each moved part, the largest courtyard box first (`sizes[i]`, width times height;
+/// equal areas by reference): a big part needs a free strip that the small ones, settled
+/// first, would have scattered across the board. A decoupling cap is the exception: it
+/// settles right after its IC (before the other moved parts when the IC is held or
+/// unmoved, see `settling_order`). Its search starts at the IC pad, not at the cap's own
+/// centre, and takes among the cells of a ring the one that puts the cap's pad nearest the
+/// IC pad (`MeasuredPair`). When its courtyard bbox (`sizes[i]` at
 /// `centres[i]`) overhangs the outline (`Outline::overhang` deeper than
 /// `containment_threshold_mm`) or overlaps a settled part that shares a side with it
 /// (`BoardModel::part_sides`: a through-hole part is on both) or a copper obstacle on its
@@ -1360,15 +1443,28 @@ fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
 /// box grown by `edge_mm` on every side must have no overhang (a square growth, a little
 /// more than the Euclidean distance at a rounded corner). Cells are ordered by distance,
 /// the ring's cells in a fixed order, so the result is the same on every run.
+// Used by tests; the generators know the turns and call `legalize_turned`.
+#[allow(dead_code)]
 pub(crate) fn legalize(
     model: &BoardModel,
     sizes: &[(f64, f64)],
     centres: &mut [(f64, f64)],
 ) -> Result<(), GenerateFailure> {
+    legalize_turned(model, sizes, &vec![0; model.parts.len()], centres)
+}
+
+/// `legalize` of parts turned by `turns[i]` quarter turns from their input rotation (which
+/// `sizes[i]` already shows); the turn moves a pad offset of the decoupling search.
+pub(crate) fn legalize_turned(
+    model: &BoardModel,
+    sizes: &[(f64, f64)],
+    turns: &[i32],
+    centres: &mut [(f64, f64)],
+) -> Result<(), GenerateFailure> {
     let count = model.parts.len();
-    if sizes.len() != count || centres.len() != count {
+    if sizes.len() != count || centres.len() != count || turns.len() != count {
         return Err(GenerateFailure::Invalid(
-            "legalize needs one size and one centre per part".to_string(),
+            "legalize needs one size, one turn and one centre per part".to_string(),
         ));
     }
     let threshold = model.outline.containment_threshold_mm();
@@ -1435,16 +1531,48 @@ pub(crate) fn legalize(
     let mut settled: Vec<usize> = (0..count)
         .filter(|&i| !model.movable[i] || unmoved(i, centres))
         .collect();
-    let queue: Vec<usize> = (0..count)
+    let mut largest: Vec<usize> = (0..count)
         .filter(|&i| model.movable[i] && !unmoved(i, centres))
         .collect();
+    // Largest first, as greedy legalization does; the part index is the reference order.
+    largest.sort_unstable_by(|&a, &b| {
+        let area = |i: usize| sizes[i].0 * sizes[i].1;
+        area(b).total_cmp(&area(a)).then(a.cmp(&b))
+    });
+    let pairs: Vec<MeasuredPair> = measured_pairs(model)
+        .into_iter()
+        .filter(|pair| pair.cap != pair.ic)
+        .collect();
     let mut failed: Vec<String> = Vec::new();
-    for i in queue {
-        if !legal_at(i, centres[i], &settled, centres) {
-            let base = (snap(centres[i].0), snap(centres[i].1));
+    for (i, pair) in settling_order(&largest, &pairs) {
+        // A decoupling cap searches from the IC pad (the IC settled first, or did not
+        // move), and keeps nothing of its own proposed centre.
+        let pad_target = pair.map(|k| {
+            let (ic, offset) = (
+                pairs[k].ic,
+                turn_vector(pairs[k].ic_offset, turns[pairs[k].ic]),
+            );
+            (centres[ic].0 + offset.0, centres[ic].1 + offset.1)
+        });
+        let legal_as_it_is = pad_target.is_none() && legal_at(i, centres[i], &settled, centres);
+        if !legal_as_it_is {
+            let origin = pad_target.unwrap_or(centres[i]);
+            let base = (snap(origin.0), snap(origin.1));
             let mut found = None;
             'rings: for ring in 0..=LEGALIZE_RINGS as i64 {
-                for (di, dj) in ring_cells(ring) {
+                let mut cells = ring_cells(ring);
+                if let (Some(target), Some(k)) = (pad_target, pair) {
+                    // The cap's own pad, from the cell's centre, nearest the IC pad first;
+                    // equal distances keep the ring's order.
+                    let own = turn_vector(pairs[k].cap_offset, turns[i]);
+                    let away = |&(di, dj): &(i64, i64)| {
+                        let x = base.0 + di as f64 * GRID_MM + own.0;
+                        let y = base.1 + dj as f64 * GRID_MM + own.1;
+                        (x - target.0).hypot(y - target.1)
+                    };
+                    cells.sort_by(|a, b| away(a).total_cmp(&away(b)));
+                }
+                for (di, dj) in cells {
                     let cell = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
                     if legal_at(i, cell, &settled, centres) {
                         found = Some(cell);

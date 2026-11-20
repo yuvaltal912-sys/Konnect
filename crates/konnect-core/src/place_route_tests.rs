@@ -598,6 +598,39 @@ fn no_winner(baseline: std::result::Result<Baseline, String>) -> CallToolResult 
 }
 
 #[tokio::test]
+async fn the_routing_record_carries_the_calls_differential_pairs() {
+    // A call without pairs: both lists are there, empty, so a run shows no pair was passed.
+    let done = finished(no_gate_failures());
+    let RouteResult::Routed { call, .. } = read_route_result(&success_result(&done)) else {
+        panic!("a winner is routed");
+    };
+    assert_eq!(call["differential_pairs"], json!([]));
+    assert_eq!(call["differential_pairs_unresolved"], json!([]));
+    assert!(call.get("differential_pairs_note").is_none(), "{call}");
+
+    // A call that passed a pair and could not resolve another, with a note.
+    let mut body: Value = serde_json::from_str(&text_of(&success_result(&done))).unwrap();
+    body["differential_pairs"] = json!([{
+        "positive": "CAN_H", "negative": "CAN_L",
+        "dsn_positive": "CAN_H", "dsn_negative": "CAN_L", "gap_mm": 0.2,
+    }]);
+    body["differential_pairs_unresolved"] = json!([
+        { "positive": "USB_P", "negative": "USB_N", "reason": "no such net" }
+    ]);
+    body["differential_pairs_note"] = json!("one pair used");
+    let RouteResult::Routed { call, .. } = read_route_result(&CallToolResult::json(&body)) else {
+        panic!("a winner is routed");
+    };
+    assert_eq!(call["differential_pairs"][0]["positive"], "CAN_H");
+    assert_eq!(call["differential_pairs"][0]["gap_mm"], 0.2);
+    assert_eq!(
+        call["differential_pairs_unresolved"][0]["reason"],
+        "no such net"
+    );
+    assert_eq!(call["differential_pairs_note"], "one pair used");
+}
+
+#[tokio::test]
 async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
     // A winner: its gates and measures, the baseline's violations, the status, the summary.
     let done = finished(no_gate_failures());

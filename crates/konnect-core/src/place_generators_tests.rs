@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::place_held::tests::{board, evaluate_text, pad, parse, Fp, Shape};
-use crate::place_held::{self, decoupling_pairs, groups, held_set, HoldRules};
+use crate::place_held::{self, decoupling_pairs, groups, held_set, DecouplingPair, HoldRules};
 use crate::tools::pcb_components::placements_applied_to;
 use konnect_sexp::board::Side;
 use std::collections::BTreeSet;
@@ -2461,8 +2461,575 @@ fn gap_to_text(model: &BoardModel, sizes: &[(f64, f64)], at: (f64, f64)) -> f64 
 }
 
 #[test]
-fn the_generator_version_is_six() {
-    // The obstacles, the part sides and the exact arc, text and path boxes change what
+fn the_generator_version_is_eight() {
+    // The obstacles, the part sides, the exact boxes and the largest-first order change what
     // every recipe gives, so a record of an earlier version is not reproducible.
-    assert_eq!(GENERATOR_VERSION, 6);
+    assert_eq!(GENERATOR_VERSION, 8);
+}
+
+// ─── Largest first ───────────────────────────────────────────────────────────
+
+/// The pinned outline (x 10..70, y 20..60) with `parts`, each `(reference, half width, half
+/// height)` read far from (40, 40); the centres of all of them are then put at `at`.
+fn dropped_parts(parts: &[(&str, f64, f64)], at: (f64, f64)) -> (BoardModel, Vec<(f64, f64)>) {
+    let fps: Vec<Fp> = parts
+        .iter()
+        .enumerate()
+        .map(|(k, (reference, hw, hh))| {
+            Fp::new(reference, 12.0 + 3.0 * k as f64, 22.0)
+                .court(*hw, *hh)
+                .two_pad("N1", "N2")
+        })
+        .collect();
+    let model = model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &fps), &[]);
+    let centres = vec![at; model.parts.len()];
+    (model, centres)
+}
+
+fn index_of(model: &BoardModel, reference: &str) -> usize {
+    model
+        .references
+        .binary_search(&reference.to_string())
+        .unwrap()
+}
+
+#[test]
+fn a_big_part_fits_because_it_settles_before_the_small_one() {
+    // The board is 60 x 40 mm. Z1's courtyard is 38 x 38: it fits only where nothing small
+    // sits in the middle. A1 (2 x 1 mm) is first by reference, and both are dropped on the
+    // centre. In reference order A1 would stay there and Z1 would find no room at all.
+    let (model, mut centres) = dropped_parts(&[("A1", 1.0, 0.5), ("Z1", 19.0, 19.0)], (40.0, 40.0));
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).expect("the big part settles first");
+    let (a1, z1) = (index_of(&model, "A1"), index_of(&model, "Z1"));
+    assert_eq!(centres[z1], (40.0, 40.0), "the big part keeps the centre");
+    // The small one goes to the nearest free cell: 20.5 mm to the left (41 steps), the
+    // left cell before the right one.
+    assert_eq!(centres[a1], (19.5, 40.0));
+    assert!(gap_between_parts(&sizes, &centres, a1, z1) >= MOVED_CLEARANCE_MM - 1e-9);
+}
+
+#[test]
+fn parts_settle_by_decreasing_area_and_equal_areas_by_reference() {
+    // Three parts dropped on one cell. The largest keeps it, the next takes the nearest
+    // cell that is free of it, the smallest the nearest free of both: not in reference order.
+    let (model, mut centres) = dropped_parts(
+        &[("A1", 1.0, 0.5), ("B1", 2.0, 1.0), ("C1", 3.0, 1.5)],
+        (40.0, 40.0),
+    );
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    let at = |r: &str| centres[index_of(&model, r)];
+    assert_eq!(at("C1"), (40.0, 40.0), "the largest settles first");
+    // B1 (4 x 2) clears C1 (6 x 3) by 2.502 mm in y: 3 mm, up before down.
+    assert_eq!(at("B1"), (40.0, 37.0));
+    for (a, b) in [("A1", "B1"), ("A1", "C1"), ("B1", "C1")] {
+        let gap = gap_between_parts(&sizes, &centres, index_of(&model, a), index_of(&model, b));
+        assert!(gap >= MOVED_CLEARANCE_MM - 1e-9, "{a} {b} {gap}");
+    }
+    // Equal areas, different shapes: the smaller reference first. B1 4 x 2 and C1 2 x 4 both
+    // 8 mm2; B1 keeps the cell.
+    let (model, mut centres) = dropped_parts(&[("B1", 2.0, 1.0), ("C1", 1.0, 2.0)], (40.0, 40.0));
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[index_of(&model, "B1")], (40.0, 40.0));
+    assert_ne!(centres[index_of(&model, "C1")], (40.0, 40.0));
+}
+
+#[test]
+fn held_and_unmoved_parts_still_settle_first_whatever_their_size() {
+    // J1 is held (a connector) and 2 x 1 mm; A1 is movable and does not move, 2 x 1 mm.
+    // Z1 is moved onto each of them and is the largest part: it moves off them, they stay.
+    let parts = vec![
+        Fp::new("J1", 30.0, 30.0)
+            .court(1.0, 0.5)
+            .pad(pad("1", 0.0, 0.0, Some("N1"))),
+        Fp::new("A1", 50.0, 30.0)
+            .court(1.0, 0.5)
+            .two_pad("N1", "N2"),
+        Fp::new("Z1", 15.0, 50.0)
+            .court(4.0, 3.0)
+            .two_pad("N2", "N3"),
+    ];
+    let model = model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &parts), &[]);
+    let (j1, a1, z1) = (
+        index_of(&model, "J1"),
+        index_of(&model, "A1"),
+        index_of(&model, "Z1"),
+    );
+    assert!(!model.movable[j1] && model.movable[a1]);
+    let sizes = as_read_sizes(&model);
+    let read = as_read_centres(&model);
+    // Z1 dropped between them, overlapping both.
+    let mut centres = read.clone();
+    centres[z1] = (40.0, 30.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[j1], read[j1]);
+    assert_eq!(centres[a1], read[a1]);
+    assert_eq!(centres[z1], (40.0, 30.0), "clear of both, so it stays");
+    centres[z1] = (30.0, 30.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!((centres[j1], centres[a1]), (read[j1], read[a1]));
+    assert_ne!(
+        centres[z1],
+        (30.0, 30.0),
+        "dropped on the held J1, Z1 moves"
+    );
+    assert!(gap_between_parts(&sizes, &centres, z1, j1) >= MOVED_CLEARANCE_MM - 1e-9);
+    centres[z1] = (50.0, 30.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!((centres[j1], centres[a1]), (read[j1], read[a1]));
+    assert_ne!(
+        centres[z1],
+        (50.0, 30.0),
+        "dropped on the unmoved A1, Z1 moves"
+    );
+    assert!(gap_between_parts(&sizes, &centres, z1, a1) >= MOVED_CLEARANCE_MM - 1e-9);
+}
+
+#[test]
+fn the_order_is_by_area_not_by_perimeter() {
+    // P1 is 10 x 1 mm (area 10, sides sum 11), Q1 is 4 x 4 mm (area 16, sides sum 8). Both
+    // are dropped on one cell: the larger area, Q1, keeps it, though P1 is first by
+    // reference and by the sum of its sides.
+    let (model, mut centres) = dropped_parts(&[("P1", 5.0, 0.5), ("Q1", 2.0, 2.0)], (40.0, 40.0));
+    let sizes = as_read_sizes(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[index_of(&model, "Q1")], (40.0, 40.0));
+    assert_ne!(centres[index_of(&model, "P1")], (40.0, 40.0));
+}
+
+// ─── Decoupling caps settle after their IC, from its pad ─────────────────────
+
+fn pair_of(cap: &str, cap_pad: &str, ic: &str, ic_pad: &str, limit_mm: f64) -> DecouplingPair {
+    DecouplingPair {
+        cap: cap.to_string(),
+        cap_pad: cap_pad.to_string(),
+        ic: ic.to_string(),
+        ic_pad: ic_pad.to_string(),
+        net: "VCC".to_string(),
+        limit_mm,
+        basis: "test".to_string(),
+    }
+}
+
+/// The pinned board with `parts` and `pairs` as its intent.
+fn decoupling_model(parts: Vec<Fp>, pairs: Vec<DecouplingPair>) -> BoardModel {
+    let mut model = model_of(&board(Shape::Rect(10.0, 20.0, 70.0, 60.0), &parts), &[]);
+    model.intent = Intent::new(Vec::new(), pairs);
+    model
+}
+
+/// U1, a 4 x 4 mm part at (40, 40), held by a lock, with pad "1" on its left side at
+/// (38.2, 40).
+fn ic() -> Fp {
+    Fp::new("U1", 40.0, 40.0)
+        .court(2.0, 2.0)
+        .locked()
+        .pad(pad("1", -1.8, 0.0, Some("VCC")))
+}
+
+/// A 2 x 1 mm capacitor read at `at`: pad "1" at the left, "2" at the right.
+fn cap(reference: &str, at: (f64, f64)) -> Fp {
+    Fp::new(reference, at.0, at.1).two_pad("VCC", "GND")
+}
+
+/// The distance between the pads of `reference`'s pair, the parts at `centres`.
+fn pad_distance(model: &BoardModel, reference: &str, centres: &[(f64, f64)]) -> f64 {
+    let pair = measured_pairs(model)
+        .into_iter()
+        .find(|p| p.cap == index_of(model, reference))
+        .expect("a measured pair");
+    let (c, i) = (centres[pair.cap], centres[pair.ic]);
+    let own = (c.0 + pair.cap_offset.0, c.1 + pair.cap_offset.1);
+    let ic_at = (i.0 + pair.ic_offset.0, i.1 + pair.ic_offset.1);
+    (own.0 - ic_at.0).hypot(own.1 - ic_at.1)
+}
+
+/// A crowd of big parts, all read far away, and two caps of U1.
+fn crowded_ic() -> BoardModel {
+    let mut parts = vec![ic(), cap("C1", (60.0, 50.0)), cap("C2", (60.0, 52.0))];
+    for k in 0..4 {
+        parts.push(
+            Fp::new(&format!("B{k}"), 20.0 + 5.0 * k as f64, 55.0)
+                .court(2.0, 1.0)
+                .two_pad("N1", "N2"),
+        );
+    }
+    decoupling_model(
+        parts,
+        vec![
+            pair_of("C1", "2", "U1", "1", 4.0),
+            pair_of("C2", "2", "U1", "1", 4.0),
+        ],
+    )
+}
+
+/// Everything movable dropped where a designer would want the caps.
+type SizesAndCentres = (Vec<(f64, f64)>, Vec<(f64, f64)>);
+
+fn dropped_on_the_pin(model: &BoardModel) -> SizesAndCentres {
+    let sizes = as_read_sizes(model);
+    let mut centres = as_read_centres(model);
+    for (i, centre) in centres.iter_mut().enumerate() {
+        if model.movable[i] {
+            *centre = (34.5, 40.0);
+        }
+    }
+    (sizes, centres)
+}
+
+#[test]
+fn an_ics_caps_settle_right_after_it_and_land_within_their_limit() {
+    let model = crowded_ic();
+    let (sizes, mut centres) = dropped_on_the_pin(&model);
+    legalize(&model, &sizes, &mut centres).expect("room for all");
+    for reference in ["C1", "C2"] {
+        let d = pad_distance(&model, reference, &centres);
+        assert!(d <= 4.0, "{reference} is {d} mm from the pin");
+    }
+    // Where the pad is: C1 takes the cell 1.5 mm left of the pin's column, C2 the next.
+    assert_eq!(centres[index_of(&model, "C1")], (36.5, 40.0));
+    assert_eq!(centres[index_of(&model, "C2")], (36.5, 38.5));
+    // The old order settled the big parts first: with no pair known, at least one cap is out.
+    let mut plain = model.clone();
+    plain.intent = Intent::new(Vec::new(), Vec::new());
+    let (sizes, mut centres) = dropped_on_the_pin(&plain);
+    legalize(&plain, &sizes, &mut centres).expect("room for all");
+    let out = ["C1", "C2"]
+        .iter()
+        .filter(|r| pad_distance(&model, r, &centres) > 4.0)
+        .count();
+    assert!(out >= 1, "the unpaired order left both caps in range");
+}
+
+#[test]
+fn a_caps_search_starts_at_the_ic_pad_not_at_its_own_centre() {
+    // C1 is read, and proposed, far away at (60, 50), where it is legal. It still lands
+    // 1.5 mm left of the pin: the cell 3 steps out whose pad is nearest the IC pad.
+    let model = decoupling_model(
+        vec![ic(), cap("C1", (60.0, 50.0))],
+        vec![pair_of("C1", "2", "U1", "1", 2.0)],
+    );
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    // The cap did not move in the input, so it is unmoved and stays: drop it elsewhere first.
+    assert_eq!(centres[index_of(&model, "C1")], (60.0, 50.0));
+    let mut centres = as_read_centres(&model);
+    centres[index_of(&model, "C1")] = (60.0, 51.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    let c1 = centres[index_of(&model, "C1")];
+    assert_eq!(c1, (36.5, 40.0));
+    assert!((pad_distance(&model, "C1", &centres) - 1.2).abs() < 1e-9);
+    // Without the pair it keeps the legal cell it was dropped on.
+    let mut plain = model.clone();
+    plain.intent = Intent::new(Vec::new(), Vec::new());
+    let mut centres = as_read_centres(&plain);
+    centres[index_of(&plain, "C1")] = (60.0, 51.0);
+    legalize(&plain, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[index_of(&plain, "C1")], (60.0, 51.0));
+}
+
+#[test]
+fn a_cap_without_a_measured_pair_keeps_its_place() {
+    // The pair names an IC that is not on the board, a pad that does not exist, and a pad
+    // that is on the part twice: none can be measured, so C1, C2 and C3 stay where dropped.
+    let parts = vec![
+        ic(),
+        cap("C1", (60.0, 50.0)),
+        cap("C2", (60.0, 53.0)),
+        cap("C3", (60.0, 56.0)).pad(pad("2", 0.0, 0.3, Some("GND"))),
+    ];
+    let model = decoupling_model(
+        parts,
+        vec![
+            pair_of("C1", "2", "U9", "1", 2.0),
+            pair_of("C2", "9", "U1", "1", 2.0),
+            pair_of("C3", "2", "U1", "1", 2.0),
+        ],
+    );
+    assert!(measured_pairs(&model).is_empty());
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    let dropped = [(60.0, 51.0), (60.0, 54.0), (60.0, 57.0)];
+    for (reference, at) in ["C1", "C2", "C3"].iter().zip(dropped) {
+        centres[index_of(&model, reference)] = at;
+    }
+    legalize(&model, &sizes, &mut centres).unwrap();
+    for (reference, at) in ["C1", "C2", "C3"].iter().zip(dropped) {
+        assert_eq!(centres[index_of(&model, reference)], at, "{reference}");
+    }
+}
+
+#[test]
+fn the_caps_of_a_moved_ic_land_by_its_final_pad() {
+    // U2 moves (dropped on the left of the board), and the big parts settle before it. Its
+    // caps follow it and end within 2 mm of the pad where it finally is.
+    let u2 = Fp::new("U2", 50.0, 30.0)
+        .court(2.0, 2.0)
+        .pad(pad("1", -1.8, 0.0, Some("VCC")));
+    let mut parts = vec![u2, cap("C1", (15.0, 55.0)), cap("C2", (20.0, 55.0))];
+    for k in 0..3 {
+        parts.push(
+            Fp::new(&format!("B{k}"), 12.0 + 5.0 * k as f64, 22.0)
+                .court(3.0, 2.0)
+                .two_pad("N1", "N2"),
+        );
+    }
+    let model = decoupling_model(
+        parts,
+        vec![
+            pair_of("C1", "2", "U2", "1", 2.0),
+            pair_of("C2", "2", "U2", "1", 2.0),
+        ],
+    );
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    for (i, centre) in centres.iter_mut().enumerate() {
+        if model.movable[i] {
+            *centre = (30.0, 40.0);
+        }
+    }
+    legalize(&model, &sizes, &mut centres).unwrap();
+    for reference in ["C1", "C2"] {
+        let d = pad_distance(&model, reference, &centres);
+        assert!(d <= 2.0, "{reference} is {d} mm from the pad of U2");
+    }
+}
+
+#[test]
+fn unmoved_and_held_parts_stay_where_a_cap_search_runs() {
+    // U1 is held, U3 is movable and unmoved; C3 is an unmoved cap of U1. C1 (U1) and C4 (U3)
+    // are dropped far away: they come to their pins, and nothing else moves.
+    let u3 = Fp::new("U3", 20.0, 30.0)
+        .court(2.0, 2.0)
+        .pad(pad("1", 1.8, 0.0, Some("VCC")));
+    let parts = vec![
+        ic(),
+        u3,
+        cap("C1", (60.0, 50.0)),
+        cap("C3", (36.5, 40.0)),
+        cap("C4", (60.0, 55.0)),
+    ];
+    let model = decoupling_model(
+        parts,
+        vec![
+            pair_of("C1", "2", "U1", "1", 2.0),
+            pair_of("C3", "2", "U1", "1", 2.0),
+            pair_of("C4", "1", "U3", "1", 2.0),
+        ],
+    );
+    let sizes = as_read_sizes(&model);
+    let read = as_read_centres(&model);
+    let mut centres = read.clone();
+    centres[index_of(&model, "C1")] = (60.0, 51.0);
+    centres[index_of(&model, "C4")] = (60.0, 56.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    for reference in ["U1", "U3", "C3"] {
+        let i = index_of(&model, reference);
+        assert_eq!(centres[i], read[i], "{reference}");
+    }
+    for reference in ["C1", "C4"] {
+        let d = pad_distance(&model, reference, &centres);
+        assert!(d <= 2.0, "{reference} {d}");
+    }
+    // C1 does not take C3's cell: it lands clear of it.
+    let (c1, c3) = (index_of(&model, "C1"), index_of(&model, "C3"));
+    assert!(gap_between_parts(&sizes, &centres, c1, c3) >= MOVED_CLEARANCE_MM - 1e-9);
+    // And the whole thing is the same twice.
+    let mut again = read.clone();
+    again[index_of(&model, "C1")] = (60.0, 51.0);
+    again[index_of(&model, "C4")] = (60.0, 56.0);
+    legalize(&model, &sizes, &mut again).unwrap();
+    assert_eq!(again, centres);
+}
+
+#[test]
+fn a_turned_cap_measures_its_pad_from_the_turned_offset() {
+    // C1 turned a quarter: 1 x 2 mm, its right pad (0.5, 0) now 0.5 mm above the centre.
+    // Left of the pin, the cell whose pad is nearest the IC pad is 0.5 mm below the pin's
+    // row, which puts the pad on it: (37, 40.5).
+    let model = decoupling_model(
+        vec![ic(), cap("C1", (60.0, 50.0))],
+        vec![pair_of("C1", "2", "U1", "1", 2.0)],
+    );
+    let mut sizes = as_read_sizes(&model);
+    let c1 = index_of(&model, "C1");
+    sizes[c1] = (sizes[c1].1, sizes[c1].0);
+    let mut turns = vec![0; model.parts.len()];
+    turns[c1] = 1;
+    let mut centres = as_read_centres(&model);
+    centres[c1] = (60.0, 51.0);
+    legalize_turned(&model, &sizes, &turns, &mut centres).unwrap();
+    assert_eq!(centres[c1], (37.0, 40.5));
+    assert!(matches!(
+        legalize_turned(&model, &sizes, &[0], &mut centres),
+        Err(GenerateFailure::Invalid(_))
+    ));
+}
+
+fn measured(cap: usize, ic: usize) -> MeasuredPair {
+    MeasuredPair {
+        cap,
+        ic,
+        cap_offset: (0.0, 0.0),
+        ic_offset: (0.0, 0.0),
+    }
+}
+
+fn parts_of(order: &[(usize, Option<usize>)]) -> Vec<usize> {
+    order.iter().map(|(part, _)| *part).collect()
+}
+
+#[test]
+fn the_settling_order_puts_a_cap_after_its_ic_and_the_caps_of_a_fixed_ic_first() {
+    // Moved parts largest first: 5, 4, 3, 2, 1, 0. Caps 1 and 0 belong to the moved 4;
+    // cap 3 belongs to 9, which is not moved; 7 is no cap and no IC.
+    let largest = [5, 4, 3, 2, 1, 0];
+    let pairs = [measured(0, 4), measured(3, 9), measured(1, 4)];
+    let order = settling_order(&largest, &pairs);
+    // 3 first (its IC is fixed), then 5, then 4 with its caps in pair order (0, then 1), then 2.
+    assert_eq!(parts_of(&order), vec![3, 5, 4, 0, 1, 2]);
+    // The pair index rides along for the caps.
+    assert_eq!(
+        order,
+        vec![
+            (3, Some(1)),
+            (5, None),
+            (4, None),
+            (0, Some(0)),
+            (1, Some(2)),
+            (2, None)
+        ]
+    );
+    // A cap in two pairs uses the first; a part with no pair keeps its place.
+    let pairs = [measured(1, 5), measured(1, 4)];
+    assert_eq!(parts_of(&settling_order(&[5, 4, 1], &pairs)), vec![5, 1, 4]);
+    // Caps of a fixed IC in pair order, whatever their sizes: 0 is the largest.
+    let pairs = [measured(2, 9), measured(0, 9)];
+    assert_eq!(parts_of(&settling_order(&[3, 0, 2], &pairs)), vec![2, 0, 3]);
+    // A pair whose cap is not moved is no cap here.
+    let pairs = [measured(8, 4)];
+    assert_eq!(parts_of(&settling_order(&[4, 1], &pairs)), vec![4, 1]);
+    // A loop of pairs leaves no part out and none twice.
+    let pairs = [measured(1, 2), measured(2, 1)];
+    let looped = parts_of(&settling_order(&[1, 2, 3], &pairs));
+    assert_eq!(looped.len(), 3);
+    assert!(looped.contains(&1) && looped.contains(&2) && looped.contains(&3));
+    // A chain: the cap of a cap follows it.
+    let pairs = [measured(2, 1), measured(3, 2)];
+    assert_eq!(
+        parts_of(&settling_order(&[4, 1, 2, 3], &pairs)),
+        vec![4, 1, 2, 3]
+    );
+}
+
+#[test]
+fn a_cap_is_placed_by_pads_that_are_off_the_axes() {
+    let lone = |u1: Fp, c1: Fp| {
+        let model = decoupling_model(vec![u1, c1], vec![pair_of("C1", "2", "U1", "1", 2.0)]);
+        let sizes = as_read_sizes(&model);
+        let mut centres = as_read_centres(&model);
+        let c1 = index_of(&model, "C1");
+        centres[c1] = (60.0, 51.0);
+        legalize(&model, &sizes, &mut centres).unwrap();
+        centres[c1]
+    };
+    // A cap with its pad 2 off the axis: (0.5, 0.3). U1's pin is 0.6 mm below its middle,
+    // on the left: at (38.2, 40.6). The cap goes 1.5 mm left, on the row that puts the pad
+    // nearest: 40.5 (pad at 40.8); the row 40 (pad 40.3) and 41 (pad 41.3) are farther.
+    let offset_cap = |reference: &str| {
+        Fp::new(reference, 60.0, 50.0)
+            .pad(pad("1", -0.5, -0.3, Some("VCC")))
+            .pad(pad("2", 0.5, 0.3, Some("GND")))
+    };
+    let low_pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", -1.8, 0.6, Some("VCC")));
+    assert_eq!(lone(low_pin, offset_cap("C1")), (36.5, 40.5));
+    // The same pin 0.6 mm above the middle, at 39.4: the row 39 puts the pad at 39.3.
+    let high_pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", -1.8, -0.6, Some("VCC")));
+    assert_eq!(lone(high_pin, offset_cap("C1")), (36.5, 39.0));
+    // A pin on the top edge, 0.8 mm right of the middle: (40.8, 38.2). The cap goes above
+    // it, 1 mm up (a cell 0.5 mm up would touch U1), at the column whose right pad (0.5 mm
+    // from its centre) is nearest: 40.5.
+    let top_pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", 0.8, -1.8, Some("VCC")));
+    assert_eq!(lone(top_pin, cap("C1", (60.0, 50.0))), (40.5, 37.0));
+    // And 0.8 mm left of the middle: (39.2, 38.2): the cell 39.0.
+    let top_left =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", -0.8, -1.8, Some("VCC")));
+    assert_eq!(lone(top_left, cap("C1", (60.0, 50.0))), (38.5, 37.0));
+    // A pin at (41.1, 38.2) and a cap whose pad 2 is 0.9 mm right of its centre: the cell
+    // 40 puts the pad at 40.9 (0.2 off), the cell 40.5 at 41.4 (0.3 off).
+    let wide = Fp::new("C1", 60.0, 50.0)
+        .pad(pad("1", -0.5, 0.0, Some("VCC")))
+        .pad(pad("2", 0.9, 0.0, Some("GND")));
+    let pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", 1.1, -1.8, Some("VCC")));
+    assert_eq!(lone(pin, wide), (40.0, 37.0));
+}
+
+#[test]
+fn a_turned_ics_pad_offset_is_turned_before_the_cap_searches_from_it() {
+    // U2 is a two-pad part, turned a quarter, dropped at (40, 40). Its pad 1 is at (-1.8, 0.6)
+    // as read; turned it is at (0.6, 1.8): on the bottom edge, 0.6 mm right of the middle.
+    // The cap goes below it (y 43, the cell whose pad 2 is nearest x 40.6), not to the left.
+    let u2 = Fp::new("U2", 20.0, 30.0)
+        .court(2.0, 2.0)
+        .pad(pad("1", -1.8, 0.6, Some("VCC")))
+        .pad(pad("2", 1.8, -0.6, Some("GND")));
+    let model = decoupling_model(
+        vec![u2, cap("C1", (60.0, 50.0))],
+        vec![pair_of("C1", "2", "U2", "1", 2.0)],
+    );
+    let (u2, c1) = (index_of(&model, "U2"), index_of(&model, "C1"));
+    let sizes = as_read_sizes(&model);
+    let mut turns = vec![0; model.parts.len()];
+    turns[u2] = 1;
+    let mut centres = as_read_centres(&model);
+    centres[u2] = (40.0, 40.0);
+    centres[c1] = (60.0, 51.0);
+    legalize_turned(&model, &sizes, &turns, &mut centres).unwrap();
+    assert_eq!(centres[u2], (40.0, 40.0));
+    assert_eq!(centres[c1], (40.0, 43.0));
+    // Unturned, the same pad is on the left edge and the cap goes there.
+    let mut centres = as_read_centres(&model);
+    centres[u2] = (40.0, 40.0);
+    centres[c1] = (60.0, 51.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[c1], (36.5, 40.5));
+}
+
+#[test]
+fn a_pair_of_a_part_with_itself_is_ignored() {
+    // C1 is paired with its own pad. It is no decoupling cap of anything: it stays on the
+    // legal cell it was dropped on, as any part does, instead of searching from its pad.
+    let model = decoupling_model(
+        vec![ic(), cap("C1", (60.0, 50.0))],
+        vec![pair_of("C1", "1", "C1", "2", 2.0)],
+    );
+    assert_eq!(measured_pairs(&model).len(), 1, "the pair can be measured");
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    let c1 = index_of(&model, "C1");
+    centres[c1] = (60.0, 51.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[c1], (60.0, 51.0));
 }
