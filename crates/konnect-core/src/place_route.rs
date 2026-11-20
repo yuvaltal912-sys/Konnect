@@ -367,7 +367,7 @@ pub(crate) fn read_route_result(result: &CallToolResult) -> RouteResult {
             "the result has a winner whose gates, measures or baseline cannot be read{note}"
         ));
     };
-    let call = json!({
+    let mut call = json!({
         "engine": body["engine"],
         "effort": body["effort"],
         "lanes": search["lanes"],
@@ -379,7 +379,13 @@ pub(crate) fn read_route_result(result: &CallToolResult) -> RouteResult {
         "winner_shape": winner["shape"],
         "winner_seed": winner["seed"],
         "search_folder": body["artifacts"]["search_folder"],
+        // Row DP's fields: whether a pair was passed, and which could not be.
+        "differential_pairs": body["differential_pairs"],
+        "differential_pairs_unresolved": body["differential_pairs_unresolved"],
     });
+    if let Some(note) = body.get("differential_pairs_note") {
+        call["differential_pairs_note"] = note.clone();
+    }
     RouteResult::Routed {
         gates,
         measures,

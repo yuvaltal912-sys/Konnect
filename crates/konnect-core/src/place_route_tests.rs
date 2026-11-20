@@ -545,6 +545,7 @@ fn success_result(finished: &Finished) -> CallToolResult {
         &plan(),
         &[Shape::AsExported, Shape::Omitted],
         &finished.outcome,
+        &crate::tools::route_pairs::PairsPlan::default(),
     );
     assert_eq!(result["success"], true, "{result}");
     CallToolResult::json(&result)
@@ -582,12 +583,51 @@ fn no_winner(baseline: std::result::Result<Baseline, String>) -> CallToolResult 
         &plan(),
         &[Shape::AsExported, Shape::Omitted],
         &outcome,
+        &crate::tools::route_pairs::PairsPlan::default(),
     )["search"]
         .clone();
     assert!(search["winner"].is_null());
-    let result = no_winner_result(&call, &outcome, search);
+    let result = no_winner_result(
+        &call,
+        &outcome,
+        search,
+        &crate::tools::route_pairs::PairsPlan::default(),
+    );
     assert!(result.is_error);
     result
+}
+
+#[tokio::test]
+async fn the_routing_record_carries_the_calls_differential_pairs() {
+    // A call without pairs: both lists are there, empty, so a run shows no pair was passed.
+    let done = finished(no_gate_failures());
+    let RouteResult::Routed { call, .. } = read_route_result(&success_result(&done)) else {
+        panic!("a winner is routed");
+    };
+    assert_eq!(call["differential_pairs"], json!([]));
+    assert_eq!(call["differential_pairs_unresolved"], json!([]));
+    assert!(call.get("differential_pairs_note").is_none(), "{call}");
+
+    // A call that passed a pair and could not resolve another, with a note.
+    let mut body: Value = serde_json::from_str(&text_of(&success_result(&done))).unwrap();
+    body["differential_pairs"] = json!([{
+        "positive": "CAN_H", "negative": "CAN_L",
+        "dsn_positive": "CAN_H", "dsn_negative": "CAN_L", "gap_mm": 0.2,
+    }]);
+    body["differential_pairs_unresolved"] = json!([
+        { "positive": "USB_P", "negative": "USB_N", "reason": "no such net" }
+    ]);
+    body["differential_pairs_note"] = json!("one pair used");
+    let RouteResult::Routed { call, .. } = read_route_result(&CallToolResult::json(&body)) else {
+        panic!("a winner is routed");
+    };
+    assert_eq!(call["differential_pairs"][0]["positive"], "CAN_H");
+    assert_eq!(call["differential_pairs"][0]["gap_mm"], 0.2);
+    assert_eq!(
+        call["differential_pairs_unresolved"][0]["reason"],
+        "no such net"
+    );
+    assert_eq!(call["differential_pairs_note"], "one pair used");
 }
 
 #[tokio::test]

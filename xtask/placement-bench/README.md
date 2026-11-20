@@ -12,7 +12,7 @@ One folder per board under `target/creation-research/placement-search/bench/<boa
 | Path | What |
 |---|---|
 | `orig/` | the original project copy, read-only; never opened again |
-| `input/` | the project copy with its routing stripped; the search's input |
+| `input/` | the project copy with its routing stripped; the search's input. It holds the project's `.kicad_sch` files too (the root named like the board, `board.kicad_sch` for `board.kicad_pcb`, and every sheet file it names), which the schematic-neighbour measure reads (design D23) |
 | `rules.json` | each net's effective routing rules (`net_rules.py`) |
 | `held.json` | extra references to hold, besides the owner's KiCad locks (a JSON array, `[]` for none) |
 | `ai/board.kicad_pcb` | A, the AI's placement, with its session time |
@@ -27,7 +27,7 @@ hold the lane locks (native, then instr) while a board runs.
    copies only.
 2. Make `input/` from `orig/` and strip its routing with the bench's strip,
    `place_route::strip_routing` (tracks, arcs, vias and teardrop zones; every other byte
-   kept). Use stage 7's design-intent record in `input/.konnect/`.
+   kept). Copy the project's `.kicad_sch` files into `input/` unchanged, in the same relative layout, with the root schematic named like the board. Without the root, `search.json` records the measure as `null` with its reason, and the search runs as before. Use stage 7's design-intent record in `input/.konnect/`.
 3. Where the held set refuses a shared reference (parts with pads that share one), give
    those parts unique references in the `input/` copy (for example `C7` shared by four
    parts becomes `C7_1` to `C7_4`). Pad-less footprints (logos) may share a reference and
