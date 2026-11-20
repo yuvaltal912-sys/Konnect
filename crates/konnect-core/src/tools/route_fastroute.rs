@@ -15,6 +15,7 @@ use crate::specctra::RoutingHints;
 use crate::tools::integration::{
     completion_report, width_fallback_argument, width_report, WidthFallback, WidthOutcome,
 };
+use crate::tools::route_pairs;
 use crate::tools::{get_path, ToolContext};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -349,7 +350,9 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 ///    an error result carrying its reason and next step.
 /// 5. The DSN text, `route_search::shapes`, the manifest's hints
 ///    (`specctra::manifest_routing_hints`), the amps file
-///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), `width_fallback`
+///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), the design intent's
+///    differential pairs (`route_pairs::plan`, written to `<folder>/pairs.txt` and sent
+///    as `--pairs=<file>` on every pass of every run), `width_fallback`
 ///    (default floor, as `integration::width_arguments` reads it), the plan
 ///    (`launch_order`, `lanes(available cores, effort)`, `HANG_CAP`).
 /// 6. `route_search::search` with a [`FastrouteRunner`].
@@ -649,6 +652,10 @@ async fn search_and_write(
             ));
         }
     };
+    // The pairs the design intent declares, resolved against this DSN's nets. Read
+    // before the judge moves into the runner.
+    let pairs_plan = route_pairs::plan(&judge.board, &dsn_text);
+    let pairs = route_pairs::write_file(&call.folder, &pairs_plan)?;
     let hints = crate::specctra::manifest_routing_hints(&call.dsn);
     let amps = match fastroute::amps_file_text(&judge.manifest) {
         Some(text) => {
@@ -674,6 +681,7 @@ async fn search_and_write(
         dsn_text: Arc::new(dsn_text),
         hints,
         amps,
+        pairs,
         fallback: call.fallback,
         folder: call.folder.clone(),
         judge: Arc::new(judge),
@@ -701,7 +709,7 @@ async fn search_and_write(
     else {
         let mut search = search_json(&plan, &shapes, &outcome, Listing::Best);
         settings(&mut search);
-        return Ok(no_winner_result(call, &outcome, search));
+        return Ok(no_winner_result(call, &outcome, search, &pairs_plan));
     };
     let routed = winner.routed.as_ref().expect("filtered above");
     let session = std::fs::read_to_string(&routed.held.ses).map_err(|error| {
@@ -723,6 +731,7 @@ async fn search_and_write(
         &plan,
         &shapes,
         &outcome,
+        &pairs_plan,
     );
     settings(&mut result["search"]);
     if let Err(error) = reduced {
@@ -741,6 +750,7 @@ pub(crate) fn no_winner_result(
     call: &Call,
     outcome: &SearchOutcome,
     mut search: Value,
+    pairs: &route_pairs::PairsPlan,
 ) -> CallToolResult {
     if let Err(error) = reduce_run_folders(&call.folder, outcome) {
         search["reduce_error"] = json!(format!("{error:#}"));
@@ -776,7 +786,11 @@ pub(crate) fn no_winner_result(
             },
             message,
         ),
-        vec![("search", search)],
+        {
+            let mut fields = vec![("search", search)];
+            fields.extend(pairs.fields());
+            fields
+        },
     )
 }
 
@@ -819,6 +833,8 @@ pub(crate) struct FastrouteRunner {
     pub dsn_text: Arc<String>,
     pub hints: RoutingHints,
     pub amps: Option<PathBuf>,
+    /// The call's `--pairs` file (`route_pairs::plan`), none without declared pairs.
+    pub pairs: Option<PathBuf>,
     pub fallback: WidthFallback,
     /// The search folder: run `i` lives in `run-<i, 3 digits>-<shape>-s<seed>`.
     pub folder: PathBuf,
@@ -855,6 +871,7 @@ impl Runner for FastrouteRunner {
         let dsn_text = Arc::clone(&self.dsn_text);
         let hints = self.hints;
         let amps = self.amps.clone();
+        let pairs = self.pairs.clone();
         let fallback = self.fallback;
         let folder = self.folder.join(run_folder_name(index, shape, seed));
         Box::pin(async move {
@@ -880,7 +897,10 @@ impl Runner for FastrouteRunner {
                 &folder,
                 &dsn,
                 &hints,
-                amps.as_deref(),
+                fastroute::CallFiles {
+                    amps: amps.as_deref(),
+                    pairs: pairs.as_deref(),
+                },
                 fallback,
                 deadline,
             )
@@ -1307,7 +1327,9 @@ const JUDGED_COMPLETE_WHEN_END: &str = "fastroute's count does not show that. Th
 /// launched, judged, winner { index, shape, seed, gates, measures, passes, kept },
 /// runs (every record), elapsed_s, budget_overrun_s, stopped_launching, baseline };
 /// `artifacts` { dsn_path, ses_output_path, search_folder, judged_board };
-/// `passes` and `result_pass` of the winner, as the Freerouting hold path names them.
+/// `passes` and `result_pass` of the winner, as the Freerouting hold path names them;
+/// `differential_pairs` and `differential_pairs_unresolved` (and
+/// `differential_pairs_note` when the design intent could not be used), from `pairs`.
 #[allow(clippy::too_many_arguments)] // the parts of one finished call, each read once
 pub(crate) fn result_json(
     dsn: &Path,
@@ -1318,6 +1340,7 @@ pub(crate) fn result_json(
     plan: &crate::route_search::SearchPlan,
     shapes: &[Shape],
     outcome: &crate::route_search::SearchOutcome,
+    pairs: &route_pairs::PairsPlan,
 ) -> Value {
     let search = search_json(plan, shapes, outcome, Listing::Best);
     let winner = outcome
@@ -1325,11 +1348,15 @@ pub(crate) fn result_json(
         .and_then(|position| outcome.runs.get(position))
         .and_then(|record| Some((record.routed.as_ref()?, record.judged.as_ref()?)));
     let Some((routed, judged)) = winner else {
-        return json!({
+        let mut result = json!({
             "success": false,
             "error": "no run was routed and judged",
             "search": search,
         });
+        for (key, value) in pairs.fields() {
+            result[key] = value;
+        }
+        return result;
     };
     // The planes the winning variant gave the router, with their layers, from
     // the variant's own DSN.
@@ -1434,6 +1461,9 @@ pub(crate) fn result_json(
         "width_exceptions": widths.exceptions,
         "width_exceptions_total": widths.exceptions_total,
     });
+    for (key, value) in pairs.fields() {
+        result[key] = value;
+    }
     if let Some(error) = width_error {
         result["width_report_error"] = json!(error);
     }

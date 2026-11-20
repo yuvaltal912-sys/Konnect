@@ -116,6 +116,12 @@ A project folder with such a `konnect.toml` turns simulation on there. Without
 that key, `konnect init` installs no `kicad-simulation` skill, and removes one
 that an earlier install left.
 
+## Differential pairs
+
+Differential pairs declared in the design intent
+(`interfaces[].differential_pairs`) are routed coupled. The routing result lists
+them, and any pair it left out with the reason.
+
 ## Change the fastroute build
 
 Edit `packaging/1-kopper/fastroute.json` (`build`, `engine_commit`, `sha256`) in

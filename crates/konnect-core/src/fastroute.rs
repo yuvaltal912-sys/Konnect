@@ -315,21 +315,33 @@ pub(crate) struct Pass {
     pub initial_session: Option<PathBuf>,
 }
 
+/// The files of one call that every pass of every run reads (they live in the call's
+/// folder, never in a run's), each given only when the call has it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct CallFiles<'a> {
+    /// The `--x.par_via_amps` file ([`amps_file_text`]).
+    pub amps: Option<&'a Path>,
+    /// The `--pairs` file: the differential pairs the design intent declares
+    /// (`tools/route_pairs.rs`). A per-call input, so not a [`CANDIDATE_SWITCHES`]
+    /// entry.
+    pub pairs: Option<&'a Path>,
+}
+
 /// The command line of one pass, every setting once, in this order: `-de <dsn>`,
 /// `-do <ses>`, `--report=<report>`, [`PRESET`], `--router.optimizer.enabled=<bool>`,
 /// `--router.neck_width_um=<um>`, `--router.copper_to_edge_clearance_um=<um>` when
 /// `hints` has one (sent as `250.001` when it is within 1e-9 of 250, as the
 /// Freerouting path does), `--router.autorouter.max_threads=` and
 /// `--router.optimizer.max_threads=` at [`THREADS`], [`CANDIDATE_SWITCHES`],
-/// `--x.par_via_amps=<amps>` when given, and `--initial-session=<file>` as one
-/// token when the pass has one. Numbers are written without a trailing `.0` when
+/// `--x.par_via_amps=<amps>` when given, `--pairs=<file>` when given, and
+/// `--initial-session=<file>` as one token when the pass has one. Numbers are written without a trailing `.0` when
 /// whole. Never `--live`, `--multi-start`, `--max-time` or `--diagnose`.
 pub(crate) fn pass_arguments(
     dsn: &Path,
     ses: &Path,
     report: &Path,
     hints: &RoutingHints,
-    amps: Option<&Path>,
+    files: CallFiles<'_>,
     pass: &Pass,
 ) -> Vec<String> {
     let mut args = vec![
@@ -360,8 +372,11 @@ pub(crate) fn pass_arguments(
     args.push(format!("--router.autorouter.max_threads={THREADS}"));
     args.push(format!("--router.optimizer.max_threads={THREADS}"));
     args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
-    if let Some(amps) = amps {
+    if let Some(amps) = files.amps {
         args.push(format!("--x.par_via_amps={}", amps.display()));
+    }
+    if let Some(pairs) = files.pairs {
+        args.push(format!("--pairs={}", pairs.display()));
     }
     if let Some(initial) = &pass.initial_session {
         args.push(format!("--initial-session={}", initial.display()));
@@ -493,7 +508,7 @@ pub(crate) async fn run_pass(
     folder: &Path,
     dsn: &Path,
     hints: &RoutingHints,
-    amps: Option<&Path>,
+    files: CallFiles<'_>,
     pass: Pass,
     deadline: Instant,
 ) -> std::result::Result<PassOutcome, PassError> {
@@ -514,7 +529,7 @@ pub(crate) async fn run_pass(
 
     let ses = folder.join(format!("{}.ses", pass.name));
     let report = folder.join(format!("{}.json", pass.name));
-    let args = pass_arguments(dsn, &ses, &report, hints, amps, &pass);
+    let args = pass_arguments(dsn, &ses, &report, hints, files, &pass);
 
     let log_path = folder.join("fastroute.log");
     let (log, log_err) = std::fs::OpenOptions::new()
@@ -650,7 +665,7 @@ pub(crate) async fn route_held(
     folder: &Path,
     dsn: &Path,
     hints: &RoutingHints,
-    amps: Option<&Path>,
+    files: CallFiles<'_>,
     fallback: WidthFallback,
     deadline: Instant,
 ) -> std::result::Result<Held, PassError> {
@@ -682,7 +697,7 @@ pub(crate) async fn route_held(
         &pass_folder("full")?,
         dsn,
         hints,
-        amps,
+        files,
         Pass {
             name: "full",
             neck_width_um: 0.0,
@@ -733,7 +748,7 @@ pub(crate) async fn route_held(
                     &pass_folder("fallback")?,
                     dsn,
                     hints,
-                    amps,
+                    files,
                     Pass {
                         name: "fallback",
                         neck_width_um: floor,
@@ -784,7 +799,7 @@ pub(crate) async fn route_held(
                 &pass_folder("polish")?,
                 dsn,
                 hints,
-                amps,
+                files,
                 Pass {
                     name: "polish",
                     neck_width_um: 0.0,

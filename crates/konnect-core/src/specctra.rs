@@ -2397,6 +2397,44 @@ pub(crate) fn dsn_planes(dsn: &str) -> Result<Vec<DsnPlane>> {
     Ok(planes.into_iter().collect())
 }
 
+/// The nets of a DSN's `network`, as the DSN writes their names (what a router
+/// matches names against): the name of each `(network (net NAME ...))`, in file
+/// order, each once. A `net` elsewhere (the `wiring`) is not read. Keywords are
+/// matched in any letter case. A DSN with no `network` gives none; one that cannot
+/// be parsed is an error.
+pub(crate) fn dsn_net_names(dsn: &str) -> Result<Vec<String>> {
+    let is = |node: &SexpNode, name: &str| {
+        node.head()
+            .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    };
+    let root = parse_dsn_sexp(dsn)
+        .map_err(|_| anyhow::anyhow!("the DSN is not a readable S-expression"))?;
+    if !is(&root, "pcb") {
+        bail!("the DSN's root is not 'pcb'");
+    }
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    for network in root
+        .children()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|n| is(n, "network"))
+    {
+        for net in network
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|n| is(n, "net"))
+        {
+            let name = dsn_atom(net, 1, "network net name")?.to_string();
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// The reverse manifest the export wrote beside `dsn` (`<dsn>.konnect.json`),
 /// when it is there and is JSON.
 pub(crate) fn manifest_beside(dsn: &Path) -> Option<serde_json::Value> {
