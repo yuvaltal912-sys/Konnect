@@ -278,6 +278,8 @@ fn actual_mm_does_not_read_the_words() {
             Some(36.3050),
         ),
         ("actual 0.0000 mm, min 2000.0000 mm", Some(0.0)),
+        // A number inside a word or a name is not a length, even before "mm".
+        ("rule 'abc12mm' min length 2000.0000 mm; actual 5.0000 mm", Some(5.0)),
     ] {
         assert_eq!(actual_mm(text), expected, "{text}");
     }
