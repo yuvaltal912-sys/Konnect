@@ -50,7 +50,9 @@ pub(crate) fn copy_project(board: &Path, into: &Path) -> Result<PathBuf> {
         .collect();
     wanted.push("fp-lib-table".to_string());
     wanted.push("sym-lib-table".to_string());
-    wanted.push(".konnect".to_string());
+    // Only the design intent: the rest of `.konnect` (baselines, checkpoints,
+    // call logs) is the live project's own state.
+    wanted.push(".konnect/design_intent.json".to_string());
     // Every `*.pretty` library folder, in name order so that a copy is repeatable.
     let mut pretty: Vec<String> = std::fs::read_dir(folder)
         .with_context(|| format!("read board folder '{}'", folder.display()))?
@@ -62,6 +64,18 @@ pub(crate) fn copy_project(board: &Path, into: &Path) -> Result<PathBuf> {
     wanted.extend(pretty);
 
     for name in wanted {
+        // A file inside a folder (`.konnect/design_intent.json`) is looked up through
+        // the folder, so the folder must not be a link either.
+        if let Some((folder_name, _)) = name.split_once('/') {
+            let link = std::fs::symlink_metadata(folder.join(folder_name))
+                .is_ok_and(|meta| meta.file_type().is_symlink());
+            if link {
+                bail!(
+                    "'{}' is a symbolic link; the scratch copy does not follow links",
+                    folder.join(folder_name).display()
+                );
+            }
+        }
         let from = folder.join(&name);
         let Ok(kind) = std::fs::symlink_metadata(&from).map(|meta| meta.file_type()) else {
             continue; // not present
@@ -73,6 +87,10 @@ pub(crate) fn copy_project(board: &Path, into: &Path) -> Result<PathBuf> {
             );
         }
         let to = into.join(&name);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create '{}'", parent.display()))?;
+        }
         if kind.is_dir() {
             copy_folder(&from, &to)?;
         } else if kind.is_file() {
