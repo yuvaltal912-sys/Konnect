@@ -109,7 +109,7 @@ fn the_probe_rules_are_one_numbered_length_rule_per_net() {
 #[test]
 fn the_probe_minimum_is_below_kicads_32_bit_limit_and_above_any_net() {
     // 2147.48 mm is the largest minimum KiCad keeps (`KiROUND` clamps above it).
-    assert!(PROBE_MIN_MM < 2147.48 && PROBE_MIN_MM >= 1000.0);
+    const { assert!(PROBE_MIN_MM < 2147.48 && PROBE_MIN_MM >= 1000.0) };
     assert!(probe_rules_text(&names(&["A"])).contains("(min 2000mm)"));
 }
 

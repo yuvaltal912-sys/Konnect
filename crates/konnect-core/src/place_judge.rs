@@ -352,11 +352,10 @@ pub(crate) type Key = [i64; 19];
 /// 6. G4 failed; 7. the intent's length miss; 8. KiCad's own length and skew
 ///    violations (Row LT: `route_judge::rank_measures`' positions 3 to 5);
 /// 9. decoupling violations; 10. connector violations (requirements before preferences);
-/// 11. to 16. the routing key's acute corners, signal and power length steps, right
-///    angles, vias off the pour nets and minus copper quality
-///    (`route_judge::KEY_QUALITY`), from `route_judge::rank_measures`, the steps taken
-///    against the shortest routed candidate that passes P1, P2 and G1 (so an illegal
-///    placement cannot set them);
+/// 11. to 16. the routing key's quality measures (`route_judge::KEY_QUALITY`): acute corners,
+///     signal and power length steps, right angles, vias off the pour nets, minus copper quality.
+///     They come from `route_judge::rank_measures`, the steps taken against the shortest routed
+///     candidate that passes P1, P2 and G1 (so an illegal placement cannot set them);
 /// 17. silk entries; 18. minus the placement score.
 ///
 /// Missing values sort last. Ties go to the lower id, so O, then A, then the

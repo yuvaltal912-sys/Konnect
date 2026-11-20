@@ -807,6 +807,8 @@ pub(crate) async fn search(plan: &SearchPlan, runner: Arc<dyn Runner>) -> Search
 }
 
 /// A finished job, as the scheduler's `select!` hands it over.
+// One event is moved once into the loop; a box would only add an allocation per run.
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Baseline(std::result::Result<Result<Baseline>, JoinError>),
     Judge(std::result::Result<(Id, Result<Judged>), JoinError>),
