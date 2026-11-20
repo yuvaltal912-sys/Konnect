@@ -61,6 +61,7 @@ mod response_budget_tests;
 pub(crate) mod route_fastroute;
 #[cfg(test)]
 mod route_obstacle_tests;
+pub(crate) mod route_pairs;
 mod route_refine;
 #[cfg(test)]
 mod route_refine_tests;

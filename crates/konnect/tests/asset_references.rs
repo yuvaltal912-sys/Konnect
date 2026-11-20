@@ -1032,6 +1032,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Result fields of the fastroute `completion` (D21: the judged status).
         "router_unrouted",
         "stitching_vias",
+        // Result fields of `route_specctra_dsn` (D23: differential pairs).
+        "differential_pairs",
+        "differential_pairs_unresolved",
     ];
 
     let mut phantom = Vec::new();

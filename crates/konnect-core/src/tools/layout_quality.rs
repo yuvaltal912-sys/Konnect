@@ -381,7 +381,10 @@ fn read_netclasses(board: &Path, nets: &BTreeSet<String>) -> HashMap<String, Vec
         .unwrap_or_default()
 }
 
-fn netclasses_from_source(text: &str, nets: &BTreeSet<String>) -> HashMap<String, Vec<String>> {
+pub(super) fn netclasses_from_source(
+    text: &str,
+    nets: &BTreeSet<String>,
+) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let Ok(json) = serde_json::from_str::<Value>(text) else {
         return out;

@@ -28,12 +28,16 @@ fn pass(name: &'static str, neck: f64, optimizer: bool, initial: Option<&str>) -
 }
 
 fn args_of(pass: &Pass, hints: &RoutingHints, amps: Option<&Path>) -> Vec<String> {
+    args_with(pass, hints, CallFiles { amps, pairs: None })
+}
+
+fn args_with(pass: &Pass, hints: &RoutingHints, files: CallFiles<'_>) -> Vec<String> {
     pass_arguments(
         Path::new("/d/in.dsn"),
         Path::new("/d/out.ses"),
         Path::new("/d/out.json"),
         hints,
-        amps,
+        files,
         pass,
     )
 }
@@ -90,8 +94,17 @@ fn every_pass_kind_sends_each_setting_once_and_nothing_forbidden() {
         pass("polish", 0.0, true, Some("/d/with space/fallback.ses")),
     ];
     for pass in &passes {
-        for amps in [None, Some(amps.as_path())] {
-            let args = args_of(pass, &hints(Some(250), Some(120)), amps);
+        for (amps, pairs) in [
+            (None, None),
+            (Some(amps.as_path()), None),
+            (None, Some(Path::new("/d/pairs.txt"))),
+            (Some(amps.as_path()), Some(Path::new("/d/pairs.txt"))),
+        ] {
+            let args = args_with(
+                pass,
+                &hints(Some(250), Some(120)),
+                CallFiles { amps, pairs },
+            );
             let mut seen = HashSet::new();
             for token in &args {
                 assert!(
@@ -163,6 +176,58 @@ fn amps_switch_is_present_only_when_given() {
     let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
     assert!(at("--x.par_via_each_a=") < at("--x.par_via_amps="));
     assert!(at("--x.par_via_amps=") < at("--initial-session="));
+}
+
+/// `--pairs` is a per-call input: it is sent only when the call has a pairs file, as
+/// one token, after the amps switch and before the initial session, and it is not a
+/// candidate switch (those go on every pass of every call).
+#[test]
+fn pairs_switch_is_present_only_when_given() {
+    let none = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    assert!(!none.iter().any(|token| token.starts_with("--pairs")));
+    let pairs = Path::new("/d/with space/pairs.txt");
+    let amps = Path::new("/d/amps.txt");
+    let some = args_with(
+        &pass("fallback", 120.0, false, Some("/d/full.ses")),
+        &hints(None, None),
+        CallFiles {
+            amps: Some(amps),
+            pairs: Some(pairs),
+        },
+    );
+    assert_eq!(value(&some, "--pairs="), Some("/d/with space/pairs.txt"));
+    assert_eq!(
+        some.iter()
+            .filter(|token| token.starts_with("--pairs"))
+            .count(),
+        1
+    );
+    assert!(!some.iter().any(|token| token == "/d/with space/pairs.txt"));
+    let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
+    assert!(at("--x.par_via_amps=") < at("--pairs="));
+    assert!(at("--pairs=") < at("--initial-session="));
+    // Without amps the pairs file still goes, and the amps switch does not.
+    let only = args_with(
+        &pass("full", 0.0, true, None),
+        &hints(None, None),
+        CallFiles {
+            amps: None,
+            pairs: Some(pairs),
+        },
+    );
+    assert_eq!(value(&only, "--pairs="), Some("/d/with space/pairs.txt"));
+    assert!(value(&only, "--x.par_via_amps=").is_none());
+    // The file is never one of the fixed switches, and the rest of the line is the
+    // same with and without it.
+    assert!(!CANDIDATE_SWITCHES
+        .iter()
+        .any(|switch| switch.starts_with("--pairs")));
+    let without: Vec<&String> = only
+        .iter()
+        .filter(|token| !token.starts_with("--pairs"))
+        .collect();
+    let plain = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    assert_eq!(without, plain.iter().collect::<Vec<_>>());
 }
 
 #[test]
@@ -445,13 +510,14 @@ int main(int argc, char **argv) {
         sleep(30);
         return 0;
     }
-    const char *dsn = NULL, *ses = NULL, *report = NULL;
+    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL;
     int version = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) version = 1;
         else if (strcmp(argv[i], "-de") == 0 && i + 1 < argc) dsn = argv[++i];
         else if (strcmp(argv[i], "-do") == 0 && i + 1 < argc) ses = argv[++i];
         else if (strncmp(argv[i], "--report=", 9) == 0) report = argv[i] + 9;
+        else if (strncmp(argv[i], "--pairs=", 8) == 0) pairs = argv[i] + 8;
     }
     if (version) {
         char text[256] = "fastroute 0.1.14";
@@ -511,6 +577,24 @@ int main(int argc, char **argv) {
     if (e) {
         for (int i = 1; i < argc; i++) fprintf(e, "%s\n", argv[i]);
         fclose(e);
+    }
+
+    if (pairs) {
+        // What the run could read of its pairs file, beside the session.
+        snprintf(path, sizeof path, "%s.pairs", ses);
+        FILE *out = fopen(path, "w");
+        FILE *in = fopen(pairs, "r");
+        if (out) {
+            if (in) {
+                char buf[1024];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+            } else {
+                fputs("UNREADABLE\n", out);
+            }
+            fclose(out);
+        }
+        if (in) fclose(in);
     }
 
     char key[300], val[1100];
@@ -660,7 +744,7 @@ int main(int argc, char **argv) {
             &fixture.run_dir(),
             &fixture.dsn(),
             hints,
-            None,
+            CallFiles::default(),
             pass("full", 0.0, true, None),
             soon(seconds),
         )
@@ -1135,7 +1219,10 @@ int main(int argc, char **argv) {
             &fixture.run_dir(),
             &fixture.dsn(),
             &hints,
-            Some(&amps),
+            CallFiles {
+                amps: Some(&amps),
+                pairs: None,
+            },
             pass.clone(),
             soon(30),
         )
@@ -1152,7 +1239,10 @@ int main(int argc, char **argv) {
             &fixture.run_dir().join("fallback.ses"),
             &fixture.run_dir().join("fallback.json"),
             &hints,
-            Some(&amps),
+            CallFiles {
+                amps: Some(&amps),
+                pairs: None,
+            },
             &pass,
         );
         assert_eq!(seen, expected);
@@ -1265,7 +1355,7 @@ int main(int argc, char **argv) {
             &run_dir,
             &dsn,
             &routing_hints,
-            None,
+            CallFiles::default(),
             pass("full", 0.0, true, None),
             soon(120),
         );
@@ -1359,7 +1449,7 @@ int main(int argc, char **argv) {
             &fixture.path().join("held"),
             &fixture.dsn(),
             hints,
-            None,
+            CallFiles::default(),
             fallback,
             soon(seconds),
         )
@@ -1550,6 +1640,166 @@ int main(int argc, char **argv) {
         assert_eq!(held.kept, "polish");
     }
 
+    /// The pairs file is one input of the whole call: every pass of the hold
+    /// sequence (Full, Fallback and Polish) gets the same `--pairs` token, and the
+    /// sandboxed run can read the file, which lives outside every run folder.
+    #[tokio::test]
+    async fn every_pass_of_the_hold_gets_the_pairs_file_and_can_read_it() {
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let pairs = fixture.path().join("pairs.txt");
+        let text = "pair /CAN_H /CAN_L gap=0.2\n";
+        std::fs::write(&pairs, text).unwrap();
+        let held = route_held(
+            &fixture.binary(),
+            &fixture.path().join("held"),
+            &fixture.dsn(),
+            &floor_hints(),
+            CallFiles {
+                amps: None,
+                pairs: Some(&pairs),
+            },
+            WidthFallback::Floor,
+            soon(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.kept, "polish", "all three passes ran");
+        let expected = format!("--pairs={}", pairs.display());
+        for name in ["full", "fallback", "polish"] {
+            let args = pass_args(&fixture, name);
+            assert_eq!(
+                args.iter().filter(|token| **token == expected).count(),
+                1,
+                "{name}: {args:?}"
+            );
+            let read = std::fs::read_to_string(
+                fixture
+                    .path()
+                    .join("held")
+                    .join(name)
+                    .join(format!("{name}.ses.pairs")),
+            )
+            .unwrap();
+            assert_eq!(read, text, "{name}: what the sandboxed run read");
+        }
+    }
+
+    /// The DSN of the runner tests: one plane, two components and two nets, in the
+    /// shape Konnect exports.
+    const RUNNER_DSN: &str = "(pcb board.kicad_pcb\n  (parser\n    (string_quote \")\n    \
+(space_in_quoted_tokens on)\n    (host_cad Konnect)\n  )\n  (resolution um 10)\n  (unit um)\n  \
+(structure\n    (layer F.Cu\n      (type signal)\n    )\n    (boundary\n      \
+(path pcb 0 0 0 100 0 100 100 0 100)\n    )\n    (plane GND\n      \
+(polygon F.Cu 0 1 1 9 1 9 9 1 9)\n    )\n    (via konnect_via_0001)\n    (rule\n      \
+(width 200)\n      (clearance 200)\n    )\n  )\n  (placement\n    (component img_C1\n      \
+(place C1 1000 -1000 front 90)\n    )\n    (component img_C2\n      \
+(place C2 2000 -1000 front 90)\n    )\n  )\n  (library\n    (image img_C1\n      \
+(pin pad_1 1 0 0)\n    )\n  )\n  (network\n    (net /CAN_H\n      (pins C1-1 C2-1)\n    )\n    \
+(net /CAN_L\n      (pins C1-2 C2-2)\n    )\n  )\n  (wiring\n  )\n)\n";
+
+    /// Every run of a search, whatever its shape and seed, routes with the call's
+    /// pairs file on every pass: the production runner hands it to each run.
+    #[tokio::test]
+    async fn every_run_of_a_search_gets_the_pairs_switch() {
+        use crate::route_judge::JudgeContext;
+        use crate::route_search::{Runner, Shape};
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::FastrouteRunner;
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let search = fixture.path().join("search");
+        std::fs::create_dir_all(&search).unwrap();
+        let pairs = search.join("pairs.txt");
+        std::fs::write(&pairs, "pair /CAN_H /CAN_L\n").unwrap();
+        let runner = |pairs: Option<PathBuf>| FastrouteRunner {
+            binary: fixture.binary(),
+            dsn_text: Arc::new(RUNNER_DSN.to_string()),
+            hints: floor_hints(),
+            amps: None,
+            pairs,
+            fallback: WidthFallback::Floor,
+            folder: search.clone(),
+            judge: Arc::new(JudgeContext {
+                board: fixture.path().join("board.kicad_pcb"),
+                board_text: String::new(),
+                manifest: json!({}),
+                manifest_text: "{}".to_string(),
+                kicad_cli: String::new(),
+                pour_nets: Default::default(),
+                power_nets: Default::default(),
+                floors_mm: Default::default(),
+                root: search.join("judge"),
+                kicad_config_home: None,
+            }),
+            tools: Arc::new(ToolContext::new(
+                ServerConfig::default(),
+                Arc::new(ToolRouter::new()),
+            )),
+        };
+        let runs = [
+            (0, Shape::AsExported, 1),
+            (1, Shape::Omitted, 1),
+            (2, Shape::AsExported, 2),
+            (3, Shape::Omitted, 2),
+        ];
+        let with = runner(Some(pairs.clone()));
+        for (index, shape, seed) in runs {
+            let routed = with.route(index, shape, seed, soon(60)).await.unwrap();
+            assert_eq!(
+                routed.held.kept, "polish",
+                "run {index}: all three passes ran"
+            );
+            for name in ["full", "fallback", "polish"] {
+                let args = std::fs::read_to_string(
+                    routed.folder.join(name).join(format!("{name}.ses.args")),
+                )
+                .unwrap();
+                let hits = args
+                    .lines()
+                    .filter(|line| *line == format!("--pairs={}", pairs.display()))
+                    .count();
+                assert_eq!(hits, 1, "run {index} pass {name}: {args}");
+            }
+        }
+        // Control: a runner with no pairs file sends the switch on no run.
+        let without = runner(None);
+        let routed = without
+            .route(10, Shape::AsExported, 1, soon(60))
+            .await
+            .unwrap();
+        for name in ["full", "fallback", "polish"] {
+            let args =
+                std::fs::read_to_string(routed.folder.join(name).join(format!("{name}.ses.args")))
+                    .unwrap();
+            assert!(!args.contains("--pairs"), "{name}: {args}");
+        }
+    }
+
+    /// Control: a call without a pairs file sends no `--pairs` on any pass.
+    #[tokio::test]
+    async fn a_call_without_pairs_sends_no_pairs_switch_on_any_pass() {
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 60)
+            .await
+            .unwrap();
+        assert_eq!(held.kept, "polish");
+        for name in ["full", "fallback", "polish"] {
+            let args = pass_args(&fixture, name);
+            assert!(
+                !args.iter().any(|token| token.starts_with("--pairs")),
+                "{name}: {args:?}"
+            );
+            assert!(!fixture
+                .path()
+                .join("held")
+                .join(name)
+                .join(format!("{name}.ses.pairs"))
+                .exists());
+        }
+    }
+
     #[tokio::test]
     async fn a_pass_killed_by_the_deadline_ends_the_run_even_after_full_succeeded() {
         let fixture = Fixture::new("unrouted.full=3\nsleep.fallback=1\n");
@@ -1663,7 +1913,7 @@ int main(int argc, char **argv) {
             &folder,
             &fixture.dsn(),
             &hints(Some(250), None),
-            None,
+            CallFiles::default(),
             pass("full", 0.0, true, None),
             soon(30),
         )
