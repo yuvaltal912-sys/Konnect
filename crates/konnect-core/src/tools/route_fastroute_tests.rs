@@ -10,6 +10,7 @@ use crate::route_judge::{Gates, Measures};
 use crate::route_search::Lanes;
 use crate::router::ToolRouter;
 use crate::tools::integration::handle_route_specctra_dsn;
+use crate::tools::route_pairs::{PairsPlan, ResolvedPair, UnresolvedPair};
 use crate::tools::ServerConfig;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -1174,6 +1175,7 @@ fn the_result_has_every_documented_key() {
         &plan(),
         &[Shape::AsExported, Shape::Omitted],
         &search.outcome,
+        &PairsPlan::default(),
     );
     assert_eq!(result["success"], true, "{result}");
     assert_eq!(result["method"], "local_fastroute_best_of_n");
@@ -1275,6 +1277,203 @@ fn the_result_has_every_documented_key() {
         .ends_with("run-000-as_exported-s1"));
 }
 
+/// The result reports the pairs: both lists are there, empty when the call has no
+/// pairs, and a note only when the design intent could not be used.
+#[test]
+fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
+    let search = finished_search();
+    let ses = search.root.join("out.ses");
+    std::fs::write(&ses, "(session board)").unwrap();
+    let dsn = search.root.join("board.dsn");
+    std::fs::write(&dsn, "(pcb board)").unwrap();
+    let result_with = |pairs: &PairsPlan| {
+        result_json(
+            &dsn,
+            &ses,
+            &search.folder,
+            &candidate(),
+            (Effort::H, EffortSource::UserConfig),
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+            pairs,
+        )
+    };
+    let none = result_with(&PairsPlan::default());
+    assert_eq!(none["differential_pairs"], json!([]), "{none}");
+    assert_eq!(none["differential_pairs_unresolved"], json!([]), "{none}");
+    assert!(none.get("differential_pairs_note").is_none());
+
+    let plan_with_pairs = PairsPlan {
+        resolved: vec![ResolvedPair {
+            positive: "CAN_H".into(),
+            negative: "CAN_L".into(),
+            dsn_positive: "/CAN_H".into(),
+            dsn_negative: "/CAN_L".into(),
+            gap_mm: Some(0.2),
+        }],
+        unresolved: vec![UnresolvedPair {
+            positive: "USB_DP".into(),
+            negative: "USB_DN".into(),
+            reason: "no net of the DSN is named 'USB_DN'".into(),
+        }],
+        note: Some("the design intent cannot be used".into()),
+    };
+    let some = result_with(&plan_with_pairs);
+    assert_eq!(
+        some["differential_pairs"],
+        json!([{ "positive": "CAN_H", "negative": "CAN_L", "dsn_positive": "/CAN_H",
+                 "dsn_negative": "/CAN_L", "gap_mm": 0.2 }])
+    );
+    assert_eq!(
+        some["differential_pairs_unresolved"][0]["reason"],
+        "no net of the DSN is named 'USB_DN'"
+    );
+    assert_eq!(
+        some["differential_pairs_note"],
+        "the design intent cannot be used"
+    );
+    // Nothing else of the result moved.
+    let mut without = some.clone();
+    for key in [
+        "differential_pairs",
+        "differential_pairs_unresolved",
+        "differential_pairs_note",
+    ] {
+        without.as_object_mut().unwrap().remove(key);
+    }
+    let mut plain = none.clone();
+    for key in ["differential_pairs", "differential_pairs_unresolved"] {
+        plain.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(without, plain);
+
+    // A search with no winner is an error, and it reports the pairs too.
+    let call = Call {
+        dsn: dsn.clone(),
+        ses_output: search.root.join("none.ses"),
+        folder: search.folder.clone(),
+        effort: (Effort::M, EffortSource::Default),
+        fallback: WidthFallback::Floor,
+    };
+    let finished = outcome(Vec::new(), None);
+    let error = no_winner_result(&call, &finished, json!({ "runs": [] }), &plan_with_pairs);
+    assert!(error.is_error);
+    assert_eq!(
+        body(&error)["differential_pairs"][0]["dsn_positive"],
+        "/CAN_H"
+    );
+    assert_eq!(
+        body(&error)["differential_pairs_unresolved"][0]["positive"],
+        "USB_DP"
+    );
+    let error = no_winner_result(&call, &finished, json!({}), &PairsPlan::default());
+    assert_eq!(body(&error)["differential_pairs"], json!([]));
+    assert_eq!(body(&error)["differential_pairs_unresolved"], json!([]));
+    // The summary form of a result without a winner carries them as well.
+    let failed = result_json(
+        &dsn,
+        &ses,
+        &search.folder,
+        &candidate(),
+        (Effort::M, EffortSource::Default),
+        &plan(),
+        &[Shape::AsExported],
+        &finished,
+        &plan_with_pairs,
+    );
+    assert_eq!(failed["success"], false);
+    assert_eq!(failed["differential_pairs"][0]["gap_mm"], 0.2);
+}
+
+/// The end of a call, `conclude`, reports the call's pairs whichever way the search
+/// ended: the success result and the no-winner error. (The call path above it is
+/// tested in `fastroute_tests.rs`, with a fake fastroute.)
+#[test]
+fn a_finished_search_reports_the_pairs_in_either_ending() {
+    let pairs = PairsPlan {
+        resolved: vec![ResolvedPair {
+            positive: "CAN_H".into(),
+            negative: "CAN_L".into(),
+            dsn_positive: "/CAN_H".into(),
+            dsn_negative: "/CAN_L".into(),
+            gap_mm: Some(0.2),
+        }],
+        unresolved: vec![UnresolvedPair {
+            positive: "USB_DP".into(),
+            negative: "USB_DN".into(),
+            reason: "no net of the DSN is named 'USB_DN'".into(),
+        }],
+        note: None,
+    };
+    let kicad = route_judge::PrivateConfig {
+        home: PathBuf::from("/x/kicad-config"),
+        skipped_links: Vec::new(),
+    };
+    let shapes = [Shape::AsExported, Shape::Omitted];
+    let ended = |winner: bool, pairs: &PairsPlan| {
+        let search = finished_search();
+        let dsn = search.root.join("board.dsn");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let call = Call {
+            dsn,
+            ses_output: search.root.join("out.ses"),
+            folder: search.folder.clone(),
+            effort: (Effort::M, EffortSource::Default),
+            fallback: WidthFallback::Floor,
+        };
+        let Search {
+            _dir, mut outcome, ..
+        } = search;
+        if !winner {
+            outcome.winner = None;
+        }
+        let result = conclude(
+            &json!({}),
+            &call,
+            &candidate(),
+            &plan(),
+            &shapes,
+            &outcome,
+            &kicad,
+            pairs,
+        )
+        .unwrap();
+        (result, call, _dir)
+    };
+
+    // A winner: the success result, the session written, the search file kept.
+    let (result, call, _root) = ended(true, &pairs);
+    assert!(!result.is_error);
+    let found = body(&result);
+    assert_eq!(found["success"], true);
+    assert_eq!(found["differential_pairs"][0]["dsn_positive"], "/CAN_H");
+    assert_eq!(found["differential_pairs"][0]["gap_mm"], 0.2);
+    assert_eq!(
+        found["differential_pairs_unresolved"][0]["positive"],
+        "USB_DP"
+    );
+    assert!(call.ses_output.is_file());
+    assert!(call.folder.join("search.json").is_file());
+    // No winner: the error, nothing written, the same fields.
+    let (result, call, _root) = ended(false, &pairs);
+    assert!(result.is_error);
+    let found = body(&result);
+    assert_eq!(found["differential_pairs"][0]["dsn_negative"], "/CAN_L");
+    assert_eq!(
+        found["differential_pairs_unresolved"][0]["negative"],
+        "USB_DN"
+    );
+    assert!(!call.ses_output.exists());
+    // Control: without pairs both endings carry empty lists.
+    for winner in [true, false] {
+        let (result, _call, _root) = ended(winner, &PairsPlan::default());
+        let found = body(&result);
+        assert_eq!(found["differential_pairs"], json!([]), "winner {winner}");
+        assert_eq!(found["differential_pairs_unresolved"], json!([]));
+    }
+}
+
 #[test]
 fn a_fast_result_has_runs_and_no_budget_and_an_overrun_is_reported() {
     let search = finished_search();
@@ -1296,6 +1495,7 @@ fn a_fast_result_has_runs_and_no_budget_and_an_overrun_is_reported() {
         &plan(),
         &[Shape::AsExported],
         &finished,
+        &PairsPlan::default(),
     );
     assert_eq!(result["effort"]["level"], "fast");
     assert_eq!(result["effort"]["source"], "default");
@@ -1344,7 +1544,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         Listing::Best,
     );
     assert!(search["winner"].is_null());
-    let result = no_winner_result(&call, &finished, search);
+    let result = no_winner_result(&call, &finished, search, &PairsPlan::default());
     assert!(result.is_error);
     assert_eq!(kind(&result), "handler_error");
     let text = message(&result);
@@ -1367,6 +1567,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         &plan(),
         &[Shape::AsExported],
         &finished,
+        &PairsPlan::default(),
     );
     assert_eq!(none["success"], false);
 }
@@ -1387,7 +1588,7 @@ fn a_failed_search_keeps_its_records_and_not_its_boards() {
         fallback: WidthFallback::Floor,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
-    let result = no_winner_result(&call, &failed, summary);
+    let result = no_winner_result(&call, &failed, summary, &PairsPlan::default());
     assert!(result.is_error);
     assert!(body(&result)["search"].get("reduce_error").is_none());
     for (index, shape, seed) in [
@@ -1425,7 +1626,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
         fallback: WidthFallback::Floor,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
-    let result = no_winner_result(&call, &failed, summary);
+    let result = no_winner_result(&call, &failed, summary, &PairsPlan::default());
     assert!(result.is_error);
     assert!(
         body(&result)["search"]["reduce_error"].is_string(),
@@ -1615,6 +1816,7 @@ fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
             &plan(),
             &[Shape::AsExported, Shape::Omitted],
             &search.outcome,
+            &PairsPlan::default(),
         )
     };
 
@@ -1735,6 +1937,7 @@ fn the_winners_width_report_sets_the_status_as_for_freerouting() {
             &plan(),
             &[Shape::AsExported, Shape::Omitted],
             &search.outcome,
+            &PairsPlan::default(),
         )
     };
 
@@ -1838,6 +2041,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         dsn_text: Arc::new(String::new()),
         hints: RoutingHints::default(),
         amps: None,
+        pairs: None,
         fallback: WidthFallback::Floor,
         folder: search.folder.clone(),
         judge: Arc::new(judge),
@@ -2004,6 +2208,7 @@ fn a_winner_released_during_the_search_has_no_judged_board_and_says_why() {
         &plan(),
         &[Shape::AsExported, Shape::Omitted],
         &search.outcome,
+        &PairsPlan::default(),
     );
     assert_eq!(result["success"], true);
     assert!(result["completion"]["judged"]["judged_board"].is_null());

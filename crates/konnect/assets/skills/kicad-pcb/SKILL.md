@@ -355,6 +355,11 @@ placement orders, judges every run itself on scratch copies of the board
 4. Continue from step 4 of the Freerouting round trip: the same import
    review, apply, refill, stitching (`completion.next_steps`) and DRC.
 
+Differential pairs declared in the design intent
+(`set_design_intent`, `interfaces[].differential_pairs`) are routed coupled.
+`differential_pairs` lists them; `differential_pairs_unresolved` lists any pair
+left out, with its reason (a name that matches no net of the DSN, or several).
+
 ### Freerouting round trip
 
 When the user asks for Freerouting (`engine: 'freerouting'`), use the local Freerouting path. Load `pcb_export`,

@@ -545,6 +545,7 @@ fn success_result(finished: &Finished) -> CallToolResult {
         &plan(),
         &[Shape::AsExported, Shape::Omitted],
         &finished.outcome,
+        &crate::tools::route_pairs::PairsPlan::default(),
     );
     assert_eq!(result["success"], true, "{result}");
     CallToolResult::json(&result)
@@ -582,10 +583,16 @@ fn no_winner(baseline: std::result::Result<Baseline, String>) -> CallToolResult 
         &plan(),
         &[Shape::AsExported, Shape::Omitted],
         &outcome,
+        &crate::tools::route_pairs::PairsPlan::default(),
     )["search"]
         .clone();
     assert!(search["winner"].is_null());
-    let result = no_winner_result(&call, &outcome, search);
+    let result = no_winner_result(
+        &call,
+        &outcome,
+        search,
+        &crate::tools::route_pairs::PairsPlan::default(),
+    );
     assert!(result.is_error);
     result
 }

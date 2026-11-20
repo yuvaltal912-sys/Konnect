@@ -28,12 +28,16 @@ fn pass(name: &'static str, neck: f64, optimizer: bool, initial: Option<&str>) -
 }
 
 fn args_of(pass: &Pass, hints: &RoutingHints, amps: Option<&Path>) -> Vec<String> {
+    args_with(pass, hints, CallFiles { amps, pairs: None })
+}
+
+fn args_with(pass: &Pass, hints: &RoutingHints, files: CallFiles<'_>) -> Vec<String> {
     pass_arguments(
         Path::new("/d/in.dsn"),
         Path::new("/d/out.ses"),
         Path::new("/d/out.json"),
         hints,
-        amps,
+        files,
         pass,
     )
 }
@@ -90,8 +94,17 @@ fn every_pass_kind_sends_each_setting_once_and_nothing_forbidden() {
         pass("polish", 0.0, true, Some("/d/with space/fallback.ses")),
     ];
     for pass in &passes {
-        for amps in [None, Some(amps.as_path())] {
-            let args = args_of(pass, &hints(Some(250), Some(120)), amps);
+        for (amps, pairs) in [
+            (None, None),
+            (Some(amps.as_path()), None),
+            (None, Some(Path::new("/d/pairs.txt"))),
+            (Some(amps.as_path()), Some(Path::new("/d/pairs.txt"))),
+        ] {
+            let args = args_with(
+                pass,
+                &hints(Some(250), Some(120)),
+                CallFiles { amps, pairs },
+            );
             let mut seen = HashSet::new();
             for token in &args {
                 assert!(
@@ -163,6 +176,58 @@ fn amps_switch_is_present_only_when_given() {
     let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
     assert!(at("--x.par_via_each_a=") < at("--x.par_via_amps="));
     assert!(at("--x.par_via_amps=") < at("--initial-session="));
+}
+
+/// `--pairs` is a per-call input: it is sent only when the call has a pairs file, as
+/// one token, after the amps switch and before the initial session, and it is not a
+/// candidate switch (those go on every pass of every call).
+#[test]
+fn pairs_switch_is_present_only_when_given() {
+    let none = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    assert!(!none.iter().any(|token| token.starts_with("--pairs")));
+    let pairs = Path::new("/d/with space/pairs.txt");
+    let amps = Path::new("/d/amps.txt");
+    let some = args_with(
+        &pass("fallback", 120.0, false, Some("/d/full.ses")),
+        &hints(None, None),
+        CallFiles {
+            amps: Some(amps),
+            pairs: Some(pairs),
+        },
+    );
+    assert_eq!(value(&some, "--pairs="), Some("/d/with space/pairs.txt"));
+    assert_eq!(
+        some.iter()
+            .filter(|token| token.starts_with("--pairs"))
+            .count(),
+        1
+    );
+    assert!(!some.iter().any(|token| token == "/d/with space/pairs.txt"));
+    let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
+    assert!(at("--x.par_via_amps=") < at("--pairs="));
+    assert!(at("--pairs=") < at("--initial-session="));
+    // Without amps the pairs file still goes, and the amps switch does not.
+    let only = args_with(
+        &pass("full", 0.0, true, None),
+        &hints(None, None),
+        CallFiles {
+            amps: None,
+            pairs: Some(pairs),
+        },
+    );
+    assert_eq!(value(&only, "--pairs="), Some("/d/with space/pairs.txt"));
+    assert!(value(&only, "--x.par_via_amps=").is_none());
+    // The file is never one of the fixed switches, and the rest of the line is the
+    // same with and without it.
+    assert!(!CANDIDATE_SWITCHES
+        .iter()
+        .any(|switch| switch.starts_with("--pairs")));
+    let without: Vec<&String> = only
+        .iter()
+        .filter(|token| !token.starts_with("--pairs"))
+        .collect();
+    let plain = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    assert_eq!(without, plain.iter().collect::<Vec<_>>());
 }
 
 #[test]
@@ -445,13 +510,14 @@ int main(int argc, char **argv) {
         sleep(30);
         return 0;
     }
-    const char *dsn = NULL, *ses = NULL, *report = NULL;
+    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL;
     int version = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) version = 1;
         else if (strcmp(argv[i], "-de") == 0 && i + 1 < argc) dsn = argv[++i];
         else if (strcmp(argv[i], "-do") == 0 && i + 1 < argc) ses = argv[++i];
         else if (strncmp(argv[i], "--report=", 9) == 0) report = argv[i] + 9;
+        else if (strncmp(argv[i], "--pairs=", 8) == 0) pairs = argv[i] + 8;
     }
     if (version) {
         char text[256] = "fastroute 0.1.14";
@@ -511,6 +577,31 @@ int main(int argc, char **argv) {
     if (e) {
         for (int i = 1; i < argc; i++) fprintf(e, "%s\n", argv[i]);
         fclose(e);
+    }
+
+    if (pairs) {
+        // What the run could read of its pairs file, beside the session.
+        snprintf(path, sizeof path, "%s.pairs", ses);
+        FILE *out = fopen(path, "w");
+        FILE *in = fopen(pairs, "r");
+        if (out) {
+            if (in) {
+                char buf[1024];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+            } else {
+                fputs("UNREADABLE\n", out);
+            }
+            fclose(out);
+        }
+        if (in) fclose(in);
+    }
+
+    if (cfg_int("echo_pairs", 0)) {
+        // Say what this pass was given, then fail: the failure reason keeps the
+        // end of the log, so a call that fails every run still shows the switch.
+        fprintf(stderr, "PAIRS_ARG=%s\n", pairs ? pairs : "none");
+        return 3;
     }
 
     char key[300], val[1100];
@@ -660,7 +751,7 @@ int main(int argc, char **argv) {
             &fixture.run_dir(),
             &fixture.dsn(),
             hints,
-            None,
+            CallFiles::default(),
             pass("full", 0.0, true, None),
             soon(seconds),
         )
@@ -1135,7 +1226,10 @@ int main(int argc, char **argv) {
             &fixture.run_dir(),
             &fixture.dsn(),
             &hints,
-            Some(&amps),
+            CallFiles {
+                amps: Some(&amps),
+                pairs: None,
+            },
             pass.clone(),
             soon(30),
         )
@@ -1152,7 +1246,10 @@ int main(int argc, char **argv) {
             &fixture.run_dir().join("fallback.ses"),
             &fixture.run_dir().join("fallback.json"),
             &hints,
-            Some(&amps),
+            CallFiles {
+                amps: Some(&amps),
+                pairs: None,
+            },
             &pass,
         );
         assert_eq!(seen, expected);
@@ -1265,7 +1362,7 @@ int main(int argc, char **argv) {
             &run_dir,
             &dsn,
             &routing_hints,
-            None,
+            CallFiles::default(),
             pass("full", 0.0, true, None),
             soon(120),
         );
@@ -1359,7 +1456,7 @@ int main(int argc, char **argv) {
             &fixture.path().join("held"),
             &fixture.dsn(),
             hints,
-            None,
+            CallFiles::default(),
             fallback,
             soon(seconds),
         )
@@ -1550,6 +1647,334 @@ int main(int argc, char **argv) {
         assert_eq!(held.kept, "polish");
     }
 
+    /// The pairs file is one input of the whole call: every pass of the hold
+    /// sequence (Full, Fallback and Polish) gets the same `--pairs` token, and the
+    /// sandboxed run can read the file, which lives outside every run folder.
+    #[tokio::test]
+    async fn every_pass_of_the_hold_gets_the_pairs_file_and_can_read_it() {
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let pairs = fixture.path().join("pairs.txt");
+        let text = "pair /CAN_H /CAN_L gap=0.2\n";
+        std::fs::write(&pairs, text).unwrap();
+        let held = route_held(
+            &fixture.binary(),
+            &fixture.path().join("held"),
+            &fixture.dsn(),
+            &floor_hints(),
+            CallFiles {
+                amps: None,
+                pairs: Some(&pairs),
+            },
+            WidthFallback::Floor,
+            soon(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.kept, "polish", "all three passes ran");
+        let expected = format!("--pairs={}", pairs.display());
+        for name in ["full", "fallback", "polish"] {
+            let args = pass_args(&fixture, name);
+            assert_eq!(
+                args.iter().filter(|token| **token == expected).count(),
+                1,
+                "{name}: {args:?}"
+            );
+            let read = std::fs::read_to_string(
+                fixture
+                    .path()
+                    .join("held")
+                    .join(name)
+                    .join(format!("{name}.ses.pairs")),
+            )
+            .unwrap();
+            assert_eq!(read, text, "{name}: what the sandboxed run read");
+        }
+    }
+
+    /// The DSN of the runner tests: one plane, two components and two nets, in the
+    /// shape Konnect exports.
+    const RUNNER_DSN: &str = "(pcb board.kicad_pcb\n  (parser\n    (string_quote \")\n    \
+(space_in_quoted_tokens on)\n    (host_cad Konnect)\n  )\n  (resolution um 10)\n  (unit um)\n  \
+(structure\n    (layer F.Cu\n      (type signal)\n    )\n    (boundary\n      \
+(path pcb 0 0 0 100 0 100 100 0 100)\n    )\n    (plane GND\n      \
+(polygon F.Cu 0 1 1 9 1 9 9 1 9)\n    )\n    (via konnect_via_0001)\n    (rule\n      \
+(width 200)\n      (clearance 200)\n    )\n  )\n  (placement\n    (component img_C1\n      \
+(place C1 1000 -1000 front 90)\n    )\n    (component img_C2\n      \
+(place C2 2000 -1000 front 90)\n    )\n  )\n  (library\n    (image img_C1\n      \
+(pin pad_1 1 0 0)\n    )\n  )\n  (network\n    (net /CAN_H\n      (pins C1-1 C2-1)\n    )\n    \
+(net /CAN_L\n      (pins C1-2 C2-2)\n    )\n  )\n  (wiring\n  )\n)\n";
+
+    /// Every run of a search, whatever its shape and seed, routes with the call's
+    /// pairs file on every pass: the production runner hands it to each run.
+    #[tokio::test]
+    async fn every_run_of_a_search_gets_the_pairs_switch() {
+        use crate::route_judge::JudgeContext;
+        use crate::route_search::{Runner, Shape};
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::FastrouteRunner;
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let search = fixture.path().join("search");
+        std::fs::create_dir_all(&search).unwrap();
+        let pairs = search.join("pairs.txt");
+        std::fs::write(&pairs, "pair /CAN_H /CAN_L\n").unwrap();
+        let runner = |pairs: Option<PathBuf>| FastrouteRunner {
+            binary: fixture.binary(),
+            dsn_text: Arc::new(RUNNER_DSN.to_string()),
+            hints: floor_hints(),
+            amps: None,
+            pairs,
+            fallback: WidthFallback::Floor,
+            folder: search.clone(),
+            judge: Arc::new(JudgeContext {
+                board: fixture.path().join("board.kicad_pcb"),
+                board_text: String::new(),
+                manifest: json!({}),
+                manifest_text: "{}".to_string(),
+                kicad_cli: String::new(),
+                pour_nets: Default::default(),
+                power_nets: Default::default(),
+                floors_mm: Default::default(),
+                root: search.join("judge"),
+                kicad_config_home: None,
+            }),
+            tools: Arc::new(ToolContext::new(
+                ServerConfig::default(),
+                Arc::new(ToolRouter::new()),
+            )),
+        };
+        let runs = [
+            (0, Shape::AsExported, 1),
+            (1, Shape::Omitted, 1),
+            (2, Shape::AsExported, 2),
+            (3, Shape::Omitted, 2),
+        ];
+        let with = runner(Some(pairs.clone()));
+        for (index, shape, seed) in runs {
+            let routed = with.route(index, shape, seed, soon(60)).await.unwrap();
+            assert_eq!(
+                routed.held.kept, "polish",
+                "run {index}: all three passes ran"
+            );
+            for name in ["full", "fallback", "polish"] {
+                let args = std::fs::read_to_string(
+                    routed.folder.join(name).join(format!("{name}.ses.args")),
+                )
+                .unwrap();
+                let hits = args
+                    .lines()
+                    .filter(|line| *line == format!("--pairs={}", pairs.display()))
+                    .count();
+                assert_eq!(hits, 1, "run {index} pass {name}: {args}");
+            }
+        }
+        // Control: a runner with no pairs file sends the switch on no run.
+        let without = runner(None);
+        let routed = without
+            .route(10, Shape::AsExported, 1, soon(60))
+            .await
+            .unwrap();
+        for name in ["full", "fallback", "polish"] {
+            let args =
+                std::fs::read_to_string(routed.folder.join(name).join(format!("{name}.ses.args")))
+                    .unwrap();
+            assert!(!args.contains("--pairs"), "{name}: {args}");
+        }
+    }
+
+    /// One call of `route_specctra_dsn`'s fastroute engine through its real path
+    /// (`route_located`, so `search_and_write` and `conclude`), with a fake fastroute
+    /// that echoes its `--pairs` argument and fails, and a fake kicad-cli. The board
+    /// is in `project/`, the DSN and its manifest in `exported/`; `project_intent`
+    /// and `exported_intent` are the design intent files of the two folders.
+    /// Returns the error result's body and the folder the failed call set aside.
+    async fn failed_call(
+        project_intent: Option<Value>,
+        exported_intent: Option<Value>,
+    ) -> (Value, PathBuf, tempfile::TempDir) {
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::{prepare_call, route_located};
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("echo_pairs=1\n");
+        let root = fixture.path().to_path_buf();
+        let project = root.join("project");
+        let exported = root.join("exported");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&exported).unwrap();
+        let board_text = "(kicad_pcb (version 20260206))\n";
+        let board = project.join("b.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        // /CAN_H sits in a class with a diff pair gap of 0.2 mm.
+        std::fs::write(
+            project.join("b.kicad_pro"),
+            json!({ "net_settings": {
+                "classes": [{ "name": "PAIR", "priority": 0, "diff_pair_gap": 0.2 }],
+                "netclass_assignments": { "/CAN_H": ["PAIR"] } } })
+            .to_string(),
+        )
+        .unwrap();
+        for (folder, intent) in [(&project, project_intent), (&exported, exported_intent)] {
+            if let Some(intent) = intent {
+                std::fs::create_dir_all(folder.join(".konnect")).unwrap();
+                std::fs::write(
+                    folder.join(".konnect/design_intent.json"),
+                    intent.to_string(),
+                )
+                .unwrap();
+            }
+        }
+        let dsn = exported.join("board.dsn");
+        std::fs::write(&dsn, RUNNER_DSN).unwrap();
+        std::fs::write(
+            exported.join("board.dsn.konnect.json"),
+            json!({
+                "schema_version": 1,
+                "board_path": board.display().to_string(),
+                "source_sha256": format!("{:x}", Sha256::digest(board_text.as_bytes())),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cli = root.join("kicad-cli");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let args = json!({
+            "dsn_path": dsn,
+            "ses_output_path": exported.join("out.ses"),
+            "effort": "fast",
+        });
+        let call = prepare_call(&args).unwrap().expect("good arguments");
+        let result = route_located(&args, ctx, call, Located::Found(fixture.binary()))
+            .await
+            .unwrap();
+        assert!(result.is_error, "every fake pass fails");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        // The folder the failed call set aside is where its files went.
+        let kept = exported.join("out.search.failed-1");
+        assert!(kept.is_dir(), "{body}");
+        (body, kept, fixture.dir)
+    }
+
+    fn run_reasons(body: &Value) -> Vec<String> {
+        body["search"]["runs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no runs: {body}"))
+            .iter()
+            .map(|run| run["reason"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn can_intent() -> Value {
+        json!({ "schema_version": 1, "rails": [], "currents": [],
+            "interfaces": [{ "name": "CAN", "kind": "can", "nets": ["CAN_H", "CAN_L"],
+                "differential_pairs": [{ "positive": "CAN_H", "negative": "CAN_L" }] }] })
+    }
+
+    /// The real call path: the pair of the intent in the board's own folder is
+    /// resolved against the DSN, its file is written into the call's folder, every
+    /// run gets `--pairs=<that file>`, and the result reports the pair. A different
+    /// intent beside the DSN is not the board's and is not read.
+    #[tokio::test]
+    async fn a_call_gives_every_run_the_boards_pairs_and_reports_them() {
+        let decoy = json!({ "schema_version": 1, "rails": [], "currents": [],
+            "interfaces": [{ "name": "OTHER", "kind": "x", "nets": ["DECOY_P", "DECOY_N"],
+                "differential_pairs": [{ "positive": "DECOY_P", "negative": "DECOY_N" }] }] });
+        let (body, kept, _keep) = failed_call(Some(can_intent()), Some(decoy)).await;
+        // The file, in the call's own folder, with the gap of the positive net's class.
+        assert_eq!(
+            std::fs::read_to_string(kept.join("pairs.txt")).unwrap(),
+            "pair /CAN_H /CAN_L gap=0.2\n"
+        );
+        // Every run was given it, by its path in the search folder (the folder was
+        // set aside afterwards).
+        let reasons = run_reasons(&body);
+        assert_eq!(reasons.len(), 2, "{body}");
+        let given = format!(
+            "PAIRS_ARG={}",
+            kept.to_string_lossy()
+                .replace("out.search.failed-1", "out.search")
+        );
+        let given = format!("{given}/pairs.txt");
+        for reason in &reasons {
+            assert!(reason.contains(&given), "{reason} lacks {given}");
+        }
+        // The result.
+        assert_eq!(
+            body["differential_pairs"],
+            json!([{ "positive": "CAN_H", "negative": "CAN_L", "dsn_positive": "/CAN_H",
+                     "dsn_negative": "/CAN_L", "gap_mm": 0.2 }])
+        );
+        assert_eq!(body["differential_pairs_unresolved"], json!([]));
+        assert!(body.get("differential_pairs_note").is_none());
+    }
+
+    /// Control: with no design intent in the board's folder, no pairs file is made,
+    /// no run gets `--pairs`, and both result lists are empty. A call with an intent
+    /// that names a net the DSN lacks reports the pair and sends nothing either.
+    #[tokio::test]
+    async fn a_call_without_pairs_sends_nothing_and_reports_empty_lists() {
+        let (body, kept, _keep) = failed_call(None, None).await;
+        assert!(!kept.join("pairs.txt").exists());
+        let reasons = run_reasons(&body);
+        assert_eq!(reasons.len(), 2, "{body}");
+        for reason in &reasons {
+            assert!(reason.contains("PAIRS_ARG=none"), "{reason}");
+        }
+        assert_eq!(body["differential_pairs"], json!([]));
+        assert_eq!(body["differential_pairs_unresolved"], json!([]));
+
+        let missing = json!({ "schema_version": 1, "rails": [], "currents": [],
+            "interfaces": [{ "name": "X", "kind": "x", "nets": ["CAN_H", "NOT_THERE"],
+                "differential_pairs": [{ "positive": "CAN_H", "negative": "NOT_THERE" }] }] });
+        let (body, kept, _keep) = failed_call(Some(missing), None).await;
+        assert!(!kept.join("pairs.txt").exists());
+        for reason in run_reasons(&body) {
+            assert!(reason.contains("PAIRS_ARG=none"), "{reason}");
+        }
+        assert_eq!(body["differential_pairs"], json!([]));
+        assert_eq!(
+            body["differential_pairs_unresolved"][0]["negative"],
+            "NOT_THERE"
+        );
+    }
+
+    /// Control: a call without a pairs file sends no `--pairs` on any pass.
+    #[tokio::test]
+    async fn a_call_without_pairs_sends_no_pairs_switch_on_any_pass() {
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 60)
+            .await
+            .unwrap();
+        assert_eq!(held.kept, "polish");
+        for name in ["full", "fallback", "polish"] {
+            let args = pass_args(&fixture, name);
+            assert!(
+                !args.iter().any(|token| token.starts_with("--pairs")),
+                "{name}: {args:?}"
+            );
+            assert!(!fixture
+                .path()
+                .join("held")
+                .join(name)
+                .join(format!("{name}.ses.pairs"))
+                .exists());
+        }
+    }
+
     #[tokio::test]
     async fn a_pass_killed_by_the_deadline_ends_the_run_even_after_full_succeeded() {
         let fixture = Fixture::new("unrouted.full=3\nsleep.fallback=1\n");
@@ -1663,7 +2088,7 @@ int main(int argc, char **argv) {
             &folder,
             &fixture.dsn(),
             &hints(Some(250), None),
-            None,
+            CallFiles::default(),
             pass("full", 0.0, true, None),
             soon(30),
         )

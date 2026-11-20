@@ -659,7 +659,6 @@ fn copies_the_listed_files_and_folders_only() {
     assert_eq!(
         listing(&into),
         vec![
-            ".konnect/deep/more.json",
             ".konnect/design_intent.json",
             "b.kicad_dru",
             "b.kicad_prl",
@@ -678,6 +677,41 @@ fn copies_the_listed_files_and_folders_only() {
     // The source is untouched.
     assert!(board.exists());
     assert!(source.path().join("b.kicad_sch").exists());
+}
+
+/// The copy holds `.konnect/design_intent.json`, byte for byte, and nothing else
+/// of `.konnect`; with no intent file it makes no `.konnect` folder at all.
+#[test]
+fn the_design_intent_is_copied_and_nothing_else_of_konnect() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let board = project(source.path());
+    put(
+        source.path(),
+        ".konnect/design_intent.json",
+        "{\"interfaces\":[]}",
+    );
+    put(source.path(), ".konnect/baseline.json", "{}");
+    put(source.path(), ".konnect/checkpoints/a/board.kicad_pcb", "x");
+    let into = target.path().join("scratch");
+    copy_project(&board, &into).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(into.join(".konnect/design_intent.json")).unwrap(),
+        "{\"interfaces\":[]}"
+    );
+    let konnect: Vec<String> = listing(&into)
+        .into_iter()
+        .filter(|name| name.starts_with(".konnect"))
+        .collect();
+    assert_eq!(konnect, vec![".konnect/design_intent.json".to_string()]);
+
+    // Without an intent file there is no `.konnect` folder in the copy, although
+    // the source's `.konnect` still holds other files.
+    std::fs::remove_file(source.path().join(".konnect/design_intent.json")).unwrap();
+    let bare = target.path().join("bare");
+    copy_project(&board, &bare).unwrap();
+    assert!(!bare.join(".konnect").exists(), "{:?}", listing(&bare));
+    assert!(bare.join("b.kicad_pro").is_file());
 }
 
 #[test]
@@ -723,7 +757,31 @@ fn a_symbolic_link_anywhere_is_refused() {
     let target = tempfile::tempdir().unwrap();
     assert!(copy_project(&board, &target.path().join("one")).is_err());
 
-    // A link inside the design-intent folder.
+    // A linked design intent.
+    let source = tempfile::tempdir().unwrap();
+    let board = project(source.path());
+    std::fs::remove_file(source.path().join(".konnect/design_intent.json")).unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        source.path().join(".konnect/design_intent.json"),
+    )
+    .unwrap();
+    assert!(copy_project(&board, &target.path().join("two")).is_err());
+
+    // A linked `.konnect` folder, even with an intent file behind the link.
+    let source = tempfile::tempdir().unwrap();
+    let board = project(source.path());
+    put(outside.path(), "linked/design_intent.json", "{}");
+    std::fs::remove_dir_all(source.path().join(".konnect")).unwrap();
+    symlink(
+        outside.path().join("linked"),
+        source.path().join(".konnect"),
+    )
+    .unwrap();
+    assert!(copy_project(&board, &target.path().join("two-b")).is_err());
+    assert!(!target.path().join("two-b/.konnect").exists());
+
+    // A link in `.konnect` beside the intent is not looked at: no reason.
     let source = tempfile::tempdir().unwrap();
     let board = project(source.path());
     symlink(
@@ -731,7 +789,13 @@ fn a_symbolic_link_anywhere_is_refused() {
         source.path().join(".konnect/deep/linked.json"),
     )
     .unwrap();
-    assert!(copy_project(&board, &target.path().join("two")).is_err());
+    let copied = copy_project(&board, &target.path().join("two-c")).unwrap();
+    assert_eq!(copied, target.path().join("two-c/b.kicad_pcb"));
+    assert!(target
+        .path()
+        .join("two-c/.konnect/design_intent.json")
+        .is_file());
+    assert!(!target.path().join("two-c/.konnect/deep").exists());
 
     // A linked library folder.
     let source = tempfile::tempdir().unwrap();
