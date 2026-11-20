@@ -2559,6 +2559,127 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// Row LT, L6 and L7, through the production runner: with the call's Tune inputs
+    /// every run ends with the Tune pass, which gets `--tune`, every class ignored
+    /// and its own layer heights, and never `--pairs`; the routing passes get the
+    /// routing heights and the pairs file, and never `--tune`. A runner without Tune
+    /// inputs and heights runs the routing pass alone, as before.
+    #[tokio::test]
+    async fn every_run_of_a_search_tunes_with_the_calls_tune_inputs() {
+        use crate::route_judge::JudgeContext;
+        use crate::route_search::{Runner, Shape};
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::{FastrouteRunner, TuneFiles};
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("unrouted.full=0\n");
+        let search = fixture.path().join("search");
+        std::fs::create_dir_all(&search).unwrap();
+        let pairs = search.join("pairs.txt");
+        std::fs::write(&pairs, "pair /CAN_H /CAN_L skew=0.1\n").unwrap();
+        let tune_file = search.join("tune.txt");
+        std::fs::write(&tune_file, "group lt1 tolerance=0.25\n  /CAN_H\n  /CAN_L\n").unwrap();
+        let runner = |routing_heights: Option<&str>, tune: Option<TuneFiles>| FastrouteRunner {
+            binary: fixture.binary(),
+            dsn_text: Arc::new(RUNNER_DSN.to_string()),
+            hints: floor_hints(),
+            amps: None,
+            pairs: Some(pairs.clone()),
+            routing_heights: routing_heights.map(str::to_string),
+            tune,
+            fallback: WidthFallback::Floor,
+            folder: search.clone(),
+            judge: Arc::new(JudgeContext {
+                board: fixture.path().join("board.kicad_pcb"),
+                board_text: String::new(),
+                manifest: json!({}),
+                manifest_text: "{}".to_string(),
+                kicad_cli: String::new(),
+                pour_nets: Default::default(),
+                power_nets: Default::default(),
+                floors_mm: Default::default(),
+                root: search.join("judge"),
+                kicad_config_home: None,
+                lengths: None,
+            }),
+            tools: Arc::new(ToolContext::new(
+                ServerConfig::default(),
+                Arc::new(ToolRouter::new()),
+            )),
+        };
+        let args_of = |folder: &Path, name: &str| -> Vec<String> {
+            std::fs::read_to_string(folder.join(name).join(format!("{name}.ses.args")))
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let tune = TuneFiles {
+            file: tune_file.clone(),
+            classes: vec!["c1".to_string(), "c2".to_string()],
+            nets: ["/CAN_H", "/CAN_L"].iter().map(|n| n.to_string()).collect(),
+            layer_heights: Some("0,1.6".to_string()),
+        };
+        let with = runner(Some("0,1.58"), Some(tune));
+        for (index, shape, seed) in [(0, Shape::AsExported, 1), (1, Shape::Omitted, 1)] {
+            let routed = with.route(index, shape, seed, soon(60)).await.unwrap();
+            let names: Vec<&str> = routed
+                .held
+                .passes
+                .iter()
+                .map(|row| row["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["full", "fallback", "polish", "tune"], "run {index}");
+            let full = args_of(&routed.folder, "full");
+            assert!(
+                full.contains(&"--layer-heights=0,1.58".to_string()),
+                "{full:?}"
+            );
+            assert!(
+                full.contains(&format!("--pairs={}", pairs.display())),
+                "{full:?}"
+            );
+            assert!(
+                !full.iter().any(|arg| arg.starts_with("--tune")),
+                "{full:?}"
+            );
+            let tuned = args_of(&routed.folder, "tune");
+            assert!(
+                tuned.contains(&format!("--tune={}", tune_file.display())),
+                "{tuned:?}"
+            );
+            assert!(
+                tuned.contains(&"--layer-heights=0,1.6".to_string()),
+                "{tuned:?}"
+            );
+            assert!(
+                tuned.contains(&"--router.autorouter.ignore_net_classes=c1,c2".to_string()),
+                "{tuned:?}"
+            );
+            assert!(
+                !tuned.iter().any(|arg| arg.starts_with("--pairs")),
+                "{tuned:?}"
+            );
+        }
+        // Control: no Tune inputs and no routing heights, the call of a board
+        // without groups or pairs: three routing rows, no `--tune`, no heights.
+        let without = runner(None, None);
+        let routed = without
+            .route(10, Shape::AsExported, 1, soon(60))
+            .await
+            .unwrap();
+        assert_eq!(routed.held.passes.len(), 3, "{:?}", routed.held.passes);
+        assert!(!routed.folder.join("tune").exists());
+        let full = args_of(&routed.folder, "full");
+        assert!(
+            !full
+                .iter()
+                .any(|arg| arg.starts_with("--tune") || arg.starts_with("--layer-heights")),
+            "{full:?}"
+        );
+    }
+
     /// One call of `route_specctra_dsn`'s fastroute engine through its real path
     /// (`route_located`, so `search_and_write` and `conclude`), with a fake fastroute
     /// that echoes its `--pairs` argument and fails, and a fake kicad-cli. The board
@@ -2879,13 +3000,10 @@ int main(int argc, char **argv) {
             { "name": "bus", "kind": "bus", "nets": ["S1", "S2"],
               "length_groups": [{ "name": "g", "nets": ["S1", "S2"], "tolerance_mm": 0.5 }] }] })
         .to_string();
-        let cases: Vec<(
-            &str,
-            String,
-            Box<dyn Fn(&str) -> String>,
-            Box<dyn Fn(&str) -> String>,
-            &str,
-        )> = vec![
+        // What each case is called, the design intent, the edit of the DSN and of the
+        // board, and a word the refusal must name.
+        type Edit = Box<dyn Fn(&str) -> String>;
+        let cases: Vec<(&str, String, Edit, Edit, &str)> = vec![
             (
                 "an unresolved name",
                 unresolved,
@@ -2931,6 +3049,16 @@ int main(int argc, char **argv) {
                     )
                 }),
                 "'S1'",
+            ),
+            (
+                "a DSN whose net classes cannot be read",
+                group_intent(),
+                Box::new(rename(
+                    "(class konnect_class_0001 GND S1",
+                    "(class (x) GND S1",
+                )),
+                Box::new(unchanged),
+                "net classes could not be read",
             ),
             (
                 "a skew on a pair the pairs plan left out",

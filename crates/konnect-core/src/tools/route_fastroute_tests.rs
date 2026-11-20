@@ -1905,7 +1905,7 @@ async fn a_bus_is_tuned_to_its_window_and_kicad_agrees() {
 async fn a_target_no_run_can_reach_fails_g4_on_every_run() {
     let started = std::time::Instant::now();
     let (result, _dir) = route_pours_with_groups(json!([
-        { "name": "bus", "nets": ["S1", "S2", "S3", "S4"], "tolerance_mm": 0.5, "target_mm": 400.0 }
+        { "name": "bus", "nets": ["S1", "S2", "S3", "S4"], "tolerance_mm": 0.5, "target_mm": 1500.0 }
     ]))
     .await;
     let runs = result["search"]["runs"].as_array().unwrap();
