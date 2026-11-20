@@ -1423,9 +1423,7 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
             fallback: WidthFallback::Floor,
         };
         let Search {
-            _dir,
-            outcome: mut outcome,
-            ..
+            _dir, mut outcome, ..
         } = search;
         if !winner {
             outcome.winner = None;
