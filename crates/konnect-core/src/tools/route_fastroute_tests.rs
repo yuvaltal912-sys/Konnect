@@ -2272,6 +2272,11 @@ fn a_search_with_no_winner_reports_the_length_plan_unmeasured() {
         &length_plan(),
     );
     let found = body(&error);
+    // The field is there (an absent one would read as null below), unmeasured.
+    assert_eq!(
+        found["length_matching"]["groups"][0]["file_name"], "lt1",
+        "{found}"
+    );
     assert_eq!(
         found["length_matching"]["groups"][0]["pass"],
         Value::Null,
@@ -2281,6 +2286,21 @@ fn a_search_with_no_winner_reports_the_length_plan_unmeasured() {
         found["length_matching"]["groups"][0]["nets"][0]["kicad_mm"],
         Value::Null
     );
+    // The summary form of a search that judged nothing carries the plan as well.
+    let summary = result_json(
+        &search.root.join("board.dsn"),
+        &search.root.join("out.ses"),
+        &search.folder,
+        &candidate(),
+        (Effort::M, EffortSource::Argument),
+        &plan(),
+        &[Shape::AsExported],
+        &outcome,
+        &PairsPlan::default(),
+        &length_plan(),
+    );
+    assert_eq!(summary["success"], false);
+    assert_eq!(summary["length_matching"]["groups"][0]["file_name"], "lt1");
     // Control: without a plan, no field.
     let error = no_winner_result(
         &call,
