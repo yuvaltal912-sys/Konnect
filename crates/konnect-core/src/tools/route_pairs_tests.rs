@@ -304,6 +304,17 @@ fn of_several_classes_the_lowest_priority_number_decides_then_the_name() {
     );
     let text = project(classes.clone(), json!([]), assign(&["B", "A"]));
     assert_eq!(gap_mm(&text, "/N"), Some(0.32), "equal priority: by name");
+    // Priority, not name, decides: the class that sorts last by name has the lowest
+    // priority number.
+    let text = project(
+        json!([
+            { "name": "Alpha", "priority": 9, "diff_pair_gap": 0.9 },
+            { "name": "Zed", "priority": 0, "diff_pair_gap": 0.1 },
+        ]),
+        json!([]),
+        assign(&["Alpha", "Zed"]),
+    );
+    assert_eq!(gap_mm(&text, "/N"), Some(0.1));
     // A high-priority class that sets none leaves it to the next one.
     let text = project(
         json!([

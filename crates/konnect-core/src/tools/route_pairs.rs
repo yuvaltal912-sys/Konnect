@@ -291,10 +291,8 @@ pub(crate) fn write_file(folder: &Path, plan: &PairsPlan) -> anyhow::Result<Opti
 /// the call is as it was before pairs existed. An intent that exists and cannot be
 /// used gives an empty plan with a `note`.
 pub(crate) fn plan(board: &Path, dsn_text: &str) -> PairsPlan {
-    let folder = match board.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    // A bare file name has an empty parent, which joins as the current folder.
+    let folder = board.parent().unwrap_or_else(|| Path::new("."));
     let path = design_intent_path(folder);
     let declared = match read_design_intent(&path) {
         IntentRead::Absent => return PairsPlan::default(),
