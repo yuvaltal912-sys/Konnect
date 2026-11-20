@@ -8,7 +8,7 @@
 
 use super::*;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 fn hints(clearance: Option<i64>, retry: Option<i64>) -> RoutingHints {
     RoutingHints {
@@ -28,7 +28,15 @@ fn pass(name: &'static str, neck: f64, optimizer: bool, initial: Option<&str>) -
 }
 
 fn args_of(pass: &Pass, hints: &RoutingHints, amps: Option<&Path>) -> Vec<String> {
-    args_with(pass, hints, CallFiles { amps, pairs: None })
+    args_with(
+        pass,
+        hints,
+        CallFiles {
+            amps,
+            pairs: None,
+            layer_heights: None,
+        },
+    )
 }
 
 fn args_with(pass: &Pass, hints: &RoutingHints, files: CallFiles<'_>) -> Vec<String> {
@@ -103,7 +111,11 @@ fn every_pass_kind_sends_each_setting_once_and_nothing_forbidden() {
             let args = args_with(
                 pass,
                 &hints(Some(250), Some(120)),
-                CallFiles { amps, pairs },
+                CallFiles {
+                    amps,
+                    pairs,
+                    layer_heights: None,
+                },
             );
             let mut seen = HashSet::new();
             for token in &args {
@@ -193,6 +205,7 @@ fn pairs_switch_is_present_only_when_given() {
         CallFiles {
             amps: Some(amps),
             pairs: Some(pairs),
+            layer_heights: None,
         },
     );
     assert_eq!(value(&some, "--pairs="), Some("/d/with space/pairs.txt"));
@@ -213,6 +226,7 @@ fn pairs_switch_is_present_only_when_given() {
         CallFiles {
             amps: None,
             pairs: Some(pairs),
+            layer_heights: None,
         },
     );
     assert_eq!(value(&only, "--pairs="), Some("/d/with space/pairs.txt"));
@@ -393,6 +407,718 @@ fn tail_keeps_the_end() {
     assert_eq!(tail("abcdef", 3), "def");
 }
 
+// ---- Row LT: layer heights and the Tune pass's command line -----------------
+
+fn tune_inputs<'a>(
+    file: &'a Path,
+    classes: &'a [String],
+    nets: &'a BTreeSet<String>,
+    layer_heights: Option<&'a str>,
+) -> TuneInputs<'a> {
+    TuneInputs {
+        tune: file,
+        classes,
+        nets,
+        layer_heights,
+    }
+}
+
+fn names(list: &[&str]) -> BTreeSet<String> {
+    list.iter().map(|name| name.to_string()).collect()
+}
+
+fn class_list(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| name.to_string()).collect()
+}
+
+fn tune_args(
+    hints: &RoutingHints,
+    files: CallFiles<'_>,
+    classes: &[String],
+    layer_heights: Option<&str>,
+) -> Vec<String> {
+    let nets = names(&["A"]);
+    tune_pass_arguments(
+        Path::new("/d/in.dsn"),
+        Path::new("/d/out.ses"),
+        Path::new("/d/out.json"),
+        hints,
+        files,
+        &tune_inputs(Path::new("/d/tune.txt"), classes, &nets, layer_heights),
+        Path::new("/d/with space/held.ses"),
+    )
+}
+
+#[test]
+fn the_layer_heights_switch_is_one_token_after_pairs_and_only_when_given() {
+    assert_eq!(
+        layer_heights_argument("0,0.55,1.58"),
+        "--layer-heights=0,0.55,1.58"
+    );
+    for pass in [
+        pass("full", 0.0, true, None),
+        pass("fallback", 120.0, false, Some("/d/full.ses")),
+        pass("polish", 0.0, true, Some("/d/fallback.ses")),
+    ] {
+        let with = args_with(
+            &pass,
+            &hints(Some(250), Some(120)),
+            CallFiles {
+                amps: Some(Path::new("/d/amps.txt")),
+                pairs: Some(Path::new("/d/pairs.txt")),
+                layer_heights: Some("0,1.58"),
+            },
+        );
+        let at = |prefix: &str| with.iter().position(|token| token.starts_with(prefix));
+        assert_eq!(value(&with, "--layer-heights="), Some("0,1.58"));
+        assert_eq!(
+            at("--layer-heights="),
+            at("--pairs=").map(|pairs| pairs + 1),
+            "{}: right after --pairs: {with:?}",
+            pass.name
+        );
+        assert!(
+            !with.iter().any(|token| token.starts_with("--tune")),
+            "{}: routing passes never get --tune",
+            pass.name
+        );
+        // Without a pair it follows the amps file, and the initial session stays last.
+        let heights_only = args_with(
+            &pass,
+            &hints(None, None),
+            CallFiles {
+                amps: Some(Path::new("/d/amps.txt")),
+                pairs: None,
+                layer_heights: Some("0,1.58"),
+            },
+        );
+        let heights_at = heights_only
+            .iter()
+            .position(|token| token.starts_with("--layer-heights="))
+            .unwrap();
+        assert!(heights_only[heights_at - 1].starts_with("--x.par_via_amps="));
+        // Not given: not sent, and the line is the one the call had before Row LT.
+        let without = args_with(&pass, &hints(Some(250), Some(120)), CallFiles::default());
+        assert!(!without
+            .iter()
+            .any(|token| token.starts_with("--layer-heights")));
+    }
+}
+
+#[test]
+fn tune_pass_arguments_follow_the_documented_order() {
+    let args = tune_args(
+        &hints(Some(500), Some(120)),
+        CallFiles {
+            amps: Some(Path::new("/d/amps.txt")),
+            pairs: None,
+            layer_heights: Some("0,1.58"),
+        },
+        &class_list(&["konnect_class_0001", "power"]),
+        Some("0,1.58"),
+    );
+    let mut expected: Vec<String> = [
+        "-de",
+        "/d/in.dsn",
+        "-do",
+        "/d/out.ses",
+        "--report=/d/out.json",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    expected.extend(PRESET.iter().map(|s| s.to_string()));
+    expected.extend(
+        [
+            "--router.optimizer.enabled=false",
+            "--router.autorouter.ignore_net_classes=konnect_class_0001,power",
+            "--router.copper_to_edge_clearance_um=500",
+            "--router.autorouter.max_threads=2",
+            "--router.optimizer.max_threads=2",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    expected.extend(CANDIDATE_SWITCHES.iter().map(|s| s.to_string()));
+    expected.extend(
+        [
+            "--x.par_via_amps=/d/amps.txt",
+            "--tune=/d/tune.txt",
+            "--layer-heights=0,1.58",
+            "--initial-session=/d/with space/held.ses",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    assert_eq!(args, expected);
+}
+
+#[test]
+fn tune_pass_arguments_leave_out_what_is_not_given_and_never_send_a_forbidden_setting() {
+    let amps = Path::new("/d/amps.txt");
+    for (classes, hint, amps, heights) in [
+        (class_list(&[]), hints(None, None), None, None),
+        (
+            class_list(&["a"]),
+            hints(Some(250), Some(120)),
+            Some(amps),
+            Some("0,1.58"),
+        ),
+        (
+            class_list(&["a", "b", "c"]),
+            hints(Some(300), None),
+            None,
+            Some("0,1.58"),
+        ),
+    ] {
+        // The call's pairs file is on `files`, as it is for the routing passes: the
+        // Tune pass still never sends it.
+        let args = tune_args(
+            &hint,
+            CallFiles {
+                amps,
+                pairs: Some(Path::new("/d/pairs.txt")),
+                layer_heights: heights,
+            },
+            &classes,
+            heights,
+        );
+        let mut seen = HashSet::new();
+        for token in &args {
+            assert!(
+                seen.insert(key(token).to_string()),
+                "{token} repeats a setting: {args:?}"
+            );
+            for forbidden in [
+                "--pairs",
+                "--live",
+                "--multi-start",
+                "--max-time",
+                "--diagnose",
+                "--router.neck_width_um",
+            ] {
+                assert!(!token.starts_with(forbidden), "forbidden {token}");
+            }
+        }
+        for switch in CANDIDATE_SWITCHES.iter().chain(PRESET.iter()) {
+            assert_eq!(
+                args.iter()
+                    .filter(|token| token.as_str() == *switch)
+                    .count(),
+                1,
+                "{switch}"
+            );
+        }
+        assert_eq!(
+            value(&args, "--router.optimizer.enabled="),
+            Some("false"),
+            "the optimizer is off"
+        );
+        assert_eq!(
+            value(&args, "--router.autorouter.ignore_net_classes="),
+            (!classes.is_empty()).then(|| classes.join(",")).as_deref(),
+            "every class is ignored, and the switch is left out when there is none"
+        );
+        assert_eq!(
+            value(&args, "--router.copper_to_edge_clearance_um=").is_some(),
+            hint.copper_edge_clearance_um.is_some()
+        );
+        assert_eq!(value(&args, "--x.par_via_amps=").is_some(), amps.is_some());
+        assert_eq!(value(&args, "--layer-heights="), heights);
+        assert_eq!(value(&args, "--tune="), Some("/d/tune.txt"));
+        assert_eq!(
+            args.last().unwrap(),
+            "--initial-session=/d/with space/held.ses"
+        );
+    }
+    // The 250 trap holds here too (Freerouting reads exactly 250 as "unset").
+    let args = tune_args(
+        &hints(Some(250), None),
+        CallFiles::default(),
+        &class_list(&["a"]),
+        None,
+    );
+    assert_eq!(
+        value(&args, "--router.copper_to_edge_clearance_um="),
+        Some("250.001")
+    );
+}
+
+/// The Tune line and the Polish line (the routing pass nearest to it: the optimizer
+/// on, no neck) differ in exactly the Tune pass's settings and nothing else.
+#[test]
+fn the_polish_line_differs_from_the_tune_line_in_exactly_the_tune_settings() {
+    let files = CallFiles {
+        amps: Some(Path::new("/d/amps.txt")),
+        pairs: Some(Path::new("/d/pairs.txt")),
+        layer_heights: Some("0,1.58"),
+    };
+    let hint = hints(Some(500), Some(120));
+    let polish = pass_arguments(
+        Path::new("/d/in.dsn"),
+        Path::new("/d/out.ses"),
+        Path::new("/d/out.json"),
+        &hint,
+        files,
+        &pass("polish", 0.0, true, Some("/d/with space/held.ses")),
+    );
+    let tune = tune_args(
+        &hint,
+        files,
+        &class_list(&["konnect_class_0001"]),
+        Some("0,1.58"),
+    );
+    let keys = |args: &[String]| -> BTreeSet<String> {
+        args.iter().map(|token| key(token).to_string()).collect()
+    };
+    let (polish_keys, tune_keys) = (keys(&polish), keys(&tune));
+    let only_polish: BTreeSet<_> = polish_keys.difference(&tune_keys).cloned().collect();
+    let only_tune: BTreeSet<_> = tune_keys.difference(&polish_keys).cloned().collect();
+    assert_eq!(
+        only_polish,
+        names(&["--pairs", "--router.neck_width_um"]),
+        "what the Tune pass does not send"
+    );
+    assert_eq!(
+        only_tune,
+        names(&["--router.autorouter.ignore_net_classes", "--tune"]),
+        "what only the Tune pass sends"
+    );
+    // The one setting both send with another value.
+    let shared: Vec<&String> = polish_keys.intersection(&tune_keys).collect();
+    let different: Vec<&&String> = shared
+        .iter()
+        .filter(|name| value(&polish, &format!("{name}=")) != value(&tune, &format!("{name}=")))
+        .collect();
+    assert_eq!(
+        different
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>(),
+        ["--router.optimizer.enabled"],
+        "the optimizer: on for Polish, off for the Tune pass"
+    );
+    // Everything else is the same, in the same order.
+    let common = |args: &[String]| -> Vec<String> {
+        args.iter()
+            .filter(|token| {
+                let key = key(token);
+                polish_keys.contains(key) && tune_keys.contains(key)
+            })
+            .filter(|token| !token.starts_with("--router.optimizer.enabled="))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(common(&polish), common(&tune));
+}
+
+// ---- Row LT: the geometry comparison of two sessions (L6) -------------------
+
+/// Session units per micrometre in the test sessions (`resolution um 10`).
+const UNITS: i64 = 10;
+
+fn wire(layer: &str, width_um: i64, points: &[(i64, i64)]) -> String {
+    let coordinates: Vec<String> = points
+        .iter()
+        .flat_map(|(x, y)| [(x * UNITS).to_string(), (y * UNITS).to_string()])
+        .collect();
+    format!(
+        "(wire (path {layer} {} {}))",
+        width_um * UNITS,
+        coordinates.join(" ")
+    )
+}
+
+fn via(padstack: &str, x: i64, y: i64) -> String {
+    format!("(via \"{padstack}\" {} {})", x * UNITS, y * UNITS)
+}
+
+fn session_with(resolution: &str, nets: &[(&str, String)]) -> String {
+    let nets: Vec<String> = nets
+        .iter()
+        .map(|(name, items)| format!("(net {name} {items})"))
+        .collect();
+    format!(
+        "(session board (base_design board) (placement (resolution um 10)) (was_is) \
+         (routes (resolution {resolution}) (parser (host_cad Konnect)) (library_out) \
+         (network_out {})))",
+        nets.join(" ")
+    )
+}
+
+fn session(nets: &[(&str, String)]) -> String {
+    session_with("um 10", nets)
+}
+
+fn changed(before: &str, after: &str, nets: &[&str]) -> Vec<String> {
+    changed_outside(before, after, &names(nets)).unwrap()
+}
+
+/// A session of three nets, the shape most of these tests start from.
+fn base() -> String {
+    session(&[
+        (
+            "A",
+            wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)]) + &via("v", 10000, 5000),
+        ),
+        ("B", wire("F.Cu", 250, &[(0, 1000), (20000, 1000)])),
+        ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
+    ])
+}
+
+#[test]
+fn identical_sessions_and_group_net_changes_name_nothing() {
+    assert!(changed(&base(), &base(), &[]).is_empty());
+    // A group net's wire moved: nothing outside the group changed.
+    let moved = session(&[
+        (
+            "A",
+            wire("F.Cu", 250, &[(0, 0), (10000, 300), (10000, 5000)]) + &via("v", 10000, 5000),
+        ),
+        ("B", wire("F.Cu", 250, &[(0, 1000), (20000, 1000)])),
+        ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
+    ]);
+    assert!(changed(&base(), &moved, &["A"]).is_empty());
+    // The same move, with A outside the group, is named.
+    assert_eq!(changed(&base(), &moved, &["B"]), ["A"]);
+    // Net names are compared as they are written.
+    assert!(changed(&base(), &moved, &["a"]) == ["A"]);
+}
+
+#[test]
+fn another_nets_wire_or_via_moved_added_or_removed_is_named() {
+    let b = wire("F.Cu", 250, &[(0, 1000), (20000, 1000)]);
+    let c = wire("B.Cu", 200, &[(0, 2000), (0, 8000)]);
+    let a = wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)]) + &via("v", 10000, 5000);
+    let cases: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "a wire's end moved by 2 um",
+            session(&[
+                ("A", a.clone()),
+                ("B", wire("F.Cu", 250, &[(0, 1000), (20002, 1000)])),
+                ("C", c.clone()),
+            ]),
+            vec!["B"],
+        ),
+        (
+            "a via moved",
+            session(&[
+                (
+                    "A",
+                    wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)])
+                        + &via("v", 10003, 5000),
+                ),
+                ("B", b.clone()),
+                ("C", c.clone()),
+            ]),
+            vec!["A"],
+        ),
+        (
+            "a via added",
+            session(&[
+                ("A", a.clone()),
+                ("B", b.clone() + &via("v", 100, 1000)),
+                ("C", c.clone()),
+            ]),
+            vec!["B"],
+        ),
+        (
+            "a via removed",
+            session(&[
+                ("A", wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)])),
+                ("B", b.clone()),
+                ("C", c.clone()),
+            ]),
+            vec!["A"],
+        ),
+        (
+            "a via's padstack changed",
+            session(&[
+                (
+                    "A",
+                    wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)])
+                        + &via("w", 10000, 5000),
+                ),
+                ("B", b.clone()),
+                ("C", c.clone()),
+            ]),
+            vec!["A"],
+        ),
+        (
+            "a wire added",
+            session(&[
+                ("A", a.clone()),
+                (
+                    "B",
+                    b.clone() + &wire("F.Cu", 250, &[(0, 1500), (500, 1500)]),
+                ),
+                ("C", c.clone()),
+            ]),
+            vec!["B"],
+        ),
+        (
+            "a net's wire removed",
+            session(&[("A", a.clone()), ("B", b.clone()), ("C", String::new())]),
+            vec!["C"],
+        ),
+        (
+            "a net gone",
+            session(&[("A", a.clone()), ("B", b.clone())]),
+            vec!["C"],
+        ),
+        (
+            "a net appearing",
+            session(&[
+                ("A", a.clone()),
+                ("B", b.clone()),
+                ("C", c.clone()),
+                ("D", wire("F.Cu", 250, &[(0, 0), (500, 0)])),
+            ]),
+            vec!["D"],
+        ),
+        (
+            "a layer changed",
+            session(&[
+                ("A", a.clone()),
+                ("B", b.clone()),
+                ("C", wire("F.Cu", 200, &[(0, 2000), (0, 8000)])),
+            ]),
+            vec!["C"],
+        ),
+        (
+            "a width changed",
+            session(&[
+                ("A", a.clone()),
+                ("B", b.clone()),
+                ("C", wire("B.Cu", 201, &[(0, 2000), (0, 8000)])),
+            ]),
+            vec!["C"],
+        ),
+    ];
+    for (what, after, expected) in cases {
+        assert_eq!(changed(&base(), &after, &[]), expected, "{what}");
+        assert_eq!(changed(&after, &base(), &[]), expected, "{what}, reversed");
+    }
+    // Several nets are named in sorted order, and the group's are left out.
+    let all = session(&[
+        ("A", wire("F.Cu", 250, &[(0, 0), (1, 1)])),
+        ("B", wire("F.Cu", 250, &[(0, 1000), (1, 1000)])),
+        ("C", wire("B.Cu", 200, &[(0, 2000), (0, 9000)])),
+    ]);
+    assert_eq!(changed(&base(), &all, &[]), ["A", "B", "C"]);
+    assert_eq!(changed(&base(), &all, &["B"]), ["A", "C"]);
+}
+
+#[test]
+fn one_trace_split_into_collinear_pieces_compares_equal() {
+    let whole = session(&[("A", wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)]))]);
+    let split = |items: &[String]| session(&[("A", items.concat())]);
+    // Split at a point, each half its own wire.
+    assert!(changed(
+        &whole,
+        &split(&[
+            wire("F.Cu", 250, &[(0, 0), (4000, 0)]),
+            wire("F.Cu", 250, &[(4000, 0), (10000, 0), (10000, 5000)]),
+        ]),
+        &[]
+    )
+    .is_empty());
+    // Pieces in another order and direction, and an overlap: the same copper.
+    assert!(changed(
+        &whole,
+        &split(&[
+            wire("F.Cu", 250, &[(10000, 5000), (10000, 0)]),
+            wire("F.Cu", 250, &[(6000, 0), (0, 0)]),
+            wire("F.Cu", 250, &[(3000, 0), (10000, 0)]),
+        ]),
+        &[]
+    )
+    .is_empty());
+    // A path whose middle point lies on the line is the same as the path without it.
+    assert!(changed(
+        &whole,
+        &split(&[wire(
+            "F.Cu",
+            250,
+            &[(0, 0), (5000, 0), (10000, 0), (10000, 2500), (10000, 5000)]
+        )]),
+        &[]
+    )
+    .is_empty());
+    // A gap between the pieces is not merged away.
+    assert_eq!(
+        changed(
+            &whole,
+            &split(&[
+                wire("F.Cu", 250, &[(0, 0), (4000, 0)]),
+                wire("F.Cu", 250, &[(4100, 0), (10000, 0), (10000, 5000)]),
+            ]),
+            &[]
+        ),
+        ["A"]
+    );
+    // Pieces of another width or layer are not merged into the trace.
+    assert_eq!(
+        changed(
+            &whole,
+            &split(&[
+                wire("F.Cu", 250, &[(0, 0), (4000, 0)]),
+                wire("F.Cu", 300, &[(4000, 0), (10000, 0)]),
+                wire("F.Cu", 250, &[(10000, 0), (10000, 5000)]),
+            ]),
+            &[]
+        ),
+        ["A"]
+    );
+    // Parallel traces on neighbouring lines are not merged either.
+    let two = session(&[(
+        "A",
+        wire("F.Cu", 250, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 250, &[(0, 1), (1000, 1)]),
+    )]);
+    let one = session(&[("A", wire("F.Cu", 250, &[(0, 0), (1000, 0)]))]);
+    assert_eq!(changed(&two, &one, &[]), ["A"]);
+}
+
+#[test]
+fn the_comparison_rounds_to_a_micrometre_and_uses_the_sessions_own_resolution() {
+    let at = |x: f64| {
+        // Whole units: 10 per micrometre.
+        let end = (x * UNITS as f64).round() as i64;
+        session(&[(
+            "A",
+            format!("(wire (path F.Cu 2500 0 0 {end} 0)) (via \"v\" 0 {end})"),
+        )])
+    };
+    // 0.4 um is below the rounding step; 2 um is above it.
+    assert!(changed(&at(10000.0), &at(10000.4), &[]).is_empty());
+    assert!(changed(&at(10000.0), &at(9999.6), &[]).is_empty());
+    assert_eq!(changed(&at(10000.0), &at(10002.0), &[]), ["A"]);
+    assert_eq!(changed(&at(10000.0), &at(9998.0), &[]), ["A"]);
+    // The same geometry in another resolution and unit compares equal.
+    let in_mm = |resolution: &str, scale: i64| {
+        session_with(
+            resolution,
+            &[(
+                "A",
+                format!(
+                    "(wire (path F.Cu {} 0 0 {} {})) (via \"v\" 0 {})",
+                    250 * scale / 1000,
+                    10000 * scale / 1000,
+                    -5000 * scale / 1000,
+                    10000 * scale / 1000
+                ),
+            )],
+        )
+    };
+    let um1 = in_mm("um 1", 1000);
+    assert!(changed(&um1, &in_mm("um 10", 10_000), &[]).is_empty());
+    assert!(changed(&um1, &in_mm("mm 1000", 1000), &[]).is_empty());
+    assert_eq!(changed(&um1, &in_mm("mm 1000", 1001), &[]), ["A"]);
+}
+
+#[test]
+fn keywords_in_any_letter_case_read_the_same() {
+    let lower = base();
+    let upper = lower
+        .replace("(session", "(SESSION")
+        .replace("(routes", "(Routes")
+        .replace("(resolution um 10) (parser", "(RESOLUTION UM 10) (parser")
+        .replace("(network_out", "(NETWORK_OUT")
+        .replace("(net ", "(NET ")
+        .replace("(wire", "(WIRE")
+        .replace("(path", "(PATH")
+        .replace("(via", "(Via");
+    assert_ne!(lower, upper);
+    assert!(changed(&lower, &upper, &[]).is_empty());
+    // And a change is seen through the other letter case.
+    let moved = upper.replace("F.Cu 2500 0 10000", "F.Cu 2500 0 10020");
+    assert_ne!(moved, upper);
+    assert_eq!(changed(&lower, &moved, &[]), ["B"]);
+}
+
+#[test]
+fn a_net_with_no_copper_equals_a_net_that_is_not_there() {
+    let empty = session(&[("A", String::new())]);
+    let none = session(&[]);
+    assert!(changed(&empty, &none, &[]).is_empty());
+    assert!(changed(&none, &empty, &[]).is_empty());
+    // A net named in two entries is one net.
+    let twice = session(&[
+        ("A", wire("F.Cu", 250, &[(0, 0), (1000, 0)])),
+        ("A", wire("F.Cu", 250, &[(1000, 0), (3000, 0)])),
+    ]);
+    let once = session(&[("A", wire("F.Cu", 250, &[(0, 0), (3000, 0)]))]);
+    assert!(changed(&twice, &once, &[]).is_empty());
+}
+
+#[test]
+fn a_session_that_cannot_be_read_is_an_error_naming_which_one() {
+    let arc = session(&[("A", "(wire (qarc F.Cu 2500 0 0 10 0 0 10))".to_string())]);
+    for (what, text) in [
+        ("not a session", "(pcb board)".to_string()),
+        ("not balanced", "(session b (routes".to_string()),
+        ("a wire that is not a path", arc.clone()),
+        (
+            "an odd coordinate count",
+            session(&[("A", "(wire (path F.Cu 2500 0 0 10))".to_string())]),
+        ),
+        (
+            "one point",
+            session(&[("A", "(wire (path F.Cu 2500 0 0))".to_string())]),
+        ),
+        (
+            "a coordinate that is not a number",
+            session(&[("A", "(wire (path F.Cu 2500 0 0 x 0))".to_string())]),
+        ),
+        (
+            "a coordinate too large",
+            session(&[(
+                "A",
+                "(wire (path F.Cu 2500 0 0 99999999999999999 0))".to_string(),
+            )]),
+        ),
+        (
+            "a via without a position",
+            session(&[("A", "(via \"v\" 5)".to_string())]),
+        ),
+        ("no routes", "(session b (base_design b))".to_string()),
+    ] {
+        assert!(copper_by_net(&text).is_err(), "{what}");
+        let error = changed_outside(&text, &base(), &names(&[])).unwrap_err();
+        assert!(format!("{error:#}").contains("before"), "{what}: {error:#}");
+        let error = changed_outside(&base(), &text, &names(&[])).unwrap_err();
+        assert!(format!("{error:#}").contains("after"), "{what}: {error:#}");
+    }
+    // A wire's descriptors are not shapes.
+    let typed = session(&[(
+        "A",
+        "(wire (path F.Cu 2500 0 0 100 0) (type protect))".to_string(),
+    )]);
+    assert_eq!(copper_by_net(&typed).unwrap()["A"].pieces.len(), 1);
+}
+
+#[test]
+fn copper_by_net_orders_the_ends_and_the_lists() {
+    let session = session(&[(
+        "A",
+        wire("B.Cu", 250, &[(500, 0), (0, 0)])
+            + &wire("F.Cu", 250, &[(0, 0), (0, 700)])
+            + &via("z", 9, 9)
+            + &via("a", 5, 5),
+    )]);
+    let copper = copper_by_net(&session).unwrap();
+    assert_eq!(
+        copper["A"],
+        NetCopper {
+            pieces: vec![
+                ("B.Cu".to_string(), 250, [0, 0, 500, 0]),
+                ("F.Cu".to_string(), 250, [0, 0, 0, 700]),
+            ],
+            vias: vec![("a".to_string(), [5, 5]), ("z".to_string(), [9, 9])],
+        }
+    );
+}
+
 // ---- on a system that cannot isolate a run ---------------------------------
 
 #[cfg(not(target_os = "macos"))]
@@ -462,6 +1188,13 @@ static int cfg_int(const char *key, int def) {
     return cfg(key, v, sizeof v) ? atoi(v) : def;
 }
 
+// A switch for one pass (`<name>.<pass>=1`) or for every pass (`<name>=1`).
+static int cfg_pass_flag(const char *name, const char *pass) {
+    char k[300];
+    snprintf(k, sizeof k, "%s.%s", name, pass);
+    return cfg_int(k, cfg_int(name, 0));
+}
+
 static void escape_attempts(const char *sesdir) {
     char path[4400];
     snprintf(path, sizeof path, "%s/escape.txt", sesdir);
@@ -510,7 +1243,7 @@ int main(int argc, char **argv) {
         sleep(30);
         return 0;
     }
-    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL;
+    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL, *tune = NULL;
     int version = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) version = 1;
@@ -518,6 +1251,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-do") == 0 && i + 1 < argc) ses = argv[++i];
         else if (strncmp(argv[i], "--report=", 9) == 0) report = argv[i] + 9;
         else if (strncmp(argv[i], "--pairs=", 8) == 0) pairs = argv[i] + 8;
+        else if (strncmp(argv[i], "--tune=", 7) == 0) tune = argv[i] + 7;
     }
     if (version) {
         char text[256] = "fastroute 0.1.14";
@@ -604,6 +1338,12 @@ int main(int argc, char **argv) {
         return 3;
     }
 
+    if (tune && cfg_int("no_tune", 0)) {
+        // A build without tuning: its own message, then failure.
+        fprintf(stderr, "fake fastroute without tuning: unknown option --tune\n");
+        return 2;
+    }
+
     char key[300], val[1100];
     snprintf(key, sizeof key, "sleep.%s", pass);
     if (cfg(key, val, sizeof val)) {
@@ -624,7 +1364,7 @@ int main(int argc, char **argv) {
     snprintf(key, sizeof key, "unrouted.%s", pass);
     int unrouted = cfg_int(key, cfg_int("unrouted", 0));
     int violations = cfg_int("violations", 0);
-    if (report && !cfg_int("noreport", 0)) {
+    if (report && !cfg_pass_flag("noreport", pass)) {
         FILE *r = fopen(report, "w");
         if (r) {
             if (cfg("report", val, sizeof val)) {
@@ -639,10 +1379,27 @@ int main(int argc, char **argv) {
             fclose(r);
         }
     }
-    if (!cfg_int("nosession", 0)) {
+    if (!cfg_pass_flag("nosession", pass)) {
+        // The session text: a copy of the file named by copy_session.<pass> (or
+        // copy_session), else a stand-in.
+        char src[4096];
+        snprintf(key, sizeof key, "copy_session.%s", pass);
+        int have = cfg(key, src, sizeof src) || cfg("copy_session", src, sizeof src);
         FILE *s = fopen(ses, "w");
         if (s) {
-            if (!cfg_int("empty_session", 0)) fputs("(session fake)\n", s);
+            if (have) {
+                FILE *in = fopen(src, "r");
+                if (in) {
+                    char buf[4096];
+                    size_t n;
+                    while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, s);
+                    fclose(in);
+                } else {
+                    fputs("UNREADABLE\n", s);
+                }
+            } else if (!cfg_int("empty_session", 0)) {
+                fputs("(session fake)\n", s);
+            }
             fclose(s);
         }
     }
@@ -696,6 +1453,9 @@ int main(int argc, char **argv) {
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::write(bin.join("control.txt"), control).unwrap();
             Self { dir, binary }
+        }
+        fn set_control(&self, control: &str) {
+            std::fs::write(self.binary.parent().unwrap().join("control.txt"), control).unwrap();
         }
         fn path(&self) -> &Path {
             self.dir.path()
@@ -1229,6 +1989,7 @@ int main(int argc, char **argv) {
             CallFiles {
                 amps: Some(&amps),
                 pairs: None,
+                layer_heights: None,
             },
             pass.clone(),
             soon(30),
@@ -1249,6 +2010,7 @@ int main(int argc, char **argv) {
             CallFiles {
                 amps: Some(&amps),
                 pairs: None,
+                layer_heights: None,
             },
             &pass,
         );
@@ -1458,6 +2220,7 @@ int main(int argc, char **argv) {
             hints,
             CallFiles::default(),
             fallback,
+            None,
             soon(seconds),
         )
         .await
@@ -1664,8 +2427,10 @@ int main(int argc, char **argv) {
             CallFiles {
                 amps: None,
                 pairs: Some(&pairs),
+                layer_heights: None,
             },
             WidthFallback::Floor,
+            None,
             soon(60),
         )
         .await
@@ -2111,5 +2876,495 @@ int main(int argc, char **argv) {
             "{profile}"
         );
         drop(listener);
+    }
+
+    // ---- Row LT: the Tune pass ------------------------------------------------
+
+    /// Runs the hold sequence with a Tune pass whose input session is `before`
+    /// (Full's) and whose output is `after`, both given to the fake as files.
+    /// `control` adds the fake's other settings. The call also gives the routing
+    /// passes a pairs file and layer heights of their own, which the Tune pass must
+    /// not take. Returns the fixture and the run's result.
+    async fn tune_run(
+        before: &str,
+        after: &str,
+        control: &str,
+        nets: &[&str],
+        seconds: u64,
+    ) -> (Fixture, std::result::Result<Held, PassError>) {
+        let fixture = Fixture::new("");
+        let before_path = fixture.path().join("before.ses");
+        let after_path = fixture.path().join("after.ses");
+        std::fs::write(&before_path, before).unwrap();
+        std::fs::write(&after_path, after).unwrap();
+        fixture.set_control(&format!(
+            "copy_session.full={}\ncopy_session.tune={}\n{control}",
+            before_path.display(),
+            after_path.display()
+        ));
+        let tune_file = fixture.path().join("tune.txt");
+        std::fs::write(&tune_file, "group lt1 tolerance=0.5\n  A\n").unwrap();
+        let pairs = fixture.path().join("pairs.txt");
+        std::fs::write(&pairs, "pair /X /Y gap=0.2\n").unwrap();
+        let classes = class_list(&["c1", "c2"]);
+        let nets = names(nets);
+        let result = route_held(
+            &fixture.binary(),
+            &fixture.path().join("held"),
+            &fixture.dsn(),
+            &floor_hints(),
+            CallFiles {
+                amps: None,
+                pairs: Some(&pairs),
+                layer_heights: Some("9,9"),
+            },
+            WidthFallback::None,
+            Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+            soon(seconds),
+        )
+        .await;
+        (fixture, result)
+    }
+
+    /// Full, then Fallback and Polish skipped, then the Tune pass: its row.
+    fn tune_row(held: &Held) -> (&str, &str, Option<&str>) {
+        assert_eq!(held.passes.len(), 4, "{:?}", held.passes);
+        row(held, 3)
+    }
+
+    /// `base()` with A changed (a meander) and B written as two collinear pieces: the
+    /// copper of B is the same geometry.
+    fn tuned_base() -> String {
+        session(&[
+            (
+                "A",
+                wire(
+                    "F.Cu",
+                    250,
+                    &[
+                        (0, 0),
+                        (3000, 0),
+                        (3000, 800),
+                        (3500, 800),
+                        (3500, 0),
+                        (10000, 0),
+                        (10000, 5000),
+                    ],
+                ) + &via("v", 10000, 5000),
+            ),
+            (
+                "B",
+                wire("F.Cu", 250, &[(20000, 1000), (9000, 1000)])
+                    + &wire("F.Cu", 250, &[(0, 1000), (9000, 1000)]),
+            ),
+            ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_tune_pass_that_changes_only_group_nets_is_kept() {
+        let (fixture, held) = tune_run(&base(), &tuned_base(), "", &["A"], 30).await;
+        let held = held.unwrap();
+        assert_eq!(tune_row(&held), ("tune", "kept", None));
+        assert_eq!(held.kept, TUNE_PASS);
+        assert_eq!(held.ses, fixture.path().join("held/tune/tune.ses"));
+        assert_eq!(held.unrouted, 0);
+        // Its session is the one the run now holds.
+        assert_eq!(std::fs::read_to_string(&held.ses).unwrap(), tuned_base());
+        // The row joins the others, and the pass's time joins the run's.
+        assert_eq!(row(&held, 0), ("full", "kept", None));
+        assert_eq!(row(&held, 1).1, "skipped");
+        assert_eq!(row(&held, 2).1, "skipped");
+        let seconds: f64 = [0, 3]
+            .iter()
+            .map(|&i| held.passes[i]["seconds"].as_f64().unwrap())
+            .sum();
+        assert!((held.seconds - seconds).abs() < 1e-9, "{}", held.seconds);
+        assert_eq!(held.passes[3]["unrouted"], 0);
+
+        // What the pass was given: the held session, the tune file, every class
+        // ignored, the optimizer off, its own heights, and no pairs file.
+        let args = pass_args(&fixture, "tune");
+        let full = fixture.path().join("held/full/full.ses");
+        assert_eq!(
+            value(&args, "--initial-session="),
+            Some(full.to_str().unwrap())
+        );
+        assert_eq!(
+            value(&args, "--tune="),
+            Some(fixture.path().join("tune.txt").to_str().unwrap())
+        );
+        assert_eq!(
+            value(&args, "--router.autorouter.ignore_net_classes="),
+            Some("c1,c2")
+        );
+        assert_eq!(value(&args, "--router.optimizer.enabled="), Some("false"));
+        assert_eq!(value(&args, "--layer-heights="), Some("0,1.58"));
+        assert!(!args.iter().any(|t| t.starts_with("--pairs")), "{args:?}");
+        assert!(!args.iter().any(|t| t.starts_with("--router.neck_width_um")));
+        assert!(!fixture.path().join("held/tune/tune.ses.pairs").exists());
+        assert_eq!(
+            args.last().unwrap(),
+            &format!("--initial-session={}", full.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tune_pass_that_changes_another_nets_copper_is_discarded_naming_it() {
+        let moved_b = session(&[
+            (
+                "A",
+                wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)]) + &via("v", 10000, 5000),
+            ),
+            ("B", wire("F.Cu", 250, &[(0, 1000), (20000, 1002)])),
+            ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
+        ]);
+        let (fixture, held) = tune_run(&base(), &moved_b, "", &["A"], 30).await;
+        let held = held.unwrap();
+        assert_eq!(
+            tune_row(&held),
+            ("tune", "discarded", Some("changed the copper of B"))
+        );
+        // The run keeps its input session.
+        assert_eq!(held.kept, "full");
+        assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
+        assert_eq!(held.passes[3]["unrouted"], 0);
+        // A discarded pass's time still counts, as Fallback's does.
+        let seconds: f64 = [0, 3]
+            .iter()
+            .map(|&i| held.passes[i]["seconds"].as_f64().unwrap())
+            .sum();
+        assert!((held.seconds - seconds).abs() < 1e-9);
+
+        // A via moved, a net vanished and a net added are each named; the group's
+        // own net is not.
+        let after = session(&[
+            (
+                "A",
+                wire("F.Cu", 250, &[(0, 0), (10000, 100)]) + &via("v", 10000, 5000),
+            ),
+            (
+                "B",
+                wire("F.Cu", 250, &[(0, 1000), (20000, 1000)]) + &via("v", 5, 5),
+            ),
+            ("D", wire("F.Cu", 250, &[(0, 0), (500, 0)])),
+        ]);
+        let (_fixture, held) = tune_run(&base(), &after, "", &["A"], 30).await;
+        assert_eq!(
+            tune_row(&held.unwrap()),
+            ("tune", "discarded", Some("changed the copper of B, C, D"))
+        );
+        // The same pass with the group's net the only change is kept (the control).
+        let only_a = session(&[
+            ("A", wire("F.Cu", 250, &[(0, 0), (10000, 100)])),
+            ("B", wire("F.Cu", 250, &[(0, 1000), (20000, 1000)])),
+            ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
+        ]);
+        let (_fixture, held) = tune_run(&base(), &only_a, "", &["A"], 30).await;
+        assert_eq!(tune_row(&held.unwrap()).1, "kept");
+    }
+
+    #[tokio::test]
+    async fn a_discarded_tune_pass_names_at_most_five_nets() {
+        let many = |count: usize, shift: i64| {
+            let nets: Vec<(String, String)> = (1..=count)
+                .map(|n| {
+                    (
+                        format!("N{n}"),
+                        wire(
+                            "F.Cu",
+                            250,
+                            &[(0, 100 * n as i64), (5000 + shift, 100 * n as i64)],
+                        ),
+                    )
+                })
+                .collect();
+            let mut all = vec![("A".to_string(), wire("F.Cu", 250, &[(0, 0), (1000, 0)]))];
+            all.extend(nets);
+            let borrowed: Vec<(&str, String)> = all
+                .iter()
+                .map(|(name, items)| (name.as_str(), items.clone()))
+                .collect();
+            session(&borrowed)
+        };
+        for (count, expected) in [
+            (1, "changed the copper of N1"),
+            (5, "changed the copper of N1, N2, N3, N4, N5"),
+            (6, "changed the copper of N1, N2, N3, N4, N5 and 1 more"),
+            (9, "changed the copper of N1, N2, N3, N4, N5 and 4 more"),
+        ] {
+            let (_fixture, held) =
+                tune_run(&many(count, 0), &many(count, 20), "", &["A"], 30).await;
+            assert_eq!(
+                tune_row(&held.unwrap()),
+                ("tune", "discarded", Some(expected)),
+                "{count} nets"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tune_pass_that_leaves_more_connections_open_is_discarded() {
+        // Full left 1 open; the Tune pass left 3: it opened 2.
+        let (fixture, held) = tune_run(
+            &base(),
+            &tuned_base(),
+            "unrouted.full=1\nunrouted.tune=3\n",
+            &["A"],
+            30,
+        )
+        .await;
+        let held = held.unwrap();
+        assert_eq!(tune_row(&held), ("tune", "discarded", Some("opened 2")));
+        assert_eq!(held.passes[3]["unrouted"], 3);
+        assert_eq!((held.kept, held.unrouted), ("full", 1));
+        assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
+
+        // One more is one: "opened 1".
+        let (_fixture, held) = tune_run(
+            &base(),
+            &tuned_base(),
+            "unrouted.full=1\nunrouted.tune=2\n",
+            &["A"],
+            30,
+        )
+        .await;
+        assert_eq!(
+            tune_row(&held.unwrap()),
+            ("tune", "discarded", Some("opened 1"))
+        );
+
+        // Control: the same count, or fewer, is kept, and the run holds its count.
+        for (tune_open, expected) in [(1, 1), (0, 0)] {
+            let (_fixture, held) = tune_run(
+                &base(),
+                &tuned_base(),
+                &format!("unrouted.full=1\nunrouted.tune={tune_open}\n"),
+                &["A"],
+                30,
+            )
+            .await;
+            let held = held.unwrap();
+            assert_eq!(tune_row(&held), ("tune", "kept", None));
+            assert_eq!((held.kept, held.unrouted), (TUNE_PASS, expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_tune_pass_is_a_failed_row_and_the_run_keeps_its_input() {
+        let (fixture, held) = tune_run(&base(), &tuned_base(), "fail.tune=1\n", &["A"], 30).await;
+        let held = held.unwrap();
+        let (name, outcome, reason) = tune_row(&held);
+        assert_eq!((name, outcome), ("tune", "failed"));
+        assert!(
+            reason.unwrap().contains("fake failure marker for tune"),
+            "{reason:?}"
+        );
+        assert!(held.passes[3]["unrouted"].is_null());
+        assert_eq!((held.kept, held.unrouted), ("full", 0));
+        assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
+        // No session of the Tune pass is in play, and a failed pass adds no time.
+        assert!((held.seconds - held.passes[0]["seconds"].as_f64().unwrap()).abs() < 1e-9);
+
+        // A build that does not know `--tune` fails with its own message, and the
+        // run still ends with its input. (The fake that accepts it is the kept test.)
+        let (_fixture, held) = tune_run(&base(), &tuned_base(), "no_tune=1\n", &["A"], 30).await;
+        let held = held.unwrap();
+        let (name, outcome, reason) = tune_row(&held);
+        assert_eq!((name, outcome), ("tune", "failed"));
+        assert!(
+            reason
+                .unwrap()
+                .contains("fake fastroute without tuning: unknown option --tune"),
+            "{reason:?}"
+        );
+        assert_eq!(held.kept, "full");
+        // A pass that leaves no session, or no report, fails too.
+        for control in ["nosession.tune=1\n", "noreport.tune=1\n"] {
+            let (_fixture, held) = tune_run(&base(), &tuned_base(), control, &["A"], 30).await;
+            let held = held.unwrap();
+            assert_eq!(tune_row(&held).1, "failed", "{control}");
+            assert_eq!(held.kept, "full");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tune_pass_killed_by_the_deadline_ends_the_run() {
+        let (fixture, result) = tune_run(&base(), &tuned_base(), "sleep.tune=1\n", &["A"], 4).await;
+        assert!(
+            matches!(result, Err(PassError::Killed { .. })),
+            "{result:?}"
+        );
+        // Full had finished and kept its session, but a run cut short is no candidate.
+        assert!(fixture.path().join("held/full/full.ses").is_file());
+    }
+
+    #[tokio::test]
+    async fn sessions_that_cannot_be_compared_discard_the_tune_pass() {
+        // The Tune pass wrote something that is no session.
+        let (_fixture, held) = tune_run(&base(), "not a session", "", &["A"], 30).await;
+        let held = held.unwrap();
+        let (name, outcome, reason) = tune_row(&held);
+        assert_eq!((name, outcome), ("tune", "discarded"));
+        let reason = reason.unwrap();
+        assert!(reason.contains("could not be compared"), "{reason}");
+        assert!(reason.contains("after"), "{reason}");
+        assert_eq!(held.kept, "full");
+        // So did the input.
+        let (_fixture, held) = tune_run("(pcb board)", &tuned_base(), "", &["A"], 30).await;
+        let held = held.unwrap();
+        let (_, outcome, reason) = tune_row(&held);
+        assert_eq!(outcome, "discarded");
+        assert!(reason.unwrap().contains("before"));
+        assert_eq!(held.kept, "full");
+    }
+
+    /// The hold sequence at Floor fallback, in `folder` of the fixture.
+    async fn held_with(
+        fixture: &Fixture,
+        folder: &str,
+        files: CallFiles<'_>,
+        tune: Option<TuneInputs<'_>>,
+    ) -> Held {
+        route_held(
+            &fixture.binary(),
+            &fixture.path().join(folder),
+            &fixture.dsn(),
+            &floor_hints(),
+            files,
+            WidthFallback::Floor,
+            tune,
+            soon(60),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn routing_passes_never_get_tune_and_the_tune_pass_takes_its_own_heights() {
+        let fixture = Fixture::new("");
+        let session_path = fixture.path().join("any.ses");
+        std::fs::write(&session_path, base()).unwrap();
+        // Every pass writes the same valid session, so the Tune pass is kept.
+        fixture.set_control(&format!(
+            "copy_session={}\nunrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\nunrouted.tune=1\n",
+            session_path.display()
+        ));
+        let (tune_file, pairs) = (
+            fixture.path().join("tune.txt"),
+            fixture.path().join("pairs.txt"),
+        );
+        std::fs::write(&tune_file, "group lt1 tolerance=0.5\n  A\n").unwrap();
+        std::fs::write(&pairs, "pair /X /Y gap=0.2\n").unwrap();
+        let (classes, nets) = (class_list(&["c1"]), names(&["A"]));
+        let args_of_pass = |folder: &str, name: &str| -> Vec<String> {
+            std::fs::read_to_string(
+                fixture
+                    .path()
+                    .join(folder)
+                    .join(name)
+                    .join(format!("{name}.ses.args")),
+            )
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+        };
+
+        // A call with groups and a pair: routing passes get the pair's heights right
+        // after --pairs and never --tune; the Tune pass gets its own heights.
+        let held = held_with(
+            &fixture,
+            "with_pair",
+            CallFiles {
+                amps: None,
+                pairs: Some(&pairs),
+                layer_heights: Some("9,9"),
+            },
+            Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+        )
+        .await;
+        assert_eq!(held.kept, TUNE_PASS, "{:?}", held.passes);
+        for name in ["full", "fallback", "polish"] {
+            let args = args_of_pass("with_pair", name);
+            let at = |prefix: &str| args.iter().position(|t| t.starts_with(prefix));
+            assert_eq!(value(&args, "--layer-heights="), Some("9,9"), "{name}");
+            assert_eq!(
+                at("--layer-heights="),
+                at("--pairs=").map(|p| p + 1),
+                "{name}"
+            );
+            assert!(
+                !args.iter().any(|t| t.starts_with("--tune")),
+                "{name}: {args:?}"
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|t| t.starts_with("--router.autorouter.ignore_net_classes")),
+                "{name}: {args:?}"
+            );
+        }
+        let args = args_of_pass("with_pair", "tune");
+        assert_eq!(value(&args, "--layer-heights="), Some("0,1.58"));
+        assert!(!args.iter().any(|t| t.starts_with("--pairs")));
+        assert_eq!(
+            value(&args, "--initial-session="),
+            Some(
+                fixture
+                    .path()
+                    .join("with_pair/polish/polish.ses")
+                    .to_str()
+                    .unwrap()
+            ),
+            "the Tune pass starts from the last kept session"
+        );
+
+        // A call with groups but no pair: the routing passes carry no heights, the
+        // Tune pass does, and the routing lines are exactly what they were before
+        // Row LT (the same command lines pass_arguments gives without the new input).
+        let held = held_with(
+            &fixture,
+            "no_pair",
+            CallFiles::default(),
+            Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+        )
+        .await;
+        assert_eq!(held.kept, TUNE_PASS);
+        for (name, neck, optimizer, initial) in [
+            ("full", 0.0, true, None),
+            ("fallback", 120.0, false, Some("no_pair/full/full.ses")),
+            ("polish", 0.0, true, Some("no_pair/fallback/fallback.ses")),
+        ] {
+            let folder = fixture.path().join("no_pair").join(name);
+            let expected = pass_arguments(
+                &fixture.dsn(),
+                &folder.join(format!("{name}.ses")),
+                &folder.join(format!("{name}.json")),
+                &floor_hints(),
+                CallFiles::default(),
+                &Pass {
+                    name: match name {
+                        "full" => "full",
+                        "fallback" => "fallback",
+                        _ => "polish",
+                    },
+                    neck_width_um: neck,
+                    optimizer,
+                    initial_session: initial.map(|path| fixture.path().join(path)),
+                },
+            );
+            assert_eq!(args_of_pass("no_pair", name), expected, "{name}");
+        }
+        assert_eq!(
+            value(&args_of_pass("no_pair", "tune"), "--layer-heights="),
+            Some("0,1.58")
+        );
+
+        // A call with no groups has no Tune pass at all.
+        let held = held_with(&fixture, "no_groups", CallFiles::default(), None).await;
+        assert_eq!(held.kept, "polish");
+        assert!(!fixture.path().join("no_groups/tune").exists());
+        assert!(held.passes.iter().all(|row| row["name"] != "tune"));
     }
 }

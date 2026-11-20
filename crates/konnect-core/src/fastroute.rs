@@ -8,12 +8,14 @@
 //! binary found is that build before anything is routed.
 
 use crate::specctra::RoutingHints;
+use crate::specctra_seed::{lists, parse_specctra, session_routes, WIRE_DESCRIPTORS};
 use crate::tools::integration::WidthFallback;
 use anyhow::{anyhow, bail, Context, Result};
+use konnect_sexp::SexpNode;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -325,6 +327,11 @@ pub(crate) struct CallFiles<'a> {
     /// (`tools/route_pairs.rs`). A per-call input, so not a [`CANDIDATE_SWITCHES`]
     /// entry.
     pub pairs: Option<&'a Path>,
+    /// The `--layer-heights` value (`layer_heights::LayerHeights::switch_value`), sent
+    /// by [`layer_heights_argument`]. Which passes get it is the caller's choice
+    /// (Row LT, L7): routing passes carry it only when the call has a resolved pair.
+    /// The Tune pass takes its own ([`TuneInputs::layer_heights`]).
+    pub layer_heights: Option<&'a str>,
 }
 
 /// The command line of one pass, every setting once, in this order: `-de <dsn>`,
@@ -333,7 +340,8 @@ pub(crate) struct CallFiles<'a> {
 /// `hints` has one (sent as `250.001` when it is within 1e-9 of 250, as the
 /// Freerouting path does), `--router.autorouter.max_threads=` and
 /// `--router.optimizer.max_threads=` at [`THREADS`], [`CANDIDATE_SWITCHES`],
-/// `--x.par_via_amps=<amps>` when given, `--pairs=<file>` when given, and
+/// `--x.par_via_amps=<amps>` when given, `--pairs=<file>` when given,
+/// `--layer-heights=<value>` when given (Row LT, L7), and
 /// `--initial-session=<file>` as one token when the pass has one. Numbers are written without a trailing `.0` when
 /// whole. Never `--live`, `--multi-start`, `--max-time` or `--diagnose`.
 pub(crate) fn pass_arguments(
@@ -357,18 +365,7 @@ pub(crate) fn pass_arguments(
         "--router.neck_width_um={}",
         number(pass.neck_width_um)
     ));
-    if let Some(clearance) = hints.copper_edge_clearance_um {
-        // Freerouting reads exactly 250 as "unset"; the path to it sends 250.001.
-        let clearance = if (clearance as f64 - 250.0).abs() < 1e-9 {
-            250.001
-        } else {
-            clearance as f64
-        };
-        args.push(format!(
-            "--router.copper_to_edge_clearance_um={}",
-            number(clearance)
-        ));
-    }
+    args.extend(copper_edge_argument(hints));
     args.push(format!("--router.autorouter.max_threads={THREADS}"));
     args.push(format!("--router.optimizer.max_threads={THREADS}"));
     args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
@@ -378,10 +375,29 @@ pub(crate) fn pass_arguments(
     if let Some(pairs) = files.pairs {
         args.push(format!("--pairs={}", pairs.display()));
     }
+    if let Some(heights) = files.layer_heights {
+        args.push(layer_heights_argument(heights));
+    }
     if let Some(initial) = &pass.initial_session {
         args.push(format!("--initial-session={}", initial.display()));
     }
     args
+}
+
+/// `--router.copper_to_edge_clearance_um=<um>` when `hints` has a clearance (sent as
+/// `250.001` when it is within 1e-9 of 250: Freerouting reads exactly 250 as "unset",
+/// and the path to it sends 250.001).
+fn copper_edge_argument(hints: &RoutingHints) -> Option<String> {
+    let clearance = hints.copper_edge_clearance_um? as f64;
+    let clearance = if (clearance - 250.0).abs() < 1e-9 {
+        250.001
+    } else {
+        clearance
+    };
+    Some(format!(
+        "--router.copper_to_edge_clearance_um={}",
+        number(clearance)
+    ))
 }
 
 /// The `--x.par_via_amps` file from the manifest's `intent_widths` rows: one
@@ -512,6 +528,23 @@ pub(crate) async fn run_pass(
     pass: Pass,
     deadline: Instant,
 ) -> std::result::Result<PassOutcome, PassError> {
+    run_arguments(binary, folder, pass.name, deadline, |ses, report| {
+        pass_arguments(dsn, ses, report, hints, files, &pass)
+    })
+    .await
+}
+
+/// The process part of a pass, shared by [`run_pass`] and [`run_tune_pass`] (Row LT):
+/// everything [`run_pass`] documents, for the pass called `name`. `arguments` builds
+/// the command line from the session path (`folder/<name>.ses`) and the report path
+/// (`folder/<name>.json`) the pass writes.
+async fn run_arguments(
+    binary: &Binary,
+    folder: &Path,
+    name: &str,
+    deadline: Instant,
+    arguments: impl FnOnce(&Path, &Path) -> Vec<String>,
+) -> std::result::Result<PassOutcome, PassError> {
     let started = Instant::now();
 
     // The profile names the real path: the sandbox resolves symbolic links first.
@@ -527,9 +560,9 @@ pub(crate) async fn run_pass(
         ))
     })?;
 
-    let ses = folder.join(format!("{}.ses", pass.name));
-    let report = folder.join(format!("{}.json", pass.name));
-    let args = pass_arguments(dsn, &ses, &report, hints, files, &pass);
+    let ses = folder.join(format!("{name}.ses"));
+    let report = folder.join(format!("{name}.json"));
+    let args = arguments(&ses, &report);
 
     let log_path = folder.join("fastroute.log");
     let (log, log_err) = std::fs::OpenOptions::new()
@@ -587,8 +620,7 @@ pub(crate) async fn run_pass(
     };
     if !status.success() {
         return Err(PassError::Failed(anyhow!(
-            "fastroute pass {} exited with {status}; log tail: {}",
-            pass.name,
+            "fastroute pass {name} exited with {status}; log tail: {}",
             log_tail()
         )));
     }
@@ -596,8 +628,7 @@ pub(crate) async fn run_pass(
         Ok(meta) if meta.is_file() && meta.len() > 0 => {}
         _ => {
             return Err(PassError::Failed(anyhow!(
-                "fastroute pass {} left no session ({} is missing or empty); log tail: {}",
-                pass.name,
+                "fastroute pass {name} left no session ({} is missing or empty); log tail: {}",
                 ses.display(),
                 log_tail()
             )))
@@ -629,7 +660,7 @@ pub(crate) async fn run_pass(
 pub(crate) struct Held {
     pub ses: PathBuf,
     pub unrouted: usize,
-    /// `full`, `fallback` or `polish`.
+    /// `full`, `fallback`, `polish` or, after a kept Tune pass, [`TUNE_PASS`].
     pub kept: &'static str,
     /// One row per pass: `name`, `outcome` (`kept`, `discarded`, `skipped` or
     /// `failed`), `unrouted`, `seconds`, and `reason` for a pass discarded, skipped
@@ -660,6 +691,10 @@ pub(crate) struct Held {
 /// session (Full's, or Fallback's when that was kept), as the product's sequence
 /// leaves the earlier session when a later pass cannot improve on it. A failed
 /// Fallback leaves Polish `skipped`.
+///
+/// Row LT: with `tune`, [`tune_held`] runs after the sequence, from the session it
+/// kept, and its row joins `passes`. Routing passes never get `--tune`.
+#[allow(clippy::too_many_arguments)] // the parts of one call, each read once
 pub(crate) async fn route_held(
     binary: &Binary,
     folder: &Path,
@@ -667,21 +702,10 @@ pub(crate) async fn route_held(
     hints: &RoutingHints,
     files: CallFiles<'_>,
     fallback: WidthFallback,
+    tune: Option<TuneInputs<'_>>,
     deadline: Instant,
 ) -> std::result::Result<Held, PassError> {
-    let row = |name: &str,
-               outcome: &str,
-               unrouted: Option<usize>,
-               seconds: Option<f64>,
-               reason: Option<&str>| {
-        json!({
-            "name": name,
-            "outcome": outcome,
-            "unrouted": unrouted,
-            "seconds": seconds,
-            "reason": reason,
-        })
-    };
+    let row = pass_row;
     let pass_folder = |name: &str| -> std::result::Result<PathBuf, PassError> {
         let path = folder.join(name);
         std::fs::create_dir_all(&path).map_err(|error| {
@@ -843,13 +867,441 @@ pub(crate) async fn route_held(
         }
     }
 
-    Ok(Held {
+    let held = Held {
         ses: kept_ses,
         unrouted: kept_unrouted,
         kept,
         passes,
         seconds,
+    };
+    match tune {
+        Some(tune) => tune_held(binary, folder, dsn, hints, files, &tune, held, deadline).await,
+        None => Ok(held),
+    }
+}
+
+/// One row of [`Held::passes`].
+fn pass_row(
+    name: &str,
+    outcome: &str,
+    unrouted: Option<usize>,
+    seconds: Option<f64>,
+    reason: Option<&str>,
+) -> Value {
+    json!({
+        "name": name,
+        "outcome": outcome,
+        "unrouted": unrouted,
+        "seconds": seconds,
+        "reason": reason,
     })
+}
+
+/// Row LT: the Tune pass's name and folder (docs/LENGTH_TUNING_DESIGN.md, L6).
+pub(crate) const TUNE_PASS: &str = "tune";
+
+/// How many nets a discarded Tune pass's reason names before it says "and N more".
+const MAX_NAMED_NETS: usize = 5;
+
+/// What the Tune pass needs beyond a routing pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Row LT: Stage 4b builds it in the runner
+pub(crate) struct TuneInputs<'a> {
+    /// The call's `--tune` file (`tools/route_lengths.rs`).
+    pub tune: &'a Path,
+    /// Every net class of the DSN (`specctra::dsn_class_names`): the autorouter
+    /// ignores them all, so it routes nothing.
+    pub classes: &'a [String],
+    /// The DSN names of the nets the tune file lists: the only nets whose wiring the
+    /// pass may change.
+    pub nets: &'a BTreeSet<String>,
+    /// The Tune pass's own `--layer-heights` value (L7: sent whenever the call has
+    /// heights, where the routing passes get them only with a resolved pair, so it
+    /// is not [`CallFiles::layer_heights`]).
+    pub layer_heights: Option<&'a str>,
+}
+
+/// `--layer-heights=<value>` from `layer_heights::LayerHeights::switch_value`.
+pub(crate) fn layer_heights_argument(value: &str) -> String {
+    format!("--layer-heights={value}")
+}
+
+/// The Tune pass's command line, every setting once, in this order: `-de <dsn>`,
+/// `-do <ses>`, `--report=<report>`, [`PRESET`], `--router.optimizer.enabled=false`,
+/// `--router.autorouter.ignore_net_classes=<classes, comma separated>` (left out
+/// when there is none), `--router.copper_to_edge_clearance_um=` when `hints` has
+/// one, the two thread settings at [`THREADS`], [`CANDIDATE_SWITCHES`],
+/// `--x.par_via_amps=` when `files` has it, `--tune=<file>`, `--layer-heights=`
+/// when `files` has it, and `--initial-session=<initial>`. Never `--pairs`,
+/// `--live`, `--multi-start`, `--max-time`, `--diagnose` or a neck width.
+pub(crate) fn tune_pass_arguments(
+    dsn: &Path,
+    ses: &Path,
+    report: &Path,
+    hints: &RoutingHints,
+    files: CallFiles<'_>,
+    tune: &TuneInputs<'_>,
+    initial: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "-de".to_string(),
+        dsn.display().to_string(),
+        "-do".to_string(),
+        ses.display().to_string(),
+        format!("--report={}", report.display()),
+    ];
+    args.extend(PRESET.iter().map(|argument| argument.to_string()));
+    args.push("--router.optimizer.enabled=false".to_string());
+    if !tune.classes.is_empty() {
+        args.push(format!(
+            "--router.autorouter.ignore_net_classes={}",
+            tune.classes.join(",")
+        ));
+    }
+    args.extend(copper_edge_argument(hints));
+    args.push(format!("--router.autorouter.max_threads={THREADS}"));
+    args.push(format!("--router.optimizer.max_threads={THREADS}"));
+    args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
+    if let Some(amps) = files.amps {
+        args.push(format!("--x.par_via_amps={}", amps.display()));
+    }
+    args.push(format!("--tune={}", tune.tune.display()));
+    if let Some(heights) = files.layer_heights {
+        args.push(layer_heights_argument(heights));
+    }
+    args.push(format!("--initial-session={}", initial.display()));
+    args
+}
+
+/// Runs the Tune pass in `folder` exactly as [`run_pass`] runs a pass (the same
+/// sandbox, environment, log and deadline; [`run_arguments`]), with
+/// [`tune_pass_arguments`]. Its session is `folder/tune.ses`, its report
+/// `folder/tune.json`.
+#[allow(clippy::too_many_arguments)] // the parts of one pass, each read once
+pub(crate) async fn run_tune_pass(
+    binary: &Binary,
+    folder: &Path,
+    dsn: &Path,
+    hints: &RoutingHints,
+    files: CallFiles<'_>,
+    tune: &TuneInputs<'_>,
+    initial: &Path,
+    deadline: Instant,
+) -> std::result::Result<PassOutcome, PassError> {
+    run_arguments(binary, folder, TUNE_PASS, deadline, |ses, report| {
+        tune_pass_arguments(dsn, ses, report, hints, files, tune, initial)
+    })
+    .await
+}
+
+/// One net's copper in a session, as geometry (L6): its straight pieces by layer and
+/// width, collinear pieces that touch merged into one, each piece's ends rounded to
+/// 1 µm and ordered; its vias by padstack and rounded position. Both lists sorted.
+/// Two sessions that split one trace into different pieces compare equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NetCopper {
+    /// (layer, width in µm, [x1, y1, x2, y2] in µm).
+    pub pieces: Vec<(String, i64, [i64; 4])>,
+    /// (padstack, [x, y] in µm).
+    pub vias: Vec<(String, [i64; 2])>,
+}
+
+/// A session value in micrometres, rounded to 1 µm.
+fn session_um(node: Option<&SexpNode>, um_per_unit: f64, what: &str) -> Result<i64> {
+    let value: f64 = node
+        .and_then(SexpNode::as_str)
+        .with_context(|| format!("the session's {what} is missing"))?
+        .parse()
+        .map_err(|_| anyhow!("the session's {what} is not a number"))?;
+    let um = (value * um_per_unit).round();
+    // A coordinate this large is not a board: the products below must not overflow.
+    if !um.is_finite() || um.abs() > 1e12 {
+        bail!("the session's {what} is too large to compare");
+    }
+    Ok(um as i64)
+}
+
+fn gcd(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// A straight piece on its line: its two ends, each with its position along the
+/// line's direction.
+type Span = (i128, [i64; 2], i128, [i64; 2]);
+
+/// A session's copper by net: every `(net NAME (wire …) (via …))` of
+/// `(routes (network_out …))`, read with the session's own `resolution`, as
+/// [`NetCopper`]. Keywords in any letter case; a session that does not parse, or a
+/// wire that is not a `path`, is an error.
+pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper>> {
+    let session = parse_specctra(ses_text, "session")?;
+    let (routes, um_per_unit) = session_routes(&session)?;
+    // A net named in two `net` entries is one net.
+    let mut paths: BTreeMap<String, Vec<(String, i64, Vec<[i64; 2]>)>> = BTreeMap::new();
+    let mut vias: BTreeMap<String, Vec<(String, [i64; 2])>> = BTreeMap::new();
+    for network in lists(routes, "network_out") {
+        for net in lists(network, "net") {
+            let name = net
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .context("a net of the session has no name")?
+                .to_string();
+            paths.entry(name.clone()).or_default();
+            vias.entry(name.clone()).or_default();
+            for wire in lists(net, "wire") {
+                for shape in wire.children().unwrap_or(&[]).iter().skip(1) {
+                    let Some(head) = shape.head() else { continue };
+                    let form = head.to_ascii_lowercase();
+                    if WIRE_DESCRIPTORS.contains(&form.as_str()) {
+                        continue;
+                    }
+                    if form != "path" {
+                        bail!("net {name}: a wire holds a {form}, not a path");
+                    }
+                    let layer = shape
+                        .get(1)
+                        .and_then(SexpNode::as_str)
+                        .with_context(|| format!("net {name}: a path has no layer"))?
+                        .to_string();
+                    let width = session_um(shape.get(2), um_per_unit, "path width")?;
+                    let values = shape.children().unwrap_or(&[]);
+                    if values.len() < 7 || (values.len() - 3) % 2 != 0 {
+                        bail!("net {name}: a path holds fewer than two points or an odd number of coordinates");
+                    }
+                    let points = values[3..]
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            Ok([
+                                session_um(Some(&pair[0]), um_per_unit, "path coordinate")?,
+                                session_um(Some(&pair[1]), um_per_unit, "path coordinate")?,
+                            ])
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    paths
+                        .entry(name.clone())
+                        .or_default()
+                        .push((layer, width, points));
+                }
+            }
+            for via in lists(net, "via") {
+                let padstack = via
+                    .get(1)
+                    .and_then(SexpNode::as_str)
+                    .with_context(|| format!("net {name}: a via has no padstack"))?
+                    .to_string();
+                let at = [
+                    session_um(via.get(2), um_per_unit, "via x")?,
+                    session_um(via.get(3), um_per_unit, "via y")?,
+                ];
+                vias.entry(name.clone()).or_default().push((padstack, at));
+            }
+        }
+    }
+    let mut result = BTreeMap::new();
+    for (name, paths) in paths {
+        // Each straight piece on its own line (layer, width, direction, offset).
+        let mut lines: BTreeMap<(String, i64, i128, i128, i128), Vec<Span>> = BTreeMap::new();
+        for (layer, width, points) in paths {
+            for pair in points.windows(2) {
+                let (p, q) = (pair[0], pair[1]);
+                if p == q {
+                    continue;
+                }
+                let (dx, dy) = (i128::from(q[0] - p[0]), i128::from(q[1] - p[1]));
+                let g = gcd(dx, dy);
+                let (mut a, mut b) = (dx / g, dy / g);
+                if a < 0 || (a == 0 && b < 0) {
+                    (a, b) = (-a, -b);
+                }
+                let offset = a * i128::from(p[1]) - b * i128::from(p[0]);
+                let along = |at: [i64; 2]| a * i128::from(at[0]) + b * i128::from(at[1]);
+                let span = if along(p) <= along(q) {
+                    (along(p), p, along(q), q)
+                } else {
+                    (along(q), q, along(p), p)
+                };
+                lines
+                    .entry((layer.clone(), width, a, b, offset))
+                    .or_default()
+                    .push(span);
+            }
+        }
+        let mut pieces = Vec::new();
+        for ((layer, width, _, _, _), mut spans) in lines {
+            spans.sort();
+            let mut current = spans[0];
+            for span in &spans[1..] {
+                if span.0 <= current.2 {
+                    // Touching or overlapping: one piece.
+                    if span.2 > current.2 {
+                        current.2 = span.2;
+                        current.3 = span.3;
+                    }
+                } else {
+                    pieces.push((
+                        layer.clone(),
+                        width,
+                        [current.1[0], current.1[1], current.3[0], current.3[1]],
+                    ));
+                    current = *span;
+                }
+            }
+            pieces.push((
+                layer,
+                width,
+                [current.1[0], current.1[1], current.3[0], current.3[1]],
+            ));
+        }
+        pieces.sort();
+        let mut net_vias = vias.remove(&name).unwrap_or_default();
+        net_vias.sort();
+        result.insert(
+            name,
+            NetCopper {
+                pieces,
+                vias: net_vias,
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// The nets outside `nets` whose copper differs between two sessions (one appears
+/// in only one of them, or their [`NetCopper`] differ), sorted: the Tune pass's
+/// guard (L6). A net that has no copper in one session and is missing from the
+/// other is not different.
+pub(crate) fn changed_outside(
+    before: &str,
+    after: &str,
+    nets: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let before = copper_by_net(before).context("the session before the Tune pass")?;
+    let after = copper_by_net(after).context("the session after the Tune pass")?;
+    let empty = NetCopper::default();
+    let names: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    Ok(names
+        .into_iter()
+        .filter(|name| !nets.contains(*name))
+        .filter(|name| before.get(*name).unwrap_or(&empty) != after.get(*name).unwrap_or(&empty))
+        .cloned()
+        .collect())
+}
+
+/// The Tune pass after the hold sequence (L6), in `folder/tune`: from `held.ses`.
+/// - Killed by `deadline`: `PassError::Killed` ends the run (D4).
+/// - Failed (an error, no session, an unreadable report): a `failed` row with its
+///   reason; the run keeps `held`.
+/// - It leaves more open than `held.unrouted`: `discarded` ("opened N", N the
+///   connections it opened).
+/// - [`changed_outside`] names a net, or cannot read either session: `discarded`
+///   ("changed the copper of <nets>", at most 5 named, then "and N more").
+/// - Else `kept`: `held.ses` becomes the Tune pass's session, `held.kept` is
+///   [`TUNE_PASS`], and `held.unrouted` its count.
+///
+/// The row joins `held.passes` with `name`, `outcome`, `unrouted`, `seconds` and
+/// `reason`, as every pass row; `held.seconds` adds the pass's time. The pass gets
+/// [`TuneInputs::layer_heights`] and never the call's pairs file.
+#[allow(clippy::too_many_arguments)] // the parts of one pass, each read once
+pub(crate) async fn tune_held(
+    binary: &Binary,
+    folder: &Path,
+    dsn: &Path,
+    hints: &RoutingHints,
+    files: CallFiles<'_>,
+    tune: &TuneInputs<'_>,
+    mut held: Held,
+    deadline: Instant,
+) -> std::result::Result<Held, PassError> {
+    let pass_folder = folder.join(TUNE_PASS);
+    let files = CallFiles {
+        amps: files.amps,
+        pairs: None,
+        layer_heights: tune.layer_heights,
+    };
+    let result = match std::fs::create_dir_all(&pass_folder) {
+        Ok(()) => {
+            run_tune_pass(
+                binary,
+                &pass_folder,
+                dsn,
+                hints,
+                files,
+                tune,
+                &held.ses,
+                deadline,
+            )
+            .await
+        }
+        Err(error) => Err(PassError::Failed(anyhow!(
+            "{} could not be created: {error}",
+            pass_folder.display()
+        ))),
+    };
+    let Some(outcome) = settle(TUNE_PASS, result, &mut held.passes)? else {
+        return Ok(held);
+    };
+    held.seconds += outcome.seconds;
+    let discard = |reason: String| {
+        pass_row(
+            TUNE_PASS,
+            "discarded",
+            Some(outcome.unrouted),
+            Some(outcome.seconds),
+            Some(&reason),
+        )
+    };
+    if outcome.unrouted > held.unrouted {
+        held.passes.push(discard(format!(
+            "opened {}",
+            outcome.unrouted - held.unrouted
+        )));
+        return Ok(held);
+    }
+    let compared = std::fs::read_to_string(&held.ses)
+        .with_context(|| format!("{} could not be read", held.ses.display()))
+        .and_then(|before| {
+            std::fs::read_to_string(&outcome.ses)
+                .with_context(|| format!("{} could not be read", outcome.ses.display()))
+                .and_then(|after| changed_outside(&before, &after, tune.nets))
+        });
+    match compared {
+        Err(error) => held.passes.push(discard(tail(
+            &format!("the sessions could not be compared: {error:#}"),
+            QUOTE_CHARS,
+        ))),
+        Ok(changed) if !changed.is_empty() => {
+            let mut named = changed
+                .iter()
+                .take(MAX_NAMED_NETS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if changed.len() > MAX_NAMED_NETS {
+                named.push_str(&format!(" and {} more", changed.len() - MAX_NAMED_NETS));
+            }
+            held.passes.push(discard(tail(
+                &format!("changed the copper of {named}"),
+                QUOTE_CHARS,
+            )));
+        }
+        Ok(_) => {
+            held.passes.push(pass_row(
+                TUNE_PASS,
+                "kept",
+                Some(outcome.unrouted),
+                Some(outcome.seconds),
+                None,
+            ));
+            held.ses = outcome.ses;
+            held.kept = TUNE_PASS;
+            held.unrouted = outcome.unrouted;
+        }
+    }
+    Ok(held)
 }
 
 /// What a later pass's result means for the run: its outcome, or `None` after a
