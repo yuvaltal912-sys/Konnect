@@ -1123,6 +1123,45 @@ fn copper_by_net_orders_the_ends_and_the_lists() {
     );
 }
 
+/// A raw wire in session units (not micrometres), so a coordinate need not be a whole
+/// micrometre.
+fn raw_wire(points: &[(i64, i64)]) -> String {
+    let coordinates: Vec<String> = points
+        .iter()
+        .flat_map(|(x, y)| [x.to_string(), y.to_string()])
+        .collect();
+    format!("(wire (path F.Cu 2500 {}))", coordinates.join(" "))
+}
+
+#[test]
+fn a_diagonal_split_at_different_vertices_is_the_same_copper() {
+    // Slope 1:3, odd session units: rounded to 1 um first, the pieces would no longer
+    // lie on one line and would not merge.
+    let whole = session(&[("A", raw_wire(&[(1, 2), (1003, 336)]))]);
+    let split = session(&[("A", raw_wire(&[(1, 2), (16, 7), (1003, 336)]))]);
+    let split_twice = session(&[(
+        "A",
+        raw_wire(&[(1, 2), (16, 7)]) + &raw_wire(&[(1003, 336), (301, 102), (16, 7)]),
+    )]);
+    assert!(changed(&whole, &split, &[]).is_empty());
+    assert!(changed(&split, &split_twice, &[]).is_empty());
+    assert_eq!(
+        copper_by_net(&whole).unwrap(),
+        copper_by_net(&split).unwrap()
+    );
+    // Only the merged piece's ends are rounded: (0.1, 0.2) and (100.3, 33.6) um.
+    assert_eq!(
+        copper_by_net(&split).unwrap()["A"].pieces,
+        vec![("F.Cu".to_string(), 250, [0, 0, 100, 34])]
+    );
+    // Negative control: the same diagonal shifted by 2 um is other copper.
+    let shifted = session(&[(
+        "A",
+        raw_wire(&[(21, 2), (36, 7)]) + &raw_wire(&[(36, 7), (1023, 336)]),
+    )]);
+    assert_eq!(changed(&whole, &shifted, &[]), vec!["A".to_string()]);
+}
+
 // ---- on a system that cannot isolate a run ---------------------------------
 
 #[cfg(not(target_os = "macos"))]

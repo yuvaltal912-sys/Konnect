@@ -996,7 +996,9 @@ pub(crate) async fn run_tune_pass(
 /// One net's copper in a session, as geometry (L6): its straight pieces by layer and
 /// width, collinear pieces that touch merged into one, each piece's ends rounded to
 /// 1 µm and ordered; its vias by padstack and rounded position. Both lists sorted.
-/// Two sessions that split one trace into different pieces compare equal.
+/// Two sessions that split one trace into different pieces compare equal: the
+/// merge runs on the session's own coordinates, and only the merged pieces' ends are
+/// rounded, so a trace at any angle splits and merges the same way in both.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NetCopper {
     /// (layer, width in µm, [x1, y1, x2, y2] in µm).
@@ -1028,12 +1030,32 @@ fn gcd(a: i128, b: i128) -> i128 {
     a
 }
 
-/// A path of a session: its layer, width in µm and points in µm.
-type SessionPath = (String, i64, Vec<[i64; 2]>);
+/// Session coordinates are held in thousandths of a session unit: exact for any
+/// coordinate a session writes with up to three decimals (they are integers in
+/// practice), and the integer products of the collinear merge stay exact.
+const TICKS_PER_UNIT: f64 = 1000.0;
 
-/// A straight piece on its line: its two ends, each with its position along the
-/// line's direction.
-type Span = (i128, [i64; 2], i128, [i64; 2]);
+/// A path of a session: its layer, width in µm and points in ticks.
+type SessionPath = (String, i64, Vec<[i128; 2]>);
+
+/// A straight piece on its line: its two ends in ticks, each with its position along
+/// the line's direction.
+type Span = (i128, [i128; 2], i128, [i128; 2]);
+
+/// A session coordinate in ticks, exact. The size check is on the micrometres.
+fn session_ticks(node: Option<&SexpNode>, um_per_unit: f64, what: &str) -> Result<i128> {
+    let value: f64 = node
+        .and_then(SexpNode::as_str)
+        .with_context(|| format!("the session's {what} is missing"))?
+        .parse()
+        .map_err(|_| anyhow!("the session's {what} is not a number"))?;
+    let um = value * um_per_unit;
+    // A coordinate this large is not a board: the products below must not overflow.
+    if !um.is_finite() || um.abs() > 1e12 {
+        bail!("the session's {what} is too large to compare");
+    }
+    Ok((value * TICKS_PER_UNIT).round() as i128)
+}
 
 /// A session's copper by net: every `(net NAME (wire …) (via …))` of
 /// `(routes (network_out …))`, read with the session's own `resolution`, as
@@ -1078,8 +1100,8 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
                         .chunks_exact(2)
                         .map(|pair| {
                             Ok([
-                                session_um(Some(&pair[0]), um_per_unit, "path coordinate")?,
-                                session_um(Some(&pair[1]), um_per_unit, "path coordinate")?,
+                                session_ticks(Some(&pair[0]), um_per_unit, "path coordinate")?,
+                                session_ticks(Some(&pair[1]), um_per_unit, "path coordinate")?,
                             ])
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -1113,14 +1135,14 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
                 if p == q {
                     continue;
                 }
-                let (dx, dy) = (i128::from(q[0] - p[0]), i128::from(q[1] - p[1]));
+                let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
                 let g = gcd(dx, dy);
                 let (mut a, mut b) = (dx / g, dy / g);
                 if a < 0 || (a == 0 && b < 0) {
                     (a, b) = (-a, -b);
                 }
-                let offset = a * i128::from(p[1]) - b * i128::from(p[0]);
-                let along = |at: [i64; 2]| a * i128::from(at[0]) + b * i128::from(at[1]);
+                let offset = a * p[1] - b * p[0];
+                let along = |at: [i128; 2]| a * at[0] + b * at[1];
                 let span = if along(p) <= along(q) {
                     (along(p), p, along(q), q)
                 } else {
@@ -1132,6 +1154,9 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
                     .push(span);
             }
         }
+        // Only the merged pieces' ends are rounded, to the micrometre.
+        let um = |ticks: i128| (ticks as f64 * um_per_unit / TICKS_PER_UNIT).round() as i64;
+        let end = |span: &Span| [um(span.1[0]), um(span.1[1]), um(span.3[0]), um(span.3[1])];
         let mut pieces = Vec::new();
         for ((layer, width, _, _, _), mut spans) in lines {
             spans.sort();
@@ -1144,19 +1169,11 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
                         current.3 = span.3;
                     }
                 } else {
-                    pieces.push((
-                        layer.clone(),
-                        width,
-                        [current.1[0], current.1[1], current.3[0], current.3[1]],
-                    ));
+                    pieces.push((layer.clone(), width, end(&current)));
                     current = *span;
                 }
             }
-            pieces.push((
-                layer,
-                width,
-                [current.1[0], current.1[1], current.3[0], current.3[1]],
-            ));
+            pieces.push((layer, width, end(&current)));
         }
         pieces.sort();
         let mut net_vias = vias.remove(&name).unwrap_or_default();
