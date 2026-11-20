@@ -1891,7 +1891,7 @@ async fn a_bus_is_tuned_to_its_window_and_kicad_agrees() {
     eprintln!("E2E bus: KiCad skew violations with the suggested rule: {violations} ({rule})");
     assert_eq!(violations, 0, "{rule}");
     // Control: the same rule at a thousandth of the tolerance is broken.
-    let tight = rule.replace("max 0.5mm", "max 0.0001mm");
+    let tight = rule.replace("max 0.5001mm", "max 0.0001mm");
     assert_ne!(tight, rule, "{rule}");
     assert!(skew_violations_with_rule(&judged, &tight) > 0, "{tight}");
 }
