@@ -343,9 +343,9 @@ placement orders, judges every run itself on scratch copies of the board
    one. If it refuses with `setup` (fastroute is not at its default place),
    stop and report the steps; route with `engine: 'freerouting'` only if the
    user says so. Read `status`: it is `complete` only when the winning run
-   passes all three of the judge's gates (`completion.judged.gates`: complete
-   after refill and stitching, DRC no worse than the unrouted board, widths);
-   `complete_with_gate_failures` and `incomplete` list what failed. When
+   passes all four of the judge's gates (`completion.judged.gates`: complete
+   after refill and stitching, DRC no worse than the unrouted board, widths,
+   lengths); `complete_with_gate_failures` and `incomplete` list what failed. When
    every gate passed, `status` is the judge's, not fastroute's own count
    (`completion.router_unrouted`), unless the judge had to add stitching vias
    (`completion.judged.stitching_vias`): then follow `next_steps`. Report
@@ -359,6 +359,27 @@ Differential pairs declared in the design intent
 (`set_design_intent`, `interfaces[].differential_pairs`) are routed coupled.
 `differential_pairs` lists them; `differential_pairs_unresolved` lists any pair
 left out, with its reason (a name that matches no net of the DSN, or several).
+
+Matched lengths (serpentine routing). Before routing, declare each bus or byte
+lane in the design intent: `interfaces[].length_groups` = `{name, nets[],
+tolerance_mm, target_mm?}`, and `max_skew_mm` on a differential pair. Without
+`target_mm`, every net of the group ends within `tolerance_mm` of the group's
+longest net; with it, within `target_mm` plus or minus `tolerance_mm`. Lengths
+are KiCad's own. fastroute only lengthens a net, and tunes only what the intent
+declares: when the board already has KiCad `length` or `skew` rules in its
+`.kicad_dru`, mirror each one into a group first (Konnect lists those rules in
+`length_matching.kicad_rules`, checks them in KiCad's DRC, and never tunes from
+them). A group that cannot be applied (a name that matches no net or several,
+a target no net can meet) refuses the call before anything is routed; fix the
+one name it names and call again. After the call read `length_matching`: for
+each net its length, its window and its miss, `pass` per group, and
+`kicad_violations`. A failed window fails the fourth gate, so `status` is
+`complete_with_gate_failures`. The next steps give a KiCad rule for each group.
+After `apply_specctra_ses`, add them with `create_custom_drc_rule(board, name,
+rule)` (dry run first) so KiCad keeps checking the lengths after hand edits.
+A pair inside a group is tuned net by net (`pairs_tuned_net_by_net`): its
+coupling is not held along the meanders. `engine: 'freerouting'` tunes nothing
+and says so in `length_matching_note`.
 
 ### Freerouting round trip
 
@@ -842,7 +863,9 @@ statements are compiled on scratch copies; a successful edit does not establish
 that the board passes DRC.
 
 Custom-rule DSN export supports unconditional numeric clearance and track-width
-minima. Other custom-rule forms return a blocker. Re-export after any project,
+minima, and skips a rule whose constraints are only `length` or `skew` (the DSN
+carries neither; KiCad's DRC still checks them). Other custom-rule forms return a
+blocker. Re-export after any project,
 rule or live netclass change. Keep exactly one PCB open for export/import.
 `plan_specctra_ses_import` does not run DRC. Application verifies the committed
 copper against private copies of the captured settings; inspect the result and
