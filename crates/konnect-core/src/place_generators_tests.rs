@@ -2973,4 +2973,15 @@ fn a_cap_is_placed_by_pads_that_are_off_the_axes() {
             .locked()
             .pad(pad("1", -0.8, -1.8, Some("VCC")));
     assert_eq!(lone(top_left, cap("C1", (60.0, 50.0))), (38.5, 37.0));
+    // A pin at (41.1, 38.2) and a cap whose pad 2 is 0.9 mm right of its centre: the cell
+    // 40 puts the pad at 40.9 (0.2 off), the cell 40.5 at 41.4 (0.3 off).
+    let wide = Fp::new("C1", 60.0, 50.0)
+        .pad(pad("1", -0.5, 0.0, Some("VCC")))
+        .pad(pad("2", 0.9, 0.0, Some("GND")));
+    let pin =
+        Fp::new("U1", 40.0, 40.0)
+            .court(2.0, 2.0)
+            .locked()
+            .pad(pad("1", 1.1, -1.8, Some("VCC")));
+    assert_eq!(lone(pin, wide), (40.0, 37.0));
 }
