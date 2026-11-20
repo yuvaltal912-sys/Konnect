@@ -546,3 +546,397 @@ fn a_net_name_with_outer_spaces_is_kept_as_written() {
     );
     assert!(file_text(other.path()).is_none(), "and nothing is written");
 }
+
+// ─── Row LT: length groups and pair skews ────────────────────────────────────
+
+/// One interface of six nets, with the given length groups and pairs.
+fn ram(groups: Value, pairs: Value) -> Value {
+    json!([{
+        "name": "ram", "kind": "ddr",
+        "nets": ["D0", "D1", "D2", "D3", "DQS", "DQSN"],
+        "differential_pairs": pairs,
+        "length_groups": groups
+    }])
+}
+
+fn all_nets() -> Value {
+    json!(["D0", "D1", "D2", "D3", "DQS", "DQSN"])
+}
+
+fn good_pairs() -> Value {
+    json!([{ "positive": "DQS", "negative": "DQSN", "max_skew_mm": 0.1 }])
+}
+
+fn good_groups() -> Value {
+    json!([{ "name": "g", "nets": all_nets(), "tolerance_mm": 0.5 }])
+}
+
+/// The reason a refused interfaces section gives.
+fn refusal_reason(value: Value) -> Option<String> {
+    let dir = project();
+    let result = set(dir.path(), "interfaces", value, None);
+    if !result.is_error {
+        return None;
+    }
+    assert_eq!(kind(&result).as_deref(), Some("invalid_argument"));
+    assert!(file_text(dir.path()).is_none(), "a refusal wrote the file");
+    Some(
+        body(&result)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+/// A pre-Row-LT record, in the exact text the writer produces: it has none of the new
+/// keys.
+const OLD_RECORD: &str = r#"{
+  "schema_version": 1,
+  "rails": [],
+  "currents": [],
+  "interfaces": [
+    {
+      "name": "USB",
+      "kind": "usb2",
+      "nets": [
+        "USB_DP",
+        "USB_DN"
+      ],
+      "differential_pairs": [
+        {
+          "positive": "USB_DP",
+          "negative": "USB_DN"
+        }
+      ],
+      "differential_impedance_ohm": 90.0
+    }
+  ]
+}
+"#;
+
+fn read_text(text: &str) -> IntentRead {
+    let dir = project();
+    let path = design_intent_path(dir.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, text).unwrap();
+    read_design_intent(&path)
+}
+
+#[test]
+fn a_record_without_the_length_fields_reads_and_writes_back_byte_for_byte() {
+    let IntentRead::Loaded { intent, text } = read_text(OLD_RECORD) else {
+        panic!("a record from before Row LT must load")
+    };
+    assert_eq!(text, OLD_RECORD);
+    assert!(intent.interfaces[0].length_groups.is_empty());
+    assert_eq!(intent.interfaces[0].differential_pairs[0].max_skew_mm, None);
+    let written = serde_json::to_string_pretty(&*intent).unwrap() + "\n";
+    assert_eq!(written, OLD_RECORD, "the new fields must not appear unset");
+    assert!(!written.contains("length_groups") && !written.contains("max_skew_mm"));
+}
+
+#[test]
+fn a_record_with_the_length_fields_round_trips() {
+    // The text is the typed record's own, so key order is the struct's.
+    let typed: DesignIntent = serde_json::from_value(json!({
+        "schema_version": 1,
+        "rails": [],
+        "currents": [],
+        "interfaces": ram(
+            json!([
+                { "name": "low", "nets": ["D0", "D1"], "tolerance_mm": 0.5 },
+                { "name": "high", "nets": ["D2", "D3", "DQS", "DQSN"], "tolerance_mm": 0.25,
+                  "target_mm": 40.0, "notes": "byte lane" }
+            ]),
+            good_pairs()
+        )
+    }))
+    .unwrap();
+    let text = serde_json::to_string_pretty(&typed).unwrap() + "\n";
+    let IntentRead::Loaded { intent, text: read } = read_text(&text) else {
+        panic!("a valid record with length groups must load")
+    };
+    let group = &intent.interfaces[0].length_groups[1];
+    assert_eq!(group.target_mm, Some(40.0));
+    assert_eq!(group.notes.as_deref(), Some("byte lane"));
+    assert_eq!(
+        intent.interfaces[0].differential_pairs[0].max_skew_mm,
+        Some(0.1)
+    );
+    let written = serde_json::to_string_pretty(&*intent).unwrap() + "\n";
+    assert_eq!(written, read, "the record writes back as it was read");
+
+    // The same record through the tool reads back too.
+    let dir = project();
+    let value = ram(
+        json!([{ "name": "g", "nets": all_nets(), "tolerance_mm": 0.5, "target_mm": 30 }]),
+        good_pairs(),
+    );
+    let result = set(dir.path(), "interfaces", value, None);
+    assert!(!result.is_error, "{:?}", body(&result));
+    let read = body(&get_design_intent_at(dir.path()));
+    assert_eq!(
+        read["intent"]["interfaces"][0]["length_groups"][0]["target_mm"], 30.0,
+        "{read}"
+    );
+}
+
+#[test]
+fn an_unknown_key_inside_a_length_group_or_a_pair_is_refused() {
+    // Negative control of the schema row: the new structs are closed.
+    for value in [
+        ram(
+            json!([{ "name": "g", "nets": all_nets(), "tolerance_mm": 0.5, "slack_mm": 1 }]),
+            good_pairs(),
+        ),
+        ram(
+            good_groups(),
+            json!([{ "positive": "DQS", "negative": "DQSN", "max_skew": 0.1 }]),
+        ),
+    ] {
+        let reason =
+            refusal_reason(value.clone()).unwrap_or_else(|| panic!("{value} was accepted"));
+        assert!(reason.contains("unknown field"), "{reason}");
+    }
+    // The control: the record without the stray key is accepted.
+    assert!(refusal_reason(ram(good_groups(), good_pairs())).is_none());
+
+    // A file with a stray key inside a group is unusable, and a read says so.
+    let text = serde_json::to_string(&json!({
+        "schema_version": 1,
+        "interfaces": ram(
+            json!([{ "name": "g", "nets": all_nets(), "tolerance_mm": 0.5, "slack_mm": 1 }]),
+            json!([])
+        )
+    }))
+    .unwrap();
+    assert!(matches!(read_text(&text), IntentRead::Unusable { .. }));
+}
+
+/// Each length rule of L1a refuses with the path of what is wrong, and the same
+/// record with the rule met is accepted.
+#[test]
+fn every_length_rule_refuses_with_its_path_and_accepts_when_met() {
+    let all = all_nets();
+    // (bad groups, bad pairs, expected text, good groups, good pairs)
+    let cases: Vec<(Value, Value, &str, Value, Value)> = vec![
+        (
+            json!([{ "name": "g", "nets": ["D0", "D1", "X"], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].nets[2]: 'X' is not one of this interface's nets",
+            json!([{ "name": "g", "nets": ["D0", "D1", "D2"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "a", "nets": ["D0", "D1"], "tolerance_mm": 0.5 },
+                   { "name": "b", "nets": ["D1", "D2"], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[1].nets[0]: 'D1' is already in length group \
+             interfaces[0].length_groups[0]",
+            json!([{ "name": "a", "nets": ["D0", "D1"], "tolerance_mm": 0.5 },
+                   { "name": "b", "nets": ["D2", "D3"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0", "D0"], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].nets[1]: 'D0' is listed twice in this group",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0"], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].nets: a group without target_mm",
+            json!([{ "name": "g", "nets": ["D0"], "tolerance_mm": 0.5, "target_mm": 30 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": [], "tolerance_mm": 0.5, "target_mm": 30 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].nets: a length group needs at least one net",
+            json!([{ "name": "g", "nets": ["D0"], "tolerance_mm": 0.5, "target_mm": 30 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].tolerance_mm: 0 must be greater than zero",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.01 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": -0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].tolerance_mm: -0.5 must be greater than zero",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5, "target_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].target_mm: 0.5 must be greater than tolerance_mm 0.5",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5, "target_mm": 0.6 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5, "target_mm": -3 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].target_mm",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5, "target_mm": 3 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "a", "nets": ["D0", "D1"], "tolerance_mm": 0.5 },
+                   { "name": "a", "nets": ["D2", "D3"], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[1].name: 'a' is used twice",
+            json!([{ "name": "a", "nets": ["D0", "D1"], "tolerance_mm": 0.5 },
+                   { "name": "b", "nets": ["D2", "D3"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": " g", "nets": ["D0", "D1"], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].name: ' g' has leading or trailing whitespace",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        (
+            json!([{ "name": "g", "nets": ["D0", " "], "tolerance_mm": 0.5 }]),
+            json!([]),
+            "interfaces[0].length_groups[0].nets[1]: ' ' is only whitespace",
+            json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": 0.5 }]),
+            json!([]),
+        ),
+        // A pair split across two groups.
+        (
+            json!([{ "name": "a", "nets": ["D0", "DQS"], "tolerance_mm": 0.5 },
+                   { "name": "b", "nets": ["D1", "DQSN"], "tolerance_mm": 0.5 }]),
+            good_pairs(),
+            "interfaces[0].differential_pairs[0]: 'DQS' and 'DQSN' must be in the same length group",
+            json!([{ "name": "a", "nets": ["D0", "DQS", "DQSN"], "tolerance_mm": 0.5 },
+                   { "name": "b", "nets": ["D1", "D2"], "tolerance_mm": 0.5 }]),
+            good_pairs(),
+        ),
+        // A pair with one net in a group and the other in none.
+        (
+            json!([{ "name": "a", "nets": ["D0", "DQS"], "tolerance_mm": 0.5 }]),
+            good_pairs(),
+            "interfaces[0].differential_pairs[0]: 'DQS' and 'DQSN' must be in the same length group",
+            json!([{ "name": "a", "nets": ["D0", "DQS", "DQSN"], "tolerance_mm": 0.5 }]),
+            good_pairs(),
+        ),
+        // A pair in no group stays allowed.
+        (
+            json!([{ "name": "a", "nets": ["D0", "DQSN"], "tolerance_mm": 0.5 }]),
+            good_pairs(),
+            "must be in the same length group",
+            json!([{ "name": "a", "nets": ["D0", "D1"], "tolerance_mm": 0.5 }]),
+            good_pairs(),
+        ),
+        (
+            json!([]),
+            json!([{ "positive": "DQS", "negative": "DQSN", "max_skew_mm": 0 }]),
+            "interfaces[0].differential_pairs[0].max_skew_mm: 0 must be greater than zero",
+            json!([]),
+            json!([{ "positive": "DQS", "negative": "DQSN", "max_skew_mm": 0.001 }]),
+        ),
+        (
+            json!([]),
+            json!([{ "positive": "DQS", "negative": "DQSN", "max_skew_mm": -1 }]),
+            "interfaces[0].differential_pairs[0].max_skew_mm: -1 must be greater than zero",
+            json!([]),
+            json!([{ "positive": "DQS", "negative": "DQSN" }]),
+        ),
+    ];
+    for (bad_groups, bad_pairs, expected, good_groups, good_pairs) in cases {
+        let bad = ram(bad_groups, bad_pairs);
+        let reason = refusal_reason(bad.clone())
+            .unwrap_or_else(|| panic!("{bad} was accepted, wanted '{expected}'"));
+        assert!(
+            reason.contains(expected),
+            "{bad}: '{reason}' lacks '{expected}'"
+        );
+        let good = ram(good_groups, good_pairs);
+        assert!(
+            refusal_reason(good.clone()).is_none(),
+            "control: {good} must be accepted"
+        );
+    }
+    // A net listed in a group of another interface is refused too (one group per net).
+    let two = json!([
+        { "name": "a", "kind": "x", "nets": ["N0", "N1"],
+          "length_groups": [{ "name": "g", "nets": ["N0", "N1"], "tolerance_mm": 0.5 }] },
+        { "name": "b", "kind": "x", "nets": ["N1", "N2"],
+          "length_groups": [{ "name": "g", "nets": ["N1", "N2"], "tolerance_mm": 0.5 }] }
+    ]);
+    let reason = refusal_reason(two).expect("a net in two groups of two interfaces");
+    assert!(
+        reason.contains(
+            "interfaces[1].length_groups[0].nets[0]: 'N1' is already in length group \
+             interfaces[0].length_groups[0]"
+        ),
+        "{reason}"
+    );
+    let _ = all;
+}
+
+#[test]
+fn the_set_design_intent_description_names_the_two_new_fields() {
+    let tools = tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "set_design_intent")
+        .expect("set_design_intent is registered");
+    assert!(tool.description.contains("length_groups"));
+    assert!(tool.description.contains("max_skew_mm"));
+}
+
+#[test]
+fn non_finite_lengths_are_refused_by_the_validator() {
+    // JSON cannot carry NaN or infinity, so the typed record is built by hand.
+    let mut intent: DesignIntent = serde_json::from_value(json!({
+        "schema_version": 1,
+        "interfaces": ram(good_groups(), good_pairs())
+    }))
+    .unwrap();
+    assert!(
+        validate_lengths(&intent).is_empty(),
+        "control: the record is valid"
+    );
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut broken = intent.clone();
+        broken.interfaces[0].length_groups[0].tolerance_mm = value;
+        let problems = validate_lengths(&broken);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("length_groups[0].tolerance_mm")),
+            "tolerance {value}: {problems:?}"
+        );
+        let mut broken = intent.clone();
+        broken.interfaces[0].length_groups[0].target_mm = Some(value);
+        let problems = validate_lengths(&broken);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("length_groups[0].target_mm")),
+            "target {value}: {problems:?}"
+        );
+        let mut broken = intent.clone();
+        broken.interfaces[0].differential_pairs[0].max_skew_mm = Some(value);
+        let problems = validate_lengths(&broken);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("differential_pairs[0].max_skew_mm")),
+            "skew {value}: {problems:?}"
+        );
+    }
+    intent.interfaces[0].length_groups[0].target_mm = Some(f64::NAN);
+    assert!(
+        !validate(&intent).is_empty(),
+        "validate includes the length rules"
+    );
+}
