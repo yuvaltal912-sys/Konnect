@@ -13,9 +13,6 @@
 //! Read from the saved board's text, as `trace_current.rs` reads copper thickness:
 //! the route call works on files, and IPC is not available there.
 
-// Stage 1 of Row LT builds this module; the route call uses it from Stage 2 on.
-#![allow(dead_code)]
-
 use konnect_sexp::{parse_sexp, SexpNode};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -84,6 +81,7 @@ fn micrometres(mm: f64) -> String {
 impl LayerHeights {
     /// The switch value, `0,0.55,1.065,1.58`: each height in mm, rounded to the
     /// micrometre, without trailing zeros; `None` without heights.
+    #[allow(dead_code)] // Row LT: the runner sends it from Stage 4 on
     pub(crate) fn switch_value(&self) -> Option<String> {
         let heights = self.heights_mm.as_ref()?;
         Some(
@@ -278,6 +276,7 @@ pub(crate) fn copper_heights_mm(items: &[StackItem]) -> BTreeMap<String, f64> {
 /// upper one through the lower one, both copper thicknesses included; 0 for the same
 /// layer; `None` when either is not a copper item. For the tests and the
 /// verification's residual report (how far fastroute's via count is from KiCad's).
+#[allow(dead_code)] // Row LT: tests and the verification's residual report
 pub(crate) fn kicad_layer_distance_mm(
     items: &[StackItem],
     first: &str,
