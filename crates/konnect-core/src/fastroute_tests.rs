@@ -1063,6 +1063,10 @@ fn a_session_that_cannot_be_read_is_an_error_naming_which_one() {
             session(&[("A", "(wire (path F.Cu 2500 0 0 10))".to_string())]),
         ),
         (
+            "an odd coordinate count with two points",
+            session(&[("A", "(wire (path F.Cu 2500 0 0 10 0 5))".to_string())]),
+        ),
+        (
             "one point",
             session(&[("A", "(wire (path F.Cu 2500 0 0))".to_string())]),
         ),
@@ -3366,5 +3370,117 @@ int main(int argc, char **argv) {
         assert_eq!(held.kept, "polish");
         assert!(!fixture.path().join("no_groups/tune").exists());
         assert!(held.passes.iter().all(|row| row["name"] != "tune"));
+    }
+
+    /// A real Tune pass, sandboxed as every pass is: the candidate build lengthens
+    /// the short net of a two-net group and touches no other net, and with a window
+    /// no net misses it changes nothing. Run by hand, never `--live`:
+    ///
+    /// ```text
+    /// cargo test -p konnect-core --lib a_real_tune_pass -- --ignored --nocapture
+    /// ```
+    ///
+    /// `KONNECT_FASTROUTE` names the binary (default: the candidate's place under
+    /// `HOME`). The board is the public fixture `specctra_pours_routing`.
+    #[tokio::test]
+    #[ignore = "needs the candidate fastroute build (KONNECT_FASTROUTE or its default place); runs it sandboxed"]
+    async fn a_real_tune_pass_lengthens_only_its_nets() {
+        use crate::route_search::{variant_text, Shape};
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let dir = tempfile::tempdir().unwrap();
+        let environment = std::env::var("KONNECT_FASTROUTE").ok();
+        let binary = match locate(
+            None,
+            environment.as_deref(),
+            None,
+            None,
+            home.as_deref(),
+            &dir.path().join("probe"),
+        )
+        .await
+        {
+            Located::Found(binary) => binary,
+            other => panic!("no usable fastroute: {other:?}"),
+        };
+        let fixture_dsn =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/specctra_pours_routing.dsn");
+        let dsn_text = variant_text(
+            &std::fs::read_to_string(fixture_dsn).unwrap(),
+            Shape::AsExported,
+            1,
+        )
+        .unwrap();
+        let dsn = dir.path().join("variant.dsn");
+        std::fs::write(&dsn, &dsn_text).unwrap();
+        let classes = crate::specctra::dsn_class_names(&dsn_text).unwrap();
+        assert!(!classes.is_empty());
+        let nets = names(&["S1", "S2"]);
+        let hint = RoutingHints {
+            copper_edge_clearance_um: Some(300),
+            retry_width_um: None,
+            retry_off_reason: Some("a test"),
+        };
+        let wire_mm = |ses: &Path, net: &str| -> f64 {
+            copper_by_net(&std::fs::read_to_string(ses).unwrap()).unwrap()[net]
+                .pieces
+                .iter()
+                .map(|(_, _, [x1, y1, x2, y2])| {
+                    (((x2 - x1) as f64).powi(2) + ((y2 - y1) as f64).powi(2)).sqrt() / 1000.0
+                })
+                .sum()
+        };
+        let mut lengths = Vec::new();
+        for (name, tolerance) in [("wide", "30"), ("tight", "0.5")] {
+            let tune_file = dir.path().join(format!("{name}.txt"));
+            std::fs::write(
+                &tune_file,
+                format!("group lt1 tolerance={tolerance}\n  S1\n  S2\n"),
+            )
+            .unwrap();
+            let held = route_held(
+                &binary,
+                &dir.path().join(name),
+                &dsn,
+                &hint,
+                CallFiles::default(),
+                WidthFallback::None,
+                Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+                soon(300),
+            )
+            .await
+            .unwrap();
+            let rows: Vec<_> = held.passes.iter().map(|r| r["outcome"].clone()).collect();
+            let tune_row = held.passes.last().unwrap();
+            assert_eq!(tune_row["name"], "tune", "{rows:?}");
+            assert_eq!(tune_row["outcome"], "kept", "{tune_row}");
+            assert_eq!(held.kept, TUNE_PASS);
+            let full = dir.path().join(name).join("full/full.ses");
+            assert!(changed_outside(
+                &std::fs::read_to_string(&full).unwrap(),
+                &std::fs::read_to_string(&held.ses).unwrap(),
+                &nets
+            )
+            .unwrap()
+            .is_empty());
+            let (before, after) = (wire_mm(&full, "S2"), wire_mm(&held.ses, "S2"));
+            eprintln!(
+                "{name}: S2 {before:.2} -> {after:.2} mm, S1 {:.2} -> {:.2}",
+                wire_mm(&full, "S1"),
+                wire_mm(&held.ses, "S1")
+            );
+            lengths.push((
+                before,
+                after,
+                wire_mm(&full, "S1"),
+                wire_mm(&held.ses, "S1"),
+            ));
+        }
+        // A window no net misses changes the geometry of nothing; a tight one
+        // lengthens the short net and leaves the longest alone.
+        let (before, after, ..) = lengths[0];
+        assert!((before - after).abs() < 1e-3, "{lengths:?}");
+        let (before, after, s1_before, s1_after) = lengths[1];
+        assert!(after > before + 5.0, "{lengths:?}");
+        assert!((s1_before - s1_after).abs() < 1e-3, "{lengths:?}");
     }
 }
