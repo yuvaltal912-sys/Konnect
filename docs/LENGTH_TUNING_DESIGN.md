@@ -1,12 +1,13 @@
 # Length tuning (serpentine routing) with fastroute: design (Row LT)
 
-Status: design only. Claude Opus 5.5 (xhigh) designed it down to the skeletons on 2026-11-20,
+Status: being built. Claude Opus 5.5 (xhigh) designed it down to the skeletons on 2026-11-20,
 on branch `claude/length-tuning-design-674041` from `fork/main` `8795de82`. It builds on Row DP
-(differential pairs to fastroute, branch `claude/fastroute-pairs` at `5448e46d`, whose code is
-that of `98d1f837`; not merged yet) as if DP were merged. The owner approved its three
-decisions as recommended on 2026-11-20 ("Yes, as recommended"). Sonnet 5.5 (high) agents
-write the bodies when he starts the build, after DP is merged. Nothing is built, and no board
-was written.
+(differential pairs to fastroute), which merged as #93 (main `d758fbab`). After the code this
+design read (`98d1f837`), DP's review fixes split `conclude` out of `search_and_write` and made a
+netclass gap of 0 count as unset; where a skeleton names a DP item, the bodies follow the merged
+code. The owner approved its three decisions as recommended on 2026-11-20 ("Yes, as
+recommended") and started the build the same day, on branch `claude/length-tuning` (this
+design with main `0a3fc504` merged in). Sonnet 5.5 (high) agents write the bodies.
 
 ## What the owner asked for
 
