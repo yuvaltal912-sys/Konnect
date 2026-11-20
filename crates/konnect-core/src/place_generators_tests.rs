@@ -2985,3 +2985,51 @@ fn a_cap_is_placed_by_pads_that_are_off_the_axes() {
             .pad(pad("1", 1.1, -1.8, Some("VCC")));
     assert_eq!(lone(pin, wide), (40.0, 37.0));
 }
+
+#[test]
+fn a_turned_ics_pad_offset_is_turned_before_the_cap_searches_from_it() {
+    // U2 is a two-pad part, turned a quarter, dropped at (40, 40). Its pad 1 is at (-1.8, 0.6)
+    // as read; turned it is at (0.6, 1.8): on the bottom edge, 0.6 mm right of the middle.
+    // The cap goes below it (y 43, the cell whose pad 2 is nearest x 40.6), not to the left.
+    let u2 = Fp::new("U2", 20.0, 30.0)
+        .court(2.0, 2.0)
+        .pad(pad("1", -1.8, 0.6, Some("VCC")))
+        .pad(pad("2", 1.8, -0.6, Some("GND")));
+    let model = decoupling_model(
+        vec![u2, cap("C1", (60.0, 50.0))],
+        vec![pair_of("C1", "2", "U2", "1", 2.0)],
+    );
+    let (u2, c1) = (index_of(&model, "U2"), index_of(&model, "C1"));
+    let sizes = as_read_sizes(&model);
+    let mut turns = vec![0; model.parts.len()];
+    turns[u2] = 1;
+    let mut centres = as_read_centres(&model);
+    centres[u2] = (40.0, 40.0);
+    centres[c1] = (60.0, 51.0);
+    legalize_turned(&model, &sizes, &turns, &mut centres).unwrap();
+    assert_eq!(centres[u2], (40.0, 40.0));
+    assert_eq!(centres[c1], (40.0, 43.0));
+    // Unturned, the same pad is on the left edge and the cap goes there.
+    let mut centres = as_read_centres(&model);
+    centres[u2] = (40.0, 40.0);
+    centres[c1] = (60.0, 51.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[c1], (36.5, 40.5));
+}
+
+#[test]
+fn a_pair_of_a_part_with_itself_is_ignored() {
+    // C1 is paired with its own pad. It is no decoupling cap of anything: it stays on the
+    // legal cell it was dropped on, as any part does, instead of searching from its pad.
+    let model = decoupling_model(
+        vec![ic(), cap("C1", (60.0, 50.0))],
+        vec![pair_of("C1", "1", "C1", "2", 2.0)],
+    );
+    assert_eq!(measured_pairs(&model).len(), 1, "the pair can be measured");
+    let sizes = as_read_sizes(&model);
+    let mut centres = as_read_centres(&model);
+    let c1 = index_of(&model, "C1");
+    centres[c1] = (60.0, 51.0);
+    legalize(&model, &sizes, &mut centres).unwrap();
+    assert_eq!(centres[c1], (60.0, 51.0));
+}
