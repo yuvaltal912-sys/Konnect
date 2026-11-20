@@ -2435,6 +2435,94 @@ pub(crate) fn dsn_net_names(dsn: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The root of a DSN for the Row LT readers: its S-expression, which must be a `pcb`.
+fn pcb_root(dsn: &str) -> Result<SexpNode> {
+    let root = parse_dsn_sexp(dsn)
+        .map_err(|_| anyhow::anyhow!("the DSN is not a readable S-expression"))?;
+    if root
+        .head()
+        .is_none_or(|head| !head.eq_ignore_ascii_case("pcb"))
+    {
+        bail!("the DSN's root is not 'pcb'");
+    }
+    Ok(root)
+}
+
+/// The children of `node` whose keyword is `name`, in any letter case.
+fn keyword_children<'a>(node: &'a SexpNode, name: &str) -> Vec<&'a SexpNode> {
+    node.children()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|child| {
+            child
+                .head()
+                .is_some_and(|head| head.eq_ignore_ascii_case(name))
+        })
+        .collect()
+}
+
+/// Row LT: the layers of a DSN's `structure`, as the DSN names them, in file order,
+/// which is how fastroute numbers them. Refused when a layer has no
+/// `(property (index N))` or the file order is not the index order: a height list
+/// read against the wrong layers would count vias wrongly without any error.
+/// Keywords match in any letter case; a DSN that does not parse is an error.
+#[allow(dead_code)] // Row LT: the route call uses it from Stage 2 on
+pub(crate) fn dsn_layer_names(dsn: &str) -> Result<Vec<String>> {
+    let root = pcb_root(dsn)?;
+    let mut names: Vec<String> = Vec::new();
+    for structure in keyword_children(&root, "structure") {
+        for layer in keyword_children(structure, "layer") {
+            let name = dsn_atom(layer, 1, "layer name")?.to_string();
+            let index = keyword_children(layer, "property")
+                .into_iter()
+                .flat_map(|property| keyword_children(property, "index"))
+                .next()
+                .with_context(|| format!("the DSN layer '{name}' has no (property (index N))"))?;
+            let index = dsn_atom(index, 1, "layer index")?
+                .parse::<usize>()
+                .with_context(|| {
+                    format!("the index of the DSN layer '{name}' is not an integer")
+                })?;
+            if index != names.len() {
+                bail!(
+                    "the DSN lists layer '{name}' at position {} with index {index}: its file \
+                     order is not its index order",
+                    names.len()
+                );
+            }
+            if names.contains(&name) {
+                bail!("the DSN lists the layer '{name}' twice");
+            }
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Row LT: the net classes of a DSN's `network` (`(class NAME net …)`), in file
+/// order, each once: what the Tune pass lists in
+/// `--router.autorouter.ignore_net_classes`. A class name holding a comma cannot be
+/// listed (fastroute splits the value at commas); it is left out, and the Tune
+/// pass's other-net check (L6) still guards its nets.
+#[allow(dead_code)] // Row LT: the route call uses it from Stage 2 on
+pub(crate) fn dsn_class_names(dsn: &str) -> Result<Vec<String>> {
+    let root = pcb_root(dsn)?;
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    for network in keyword_children(&root, "network") {
+        for class in keyword_children(network, "class") {
+            let name = dsn_atom(class, 1, "network class name")?.to_string();
+            if name.contains(',') {
+                continue;
+            }
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// The reverse manifest the export wrote beside `dsn` (`<dsn>.konnect.json`),
 /// when it is there and is JSON.
 pub(crate) fn manifest_beside(dsn: &Path) -> Option<serde_json::Value> {
@@ -4804,3 +4892,7 @@ mod hole_clearance_tests;
 #[cfg(test)]
 #[path = "specctra_pours_tests.rs"]
 mod pours_tests;
+
+#[cfg(test)]
+#[path = "specctra_lengths_tests.rs"]
+mod lengths_tests;
