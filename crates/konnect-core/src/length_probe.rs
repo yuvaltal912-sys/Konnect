@@ -2,15 +2,37 @@
 //! measures every checked net on a copy of the judged board, and Konnect compares
 //! those lengths with the design intent's groups and pair skews.
 //!
-//! Stage 2 of Row LT holds only the data types the length plan
-//! (`tools/route_lengths.rs`) builds and reports: what is checked, and what a check
-//! found. Stage 3 adds the probe, the check itself and G4's lines.
+//! The copy's `.kicad_dru` holds probe rules only, one `length (min 2000mm)` rule
+//! per net, so that KiCad reports every checked net with its actual length; every
+//! other DRC check the project lists is set to `ignore`, which KiCad skips. The
+//! board's own rules are checked by the judge's ordinary DRC (G4(c)), never here: a
+//! probe rule would override a board rule for the same net.
 
-// Stage 2 of Row LT builds these types; the judge uses them from Stage 3 on.
+// The judge uses these from the next commit on.
 #![allow(dead_code)]
 
+use crate::tools::cli::DrcReport;
 use crate::tools::route_lengths::Window;
+use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// The probe rules' name prefix; rule `n` (from 1) is `__konnect_len_<n, 4 digits>`.
+pub(crate) const PROBE_RULE_PREFIX: &str = "__konnect_len_";
+/// The probe rules' minimum length, mm: no real net reaches it, so every probed net
+/// is reported, and the actual length is the other number of the message. KiCad
+/// holds a constraint as a 32-bit count of nanometres, so the largest minimum it
+/// keeps is 2147.48 mm (`KiROUND` clamps above that); this is below it.
+pub(crate) const PROBE_MIN_MM: f64 = 2000.0;
+/// The probe's folder in a run's judge folder.
+pub(crate) const PROBE_FOLDER: &str = "lengths";
+/// The rank key's step for the intent miss, mm (L10).
+pub(crate) const MISS_STEP_MM: f64 = 0.01;
+/// How far past a window's end a length may be and still pass, mm: half of the
+/// last digit KiCad prints (4 decimals), so that a net printed on the bound passes.
+pub(crate) const PRINTED_HALF_DIGIT_MM: f64 = 0.000_05;
 
 /// KiCad's rule keys of length and skew violations: G4 counts them, G2 does not
 /// (L9).
@@ -110,3 +132,415 @@ pub(crate) struct LengthMeasures {
     /// The probe's own DRC time, seconds.
     pub probe_s: f64,
 }
+
+/// The probe's `.kicad_dru`: `(version 1)`, then for net `n` (from 1, in `nets`
+/// order) `(rule "__konnect_len_<n>" (severity error) (constraint length (min
+/// 2000mm)) (condition "A.NetName == '<net>'"))`. The names are
+/// `route_lengths::tune_token`s and no two board nets are equal ignoring case (L4),
+/// so none needs escaping and each rule catches one net.
+pub(crate) fn probe_rules_text(nets: &[String]) -> String {
+    let mut text = String::from("(version 1)\n");
+    for (position, net) in nets.iter().enumerate() {
+        text.push_str(&format!(
+            "(rule \"{PROBE_RULE_PREFIX}{:04}\"\n  (severity error)\n  (constraint length (min {PROBE_MIN_MM}mm))\n  (condition \"A.NetName == '{net}'\"))\n",
+            position + 1
+        ));
+    }
+    text
+}
+
+/// The probe copy's `.kicad_pro`: the project's own text with every key of
+/// `board.design_settings.rule_severities` set to `"ignore"` except
+/// `length_out_of_range`, which is `"error"` (added when missing, with the object
+/// that holds it). A project that sets that key to `ignore` hides every probe
+/// violation whatever a rule's own `severity` says, so it is forced. A check the
+/// project does not list runs at KiCad's default severity: slower, never wrong.
+/// Everything else, `use_height_for_length_calcs` included, is kept. An error when
+/// the text is not a JSON object.
+pub(crate) fn probe_project_text(project_text: &str) -> Result<String> {
+    let mut project: Value =
+        serde_json::from_str(project_text).context("the project file is not JSON")?;
+    ensure!(project.is_object(), "the project file is not a JSON object");
+    // A key that is present but not an object is replaced: the probe's own settings
+    // must be exact.
+    let object_at = |value: &mut Value, key: &str| {
+        if !value[key].is_object() {
+            value[key] = json!({});
+        }
+    };
+    object_at(&mut project, "board");
+    object_at(&mut project["board"], "design_settings");
+    object_at(&mut project["board"]["design_settings"], "rule_severities");
+    let severities = project["board"]["design_settings"]["rule_severities"]
+        .as_object_mut()
+        .context("the project's rule severities are not an object")?;
+    for severity in severities.values_mut() {
+        *severity = json!("ignore");
+    }
+    severities.insert("length_out_of_range".to_string(), json!("error"));
+    serde_json::to_string_pretty(&project).context("write the probe's project file")
+}
+
+/// `kicad-cli pcb drc --output <out> --format json --units mm <board>`: no refill,
+/// no save, no schematic parity.
+pub(crate) fn probe_drc_args<'a>(out: &'a str, board: &'a str) -> Vec<&'a str> {
+    vec![
+        "pcb", "drc", "--output", out, "--format", "json", "--units", "mm", board,
+    ]
+}
+
+/// The actual length in a probe violation's description, mm: every number followed
+/// by `mm` (a decimal comma read as a point), less the ones within 0.001 of
+/// [`PROBE_MIN_MM`]; `None` unless exactly one is left (a net at 2000 mm or longer
+/// reads `None` and is unmeasured). The words around the numbers are never read, so
+/// KiCad's language does not matter. Its tests use a report captured from a real
+/// `kicad-cli` run, not a hand-written message.
+pub(crate) fn actual_mm(description: &str) -> Option<f64> {
+    let chars: Vec<char> = description.chars().collect();
+    let mut found: Vec<f64> = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        if !chars[at].is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < chars.len() && chars[at].is_ascii_digit() {
+            at += 1;
+        }
+        if at + 1 < chars.len()
+            && matches!(chars[at], '.' | ',')
+            && chars[at + 1].is_ascii_digit()
+        {
+            at += 1;
+            while at < chars.len() && chars[at].is_ascii_digit() {
+                at += 1;
+            }
+        }
+        // A number inside a word or a name (`len_0001`) is not a length.
+        if start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+            continue;
+        }
+        let mut unit = at;
+        while unit < chars.len() && chars[unit].is_whitespace() {
+            unit += 1;
+        }
+        let is_mm = unit + 1 < chars.len()
+            && chars[unit] == 'm'
+            && chars[unit + 1] == 'm'
+            && !chars.get(unit + 2).is_some_and(|ch| ch.is_alphabetic());
+        if !is_mm {
+            continue;
+        }
+        let number: String = chars[start..at]
+            .iter()
+            .map(|ch| if *ch == ',' { '.' } else { *ch })
+            .collect();
+        if let Ok(value) = number.parse::<f64>() {
+            found.push(value);
+        }
+    }
+    found.retain(|mm| (mm - PROBE_MIN_MM).abs() >= 0.001);
+    match found[..] {
+        // KiCad reports only a length below the minimum, so a number above it is
+        // not an actual length.
+        [mm] if mm < PROBE_MIN_MM => Some(mm),
+        _ => None,
+    }
+}
+
+/// The probe's lengths by net, and the nets it gave no entry for (in `nets` order).
+/// A violation counts when its rule is `length_out_of_range`, its description names
+/// a probe rule, and one of its items names that rule's net as `[<net>]`. Two
+/// entries for one net, an entry whose items name another net, or a rule number
+/// that was never written, is an error (the probe is not trusted).
+pub(crate) fn parse_probe(
+    report: &DrcReport,
+    nets: &[String],
+) -> Result<(BTreeMap<String, f64>, Vec<String>)> {
+    let mut lengths: BTreeMap<String, f64> = BTreeMap::new();
+    let mut seen: Vec<bool> = vec![false; nets.len()];
+    for violation in report
+        .violations
+        .iter()
+        .filter(|violation| violation.rule == "length_out_of_range")
+    {
+        let Some(at) = violation.description.find(PROBE_RULE_PREFIX) else {
+            continue;
+        };
+        let digits: String = violation.description[at + PROBE_RULE_PREFIX.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let Ok(number) = digits.parse::<usize>() else {
+            continue;
+        };
+        let Some(position) = number.checked_sub(1).filter(|p| *p < nets.len()) else {
+            bail!(
+                "the length probe's report names rule {PROBE_RULE_PREFIX}{digits}, but only {} rule(s) were written",
+                nets.len()
+            );
+        };
+        let net = &nets[position];
+        let tag = format!("[{net}]");
+        let names_net = violation
+            .items
+            .iter()
+            .any(|item| item.description.contains(&tag));
+        if !names_net {
+            ensure!(
+                violation.items.is_empty(),
+                "the length probe's rule {PROBE_RULE_PREFIX}{digits} is for net '{net}', but its items name another net ({})",
+                violation
+                    .items
+                    .iter()
+                    .map(|item| item.description.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            continue;
+        }
+        ensure!(
+            !seen[position],
+            "the length probe reports net '{net}' twice"
+        );
+        seen[position] = true;
+        if let Some(mm) = actual_mm(&violation.description) {
+            lengths.insert(net.clone(), mm);
+        }
+    }
+    let unmeasured = nets
+        .iter()
+        .filter(|net| !lengths.contains_key(*net))
+        .cloned()
+        .collect();
+    Ok((lengths, unmeasured))
+}
+
+/// Runs the probe for `nets` on the judged board `judged`: `scratch_board::
+/// copy_project` into `folder`, the board's text copied there, the `.kicad_dru`
+/// replaced by [`probe_rules_text`], the `.kicad_pro` by [`probe_project_text`]
+/// (left as copied when there is none), then kicad-cli with [`probe_drc_args`] and
+/// `KICAD_CONFIG_HOME` = `config_home` when given. Returns the lengths, the
+/// unmeasured nets and the DRC's seconds. kicad-cli failing, or a report that does
+/// not read, is an error: the judge fails.
+pub(crate) async fn probe_lengths(
+    kicad_cli: &str,
+    config_home: Option<&Path>,
+    judged: &Path,
+    folder: &Path,
+    nets: &[String],
+) -> Result<(BTreeMap<String, f64>, Vec<String>, f64)> {
+    if folder.exists() {
+        std::fs::remove_dir_all(folder)
+            .with_context(|| format!("clear the old probe folder '{}'", folder.display()))?;
+    }
+    let board = crate::scratch_board::copy_project(judged, folder)?;
+    std::fs::copy(judged, &board).with_context(|| {
+        format!(
+            "copy the judged board '{}' to '{}'",
+            judged.display(),
+            board.display()
+        )
+    })?;
+    std::fs::write(board.with_extension("kicad_dru"), probe_rules_text(nets))
+        .context("write the probe's rules")?;
+    let project = board.with_extension("kicad_pro");
+    if project.is_file() {
+        let own = std::fs::read_to_string(&project)
+            .with_context(|| format!("read the project file '{}'", project.display()))?;
+        let probe = probe_project_text(&own)
+            .with_context(|| format!("the project file '{}' cannot be probed", project.display()))?;
+        std::fs::write(&project, probe).context("write the probe's project file")?;
+    }
+
+    let out = board.with_extension("length.json");
+    let args = probe_drc_args(
+        out.to_str().context("scratch path is not UTF-8")?,
+        board.to_str().context("scratch path is not UTF-8")?,
+    );
+    let started = std::time::Instant::now();
+    let report = crate::tools::cli::drc_report_from_args(kicad_cli, &args, &out, config_home)
+        .await
+        .context("kicad-cli's length probe failed")?;
+    let seconds = started.elapsed().as_secs_f64();
+    let (lengths, unmeasured) = parse_probe(&report, nets)?;
+    Ok((lengths, unmeasured, seconds))
+}
+
+/// The measures of a run (L9): each group's nets against `Window::range_mm` (skew
+/// mode against the longest measured net), each pair's skew against its maximum, a
+/// net past a window's end by at most [`PRINTED_HALF_DIGIT_MM`] counted inside; the
+/// misses summed.
+pub(crate) fn check(
+    checks: &LengthChecks,
+    lengths: &BTreeMap<String, f64>,
+    unmeasured: Vec<String>,
+    probe_s: f64,
+) -> LengthMeasures {
+    // How far `value` is outside `low..=high`, mm: 0 on a bound, within half a
+    // printed digit.
+    let outside = |value: f64, low: f64, high: f64| -> f64 {
+        if value < low - PRINTED_HALF_DIGIT_MM {
+            low - value
+        } else if value > high + PRINTED_HALF_DIGIT_MM {
+            value - high
+        } else {
+            0.0
+        }
+    };
+    let mut miss_mm = 0.0;
+    let mut groups = Vec::new();
+    for group in &checks.groups {
+        let longest_mm = group
+            .nets
+            .iter()
+            .filter_map(|net| lengths.get(net).copied())
+            .fold(None, |most: Option<f64>, mm| Some(most.map_or(mm, |m| m.max(mm))));
+        let (low_mm, high_mm) = group.window.range_mm(longest_mm.unwrap_or(0.0));
+        let nets = group
+            .nets
+            .iter()
+            .map(|net| {
+                let kicad_mm = lengths.get(net).copied();
+                let miss = kicad_mm.map_or(0.0, |mm| outside(mm, low_mm, high_mm));
+                miss_mm += miss;
+                NetLength {
+                    net: net.clone(),
+                    kicad_mm,
+                    low_mm,
+                    high_mm,
+                    miss_mm: miss,
+                }
+            })
+            .collect();
+        groups.push(GroupLengths {
+            interface: group.interface.clone(),
+            name: group.name.clone(),
+            longest_mm,
+            nets,
+        });
+    }
+    let pairs = checks
+        .pairs
+        .iter()
+        .map(|pair| {
+            let skew_mm = match (lengths.get(&pair.positive), lengths.get(&pair.negative)) {
+                (Some(positive), Some(negative)) => Some((positive - negative).abs()),
+                _ => None,
+            };
+            let miss = skew_mm.map_or(0.0, |skew| outside(skew, 0.0, pair.max_skew_mm));
+            miss_mm += miss;
+            PairSkew {
+                positive: pair.positive.clone(),
+                negative: pair.negative.clone(),
+                skew_mm,
+                max_skew_mm: pair.max_skew_mm,
+                miss_mm: miss,
+            }
+        })
+        .collect();
+    // A checked net with no length is unmeasured whatever the caller listed.
+    let mut unmeasured = unmeasured;
+    unmeasured.extend(
+        checks
+            .nets()
+            .into_iter()
+            .filter(|net| !lengths.contains_key(net)),
+    );
+    unmeasured.sort();
+    unmeasured.dedup();
+    LengthMeasures {
+        groups,
+        pairs,
+        unmeasured,
+        miss_mm,
+        probe_s,
+    }
+}
+
+/// Whether G2 counts a KiCad rule key: every key but [`LENGTH_RULE_KEYS`].
+pub(crate) fn counts_in_g2(rule: &str) -> bool {
+    !LENGTH_RULE_KEYS.contains(&rule)
+}
+
+/// KiCad's own length and skew violations on the judged board (`Measures.
+/// violations`), summed.
+pub(crate) fn kicad_rule_violations(violations: &BTreeMap<String, usize>) -> usize {
+    LENGTH_RULE_KEYS
+        .iter()
+        .map(|key| violations.get(*key).copied().unwrap_or(0))
+        .sum()
+}
+
+/// G4's lines (L9), one per failure: each net outside its window ("group 'dq'
+/// (ram): /DQ7 is 41.20 mm, 0.62 mm below its window 41.82–42.32 mm"), each
+/// unmeasured net, each pair over its skew, and KiCad's own violations by key
+/// ("KiCad: 2 length_out_of_range violation(s) of the board's own rules"). Empty
+/// when everything passes; `measures` is `None` when the call checks nothing.
+pub(crate) fn g4_lines(
+    measures: Option<&LengthMeasures>,
+    violations: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(measures) = measures {
+        for group in &measures.groups {
+            for net in group.nets.iter().filter(|net| net.miss_mm > 0.0) {
+                let Some(mm) = net.kicad_mm else { continue };
+                // A miss that rounds to 0.00 is shown with the digits KiCad prints.
+                let digits = if net.miss_mm < 0.005 { 4 } else { 2 };
+                let way = if mm < net.low_mm { "below" } else { "above" };
+                lines.push(format!(
+                    "group '{}' ({}): {} is {mm:.digits$} mm, {:.digits$} mm {way} its window {:.digits$}\u{2013}{:.digits$} mm",
+                    group.name, group.interface, net.net, net.miss_mm, net.low_mm, net.high_mm
+                ));
+            }
+        }
+        for pair in measures.pairs.iter().filter(|pair| pair.miss_mm > 0.0) {
+            let Some(skew) = pair.skew_mm else { continue };
+            let digits = if pair.miss_mm < 0.005 { 4 } else { 2 };
+            lines.push(format!(
+                "pair {} / {}: skew {skew:.digits$} mm, {:.digits$} mm over its maximum {:.digits$} mm",
+                pair.positive, pair.negative, pair.miss_mm, pair.max_skew_mm
+            ));
+        }
+        for net in &measures.unmeasured {
+            lines.push(format!(
+                "{net}: KiCad gave no length for this net (not on the board, or 2000 mm or longer)"
+            ));
+        }
+    }
+    for key in LENGTH_RULE_KEYS {
+        let count = violations.get(key).copied().unwrap_or(0);
+        if count > 0 {
+            lines.push(format!(
+                "KiCad: {count} {key} violation(s) of the board's own rules"
+            ));
+        }
+    }
+    lines
+}
+
+/// The rank key's length part (L10), positions 3 to 5: G4 failed (0 or 1), the
+/// intent miss in [`MISS_STEP_MM`] steps (`round`; `i64::MAX` when a net is
+/// unmeasured; 0 without measures), KiCad's own violations.
+pub(crate) fn key_part(
+    g4_failed: bool,
+    measures: Option<&LengthMeasures>,
+    violations: &BTreeMap<String, usize>,
+) -> [i64; 3] {
+    let miss = match measures {
+        None => 0,
+        Some(measures) if !measures.unmeasured.is_empty() => i64::MAX,
+        Some(measures) => (measures.miss_mm / MISS_STEP_MM).round() as i64,
+    };
+    [
+        i64::from(g4_failed),
+        miss,
+        kicad_rule_violations(violations) as i64,
+    ]
+}
+
+#[cfg(test)]
+#[path = "length_probe_tests.rs"]
+mod tests;

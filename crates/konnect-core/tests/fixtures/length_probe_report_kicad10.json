@@ -1,0 +1,393 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-11-20T16:44:18",
+    "ignored_checks": [
+        {
+            "description": "Footprint has no courtyard defined",
+            "key": "missing_courtyard"
+        },
+        {
+            "description": "Track endpoint not centered on via",
+            "key": "track_not_centered_on_via"
+        },
+        {
+            "description": "Tuning profile track geometries",
+            "key": "tuning_profile_track_geometries"
+        },
+        {
+            "description": "Footprint doesn't match symbol's footprint filters",
+            "key": "footprint_filters_mismatch"
+        },
+        {
+            "description": "Footprint component type doesn't match footprint pads",
+            "key": "footprint_type_mismatch"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "10.0.8",
+    "schematic_parity": [],
+    "source": "specctra_pours_routing.kicad_pcb",
+    "unconnected_items": [],
+    "violations": [
+        {
+            "description": "Track length out of range (rule '__konnect_len_0001' min length 2000.0000 mm; actual 52.2760 mm)",
+            "items": [
+                {
+                    "description": "Track [S1] on F.Cu, length 13.4851 mm",
+                    "pos": {
+                        "x": 106.9936,
+                        "y": 121.5415
+                    },
+                    "uuid": "1fcd8264-477e-4c8c-84b0-053306105275"
+                },
+                {
+                    "description": "Track [S1] on F.Cu, length 12.2779 mm",
+                    "pos": {
+                        "x": 115.6754,
+                        "y": 130.2233
+                    },
+                    "uuid": "828ddcfc-cc61-45f4-85b7-0de4a230eee8"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0002' min length 2000.0000 mm; actual 37.5011 mm)",
+            "items": [
+                {
+                    "description": "Via [S2] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 125.0005,
+                        "y": 132.9811
+                    },
+                    "uuid": "94f20b0f-af12-419f-bf5b-87342161e85b"
+                },
+                {
+                    "description": "Via [S2] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 125.0005,
+                        "y": 109.1188
+                    },
+                    "uuid": "b0c6e4f1-c8d2-4e16-bf1e-8e98b6b7a6aa"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0003' min length 2000.0000 mm; actual 36.3050 mm)",
+            "items": [
+                {
+                    "description": "Via [S3] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 127.4635,
+                        "y": 131.3802
+                    },
+                    "uuid": "3dcf1b20-b119-4e9c-8992-3325618ee98d"
+                },
+                {
+                    "description": "Via [S3] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 127.9535,
+                        "y": 109.1188
+                    },
+                    "uuid": "918fcf37-39d2-4873-9577-d638c62a0c8f"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0004' min length 2000.0000 mm; actual 54.2499 mm)",
+            "items": [
+                {
+                    "description": "Via [S4] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 116.1415,
+                        "y": 109.9476
+                    },
+                    "uuid": "b0edd6d2-0f82-4f1c-a226-a247d9fa8fc0"
+                },
+                {
+                    "description": "Via [S4] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 107.2825,
+                        "y": 129.9445
+                    },
+                    "uuid": "dddf4110-196c-4db2-b4b7-226c79e4e2e0"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0005' min length 2000.0000 mm; actual 33.1560 mm)",
+            "items": [
+                {
+                    "description": "Track [S5] on F.Cu, length 2.5597 mm",
+                    "pos": {
+                        "x": 140.05,
+                        "y": 120.0
+                    },
+                    "uuid": "b196a5d5-d81a-4325-81de-6f5ab32fc7b6"
+                },
+                {
+                    "description": "Track [S5] on F.Cu, length 1.2162 mm",
+                    "pos": {
+                        "x": 108.86,
+                        "y": 121.81
+                    },
+                    "uuid": "c78779ca-a3bc-4cd4-9163-12ac8e897b97"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0006' min length 2000.0000 mm; actual 12.3816 mm)",
+            "items": [
+                {
+                    "description": "Track [S6] on F.Cu, length 1.4562 mm",
+                    "pos": {
+                        "x": 118.05,
+                        "y": 120.0
+                    },
+                    "uuid": "30ecaeb4-f4bb-434b-8d85-0fbf829a4c2f"
+                },
+                {
+                    "description": "Track [S6] on F.Cu, length 0.1127 mm",
+                    "pos": {
+                        "x": 129.9203,
+                        "y": 121.0297
+                    },
+                    "uuid": "965e6cda-5913-454e-82e6-76efa95d6878"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0007' min length 2000.0000 mm; actual 0.0000 mm)",
+            "items": [
+                {
+                    "description": "Pad 2 [GND] of R6 on F.Cu",
+                    "pos": {
+                        "x": 119.95,
+                        "y": 120.0
+                    },
+                    "uuid": "429c4159-b511-5e80-b475-65aa5574a08e"
+                },
+                {
+                    "description": "Pad 2 [GND] of R2 on F.Cu",
+                    "pos": {
+                        "x": 119.0,
+                        "y": 107.05
+                    },
+                    "uuid": "eb4d1f6b-cb78-578f-af95-f32a2eb90867"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Isolated copper fill",
+            "items": [
+                {
+                    "description": "Zone 'GND_BOTTOM' [GND] on B.Cu, priority 0",
+                    "pos": {
+                        "x": 101.0,
+                        "y": 101.0
+                    },
+                    "uuid": "e67b4499-14f0-52fa-8c00-ae1d40060956"
+                }
+            ],
+            "severity": "warning",
+            "type": "isolated_copper"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R6",
+                    "pos": {
+                        "x": 119.0,
+                        "y": 120.0
+                    },
+                    "uuid": "0a3dcc91-f698-5795-b479-bd1080f80b38"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R2",
+                    "pos": {
+                        "x": 119.0,
+                        "y": 108.0
+                    },
+                    "uuid": "0dfd642f-799a-53d0-baab-3585c6e9ff9d"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R8",
+                    "pos": {
+                        "x": 141.0,
+                        "y": 120.0
+                    },
+                    "uuid": "152c2986-79e9-5b85-ac19-4340ae5acdc5"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R3",
+                    "pos": {
+                        "x": 130.0,
+                        "y": 108.0
+                    },
+                    "uuid": "1a22c61a-936e-5f08-9b31-5f053bc989cd"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R9",
+                    "pos": {
+                        "x": 108.0,
+                        "y": 132.0
+                    },
+                    "uuid": "282bac83-1d6d-59a7-94fc-2760a246ef5a"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R12",
+                    "pos": {
+                        "x": 141.0,
+                        "y": 132.0
+                    },
+                    "uuid": "53673da3-54c6-514d-9548-5f49a421081e"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R10",
+                    "pos": {
+                        "x": 119.0,
+                        "y": 132.0
+                    },
+                    "uuid": "56bb1990-fdf8-5783-a424-9a2814b01f74"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R1",
+                    "pos": {
+                        "x": 108.0,
+                        "y": 108.0
+                    },
+                    "uuid": "ae6cfca7-03b7-5c6c-830d-5b3ae030c795"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R4",
+                    "pos": {
+                        "x": 141.0,
+                        "y": 108.0
+                    },
+                    "uuid": "b57ee82c-ad0a-5d26-8685-bd35055f2ae1"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R7",
+                    "pos": {
+                        "x": 130.0,
+                        "y": 120.0
+                    },
+                    "uuid": "be3e5415-312d-5cd1-baca-7d44ef11e111"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R11",
+                    "pos": {
+                        "x": 130.0,
+                        "y": 132.0
+                    },
+                    "uuid": "d63f9f02-c018-5523-8243-944f2528f813"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Resistor_SMD'",
+            "items": [
+                {
+                    "description": "Footprint R5",
+                    "pos": {
+                        "x": 108.0,
+                        "y": 120.0
+                    },
+                    "uuid": "ec796211-b6a8-51f8-a50a-d2e256e7dbf4"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        }
+    ]
+}
