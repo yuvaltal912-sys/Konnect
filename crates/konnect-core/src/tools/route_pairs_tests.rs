@@ -235,7 +235,8 @@ fn a_pattern_gives_the_class_as_an_assignment_does() {
 }
 
 #[test]
-fn the_gap_is_absent_when_the_class_sets_zero_or_nothing() {
+fn a_gap_of_zero_counts_as_not_set_and_the_next_class_decides() {
+    // A class at 0 with Default at 0.25 gives 0.25.
     let zero = project(
         json!([
             { "name": "Default", "diff_pair_gap": 0.25 },
@@ -244,8 +245,46 @@ fn the_gap_is_absent_when_the_class_sets_zero_or_nothing() {
         json!([]),
         json!({ "/CAN_H": "CAN" }),
     );
-    // A class that sets 0 decides: KiCad takes it, and 0 is "no gap".
-    assert_eq!(gap_mm(&zero, "/CAN_H"), None);
+    assert_eq!(gap_mm(&zero, "/CAN_H"), Some(0.25));
+    // A class at 0 falls through to the next class by priority before Default.
+    let between = project(
+        json!([
+            { "name": "Default", "diff_pair_gap": 0.25 },
+            { "name": "A", "priority": 0, "diff_pair_gap": 0.0 },
+            { "name": "B", "priority": 1, "diff_pair_gap": 0.18 },
+        ]),
+        json!([]),
+        json!({ "/N": ["A", "B"] }),
+    );
+    assert_eq!(gap_mm(&between, "/N"), Some(0.18));
+    // Zero all the way down (class and Default) is no gap.
+    let all_zero = project(
+        json!([
+            { "name": "Default", "diff_pair_gap": 0 },
+            { "name": "CAN", "priority": 0, "diff_pair_gap": 0 },
+        ]),
+        json!([]),
+        json!({ "/CAN_H": "CAN" }),
+    );
+    assert_eq!(gap_mm(&all_zero, "/CAN_H"), None);
+    // A class at 0 and no Default class is no gap.
+    let no_default = project(
+        json!([{ "name": "CAN", "priority": 0, "diff_pair_gap": 0 }]),
+        json!([]),
+        json!({ "/CAN_H": "CAN" }),
+    );
+    assert_eq!(gap_mm(&no_default, "/CAN_H"), None);
+    // A negative value is not a gap either.
+    let negative = project(
+        json!([{ "name": "CAN", "priority": 0, "diff_pair_gap": -0.2 }]),
+        json!([]),
+        json!({ "/CAN_H": "CAN" }),
+    );
+    assert_eq!(gap_mm(&negative, "/CAN_H"), None);
+}
+
+#[test]
+fn the_gap_is_absent_when_no_class_sets_one() {
     let nothing = project(
         json!([
             { "name": "Default", "clearance": 0.2 },
