@@ -2666,7 +2666,9 @@ fn crowded_ic() -> BoardModel {
 }
 
 /// Everything movable dropped where a designer would want the caps.
-fn dropped_on_the_pin(model: &BoardModel) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+type SizesAndCentres = (Vec<(f64, f64)>, Vec<(f64, f64)>);
+
+fn dropped_on_the_pin(model: &BoardModel) -> SizesAndCentres {
     let sizes = as_read_sizes(model);
     let mut centres = as_read_centres(model);
     for (i, centre) in centres.iter_mut().enumerate() {
