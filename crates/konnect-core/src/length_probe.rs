@@ -57,6 +57,11 @@ pub(crate) struct CheckedPair {
 pub(crate) struct LengthChecks {
     pub groups: Vec<CheckedGroup>,
     pub pairs: Vec<CheckedPair>,
+    /// The board's own `.kicad_dru` has length or skew rules (G4(c)): the judge's DRC
+    /// copy of the project is made to report them whatever the project's severities
+    /// say ([`forced_severities_text`]). Not a group or a pair: it does not make
+    /// [`LengthChecks::is_empty`] false, so it starts no probe.
+    pub board_rules: bool,
 }
 
 impl LengthChecks {
@@ -155,27 +160,71 @@ pub(crate) fn probe_rules_text(nets: &[String]) -> String {
 /// Everything else, `use_height_for_length_calcs` included, is kept. An error when
 /// the text is not a JSON object.
 pub(crate) fn probe_project_text(project_text: &str) -> Result<String> {
-    let mut project: Value =
-        serde_json::from_str(project_text).context("the project file is not JSON")?;
-    ensure!(project.is_object(), "the project file is not a JSON object");
-    // A key that is present but not an object is replaced: the probe's own settings
-    // must be exact.
-    let object_at = |value: &mut Value, key: &str| {
-        if !value[key].is_object() {
-            value[key] = json!({});
-        }
-    };
-    object_at(&mut project, "board");
-    object_at(&mut project["board"], "design_settings");
-    object_at(&mut project["board"]["design_settings"], "rule_severities");
-    let severities = project["board"]["design_settings"]["rule_severities"]
-        .as_object_mut()
-        .context("the project's rule severities are not an object")?;
+    let mut project = parse_project(project_text)?;
+    let severities = rule_severities(&mut project)?;
     for severity in severities.values_mut() {
         *severity = json!("ignore");
     }
     severities.insert("length_out_of_range".to_string(), json!("error"));
     serde_json::to_string_pretty(&project).context("write the probe's project file")
+}
+
+fn parse_project(project_text: &str) -> Result<Value> {
+    let project: Value =
+        serde_json::from_str(project_text).context("the project file is not JSON")?;
+    ensure!(project.is_object(), "the project file is not a JSON object");
+    Ok(project)
+}
+
+/// `board.design_settings.rule_severities` of a project, with the objects that hold
+/// it added when missing. A key that is present but not an object is replaced: the
+/// copy's own settings must be exact.
+fn rule_severities(project: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
+    let object_at = |value: &mut Value, key: &str| {
+        if !value[key].is_object() {
+            value[key] = json!({});
+        }
+    };
+    object_at(project, "board");
+    object_at(&mut project["board"], "design_settings");
+    object_at(&mut project["board"]["design_settings"], "rule_severities");
+    project["board"]["design_settings"]["rule_severities"]
+        .as_object_mut()
+        .context("the project's rule severities are not an object")
+}
+
+/// The judge's DRC copy's `.kicad_pro` when the board has its own length or skew
+/// rules (G4(c)): the project's own text with [`LENGTH_RULE_KEYS`] set to
+/// `"error"`, everything else kept. A project that sets either key to `ignore`
+/// would hide the board's own rules from KiCad's report, and G4 would pass on a
+/// check that never ran. G2 does not count these keys, so forcing them changes
+/// nothing there. Only ever applied to a scratch copy, never to the owner's project.
+pub(crate) fn forced_severities_text(project_text: &str) -> Result<String> {
+    let mut project = parse_project(project_text)?;
+    let severities = rule_severities(&mut project)?;
+    for key in LENGTH_RULE_KEYS {
+        severities.insert(key.to_string(), json!("error"));
+    }
+    serde_json::to_string_pretty(&project).context("write the judge copy's project file")
+}
+
+/// [`forced_severities_text`] applied to the `.kicad_pro` beside `board` (a judge's
+/// scratch copy); left alone when the copy has none (KiCad's default is `error`).
+pub(crate) fn force_length_severities(board: &Path) -> Result<()> {
+    let project = board.with_extension("kicad_pro");
+    if !project.is_file() {
+        return Ok(());
+    }
+    let own = std::fs::read_to_string(&project)
+        .with_context(|| format!("read the project file '{}'", project.display()))?;
+    let forced = forced_severities_text(&own).with_context(|| {
+        format!(
+            "the project file '{}' cannot be made to report the board's length rules",
+            project.display()
+        )
+    })?;
+    std::fs::write(&project, forced)
+        .with_context(|| format!("write the project file '{}'", project.display()))
 }
 
 /// `kicad-cli pcb drc --output <out> --format json --units mm <board>`: no refill,

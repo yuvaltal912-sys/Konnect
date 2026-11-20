@@ -2202,7 +2202,7 @@ fn the_result_carries_length_matching_the_tune_row_and_the_rule_steps() {
         advice[0]
     );
     assert!(
-        advice[1].contains("create_custom_drc_rule") && advice[1].contains("1kopper_len_lt1"),
+        advice[1].contains("create_custom_drc_rule") && advice[1].contains("1kopper_len_bus_g"),
         "{}",
         advice[1]
     );
@@ -2323,7 +2323,8 @@ fn the_judge_checks_the_plan_and_routing_passes_get_heights_only_with_a_pair() {
     let checks = judge_checks(&length_plan()).expect("a group is checked");
     assert_eq!(checks.groups.len(), 1);
     assert_eq!(checks.nets(), vec!["S1".to_string(), "S2".to_string()]);
-    // A KiCad rule listed and no group: still nothing for the judge to probe.
+    // A KiCad rule listed and no group: nothing to probe, but the judge is told the
+    // board has rules of its own, so that its DRC copy reports them (G4(c)).
     let listed = LengthPlan {
         kicad_rules: vec![crate::tools::route_lengths::KicadLengthRule {
             name: "len".to_string(),
@@ -2332,7 +2333,8 @@ fn the_judge_checks_the_plan_and_routing_passes_get_heights_only_with_a_pair() {
         }],
         ..LengthPlan::default()
     };
-    assert!(judge_checks(&listed).is_none());
+    let rules_only = judge_checks(&listed).expect("the board's own rules are checked");
+    assert!(rules_only.board_rules && rules_only.is_empty());
     // A gated pair alone is checked.
     let skew_only = LengthPlan {
         pairs: vec![GatedPair {

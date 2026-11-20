@@ -538,6 +538,55 @@ fn two_names_for_one_net_refuse_because_a_net_has_one_window() {
 }
 
 #[test]
+fn a_pair_split_across_groups_refuses_on_the_resolved_names() {
+    // The pair is written `/DQ0`, `/DQ1`; the groups write the same nets `DQ0` and
+    // `DQ1`, so the intent's own check, comparing spellings, cannot see the split.
+    let pairs = pairs_of(vec![resolved_pair("/DQ0", "/DQ1", "/DQ0", "/DQ1", None)]);
+    // One net of the pair in a group, the other in none.
+    assert_refusal(
+        resolve(
+            &[declared("ram", "dq", &["DQ0", "DQ2"], 0.5, None)],
+            &[],
+            &dsn_nets(),
+            &board_nets(),
+            &pairs,
+        ),
+        &[
+            "'/DQ0' and '/DQ1'",
+            "'/DQ0' is in the length group 'dq' of interface 'ram'",
+            "'/DQ1' is in no length group",
+        ],
+        "same length group",
+    );
+    // The two nets in two groups.
+    assert_refusal(
+        resolve(
+            &[
+                declared("ram", "lo", &["DQ0", "DQ2"], 0.5, None),
+                declared("ram", "hi", &["DQ1", "/a/CLK"], 0.5, None),
+            ],
+            &[],
+            &dsn_nets(),
+            &board_nets(),
+            &pairs,
+        ),
+        &["'lo'", "'hi'", "split"],
+        "set_design_intent",
+    );
+    // Controls: both in one group, or in none, plan.
+    for groups in [
+        vec![declared("ram", "dq", &["DQ0", "DQ1"], 0.5, None)],
+        vec![declared("ram", "other", &["DQ2", "/a/CLK"], 0.5, None)],
+        vec![],
+    ] {
+        assert!(
+            resolve(&groups, &[], &dsn_nets(), &board_nets(), &pairs).is_ok(),
+            "{groups:?}"
+        );
+    }
+}
+
+#[test]
 fn a_skew_on_a_pair_the_pairs_plan_left_out_refuses_with_its_reason() {
     let skews = [declared_skew("DQS_P", "DQS_N", 0.2)];
     // Left out by D23, with its reason.
@@ -672,16 +721,19 @@ fn a_pair_inside_a_group_is_listed_in_it_and_its_skew_is_gated_with_the_group() 
     );
     assert_eq!(gated.len(), 1);
     assert_eq!(gated[0].group.as_deref(), Some("byte"));
-    // A pair with one net in a group and one outside is not listed in the group.
-    let (lopsided, _) = resolve(
+    // A pair with one net in a group and one outside is refused (L1a, on DSN names).
+    let lopsided = resolve(
         &[declared("lane", "half", &["S_P"], 0.5, None)],
         &[],
         &nets,
         &board,
         &pairs,
-    )
-    .unwrap();
-    assert!(lopsided[0].pairs.is_empty());
+    );
+    assert_refusal(
+        lopsided,
+        &["'S_P'", "'S_N'", "'half'", "no length group"],
+        "same length group",
+    );
 }
 
 // ─── The tune file (L5) ─────────────────────────────────────────────────────
@@ -1121,10 +1173,10 @@ fn two_pads_of_one_footprint_are_never_paired() {
             pad("2", "N1", 10.0, 1.0, 1.0),
         ],
     )]);
-    assert_eq!(
-        shortest_possible_mm(&one, &set(&["N1"])).unwrap()["N1"],
-        0.0
-    );
+    // Such a net is left out: no bound is taken across the other footprints either.
+    assert!(!shortest_possible_mm(&one, &set(&["N1"]))
+        .unwrap()
+        .contains_key("N1"));
     // Control: the same pads in two footprints are 20 mm apart.
     let two = board_of(&[
         footprint(-10.0, 0.0, &[pad("1", "N1", 0.0, 1.0, 1.0)]),
@@ -1212,6 +1264,42 @@ fn a_target_exactly_at_the_pad_distance_is_accepted_on_a_real_board() {
     assert!(impossible_target(&[target_group(15.0, 0.5)], &shortest).is_some());
 }
 
+#[test]
+fn a_net_with_two_pads_in_one_footprint_is_not_refused() {
+    // N1 has pads at 0 and 20 mm in one footprint (its copper joins them), and a third
+    // pad at 20 mm in another: a track of 1 mm can complete the net, though the pads
+    // at 0 and 20 mm are in different footprints in the control below and would give 18.6.
+    let board = |split: bool| {
+        let near = if split {
+            vec![
+                footprint(0.0, 0.0, &[pad("1", "N1", 0.0, 1.0, 1.0)]),
+                footprint(20.0, 0.0, &[pad("1", "N1", 0.0, 1.0, 1.0)]),
+            ]
+        } else {
+            vec![footprint(
+                0.0,
+                0.0,
+                &[
+                    pad("1", "N1", 0.0, 1.0, 1.0),
+                    pad("2", "N1", 20.0, 1.0, 1.0),
+                ],
+            )]
+        };
+        let mut parts = near;
+        parts.push(footprint(20.5, 0.0, &[pad("1", "N1", 0.0, 1.0, 1.0)]));
+        board_of(&parts)
+    };
+    let nets = set(&["N1"]);
+    let one_footprint = shortest_possible_mm(&board(false), &nets).unwrap();
+    assert!(!one_footprint.contains_key("N1"), "{one_footprint:?}");
+    assert!(impossible_target(&[target_group(10.0, 1.0)], &one_footprint).is_none());
+    // Negative control: the same pads in distinct footprints keep the bound, and the
+    // same target is refused.
+    let split = shortest_possible_mm(&board(true), &nets).unwrap();
+    assert!(split["N1"] > 18.0, "{split:?}");
+    assert!(impossible_target(&[target_group(10.0, 1.0)], &split).is_some());
+}
+
 // ─── KiCad's own length and skew rules (L15) ────────────────────────────────
 
 const DRU: &str = r#"(version 1)
@@ -1265,31 +1353,93 @@ fn kicads_length_and_skew_rules_are_listed_as_the_file_writes_them() {
 
 // ─── The rules a group is suggested as (L16) ────────────────────────────────
 
+/// The rule text suggested for group `index` of `plan`, under its call-wide name.
+fn suggested(plan: &LengthPlan, index: usize) -> String {
+    kicad_rule_suggestion(&plan.groups[index], &rule_names(&plan.groups)[index])
+}
+
+#[test]
+fn a_rules_name_follows_its_interface_and_group_and_is_unique_in_the_call() {
+    let plan = two_group_plan();
+    assert_eq!(
+        rule_names(&plan.groups),
+        strings(&["1kopper_len_ram_dq_low", "1kopper_len_ram_addr"])
+    );
+    // A reorder gives each group the same name, not the other's.
+    let mut reordered = plan.clone();
+    reordered.groups.reverse();
+    assert_eq!(
+        rule_names(&reordered.groups),
+        strings(&["1kopper_len_ram_addr", "1kopper_len_ram_dq_low"])
+    );
+    // Characters outside [A-Za-z0-9_] become `_`.
+    let odd = group(
+        "my bus",
+        "data/low",
+        "lt1",
+        &[("N1", "N1")],
+        Window::Skew { tolerance_mm: 0.1 },
+        &[],
+    );
+    assert_eq!(
+        rule_names(std::slice::from_ref(&odd)),
+        strings(&["1kopper_len_my_bus_data_low"])
+    );
+    // Two groups whose sanitized names meet get `_2`, `_3`.
+    let alike = |interface: &str, name: &str| {
+        group(
+            interface,
+            name,
+            "lt1",
+            &[("N1", "N1")],
+            Window::Skew { tolerance_mm: 0.1 },
+            &[],
+        )
+    };
+    let clashing = [
+        alike("a b", "c"),
+        alike("a_b", "c"),
+        alike("a.b", "c"),
+        alike("a_b_c", "2"),
+    ];
+    assert_eq!(
+        rule_names(&clashing),
+        strings(&[
+            "1kopper_len_a_b_c",
+            "1kopper_len_a_b_c_2",
+            "1kopper_len_a_b_c_3",
+            "1kopper_len_a_b_c_2_2"
+        ])
+    );
+}
+
 #[test]
 fn a_skew_group_is_suggested_as_a_kicad_skew_rule_with_the_whole_tolerance() {
     let plan = two_group_plan();
+    // One printed digit (0.0001 mm) looser than the window, so a net the judge passes
+    // is never flagged by the rule (L16).
     assert_eq!(
-        kicad_rule_suggestion(&plan.groups[0]),
-        "(rule \"1kopper_len_lt1\" (constraint skew (max 0.5mm)) (condition \"A.NetName == '/DQ0' || A.NetName == '/DQ1' || A.NetName == '/DQS_P' || A.NetName == '/DQS_N'\"))"
+        suggested(&plan, 0),
+        "(rule \"1kopper_len_ram_dq_low\" (constraint skew (max 0.5001mm)) (condition \"A.NetName == '/DQ0' || A.NetName == '/DQ1' || A.NetName == '/DQS_P' || A.NetName == '/DQS_N'\"))"
     );
     // Not fastroute's share: the whole tolerance is what the judge checked.
-    assert!(!kicad_rule_suggestion(&plan.groups[0]).contains("0.25mm"));
+    assert!(!suggested(&plan, 0).contains("0.25mm"));
 }
 
 #[test]
 fn a_target_group_is_suggested_as_a_kicad_length_rule_with_min_max_and_opt() {
     let plan = two_group_plan();
     assert_eq!(
-        kicad_rule_suggestion(&plan.groups[1]),
-        "(rule \"1kopper_len_lt2\" (constraint length (min 41.5mm) (max 42.5mm) (opt 42mm)) (condition \"A.NetName == '/A0' || A.NetName == '/A1'\"))"
+        suggested(&plan, 1),
+        "(rule \"1kopper_len_ram_addr\" (constraint length (min 41.4999mm) (max 42.5001mm) (opt 42mm)) (condition \"A.NetName == '/A0' || A.NetName == '/A1'\"))"
     );
     // Float noise stays out of the rule text.
     let mut noisy = target_group(42.1, 0.07);
     noisy.nets[0].dsn = "N1".into();
     assert!(
-        kicad_rule_suggestion(&noisy).contains("(min 42.03mm) (max 42.17mm) (opt 42.1mm)"),
+        kicad_rule_suggestion(&noisy, "n").contains("(min 42.0299mm) (max 42.1701mm) (opt 42.1mm)"),
         "{}",
-        kicad_rule_suggestion(&noisy)
+        kicad_rule_suggestion(&noisy, "n")
     );
 }
 
@@ -1297,7 +1447,7 @@ fn a_target_group_is_suggested_as_a_kicad_length_rule_with_min_max_and_opt() {
 fn a_gated_pair_is_suggested_as_a_kicad_skew_rule_on_its_two_nets() {
     assert_eq!(
         kicad_pair_rule_suggestion(&gated("DQS_P", "DQS_N", 0.05, None)),
-        "(rule \"1kopper_skew_/DQS_P_/DQS_N\" (constraint skew (max 0.05mm)) (condition \"A.NetName == '/DQS_P' || A.NetName == '/DQS_N'\"))"
+        "(rule \"1kopper_skew_/DQS_P_/DQS_N\" (constraint skew (max 0.0501mm)) (condition \"A.NetName == '/DQS_P' || A.NetName == '/DQS_N'\"))"
     );
 }
 
@@ -1308,17 +1458,17 @@ fn a_suggested_rule_is_a_rule_kicad_s_file_framing_and_the_listing_accept() {
     let plan = two_group_plan();
     let pair = gated("DQS_P", "DQS_N", 0.05, None);
     let texts = [
-        kicad_rule_suggestion(&plan.groups[0]),
-        kicad_rule_suggestion(&plan.groups[1]),
+        suggested(&plan, 0),
+        suggested(&plan, 1),
         kicad_pair_rule_suggestion(&pair),
     ];
     let file = format!("(version 1)\n{}\n", texts.join("\n"));
     let listed = kicad_length_rules(&file).unwrap();
     assert_eq!(listed.len(), 3);
-    assert_eq!(listed[0].name, "1kopper_len_lt1");
+    assert_eq!(listed[0].name, "1kopper_len_ram_dq_low");
     assert_eq!(
         listed[1].constraints,
-        vec!["(constraint length (min 41.5mm) (max 42.5mm) (opt 42mm))"]
+        vec!["(constraint length (min 41.4999mm) (max 42.5001mm) (opt 42mm))"]
     );
     assert_eq!(listed[2].name, "1kopper_skew_/DQS_P_/DQS_N");
     // And the board that carries them can still be exported (L19).
@@ -1341,15 +1491,15 @@ fn measures(miss_mm: f64, unmeasured: &[&str]) -> LengthMeasures {
 fn the_next_steps_give_the_rule_of_every_checked_group_and_pair() {
     let mut plan = two_group_plan();
     plan.pairs = vec![gated("DQS_P", "DQS_N", 0.05, Some("dq_low"))];
-    let steps = plan.next_steps(None);
+    let steps = plan.next_steps(None, 0);
     assert_eq!(steps.len(), 3, "{steps:?}");
     assert!(
         steps[0].contains("group 'dq_low' of interface 'ram'"),
         "{}",
         steps[0]
     );
-    assert!(steps[0].contains(&kicad_rule_suggestion(&plan.groups[0])));
-    assert!(steps[1].contains(&kicad_rule_suggestion(&plan.groups[1])));
+    assert!(steps[0].contains(&suggested(&plan, 0)));
+    assert!(steps[1].contains(&suggested(&plan, 1)));
     assert!(steps[2].contains(&kicad_pair_rule_suggestion(&plan.pairs[0])));
     for step in &steps {
         assert!(
@@ -1357,7 +1507,7 @@ fn the_next_steps_give_the_rule_of_every_checked_group_and_pair() {
             "{step}"
         );
     }
-    assert!(steps[0].contains("name \"1kopper_len_lt1\""));
+    assert!(steps[0].contains("name \"1kopper_len_ram_dq_low\""));
     assert!(steps[2].contains("name \"1kopper_skew_/DQS_P_/DQS_N\""));
     // Both modes are told apart.
     assert!(steps[0].contains("constraint skew") && steps[1].contains("constraint length"));
@@ -1370,17 +1520,19 @@ fn the_next_steps_give_the_rule_of_every_checked_group_and_pair() {
         }],
         ..LengthPlan::default()
     };
-    assert!(rules_only.next_steps(None).is_empty());
-    assert!(rules_only.next_steps(Some(&measures(1.0, &[]))).is_empty());
+    assert!(rules_only.next_steps(None, 0).is_empty());
+    assert!(rules_only
+        .next_steps(Some(&measures(1.0, &[])), 0)
+        .is_empty());
 }
 
 #[test]
 fn a_miss_adds_what_can_change_it_first_and_a_pass_adds_nothing() {
     let plan = two_group_plan();
-    let met = plan.next_steps(Some(&measures(0.0, &[])));
-    assert_eq!(met, plan.next_steps(None), "a pass adds no line");
+    let met = plan.next_steps(Some(&measures(0.0, &[])), 0);
+    assert_eq!(met, plan.next_steps(None, 0), "a pass adds no line");
     for missed in [measures(0.62, &[]), measures(0.0, &["/DQ0"])] {
-        let steps = plan.next_steps(Some(&missed));
+        let steps = plan.next_steps(Some(&missed), 0);
         assert_eq!(steps.len(), met.len() + 1);
         assert!(
             steps[0].contains("tolerance_mm") && steps[0].contains("higher effort"),
@@ -1390,6 +1542,41 @@ fn a_miss_adds_what_can_change_it_first_and_a_pass_adds_nothing() {
         assert!(steps[0].contains("room"), "{}", steps[0]);
         assert_eq!(&steps[1..], &met[..], "the rules still follow");
     }
+}
+
+#[test]
+fn a_violation_of_the_boards_own_rules_says_the_session_cannot_be_applied() {
+    let plan = two_group_plan();
+    let steps = plan.next_steps(Some(&measures(0.0, &[])), 2);
+    let clean = plan.next_steps(Some(&measures(0.0, &[])), 0);
+    assert_eq!(steps.len(), clean.len() + 1);
+    assert!(
+        steps[0].contains("2 violation(s)")
+            && steps[0].contains("apply_specctra_ses rolls back")
+            && steps[0].contains(".kicad_dru"),
+        "{}",
+        steps[0]
+    );
+    assert_eq!(&steps[1..], &clean[..]);
+    // It is about the board's rules, so a call that checks no group has it too.
+    let rules_only = LengthPlan::default().next_steps(None, 1);
+    assert_eq!(rules_only.len(), 1, "{rules_only:?}");
+    // Control: no violation, no line.
+    assert!(LengthPlan::default().next_steps(None, 0).is_empty());
+}
+
+#[test]
+fn the_judge_is_told_when_the_board_has_length_rules_of_its_own() {
+    let mut plan = two_group_plan();
+    assert!(!plan.checks().board_rules);
+    plan.kicad_rules = kicad_length_rules(DRU).unwrap();
+    assert!(plan.checks().board_rules);
+    // Rules alone, with nothing to tune: not a group or a pair, so no probe.
+    let only = LengthPlan {
+        kicad_rules: kicad_length_rules(DRU).unwrap(),
+        ..LengthPlan::default()
+    };
+    assert!(only.checks().board_rules && only.checks().is_empty());
 }
 
 // ─── The result's fields (L15) ──────────────────────────────────────────────

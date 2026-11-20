@@ -375,7 +375,9 @@ one name it names and call again. After the call read `length_matching`: for
 each net its length, its window and its miss, `pass` per group, and
 `kicad_violations`. A failed window fails the fourth gate, so `status` is
 `complete_with_gate_failures`. The next steps give a KiCad rule for each group.
-After `apply_specctra_ses`, add them with `create_custom_drc_rule(board, name,
+A session that breaks the board's own length or skew rules cannot be applied:
+`apply_specctra_ses` rolls back when the board has a `.kicad_dru` and the
+candidate's DRC is not clean. After `apply_specctra_ses`, add them with `create_custom_drc_rule(board, name,
 rule)` (dry run first) so KiCad keeps checking the lengths after hand edits.
 A pair inside a group is tuned net by net (`pairs_tuned_net_by_net`): its
 coupling is not held along the meanders. `engine: 'freerouting'` tunes nothing

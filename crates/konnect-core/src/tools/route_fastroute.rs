@@ -747,10 +747,11 @@ async fn search_and_write(
 }
 
 /// What the judge checks for this call (L8, L9): the plan's groups and pair skews, or
-/// `None` when it has none, so that the judge runs no probe and G4 has no intent
-/// lines (L18).
+/// `None` when it has none and the board has no length or skew rules of its own, so
+/// that the judge runs no probe and G4 has no intent lines (L18). A board with such
+/// rules always gets checks (its `board_rules` flag), even with no group or pair.
 fn judge_checks(plan: &LengthPlan) -> Option<Arc<crate::length_probe::LengthChecks>> {
-    (!plan.is_empty()).then(|| Arc::new(plan.checks()))
+    (!plan.is_empty() || !plan.kicad_rules.is_empty()).then(|| Arc::new(plan.checks()))
 }
 
 /// The `--layer-heights` value of the routing passes (L7): only when the call has a
@@ -1634,7 +1635,10 @@ pub(crate) fn result_json(
     {
         result[key] = value;
     }
-    let length_steps = lengths.next_steps(winner_lengths);
+    let length_steps = lengths.next_steps(
+        winner_lengths,
+        crate::length_probe::kicad_rule_violations(&judged.measures.violations),
+    );
     if let Some(steps) = result["completion"]["next_steps"].as_array_mut() {
         for line in length_steps {
             let number = steps.len() + 1;

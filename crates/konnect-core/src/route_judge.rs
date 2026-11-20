@@ -709,6 +709,15 @@ async fn judge_with(
     let mut board = crate::scratch_board::copy_project(&ctx.board, &run_dir.join("r0"))?;
     let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan)?;
     write_board(&board, &routed_text)?;
+    // The board's own length and skew rules must be seen whatever the project's
+    // severities say (G4(c)): forced in this scratch copy's project, never the owner's.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| checks.board_rules)
+    {
+        crate::length_probe::force_length_severities(&board)?;
+    }
 
     // 3. KiCad's refill and DRC, on this judge's own settings copy.
     let config = OwnConfig::new(ctx, &format!("run-{}", routed.index))?;

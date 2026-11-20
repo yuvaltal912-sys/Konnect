@@ -45,7 +45,7 @@ pub(crate) const FASTROUTE_WINDOW_SHARE: f64 = 0.5;
 pub(crate) const UNSAFE_NAME_CHARS: &[char] = &['#', '*', '?', '\'', '"', '\\'];
 
 /// The prefix of the KiCad rules the next steps suggest (L16); the rule of group
-/// `lt1` is `1kopper_len_lt1`.
+/// 'dq' of interface 'ram' is `1kopper_len_ram_dq`.
 const RULE_PREFIX: &str = "1kopper_";
 
 /// L14: what the Freerouting path says when the intent declares lengths.
@@ -294,6 +294,7 @@ impl LengthPlan {
                     max_skew_mm: pair.max_skew_mm,
                 })
                 .collect(),
+            board_rules: !self.kicad_rules.is_empty(),
         }
     }
 
@@ -413,9 +414,23 @@ impl LengthPlan {
     /// `completion.next_steps` lines (L16): the KiCad rule text of every checked
     /// group and pair ([`kicad_rule_suggestion`], [`kicad_pair_rule_suggestion`])
     /// with `create_custom_drc_rule`; and, on a miss, what can change it. A plan that
-    /// checks nothing has no lines, whatever it lists of KiCad's own rules.
-    pub(crate) fn next_steps(&self, winner: Option<&LengthMeasures>) -> Vec<String> {
+    /// checks nothing has no rule lines, whatever it lists of KiCad's own rules.
+    /// `kicad_violations` is the winner's count of KiCad's own `length_out_of_range`
+    /// and `skew_out_of_range` violations (G4(c)): when it is not 0 the first line says
+    /// the session cannot be applied as it is.
+    pub(crate) fn next_steps(
+        &self,
+        winner: Option<&LengthMeasures>,
+        kicad_violations: usize,
+    ) -> Vec<String> {
         let mut steps = Vec::new();
+        if kicad_violations > 0 {
+            steps.push(format!(
+                "KiCad's own length or skew rules of the board are violated on this result ({kicad_violations} violation(s), `length_matching.kicad_violations`). \
+                 apply_specctra_ses rolls back when the board has a .kicad_dru and the candidate's DRC is not clean, so this session cannot be applied as it is: \
+                 change the board's rule or the design intent, or route again at a higher effort."
+            ));
+        }
         if let Some(measures) = winner.filter(|_| !self.is_empty()) {
             if measures.miss_mm > 0.0 || !measures.unmeasured.is_empty() {
                 steps.push(
@@ -427,15 +442,16 @@ impl LengthPlan {
                 );
             }
         }
-        for group in &self.groups {
+        let names = rule_names(&self.groups);
+        for (group, name) in self.groups.iter().zip(&names) {
             steps.push(format!(
                 "To keep KiCad checking group '{}' of interface '{}' after hand edits, call create_custom_drc_rule with name \"{}\" \
                  and rule {} once apply_specctra_ses has run (dry_run first, then apply with the plan revision it returns). \
                  The rule is checked by KiCad's own DRC and stays in the board when it is exported again.",
                 group.name,
                 group.interface,
-                rule_name(group),
-                kicad_rule_suggestion(group)
+                name,
+                kicad_rule_suggestion(group, name)
             ));
         }
         for pair in &self.pairs {
@@ -682,6 +698,31 @@ pub(crate) fn resolve(
             pairs: group_pairs,
         });
     }
+    // L1a again, on the resolved DSN names: the intent's own check compares spellings,
+    // so a pair written `/A`, `/B` against a group that lists `A` and `C` passed it.
+    for pair in &pairs.resolved {
+        let holder = |dsn: &str| held.get(dsn);
+        let (positive, negative) = (holder(&pair.dsn_positive), holder(&pair.dsn_negative));
+        if positive == negative {
+            continue;
+        }
+        let place = |net: &str, group: Option<&(String, String)>| match group {
+            Some((interface, name)) => {
+                format!("'{net}' is in the length group '{name}' of interface '{interface}'")
+            }
+            None => format!("'{net}' is in no length group"),
+        };
+        return Err(refuse(
+            format!(
+                "The differential pair '{}' and '{}' is split: {}, and {}. A pair is in one length group, both nets together, or in none, so that the Tune pass matches the pair as one.",
+                pair.positive,
+                pair.negative,
+                place(&pair.positive, positive),
+                place(&pair.negative, negative)
+            ),
+            "Put both nets of the pair in the same length group of the design intent, or in none, with set_design_intent, then call route_specctra_dsn again.",
+        ));
+    }
     let mut gated = Vec::with_capacity(skews.len());
     for skew in skews {
         let who = format!(
@@ -751,8 +792,10 @@ pub(crate) fn board_net_names(board_text: &str) -> anyhow::Result<BTreeSet<Strin
 /// (`konnect_sexp::board_geometry::BoardGeometry`). Only `nets` are computed, and a
 /// net that owns a zone is left out (a pour can join its pads with no track).
 ///
-/// Two pads of one footprint are never paired (they may be one pin or a net tie, which
-/// join them inside the footprint), and a pad's radius is the larger of its half
+/// A net with two or more pads in one footprint is left out: the footprint's own
+/// copper may join them (one pin, a net tie), so a track between the other pads can be
+/// shorter than any bound taken across footprints, and a target that can be met must
+/// never be refused. A pad's radius is the larger of its half
 /// diagonal and its farthest outline point from its centre. A board with a zone
 /// Konnect cannot read leaves every net out: any of them may own it.
 pub(crate) fn shortest_possible_mm(
@@ -798,11 +841,15 @@ pub(crate) fn shortest_possible_mm(
         }
         let mut bound = 0.0_f64;
         let points = pads.get(net.as_str()).map(Vec::as_slice).unwrap_or(&[]);
-        for (i, (first_footprint, first, first_radius)) in points.iter().enumerate() {
-            for (second_footprint, second, second_radius) in &points[i + 1..] {
-                if first_footprint == second_footprint {
-                    continue;
-                }
+        let shares_a_footprint = points
+            .iter()
+            .enumerate()
+            .any(|(i, (footprint, ..))| points[i + 1..].iter().any(|other| other.0 == *footprint));
+        if shares_a_footprint {
+            continue;
+        }
+        for (i, (_, first, first_radius)) in points.iter().enumerate() {
+            for (_, second, second_radius) in &points[i + 1..] {
                 let apart =
                     (first.0 - second.0).hypot(first.1 - second.1) - first_radius - second_radius;
                 bound = bound.max(apart);
@@ -915,9 +962,37 @@ fn net_condition<'a>(nets: impl IntoIterator<Item = &'a str>) -> String {
         .join(" || ")
 }
 
-/// The name of the rule that checks `group` (L16): `1kopper_len_<file name>`.
-fn rule_name(group: &ResolvedGroup) -> String {
-    format!("{RULE_PREFIX}len_{}", group.file_name)
+/// A name part as a rule name may hold it: every character outside `[A-Za-z0-9_]`
+/// becomes `_`.
+fn sanitize_name(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// The names of the rules that check `groups` (L16), in order:
+/// `1kopper_len_<interface>_<group>` with both names sanitized, and `_2`, `_3`, … on
+/// a name already taken in this call. They follow the group's own names, not its
+/// place in the intent, so a reorder or a second call names a group the same.
+fn rule_names(groups: &[ResolvedGroup]) -> Vec<String> {
+    let mut taken = BTreeSet::new();
+    groups
+        .iter()
+        .map(|group| {
+            let base = format!(
+                "{RULE_PREFIX}len_{}_{}",
+                sanitize_name(&group.interface),
+                sanitize_name(&group.name)
+            );
+            let mut name = base.clone();
+            let mut count = 2;
+            while !taken.insert(name.clone()) {
+                name = format!("{base}_{count}");
+                count += 1;
+            }
+            name
+        })
+        .collect()
 }
 
 /// The name of the rule that checks a gated pair's skew.
@@ -928,40 +1003,50 @@ fn pair_rule_name(pair: &GatedPair) -> String {
     )
 }
 
-/// The KiCad rule that checks `group` as the judge did (L16), named by its file
-/// name: `(rule "1kopper_len_lt1" (constraint skew (max <T>mm)) (condition
-/// "A.NetName == '<net>' || …"))` in skew mode, `(constraint length (min <L−T>mm)
-/// (max <L+T>mm) (opt <L>mm))` in target mode. The full intent tolerance, not
-/// fastroute's share.
-pub(crate) fn kicad_rule_suggestion(group: &ResolvedGroup) -> String {
+/// How much looser than the judge's window a suggested rule's bounds are, each side,
+/// mm: one printed digit of KiCad's report. The judge lets a net sit up to half a
+/// digit outside its window ([`crate::length_probe::PRINTED_HALF_DIGIT_MM`]); a rule
+/// on the window itself would flag that net, so a judge pass and KiCad agree only
+/// when the rule is this much wider.
+const RULE_SLACK_MM: f64 = 0.0001;
+
+/// The KiCad rule that checks `group` as the judge did (L16), named `name`
+/// ([`rule_names`]): `(rule "1kopper_len_ram_dq" (constraint skew (max <T+0.0001>mm))
+/// (condition "A.NetName == '<net>' || …"))` in skew mode, `(constraint length (min
+/// <L−T−0.0001>mm) (max <L+T+0.0001>mm) (opt <L>mm))` in target mode. The full intent
+/// tolerance, not fastroute's share, widened by [`RULE_SLACK_MM`] on each side.
+pub(crate) fn kicad_rule_suggestion(group: &ResolvedGroup, name: &str) -> String {
     let constraint = match group.window {
         Window::Skew { tolerance_mm } => {
-            format!("(constraint skew (max {}mm))", mm_text(tolerance_mm))
+            format!(
+                "(constraint skew (max {}mm))",
+                mm_text(tolerance_mm + RULE_SLACK_MM)
+            )
         }
         Window::Target {
             target_mm,
             tolerance_mm,
         } => format!(
             "(constraint length (min {}mm) (max {}mm) (opt {}mm))",
-            mm_text(target_mm - tolerance_mm),
-            mm_text(target_mm + tolerance_mm),
+            mm_text(target_mm - tolerance_mm - RULE_SLACK_MM),
+            mm_text(target_mm + tolerance_mm + RULE_SLACK_MM),
             mm_text(target_mm)
         ),
     };
     format!(
         "(rule {} {constraint} (condition \"{}\"))",
-        custom_rules::quote(&rule_name(group)),
+        custom_rules::quote(name),
         net_condition(group.nets.iter().map(|net| net.dsn.as_str()))
     )
 }
 
-/// The KiCad rule that checks a gated pair's skew: `(constraint skew (max <S>mm))`
-/// on its two nets.
+/// The KiCad rule that checks a gated pair's skew: `(constraint skew (max <S+0.0001>mm))`
+/// on its two nets ([`RULE_SLACK_MM`] wider than the judge's maximum).
 pub(crate) fn kicad_pair_rule_suggestion(pair: &GatedPair) -> String {
     format!(
         "(rule {} (constraint skew (max {}mm)) (condition \"{}\"))",
         custom_rules::quote(&pair_rule_name(pair)),
-        mm_text(pair.max_skew_mm),
+        mm_text(pair.max_skew_mm + RULE_SLACK_MM),
         net_condition([pair.dsn_positive.as_str(), pair.dsn_negative.as_str()])
     )
 }

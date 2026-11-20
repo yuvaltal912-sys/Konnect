@@ -76,6 +76,53 @@ fn report_of(violations: Vec<DrcViolation>) -> DrcReport {
 // ------------------------------------------------------------ probe files (L8)
 
 #[test]
+fn the_judge_copys_project_forces_the_two_length_keys_to_error_and_keeps_the_rest() {
+    let own = r#"{"board": {"design_settings": {"rule_severities": {"length_out_of_range": "ignore", "skew_out_of_range": "warning", "clearance": "ignore"}, "rules": {"min_clearance": 0.2}}}, "meta": {"version": 3}}"#;
+    let forced: Value = serde_json::from_str(&forced_severities_text(own).unwrap()).unwrap();
+    let severities = &forced["board"]["design_settings"]["rule_severities"];
+    assert_eq!(severities["length_out_of_range"], "error");
+    assert_eq!(severities["skew_out_of_range"], "error");
+    // Everything else is the project's own: another check stays ignored.
+    assert_eq!(severities["clearance"], "ignore");
+    assert_eq!(
+        forced["board"]["design_settings"]["rules"]["min_clearance"],
+        0.2
+    );
+    assert_eq!(forced["meta"]["version"], 3);
+    // Missing objects are added; a project that is not an object is an error.
+    let bare: Value = serde_json::from_str(&forced_severities_text("{}").unwrap()).unwrap();
+    assert_eq!(
+        bare["board"]["design_settings"]["rule_severities"]["skew_out_of_range"],
+        "error"
+    );
+    assert!(forced_severities_text("[]").is_err());
+    assert!(forced_severities_text("not json").is_err());
+}
+
+#[test]
+fn forcing_the_severities_rewrites_only_the_copy_beside_the_board() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("b.kicad_pcb");
+    // No project beside the board: nothing to rewrite, and no file is made.
+    force_length_severities(&board).unwrap();
+    assert!(!dir.path().join("b.kicad_pro").exists());
+    let project = dir.path().join("b.kicad_pro");
+    std::fs::write(
+        &project,
+        r#"{"board": {"design_settings": {"rule_severities": {"skew_out_of_range": "ignore"}}}}"#,
+    )
+    .unwrap();
+    force_length_severities(&board).unwrap();
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&project).unwrap()).unwrap();
+    assert_eq!(
+        after["board"]["design_settings"]["rule_severities"]["skew_out_of_range"],
+        "error"
+    );
+    std::fs::write(&project, "not json").unwrap();
+    assert!(force_length_severities(&board).is_err());
+}
+
+#[test]
 fn the_probe_rules_are_one_numbered_length_rule_per_net() {
     let nets = names(&["/DQ0", "/DQ1", "S3"]);
     let text = probe_rules_text(&nets);
@@ -433,7 +480,11 @@ fn lengths_of(rows: &[(&str, f64)]) -> BTreeMap<String, f64> {
 }
 
 fn checks_of(groups: Vec<CheckedGroup>, pairs: Vec<CheckedPair>) -> LengthChecks {
-    LengthChecks { groups, pairs }
+    LengthChecks {
+        groups,
+        pairs,
+        board_rules: false,
+    }
 }
 
 fn miss_of(measures: &LengthMeasures, net: &str) -> f64 {

@@ -2426,6 +2426,7 @@ exit 0
                 },
             }],
             pairs: vec![],
+            board_rules: false,
         })
     }
 
@@ -2509,6 +2510,48 @@ exit 0
             assert!(judged.gates.g4.is_empty());
             assert_eq!(h.calls().len(), 2, "the baseline and the routed board only");
             assert!(!h.run_dir().join("lengths").exists());
+        }
+    }
+
+    /// The scratch copy's project a judged run used.
+    fn judged_project(h: &Harness) -> Value {
+        let text = std::fs::read_to_string(h.run_dir().join("r0/specctra_rounded_board.kicad_pro"))
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_board_with_length_rules_is_judged_on_a_project_that_reports_them() {
+        const OWN: &str = r#"{"board": {"design_settings": {"rule_severities": {"length_out_of_range": "ignore", "skew_out_of_range": "ignore", "clearance": "ignore"}}}}"#;
+        for (board_rules, wanted) in [(true, "error"), (false, "ignore")] {
+            let mut h = harness(&[], drc_json(&[], &[]), &[]);
+            let source = h.ctx.board.with_extension("kicad_pro");
+            std::fs::write(&source, OWN).unwrap();
+            // The export of a board with a project file records its hash.
+            let mut manifest: Value = serde_json::from_str(&h.ctx.manifest_text).unwrap();
+            manifest["routing_context"] = json!({
+                "project_sha256": format!("{:x}", Sha256::digest(OWN.as_bytes())),
+                "custom_rules_sha256": null,
+                "effective_rules_sha256": "0",
+            });
+            h.ctx.manifest_text = manifest.to_string();
+            // No group or pair: the board's rules alone make the checks.
+            h.ctx.lengths = Some(Arc::new(crate::length_probe::LengthChecks {
+                board_rules,
+                ..Default::default()
+            }));
+            let base = baseline(&h.ctx).await.unwrap();
+            let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+            let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+            let severities = &judged_project(&h)["board"]["design_settings"]["rule_severities"];
+            assert_eq!(severities["length_out_of_range"], wanted, "{board_rules}");
+            assert_eq!(severities["skew_out_of_range"], wanted, "{board_rules}");
+            // Another check keeps the project's own setting; G2 and the probe are not asked.
+            assert_eq!(severities["clearance"], "ignore");
+            assert_eq!(h.calls().len(), 2, "the baseline and the routed board only");
+            assert!(judged.measures.lengths.is_none() && judged.gates.g4.is_empty());
+            // The owner's project is never written.
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), OWN);
         }
     }
 
