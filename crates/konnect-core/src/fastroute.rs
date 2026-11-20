@@ -1029,6 +1029,9 @@ fn gcd(a: i128, b: i128) -> i128 {
     a
 }
 
+/// A path of a session: its layer, width in µm and points in µm.
+type SessionPath = (String, i64, Vec<[i64; 2]>);
+
 /// A straight piece on its line: its two ends, each with its position along the
 /// line's direction.
 type Span = (i128, [i64; 2], i128, [i64; 2]);
@@ -1041,7 +1044,7 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
     let session = parse_specctra(ses_text, "session")?;
     let (routes, um_per_unit) = session_routes(&session)?;
     // A net named in two `net` entries is one net.
-    let mut paths: BTreeMap<String, Vec<(String, i64, Vec<[i64; 2]>)>> = BTreeMap::new();
+    let mut paths: BTreeMap<String, Vec<SessionPath>> = BTreeMap::new();
     let mut vias: BTreeMap<String, Vec<(String, [i64; 2])>> = BTreeMap::new();
     for network in lists(routes, "network_out") {
         for net in lists(network, "net") {
