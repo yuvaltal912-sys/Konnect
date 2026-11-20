@@ -310,9 +310,11 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 - With the pair passed, the hand placement's CAN pair routed at equal lengths (42.3 / 42.3 mm, against 36.7 / 41.1 without) and 13.6 mm coupled within 0.5 mm (against 0.7).
 - Unit tests on this branch: `cargo test -p konnect-core --lib place_` 247 passed, 0 failed, 1 ignored (the bench); `route_pairs` 29 passed; the konnect crate's `asset_references` 12 and `schema_parameter_usage` 5 passed; fmt and `clippy --workspace --all-targets -D warnings` clean. `cargo mutants` on the new `legalize` code: every miss killed by a test or named; the survivors are the old outline-containment and equal-gap comparisons.
 
+- The gate on `c715c774` (main `d758fbab` merged in), run twice, 2026-11-20, records in `target/creation-research/placement-search/gate/ps-dp-merged` and `ps-dp-merged2`. Each run was red on one test from main's code that this branch does not touch, and each test passed on its retry; the other run of each suite was clean. Run 1: `freerouting_setup_tests::a_session_unreadable_for_widths_is_reported_and_not_complete` failed once (its fake Java was not found; 4252 passed, 1 failed). Run 2: workspace tests 5183 passed, 0 failed, 170 ignored; `simulation_live` 94 of 95, with `every_simulation_demo_flattens_or_names_its_export_failure` failing on the IBIS demo (`Cannot find U1.cache.`, the known flake while KiCad is open; it was open); run 1 had 95 of 95. Both runs: sandboxed fastroute 38 passed, doc tests, fmt, `clippy -D warnings`, `deny`, `fix-doc-counts` changing nothing, the release build, protected files unchanged, the installed binary's SHA-256 starting `3de188bb775ab4ce`.
+
 **Not verified (this branch):** the A arm, and B4 to B6.
 
-**Next:** the gate on the merged branch, then this PR's exact text to the owner; publish on his yes.
+**Next:** this PR's exact text to the owner; publish on his yes.
 
 **What it is.** The bench is an ignored test, `place_bench`, in `konnect-core`. It runs on board copies named in a bench folder's `bench.json`. On each board it does the following:
 - It makes 288 candidates with all three families, 160 by default since 2026-11-19: F, the force core from a seeded scatter; S, schematic clusters shelf-packed; P, seeded edits of the owner's placement (off unless `bench.json` names `"perturb"`).
