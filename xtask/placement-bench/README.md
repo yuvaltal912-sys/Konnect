@@ -66,7 +66,8 @@ The original boards are private: no net, part or board name goes into a document
 | `time_limit_minutes` | the whole board's limit, generation included | 100 |
 | `effort` | `fast`, `m`, `h` or `xh` | `m` |
 | `hold` | which parts the search holds: `locks` or `rules` (below) | `locks` |
-| `families` | the generator families, any of `force`, `schematic`, `perturb` | `["force", "schematic"]` |
+| `families` | the generator families, any of `force`, `schematic`, `perturb`, `converge` | `["force", "schematic"]` |
+| `converge_terms` | family C's two new cost terms (schematic neighbours, silk labels): `on` or `off` | `on` |
 
 `hold`:
 - `locks`: held are the footprints KiCad locks, `held.json`'s references, and the footprints
@@ -82,6 +83,19 @@ naming `perturb` brings the 128 P recipes back. P edits the owner's own placemen
 meaning in his flow, so it is off by default. O and A are routed as references whatever is
 named. An unknown `hold` value, an unknown family or an empty `families` list is refused before
 anything runs. The hold rules and the matrix are recorded in `search.json`'s plan.
+
+`converge` adds family C, the convergent search (`docs/CONVERGENT_PLACEMENT_DESIGN.md`). It
+refines F's and S's candidates, so it needs `force` or `schematic` named with it and is refused
+alone. It runs after every F, S and P candidate exists (phase 1b), at the design's measured
+parameters and outer rules; its wall time does not count against `time_limit_minutes`.
+`converge_terms: "off"` sets the neighbour weight and the label cost to 0 for that board (the
+design's measurement step 3); any other value than `on` or `off` is refused. With C,
+`search.json` also holds C's parameters and rule (`plan.matrix.converge`), each C record's
+trace (`converge`: the cost term by term at the start and the end, both stop reasons, stages,
+sweeps, evaluations, the best cost after every stage and sweep), and the outer trace (top-level
+`converge`: the starts taken and the best cost after each, the cost by effort level, why each
+rule stopped, seconds). `table.md` gets C's row and verdict, and one line of counts on the
+outer loops.
 
 Per board the folder holds `input/`, `rules.json`, `held.json` (a JSON array of the
 references to hold besides the mode's own: `["J1", "H3"]`, or `[]`) and optionally `ai/board.kicad_pcb`.
@@ -105,3 +119,22 @@ board's folder, and prints one line per board.
 
 The bench does not take the lane locks (native, then instr): the driver that starts it
 holds them for each board's run.
+
+## Family C without routing
+
+`converge_check`, an ignored test beside `place_bench`, runs family C on every board that names
+`converge`, with no routing call (the design's measurement step 1). It takes the same
+environment and guards as `place_bench`, starts no KiCad and no router, and writes only
+`<board folder>/converge-check.json` (refused when the file exists): phase 1's counts, the outer
+trace, and per C run its recipe (start family, seed, parameter-set index, level), outcome,
+cost, both stop reasons, stages, sweeps, evaluations, the start and end terms, and seconds.
+`KONNECT_CONVERGE_PORT_CHECK=1` adds the port's check: 5 runs at level 0, seeds 1 to 5, both
+new terms off, from F seed 24 with rail weight 0, and their median cost. Counts and numbers
+only.
+
+```text
+KONNECT_PLACE_BENCH=<bench folder> KONNECT_FASTROUTE=<any executable fastroute> \
+KICAD_CONFIG_HOME=<bench folder>/scratch/kicad-config \
+KONNECT_STATE_DIR=<bench folder>/scratch/state [KONNECT_CONVERGE_PORT_CHECK=1] \
+cargo test -p konnect-core --release --lib place_bench_tests::converge_check -- --exact --ignored --nocapture
+```

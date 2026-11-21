@@ -10,9 +10,12 @@
 // is used by the bench test alone or by nothing (each says which).
 #![allow(dead_code)]
 
+use crate::place_converge::{
+    effort_stop, hoods_sha256, starts_stop, ConvergeParams, OuterRule, Trace,
+};
 use crate::place_generators::{
-    board_model, generate, neutral_start, recipes, BoardModel, Candidate, Clearances, Family,
-    GenerateFailure, Matrix, Recipe, GENERATOR_VERSION,
+    board_model, generate, neutral_start, recipes, BoardModel, Candidate, Clearances,
+    ConvergeRecipe, Family, GenerateFailure, Matrix, Params, Recipe, GENERATOR_VERSION,
 };
 use crate::place_held::{
     check_held, decoupling_pairs, groups, held_set, placements_of, same_board, sha256_hex, HeldSet,
@@ -110,6 +113,8 @@ pub(crate) struct Record {
     /// `schematic_neighbours_reason` says why).
     pub schematic_neighbours: Option<SchematicMeasure>,
     pub schematic_neighbours_reason: Option<String>,
+    /// Family C's trace (design C11). `None` for every other origin.
+    pub converge: Option<Trace>,
     #[serde(skip)]
     pub board_text: Option<String>,
     #[serde(skip)]
@@ -140,6 +145,7 @@ impl Record {
             route_gates: None,
             schematic_neighbours: None,
             schematic_neighbours_reason: None,
+            converge: None,
             board_text: None,
             judged: None,
         }
@@ -177,14 +183,32 @@ impl Record {
         }
     }
 
-    /// A short label for the table: no reference, no net, only the origin and numbers.
+    /// A short label for the table: no reference, no net, only the origin and numbers. A
+    /// run of family C also names its effort level, since the levels of one start share
+    /// its seed.
     fn label(&self) -> String {
         match &self.origin {
             Origin::Owner { call } => format!("O call {call}"),
             Origin::Ai { call, .. } => format!("A call {call}"),
-            Origin::Generated { recipe, .. } => {
-                format!("{} seed {}", self.group(), recipe.seed)
-            }
+            Origin::Generated { recipe, .. } => match &recipe.params {
+                Params::Converge(run) => format!(
+                    "{} seed {} level {}",
+                    self.group(),
+                    recipe.seed,
+                    run.params.level
+                ),
+                _ => format!("{} seed {}", self.group(), recipe.seed),
+            },
+        }
+    }
+
+    /// What a rule of family C reads for this run (design C7): its trace's end cost when
+    /// the record is `generated`, the board as written; infinity for a run that failed or
+    /// whose board did not get through the screen.
+    fn run_cost(&self) -> f64 {
+        match (&self.converge, self.outcome) {
+            (Some(trace), "generated") => trace.end.cost,
+            _ => f64::INFINITY,
         }
     }
 }
@@ -236,6 +260,8 @@ pub(crate) struct Outcome {
     pub clearances: Clearances,
     /// P2's yardstick: the input board's unrouted check.
     pub input_unrouted: BTreeMap<String, usize>,
+    /// Family C's outer loops (phase 1b); `None` when the matrix leaves the family off.
+    pub converge: Option<OuterTrace>,
 }
 
 /// The routing phase's two jobs, so that the scheduler is tested with fakes on a
@@ -480,7 +506,7 @@ fn generated_record(
     let started = std::time::Instant::now();
     let generated = generator(model, recipe);
     record.timings.generate_ms = Some(milliseconds(started));
-    let candidate = match generated {
+    let mut candidate = match generated {
         Ok(candidate) => candidate,
         Err(failure) => {
             record.reason = Some(describe(&failure));
@@ -488,6 +514,8 @@ fn generated_record(
         }
     };
     record.converged = candidate.converged;
+    // Family C's run files its trace (design C11); every other family has none.
+    record.converge = candidate.trace.take();
     let started = std::time::Instant::now();
     let written = placements_applied_to(&model.text, &candidate.placements);
     record.timings.write_ms = Some(milliseconds(started));
@@ -524,6 +552,37 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         text.clone()
     } else {
         "the generator panicked without a message".to_string()
+    }
+}
+
+/// `generated_record` with a panic in the job caught (`std::panic::catch_unwind`) and
+/// recorded `generate_failed` with its message, so that no job's failure stops another.
+fn caught_record(
+    model: &BoardModel,
+    id: usize,
+    recipe: &Recipe,
+    generator: GenerateFn<'_>,
+) -> Record {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        generated_record(model, id, recipe, generator)
+    })) {
+        Ok(record) => record,
+        Err(payload) => {
+            let mut record = Record::bare(
+                model,
+                id,
+                Origin::Generated {
+                    recipe: recipe.clone(),
+                    generator_version: GENERATOR_VERSION,
+                },
+                "generate_failed",
+            );
+            record.reason = Some(format!(
+                "the generator panicked: {}",
+                panic_message(payload.as_ref())
+            ));
+            record
+        }
     }
 }
 
@@ -595,28 +654,7 @@ pub(crate) fn generate_all_with(
                 let Some(recipe) = recipes.get(slot) else {
                     break;
                 };
-                let id = first_id + slot;
-                let record = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    generated_record(model, id, recipe, generator)
-                })) {
-                    Ok(record) => record,
-                    Err(payload) => {
-                        let mut record = Record::bare(
-                            model,
-                            id,
-                            Origin::Generated {
-                                recipe: recipe.clone(),
-                                generator_version: GENERATOR_VERSION,
-                            },
-                            "generate_failed",
-                        );
-                        record.reason = Some(format!(
-                            "the generator panicked: {}",
-                            panic_message(payload.as_ref())
-                        ));
-                        record
-                    }
-                };
+                let record = caught_record(model, first_id + slot, recipe, generator);
                 *slots[slot].lock().unwrap_or_else(PoisonError::into_inner) = Some(record);
             });
         }
@@ -633,6 +671,271 @@ pub(crate) fn generate_all_with(
     records
 }
 
+// ─── Phase 1b: family C ──────────────────────────────────────────────────────
+
+/// The outer loops' own record, `search.json`'s `converge`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct OuterTrace {
+    pub params: ConvergeParams,
+    pub rule: OuterRule,
+    /// The ids of the starts taken, in start order, and the best cost after each;
+    /// `None` while every run so far failed.
+    pub starts: Vec<usize>,
+    pub best_by_start: Vec<Option<f64>>,
+    /// `rule`, `guard`, or `no_more_starts` (every start was taken).
+    pub starts_stop: &'static str,
+    /// The id of the start the effort was doubled on, and its cost at levels 0, 1, ...
+    pub best_start: Option<usize>,
+    pub cost_by_level: Vec<f64>,
+    /// `rule` or `guard`; `None` when no run of a start succeeded.
+    pub effort_stop: Option<&'static str>,
+    /// Wall time of the whole phase.
+    pub seconds: f64,
+}
+
+/// A record's start cost (design C8): the screen's airwire length plus
+/// `params.crossing_mm` per crossing. The requirement terms are left out: every run
+/// repairs them. `None` without both numbers.
+fn start_cost(record: &Record, params: &ConvergeParams) -> Option<f64> {
+    let screen = record.screen.as_ref()?;
+    Some(screen.wirelength_mm? + params.crossing_mm * screen.crossings? as f64)
+}
+
+/// Family C's starts (design C8): the records of F and S with outcome `generated` that
+/// pass P1, the lowest start cost first, a record without one last, ties to the lower id.
+fn converge_pool<'r>(starts: &'r [Record], params: &ConvergeParams) -> Vec<&'r Record> {
+    let mut pool: Vec<(&Record, Option<f64>)> = starts
+        .iter()
+        .filter(|r| {
+            matches!(r.group(), "F" | "S")
+                && r.outcome == "generated"
+                && r.screen_key.is_some_and(|key| key[0] == 0)
+        })
+        .map(|r| (r, start_cost(r, params)))
+        .collect();
+    pool.sort_by(|(a, cost_a), (b, cost_b)| {
+        let by_cost = match (cost_a, cost_b) {
+            (Some(x), Some(y)) => x.total_cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        by_cost.then(a.id.cmp(&b.id))
+    });
+    pool.into_iter().map(|(record, _)| record).collect()
+}
+
+/// The recipe of a run of family C from `start` with `params`: the start recipe's seed.
+fn converge_recipe(start: &Recipe, params: ConvergeParams) -> Recipe {
+    Recipe {
+        family: Family::Converge,
+        seed: start.seed,
+        params: Params::Converge(ConvergeRecipe {
+            start: Box::new(start.clone()),
+            params,
+        }),
+    }
+}
+
+/// The recipe a record of F or S was made from.
+fn recipe_of(record: &Record) -> &Recipe {
+    match &record.origin {
+        Origin::Generated { recipe, .. } => recipe,
+        _ => unreachable!("a start of family C is a generated record of F or S"),
+    }
+}
+
+/// Phase 1b, family C. `starts` are the records of families F and S as phase 1 left
+/// them. The pool is those with outcome `generated` that pass P1 (`screen_key[0] == 0`),
+/// ordered by start cost (the screen's `wirelength_mm` + `params.crossing_mm` x
+/// `crossings`; a record without both sorts last), ties to the lower id.
+///
+/// Starts. The pool's starts are handed in that order to `threads` scoped threads from
+/// one atomic counter. Each job is `generated_record` with the recipe
+/// `Recipe { family: Converge, seed: <the start recipe's seed>, params: Params::Converge(
+/// ConvergeRecipe { start, params: *params }) }` (generate, write, held check, evaluate,
+/// screen, as for every family) and files the candidate's trace on its record. After
+/// each job the costs of the longest finished prefix are read by
+/// `place_converge::starts_stop`; once it gives n, no new start is handed out, the
+/// running jobs end, and exactly the records of the first n starts are kept.
+///
+/// Effort. The start whose record has the lowest cost (ties to the earlier start) is
+/// run again with `params.level` 1, 2, ..., one level at a time, each a record like the
+/// others; after each, `place_converge::effort_stop` reads the costs of levels 0 up, and
+/// the loop ends when it gives a count. Every level's record is kept, the one that did
+/// not pay too.
+///
+/// Ids are `first_id` upward: the starts in start order, then the levels. A panic is a
+/// `generate_failed` record and costs infinity. The result is the same for any number of
+/// threads.
+pub(crate) fn converge_all(
+    model: &BoardModel,
+    starts: &[Record],
+    params: &ConvergeParams,
+    rule: &OuterRule,
+    threads: usize,
+    first_id: usize,
+) -> (Vec<Record>, OuterTrace) {
+    converge_all_with(model, starts, params, rule, threads, first_id, &generate)
+}
+
+/// The progress of the starts' pool: each start's record in its slot, and the count
+/// `starts_stop` gave once it gave one.
+struct StartsProgress {
+    slots: Vec<Option<Record>>,
+    stop: Option<usize>,
+}
+
+/// [`converge_all`] with the generator given: the production one is [`generate`].
+pub(crate) fn converge_all_with(
+    model: &BoardModel,
+    starts: &[Record],
+    params: &ConvergeParams,
+    rule: &OuterRule,
+    threads: usize,
+    first_id: usize,
+    generator: GenerateFn<'_>,
+) -> (Vec<Record>, OuterTrace) {
+    let started = std::time::Instant::now();
+    let pool = converge_pool(starts, params);
+    let recipes: Vec<Recipe> = pool
+        .iter()
+        .map(|start| converge_recipe(recipe_of(start), *params))
+        .collect();
+    // `starts_stop` stops at `max_starts` whatever the costs say, so no start past it is
+    // ever kept: none is handed out (at least one, as the rule reads at least one).
+    let handed = recipes.len().min(rule.max_starts.max(1));
+    let progress = Mutex::new(StartsProgress {
+        slots: vec![None; handed],
+        stop: None,
+    });
+    let next = AtomicUsize::new(0);
+    let workers = threads.max(1).min(handed);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let slot = next.fetch_add(1, Ordering::SeqCst);
+                if slot >= handed {
+                    break;
+                }
+                // Once the rule has stopped, no new start is handed out. Every start
+                // before the stop was handed out already: the rule read their records.
+                if progress
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .stop
+                    .is_some()
+                {
+                    break;
+                }
+                let record = caught_record(model, first_id + slot, &recipes[slot], generator);
+                let mut progress = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                progress.slots[slot] = Some(record);
+                if progress.stop.is_none() {
+                    let costs: Vec<f64> = progress
+                        .slots
+                        .iter()
+                        .map_while(Option::as_ref)
+                        .map(Record::run_cost)
+                        .collect();
+                    progress.stop = starts_stop(&costs, rule);
+                }
+            });
+        }
+    });
+    let progress = progress
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    // Exactly the first n starts: a job that was running when the rule stopped ends, and
+    // its record is not kept, so the records do not depend on the number of threads.
+    let kept = progress.stop.unwrap_or(handed);
+    let mut records: Vec<Record> = progress
+        .slots
+        .into_iter()
+        .take(kept)
+        .map(|slot| slot.expect("every start before the stop has its record"))
+        .collect();
+    let costs: Vec<f64> = records.iter().map(Record::run_cost).collect();
+    let starts_word = match progress.stop {
+        None => "no_more_starts",
+        // The same function without its guard: did the rule itself stop at n?
+        Some(n) => {
+            let unguarded = OuterRule {
+                max_starts: usize::MAX,
+                ..*rule
+            };
+            if starts_stop(&costs, &unguarded) == Some(n) {
+                "rule"
+            } else {
+                "guard"
+            }
+        }
+    };
+    let mut best_by_start = Vec::new();
+    let mut best_so_far = f64::INFINITY;
+    for &cost in &costs {
+        best_so_far = best_so_far.min(cost);
+        best_by_start.push(best_so_far.is_finite().then_some(best_so_far));
+    }
+
+    // Effort: the best start again, one level at a time.
+    let best = (0..costs.len())
+        .filter(|&k| costs[k].is_finite())
+        .min_by(|&a, &b| costs[a].total_cmp(&costs[b]).then(a.cmp(&b)));
+    let mut cost_by_level = Vec::new();
+    let mut effort_word = None;
+    if let Some(best) = best {
+        cost_by_level.push(costs[best]);
+        let start = recipe_of(pool[best]);
+        let mut level = 0u32;
+        loop {
+            if let Some(count) = effort_stop(&cost_by_level, rule) {
+                let unguarded = OuterRule {
+                    max_level: u32::MAX,
+                    ..*rule
+                };
+                effort_word = Some(if effort_stop(&cost_by_level, &unguarded) == Some(count) {
+                    "rule"
+                } else {
+                    "guard"
+                });
+                break;
+            }
+            level += 1;
+            let recipe = converge_recipe(start, ConvergeParams { level, ..*params });
+            let record = caught_record(model, first_id + records.len(), &recipe, generator);
+            cost_by_level.push(record.run_cost());
+            records.push(record);
+        }
+    }
+    let trace = OuterTrace {
+        params: *params,
+        rule: *rule,
+        starts: pool.iter().take(kept).map(|start| start.id).collect(),
+        best_by_start,
+        starts_stop: starts_word,
+        best_start: best.map(|best| pool[best].id),
+        cost_by_level,
+        effort_stop: effort_word,
+        seconds: started.elapsed().as_secs_f64(),
+    };
+    (records, trace)
+}
+
+/// Checks family C's records for duplicates like any candidate's (design C1): a board
+/// equal to the input board, to the board of an earlier record that holds one (A's and
+/// the lower ids' are among `records`), or to an earlier run's of C is `duplicate`.
+fn mark_converge_duplicates(model: &BoardModel, records: &[Record], converged: &mut [Record]) {
+    let mut holders: Vec<(Option<usize>, String)> = vec![(None, model.held.board_sha256.clone())];
+    holders.extend(
+        records
+            .iter()
+            .filter(|r| r.outcome == "generated")
+            .filter_map(|r| Some((Some(r.id), r.board_sha256.clone()?))),
+    );
+    mark_duplicates(converged, &holders);
+}
+
 // ─── Phase 2: selection ──────────────────────────────────────────────────────
 
 /// Phase 2, selection, as candidate ids in routing order: O's calls, then A's; then,
@@ -646,6 +949,15 @@ pub(crate) fn generate_all_with(
 /// screen's check is always the first thing cut. A candidate whose board equals an
 /// earlier one's (`board_sha256`) was recorded `duplicate` in phase 1 and is never
 /// selected; nor is a record that failed before the screen.
+///
+/// Family C (design C12) has its own order: its candidates that pass P1, by the screen's
+/// requirement fields (score incomplete, decoupling violations, connector violations),
+/// then by the cost the family converged on (`Trace::end.cost`), ties to the lower id; its
+/// best and drawn ones as for the others, drawn after P's, so F's, S's and P's draws do
+/// not change. In round r, C's call goes in at place 3 - (r mod 4) among the three
+/// families' slots of that round (last in round 0, first in round 3), which leaves F's, S's
+/// and P's order as it is without C, and is the rotation over F, S, P, C for the
+/// bench's four rounds.
 pub(crate) fn routing_order(
     records: &[Record],
     best: usize,
@@ -661,51 +973,80 @@ pub(crate) fn routing_order(
                 .map(|r| r.id),
         );
     }
-    let mut rng = SplitMix64(draw_seed);
-    let mut sequences: Vec<Vec<usize>> = Vec::new();
-    for family in ["F", "S", "P"] {
-        // Only a candidate that passes P1 is a candidate for a routing call: the best
-        // of a pool that held the ones that fail it would be a call spent on an
-        // illegal placement.
-        let mut pool: Vec<&Record> = records
+    // Only a candidate that passes P1 is a candidate for a routing call: the best of a
+    // pool that held the ones that fail it would be a call spent on an illegal placement.
+    let passing = |family: &str| -> Vec<&Record> {
+        records
             .iter()
             .filter(|r| {
                 r.group() == family
                     && r.outcome == "generated"
                     && r.screen_key.is_some_and(|key| key[0] == 0)
             })
-            .collect();
+            .collect()
+    };
+    let mut rng = SplitMix64(draw_seed);
+    let mut sequences: Vec<Vec<usize>> = Vec::new();
+    for family in ["F", "S", "P"] {
+        let mut pool = passing(family);
         pool.sort_by(|a, b| a.screen_key.cmp(&b.screen_key).then(a.id.cmp(&b.id)));
-        let picked: Vec<usize> = pool.iter().take(best).map(|r| r.id).collect();
-        // The rest, in id order, so the draw is a function of the seed and the records
-        // alone.
-        let mut rest: Vec<usize> = pool.iter().skip(best).map(|r| r.id).collect();
-        rest.sort_unstable();
-        let mut lucky = Vec::new();
-        for _ in 0..drawn {
-            if rest.is_empty() {
-                break;
-            }
-            let at = rng.below(rest.len() as u64) as usize;
-            lucky.push(rest.remove(at));
-        }
-        let mut sequence = Vec::new();
-        sequence.extend(picked.first().copied());
-        sequence.extend(lucky);
-        sequence.extend(picked.iter().skip(1).copied());
-        sequences.push(sequence);
+        sequences.push(family_sequence(&pool, best, drawn, &mut rng));
     }
-    let longest = sequences.iter().map(Vec::len).max().unwrap_or(0);
+    let mut converged = passing("C");
+    let requirements = |r: &Record| r.screen_key.map(|key| [key[1], key[2], key[3]]);
+    converged.sort_by(|a, b| {
+        requirements(a)
+            .cmp(&requirements(b))
+            .then(a.run_cost().total_cmp(&b.run_cost()))
+            .then(a.id.cmp(&b.id))
+    });
+    let c_sequence = family_sequence(&converged, best, drawn, &mut rng);
+    let longest = sequences
+        .iter()
+        .chain([&c_sequence])
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
     for round in 0..longest {
-        for step in 0..sequences.len() {
-            order.extend(
+        let mut slots: Vec<Option<usize>> = (0..sequences.len())
+            .map(|step| {
                 sequences[(round + step) % sequences.len()]
                     .get(round)
-                    .copied(),
-            );
-        }
+                    .copied()
+            })
+            .collect();
+        let place = sequences.len() - round % (sequences.len() + 1);
+        slots.insert(place, c_sequence.get(round).copied());
+        order.extend(slots.into_iter().flatten());
     }
     order
+}
+
+/// One family's calls in order from its pool, sorted best first: its best, then its
+/// `drawn` ones drawn uniformly with `rng` from the rest in id order (so the draw is a
+/// function of the seed and the records alone), then its other best ones.
+fn family_sequence(
+    pool: &[&Record],
+    best: usize,
+    drawn: usize,
+    rng: &mut SplitMix64,
+) -> Vec<usize> {
+    let picked: Vec<usize> = pool.iter().take(best).map(|r| r.id).collect();
+    let mut rest: Vec<usize> = pool.iter().skip(best).map(|r| r.id).collect();
+    rest.sort_unstable();
+    let mut lucky = Vec::new();
+    for _ in 0..drawn {
+        if rest.is_empty() {
+            break;
+        }
+        let at = rng.below(rest.len() as u64) as usize;
+        lucky.push(rest.remove(at));
+    }
+    let mut sequence = Vec::new();
+    sequence.extend(picked.first().copied());
+    sequence.extend(lucky);
+    sequence.extend(picked.iter().skip(1).copied());
+    sequence
 }
 
 // ─── Phase 3: the launch rule ────────────────────────────────────────────────
@@ -731,6 +1072,13 @@ pub(crate) fn may_route(
 ) -> bool {
     let expected = median(call_walls).unwrap_or_else(|| first_call_estimate(effort));
     elapsed.saturating_add(expected) <= limit
+}
+
+/// The time the launch rule reads (design C13): the time since the search began less
+/// the time phase 1b (family C) took. The board's limit was sized for the routing calls,
+/// and a search that takes its own time must not cost a reference or a family a call.
+pub(crate) fn launch_elapsed(since_start: Duration, phase_1b: Duration) -> Duration {
+    since_start.saturating_sub(phase_1b)
 }
 
 /// Calls in a row that gave no routed candidate (`export_refused`, `route_failed` and
@@ -908,34 +1256,15 @@ fn file_call(
 }
 
 /// The whole search of one board (flow steps 1 to 8): the held set and the intent,
-/// the model, the input's unrouted check, the references and phase 1, selection, then
-/// the routing phase one call at a time in `routing_order` while `may_route` allows,
+/// the model, the input's unrouted check, the references and phase 1, phase 1b (family
+/// C, `converge_all`) when the matrix has it, selection, then the routing phase one call
+/// at a time in `routing_order` while `may_route` allows (on `launch_elapsed`),
 /// each candidate's P gates and route result, the keys, and `search.json` and
 /// `table.md` in `plan.folder`. Errs only before phase 1 (a held set that cannot be
 /// proved, an input that does not parse); every later failure is a record.
 pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::Result<Outcome> {
     let started = Instant::now();
-    let text = std::fs::read_to_string(&plan.route.board).map_err(|error| {
-        anyhow::anyhow!(
-            "the input board '{}' cannot be read: {error}",
-            plan.route.board.display()
-        )
-    })?;
-    let held = held_set(&text, &plan.caller_held, &plan.hold).map_err(|refusal| {
-        anyhow::anyhow!("{} Next step: {}", refusal.reason, refusal.next_step)
-    })?;
-    let tree = konnect_sexp::parse_sexp(&text)?;
-    let edge_mount = Allowlist::new(real_held_references(&held));
-    let evaluated = evaluate(&tree, &edge_mount, MAX_NET_REFERENCES)?;
-    let pairs = decoupling_pairs(&evaluated)?;
-    let intent = Intent::new(groups(&tree, &held, &[]), pairs);
-    let input_failures = movable_failure_keys(&evaluated, &held)?;
-    // The schematic neighbourhoods, fixed once from the input board's project (D23). A
-    // missing or unreadable schematic is a reason on every record, not an error.
-    let schematic = SchematicBaseline::read(&plan.route.board, &tree);
-    let mut model = board_model(&text, held, intent)?;
-    model.input_failures = input_failures;
-    model.clearances = Clearances::from_inputs(&plan.route.rules, &plan.route.options);
+    let (model, schematic) = search_model(plan)?;
     std::fs::create_dir_all(plan.folder.join("candidates"))?;
 
     // References: O, then A.
@@ -1005,6 +1334,20 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     mark_duplicates(&mut generated, &earlier);
     records.extend(generated);
 
+    // Phase 1b, family C (design C1): after every record of F, S and P exists, so their
+    // ids and their draws in the selection do not change. Its time is its own (C13).
+    let mut outer: Option<OuterTrace> = None;
+    let mut phase_1b = Duration::ZERO;
+    if let Some((params, rule)) = &plan.matrix.converge {
+        let phase_started = Instant::now();
+        let (mut converged, trace) =
+            converge_all(&model, &records, params, rule, plan.threads, records.len());
+        mark_converge_duplicates(&model, &records, &mut converged);
+        records.extend(converged);
+        phase_1b = phase_started.elapsed();
+        outer = Some(trace);
+    }
+
     for record in &mut records {
         record.file_schematic(&schematic);
     }
@@ -1034,7 +1377,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     let mut stopped_code: Option<&'static str> = None;
     let mut input_unrouted = BTreeMap::new();
     match routing
-        .unrouted(text.clone(), plan.folder.join("input-check"))
+        .unrouted(model.text.clone(), plan.folder.join("input-check"))
         .await
     {
         Ok(counts) => input_unrouted = counts,
@@ -1063,7 +1406,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             continue;
         }
         if !may_route(
-            started.elapsed(),
+            launch_elapsed(started.elapsed(), phase_1b),
             plan.time_limit,
             &walls,
             plan.route.effort,
@@ -1110,6 +1453,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
         stopped_code,
         clearances: model.clearances,
         input_unrouted,
+        converge: outer,
     };
     std::fs::write(
         plan.folder.join("search.json"),
@@ -1117,6 +1461,45 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     )?;
     std::fs::write(plan.folder.join("table.md"), table(plan, &outcome))?;
     Ok(outcome)
+}
+
+/// The board model as `search` builds it, and the schematic baseline (design D23): the
+/// held set and the intent from the input board's own score, its failures as P1's
+/// yardstick, the clearances from the routing inputs, and the schematic neighbourhoods
+/// that family C reads (`None` when the schematic cannot be read; the baseline then
+/// carries the reason). Writes nothing. Errs as `search` does before phase 1: a held set
+/// that cannot be proved, an input that does not parse.
+pub(crate) fn search_model(
+    plan: &Plan,
+) -> anyhow::Result<(BoardModel, Result<SchematicBaseline, String>)> {
+    let text = std::fs::read_to_string(&plan.route.board).map_err(|error| {
+        anyhow::anyhow!(
+            "the input board '{}' cannot be read: {error}",
+            plan.route.board.display()
+        )
+    })?;
+    let held = held_set(&text, &plan.caller_held, &plan.hold).map_err(|refusal| {
+        anyhow::anyhow!("{} Next step: {}", refusal.reason, refusal.next_step)
+    })?;
+    let tree = konnect_sexp::parse_sexp(&text)?;
+    let edge_mount = Allowlist::new(real_held_references(&held));
+    let evaluated = evaluate(&tree, &edge_mount, MAX_NET_REFERENCES)?;
+    let pairs = decoupling_pairs(&evaluated)?;
+    let intent = Intent::new(groups(&tree, &held, &[]), pairs);
+    let input_failures = movable_failure_keys(&evaluated, &held)?;
+    // The schematic neighbourhoods, fixed once from the input board's project (D23). A
+    // missing or unreadable schematic is a reason on every record, not an error.
+    let schematic = SchematicBaseline::read(&plan.route.board, &tree);
+    let mut model = board_model(&text, held, intent)?;
+    model.input_failures = input_failures;
+    model.clearances = Clearances::from_inputs(&plan.route.rules, &plan.route.options);
+    // Family C reads the neighbourhoods the measure reads (design C11), and none when
+    // the schematic cannot be read.
+    model.hoods = schematic
+        .as_ref()
+        .ok()
+        .map(|baseline| baseline.hoods.clone());
+    Ok((model, schematic))
 }
 
 /// Rebuilds a generated record's board text and proves it is the recorded one. Errs
@@ -1136,14 +1519,31 @@ pub(crate) fn rerun(model: &BoardModel, record: &Record) -> anyhow::Result<Strin
         "candidate {} was made by generator version {generator_version}, this build is {GENERATOR_VERSION}",
         record.id
     );
-    // Family C's rerun also proves the schematic neighbourhoods its trace names (design
-    // C11), and the record does not carry the trace yet: refused until it does, so a C
-    // board is never rebuilt from a model it was not made with.
-    anyhow::ensure!(
-        recipe.family != Family::Converge,
-        "candidate {} is of family C, whose rerun is not built yet",
-        record.id
-    );
+    // Family C (design C11): the start is generated again from its own recipe inside
+    // `generate`, so the start recipe must be one of F or S; and the run read the
+    // schematic neighbourhoods its trace names, so a model with other ones would make
+    // another board.
+    if recipe.family == Family::Converge {
+        let Params::Converge(run) = &recipe.params else {
+            anyhow::bail!(
+                "candidate {} is of family C and its recipe is not a run of family C",
+                record.id
+            );
+        };
+        anyhow::ensure!(
+            run.start.family != Family::Converge,
+            "candidate {} is of family C and starts from a recipe of family C, which is no start",
+            record.id
+        );
+        let trace = record.converge.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("candidate {} is of family C and has no trace", record.id)
+        })?;
+        anyhow::ensure!(
+            model.hoods.as_ref().map(hoods_sha256) == trace.hoods_sha256,
+            "candidate {} was made with other schematic neighbourhoods",
+            record.id
+        );
+    }
     anyhow::ensure!(
         record.input_sha256 == model.held.board_sha256,
         "candidate {} was made from another input board",
@@ -1178,8 +1578,9 @@ pub(crate) fn rerun(model: &BoardModel, record: &Record) -> anyhow::Result<Strin
 
 // ─── The records on disk and the table ───────────────────────────────────────
 
-/// `search.json`: the plan (matrix, limits, effort, fastroute, threads, host cores),
-/// every record, the input's unrouted check, and how the search ended.
+/// `search.json`: the plan (matrix with family C's parameters and outer rule, limits,
+/// effort, fastroute, threads, host cores), every record (a run of C with its trace), the
+/// input's unrouted check, family C's outer trace, and how the search ended.
 pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
     let matrix = &plan.matrix;
     let fastroute_sha256 = std::fs::read(&plan.route.fastroute)
@@ -1196,6 +1597,9 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
                 "schematic": matrix.schematic,
                 "perturb_seeds": matrix.perturb_seeds,
                 "perturb": matrix.perturb,
+                "converge": matrix
+                    .converge
+                    .map(|(params, rule)| json!({ "params": params, "rule": rule })),
             },
             "recipes": recipes(matrix).len(),
             "hold_rules": plan.hold,
@@ -1214,6 +1618,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
         },
         "records": outcome.records,
         "input_unrouted": outcome.input_unrouted,
+        "converge": outcome.converge,
         "elapsed_s": outcome.elapsed.as_secs_f64(),
         "stopped_routing": outcome.stopped_routing,
         "stopped_code": outcome.stopped_code,
@@ -1275,19 +1680,48 @@ fn number(value: Option<f64>) -> String {
     value.map_or("-".to_string(), |v| format!("{v:.1}"))
 }
 
+/// `table.md`'s line on family C's outer loops, counts only: the starts taken and how
+/// the rule for starts stopped, the effort levels run on the best start and how the rule
+/// for effort stopped, the runs a guard ended, and phase 1b's wall time (C13: not counted
+/// against the board's limit).
+fn outer_loops_line(outer: &OuterTrace, records: &[Record]) -> String {
+    let runs: Vec<&Record> = records.iter().filter(|r| r.group() == "C").collect();
+    let guarded = runs
+        .iter()
+        .filter(|r| r.converge.as_ref().is_some_and(|trace| !trace.converged()))
+        .count();
+    let levels = match outer.cost_by_level.len() {
+        0 => "no effort level (no start's run succeeded)".to_string(),
+        n => format!(
+            "effort levels 0 to {} on the best start, the rule for effort stopped by `{}`",
+            n - 1,
+            outer.effort_stop.unwrap_or("-")
+        ),
+    };
+    format!(
+        "Family C's outer loops: {} start(s) taken, the rule for starts stopped by `{}`; {levels}; \
+         {guarded} of {} run(s) ended by a guard; {:.0} s, not counted against the time limit.\n",
+        outer.starts.len(),
+        outer.starts_stop,
+        runs.len(),
+        outer.seconds
+    )
+}
+
 /// `table.md` of one board, counts only, no net or part names: one row per routed
 /// candidate in rank order (rank, origin, family and seed, P1, P2, G1, unconnected,
 /// G2, G3, decoupling, connector, acute, signal and power mm, vias off the pours,
 /// copper quality, silk, placement score, and the two reported-only schematic-neighbour
 /// columns of D23), then one row per family and reference (best
 /// rank, median rank of its routed candidates, how many pass every gate, how many were
-/// generated, failed, duplicates and screened out), then each family's verdict against
-/// O and against A (`verdict`).
+/// generated, failed, duplicates and screened out), family C's one line of counts on its
+/// outer loops when the matrix has it, then each family's verdict against O and against
+/// A (`verdict`).
 pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
     // Only the families the matrix makes recipes for: a family the bench left out
     // (`families` in `bench.json`) has no row and no verdict.
     let all_recipes = recipes(&plan.matrix);
-    let families: Vec<&str> = [
+    let mut families: Vec<&str> = [
         (Family::Force, "F"),
         (Family::Schematic, "S"),
         (Family::Perturb, "P"),
@@ -1296,6 +1730,10 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
     .filter(|(family, _)| all_recipes.iter().any(|r| r.family == *family))
     .map(|(_, letter)| letter)
     .collect();
+    // Family C has no fixed recipes: it is in when the matrix has its parameters.
+    if plan.matrix.converge.is_some() {
+        families.push("C");
+    }
     let mut text = format!("# Placement search: {}\n\n", plan.name);
     text.push_str(&format!(
         "Effort {}, {} recipes (families {}), {} candidates, {:.0} s elapsed.",
@@ -1430,6 +1868,10 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             ranks.len(),
         ));
         ranks_of.insert(group, ranks);
+    }
+    if let Some(outer) = &outcome.converge {
+        text.push('\n');
+        text.push_str(&outer_loops_line(outer, &outcome.records));
     }
 
     text.push_str("\n## Verdicts\n\n");

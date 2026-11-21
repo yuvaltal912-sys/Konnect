@@ -10,17 +10,28 @@
 //!
 //! `bench.json` names, per board: its folder below the bench folder (holding
 //! `input/` with the stripped project copy, `rules.json`, `held.json` and optionally
-//! `ai/board.kicad_pcb`), its time limit, the effort, `hold` (`locks` or `rules`) and
-//! `families`. The bench writes only below
+//! `ai/board.kicad_pcb`), its time limit, the effort, `hold` (`locks` or `rules`),
+//! `families` and `converge_terms`. The bench writes only below
 //! the bench folder. The format is in `xtask/placement-bench/README.md`.
+//!
+//! `converge_check`, the other ignored test here, runs family C without routing (design
+//! measurement step 1) on every board that names `converge`, with the same guards, and
+//! writes `<board folder>/converge-check.json`.
 
-use crate::place_generators::{Family, Matrix};
+use crate::place_converge::{converge, ConvergeParams, OuterRule, Terms, Trace};
+use crate::place_generators::{
+    generate, recipes, BoardModel, Family, GenerateFailure, Matrix, Params, Recipe,
+    GENERATOR_VERSION,
+};
 use crate::place_held::HoldRules;
 use crate::place_route::{export_options, isolated_context, rules_from_json, RouteInputs};
-use crate::place_search::{search, PlaceRouteCall, Plan};
+use crate::place_search::{
+    converge_all, generate_all, search, search_model, Origin, PlaceRouteCall, Plan, Record,
+};
 use crate::route_search::Effort;
 use anyhow::{bail, ensure, Context};
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -45,10 +56,26 @@ pub(crate) struct BenchBoard {
     /// Which parts the search holds: `locks` (default) or `rules`.
     #[serde(default)]
     pub hold: HoldMode,
-    /// The families of the matrix: any of `force`, `schematic` and `perturb` (default
-    /// `force` and `schematic`). O and A are references whatever is named.
+    /// The families of the matrix: any of `force`, `schematic`, `perturb` and
+    /// `converge` (default `force` and `schematic`; `converge` needs one of the first two).
+    /// O and A are references whatever is named.
     #[serde(default = "default_families")]
     pub families: Vec<BenchFamily>,
+    /// Family C's two new cost terms, the schematic neighbours and the silk labels: `on`
+    /// (default) or `off` (both weights 0, the design's measurement step 3).
+    #[serde(default)]
+    pub converge_terms: ConvergeTerms,
+}
+
+/// The bench's `converge_terms` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ConvergeTerms {
+    /// `ConvergeParams::measured`'s neighbour weight and label cost.
+    #[default]
+    On,
+    /// `neighbour_weight` 0 and `label_mm` 0.
+    Off,
 }
 
 /// The bench's `hold` option, the owner's flow of 2026-11-19 or the earlier rules.
@@ -70,6 +97,8 @@ pub(crate) enum BenchFamily {
     Force,
     Schematic,
     Perturb,
+    /// C, the convergent search (`place_converge`), which refines F's and S's candidates.
+    Converge,
 }
 
 fn default_families() -> Vec<BenchFamily> {
@@ -85,7 +114,9 @@ impl BenchBoard {
         }
     }
 
-    /// `Matrix::bench` with only the board's `families`.
+    /// `Matrix::bench` with only the board's `families`; with `converge`, family C at
+    /// `ConvergeParams::measured(0)` and `OuterRule::measured()` (design C7), its two new
+    /// terms off when `converge_terms` is `off`.
     pub(crate) fn matrix(&self) -> Matrix {
         let families: Vec<Family> = self
             .families
@@ -94,9 +125,40 @@ impl BenchBoard {
                 BenchFamily::Force => Family::Force,
                 BenchFamily::Schematic => Family::Schematic,
                 BenchFamily::Perturb => Family::Perturb,
+                BenchFamily::Converge => Family::Converge,
             })
             .collect();
-        Matrix::bench().only(&families)
+        let mut matrix = Matrix::bench().only(&families);
+        if families.contains(&Family::Converge) {
+            let mut params = ConvergeParams::measured(0);
+            if self.converge_terms == ConvergeTerms::Off {
+                params.neighbour_weight = 0.0;
+                params.label_mm = 0.0;
+            }
+            matrix.converge = Some((params, OuterRule::measured()));
+        }
+        matrix
+    }
+
+    /// Refuses an empty `families`, and `converge` without `force` or `schematic`:
+    /// family C's starts are their candidates (design C1, C8), so without them it has
+    /// nothing to refine.
+    pub(crate) fn check_families(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.families.is_empty(),
+            "board {}: families names no family (use force, schematic, perturb, converge)",
+            self.name
+        );
+        ensure!(
+            !self.families.contains(&BenchFamily::Converge)
+                || self
+                    .families
+                    .iter()
+                    .any(|f| matches!(f, BenchFamily::Force | BenchFamily::Schematic)),
+            "board {}: the family converge refines the candidates of force and schematic; name at least one of them with it",
+            self.name
+        );
+        Ok(())
     }
 }
 
@@ -236,11 +298,7 @@ fn check_scratch(
 /// The input board of `board`: `<folder>/input/<file>`, links followed, which must lie
 /// inside `bench`. Also the AI board when the folder has one.
 fn check_board_inputs(bench: &Path, board: &BenchBoard) -> anyhow::Result<()> {
-    ensure!(
-        !board.families.is_empty(),
-        "board {}: families names no family (use force, schematic, perturb)",
-        board.name
-    );
+    board.check_families()?;
     let folder = Path::new(&board.folder);
     ensure!(
         folder.is_relative()
@@ -449,18 +507,13 @@ fn board_plan(
     }
 }
 
-/// One board's search; returns the line to print.
-fn run_board(
+/// The routing inputs of one board as the bench reads them (its input board, `rules.json`,
+/// the effort, the export options), its AI board when it has one, and its `held.json`.
+fn board_inputs(
     env: &BenchEnv,
     board: &BenchBoard,
-    runtime: &tokio::runtime::Runtime,
-) -> anyhow::Result<String> {
-    let folder = env.folder.join(&board.folder);
-    ensure!(
-        !folder.join("search.json").exists() && !folder.join("candidates").exists(),
-        "board {} already holds a run; move or remove its search.json and candidates/ first",
-        board.name
-    );
+    folder: &Path,
+) -> anyhow::Result<(RouteInputs, Option<PathBuf>, BTreeSet<String>)> {
     let input = folder.join("input");
     let file = match &board.board {
         Some(name) => input.join(name),
@@ -488,14 +541,28 @@ fn run_board(
         kicad_cli: env.kicad_cli.clone(),
         kicad_config_home: env.kicad_config_home.clone(),
     };
-    let ctx = isolated_context(&folder.join("isolation"), &env.kicad_cli)?;
-    let plan = board_plan(
-        board,
-        folder.clone(),
-        inputs.clone(),
+    Ok((
+        inputs,
         ai.is_file().then_some(ai),
         read_held(&folder.join("held.json"))?,
+    ))
+}
+
+/// One board's search; returns the line to print.
+fn run_board(
+    env: &BenchEnv,
+    board: &BenchBoard,
+    runtime: &tokio::runtime::Runtime,
+) -> anyhow::Result<String> {
+    let folder = env.folder.join(&board.folder);
+    ensure!(
+        !folder.join("search.json").exists() && !folder.join("candidates").exists(),
+        "board {} already holds a run; move or remove its search.json and candidates/ first",
+        board.name
     );
+    let (inputs, ai, held) = board_inputs(env, board, &folder)?;
+    let ctx = isolated_context(&folder.join("isolation"), &env.kicad_cli)?;
+    let plan = board_plan(board, folder.clone(), inputs.clone(), ai, held);
     let outcome = runtime.block_on(search(&plan, Arc::new(PlaceRouteCall { inputs, ctx })))?;
     let mut counts = std::collections::BTreeMap::new();
     for record in &outcome.records {
@@ -535,6 +602,274 @@ fn place_bench() {
     let mut failed = 0usize;
     for board in &env.boards {
         match run_board(&env, board, &runtime) {
+            Ok(line) => println!("{line}"),
+            Err(error) => {
+                failed += 1;
+                println!("{}: failed: {error:#}", board.name);
+            }
+        }
+    }
+    assert_eq!(failed, 0, "{failed} board(s) failed; see the lines above");
+}
+
+// ─── Family C without routing (design measurement step 1) ────────────────────
+
+/// A generator failure as one count-only phrase: `NoRoom`'s list names parts, and
+/// `converge-check.json` names none.
+fn failure_phrase(failure: &GenerateFailure) -> String {
+    match failure {
+        GenerateFailure::NoRoom(parts) => format!("no room for {} part(s)", parts.len()),
+        GenerateFailure::Invalid(_) => "invalid".to_string(),
+        GenerateFailure::Panicked(_) => "panicked".to_string(),
+    }
+}
+
+/// What one run did, numbers only: converged, both stop reasons, stages, sweeps,
+/// evaluations, repairs, the first temperature, what a broken requirement cost, the
+/// start and end `Terms`, its wall time and the time of one evaluation.
+fn run_fields(trace: &Trace, seconds: Option<f64>) -> serde_json::Map<String, serde_json::Value> {
+    let terms = |terms: &Terms| serde_json::to_value(terms).expect("terms are JSON");
+    let fields = json!({
+        "converged": trace.converged(),
+        "anneal_stop": trace.anneal_stop,
+        "descent_stop": trace.descent_stop,
+        "stages": trace.stages,
+        "sweeps": trace.sweeps,
+        "evaluations": trace.evaluations,
+        "repairs_tried": trace.repairs_tried,
+        "repairs_made": trace.repairs_made,
+        "first_temperature": trace.first_temperature,
+        "requirement_mm": trace.requirement_mm,
+        "start": terms(&trace.start),
+        "end": terms(&trace.end),
+        "seconds": seconds,
+        "microseconds_per_evaluation": seconds
+            .filter(|_| trace.evaluations > 0)
+            .map(|s| s * 1e6 / trace.evaluations as f64),
+    });
+    match fields {
+        serde_json::Value::Object(map) => map,
+        _ => unreachable!("an object"),
+    }
+}
+
+/// One record of family C in `converge-check.json`: its id, its recipe (the start's
+/// family, seed and parameter-set index in `matrix`, the level), its outcome, and its
+/// run's numbers. No reason: a failure's reason can name parts.
+fn converge_run_json(record: &Record, matrix: &Matrix) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert("id".into(), json!(record.id));
+    if let Origin::Generated { recipe, .. } = &record.origin {
+        if let Params::Converge(run) = &recipe.params {
+            let set = match &run.start.params {
+                Params::Force(params) => matrix.force.iter().position(|p| p == params),
+                Params::Schematic(params) => matrix.schematic.iter().position(|p| p == params),
+                _ => None,
+            };
+            // Its own key: the run's fields below have a `start` of their own (the terms).
+            out.insert(
+                "recipe".into(),
+                json!({
+                    "start": { "family": run.start.family, "seed": run.start.seed, "set": set },
+                    "level": run.params.level,
+                }),
+            );
+        }
+    }
+    out.insert("outcome".into(), json!(record.outcome));
+    if let Some(trace) = &record.converge {
+        out.insert("cost".into(), json!(trace.end.cost));
+        out.extend(run_fields(
+            trace,
+            record.timings.generate_ms.map(|ms| ms / 1000.0),
+        ));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// The port's check (design, measurement step 1): from the F recipe of seed 24 whose
+/// parameter set has rail weight 0 (`Matrix::bench`), 5 runs of `converge` at level 0
+/// with seeds 1 to 5 and both new terms off, as the experiment ran; each run's numbers
+/// and the median of their costs (the lower middle of an even count). Errs when no set
+/// has rail weight 0, or the start does not generate.
+fn port_check(model: &BoardModel) -> anyhow::Result<serde_json::Value> {
+    let bench = Matrix::bench();
+    let set = bench
+        .force
+        .iter()
+        .position(|params| params.rail_weight == 0.0)
+        .context("no F parameter set of the bench matrix has rail weight 0: the port's check has no start")?;
+    let start_recipe = Recipe {
+        family: Family::Force,
+        seed: 24,
+        params: Params::Force(bench.force[set]),
+    };
+    let start = generate(model, &start_recipe).map_err(|failure| {
+        anyhow::anyhow!(
+            "the port's start (F seed 24, set {set}) does not generate: {}",
+            failure_phrase(&failure)
+        )
+    })?;
+    let params = ConvergeParams {
+        neighbour_weight: 0.0,
+        label_mm: 0.0,
+        ..ConvergeParams::measured(0)
+    };
+    let seeds: Vec<u64> = (1..=5).collect();
+    let results: Vec<(u64, Result<Trace, String>, f64)> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = seeds
+            .iter()
+            .map(|&seed| {
+                let (start, params) = (&start, &params);
+                scope.spawn(move || {
+                    let began = std::time::Instant::now();
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        converge(model, model.hoods.as_ref(), &start.placements, seed, params)
+                    }));
+                    let trace = match run {
+                        Ok(Ok((_, trace))) => Ok(trace),
+                        Ok(Err(failure)) => Err(failure_phrase(&failure)),
+                        Err(_) => Err("panicked".to_string()),
+                    };
+                    (seed, trace, began.elapsed().as_secs_f64())
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().expect("a port run's thread"))
+            .collect()
+    });
+    let mut costs: Vec<f64> = results
+        .iter()
+        .filter_map(|(_, trace, _)| trace.as_ref().ok().map(|t| t.end.cost))
+        .collect();
+    costs.sort_by(f64::total_cmp);
+    let median = (!costs.is_empty()).then(|| costs[(costs.len() - 1) / 2]);
+    let runs: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(seed, trace, seconds)| {
+            let mut out = serde_json::Map::new();
+            out.insert("seed".into(), json!(seed));
+            match trace {
+                Ok(trace) => {
+                    out.insert("cost".into(), json!(trace.end.cost));
+                    out.extend(run_fields(trace, Some(*seconds)));
+                }
+                Err(phrase) => {
+                    out.insert("failed".into(), json!(phrase));
+                }
+            }
+            serde_json::Value::Object(out)
+        })
+        .collect();
+    Ok(json!({
+        "start": { "family": Family::Force, "seed": 24, "set": set },
+        "params": params,
+        "runs": runs,
+        "runs_ended": costs.len(),
+        "median_cost": median,
+    }))
+}
+
+/// Family C on one board without routing: the model as the search builds it
+/// (`search_model`: hold rules, clearances, intent, neighbourhoods), phase 1 (the board's
+/// F and S recipes) and phase 1b (`converge_all`) with no routing call, and the port's
+/// check when `port` is set. Writes `<board folder>/converge-check.json`, counts and
+/// numbers only, and refuses a folder that already holds one. Returns the line to print.
+fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyhow::Result<String> {
+    let folder = env.folder.join(&board.folder);
+    let out = folder.join("converge-check.json");
+    ensure!(
+        !out.exists(),
+        "board {} already holds a converge-check.json; move or remove it first",
+        board.name
+    );
+    let (inputs, ai, held) = board_inputs(env, board, &folder)?;
+    let plan = board_plan(board, folder.clone(), inputs, ai, held);
+    let (params, rule) = plan
+        .matrix
+        .converge
+        .with_context(|| format!("board {} does not name converge", board.name))?;
+    let (model, _) = search_model(&plan)?;
+    let phase_1 = std::time::Instant::now();
+    let records = generate_all(&model, &recipes(&plan.matrix), plan.threads, 0);
+    let phase_1_s = phase_1.elapsed().as_secs_f64();
+    let starts_available = records
+        .iter()
+        .filter(|r| {
+            matches!(&r.origin, Origin::Generated { recipe, .. }
+                if matches!(recipe.family, Family::Force | Family::Schematic))
+                && r.outcome == "generated"
+                && r.screen_key.is_some_and(|key| key[0] == 0)
+        })
+        .count();
+    let (runs, outer) = converge_all(
+        &model,
+        &records,
+        &params,
+        &rule,
+        plan.threads,
+        records.len(),
+    );
+    let port = if port {
+        Some(port_check(&model)?)
+    } else {
+        None
+    };
+    let file = json!({
+        "board": board.name,
+        "generator_version": GENERATOR_VERSION,
+        "threads": plan.threads,
+        "phase_1": {
+            "records": records.len(),
+            "generated": records.iter().filter(|r| r.outcome == "generated").count(),
+            "starts_available": starts_available,
+            "seconds": phase_1_s,
+        },
+        "outer": outer,
+        "runs": runs
+            .iter()
+            .map(|record| converge_run_json(record, &plan.matrix))
+            .collect::<Vec<_>>(),
+        "port_check": port,
+    });
+    std::fs::write(&out, serde_json::to_string_pretty(&file)?)?;
+    Ok(format!(
+        "{}: {} start(s) of {starts_available} (rule for starts: {}), {} effort level(s) (rule for effort: {}), {} run(s), phase 1b {:.1} s, {}",
+        board.name,
+        outer.starts.len(),
+        outer.starts_stop,
+        outer.cost_by_level.len(),
+        outer.effort_stop.unwrap_or("-"),
+        runs.len(),
+        outer.seconds,
+        out.display()
+    ))
+}
+
+/// Family C without routing (design measurement step 1) on every board of `bench.json`
+/// that names `converge`: the same environment and guards as `place_bench`, then
+/// `converge_check_board`. `KONNECT_CONVERGE_PORT_CHECK=1` adds the port's check. Starts
+/// no KiCad and no router.
+#[test]
+#[ignore = "needs KONNECT_PLACE_BENCH, KONNECT_FASTROUTE, KICAD_CONFIG_HOME and KONNECT_STATE_DIR, as place_bench"]
+fn converge_check() {
+    let env = bench_environment().unwrap_or_else(|error| panic!("the bench is refused: {error:#}"));
+    let port = std::env::var("KONNECT_CONVERGE_PORT_CHECK").is_ok_and(|value| value == "1");
+    let boards: Vec<&BenchBoard> = env
+        .boards
+        .iter()
+        .filter(|board| board.families.contains(&BenchFamily::Converge))
+        .collect();
+    assert!(!boards.is_empty(), "no board of bench.json names converge");
+    println!(
+        "bench folder {}, the port's check {}",
+        env.folder.display(),
+        if port { "on" } else { "off" }
+    );
+    let mut failed = 0usize;
+    for board in boards {
+        match converge_check_board(&env, board, port) {
             Ok(line) => println!("{line}"),
             Err(error) => {
                 failed += 1;
@@ -950,4 +1285,105 @@ fn bench_json_defaults_and_overrides() {
     assert_eq!(file.boards[1].time_limit_minutes, 5);
     assert_eq!(file.boards[1].board.as_deref(), Some("x.kicad_pcb"));
     assert_eq!(Effort::parse(&file.boards[1].effort), Some(Effort::Fast));
+}
+
+#[test]
+fn converge_needs_f_or_s_and_the_default_stays_f_and_s() {
+    // The default: F and S, family C off.
+    let default = board_of(r#"{"name":"B4","folder":"B4"}"#);
+    assert_eq!(
+        default.families,
+        vec![BenchFamily::Force, BenchFamily::Schematic]
+    );
+    assert!(default.check_families().is_ok());
+    assert_eq!(default.matrix().converge, None);
+    // Named with F and S: C at the measured parameters and rule, and the F and S recipes
+    // are the same ones.
+    let with_c =
+        board_of(r#"{"name":"B4","folder":"B4","families":["force","schematic","converge"]}"#);
+    assert!(with_c.check_families().is_ok());
+    assert_eq!(
+        with_c.matrix().converge,
+        Some((ConvergeParams::measured(0), OuterRule::measured()))
+    );
+    assert_eq!(recipes(&with_c.matrix()), recipes(&default.matrix()));
+    // One of F and S is enough.
+    for entry in [
+        r#"{"name":"B4","folder":"B4","families":["force","converge"]}"#,
+        r#"{"name":"B4","folder":"B4","families":["converge","schematic"]}"#,
+    ] {
+        let board = board_of(entry);
+        assert!(board.check_families().is_ok(), "{entry}");
+        assert!(board.matrix().converge.is_some(), "{entry}");
+    }
+    // Negative control: C alone, or with P only, is refused with its word, before
+    // anything runs.
+    for entry in [
+        r#"{"name":"B1","folder":"B1","families":["converge"]}"#,
+        r#"{"name":"B1","folder":"B1","families":["perturb","converge"]}"#,
+    ] {
+        let message = format!("{:#}", board_of(entry).check_families().unwrap_err());
+        assert!(
+            message.contains("converge") && message.contains("force"),
+            "{entry}: {message}"
+        );
+        let scene = scene();
+        std::fs::write(
+            scene.bench.join("bench.json"),
+            format!(r#"{{"boards":[{entry}]}}"#),
+        )
+        .unwrap();
+        assert!(refusal(&scene.raw()).contains("converge"), "{entry}");
+    }
+    // The option reaches the plan.
+    let plan = board_plan(
+        &with_c,
+        PathBuf::from("run"),
+        RouteInputs {
+            rules: Default::default(),
+            options: export_options(Path::new("b.kicad_pcb")),
+            board: PathBuf::from("b.kicad_pcb"),
+            effort: Effort::Fast,
+            fastroute: PathBuf::from("fastroute"),
+            kicad_cli: "kicad-cli".into(),
+            kicad_config_home: PathBuf::from("cfg"),
+        },
+        None,
+        BTreeSet::new(),
+    );
+    assert!(plan.matrix.converge.is_some());
+}
+
+#[test]
+fn converge_terms_off_turns_both_new_terms_off_and_nothing_else() {
+    let on = board_of(r#"{"name":"B4","folder":"B4","families":["force","converge"]}"#);
+    assert_eq!(on.converge_terms, ConvergeTerms::On);
+    let named_on = board_of(
+        r#"{"name":"B4","folder":"B4","families":["force","converge"],"converge_terms":"on"}"#,
+    );
+    assert_eq!(named_on.matrix(), on.matrix());
+    let off = board_of(
+        r#"{"name":"B4","folder":"B4","families":["force","converge"],"converge_terms":"off"}"#,
+    );
+    let (params, rule) = off.matrix().converge.expect("family C");
+    assert_eq!(
+        params,
+        ConvergeParams {
+            neighbour_weight: 0.0,
+            label_mm: 0.0,
+            ..ConvergeParams::measured(0)
+        }
+    );
+    assert_eq!(rule, OuterRule::measured());
+    // Negative control: on, the two terms keep their measured weights.
+    let (on_params, _) = on.matrix().converge.unwrap();
+    assert!(on_params.neighbour_weight > 0.0 && on_params.label_mm > 0.0);
+    // An unknown value is refused before anything runs.
+    let scene = scene();
+    std::fs::write(
+        scene.bench.join("bench.json"),
+        r#"{"boards":[{"name":"B1","folder":"B1","families":["force","converge"],"converge_terms":"half"}]}"#,
+    )
+    .unwrap();
+    assert!(refusal(&scene.raw()).contains("half"));
 }

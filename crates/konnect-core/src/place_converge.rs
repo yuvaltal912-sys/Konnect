@@ -1915,8 +1915,9 @@ const MIN_RADIUS_MM: f64 = 1.0;
 
 /// SHA-256 of the neighbourhoods' JSON, keys sorted (design C11): the keys are written in
 /// sorted order and the map is a `BTreeMap`, so the text does not depend on how
-/// `serde_json` orders a map.
-fn hoods_sha256(hoods: &Neighbourhoods) -> String {
+/// `serde_json` orders a map. `place_search::rerun` reads it too, to refuse a model whose
+/// neighbourhoods are not the ones a trace names.
+pub(crate) fn hoods_sha256(hoods: &Neighbourhoods) -> String {
     let json = serde_json::json!({
         "alone": hoods.alone,
         "measured": hoods.measured,
