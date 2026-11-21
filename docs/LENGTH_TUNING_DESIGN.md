@@ -2055,3 +2055,24 @@ checkout of this branch (the merge of `claude/length-tuning` `735ce4ae`). Then
 exited 0 in 20 s. All 24 warnings are `never used` or `never constructed`, each on an item of
 these skeletons. The first draft's blocks had also compiled (11:31, exit 0). The scratch
 checkout was then removed.
+
+### Build review: the design owner's verdicts (2026-11-22)
+
+The build of L20 to L27 (`claude/length-tuning` `a5baf3fc`) had an independent review
+(`target/creation-research/length-tuning/review2.md`, git-ignored). It found nothing must-fix.
+These are the verdicts on the items that touch the design; the fix agent changes the code to
+match.
+
+| Item | Verdict | Change |
+|---|---|---|
+| S1 | **Yes: the untuned board joins the rank.** | L23 changes. The pool `judge_candidates` ranks holds the untuned `Judged` and every candidate `tune_harm` leaves. The best rank key wins, and on an exact tie the untuned board wins: no meander without a gain. So an overshoot that makes G4's miss larger never beats the untuned board. Test: a candidate that overshoots a window (miss 5 → 7) with no DRC change loses to the untuned board. Its control: a candidate that shrinks the miss wins |
+| S2 | **Yes: `tune_harm` compares the numbers, not the line counts.** | Lines are worse values of `unconnected`; of each DRC type count except the two length keys; of `nets_undersized`, `narrow_paths` and `below_floor`; of `routed_share` (any drop); and of `audit_complete` (true to false). The `g3.len()` comparison goes. `stitching_vias` is not compared: the judge adds them to repair pours, and what they leave open is in `unconnected`. Tests: `narrow_paths` 1 → 30 is a line; `routed_share` 1 → 0.99 is a line |
+| S3 | **Yes: force the two keys, in calls that have checks.** | When the call checks a group or a pair, the judge's scratch `.kicad_pro`, the baseline's included, sets `track_dangling` to at least `warning` and `unconnected_items` to at least `error`, KiCad's own defaults. A key already at that level or higher is left alone. Calls without checks are unchanged. Test: a project with `track_dangling: ignore` and a dangling checked net fails G4(d). Its control: the same project in a call without checks keeps its severity |
+| S5 | **List every net the written session leaves untuned.** | `untuned_nets` lists every tune-file net the written session leaves untuned, with its reason. When the judge keeps the untuned board, that is every net, with "the judge kept the untuned board: <the rejection or rank reason>"; when no candidate survived its passes, every net, with the last pass's reason. Otherwise it lists the chosen candidate's dropped nets, as now. The skill and `API_MIGRATIONS.md` use that one sentence |
+| S6 | **A faulted net in no group adds the longer measured length of its pair as its miss.** | That is "as if no length were usable", as L22 does for a group net with its window's lower bound. If the pair is unmeasured, the net counts as unmeasured. Test: a run with a crossing on a pair-only net ranks below a run whose only fault is that pair's skew 0.5 mm over |
+| N1 | **Yes: an error.** | `apply` returns `Err` when the chosen variant has no candidate, and the judge fails. The test at `route_judge_tests.rs:2284-2294` expects the error |
+| N3 | **Skip arcs.** | `raw_copper` leaves out a `qarc`: it is not a straight piece, and contacts with arcs are not checked (fastroute writes none). Test: a session with a `qarc` does not fail the judge, and its straight pieces are still checked |
+| N5 | **Clamp the pinned `min` at 0.** | Mechanical |
+| N2, N7, N9 | **Wording only.** | N2: the `tune.rows` entry of a candidate the judge did not choose says `not_chosen`, and an unjudged run's says `candidate`. N7: a discard for lack of rounds or time adds "(no round left)" or "(the deadline leaves no room)". N9: the skill says "a pour of a net outside the tune file", and `1-KOPPER.md` adds "tracks below their floor" |
+| N10, N11 | **No change in this PR.** | N10 is a recorded cost: the pour-safe passes are paid even when their candidate is never judged. N11, a killed later pass losing the run, keeps D4 as written. The 2× rule makes it rare, and keeping the held session in that case is a follow-up, not a correctness fix |
+| S4, N4, N6, N8 | **Mechanical, as the parent session plans.** | N4: `self_contacts` in `spawn_blocking`. N6: a comment that pins the rounded key against the importer's exact key |
