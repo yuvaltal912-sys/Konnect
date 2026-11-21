@@ -500,6 +500,8 @@ fn finished(gates: Gates) -> Finished {
                 json!({ "name": "full", "outcome": "kept", "unrouted": 0, "seconds": 12.3 }),
             ],
             seconds: 12.3,
+            untuned: None,
+            tune: Default::default(),
         },
         planes: vec![],
         folder: run,

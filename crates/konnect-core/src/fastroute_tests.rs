@@ -420,6 +420,24 @@ fn tune_inputs<'a>(
         classes,
         nets,
         layer_heights,
+        planes: &[],
+    }
+}
+
+/// The next round's tune file when no group can be written (these tests have no
+/// plan): a pass that touches itself is then discarded.
+fn no_next(
+    _folder: &Path,
+    _dropped: &BTreeSet<String>,
+) -> Result<Option<(PathBuf, BTreeSet<String>)>> {
+    Ok(None)
+}
+
+/// A request without a next round.
+fn tune_request(inputs: TuneInputs<'_>) -> TuneRequest<'_> {
+    TuneRequest {
+        inputs,
+        next: &no_next,
     }
 }
 
@@ -444,6 +462,7 @@ fn tune_args(
         Path::new("/d/out.json"),
         hints,
         files,
+        TuneVariant::Free,
         &tune_inputs(Path::new("/d/tune.txt"), classes, &nets, layer_heights),
         Path::new("/d/with space/held.ses"),
     )
@@ -531,6 +550,7 @@ fn tune_pass_arguments_follow_the_documented_order() {
     expected.extend(
         [
             "--router.optimizer.enabled=false",
+            "--router.autorouter.enabled=false",
             "--router.autorouter.ignore_net_classes=konnect_class_0001,power",
             "--router.copper_to_edge_clearance_um=500",
             "--router.autorouter.max_threads=2",
@@ -681,7 +701,11 @@ fn the_polish_line_differs_from_the_tune_line_in_exactly_the_tune_settings() {
     );
     assert_eq!(
         only_tune,
-        names(&["--router.autorouter.ignore_net_classes", "--tune"]),
+        names(&[
+            "--router.autorouter.enabled",
+            "--router.autorouter.ignore_net_classes",
+            "--tune"
+        ]),
         "what only the Tune pass sends"
     );
     // The one setting both send with another value.
@@ -1303,7 +1327,617 @@ fn a_piece_of_no_length_is_no_copper() {
     assert!(changed(&alone, &session(&[]), &[]).is_empty());
 }
 
+// ---- Row LT, L20 and L24: the router switch and the pour-safe switch ---------
+
+/// The Tune line of a candidate, with the given classes.
+fn variant_args(variant: TuneVariant, classes: &[String]) -> Vec<String> {
+    let nets = names(&["A"]);
+    tune_pass_arguments(
+        Path::new("/d/in.dsn"),
+        Path::new("/d/out.ses"),
+        Path::new("/d/out.json"),
+        &hints(Some(500), Some(120)),
+        CallFiles {
+            amps: Some(Path::new("/d/amps.txt")),
+            pairs: None,
+            layer_heights: Some("0,1.58"),
+        },
+        variant,
+        &tune_inputs(Path::new("/d/tune.txt"), classes, &nets, Some("0,1.58")),
+        Path::new("/d/held.ses"),
+    )
+}
+
+#[test]
+fn the_tune_line_turns_the_autorouter_off_once_right_after_the_optimizer_switch() {
+    assert_eq!(TUNE_ROUTER_OFF, "--router.autorouter.enabled=false");
+    for variant in [TuneVariant::Free, TuneVariant::PourSafe] {
+        for classes in [class_list(&[]), class_list(&["c1", "c2"])] {
+            let args = variant_args(variant, &classes);
+            let at = |token: &str| args.iter().position(|arg| arg == token);
+            assert_eq!(
+                args.iter().filter(|arg| *arg == TUNE_ROUTER_OFF).count(),
+                1,
+                "{variant:?}: {args:?}"
+            );
+            assert_eq!(
+                at(TUNE_ROUTER_OFF),
+                at("--router.optimizer.enabled=false").map(|optimizer| optimizer + 1),
+                "{variant:?}: right after the optimizer switch"
+            );
+            // The class list stays as a second lock, and no other setting reads the
+            // autorouter's switch.
+            assert_eq!(
+                value(&args, "--router.autorouter.ignore_net_classes=").is_some(),
+                !classes.is_empty()
+            );
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("--router.autorouter.enabled"))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn no_routing_pass_line_ever_holds_the_tune_switches() {
+    for pass in [
+        pass("full", 0.0, true, None),
+        pass("fallback", 120.0, false, Some("/d/full.ses")),
+        pass("polish", 0.0, true, Some("/d/fallback.ses")),
+    ] {
+        let args = args_with(
+            &pass,
+            &hints(Some(250), Some(120)),
+            CallFiles {
+                amps: Some(Path::new("/d/amps.txt")),
+                pairs: Some(Path::new("/d/pairs.txt")),
+                layer_heights: Some("0,1.58"),
+            },
+        );
+        for token in &args {
+            assert!(
+                !token.starts_with("--router.autorouter.enabled")
+                    && !token.starts_with("--router.plane_as_obstacle"),
+                "{}: {token}",
+                pass.name
+            );
+        }
+        assert!(!args
+            .iter()
+            .any(|t| t == TUNE_ROUTER_OFF || t == TUNE_POUR_SAFE));
+    }
+}
+
+#[test]
+fn only_the_pour_safe_line_holds_the_plane_switch_once() {
+    assert_eq!(TUNE_POUR_SAFE, "--router.plane_as_obstacle=true");
+    let classes = class_list(&["c1"]);
+    let free = variant_args(TuneVariant::Free, &classes);
+    let safe = variant_args(TuneVariant::PourSafe, &classes);
+    assert!(
+        !free
+            .iter()
+            .any(|arg| arg.starts_with("--router.plane_as_obstacle")),
+        "{free:?}"
+    );
+    assert_eq!(safe.iter().filter(|arg| *arg == TUNE_POUR_SAFE).count(), 1);
+    // The pour-safe line is the free line plus that one token, after the router switch.
+    let mut expected = free.clone();
+    let at = expected
+        .iter()
+        .position(|arg| arg == TUNE_ROUTER_OFF)
+        .unwrap();
+    expected.insert(at + 1, TUNE_POUR_SAFE.to_string());
+    assert_eq!(safe, expected);
+}
+
+#[test]
+fn a_tune_candidates_folder_names_its_variant_and_round() {
+    assert_eq!(TuneVariant::Free.folder_name(1), "tune");
+    assert_eq!(TuneVariant::Free.folder_name(2), "tune-r2");
+    assert_eq!(TuneVariant::Free.folder_name(3), "tune-r3");
+    assert_eq!(TuneVariant::PourSafe.folder_name(1), "tune-pour-safe");
+    assert_eq!(TuneVariant::PourSafe.folder_name(2), "tune-pour-safe-r2");
+    // Round 1 is the unsuffixed folder of today's Tune pass.
+    assert_eq!(TuneVariant::Free.folder_name(1), TUNE_PASS);
+    assert_eq!(
+        serde_json::to_value(TuneVariant::PourSafe).unwrap(),
+        json!("pour_safe")
+    );
+    assert_eq!(
+        serde_json::to_value(TuneVariant::Free).unwrap(),
+        json!("free")
+    );
+}
+
+// ---- Row LT, L21: self contacts ----------------------------------------------
+
+type FixtureText = &'static str;
+
+const A_DQ10_TUNED: FixtureText = include_str!("../tests/fixtures/length_tuning/a_dq10_tuned.ses");
+const A_DQ8_CROSSING: FixtureText =
+    include_str!("../tests/fixtures/length_tuning/a_dq8_crossing.ses");
+const A_CLEAN: FixtureText = include_str!("../tests/fixtures/length_tuning/a_clean_dq2_dq16.ses");
+const A_DQ0_HELD: FixtureText = include_str!("../tests/fixtures/length_tuning/a_dq0_held.ses");
+const A_DQ0_TUNED: FixtureText = include_str!("../tests/fixtures/length_tuning/a_dq0_tuned.ses");
+const B_C_N_HELD: FixtureText = include_str!("../tests/fixtures/length_tuning/b_c_n_held.ses");
+const B_C_N_TUNED: FixtureText = include_str!("../tests/fixtures/length_tuning/b_c_n_tuned.ses");
+const B_D1_P_HELD: FixtureText = include_str!("../tests/fixtures/length_tuning/b_d1_p_held.ses");
+const B_D1_P_TUNED: FixtureText = include_str!("../tests/fixtures/length_tuning/b_d1_p_tuned.ses");
+const B_FB_TUNED: FixtureText = include_str!("../tests/fixtures/length_tuning/b_fb_tuned.ses");
+const B_C_N: &str = "/CM5/DPHY0_P.C_N";
+
+/// A piece as a [`SelfContact`] names it: width and ends in µm.
+fn piece(width_um: i64, ends: [i64; 4]) -> (i64, [i64; 4]) {
+    (width_um, ends)
+}
+
+/// The self contacts of net `A` of a session made of `items`.
+fn contacts_of(items: String) -> Vec<SelfContact> {
+    self_contacts(&session(&[("A", items)]), &names(&["A"]))
+        .unwrap()
+        .remove("A")
+        .unwrap_or_default()
+}
+
+/// The kinds of those contacts.
+fn kinds_of(items: String) -> Vec<ContactKind> {
+    contacts_of(items).iter().map(|c| c.kind).collect()
+}
+
+fn kind_count(contacts: &[SelfContact], kind: ContactKind) -> usize {
+    contacts.iter().filter(|c| c.kind == kind).count()
+}
+
+#[test]
+fn two_distinct_collinear_pieces_overlap_and_name_both_pieces_rounded_and_ordered() {
+    // /DQ10 of A-tuned: its wire holds In1.Cu pieces at y = -100.4201 mm (session
+    // units of 0.1 µm): segment 71, (1626829 to 1646829), and segment 77, (1620829 to
+    // 1649012), a partial collinear overlap. Rounded to 1 µm.
+    let found = self_contacts(A_DQ10_TUNED, &names(&["/DQ10"])).unwrap();
+    let contacts = &found["/DQ10"];
+    assert!(
+        contacts.contains(&SelfContact {
+            layer: "In1.Cu".to_string(),
+            kind: ContactKind::Overlap,
+            pieces: [
+                piece(200, [162083, -100420, 164901, -100420]),
+                piece(200, [162683, -100420, 164683, -100420]),
+            ],
+        }),
+        "segments 71 and 77"
+    );
+    // Segments 51 and 143 of the same wire are an exact repeat: one piece, so no
+    // contact holds the same piece twice.
+    assert!(contacts.iter().all(|c| c.pieces[0] != c.pieces[1]));
+    // Counted pair by pair after the exact repeats are merged, as an independent
+    // script does: 148 crossings, 125 overlaps, 286 touches.
+    assert_eq!(kind_count(contacts, ContactKind::Crossing), 148);
+    assert_eq!(kind_count(contacts, ContactKind::Overlap), 125);
+    assert_eq!(kind_count(contacts, ContactKind::Touch), 286);
+    // Two pieces on the same stretch, given in either order and direction, are the
+    // same contact: the pair is ordered and so are the ends.
+    let reversed = contacts_of(
+        wire("F.Cu", 200, &[(1000, 0), (0, 0)]) + &wire("F.Cu", 200, &[(500, 0), (1500, 0)]),
+    );
+    assert_eq!(
+        reversed,
+        vec![SelfContact {
+            layer: "F.Cu".to_string(),
+            kind: ContactKind::Overlap,
+            pieces: [piece(200, [0, 0, 1000, 0]), piece(200, [500, 0, 1500, 0])],
+        }]
+    );
+}
+
+#[test]
+fn exact_repeats_are_one_piece_and_never_a_contact() {
+    // /DQ10 segments 51 and 143: the same In1.Cu piece twice. The session holds it
+    // twice (a piece alone that way has no contact at all):
+    let twice = "1602829 -1004201\n            1632829 -1004201";
+    assert!(
+        A_DQ10_TUNED.matches(twice).count() >= 2,
+        "the repeat is in the fixture"
+    );
+    let one = session(&[("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)]))]);
+    let many =
+        |copies: usize| session(&[("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)]).repeat(copies))]);
+    for copies in [2, 3, 4] {
+        assert!(self_contacts(&many(copies), &names(&["A"]))
+            .unwrap()
+            .is_empty());
+    }
+    assert!(self_contacts(&one, &names(&["A"])).unwrap().is_empty());
+    // Either direction is the same piece.
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(1000, 0), (0, 0)])
+    )
+    .is_empty());
+    // M1's C_N piece in four copies, and /PCIe-M2/FB's copied bridge, in B's step 0b
+    // Tune session: one piece each, no contact (C_N keeps its two held touches).
+    assert!(
+        B_C_N_TUNED
+            .matches("1247100 -453274\n            1247100 -451150")
+            .count()
+            >= 3
+    );
+    let found = self_contacts(B_C_N_TUNED, &names(&[B_C_N])).unwrap();
+    assert!(found[B_C_N].iter().all(|c| c.kind == ContactKind::Touch));
+    assert_eq!(found[B_C_N].len(), 2);
+    assert!(B_FB_TUNED.matches("1273150 -714600").count() >= 2);
+    assert!(self_contacts(B_FB_TUNED, &names(&["/PCIe-M2/FB"]))
+        .unwrap()
+        .is_empty());
+    // The key is layer, width and ends: the same ends with another width or on
+    // another layer are not a repeat (the first overlaps; the other is none).
+    assert_eq!(
+        kinds_of(
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 150, &[(0, 0), (1000, 0)])
+        ),
+        [ContactKind::Overlap]
+    );
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("B.Cu", 200, &[(0, 0), (1000, 0)])
+    )
+    .is_empty());
+    // A piece nudged by 1 µm is not the same piece: the pair is an overlap.
+    assert_eq!(
+        kinds_of(
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(1, 0), (1000, 0)])
+        ),
+        [ContactKind::Overlap]
+    );
+}
+
+#[test]
+fn centre_lines_that_cross_are_a_crossing_on_one_layer_only_and_for_one_net() {
+    // A crossing pair of A-tuned's /DQ8, cut from its tune session.
+    let found = self_contacts(A_DQ8_CROSSING, &names(&["/DQ8"])).unwrap();
+    assert_eq!(found["/DQ8"].len(), 1);
+    assert_eq!(found["/DQ8"][0].kind, ContactKind::Crossing);
+    assert_eq!(found["/DQ8"][0].layer, "F.Cu");
+    assert_eq!(
+        found["/DQ8"][0].pieces,
+        [
+            piece(200, [147185, -108478, 147609, -108054]),
+            piece(200, [147420, -108443, 147420, -107443]),
+        ]
+    );
+    // The same cross on two layers is no contact; on one layer it is.
+    let cross_on = |second: &str| {
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire(second, 200, &[(500, -500), (500, 500)])
+    };
+    assert_eq!(kinds_of(cross_on("F.Cu")), [ContactKind::Crossing]);
+    assert!(kinds_of(cross_on("B.Cu")).is_empty());
+    // A crossing of two nets is no self contact.
+    let two = session(&[
+        ("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)])),
+        ("B", wire("F.Cu", 200, &[(500, -500), (500, 500)])),
+    ]);
+    assert!(self_contacts(&two, &names(&["A", "B"])).unwrap().is_empty());
+    // A net that is not asked for is not read.
+    let both = session(&[
+        ("A", wire("F.Cu", 200, &[(0, 0), (1000, 0), (1000, 800)])),
+        (
+            "B",
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)])
+                + &wire("F.Cu", 200, &[(500, -500), (500, 500)]),
+        ),
+    ]);
+    assert!(self_contacts(&both, &names(&["A"])).unwrap().is_empty());
+    assert_eq!(self_contacts(&both, &names(&["A", "B"])).unwrap().len(), 1);
+    assert!(self_contacts(&both, &names(&[])).unwrap().is_empty());
+    assert!(self_contacts(&both, &names(&["C"])).unwrap().is_empty());
+}
+
+#[test]
+fn nets_without_a_contact_are_left_out() {
+    // /DQ2 and /DQ16 of A-tuned: two of the 12 clean nets.
+    assert!(self_contacts(A_CLEAN, &names(&["/DQ2", "/DQ16"]))
+        .unwrap()
+        .is_empty());
+    // Control: the scanner is not blind to a net of the same session shape.
+    assert!(self_contacts(A_DQ10_TUNED, &names(&["/DQ10"]))
+        .unwrap()
+        .contains_key("/DQ10"));
+}
+
+#[test]
+fn joins_corners_and_end_to_end_pieces_are_no_contact() {
+    // A T-junction: one piece's end on the other.
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 0), (500, 600)])
+    )
+    .is_empty());
+    // The junction from either side.
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(500, 0), (500, 600)]) + &wire("F.Cu", 200, &[(0, 0), (1000, 0)])
+    )
+    .is_empty());
+    // A plain corner, and a 45 degree corner (the two pieces' copper overlaps near
+    // the corner, but they share an end).
+    assert!(kinds_of(wire("F.Cu", 200, &[(0, 0), (1000, 0), (1000, 1000)])).is_empty());
+    assert!(kinds_of(wire("F.Cu", 200, &[(0, 0), (1000, 0), (1500, 500)])).is_empty());
+    // Pieces that meet end to end on one line.
+    assert!(kinds_of(wire("F.Cu", 200, &[(0, 0), (1000, 0), (2000, 0)])).is_empty());
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(1000, 0), (2000, 0)])
+    )
+    .is_empty());
+    // A piece of no length is no copper.
+    assert!(kinds_of(wire("F.Cu", 200, &[(0, 0), (0, 0), (1000, 0)])).is_empty());
+    // Control: a corner whose far piece folds back over the first one does overlap,
+    // although they share an end.
+    assert_eq!(
+        kinds_of(wire("F.Cu", 200, &[(0, 0), (1000, 0), (500, 0)])),
+        [ContactKind::Overlap]
+    );
+}
+
+#[test]
+fn a_shared_stretch_is_an_overlap_only_when_longer_than_a_micrometre() {
+    let on_line = |second_start: i64| {
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)])
+            + &wire("F.Cu", 200, &[(second_start, 0), (second_start + 1000, 0)])
+    };
+    // 500 µm, 2 µm shared: overlaps.
+    assert_eq!(kinds_of(on_line(500)), [ContactKind::Overlap]);
+    assert_eq!(kinds_of(on_line(998)), [ContactKind::Overlap]);
+    // 1 µm shared is not longer than the margin; the pieces are 0 apart, a touch.
+    assert_eq!(kinds_of(on_line(999)), [ContactKind::Touch]);
+    // No stretch shared and a gap smaller than the widths allow: a touch; wider: none.
+    assert_eq!(kinds_of(on_line(1100)), [ContactKind::Touch]);
+    assert!(kinds_of(on_line(1300)).is_empty());
+    // Pieces of different widths on one line overlap too.
+    assert_eq!(
+        kinds_of(
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 150, &[(200, 0), (800, 0)])
+        ),
+        [ContactKind::Overlap]
+    );
+    // Overlap is not read off a different line.
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(0, 600), (1000, 600)])
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_touch_is_closer_than_half_the_widths_minus_a_micrometre() {
+    let legs = |width_a: i64, width_b: i64, gap: i64| {
+        wire("F.Cu", width_a, &[(0, 0), (1000, 0)])
+            + &wire("F.Cu", width_b, &[(0, gap), (1000, gap)])
+    };
+    // Two legs 0.1 mm apart at width 0.2 mm.
+    assert_eq!(kinds_of(legs(200, 200, 100)), [ContactKind::Touch]);
+    // Half the widths minus 2 µm is a touch, minus 0 µm is not; minus 1 µm, the
+    // margin itself, is not either.
+    assert_eq!(kinds_of(legs(200, 200, 198)), [ContactKind::Touch]);
+    assert!(kinds_of(legs(200, 200, 199)).is_empty());
+    assert!(kinds_of(legs(200, 200, 200)).is_empty());
+    // Unequal widths: half their sum, 150 µm.
+    assert_eq!(kinds_of(legs(200, 100, 148)), [ContactKind::Touch]);
+    assert!(kinds_of(legs(200, 100, 149)).is_empty());
+    assert!(kinds_of(legs(200, 100, 150)).is_empty());
+    // The same gap is a touch for wide copper and none for narrow.
+    assert_eq!(kinds_of(legs(400, 400, 300)), [ContactKind::Touch]);
+    assert!(kinds_of(legs(100, 100, 300)).is_empty());
+    // An end close to the other piece's side, not on it.
+    assert_eq!(
+        kinds_of(
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 150), (500, 900)])
+        ),
+        [ContactKind::Touch]
+    );
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 250), (500, 900)])
+    )
+    .is_empty());
+    // A touch on another layer is none.
+    assert!(kinds_of(
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("B.Cu", 200, &[(0, 100), (1000, 100)])
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_session_that_does_not_parse_has_no_contacts_to_give() {
+    assert!(self_contacts("not a session", &names(&["A"])).is_err());
+    assert!(self_contacts("(session x)", &names(&["A"])).is_err());
+}
+
+// ---- Row LT, L21: contacts the Tune pass made ----------------------------------
+
+fn new_contacts(before: &str, after: &str, nets: &[&str]) -> BTreeMap<String, Vec<SelfContact>> {
+    new_self_contacts(before, after, &names(nets)).unwrap()
+}
+
+#[test]
+fn a_contact_with_a_new_piece_names_the_net() {
+    let held = session(&[("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)]))]);
+    let tuned = session(&[(
+        "A",
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, -500), (500, 500)]),
+    )]);
+    let found = new_contacts(&held, &tuned, &["A"]);
+    assert_eq!(found.keys().collect::<Vec<_>>(), ["A"]);
+    assert_eq!(found["A"].len(), 1);
+    assert_eq!(found["A"][0].kind, ContactKind::Crossing);
+    // A net outside the asked nets is not looked at.
+    assert!(new_contacts(&held, &tuned, &["B"]).is_empty());
+    assert!(new_contacts(&held, &tuned, &[]).is_empty());
+}
+
+#[test]
+fn a_contact_the_held_session_already_has_names_nothing() {
+    let crossing =
+        || wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, -500), (500, 500)]);
+    let held = session(&[("A", crossing())]);
+    // The same two pieces, written as the Tune pass might (another split, the other
+    // direction): still the same raw pieces to 1 µm.
+    let tuned = session(&[(
+        "A",
+        wire("F.Cu", 200, &[(500, 500), (500, -500)]) + &wire("F.Cu", 200, &[(1000, 0), (0, 0)]),
+    )]);
+    assert!(
+        !contacts_of(crossing()).is_empty(),
+        "the held contact exists"
+    );
+    assert!(new_contacts(&held, &tuned, &["A"]).is_empty());
+    assert!(new_contacts(&held, &held, &["A"]).is_empty());
+    // A held contact whose piece was replaced by a new contacting piece names the
+    // net: the counts of contacts are the same, the identity is not.
+    let replaced = session(&[(
+        "A",
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(600, -500), (600, 500)]),
+    )]);
+    assert_eq!(new_contacts(&held, &replaced, &["A"]).len(), 1);
+    // Rounding to 1 µm: a piece moved by 0.4 µm is the same piece, by 0.6 µm is not.
+    let nudged = |dx_tenths: i64| {
+        session_with(
+            "um 10",
+            &[(
+                "A",
+                format!(
+                    "(wire (path F.Cu 2000 {} {} {} {})) (wire (path F.Cu 2000 5000 -5000 5000 5000))",
+                    0,
+                    0,
+                    10000 + dx_tenths,
+                    0
+                ),
+            )],
+        )
+    };
+    let base = nudged(0);
+    assert!(new_contacts(&base, &nudged(4), &["A"]).is_empty());
+    assert_eq!(new_contacts(&base, &nudged(6), &["A"]).len(), 1);
+}
+
+#[test]
+fn a_copy_of_a_held_piece_is_the_same_piece_and_a_distinct_overlapping_piece_is_new() {
+    let once = session(&[("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)]))]);
+    let copies = |n: usize| session(&[("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)]).repeat(n))]);
+    // fastroute's load-time copies of a held piece are no new piece and no contact.
+    for n in [2, 3, 4] {
+        assert!(
+            new_contacts(&once, &copies(n), &["A"]).is_empty(),
+            "{n} copies"
+        );
+        assert!(new_contacts(&copies(n), &once, &["A"]).is_empty());
+        assert!(new_contacts(&copies(2), &copies(n), &["A"]).is_empty());
+    }
+    // Control: a distinct piece laid over the held one is new, and names the net.
+    let over = session(&[(
+        "A",
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 0), (1500, 0)]),
+    )]);
+    let found = new_contacts(&once, &over, &["A"]);
+    assert_eq!(found["A"].len(), 1);
+    assert_eq!(found["A"][0].kind, ContactKind::Overlap);
+    // ...also when the held piece was copied in the Tune session.
+    let over_copied = session(&[(
+        "A",
+        wire("F.Cu", 200, &[(0, 0), (1000, 0)]).repeat(3)
+            + &wire("F.Cu", 200, &[(500, 0), (1500, 0)]),
+    )]);
+    assert_eq!(new_contacts(&once, &over_copied, &["A"])["A"].len(), 1);
+}
+
+#[test]
+fn the_routers_own_s_bend_in_the_held_session_names_nothing() {
+    // /DQ0 of A-tuned's held session: a jog that comes closer than a width.
+    let own = self_contacts(A_DQ0_HELD, &names(&["/DQ0"])).unwrap();
+    assert_eq!(own["/DQ0"].len(), 1);
+    assert_eq!(own["/DQ0"][0].kind, ContactKind::Touch);
+    assert!(new_contacts(A_DQ0_HELD, A_DQ0_HELD, &["/DQ0"]).is_empty());
+    // After the Tune pass the touch is still there, but not new; the pass's other
+    // change to /DQ0 is copies of held pieces, which are no new piece either.
+    assert!(self_contacts(A_DQ0_TUNED, &names(&["/DQ0"]))
+        .unwrap()
+        .contains_key("/DQ0"));
+    assert!(new_contacts(A_DQ0_HELD, A_DQ0_TUNED, &["/DQ0"]).is_empty());
+}
+
+/// The held C_N of B with its 20 µm stub (In1.Cu, inside a via's own copper at
+/// (104.4926, -50.0396) mm) taken out, as the Tune pass with the router off leaves it.
+fn without_the_stub(text: &str) -> String {
+    let stub = "        (wire\n          (path In1.Cu 1270\n            1044926 -500396\n            1044926 -500596\n          )\n        )\n";
+    assert!(text.contains(stub), "the stub is in the held session");
+    text.replacen(stub, "", 1)
+}
+
+#[test]
+fn a_held_stub_inside_a_via_that_the_tune_session_lacks_is_no_contact_and_no_fault() {
+    let after = without_the_stub(B_C_N_HELD);
+    assert!(B_C_N_HELD.contains("1044926 -500396") && !after.contains("1044926 -500396"));
+    // The stub touches nothing in the held session, and its loss adds nothing.
+    let held_own = self_contacts(B_C_N_HELD, &names(&[B_C_N])).unwrap();
+    let after_own = self_contacts(&after, &names(&[B_C_N])).unwrap();
+    assert_eq!(held_own[B_C_N], after_own[B_C_N]);
+    assert!(new_contacts(B_C_N_HELD, &after, &[B_C_N]).is_empty());
+}
+
+#[test]
+fn copies_of_a_held_bridge_do_not_name_c_n_but_two_new_crossings_name_d1_p() {
+    // C_N of B's step 0b run: its 0.212 mm piece on In1.Cu is in the Tune session in
+    // four copies (fastroute copies bridges when it loads a session). Nothing else
+    // of C_N's contacts is new: it is not named.
+    assert!(new_contacts(B_C_N_HELD, B_C_N_TUNED, &[B_C_N]).is_empty());
+    // Control: D1_P, from the same session, got 2 crossings the held session does
+    // not have.
+    let d1_p = "/CM5/DPHY0_P.D1_P";
+    let found = new_contacts(B_D1_P_HELD, B_D1_P_TUNED, &[d1_p]);
+    let crossings: Vec<&SelfContact> = found[d1_p]
+        .iter()
+        .filter(|c| c.kind == ContactKind::Crossing)
+        .collect();
+    assert_eq!(crossings.len(), 2, "{:?}", found[d1_p]);
+    assert!(crossings.iter().all(|c| c.layer == "B.Cu"));
+    assert!(self_contacts(B_D1_P_HELD, &names(&[d1_p]))
+        .unwrap()
+        .values()
+        .flatten()
+        .all(|c| c.kind == ContactKind::Touch));
+}
+
+#[test]
+fn sessions_that_do_not_parse_are_an_error_naming_which() {
+    let good = session(&[("A", wire("F.Cu", 200, &[(0, 0), (1000, 0)]))]);
+    let error = new_self_contacts("not a session", &good, &names(&["A"])).unwrap_err();
+    assert!(format!("{error:#}").contains("before"), "{error:#}");
+    let error = new_self_contacts(&good, "not a session", &names(&["A"])).unwrap_err();
+    assert!(format!("{error:#}").contains("after"), "{error:#}");
+}
+
 // ---- on a system that cannot isolate a run ---------------------------------
+
+#[test]
+fn another_pass_needs_a_deadline_at_least_twice_the_last_pass_away() {
+    let left = |seconds: f64| Duration::from_secs_f64(seconds);
+    assert!(
+        room_for_another_pass(left(2.0), 1.0),
+        "exactly twice is enough"
+    );
+    assert!(room_for_another_pass(left(2.5), 1.0));
+    assert!(room_for_another_pass(left(100.0), 10.0));
+    assert!(!room_for_another_pass(left(1.99), 1.0));
+    assert!(!room_for_another_pass(left(0.6), 1.0));
+    assert!(!room_for_another_pass(left(0.0), 1.0));
+    // A pass of no time needs no time.
+    assert!(room_for_another_pass(left(0.0), 0.0));
+}
+
+#[tokio::test]
+async fn the_deadline_helper_reads_the_time_left_and_never_goes_below_zero() {
+    let now = Instant::now();
+    assert!(deadline_leaves_room(now + Duration::from_secs(60), 1.0));
+    assert!(!deadline_leaves_room(now + Duration::from_secs(60), 40.0));
+    assert!(!deadline_leaves_room(now - Duration::from_millis(1), 1.0));
+    assert!(deadline_leaves_room(now - Duration::from_millis(1), 0.0));
+}
 
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
@@ -1532,10 +2166,23 @@ int main(int argc, char **argv) {
     }
 
     char key[300], val[1100];
+    // The folder the session is written in (`tune`, `tune-r2`, ...): a pass can be
+    // told apart from the same pass in another round.
+    char folder[128];
+    {
+        const char *fb = strrchr(sesdir, '/');
+        snprintf(folder, sizeof folder, "%s", fb ? fb + 1 : sesdir);
+    }
     snprintf(key, sizeof key, "sleep.%s", pass);
     if (cfg(key, val, sizeof val)) {
         sleep(30);
         return 0;
+    }
+    // `delay_ms.<folder>=N` or `delay_ms=N`: the pass takes that long, then goes on.
+    snprintf(key, sizeof key, "delay_ms.%s", folder);
+    {
+        int delay = cfg_int(key, cfg_int("delay_ms", 0));
+        if (delay > 0) usleep((useconds_t)delay * 1000);
     }
     snprintf(key, sizeof key, "fail.%s", pass);
     if (cfg(key, val, sizeof val)) {
@@ -1570,8 +2217,12 @@ int main(int argc, char **argv) {
         // The session text: a copy of the file named by copy_session.<pass> (or
         // copy_session), else a stand-in.
         char src[4096];
-        snprintf(key, sizeof key, "copy_session.%s", pass);
-        int have = cfg(key, src, sizeof src) || cfg("copy_session", src, sizeof src);
+        snprintf(key, sizeof key, "copy_session.%s", folder);
+        int have = cfg(key, src, sizeof src);
+        if (!have) {
+            snprintf(key, sizeof key, "copy_session.%s", pass);
+            have = cfg(key, src, sizeof src) || cfg("copy_session", src, sizeof src);
+        }
         FILE *s = fopen(ses, "w");
         if (s) {
             if (have) {
@@ -2800,6 +3451,7 @@ int main(int argc, char **argv) {
             classes: vec!["c1".to_string(), "c2".to_string()],
             nets: ["/CAN_H", "/CAN_L"].iter().map(|n| n.to_string()).collect(),
             layer_heights: Some("0,1.6".to_string()),
+            plan: std::sync::Arc::new(crate::tools::route_lengths::LengthPlan::default()),
         };
         let with = runner(Some("0,1.58"), Some(tune));
         for (index, shape, seed) in [(0, Shape::AsExported, 1), (1, Shape::Omitted, 1)] {
@@ -3610,7 +4262,12 @@ int main(int argc, char **argv) {
                 layer_heights: Some("9,9"),
             },
             WidthFallback::None,
-            Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+            Some(tune_request(tune_inputs(
+                &tune_file,
+                &classes,
+                &nets,
+                Some("0,1.58"),
+            ))),
             soon(seconds),
         )
         .await;
@@ -3915,7 +4572,7 @@ int main(int argc, char **argv) {
         fixture: &Fixture,
         folder: &str,
         files: CallFiles<'_>,
-        tune: Option<TuneInputs<'_>>,
+        tune: Option<TuneRequest<'_>>,
     ) -> Held {
         route_held(
             &fixture.binary(),
@@ -3972,7 +4629,12 @@ int main(int argc, char **argv) {
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
             },
-            Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+            Some(tune_request(tune_inputs(
+                &tune_file,
+                &classes,
+                &nets,
+                Some("0,1.58"),
+            ))),
         )
         .await;
         assert_eq!(held.kept, TUNE_PASS, "{:?}", held.passes);
@@ -4018,7 +4680,12 @@ int main(int argc, char **argv) {
             &fixture,
             "no_pair",
             CallFiles::default(),
-            Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+            Some(tune_request(tune_inputs(
+                &tune_file,
+                &classes,
+                &nets,
+                Some("0,1.58"),
+            ))),
         )
         .await;
         assert_eq!(held.kept, TUNE_PASS);
@@ -4131,7 +4798,12 @@ int main(int argc, char **argv) {
                 &hint,
                 CallFiles::default(),
                 WidthFallback::None,
-                Some(tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))),
+                Some(tune_request(tune_inputs(
+                    &tune_file,
+                    &classes,
+                    &nets,
+                    Some("0,1.58"),
+                ))),
                 soon(300),
             )
             .await
@@ -4169,5 +4841,773 @@ int main(int argc, char **argv) {
         let (before, after, s1_before, s1_after) = lengths[1];
         assert!(after > before + 5.0, "{lengths:?}");
         assert!((s1_before - s1_after).abs() < 1e-3, "{lengths:?}");
+    }
+
+    // ---- Row LT, L21 and L24: rounds, candidates ------------------------------
+
+    /// A session of the nets `names`, each one 1 mm piece on F.Cu 5 mm below the
+    /// last; a net of `crossed` also gets a piece across its middle, a new piece that
+    /// crosses the net's own copper.
+    fn rows_session(names: &[&str], crossed: &[&str]) -> String {
+        let nets: Vec<(&str, String)> = names
+            .iter()
+            .enumerate()
+            .map(|(row, name)| {
+                let y = row as i64 * 5000;
+                let mut items = wire("F.Cu", 200, &[(0, y), (1000, y)]);
+                if crossed.contains(name) {
+                    items.push_str(&wire("F.Cu", 200, &[(500, y - 400), (500, y + 400)]));
+                }
+                (*name, items)
+            })
+            .collect();
+        session(&nets)
+    }
+
+    /// What the next round's tune file does in a test.
+    enum NextMode<'a> {
+        /// The nets of the call minus the dropped ones, written as a note; none left:
+        /// no file.
+        Without,
+        /// `route_lengths::write_file_without` of this plan.
+        Plan(&'a crate::tools::route_lengths::LengthPlan),
+        /// An error.
+        Fails,
+    }
+
+    struct Attempt {
+        fixture: Fixture,
+        result: std::result::Result<Option<TuneCandidate>, PassError>,
+        outcome: TuneOutcome,
+        /// The dropped set each call of the next-file function was given.
+        calls: Vec<BTreeSet<String>>,
+    }
+
+    impl Attempt {
+        fn args(&self, folder: &str) -> Vec<String> {
+            std::fs::read_to_string(
+                self.fixture
+                    .path()
+                    .join("run")
+                    .join(folder)
+                    .join("tune.ses.args"),
+            )
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+        }
+        fn folder(&self, name: &str) -> PathBuf {
+            self.fixture.path().join("run").join(name)
+        }
+        fn reasons(&self) -> Vec<(String, String)> {
+            self.outcome
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["outcome"].as_str().unwrap().to_string(),
+                        row["reason"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// One candidate's [`tune_attempt`] through the fake, from the held session
+    /// `held`: `rounds` gives the session each pass folder (`tune`, `tune-r2`, ...)
+    /// writes.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt(
+        variant: TuneVariant,
+        held: &str,
+        rounds: &[(&str, String)],
+        control: &str,
+        nets: &[&str],
+        mode: NextMode<'_>,
+        deadline: Instant,
+    ) -> Attempt {
+        let fixture = Fixture::new("");
+        let held_path = fixture.path().join("held.ses");
+        std::fs::write(&held_path, held).unwrap();
+        let mut lines = String::new();
+        for (folder, text) in rounds {
+            let path = fixture.path().join(format!("{folder}.session"));
+            std::fs::write(&path, text).unwrap();
+            lines.push_str(&format!("copy_session.{folder}={}\n", path.display()));
+        }
+        fixture.set_control(&format!("{lines}{control}"));
+        let tune_file = fixture.path().join("tune.txt");
+        std::fs::write(&tune_file, "group lt1 tolerance=0.5\n  X\n").unwrap();
+        let pairs = fixture.path().join("pairs.txt");
+        std::fs::write(&pairs, "pair /X /Y gap=0.2\n").unwrap();
+        let classes = class_list(&["c1", "c2"]);
+        let nets = names(nets);
+        let first = tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"));
+        let calls = std::sync::Mutex::new(Vec::new());
+        let next = |folder: &Path,
+                    dropped: &BTreeSet<String>|
+         -> Result<Option<(PathBuf, BTreeSet<String>)>> {
+            calls.lock().unwrap().push(dropped.clone());
+            match &mode {
+                NextMode::Without => {
+                    let listed: BTreeSet<String> = nets.difference(dropped).cloned().collect();
+                    if listed.is_empty() {
+                        return Ok(None);
+                    }
+                    let path = folder.join("tune.txt");
+                    std::fs::write(&path, format!("# without {dropped:?}\n")).unwrap();
+                    Ok(Some((path, listed)))
+                }
+                NextMode::Plan(plan) => {
+                    crate::tools::route_lengths::write_file_without(folder, plan, dropped)
+                }
+                NextMode::Fails => bail!("a disk that is full"),
+            }
+        };
+        let mut outcome = TuneOutcome::default();
+        let result = tune_attempt(
+            &fixture.binary(),
+            &fixture.path().join("run"),
+            variant,
+            &fixture.dsn(),
+            &floor_hints(),
+            CallFiles {
+                amps: None,
+                pairs: Some(&pairs),
+                layer_heights: Some("9,9"),
+            },
+            &first,
+            &next,
+            &held_path,
+            0,
+            deadline,
+            &mut outcome,
+        )
+        .await;
+        let calls = calls.into_inner().unwrap();
+        Attempt {
+            fixture,
+            result,
+            outcome,
+            calls,
+        }
+    }
+
+    /// The candidate an attempt gave, if any.
+    fn kept_of(run: &Attempt) -> Option<&TuneCandidate> {
+        run.result
+            .as_ref()
+            .expect("the attempt did not fail")
+            .as_ref()
+    }
+
+    const XYZ: [&str; 3] = ["X", "Y", "Z"];
+
+    #[tokio::test]
+    async fn a_pass_without_contacts_is_the_candidate_after_one_pass() {
+        let held = rows_session(&XYZ, &[]);
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[("tune", rows_session(&XYZ, &[]))],
+            "",
+            &XYZ,
+            NextMode::Without,
+            soon(30),
+        )
+        .await;
+        let candidate = kept_of(&run).expect("a candidate");
+        assert_eq!(candidate.variant, TuneVariant::Free);
+        assert_eq!(candidate.passes, 1);
+        assert!(candidate.dropped.is_empty());
+        assert_eq!(candidate.unrouted, 0);
+        assert_eq!(candidate.ses, run.fixture.path().join("run/tune/tune.ses"));
+        assert!(run.calls.is_empty(), "no next round was asked for");
+        assert!(!run.folder("tune-r2").exists());
+        assert_eq!(run.outcome.rows.len(), 1);
+        let row = &run.outcome.rows[0];
+        assert_eq!(
+            (
+                row["name"].clone(),
+                row["outcome"].clone(),
+                row["variant"].clone(),
+                row["round"].clone()
+            ),
+            (json!("tune"), json!("kept"), json!("free"), json!(1))
+        );
+        assert!(run.outcome.seconds > 0.0);
+        // The pass gets its own heights and never the call's pairs file.
+        let args = run.args("tune");
+        assert!(!args.iter().any(|t| t.starts_with("--pairs")), "{args:?}");
+        assert_eq!(value(&args, "--layer-heights="), Some("0,1.58"));
+        assert!(args.contains(&TUNE_ROUTER_OFF.to_string()));
+        assert!(!args.contains(&TUNE_POUR_SAFE.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_net_that_touches_itself_is_dropped_and_the_next_round_runs_without_it() {
+        let held = rows_session(&XYZ, &[]);
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[
+                ("tune", rows_session(&XYZ, &["X"])),
+                ("tune-r2", rows_session(&XYZ, &[])),
+            ],
+            "",
+            &XYZ,
+            NextMode::Without,
+            soon(60),
+        )
+        .await;
+        let candidate = kept_of(&run).expect("a candidate");
+        assert_eq!(candidate.passes, 2);
+        assert_eq!(
+            candidate.ses,
+            run.fixture.path().join("run/tune-r2/tune.ses")
+        );
+        assert_eq!(candidate.dropped.len(), 1);
+        assert_eq!(candidate.dropped[0].0, "X");
+        assert!(
+            candidate.dropped[0].1.contains("1 crossing"),
+            "{:?}",
+            candidate.dropped
+        );
+        assert_eq!(run.calls, vec![names(&["X"])]);
+        let reasons = run.reasons();
+        assert_eq!(reasons.len(), 2);
+        assert_eq!(reasons[0].0, "discarded");
+        assert!(
+            reasons[0].1.starts_with("meanders touch their own net: X"),
+            "{reasons:?}"
+        );
+        assert!(reasons[0].1.contains("tuned again without"), "{reasons:?}");
+        assert_eq!(reasons[1], ("kept".to_string(), String::new()));
+        assert_eq!(run.outcome.rows[1]["round"], json!(2));
+        assert_eq!(run.outcome.rows[1]["variant"], json!("free"));
+        // Round 2 is given its own tune file and the same held session.
+        let round_two = run.args("tune-r2");
+        let held_path = run.fixture.path().join("held.ses");
+        assert_eq!(
+            value(&round_two, "--tune="),
+            Some(run.folder("tune-r2").join("tune.txt").to_str().unwrap())
+        );
+        assert_eq!(
+            value(&round_two, "--initial-session="),
+            Some(held_path.to_str().unwrap())
+        );
+        assert!(
+            std::fs::read_to_string(run.folder("tune-r2").join("tune.txt"))
+                .unwrap()
+                .contains("\"X\"")
+        );
+        assert_eq!(
+            value(&run.args("tune"), "--tune="),
+            Some(run.fixture.path().join("tune.txt").to_str().unwrap())
+        );
+        assert!(!round_two.iter().any(|t| t.starts_with("--pairs")));
+        assert_eq!(value(&round_two, "--layer-heights="), Some("0,1.58"));
+        // The seconds of both passes are counted.
+        let total: f64 = run
+            .outcome
+            .rows
+            .iter()
+            .map(|row| row["seconds"].as_f64().unwrap())
+            .sum();
+        assert!((run.outcome.seconds - total).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn contacts_on_every_pass_end_in_a_discard_after_three_rounds() {
+        let held = rows_session(&XYZ, &[]);
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[
+                ("tune", rows_session(&XYZ, &["X"])),
+                ("tune-r2", rows_session(&XYZ, &["Y"])),
+                ("tune-r3", rows_session(&XYZ, &["Z"])),
+                ("tune-r4", rows_session(&XYZ, &[])),
+            ],
+            "",
+            &XYZ,
+            NextMode::Without,
+            soon(120),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert_eq!(TUNE_ROUNDS_MAX, 3);
+        assert_eq!(run.calls, vec![names(&["X"]), names(&["X", "Y"])]);
+        let reasons = run.reasons();
+        assert_eq!(reasons.len(), 3, "{reasons:?}");
+        assert!(reasons.iter().all(|(outcome, _)| outcome == "discarded"));
+        assert!(reasons[0].1.starts_with("meanders touch their own net: X"));
+        assert!(reasons[1].1.starts_with("meanders touch their own net: Y"));
+        assert_eq!(reasons[2].1, "meanders touch their own net: Z");
+        assert!(run.folder("tune-r3").is_dir());
+        assert!(!run.folder("tune-r4").exists(), "no fourth pass");
+        assert_eq!(run.outcome.rows[2]["round"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn a_pass_is_discarded_when_no_group_is_left_or_the_next_file_cannot_be_written() {
+        let held = rows_session(&XYZ, &[]);
+        // The only tuned net touches itself: `next` has no group to write.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[("tune", rows_session(&XYZ, &["X"]))],
+            "",
+            &["X"],
+            NextMode::Without,
+            soon(60),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert_eq!(run.calls.len(), 1);
+        assert_eq!(
+            run.reasons(),
+            [(
+                "discarded".to_string(),
+                "meanders touch their own net: X".to_string()
+            )]
+        );
+        assert!(!run.folder("tune-r2/tune.ses").exists());
+        // A file that cannot be written.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[("tune", rows_session(&XYZ, &["X"]))],
+            "",
+            &XYZ,
+            NextMode::Fails,
+            soon(60),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        let reasons = run.reasons();
+        assert_eq!(reasons.len(), 1);
+        assert!(
+            reasons[0].1.starts_with("meanders touch their own net: X"),
+            "{reasons:?}"
+        );
+        assert!(reasons[0].1.contains("a disk that is full"), "{reasons:?}");
+    }
+
+    #[tokio::test]
+    async fn a_round_is_not_started_when_the_deadline_leaves_less_than_twice_the_last_pass() {
+        let held = rows_session(&XYZ, &[]);
+        let sessions = [
+            ("tune", rows_session(&XYZ, &["X"])),
+            ("tune-r2", rows_session(&XYZ, &[])),
+        ];
+        // The pass takes 3 s or more (a started process can take seconds more on a
+        // busy machine): with 8 s in all, less than twice that is left at any load.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &sessions,
+            "delay_ms=3000\n",
+            &XYZ,
+            NextMode::Without,
+            soon(8),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert!(run.calls.is_empty(), "no next file was written");
+        assert_eq!(
+            run.reasons(),
+            [(
+                "discarded".to_string(),
+                "meanders touch their own net: X".to_string()
+            )]
+        );
+        assert!(!run.folder("tune-r2").exists());
+        // Control: a pass of 0.3 s with 10 s in all leaves far more than twice, so the
+        // second round runs and is kept.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &sessions,
+            "delay_ms=300\n",
+            &XYZ,
+            NextMode::Without,
+            soon(10),
+        )
+        .await;
+        assert_eq!(
+            kept_of(&run).expect("a candidate").passes,
+            2,
+            "{:?}",
+            run.outcome.rows
+        );
+    }
+
+    /// A skew group of four nets, `A` and `B` a pair.
+    fn paired_plan() -> crate::tools::route_lengths::LengthPlan {
+        use crate::tools::route_lengths::{GroupNet, LengthPlan, ResolvedGroup, Window};
+        LengthPlan {
+            groups: vec![ResolvedGroup {
+                interface: "i".to_string(),
+                name: "g".to_string(),
+                file_name: "lt1".to_string(),
+                nets: ["A", "B", "C", "D"]
+                    .iter()
+                    .map(|net| GroupNet {
+                        intent: net.to_string(),
+                        dsn: net.to_string(),
+                    })
+                    .collect(),
+                window: Window::Skew { tolerance_mm: 0.5 },
+                pairs: vec![("A".to_string(), "B".to_string(), 0.025)],
+            }],
+            ..LengthPlan::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_net_that_is_half_of_a_pair_takes_its_partner_and_the_pair_group_with_it() {
+        const ABCD: [&str; 4] = ["A", "B", "C", "D"];
+        let held = rows_session(&ABCD, &[]);
+        let plan = paired_plan();
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[
+                ("tune", rows_session(&ABCD, &["A"])),
+                ("tune-r2", rows_session(&ABCD, &[])),
+            ],
+            "",
+            &ABCD,
+            NextMode::Plan(&plan),
+            soon(60),
+        )
+        .await;
+        let candidate = kept_of(&run).expect("a candidate");
+        assert_eq!(candidate.passes, 2);
+        let dropped: Vec<&str> = candidate
+            .dropped
+            .iter()
+            .map(|(net, _)| net.as_str())
+            .collect();
+        assert_eq!(dropped, ["A", "B"]);
+        assert!(
+            candidate.dropped[0].1.contains("crossing"),
+            "{:?}",
+            candidate.dropped
+        );
+        assert!(
+            candidate.dropped[1].1.contains("left out with"),
+            "{:?}",
+            candidate.dropped
+        );
+        let file = std::fs::read_to_string(run.folder("tune-r2").join("tune.txt")).unwrap();
+        assert!(
+            file.contains("group lt1 tolerance=0.25\n  C\n  D\n"),
+            "{file}"
+        );
+        assert!(!file.contains("lt1p1") && !file.contains("  A\n") && !file.contains("  B\n"));
+        // Control: a net with no partner takes only itself, and the pair group stays.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[
+                ("tune", rows_session(&ABCD, &["C"])),
+                ("tune-r2", rows_session(&ABCD, &[])),
+            ],
+            "",
+            &ABCD,
+            NextMode::Plan(&plan),
+            soon(60),
+        )
+        .await;
+        let candidate = kept_of(&run).expect("a candidate");
+        assert_eq!(candidate.dropped.len(), 1);
+        assert_eq!(candidate.dropped[0].0, "C");
+        let file = std::fs::read_to_string(run.folder("tune-r2").join("tune.txt")).unwrap();
+        assert!(
+            file.contains("group lt1 tolerance=0.25\n  A\n  B\n  D\n"),
+            "{file}"
+        );
+        assert!(
+            file.contains("group lt1p1 tolerance=0.025\n  A\n  B\n"),
+            "{file}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_discard_reasons_of_a_pass_that_opened_or_changed_come_before_the_contacts() {
+        let held = rows_session(&XYZ, &[]);
+        // Changed another net: Y is not tuned here.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[("tune", rows_session(&XYZ, &["Y"]))],
+            "",
+            &["X"],
+            NextMode::Without,
+            soon(60),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert_eq!(
+            run.reasons(),
+            [(
+                "discarded".to_string(),
+                "changed the copper of Y".to_string()
+            )]
+        );
+        assert!(run.calls.is_empty());
+        // Opened a connection: the held session left none open.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[("tune", rows_session(&XYZ, &["X"]))],
+            "unrouted.tune=2\n",
+            &XYZ,
+            NextMode::Without,
+            soon(60),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert_eq!(
+            run.reasons(),
+            [("discarded".to_string(), "opened 2".to_string())]
+        );
+        assert!(run.calls.is_empty());
+        // A pass that fails is a failed row and no candidate.
+        let run = attempt(
+            TuneVariant::Free,
+            &held,
+            &[("tune", rows_session(&XYZ, &[]))],
+            "fail.tune=1\n",
+            &XYZ,
+            NextMode::Without,
+            soon(60),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert_eq!(run.outcome.rows[0]["outcome"], json!("failed"));
+        assert!(run.outcome.rows[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fake failure marker for tune"));
+    }
+
+    #[tokio::test]
+    async fn the_pour_safe_attempt_runs_in_its_own_folder_with_the_plane_switch() {
+        let held = rows_session(&XYZ, &[]);
+        let run = attempt(
+            TuneVariant::PourSafe,
+            &held,
+            &[
+                ("tune-pour-safe", rows_session(&XYZ, &["X"])),
+                ("tune-pour-safe-r2", rows_session(&XYZ, &[])),
+            ],
+            "",
+            &XYZ,
+            NextMode::Without,
+            soon(60),
+        )
+        .await;
+        let candidate = kept_of(&run).expect("a candidate");
+        assert_eq!(candidate.variant, TuneVariant::PourSafe);
+        assert_eq!(
+            candidate.ses,
+            run.fixture.path().join("run/tune-pour-safe-r2/tune.ses")
+        );
+        assert!(!run.folder("tune").exists());
+        for folder in ["tune-pour-safe", "tune-pour-safe-r2"] {
+            assert!(
+                run.args(folder).contains(&TUNE_POUR_SAFE.to_string()),
+                "{folder}"
+            );
+        }
+        assert_eq!(run.outcome.rows[0]["variant"], json!("pour_safe"));
+    }
+
+    /// The hold sequence with a Tune pass for a DSN whose planes are `planes`, the
+    /// Free candidate writing `free` and the pour-safe one `pour`.
+    async fn candidates_run(
+        free: &str,
+        pour: &str,
+        planes: &[&str],
+        control: &str,
+        seconds: u64,
+    ) -> (Fixture, Held) {
+        let fixture = Fixture::new("");
+        let write = |name: &str, text: &str| -> PathBuf {
+            let path = fixture.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let (before, free, pour) = (
+            write("before.ses", &base()),
+            write("free.ses", free),
+            write("pour.ses", pour),
+        );
+        fixture.set_control(&format!(
+            "copy_session.full={}\ncopy_session.tune={}\ncopy_session.tune-pour-safe={}\n{control}",
+            before.display(),
+            free.display(),
+            pour.display(),
+        ));
+        let tune_file = fixture.path().join("tune.txt");
+        std::fs::write(&tune_file, "group lt1 tolerance=0.5\n  A\n").unwrap();
+        let classes = class_list(&["c1"]);
+        let nets = names(&["A"]);
+        let planes: Vec<String> = planes.iter().map(|net| net.to_string()).collect();
+        let held = route_held(
+            &fixture.binary(),
+            &fixture.path().join("held"),
+            &fixture.dsn(),
+            &floor_hints(),
+            CallFiles::default(),
+            WidthFallback::None,
+            Some(TuneRequest {
+                inputs: TuneInputs {
+                    planes: &planes,
+                    ..tune_inputs(&tune_file, &classes, &nets, None)
+                },
+                next: &no_next,
+            }),
+            soon(seconds),
+        )
+        .await
+        .unwrap();
+        (fixture, held)
+    }
+
+    fn moved_b() -> String {
+        session(&[
+            (
+                "A",
+                wire("F.Cu", 250, &[(0, 0), (10000, 0), (10000, 5000)]) + &via("v", 10000, 5000),
+            ),
+            ("B", wire("F.Cu", 250, &[(0, 1000), (20000, 1300)])),
+            ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
+        ])
+    }
+
+    #[tokio::test]
+    async fn the_pour_safe_candidate_runs_only_when_the_dsn_has_a_plane_of_a_net_outside_the_tune_file(
+    ) {
+        for (planes, runs) in [
+            (&[][..], false),
+            (&["A"][..], false),
+            (&["GND"][..], true),
+            (&["A", "GND"][..], true),
+        ] {
+            let (fixture, held) =
+                candidates_run(&tuned_base(), &tuned_base(), planes, "", 60).await;
+            let folder = fixture.path().join("held/tune-pour-safe");
+            assert_eq!(folder.is_dir(), runs, "{planes:?}");
+            let variants: Vec<TuneVariant> =
+                held.tune.candidates.iter().map(|c| c.variant).collect();
+            assert_eq!(
+                variants,
+                if runs {
+                    vec![TuneVariant::Free, TuneVariant::PourSafe]
+                } else {
+                    vec![TuneVariant::Free]
+                },
+                "{planes:?}"
+            );
+            let free_args = pass_args(&fixture, "tune");
+            assert!(!free_args.contains(&TUNE_POUR_SAFE.to_string()));
+            assert!(free_args.contains(&TUNE_ROUTER_OFF.to_string()));
+            if runs {
+                let args: Vec<String> = std::fs::read_to_string(folder.join("tune.ses.args"))
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                assert_eq!(
+                    args.iter().filter(|t| *t == TUNE_POUR_SAFE).count(),
+                    1,
+                    "{planes:?}"
+                );
+            }
+            // Until the judge chooses (stage 5b), the Free candidate flows on, as the
+            // one kept Tune pass did, and the untuned session is kept beside it.
+            assert_eq!(held.kept, TUNE_PASS);
+            assert_eq!(held.ses, fixture.path().join("held/tune/tune.ses"));
+            assert_eq!(
+                held.untuned,
+                Some(fixture.path().join("held/full/full.ses"))
+            );
+            assert_eq!(held.passes.len(), 4, "{:?}", held.passes);
+            assert_eq!(held.tune.rows.len(), if runs { 2 } else { 1 });
+            let seconds: f64 = held.passes[0]["seconds"].as_f64().unwrap()
+                + held
+                    .tune
+                    .rows
+                    .iter()
+                    .map(|row| row["seconds"].as_f64().unwrap())
+                    .sum::<f64>();
+            assert!((held.seconds - seconds).abs() < 1e-9, "{}", held.seconds);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pour_safe_candidate_alone_does_not_replace_the_held_session_yet() {
+        // Free changes another net's copper and is discarded; the pour-safe pass is
+        // fine. Stage 5b's judge will use it; until then the run keeps its session.
+        let (fixture, held) = candidates_run(&moved_b(), &tuned_base(), &["GND"], "", 60).await;
+        let variants: Vec<TuneVariant> = held.tune.candidates.iter().map(|c| c.variant).collect();
+        assert_eq!(variants, [TuneVariant::PourSafe]);
+        assert_eq!(held.kept, "full");
+        assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
+        assert_eq!(
+            held.untuned,
+            Some(fixture.path().join("held/full/full.ses"))
+        );
+        assert_eq!(
+            tune_row(&held),
+            ("tune", "discarded", Some("changed the copper of B"))
+        );
+        // Both discarded: no candidate, and no untuned copy to judge beside it.
+        let (_fixture, held) = candidates_run(&moved_b(), &moved_b(), &["GND"], "", 60).await;
+        assert!(held.tune.candidates.is_empty());
+        assert_eq!(held.untuned, None);
+        assert_eq!(held.kept, "full");
+    }
+
+    #[tokio::test]
+    async fn the_pour_safe_attempt_is_skipped_when_the_deadline_leaves_less_than_twice_a_tune_pass()
+    {
+        // The Free pass takes 4 s or more; with 10 s in all, less than twice that is
+        // left at any load, and the pass is not killed.
+        let (fixture, held) = candidates_run(
+            &tuned_base(),
+            &tuned_base(),
+            &["GND"],
+            "delay_ms.tune=4000\n",
+            10,
+        )
+        .await;
+        assert!(!fixture.path().join("held/tune-pour-safe").exists());
+        let skipped = held.tune.rows.last().unwrap();
+        assert_eq!(skipped["outcome"], json!("skipped"));
+        assert_eq!(skipped["variant"], json!("pour_safe"));
+        assert!(skipped["reason"]
+            .as_str()
+            .unwrap()
+            .contains("less than twice"));
+        assert_eq!(held.tune.candidates.len(), 1);
+        // The skipped row is not a pass run and adds no time.
+        assert!(skipped["seconds"].is_null());
+        // Control: a short pass leaves room for it.
+        let (fixture, held) = candidates_run(
+            &tuned_base(),
+            &tuned_base(),
+            &["GND"],
+            "delay_ms.tune=100\n",
+            60,
+        )
+        .await;
+        assert!(fixture.path().join("held/tune-pour-safe").is_dir());
+        assert_eq!(held.tune.candidates.len(), 2);
     }
 }

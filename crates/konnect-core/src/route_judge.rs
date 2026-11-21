@@ -685,6 +685,10 @@ async fn judge_with(
     baseline: &Baseline,
     tools: &dyn ToolCaller,
 ) -> Result<Judged> {
+    // stage 5b: with `routed.held.untuned` and `routed.held.tune.candidates` set, L23's
+    // `judge_candidates` judges the untuned session and each candidate here, and the
+    // runner rewrites `Routed.held` from the choice. Until then `held.ses` is the
+    // Free candidate's (or the untuned) session and nothing else is judged.
     // 1. The session, read by the importer's own checks: a session it would refuse
     //    is a failed judge.
     let ses_text = tokio::fs::read_to_string(&routed.held.ses)

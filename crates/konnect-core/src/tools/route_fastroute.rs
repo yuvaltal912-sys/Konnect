@@ -46,6 +46,10 @@ pub(crate) const FASTROUTE_ONLY: &[&str] = &["effort", "fastroute_path"];
 /// What a run folder holds that this code made, and so may remove when it reduces
 /// the folder to its record: the variant DSN and the four passes' folders
 /// (`fastroute::route_held`). Anything else a run folder holds is left alone.
+///
+/// stage 5b: L26 adds the other Tune pass folders (`tune-r2`, `tune-r3`,
+/// `tune-pour-safe`, ...) and the judge's `run-<i>-untuned` and `run-<i>-pour-safe`
+/// folders here and in [`release_run`]; until then they are left alone.
 const RUN_ENTRIES: &[&str] = &["variant.dsn", "full", "fallback", "polish", "tune"];
 
 /// A refusal of one argument, worded as the other refusals of this tool are.
@@ -697,6 +701,7 @@ async fn search_and_write(
         classes,
         nets: lengths_plan.tune_nets(),
         layer_heights: lengths_plan.heights.switch_value(),
+        plan: Arc::new(lengths_plan.clone()),
     });
     judge.lengths = judge_checks(&lengths_plan);
     let hints = crate::specctra::manifest_routing_hints(&call.dsn);
@@ -964,6 +969,8 @@ pub(crate) struct TuneFiles {
     /// The Tune pass's own `--layer-heights` value (L7): sent whenever the call has
     /// heights.
     pub layer_heights: Option<String>,
+    /// The call's length plan: the next round's tune file is written from it (L21).
+    pub plan: Arc<route_lengths::LengthPlan>,
 }
 
 /// A shape's name as the run folders and the result spell it.
@@ -1018,6 +1025,13 @@ impl Runner for FastrouteRunner {
                 .collect();
             planes.sort();
             planes.dedup();
+            // Row LT, L21: the next round's tune file, without the nets that touched
+            // themselves.
+            let plan = tune.as_ref().map(|tune| Arc::clone(&tune.plan));
+            let next = |folder: &Path, dropped: &std::collections::BTreeSet<String>| match &plan {
+                Some(plan) => route_lengths::write_file_without(folder, plan, dropped),
+                None => Ok(None),
+            };
             let held = fastroute::route_held(
                 &binary,
                 &folder,
@@ -1029,11 +1043,15 @@ impl Runner for FastrouteRunner {
                     layer_heights: routing_heights.as_deref(),
                 },
                 fallback,
-                tune.as_ref().map(|tune| fastroute::TuneInputs {
-                    tune: &tune.file,
-                    classes: &tune.classes,
-                    nets: &tune.nets,
-                    layer_heights: tune.layer_heights.as_deref(),
+                tune.as_ref().map(|tune| fastroute::TuneRequest {
+                    inputs: fastroute::TuneInputs {
+                        tune: &tune.file,
+                        classes: &tune.classes,
+                        nets: &tune.nets,
+                        layer_heights: tune.layer_heights.as_deref(),
+                        planes: &planes,
+                    },
+                    next: &next,
                 }),
                 deadline,
             )
@@ -1625,6 +1643,9 @@ pub(crate) fn result_json(
     }
     // Row LT: what was asked of the lengths, what the winner measured, and the KiCad
     // rules that keep checking it (L15, L16).
+    // stage 5b: `held.passes` holds the Free attempt's last row; L15's
+    // `tune_candidates` and `untuned_nets` come from `held.tune`, and L23 makes the
+    // row the chosen candidate's.
     let tune_row = routed
         .held
         .passes

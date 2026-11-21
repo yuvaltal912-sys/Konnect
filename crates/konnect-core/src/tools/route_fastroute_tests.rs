@@ -850,6 +850,8 @@ fn routed(root: &Path, index: usize, shape: Shape, seed: u64, planes: &[&str]) -
                 json!({ "name": "full", "outcome": "kept", "unrouted": 0, "seconds": 12.3 }),
             ],
             seconds: 12.3,
+            untuned: None,
+            tune: Default::default(),
         },
         planes: planes.iter().map(|net| net.to_string()).collect(),
         folder,

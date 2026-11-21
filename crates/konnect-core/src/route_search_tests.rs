@@ -797,6 +797,8 @@ fn routed(index: usize, shape: Shape, seed: u64) -> Routed {
             kept: "full",
             passes: Vec::new(),
             seconds: 1.0,
+            untuned: None,
+            tune: Default::default(),
         },
         planes: Vec::new(),
         folder: PathBuf::from("run"),
