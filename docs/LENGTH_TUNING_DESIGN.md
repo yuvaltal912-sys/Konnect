@@ -11,7 +11,8 @@ design with main `0a3fc504` merged in). Sonnet 5.5 (high) agents write the bodie
 
 The verification of 2026-11-21 failed its measure of success, and findings F2 to F6 came
 back to the design: see "Addendum: the verification findings F2 to F6" at the end (L20 to
-L27, owner decisions 4 to 6, designed and not built).
+L27, owner decisions 4 to 6, designed and not built). The owner approved decisions 4 to 6 as
+recommended on 2026-11-21 ("Yes, as recommended").
 
 ## What the owner asked for
 
@@ -1565,6 +1566,9 @@ verification's hypothesis is wrong.**
 
 ### Decisions for the owner
 
+**Approved:** the owner approved decisions 4, 5 and 6 as recommended on 2026-11-21 ("Yes, as
+recommended").
+
 4. **A fastroute row for the tuner and the pair router (FT).**
    - **What it changes** in fastroute:
      - Each meander is checked against its own net's other copper: no crossing, no overlap,
@@ -1932,7 +1936,7 @@ routing verification. The parent session runs all four; the fixtures stay in
   - Negative control: A-tuned run 2's held session with the switch gives, for every net, the
     geometry of the recorded `tune/tune.ses`, because on A the stage removed nothing.
   - Also: x18 accepts the switch (no "unknown option").
-- **M1b (a routing run).** Fixture F at Fast, with a build that sends the switch and keeps
+- **M1b (a routing run).** Fixture F at effort M (the owner's rule: check runs at M only), with a build that sends the switch and keeps
   every pass folder: no "changed the copper of GND". If a GND discard remains, its folder says
   why.
 - **M2 (kicad-cli only).** B-tuned's item 2 board with L25's rule set: the group as a pinned
