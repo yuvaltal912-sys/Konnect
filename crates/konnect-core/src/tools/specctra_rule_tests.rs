@@ -150,12 +150,15 @@ struct Scene {
 }
 impl Scene {
     async fn new(fault: Fault) -> Self {
+        Self::with_rules(fault, RULES).await
+    }
+    async fn with_rules(fault: Fault, rules: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
         std::fs::write(&board, SOURCE).unwrap();
         let board = board.canonicalize().unwrap();
         std::fs::write(board.with_extension("kicad_pro"), "{}\n").unwrap();
-        std::fs::write(board.with_extension("kicad_dru"), RULES).unwrap();
+        std::fs::write(board.with_extension("kicad_dru"), rules).unwrap();
         let class_marker = dir.path().join("class-changed");
         let board_marker = dir.path().join("board-changed");
         let mut clean = json!({"violations":[],"unconnected_items":[],"ignored_checks":[],"included_severities":["error","warning","exclusion"]});
@@ -635,6 +638,58 @@ async fn served_export_refuses_native_requirement_and_unrepresentable_rules() {
     assert_eq!(result["isError"], true);
     assert_eq!(scene.state.lock().unwrap().class_reads, reads);
     assert!(!output.exists());
+}
+
+/// Row LT (L19): KiCad length and skew rules change nothing the DSN carries, so a
+/// board with them exports to the same DSN as the board without them, and its
+/// session still applies.
+#[tokio::test]
+async fn served_length_and_skew_rules_leave_the_dsn_and_the_apply_unchanged() {
+    let neutral = "(version 1)\n\
+        (rule \"ddr_len\" (condition \"A.NetClass == 'DDR' || A.NetName == 'GND'\") (layer \"outer\") (severity warning) (constraint length (min 10mm) (max 12mm) (opt 11mm)))\n\
+        (rule \"ddr_skew\" (condition \"A.inDiffPair('/D+')\") (constraint skew (max 0.1mm)))\n";
+    let scene = Scene::with_rules(Fault::default(), neutral).await;
+    let with_rules = std::fs::read_to_string(&scene.output).unwrap();
+    // The same board with the rules removed exports to the same DSN.
+    let dru = scene.board.with_extension("kicad_dru");
+    std::fs::write(&dru, "(version 1)\n").unwrap();
+    let reference = scene.dir.path().join("reference.dsn");
+    let result = scene
+        .call(
+            "export_specctra_dsn",
+            json!({"board":scene.board,"output":reference,"native_bridge_mode":"disable"}),
+        )
+        .await;
+    assert_ne!(result["isError"], true, "{result:#}");
+    assert_eq!(with_rules, std::fs::read_to_string(&reference).unwrap());
+    // The rules go back, as at the first export, and the session applies.
+    std::fs::write(&dru, neutral).unwrap();
+    let result = scene.apply().await;
+    assert_ne!(result["isError"], true, "{result:#}");
+    assert_eq!(scene.state.lock().unwrap().items.len(), 5);
+}
+
+/// The negative controls of the same row: a conditioned clearance rule, and a rule
+/// that mixes length with clearance, still refuse the export, and nothing is written.
+#[tokio::test]
+async fn served_conditioned_clearance_and_mixed_rules_still_refuse_the_export() {
+    let scene = Scene::new(Fault::default()).await;
+    for rules in [
+        "(version 1)(rule \"C\" (condition \"A.NetName == 'GND'\") (constraint clearance (min 0.2mm)))",
+        "(version 1)(rule \"M\" (constraint length (min 1mm)) (constraint clearance (min 0.2mm)))",
+        "(version 1)(rule \"L\" (constraint length (min 1mm)))(rule \"C\" (condition \"1 == 1\") (constraint clearance (min 0.2mm)))",
+    ] {
+        std::fs::write(scene.board.with_extension("kicad_dru"), rules).unwrap();
+        let output = scene.dir.path().join("refused.dsn");
+        let result = scene
+            .call(
+                "export_specctra_dsn",
+                json!({"board":scene.board,"output":output,"native_bridge_mode":"disable"}),
+            )
+            .await;
+        assert_eq!(result["isError"], true, "{rules}: {result:#}");
+        assert!(!output.exists(), "{rules}");
+    }
 }
 
 #[tokio::test]

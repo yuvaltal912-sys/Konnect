@@ -29,7 +29,7 @@ use konnect_sexp::SexpError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The record format this build reads and writes.
@@ -127,6 +127,9 @@ pub struct Interface {
     pub nets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub differential_pairs: Vec<DiffPair>,
+    /// Row LT: nets of this interface routed to matched lengths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub length_groups: Vec<LengthGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub single_ended_impedance_ohm: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +144,32 @@ pub struct Interface {
 pub struct DiffPair {
     pub positive: String,
     pub negative: String,
+    /// Row LT: the largest difference allowed between the two nets' lengths, in mm,
+    /// measured as KiCad measures them. Sent to fastroute as the pair's `skew=` and
+    /// checked by the judge. Absent: fastroute's own default (0.1 mm), not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_skew_mm: Option<f64>,
+}
+
+/// Row LT: nets of one interface routed to matched lengths
+/// (docs/LENGTH_TUNING_DESIGN.md, L1 and L2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LengthGroup {
+    /// Unique within its interface. Free text: the tune file never holds it.
+    pub name: String,
+    /// Nets of this interface; each net is in at most one length group of the
+    /// record.
+    pub nets: Vec<String>,
+    /// mm, greater than zero. Without `target_mm`: every net within this of the
+    /// group's longest net (KiCad's `skew (max …)`). With it: every net within
+    /// `target_mm` ± this (KiCad's `length (min …) (max …)`).
+    pub tolerance_mm: f64,
+    /// mm, greater than `tolerance_mm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_mm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 /// What the board will be built to.
@@ -330,6 +359,101 @@ fn validate(intent: &DesignIntent) -> Vec<String> {
             if diameter <= drill {
                 problems.push(format!(
                     "fab_target.min_via_diameter_mm: {diameter} is not larger than min_via_drill_mm {drill}"
+                ));
+            }
+        }
+    }
+    problems.extend(validate_lengths(intent));
+    problems
+}
+
+/// Every reason the record's length groups and pair skews cannot be used, each
+/// prefixed with where it is (`interfaces[i].length_groups[j].nets[k]: …`), as
+/// [`validate`] reports. `validate` appends these to its own list:
+/// - a group's `name` passes `name_ok` and is unique within its interface;
+/// - `nets` is not empty, each net passes `net_ok`, is one of the interface's
+///   `nets`, appears once in the group and in no other length group of the record;
+/// - a group without `target_mm` has at least two nets;
+/// - `tolerance_mm` is finite and greater than zero; `target_mm`, when set, is
+///   finite and greater than `tolerance_mm`;
+/// - each pair's `max_skew_mm`, when set, is finite and greater than zero;
+/// - for every pair of the record, its two nets are in the same length group, or
+///   neither is in one.
+fn validate_lengths(intent: &DesignIntent) -> Vec<String> {
+    let mut problems = Vec::new();
+    // Net -> (interface index, group index) of the group that holds it.
+    let mut group_of: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (i, interface) in intent.interfaces.iter().enumerate() {
+        let at = format!("interfaces[{i}]");
+        let interface_nets: BTreeSet<&str> = interface.nets.iter().map(String::as_str).collect();
+        let mut group_names = BTreeSet::new();
+        for (j, group) in interface.length_groups.iter().enumerate() {
+            let gat = format!("{at}.length_groups[{j}]");
+            name_ok(&mut problems, &format!("{gat}.name"), &group.name);
+            if !group_names.insert(group.name.as_str()) {
+                problems.push(format!("{gat}.name: '{}' is used twice", group.name));
+            }
+            if group.nets.is_empty() {
+                problems.push(format!("{gat}.nets: a length group needs at least one net"));
+            } else if group.target_mm.is_none() && group.nets.len() < 2 {
+                problems.push(format!(
+                    "{gat}.nets: a group without target_mm matches nets to each other and needs at least 2 nets"
+                ));
+            }
+            let mut in_group = BTreeSet::new();
+            for (k, net) in group.nets.iter().enumerate() {
+                let nat = format!("{gat}.nets[{k}]");
+                net_ok(&mut problems, &nat, net);
+                if !interface_nets.contains(net.as_str()) {
+                    problems.push(format!(
+                        "{nat}: '{net}' is not one of this interface's nets"
+                    ));
+                }
+                if !in_group.insert(net.as_str()) {
+                    problems.push(format!("{nat}: '{net}' is listed twice in this group"));
+                } else if let Some(&(oi, oj)) = group_of.get(net.as_str()) {
+                    problems.push(format!(
+                        "{nat}: '{net}' is already in length group interfaces[{oi}].length_groups[{oj}]"
+                    ));
+                } else {
+                    group_of.insert(net.as_str(), (i, j));
+                }
+            }
+            // A non-finite tolerance is already reported by `positive` below.
+            let tolerance_ok = group.tolerance_mm > 0.0;
+            positive(
+                &mut problems,
+                &format!("{gat}.tolerance_mm"),
+                Some(group.tolerance_mm),
+            );
+            if let Some(target) = group.target_mm {
+                if !target.is_finite() {
+                    problems.push(format!("{gat}.target_mm: {target} must be finite"));
+                } else if tolerance_ok && target <= group.tolerance_mm {
+                    problems.push(format!(
+                        "{gat}.target_mm: {target} must be greater than tolerance_mm {}",
+                        group.tolerance_mm
+                    ));
+                }
+            }
+        }
+    }
+    for (i, interface) in intent.interfaces.iter().enumerate() {
+        for (j, pair) in interface.differential_pairs.iter().enumerate() {
+            let pat = format!("interfaces[{i}].differential_pairs[{j}]");
+            positive(
+                &mut problems,
+                &format!("{pat}.max_skew_mm"),
+                pair.max_skew_mm,
+            );
+            let (p, n) = (
+                group_of.get(pair.positive.as_str()),
+                group_of.get(pair.negative.as_str()),
+            );
+            if p != n {
+                problems.push(format!(
+                    "{pat}: '{}' and '{}' must be in the same length group, or neither in one",
+                    pair.positive, pair.negative
                 ));
             }
         }
@@ -526,11 +650,15 @@ pub fn tools() -> Vec<ToolDef> {
              Sections: 'rails' = [{name, nets[], voltage_v, max_current_a?, tolerance_pct?, \
              source_ref?, max_temp_rise_c?, notes?}]; 'currents' (non-rail nets) = [{net, \
              max_current_a, max_temp_rise_c?, notes?}]; 'interfaces' = [{name, kind, nets[], \
-             differential_pairs?: [{positive, negative}], single_ended_impedance_ohm?, \
+             differential_pairs?: [{positive, negative, max_skew_mm?}], length_groups?: \
+             [{name, nets[], tolerance_mm, target_mm?, notes?}], single_ended_impedance_ohm?, \
              differential_impedance_ohm?, notes?}]; 'fab_target' = {house?, layer_count?, \
              board_thickness_mm?, outer_copper_oz?, inner_copper_oz?, min_track_mm?, \
              min_clearance_mm?, min_via_drill_mm?, min_via_diameter_mm?, notes?} or null to clear. \
-             An empty array clears a list section. Unknown keys, duplicate names, a net in two \
+             length_groups tune nets to matched lengths (without target_mm: every net within \
+             tolerance_mm of the longest; with it: target_mm ± tolerance_mm); max_skew_mm limits \
+             a pair's length difference; both are in mm and are used by fastroute routing. An \
+             empty array clears a list section. Unknown keys, duplicate names, a net in two \
              rails or in both a rail and 'currents', and non-positive values are refused. When a \
              record exists, pass expected_revision from get_design_intent; a mismatch is \
              stale_target and writes nothing. dry_run validates and returns the result without \

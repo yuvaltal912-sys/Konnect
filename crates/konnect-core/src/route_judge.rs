@@ -65,6 +65,10 @@ pub(crate) struct JudgeContext {
     /// them writes the owner's real settings. `prepare` sets `None`; the caller sets
     /// it once the search folder exists.
     pub kicad_config_home: Option<PathBuf>,
+    /// Row LT: what the call's length plan checks (`route_lengths::LengthPlan::
+    /// checks`); `None` or empty: no probe, no G4(a) or G4(b). `prepare` sets `None`;
+    /// the caller sets it after the plan is built.
+    pub lengths: Option<Arc<crate::length_probe::LengthChecks>>,
 }
 
 /// The unrouted board, refilled and checked the same way every run is (G2's
@@ -245,6 +249,7 @@ pub(crate) fn prepare(
         floors_mm,
         root: root.to_path_buf(),
         kicad_config_home: None,
+        lengths: None,
     })
 }
 
@@ -586,6 +591,10 @@ pub(crate) struct Measures {
     pub stitching_vias: usize,
     /// The route's own time, seconds.
     pub route_s: f64,
+    /// Row LT: what the length probe found, when the call checks a group or a pair
+    /// skew (`length_probe::check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lengths: Option<crate::length_probe::LengthMeasures>,
 }
 
 /// Each gate passes when its list is empty; each entry is one readable line.
@@ -594,11 +603,15 @@ pub(crate) struct Gates {
     pub g1: Vec<String>,
     pub g2: Vec<String>,
     pub g3: Vec<String>,
+    /// Row LT, length (L9): the intent's groups and pair skews on KiCad's own
+    /// lengths, and KiCad's own `length` and `skew` rules, absolute.
+    #[serde(default)]
+    pub g4: Vec<String>,
 }
 
 impl Gates {
     pub(crate) fn all_pass(&self) -> bool {
-        self.g1.is_empty() && self.g2.is_empty() && self.g3.is_empty()
+        self.g1.is_empty() && self.g2.is_empty() && self.g3.is_empty() && self.g4.is_empty()
     }
 }
 
@@ -631,7 +644,9 @@ pub(crate) struct Judged {
 ///    `scratch_board::write_planned` into `r<n>` (project copied the same way),
 ///    refill and DRC; the round's row records the counts.
 /// 5. `audit_layout_quality` through the tool registry on the last board.
-/// 6. [`measure`], then [`gates`]. The folders of earlier rounds are removed whole
+/// 6. Row LT: [`judge_lengths`] on the last board when the call checks a group or a
+///    pair skew.
+/// 7. [`measure`], then [`gates`]. The folders of earlier rounds are removed whole
 ///    (board, report and copied project files), once the next round's board is
 ///    written and checked; the last round's folder is kept, and its board is named in
 ///    `Judged::board`.
@@ -694,6 +709,15 @@ async fn judge_with(
     let mut board = crate::scratch_board::copy_project(&ctx.board, &run_dir.join("r0"))?;
     let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan)?;
     write_board(&board, &routed_text)?;
+    // The board's own length and skew rules must be seen whatever the project's
+    // severities say (G4(c)): forced in this scratch copy's project, never the owner's.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| checks.board_rules)
+    {
+        crate::length_probe::force_length_severities(&board)?;
+    }
 
     // 3. KiCad's refill and DRC, on this judge's own settings copy.
     let config = OwnConfig::new(ctx, &format!("run-{}", routed.index))?;
@@ -820,8 +844,14 @@ async fn judge_with(
     let audit: Value =
         serde_json::from_str(&text).context("the layout audit result is not JSON")?;
 
-    // 6. Measures and gates.
-    let measures = measure(
+    // 6. Row LT: KiCad's own lengths of the checked nets, on a copy of the last board.
+    let lengths = match ctx.lengths.as_deref() {
+        Some(checks) => judge_lengths(ctx, checks, config.path(), &board, &run_dir).await?,
+        None => None,
+    };
+
+    // 7. Measures and gates.
+    let mut measures = measure(
         ctx,
         &drc,
         &audit,
@@ -830,6 +860,7 @@ async fn judge_with(
         stitching_vias,
         routed.held.seconds,
     )?;
+    measures.lengths = lengths;
     let gates = gates(&measures, baseline);
     Ok(Judged {
         measures,
@@ -837,6 +868,35 @@ async fn judge_with(
         board,
         rounds,
     })
+}
+
+/// Row LT, step 6 of the judge (after the audit): when `checks` is not empty,
+/// `length_probe::probe_lengths` on the last board, in `<run dir>/lengths`, with the
+/// run's own KiCad settings, then `length_probe::check`. `None` when nothing is
+/// checked. A probe error fails the judge.
+pub(crate) async fn judge_lengths(
+    ctx: &JudgeContext,
+    checks: &crate::length_probe::LengthChecks,
+    config: Option<&Path>,
+    board: &Path,
+    run_dir: &Path,
+) -> Result<Option<crate::length_probe::LengthMeasures>> {
+    if checks.is_empty() {
+        return Ok(None);
+    }
+    let nets = checks.nets();
+    let (lengths, unmeasured, probe_s) = crate::length_probe::probe_lengths(
+        &ctx.kicad_cli,
+        config,
+        board,
+        &run_dir.join(crate::length_probe::PROBE_FOLDER),
+        &nets,
+    )
+    .await
+    .context("the length probe failed")?;
+    Ok(Some(crate::length_probe::check(
+        checks, &lengths, unmeasured, probe_s,
+    )))
 }
 
 /// The measures of a run from its parts: KiCad's last report, the audit's JSON, the
@@ -910,6 +970,7 @@ pub(crate) fn measure(
         longest_below_mm,
         stitching_vias,
         route_s,
+        lengths: None,
     })
 }
 
@@ -988,6 +1049,10 @@ fn arc_length_mm(start: [f64; 2], mid: [f64; 2], end: [f64; 2]) -> f64 {
 ///   intent-width net with at most [`BELOW_INTENT_SHARE`] of its length and no
 ///   stretch longer than [`BELOW_INTENT_SECTION_MM`] below its intent width; audit
 ///   4.2 nets undersized 0 and 4.3 narrow paths 0 when the audit gave them.
+/// - G4 length (Row LT, L9): every checked group and pair skew meets its window on
+///   KiCad's own lengths, no checked net is unmeasured, and KiCad's own DRC has 0
+///   `length_out_of_range` and 0 `skew_out_of_range`, absolute. G2 does not count
+///   those two keys.
 pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
     let mut g1 = Vec::new();
     if m.unconnected != 0 {
@@ -1011,6 +1076,10 @@ pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
 
     let mut g2 = Vec::new();
     for (rule, count) in &m.violations {
+        // Row LT: KiCad's length and skew rules are G4's, absolute (L9).
+        if !crate::length_probe::counts_in_g2(rule) {
+            continue;
+        }
         let allowed = baseline.violations.get(rule).copied().unwrap_or(0);
         if *count > allowed {
             g2.push(format!(
@@ -1063,20 +1132,36 @@ pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
         g3.push(format!("the audit finds {narrow} narrow path(s) (4.3)"));
     }
 
-    Gates { g1, g2, g3 }
+    let g4 = crate::length_probe::g4_lines(m.lengths.as_ref(), &m.violations);
+
+    Gates { g1, g2, g3, g4 }
 }
 
-/// A run's rank key; the least is the best.
-pub(crate) type Key = [i64; 10];
+/// Row LT: the length of the rank key (docs/LENGTH_TUNING_DESIGN.md, L10): G1, G2,
+/// G3, G4, intent miss, KiCad's length violations, then the ten-entry key's
+/// measures from acute corners on. `Key` is `[i64; KEY_LEN]`.
+pub(crate) const KEY_LEN: usize = 13;
 
-/// The rank key of decision 12 for every judged run at once (the length steps need
-/// the shortest): G1, G2 and G3 failed (0 or 1 each); acute corners (whole);
-/// signal length over the shortest signal length among the runs that pass G1 (among
-/// all judged runs when none does), in steps of
+/// Where the quality measures sit in the key (acute corners to minus copper
+/// quality): what the placement key copies (it read `3..9` before Row LT).
+pub(crate) const KEY_QUALITY: std::ops::Range<usize> = 6..12;
+
+/// A run's rank key; the least is the best.
+pub(crate) type Key = [i64; KEY_LEN];
+
+/// The rank key of decision 12 and L10 for every judged run at once (the length
+/// steps need the shortest): G1, G2, G3 and G4 failed (0 or 1 each); the intent
+/// miss (the sum of every measured net's distance outside its window, in 0.01 mm
+/// steps; `i64::MAX` when a checked net is unmeasured; 0 when nothing is checked);
+/// KiCad's own length and skew violations; then [`KEY_QUALITY`]: acute corners
+/// (whole); signal length over the shortest signal length among the runs that pass G1
+/// (among all judged runs when none does), in steps of
 /// [`LENGTH_STEP`] (`round(ratio / step)`); power length the same; right angles
 /// (whole); vias off the pour nets; minus copper quality (rounded to whole points);
-/// route seconds (rounded down). A measure the audit did not give sorts last
-/// (`i64::MAX`). When every run's length of a category is 0, that step is 0 for all.
+/// and last the route seconds (rounded down). A measure the audit did not give sorts
+/// last (`i64::MAX`). When every run's length of a category is 0, that step is 0 for
+/// all. Without length groups, pair skews or KiCad length rules, positions 3 to 5
+/// are 0 for every run and the order is the one before Row LT.
 pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
     let runs: Vec<(&Measures, &Gates, bool)> = judged
         .iter()
@@ -1130,10 +1215,15 @@ pub(crate) fn rank_measures(runs: &[(&Measures, &Gates, bool)]) -> Vec<Key> {
     let whole = |value: Option<f64>| value.map_or(i64::MAX, |value| value.round() as i64);
     runs.iter()
         .map(|&(m, g, _)| {
+            let [g4, miss, kicad] =
+                crate::length_probe::key_part(!g.g4.is_empty(), m.lengths.as_ref(), &m.violations);
             [
                 i64::from(!g.g1.is_empty()),
                 i64::from(!g.g2.is_empty()),
                 i64::from(!g.g3.is_empty()),
+                g4,
+                miss,
+                kicad,
                 whole(m.acute),
                 step(m.signal_mm, shortest_signal),
                 step(m.power_mm, shortest_power),

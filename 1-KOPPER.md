@@ -116,6 +116,24 @@ A project folder with such a `konnect.toml` turns simulation on there. Without
 that key, `konnect init` installs no `kicad-simulation` skill, and removes one
 that an earlier install left.
 
+## Differential pairs
+
+Differential pairs declared in the design intent
+(`interfaces[].differential_pairs`) are routed coupled. The routing result lists
+them, and any pair it left out with the reason.
+
+## Matched lengths
+
+Nets that must have matched lengths are declared in the design intent
+(`interfaces[].length_groups`, and `max_skew_mm` on a pair). fastroute lengthens
+the short nets with serpentines, and the judge measures every checked net with
+KiCad. A group that cannot be applied refuses the call before anything is routed.
+The routing result carries `length_matching` (what was asked, each net's length
+and miss) and, in `completion.next_steps`, the KiCad rules that keep checking it.
+A winner that misses a window has `status` `complete_with_gate_failures`.
+Freerouting does not tune lengths and says so. The design:
+`docs/LENGTH_TUNING_DESIGN.md`.
+
 ## Change the fastroute build
 
 Edit `packaging/1-kopper/fastroute.json` (`build`, `engine_commit`, `sha256`) in

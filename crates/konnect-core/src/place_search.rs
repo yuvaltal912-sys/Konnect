@@ -23,6 +23,7 @@ use crate::place_judge::{
     screen_key, Judged, Key, PlacementGates, RouteResult, Screen, ScreenKey, SILK,
 };
 use crate::place_route::{export_candidate, route_candidate, unrouted_check, RouteInputs};
+use crate::place_schematic::{SchematicBaseline, SchematicMeasure};
 use crate::route_judge::Gates;
 use crate::route_search::{median, BoxFuture, Effort, SplitMix64, HANG_CAP};
 use crate::tools::pcb_components::{placements_applied_to, placements_moved_applied_to};
@@ -101,8 +102,14 @@ pub(crate) struct Record {
     pub placement_gates: Option<PlacementGates>,
     /// The candidate's unrouted check, counts by DRC type (`search.baseline`).
     pub unrouted: Option<BTreeMap<String, usize>>,
-    /// The routing winner's G1 to G3 lines. In `search.json` only: they can name nets.
+    /// The routing winner's G1 to G4 lines. In `search.json` only: they can name nets.
     pub route_gates: Option<Gates>,
+    /// How near this board keeps the parts that the schematic draws next to each other,
+    /// against the input's (design D23). Reported only: it is not in the rank key. `None`
+    /// when no board was made or the measure could not be taken (then
+    /// `schematic_neighbours_reason` says why).
+    pub schematic_neighbours: Option<SchematicMeasure>,
+    pub schematic_neighbours_reason: Option<String>,
     #[serde(skip)]
     pub board_text: Option<String>,
     #[serde(skip)]
@@ -131,8 +138,28 @@ impl Record {
             placement_gates: None,
             unrouted: None,
             route_gates: None,
+            schematic_neighbours: None,
+            schematic_neighbours_reason: None,
             board_text: None,
             judged: None,
+        }
+    }
+
+    /// Files the schematic-neighbour measure of this record's board text, when it has one:
+    /// the measure, or the reason it could not be taken (no schematic, a board that does
+    /// not parse). Reported only.
+    fn file_schematic(&mut self, baseline: &Result<SchematicBaseline, String>) {
+        let Some(text) = &self.board_text else {
+            return;
+        };
+        let measured = baseline.as_ref().map_err(Clone::clone).and_then(|base| {
+            let tree = konnect_sexp::parse_sexp(text)
+                .map_err(|error| format!("the board text does not parse: {error}"))?;
+            base.measure(&tree)
+        });
+        match measured {
+            Ok(measure) => self.schematic_neighbours = Some(measure),
+            Err(reason) => self.schematic_neighbours_reason = Some(reason),
         }
     }
 
@@ -902,6 +929,9 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     let pairs = decoupling_pairs(&evaluated)?;
     let intent = Intent::new(groups(&tree, &held, &[]), pairs);
     let input_failures = movable_failure_keys(&evaluated, &held)?;
+    // The schematic neighbourhoods, fixed once from the input board's project (D23). A
+    // missing or unreadable schematic is a reason on every record, not an error.
+    let schematic = SchematicBaseline::read(&plan.route.board, &tree);
     let mut model = board_model(&text, held, intent)?;
     model.input_failures = input_failures;
     model.clearances = Clearances::from_inputs(&plan.route.rules, &plan.route.options);
@@ -973,6 +1003,10 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     let mut generated = generate_all(&model, &recipes(&plan.matrix), plan.threads, first_id);
     mark_duplicates(&mut generated, &earlier);
     records.extend(generated);
+
+    for record in &mut records {
+        record.file_schematic(&schematic);
+    }
 
     // Phase 2.
     let order = routing_order(
@@ -1234,8 +1268,9 @@ fn number(value: Option<f64>) -> String {
 
 /// `table.md` of one board, counts only, no net or part names: one row per routed
 /// candidate in rank order (rank, origin, family and seed, P1, P2, G1, unconnected,
-/// G2, G3, decoupling, connector, acute, signal and power mm, vias off the pours,
-/// copper quality, silk, placement score), then one row per family and reference (best
+/// G2, G3, G4, decoupling, connector, acute, signal and power mm, vias off the pours,
+/// copper quality, silk, placement score, and the two reported-only schematic-neighbour
+/// columns of D23), then one row per family and reference (best
 /// rank, median rank of its routed candidates, how many pass every gate, how many were
 /// generated, failed, duplicates and screened out), then each family's verdict against
 /// O and against A (`verdict`).
@@ -1267,8 +1302,15 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
         text.push_str(&format!(" Routing stopped early: {code}."));
     }
     text.push_str("\n\n## Routed candidates, best first\n\n");
-    text.push_str("| rank | origin | P1 | P2 | G1 | unconnected | G2 | G3 | decoupling | connector | acute | signal mm | power mm | vias off pours | copper quality | silk | score |\n");
-    text.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    text.push_str(
+        "The last two columns (`sch. nbr mm`: the mean distance of each part to its nearest \
+         schematic neighbours, and `pulled away`: the parts that moved away from them, against \
+         the input) are reported only; they do not rank.\n\n",
+    );
+    text.push_str("| rank | origin | P1 | P2 | G1 | unconnected | G2 | G3 | G4 | decoupling | connector | acute | signal mm | power mm | vias off pours | copper quality | silk | score | sch. nbr mm | pulled away |\n");
+    text.push_str(
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
     let mut routed: Vec<&Record> = outcome
         .records
         .iter()
@@ -1286,7 +1328,7 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             continue;
         };
         text.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} |\n",
             record.rank.unwrap_or_default(),
             record.label(),
             pass_word(judged.placement.p1.is_empty()),
@@ -1295,6 +1337,7 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             measures.unconnected,
             pass_word(gates.g2.is_empty()),
             pass_word(gates.g3.is_empty()),
+            pass_word(gates.g4.is_empty()),
             judged.screen.decoupling_violations,
             judged.screen.connector_violations,
             number(measures.acute),
@@ -1304,6 +1347,11 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             number(measures.copper_quality),
             judged.silk.map_or("-".to_string(), |silk| silk.to_string()),
             judged.screen.score,
+            number(record.schematic_neighbours.as_ref().map(|m| m.mean_mm)),
+            record
+                .schematic_neighbours
+                .as_ref()
+                .map_or("-".to_string(), |m| m.parts_pulled_away.to_string()),
         ));
     }
 

@@ -3,6 +3,51 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: matched lengths with fastroute (Row LT)
+
+Nets that must have matched lengths are declared in the design intent, and
+`route_specctra_dsn` (fastroute) tunes and checks them. Design:
+`docs/LENGTH_TUNING_DESIGN.md`.
+
+- **`set_design_intent`** accepts two more optional fields, still
+  `schema_version` 1: `interfaces[].length_groups[]` = `{name, nets[],
+  tolerance_mm, target_mm?, notes?}` and
+  `interfaces[].differential_pairs[].max_skew_mm`. A record without them is
+  written as before. A Konnect build from before this change refuses a record that
+  uses them (unknown field), which is correct: it cannot honour them.
+- **`route_specctra_dsn`, fastroute.**
+  - A length group, or a pair's `max_skew_mm`, that cannot be applied refuses the
+    call before anything is routed (`invalid_configuration`, naming the group, the
+    net and the fix): a name that matches no net or several, a name with white
+    space or one of `# * ? ' " \`, a target no net can meet, an intent that cannot
+    be read but declares lengths.
+  - A Tune pass runs after the hold sequence when a group exists, and its row is
+    in `passes`. Judge gate **G4** checks the groups, the pair skews and KiCad's own
+    `length` and `skew` rules, on lengths KiCad measures. `completion.judged.gates`
+    gains `g4`; a failed G4 gives `status` `complete_with_gate_failures`, and the
+    judged `complete` needs all four gates. `search.runs` rows carry `g4_failed` and
+    `length_miss_mm` for a run that was checked.
+  - The winner's rank `key` has 13 entries (it had 10): G4 failed, the intent miss
+    and KiCad's own length violations come after G3.
+  - New result field `length_matching` when the intent declares a group or a skew,
+    or the board's `.kicad_dru` has a `length` or `skew` rule: `groups`, `pairs`,
+    `layer_heights`, `kicad_rules`, `kicad_violations`, `tune_pass`,
+    `pairs_tuned_net_by_net`, and `note`. `completion.next_steps` gains the KiCad
+    rule of each checked group, for `create_custom_drc_rule` after
+    `apply_specctra_ses`. Nothing is written for the caller.
+  - A call with a resolved pair also sends `--layer-heights` to every pass.
+  - A board without a group or a skew is unchanged, except where its `.kicad_dru`
+    holds `length` or `skew` rules: G4 then counts KiCad's own violations of them
+    (the unrouted baseline no longer excuses them in G2), so such a board can get
+    `complete_with_gate_failures`.
+- **`route_specctra_dsn`, `engine: "freerouting"`** routes as before. With a length
+  group or a pair skew in the intent, the result carries `length_matching_note`
+  (Freerouting does not tune lengths).
+- **`export_specctra_dsn`, `apply_specctra_ses`** no longer refuse a board whose
+  `.kicad_dru` holds a rule with only `length` or `skew` constraints: the DSN
+  carries neither, so the rule is skipped. A rule that mixes one with another
+  constraint is projected or refused as before.
+
 ## Unreleased: the switching hot loops read pin types too
 
 `audit_layout_quality` checks 8.1 and 8.2 find a converter's input and ground

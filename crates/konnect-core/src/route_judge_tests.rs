@@ -327,6 +327,7 @@ fn measures() -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 10.0,
+        lengths: None,
     }
 }
 
@@ -368,7 +369,8 @@ fn a_clean_run_passes_every_gate() {
         Gates {
             g1: vec![],
             g2: vec![],
-            g3: vec![]
+            g3: vec![],
+            g4: vec![]
         }
     );
     assert!(g.all_pass());
@@ -396,6 +398,7 @@ fn all_pass_needs_all_three_lists_empty() {
         g1: vec![],
         g2: vec![],
         g3: vec![],
+        g4: vec![],
     };
     assert!(pass.all_pass());
     for failed in [
@@ -411,6 +414,10 @@ fn all_pass_needs_all_three_lists_empty() {
             g3: vec!["x".into()],
             ..pass.clone()
         },
+        Gates {
+            g4: vec!["x".into()],
+            ..pass.clone()
+        },
     ] {
         assert!(!failed.all_pass());
     }
@@ -418,7 +425,7 @@ fn all_pass_needs_all_three_lists_empty() {
 
 /// The gate lists of `m` when exactly one gate is expected to fail with one line.
 fn only(g: &Gates, which: usize) {
-    let lists = [&g.g1, &g.g2, &g.g3];
+    let lists = [&g.g1, &g.g2, &g.g3, &g.g4];
     for (index, list) in lists.iter().enumerate() {
         if index == which {
             assert_eq!(list.len(), 1, "G{} lines: {list:?}", index + 1);
@@ -501,6 +508,95 @@ fn g2_equal_passes_one_more_fails_a_new_type_fails() {
     // Two types over: two lines.
     m.violations = rules(&[("clearance", 9), ("shorting_items", 1)]);
     assert_eq!(gates(&m, &baseline).g2.len(), 2);
+}
+
+/// A run's length measures: `miss_mm` outside a target window on one net.
+fn length_measures(miss_mm: f64, unmeasured: &[&str]) -> crate::length_probe::LengthMeasures {
+    use crate::length_probe::{GroupLengths, LengthMeasures, NetLength};
+    let (mm, miss) = if miss_mm > 0.0 {
+        (Some(41.5 - miss_mm), miss_mm)
+    } else {
+        (Some(42.0), 0.0)
+    };
+    LengthMeasures {
+        groups: vec![GroupLengths {
+            interface: "ram".into(),
+            name: "dq".into(),
+            longest_mm: mm,
+            nets: vec![NetLength {
+                net: "/DQ0".into(),
+                kicad_mm: mm,
+                low_mm: 41.5,
+                high_mm: 42.5,
+                miss_mm: miss,
+            }],
+        }],
+        pairs: vec![],
+        unmeasured: unmeasured.iter().map(|net| net.to_string()).collect(),
+        miss_mm,
+        probe_s: 0.1,
+    }
+}
+
+/// G2 stopped counting KiCad's own length and skew violations: against the unrouted
+/// board, a run with fewer of them than the baseline used to pass every gate, though
+/// the board still broke a rule; G4 counts them, absolute.
+#[test]
+fn g2_and_g4_split_kicads_length_violations() {
+    let b = base(&[("length_out_of_range", 3), ("clearance", 1)]);
+
+    // Before Row LT this run passed G2 (2 is not more than the baseline's 3), and
+    // nothing else failed: the board was called clean while breaking two rules.
+    let mut m = measures();
+    m.violations = rules(&[("length_out_of_range", 2), ("clearance", 1)]);
+    let g = gates(&m, &b);
+    assert!(g.g2.is_empty(), "G2 does not count the length keys: {g:?}");
+    assert_eq!(
+        g.g4,
+        vec!["KiCad: 2 length_out_of_range violation(s) of the board's own rules"]
+    );
+    assert!(!g.all_pass());
+
+    // More than the baseline has is no longer a G2 failure either: one gate, one breach.
+    m.violations = rules(&[("length_out_of_range", 4), ("skew_out_of_range", 1)]);
+    let g = gates(&m, &b);
+    assert!(g.g2.is_empty(), "{g:?}");
+    assert_eq!(g.g4.len(), 2);
+
+    // The other keys are G2's as before: a clearance over the baseline still fails G2.
+    m.violations = rules(&[("clearance", 2)]);
+    let g = gates(&m, &b);
+    assert_eq!(g.g2.len(), 1, "{g:?}");
+    assert!(g.g4.is_empty());
+
+    // Negative control: a run with none of them passes G4.
+    m.violations = rules(&[("clearance", 1)]);
+    assert!(gates(&m, &b).all_pass());
+}
+
+#[test]
+fn g4_fails_on_the_intents_lengths_and_names_the_net() {
+    let b = base(&[]);
+    let mut m = measures();
+    m.lengths = Some(length_measures(0.62, &[]));
+    let g = gates(&m, &b);
+    only(&g, 3);
+    assert_eq!(
+        g.g4[0],
+        "group 'dq' (ram): /DQ0 is 40.88 mm, 0.62 mm below its window 41.50\u{2013}42.50 mm"
+    );
+
+    // Everything inside its window: G4 passes.
+    m.lengths = Some(length_measures(0.0, &[]));
+    assert!(gates(&m, &b).all_pass());
+
+    // A checked net with no length fails G4 on its own.
+    m.lengths = Some(length_measures(0.0, &["/DQ0"]));
+    only(&gates(&m, &b), 3);
+
+    // Without length measures and without KiCad's own violations G4 is empty.
+    m.lengths = None;
+    assert!(gates(&m, &b).g4.is_empty());
 }
 
 #[test]
@@ -608,6 +704,19 @@ fn the_three_gates_are_judged_independently() {
 
 // --------------------------------------------------------------------- rank
 
+/// The key's positions (L10): G1, G2, G3, G4, intent miss, KiCad's violations, then
+/// `KEY_QUALITY` and the route seconds.
+const G4: usize = 3;
+const MISS: usize = 4;
+const KICAD: usize = 5;
+const ACUTE: usize = 6;
+const SIGNAL: usize = 7;
+const POWER: usize = 8;
+const RIGHT: usize = 9;
+const VIAS: usize = 10;
+const QUALITY: usize = 11;
+const SECONDS: usize = 12;
+
 #[derive(Clone)]
 struct Spec {
     failed: [bool; 3],
@@ -655,6 +764,7 @@ fn run(s: &Spec) -> Judged {
             g1: line(s.failed[0]),
             g2: line(s.failed[1]),
             g3: line(s.failed[2]),
+            g4: vec![],
         },
         board: PathBuf::new(),
         rounds: vec![],
@@ -675,11 +785,12 @@ fn the_key_of_a_lone_run_follows_the_documented_order() {
     s.vias = 4;
     s.quality = Some(80.4);
     s.seconds = 12.9;
-    // [G1, G2, G3, acute, signal step, power step, right angles, vias off pour,
-    //  -copper quality, route seconds]: a lone run is its own shortest (ratio 1, step 50).
+    // [G1, G2, G3, G4, intent miss, KiCad length violations, acute, signal step,
+    //  power step, right angles, vias off pour, -copper quality, route seconds]: a lone
+    //  run is its own shortest (ratio 1, step 50).
     assert_eq!(
         keys(&[s.clone()]),
-        vec![[0, 0, 0, 2, 50, 50, 3, 4, -80, 12]]
+        vec![[0, 0, 0, 0, 0, 0, 2, 50, 50, 3, 4, -80, 12]]
     );
 
     s.failed = [true, false, true];
@@ -729,18 +840,18 @@ fn lengths_are_compared_in_steps_against_the_shortest_judged_run() {
     b.signal = 100.5;
     b.power = 5.0;
     let ks = keys(&[a.clone(), b.clone()]);
-    assert_eq!(ks[0][4], ks[1][4], "same signal step");
-    assert_eq!(ks[0][4], 50);
-    assert_eq!(ks[1][5], 50);
-    assert_eq!(ks[0][5], 60);
+    assert_eq!(ks[0][SIGNAL], ks[1][SIGNAL], "same signal step");
+    assert_eq!(ks[0][SIGNAL], 50);
+    assert_eq!(ks[1][POWER], 50);
+    assert_eq!(ks[0][POWER], 60);
     assert!(ks[1] < ks[0], "the shorter power wins when signal ties");
 
     // 102 / 100: one step is 2 %: a different step.
     let mut c = spec();
     c.signal = 102.0;
     let ks = keys(&[spec(), c]);
-    assert_eq!(ks[0][4], 50);
-    assert_eq!(ks[1][4], 51);
+    assert_eq!(ks[0][SIGNAL], 50);
+    assert_eq!(ks[1][SIGNAL], 51);
 }
 
 #[test]
@@ -751,8 +862,8 @@ fn when_every_length_of_a_category_is_zero_its_step_is_zero() {
     let mut b = a.clone();
     b.acute = Some(3.0);
     for key in keys(&[a, b]) {
-        assert_eq!(key[4], 0, "signal step");
-        assert_eq!(key[5], 0, "power step");
+        assert_eq!(key[SIGNAL], 0, "signal step");
+        assert_eq!(key[POWER], 0, "power step");
     }
 }
 
@@ -761,9 +872,9 @@ fn a_run_with_none_of_a_category_among_runs_that_have_some_has_step_zero() {
     let mut none = spec();
     none.power = 0.0;
     let ks = keys(&[none, spec()]);
-    assert_eq!(ks[0][5], 0);
+    assert_eq!(ks[0][POWER], 0);
     assert_eq!(
-        ks[1][5], 50,
+        ks[1][POWER], 50,
         "the shortest run that has any is the reference"
     );
 }
@@ -775,7 +886,10 @@ fn a_measure_the_audit_did_not_give_sorts_last() {
     missing.right = None;
     missing.quality = None;
     let k = keys(&[missing])[0];
-    assert_eq!((k[3], k[6], k[8]), (i64::MAX, i64::MAX, i64::MAX));
+    assert_eq!(
+        (k[ACUTE], k[RIGHT], k[QUALITY]),
+        (i64::MAX, i64::MAX, i64::MAX)
+    );
 
     // Even a run with many acute corners sorts before a run with none known.
     let mut many = spec();
@@ -803,10 +917,10 @@ fn copper_quality_counts_in_whole_points_and_seconds_round_down() {
     b.quality = Some(89.6);
     b.seconds = 10.0;
     let ks = keys(&[a, b]);
-    assert_eq!(ks[0][8], -90);
-    assert_eq!(ks[1][8], -90, "89.6 rounds to 90 as well");
-    assert_eq!(ks[0][9], 10);
-    assert_eq!(ks[1][9], 10);
+    assert_eq!(ks[0][QUALITY], -90);
+    assert_eq!(ks[1][QUALITY], -90, "89.6 rounds to 90 as well");
+    assert_eq!(ks[0][SECONDS], 10);
+    assert_eq!(ks[1][SECONDS], 10);
 }
 
 #[test]
@@ -816,8 +930,149 @@ fn rank_returns_one_key_per_run_in_input_order() {
     worse.acute = Some(9.0);
     let ks = keys(&[worse, spec(), spec()]);
     assert_eq!(ks.len(), 3);
-    assert_eq!(ks[0][3], 9);
+    assert_eq!(ks[0][ACUTE], 9);
     assert_eq!(ks[1], ks[2]);
+}
+
+/// A judged run from `spec`, with Row LT's length parts set.
+fn run_with_lengths(
+    s: &Spec,
+    g4_failed: bool,
+    lengths: Option<crate::length_probe::LengthMeasures>,
+    violations: &[(&str, usize)],
+) -> Judged {
+    let mut judged = run(s);
+    if g4_failed {
+        judged.gates.g4 = vec!["failed".to_string()];
+    }
+    judged.measures.lengths = lengths;
+    judged.measures.violations = rules(violations);
+    judged
+}
+
+fn keys_of(runs: &[Judged]) -> Vec<Key> {
+    let refs: Vec<&Judged> = runs.iter().collect();
+    rank(&refs)
+}
+
+#[test]
+fn the_key_has_thirteen_places_and_the_quality_measures_are_named() {
+    assert_eq!(KEY_LEN, 13);
+    assert_eq!(keys(&[spec()])[0].len(), KEY_LEN);
+    // The six quality measures: acute corners to minus copper quality.
+    assert_eq!(KEY_QUALITY, ACUTE..QUALITY + 1);
+    let mut s = spec();
+    s.acute = Some(2.0);
+    s.right = Some(3.0);
+    s.vias = 4;
+    s.quality = Some(80.0);
+    let key = keys(&[s])[0];
+    assert_eq!(key[KEY_QUALITY], [2, 50, 50, 3, 4, -80]);
+    assert_eq!(key[VIAS], 4);
+    assert_eq!(key[SECONDS], 10);
+}
+
+/// Without a length group, a pair skew or a KiCad length rule, positions 3 to 5 are 0
+/// for every run, so the order is the one the key had before Row LT (the oracle
+/// `rank_before_the_pull_out` has those three places, 0, and nothing else).
+#[test]
+fn without_lengths_positions_three_to_five_are_zero_and_the_order_is_todays() {
+    let with = |change: &dyn Fn(&mut Spec)| {
+        let mut s = spec();
+        change(&mut s);
+        s
+    };
+    let specs = vec![
+        with(&|s| s.failed[2] = true),
+        spec(),
+        with(&|s| s.acute = Some(3.0)),
+        with(&|s| s.signal = 120.0),
+        with(&|s| s.vias = 2),
+        with(&|s| s.seconds = 99.0),
+        with(&|s| s.failed[0] = true),
+        with(&|s| s.quality = Some(10.0)),
+    ];
+    let ks = keys(&specs);
+    for key in &ks {
+        assert_eq!(key[G4..ACUTE], [0, 0, 0], "{key:?}");
+    }
+    let judged: Vec<Judged> = specs.iter().map(run).collect();
+    let refs: Vec<&Judged> = judged.iter().collect();
+    assert_eq!(ks, rank_before_the_pull_out(&refs));
+    // Dropping the three places leaves the old ten-entry key, in the old order.
+    let mut by_new: Vec<usize> = (0..ks.len()).collect();
+    by_new.sort_by_key(|&i| ks[i]);
+    let old = |key: &Key| -> Vec<i64> { key[..3].iter().chain(&key[ACUTE..]).copied().collect() };
+    let mut by_old: Vec<usize> = (0..ks.len()).collect();
+    by_old.sort_by_key(|&i| old(&ks[i]));
+    assert_eq!(by_new, by_old);
+}
+
+#[test]
+fn g4_ranks_after_g3_and_before_every_quality_measure() {
+    let clean = spec();
+    let mut few_corners = spec();
+    few_corners.acute = Some(0.0);
+    let mut many_corners = spec();
+    many_corners.acute = Some(50.0);
+    many_corners.signal = 300.0;
+    many_corners.seconds = 500.0;
+    let mut g3_failed = spec();
+    g3_failed.failed[2] = true;
+
+    let runs = vec![
+        run_with_lengths(&g3_failed, false, None, &[]),
+        // Fails G4, with the best quality measures.
+        run_with_lengths(&few_corners, true, Some(length_measures(0.3, &[])), &[]),
+        // Passes G4, with the worst.
+        run_with_lengths(&many_corners, false, Some(length_measures(0.0, &[])), &[]),
+        run_with_lengths(&clean, false, Some(length_measures(0.0, &[])), &[]),
+    ];
+    let ks = keys_of(&runs);
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by_key(|&i| ks[i]);
+    // clean, the long run that meets every length, the one that misses by 0.3 mm, and
+    // last the run that failed G3.
+    assert_eq!(order, vec![3, 2, 1, 0]);
+    assert_eq!(ks[1][G4], 1);
+    assert_eq!(ks[2][G4], 0);
+    assert_eq!(ks[1][MISS], 30);
+    // G3 weighs more than G4.
+    assert_eq!((ks[0][2], ks[0][G4]), (1, 0));
+}
+
+#[test]
+fn among_runs_that_miss_the_smaller_miss_ranks_first_then_fewer_kicad_violations() {
+    let s = spec();
+    let runs = vec![
+        run_with_lengths(&s, true, Some(length_measures(0.50, &[])), &[]),
+        run_with_lengths(&s, true, Some(length_measures(0.20, &[])), &[]),
+        // The same miss as the second, with two of KiCad's own violations.
+        run_with_lengths(
+            &s,
+            true,
+            Some(length_measures(0.20, &[])),
+            &[("length_out_of_range", 1), ("skew_out_of_range", 1)],
+        ),
+        // A checked net with no length: last of the runs that fail G4.
+        run_with_lengths(&s, true, Some(length_measures(0.0, &["/DQ0"])), &[]),
+        // Only KiCad's own rules, no intent: one violation.
+        run_with_lengths(&s, true, None, &[("length_out_of_range", 1)]),
+    ];
+    let ks = keys_of(&runs);
+    assert_eq!(ks[1][MISS], 20);
+    assert_eq!(ks[2][KICAD], 2);
+    assert_eq!(ks[3][MISS], i64::MAX);
+    assert_eq!(ks[4][KICAD], 1);
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by_key(|&i| ks[i]);
+    // No intent miss (4, with one KiCad violation) < 0.20 mm (1) < 0.20 mm with two
+    // KiCad violations (2) < 0.50 mm (0) < a net unmeasured (3).
+    assert_eq!(order, vec![4, 1, 2, 0, 3]);
+
+    // KiCad's violations count by key: the clearance key is not among them.
+    let run = run_with_lengths(&s, false, None, &[("clearance", 7)]);
+    assert_eq!(keys_of(&[run])[0][KICAD], 0);
 }
 
 // ------------------------------------------------------------------ measure
@@ -842,6 +1097,7 @@ fn context() -> JudgeContext {
             .collect(),
         root: PathBuf::from("/r"),
         kicad_config_home: None,
+        lengths: None,
     }
 }
 
@@ -1359,13 +1615,16 @@ fn a_run_that_fails_g1_does_not_set_the_length_reference() {
     degenerate.failed[0] = true;
 
     let ks = keys(&[a.clone(), b.clone(), degenerate]);
-    assert_eq!(ks[0][4], 50, "stepped against the complete runs' shortest");
-    assert_eq!(ks[1][4], 50);
+    assert_eq!(
+        ks[0][SIGNAL], 50,
+        "stepped against the complete runs' shortest"
+    );
+    assert_eq!(ks[1][SIGNAL], 50);
     assert!(ks[1] < ks[0], "so the vias off the pour decide: {ks:?}");
     // The two complete runs rank as they do without the degenerate one.
     let alone = keys(&[a, b]);
-    assert_eq!(alone[0][4..], ks[0][4..]);
-    assert_eq!(alone[1][4..], ks[1][4..]);
+    assert_eq!(alone[0][SIGNAL..], ks[0][SIGNAL..]);
+    assert_eq!(alone[1][SIGNAL..], ks[1][SIGNAL..]);
     // And the degenerate run is last, by G1.
     assert!(ks[2] > ks[0] && ks[2] > ks[1]);
 }
@@ -1379,8 +1638,8 @@ fn when_no_run_passes_g1_the_reference_is_the_shortest_of_all() {
     b.signal = 200.0;
     b.failed[0] = true;
     let ks = keys(&[a, b]);
-    assert_eq!(ks[0][4], 50);
-    assert_eq!(ks[1][4], 100);
+    assert_eq!(ks[0][SIGNAL], 50);
+    assert_eq!(ks[1][SIGNAL], 100);
 }
 
 // ------------------------------------------------- rank_measures (the pool)
@@ -1435,6 +1694,11 @@ fn rank_before_the_pull_out(judged: &[&Judged]) -> Vec<Key> {
                 i64::from(!g.g1.is_empty()),
                 i64::from(!g.g2.is_empty()),
                 i64::from(!g.g3.is_empty()),
+                // Row LT: G4, the intent miss and KiCad's length violations are 0 for
+                // every run that checks no length.
+                0,
+                0,
+                0,
                 whole(m.acute),
                 step(m.signal_mm, shortest_signal),
                 step(m.power_mm, shortest_power),
@@ -1513,10 +1777,13 @@ fn a_short_run_that_fails_g1_does_not_set_the_steps_of_rank_measures() {
     short_failed.failed[0] = true;
     let ks = pooled(&[(spec(), true), (short_failed, true)]);
     assert_eq!(
-        ks[0][4], 50,
+        ks[0][SIGNAL], 50,
         "stepped against the complete run's own length"
     );
-    assert_eq!(ks[1][4], 1, "1 / 100 is a step of 0.5, which rounds to 1");
+    assert_eq!(
+        ks[1][SIGNAL], 1,
+        "1 / 100 is a step of 0.5, which rounds to 1"
+    );
     assert_eq!(ks[1][0], 1, "and it fails G1");
 }
 
@@ -1529,17 +1796,17 @@ fn a_short_run_outside_the_pool_does_not_set_the_length_steps() {
     let outside = pooled(&[(spec(), true), (short.clone(), false)]);
     let inside = pooled(&[(spec(), true), (short, true)]);
     assert_eq!(
-        outside[0][4..6],
+        outside[0][SIGNAL..POWER + 1],
         [50, 50],
         "the pool's run is its own reference"
     );
     assert_eq!(
-        inside[0][4..6],
+        inside[0][SIGNAL..POWER + 1],
         [500, 500],
         "in the pool, the short run is the reference"
     );
     // The run outside the pool still has a key, stepped against the pool: below 50.
-    assert_eq!(outside[1][4..6], [5, 5]);
+    assert_eq!(outside[1][SIGNAL..POWER + 1], [5, 5]);
     assert!(
         outside[1] < outside[0],
         "shorter, so it ranks above, and sets nothing"
@@ -1564,15 +1831,15 @@ fn rank_measures_falls_back_by_the_pool_then_to_every_run() {
         (mid_failed.clone(), true),
         (long_failed.clone(), true),
     ]);
-    assert_eq!(ks[1][4], 50);
-    assert_eq!(ks[2][4], 100);
-    assert_eq!(ks[0][4], 25, "50 / 100 / 0.02");
+    assert_eq!(ks[1][SIGNAL], 50);
+    assert_eq!(ks[2][SIGNAL], 100);
+    assert_eq!(ks[0][SIGNAL], 25, "50 / 100 / 0.02");
 
     // Nothing is in the pool: the shortest of every run (50).
     let ks = pooled(&[(short_ok, false), (mid_failed, false), (long_failed, false)]);
-    assert_eq!(ks[0][4], 50);
-    assert_eq!(ks[1][4], 100);
-    assert_eq!(ks[2][4], 200);
+    assert_eq!(ks[0][SIGNAL], 50);
+    assert_eq!(ks[1][SIGNAL], 100);
+    assert_eq!(ks[2][SIGNAL], 200);
 
     assert!(rank_measures(&[]).is_empty());
 }
@@ -1604,10 +1871,12 @@ fn measures_and_gates_survive_a_round_trip() {
     m.longest_below_mm = BTreeMap::from([("VCC".to_string(), 1.5)]);
     m.stitching_vias = 4;
     m.route_s = 12.25;
+    m.lengths = Some(length_measures(0.62, &["/DQ9"]));
     let g = Gates {
         g1: vec!["3 unconnected item(s)".to_string()],
         g2: vec![],
         g3: vec!["VCC: a 1.50 mm stretch".to_string(), "another".to_string()],
+        g4: vec!["group 'dq' (ram): /DQ0 is 40.88 mm".to_string()],
     };
 
     let text = serde_json::to_string(&json!({ "measures": m, "gates": g })).unwrap();
@@ -1620,6 +1889,22 @@ fn measures_and_gates_survive_a_round_trip() {
     assert_eq!(m_back.acute, None);
     assert_eq!(m_back.copper_quality, None);
     assert_eq!(m_back.narrow_paths, None);
+}
+
+/// A record written before Row LT has neither `lengths` nor `g4`: it still reads, and
+/// a run with no length measures does not write the field.
+#[test]
+fn a_record_from_before_row_lt_still_reads() {
+    let m = measures();
+    let mut value = serde_json::to_value(&m).unwrap();
+    assert!(value.get("lengths").is_none(), "{value}");
+    value.as_object_mut().unwrap().remove("lengths");
+    let back: Measures = serde_json::from_value(value).unwrap();
+    assert_eq!(back.lengths, None);
+
+    let old: Gates = serde_json::from_value(json!({ "g1": [], "g2": ["x"], "g3": [] })).unwrap();
+    assert_eq!(old.g4, Vec::<String>::new());
+    assert!(!old.all_pass());
 }
 
 // ------------------------------------------------------- the private KiCad settings
@@ -2104,6 +2389,221 @@ exit 0
         );
         // Same violations as the baseline: G2 is quiet.
         assert!(judged.gates.g2.is_empty(), "{:?}", judged.gates);
+    }
+
+    /// The fake kicad-cli's report of the length probe: one `length_out_of_range` entry
+    /// for each `(net, mm)`, rule `n` for the n-th, its item naming the net.
+    fn probe_json(entries: &[(&str, f64)]) -> String {
+        json!({
+            "violations": entries
+                .iter()
+                .enumerate()
+                .map(|(index, (net, mm))| json!({
+                    "type": "length_out_of_range",
+                    "severity": "error",
+                    "description": format!(
+                        "Track length out of range (rule '__konnect_len_{:04}' min length 2000.0000 mm; actual {mm:.4} mm)",
+                        index + 1
+                    ),
+                    "items": [{ "description": format!("Track [{net}] on F.Cu, length 3 mm") }]
+                }))
+                .collect::<Vec<_>>(),
+            "unconnected_items": [],
+        })
+        .to_string()
+    }
+
+    fn dq_checks(nets: &[&str]) -> Arc<crate::length_probe::LengthChecks> {
+        use crate::length_probe::{CheckedGroup, LengthChecks};
+        Arc::new(LengthChecks {
+            groups: vec![CheckedGroup {
+                interface: "ram".into(),
+                name: "dq".into(),
+                nets: nets.iter().map(|net| net.to_string()).collect(),
+                window: crate::tools::route_lengths::Window::Target {
+                    target_mm: 40.0,
+                    tolerance_mm: 0.5,
+                },
+            }],
+            pairs: vec![],
+            board_rules: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_judge_probes_the_checked_nets_on_the_last_board_and_gates_on_them() {
+        // Call 1 is the baseline, 2 the routed board's refill, 3 the length probe.
+        let mut h = harness(
+            &[],
+            drc_json(&[], &[]),
+            &[(3, probe_json(&[("GND", 40.2), ("VCC", 39.0)]))],
+        );
+        h.ctx.lengths = Some(dq_checks(&["GND", "VCC"]));
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+
+        let lengths = judged.measures.lengths.as_ref().expect("the probe ran");
+        assert_eq!(lengths.groups[0].nets[0].kicad_mm, Some(40.2));
+        assert_eq!(lengths.groups[0].nets[0].miss_mm, 0.0);
+        assert!(
+            (lengths.groups[0].nets[1].miss_mm - 0.5).abs() < 1e-9,
+            "39.0 against 39.5"
+        );
+        assert!((lengths.miss_mm - 0.5).abs() < 1e-9);
+        // G4 names the short net; the other gates are quiet.
+        assert!(judged.gates.g2.is_empty(), "{:?}", judged.gates);
+        assert_eq!(judged.gates.g4.len(), 1, "{:?}", judged.gates);
+        assert!(
+            judged.gates.g4[0].contains("VCC is 39.00 mm"),
+            "{:?}",
+            judged.gates
+        );
+        assert!(!judged.gates.all_pass());
+
+        // The probe's copy, in the run's folder next to the judged board's folders.
+        let folder = h.run_dir().join("lengths");
+        assert_eq!(
+            std::fs::read_to_string(folder.join(board_name())).unwrap(),
+            std::fs::read_to_string(&judged.board).unwrap()
+        );
+        let rules =
+            std::fs::read_to_string(folder.join("specctra_rounded_board.kicad_dru")).unwrap();
+        assert_eq!(
+            rules,
+            crate::length_probe::probe_rules_text(&lengths_nets(&["GND", "VCC"]))
+        );
+
+        // Three kicad-cli runs; the probe is the third, on the run's own settings
+        // copy, with no refill and no save.
+        let calls = h.calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        let own = h.own_config("run-0");
+        assert_eq!(
+            calls[2],
+            format!(
+                "KICAD_CONFIG_HOME={own} pcb drc --output {} --format json --units mm {}",
+                folder.join("specctra_rounded_board.length.json").display(),
+                folder.join(board_name()).display()
+            )
+        );
+        // The own copy is gone once the judge is done.
+        assert!(!h.ctx.root.join("kicad-config/run-0").exists());
+    }
+
+    fn lengths_nets(nets: &[&str]) -> Vec<String> {
+        nets.iter().map(|net| net.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_judge_with_nothing_to_check_runs_no_probe() {
+        for checks in [
+            None,
+            Some(Arc::new(crate::length_probe::LengthChecks::default())),
+        ] {
+            let mut h = harness(&[], drc_json(&[], &[]), &[]);
+            h.ctx.lengths = checks;
+            let base = baseline(&h.ctx).await.unwrap();
+            let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+            let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+            assert_eq!(judged.measures.lengths, None);
+            assert!(judged.gates.g4.is_empty());
+            assert_eq!(h.calls().len(), 2, "the baseline and the routed board only");
+            assert!(!h.run_dir().join("lengths").exists());
+        }
+    }
+
+    /// The scratch copy's project a judged run used.
+    fn judged_project(h: &Harness) -> Value {
+        let text = std::fs::read_to_string(h.run_dir().join("r0/specctra_rounded_board.kicad_pro"))
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_board_with_length_rules_is_judged_on_a_project_that_reports_them() {
+        const OWN: &str = r#"{"board": {"design_settings": {"rule_severities": {"length_out_of_range": "ignore", "skew_out_of_range": "ignore", "clearance": "ignore"}}}}"#;
+        for (board_rules, wanted) in [(true, "error"), (false, "ignore")] {
+            let mut h = harness(&[], drc_json(&[], &[]), &[]);
+            let source = h.ctx.board.with_extension("kicad_pro");
+            std::fs::write(&source, OWN).unwrap();
+            // The export of a board with a project file records its hash.
+            let mut manifest: Value = serde_json::from_str(&h.ctx.manifest_text).unwrap();
+            manifest["routing_context"] = json!({
+                "project_sha256": format!("{:x}", Sha256::digest(OWN.as_bytes())),
+                "custom_rules_sha256": null,
+                "effective_rules_sha256": "0",
+            });
+            h.ctx.manifest_text = manifest.to_string();
+            // No group or pair: the board's rules alone make the checks.
+            h.ctx.lengths = Some(Arc::new(crate::length_probe::LengthChecks {
+                board_rules,
+                ..Default::default()
+            }));
+            let base = baseline(&h.ctx).await.unwrap();
+            let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+            let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+            let severities = &judged_project(&h)["board"]["design_settings"]["rule_severities"];
+            assert_eq!(severities["length_out_of_range"], wanted, "{board_rules}");
+            assert_eq!(severities["skew_out_of_range"], wanted, "{board_rules}");
+            // Another check keeps the project's own setting; G2 and the probe are not asked.
+            assert_eq!(severities["clearance"], "ignore");
+            assert_eq!(h.calls().len(), 2, "the baseline and the routed board only");
+            assert!(judged.measures.lengths.is_none() && judged.gates.g4.is_empty());
+            // The owner's project is never written.
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), OWN);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_cannot_be_trusted_fails_the_judge() {
+        // The same net reported twice.
+        let mut h = harness(
+            &[],
+            drc_json(&[], &[]),
+            &[(3, probe_json(&[("GND", 40.0), ("GND", 40.0)]))],
+        );
+        h.ctx.lengths = Some(dq_checks(&["GND"]));
+        // One rule was written; the second entry names rule 2, which was not.
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planner"));
+        let error = judge_with(&h.ctx, &h.routed, &base, &tools)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("length probe"), "{error:#}");
+    }
+
+    /// The call's own KiCad rules are G4's: a run with fewer `length_out_of_range`
+    /// violations than the unrouted board has used to pass G2 and be called complete.
+    #[tokio::test]
+    async fn kicads_own_length_violations_fail_g4_and_not_g2_in_the_judge() {
+        let mut h = harness(
+            &[],
+            drc_json(
+                &[],
+                &[
+                    "length_out_of_range",
+                    "length_out_of_range",
+                    "length_out_of_range",
+                ],
+            ),
+            &[(
+                2,
+                drc_json(&[], &["length_out_of_range", "length_out_of_range"]),
+            )],
+        );
+        h.ctx.lengths = None;
+        let base = baseline(&h.ctx).await.unwrap();
+        assert_eq!(base.violations, rules(&[("length_out_of_range", 3)]));
+        let tools = Scripted::new(&h, |_| panic!("no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert!(judged.gates.g2.is_empty(), "{:?}", judged.gates);
+        assert_eq!(
+            judged.gates.g4,
+            vec!["KiCad: 2 length_out_of_range violation(s) of the board's own rules"]
+        );
+        // And no probe ran: nothing from the intent is checked.
+        assert_eq!(h.calls().len(), 2);
     }
 
     #[tokio::test]

@@ -61,6 +61,7 @@ fn measures(unconnected: usize, signal_mm: f64) -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 10.0,
+        lengths: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn open_gates() -> Gates {
         g1: Vec::new(),
         g2: Vec::new(),
         g3: Vec::new(),
+        g4: Vec::new(),
     }
 }
 
@@ -571,6 +573,17 @@ fn a_pair_whose_pads_are_missing_is_a_violation() {
 
 // ─── The rank key ────────────────────────────────────────────────────────────
 
+/// The key's positions: P, not routed, G1, unconnected, G2, G3, then Row LT's G4,
+/// intent miss and KiCad's length violations, decoupling, connectors, the routing
+/// key's quality measures (`route_judge::KEY_QUALITY`), silk, minus the score.
+const G4: usize = 6;
+const MISS: usize = 7;
+const KICAD: usize = 8;
+const ACUTE: usize = 11;
+const SIGNAL: usize = 12;
+const SILK: usize = 17;
+const SCORE: usize = 18;
+
 #[test]
 fn a_shorter_candidate_with_an_open_connection_ranks_below_a_complete_one() {
     let complete_long = complete(1, 200.0);
@@ -582,7 +595,7 @@ fn a_shorter_candidate_with_an_open_connection_ranks_below_a_complete_one() {
     );
     let keys = rank(&[&complete_long, &open_short]);
     // The open one is shorter: its length step is the smaller.
-    assert!(keys[1][9] < keys[0][9], "{keys:?}");
+    assert!(keys[1][SIGNAL] < keys[0][SIGNAL], "{keys:?}");
     // But it left connections open, and that comes first.
     assert_eq!((keys[0][3], keys[1][3]), (0, 2));
     assert!(keys[0] < keys[1]);
@@ -609,6 +622,7 @@ fn each_gate_has_its_own_slot_in_the_key() {
                     g1: line(g1),
                     g2: line(g2),
                     g3: line(g3),
+                    g4: Vec::new(),
                 },
             ),
         )
@@ -657,7 +671,7 @@ fn an_illegal_placement_does_not_set_the_length_steps() {
     assert_eq!(with[2][0], 1);
     assert!(with[2] > with[0] && with[2] > with[1]);
     assert_eq!(
-        with[2][9], 25,
+        with[2][SIGNAL], 25,
         "50 mm against the 100 mm reference of the legal pool"
     );
 
@@ -672,6 +686,7 @@ fn an_illegal_placement_does_not_set_the_length_steps() {
                 g1: vec!["5 open".into()],
                 g2: Vec::new(),
                 g3: Vec::new(),
+                g4: Vec::new(),
             },
         ),
     );
@@ -700,7 +715,7 @@ fn the_pool_is_the_candidates_that_pass_p1_p2_and_g1() {
         routed(measures(0, 150.0), open_gates()),
     );
     let keys = rank(&[&a, &b]);
-    assert!(keys[0][9] < keys[1][9], "{keys:?}");
+    assert!(keys[0][SIGNAL] < keys[1][SIGNAL], "{keys:?}");
     // A P2 failure alone also keeps a run out of the pool.
     let p2_failed = judged(
         3,
@@ -713,7 +728,7 @@ fn the_pool_is_the_candidates_that_pass_p1_p2_and_g1() {
     );
     let ok = complete(4, 100.0);
     let keys = rank(&[&ok, &p2_failed]);
-    assert_eq!(keys[0][9], 50, "100 mm against itself is step 1/0.02");
+    assert_eq!(keys[0][SIGNAL], 50, "100 mm against itself is step 1/0.02");
 }
 
 #[test]
@@ -722,7 +737,10 @@ fn a_decoupling_violation_ranks_below_any_longer_route() {
     let mut short_but_wrong = complete(2, 100.0);
     short_but_wrong.screen.decoupling_violations = 1;
     let keys = rank(&[&long_but_right, &short_but_wrong]);
-    assert!(keys[1][9] < keys[0][9], "the violating one is shorter");
+    assert!(
+        keys[1][SIGNAL] < keys[0][SIGNAL],
+        "the violating one is shorter"
+    );
     assert!(keys[0] < keys[1]);
     // Likewise a connector violation.
     let mut wrong_connector = complete(3, 100.0);
@@ -762,6 +780,7 @@ fn an_unrouted_candidate_ranks_below_every_routed_one() {
             g1: Vec::new(),
             g2: vec!["g2".into()],
             g3: vec!["g3".into()],
+            g4: Vec::new(),
         },
     );
     let no_winner = judged(
@@ -794,7 +813,10 @@ fn an_unrouted_candidate_ranks_below_every_routed_one() {
     assert_eq!(keys[0][1], 0);
     assert!(keys[2..].iter().all(|k| k[1] == 1));
     assert_eq!(keys[2][3], i64::MAX);
-    assert_eq!(keys[2][8..14], [i64::MAX; 6]);
+    assert_eq!(keys[2][ACUTE..SILK], [i64::MAX; 6]);
+    // So is the length part of the key (G4, the miss and KiCad's violations) of a run that is
+    // not routed.
+    assert_eq!(keys[2][G4..G4 + 3], [i64::MAX; 3]);
     assert_eq!(
         order(&[&failed, &not_routed, &no_winner, &failed_gates, &routed_one]),
         vec![1, 2, 3, 4, 5]
@@ -821,12 +843,111 @@ fn the_key_ends_with_silk_and_the_score() {
     let mut unknown = complete(3, 100.0);
     unknown.silk = None;
     let keys = rank(&[&quiet, &noisy, &unknown]);
-    assert_eq!((keys[0][14], keys[1][14], keys[2][14]), (0, 4, i64::MAX));
+    assert_eq!(
+        (keys[0][SILK], keys[1][SILK], keys[2][SILK]),
+        (0, 4, i64::MAX)
+    );
     assert_eq!(order(&[&unknown, &noisy, &quiet]), vec![1, 2, 3]);
     let mut scored = complete(4, 100.0);
     scored.screen.score = 99;
-    assert_eq!(rank(&[&scored])[0][15], -99);
+    assert_eq!(rank(&[&scored])[0][SCORE], -99);
     assert_eq!(order(&[&quiet, &scored]), vec![4, 1]);
+}
+
+/// A routed candidate whose run has Row LT's length parts.
+fn routed_with_lengths(
+    id: usize,
+    signal_mm: f64,
+    g4_failed: bool,
+    miss_mm: f64,
+    kicad_violations: usize,
+) -> Judged {
+    let mut m = measures(0, signal_mm);
+    m.violations = BTreeMap::from([("length_out_of_range".to_string(), kicad_violations)]);
+    m.lengths = Some(crate::length_probe::LengthMeasures {
+        groups: vec![],
+        pairs: vec![],
+        unmeasured: vec![],
+        miss_mm,
+        probe_s: 0.0,
+    });
+    let mut gates = open_gates();
+    if g4_failed {
+        gates.g4 = vec!["a net is outside its window".into()];
+    }
+    judged(id, plain_screen(), passing(), routed(m, gates))
+}
+
+#[test]
+fn the_length_part_of_the_key_sits_after_g3_and_before_the_placement_measures() {
+    // Without lengths, the three places are 0 for a routed candidate.
+    let plain = complete(1, 100.0);
+    assert_eq!(rank(&[&plain])[0][G4..G4 + 3], [0, 0, 0]);
+
+    let clean = routed_with_lengths(1, 100.0, false, 0.0, 0);
+    let missing = routed_with_lengths(2, 100.0, true, 0.37, 2);
+    let keys = rank(&[&clean, &missing]);
+    assert_eq!(keys[0][G4..G4 + 3], [0, 0, 0]);
+    assert_eq!(keys[1][G4], 1);
+    assert_eq!(keys[1][MISS], 37);
+    assert_eq!(keys[1][KICAD], 2);
+    // They are the routing key's own (`route_judge::rank_measures`).
+    let routing = rank_measures(&[
+        (&measures_of(&clean), &gates_of(&clean), true),
+        (&measures_of(&missing), &gates_of(&missing), true),
+    ]);
+    assert_eq!(keys[1][G4..G4 + 3], routing[1][3..6]);
+    assert_eq!(
+        keys[1][ACUTE..SILK],
+        routing[1][crate::route_judge::KEY_QUALITY]
+    );
+
+    // A candidate that is not routed has none of them.
+    let not_routed = judged(
+        3,
+        plain_screen(),
+        passing(),
+        RouteResult::NotRouted {
+            why: "screened_out",
+        },
+    );
+    assert_eq!(rank(&[&not_routed])[0][G4..G4 + 3], [i64::MAX; 3]);
+}
+
+fn measures_of(run: &Judged) -> Measures {
+    match &run.route {
+        RouteResult::Routed { measures, .. } => measures.clone(),
+        other => panic!("not routed: {other:?}"),
+    }
+}
+
+fn gates_of(run: &Judged) -> Gates {
+    match &run.route {
+        RouteResult::Routed { gates, .. } => gates.clone(),
+        other => panic!("not routed: {other:?}"),
+    }
+}
+
+#[test]
+fn a_candidate_that_meets_every_length_beats_a_shorter_one_that_misses() {
+    let long_but_right = routed_with_lengths(1, 400.0, false, 0.0, 0);
+    let short_but_missing = routed_with_lengths(2, 100.0, true, 0.2, 0);
+    let keys = rank(&[&long_but_right, &short_but_missing]);
+    assert!(
+        keys[1][SIGNAL] < keys[0][SIGNAL],
+        "the missing one is shorter"
+    );
+    assert!(keys[0] < keys[1]);
+    // Lengths come before the placement requirements: a decoupling violation with
+    // every length met still beats a clean candidate that fails G4.
+    let mut wrong_decoupling = routed_with_lengths(3, 100.0, false, 0.0, 0);
+    wrong_decoupling.screen.decoupling_violations = 1;
+    assert_eq!(order(&[&short_but_missing, &wrong_decoupling]), vec![3, 2]);
+    // Among those that miss, the smaller miss and then the fewer KiCad violations.
+    let a = routed_with_lengths(4, 100.0, true, 0.5, 0);
+    let b = routed_with_lengths(5, 100.0, true, 0.2, 3);
+    let c = routed_with_lengths(6, 100.0, true, 0.2, 1);
+    assert_eq!(order(&[&a, &b, &c]), vec![6, 5, 4]);
 }
 
 #[test]
@@ -844,15 +965,16 @@ fn rank_reads_the_routing_key_through_rank_measures() {
         routed(m.clone(), open_gates()),
     );
     let key = rank(&[&run])[0];
-    assert_eq!(key[8], 3);
-    assert_eq!(key[11], 4);
-    assert_eq!(key[12], 5);
-    assert_eq!(key[13], -77);
+    assert_eq!(key[ACUTE], 3);
+    assert_eq!(key[ACUTE + 3], 4, "right angles");
+    assert_eq!(key[ACUTE + 4], 5, "vias off the pour nets");
+    assert_eq!(key[ACUTE + 5], -77, "minus copper quality");
     let direct = rank_measures(&[(&m, &open_gates(), true)])[0];
-    assert_eq!(key[8..14], direct[3..9]);
+    // The placement key copies the routing key's quality measures by `KEY_QUALITY`.
+    assert_eq!(key[ACUTE..SILK], direct[crate::route_judge::KEY_QUALITY]);
     // A measure the audit did not give sorts last.
     let mut unknown = m;
     unknown.acute = None;
     let run = judged(2, plain_screen(), passing(), routed(unknown, open_gates()));
-    assert_eq!(rank(&[&run])[0][8], i64::MAX);
+    assert_eq!(rank(&[&run])[0][ACUTE], i64::MAX);
 }

@@ -768,6 +768,7 @@ fn judged(acute: f64, g1_failed: bool) -> Judged {
             longest_below_mm: BTreeMap::new(),
             stitching_vias: 0,
             route_s: 1.0,
+            lengths: None,
         },
         gates: Gates {
             g1: if g1_failed {
@@ -777,6 +778,7 @@ fn judged(acute: f64, g1_failed: bool) -> Judged {
             },
             g2: Vec::new(),
             g3: Vec::new(),
+            g4: Vec::new(),
         },
         board: PathBuf::from("/nonexistent/judged.kicad_pcb"),
         rounds: Vec::new(),
