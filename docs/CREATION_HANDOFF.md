@@ -93,7 +93,7 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 
 ## Next: what to pick
 
-**Now (2026-11-21, Row CP).** The convergent placement search (family C in the placement bench) is built on `claude/convergent-placement-design` and is being measured; the owner started the row on 2026-11-20. On a copy of his board, C's best placement ranks first and beats his own. See "Row CP" for what is verified and what is still open. Four limits it found are handed to Codex as "Row CL": start there if you are Codex.
+**Now (2026-11-21, Row CP).** The convergent placement search (family C in the placement bench) is built and measured on `claude/convergent-placement-design` (local only, no PR), and stopped there on the owner's word on 2026-11-21 before the fix round, mutants, the final gate and the PR text. On copies of two of his boards, C's best placement ranks first and beats his own. See "Row CP" for what is verified and what is still open. Four limits it found are handed to Codex as "Row CL": start there if you are Codex.
 
 **Before (2026-11-20).** No row is in progress. Row DP merged as [#93](https://github.com/yuvaltal912-sys/Konnect/pull/93) (main `d758fbab`, a noreply merge whose tree equals the PR head `bd8a009a`). Row PS's changes since #92 (the schematic-neighbour measure D23, generators 7 and 8, the routing record's pair fields) merged as [#94](https://github.com/yuvaltal912-sys/Konnect/pull/94) (main `a68a0fa7`, a noreply merge whose tree equals the PR head `503ba63f`). Row LT (length tuning) is designed on branch `claude/length-tuning-design-674041` (`docs/LENGTH_TUNING_DESIGN.md` on that branch, not on this one); the owner approved its three decisions on 2026-11-20, and the build waits for his word. See "Row PS" and "Row DP". Still open: Row RJ's first live run.
 
@@ -291,7 +291,7 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 ## Row CP, the convergent placement search (family C)
 
-**State, 2026-11-21.** In progress on `claude/convergent-placement-design`, from `fork/main` `0a3fc504`: built, reviewed once, and measured on a copy of the owner's board. Nothing is pushed and there is no PR. Design: [`CONVERGENT_PLACEMENT_DESIGN.md`](CONVERGENT_PLACEMENT_DESIGN.md). The owner approved it with its three decisions as recommended on 2026-11-20 ("כן, כמומלץ") and started the build the same day ("תתחיל בבניית ההצבה"). He asked for Opus 5.5 (high) agents to write the bodies from the design's skeletons; the supervising session runs on Claude Fable 5.2.
+**State, 2026-11-21, evening.** Stopped on the owner's word, on `claude/convergent-placement-design`, from `fork/main` `0a3fc504`: built, reviewed twice, and measured on copies of two of the owner's boards with routing. Not yet through the fix round, mutants, the final gate or a PR (see "Not done" below). Nothing is pushed and there is no PR. Design: [`CONVERGENT_PLACEMENT_DESIGN.md`](CONVERGENT_PLACEMENT_DESIGN.md). The owner approved it with its three decisions as recommended on 2026-11-20 ("כן, כמומלץ") and started the build the same day ("תתחיל בבניית ההצבה"). He asked for Opus 5.5 (high) agents to write the bodies from the design's skeletons; the supervising session runs on Claude Fable 5.2.
 
 **What it is.** A fourth family, C (`converge`), in the placement bench of Row PS. It has one cost per placement, a search that refines the candidates of F and S while the cost falls, and three stop rules that read the cost and nothing else: for a run, for the starts and for the effort. It adds no tool, no apply path and no registry change.
 
@@ -336,9 +336,22 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **Owner decision, 2026-11-21:** the bench of step 4 runs on two boards, B5 and B6, not three ("אנחנו מריצים על 2 לוחות עכשיו לא על 3"; he chose the two). B4 gets no bench run in this row.
 
-**Not verified yet.** An independent review of the changes after `60c9be73` (the performance pass, the fix round, the amendments); mutants on the guards; the gate on the final commit.
+- **The independent review of `60c9be73..HEAD`** (a Sonnet 5.5 agent that wrote none of it, read-only, nothing built or run; private record `reports/review-final.md`): **no finding of the first rank** (no wrong result, hang, panic or private data in an output). It confirms that the cell skipping of the performance pass gives the cell a full ring-order test gives, that `legal_at`'s reordering changes no verdict, that A1 and A2 are built as written with nothing of the old estimate left, and that nothing depends on the thread count, hash order or time. Its findings are **not fixed yet**:
+  - B1: the silk switch calls `place_route::unrouted_check`, which does not require the DRC report's unconnected-items category as the bench's own baseline (`route_judge::baseline`) does; a degraded report could be recorded as 0 silk entries with no reason.
+  - B2: `GENERATOR_VERSION` stays 9 although family C's output for one recipe changed with A1 and A2; an old C record fails `rerun` at the board hash, not at the version.
+  - Tests: the nearest-legal-cell equivalence test builds its precondition into itself; making room has no cell-by-cell comparison; the run goldens were recorded again on the new code, so they freeze behaviour and do not prove it; the goldens' bits depend on `exp`, `ln` and `powf` and may differ on Linux or Windows; no test of `silk_check` (it needs a real kicad-cli) or of the NaN path in `legal_at`.
+  - Small: a silk check that fails for every run still ends as a passing test; a failure in `isolated_context` loses the search result; `first_legal_cell` wants an assert that its span is at most 64; README wording.
 
-**Next:** (1) done in `521c1ac9`: `KONNECT_CONVERGE_SILK=1` on `converge_check` writes each C run's board to scratch and counts its silk entries with the bench's own check, for the paired reading of A3; to validate against the bench's recorded silk on the owner's board; (2) to (3) done, see above; (4) the independent review, mutants on the guards and the gate. The row is done when the design's answers are filled for every board and the exact PR title and body are with the owner.
+**Stopped here on the owner's word, 2026-11-21 ("תתעד הכל, תסגור את הדברים שפתוחים ואל תתחיל דברים חדשים").** Everything above is committed on the branch; nothing is pushed and there is no PR. No process of this row is running and it holds no lane lock.
+
+**Not done.**
+- **The fix round** for the review's findings above.
+- **Mutants on the guards: none ran.** The agent waited an hour for the heavy lane and never got it (other sessions held it in turn, with gaps shorter than the driver's 30 s poll). Its plan is ready in the private record `reports/mutants.md`: eight chunks of at most 90 mutants, about 560 in all, with the command for each, over `Legality::legal_at` and `clear_of` with their helpers, `CostModel::legal`, `make_room`, `first_legal_cell` and `delta`, the first temperature, annealing and descent with their stop conditions, `repair`, `starts_stop`, `effort_stop`, `Trace::converged`, `OuterRule::pays`, `routing_order`, `silk_entries` and the starts' order.
+- **The gate on the final commit.** The last full gate is the baseline on `ff01d66e`; since then only the scoped runs recorded above (`--lib place_` on `521c1ac9`: 346 passed, 0 failed, 7 ignored). The `konnect` crate's guard tests `asset_references` and `schema_parameter_usage` have not run on this branch.
+- **The PR's title and body**, and so the owner's yes to them.
+- A bench run on B6 and B4 (see "Row CL"), and the verify worktree's build output, which is still on disk (`.claude/worktrees/convergent-placement-verify`, detached at `71c7e2f4`).
+
+**Next,** each on the owner's word: (1) the fix round, with a test and a negative control for B1; (2) the mutants by the prepared chunks, at a time when the heavy lane is free, and tests for the real gaps they show; (3) the full gate on the resulting commit, with the installed binary's SHA-256 checked; (4) the exact PR title and body to the owner. The PR must say plainly: the first port check failed (1259.8 against 1245) and passed after A1 and A2 (1206.1); the terms question and A3; the five limits in the design; two boards routed, one with an A reference.
 
 ## Row CL, four limits found by Row CP (handed to Codex, 2026-11-21)
 
