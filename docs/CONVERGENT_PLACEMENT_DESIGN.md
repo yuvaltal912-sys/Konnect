@@ -8,7 +8,9 @@ directly. The owner approved its three decisions as recommended the same day ("�
 then started the build ("תתחיל בבניית ההצבה") with Opus 5.5 (high) agents writing the bodies, as
 he asked. The text below is the design as it was approved, with two decisions amended after the
 first measurement (C4's attraction grid and C5's first temperature: see "Amendments after the
-first measurement") and three rows of the tests table corrected. No board of his was written.
+first measurement"), one measurement question given a paired reading (A3, in the same section)
+and three rows of the tests table corrected. The answers measured so far are under "The answers
+on the owner's board". No board of his was written.
 
 ## The design on one page
 
@@ -216,6 +218,41 @@ was fixed, and the wider sweeps are in the row's records.
 Also learned on the way, with no change to the design: on the public demo board and on the
 owner's, the run at effort level 1 did not pay against level 0, so the rule for effort stopped
 after one level; it reads one run per level, which is a noisy reading (C7's own caution).
+
+### A3: the question about the new terms is read in pairs
+
+Fixed on 2026-11-21, after the two bench runs on the owner's board (steps 2 and 3) and before
+any paired run existed.
+
+"Do the new terms earn their place?" did not say which candidates it compares. Read as the bench
+reads a family, by its best routed candidate, the silk half **fails** on the owner's board: 172
+silk entries with the terms on against 154 with them off. The other two halves pass: 3 parts
+pulled away against 5, and 1336.7 mm of routed signal against 1359.2.
+
+That reading compares two different placements, from two different starts, and the spread
+between starts is wider than the difference it found: the four routed C candidates have 158 to
+172 silk entries with the terms on, and 154 to 189 with them off. On the two starts that both
+runs routed at level 0, the terms on gave fewer entries both times (161 against 176, and 172
+against 189). So that reading settles the question in neither direction, and no weight is
+changed on it.
+
+From here on the question is read in pairs. It needs no routing call, because silk entries and
+parts pulled away are measures of the placement: the bench reads both on a candidate's board
+before it is routed.
+
+- **A pair** is one start that the search takes at level 0 both with the terms on and with them
+  off: the two ends, with their silk entries and their parts pulled away.
+- **On a board, a term passes** when its mean over the pairs is lower with the terms on: silk
+  entries for the label term, parts pulled away for the neighbour term. The neighbour term can
+  be read only on a board whose input holds its schematic.
+- **The boards** are the owner's board and B4, B5 and B6.
+- **A term that does not pass on more than half of the boards where it can be read is set to
+  0**, the document says so, and the bench runs are repeated on the final weights.
+- The length half stays as written and as measured on the owner's board, where it passed.
+
+Limits. The two terms are switched together, so one term's effect is not separated from the
+other's. And this reading was chosen after the first one had been seen, which is why it is
+decided on runs that did not exist when it was fixed.
 
 ## Modules
 
@@ -1075,6 +1112,42 @@ decision with its reason.
 
 A question that fails is reported as it is. Expected cost: minutes for C itself; 100 minutes of
 routing calls per bench run.
+
+### The answers on the owner's board (2026-11-21)
+
+Commit `d413bf8c`, release, 15 threads, effort M. Step 2 took 4606 s and step 3 4652 s; each
+routed 15 candidates (O 3, F 4, S 4, C 4). Counts and numbers only. One routing call per
+candidate, and one board: not yet a general result.
+
+| Question | Answer | What was measured |
+|---|---|---|
+| Is the port the experiment's search? | Failed, then passes | First run: a median of 1259.8. After A1 and A2, the same start, seeds and threshold: 1136.2, 1148.2, 1206.1, 1226.3 and 1235.6, a median of 1206.1 against 1245 |
+| Does it stop by convergence? | Passes | Every run ended by its rules (annealing quiet, descent at a fixed point) and both outer rules stopped by their rule: 7 runs in step 1's second run, 7 in step 2, 6 in step 3. No guard. On the public demo board the dry run of commit `60c9be73` (before the performance pass and the amendments) ended its 7 runs by their rules too; it is still to be repeated on the final commit |
+| Is the result legal and complete? | Passes | C's best passes P1, P2 and G1 to G3 with no decoupling and no connector violation; O has none either |
+| Is it better than the generators? | Passes | C's best ranks 1; F's best ranks 7 and S's best 8, each with 2 decoupling violations |
+| Is it as good as a hand placement? | Passes: "beats" | C's best against O: 1336.7 mm of routed signal against 1738.0 (0.77 times), 69 vias off pours against 82, copper quality 57.6 against 59.7, 172 silk entries against 109 |
+| Do the new terms earn their place? | Not settled | As written, on each run's best: silk fails (172 against 154), parts pulled away pass (3 against 5), length passes (1336.7 mm against 1359.2). Read in pairs from here on: see A3 |
+| Does making room work? | Passes | No C run ended with a pair out of range: 0 of 12 in step 1's second run, 0 of 7 in step 2, 0 of 6 in step 3 |
+
+What these runs also showed:
+
+- **The cost does not see whether a placement routes completely.** In each bench run the C
+  candidate with the shortest routed signal failed G1 (25 and 26 unconnected items; a different
+  start each time), and ranks 11. With the terms on it is also the candidate of the lowest
+  cost. The other three routed C candidates of each run pass every gate.
+- **Silk is worse than the hand placement's in every C candidate**: 154 to 189 entries against
+  109, with the terms on or off.
+- **With the terms on, two of the three complete C candidates rank below O** (5 and 6), by 1.0
+  and 3.0 acute corners of their routing; with the terms off the three rank 1 to 3. One call
+  each.
+- **The rule for effort**: with the terms on, level 1 paid (1360.2 to 1297.4) and level 2 did
+  not (1366.0); with them off, level 1 did not pay (1186.2 to 1185.9). C's search took 66 s and
+  42 s.
+- **The same five starts at level 0, terms on against off** (means): airwire 998 mm against
+  977, crossings 51.8 against 46.6, label conflicts 115 against 159, parts pulled away 4.8
+  against 6.8.
+
+Still open here: B4, B5 and B6 (step 4), and the paired reading of A3 on the four boards.
 
 ## What this design does not do
 
