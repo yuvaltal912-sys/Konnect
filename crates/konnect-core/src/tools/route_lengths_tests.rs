@@ -1245,6 +1245,46 @@ fn with_nothing_dropped_the_file_is_the_plans_file_and_gains_no_partner() {
 }
 
 #[test]
+fn a_group_that_lost_no_net_stays_as_the_plan_wrote_it() {
+    // A skew group of one net (nothing to skew against) is written by
+    // `tune_file_text`; dropping a net of another group does not take it out.
+    let plan = LengthPlan {
+        groups: vec![
+            group(
+                "i",
+                "solo",
+                "lt1",
+                &[("a", "/A")],
+                Window::Skew { tolerance_mm: 0.5 },
+                &[],
+            ),
+            group(
+                "i",
+                "other",
+                "lt2",
+                &[("b", "/B"), ("c", "/C"), ("d", "/D")],
+                Window::Skew { tolerance_mm: 0.5 },
+                &[],
+            ),
+        ],
+        ..LengthPlan::default()
+    };
+    let text = tune_file_without(&plan, &set(&["/D"])).unwrap();
+    assert!(text.contains("group lt1 tolerance=0.25\n  /A\n"), "{text}");
+    assert!(
+        text.contains("group lt2 tolerance=0.25\n  /B\n  /C\n"),
+        "{text}"
+    );
+    assert_eq!(
+        plan.tune_nets_without(&set(&["/D"])),
+        set(&["/A", "/B", "/C"])
+    );
+    // Control: a group that did lose a net and is left with one is out.
+    let text = tune_file_without(&plan, &set(&["/C", "/D"])).unwrap();
+    assert!(text.contains("lt1") && !text.contains("lt2"), "{text}");
+}
+
+#[test]
 fn a_dropped_net_of_a_pair_adds_its_partner() {
     let plan = two_group_plan();
     assert_eq!(

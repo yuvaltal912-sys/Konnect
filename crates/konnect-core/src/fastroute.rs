@@ -1395,9 +1395,6 @@ fn piece_contact(first: &Piece, second: &Piece, ticks_per_um: f64) -> Option<Con
             return None;
         }
     } else {
-        if shared_end {
-            return None;
-        }
         let other = [
             cross(second.a, second.b, first.a),
             cross(second.a, second.b, first.b),
@@ -1407,7 +1404,8 @@ fn piece_contact(first: &Piece, second: &Piece, ticks_per_um: f64) -> Option<Con
         if opposite(side) && opposite(other) {
             return Some(ContactKind::Crossing);
         }
-        // A junction: one piece's end lies on the other piece.
+        // A junction: one piece's end lies on the other piece (two pieces that share
+        // an end point are one: that point is on both).
         if (side[0] == 0 && within(first, second.a))
             || (side[1] == 0 && within(first, second.b))
             || (other[0] == 0 && within(second, first.a))
