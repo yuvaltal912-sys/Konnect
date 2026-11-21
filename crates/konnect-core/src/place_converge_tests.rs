@@ -1,13 +1,18 @@
 //! Tests of `place_converge`, the convergent placement search (family C): the cost model
-//! (stage 2). The stages that fill the search's bodies add their tests here.
+//! (stage 2), and the search, its moves, its rules and whole runs (stage 3).
 
 use super::*;
 use crate::place_generators::tests::{
     converge_params, demo_model, demo_parts, demo_text, model_of,
 };
-use crate::place_generators::{board_model, placements_from, unit};
+use crate::place_generators::{
+    board_model, generate, placements_from, recipes, unit, ConvergeRecipe, Family, Matrix, Params,
+    Recipe,
+};
 use crate::place_held::tests::{board, evaluate_text, pad, parse, Fp, Shape};
-use crate::place_held::{decoupling_pairs, groups, held_set, placements_of, DecouplingPair};
+use crate::place_held::{
+    check_held, decoupling_pairs, groups, held_set, placements_of, DecouplingPair,
+};
 use crate::place_held::{HoldRules, Intent};
 use crate::place_judge::{pair_violations, screen};
 use crate::place_schematic::part_distances;
@@ -127,9 +132,34 @@ fn shift(rng: &mut SplitMix64, radius: f64) -> f64 {
 }
 
 /// A random move of the movable parts: a shift (0), a turn (1), a swap (2), a move of
-/// three or four parts at once (3), a part back where and as it was read (4).
-fn random_move(cost: &CostModel<'_>, state: &State, rng: &mut SplitMix64, kind: u64) -> Move {
+/// three or four parts at once (3), a part back where and as it was read (4), a proposal
+/// of the search's own (`propose`, 5), making room for a broken pair (`make_room`, 6).
+/// `None` when the search's own has nothing to propose.
+fn random_move(
+    cost: &CostModel<'_>,
+    state: &State,
+    rng: &mut SplitMix64,
+    kind: u64,
+) -> Option<Move> {
     let movable = &cost.movable;
+    match kind {
+        5 => {
+            let p = movable[rng.below(movable.len() as u64) as usize];
+            let radius = 0.5 + 6.0 * unit(rng);
+            return cost.propose(state, p, radius, rng);
+        }
+        6 => {
+            let broken: Vec<usize> = (0..cost.pairs.len())
+                .filter(|&k| state.pair_mm[k] > cost.pairs[k].limit_mm)
+                .collect();
+            if broken.is_empty() {
+                return None;
+            }
+            let k = broken[rng.below(broken.len() as u64) as usize];
+            return cost.make_room(state, k);
+        }
+        _ => {}
+    }
     let pick = |rng: &mut SplitMix64| movable[rng.below(movable.len() as u64) as usize];
     let p = pick(rng);
     let (at, turns) = (state.centres[p], state.turns[p]);
@@ -162,7 +192,7 @@ fn random_move(cost: &CostModel<'_>, state: &State, rng: &mut SplitMix64, kind: 
         }
         _ => vec![(p, cost.read_centres[p], 0)],
     };
-    Move { parts }
+    Some(Move { parts })
 }
 
 /// `count` random legal moves applied to `state`, kinds drawn from `kinds`; the moves
@@ -175,13 +205,15 @@ fn random_walk(
     kinds: &[u64],
     mut after: impl FnMut(&State, &Move, &Delta),
 ) -> Vec<usize> {
-    let mut made = vec![0; 5];
+    let mut made = vec![0; 7];
     let mut tries = 0;
     while made.iter().sum::<usize>() < count {
         tries += 1;
         assert!(tries < 200 * count, "too few legal moves: {made:?}");
         let kind = kinds[rng.below(kinds.len() as u64) as usize];
-        let mv = random_move(cost, state, rng, kind);
+        let Some(mv) = random_move(cost, state, rng, kind) else {
+            continue;
+        };
         if !cost.legal(state, &mv) {
             continue;
         }
@@ -518,7 +550,7 @@ fn a_states_caches_equal_a_full_evaluation() {
         &mut state,
         &mut rng,
         10_000,
-        &[0, 0, 1, 2, 3, 3, 4],
+        &[0, 0, 1, 2, 3, 3, 4, 5, 5, 5, 6],
         |state, mv, _| {
             let fresh = cost.state(state.centres.clone(), state.turns.clone());
             assert_same_caches(state, &fresh, &format!("after {mv:?}"));
@@ -528,9 +560,38 @@ fn a_states_caches_equal_a_full_evaluation() {
         },
     );
     assert!(
-        made.iter().all(|&n| n > 300),
+        made[..6].iter().all(|&n| n > 300),
         "every kind of move was made: {made:?}"
     );
+    assert!(made[6] >= 20, "making room was made: {made:?}");
+    // `propose`'s four kinds, each made: a walk of its own moves, classified by the draw
+    // `propose` makes first.
+    let mut kinds = [0usize; 4];
+    let mut tries = 0;
+    while kinds.iter().any(|&n| n < 100) {
+        tries += 1;
+        assert!(tries < 200_000, "propose's kinds: {kinds:?}");
+        let p = cost.movable[rng.below(cost.movable.len() as u64) as usize];
+        let draw = unit(&mut rng.clone());
+        let Some(mv) = cost.propose(&state, p, 4.0, &mut rng) else {
+            continue;
+        };
+        if !cost.legal(&state, &mv) {
+            continue;
+        }
+        let kind = match draw {
+            d if d < SHIFT_SHARE => 0,
+            d if d < SHIFT_SHARE + TURN_SHARE => 1,
+            d if d < SHIFT_SHARE + TURN_SHARE + SWAP_SHARE => 2,
+            _ => 3,
+        };
+        kinds[kind] += 1;
+        let delta = cost.delta(&state, &mv);
+        cost.apply(&mut state, &mv, delta);
+        let fresh = cost.state(state.centres.clone(), state.turns.clone());
+        assert_same_caches(&state, &fresh, &format!("after the proposal {mv:?}"));
+    }
+
     assert!(
         seen.0 > 0 && seen.1 > 0 && seen.2 > 0,
         "the walk crossed nets, labels and pairs: {seen:?}"
@@ -1300,8 +1361,13 @@ fn time_one_delta_on_the_demo() {
     let model = demo_with_pairs();
     let hoods = demo_hoods();
     time_deltas("demo", &cost_of(&model, Some(&hoods)));
-    // 96 two-pad parts in a 12 x 8 grid on a 100 x 70 board, each on two signal nets
-    // and every fourth one on a rail: about the size of a real board.
+    let model = ninety_six_parts();
+    time_deltas("96 parts", &cost_of(&model, None));
+}
+
+/// 96 two-pad parts in a 12 x 8 grid on a 100 x 70 board, each on two signal nets and
+/// every fourth one on a rail: about the size of a real board.
+fn ninety_six_parts() -> BoardModel {
     let parts: Vec<Fp> = (0..96)
         .map(|k| {
             let (i, j) = (k % 12, k / 12);
@@ -1319,8 +1385,7 @@ fn time_one_delta_on_the_demo() {
             }
         })
         .collect();
-    let model = model_of(&board(Shape::Rect(0.0, 0.0, 100.0, 70.0), &parts), &[]);
-    time_deltas("96 parts", &cost_of(&model, None));
+    model_of(&board(Shape::Rect(0.0, 0.0, 100.0, 70.0), &parts), &[])
 }
 
 fn time_deltas(name: &str, cost: &CostModel<'_>) {
@@ -1329,7 +1394,7 @@ fn time_deltas(name: &str, cost: &CostModel<'_>) {
     let mut moves = Vec::new();
     while moves.len() < 100_000 {
         let kind = [0, 0, 0, 1, 2][rng.below(5) as usize];
-        let mv = random_move(cost, &state, &mut rng, kind);
+        let mv = random_move(cost, &state, &mut rng, kind).unwrap();
         if cost.legal(&state, &mv) {
             moves.push(mv);
         }
@@ -1352,4 +1417,1171 @@ fn time_deltas(name: &str, cost: &CostModel<'_>) {
         delta.as_secs_f64() * 1e6 / moves.len() as f64,
         legality.as_secs_f64() * 1e6 / moves.len() as f64
     );
+}
+
+// ─── The rules, read alone ───────────────────────────────────────────────────
+
+#[test]
+fn quiet_enough_needs_the_quiet_stages_and_the_cold() {
+    // (quiet stages in a row, uphill share, level, ends)
+    let table: [(usize, f64, u32, bool); 10] = [
+        (5, 0.0, 0, true),
+        (5, 0.009, 0, true),
+        (9, 0.005, 0, true),
+        (4, 0.0, 0, false),
+        (0, 0.0, 0, false),
+        (5, 0.01, 0, false),
+        // The control: 5 quiet stages at an uphill share of 3 % do not end the run.
+        (5, 0.03, 0, false),
+        (5, 0.0, 1, false),
+        (10, 0.0, 1, true),
+        (20, 0.005, 2, true),
+    ];
+    for (run, share, level, ends) in table {
+        assert_eq!(
+            quiet_enough(run, share, &ConvergeParams::measured(level)),
+            ends,
+            "{run} quiet stages at an uphill share of {share}, level {level}"
+        );
+    }
+}
+
+#[test]
+fn the_shift_radius_follows_the_temperature_at_every_level() {
+    // The radius part of `a_level_scales_the_cooling_the_patience_and_the_quiet_gain`:
+    // at one temperature, the same radius at levels 0 to 3; and level k reaches level
+    // 0's temperature after one stage in 2^k stages, with the same radius.
+    let (r0, first) = (20.0, 300.0);
+    let base = ConvergeParams::measured(0);
+    for t in [300.0, 120.0, 17.5, 0.3, 1e-4] {
+        let at_0 = shift_radius(&base, r0, t, first);
+        for level in 1..=3u32 {
+            let params = ConvergeParams::measured(level);
+            assert_eq!(
+                shift_radius(&params, r0, t, first),
+                at_0,
+                "T {t}, level {level}"
+            );
+        }
+    }
+    assert_eq!(shift_radius(&base, r0, first, first), r0);
+    assert_eq!(shift_radius(&base, r0, first * 1e-9, first), 1.0);
+    for level in 0..=3u32 {
+        let params = ConvergeParams::measured(level);
+        let stages = 1i32 << level;
+        let t = first * params.cooling_at_level().powi(stages * 10);
+        let t0 = first * base.cooling.powi(10);
+        assert!((t / t0 - 1.0).abs() < 1e-12, "level {level}");
+        let (r, r_0) = (
+            shift_radius(&params, r0, t, first),
+            shift_radius(&base, r0, t0, first),
+        );
+        assert!((r - r_0).abs() < 1e-9, "level {level}: {r} against {r_0}");
+    }
+}
+
+#[test]
+fn starts_stop_reads_the_costs_in_start_order() {
+    let rule = OuterRule::measured();
+    let inf = f64::INFINITY;
+    // The experiment's 8 generated starts in start order (design, "What was measured"):
+    // the first ended best, at 1195; the other seven between 1255 and 2201, and 3260 for
+    // the run that ended with two broken pairs. The design gives no more of their order,
+    // so the filler values and their orders are this test's: any order of the seven
+    // gives 4, because the first start is the best and three starts in a row then fail
+    // to pay.
+    let experiment = [
+        1195.0, 1255.0, 2201.0, 3260.0, 1400.0, 1600.0, 1800.0, 2000.0,
+    ];
+    assert_eq!(starts_stop(&experiment, &rule), Some(4));
+    let mut reversed = experiment;
+    reversed[1..].reverse();
+    assert_eq!(starts_stop(&reversed, &rule), Some(4));
+    let mut sorted = experiment;
+    sorted[1..].sort_by(f64::total_cmp);
+    assert_eq!(starts_stop(&sorted, &rule), Some(4));
+    // The best of the 4 is the best of all 8.
+    let best = |costs: &[f64]| costs.iter().copied().fold(inf, f64::min);
+    assert_eq!(best(&experiment[..4]), best(&experiment));
+
+    // (costs in start order, the n the rule gives)
+    let table: Vec<(Vec<f64>, Option<usize>)> = vec![
+        (vec![], None),
+        (vec![100.0], None),
+        (vec![100.0, 101.0, 102.0], None),
+        (vec![100.0, 101.0, 102.0, 103.0], Some(4)),
+        // A start that pays (below 0.99 x the best of the starts before the window)
+        // keeps the search going.
+        (vec![100.0, 101.0, 98.0, 103.0], None),
+        (vec![100.0, 101.0, 98.0, 103.0, 104.0], None),
+        (vec![100.0, 101.0, 98.0, 103.0, 104.0, 105.0], Some(6)),
+        (vec![100.0, 99.5, 99.2, 99.1], Some(4)),
+        (vec![100.0, 90.0, 80.0, 70.0, 69.9, 69.8, 69.7], Some(7)),
+        // A failed start is infinity: three failures in a row stop the search, and a
+        // first finite cost pays against every failure before it.
+        (vec![inf, inf, inf, inf], Some(4)),
+        (vec![inf, inf, inf, 500.0], None),
+        (vec![inf, inf, inf, 500.0, inf, inf, inf], Some(7)),
+        (vec![100.0, inf, inf, inf], Some(4)),
+    ];
+    for (costs, n) in &table {
+        assert_eq!(starts_stop(costs, &rule), *n, "{costs:?}");
+    }
+
+    // The guard: at `max_starts` whatever the costs say.
+    let falling: Vec<f64> = (0..100).map(|k| 1000.0 * 0.9f64.powi(k)).collect();
+    assert_eq!(starts_stop(&falling, &rule), Some(64));
+    assert_eq!(starts_stop(&falling[..63], &rule), None);
+    let short = OuterRule {
+        max_starts: 2,
+        ..rule
+    };
+    assert_eq!(starts_stop(&[100.0, 50.0, 25.0], &short), Some(2));
+
+    // The control: a window of 1 stops after 2 on the experiment's list.
+    let one = OuterRule { window: 1, ..rule };
+    assert_eq!(starts_stop(&experiment, &one), Some(2));
+}
+
+#[test]
+fn effort_stop_ends_at_the_first_level_that_does_not_pay() {
+    let rule = OuterRule::measured();
+    // (cost at levels 0, 1, ..., the levels the rule gives)
+    let table: Vec<(Vec<f64>, Option<usize>)> = vec![
+        (vec![], None),
+        (vec![1000.0], None),
+        // The experiment's three starts at levels 0 to 2: each doubling paid.
+        (vec![2212.0, 1208.0, 1124.0], None),
+        (vec![1241.0, 1139.0, 1109.0], None),
+        (vec![2046.0, 1994.0, 1919.0], None),
+        (vec![1000.0, 995.0], Some(2)),
+        (vec![1000.0, 1010.0], Some(2)),
+        (vec![1000.0, 980.0, 975.0], Some(3)),
+        // Read against the best of the levels below, not the last one.
+        (vec![1000.0, 1100.0], Some(2)),
+        (vec![1000.0, 980.0, 1200.0, 900.0], Some(3)),
+        // A failed level 0 is paid by any finite level 1.
+        (vec![f64::INFINITY, 900.0, 880.0], None),
+    ];
+    for (costs, n) in &table {
+        assert_eq!(effort_stop(costs, &rule), *n, "{costs:?}");
+    }
+    // The guard: after `max_level` (level 5, the sixth cost) whatever the costs say.
+    let halving: Vec<f64> = (0..10).map(|k| 1000.0 * 0.5f64.powi(k)).collect();
+    assert_eq!(effort_stop(&halving, &rule), Some(6));
+    assert_eq!(effort_stop(&halving[..5], &rule), None);
+    let flat = OuterRule {
+        max_level: 0,
+        ..rule
+    };
+    assert_eq!(effort_stop(&[1000.0], &flat), Some(1));
+
+    // The control: a gain of 0 never stops before the guard on levels that each gain
+    // 0.5 %, where the measured gain stops after level 1.
+    let creeping: Vec<f64> = (0..10).map(|k| 1000.0 * 0.995f64.powi(k)).collect();
+    assert_eq!(effort_stop(&creeping, &rule), Some(2));
+    let any = OuterRule { gain: 0.0, ..rule };
+    assert_eq!(effort_stop(&creeping, &any), Some(6));
+}
+
+// ─── Whole runs ──────────────────────────────────────────────────────────────
+
+/// The measured parameters at `level` with 20 proposals per part and stage, not 200:
+/// whole-run tests in a debug build take seconds, not minutes. Only the stage length
+/// differs; the rules and every weight are the measured ones.
+fn quick(level: u32) -> ConvergeParams {
+    ConvergeParams {
+        stage_per_part: 20,
+        ..ConvergeParams::measured(level)
+    }
+}
+
+/// One run from the board as read (an empty start).
+fn run(
+    model: &BoardModel,
+    hoods: Option<&Neighbourhoods>,
+    seed: u64,
+    params: &ConvergeParams,
+) -> (Candidate, Trace) {
+    converge(model, hoods, &[], seed, params).expect("a run")
+}
+
+/// The board a candidate writes.
+fn board_of(model: &BoardModel, candidate: &Candidate) -> String {
+    placements_applied_to(&model.text, &candidate.placements).expect("the board is written")
+}
+
+/// The hard failures of `text` that are courtyard overlaps or parts outside the outline
+/// and name a movable part.
+fn movable_hard_failures(model: &BoardModel, text: &str) -> Vec<serde_json::Value> {
+    let scored = evaluated(model, text);
+    scored["hard_failures"]
+        .as_array()
+        .expect("the score lists its hard failures")
+        .iter()
+        .filter(|f| {
+            matches!(
+                f["kind"].as_str(),
+                Some("courtyard_overlap" | "outside_outline")
+            )
+        })
+        .filter(|f| {
+            f["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| model.held.movable.contains(r.as_str().unwrap()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// A crowded board: U1 and 21 resistors in a chain on a 22 x 12 mm board, a part gap of
+/// 0.3 mm and an edge clearance of 0.5 mm, so that most moves are refused.
+fn crowded() -> BoardModel {
+    let mut parts = vec![Fp::new("U1", 11.0, 7.0)
+        .court(1.5, 1.5)
+        .pad(pad("1", -1.0, -1.0, Some("N0")))
+        .pad(pad("2", 1.0, 0.0, Some("N10")))
+        .pad(pad("3", -1.0, 1.0, Some("N21")))];
+    for k in 0..21 {
+        let (row, column) = (k / 7, k % 7);
+        let y = [1.5, 3.5, 10.5][row];
+        parts.push(
+            Fp::new(&format!("R{}", k + 1), 2.0 + 3.0 * column as f64, y)
+                .two_pad(&format!("N{k}"), &format!("N{}", (k * 5 + 3) % 22)),
+        );
+    }
+    let mut model = model_of(&board(Shape::Rect(0.0, 0.0, 22.0, 12.0), &parts), &[]);
+    model.clearances.part_gap_mm = 0.3;
+    model.clearances.edge_mm = 0.5;
+    model
+}
+
+#[test]
+fn a_converged_board_has_no_new_hard_failure() {
+    let model = crowded();
+    assert!(movable_hard_failures(&model, &model.text).is_empty());
+    for seed in [1, 2] {
+        let (candidate, trace) = run(&model, None, seed, &quick(0));
+        assert!(trace.converged(), "seed {seed}: {trace:?}");
+        let text = board_of(&model, &candidate);
+        let failures = movable_hard_failures(&model, &text);
+        assert!(failures.is_empty(), "seed {seed}: {failures:?}");
+        // Every moved part keeps C's gap on the written board too.
+        let cost = cost_of(&model, None);
+        let state = rebuilt(&cost, &text);
+        for &p in &cost.movable {
+            let mv = Move {
+                parts: vec![(p, state.centres[p], state.turns[p])],
+            };
+            let moved = state.centres[p] != cost.read_centres[p] || state.turns[p] != 0;
+            assert!(
+                !moved || cost.legal(&state, &mv),
+                "seed {seed}: {} is legal where it ended",
+                model.references[p]
+            );
+        }
+        assert!(candidate.placements.len() > 10, "the run moved parts");
+    }
+}
+
+/// The demo with a part of every hold reason: the connector J1, the mounting hole H1, a
+/// part with no netted pad (TP1), a KiCad lock (L1) and a caller's part (C8).
+fn every_hold_reason() -> BoardModel {
+    let mut parts = demo_parts();
+    parts.push(Fp::new("TP1", 50.0, 6.0).pad(pad("1", 0.0, 0.0, None)));
+    parts.push(Fp::new("L1", 50.0, 34.0).locked().two_pad("SIG1", "SIG2"));
+    model_of(&board(OUTLINE, &parts), &["C8"])
+}
+
+#[test]
+fn family_c_never_lists_a_held_part() {
+    let model = every_hold_reason();
+    let reasons: BTreeSet<crate::place_held::HoldReason> = model
+        .held
+        .held
+        .values()
+        .flat_map(|part| part.reasons.iter().copied())
+        .collect();
+    assert_eq!(reasons.len(), 4, "{reasons:?}");
+    for held in ["J1", "H1", "TP1", "L1", "C8"] {
+        assert!(model.held.held.contains_key(held), "{held}");
+    }
+    for seed in [1, 2] {
+        let (candidate, _) = run(&model, None, seed, &quick(0));
+        assert!(!candidate.placements.is_empty());
+        for placement in &candidate.placements {
+            assert!(
+                model.held.movable.contains(&placement.reference),
+                "seed {seed}: {} is held",
+                placement.reference
+            );
+        }
+        let text = board_of(&model, &candidate);
+        assert_eq!(
+            check_held(&model.held, &parse(&text)),
+            Ok(()),
+            "seed {seed}"
+        );
+    }
+    // Inside the search too: `placements_from` never writes a held part, so the board
+    // alone would not show one that moved in the search's own state.
+    let cost = CostModel::build(&model, None, &quick(0)).unwrap();
+    let (mut state, mut rng, mut evaluations) = annealed(&cost, 1);
+    descend(&cost, &mut state, &mut rng, &mut evaluations);
+    for p in (0..model.parts.len()).filter(|&p| !model.movable[p]) {
+        assert_eq!(
+            (state.centres[p], state.turns[p]),
+            (cost.read_centres[p], 0),
+            "{} stayed where and as it was read",
+            model.references[p]
+        );
+    }
+}
+
+#[test]
+fn no_part_changes_side_in_a_whole_run() {
+    let model = demo_with_pairs();
+    let (candidate, _) = run(&model, Some(&demo_hoods()), 3, &quick(0));
+    let text = board_of(&model, &candidate);
+    let scan = konnect_sexp::board::footprint_courtyards(&parse(&text));
+    for item in &scan.items {
+        let reference = item.reference.as_deref().unwrap();
+        let p = index_of(&model, reference);
+        assert_eq!(item.layer_side, model.parts[p].layer_side, "{reference}");
+    }
+    let r6 = index_of(&model, "R6");
+    assert_eq!(model.parts[r6].layer_side, konnect_sexp::board::Side::Back);
+    assert!(
+        candidate.placements.iter().any(|p| p.reference == "R6"),
+        "the back part moved"
+    );
+}
+
+#[test]
+fn a_part_read_off_the_quarter_turns_is_never_turned_in_a_whole_run() {
+    let mut parts = vec![Fp::new("R1", 20.0, 20.0).rot(45.0).two_pad("A", "B")];
+    for k in 2..=7 {
+        let x = 8.0 + 6.0 * k as f64;
+        parts.push(Fp::new(&format!("R{k}"), x, 30.0).two_pad(&format!("N{k}"), "A"));
+    }
+    parts.push(Fp::new("R8", 10.0, 10.0).two_pad("B", "N4"));
+    let model = model_of(&board(OUTLINE, &parts), &[]);
+    let mut turned = 0;
+    for seed in [1, 2] {
+        let (candidate, _) = run(&model, None, seed, &quick(0));
+        for placement in &candidate.placements {
+            let p = index_of(&model, &placement.reference);
+            let read = model.parts[p].rotation_deg;
+            if placement.reference == "R1" {
+                assert_eq!(placement.rotation, read, "seed {seed}: R1 kept 45 degrees");
+            } else if placement.rotation != read {
+                turned += 1;
+            }
+        }
+    }
+    // The control, in the same runs: a part read at 0 degrees does turn.
+    assert!(turned > 0, "a part read at 0 degrees turned");
+}
+
+#[test]
+fn with_turn_parts_off_every_part_keeps_its_rotation() {
+    let model = demo_with_pairs();
+    let off = ConvergeParams {
+        turn_parts: false,
+        ..quick(0)
+    };
+    let (candidate, trace) = run(&model, Some(&demo_hoods()), 4, &off);
+    assert!(trace.converged());
+    assert!(!candidate.placements.is_empty());
+    for placement in &candidate.placements {
+        let p = index_of(&model, &placement.reference);
+        assert_eq!(
+            placement.rotation, model.parts[p].rotation_deg,
+            "{}",
+            placement.reference
+        );
+    }
+    // With turns on, the same run turns parts.
+    let (on, _) = run(&model, Some(&demo_hoods()), 4, &quick(0));
+    assert!(on
+        .placements
+        .iter()
+        .any(|p| p.rotation != model.parts[index_of(&model, &p.reference)].rotation_deg));
+}
+
+/// `jobs` run on a pool of `threads` scoped threads from one atomic counter, each the
+/// written board of its run, in job order.
+fn pooled_runs(
+    model: &BoardModel,
+    hoods: &Neighbourhoods,
+    jobs: &[(u64, ConvergeParams)],
+    threads: usize,
+) -> Vec<(String, Trace)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<(String, Trace)>>> =
+        jobs.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= jobs.len() {
+                    break;
+                }
+                let (seed, params) = jobs[i];
+                let (candidate, trace) = run(model, Some(hoods), seed, &params);
+                *slots[i].lock().unwrap() = Some((board_of(model, &candidate), trace));
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap().unwrap())
+        .collect()
+}
+
+#[test]
+fn the_same_run_gives_the_same_board_bytes() {
+    let model = demo_with_pairs();
+    let hoods = demo_hoods();
+    let jobs: Vec<(u64, ConvergeParams)> = (1..=4).map(|seed| (seed, quick(0))).collect();
+    let alone = pooled_runs(&model, &hoods, &jobs, 1);
+    let again = pooled_runs(&model, &hoods, &jobs, 1);
+    let wide = pooled_runs(&model, &hoods, &jobs, 8);
+    assert_eq!(alone, again, "twice");
+    assert_eq!(alone, wide, "from 1 and from 8 threads");
+    // Another seed gives another board; so does level 1 from the same seed.
+    assert_ne!(alone[0].0, alone[1].0, "seeds 1 and 2");
+    let level_1 = pooled_runs(&model, &hoods, &[(1, quick(1))], 1);
+    assert_ne!(alone[0].0, level_1[0].0, "levels 0 and 1");
+    assert_eq!(level_1[0].1.level, 1);
+    // The levels of one start do not repeat each other's stream: the first temperature
+    // reads the stream and not the level, so it differs only because the stream was
+    // advanced by the level.
+    assert_ne!(
+        alone[0].1.first_temperature, level_1[0].1.first_temperature,
+        "the stream of level 1 is advanced"
+    );
+}
+
+#[test]
+fn a_run_of_generate_is_the_same_twice() {
+    // `generate` with a recipe of family C, as `rerun` will call it: the same candidate,
+    // its trace included.
+    let mut model = demo_with_pairs();
+    model.hoods = Some(demo_hoods());
+    let start = recipes(&Matrix::bench())
+        .into_iter()
+        .find(|r| r.family == Family::Force && r.seed == 2)
+        .unwrap();
+    let recipe = Recipe {
+        family: Family::Converge,
+        seed: start.seed,
+        params: Params::Converge(ConvergeRecipe {
+            start: Box::new(start),
+            params: quick(0),
+        }),
+    };
+    let first = generate(&model, &recipe).expect("a run");
+    let second = generate(&model, &recipe).expect("a run");
+    assert_eq!(first, second);
+    let trace = first.trace.as_ref().expect("a trace");
+    assert_eq!(first.converged, Some(trace.converged()));
+    assert_eq!(first.iterations_run, Some(trace.stages));
+    assert!(trace.hoods_sha256.is_some());
+}
+
+#[test]
+fn the_trace_holds_the_start_as_given_and_the_end_as_written() {
+    // An F candidate as the start, on the demo with a part gap of 0.7 mm (above the
+    // 0.5 mm grid step): F legalizes with courtyards that may touch, so C must move some
+    // of its parts first.
+    let mut model = demo_with_pairs();
+    model.clearances.part_gap_mm = 0.7;
+    let hoods = demo_hoods();
+    let recipe = recipes(&Matrix::bench())
+        .into_iter()
+        .find(|r| r.family == Family::Force && r.seed == 3)
+        .unwrap();
+    let start = generate(&model, &recipe)
+        .expect("an F candidate")
+        .placements;
+    let (candidate, trace) = converge(&model, Some(&hoods), &start, 3, &quick(0)).unwrap();
+
+    // The start as given, before it was made legal, under the run's R.
+    let cost = CostModel::build(&model, Some(&hoods), &quick(0))
+        .unwrap()
+        .with_requirement(trace.requirement_mm);
+    let (centres, turns) = centres_of(&cost, &start).unwrap();
+    let given = cost.state(centres, turns);
+    assert_eq!(trace.start, cost.terms(&given));
+    let legal = state_from(&cost, &start).unwrap();
+    assert_ne!(legal.centres, given.centres, "C moved parts of the start");
+    assert!(trace.requirement_mm >= 1000.0);
+
+    // The end as written: the screen's own airwire length, crossings, pair and connector
+    // counts of the written board.
+    let text = board_of(&model, &candidate);
+    let scored = evaluated(&model, &text);
+    let metrics = &scored["routing_metrics"];
+    let length = metrics["wirelength_mm"].as_f64().unwrap();
+    assert!(
+        (trace.end.airwire_mm - length).abs() <= 1e-6,
+        "{} against {length}",
+        trace.end.airwire_mm
+    );
+    assert_eq!(
+        trace.end.crossings as u64,
+        metrics["proper_crossings"].as_u64().unwrap()
+    );
+    assert_eq!(
+        trace.end.pair_violations,
+        pair_violations(&parse(&text), &model.intent.pairs)
+    );
+    assert_eq!(
+        trace.end.connector_violations,
+        screen(&scored, &model.held, &[], 0, None)
+            .unwrap()
+            .connector_violations
+    );
+    assert_eq!(trace.end, cost.terms(&rebuilt(&cost, &text)));
+    // The curve ends at the end's cost, to the rounding of the written anchors.
+    let last = *trace.best_by_step.last().unwrap();
+    assert!(
+        (last - trace.end.cost).abs() < 1e-2,
+        "{last} against {}",
+        trace.end.cost
+    );
+}
+
+/// Three fixtures for the stop rules: the demo with pairs and neighbourhoods, the stock
+/// rectangle and the rounded board.
+fn three_fixtures() -> Vec<(&'static str, BoardModel, Option<Neighbourhoods>)> {
+    vec![
+        ("demo", demo_with_pairs(), Some(demo_hoods())),
+        (
+            "rectangle",
+            model_of(&std::fs::read_to_string(RECTANGLE).unwrap(), &[]),
+            None,
+        ),
+        (
+            "rounded",
+            model_of(&std::fs::read_to_string(ROUNDED).unwrap(), &[]),
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn a_run_stops_by_its_rules_on_the_fixtures() {
+    for (name, model, hoods) in three_fixtures() {
+        for level in [0, 1] {
+            let (candidate, trace) = run(&model, hoods.as_ref(), 5, &quick(level));
+            let what = format!("{name} at level {level}");
+            assert_eq!(trace.anneal_stop, AnnealStop::Quiet, "{what}");
+            assert!(
+                matches!(
+                    trace.descent_stop,
+                    DescentStop::FixedPoint | DescentStop::Quiet
+                ),
+                "{what}: {:?}",
+                trace.descent_stop
+            );
+            assert!(
+                trace.converged() && candidate.converged == Some(true),
+                "{what}"
+            );
+            assert!(trace.stages < quick(level).max_stages_at_level(), "{what}");
+            // The curve: one best cost per stage, then one per sweep, never rising.
+            assert_eq!(
+                trace.best_by_step.len(),
+                trace.stages + trace.sweeps,
+                "{what}"
+            );
+            assert!(
+                trace.best_by_step[..trace.stages]
+                    .windows(2)
+                    .all(|w| w[1] <= w[0] + 1e-6),
+                "{what}: annealing's best rose"
+            );
+            assert!(
+                trace.best_by_step[trace.stages..]
+                    .windows(2)
+                    .all(|w| w[1] <= w[0] + 1e-6),
+                "{what}: descent rose"
+            );
+            assert!(trace.end.cost <= trace.start.cost + 1e-6, "{what}");
+            assert!(
+                trace.evaluations > 0 && trace.first_temperature > 0.0,
+                "{what}"
+            );
+        }
+    }
+    // The control: a guard of 3 stages ends annealing on the guard, and the run is
+    // recorded as not converged.
+    let (_, model, hoods) = three_fixtures().remove(0);
+    let guarded = ConvergeParams {
+        max_stages: 3,
+        ..quick(0)
+    };
+    let (candidate, trace) = run(&model, hoods.as_ref(), 5, &guarded);
+    assert_eq!((trace.stages, trace.anneal_stop), (3, AnnealStop::Guard));
+    assert!(!trace.converged());
+    assert_eq!(candidate.converged, Some(false));
+}
+
+#[test]
+fn the_first_temperature_trials_do_not_move_the_start() {
+    let model = demo_with_pairs();
+    let cost = cost_of(&model, None);
+    let state = state_from(&cost, &[]).unwrap();
+    let before = state.clone();
+    let mut rng = SplitMix64(7);
+    let t = first_temperature(&cost, &state, &mut rng);
+    assert_eq!(state, before, "the start is as it was");
+    assert!(t.is_finite() && t > 0.0, "{t}");
+    // The trials walk on: each from where the one before left the parts. Replayed here
+    // by hand, they give the same temperature and move parts on the copy.
+    let mut rng = SplitMix64(7);
+    let mut copy = state.clone();
+    let (mut ups, mut sum, mut made) = (0, 0.0, 0);
+    for _ in 0..400 {
+        let p = cost.movable[rng.below(cost.movable.len() as u64) as usize];
+        let (dx, dy) = (grid_shift(&mut rng, 10.0), grid_shift(&mut rng, 10.0));
+        let at = copy.centres[p];
+        let mv = Move {
+            parts: vec![(p, (at.0 + dx, at.1 + dy), copy.turns[p])],
+        };
+        if cost.legal(&copy, &mv) {
+            let delta = cost.delta(&copy, &mv);
+            if delta.cost > 0.0 {
+                ups += 1;
+                sum += delta.cost;
+            }
+            cost.apply(&mut copy, &mv, delta);
+            made += 1;
+        }
+    }
+    assert!(made > 100 && ups > 10, "{made} trials made, {ups} uphill");
+    assert_ne!(
+        copy.centres, state.centres,
+        "the trials moved parts on the copy"
+    );
+    assert!((t - sum / ups as f64 / std::f64::consts::LN_2).abs() < 1e-9);
+}
+
+/// U1, its decoupling capacitor C1 beside it (locked), and 60 locked single-pad parts
+/// far to the right, each on a net of its own with one of U1's pins: the soft cost of
+/// the start is about 20 m, and U1 beside the far parts saves almost all of it.
+fn far_pins() -> (BoardModel, usize) {
+    let mut u1 = Fp::new("U1", 20.0, 50.0)
+        .court(2.0, 15.5)
+        .pad(pad("61", -1.5, 0.0, Some("VCC")));
+    let mut parts = Vec::new();
+    for k in 1..=60 {
+        let y = -14.75 + 0.5 * (k - 1) as f64;
+        let net = format!("S{k}");
+        u1 = u1.pad(pad(&k.to_string(), 1.0, y, Some(&net)));
+        parts.push(
+            Fp::new(&format!("R{k}"), 350.0, 50.0 + y)
+                .locked()
+                .court(0.2, 0.2)
+                .pad(pad("1", 0.0, 0.0, Some(&net))),
+        );
+    }
+    parts.push(u1);
+    parts.push(Fp::new("C1", 16.0, 50.0).locked().two_pad("VCC", "GND"));
+    let text = board(Shape::Rect(0.0, 0.0, 400.0, 100.0), &parts);
+    let set = held_set(&text, &BTreeSet::new(), &HoldRules::default()).unwrap();
+    let pairs = vec![DecouplingPair {
+        cap: "C1".to_string(),
+        cap_pad: "1".to_string(),
+        ic: "U1".to_string(),
+        ic_pad: "61".to_string(),
+        net: "VCC".to_string(),
+        limit_mm: 5.0,
+        basis: "test".to_string(),
+    }];
+    let model = board_model(&text, set, Intent::new(Vec::new(), pairs)).unwrap();
+    let u1 = index_of(&model, "U1");
+    (model, u1)
+}
+
+#[test]
+fn a_broken_requirement_costs_at_least_the_starts_soft_cost() {
+    let (model, u1) = far_pins();
+    assert_eq!(model.movable.iter().filter(|&&m| m).count(), 1);
+    let fixed = cost_of(&model, None);
+    let start = state_from(&fixed, &[]).unwrap();
+    let soft = fixed.terms(&start).soft;
+    assert!(soft > 10_000.0, "the start's soft cost is {soft}");
+    assert_eq!(fixed.terms(&start).pair_violations, 0);
+    // U1 beside the far parts: the pair breaks, the airwire falls by about 19 m.
+    let trade = Move {
+        parts: vec![(u1, (340.0, 50.0), 0)],
+    };
+    assert!(fixed.legal(&start, &trade));
+
+    // The run's R is the start's soft cost, and under it the trade costs more than it
+    // saves.
+    let short = ConvergeParams {
+        stage_per_part: 1,
+        max_stages: 1,
+        max_sweeps: 1,
+        ..converge_params()
+    };
+    let (_, trace) = converge(&model, None, &[], 1, &short).unwrap();
+    assert_eq!(trace.requirement_mm, soft);
+    let followed = cost_of(&model, None).with_requirement(trace.requirement_mm);
+    let start = followed.state(start.centres.clone(), start.turns.clone());
+    let delta = followed.delta(&start, &trade);
+    assert!(delta.cost > 0.0, "under R = {soft}: {}", delta.cost);
+
+    // The contrast on the same fixture: under a fixed 1000 mm the move trades the pair
+    // for length.
+    let start = fixed.state(start.centres.clone(), start.turns.clone());
+    let delta = fixed.delta(&start, &trade);
+    assert!(delta.cost < 0.0, "under R = 1000: {}", delta.cost);
+
+    // R is never below the parameter: on the demo (soft cost far below 1000 mm) it is
+    // 1000 mm.
+    let (_, trace) = converge(&demo_with_pairs(), None, &[], 1, &short).unwrap();
+    assert_eq!(trace.requirement_mm, 1000.0);
+}
+
+/// The state a run reaches before descent: the start, its first temperature and
+/// annealing, as `converge` runs them.
+fn annealed(cost: &CostModel<'_>, seed: u64) -> (State, SplitMix64, u64) {
+    let mut state = state_from(cost, &[]).unwrap();
+    let mut rng = SplitMix64(seed);
+    let t = first_temperature(cost, &state, &mut rng);
+    let mut evaluations = 0;
+    anneal(cost, &mut state, t, &mut rng, &mut evaluations);
+    (state, rng, evaluations)
+}
+
+/// The lowest cost change of any legal move of descent's set on `state`.
+fn best_single_move(cost: &CostModel<'_>, state: &State) -> f64 {
+    let mut best = f64::INFINITY;
+    for &p in &cost.movable {
+        for mv in cost.descent_moves(state, p) {
+            if cost.legal(state, &mv) {
+                best = best.min(cost.delta(state, &mv).cost);
+            }
+        }
+    }
+    best
+}
+
+#[test]
+fn after_descent_no_single_move_lowers_the_cost() {
+    let model = demo_with_pairs();
+    let cost = CostModel::build(&model, Some(&demo_hoods()), &quick(0)).unwrap();
+    let mut fixed_points = 0;
+    for seed in [1, 2, 3] {
+        let (mut state, mut rng, mut evaluations) = annealed(&cost, seed);
+        // The control: annealing alone leaves a single move that lowers the cost.
+        let after_anneal = best_single_move(&cost, &state);
+        assert!(after_anneal < -1e-9, "seed {seed}: {after_anneal}");
+        let (_, stop, _) = descend(&cost, &mut state, &mut rng, &mut evaluations);
+        if stop == DescentStop::FixedPoint {
+            fixed_points += 1;
+            let after = best_single_move(&cost, &state);
+            assert!(
+                after >= -1e-9,
+                "seed {seed}: a move lowers the cost by {after}"
+            );
+        }
+    }
+    assert!(fixed_points > 0, "descent reached a fixed point");
+}
+
+// ─── Making room ─────────────────────────────────────────────────────────────
+
+/// U1 at (30, 20) boxed in by 24 movable 2.4 mm parts B1 to B24 (0.1 to 0.35 mm apart),
+/// and its capacitor C1 far off at `cap_at`: every cell within C1's 3 mm limit of U1's
+/// pad 1 is taken. `locked` locks the blockers it names. The blockers sit on a ground
+/// rail with a pour, and the board's labels are on `F.Fab`, not on silk: nothing in the
+/// cost moves a blocker, so no single move frees a cell for C1. U1 is locked, so it
+/// cannot go to C1 instead.
+fn boxed(locked: &[usize], outline: Shape, cap_at: (f64, f64), extra: Vec<Fp>) -> BoardModel {
+    let offsets = [-5.25, -2.75, 0.0, 2.75, 5.25];
+    let mut parts = vec![
+        Fp::new("U1", 30.0, 20.0)
+            .locked()
+            .court(1.5, 1.5)
+            .pad(pad("1", -1.0, 0.0, Some("VCC")))
+            .pad(pad("2", 1.0, 0.0, Some("GND"))),
+        Fp::new("C1", cap_at.0, cap_at.1).two_pad("VCC", "GND"),
+    ];
+    let mut n = 0;
+    for &dx in &offsets {
+        for &dy in &offsets {
+            if dx == 0.0 && dy == 0.0 {
+                continue;
+            }
+            n += 1;
+            let mut blocker = Fp::new(&format!("B{n}"), 30.0 + dx, 20.0 + dy)
+                .court(1.2, 1.2)
+                .pad(pad("1", 0.0, 0.0, Some("GND")));
+            if locked.contains(&n) {
+                blocker = blocker.locked();
+            }
+            parts.push(blocker);
+        }
+    }
+    parts.extend(extra);
+    let text = board(outline, &parts).replace(
+        "(at 0 -1.5 0) (layer \"F.SilkS\")",
+        "(at 0 -1.5 0) (layer \"F.Fab\")",
+    );
+    let zone = "(zone (net \"GND\") (layer \"F.Cu\") (uuid \"77777777-0000-4000-8000-000000000002\") (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1) (xy 0 1))))\n)\n";
+    let text = format!("{}{zone}", text.trim_end().strip_suffix(')').unwrap());
+    let set = held_set(&text, &BTreeSet::new(), &HoldRules::default()).unwrap();
+    let pairs = vec![DecouplingPair {
+        cap: "C1".to_string(),
+        cap_pad: "1".to_string(),
+        ic: "U1".to_string(),
+        ic_pad: "1".to_string(),
+        net: "VCC".to_string(),
+        limit_mm: 3.0,
+        basis: "test".to_string(),
+    }];
+    board_model(&text, set, Intent::new(Vec::new(), pairs)).unwrap()
+}
+
+/// Two locked fillers that leave a slot 1.6 mm tall around (50, 34): C1 fits there, a
+/// blocker does not, so no swap of C1 with a blocker is legal.
+fn slot_at_50_34() -> Vec<Fp> {
+    vec![
+        Fp::new("F1", 50.0, 32.2)
+            .locked()
+            .court(3.0, 1.0)
+            .pad(pad("1", 0.0, 0.0, Some("GND"))),
+        Fp::new("F2", 50.0, 35.8)
+            .locked()
+            .court(3.0, 1.0)
+            .pad(pad("1", 0.0, 0.0, Some("GND"))),
+    ]
+}
+
+fn boxed_in() -> BoardModel {
+    boxed(&[], OUTLINE, (50.0, 34.0), slot_at_50_34())
+}
+
+/// Every part of `state` that moved is legal where it stands.
+fn assert_nothing_overlaps(cost: &CostModel<'_>, state: &State, what: &str) {
+    for &p in &cost.movable {
+        if state.centres[p] == cost.read_centres[p] && state.turns[p] == 0 {
+            continue;
+        }
+        let mv = Move {
+            parts: vec![(p, state.centres[p], state.turns[p])],
+        };
+        assert!(
+            cost.legal(state, &mv),
+            "{what}: {} overlaps",
+            cost.model.references[p]
+        );
+    }
+}
+
+#[test]
+fn a_capacitor_boxed_out_of_range_gets_a_cell_by_its_ic() {
+    let model = boxed_in();
+    let cost = cost_of(&model, None);
+    let c1 = index_of(&model, "C1");
+    assert!(cost.movable.len() == 25 && cost.part_nets[c1].len() == 1);
+    let start = state_from(&cost, &[]).unwrap();
+    assert_eq!(cost.terms(&start).pair_violations, 1);
+    // No single move of C1 brings it within its limit: every cell there is taken.
+    let mut rng = SplitMix64(11);
+    for _ in 0..20_000 {
+        if let Some(mv) = cost.propose(&start, c1, 30.0, &mut rng) {
+            if cost.legal(&start, &mv) && mv.parts.iter().any(|&(p, ..)| p == c1) {
+                let mut after = start.clone();
+                let delta = cost.delta(&after, &mv);
+                cost.apply(&mut after, &mv, delta);
+                assert_eq!(cost.terms(&after).pair_violations, 1, "{mv:?}");
+            }
+        }
+    }
+
+    // `repair` makes room: the pair within its limit, nothing overlapping.
+    let mut state = start.clone();
+    let mut evaluations = 0;
+    assert_eq!(repair(&cost, &mut state, &mut evaluations), (1, 1));
+    assert_eq!(cost.terms(&state).pair_violations, 0);
+    assert_same_caches(
+        &state,
+        &cost.state(state.centres.clone(), state.turns.clone()),
+        "after repair",
+    );
+    assert_nothing_overlaps(&cost, &state, "after repair");
+    let written = written(&model, &state);
+    assert!(movable_hard_failures(&model, &written).is_empty());
+    assert_eq!(pair_violations(&parse(&written), &model.intent.pairs), 0);
+
+    // Descent alone, from the boxed start: it runs `repair` first and ends with the pair
+    // within its limit (the control: without `repair` no move of its set frees a cell).
+    let mut state = start.clone();
+    let (_, stop, _) = descend(&cost, &mut state, &mut SplitMix64(3), &mut evaluations);
+    assert_eq!(cost.terms(&state).pair_violations, 0, "descent: {stop:?}");
+    assert_nothing_overlaps(&cost, &state, "after descent");
+
+    // A whole run ends with the pair within its limit.
+    let (candidate, trace) = run(&model, None, 1, &quick(0));
+    assert_eq!(trace.end.pair_violations, 0, "{trace:?}");
+    assert!(trace.repairs_tried >= trace.repairs_made);
+    let text = board_of(&model, &candidate);
+    assert!(movable_hard_failures(&model, &text).is_empty());
+}
+
+#[test]
+fn making_room_never_moves_a_held_part() {
+    // The six blockers left of U1 locked: C1 must go elsewhere, and only movable
+    // blockers make room for it.
+    let left = [6, 7, 8, 9, 10, 11];
+    let model = boxed(&left, OUTLINE, (50.0, 34.0), slot_at_50_34());
+    let cost = cost_of(&model, None);
+    for k in left {
+        assert!(!model.movable[index_of(&model, &format!("B{k}"))], "B{k}");
+    }
+    let state = state_from(&cost, &[]).unwrap();
+    let mv = cost
+        .make_room(&state, 0)
+        .expect("room on a side of movable parts");
+    assert!(mv.parts.len() >= 2, "{mv:?}");
+    for &(p, ..) in &mv.parts {
+        assert!(model.movable[p], "{} is held", model.references[p]);
+    }
+    assert!(cost.legal(&state, &mv));
+    // Every blocker held: no cell within the limit is legal against the held parts.
+    let all: Vec<usize> = (1..=24).collect();
+    let model = boxed(&all, OUTLINE, (50.0, 34.0), slot_at_50_34());
+    let cost = cost_of(&model, None);
+    let state = state_from(&cost, &[]).unwrap();
+    assert_eq!(cost.make_room(&state, 0), None);
+}
+
+#[test]
+fn making_room_is_refused_when_a_displaced_part_finds_no_cell() {
+    // The board ends 0.05 mm outside the blockers on the left and 1.05 mm above and below
+    // them; right of them two locked fillers leave C1 a slot 2.2 mm tall. A displaced
+    // 2.4 mm blocker finds no cell anywhere.
+    let fillers = || {
+        vec![
+            Fp::new("F1", 39.25, 15.75)
+                .locked()
+                .court(2.65, 3.15)
+                .pad(pad("1", 0.0, 0.0, Some("GND"))),
+            Fp::new("F2", 39.25, 24.25)
+                .locked()
+                .court(2.65, 3.15)
+                .pad(pad("1", 0.0, 0.0, Some("GND"))),
+        ]
+    };
+    let tight = boxed(
+        &[],
+        Shape::Rect(23.5, 12.5, 42.0, 27.5),
+        (38.0, 20.0),
+        fillers(),
+    );
+    let cost = cost_of(&tight, None);
+    let state = state_from(&cost, &[]).unwrap();
+    assert_eq!(cost.terms(&state).pair_violations, 1);
+    assert_eq!(cost.make_room(&state, 0), None);
+    // The same board with a strip below the blockers: the displaced blocker finds a cell
+    // there, and the move is legal as a whole.
+    let roomy = boxed(
+        &[],
+        Shape::Rect(23.5, 9.0, 42.0, 27.5),
+        (38.0, 20.0),
+        fillers(),
+    );
+    let cost = cost_of(&roomy, None);
+    let state = state_from(&cost, &[]).unwrap();
+    let mv = cost.make_room(&state, 0).expect("room in the strip");
+    assert!(mv.parts.len() >= 2 && cost.legal(&state, &mv), "{mv:?}");
+}
+
+// ─── The cost model's run-level halves ───────────────────────────────────────
+
+#[test]
+fn an_unmeasured_pair_is_a_constant_violation_and_the_run_still_ends() {
+    let text = board(OUTLINE, &demo_parts());
+    let set = held_set(&text, &BTreeSet::new(), &HoldRules::default()).unwrap();
+    // U1 has no pad 9.
+    let pairs = vec![DecouplingPair {
+        cap: "C1".to_string(),
+        cap_pad: "1".to_string(),
+        ic: "U1".to_string(),
+        ic_pad: "9".to_string(),
+        net: "VCC".to_string(),
+        limit_mm: 3.0,
+        basis: "test".to_string(),
+    }];
+    let model = board_model(&text, set, Intent::new(Vec::new(), pairs.clone())).unwrap();
+    let (candidate, trace) = run(&model, None, 1, &quick(0));
+    assert!(trace.converged(), "{trace:?}");
+    assert_eq!(trace.start.pair_violations, 1);
+    assert_eq!(trace.end.pair_violations, 1);
+    let text = board_of(&model, &candidate);
+    assert_eq!(pair_violations(&parse(&text), &pairs), 1);
+    assert!((trace.end.cost - trace.end.soft - trace.requirement_mm).abs() < 1e-9);
+}
+
+/// The demo with an indicator LED D1 on the two rails only, both rails poured: nothing
+/// in the nets pulls D1 anywhere.
+fn led_on_rails() -> BoardModel {
+    let mut parts = demo_parts();
+    parts.push(Fp::new("D1", 6.0, 20.0).two_pad("VCC", "GND"));
+    let text = board(OUTLINE, &parts);
+    let zones: String = ["VCC", "GND"]
+        .iter()
+        .enumerate()
+        .map(|(k, net)| {
+            format!(
+                "(zone (net \"{net}\") (layer \"F.Cu\") (uuid \"77777777-0000-4000-8000-00000000001{k}\") (polygon (pts (xy 0 0) (xy 60 0) (xy 60 40) (xy 0 40))))\n"
+            )
+        })
+        .collect();
+    let text = format!("{}{zones})\n", text.trim_end().strip_suffix(')').unwrap());
+    model_of(&text, &[])
+}
+
+#[test]
+fn a_part_on_rails_only_ends_by_its_schematic_neighbours() {
+    let model = led_on_rails();
+    let (d1, j1) = (index_of(&model, "D1"), index_of(&model, "J1"));
+    let cost = cost_of(&model, None);
+    assert!(cost.part_nets[d1].is_empty(), "D1 is on poured rails only");
+    let hoods = hoods_of(&[("D1", &["J1"]), ("R1", &["R2"])]);
+    let distance = |candidate: &Candidate| {
+        let text = board_of(&model, candidate);
+        let state = rebuilt(&cost, &text);
+        let (a, b) = (state.centres[d1], state.centres[j1]);
+        (a.0 - b.0).hypot(a.1 - b.1)
+    };
+    let (pulled, trace) = run(&model, Some(&hoods), 1, &quick(0));
+    assert!(trace.converged() && trace.end.neighbour_mm.is_some());
+    let near = distance(&pulled);
+    // The control: without the term the same part ends farther away.
+    let off = ConvergeParams {
+        neighbour_weight: 0.0,
+        ..quick(0)
+    };
+    let (loose, _) = run(&model, Some(&hoods), 1, &off);
+    let far = distance(&loose);
+    assert!(near < far, "with the term {near} mm, without {far} mm");
+    assert!(near < 6.0, "D1 ends by J1: {near} mm");
+    // With no schematic the run still ends, and the trace has no neighbour term.
+    let (_, trace) = run(&model, None, 1, &quick(0));
+    assert!(trace.converged());
+    assert_eq!(trace.end.neighbour_mm, None);
+    assert_eq!(trace.hoods_sha256, None);
+}
+
+#[test]
+fn the_hoods_hash_is_of_their_sorted_json() {
+    let hoods = demo_hoods();
+    let text = r#"{"alone":0,"measured":5,"neighbours":{"C1":["U1","C2"],"C5":["R4"],"R1":["R2","R3","C1"],"R6":["J1"],"U1":["C1"]},"unmatched":0}"#;
+    assert_eq!(
+        hoods_sha256(&hoods),
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    );
+    let mut other = hoods.clone();
+    other.alone = 1;
+    assert_ne!(hoods_sha256(&hoods), hoods_sha256(&other));
+}
+
+// ─── Speed (not a guard) ─────────────────────────────────────────────────────
+
+/// One run of `converge` on the demo with decoupling pairs and neighbourhoods, from the
+/// board as read; its trace and wall time.
+fn timed_run(params: &ConvergeParams, seed: u64) -> (Trace, std::time::Duration) {
+    let model = demo_with_pairs();
+    let hoods = demo_hoods();
+    let started = std::time::Instant::now();
+    let (_, trace) = converge(&model, Some(&hoods), &[], seed, params).expect("a run");
+    (trace, started.elapsed())
+}
+
+/// The cost of whole runs on the demo at levels 0 and 1, with the measured parameters,
+/// for the measurement. Run by hand in a release build:
+/// `cargo test --release -p konnect-core --locked --lib place_converge::tests::time_a_run_on_the_demo -- --exact --ignored --nocapture`.
+#[test]
+#[ignore]
+fn time_a_run_on_the_demo() {
+    for level in [0, 1] {
+        for seed in 1..=3 {
+            let (trace, took) = timed_run(&ConvergeParams::measured(level), seed);
+            println!(
+                "level {level} seed {seed}: {} stages ({:?}), {} sweeps ({:?}), {} evaluations, \
+                 repairs {} made of {} tried, first T {:.3}, R {:.1}, start cost {:.3} (airwire {:.2}, \
+                 crossings {}, pairs broken {}), end cost {:.3} (airwire {:.2}, crossings {}, pairs \
+                 broken {}, labels {}), {:.2} s, {:.2} µs per evaluation",
+                trace.stages,
+                trace.anneal_stop,
+                trace.sweeps,
+                trace.descent_stop,
+                trace.evaluations,
+                trace.repairs_made,
+                trace.repairs_tried,
+                trace.first_temperature,
+                trace.requirement_mm,
+                trace.start.cost,
+                trace.start.airwire_mm,
+                trace.start.crossings,
+                trace.start.pair_violations,
+                trace.end.cost,
+                trace.end.airwire_mm,
+                trace.end.crossings,
+                trace.end.pair_violations,
+                trace.end.label_conflicts,
+                took.as_secs_f64(),
+                took.as_secs_f64() * 1e6 / trace.evaluations as f64,
+            );
+        }
+    }
+}
+
+/// A whole run at levels 0 and 1 on the 96-part board, with the measured parameters: what
+/// to expect on a board of the owner's size. Run by hand in a release build:
+/// `cargo test --release -p konnect-core --locked --lib place_converge::tests::time_a_run_on_96_parts -- --exact --ignored --nocapture`.
+#[test]
+#[ignore]
+fn time_a_run_on_96_parts() {
+    let model = ninety_six_parts();
+    for level in [0, 1] {
+        let started = std::time::Instant::now();
+        let (_, trace) = run(&model, None, 1, &ConvergeParams::measured(level));
+        let took = started.elapsed();
+        println!(
+            "96 parts, level {level}: {} stages ({:?}), {} sweeps ({:?}), {} evaluations, \
+             repairs {} made of {} tried, first T {:.3}, start cost {:.3} (airwire {:.2}, \
+             crossings {}), end cost {:.3} (airwire {:.2}, crossings {}, labels {}), {:.2} s, \
+             {:.2} µs per evaluation",
+            trace.stages,
+            trace.anneal_stop,
+            trace.sweeps,
+            trace.descent_stop,
+            trace.evaluations,
+            trace.repairs_made,
+            trace.repairs_tried,
+            trace.first_temperature,
+            trace.start.cost,
+            trace.start.airwire_mm,
+            trace.start.crossings,
+            trace.end.cost,
+            trace.end.airwire_mm,
+            trace.end.crossings,
+            trace.end.label_conflicts,
+            took.as_secs_f64(),
+            took.as_secs_f64() * 1e6 / trace.evaluations as f64,
+        );
+    }
 }

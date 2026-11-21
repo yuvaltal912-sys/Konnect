@@ -8,14 +8,12 @@
 //! thread. The search around the runs (which starts, how much effort, when to stop) is
 //! `place_search::converge_all`, by the rules of [`OuterRule`].
 
-// Temporary, for the `todo!()` bodies of the skeleton, which leave parameters and imports
-// unused: the stage that fills the last body removes this line.
-#![allow(unused_variables, unused_imports)]
 // Only the bench reaches this module (`place_search`, design C1), as with `place_search`.
 #![allow(dead_code)]
 
 use crate::place_generators::{
-    legalize_with, text_box, turn_vector, BoardModel, Candidate, GapRule, GenerateFailure, Legality,
+    legalize_with, placements_from, text_box, turn_vector, unit, BoardModel, Candidate, GapRule,
+    GenerateFailure, Legality, GRID_MM,
 };
 use crate::place_held::footprint_keys;
 use crate::place_schematic::Neighbourhoods;
@@ -28,6 +26,8 @@ use konnect_sexp::board::{footprint_courtyards, footprints, zones};
 use konnect_sexp::geometry::{rotate_about, transform_pad};
 use konnect_sexp::parser::SexpNode;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 
@@ -430,6 +430,10 @@ pub(crate) struct CostModel<'a> {
     hood_of: Vec<Vec<usize>>,
     /// Whether the board has neighbourhoods at all (`Terms::neighbour_mm`).
     has_hoods: bool,
+    /// The compound moves of making room this run tried and made (`repair` adds to it,
+    /// `converge` reads it into the trace): the run's one model is the one place both
+    /// annealing and descent reach.
+    repairs: Cell<(u64, u64)>,
 }
 
 /// One edge of a net's airwire tree: (from, to), as the score's tree gives it.
@@ -1012,6 +1016,7 @@ impl<'a> CostModel<'a> {
             hoods: hood_lists,
             hood_of,
             has_hoods: hoods.is_some(),
+            repairs: Cell::new((0, 0)),
         })
     }
 
@@ -1543,7 +1548,40 @@ impl<'a> CostModel<'a> {
         radius_mm: f64,
         rng: &mut SplitMix64,
     ) -> Option<Move> {
-        todo!()
+        let (at, turns) = (state.centres[part], state.turns[part]);
+        let kind = unit(rng);
+        if kind < SHIFT_SHARE {
+            let (dx, dy) = (grid_shift(rng, radius_mm), grid_shift(rng, radius_mm));
+            if dx == 0.0 && dy == 0.0 {
+                return None;
+            }
+            Some(Move {
+                parts: vec![(part, (at.0 + dx, at.1 + dy), turns)],
+            })
+        } else if kind < SHIFT_SHARE + TURN_SHARE {
+            if !self.may_turn[part] {
+                return None;
+            }
+            let by = 1 + rng.below(3) as u8;
+            Some(Move {
+                parts: vec![(part, at, (turns + by) % 4)],
+            })
+        } else if kind < SHIFT_SHARE + TURN_SHARE + SWAP_SHARE {
+            let other = self.movable[rng.below(self.movable.len() as u64) as usize];
+            if other == part {
+                return None;
+            }
+            Some(Move {
+                parts: vec![
+                    (part, state.centres[other], turns),
+                    (other, at, state.turns[other]),
+                ],
+            })
+        } else {
+            let mv = self.attraction(state, part, radius_mm / 4.0, rng)?;
+            let (_, to, to_turns) = mv.parts[0];
+            (to != at || to_turns != turns).then_some(mv)
+        }
     }
 
     /// Making room (design C4), for a decoupling pair past its limit: the capacitor at the
@@ -1553,14 +1591,113 @@ impl<'a> CostModel<'a> {
     /// nearest legal cell, largest first, against everything as it then stands. `None`
     /// when no such cell exists or a displaced part finds none within 25 rings. The move
     /// names the capacitor and every displaced part.
+    ///
+    /// "Nearest the IC's pad" is the capacitor's own pad of the pair: the cells are its
+    /// centre on the grid, ordered by how far they put that pad from the IC's pad (ties by
+    /// grid step), and the capacitor keeps its turns. A held capacitor, or a pair whose
+    /// two pads are on one part, gets no move. A displaced part keeps its turns and
+    /// searches from its own centre, snapped to the grid.
     fn make_room(&self, state: &State, pair: usize) -> Option<Move> {
-        todo!()
+        let Pair {
+            cap: (cap, cap_slot),
+            ic: (ic, ic_slot),
+            limit_mm,
+        } = self.pairs[pair];
+        if cap == ic || !self.model.movable[cap] {
+            return None;
+        }
+        let target = self.pad_at(ic, ic_slot, state.centres[ic], state.turns[ic]);
+        let turns = state.turns[cap];
+        let size = self.size_at(cap, turns);
+        // The cap's pad from its centre: the search is laid around the centre that puts
+        // the pad on the IC's pad.
+        let here = state.centres[cap];
+        let own = self.pad_at(cap, cap_slot, here, turns);
+        let base = (
+            snap_to(target.0 - (own.0 - here.0), GRID_MM),
+            snap_to(target.1 - (own.1 - here.1), GRID_MM),
+        );
+        let reach = (limit_mm / GRID_MM).ceil() as i64 + 1;
+        let mut cells: Vec<(f64, i64, i64)> = Vec::new();
+        for di in -reach..=reach {
+            for dj in -reach..=reach {
+                let cell = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
+                let pad = self.pad_at(cap, cap_slot, cell, turns);
+                let d = (pad.0 - target.0).hypot(pad.1 - target.1);
+                if d <= limit_mm {
+                    cells.push((d, di, dj));
+                }
+            }
+        }
+        cells.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+        // Legal against the outline, the copper, the held parts and the IC only.
+        let count = self.model.parts.len();
+        let fixed: Vec<usize> = (0..count)
+            .filter(|&j| j != cap && (j == ic || !self.model.movable[j]))
+            .collect();
+        let cell = cells.into_iter().find_map(|(_, di, dj)| {
+            let cell = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
+            self.legality
+                .legal_at(
+                    cap,
+                    cell,
+                    size,
+                    fixed.iter().copied(),
+                    &state.centres,
+                    &state.sizes,
+                )
+                .then_some(cell)
+        })?;
+
+        // The movable parts the capacitor now lies over, largest first.
+        let mut displaced: Vec<usize> = (0..count)
+            .filter(|&j| {
+                j != cap
+                    && j != ic
+                    && self.model.movable[j]
+                    && !self
+                        .legality
+                        .clear_of(cap, cell, size, j, state.centres[j], state.sizes[j])
+            })
+            .collect();
+        displaced.sort_by(|&a, &b| {
+            let area = |p: usize| state.sizes[p].0 * state.sizes[p].1;
+            area(b).total_cmp(&area(a)).then(a.cmp(&b))
+        });
+        let mut centres = state.centres.clone();
+        centres[cap] = cell;
+        let mut parts = vec![(cap, cell, turns)];
+        for d in displaced {
+            let from = (
+                snap_to(centres[d].0, GRID_MM),
+                snap_to(centres[d].1, GRID_MM),
+            );
+            let found = nearest_cells().iter().find_map(|&(di, dj)| {
+                let at = (from.0 + di as f64 * GRID_MM, from.1 + dj as f64 * GRID_MM);
+                self.legality
+                    .legal_at(
+                        d,
+                        at,
+                        state.sizes[d],
+                        (0..count).filter(|&j| j != d),
+                        &centres,
+                        &state.sizes,
+                    )
+                    .then_some(at)
+            })?;
+            centres[d] = found;
+            parts.push((d, found, state.turns[d]));
+        }
+        Some(Move { parts })
     }
 
     /// The attraction of `part`: the mean of the pads its nets reach on other parts (a
     /// pair's pad counts three times), jittered by up to `jitter_mm`, then the nearest
     /// legal cell on the 0.5 mm grid within 25 rings. `None` when the part reaches no
     /// other part or no cell is legal.
+    ///
+    /// A pad counts by its net's weight in the cost (a rail's by `rail_weight`), as the
+    /// experiment weighed it. A jitter of 0 draws nothing from `rng`.
     fn attraction(
         &self,
         state: &State,
@@ -1568,8 +1705,226 @@ impl<'a> CostModel<'a> {
         jitter_mm: f64,
         rng: &mut SplitMix64,
     ) -> Option<Move> {
-        todo!()
+        let jitter = if jitter_mm > 0.0 {
+            let dx = (2.0 * unit(rng) - 1.0) * jitter_mm;
+            let dy = (2.0 * unit(rng) - 1.0) * jitter_mm;
+            (dx, dy)
+        } else {
+            (0.0, 0.0)
+        };
+        self.attraction_at(state, part, jitter)
     }
+
+    /// The attraction of `part` with the jitter given (see `attraction`).
+    fn attraction_at(&self, state: &State, part: usize, jitter: (f64, f64)) -> Option<Move> {
+        let pad =
+            |(q, slot): (usize, usize)| self.pad_at(q, slot, state.centres[q], state.turns[q]);
+        let (mut sx, mut sy, mut weight) = (0.0, 0.0, 0.0);
+        for &n in &self.part_nets[part] {
+            let net = &self.nets[n];
+            for &site in &net.sites {
+                if site.0 != part {
+                    let (x, y) = pad(site);
+                    sx += net.weight * x;
+                    sy += net.weight * y;
+                    weight += net.weight;
+                }
+            }
+        }
+        for &k in &self.part_pairs[part] {
+            let pair = &self.pairs[k];
+            let other = if pair.cap.0 == part {
+                pair.ic
+            } else {
+                pair.cap
+            };
+            if other.0 != part {
+                let (x, y) = pad(other);
+                sx += PAIR_PULL * x;
+                sy += PAIR_PULL * y;
+                weight += PAIR_PULL;
+            }
+        }
+        if weight <= 0.0 {
+            return None;
+        }
+        let base = (
+            snap_to(sx / weight + jitter.0, GRID_MM),
+            snap_to(sy / weight + jitter.1, GRID_MM),
+        );
+        let mut mv = Move {
+            parts: vec![(part, base, state.turns[part])],
+        };
+        for &(di, dj) in nearest_cells() {
+            mv.parts[0].1 = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
+            if self.legal(state, &mv) {
+                return Some(mv);
+            }
+        }
+        None
+    }
+
+    /// The moves descent tries for `part`, in its fixed order (design C6): shifts of
+    /// 0.25, 0.5, 1, 2 and 4 mm in the 8 compass directions, the 3 turns (when the part
+    /// may turn), the attraction without jitter (when it goes somewhere), and swaps with
+    /// the part's 6 nearest movable parts (by centre distance, ties by index). Lazy: the
+    /// attraction and the nearest parts are found only when the moves before them are
+    /// reached.
+    fn descent_moves<'s>(
+        &'s self,
+        state: &'s State,
+        part: usize,
+    ) -> impl Iterator<Item = Move> + 's {
+        let (at, turns) = (state.centres[part], state.turns[part]);
+        let shifts = DESCENT_STEPS_MM.iter().flat_map(move |&step| {
+            DIRECTIONS.iter().map(move |&(dx, dy)| Move {
+                parts: vec![(part, (at.0 + dx * step, at.1 + dy * step), turns)],
+            })
+        });
+        let may_turn = self.may_turn[part];
+        let turned = (1..=3u8).filter(move |_| may_turn).map(move |by| Move {
+            parts: vec![(part, at, (turns + by) % 4)],
+        });
+        let attracted = std::iter::once_with(move || self.attraction_at(state, part, (0.0, 0.0)))
+            .flatten()
+            .filter(move |mv| mv.parts[0].1 != at);
+        let swaps = std::iter::once_with(move || {
+            let mut near: Vec<(f64, usize)> = self
+                .movable
+                .iter()
+                .filter(|&&o| o != part)
+                .map(|&o| {
+                    let c = state.centres[o];
+                    ((c.0 - at.0).powi(2) + (c.1 - at.1).powi(2), o)
+                })
+                .collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            near.truncate(DESCENT_SWAPS);
+            near
+        })
+        .flatten()
+        .map(move |(_, other)| Move {
+            parts: vec![
+                (part, state.centres[other], turns),
+                (other, at, state.turns[other]),
+            ],
+        });
+        shifts.chain(turned).chain(attracted).chain(swaps)
+    }
+
+    /// `state` with every cache computed from nothing again (design C9), the placement
+    /// unchanged.
+    fn rebuild(&self, state: &mut State) {
+        let centres = std::mem::take(&mut state.centres);
+        let turns = std::mem::take(&mut state.turns);
+        *state = self.state(centres, turns);
+    }
+}
+
+/// The shares of the four drawn moves (design C4): shift 55, turn 12, swap 15, and the
+/// attraction the rest (18).
+const SHIFT_SHARE: f64 = 0.55;
+const TURN_SHARE: f64 = 0.12;
+const SWAP_SHARE: f64 = 0.15;
+
+/// The grid of a drawn shift's offset, mm (design C4).
+const SHIFT_GRID_MM: f64 = 0.25;
+
+/// A decoupling pair's pad counts this many times in the attraction (design C4).
+const PAIR_PULL: f64 = 3.0;
+
+/// The rings of a nearest-legal-cell search on `GRID_MM`: ring 0 and 24 more (design C4).
+const CELL_RINGS: i64 = 25;
+
+/// The first temperature's trials (design C5): this many shifts of up to this far.
+const TRIAL_SHIFTS: usize = 400;
+const TRIAL_RADIUS_MM: f64 = 10.0;
+/// The first temperature when no trial went uphill.
+const COLD_START_TEMPERATURE: f64 = 50.0;
+
+/// Descent's shifts (design C6), and its swaps with this many nearest parts.
+const DESCENT_STEPS_MM: [f64; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+const DIRECTIONS: [(f64, f64); 8] = [
+    (1.0, 0.0),
+    (-1.0, 0.0),
+    (0.0, 1.0),
+    (0.0, -1.0),
+    (1.0, 1.0),
+    (1.0, -1.0),
+    (-1.0, 1.0),
+    (-1.0, -1.0),
+];
+const DESCENT_SWAPS: usize = 6;
+
+/// Descent makes a move only when it lowers the cost by more than this, mm; annealing
+/// keeps a new best only when it is lower by more than this.
+const LOWER_BY_MM: f64 = 1e-9;
+
+/// `value` on the grid of `step`.
+fn snap_to(value: f64, step: f64) -> f64 {
+    (value / step).round() * step
+}
+
+/// A drawn shift of up to `radius_mm` on one axis, on the 0.25 mm grid.
+fn grid_shift(rng: &mut SplitMix64, radius_mm: f64) -> f64 {
+    snap_to((2.0 * unit(rng) - 1.0) * radius_mm, SHIFT_GRID_MM)
+}
+
+/// The cells of rings 0 to 24 around a centre cell, as grid steps: ring by ring, each
+/// ring nearest first and ties by step, as `legalize`'s ring search walks them.
+fn nearest_cells() -> &'static [(i64, i64)] {
+    static CELLS: std::sync::OnceLock<Vec<(i64, i64)>> = std::sync::OnceLock::new();
+    CELLS.get_or_init(|| {
+        let mut all = vec![(0, 0)];
+        for ring in 1..CELL_RINGS {
+            let mut cells = Vec::with_capacity(8 * ring as usize);
+            for i in -ring..=ring {
+                cells.push((i, -ring));
+                cells.push((i, ring));
+            }
+            for j in (-ring + 1)..ring {
+                cells.push((-ring, j));
+                cells.push((ring, j));
+            }
+            cells.sort_by_key(|&(i, j)| (i * i + j * j, i, j));
+            all.extend(cells);
+        }
+        all
+    })
+}
+
+/// The fall from `before` to `after` as a share of `before`; 0 when `before` is not
+/// above 0 (a cost of 0 cannot fall).
+fn gain_of(before: f64, after: f64) -> f64 {
+    if before > 0.0 {
+        (before - after) / before
+    } else {
+        0.0
+    }
+}
+
+/// The shift radius at `temperature` (design C5): `r0 x (T / first T)^radius_exponent`,
+/// never below 1 mm. It reads the temperature and not the level or the stage count, so
+/// every level shrinks it over the same range of temperatures.
+fn shift_radius(params: &ConvergeParams, r0: f64, temperature: f64, first: f64) -> f64 {
+    (r0 * (temperature / first).powf(params.radius_exponent)).max(MIN_RADIUS_MM)
+}
+
+/// The least shift radius, mm (design C5).
+const MIN_RADIUS_MM: f64 = 1.0;
+
+/// SHA-256 of the neighbourhoods' JSON, keys sorted (design C11): the keys are written in
+/// sorted order and the map is a `BTreeMap`, so the text does not depend on how
+/// `serde_json` orders a map.
+fn hoods_sha256(hoods: &Neighbourhoods) -> String {
+    let json = serde_json::json!({
+        "alone": hoods.alone,
+        "measured": hoods.measured,
+        "neighbours": hoods.neighbours,
+        "unmatched": hoods.unmatched,
+    });
+    let text = serde_json::to_string(&json).expect("the neighbourhoods are JSON");
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 /// The state a run starts from (design C8): `start`, the placements of a candidate of
@@ -1650,14 +2005,41 @@ fn centres_of(
 /// cost changes over ln 2, so that about half of such moves are accepted (50 when none
 /// was uphill).
 fn first_temperature(cost: &CostModel<'_>, state: &State, rng: &mut SplitMix64) -> f64 {
-    todo!()
+    let mut copy = state.clone();
+    let count = cost.movable.len() as u64;
+    let (mut uphill, mut sum) = (0usize, 0.0);
+    for _ in 0..TRIAL_SHIFTS {
+        let part = cost.movable[rng.below(count) as usize];
+        let (dx, dy) = (
+            grid_shift(rng, TRIAL_RADIUS_MM),
+            grid_shift(rng, TRIAL_RADIUS_MM),
+        );
+        let at = copy.centres[part];
+        let mv = Move {
+            parts: vec![(part, (at.0 + dx, at.1 + dy), copy.turns[part])],
+        };
+        if !cost.legal(&copy, &mv) {
+            continue;
+        }
+        let delta = cost.delta(&copy, &mv);
+        if delta.cost > 0.0 {
+            uphill += 1;
+            sum += delta.cost;
+        }
+        cost.apply(&mut copy, &mv, delta);
+    }
+    if uphill == 0 {
+        COLD_START_TEMPERATURE
+    } else {
+        sum / uphill as f64 / std::f64::consts::LN_2
+    }
 }
 
 /// Whether annealing ends after a stage (design C6): `quiet_run` stages in a row were
 /// quiet, at least `quiet_stages_at_level`, and the stage's uphill share is below
 /// `uphill_floor`. Both are needed.
 pub(crate) fn quiet_enough(quiet_run: usize, uphill_share: f64, params: &ConvergeParams) -> bool {
-    todo!()
+    quiet_run >= params.quiet_stages_at_level() && uphill_share < params.uphill_floor
 }
 
 /// Annealing (design C5, C6). A stage is `stage_per_part` proposals per movable part at
@@ -1679,7 +2061,75 @@ fn anneal(
     rng: &mut SplitMix64,
     evaluations: &mut u64,
 ) -> (usize, AnnealStop, Vec<f64>) {
-    todo!()
+    let params = &cost.params;
+    let first = temperature;
+    let (bx0, by0, bx1, by1) = cost.model.bounds;
+    let r0 = (bx1 - bx0).min(by1 - by0) / 2.0;
+    let count = cost.movable.len();
+    let per_stage = params.stage_per_part.saturating_mul(count);
+    let (cooling, quiet_gain, most) = (
+        params.cooling_at_level(),
+        params.quiet_gain_at_level(),
+        params.max_stages_at_level(),
+    );
+    let mut t = first;
+    let mut radius = shift_radius(params, r0, t, first);
+    let mut best = state.cost;
+    let mut best_at: Placement = (state.centres.clone(), state.turns.clone());
+    let mut curve = Vec::new();
+    let (mut stages, mut quiet_run) = (0usize, 0usize);
+    let stop = loop {
+        stages += 1;
+        let at_start = best;
+        let (mut proposals, mut uphill) = (0u64, 0u64);
+        for _ in 0..per_stage {
+            let part = cost.movable[rng.below(count as u64) as usize];
+            let Some(mv) = cost.propose(state, part, radius, rng) else {
+                continue;
+            };
+            proposals += 1;
+            if !cost.legal(state, &mv) {
+                continue;
+            }
+            let delta = cost.delta(state, &mv);
+            *evaluations += 1;
+            if delta.cost > 0.0 {
+                // Uphill: made with probability exp(-change / T).
+                if unit(rng) >= (-delta.cost / t).exp() {
+                    continue;
+                }
+                uphill += 1;
+            }
+            cost.apply(state, &mv, delta);
+            if state.cost < best - LOWER_BY_MM {
+                best = state.cost;
+                best_at = (state.centres.clone(), state.turns.clone());
+            }
+        }
+        repair(cost, state, evaluations);
+        cost.rebuild(state);
+        if state.cost < best - LOWER_BY_MM {
+            best = state.cost;
+            best_at = (state.centres.clone(), state.turns.clone());
+        }
+        curve.push(best);
+        quiet_run = if gain_of(at_start, best) < quiet_gain {
+            quiet_run + 1
+        } else {
+            0
+        };
+        let uphill_share = uphill as f64 / proposals.max(1) as f64;
+        if quiet_enough(quiet_run, uphill_share, params) {
+            break AnnealStop::Quiet;
+        }
+        if stages >= most {
+            break AnnealStop::Guard;
+        }
+        t *= cooling;
+        radius = shift_radius(params, r0, t, first);
+    };
+    *state = cost.state(best_at.0, best_at.1);
+    (stages, stop, curve)
 }
 
 /// Descent (design C6). A sweep visits every movable part once, in an order drawn by
@@ -1695,14 +2145,87 @@ fn descend(
     rng: &mut SplitMix64,
     evaluations: &mut u64,
 ) -> (usize, DescentStop, Vec<f64>) {
-    todo!()
+    let params = &cost.params;
+    repair(cost, state, evaluations);
+    cost.rebuild(state);
+    let mut curve = Vec::new();
+    let (mut sweeps, mut quiet) = (0usize, 0usize);
+    loop {
+        sweeps += 1;
+        let before = state.cost;
+        let mut moved = 0usize;
+        let mut order = cost.movable.clone();
+        // Fisher-Yates, by the seeded stream.
+        for i in (1..order.len()).rev() {
+            let j = rng.below(i as u64 + 1) as usize;
+            order.swap(i, j);
+        }
+        for &part in &order {
+            loop {
+                let found = cost.descent_moves(state, part).find_map(|mv| {
+                    if !cost.legal(state, &mv) {
+                        return None;
+                    }
+                    *evaluations += 1;
+                    let delta = cost.delta(state, &mv);
+                    (delta.cost < -LOWER_BY_MM).then_some((mv, delta))
+                });
+                let Some((mv, delta)) = found else {
+                    break;
+                };
+                cost.apply(state, &mv, delta);
+                moved += 1;
+            }
+        }
+        cost.rebuild(state);
+        curve.push(state.cost);
+        quiet = if gain_of(before, state.cost) < params.quiet_gain {
+            quiet + 1
+        } else {
+            0
+        };
+        if moved == 0 {
+            return (sweeps, DescentStop::FixedPoint, curve);
+        }
+        if quiet >= params.quiet_sweeps {
+            return (sweeps, DescentStop::Quiet, curve);
+        }
+        if sweeps >= params.max_sweeps {
+            return (sweeps, DescentStop::Guard, curve);
+        }
+    }
 }
 
 /// The repair of broken requirements: for every decoupling pair past its limit, in pair
 /// order, `CostModel::make_room`, made when it lowers the cost. Returns how many were
 /// tried and how many made.
+///
+/// A pair is read as the state stands after the repairs before it. "Tried" is a compound
+/// move that `make_room` gave; it is made when it is legal as a whole and lowers the
+/// cost. The counts are also added to the cost model's run totals (`Trace`).
 fn repair(cost: &CostModel<'_>, state: &mut State, evaluations: &mut u64) -> (u64, u64) {
-    todo!()
+    let (mut tried, mut made) = (0u64, 0u64);
+    for k in 0..cost.pairs.len() {
+        if state.pair_mm[k] <= cost.pairs[k].limit_mm {
+            continue;
+        }
+        let Some(mv) = cost.make_room(state, k) else {
+            continue;
+        };
+        tried += 1;
+        if !cost.legal(state, &mv) {
+            continue;
+        }
+        let delta = cost.delta(state, &mv);
+        *evaluations += 1;
+        if delta.cost < 0.0 {
+            cost.apply(state, &mv, delta);
+            made += 1;
+        }
+    }
+    let (all_tried, all_made) = cost.repairs.get();
+    cost.repairs.set((all_tried + tried, all_made + made));
+    (tried, made)
 }
 
 /// One run of family C from `start`: `CostModel::build`, `state_from`,
@@ -1720,7 +2243,56 @@ pub(crate) fn converge(
     seed: u64,
     params: &ConvergeParams,
 ) -> Result<(Candidate, Trace), GenerateFailure> {
-    todo!()
+    let cost = CostModel::build(model, hoods, params)?;
+    let given = centres_of(&cost, start)?;
+    let legal = state_from(&cost, start)?;
+    // R follows the start the run works from: the start made legal (its soft cost does
+    // not depend on R). Every state of the model before is built again under it.
+    let requirement = params.requirement_mm.max(cost.terms(&legal).soft);
+    let cost = cost.with_requirement(requirement);
+    let start_terms = cost.terms(&cost.state(given.0, given.1));
+    let mut state = cost.state(legal.centres, legal.turns);
+
+    let mut rng = SplitMix64(seed);
+    for _ in 0..params.level {
+        rng.next_u64();
+    }
+    let mut evaluations = 0u64;
+    let first = first_temperature(&cost, &state, &mut rng);
+    let (stages, anneal_stop, mut best_by_step) =
+        anneal(&cost, &mut state, first, &mut rng, &mut evaluations);
+    let (sweeps, descent_stop, by_sweep) = descend(&cost, &mut state, &mut rng, &mut evaluations);
+    best_by_step.extend(by_sweep);
+
+    let turns: Vec<i32> = state.turns.iter().map(|&q| i32::from(q)).collect();
+    let placements = placements_from(model, &state.centres, &turns);
+    // The end as written: the state rebuilt from the anchors `placements_from` rounded.
+    let (centres, turns) = centres_of(&cost, &placements)?;
+    let end = cost.terms(&cost.state(centres, turns));
+    let (repairs_tried, repairs_made) = cost.repairs.get();
+    let trace = Trace {
+        level: params.level,
+        requirement_mm: requirement,
+        hoods_sha256: hoods.map(hoods_sha256),
+        start: start_terms,
+        end,
+        repairs_tried,
+        repairs_made,
+        first_temperature: first,
+        stages,
+        anneal_stop,
+        sweeps,
+        descent_stop,
+        evaluations,
+        best_by_step,
+    };
+    let candidate = Candidate {
+        placements,
+        converged: Some(trace.converged()),
+        iterations_run: Some(stages),
+        trace: None,
+    };
+    Ok((candidate, trace))
 }
 
 /// The rule for starts, on the best costs of the runs of starts 1, 2, 3, ... in start
@@ -1730,7 +2302,16 @@ pub(crate) fn converge(
 /// and at `max_starts` whatever the costs say. A start whose run failed is
 /// `f64::INFINITY`.
 pub(crate) fn starts_stop(costs: &[f64], rule: &OuterRule) -> Option<usize> {
-    todo!()
+    let best = |n: usize| costs[..n].iter().copied().fold(f64::INFINITY, f64::min);
+    for n in 1..=costs.len() {
+        if n > rule.window && !rule.pays(best(n - rule.window), best(n)) {
+            return Some(n);
+        }
+        if n >= rule.max_starts {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// The rule for effort, on the cost of the best start's run at levels 0, 1, 2, ...: the
@@ -1738,7 +2319,17 @@ pub(crate) fn starts_stop(costs: &[f64], rule: &OuterRule) -> Option<usize> {
 /// stopped within `costs`. It stops after the first level k >= 1 whose cost does not pay
 /// against the best of the levels below it, and after `max_level` whatever the costs say.
 pub(crate) fn effort_stop(costs: &[f64], rule: &OuterRule) -> Option<usize> {
-    todo!()
+    let mut below = f64::INFINITY;
+    for (k, &cost) in costs.iter().enumerate() {
+        if k >= 1 && !rule.pays(below, cost) {
+            return Some(k + 1);
+        }
+        if k >= rule.max_level as usize {
+            return Some(k + 1);
+        }
+        below = below.min(cost);
+    }
+    None
 }
 
 #[cfg(test)]
