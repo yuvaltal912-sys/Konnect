@@ -93,7 +93,9 @@ Each worker owns one creation PR on its own branch. The owner's boundary (2026-1
 
 ## Next: what to pick
 
-**Now (2026-11-20).** No row is in progress. Row DP merged as [#93](https://github.com/yuvaltal912-sys/Konnect/pull/93) (main `d758fbab`, a noreply merge whose tree equals the PR head `bd8a009a`). Row PS's changes since #92 (the schematic-neighbour measure D23, generators 7 and 8, the routing record's pair fields) merged as [#94](https://github.com/yuvaltal912-sys/Konnect/pull/94) (main `a68a0fa7`, a noreply merge whose tree equals the PR head `503ba63f`). Row LT (length tuning) is designed on branch `claude/length-tuning-design-674041` (`docs/LENGTH_TUNING_DESIGN.md` on that branch, not on this one); the owner approved its three decisions on 2026-11-20, and the build waits for his word. See "Row PS" and "Row DP". Still open: Row RJ's first live run.
+**Now (2026-11-21).** Row CL Limit 2 is in progress on `codex/export-custom-pad` (see its section below).
+
+**Previously (2026-11-20).** Row DP merged as [#93](https://github.com/yuvaltal912-sys/Konnect/pull/93) (main `d758fbab`, a noreply merge whose tree equals the PR head `bd8a009a`). Row PS's changes since #92 (the schematic-neighbour measure D23, generators 7 and 8, the routing record's pair fields) merged as [#94](https://github.com/yuvaltal912-sys/Konnect/pull/94) (main `a68a0fa7`, a noreply merge whose tree equals the PR head `503ba63f`). Row LT (length tuning) is designed on branch `claude/length-tuning-design-674041` (`docs/LENGTH_TUNING_DESIGN.md` on that branch, not on this one); the owner approved its three decisions on 2026-11-20, and the build waits for his word. See "Row PS" and "Row DP". Still open: Row RJ's first live run.
 
 **Before (2026-11-19).** Row PS, the placement-search bench, merged as [#90](https://github.com/yuvaltal912-sys/Konnect/pull/90); its owner-flow change (the bench holds only his KiCad locks and runs F and S, not P) merged as [#92](https://github.com/yuvaltal912-sys/Konnect/pull/92) (main `8795de82`, a noreply merge whose tree equals the PR head `0fc4ef63`). The owner has locked his parts on the copies in `target/creation-research/placement-search/lock-copies/`: B4 6, B5 10, B6 6 footprints (he left the B4 and B6 connectors unlocked on purpose). B4 to B6 have not run; the first run was his new board "dash" (see "Row PS").
 
@@ -286,6 +288,12 @@ The plan is four PRs:
 The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still serve every toolset, so embedding callers and the core tests see no change. The live simulation tests turn the key on in every server they start.
 
 **Evidence.** Recorded in the PR description: the targeted tests, one negative control per guard, the independent review and the full gate.
+
+## Row CL, Limit 2 — custom pads in the Specctra export
+
+**In progress, 2026-11-21.** The owner assigned this export fix on `codex/export-custom-pad`, based on `fork/main` at `0a3fc504`. Row CP's local handoff at `af59d99a` records the original refusal. The branch, its scratch boards, and its verification records are in the owner's requested `konnect-cp-limits/Konnect` worktree. Limits 1 and 3 belong to Row CP's placement work.
+
+**Acceptance.** Export the copper of a public custom-pad fixture, test it against a negative control, route it through the placement bench and `route_with_fastroute`, and route the owner's placement on a fresh B6 copy. The baseline gate is queued on an isolated copy of the base. The owner reviews the exact publication text before a push or PR.
 
 ## Row PS, the best-of-N placement search (bench)
 
