@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased custom pads in Specctra exports
+
+`export_specctra_dsn` accepts a custom copper pad when its anchor and supported
+primitives form one convex polygon on KiCad’s grid and remain convex after
+conversion to the DSN grid. Consumers
+of the reverse manifest can now see `"shape": "custom"` on a padstack. Its
+`size_x_um` and `size_y_um` describe the KiCad anchor. Read the DSN polygon
+for the complete copper boundary. Custom pads use the Rust exporter in native
+bridge mode `prefer`. Mode `require` reports that the bridge cannot verify the
+polygon. The supported primitive and layer combinations are listed under
+`export_specctra_dsn` in [the tool directory](../tool-directory.md).
+
 ## Unreleased: the switching hot loops read pin types too
 
 `audit_layout_quality` checks 8.1 and 8.2 find a converter's input and ground
@@ -1743,7 +1755,7 @@ or oval pad, or a copper zone. It now exports them; the other refusals stand.
 - **Pads.** `roundrect` is written as its bounding rectangle: the router never sees
   copper that is not there, and may not use the corners. `oval` is written as a
   stadium (a path as wide as the short side); an oval with equal sides is a circle.
-  Trapezoid and custom pads are still refused.
+  That release refused trapezoid and custom pads.
 - **Zones.** A copper pour becomes a Specctra `plane` of its net on each of its copper
   layers, which is how KiCad's own DSN export writes one. A rule area that forbids
   tracks or vias becomes a keepout (tracks only, vias only, or both). Both come from the

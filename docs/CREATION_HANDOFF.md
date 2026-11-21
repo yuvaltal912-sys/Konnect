@@ -1,5 +1,7 @@
 # Creation handoff
 
+**2026-11-21.** Row CL Limit 2 is open for review. Its section below records the public fixture and B6 routing results. [PR #97](https://github.com/yuvaltal912-sys/Konnect/pull/97)
+
 **S11 resumed 2026-11-12; implemented, reviewed and gated 2026-11-13.** The owner resumed PRs #63, #64 and #65 under one supervisor session (decision row "Claude resume of three PRs"); the 2026-11-10 pause no longer applies to #64. S11 runs as Claude (`claude-opus-5-5`, `xhigh`). Current state: "Row S11: suspected zone-fill defects".
 
 The current state of the creation-side work: schematic, PCB and library tools. Anyone picking this up, human or agent, starts here. Update this file in the same commit that changes the state. The simulation track has its own file, [`SIMULATION_HANDOFF.md`](SIMULATION_HANDOFF.md).
@@ -286,6 +288,34 @@ The plan is four PRs:
 The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still serve every toolset, so embedding callers and the core tests see no change. The live simulation tests turn the key on in every server they start.
 
 **Evidence.** Recorded in the PR description: the targeted tests, one negative control per guard, the independent review and the full gate.
+
+## Row CL, Limit 2 — custom pads in the Specctra export
+
+**Implemented and published, 2026-11-21.** Commit `6e9a58f0` implements the owner’s export fix on `codex/export-custom-pad`, based on `fork/main` at `0a3fc504`. Row CP's local handoff at `af59d99a` records the original refusal. Local claim `6d3c90cb` records the owner’s requested worktree at `~/.codex/worktrees/konnect-cp-limits/Konnect`. Its scratch boards and verification records stay there. Limits 1 and 3 belong to Row CP's placement work.
+
+The Rust exporter merges the anchor and supported copper primitives on KiCad's nanometre grid, checks for one convex region without holes, and projects it to the 0.1 µm DSN grid. Each pin keeps its own offset, orientation and copper layers. The complete polygon participates in padstack identity. The public fixture derives entirely from the two-resistor test board and was written with KiCad 10.0.8. The tool directory and API migration entry describe the supported shapes.
+
+**Verified on macOS.** Local evidence is under `target/row-cl/` in this worktree.
+
+- Base verification at `0a3fc504` used the creation gate's shared locks and protected configuration. Workspace tests passed (5,183 plus 38 sandboxed), as did nine doc tests, fmt, Clippy, licenses, doc counts and the release build. The first live simulation run passed 94 of 95. The IBIS demo reported `Cannot find U1.cache` and passed on an isolated retry. The installed binary and protected settings matched their original hashes. See `gate/baseline-verified/results.json`.
+- The five original regression tests all failed on the pre-change exporter. The feature build passed all 17 focused tests with `cargo test -p konnect-core --locked --lib specctra::custom_pad_tests`. The opt-in native fixture test ran separately and passed through `route_with_fastroute`, scratch KiCad refill/DRC and strict SES import with real track geometry.
+- The placement bench routed the public fixture on all three reference calls and one generated placement with zero unconnected items and all three gates passing. The reference still has two library-footprint findings and one silkscreen-over-copper finding. Both custom copper polygons agreed with KiCad's merged outlines to within 4.94 µm. The 6 µm comparison allowance covers 5 µm curve chording, DSN rounding and the independent native contour. See `logs/public-verified-result.json` and `logs/public-verified-copper.json`.
+- The B6 diagnostic with effort M and a seven-minute bench limit returned a judged SES for the owner's byte-identical input placement (35 runs judged in the first reference call). KiCad's unconnected count fell from 136 to 2. The two open items involve four endpoints on nets with no custom pads. G2 and G3 passed. The time limit allowed one of the three reference calls. All 32 custom pad boundaries met the same native comparison threshold. The original diagnostic had refused all three owner calls before routing. See `logs/B6-result.json`, `logs/B6-copper.json` and `logs/B6-open-counts.json`.
+- The independent review prompted fixes and regression controls for nanometre gaps, swept circular line caps, odd-sized anchors, plated drill containment, both surface offset forms, layer-specific drilling, repeated primitive lists and native bridge policy. The final source review accepted those changes. The local AST graph includes the new exporter and its tests.
+
+- A second B6 bench with effort H and a 15-minute limit judged 113 trials. It selected a byte-identical SES. The saved, refilled board has 547 track segments and 33 vias. A check by footprint UUID found all 127 positions, rotations and sides equal to the input. Its two opens, the G1 result, and the passing G2 and G3 checks matched effort M. All four open endpoints mapped to the judged board, with zero belonging to custom pads and zero affected nets containing a custom pad. See `logs/B6-high-result.json` and `logs/B6-high-open-counts.json`.
+- The focused coverage run (`cargo llvm-cov --locked -p konnect-core --lib --json --summary-only -- specctra::custom_pad_tests`) covered 186 of 193 executable lines in `specctra_custom_pad.rs`.
+
+- Targeted `cargo mutants` caught all five selected polygon and drill mutations. Separately, each of 16 source mutations failed its named regression test. The controls cover lost copper, Y reflection, premature rounding, islands, holes, concavity, odd anchor sizes, stroke width, drill containment, surface offsets, layer rules and native-bridge handling. The results are in `mutants/mutants.out/outcomes.json` and `controls/results.json`.
+- The staged macOS gate passed 5,200 workspace tests plus 38 sandboxed router tests, nine doc tests and all 95 live simulation tests. Formatting, workspace Clippy with warnings denied, dependency licenses, doc counts, the release build and the protected-file checks passed. The installed binary SHA-256 begins with `3de188bb775ab4ce`. The standard commands and split for the nested sandbox are recorded in `gate/candidate/results.json`. The post-commit gate records the exact commit in `gate/final/results.json` and the release server's public-fixture routing response in `gate/final/served/route.json`.
+
+**Reproduce the public route.** Set `KONNECT_FASTROUTE` to the router binary and use scratch `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`. Run `cargo test --release -p konnect-core --locked --lib specctra::custom_pad_tests::fastroute_connects_the_custom_pad_fixture_after_kicad_refill -- --ignored --exact`. To repeat the placement bench, prepare a fresh folder with the saved input and routing rules as described in [the bench README](../xtask/placement-bench/README.md).
+
+**Post-commit verification.** One IPC handshake test failed in the first workspace pass on `6e9a58f0`. It passed on its isolated retry and in a full repeat of that phase (5,200 passed). The 38 separately sandboxed router tests and all 95 live simulation tests passed. The release server returned `complete` for the public fixture with zero unconnected items. See `gate/final/workspace-repeat.json` and `gate/final/served/served.json`.
+
+**Publication.** The owner approved the exact title and body for PR #97. GitHub's readback matched the approved text byte for byte and confirmed the published implementation head `6e9a58f0`. When the PR opened, `main` had advanced to `dddcd769` with the Row RJ fix in #96. Both branches had edited the handoff header and the same progress paragraph. Row CL now has its own status entry. [PR #97](https://github.com/yuvaltal912-sys/Konnect/pull/97)
+
+**Next step.** The owner reviews PR #97 for integration. The two open B6 connections are recorded for routing work. This export change was verified on macOS.
 
 ## Row PS, the best-of-N placement search (bench)
 

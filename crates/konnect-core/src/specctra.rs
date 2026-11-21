@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+#[path = "specctra_custom_pad.rs"]
+mod custom_pad;
+
 const UM_PER_MM: f64 = 1_000.0;
 const DSN_RESOLUTION: f32 = 10.0;
 /// The most an arc or circle may stray from its chord approximation, in mm.
@@ -46,6 +49,24 @@ pub(crate) struct ExportBundle {
     pub renamed_references: Vec<serde_json::Value>,
     /// Teardrop zones left out of the DSN (see [`is_teardrop`]).
     pub teardrops_skipped: usize,
+    /// Their polygon identity is validated only by the Rust exporter.
+    has_custom_pads: bool,
+}
+
+impl ExportBundle {
+    pub(crate) fn rust_only_bridge_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if !self.renamed_references.is_empty() {
+            reasons.push("footprints share a Reference");
+        }
+        if self.teardrops_skipped > 0 {
+            reasons.push("the board has teardrops");
+        }
+        if self.has_custom_pads {
+            reasons.push("the board has custom pad polygons");
+        }
+        reasons
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -58,11 +79,14 @@ enum PadShape {
     RoundRect,
     /// Written as a stadium: a path of the short dimension's width.
     Oval,
+    Custom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PadstackKey {
     shape: PadShape,
+    /// The merged pad-local outline in DSN resolution units (0.1 µm).
+    custom_outline: Vec<(i64, i64)>,
     layers: Vec<String>,
     size_x_um: i64,
     size_y_um: i64,
@@ -988,6 +1012,9 @@ pub(crate) fn export_dsn_with_options(
         net_count: net_pins.len(),
         class_count: class_nets.len(),
         renamed_references,
+        has_custom_pads: padstack_names
+            .keys()
+            .any(|key| key.shape == PadShape::Custom),
         teardrops_skipped: tree
             .find_all("zone")
             .into_iter()
@@ -1068,6 +1095,9 @@ pub(crate) fn adopt_native_dsn(
                 "native DSN not adopted: {} footprint(s) sharing a Reference were renamed, which KiCad's exporter cannot do",
                 baseline.renamed_references.len()
             );
+        }
+        if baseline.has_custom_pads {
+            bail!("native DSN not adopted: custom pad polygon identity needs the Rust exporter");
         }
         if let Some(back) = manifest.components.iter().find(|c| c.kicad_side == "back") {
             bail!(
@@ -3077,18 +3107,41 @@ fn footprints(
             let size_y_um = positive_um(size.get_f64(2), "pad height")?;
             let drill = pad.find("drill");
             // An oval drill is `(drill oval w h)`, a round one `(drill d)`.
-            let drill_dims = match drill {
+            let surface = matches!(pad_type, "smd" | "connect");
+            // KiCad clears the hole on SMD/connect pads, including a saved
+            // `(drill oval (offset ...))`. Their copper offset still applies.
+            let drill_dims_mm = match drill.filter(|_| !surface) {
                 None => None,
                 Some(d) if d.get(1).and_then(SexpNode::as_str) == Some("oval") => Some((
-                    positive_um(d.get_f64(2), "pad drill width")?,
-                    positive_um(d.get_f64(3).or(d.get_f64(2)), "pad drill height")?,
+                    finite_number(d.get_f64(2), "pad drill width")?,
+                    finite_number(d.get_f64(3).or(d.get_f64(2)), "pad drill height")?,
                 )),
                 Some(d) => {
-                    let v = positive_um(d.get_f64(1), "pad drill")?;
-                    Some((v, v))
+                    let diameter = finite_number(d.get_f64(1), "pad drill")?;
+                    Some((diameter, diameter))
                 }
             };
+            let drill_dims = drill_dims_mm
+                .map(|(w, h)| -> Result<_> {
+                    Ok((
+                        positive_um(Some(w), "pad drill width")?,
+                        positive_um(Some(h), "pad drill height")?,
+                    ))
+                })
+                .transpose()?;
 
+            let shape_name = pad.get(3).and_then(SexpNode::as_str);
+            if pad.find("padstack").is_some_and(|stack| {
+                shape_name == Some("custom")
+                    || stack.find_all("layer").iter().any(|l| {
+                        l.find_str("shape") == Some("custom") || l.find("primitives").is_some()
+                    })
+            }) {
+                bail!("unsupported routing profile: pad {label} has layer-specific custom copper");
+            }
+            if pad_type == "np_thru_hole" && shape_name == Some("custom") {
+                bail!("unsupported routing profile: non-plated pad {label} has custom copper");
+            }
             if pad_type == "np_thru_hole" {
                 // An unplated hole: no pin, an obstacle on every copper layer,
                 // as large as the larger of its pad and its drill.
@@ -3103,11 +3156,12 @@ fn footprints(
                 continue;
             }
 
-            let shape = match pad.get(3).and_then(SexpNode::as_str) {
+            let shape = match shape_name {
                 Some("circle") => PadShape::Circle,
                 Some("rect") => PadShape::Rect,
                 Some("roundrect") => PadShape::RoundRect,
                 Some("oval") => PadShape::Oval,
+                Some("custom") => PadShape::Custom,
                 Some(other) => {
                     bail!("unsupported routing profile: pad {label} has shape '{other}'")
                 }
@@ -3127,7 +3181,12 @@ fn footprints(
                     "unsupported first routing profile: pad {label} has a local clearance override"
                 );
             }
-            if pad.find_str("remove_unused_layers") == Some("yes") {
+            if pad.find_str("remove_unused_layers") == Some("yes")
+                || (shape == PadShape::Custom
+                    && pad.find("remove_unused_layers").is_some_and(|flag| {
+                        !matches!(flag.get(1).and_then(SexpNode::as_str), Some("no" | "false"))
+                    }))
+            {
                 bail!("unsupported first routing profile: pad {label} removes copper on unused layers");
             }
             // KiCad writes a pad's shape offset inside its drill. Before PR 16
@@ -3169,7 +3228,7 @@ fn footprints(
             // A plated hole with no ring and no net (a plated mounting hole
             // drilled to its pad size) is a hole to the router, like an
             // unplated one.
-            if pad_type == "thru_hole" && net.is_none() {
+            if pad_type == "thru_hole" && net.is_none() && shape != PadShape::Custom {
                 if let Some((dx, dy)) = drill_dims {
                     if dx >= size_x_um && dy >= size_y_um {
                         holes.push(HoleModel {
@@ -3183,7 +3242,19 @@ fn footprints(
                     }
                 }
             }
-            let (layers, drill_um) = if pad_type == "smd" || pad_type == "connect" {
+            if shape == PadShape::Custom
+                && [
+                    "backdrill",
+                    "tertiary_drill",
+                    "front_post_machining",
+                    "back_post_machining",
+                ]
+                .iter()
+                .any(|tag| pad.find(tag).is_some())
+            {
+                bail!("unsupported routing profile: pad {label} has machined custom copper");
+            }
+            let (layers, drill_um) = if surface {
                 // One outer copper layer, either side: the DSN never mirrors,
                 // so a pad's own layer is the layer the router sees.
                 if layers != ["F.Cu".to_string()] && layers != ["B.Cu".to_string()] {
@@ -3196,9 +3267,14 @@ fn footprints(
             } else {
                 // A plated hole has copper on every layer of the stack (pads
                 // that remove unused layers are refused above).
-                if !(layers == ["*.Cu".to_string()]
-                    || layers == ["F.Cu".to_string(), "B.Cu".to_string()])
-                {
+                if shape == PadShape::Custom {
+                    let all_copper = layers == ["*.Cu"]
+                        || (layers.len() == copper_layers.len()
+                            && copper_layers.iter().all(|layer| layers.contains(layer)));
+                    if !all_copper {
+                        bail!("unsupported routing profile: custom pad {label} has a partial copper stack");
+                    }
+                } else if !(layers == ["*.Cu"] || layers == ["F.Cu", "B.Cu"]) {
                     bail!(
                         "unsupported through-hole pad {label}: copper layers are [{}]",
                         layers.join(", ")
@@ -3206,10 +3282,17 @@ fn footprints(
                 }
                 let (dx, dy) = drill_dims.context("through-hole pad has no drill")?;
                 // The router sees the copper; a slot only has to fit inside it.
-                if dx >= size_x_um || dy >= size_y_um {
+                if shape != PadShape::Custom && (dx >= size_x_um || dy >= size_y_um) {
                     bail!("pad {label} drill {dx}x{dy} um is not smaller than its copper size");
                 }
                 (copper_layers.to_vec(), Some(dx.min(dy)))
+            };
+            let custom_outline = if shape == PadShape::Custom {
+                custom_pad::outline(pad, drill_dims_mm).map_err(|error| {
+                    anyhow::anyhow!("unsupported routing profile: pad {label}: {error:#}")
+                })?
+            } else {
+                Vec::new()
             };
             pads.push(PadModel {
                 number,
@@ -3220,6 +3303,7 @@ fn footprints(
                 net,
                 padstack: PadstackKey {
                     shape,
+                    custom_outline,
                     layers,
                     size_x_um,
                     size_y_um,
@@ -3615,6 +3699,19 @@ fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
         .layers
         .iter()
         .map(|layer| match key.shape {
+            PadShape::Custom => dsn::Shape::Polygon(dsn::Polygon {
+                layer: layer.clone(),
+                width: 0.0,
+                coords: key
+                    .custom_outline
+                    .iter()
+                    .chain(key.custom_outline.first())
+                    .map(|&(x, y)| dsn::Point {
+                        x: x as f64 / f64::from(DSN_RESOLUTION),
+                        y: y as f64 / f64::from(DSN_RESOLUTION),
+                    })
+                    .collect(),
+            }),
             PadShape::Circle => dsn::Shape::Circle(dsn::Circle {
                 layer: layer.clone(),
                 diameter: key.size_x_um as f64,
@@ -3792,8 +3889,15 @@ fn build_manifest(
             copper_layers: copper_layers.len() as u32,
             component_side: if any_back { "front_and_back" } else { "front" }.to_string(),
             pad_shapes: ["circle", "rect", "roundrect", "oval"]
+                .into_iter()
+                .chain(
+                    padstack_names
+                        .keys()
+                        .any(|k| k.shape == PadShape::Custom)
+                        .then_some("custom"),
+                )
                 .map(str::to_string)
-                .to_vec(),
+                .collect(),
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
@@ -3916,7 +4020,7 @@ mod tests {
     use super::*;
     use konnect_ipc::IpcRoutingRules;
 
-    fn rules() -> IpcEffectiveRoutingRules {
+    pub(super) fn rules() -> IpcEffectiveRoutingRules {
         ["GND", "VCC"]
             .into_iter()
             .map(|net| {
@@ -4187,7 +4291,7 @@ mod tests {
 
     const ROUNDED: &str = include_str!("../tests/fixtures/specctra_rounded_board.kicad_pcb");
 
-    fn parse_dsn(text: &str) -> dsn::DsnFile {
+    pub(super) fn parse_dsn(text: &str) -> dsn::DsnFile {
         let mut tokenizer = ListTokenizer::new(BufReader::new(Cursor::new(text.as_bytes())));
         dsn::DsnFile::read_dsn(&mut tokenizer).expect("the DSN parses")
     }
@@ -4804,3 +4908,7 @@ mod hole_clearance_tests;
 #[cfg(test)]
 #[path = "specctra_pours_tests.rs"]
 mod pours_tests;
+
+#[cfg(test)]
+#[path = "specctra_custom_pad_tests.rs"]
+mod custom_pad_tests;
