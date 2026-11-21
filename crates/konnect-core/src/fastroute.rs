@@ -1521,6 +1521,9 @@ fn net_contacts(paths: &[SessionPath], um_per_unit: f64) -> Vec<SelfContact> {
 /// for an overlap; a junction (one piece's end on the other, not collinear) is no
 /// contact. Only nets with a contact are in the map. A session that does not parse
 /// is an error.
+// stage 5b: L22's `length_probe::path_faults` calls this on the judged session; until
+// then only the tests do.
+#[allow(dead_code)]
 pub(crate) fn self_contacts(
     ses_text: &str,
     nets: &BTreeSet<String>,
