@@ -1698,6 +1698,32 @@ fn a_shared_stretch_is_an_overlap_only_when_longer_than_a_micrometre() {
         ),
         [ContactKind::Overlap]
     );
+    // The same on a slanted line (3:4, so the stretch is exact): the pieces are in
+    // session units of 0.1 µm. Sharing 1.5 µm is an overlap, sharing 1.0 µm is not.
+    let slanted = |back: i64| {
+        let raw = |x1: i64, y1: i64, x2: i64, y2: i64| {
+            format!("(wire (path F.Cu 2000 {x1} {y1} {x2} {y2}))")
+        };
+        session_with(
+            "um 10",
+            &[(
+                "A",
+                raw(0, 0, 30000, 40000) + &raw(30000 - 3 * back, 40000 - 4 * back, 30300, 40400),
+            )],
+        )
+    };
+    let slanted_kinds = |back: i64| -> Vec<ContactKind> {
+        self_contacts(&slanted(back), &names(&["A"]))
+            .unwrap()
+            .remove("A")
+            .unwrap_or_default()
+            .iter()
+            .map(|contact| contact.kind)
+            .collect()
+    };
+    assert_eq!(slanted_kinds(3), [ContactKind::Overlap]);
+    assert_eq!(slanted_kinds(2), [ContactKind::Touch]);
+    assert_eq!(slanted_kinds(300), [ContactKind::Overlap]);
     // Overlap is not read off a different line.
     assert!(kinds_of(
         wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(0, 600), (1000, 600)])
@@ -1736,6 +1762,33 @@ fn a_touch_is_closer_than_half_the_widths_minus_a_micrometre() {
         wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 250), (500, 900)])
     )
     .is_empty());
+    // A diagonal piece with the other's end off its side (the distance is across the
+    // diagonal): 250 / sqrt 2 = 177 µm is a touch, 300 / sqrt 2 = 212 µm is not.
+    let rising = |end_x: i64| {
+        wire("F.Cu", 200, &[(0, 0), (1000, 1000)])
+            + &wire("F.Cu", 200, &[(end_x, 300), (2000, 300)])
+    };
+    assert_eq!(kinds_of(rising(550)), [ContactKind::Touch]);
+    assert!(kinds_of(rising(600)).is_empty());
+    let falling = |end_x: i64| {
+        wire("F.Cu", 200, &[(0, 1000), (1000, 0)])
+            + &wire("F.Cu", 200, &[(end_x, 700), (2000, 700)])
+    };
+    assert_eq!(kinds_of(falling(550)), [ContactKind::Touch]);
+    assert!(kinds_of(falling(600)).is_empty());
+    // The other way round: the diagonal's end near a straight piece's side.
+    assert_eq!(
+        kinds_of(
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 300), (700, 500)])
+        ),
+        [] as [ContactKind; 0]
+    );
+    assert_eq!(
+        kinds_of(
+            wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("F.Cu", 200, &[(500, 150), (700, 350)])
+        ),
+        [ContactKind::Touch]
+    );
     // A touch on another layer is none.
     assert!(kinds_of(
         wire("F.Cu", 200, &[(0, 0), (1000, 0)]) + &wire("B.Cu", 200, &[(0, 100), (1000, 100)])
