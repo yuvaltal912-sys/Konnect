@@ -1152,7 +1152,77 @@ What these runs also showed:
   977, crossings 51.8 against 46.6, label conflicts 115 against 159, parts pulled away 4.8
   against 6.8.
 
-Still open here: B4, B5 and B6 (step 4), and the paired reading of A3 on the four boards.
+### The paired reading of A3, and the weights (2026-11-21)
+
+`converge_check` with `KONNECT_CONVERGE_SILK=1` (commit `521c1ac9`), no routing call. The switch
+was first proved against the bench: on the owner's board it gives the four runs that step 2
+routed exactly the bench's silk entries (161, 172, 161, 158) and gives the input the bench's
+109. Means over the pairs, terms on against off:
+
+| Board | Pairs | Silk entries | Parts pulled away | Airwire mm | Crossings |
+|---|---|---|---|---|---|
+| The owner's board | 5 | 161.4 against 164.4: passes | 4.8 against 6.8: passes | 998 against 977 | 51.8 against 46.6 |
+| B5 | 6 | 212.5 against 231.2: passes | 1.83 against 2.17: passes | 531 against 511 | 19.2 against 14.8 |
+| B6 | 5 | not read: the export refuses the board (below) | 34.8 against 62.8: passes | 603 against 603 | 1.0 against 1.2 |
+
+**Both terms stay at their measured weights.** The neighbour term passes on three boards of
+three, the label term on two of the two where it can be read. The label term's effect is small
+(3 entries in 163 on the owner's board, lower on 3 pairs of 5; 19 in 231 on B5, lower on 3 pairs
+of 6), and both terms cost about 2 to 4 % of airwire length on two of the boards. No weight
+changed, so the bench of step 2 is the measurement of the final weights.
+
+### Step 4: B5, B6 and B4 (2026-11-21)
+
+The lock copies hold no schematic; the owner pointed to his project folders, and the schematics
+of B5 and B6 were copied into their bench inputs, read-only (B6's two large pin-socket
+connectors are held at his positions, on his word the same day).
+
+**B5** (94 parts, 14 held; commit `521c1ac9`, effort M, 4309 s, with the A reference: one
+Sonnet 5.5 session of 16 minutes, placing by judgement from a neutral start). 18 candidates
+routed (O 3, A 3, F 4, S 4, C 4) and all 18 pass every gate.
+
+| Question | Answer | What was measured |
+|---|---|---|
+| Does it stop by convergence? | Passes | 9 runs, each by its rules; 8 starts and levels 0 to 1, both outer rules by their rule; no guard; 38 s |
+| Is the result legal and complete? | Passes | C's four routed candidates pass P1, P2 and G1 to G3 with no decoupling and no connector violation |
+| Is it better than the generators? | Passes | C ranks 1 to 4; F's best ranks 11 and S's best 14 |
+| Is it as good as a hand placement? | "beats" O, and "beats" A | C's best: 778.6 mm of routed signal against 1026.3 (O, 0.76 times) and 1021.6 (A); 42 vias off pours against 39 and 40; copper quality 58.9 against 66.9 and 66.5; 168 silk entries against 0 and 91 |
+| Does making room work? | Passes | No C run ended with a pair out of range |
+
+What B5 also showed:
+
+- **The whole copper-quality gap is the decoupling loop.** The layout audit on the six winning
+  routed boards gives check 4.1 0.27 on O, 0.272 on A and 0.0 on all four C boards: with 4
+  supply pins and a 10 mm threshold, O's median loop is 14.2 mm and C's best 37.0 mm, with one
+  pin left without a capacitor. The tools find no decoupling pair on this board, so C's
+  requirement term had nothing to hold, and the bench's decoupling column reads 0 for everyone.
+- **Silk is far worse than the hand placement's**: 168 to 212 entries against 0.
+- **The rule for effort** stopped at level 1 (760.8 against 758.2 did not pay), and that level-1
+  placement is the one that routed best.
+- O's own placement has 5 hard failures in the placement screen (courtyards closer than C's
+  rule allows itself), so the comparison does not favour C.
+
+**B6** (127 parts, 10 held). Family C runs: every run ends by its rules, with 2 connector
+violations left of 20 to 27 at the start. **It cannot be routed through the bench**: the export
+refuses the owner's own placement and every candidate (`unsupported routing profile`: a pad of
+shape `custom`). So B6 gives a placement reading only, and no answer on routing.
+
+**B4** (118 parts, 12 held). No bench run (the owner's decision). **Family C generates
+nothing**: every run fails with "no room for 1 part" under C's own gap rule, from each of the 4
+starts taken, while F and S generate all 160 candidates.
+
+### Limits found by this measurement
+
+1. A board too dense for C's gap rule gets no C placement (B4).
+2. A footprint with a custom-shaped pad stops the export, so the board is not routed (B6; the
+   export, not family C).
+3. The cost does not see whether a placement routes completely (the owner's board: in each run
+   the C candidate with the shortest signal left 25 or 26 items unconnected).
+4. Where the tools find no decoupling pair, C does not keep the capacitors by their ICs (B5).
+5. Silk is worse than a hand placement's on every board measured, with the label term on.
+
+Limits 1 to 4 are handed on as "Row CL" in the handoff file. One board routed with an A
+reference, two boards routed in all: not yet a general result.
 
 ## What this design does not do
 
