@@ -11,8 +11,9 @@ design with main `0a3fc504` merged in). Sonnet 5.5 (high) agents write the bodie
 
 The verification of 2026-11-21 failed its measure of success, and findings F2 to F6 came
 back to the design: see "Addendum: the verification findings F2 to F6" at the end (L20 to
-L27, owner decisions 4 to 6, designed and not built). The owner approved decisions 4 to 6 as
-recommended on 2026-11-21 ("Yes, as recommended").
+L27, owner decisions 4 to 6, built in stages 5a and 5b on `claude/length-tuning`, not yet verified
+again). The owner approved decisions 4 to 6 as recommended on 2026-11-21 ("Yes, as
+recommended").
 
 ## What the owner asked for
 
@@ -1296,17 +1297,21 @@ x18 under Konnect's sandbox profile, kicad-cli 10.0.8 (the installed build; the 
   of the 10 nets, tolerance 0.15 mm.
 - **Calls.** Effort M, and a control without the group.
 
-**The measure of success.** Every item must hold:
+**The measure of success** (L27, owner decision 6: tuning is judged against its own run, because at
+M on a large board the untuned control fails G1 and "the winner passes G1 to G4" cannot separate
+tuning from routing). Every item must hold:
 
-1. **All gates.** On both boards the winner passes G1 to G4.
-2. **KiCad agrees independently.** A copy of each winner's judged board gets the suggested
-   KiCad rules (L16) in its `.kicad_dru`. `kicad-cli pcb drc` on it then reports 0
-   `length_out_of_range` and 0 `skew_out_of_range`.
-3. **Tuning touched only its nets.** No Tune pass was discarded for another net, counted over
-   every run, and the winner's Tune pass was kept.
-4. **The meanders add no DRC trouble.** The winner's own held session (before its Tune pass)
-   is judged as well, by the same judge. No DRC type is worse after the Tune pass than before
-   it. This compares one run with itself, so routing chance plays no part.
+1. **No harm, in every judged run.** The board the judge chose has no more unconnected items
+   and no more violations of any DRC type than its own untuned board (L23's counts; the length
+   and skew keys are G4's). This compares one run with itself, so routing chance plays no part.
+2. **G4 on the winner.** The winner passes G4 (windows, KiCad's own rules, and G4(d): no
+   checked net's copper crosses or overlaps itself or dangles).
+3. **KiCad agrees independently.** A copy of each winner's judged board gets the suggested
+   KiCad rules (L16, with L25's pinned rule for a group that holds a pair) in its `.kicad_dru`.
+   `kicad-cli pcb drc` on it then reports 0 `length_out_of_range` and 0 `skew_out_of_range`.
+4. **Tuning touched only its nets.** No Tune pass was discarded for another net or for opening
+   connections, counted over every run.
+5. **On fixture F**, where the untuned control passes G1, the winner also passes G1 to G3.
 
 **Recorded for the owner** (not pass/fail):
 
@@ -1399,7 +1404,8 @@ document and the handoff line only.
 
 ## Addendum: the verification findings F2 to F6 (2026-11-21)
 
-Status: designed, not built. The verification of 2026-11-21 failed its measure of success
+Status: built (stage 5a: L20, L21, L24; stage 5b: L22, L23, L25, L26, L27; see
+`CREATION_HANDOFF.md`), not yet verified again. The verification of 2026-11-21 failed its measure of success
 (`target/creation-research/length-tuning/verify/RESULTS.md`, git-ignored). Per the design's
 own rule, the owner sent findings F2 to F6 back here ("גם וגם", 2026-11-21). Claude Opus 5.5
 designed this addendum on branch `claude/length-tuning-design-674041`, with `claude/length-tuning`

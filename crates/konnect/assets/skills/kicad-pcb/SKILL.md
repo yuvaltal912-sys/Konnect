@@ -380,8 +380,21 @@ A session that breaks the board's own length or skew rules cannot be applied:
 candidate's DRC is not clean. After `apply_specctra_ses`, add them with `create_custom_drc_rule(board, name,
 rule)` (dry run first) so KiCad keeps checking the lengths after hand edits.
 A pair inside a group is tuned net by net (`pairs_tuned_net_by_net`): its
-coupling is not held along the meanders. `engine: 'freerouting'` tunes nothing
-and says so in `length_matching_note`.
+coupling is not held along the meanders. The judge compares each tuned board with
+the same run's untuned board and rejects a tuned one that has more unconnected
+items, more violations of any DRC type, more width failures or more tracks below
+their floor; the run then keeps its untuned board and the fourth gate shows what
+is missing. `length_matching.tune_candidates` says what was judged, rejected
+and chosen, and `untuned_nets` lists each net left untuned and why (its meanders
+touched its own copper). A checked net whose copper crosses or overlaps itself, or
+that KiCad reports as dangling or unconnected, fails the fourth gate: KiCad's
+length would count copper the signal does not travel. On a board with another
+net's pour on an inner layer, a second pour-safe candidate is tuned and judged
+only when the first is rejected or misses. A group that holds a pair with
+`max_skew_mm` is suggested as a `length` rule pinned to the routed lengths,
+because KiCad checks one `skew` rule for a net; the pair keeps its own `skew`
+rule. `engine: 'freerouting'` tunes nothing and says so in
+`length_matching_note`.
 
 ### Freerouting round trip
 
