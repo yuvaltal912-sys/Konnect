@@ -176,7 +176,9 @@ part: its starts are F's and S's candidates, which know what S0 knows.
 
 Approved as recommended by the owner on 2026-11-20 ("כן, כמומלץ"): parts may turn, both
 terms are in the cost, and B4, B5 and B6 are prepared in the same row after the two prepared
-boards.
+boards. **Changed by the owner on 2026-11-21** ("אנחנו מריצים על 2 לוחות עכשיו לא על 3"): step 4
+runs on two boards, B5 and B6, his choice of the two. B4 gets no bench run in this row; family
+C failed to generate on it in the preparation's load check, which is diagnosed all the same.
 
 1. **May the search turn any part you did not lock, by quarter turns?** F and S turn nothing
    today (D5). Recommendation: yes. Your flow says a locked part is fixed and the rest is the
@@ -245,7 +247,9 @@ before it is routed.
 - **On a board, a term passes** when its mean over the pairs is lower with the terms on: silk
   entries for the label term, parts pulled away for the neighbour term. The neighbour term can
   be read only on a board whose input holds its schematic.
-- **The boards** are the owner's board and B4, B5 and B6.
+- **The boards** are the owner's board, B5 and B6. (Written as "and B4, B5 and B6"; on
+  2026-11-21, before any paired run on them, the owner cut step 4 to two boards and chose B5
+  and B6.)
 - **A term that does not pass on more than half of the boards where it can be read is set to
   0**, the document says so, and the bench runs are repeated on the final weights.
 - The length half stays as written and as measured on the owner's board, where it passed.
@@ -1094,7 +1098,8 @@ decision with its reason.
    calls, 4 calls per family.
 3. **The same run with both new terms off** (`neighbour_weight` 0, `label_mm` 0): what the terms
    buy and cost.
-4. **B4, B5, B6** (owner decision 3), after steps 1 to 3 on the two prepared boards: the
+4. **B5 and B6** (owner decision 3 as he changed it on 2026-11-21; written for B4, B5 and
+   B6), after steps 1 to 3 on the two prepared boards: the
    bench preparation from his lock copies, one AI placement each for the A reference, then the
    same run.
 

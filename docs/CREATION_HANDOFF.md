@@ -330,9 +330,11 @@ The library default is unchanged: `ToolRouter::new` and `McpHandler::new` still 
 
 **Records.** `target/creation-research/convergent-placement/`: the lane driver `chunk.sh` (every cargo command of this row goes through it), the gate, `PROGRESS.md` and the agents' reports. The experiment behind the design is in `target/creation-research/convergence-study/`.
 
-**Not verified yet.** B4, B5 and B6; the A arm; the paired reading of the terms (A3); the dry run on the public demo board on the final commit; an independent review of the changes after `60c9be73` (the performance pass, the fix round, the amendments); mutants on the guards; the gate on the final commit.
+**Owner decision, 2026-11-21:** the bench of step 4 runs on two boards, B5 and B6, not three ("אנחנו מריצים על 2 לוחות עכשיו לא על 3"; he chose the two). B4 gets no bench run in this row.
 
-**Next:** (1) a switch on `converge_check` that writes each C run's board to scratch and counts its silk entries with the bench's own check, for the paired reading of A3; (2) the bench preparation of B4, B5 and B6 from the lock copies, with one AI placement each for the A reference; (3) the paired reading on the four boards, then the bench on B4 to B6 on the final weights (and again on the owner's board if a weight changes); (4) the independent review, mutants on the guards and the gate. The row is done when the design's answers are filled for every board and the exact PR title and body are with the owner.
+**Not verified yet.** B5 and B6; the A arm; the paired reading of the terms (A3); the dry run on the public demo board on the final commit; an independent review of the changes after `60c9be73` (the performance pass, the fix round, the amendments); mutants on the guards; the gate on the final commit.
+
+**Next:** (1) done in `521c1ac9`: `KONNECT_CONVERGE_SILK=1` on `converge_check` writes each C run's board to scratch and counts its silk entries with the bench's own check, for the paired reading of A3; to validate against the bench's recorded silk on the owner's board; (2) the bench preparation of B5 and B6 from the lock copies, with one AI placement each for the A reference; (3) the paired reading on the three boards, then the bench on B5 and B6 on the final weights (and again on the owner's board if a weight changes); (4) the independent review, mutants on the guards and the gate. The row is done when the design's answers are filled for every board and the exact PR title and body are with the owner.
 
 ## Row PS, the best-of-N placement search (bench)
 
