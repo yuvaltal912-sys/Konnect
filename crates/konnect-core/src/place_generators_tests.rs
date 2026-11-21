@@ -3282,6 +3282,36 @@ fn parts_that_share_no_side_are_always_clear() {
 }
 
 #[test]
+fn two_boxes_exactly_the_gap_apart_are_clear_on_either_axis() {
+    // Two 2 x 2 mm boxes on one side under the gap rule with a 0.25 mm gap (exact in
+    // binary): 2.25 mm between their centres is exactly the gap, which is clear; 2.0 mm
+    // (touching) is not. On x and on y. Pins the strict `>` of `clear_of` against `>=`
+    // (found by cargo-mutants, Row CP).
+    let parts = vec![
+        Fp::new("R1", 20.0, 30.0).two_pad("N1", "N2"),
+        Fp::new("R2", 40.0, 40.0).two_pad("N2", "N3"),
+    ];
+    let model = with_clearances(copper_model_of(parts, &[], ""), 0.25, 0.0);
+    let (r1, r2) = (index_of(&model, "R1"), index_of(&model, "R2"));
+    let legality = Legality::new(&model, GapRule::Everywhere);
+    let size = (2.0, 2.0);
+    let at = (10.0, 10.0);
+    for (axis, gap_apart, touching) in [
+        ("x", (12.25, 10.0), (12.0, 10.0)),
+        ("y", (10.0, 12.25), (10.0, 12.0)),
+    ] {
+        assert!(
+            legality.clear_of(r2, gap_apart, size, r1, at, size),
+            "exactly the gap apart on {axis} is clear"
+        );
+        assert!(
+            !legality.clear_of(r2, touching, size, r1, at, size),
+            "touching on {axis} is not clear"
+        );
+    }
+}
+
+#[test]
 fn legality_keeps_a_part_inside_the_outline_by_the_edge_clearance() {
     // R1 (2 x 1 mm) with its left side 0.3 mm from the straight edge, and with its
     // top-left corner 0.2 mm inside the arc of a rounded corner: legal with no edge

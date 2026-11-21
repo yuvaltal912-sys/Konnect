@@ -3774,6 +3774,36 @@ fn scatter(
 }
 
 #[test]
+fn a_blocker_far_above_the_base_does_not_hide_the_one_legal_cell_far_below() {
+    // The only legal cell is 11.5 mm below the base (the second row of the search) and
+    // the only blocker sits 12.5 mm above it, so its rows are near the top of the search:
+    // the cell is found. Pins the rows' arithmetic of `first_legal_cell` (a row placed by
+    // `+` instead of `-` marks the blocker's rows at the bottom, and the cell is skipped;
+    // found by cargo-mutants, Row CP). The random-state comparison rarely reaches it,
+    // since it needs every nearer cell illegal.
+    let model = crowded();
+    let cost = cost_of(&model, None);
+    let mut state = as_read(&cost);
+    let part = cost.movable[0];
+    let blocker = (0..model.parts.len())
+        .find(|&j| j != part && model.part_sides[j].intersects(model.part_sides[part]))
+        .expect("a second part on the same side");
+    let base = (100.0, 100.0);
+    state.centres[blocker] = (base.0, base.1 + 12.5);
+    let size = cost.size_at(part, state.turns[part]);
+    let target = (base.0, base.1 - 11.5);
+    let found = cost.first_legal_cell(
+        part,
+        size,
+        base,
+        [blocker],
+        (&state.centres, &state.sizes),
+        |cell| cell == target,
+    );
+    assert_eq!(found, Some(target));
+}
+
+#[test]
 fn the_first_legal_cell_equals_a_plain_ring_search_at_the_real_call_site() {
     // The attraction's call: `first_legal_cell` with every other part as a blocker and the
     // search's own `legal` (`CostModel::legal`, which tests every part but the one it
