@@ -1904,7 +1904,7 @@ async fn judge_candidates(
 | L20 router off | the Tune pass's line holds `--router.autorouter.enabled=false` once, after the optimizer switch | Full, Fallback and Polish lines never hold it (DP's tests unchanged) |
 | L24 switch | the pour-safe candidate's line holds `--router.plane_as_obstacle=true` once; it runs only when the DSN has a plane of a net outside the tune file | the free candidate's line never holds it; a DSN whose only plane is a tuned net's runs no pour-safe candidate |
 | `self_contacts` | fixtures cut from A-tuned's `tune.ses`: `/DQ10`'s segments 51 and 143 (overlap); a crossing pair of `/DQ8`; two legs 0.1 mm apart at width 0.2 mm (touch); a touch on each side of the threshold (half the widths minus 2 µm is a touch, minus 0 µm is not) | `/DQ16` and `/DQ2` (0 contacts); a T-junction; a plain corner; a 45° corner whose copper overlaps near the corner; collinear pieces that meet end to end (no overlap); a crossing on two different layers; a crossing with another net |
-| `new_self_contacts` | a contact with a piece new in the Tune session names the net; a held contact whose piece was replaced by a new contacting piece names it too | a contact already in the held session (the same two pieces) names nothing; the router's S-bend jog (`/DQ0`, held session) names nothing |
+| `new_self_contacts` | a contact with a piece new in the Tune session names the net; a held contact whose piece was replaced by a new contacting piece names it too | a contact already in the held session (the same two pieces) names nothing; the router's S-bend jog (`/DQ0`, held session) names nothing; a held 20 µm stub inside a via that is missing from the Tune session (M1's `C_N`) is no contact and no fault; M1's `C_N` piece laid three times (`addendum/m1_B_switch/tune.ses`) is an overlap |
 | L21 rounds | fake binaries: one whose first pass makes a contact on net X and whose second does not (candidate kept, X dropped with its reason, the round-2 file without X); one that makes a contact on every pass (`discarded` after 3, "meanders touch their own net"); a deadline that leaves less than twice the last pass's time (no next round, `discarded`) | a fake with no contact runs one pass; a dropped net that is half of a pair drops its partner and the pair group |
 | `tune_file_without`, `with_pair_partners` | a group losing nets, a skew group falling below 2 nets (left out), a pair group of a dropped net (left out); a dropped `P` adds its `N` | an empty `dropped` gives `tune_file_text` exactly, and adds no partner |
 | L22 G4(d) | a checked net whose judged session crosses or overlaps itself, and one that DRC names in `track_dangling`: a G4 line each, and the net's miss is its window's lower bound | an unchecked net with faults gives no line; a checked net with only touches passes; two runs with faulted nets of different windows still rank apart |
@@ -1959,6 +1959,59 @@ routing verification. The parent session runs all four; the fixtures stay in
   - Expected while FT has not landed: on A the nets that needed most length are dropped
     (`untuned_nets`) and G4 fails honestly, with no crossing or overlap in any chosen board.
     On B the Tune pass is kept.
+
+### Step 0b results and the design owner's verdict (2026-11-21)
+
+The parent session ran M1 to M3 as written. The record is
+`target/creation-research/length-tuning/verify/ADDENDUM_MEASURES.md` (git-ignored); the raw data
+is in `addendum/m1.json`, `m2.json` and `m3.json` there.
+
+**M1 passes as step 0b, with no design change.**
+- **What step 0b had to show, and what it gave:**
+  - x18 accepts `--router.autorouter.enabled=false`, and the log has no autorouter stage;
+  - unrouted equals held (4 = 4), and no net outside the tune file changes;
+  - `D1_N` and `D0_N` keep every held piece;
+  - the control reproduces "opened 2", and A run 2 reproduces its recorded geometry.
+- **The one exception: a 20 µm stub of `C_N` is gone.** It is on In1.Cu at the via at
+  (104.493, −50.040), from −50.040 to −50.060 mm. It lies inside that via's own copper and
+  connects nothing.
+  - **Why it is not a guard case.** Losing it opens nothing: the unrouted count, L22's DRC
+    check and the judge's G1 already cover a lost connection. It changes KiCad's length by
+    0.02 mm, and it removes copper the signal never travelled.
+  - **What the tests pin.** L21's tests gain this as a negative control: a held stub inside a
+    via that is missing from the Tune session counts as no contact and no fault.
+- **`C_N`'s 0.212 mm piece laid three times** is F5's mechanism on board B. L21 already
+  catches it as an overlap, and drops `C_N` with `C_P` and their pair group.
+  - Until FT lands, B's clock pair is left untuned by the free candidate, and G4 says so.
+  - This is a fixture for L21's tests: `addendum/m1_B_switch/tune.ses`.
+- **`D2_N`** is 10.73 mm short with no room for meanders. That is a real lack of room, which
+  G4 reports.
+
+**M2 confirms L25.** With L25's rules, KiCad reports 9 `length_out_of_range` plus 1
+`skew_out_of_range`, in either rule order: the same 10 as G4. The old rule set matches
+`shadowing_check.json`.
+
+**M3 confirms L24's purpose, and L24 stays as designed.**
+- **What the plane switch did, as intended:**
+  - no new piece on In1.Cu or In2.Cu;
+  - 0 import errors, and unrouted equals held;
+  - 21 unconnected items after the refill, the untuned count (25 without the switch).
+- **What it cost.** 6 DQ nets are left short, up to 218.6 mm, and 24 of 32 nets touch their
+  own copper (20 without it). The switch moves the meanders onto the free layers, but cannot
+  stop them touching themselves: that is fastroute's tuner (F5), which FT fixes.
+- **Why L24 stays.**
+  - L21 drops every net that touches, in both candidates alike, so the pour-safe candidate
+    adds no risk.
+  - L23 chooses among whatever survives, so it adds no wrong choice.
+  - Its extra cost is bounded: up to 3 Tune passes at about 24 s on A.
+  - Once FT lands, it is the candidate that tunes without cutting a pour.
+- **M4's expectation for A, while FT has not landed:** in both candidates most DQ nets are
+  dropped (`untuned_nets`). G4 fails, with every miss named. The chosen board has no more
+  unconnected items or DRC violations than its untuned board, and no crossing or overlap.
+
+**Verdict: the bodies of L20 to L27 can be built as designed.** One test row gains the
+via-stub negative control. FT does not block the build; it changes only how many nets
+survive L21.
 
 ### Verification of this addendum
 
