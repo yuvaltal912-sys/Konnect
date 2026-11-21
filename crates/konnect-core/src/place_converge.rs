@@ -442,6 +442,9 @@ type Edge = objectives::TreeEdge;
 /// Every part's centre and quarter turns.
 type Placement = (Vec<(f64, f64)>, Vec<u8>);
 
+/// Every part's box centre and size, as a legality test reads them.
+type Boxes<'s> = (&'s [(f64, f64)], &'s [(f64, f64)]);
+
 /// A placement and the caches that make a move's cost change cheap.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct State {
@@ -1672,19 +1675,24 @@ impl<'a> CostModel<'a> {
                 snap_to(centres[d].0, GRID_MM),
                 snap_to(centres[d].1, GRID_MM),
             );
-            let found = nearest_cells().iter().find_map(|&(di, dj)| {
-                let at = (from.0 + di as f64 * GRID_MM, from.1 + dj as f64 * GRID_MM);
-                self.legality
-                    .legal_at(
+            let others: Vec<usize> = (0..count).filter(|&j| j != d).collect();
+            let found = self.first_legal_cell(
+                d,
+                state.sizes[d],
+                from,
+                others.iter().copied(),
+                (&centres, &state.sizes),
+                |at| {
+                    self.legality.legal_at(
                         d,
                         at,
                         state.sizes[d],
-                        (0..count).filter(|&j| j != d),
+                        others.iter().copied(),
                         &centres,
                         &state.sizes,
                     )
-                    .then_some(at)
-            })?;
+                },
+            )?;
             centres[d] = found;
             parts.push((d, found, state.turns[d]));
         }
@@ -1755,13 +1763,96 @@ impl<'a> CostModel<'a> {
         let mut mv = Move {
             parts: vec![(part, base, state.turns[part])],
         };
-        for &(di, dj) in nearest_cells() {
-            mv.parts[0].1 = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
-            if self.legal(state, &mv) {
-                return Some(mv);
+        // `legal` tests the part against every other part where it stands, so a cell that
+        // one of them blocks is one `legal` refuses.
+        let size = self.size_at(part, state.turns[part]);
+        let cell = self.first_legal_cell(
+            part,
+            size,
+            base,
+            (0..self.model.parts.len()).filter(|&j| j != part),
+            (&state.centres, &state.sizes),
+            |cell| {
+                mv.parts[0].1 = cell;
+                self.legal(state, &mv)
+            },
+        )?;
+        mv.parts[0].1 = cell;
+        Some(mv)
+    }
+
+    /// The first cell of `nearest_cells` around `base` (rings 0 to 24 on `GRID_MM`) at
+    /// which `legal` holds, or `None`. It is the cell
+    /// `nearest_cells().iter().map(cell).find(legal)` gives, found with fewer calls of
+    /// `legal`, on one condition: `legal(cell)` is false whenever part `part`, its box of
+    /// `size` at the cell, is not `Legality::clear_of` some part `j` of `blockers` at
+    /// `centres[j]` with `sizes[j]` (the caller's `legal` tests at least these parts).
+    ///
+    /// Why it is the same cell: `clear_of` is false exactly when the overlap on x and the
+    /// overlap on y both pass the gate, and the overlap on x reads only the cell's x (on y,
+    /// only its y). So for each blocker the columns whose x passes are found once, by
+    /// `clear_of` itself at the blocker's own y (where the y overlap is half the two
+    /// heights, which passes any gate of at least 0), and the rows likewise. A cell in
+    /// both is one where `clear_of` is false, so `legal` is false and it is skipped; every
+    /// other cell is decided by `legal` itself, in the same order as before. A blocker
+    /// too far for any cell to reach is not tested at all; that only saves time, since a
+    /// cell it does not mark is decided by `legal`.
+    fn first_legal_cell(
+        &self,
+        part: usize,
+        size: (f64, f64),
+        base: (f64, f64),
+        blockers: impl IntoIterator<Item = usize>,
+        (centres, sizes): Boxes<'_>,
+        mut legal: impl FnMut((f64, f64)) -> bool,
+    ) -> Option<(f64, f64)> {
+        const SPAN: usize = 2 * (CELL_RINGS as usize - 1) + 1;
+        let reach = (CELL_RINGS - 1) as f64 * GRID_MM;
+        // A blocker farther than this from the search's centre on an axis blocks no cell:
+        // the reach, the two half sizes, the widest gap and a millimetre more.
+        let slack = self.model.clearances.part_gap_mm.max(0.0) + 1.0;
+        let offset = CELL_RINGS - 1;
+        // A cell's coordinates, by the same arithmetic as the search's own.
+        let column = |k: usize| base.0 + (k as i64 - offset) as f64 * GRID_MM;
+        let row = |k: usize| base.1 + (k as i64 - offset) as f64 * GRID_MM;
+        // `blocked[column]` has bit `row` set when a blocker is not clear of that cell.
+        let mut blocked = [0u64; SPAN];
+        for j in blockers {
+            let (at, other) = (centres[j], sizes[j]);
+            if (at.0 - base.0).abs() > reach + (size.0 + other.0) / 2.0 + slack
+                || (at.1 - base.1).abs() > reach + (size.1 + other.1) / 2.0 + slack
+            {
+                continue;
+            }
+            let mut rows = 0u64;
+            for k in 0..SPAN {
+                if !self
+                    .legality
+                    .clear_of(part, (at.0, row(k)), size, j, at, other)
+                {
+                    rows |= 1 << k;
+                }
+            }
+            if rows == 0 {
+                continue;
+            }
+            for (k, columns) in blocked.iter_mut().enumerate() {
+                if !self
+                    .legality
+                    .clear_of(part, (column(k), at.1), size, j, at, other)
+                {
+                    *columns |= rows;
+                }
             }
         }
-        None
+        nearest_cells().iter().find_map(|&(di, dj)| {
+            let (ci, cj) = ((di + offset) as usize, (dj + offset) as usize);
+            if blocked[ci] & (1 << cj) != 0 {
+                return None;
+            }
+            let cell = (base.0 + di as f64 * GRID_MM, base.1 + dj as f64 * GRID_MM);
+            legal(cell).then_some(cell)
+        })
     }
 
     /// The moves descent tries for `part`, in its fixed order (design C6): shifts of

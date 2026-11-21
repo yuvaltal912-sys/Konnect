@@ -1685,17 +1685,15 @@ impl<'a> Legality<'a> {
         {
             return false;
         }
-        if model
-            .outline
-            .overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-            .depth_mm
-            > threshold
+        // The four tests are pure and the answer is their conjunction, so their order
+        // changes nothing but the time: the cheap box tests first, `Outline::overhang`
+        // (the dearest, and the one a crowded board rarely fails) last.
+        if others
+            .into_iter()
+            .any(|j| !self.clear_of(i, at, size, j, centres[j], sizes[j]))
         {
             return false;
         }
-        let hits_part = others
-            .into_iter()
-            .any(|j| !self.clear_of(i, at, size, j, centres[j], sizes[j]));
         let sides = model.part_sides[i];
         let hits_copper = model.copper.iter().any(|obstacle| {
             sides.intersects(obstacle.sides) && {
@@ -1706,7 +1704,19 @@ impl<'a> Legality<'a> {
                 ix > gate && iy > gate
             }
         });
-        !(hits_part || hits_copper)
+        if hits_copper {
+            return false;
+        }
+        // Written as before, so that a depth that is not a number answers as it did.
+        if model
+            .outline
+            .overhang(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            .depth_mm
+            > threshold
+        {
+            return false;
+        }
+        true
     }
 
     /// Whether parts `i` and `j`, at the given centres and sizes, keep the rule's gap, or

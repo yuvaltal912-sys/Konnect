@@ -2585,3 +2585,131 @@ fn time_a_run_on_96_parts() {
         );
     }
 }
+
+// ─── Goldens of whole runs (the performance pass) ────────────────────────────
+
+/// Whole runs as the code of stage 4 (`60c9be73`) made them, before any speed-up: a change
+/// that changes a run's behaviour by one bit fails `whole_runs_are_the_recorded_goldens`.
+const RUN_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/tools/placement/fixtures/converge_runs.json"
+);
+
+/// The crowded board with copper texts on both sides, so that the copper obstacles refuse
+/// moves too.
+fn crowded_copper() -> BoardModel {
+    let text = crowded().text;
+    let end = text.rfind(')').expect("a board ends with a parenthesis");
+    let items: String = [("AB", "6 6", "F.Cu"), ("CD", "16 6", "F.Cu"), ("EF", "11 9", "B.Cu")]
+        .iter()
+        .map(|(words, at, layer)| {
+            format!(
+                "(gr_text \"{words}\" (at {at}) (layer \"{layer}\") (effects (font (size 1 1) (thickness 0.15))))\n"
+            )
+        })
+        .collect();
+    let mut model = model_of(&format!("{}{items})\n", &text[..end]), &[]);
+    assert_eq!(model.copper.len(), 3, "three copper obstacles");
+    model.clearances.part_gap_mm = 0.3;
+    model.clearances.edge_mm = 0.5;
+    model
+}
+
+/// A float's bits, as the goldens keep them.
+fn bits_of(value: f64) -> String {
+    format!("{:016x}", value.to_bits())
+}
+
+/// What a run's golden pins: the SHA-256 of the board as written, and from the trace the
+/// stages, sweeps, evaluations, repairs, both stop reasons, the first temperature's bits,
+/// the end cost's bits and the bits of every value of `best_by_step`.
+fn run_golden(model: &BoardModel, candidate: &Candidate, trace: &Trace) -> serde_json::Value {
+    serde_json::json!({
+        "board_sha256": format!("{:x}", Sha256::digest(board_of(model, candidate).as_bytes())),
+        "stages": trace.stages,
+        "sweeps": trace.sweeps,
+        "evaluations": trace.evaluations,
+        "repairs": [trace.repairs_tried, trace.repairs_made],
+        "anneal_stop": trace.anneal_stop,
+        "descent_stop": trace.descent_stop,
+        "first_temperature": bits_of(trace.first_temperature),
+        "end_cost": bits_of(trace.end.cost),
+        "best_by_step": trace.best_by_step.iter().map(|&v| bits_of(v)).collect::<Vec<_>>(),
+    })
+}
+
+/// The goldens' runs, by name: four boards (the demo with pairs and neighbourhoods, the
+/// crowded board, the crowded board with copper, the rounded board with a cut-out) at
+/// levels 0 and 1 with seeds 1 and 2 from the board as read, and one run from an F start
+/// that C must make legal first (the demo with a part gap of 0.7 mm). `quick` parameters.
+fn run_golden_cases() -> BTreeMap<String, serde_json::Value> {
+    let boards = [
+        ("demo", demo_with_pairs(), Some(demo_hoods())),
+        ("crowded", crowded(), None),
+        ("crowded_copper", crowded_copper(), None),
+        (
+            "rounded",
+            model_of(&std::fs::read_to_string(ROUNDED).unwrap(), &[]),
+            None,
+        ),
+    ];
+    let mut cases = BTreeMap::new();
+    for (name, model, hoods) in &boards {
+        for level in [0, 1] {
+            for seed in [1, 2] {
+                let (candidate, trace) = run(model, hoods.as_ref(), seed, &quick(level));
+                cases.insert(
+                    format!("{name} level {level} seed {seed}"),
+                    run_golden(model, &candidate, &trace),
+                );
+            }
+        }
+    }
+    let mut model = demo_with_pairs();
+    model.clearances.part_gap_mm = 0.7;
+    let hoods = demo_hoods();
+    let recipe = recipes(&Matrix::bench())
+        .into_iter()
+        .find(|r| r.family == Family::Force && r.seed == 3)
+        .unwrap();
+    let start = generate(&model, &recipe)
+        .expect("an F candidate")
+        .placements;
+    let (candidate, trace) = converge(&model, Some(&hoods), &start, 3, &quick(0)).unwrap();
+    cases.insert(
+        "demo_gap from F seed 3 level 0 seed 3".to_string(),
+        run_golden(&model, &candidate, &trace),
+    );
+    cases
+}
+
+/// Writes the goldens of whole runs. Run once, on the code whose runs are the truth (stage
+/// 4's), with `--ignored`; the test below then reads them.
+#[test]
+#[ignore = "records the golden file; run once, on the code whose runs are the truth"]
+fn record_run_goldens() {
+    let text = serde_json::to_string_pretty(&run_golden_cases()).unwrap() + "\n";
+    std::fs::write(RUN_GOLDEN, text).unwrap();
+}
+
+#[test]
+fn whole_runs_are_the_recorded_goldens() {
+    let golden: BTreeMap<String, serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(RUN_GOLDEN)
+            .unwrap_or_else(|error| panic!("golden {RUN_GOLDEN} unreadable: {error}")),
+    )
+    .unwrap();
+    let cases = run_golden_cases();
+    assert_eq!(cases.len(), 17);
+    assert_eq!(
+        cases.keys().collect::<Vec<_>>(),
+        golden.keys().collect::<Vec<_>>(),
+        "the same cases as recorded"
+    );
+    for (name, run) in &cases {
+        assert_eq!(
+            run, &golden[name],
+            "{name}: the run changed from the recorded golden"
+        );
+    }
+}
