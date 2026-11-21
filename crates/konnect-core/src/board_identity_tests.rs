@@ -126,3 +126,67 @@ fn the_judge_accepts_the_saved_file_of_a_board_exported_over_ipc() {
         &manifest
     ));
 }
+
+/// The one rule the judge's preflight and its import-plan call share.
+#[test]
+fn matches_export_takes_the_bytes_or_the_tree_and_nothing_else() {
+    let live = ipc_form(SAVED);
+    let byte_hash = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+    let tree = canonical_sha256(SAVED).unwrap();
+
+    // The bytes of the recorded text, in either letter case, without a tree hash.
+    assert!(matches_export(
+        live.as_bytes(),
+        Some(&byte_hash(&live)),
+        None
+    ));
+    assert!(matches_export(
+        live.as_bytes(),
+        Some(&byte_hash(&live).to_uppercase()),
+        None
+    ));
+    // The saved file of that board: other bytes, same tree.
+    assert!(matches_export(
+        SAVED.as_bytes(),
+        Some(&byte_hash(&live)),
+        Some(&tree)
+    ));
+    assert!(matches_export(
+        SAVED.as_bytes(),
+        Some(&byte_hash(&live)),
+        Some(&tree.to_uppercase())
+    ));
+    // The tree hash alone, with no byte hash recorded.
+    assert!(matches_export(SAVED.as_bytes(), None, Some(&tree)));
+
+    // Controls. Other bytes and no tree hash: refused.
+    assert!(!matches_export(
+        SAVED.as_bytes(),
+        Some(&byte_hash(&live)),
+        None
+    ));
+    assert!(!matches_export(SAVED.as_bytes(), None, None));
+    // A changed board: refused by both hashes.
+    let moved = SAVED.replacen("(at ", "(at 1", 1);
+    assert!(!matches_export(
+        moved.as_bytes(),
+        Some(&byte_hash(&live)),
+        Some(&tree)
+    ));
+    // Text that does not parse, and bytes that are not text, match by bytes only.
+    assert!(!matches_export(
+        b"(kicad_pcb (unclosed",
+        Some(&byte_hash(&live)),
+        Some(&tree)
+    ));
+    assert!(!matches_export(
+        &[0xff, 0xfe, 0x28],
+        Some(&byte_hash(&live)),
+        Some(&tree)
+    ));
+    assert!(matches_export(
+        b"(kicad_pcb (unclosed",
+        Some(&byte_hash("(kicad_pcb (unclosed")),
+        Some(&tree)
+    ));
+}

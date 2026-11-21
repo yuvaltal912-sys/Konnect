@@ -44,6 +44,8 @@ nom = "8"
 # Specctra DSN/SES syntax. Konnect owns the KiCad lowering and manifest;
 # Topola supplies the format AST and serializer/parser used for parity checks.
 topola_specctra = "0.1.0"
+# Polygon union of a custom pad's anchor and copper primitives.
+i_overlay = "9.2"
 
 # NNG for KiCAD 10 IPC (nanomsg-next-gen, replaces ZeroMQ)
 nng = "1"
