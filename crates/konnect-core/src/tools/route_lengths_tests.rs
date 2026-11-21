@@ -1121,6 +1121,213 @@ fn the_file_is_written_into_the_call_folder_only_with_a_group() {
     assert!(write_file(&dir.path().join("missing"), &plan).is_err());
 }
 
+// ---- Row LT, L21: the tune file without the nets that touched themselves ------
+
+/// The tune file's groups as fastroute reads it, names only.
+fn parsed_names(text: &str) -> Vec<(String, Vec<String>)> {
+    fastroute_parse_tune(text)
+        .unwrap()
+        .into_iter()
+        .map(|group| (group.name, group.nets))
+        .collect()
+}
+
+#[test]
+fn a_dropped_net_leaves_its_group_and_a_group_keeps_its_window() {
+    let plan = two_group_plan();
+    // A plain net of a skew group (3 nets left): the group stays, with its own
+    // tolerance, and so does the pair group.
+    let text = tune_file_without(&plan, &set(&["/DQ1"])).unwrap();
+    assert_eq!(
+        text,
+        "# Length groups for fastroute --tune, written by Konnect (DSN net names only).\n\
+         group lt1 tolerance=0.25\n  /DQ0\n  /DQS_P\n  /DQS_N\n\
+         group lt2 tolerance=0.5 target=42.25\n  /A0\n  /A1\n\
+         group lt1p1 tolerance=0.15\n  /DQS_P\n  /DQS_N\n"
+    );
+    // A net of the target group: it stays with one net left (a target needs no
+    // second net).
+    let text = tune_file_without(&plan, &set(&["/A0"])).unwrap();
+    assert_eq!(
+        parsed_names(&text),
+        vec![
+            (
+                "lt1".to_string(),
+                strings(&["/DQ0", "/DQ1", "/DQS_P", "/DQS_N"])
+            ),
+            ("lt2".to_string(), strings(&["/A1"])),
+            ("lt1p1".to_string(), strings(&["/DQS_P", "/DQS_N"])),
+        ]
+    );
+    assert!(
+        text.contains("group lt2 tolerance=0.5 target=42.25\n"),
+        "{text}"
+    );
+    // A name the plan does not hold drops nothing.
+    assert_eq!(
+        tune_file_without(&plan, &set(&["/NOPE"])),
+        plan.tune_file_text()
+    );
+}
+
+#[test]
+fn a_skew_group_left_with_fewer_than_two_nets_is_left_out_with_its_pair_groups() {
+    let plan = two_group_plan();
+    // One net left in the skew group: nothing to skew against, so it is out, and
+    // its pair group with it.
+    let text = tune_file_without(&plan, &set(&["/DQ0", "/DQ1", "/DQS_P"])).unwrap();
+    assert_eq!(
+        parsed_names(&text),
+        vec![("lt2".to_string(), strings(&["/A0", "/A1"]))]
+    );
+    // Exactly two nets left: the group stays.
+    let text = tune_file_without(&plan, &set(&["/DQ0", "/DQ1"])).unwrap();
+    assert_eq!(
+        parsed_names(&text),
+        vec![
+            ("lt1".to_string(), strings(&["/DQS_P", "/DQS_N"])),
+            ("lt2".to_string(), strings(&["/A0", "/A1"])),
+            ("lt1p1".to_string(), strings(&["/DQS_P", "/DQS_N"])),
+        ]
+    );
+    // A target group with none left is out; the other group stays.
+    let text = tune_file_without(&plan, &set(&["/A0", "/A1"])).unwrap();
+    assert_eq!(
+        parsed_names(&text)
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["lt1", "lt1p1"]
+    );
+    // No group left: no file.
+    assert_eq!(
+        tune_file_without(&plan, &set(&["/DQ0", "/DQ1", "/DQS_P", "/A0", "/A1"])),
+        None
+    );
+    assert_eq!(tune_file_without(&LengthPlan::default(), &set(&[])), None);
+}
+
+#[test]
+fn the_pair_group_of_a_dropped_net_is_left_out_and_the_others_keep_their_numbers() {
+    let mut plan = two_group_plan();
+    plan.groups[0].pairs = vec![
+        ("/DQS_P".into(), "/DQS_N".into(), 0.15),
+        ("/DQ0".into(), "/DQ1".into(), 0.05),
+    ];
+    // A dropped /DQS_P (its partner is not dropped here: this function drops only
+    // what it is given): the first pair group is out and the second keeps its number.
+    let text = tune_file_without(&plan, &set(&["/DQS_P"])).unwrap();
+    assert!(!text.contains("lt1p1"), "{text}");
+    assert!(
+        text.ends_with("group lt1p2 tolerance=0.05\n  /DQ0\n  /DQ1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("group lt1 tolerance=0.25\n  /DQ0\n  /DQ1\n  /DQS_N\n"),
+        "{text}"
+    );
+    // The other net of the pair gives the same.
+    let text = tune_file_without(&plan, &set(&["/DQS_N"])).unwrap();
+    assert!(!text.contains("lt1p1") && text.contains("lt1p2"), "{text}");
+    // Control: a dropped net outside both pairs leaves both pair groups.
+    let plan_text = tune_file_without(&plan, &set(&["/A0"])).unwrap();
+    assert!(plan_text.contains("lt1p1") && plan_text.contains("lt1p2"));
+}
+
+#[test]
+fn with_nothing_dropped_the_file_is_the_plans_file_and_gains_no_partner() {
+    for plan in [two_group_plan(), LengthPlan::default()] {
+        assert_eq!(tune_file_without(&plan, &set(&[])), plan.tune_file_text());
+        assert_eq!(with_pair_partners(&plan, &set(&[])), set(&[]));
+    }
+    let plan = two_group_plan();
+    assert_eq!(plan.tune_nets_without(&set(&[])), plan.tune_nets());
+}
+
+#[test]
+fn a_dropped_net_of_a_pair_adds_its_partner() {
+    let plan = two_group_plan();
+    assert_eq!(
+        with_pair_partners(&plan, &set(&["/DQS_P"])),
+        set(&["/DQS_P", "/DQS_N"])
+    );
+    assert_eq!(
+        with_pair_partners(&plan, &set(&["/DQS_N"])),
+        set(&["/DQS_P", "/DQS_N"])
+    );
+    // A net with no partner, a net of no pair and a name the plan lacks add none.
+    assert_eq!(with_pair_partners(&plan, &set(&["/DQ0"])), set(&["/DQ0"]));
+    assert_eq!(with_pair_partners(&plan, &set(&["/A1"])), set(&["/A1"]));
+    assert_eq!(with_pair_partners(&plan, &set(&["/NOPE"])), set(&["/NOPE"]));
+    // Both already dropped; and a mix.
+    assert_eq!(
+        with_pair_partners(&plan, &set(&["/DQS_P", "/DQS_N", "/A0"])),
+        set(&["/DQS_P", "/DQS_N", "/A0"])
+    );
+    assert_eq!(
+        with_pair_partners(&plan, &set(&["/DQ1", "/DQS_N"])),
+        set(&["/DQ1", "/DQS_P", "/DQS_N"])
+    );
+    // Every pair of every group counts.
+    let mut plan = two_group_plan();
+    plan.groups[1].pairs = vec![("/A0".into(), "/A1".into(), 0.1)];
+    assert_eq!(
+        with_pair_partners(&plan, &set(&["/A1"])),
+        set(&["/A0", "/A1"])
+    );
+}
+
+#[test]
+fn the_nets_the_next_file_lists_are_the_ones_its_text_holds() {
+    let plan = two_group_plan();
+    for dropped in [
+        set(&[]),
+        set(&["/DQ1"]),
+        set(&["/DQS_P", "/DQS_N"]),
+        set(&["/DQ0", "/DQ1", "/DQS_P"]),
+        set(&["/A0"]),
+        set(&["/A0", "/A1"]),
+    ] {
+        let listed = plan.tune_nets_without(&dropped);
+        let in_text: BTreeSet<String> = tune_file_without(&plan, &dropped)
+            .map(|text| {
+                parsed_names(&text)
+                    .into_iter()
+                    .flat_map(|(_, nets)| nets)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(listed, in_text, "{dropped:?}");
+    }
+}
+
+#[test]
+fn the_next_round_writes_its_file_without_the_nets_and_their_partners() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = two_group_plan();
+    let (path, listed) = write_file_without(dir.path(), &plan, &set(&["/DQS_P"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(path, dir.path().join(TUNE_FILE));
+    // The partner went with it, and the pair group.
+    assert_eq!(listed, set(&["/DQ0", "/DQ1", "/A0", "/A1"]));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("DQS") && !text.contains("lt1p1"), "{text}");
+    assert_eq!(
+        text,
+        tune_file_without(&plan, &set(&["/DQS_P", "/DQS_N"])).unwrap()
+    );
+    // No group left: nothing is written.
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(
+        write_file_without(empty.path(), &plan, &plan.tune_nets()).unwrap(),
+        None
+    );
+    assert!(!empty.path().join(TUNE_FILE).exists());
+    // A folder that does not exist is an error.
+    assert!(write_file_without(&dir.path().join("missing"), &plan, &set(&["/DQ0"])).is_err());
+}
+
 #[test]
 fn the_judge_is_given_every_group_and_every_gated_pair_by_dsn_name() {
     let mut plan = two_group_plan();

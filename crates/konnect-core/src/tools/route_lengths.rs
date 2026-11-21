@@ -224,13 +224,45 @@ impl LengthPlan {
     /// pair's two nets). Numbers in mm without a trailing `.0`. No intent text
     /// appears in the file.
     pub(crate) fn tune_file_text(&self) -> Option<String> {
-        if self.groups.is_empty() {
+        self.tune_text(&BTreeSet::new())
+    }
+
+    /// The groups the tune file keeps once `dropped` nets are out, each with its
+    /// nets, in file order (L21): a group that lost a net and is left with fewer than
+    /// 2 nets in skew mode, or with none in target mode, is left out. A group that
+    /// lost nothing is kept as it is.
+    fn kept_groups<'a>(
+        &'a self,
+        dropped: &BTreeSet<String>,
+    ) -> Vec<(&'a ResolvedGroup, Vec<&'a GroupNet>)> {
+        self.groups
+            .iter()
+            .filter_map(|group| {
+                let nets: Vec<&GroupNet> = group
+                    .nets
+                    .iter()
+                    .filter(|net| !dropped.contains(&net.dsn))
+                    .collect();
+                let lost = nets.len() < group.nets.len();
+                let least = match group.window {
+                    Window::Skew { .. } => 2,
+                    Window::Target { .. } => 1,
+                };
+                (!lost || nets.len() >= least).then_some((group, nets))
+            })
+            .collect()
+    }
+
+    /// [`LengthPlan::tune_file_text`] without the nets of `dropped` (L21).
+    fn tune_text(&self, dropped: &BTreeSet<String>) -> Option<String> {
+        let kept = self.kept_groups(dropped);
+        if kept.is_empty() {
             return None;
         }
         let mut text = String::from(
             "# Length groups for fastroute --tune, written by Konnect (DSN net names only).\n",
         );
-        for group in &self.groups {
+        for (group, nets) in &kept {
             let (target, tolerance) = group.window.fastroute_values();
             text.push_str(&format!(
                 "group {} tolerance={}",
@@ -241,14 +273,18 @@ impl LengthPlan {
                 text.push_str(&format!(" target={}", mm_text(target)));
             }
             text.push('\n');
-            for net in &group.nets {
+            for net in nets {
                 text.push_str(&format!("  {}\n", net.dsn));
             }
         }
         // fastroute processes groups in file order, so a pair's skew is restored
-        // after the group's tuning has lengthened each of its nets on its own.
-        for group in &self.groups {
+        // after the group's tuning has lengthened each of its nets on its own. A pair
+        // keeps its number when another pair of its group is left out.
+        for (group, _) in &kept {
             for (index, (positive, negative, tolerance)) in group.pairs.iter().enumerate() {
+                if dropped.contains(positive) || dropped.contains(negative) {
+                    continue;
+                }
                 text.push_str(&format!(
                     "group {}p{} tolerance={}\n  {}\n  {}\n",
                     group.file_name,
@@ -268,6 +304,15 @@ impl LengthPlan {
         self.groups
             .iter()
             .flat_map(|group| group.nets.iter().map(|net| net.dsn.clone()))
+            .collect()
+    }
+
+    /// The DSN names of the nets the tune file lists once `dropped` are out
+    /// ([`tune_file_without`]): a net of a group that was left out is not listed.
+    pub(crate) fn tune_nets_without(&self, dropped: &BTreeSet<String>) -> BTreeSet<String> {
+        self.kept_groups(dropped)
+            .into_iter()
+            .flat_map(|(_, nets)| nets.into_iter().map(|net| net.dsn.clone()))
             .collect()
     }
 
@@ -1061,6 +1106,52 @@ pub(crate) fn write_file(folder: &Path, plan: &LengthPlan) -> anyhow::Result<Opt
     std::fs::write(&path, text)
         .map_err(|error| anyhow::anyhow!("write {}: {error}", path.display()))?;
     Ok(Some(path))
+}
+
+/// Row LT, L21: the plan's tune file without the nets of `dropped`: each group
+/// without them (a group left with fewer than 2 nets in skew mode, or with none, is
+/// left out), and the trailing pair group of every pair one of whose nets is
+/// dropped left out. `None` when no group is left.
+pub(crate) fn tune_file_without(plan: &LengthPlan, dropped: &BTreeSet<String>) -> Option<String> {
+    plan.tune_text(dropped)
+}
+
+/// Row LT, L21: `dropped` with the partner of every resolved pair one of whose nets
+/// it holds (the pairs of the plan's groups: the ones that have a trailing pair
+/// group).
+pub(crate) fn with_pair_partners(
+    plan: &LengthPlan,
+    dropped: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut all = dropped.clone();
+    for (positive, negative, _) in plan.groups.iter().flat_map(|group| &group.pairs) {
+        if dropped.contains(positive) {
+            all.insert(negative.clone());
+        }
+        if dropped.contains(negative) {
+            all.insert(positive.clone());
+        }
+    }
+    all
+}
+
+/// Row LT, L21: the next round's tune file (`fastroute::NextTuneFile`): writes
+/// [`TUNE_FILE`] into `folder` from the plan without `dropped` and the partners of
+/// its paired nets ([`with_pair_partners`], [`tune_file_without`]), and returns its
+/// path with the nets it lists; `None` (and nothing written) when no group is left.
+pub(crate) fn write_file_without(
+    folder: &Path,
+    plan: &LengthPlan,
+    dropped: &BTreeSet<String>,
+) -> anyhow::Result<Option<(PathBuf, BTreeSet<String>)>> {
+    let dropped = with_pair_partners(plan, dropped);
+    let Some(text) = tune_file_without(plan, &dropped) else {
+        return Ok(None);
+    };
+    let path = folder.join(TUNE_FILE);
+    std::fs::write(&path, text)
+        .map_err(|error| anyhow::anyhow!("write {}: {error}", path.display()))?;
+    Ok(Some((path, plan.tune_nets_without(&dropped))))
 }
 
 /// The plan of a call for the board the DSN was exported from (`board`, its saved
