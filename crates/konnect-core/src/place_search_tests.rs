@@ -1306,7 +1306,7 @@ async fn the_table_names_no_net_and_no_part() {
         table_text.contains("| C | beats | unknown |"),
         "{table_text}"
     );
-    assert!(table_text.contains("| C seed "), "{table_text}");
+    assert!(table_text.contains("| C from "), "{table_text}");
     assert!(
         table_text.contains("Family C's outer loops: "),
         "{table_text}"
@@ -1766,7 +1766,10 @@ fn family_c_record(model: &BoardModel) -> Record {
 fn a_record_of_family_c_is_group_c() {
     let record = family_c_record(&model());
     assert_eq!(record.group(), "C");
-    assert!(record.label().starts_with("C seed "), "{}", record.label());
+    assert_eq!(
+        record.label(&small_matrix()),
+        "C from F seed 1 set 0 level 0"
+    );
 }
 
 // ─── The production RouteCall ────────────────────────────────────────────────
@@ -2666,5 +2669,252 @@ fn family_c_records_are_checked_for_duplicates_like_any_candidates() {
             ("generated", None),
             ("duplicate", Some("same board as candidate 22")),
         ]
+    );
+}
+
+// ─── Family C: the fix round (Row CP) ────────────────────────────────────────
+
+/// How many object keys named `name` there are anywhere in `value`.
+fn keys_named(value: &serde_json::Value, name: &str) -> usize {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(key, inner)| usize::from(key == name) + keys_named(inner, name))
+            .sum(),
+        serde_json::Value::Array(items) => items.iter().map(|item| keys_named(item, name)).sum(),
+        _ => 0,
+    }
+}
+
+/// An outcome of `records` with nothing routed, and family C's outer trace when given.
+fn outcome_of(records: Vec<Record>, converge: Option<OuterTrace>) -> Outcome {
+    Outcome {
+        records,
+        elapsed: Duration::ZERO,
+        stopped_routing: None,
+        stopped_code: None,
+        clearances: Clearances::default(),
+        input_unrouted: BTreeMap::new(),
+        converge,
+    }
+}
+
+#[test]
+fn search_json_has_no_converge_key_when_family_c_is_off() {
+    // Family C off: no `converge` key in the plan, in a record or at the top, as before
+    // family C existed.
+    let setup = setup(100);
+    assert!(setup.plan.matrix.converge.is_none());
+    let records = vec![
+        rec(0, Origin::Owner { call: 1 }, "routed", Some([0; 6])),
+        rec(
+            1,
+            generated_origin(Family::Force, 1),
+            "generated",
+            Some([0; 6]),
+        ),
+    ];
+    let off = search_json(&setup.plan, &outcome_of(records.clone(), None));
+    assert_eq!(keys_named(&off, "converge"), 0, "{off}");
+    assert!(off["plan"]["matrix"]["force"].is_array());
+
+    // Family C on: its parameters and rule, its record's trace and the outer trace, and
+    // still no key on a record of another family.
+    let mut plan = setup.plan.clone();
+    plan.matrix.converge = Some((quick(0), OuterRule::measured()));
+    let mut with_c = records;
+    with_c.push(c_rec(2, [0; 6], 100.0));
+    let outer = OuterTrace {
+        params: quick(0),
+        rule: OuterRule::measured(),
+        starts: vec![1],
+        best_by_start: vec![Some(100.0)],
+        starts_stop: "no_more_starts",
+        best_start: Some(1),
+        cost_by_level: vec![100.0],
+        effort_stop: Some("rule"),
+        seconds: 1.0,
+    };
+    let on = search_json(&plan, &outcome_of(with_c, Some(outer)));
+    assert_eq!(keys_named(&on, "converge"), 3, "{on}");
+    assert_eq!(
+        on["plan"]["matrix"]["converge"]["params"]["stage_per_part"],
+        20
+    );
+    assert_eq!(on["plan"]["matrix"]["converge"]["rule"]["window"], 3);
+    assert_eq!(on["converge"]["starts"], json!([1]));
+    let records = on["records"].as_array().unwrap();
+    assert_eq!(records[2]["converge"]["end"]["cost"], 100.0);
+    assert!(records[..2].iter().all(|r| r.get("converge").is_none()));
+}
+
+#[test]
+fn a_c_row_names_its_start_and_its_level() {
+    // F seed 3 of every set and S seed 3, at levels 0 and 1: one label each, counts and
+    // ids only.
+    let matrix = Matrix::bench();
+    let all = recipes(&matrix);
+    let start = |family: Family, set: usize| {
+        all.iter()
+            .find(|r| {
+                r.family == family
+                    && r.seed == 3
+                    && match &r.params {
+                        Params::Force(p) => *p == matrix.force[set],
+                        Params::Schematic(p) => *p == matrix.schematic[set],
+                        _ => false,
+                    }
+            })
+            .unwrap_or_else(|| panic!("{family:?} seed 3 set {set}"))
+            .clone()
+    };
+    let starts = [
+        start(Family::Force, 0),
+        start(Family::Force, 1),
+        start(Family::Force, 2),
+        start(Family::Schematic, 0),
+        start(Family::Schematic, 1),
+    ];
+    let mut labels = Vec::new();
+    for (k, start) in starts.iter().enumerate() {
+        for level in [0, 1] {
+            let record = rec(
+                k,
+                Origin::Generated {
+                    recipe: converge_recipe(start, quick(level)),
+                    generator_version: GENERATOR_VERSION,
+                },
+                "routed",
+                None,
+            );
+            labels.push(record.label(&matrix));
+        }
+    }
+    assert_eq!(labels[2], "C from F seed 3 set 1 level 0");
+    assert_eq!(labels[7], "C from S seed 3 set 0 level 1");
+    let distinct: BTreeSet<&String> = labels.iter().collect();
+    assert_eq!(distinct.len(), labels.len(), "{labels:?}");
+    // A set the matrix does not have is a dash; the other families keep their labels.
+    let foreign = rec(
+        0,
+        Origin::Generated {
+            recipe: converge_recipe(&starts[2], quick(0)),
+            generator_version: GENERATOR_VERSION,
+        },
+        "routed",
+        None,
+    );
+    assert_eq!(
+        foreign.label(&small_matrix()),
+        "C from F seed 3 set - level 0"
+    );
+    let f = rec(0, generated_origin(Family::Force, 3), "routed", None);
+    assert_eq!(f.label(&matrix), "F seed 3");
+    assert_eq!(
+        rec(0, Origin::Owner { call: 2 }, "routed", None).label(&matrix),
+        "O call 2"
+    );
+}
+
+#[test]
+fn converge_all_starts_at_level_0_whatever_level_the_parameters_hold() {
+    let model = model();
+    let starts = rising_starts(4);
+    // Level 0: 100, 90, 95, 95 (every start taken); seed 2 is the best, level 1 costs 80
+    // and level 2 79.5, so the effort stops after level 2. Any other level costs 70.
+    let cost = |seed: u64, level: u32| {
+        Some(match (seed, level) {
+            (1, 0) => 100.0,
+            (2, 0) => 90.0,
+            (_, 0) => 95.0,
+            (_, 1) => 80.0,
+            (_, 2) => 79.5,
+            _ => 70.0,
+        })
+    };
+    let params = ConvergeParams {
+        level: 3,
+        ..quick(0)
+    };
+    let (records, outer) = converge_all_with(
+        &model,
+        &starts,
+        &params,
+        &OuterRule::measured(),
+        2,
+        0,
+        &stub(cost),
+    );
+    let levels: Vec<(u64, u32)> = records
+        .iter()
+        .map(|r| match &r.origin {
+            Origin::Generated { recipe, .. } => seed_and_level(recipe),
+            _ => unreachable!("a run of family C"),
+        })
+        .collect();
+    assert_eq!(
+        levels,
+        vec![(1, 0), (2, 0), (3, 0), (4, 0), (2, 1), (2, 2)],
+        "the starts at level 0, the effort from level 1"
+    );
+    assert_eq!(outer.params, quick(0), "the outer trace records level 0");
+    assert_eq!(outer.cost_by_level, vec![90.0, 80.0, 79.5]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn family_c_runs_without_a_readable_schematic_and_its_records_rerun() {
+    // No schematic beside the board: the model has no neighbourhoods, and family C runs
+    // without the term N.
+    let mut setup = setup(100_000);
+    setup.plan.matrix.converge = Some((quick(0), OuterRule::measured()));
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let (model, schematic) = search_model(&setup.plan).unwrap();
+    assert!(model.hoods.is_none() && schematic.is_err());
+    let runs: Vec<&Record> = outcome
+        .records
+        .iter()
+        .filter(|r| r.group() == "C")
+        .collect();
+    assert!(!runs.is_empty(), "family C made records");
+    assert!(runs.iter().any(|r| r.outcome == "routed"), "and they route");
+    for record in &runs {
+        let trace = record.converge.as_ref().expect("a trace");
+        assert_eq!(trace.hoods_sha256, None, "candidate {}", record.id);
+        assert_eq!(
+            (trace.start.neighbour_mm, trace.end.neighbour_mm),
+            (None, None)
+        );
+    }
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(setup.plan.folder.join("search.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(json["converge"].is_object(), "the outer trace");
+    for record in json["records"].as_array().unwrap() {
+        let is_c = record["origin"]["recipe"]["family"] == "converge";
+        assert_eq!(record.get("converge").is_some(), is_c, "{record}");
+        if is_c {
+            let trace = &record["converge"];
+            assert_eq!(trace.get("hoods_sha256"), Some(&serde_json::Value::Null));
+            assert_eq!(
+                trace["end"].get("neighbour_mm"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+    }
+    // `rerun` rebuilds such a record on the model built as the search builds it, and
+    // refuses a model that has neighbourhoods.
+    let record = runs
+        .iter()
+        .find(|r| r.outcome == "routed")
+        .expect("a routed run");
+    let text = rerun(&model, record).expect("rerun rebuilds it");
+    assert_eq!(Some(sha256_hex(text.as_bytes())), record.board_sha256);
+    let mut other = model.clone();
+    other.hoods = Some(fixture_hoods(&["C1", "C2", "C3"]));
+    let refused = rerun(&other, record).unwrap_err().to_string();
+    assert!(
+        refused.contains("other schematic neighbourhoods"),
+        "{refused}"
     );
 }

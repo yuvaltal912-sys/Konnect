@@ -113,7 +113,9 @@ pub(crate) struct Record {
     /// `schematic_neighbours_reason` says why).
     pub schematic_neighbours: Option<SchematicMeasure>,
     pub schematic_neighbours_reason: Option<String>,
-    /// Family C's trace (design C11). `None` for every other origin.
+    /// Family C's trace (design C11). `None` for every other origin, and then not in
+    /// `search.json` at all: with family C off the file is what it was before family C.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub converge: Option<Trace>,
     #[serde(skip)]
     pub board_text: Option<String>,
@@ -174,27 +176,24 @@ impl Record {
         match &self.origin {
             Origin::Owner { .. } => "O",
             Origin::Ai { .. } => "A",
-            Origin::Generated { recipe, .. } => match recipe.family {
-                Family::Force => "F",
-                Family::Schematic => "S",
-                Family::Perturb => "P",
-                Family::Converge => "C",
-            },
+            Origin::Generated { recipe, .. } => family_letter(recipe.family),
         }
     }
 
     /// A short label for the table: no reference, no net, only the origin and numbers. A
-    /// run of family C also names its effort level, since the levels of one start share
-    /// its seed.
-    fn label(&self) -> String {
+    /// run of family C names its start (the start's family, seed and parameter-set index
+    /// in `matrix`, `-` when the set is not one of the matrix's) and its effort level: the
+    /// starts of F and S share seeds, and the levels of one start share its seed.
+    fn label(&self, matrix: &Matrix) -> String {
         match &self.origin {
             Origin::Owner { call } => format!("O call {call}"),
             Origin::Ai { call, .. } => format!("A call {call}"),
             Origin::Generated { recipe, .. } => match &recipe.params {
                 Params::Converge(run) => format!(
-                    "{} seed {} level {}",
-                    self.group(),
-                    recipe.seed,
+                    "C from {} seed {} set {} level {}",
+                    family_letter(run.start.family),
+                    run.start.seed,
+                    start_set(&run.start, matrix).map_or("-".to_string(), |set| set.to_string()),
                     run.params.level
                 ),
                 _ => format!("{} seed {}", self.group(), recipe.seed),
@@ -210,6 +209,26 @@ impl Record {
             (Some(trace), "generated") => trace.end.cost,
             _ => f64::INFINITY,
         }
+    }
+}
+
+/// The letter of a family: `F`, `S`, `P` or `C`.
+fn family_letter(family: Family) -> &'static str {
+    match family {
+        Family::Force => "F",
+        Family::Schematic => "S",
+        Family::Perturb => "P",
+        Family::Converge => "C",
+    }
+}
+
+/// The index of a start recipe's parameter set among the matrix's sets of its family
+/// (F's or S's); `None` for another family or a set the matrix does not have.
+fn start_set(start: &Recipe, matrix: &Matrix) -> Option<usize> {
+    match &start.params {
+        Params::Force(params) => matrix.force.iter().position(|p| p == params),
+        Params::Schematic(params) => matrix.schematic.iter().position(|p| p == params),
+        _ => None,
     }
 }
 
@@ -767,7 +786,8 @@ fn recipe_of(record: &Record) -> &Recipe {
 ///
 /// Ids are `first_id` upward: the starts in start order, then the levels. A panic is a
 /// `generate_failed` record and costs infinity. The result is the same for any number of
-/// threads.
+/// threads. The starts run at level 0 whatever `params.level` holds, and the outer trace
+/// records the parameters so.
 pub(crate) fn converge_all(
     model: &BoardModel,
     starts: &[Record],
@@ -797,6 +817,12 @@ pub(crate) fn converge_all_with(
     generator: GenerateFn<'_>,
 ) -> (Vec<Record>, OuterTrace) {
     let started = std::time::Instant::now();
+    // The starts run at level 0 whatever level the parameters hold, and the effort levels
+    // count from 1 (design C7).
+    let params = &ConvergeParams {
+        level: 0,
+        ..*params
+    };
     let pool = converge_pool(starts, params);
     let recipes: Vec<Recipe> = pool
         .iter()
@@ -1580,13 +1606,14 @@ pub(crate) fn rerun(model: &BoardModel, record: &Record) -> anyhow::Result<Strin
 
 /// `search.json`: the plan (matrix with family C's parameters and outer rule, limits,
 /// effort, fastroute, threads, host cores), every record (a run of C with its trace), the
-/// input's unrouted check, family C's outer trace, and how the search ended.
+/// input's unrouted check, family C's outer trace, and how the search ended. With family
+/// C off no `converge` key is written, in the plan, a record or at the top.
 pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
     let matrix = &plan.matrix;
     let fastroute_sha256 = std::fs::read(&plan.route.fastroute)
         .ok()
         .map(|bytes| sha256_hex(&bytes));
-    json!({
+    let mut file = json!({
         "plan": {
             "name": plan.name,
             "generator_version": GENERATOR_VERSION,
@@ -1597,9 +1624,6 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
                 "schematic": matrix.schematic,
                 "perturb_seeds": matrix.perturb_seeds,
                 "perturb": matrix.perturb,
-                "converge": matrix
-                    .converge
-                    .map(|(params, rule)| json!({ "params": params, "rule": rule })),
             },
             "recipes": recipes(matrix).len(),
             "hold_rules": plan.hold,
@@ -1618,11 +1642,19 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
         },
         "records": outcome.records,
         "input_unrouted": outcome.input_unrouted,
-        "converge": outcome.converge,
         "elapsed_s": outcome.elapsed.as_secs_f64(),
         "stopped_routing": outcome.stopped_routing,
         "stopped_code": outcome.stopped_code,
-    })
+    });
+    // Family C's keys only when the family is on: with it off the file is what it was
+    // before family C.
+    if let Some((params, rule)) = matrix.converge {
+        file["plan"]["matrix"]["converge"] = json!({ "params": params, "rule": rule });
+    }
+    if let Some(outer) = &outcome.converge {
+        file["converge"] = json!(outer);
+    }
+    file
 }
 
 /// A family's verdict against one reference, by rank (1 is best).
@@ -1777,7 +1809,7 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
         text.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} |\n",
             record.rank.unwrap_or_default(),
-            record.label(),
+            record.label(&plan.matrix),
             pass_word(judged.placement.p1.is_empty()),
             pass_word(judged.placement.p2.is_empty()),
             pass_word(gates.g1.is_empty()),

@@ -63,7 +63,7 @@ The original boards are private: no net, part or board name goes into a document
 | `name` | the board's bench name; titles its table, must be unique | required |
 | `folder` | its folder below the bench folder (a plain relative path) | required |
 | `board` | the board file in `<folder>/input/` | the only `.kicad_pcb` there |
-| `time_limit_minutes` | the whole board's limit, generation included | 100 |
+| `time_limit_minutes` | the whole board's limit, generation included, except family C's phase 1b, whose time does not count against it (design C13) | 100 |
 | `effort` | `fast`, `m`, `h` or `xh` | `m` |
 | `hold` | which parts the search holds: `locks` or `rules` (below) | `locks` |
 | `families` | the generator families, any of `force`, `schematic`, `perturb`, `converge` | `["force", "schematic"]` |
@@ -130,7 +130,9 @@ trace, and per C run its recipe (start family, seed, parameter-set index, level)
 cost, both stop reasons, stages, sweeps, evaluations, the start and end terms, and seconds.
 `KONNECT_CONVERGE_PORT_CHECK=1` adds the port's check: 5 runs at level 0, seeds 1 to 5, both
 new terms off, from F seed 24 with rail weight 0, and their median cost. Counts and numbers
-only.
+only. It repeats phase 1 itself and reads no AI board, so an F or S candidate whose board
+equals A's is a start here and a `duplicate` in the bench: its pool can then differ from the
+bench's.
 
 ```text
 KONNECT_PLACE_BENCH=<bench folder> KONNECT_FASTROUTE=<any executable fastroute> \

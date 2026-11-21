@@ -739,36 +739,45 @@ fn port_check(model: &BoardModel) -> anyhow::Result<serde_json::Value> {
             .map(|job| job.join().expect("a port run's thread"))
             .collect()
     });
-    let mut costs: Vec<f64> = results
+    let costs: Vec<f64> = results
         .iter()
         .filter_map(|(_, trace, _)| trace.as_ref().ok().map(|t| t.end.cost))
         .collect();
-    costs.sort_by(f64::total_cmp);
-    let median = (!costs.is_empty()).then(|| costs[(costs.len() - 1) / 2]);
     let runs: Vec<serde_json::Value> = results
         .iter()
-        .map(|(seed, trace, seconds)| {
-            let mut out = serde_json::Map::new();
-            out.insert("seed".into(), json!(seed));
-            match trace {
-                Ok(trace) => {
-                    out.insert("cost".into(), json!(trace.end.cost));
-                    out.extend(run_fields(trace, Some(*seconds)));
-                }
-                Err(phrase) => {
-                    out.insert("failed".into(), json!(phrase));
-                }
-            }
-            serde_json::Value::Object(out)
-        })
+        .map(|(seed, trace, seconds)| port_run_json(*seed, trace, *seconds))
         .collect();
     Ok(json!({
         "start": { "family": Family::Force, "seed": 24, "set": set },
         "params": params,
         "runs": runs,
         "runs_ended": costs.len(),
-        "median_cost": median,
+        "median_cost": median_cost(&costs),
     }))
+}
+
+/// The median of the port's costs: the lower middle of an even count; `None` for none.
+fn median_cost(costs: &[f64]) -> Option<f64> {
+    let mut sorted = costs.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    (!sorted.is_empty()).then(|| sorted[(sorted.len() - 1) / 2])
+}
+
+/// One run of the port's check: its seed, and its cost and numbers, or the count-only
+/// phrase of its failure.
+fn port_run_json(seed: u64, trace: &Result<Trace, String>, seconds: f64) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert("seed".into(), json!(seed));
+    match trace {
+        Ok(trace) => {
+            out.insert("cost".into(), json!(trace.end.cost));
+            out.extend(run_fields(trace, Some(seconds)));
+        }
+        Err(phrase) => {
+            out.insert("failed".into(), json!(phrase));
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Family C on one board without routing: the model as the search builds it
@@ -1386,4 +1395,275 @@ fn converge_terms_off_turns_both_new_terms_off_and_nothing_else() {
     )
     .unwrap();
     assert!(refusal(&scene.raw()).contains("half"));
+}
+
+// ─── converge-check.json: counts and numbers only ────────────────────────────
+
+/// What a failure's text can hold: a reference, a net name and a path.
+const PRIVATE_LOOKING: [&str; 3] = ["U17", "VSECRET", "/Users/someone"];
+
+/// Every string value anywhere in `value`.
+fn strings_in(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Array(items) => items.iter().flat_map(strings_in).collect(),
+        serde_json::Value::Object(map) => map.values().flat_map(strings_in).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `value` written out holds none of `PRIVATE_LOOKING`.
+fn assert_names_nothing(value: &serde_json::Value, what: &str) {
+    let text = value.to_string();
+    for word in PRIVATE_LOOKING {
+        assert!(
+            !text.contains(word),
+            "{what}: `{word}` reached the file: {text}"
+        );
+    }
+}
+
+fn check_terms(cost: f64) -> Terms {
+    Terms {
+        cost,
+        airwire_mm: cost / 2.0,
+        rail_airwire_mm: 1.0,
+        crossings: 3,
+        pair_violations: 0,
+        pair_mm: 4.0,
+        connector_violations: 0,
+        neighbour_mm: Some(7.5),
+        label_conflicts: 2,
+        soft: cost,
+    }
+}
+
+fn check_trace(cost: f64) -> Trace {
+    Trace {
+        level: 1,
+        requirement_mm: 1000.0,
+        hoods_sha256: Some("ab".repeat(32)),
+        start: check_terms(2.0 * cost),
+        end: check_terms(cost),
+        repairs_tried: 2,
+        repairs_made: 1,
+        first_temperature: 12.5,
+        stages: 40,
+        anneal_stop: crate::place_converge::AnnealStop::Quiet,
+        sweeps: 3,
+        descent_stop: crate::place_converge::DescentStop::FixedPoint,
+        evaluations: 400,
+        best_by_step: vec![2.0 * cost, cost],
+    }
+}
+
+/// A record of family C from `start` at level 1, as `converge_all` files one.
+fn check_record(
+    id: usize,
+    start: Recipe,
+    outcome: &'static str,
+    reason: Option<&str>,
+    trace: Option<Trace>,
+) -> Record {
+    Record {
+        id,
+        origin: Origin::Generated {
+            recipe: Recipe {
+                family: Family::Converge,
+                seed: start.seed,
+                params: Params::Converge(crate::place_generators::ConvergeRecipe {
+                    start: Box::new(start),
+                    params: ConvergeParams::measured(1),
+                }),
+            },
+            generator_version: GENERATOR_VERSION,
+        },
+        board_sha256: None,
+        input_sha256: "i".into(),
+        held_sha256: "h".into(),
+        intent_sha256: "t".into(),
+        outcome,
+        reason: reason.map(str::to_string),
+        converged: trace.as_ref().map(Trace::converged),
+        screen: None,
+        screen_key: None,
+        key: None,
+        rank: None,
+        timings: crate::place_search::Timings {
+            generate_ms: Some(1500.0),
+            ..Default::default()
+        },
+        route: None,
+        placement_gates: None,
+        unrouted: None,
+        route_gates: None,
+        schematic_neighbours: None,
+        schematic_neighbours_reason: reason.map(str::to_string),
+        converge: trace,
+        board_text: None,
+        judged: None,
+    }
+}
+
+/// The bench matrix's recipe of `family`, seed 24, parameter set `set`.
+fn bench_start(family: Family, set: usize) -> Recipe {
+    let matrix = Matrix::bench();
+    recipes(&matrix)
+        .into_iter()
+        .find(|r| {
+            r.family == family
+                && r.seed == 24
+                && match &r.params {
+                    Params::Force(p) => *p == matrix.force[set],
+                    Params::Schematic(p) => *p == matrix.schematic[set],
+                    _ => false,
+                }
+        })
+        .expect("a bench recipe")
+}
+
+#[test]
+fn a_failure_phrase_is_a_count_or_a_word() {
+    let cases = [
+        (
+            GenerateFailure::NoRoom(vec!["U17".to_string(), "VSECRET".to_string()]),
+            "no room for 2 part(s)",
+        ),
+        (
+            GenerateFailure::Invalid("pad 1 of U17 on VSECRET in /Users/someone".to_string()),
+            "invalid",
+        ),
+        (
+            GenerateFailure::Panicked("U17 panicked in /Users/someone".to_string()),
+            "panicked",
+        ),
+    ];
+    for (failure, phrase) in cases {
+        assert_eq!(failure_phrase(&failure), phrase, "{failure:?}");
+    }
+}
+
+#[test]
+fn run_fields_are_numbers_and_fixed_words_only() {
+    let trace = check_trace(120.0);
+    let fields = run_fields(&trace, Some(2.0));
+    let keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+    let mut expected = vec![
+        "converged",
+        "anneal_stop",
+        "descent_stop",
+        "stages",
+        "sweeps",
+        "evaluations",
+        "repairs_tried",
+        "repairs_made",
+        "first_temperature",
+        "requirement_mm",
+        "start",
+        "end",
+        "seconds",
+        "microseconds_per_evaluation",
+    ];
+    expected.sort_unstable();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted, expected,
+        "no other field: no hash, no curve, no reason"
+    );
+    let value = serde_json::Value::Object(fields.clone());
+    let words = strings_in(&value);
+    assert_eq!(words, vec!["quiet".to_string(), "fixed_point".to_string()]);
+    assert_eq!(fields["converged"], true);
+    assert_eq!(fields["stages"], 40);
+    assert_eq!(fields["end"]["cost"], 120.0);
+    assert_eq!(fields["end"]["neighbour_mm"], 7.5);
+    assert_eq!(fields["microseconds_per_evaluation"], 2.0 * 1e6 / 400.0);
+    // No wall time, or no evaluation: no time per evaluation.
+    assert!(run_fields(&trace, None)["microseconds_per_evaluation"].is_null());
+    let idle = Trace {
+        evaluations: 0,
+        ..trace
+    };
+    assert!(run_fields(&idle, Some(2.0))["microseconds_per_evaluation"].is_null());
+}
+
+#[test]
+fn a_converge_check_record_names_no_part_net_or_path() {
+    let matrix = Matrix::bench();
+    let done = check_record(
+        200,
+        bench_start(Family::Force, 1),
+        "generated",
+        None,
+        Some(check_trace(90.0)),
+    );
+    let failed = check_record(
+        201,
+        bench_start(Family::Schematic, 1),
+        "generate_failed",
+        Some("no room for U17 on VSECRET in /Users/someone"),
+        None,
+    );
+    let done_json = converge_run_json(&done, &matrix);
+    let failed_json = converge_run_json(&failed, &matrix);
+    for (json, what) in [(&done_json, "a run"), (&failed_json, "a failed run")] {
+        assert_names_nothing(json, what);
+        assert!(json.get("reason").is_none(), "{what}: {json}");
+    }
+    // The recipe: the start's family, seed and parameter-set index, and the level.
+    assert_eq!(
+        done_json["recipe"],
+        json!({ "start": { "family": "force", "seed": 24, "set": 1 }, "level": 1 })
+    );
+    assert_eq!(failed_json["recipe"]["start"]["family"], "schematic");
+    assert_eq!(failed_json["recipe"]["start"]["set"], 1);
+    assert_eq!(done_json["id"], 200);
+    assert_eq!(done_json["outcome"], "generated");
+    assert_eq!(failed_json["outcome"], "generate_failed");
+    assert_eq!(done_json["cost"], 90.0);
+    assert_eq!(done_json["seconds"], 1.5);
+    let mut keys: Vec<&String> = failed_json.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["id", "outcome", "recipe"],
+        "a failed run: no numbers, no reason"
+    );
+    // A start whose set is not one of the matrix's has no index.
+    let small = Matrix {
+        force: Vec::new(),
+        ..Matrix::bench()
+    };
+    assert!(converge_run_json(&done, &small)["recipe"]["start"]["set"].is_null());
+}
+
+#[test]
+fn the_ports_median_is_the_lower_middle_and_a_run_holds_its_numbers_or_its_phrase() {
+    assert_eq!(median_cost(&[]), None);
+    assert_eq!(median_cost(&[5.0]), Some(5.0));
+    assert_eq!(median_cost(&[3.0, 1.0, 2.0]), Some(2.0));
+    assert_eq!(
+        median_cost(&[4.0, 1.0, 3.0, 2.0]),
+        Some(2.0),
+        "the lower middle"
+    );
+    assert_eq!(
+        median_cost(&[1195.0, 1121.0, 1300.0, 1163.0, 1250.0]),
+        Some(1195.0)
+    );
+    let ok = port_run_json(3, &Ok(check_trace(80.0)), 4.0);
+    assert_eq!(ok["seed"], 3);
+    assert_eq!(ok["cost"], 80.0);
+    assert_eq!(ok["seconds"], 4.0);
+    assert!(ok.get("failed").is_none());
+    let failure = GenerateFailure::NoRoom(vec!["U17".to_string()]);
+    let failed = port_run_json(4, &Err(failure_phrase(&failure)), 4.0);
+    assert_eq!(
+        failed,
+        json!({ "seed": 4, "failed": "no room for 1 part(s)" })
+    );
+    for (json, what) in [(&ok, "a run"), (&failed, "a failed run")] {
+        assert_names_nothing(json, what);
+    }
 }

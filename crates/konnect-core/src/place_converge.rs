@@ -12,8 +12,8 @@
 #![allow(dead_code)]
 
 use crate::place_generators::{
-    legalize_with, placements_from, text_box, turn_vector, unit, BoardModel, Candidate, GapRule,
-    GenerateFailure, Legality, GRID_MM,
+    legalize_with, placements_from, ring_cells, text_box, turn_vector, unit, BoardModel, Candidate,
+    GapRule, GenerateFailure, Legality, GRID_MM,
 };
 use crate::place_held::footprint_keys;
 use crate::place_schematic::Neighbourhoods;
@@ -1962,26 +1962,11 @@ fn grid_shift(rng: &mut SplitMix64, radius_mm: f64) -> f64 {
 }
 
 /// The cells of rings 0 to 24 around a centre cell, as grid steps: ring by ring, each
-/// ring nearest first and ties by step, as `legalize`'s ring search walks them.
+/// ring nearest first and ties by step. Built from `legalize`'s own ring function
+/// (`place_generators::ring_cells`), so the two searches walk one order.
 fn nearest_cells() -> &'static [(i64, i64)] {
     static CELLS: std::sync::OnceLock<Vec<(i64, i64)>> = std::sync::OnceLock::new();
-    CELLS.get_or_init(|| {
-        let mut all = vec![(0, 0)];
-        for ring in 1..CELL_RINGS {
-            let mut cells = Vec::with_capacity(8 * ring as usize);
-            for i in -ring..=ring {
-                cells.push((i, -ring));
-                cells.push((i, ring));
-            }
-            for j in (-ring + 1)..ring {
-                cells.push((-ring, j));
-                cells.push((ring, j));
-            }
-            cells.sort_by_key(|&(i, j)| (i * i + j * j, i, j));
-            all.extend(cells);
-        }
-        all
-    })
+    CELLS.get_or_init(|| (0..CELL_RINGS).flat_map(ring_cells).collect())
 }
 
 /// The fall from `before` to `after` as a share of `before`; 0 when `before` is not

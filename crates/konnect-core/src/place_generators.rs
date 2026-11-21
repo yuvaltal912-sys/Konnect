@@ -1399,7 +1399,9 @@ fn core_parts(model: &BoardModel, sizes: &[(f64, f64)]) -> Vec<FdPart> {
 
 /// The cells of ring `ring` around a centre cell, as grid steps, nearest first (ties
 /// by step): the centre cell alone for ring 0, else the square ring's `8 * ring` cells.
-fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
+/// Family C's nearest-legal-cell search walks the same rings (`place_converge`), so a
+/// cell is the nearest by one order in both.
+pub(crate) fn ring_cells(ring: i64) -> Vec<(i64, i64)> {
     if ring == 0 {
         return vec![(0, 0)];
     }
