@@ -879,51 +879,83 @@ struct SilkCheck {
     measured: usize,
 }
 
+/// The phrase beside a `null` silk when the check could not start at all.
+const SILK_NOT_STARTED: &str = "the silk check could not start";
+
+/// A message for a board whose silk check read none of its runs, `None` when it read at
+/// least one or there was nothing to read. The file keeps its `null`s and fixed phrases;
+/// the message is what makes the test fail, so that a check that failed everywhere is
+/// never taken for a passing one.
+fn silk_unmeasured(check: &SilkCheck) -> Option<String> {
+    (check.measured == 0 && !check.runs.is_empty()).then(|| {
+        format!(
+            "the silk check read 0 of {} run(s); every silk entry of the file is null, with its reason",
+            check.runs.len()
+        )
+    })
+}
+
 /// Design A3's two measures of every run, with no routing call, by the bench's own code:
 /// the input board's unrouted check as `search` makes it (`PlaceRouteCall::unrouted`,
 /// in `<scratch>/input-check`); then for each run its board text (`placements_applied_to`,
 /// as the bench routes it) written by `export_candidate` into `<scratch>/candidates/c<id>`,
 /// as the bench writes a candidate before its routing call, and `PlaceRouteCall::unrouted`
 /// on that copy (`place_route::unrouted_check`; the call first proves the copy on disk is
-/// the record's text). Every check runs one at a time with the bench's scratch
+/// the record's text, and refuses a report without the unconnected-items category, as the
+/// bench's own check does). Every check runs one at a time with the bench's scratch
 /// `KICAD_CONFIG_HOME` (`inputs.kicad_config_home`) under `isolated_context`, whose
 /// `ipc_address` nothing listens on. The schematic measure is `Record::file_schematic`'s.
-/// A failed check is a phrase in the file and its full text a line in the log.
+/// A failed check is a phrase in the file and its full text a line in the log; so is a
+/// check that cannot start ([`SILK_NOT_STARTED`]): this runs after the search, so it never
+/// returns an error that would lose the search's result.
 fn silk_check(
     runtime: &tokio::runtime::Runtime,
     scratch: &Path,
     inputs: &RouteInputs,
-    model: &BoardModel,
+    input_text: &str,
     schematic: &Result<SchematicBaseline, String>,
     runs: &mut [Record],
-) -> anyhow::Result<SilkCheck> {
-    let ctx = isolated_context(&scratch.join("isolation"), &inputs.kicad_cli)?;
-    let call = |board: PathBuf| PlaceRouteCall {
+) -> SilkCheck {
+    let setup = isolated_context(&scratch.join("isolation"), &inputs.kicad_cli)
+        .and_then(|ctx| {
+            let name = inputs
+                .board
+                .file_name()
+                .context("the input board has no file name")?
+                .to_owned();
+            Ok((ctx, name))
+        })
+        .map_err(|error| {
+            println!("the silk check could not start: {error:#}");
+            SILK_NOT_STARTED
+        });
+    let call = |ctx: &Arc<_>, board: PathBuf| PlaceRouteCall {
         inputs: RouteInputs {
             board,
             ..inputs.clone()
         },
-        ctx: Arc::clone(&ctx),
+        ctx: Arc::clone(ctx),
     };
-    let file_name = inputs
-        .board
-        .file_name()
-        .context("the input board has no file name")?;
-    let input = runtime
-        .block_on(
-            call(inputs.board.clone()).unrouted(model.text.clone(), scratch.join("input-check")),
-        )
-        .map_err(|error| {
-            println!("the input board's unrouted check failed: {error:#}");
-            "the unrouted check failed"
-        });
+    let input = match &setup {
+        Err(phrase) => Err(*phrase),
+        Ok((ctx, _)) => runtime
+            .block_on(
+                call(ctx, inputs.board.clone())
+                    .unrouted(input_text.to_string(), scratch.join("input-check")),
+            )
+            .map_err(|error| {
+                println!("the input board's unrouted check failed: {error:#}");
+                "the unrouted check failed"
+            }),
+    };
     let mut fields = Vec::with_capacity(runs.len());
     let mut measured = 0usize;
     for record in runs.iter_mut() {
         record.file_schematic(schematic);
-        let counts = match &record.board_text {
-            None => Err("no board"),
-            Some(text) => {
+        let counts = match (&record.board_text, &setup) {
+            (None, _) => Err("no board"),
+            (Some(_), Err(phrase)) => Err(*phrase),
+            (Some(text), Ok((ctx, file_name))) => {
                 let folder = scratch
                     .join("candidates")
                     .join(format!("c{:04}", record.id));
@@ -933,7 +965,7 @@ fn silk_check(
                         Err("the export failed")
                     }
                     Ok(_) => runtime
-                        .block_on(call(folder.join(file_name)).unrouted(text.clone(), folder))
+                        .block_on(call(ctx, folder.join(file_name)).unrouted(text.clone(), folder))
                         .map_err(|error| {
                             println!("run {}: the unrouted check failed: {error:#}", record.id);
                             "the unrouted check failed"
@@ -944,11 +976,11 @@ fn silk_check(
         measured += usize::from(counts.is_ok());
         fields.push(silk_fields(&counts, record, schematic.is_ok()));
     }
-    Ok(SilkCheck {
+    SilkCheck {
         input: input_silk_fields(&input),
         runs: fields,
         measured,
-    })
+    }
 }
 
 /// Family C on one board without routing: the model as the search builds it
@@ -1013,16 +1045,18 @@ fn converge_check_board(
         .map(|record| converge_run_json(record, &plan.matrix))
         .collect();
     let mut silk_line = String::new();
+    let mut silk_failure = None;
     let mut input_fields = None;
     if let Some(runtime) = silk {
         let check = silk_check(
             runtime,
             &scratch,
             &plan.route,
-            &model,
+            &model.text,
             &schematic,
             &mut runs,
-        )?;
+        );
+        silk_failure = silk_unmeasured(&check);
         for (value, fields) in run_values.iter_mut().zip(check.runs) {
             if let serde_json::Value::Object(map) = value {
                 map.extend(fields);
@@ -1054,6 +1088,10 @@ fn converge_check_board(
         map.extend(fields);
     }
     std::fs::write(&out, serde_json::to_string_pretty(&file)?)?;
+    // After the file: the search's result is kept, and the test still fails.
+    if let Some(message) = silk_failure {
+        bail!("board {}: {message} ({})", board.name, out.display());
+    }
     Ok(format!(
         "{}: {} start(s) of {starts_available} (rule for starts: {}), {} effort level(s) (rule for effort: {}), {} run(s), phase 1b {:.1} s{silk_line}, {}",
         board.name,
@@ -2057,4 +2095,87 @@ fn the_ports_median_is_the_lower_middle_and_a_run_holds_its_numbers_or_its_phras
     for (json, what) in [(&ok, "a run"), (&failed, "a failed run")] {
         assert_names_nothing(json, what);
     }
+}
+
+/// The silk check's inputs for a board that is not there: nothing in them is read before
+/// the check's own start fails.
+fn unstarted_inputs(root: &Path) -> RouteInputs {
+    RouteInputs {
+        rules: Default::default(),
+        options: export_options(Path::new("b.kicad_pcb")),
+        board: root.join("input/b.kicad_pcb"),
+        effort: Effort::Fast,
+        fastroute: root.join("fastroute"),
+        kicad_cli: "kicad-cli".into(),
+        kicad_config_home: root.join("cfg"),
+    }
+}
+
+#[test]
+fn a_silk_check_that_cannot_start_is_a_phrase_for_every_run_and_loses_nothing() {
+    // `isolated_context` refuses a folder that is not empty: the silk check, which runs
+    // after the whole search, answers with `null`s and one fixed phrase instead of an
+    // error that would lose the search's result. No kicad-cli is started.
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let scratch = root.join(SILK_FOLDER);
+    std::fs::create_dir_all(scratch.join("isolation")).unwrap();
+    std::fs::write(scratch.join("isolation/occupied"), "x").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut with_board = check_record(
+        1,
+        bench_start(Family::Force, 0),
+        "generated",
+        None,
+        Some(check_trace(90.0)),
+    );
+    with_board.board_text = Some("(kicad_pcb)".into());
+    let without_board = check_record(
+        2,
+        bench_start(Family::Force, 0),
+        "generated",
+        None,
+        Some(check_trace(80.0)),
+    );
+    let mut runs = [with_board, without_board];
+    let check = silk_check(
+        &runtime,
+        &scratch,
+        &unstarted_inputs(&root),
+        "(kicad_pcb)",
+        &Err("no schematic".into()),
+        &mut runs,
+    );
+    assert_eq!(check.measured, 0);
+    assert_eq!(check.runs.len(), 2);
+    assert!(check.runs[0]["silk"].is_null());
+    assert_eq!(check.runs[0]["silk_reason"], SILK_NOT_STARTED);
+    assert!(check.runs[1]["silk"].is_null());
+    assert_eq!(check.runs[1]["silk_reason"], "no board");
+    assert_eq!(
+        serde_json::Value::Object(check.input.clone()),
+        json!({ "input_silk": null, "input_silk_reason": SILK_NOT_STARTED })
+    );
+    // The scratch folder was not written into: nothing started.
+    assert!(!scratch.join("candidates").exists());
+    assert!(!scratch.join("input-check").exists());
+    // Nothing read means the test fails, with the file kept.
+    let message = silk_unmeasured(&check).expect("0 of 2 is a failure");
+    assert!(message.contains("0 of 2"), "{message}");
+}
+
+#[test]
+fn only_a_check_that_read_no_run_at_all_fails_the_test() {
+    let check = |measured: usize, runs: usize| SilkCheck {
+        input: serde_json::Map::new(),
+        runs: vec![serde_json::Map::new(); runs],
+        measured,
+    };
+    assert!(silk_unmeasured(&check(0, 3)).is_some());
+    assert!(silk_unmeasured(&check(1, 3)).is_none());
+    assert!(silk_unmeasured(&check(3, 3)).is_none());
+    // A board with no run has nothing to read; that is not this failure.
+    assert!(silk_unmeasured(&check(0, 0)).is_none());
 }

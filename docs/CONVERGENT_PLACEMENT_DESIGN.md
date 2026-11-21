@@ -170,7 +170,7 @@ part: its starts are F's and S's candidates, which know what S0 knows.
 | C11 | **Records.** Each run is a record of family C. Its recipe holds its start's recipe, its level and every parameter, so `rerun` rebuilds it (it generates the start again, then runs) from the record and a model built as the search builds it: the clearances and the schematic neighbourhoods set. The trace records the SHA-256 of the neighbourhoods the run read, and `rerun` refuses a model whose neighbourhoods differ. The record has `converged` and the run's trace: the cost term by term at the start and the end (the end's from the board as written, anchors rounded to 1 µm, so its airwire length, crossings and violation counts are the screen's own), the first temperature, stages, sweeps, both stop reasons, repairs, evaluations, and the best cost after every stage and sweep. `search.json` also gets the outer trace: the best cost after each start and after each level, and why each rule stopped. `table.md` gets C's row and one line of counts | D21: a record must say what ran and be rebuilt from it. The curves are the evidence that a stop was a convergence |
 | C12 | **Selection for routing.** C's candidates that pass P1 are ordered by the screen's requirement fields (score incomplete, decoupling violations, connector violations) and then by their cost; the best 3 and 1 drawn are routed, as for F and S | The cost is what the family converged on; the screen key orders crossings before length, which is another order. The requirement fields first keeps D18's order, and puts a run that ended with a broken pair behind every run that did not |
 | C13 | **No time limit inside C.** The board's bench limit (D15) still bounds the routing calls, and C's own wall time does not count against it: the launch rule reads the time since the search began less the time phase 1b took. C's wall time is recorded | The owner's request. The limit was sized for the routing calls (D15), and a search that takes its own time must not cost O or a family a call. The expected time is seconds to a few minutes per board: the experiment needed 0.5 to 0.97 million evaluations per run at level 0, and twice as many for each level above it, and an evaluation in Rust is expected to take tens of microseconds; the first measurement says what it is |
-| C14 | The generator version becomes 9 | D21: a record names the build that can rebuild it |
+| C14 | The generator version becomes 9, and 10 after amendments A1 and A2 changed family C's output for a recipe (2026-11-21) | D21: a record names the build that can rebuild it |
 
 ## Decisions for the owner
 
@@ -1066,7 +1066,7 @@ pub(crate) fn converge_all(
 | Selection | `family_c_is_ordered_by_requirements_then_cost` (`place_search_tests.rs`) | Ordered by the screen key, a candidate with fewer crossings and a higher cost comes first |
 | Rerun | `rerun_rebuilds_a_converged_board` | Another generator version is refused; a start recipe of family C is refused; a model with other schematic neighbourhoods is refused |
 | Counts only | `the_table_names_no_net_and_no_part`, with family C in the search | — |
-| Generator version | `the_generator_version_is_nine` | — |
+| Generator version | `the_generator_version_is_ten` | — |
 | The bench's option | `converge_needs_f_or_s_and_the_default_stays_f_and_s` (`place_bench_tests.rs`) | `["converge"]` alone is refused with its word |
 
 Scoped `cargo llvm-cov` on `place_converge.rs`, and targeted `cargo mutants` on the guards

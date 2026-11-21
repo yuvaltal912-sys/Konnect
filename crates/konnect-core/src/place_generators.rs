@@ -26,8 +26,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Bumped whenever any generator's arithmetic changes, so that a record says whether
-/// this build can reproduce it.
-pub(crate) const GENERATOR_VERSION: u32 = 9;
+/// this build can reproduce it. 10: family C's output for one recipe changed with the
+/// amendments A1 and A2 (the attraction's grid and the first temperature); a record of
+/// version 9 made before them is refused by its version, not by a mismatch of hashes.
+pub(crate) const GENERATOR_VERSION: u32 = 10;
 
 /// The grid every generator snaps centres to, and legalize searches on (the force
 /// core's legacy grid).

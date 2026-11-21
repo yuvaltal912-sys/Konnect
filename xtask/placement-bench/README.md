@@ -125,8 +125,9 @@ holds them for each board's run.
 `converge_check`, an ignored test beside `place_bench`, runs family C on every board that names
 `converge`, with no routing call (the design's measurement step 1). It takes the same
 environment and guards as `place_bench`, starts no router, starts no KiCad unless
-`KONNECT_CONVERGE_SILK=1` is set (below), and writes only `<board folder>/converge-check.json`
-(refused when the file exists): phase 1's counts, the outer trace, and per C run its recipe
+`KONNECT_CONVERGE_SILK=1` is set (below), and writes `<board folder>/converge-check.json`
+(refused when the file exists; with the silk check, also the scratch folder below):
+phase 1's counts, the outer trace, and per C run its recipe
 (start family, seed, parameter-set index, level), outcome, cost, both stop reasons, stages,
 sweeps, evaluations, the start and end terms, and seconds. `KONNECT_CONVERGE_PORT_CHECK=1` adds
 the port's check: 5 runs at level 0, seeds 1 to 5, both new terms off, from F seed 24 with rail
@@ -136,9 +137,11 @@ the bench: its pool can then differ from the bench's. Its run ids start after ph
 with no O or A record before them, so they are not the bench's ids: match runs by their recipe.
 
 `KONNECT_CONVERGE_SILK=1` adds design A3's two measures, with no routing call, by the bench's
-own code, and **starts kicad-cli** (a refill and DRC per board, one at a time, with the scratch
-`KICAD_CONFIG_HOME`; a real `kicad-cli` is needed, so `KONNECT_KICAD_CLI` must not name a
-stand-in). It runs the bench's input check on the input board (`PlaceRouteCall::unrouted`, that
+own code, and **starts kicad-cli** (a refill and DRC per board text, that is on the input and on each
+run's board, one at a time, with the scratch `KICAD_CONFIG_HOME`; a real `kicad-cli` is needed: a
+report without the unconnected-items category is refused, as the bench's own check refuses it, but
+a stand-in that returns a whole report is not detected, so `KONNECT_KICAD_CLI` must not name
+one). It runs the bench's input check on the input board (`PlaceRouteCall::unrouted`, that
 is `place_route::unrouted_check`), writes each C run's board as the bench writes a candidate
 before its routing call (`export_candidate`), runs the same check on that copy, and adds:
 
@@ -150,11 +153,15 @@ before its routing call (`export_candidate`), runs the same check on that copy, 
   `schematic_neighbours_reason`.
 
 A reason is `null` beside a value, and beside a `null` one fixed phrase (`no board`, `the export
-failed`, `the unrouted check failed`, `the input's schematic gives no neighbourhoods`, `the board
-could not be measured`); a failure's own text goes to the log only. The scratch boards stay in
-`<board folder>/converge-check-silk/` (`isolation/`, `input-check/`, `candidates/c<id>/`, the
-bench's layout) for inspection, and a run is refused while that folder exists. Without the
-variable the file is what it was before the variable existed.
+failed`, `the unrouted check failed`, `the silk check could not start`, `the input's schematic
+gives no neighbourhoods`, `the board could not be measured`); a failure's own text goes to the log
+only. If the silk check reads none of a board's runs, the file is still written (every `silk` is
+`null` with its reason) and the test fails with a message that says so. The scratch boards stay in
+`<board folder>/converge-check-silk/` (`isolation/`, `input-check/`, `candidates/c<id>/` with the
+id padded to four digits, as the bench's layout has it) for inspection, and a run is refused
+while that folder exists. Without the variable the file is what it was before the variable
+existed. Both switches are on only for the value `1`; the header line the test prints says
+which are on.
 
 ```text
 KONNECT_PLACE_BENCH=<bench folder> KONNECT_FASTROUTE=<any executable fastroute> \

@@ -2822,7 +2822,9 @@ fn time_a_run_on_96_parts() {
 /// Whole runs as the code of stage 4 (`60c9be73`) made them, before any speed-up, recorded
 /// again once after the design's amendments A1 and A2 (the attraction's grid and the first
 /// temperature), which change every run: a change that changes a run's behaviour by one bit
-/// fails `whole_runs_are_the_recorded_goldens`.
+/// fails `whole_runs_are_the_recorded_goldens`. The bits are recorded on macOS (Apple
+/// Silicon): a run goes through `exp`, `ln`, `powf` and `hypot` of the platform's math
+/// library, so they may differ in the last place on another platform.
 const RUN_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/tools/placement/fixtures/converge_runs.json"
@@ -3741,6 +3743,252 @@ fn the_first_legal_cell_is_the_one_a_search_of_every_cell_finds() {
     assert!(
         found > 50 && none > 10 && moved_off > 30,
         "found {found}, none {none}, away from the base {moved_off}"
+    );
+}
+
+/// Up to `count` random legal moves of `kinds` applied to `state`, as `random_walk` makes
+/// them, but giving up quietly after a bounded number of draws (a crowded or boxed board
+/// may have few legal moves).
+fn scatter(
+    cost: &CostModel<'_>,
+    state: &mut State,
+    rng: &mut SplitMix64,
+    count: usize,
+    kinds: &[u64],
+) {
+    let mut made = 0;
+    for _ in 0..40 * count {
+        if made == count {
+            break;
+        }
+        let kind = kinds[rng.below(kinds.len() as u64) as usize];
+        let Some(mv) = random_move(cost, state, rng, kind) else {
+            continue;
+        };
+        if cost.legal(state, &mv) {
+            let delta = cost.delta(state, &mv);
+            cost.apply(state, &mv, delta);
+            made += 1;
+        }
+    }
+}
+
+#[test]
+fn the_first_legal_cell_equals_a_plain_ring_search_at_the_real_call_site() {
+    // The attraction's call: `first_legal_cell` with every other part as a blocker and the
+    // search's own `legal` (`CostModel::legal`, which tests every part but the one it
+    // moves), against `brute_force_cell` (the rings in order, `legal` on each cell), on
+    // states a seeded random walk of legal moves reached: four fixture boards (the demo
+    // with parts on both sides, a crowded board, one with copper obstacles on both
+    // sides, the rounded board with a cut-out), two part gaps, parts turned by the walk,
+    // bases off the part's own centre on the 0.25 mm grid. The test builds no
+    // precondition of its own: whether `legal` is false wherever the mask says a blocker
+    // is in the way is exactly what an equal answer shows.
+    let boards = [
+        ("demo", demo_with_pairs(), Some(demo_hoods())),
+        ("crowded", crowded(), None),
+        ("crowded_copper", crowded_copper(), None),
+        (
+            "rounded",
+            model_of(&std::fs::read_to_string(ROUNDED).unwrap(), &[]),
+            None,
+        ),
+    ];
+    assert!(
+        boards[0].1.part_sides.iter().any(|sides| sides.bottom)
+            && boards[0].1.part_sides.iter().any(|sides| sides.top),
+        "the demo has parts on both sides"
+    );
+    let mut rng = SplitMix64(0x5eed_0f1c);
+    let (mut searches, mut found, mut moved_off, mut turned) = (0usize, 0usize, 0usize, 0usize);
+    for (name, mut model, hoods) in boards {
+        for gap in [0.0, 0.3] {
+            model.clearances.part_gap_mm = gap;
+            let cost = cost_of(&model, hoods.as_ref());
+            let count = model.parts.len();
+            for walk in 0..6 {
+                let mut state = as_read(&cost);
+                scatter(&cost, &mut state, &mut rng, 30, &[0, 1, 2, 3, 5, 6]);
+                for trial in 0..5 {
+                    let part = cost.movable[rng.below(cost.movable.len() as u64) as usize];
+                    let turns = state.turns[part];
+                    let size = cost.size_at(part, turns);
+                    let at = state.centres[part];
+                    let base = (
+                        snap_to(at.0 + shift(&mut rng, 6.0), SHIFT_GRID_MM),
+                        snap_to(at.1 + shift(&mut rng, 6.0), SHIFT_GRID_MM),
+                    );
+                    let fast = cost.first_legal_cell(
+                        part,
+                        size,
+                        base,
+                        (0..count).filter(|&j| j != part),
+                        (&state.centres, &state.sizes),
+                        |cell| {
+                            cost.legal(
+                                &state,
+                                &Move {
+                                    parts: vec![(part, cell, turns)],
+                                },
+                            )
+                        },
+                    );
+                    let plain = brute_force_cell(&cost, &state, part, base);
+                    assert_eq!(
+                        fast, plain,
+                        "{name}, gap {gap}, walk {walk}, trial {trial}, part {}",
+                        model.references[part]
+                    );
+                    searches += 1;
+                    found += usize::from(plain.is_some());
+                    moved_off += usize::from(plain.is_some_and(|cell| cell != base));
+                    turned += usize::from(turns != 0);
+                }
+            }
+        }
+    }
+    assert!(
+        searches == 240 && found > 150 && moved_off > 30 && turned > 5,
+        "{searches} searches, {found} found, {moved_off} away from their base, {turned} of turned parts"
+    );
+}
+
+/// What making room (`CostModel::make_room`) must guarantee for every pair of a state, by
+/// the design (C4): a move names the capacitor first and only movable parts, keeps their
+/// turns, is legal as a whole (every part legal against everything as it then stands),
+/// leaves the held parts where they are, and puts the pair within its limit; or it is
+/// refused (`None`). Returns whether a move was made.
+fn assert_making_room_keeps_its_guarantees(
+    cost: &CostModel<'_>,
+    state: &State,
+    pair: usize,
+    what: &str,
+) -> bool {
+    let Some(mv) = cost.make_room(state, pair) else {
+        return false;
+    };
+    let Pair { cap, limit_mm, .. } = cost.pairs[pair];
+    assert_eq!(mv.parts[0].0, cap.0, "{what}: the capacitor first");
+    for &(p, _, turns) in &mv.parts {
+        assert!(
+            cost.model.movable[p],
+            "{what}: {} is held",
+            cost.model.references[p]
+        );
+        assert_eq!(turns, state.turns[p], "{what}: a part keeps its turns");
+    }
+    assert!(cost.legal(state, &mv), "{what}: the move is not legal");
+    let mut after = state.clone();
+    let delta = cost.delta(&after, &mv);
+    cost.apply(&mut after, &mv, delta);
+    assert!(
+        after.pair_mm[pair] <= limit_mm + 1e-9,
+        "{what}: the pair ends {} mm apart, its limit {limit_mm} mm",
+        after.pair_mm[pair]
+    );
+    for p in 0..cost.model.parts.len() {
+        if !cost.model.movable[p] {
+            assert_eq!(
+                after.centres[p], state.centres[p],
+                "{what}: a held part moved"
+            );
+        }
+    }
+    // Every part that moved is legal where it stands, against all the others.
+    assert_nothing_overlaps(cost, &after, what);
+    true
+}
+
+#[test]
+fn making_room_keeps_its_guarantees_on_random_states() {
+    // The guarantees (see `assert_making_room_keeps_its_guarantees`) on states a seeded
+    // random walk reached, boards with a pair at a broken or kept distance: the boxed
+    // fixtures (all movable, the left side held, the tight board where no cell is left,
+    // the roomy one, a rounded outline, every blocker held so that no cell within the limit
+    // is legal) and the demo with its pairs. No brute-force
+    // comparison: this pins what the move promises, whichever legal cell it picks.
+    let left = [6, 7, 8, 9, 10, 11];
+    let fillers = || {
+        vec![
+            Fp::new("F1", 39.25, 15.75)
+                .locked()
+                .court(2.65, 3.15)
+                .pad(pad("1", 0.0, 0.0, Some("GND"))),
+            Fp::new("F2", 39.25, 24.25)
+                .locked()
+                .court(2.65, 3.15)
+                .pad(pad("1", 0.0, 0.0, Some("GND"))),
+        ]
+    };
+    let boards = [
+        ("boxed", boxed_in()),
+        (
+            "left held",
+            boxed(&left, OUTLINE, (50.0, 34.0), slot_at_50_34()),
+        ),
+        (
+            "tight",
+            boxed(
+                &[],
+                Shape::Rect(23.5, 12.5, 42.0, 27.5),
+                (38.0, 20.0),
+                fillers(),
+            ),
+        ),
+        (
+            "roomy",
+            boxed(
+                &[],
+                Shape::Rect(23.5, 9.0, 42.0, 27.5),
+                (38.0, 20.0),
+                fillers(),
+            ),
+        ),
+        (
+            "rounded",
+            boxed(
+                &[],
+                Shape::Rounded(0.0, 0.0, 60.0, 40.0, 8.0),
+                (50.0, 34.0),
+                slot_at_50_34(),
+            ),
+        ),
+        (
+            "every blocker held",
+            boxed(
+                &(1..=24).collect::<Vec<_>>(),
+                OUTLINE,
+                (50.0, 34.0),
+                slot_at_50_34(),
+            ),
+        ),
+        ("demo", demo_with_pairs()),
+    ];
+    let mut rng = SplitMix64(0x5eed_0a11);
+    let (mut made, mut refused, mut displacing) = (0usize, 0usize, 0usize);
+    for (name, model) in &boards {
+        let cost = cost_of(model, None);
+        assert!(!cost.pairs.is_empty(), "{name} has a pair");
+        for walk in 0..8 {
+            let mut state = state_from(&cost, &[]).unwrap_or_else(|_| as_read(&cost));
+            scatter(&cost, &mut state, &mut rng, 4 * walk, &[0, 1, 2, 3]);
+            for pair in 0..cost.pairs.len() {
+                let what = format!("{name}, walk {walk}, pair {pair}");
+                if assert_making_room_keeps_its_guarantees(&cost, &state, pair, &what) {
+                    made += 1;
+                    displacing += usize::from(
+                        cost.make_room(&state, pair)
+                            .is_some_and(|mv| mv.parts.len() > 1),
+                    );
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        made > 20 && refused > 3 && displacing > 5,
+        "{made} moves made, {refused} refused, {displacing} displacing another part"
     );
 }
 

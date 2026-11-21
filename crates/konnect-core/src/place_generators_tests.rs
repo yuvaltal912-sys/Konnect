@@ -2461,12 +2461,15 @@ fn gap_to_text(model: &BoardModel, sizes: &[(f64, f64)], at: (f64, f64)) -> f64 
 }
 
 #[test]
-fn the_generator_version_is_nine() {
+fn the_generator_version_is_ten() {
     // Version 8: the obstacles, the part sides, the exact boxes and the largest-first order
     // changed what every recipe gives. Version 9 (design C14): family C's recipes, which a
     // build of version 8 cannot rebuild; F and S give the boards they gave
-    // (`legality_is_the_closure_legalize_had`).
-    assert_eq!(GENERATOR_VERSION, 9);
+    // (`legality_is_the_closure_legalize_had`). Version 10 (design D21, amendments A1 and
+    // A2): family C's output for one recipe changed (the attraction's grid, the first
+    // temperature), so a record made before them names a build that cannot rebuild it;
+    // F and S again give the boards they gave (the goldens below).
+    assert_eq!(GENERATOR_VERSION, 10);
 }
 
 // ─── Largest first ───────────────────────────────────────────────────────────
@@ -3048,6 +3051,10 @@ fn a_pair_of_a_part_with_itself_is_ignored() {
 // which only `CourtyardsMayTouch` allows: so the goldens also guard which rule `legalize`
 // keeps.
 //
+// The hashes are of text, but the layouts behind them go through `exp`, `ln`, `powf` and
+// `hypot` of the platform's math library: they are recorded on macOS (Apple Silicon) and may
+// differ on another platform's.
+//
 // To record again (only ever from code whose boards are meant to be the new truth):
 // `cargo test -p konnect-core --lib -- --ignored record_legality_goldens`.
 
@@ -3329,6 +3336,72 @@ fn legality_keeps_a_part_off_copper_on_its_side() {
         );
         let on_back = copper_model(&gr_text("ABCD", "40 40", "B.Cu", PLAIN));
         assert!(legal(&on_back, (40.0, 40.0)), "{rule:?}: the other side");
+    }
+}
+
+#[test]
+fn a_centre_or_size_that_is_not_finite_is_never_legal() {
+    // `legal_at` runs its cheap box tests, the overlap and copper tests, and last
+    // `Outline::overhang`, whose depth is compared as `depth > threshold`: a comparison
+    // with a number that is not one is false, so the verdict of a non-finite centre or
+    // size rests on the outline test alone. A move names such a centre only if a caller
+    // computes one (`CostModel::legal` refuses it first); this pins the second line of
+    // defence, on a straight outline and on a rounded one with a copper obstacle, under
+    // both rules, with one part standing where the cell would be.
+    let nan = f64::NAN;
+    let inf = f64::INFINITY;
+    let centres_at = [
+        (nan, 20.0),
+        (20.0, nan),
+        (nan, nan),
+        (inf, 20.0),
+        (20.0, -inf),
+        (-inf, inf),
+    ];
+    let sizes_of = [(nan, 1.0), (2.0, nan), (inf, 1.0), (2.0, inf)];
+    for (outline, shape) in [
+        ("rectangle", Shape::Rect(0.0, 0.0, 60.0, 40.0)),
+        ("rounded", Shape::Rounded(0.0, 0.0, 60.0, 40.0, 10.0)),
+    ] {
+        let parts = vec![
+            Fp::new("R1", 20.0, 20.0).two_pad("N1", "N2"),
+            Fp::new("R2", 30.0, 30.0).two_pad("N3", "N4"),
+        ];
+        let text = board(shape, &parts);
+        let items = gr_text("ABCD", "50 10", "F.Cu", PLAIN);
+        let model = with_clearances(model_of(&with_items(&text, &items), &[]), 0.3, 0.5);
+        let sizes = as_read_sizes(&model);
+        let centres = as_read_centres(&model);
+        let r1 = index_of(&model, "R1");
+        for rule in [GapRule::CourtyardsMayTouch, GapRule::Everywhere] {
+            let legality = Legality::new(&model, rule);
+            // The control that the verdict is not always `false`.
+            assert!(
+                legality.legal_at(r1, (20.0, 20.0), sizes[r1], [], &centres, &sizes),
+                "{outline}, {rule:?}: a finite cell is legal"
+            );
+            for at in centres_at {
+                for others in [vec![], vec![1]] {
+                    assert!(
+                        !legality.legal_at(
+                            r1,
+                            at,
+                            sizes[r1],
+                            others.iter().copied(),
+                            &centres,
+                            &sizes
+                        ),
+                        "{outline}, {rule:?}: centre {at:?} against {others:?}"
+                    );
+                }
+            }
+            for size in sizes_of {
+                assert!(
+                    !legality.legal_at(r1, (20.0, 20.0), size, [], &centres, &sizes),
+                    "{outline}, {rule:?}: size {size:?}"
+                );
+            }
+        }
     }
 }
 

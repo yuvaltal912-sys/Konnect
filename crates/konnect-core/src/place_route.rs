@@ -397,7 +397,8 @@ pub(crate) fn read_route_result(result: &CallToolResult) -> RouteResult {
 
 /// The input board's unrouted check: its text in a scratch project under `folder`,
 /// then `tools::cli::refill_drc_on_private_copy_with_config` with
-/// `inputs.kicad_config_home`, violations counted by type. P2's yardstick.
+/// `inputs.kicad_config_home`, violations counted by type ([`unrouted_counts`], which
+/// refuses an incomplete report). P2's yardstick.
 pub(crate) async fn unrouted_check(
     inputs: &RouteInputs,
     folder: &Path,
@@ -420,11 +421,19 @@ pub(crate) async fn unrouted_check(
     )
     .await
     .context("the input board's refill and DRC failed")?;
-    let mut counts = BTreeMap::new();
-    for violation in &report.violations {
-        *counts.entry(violation.rule.clone()).or_insert(0usize) += 1;
-    }
-    Ok(counts)
+    unrouted_counts(&report)
+}
+
+/// An unrouted check's result from KiCad's report: the violations counted by type.
+/// A report without the unconnected-items category is refused, as the judge's baseline
+/// refuses it (`route_judge::unconnected_total`): such a report cannot tell an unrouted
+/// board from a routed one, and its counts must never stand for a complete check (a
+/// silk count of 0 from a report that was not whole).
+pub(crate) fn unrouted_counts(
+    report: &crate::tools::cli::DrcReport,
+) -> anyhow::Result<BTreeMap<String, usize>> {
+    crate::route_judge::unconnected_total(report)?;
+    Ok(crate::route_judge::violations_by_rule(report))
 }
 
 /// The tool context every bench call runs with: the default server config with

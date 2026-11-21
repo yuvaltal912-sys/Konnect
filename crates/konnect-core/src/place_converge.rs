@@ -1830,6 +1830,8 @@ impl<'a> CostModel<'a> {
         mut legal: impl FnMut((f64, f64)) -> bool,
     ) -> Option<(f64, f64)> {
         const SPAN: usize = 2 * (CELL_RINGS as usize - 1) + 1;
+        // A column's rows are the bits of one `u64`: more rings would overflow the shift.
+        const _: () = assert!(SPAN <= 64);
         let reach = (CELL_RINGS - 1) as f64 * GRID_MM;
         // A blocker farther than this from the search's centre on an axis blocks no cell:
         // the reach, the two half sizes, the widest gap and a millimetre more.
