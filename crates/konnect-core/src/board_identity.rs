@@ -49,6 +49,33 @@ pub(crate) fn canonical_sha256(board_text: &str) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Whether a board text is the board a manifest was exported from: the one rule
+/// the route judge's preflight and its import-plan call share. True when
+/// - the text's SHA-256 is `source_sha256` (letter case ignored), or
+/// - `canonical` (the manifest's `source_canonical_sha256`) is given and the
+///   text's [`canonical_sha256`] equals it: the same board as a tree.
+///
+/// A missing `canonical` (an export from before it was written) gets the byte
+/// check only; text that does not parse as UTF-8 or as a board matches only by
+/// bytes.
+pub(crate) fn matches_export(
+    board: &[u8],
+    source_sha256: Option<&str>,
+    canonical: Option<&str>,
+) -> bool {
+    let bytes = format!("{:x}", Sha256::digest(board));
+    if source_sha256.is_some_and(|recorded| recorded.eq_ignore_ascii_case(&bytes)) {
+        return true;
+    }
+    let Some(recorded) = canonical else {
+        return false;
+    };
+    std::str::from_utf8(board)
+        .ok()
+        .and_then(|text| canonical_sha256(text).ok())
+        .is_some_and(|tree| recorded.eq_ignore_ascii_case(&tree))
+}
+
 /// Writes a node as a tag byte, then a length, then its content: `A` and `S`
 /// carry the byte length and bytes of an atom or a quoted string, `L` the child
 /// count and then each child. An atom and a string of the same text differ.
