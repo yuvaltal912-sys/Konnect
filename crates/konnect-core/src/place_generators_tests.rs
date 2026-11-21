@@ -13,7 +13,7 @@ const OUTLINE: Shape = Shape::Rect(0.0, 0.0, 60.0, 40.0);
 
 /// The model of `text`, as the search builds it: the held set, the intent from the
 /// input board's own score, then the model.
-fn model_of(text: &str, caller: &[&str]) -> BoardModel {
+pub(crate) fn model_of(text: &str, caller: &[&str]) -> BoardModel {
     let caller: BTreeSet<String> = caller.iter().map(|r| r.to_string()).collect();
     let set = held_set(text, &caller, &HoldRules::default()).expect("the held set");
     let held: Vec<&str> = set.held.keys().map(String::as_str).collect();
@@ -25,7 +25,7 @@ fn model_of(text: &str, caller: &[&str]) -> BoardModel {
 
 /// A roomy board: U1, eight capacitors beside their pins, six resistors in a chain, one
 /// of them turned and one on the back; a held connector and a mounting hole.
-fn demo_parts() -> Vec<Fp> {
+pub(crate) fn demo_parts() -> Vec<Fp> {
     let mut parts = vec![
         Fp::new("U1", 30.0, 20.0)
             .lib("Test:U")
@@ -66,11 +66,11 @@ fn demo_parts() -> Vec<Fp> {
     parts
 }
 
-fn demo_text() -> String {
+pub(crate) fn demo_text() -> String {
     board(OUTLINE, &demo_parts())
 }
 
-fn demo_model() -> BoardModel {
+pub(crate) fn demo_model() -> BoardModel {
     model_of(&demo_text(), &[])
 }
 
@@ -3334,39 +3334,15 @@ fn legality_keeps_a_part_off_copper_on_its_side() {
 
 // ─── Family C's seams (Row CP, stage 1) ──────────────────────────────────────
 
-/// The values `ConvergeParams::measured(0)` is to return (design C2, C5, C6), written
-/// out: its body is a later stage's. Nothing in these tests runs a search with them.
+/// Family C's level-0 parameters, `ConvergeParams::measured(0)` (design C2, C5, C6).
+/// Nothing in these tests runs a search with them.
 pub(crate) fn converge_params() -> ConvergeParams {
-    ConvergeParams {
-        crossing_mm: 4.0,
-        fanout_limit: 8,
-        rail_weight: 0.3,
-        requirement_mm: 1000.0,
-        requirement_slope: 50.0,
-        neighbour_weight: 0.1,
-        label_mm: 0.2,
-        turn_parts: true,
-        level: 0,
-        stage_per_part: 200,
-        cooling: 0.95,
-        radius_exponent: 0.594,
-        quiet_gain: 0.001,
-        quiet_stages: 5,
-        uphill_floor: 0.01,
-        quiet_sweeps: 3,
-        max_stages: 2000,
-        max_sweeps: 200,
-    }
+    ConvergeParams::measured(0)
 }
 
-/// The values `OuterRule::measured` is to return (design C7), written out.
+/// Family C's outer rules, `OuterRule::measured` (design C7).
 fn outer_rule() -> OuterRule {
-    OuterRule {
-        gain: 0.01,
-        window: 3,
-        max_starts: 64,
-        max_level: 5,
-    }
+    OuterRule::measured()
 }
 
 /// A recipe of family C from `start`, with the start's seed.

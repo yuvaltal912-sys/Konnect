@@ -14,12 +14,22 @@
 // Only the bench reaches this module (`place_search`, design C1), as with `place_search`.
 #![allow(dead_code)]
 
-use crate::place_generators::{BoardModel, Candidate, GenerateFailure, Legality};
+use crate::place_generators::{
+    legalize_with, text_box, turn_vector, BoardModel, Candidate, GapRule, GenerateFailure, Legality,
+};
+use crate::place_held::footprint_keys;
 use crate::place_schematic::Neighbourhoods;
 use crate::route_search::SplitMix64;
 use crate::tools::placement::force_core::Rect;
+use crate::tools::placement::objectives::{self, Site};
+use crate::tools::placement::{ref_prefix, CONNECTOR_EDGE_LIMIT_MM};
 use konnect_ipc::types::IpcFootprintPlacement;
+use konnect_sexp::board::{footprint_courtyards, footprints, zones};
+use konnect_sexp::geometry::{rotate_about, transform_pad};
+use konnect_sexp::parser::SexpNode;
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::f64::consts::PI;
 
 /// The parameters of one run. They are part of the recipe, so a record says exactly what
 /// ran, and `rerun` rebuilds the board from it.
@@ -82,35 +92,108 @@ impl ConvergeParams {
     /// the experiment did not have, neighbour weight 0.1 and label 0.2 mm; guards 2000
     /// stages (at level 0; `max_stages_at_level` scales it) and 200 sweeps.
     pub(crate) fn measured(level: u32) -> Self {
-        todo!()
+        ConvergeParams {
+            crossing_mm: 4.0,
+            fanout_limit: 8,
+            rail_weight: 0.3,
+            requirement_mm: 1000.0,
+            requirement_slope: 50.0,
+            neighbour_weight: 0.1,
+            label_mm: 0.2,
+            turn_parts: true,
+            level,
+            stage_per_part: 200,
+            cooling: 0.95,
+            radius_exponent: 0.594,
+            quiet_gain: 0.001,
+            quiet_stages: 5,
+            uphill_floor: 0.01,
+            quiet_sweeps: 3,
+            max_stages: 2000,
+            max_sweeps: 200,
+        }
+    }
+
+    /// 2^level, as a factor.
+    fn slowdown(&self) -> f64 {
+        2f64.powi(i32::try_from(self.level).unwrap_or(i32::MAX))
+    }
+
+    /// 2^level, as a count; `usize::MAX` when it does not fit.
+    fn times(&self) -> usize {
+        1usize.checked_shl(self.level).unwrap_or(usize::MAX)
     }
 
     /// `cooling` to the power 1 / 2^level: level 1 takes two stages for the fall of the
     /// temperature that level 0 makes in one.
     pub(crate) fn cooling_at_level(&self) -> f64 {
-        todo!()
+        self.cooling.powf(1.0 / self.slowdown())
     }
 
     /// `quiet_stages` x 2^level: the same fall of the temperature as at level 0.
     pub(crate) fn quiet_stages_at_level(&self) -> usize {
-        todo!()
+        self.quiet_stages.saturating_mul(self.times())
     }
 
     /// `quiet_gain` / 2^level: a stage of level k is 1 / 2^k of a stage of level 0.
     pub(crate) fn quiet_gain_at_level(&self) -> f64 {
-        todo!()
+        self.quiet_gain / self.slowdown()
     }
 
     /// `max_stages` x 2^level.
     pub(crate) fn max_stages_at_level(&self) -> usize {
-        todo!()
+        self.max_stages.saturating_mul(self.times())
     }
 
     /// Refuses a value that is not finite, a weight below 0, a cooling outside (0, 1), a
     /// quiet gain outside (0, 1), a radius exponent that is not above 0, a level above
     /// 16, and a count of 0.
     pub(crate) fn validate(&self) -> Result<(), GenerateFailure> {
-        todo!()
+        let refuse = |what: String| Err(GenerateFailure::Invalid(what));
+        // The weights, and the uphill floor (a share): finite and at least 0.
+        for (name, value) in [
+            ("crossing_mm", self.crossing_mm),
+            ("rail_weight", self.rail_weight),
+            ("requirement_mm", self.requirement_mm),
+            ("requirement_slope", self.requirement_slope),
+            ("neighbour_weight", self.neighbour_weight),
+            ("label_mm", self.label_mm),
+            ("uphill_floor", self.uphill_floor),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return refuse(format!(
+                    "{name} {value} is not a finite number of at least 0"
+                ));
+            }
+        }
+        // Written so that a value that is not a number fails too.
+        for (name, value) in [("cooling", self.cooling), ("quiet_gain", self.quiet_gain)] {
+            if !(value > 0.0 && value < 1.0) {
+                return refuse(format!("{name} {value} is not inside (0, 1)"));
+            }
+        }
+        if !(self.radius_exponent.is_finite() && self.radius_exponent > 0.0) {
+            return refuse(format!(
+                "radius_exponent {} is not a finite number above 0",
+                self.radius_exponent
+            ));
+        }
+        if self.level > 16 {
+            return refuse(format!("level {} is above 16", self.level));
+        }
+        for (name, value) in [
+            ("fanout_limit", self.fanout_limit),
+            ("stage_per_part", self.stage_per_part),
+            ("quiet_stages", self.quiet_stages),
+            ("quiet_sweeps", self.quiet_sweeps),
+            ("max_stages", self.max_stages),
+            ("max_sweeps", self.max_sweeps),
+        ] {
+            if value == 0 {
+                return refuse(format!("{name} is 0"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -132,13 +215,21 @@ impl OuterRule {
     /// The measured rule (design C7): gain 0.01, window 3, at most 64 starts, levels up
     /// to 5.
     pub(crate) fn measured() -> Self {
-        todo!()
+        OuterRule {
+            gain: 0.01,
+            window: 3,
+            max_starts: 64,
+            max_level: 5,
+        }
     }
 
     /// Whether a best cost of `after` pays against `before`: `after` < (1 - `gain`) x
     /// `before`. An infinite `before` is paid by any finite `after`.
     pub(crate) fn pays(&self, before: f64, after: f64) -> bool {
-        todo!()
+        if before == f64::INFINITY {
+            return after.is_finite();
+        }
+        after < (1.0 - self.gain) * before
     }
 }
 
@@ -227,19 +318,23 @@ pub(crate) struct Trace {
 impl Trace {
     /// Both stops are a rule's, not a guard's.
     pub(crate) fn converged(&self) -> bool {
-        todo!()
+        self.anneal_stop == AnnealStop::Quiet && self.descent_stop != DescentStop::Guard
     }
 }
 
 /// A net as the cost reads it.
 #[derive(Debug, Clone, PartialEq)]
-struct Net {
+struct Net<'a> {
     /// 1 for an eligible net, `rail_weight` for a rail that counts.
     weight: f64,
     /// Counted by the score's measure, and in the crossings.
     eligible: bool,
-    /// Its pad sites: (part, index into the part's `pads`).
+    /// Its pad sites, in the score's order (the index's): (part, index into the part's
+    /// `pads`).
     sites: Vec<(usize, usize)>,
+    /// Each site's reference and pad number as the index has them: the score's tree
+    /// breaks ties between sites at one position by them.
+    names: Vec<(&'a str, &'a str)>,
 }
 
 /// A decoupling pair as the cost reads it: (part, pad index) of the capacitor and of the
@@ -251,39 +346,97 @@ struct Pair {
     limit_mm: f64,
 }
 
+/// Where a part's pads are, as the score's own index finds them on the written board.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Frame {
+    /// The footprint's anchor as read (`(at x y)`), which a part that did not move keeps.
+    anchor: (f64, f64),
+    /// The anchor less the courtyard box centre, as read: `placements_from` turns it with
+    /// the part and adds it to the centre, rounded to 1 µm.
+    offset: (f64, f64),
+    /// cos and sin of the rotation as read, for a part that did not move.
+    read_turn: (f64, f64),
+    /// cos and sin of the rotation the written board has after 0 to 3 quarter turns
+    /// (normalised and written to 6 decimals, as `placements_applied_to` writes it).
+    turned: [(f64, f64); 4],
+}
+
+/// One visible silk label of a part.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Label {
+    /// Its box relative to the part's centre, at 0 to 3 quarter turns of the part.
+    boxes: [Rect; 4],
+    /// On `F.SilkS` (the top), or on `B.SilkS`.
+    top: bool,
+}
+
+/// One net's airwire tree: its length, its edges as the score's tree takes them, and the
+/// box of the edges (no box when it has none).
+#[derive(Debug, Clone, PartialEq)]
+struct NetTree {
+    mm: f64,
+    edges: Vec<Edge>,
+    bbox: Rect,
+}
+
 /// Everything that does not change while parts move, built once per board and run.
 /// Parts are the model's, by its index. A part's position is its courtyard box centre and
-/// its quarter turns from the rotation read; every offset below is from that centre, as
-/// read, and is turned with the part (`place_generators::turn_vector`).
+/// its quarter turns from the rotation read. Box offsets below are from that centre, as
+/// read, and are turned with the part (`place_generators::turn_vector`). A pad is placed
+/// as the written board places it: through the anchor `placements_from` writes (1 µm)
+/// and the rotation it writes, by the arithmetic of `konnect_sexp`'s pad transform, so
+/// that the airwire length and the crossings are the score's of the written board to the
+/// last bit.
 pub(crate) struct CostModel<'a> {
     model: &'a BoardModel,
     params: ConvergeParams,
     legality: Legality<'a>,
+    /// What a broken requirement costs before its excess, mm (`with_requirement`).
+    requirement_mm: f64,
     /// Movable parts, in index order.
     movable: Vec<usize>,
-    /// A part read at a multiple of 90 degrees may turn; another keeps its rotation.
+    /// A movable part read at a multiple of 90 degrees may turn, when `turn_parts` is on;
+    /// another keeps its turns.
     may_turn: Vec<bool>,
     /// Courtyard box size as read.
     sizes: Vec<(f64, f64)>,
-    /// Each pad site's offset from the centre, in the order of the connectivity index.
+    /// Courtyard box centre as read.
+    read_centres: Vec<(f64, f64)>,
+    frames: Vec<Frame>,
+    /// Each indexed pad's local position (its `(at x y)` in the footprint), in file order.
     pads: Vec<Vec<(f64, f64)>>,
-    /// Each visible silk label's box, relative to the centre.
-    labels: Vec<Vec<Rect>>,
-    nets: Vec<Net>,
+    /// Each visible silk label.
+    labels: Vec<Vec<Label>>,
+    /// The box around a part's courtyard and labels, relative to its centre, at 0 to 3
+    /// quarter turns: two parts whose extents do not overlap have no label conflict.
+    extents: Vec<[Rect; 4]>,
+    nets: Vec<Net<'a>>,
+    /// The eligible nets, in net order.
+    eligible: Vec<usize>,
     /// The nets each part is on.
     part_nets: Vec<Vec<usize>>,
     pairs: Vec<Pair>,
     part_pairs: Vec<Vec<usize>>,
-    /// Movable parts the score's connector rule reads (reference prefix `J`).
+    /// Pairs that cannot be measured: each a violation in every state.
+    unmeasured_pairs: usize,
+    /// Every part the score's connector rule reads (reference prefix `J`), held ones
+    /// included (their term is a constant).
     connectors: Vec<usize>,
+    /// Each part's position in `connectors`.
+    part_connector: Vec<Option<usize>>,
     /// Each part's schematic neighbours, by part index; empty without a neighbourhood.
     hoods: Vec<Vec<usize>>,
     /// The parts that list each part as a neighbour.
     hood_of: Vec<Vec<usize>>,
+    /// Whether the board has neighbourhoods at all (`Terms::neighbour_mm`).
+    has_hoods: bool,
 }
 
-/// One edge of a net's airwire tree: (x0, y0, x1, y1).
-type Edge = (f64, f64, f64, f64);
+/// One edge of a net's airwire tree: (from, to), as the score's tree gives it.
+type Edge = objectives::TreeEdge;
+
+/// Every part's centre and quarter turns.
+type Placement = (Vec<(f64, f64)>, Vec<u8>);
 
 /// A placement and the caches that make a move's cost change cheap.
 #[derive(Debug, Clone, PartialEq)]
@@ -291,12 +444,18 @@ pub(crate) struct State {
     pub centres: Vec<(f64, f64)>,
     /// Quarter turns from the rotation read, 0 to 3.
     pub turns: Vec<u8>,
-    /// Each net's airwire length and tree edges (x0, y0, x1, y1).
+    /// Each part's courtyard box size at its turns.
+    sizes: Vec<(f64, f64)>,
+    /// Each net's airwire length, tree edges and the box of its edges.
     net_mm: Vec<f64>,
     net_edges: Vec<Vec<Edge>>,
+    net_box: Vec<Rect>,
     crossings: usize,
-    pair_cost: Vec<f64>,
-    connector_cost: Vec<f64>,
+    /// Each measured pair's pad-to-pad distance.
+    pair_mm: Vec<f64>,
+    /// Each connector's box centre distance to the outline's edge, negative off the board.
+    connector_mm: Vec<f64>,
+    /// Each part's mean centre distance to its schematic neighbours; 0 without any.
     neighbour_mm: Vec<f64>,
     label_conflicts: usize,
     cost: f64,
@@ -308,7 +467,8 @@ impl State {
     }
 }
 
-/// One proposed move: one part's new centre and turns, or two parts' (a swap).
+/// One proposed move: the new centre and turns of every part it names (one part, the two
+/// of a swap, or a capacitor and the parts it displaces).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Move {
     pub parts: Vec<(usize, (f64, f64), u8)>,
@@ -319,12 +479,311 @@ pub(crate) struct Move {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Delta {
     pub cost: f64,
-    nets: Vec<(usize, f64, Vec<Edge>)>,
+    nets: Vec<(usize, NetTree)>,
     crossings: i64,
     pairs: Vec<(usize, f64)>,
     connectors: Vec<(usize, f64)>,
     neighbours: Vec<(usize, f64)>,
     labels: i64,
+}
+
+/// Rounds to 1 µm: `placements_from`'s rounding of an anchor, to the same bit.
+fn round_um(value: f64) -> f64 {
+    (value * 1e3).round() / 1e3
+}
+
+/// KiCad's spelling of an angle, in (-180, 180]: `placements_from`'s and the writer's.
+fn normalised_angle(degrees: f64) -> f64 {
+    let wrapped = degrees.rem_euclid(360.0);
+    if wrapped > 180.0 {
+        wrapped - 360.0
+    } else {
+        wrapped
+    }
+}
+
+/// The rotation a board written by `placements_applied_to` gives back when it is read:
+/// the angle normalised and written to 6 decimals (`(at x y)` without one reads as 0).
+fn written_angle(degrees: f64) -> f64 {
+    let normal = normalised_angle(degrees);
+    let read: f64 = format!("{normal:.6}").parse().unwrap_or(normal);
+    if read == 0.0 {
+        0.0
+    } else {
+        read
+    }
+}
+
+/// cos and sin of `degrees`, by the arithmetic of `konnect_sexp::geometry::rotate_about`.
+fn turn_of(degrees: f64) -> (f64, f64) {
+    let theta = degrees * PI / 180.0;
+    (theta.cos(), theta.sin())
+}
+
+/// The quarter turns from `from_deg` to `to_deg`, 0 to 3.
+fn quarter_turns_between(from_deg: f64, to_deg: f64) -> u8 {
+    (((to_deg - from_deg) / 90.0).round() as i64).rem_euclid(4) as u8
+}
+
+/// Whether `degrees` is a whole number of quarter turns.
+fn on_quarter_turns(degrees: f64) -> bool {
+    let quarters = degrees / 90.0;
+    (quarters - quarters.round()).abs() < 1e-9
+}
+
+/// A rect turned by `turns` quarter turns about the origin: exact, a rect again.
+fn turned_rect((x0, y0, x1, y1): Rect, turns: u8) -> Rect {
+    let corners = [(x0, y0), (x1, y1)].map(|corner| turn_vector(corner, i32::from(turns)));
+    (
+        corners[0].0.min(corners[1].0),
+        corners[0].1.min(corners[1].1),
+        corners[0].0.max(corners[1].0),
+        corners[0].1.max(corners[1].1),
+    )
+}
+
+fn shifted((x0, y0, x1, y1): Rect, (dx, dy): (f64, f64)) -> Rect {
+    (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+}
+
+fn union((ax0, ay0, ax1, ay1): Rect, (bx0, by0, bx1, by1): Rect) -> Rect {
+    (ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1))
+}
+
+/// Whether two boxes overlap by more than nothing on both axes.
+fn overlap(a: Rect, b: Rect) -> bool {
+    a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+}
+
+/// Whether two boxes touch or overlap: when they do not, no edge in one crosses an edge
+/// in the other by the score's test (its box test is the same, strict).
+fn boxes_meet(a: Rect, b: Rect) -> bool {
+    !(a.0 > b.2 || b.0 > a.2 || a.1 > b.3 || b.1 > a.3)
+}
+
+/// The box with no point, which meets nothing.
+const NO_BOX: Rect = (
+    f64::INFINITY,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NEG_INFINITY,
+);
+
+/// The box of a tree's edges.
+fn edges_box(edges: &[Edge]) -> Rect {
+    edges.iter().fold(NO_BOX, |bbox, &(a, b)| {
+        union(
+            bbox,
+            (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)),
+        )
+    })
+}
+
+/// The score's crossings between the edges of two different nets, `lo` the net that
+/// comes first in net order (the score passes its edge first).
+fn crossings_between(lo: &[Edge], lo_box: Rect, hi: &[Edge], hi_box: Rect) -> i64 {
+    if !boxes_meet(lo_box, hi_box) {
+        return 0;
+    }
+    let mut count = 0;
+    for &(a, b) in lo {
+        for &(c, d) in hi {
+            if objectives::crosses(a, b, c, d).expect("the pad sites are finite") {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Whether a text is hidden: `(hide yes)` or a bare `hide` among its own children, or
+/// either in its `effects`. `(hide no)` is shown.
+fn is_hidden(item: &SexpNode) -> bool {
+    fn says_hide(node: &SexpNode, skip: usize) -> bool {
+        node.children()
+            .unwrap_or(&[])
+            .iter()
+            .skip(skip)
+            .any(|child| match child {
+                SexpNode::Atom(word) => word == "hide",
+                SexpNode::List(_) => {
+                    child.head() == Some("hide")
+                        && child.get(1).and_then(SexpNode::as_str) != Some("no")
+                }
+                SexpNode::Str(_) => false,
+            })
+    }
+    // The head, then a property's name and value, or an `fp_text`'s kind and text.
+    says_hide(item, 3)
+        || item
+            .find("effects")
+            .is_some_and(|effects| says_hide(effects, 1))
+}
+
+/// The label of one footprint text `item` (a `property` or an `fp_text`), or `None` when
+/// it is not a visible text on a silkscreen layer. Its centre is its `(at x y)` taken
+/// through the footprint's transform; its box is `text_box`'s stroke-font estimate for
+/// its text (`${REFERENCE}` spelled as `reference`) laid along its stored angle; the box
+/// is kept relative to `centre`, the part's courtyard centre as read.
+fn label_of(
+    item: &SexpNode,
+    reference: &str,
+    (root, rotation): ((f64, f64), f64),
+    centre: (f64, f64),
+) -> Option<Label> {
+    let top = match item.find_str("layer")? {
+        "F.SilkS" => true,
+        "B.SilkS" => false,
+        _ => return None,
+    };
+    if is_hidden(item) {
+        return None;
+    }
+    let text = item.get(2)?.as_str()?.replace("${REFERENCE}", reference);
+    if text.is_empty() {
+        return None;
+    }
+    let at = item.find("at")?;
+    let (x, y) = (at.get_f64(1)?, at.get_f64(2)?);
+    let angle = at.get_f64(3).unwrap_or(0.0);
+    if !(x.is_finite() && y.is_finite() && angle.is_finite()) {
+        return None;
+    }
+    let (ax, ay) = rotate_about(x, y, root.0, root.1, rotation);
+    // `text_box` reads a board text: the same text, effects and layer at the origin.
+    let mut estimate = vec![
+        SexpNode::Atom("gr_text".to_string()),
+        SexpNode::Str(text),
+        SexpNode::List(vec![
+            SexpNode::Atom("at".to_string()),
+            SexpNode::Atom("0".to_string()),
+            SexpNode::Atom("0".to_string()),
+            SexpNode::Atom(format!("{angle}")),
+        ]),
+    ];
+    estimate.extend(item.find("effects").cloned());
+    estimate.extend(item.find("layer").cloned());
+    let bbox = text_box(&SexpNode::List(estimate))?;
+    let base = shifted(bbox, (ax - centre.0, ay - centre.1));
+    Some(Label {
+        boxes: [0, 1, 2, 3].map(|turns| turned_rect(base, turns)),
+        top,
+    })
+}
+
+/// What `build` reads from the footprints of the board text.
+struct Footprints {
+    frames: Vec<Frame>,
+    pads: Vec<Vec<(f64, f64)>>,
+    /// Each indexed pad by (part, pad number, the bits of its board position): the
+    /// key the index's pad sites are matched by.
+    sites: BTreeMap<(usize, String, u64, u64), Vec<usize>>,
+    /// Each indexed pad by (part, pad number): a pair's pad must be found once.
+    numbers: BTreeMap<(usize, String), Vec<usize>>,
+    labels: Vec<Vec<Label>>,
+    connector: Vec<bool>,
+}
+
+/// The footprints of `tree` (the model's own text) matched to the model's parts, as
+/// `board_model` matches them: in file order, by `place_held::footprint_keys`.
+fn read_footprints(
+    model: &BoardModel,
+    tree: &SexpNode,
+    read_centres: &[(f64, f64)],
+) -> Result<Footprints, GenerateFailure> {
+    let invalid = |what: &str| GenerateFailure::Invalid(what.to_string());
+    let count = model.parts.len();
+    let nodes = footprints(tree);
+    let scan = footprint_courtyards(tree);
+    if nodes.len() != count || scan.items.len() != count || scan.skipped != 0 {
+        return Err(invalid("the board text's footprints are not the model's"));
+    }
+    let raw: Vec<Option<&str>> = scan.items.iter().map(|c| c.reference.as_deref()).collect();
+    let keys = footprint_keys(&raw);
+    let mut frames: Vec<Option<Frame>> = vec![None; count];
+    let mut read = Footprints {
+        frames: Vec::new(),
+        pads: vec![Vec::new(); count],
+        sites: BTreeMap::new(),
+        numbers: BTreeMap::new(),
+        labels: vec![Vec::new(); count],
+        connector: vec![false; count],
+    };
+    for (n, node) in nodes.iter().enumerate() {
+        let key = keys[n]
+            .as_deref()
+            .ok_or_else(|| invalid("a footprint has no reference"))?;
+        let p = model
+            .references
+            .binary_search_by(|r| r.as_str().cmp(key))
+            .map_err(|_| invalid("a footprint is not one of the model's parts"))?;
+        if frames[p].is_some() {
+            return Err(invalid("two footprints are one part of the model"));
+        }
+        let at = node
+            .find("at")
+            .ok_or_else(|| invalid("a footprint has no anchor"))?;
+        let (fx, fy) = (at.get_f64(1), at.get_f64(2));
+        let rotation = at.get_f64(3).unwrap_or(0.0);
+        let (Some(fx), Some(fy)) = (fx, fy) else {
+            return Err(invalid("a footprint's anchor cannot be read"));
+        };
+        if !(fx.is_finite() && fy.is_finite() && rotation.is_finite()) {
+            return Err(invalid("a footprint's anchor is not finite"));
+        }
+        let part = &model.parts[p];
+        frames[p] = Some(Frame {
+            anchor: (fx, fy),
+            offset: (part.at.0 - read_centres[p].0, part.at.1 - read_centres[p].1),
+            read_turn: turn_of(rotation),
+            turned: [0u8, 1, 2, 3]
+                .map(|q| turn_of(written_angle(part.rotation_deg + 90.0 * f64::from(q)))),
+        });
+        let reference = raw[n].unwrap_or(key);
+        read.connector[p] = raw[n].is_some_and(|r| ref_prefix(r) == "J");
+        // The index places the pads of a footprint with a reference and a side, and of
+        // those the pads with a number and a position.
+        let indexed = raw[n].is_some() && matches!(node.find_str("layer"), Some("F.Cu" | "B.Cu"));
+        if indexed {
+            for pad in node.find_all("pad") {
+                let Some(number) = pad.get(1).and_then(SexpNode::as_str) else {
+                    continue;
+                };
+                let Some(local) = pad.find("at").and_then(|at| {
+                    let (x, y) = (at.get_f64(1)?, at.get_f64(2)?);
+                    (x.is_finite() && y.is_finite()).then_some((x, y))
+                }) else {
+                    continue;
+                };
+                let board = transform_pad(local.0, local.1, fx, fy, rotation);
+                let slot = read.pads[p].len();
+                read.pads[p].push(local);
+                read.sites
+                    .entry((p, number.to_string(), board.0.to_bits(), board.1.to_bits()))
+                    .or_default()
+                    .push(slot);
+                read.numbers
+                    .entry((p, number.to_string()))
+                    .or_default()
+                    .push(slot);
+            }
+        }
+        for item in node.children().unwrap_or(&[]) {
+            if matches!(item.head(), Some("property" | "fp_text")) {
+                read.labels[p].extend(label_of(
+                    item,
+                    reference,
+                    ((fx, fy), rotation),
+                    read_centres[p],
+                ));
+            }
+        }
+    }
+    read.frames = frames
+        .into_iter()
+        .map(|frame| frame.ok_or_else(|| invalid("a part of the model has no footprint")))
+        .collect::<Result<_, _>>()?;
+    Ok(read)
 }
 
 impl<'a> CostModel<'a> {
@@ -357,31 +816,554 @@ impl<'a> CostModel<'a> {
         hoods: Option<&Neighbourhoods>,
         params: &ConvergeParams,
     ) -> Result<Self, GenerateFailure> {
-        todo!()
+        params.validate()?;
+        let invalid = |what: String| GenerateFailure::Invalid(what);
+        let count = model.parts.len();
+        let movable: Vec<usize> = (0..count).filter(|&i| model.movable[i]).collect();
+        if movable.is_empty() {
+            return Err(invalid("no part may move".to_string()));
+        }
+        let read_centres: Vec<(f64, f64)> = model
+            .parts
+            .iter()
+            .map(|p| ((p.bbox.0 + p.bbox.2) / 2.0, (p.bbox.1 + p.bbox.3) / 2.0))
+            .collect();
+        let sizes: Vec<(f64, f64)> = model
+            .parts
+            .iter()
+            .map(|p| (p.bbox.2 - p.bbox.0, p.bbox.3 - p.bbox.1))
+            .collect();
+        let may_turn: Vec<bool> = (0..count)
+            .map(|i| {
+                params.turn_parts
+                    && model.movable[i]
+                    && on_quarter_turns(model.parts[i].rotation_deg)
+            })
+            .collect();
+        let tree = konnect_sexp::parse_sexp(&model.text)
+            .map_err(|error| invalid(format!("the board text does not parse: {error}")))?;
+        let read = read_footprints(model, &tree, &read_centres)?;
+        let find = |reference: &str| {
+            model
+                .references
+                .binary_search_by(|r| r.as_str().cmp(reference))
+                .ok()
+        };
+
+        // The nets, in the score's order, each site matched to its pad.
+        let pours: BTreeSet<String> = zones(&tree)
+            .items
+            .into_iter()
+            .filter_map(|zone| zone.net)
+            .collect();
+        let mut sites = read.sites;
+        let mut nets = Vec::new();
+        for name in model.index.nets() {
+            let pads = model.index.pads_of_net(name);
+            let references = pads
+                .iter()
+                .map(|pad| pad.reference.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let eligible = objectives::counts_net(pads.len(), references, params.fanout_limit);
+            let rail = !eligible && pads.len() >= 2 && references > params.fanout_limit;
+            let weight = if eligible {
+                1.0
+            } else if rail && params.rail_weight > 0.0 && !pours.contains(name) {
+                params.rail_weight
+            } else {
+                continue;
+            };
+            let mut members = Vec::with_capacity(pads.len());
+            let mut names = Vec::with_capacity(pads.len());
+            for pad in pads {
+                let slot = find(&pad.reference).and_then(|p| {
+                    let key = (
+                        p,
+                        pad.pad_number.clone(),
+                        pad.at.0.to_bits(),
+                        pad.at.1.to_bits(),
+                    );
+                    let slots = sites.get_mut(&key)?;
+                    (!slots.is_empty()).then(|| (p, slots.remove(0)))
+                });
+                let slot = slot.ok_or_else(|| {
+                    invalid(format!(
+                        "pad {} of {} is not found on its footprint",
+                        pad.pad_number, pad.reference
+                    ))
+                })?;
+                members.push(slot);
+                names.push((pad.reference.as_str(), pad.pad_number.as_str()));
+            }
+            nets.push(Net {
+                weight,
+                eligible,
+                sites: members,
+                names,
+            });
+        }
+        let eligible: Vec<usize> = (0..nets.len()).filter(|&n| nets[n].eligible).collect();
+        let mut part_nets: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (n, net) in nets.iter().enumerate() {
+            let parts: BTreeSet<usize> = net.sites.iter().map(|&(p, _)| p).collect();
+            for p in parts {
+                part_nets[p].push(n);
+            }
+        }
+
+        // The pairs: each pad found once on the board, as the screen finds it.
+        let once = |reference: &str, number: &str| {
+            let p = find(reference)?;
+            match read.numbers.get(&(p, number.to_string())) {
+                Some(slots) if slots.len() == 1 => Some((p, slots[0])),
+                _ => None,
+            }
+        };
+        let mut pairs = Vec::new();
+        let mut unmeasured_pairs = 0;
+        let mut part_pairs: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for pair in &model.intent.pairs {
+            match (once(&pair.cap, &pair.cap_pad), once(&pair.ic, &pair.ic_pad)) {
+                (Some(cap), Some(ic)) => {
+                    let k = pairs.len();
+                    pairs.push(Pair {
+                        cap,
+                        ic,
+                        limit_mm: pair.limit_mm,
+                    });
+                    part_pairs[cap.0].push(k);
+                    if ic.0 != cap.0 {
+                        part_pairs[ic.0].push(k);
+                    }
+                }
+                _ => unmeasured_pairs += 1,
+            }
+        }
+
+        let connectors: Vec<usize> = (0..count).filter(|&p| read.connector[p]).collect();
+        let mut part_connector = vec![None; count];
+        for (c, &p) in connectors.iter().enumerate() {
+            part_connector[p] = Some(c);
+        }
+
+        let mut hood_lists: Vec<Vec<usize>> = vec![Vec::new(); count];
+        let mut hood_of: Vec<Vec<usize>> = vec![Vec::new(); count];
+        if let Some(hoods) = hoods {
+            for (name, near) in &hoods.neighbours {
+                let p = find(name).ok_or_else(|| {
+                    invalid(format!("the schematic part {name} is not on the board"))
+                })?;
+                hood_lists[p] = near
+                    .iter()
+                    .map(|other| {
+                        find(other).ok_or_else(|| {
+                            invalid(format!(
+                                "the schematic neighbour {other} is not on the board"
+                            ))
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            for (p, near) in hood_lists.iter().enumerate() {
+                for &q in near {
+                    if !hood_of[q].contains(&p) {
+                        hood_of[q].push(p);
+                    }
+                }
+            }
+        }
+
+        let extents: Vec<[Rect; 4]> = (0..count)
+            .map(|p| {
+                let (w, h) = sizes[p];
+                let court = (-w / 2.0, -h / 2.0, w / 2.0, h / 2.0);
+                [0u8, 1, 2, 3].map(|q| {
+                    read.labels[p]
+                        .iter()
+                        .fold(turned_rect(court, q), |extent, label| {
+                            union(extent, label.boxes[usize::from(q)])
+                        })
+                })
+            })
+            .collect();
+
+        Ok(CostModel {
+            model,
+            params: *params,
+            legality: Legality::new(model, GapRule::Everywhere),
+            requirement_mm: params.requirement_mm,
+            movable,
+            may_turn,
+            sizes,
+            read_centres,
+            frames: read.frames,
+            pads: read.pads,
+            labels: read.labels,
+            extents,
+            nets,
+            eligible,
+            part_nets,
+            pairs,
+            part_pairs,
+            unmeasured_pairs,
+            connectors,
+            part_connector,
+            hoods: hood_lists,
+            hood_of,
+            has_hoods: hoods.is_some(),
+        })
     }
 
     /// The same model with `mm` as the cost of a broken requirement (`converge` gives
-    /// the larger of the parameter and the start's soft cost).
+    /// the larger of the parameter and the start's soft cost). A state's cost is cached,
+    /// so a state of the model before is built again with `state`.
     pub(crate) fn with_requirement(self, mm: f64) -> Self {
-        todo!()
+        CostModel {
+            requirement_mm: mm,
+            ..self
+        }
+    }
+
+    /// Part `p`'s courtyard box size at `turns`.
+    fn size_at(&self, p: usize, turns: u8) -> (f64, f64) {
+        let (w, h) = self.sizes[p];
+        if turns.is_multiple_of(2) {
+            (w, h)
+        } else {
+            (h, w)
+        }
+    }
+
+    /// The anchor and the rotation (cos, sin) part `p` has on the written board at
+    /// `centre` and `turns`: as read when it is where and as it was read (it is not
+    /// written), else `placements_from`'s anchor and the written rotation.
+    fn frame_at(&self, p: usize, centre: (f64, f64), turns: u8) -> ((f64, f64), (f64, f64)) {
+        let frame = &self.frames[p];
+        if turns == 0 && centre == self.read_centres[p] {
+            (frame.anchor, frame.read_turn)
+        } else {
+            let offset = turn_vector(frame.offset, i32::from(turns));
+            (
+                (round_um(centre.0 + offset.0), round_um(centre.1 + offset.1)),
+                frame.turned[usize::from(turns)],
+            )
+        }
+    }
+
+    /// Pad `slot` of part `p` at `centre` and `turns`, by `rotate_about`'s arithmetic.
+    fn pad_at(&self, p: usize, slot: usize, centre: (f64, f64), turns: u8) -> (f64, f64) {
+        let ((ax, ay), (cos, sin)) = self.frame_at(p, centre, turns);
+        let (dx, dy) = self.pads[p][slot];
+        (ax + dx * cos + dy * sin, ay - dx * sin + dy * cos)
+    }
+
+    /// Net `n`'s tree with each part where `place` says.
+    fn tree(&self, n: usize, place: &impl Fn(usize) -> ((f64, f64), u8)) -> NetTree {
+        let net = &self.nets[n];
+        let sites: Vec<Site<'a>> = net
+            .sites
+            .iter()
+            .zip(&net.names)
+            .map(|(&(p, slot), &(reference, pad))| {
+                let (centre, turns) = place(p);
+                Site {
+                    reference,
+                    pad,
+                    at: self.pad_at(p, slot, centre, turns),
+                }
+            })
+            .collect();
+        let (mm, edges) = objectives::spanning_tree(&sites).expect("the pad sites are finite");
+        NetTree {
+            mm,
+            bbox: edges_box(&edges),
+            edges,
+        }
+    }
+
+    /// The crossings between nets `a` and `b` (different), with the edges and boxes given.
+    fn crossings_of(
+        &self,
+        (a, a_edges, a_box): (usize, &[Edge], Rect),
+        (b, b_edges, b_box): (usize, &[Edge], Rect),
+    ) -> i64 {
+        if a < b {
+            crossings_between(a_edges, a_box, b_edges, b_box)
+        } else {
+            crossings_between(b_edges, b_box, a_edges, a_box)
+        }
+    }
+
+    /// Pair `k`'s pad-to-pad distance with each part where `place` says, as the screen
+    /// measures it.
+    fn pair_distance(&self, k: usize, place: &impl Fn(usize) -> ((f64, f64), u8)) -> f64 {
+        let pair = &self.pairs[k];
+        let at = |(p, slot): (usize, usize)| {
+            let (centre, turns) = place(p);
+            self.pad_at(p, slot, centre, turns)
+        };
+        let (cap, ic) = (at(pair.cap), at(pair.ic));
+        (cap.0 - ic.0).hypot(cap.1 - ic.1)
+    }
+
+    /// What a pair at `d` costs: the distance, and the requirement past the limit.
+    fn pair_cost(&self, k: usize, d: f64) -> f64 {
+        let limit = self.pairs[k].limit_mm;
+        d + if d > limit {
+            self.requirement_mm + self.params.requirement_slope * (d - limit)
+        } else {
+            0.0
+        }
+    }
+
+    /// The score's distance of a connector's box centre to the outline's edge (a
+    /// cut-out's edge counts), negative off the board.
+    fn edge_distance(&self, centre: (f64, f64)) -> f64 {
+        let outline = &self.model.outline;
+        if outline.contains(centre) {
+            outline.boundary_distance(centre)
+        } else {
+            -outline.boundary_distance(centre)
+        }
+    }
+
+    /// What a connector at `distance` from the edge costs.
+    fn connector_cost(&self, distance: f64) -> f64 {
+        if distance > CONNECTOR_EDGE_LIMIT_MM {
+            self.requirement_mm
+                + self.params.requirement_slope * (distance - CONNECTOR_EDGE_LIMIT_MM)
+        } else {
+            0.0
+        }
+    }
+
+    /// Part `p`'s mean centre distance to its schematic neighbours, as
+    /// `place_schematic::part_distances` sums it; 0 without any.
+    fn neighbour_distance(&self, p: usize, place: &impl Fn(usize) -> ((f64, f64), u8)) -> f64 {
+        let near = &self.hoods[p];
+        if near.is_empty() {
+            return 0.0;
+        }
+        let from = place(p).0;
+        let mut sum = 0.0;
+        for &q in near {
+            let to = place(q).0;
+            sum += (from.0 - to.0).hypot(from.1 - to.1);
+        }
+        sum / near.len() as f64
+    }
+
+    /// The label conflicts between parts `a` and `b` (different) where they are given: a
+    /// visible label of one over the other's courtyard box on its own silk side, and a
+    /// label of one over a label of the other on the same silk side, each pair of labels
+    /// once. Parts that share no side have none.
+    fn label_conflicts_between(
+        &self,
+        (a, at_a, turns_a): (usize, (f64, f64), u8),
+        (b, at_b, turns_b): (usize, (f64, f64), u8),
+    ) -> usize {
+        let sides = &self.model.part_sides;
+        if (self.labels[a].is_empty() && self.labels[b].is_empty())
+            || !sides[a].intersects(sides[b])
+        {
+            return 0;
+        }
+        let (qa, qb) = (usize::from(turns_a), usize::from(turns_b));
+        if !overlap(
+            shifted(self.extents[a][qa], at_a),
+            shifted(self.extents[b][qb], at_b),
+        ) {
+            return 0;
+        }
+        let court = |p: usize, at: (f64, f64), turns: u8| {
+            let (w, h) = self.size_at(p, turns);
+            (
+                at.0 - w / 2.0,
+                at.1 - h / 2.0,
+                at.0 + w / 2.0,
+                at.1 + h / 2.0,
+            )
+        };
+        let on_side = |label: &Label, p: usize| {
+            if label.top {
+                sides[p].top
+            } else {
+                sides[p].bottom
+            }
+        };
+        let (court_a, court_b) = (court(a, at_a, turns_a), court(b, at_b, turns_b));
+        let mut count = 0;
+        for label in &self.labels[a] {
+            let over = shifted(label.boxes[qa], at_a);
+            if on_side(label, b) && overlap(over, court_b) {
+                count += 1;
+            }
+            for other in &self.labels[b] {
+                if label.top == other.top && overlap(over, shifted(other.boxes[qb], at_b)) {
+                    count += 1;
+                }
+            }
+        }
+        for label in &self.labels[b] {
+            if on_side(label, a) && overlap(shifted(label.boxes[qb], at_b), court_a) {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// The state of a placement, every cache computed from nothing. `apply` keeps the
     /// caches equal to this (the test `a_states_caches_equal_a_full_evaluation`).
     pub(crate) fn state(&self, centres: Vec<(f64, f64)>, turns: Vec<u8>) -> State {
-        todo!()
+        let count = self.model.parts.len();
+        assert!(
+            centres.len() == count && turns.len() == count,
+            "a state has one centre and one turn per part"
+        );
+        let place = |p: usize| (centres[p], turns[p]);
+        let trees: Vec<NetTree> = (0..self.nets.len()).map(|n| self.tree(n, &place)).collect();
+        let mut crossings = 0;
+        for (k, &a) in self.eligible.iter().enumerate() {
+            for &b in &self.eligible[k + 1..] {
+                crossings += crossings_between(
+                    &trees[a].edges,
+                    trees[a].bbox,
+                    &trees[b].edges,
+                    trees[b].bbox,
+                );
+            }
+        }
+        let mut label_conflicts = 0;
+        for a in 0..count {
+            for b in a + 1..count {
+                label_conflicts += self
+                    .label_conflicts_between((a, centres[a], turns[a]), (b, centres[b], turns[b]));
+            }
+        }
+        let mut state = State {
+            sizes: (0..count).map(|p| self.size_at(p, turns[p])).collect(),
+            net_mm: trees.iter().map(|tree| tree.mm).collect(),
+            net_box: trees.iter().map(|tree| tree.bbox).collect(),
+            net_edges: trees.into_iter().map(|tree| tree.edges).collect(),
+            crossings: usize::try_from(crossings).expect("a count is at least 0"),
+            pair_mm: (0..self.pairs.len())
+                .map(|k| self.pair_distance(k, &place))
+                .collect(),
+            connector_mm: self
+                .connectors
+                .iter()
+                .map(|&p| self.edge_distance(centres[p]))
+                .collect(),
+            neighbour_mm: (0..count)
+                .map(|p| self.neighbour_distance(p, &place))
+                .collect(),
+            label_conflicts,
+            cost: 0.0,
+            centres,
+            turns,
+        };
+        state.cost = self.terms(&state).cost;
+        state
     }
 
     /// The terms of `state`, for the trace and the record.
     pub(crate) fn terms(&self, state: &State) -> Terms {
-        todo!()
+        let params = &self.params;
+        let (mut airwire_mm, mut rail_airwire_mm) = (0.0, 0.0);
+        for (n, net) in self.nets.iter().enumerate() {
+            if net.eligible {
+                airwire_mm += state.net_mm[n];
+            } else {
+                rail_airwire_mm += state.net_mm[n];
+            }
+        }
+        // The requirement terms: an unmeasured pair costs the requirement in every state.
+        let mut requirement = self.unmeasured_pairs as f64 * self.requirement_mm;
+        let mut pair_violations = self.unmeasured_pairs;
+        let mut pair_mm = 0.0;
+        for (k, &d) in state.pair_mm.iter().enumerate() {
+            pair_mm += d;
+            if d > self.pairs[k].limit_mm {
+                pair_violations += 1;
+            }
+            requirement += self.pair_cost(k, d) - d;
+        }
+        let mut connector_violations = 0;
+        for &distance in &state.connector_mm {
+            if distance > CONNECTOR_EDGE_LIMIT_MM {
+                connector_violations += 1;
+            }
+            requirement += self.connector_cost(distance);
+        }
+        let neighbour_mm = self
+            .has_hoods
+            .then(|| state.neighbour_mm.iter().sum::<f64>());
+        let soft = airwire_mm
+            + params.rail_weight * rail_airwire_mm
+            + params.crossing_mm * state.crossings as f64
+            + pair_mm
+            + params.neighbour_weight * neighbour_mm.unwrap_or(0.0)
+            + params.label_mm * state.label_conflicts as f64;
+        Terms {
+            cost: soft + requirement,
+            airwire_mm,
+            rail_airwire_mm,
+            crossings: state.crossings,
+            pair_violations,
+            pair_mm,
+            connector_violations,
+            neighbour_mm,
+            label_conflicts: state.label_conflicts,
+            soft,
+        }
     }
 
     /// Whether `mv` is legal: every part it names is legal at its new centre and turns
     /// against every other part where it would be (`Legality::legal_at`, with
     /// `GapRule::Everywhere`), and the two parts of a swap against each other.
+    ///
+    /// A move is also illegal when it names no part, a part twice, a held part (held
+    /// parts never move), a centre that is not finite, turns above 3, or new turns for a
+    /// part that may not turn.
     pub(crate) fn legal(&self, state: &State, mv: &Move) -> bool {
-        todo!()
+        let count = self.model.parts.len();
+        if mv.parts.is_empty() {
+            return false;
+        }
+        for (k, &(p, at, turns)) in mv.parts.iter().enumerate() {
+            if p >= count
+                || !self.model.movable[p]
+                || turns > 3
+                || !(at.0.is_finite() && at.1.is_finite())
+                || (turns != state.turns[p] && !self.may_turn[p])
+                || mv.parts[..k].iter().any(|&(other, ..)| other == p)
+            {
+                return false;
+            }
+        }
+        let named = |j: usize| mv.parts.iter().any(|&(p, ..)| p == j);
+        for (k, &(p, at, turns)) in mv.parts.iter().enumerate() {
+            let size = self.size_at(p, turns);
+            let others = (0..count).filter(|&j| j != p && !named(j));
+            if !self
+                .legality
+                .legal_at(p, at, size, others, &state.centres, &state.sizes)
+            {
+                return false;
+            }
+            // The parts the move names, against each other where they would be.
+            for &(other, at_other, turns_other) in &mv.parts[k + 1..] {
+                let size_other = self.size_at(other, turns_other);
+                if !self
+                    .legality
+                    .clear_of(p, at, size, other, at_other, size_other)
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The cost change of the legal move `mv`: the airwire trees of the nets of its parts
@@ -390,12 +1372,160 @@ impl<'a> CostModel<'a> {
     /// parts and of the parts that list them, and the label conflicts its parts take
     /// part in. Reads `state`, changes nothing.
     pub(crate) fn delta(&self, state: &State, mv: &Move) -> Delta {
-        todo!()
+        let params = &self.params;
+        let place = |p: usize| {
+            mv.parts
+                .iter()
+                .find(|&&(q, ..)| q == p)
+                .map_or((state.centres[p], state.turns[p]), |&(_, at, turns)| {
+                    (at, turns)
+                })
+        };
+        let mut cost = 0.0;
+
+        // The nets of the moved parts, each rebuilt once.
+        let mut changed: Vec<usize> = mv
+            .parts
+            .iter()
+            .flat_map(|&(p, ..)| self.part_nets[p].iter().copied())
+            .collect();
+        changed.sort_unstable();
+        changed.dedup();
+        let trees: Vec<(usize, NetTree)> =
+            changed.iter().map(|&n| (n, self.tree(n, &place))).collect();
+        for (n, tree) in &trees {
+            cost += self.nets[*n].weight * (tree.mm - state.net_mm[*n]);
+        }
+
+        // Their crossings: against every eligible net that did not change, and among
+        // themselves, each pair of nets once.
+        let old = |n: usize| (n, state.net_edges[n].as_slice(), state.net_box[n]);
+        let mut crossings = 0i64;
+        for (k, (n, tree)) in trees.iter().enumerate() {
+            let n = *n;
+            if !self.nets[n].eligible {
+                continue;
+            }
+            let new = (n, tree.edges.as_slice(), tree.bbox);
+            for &m in &self.eligible {
+                if m == n || changed.binary_search(&m).is_ok() {
+                    continue;
+                }
+                crossings += self.crossings_of(new, old(m)) - self.crossings_of(old(n), old(m));
+            }
+            for (m, other) in &trees[k + 1..] {
+                let m = *m;
+                if !self.nets[m].eligible {
+                    continue;
+                }
+                crossings += self.crossings_of(new, (m, other.edges.as_slice(), other.bbox))
+                    - self.crossings_of(old(n), old(m));
+            }
+        }
+        cost += params.crossing_mm * crossings as f64;
+
+        let mut touched: Vec<usize> = mv
+            .parts
+            .iter()
+            .flat_map(|&(p, ..)| self.part_pairs[p].iter().copied())
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let pairs: Vec<(usize, f64)> = touched
+            .into_iter()
+            .map(|k| (k, self.pair_distance(k, &place)))
+            .collect();
+        for &(k, d) in &pairs {
+            cost += self.pair_cost(k, d) - self.pair_cost(k, state.pair_mm[k]);
+        }
+
+        let connectors: Vec<(usize, f64)> = mv
+            .parts
+            .iter()
+            .filter_map(|&(p, at, _)| self.part_connector[p].map(|c| (c, self.edge_distance(at))))
+            .collect();
+        for &(c, distance) in &connectors {
+            cost += self.connector_cost(distance) - self.connector_cost(state.connector_mm[c]);
+        }
+
+        // The moved parts that have neighbours, and the parts that list a moved part.
+        let mut near: Vec<usize> = mv
+            .parts
+            .iter()
+            .flat_map(|&(p, ..)| {
+                (!self.hoods[p].is_empty())
+                    .then_some(p)
+                    .into_iter()
+                    .chain(self.hood_of[p].iter().copied())
+            })
+            .collect();
+        near.sort_unstable();
+        near.dedup();
+        let neighbours: Vec<(usize, f64)> = near
+            .into_iter()
+            .map(|p| (p, self.neighbour_distance(p, &place)))
+            .collect();
+        for &(p, mm) in &neighbours {
+            cost += params.neighbour_weight * (mm - state.neighbour_mm[p]);
+        }
+
+        // The label conflicts of every pair of parts with a moved part in it, once: a pair
+        // of two moved parts is counted at the first of them in the move.
+        let count = self.model.parts.len();
+        let mut labels = 0i64;
+        for (k, &(p, at, turns)) in mv.parts.iter().enumerate() {
+            for o in 0..count {
+                if o == p || mv.parts[..k].iter().any(|&(earlier, ..)| earlier == o) {
+                    continue;
+                }
+                let (at_o, turns_o) = place(o);
+                let after = self.label_conflicts_between((p, at, turns), (o, at_o, turns_o));
+                let before = self.label_conflicts_between(
+                    (p, state.centres[p], state.turns[p]),
+                    (o, state.centres[o], state.turns[o]),
+                );
+                labels += after as i64 - before as i64;
+            }
+        }
+        cost += params.label_mm * labels as f64;
+
+        Delta {
+            cost,
+            nets: trees,
+            crossings,
+            pairs,
+            connectors,
+            neighbours,
+            labels,
+        }
     }
 
     /// Makes the move.
     pub(crate) fn apply(&self, state: &mut State, mv: &Move, delta: Delta) {
-        todo!()
+        for &(p, at, turns) in &mv.parts {
+            state.centres[p] = at;
+            state.turns[p] = turns;
+            state.sizes[p] = self.size_at(p, turns);
+        }
+        for (n, tree) in delta.nets {
+            state.net_mm[n] = tree.mm;
+            state.net_edges[n] = tree.edges;
+            state.net_box[n] = tree.bbox;
+        }
+        state.crossings = usize::try_from(state.crossings as i64 + delta.crossings)
+            .expect("the crossings stay at 0 or above");
+        for (k, d) in delta.pairs {
+            state.pair_mm[k] = d;
+        }
+        for (c, distance) in delta.connectors {
+            state.connector_mm[c] = distance;
+        }
+        for (p, mm) in delta.neighbours {
+            state.neighbour_mm[p] = mm;
+        }
+        state.label_conflicts = usize::try_from(state.label_conflicts as i64 + delta.labels)
+            .expect("the label conflicts stay at 0 or above");
+        state.cost += delta.cost;
     }
 
     /// A random proposal for the movable part `part` (design C4), or `None` when the kind
@@ -452,7 +1582,66 @@ fn state_from(
     cost: &CostModel<'_>,
     start: &[IpcFootprintPlacement],
 ) -> Result<State, GenerateFailure> {
-    todo!()
+    let (mut centres, turns) = centres_of(cost, start)?;
+    let sizes: Vec<(f64, f64)> = (0..centres.len())
+        .map(|p| cost.size_at(p, turns[p]))
+        .collect();
+    let quarter_turns: Vec<i32> = turns.iter().map(|&q| i32::from(q)).collect();
+    legalize_with(
+        cost.model,
+        &sizes,
+        &quarter_turns,
+        &mut centres,
+        GapRule::Everywhere,
+    )?;
+    Ok(cost.state(centres, turns))
+}
+
+/// The centres and turns of `placements` (absolute anchors and rotations, as a candidate
+/// lists them), every part they do not list where and as the model read it. A placement
+/// exactly at the anchor and rotation read is the part as read. `Invalid` when a
+/// placement names a part that is not on the board, a held part, a part twice, a value
+/// that is not finite, or a rotation that is not the part's own plus quarter turns.
+fn centres_of(
+    cost: &CostModel<'_>,
+    placements: &[IpcFootprintPlacement],
+) -> Result<Placement, GenerateFailure> {
+    let model = cost.model;
+    let invalid = |what: String| Err(GenerateFailure::Invalid(what));
+    let mut centres = cost.read_centres.clone();
+    let mut turns = vec![0u8; centres.len()];
+    let mut named = vec![false; centres.len()];
+    for placement in placements {
+        let reference = &placement.reference;
+        let Ok(p) = model.references.binary_search(reference) else {
+            return invalid(format!("{reference} is not on the board"));
+        };
+        if !model.movable[p] {
+            return invalid(format!("{reference} is held and never moves"));
+        }
+        if std::mem::replace(&mut named[p], true) {
+            return invalid(format!("{reference} is placed twice"));
+        }
+        if !(placement.x.is_finite() && placement.y.is_finite() && placement.rotation.is_finite()) {
+            return invalid(format!("{reference} has a placement that is not finite"));
+        }
+        let part = &model.parts[p];
+        if (placement.x, placement.y) == part.at && placement.rotation == part.rotation_deg {
+            continue;
+        }
+        let q = quarter_turns_between(part.rotation_deg, placement.rotation);
+        let off = normalised_angle(placement.rotation - part.rotation_deg - 90.0 * f64::from(q));
+        if off.abs() > 1e-6 {
+            return invalid(format!(
+                "{reference} at {} degrees is not its own rotation plus quarter turns",
+                placement.rotation
+            ));
+        }
+        let offset = turn_vector(cost.frames[p].offset, i32::from(q));
+        centres[p] = (placement.x - offset.0, placement.y - offset.1);
+        turns[p] = q;
+    }
+    Ok((centres, turns))
 }
 
 /// The first temperature: 400 trial shifts of up to 10 mm on each axis (0.25 mm grid)

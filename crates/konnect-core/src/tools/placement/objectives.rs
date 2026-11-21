@@ -32,11 +32,13 @@ impl Default for Limits {
     }
 }
 
+/// One pad site of a net: the owning reference and the pad number break ties between
+/// sites at the same position, so they are part of the tree's identity.
 #[derive(Clone, Debug)]
-struct Site<'a> {
-    reference: &'a str,
-    pad: &'a str,
-    at: (f64, f64),
+pub(crate) struct Site<'a> {
+    pub(crate) reference: &'a str,
+    pub(crate) pad: &'a str,
+    pub(crate) at: (f64, f64),
 }
 
 #[derive(Clone, Debug)]
@@ -178,18 +180,14 @@ fn assess_with_limits(
             .filter(|p| !valid_site(&p.reference, p.at))
             .count();
         let references: BTreeSet<_> = pads.iter().map(|p| p.reference.as_str()).collect();
-        let filtered = if pads.len() < 2 {
-            result.filtered_fewer_sites += 1;
-            Some("fewer_than_two_sites")
-        } else if references.len() < 2 {
-            result.filtered_internal += 1;
-            Some("single_reference")
-        } else if references.len() > max_net_references {
-            result.filtered_fanout += 1;
-            Some("above_reference_limit")
-        } else {
-            None
-        };
+        let filtered = net_filter(pads.len(), references.len(), max_net_references);
+        match filtered {
+            Some(Filtered::FewerThanTwoSites) => result.filtered_fewer_sites += 1,
+            Some(Filtered::SingleReference) => result.filtered_internal += 1,
+            Some(Filtered::AboveReferenceLimit) => result.filtered_fanout += 1,
+            None => {}
+        }
+        let filtered = filtered.map(Filtered::reason);
         if filtered.is_none() {
             result.eligible_nets += 1;
             result.edge_count += pads.len() - 1;
@@ -274,6 +272,84 @@ fn assess_with_limits(
     result.crossing_samples = samples.crossings;
     result.details_truncated = samples.truncated;
     result
+}
+
+/// Why the score leaves a net out of its airwire measure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filtered {
+    FewerThanTwoSites,
+    SingleReference,
+    AboveReferenceLimit,
+}
+
+impl Filtered {
+    /// The reason as the net samples spell it.
+    fn reason(self) -> &'static str {
+        match self {
+            Filtered::FewerThanTwoSites => "fewer_than_two_sites",
+            Filtered::SingleReference => "single_reference",
+            Filtered::AboveReferenceLimit => "above_reference_limit",
+        }
+    }
+}
+
+/// The score's net filter, in its order: a net with fewer than two pad sites, or on one
+/// reference, or on more than `max_net_references` distinct references is left out.
+fn net_filter(pad_sites: usize, references: usize, max_net_references: usize) -> Option<Filtered> {
+    if pad_sites < 2 {
+        Some(Filtered::FewerThanTwoSites)
+    } else if references < 2 {
+        Some(Filtered::SingleReference)
+    } else if references > max_net_references {
+        Some(Filtered::AboveReferenceLimit)
+    } else {
+        None
+    }
+}
+
+// ─── The geometry-only entry ─────────────────────────────────────────────────
+//
+// Family C's cost (`place_converge`, design C10) measures the same airwire length and
+// crossings as `assess`, thousands of times per run, on positions it moves itself. It
+// calls the score's own filter, tree and crossing test through these three functions,
+// not copies of them, so that ties between equal tree edges resolve the same way. They
+// build no JSON and keep no work limit; `assess` is unchanged by them.
+
+/// Whether the score counts a net with `pad_sites` pad sites on `references` distinct
+/// references in its airwire measure and its crossings (`net_filter`).
+pub(crate) fn counts_net(pad_sites: usize, references: usize, max_net_references: usize) -> bool {
+    net_filter(pad_sites, references, max_net_references).is_none()
+}
+
+/// One edge of a tree as `spanning_tree` gives it: (from, to).
+pub(crate) type TreeEdge = ((f64, f64), (f64, f64));
+
+/// The score's spanning tree of one net's `sites` (`mst`): its length and its edges as
+/// (from, to) in the order the tree takes them, `from` the site the new one joined. Errs
+/// where `mst` does (a coordinate that is not finite).
+pub(crate) fn spanning_tree(sites: &[Site<'_>]) -> Result<(f64, Vec<TreeEdge>), &'static str> {
+    let mut budget = usize::MAX;
+    let (length, edges) = mst("", sites, &mut budget)?;
+    Ok((
+        length,
+        edges
+            .into_iter()
+            .map(|edge| (edge.a.at, edge.b.at))
+            .collect(),
+    ))
+}
+
+/// The score's crossing test (`proper_crossing`) of the edge `a`-`b` against `c`-`d`. The
+/// score passes the edge of the net that comes first in net order as `a`-`b`, and the
+/// orientations are not exactly antisymmetric in floating point, so a caller that wants
+/// the score's count keeps that order.
+pub(crate) fn crosses(
+    a: (f64, f64),
+    b: (f64, f64),
+    c: (f64, f64),
+    d: (f64, f64),
+) -> Result<bool, &'static str> {
+    proper_crossing(a, b, c, d)
 }
 
 fn wire_points(length: f64, edges: usize, diagonal: Option<f64>) -> Option<i64> {
