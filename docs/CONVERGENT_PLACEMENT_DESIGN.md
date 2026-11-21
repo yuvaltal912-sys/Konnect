@@ -1127,7 +1127,7 @@ candidate, and one board: not yet a general result.
 | Question | Answer | What was measured |
 |---|---|---|
 | Is the port the experiment's search? | Failed, then passes | First run: a median of 1259.8. After A1 and A2, the same start, seeds and threshold: 1136.2, 1148.2, 1206.1, 1226.3 and 1235.6, a median of 1206.1 against 1245 |
-| Does it stop by convergence? | Passes | Every run ended by its rules (annealing quiet, descent at a fixed point) and both outer rules stopped by their rule: 7 runs in step 1's second run, 7 in step 2, 6 in step 3. No guard. On the public demo board the dry run of commit `60c9be73` (before the performance pass and the amendments) ended its 7 runs by their rules too; it is still to be repeated on the final commit |
+| Does it stop by convergence? | Passes | Every run ended by its rules (annealing quiet, descent at a fixed point) and both outer rules stopped by their rule: 7 runs in step 1's second run, 7 in step 2, 6 in step 3. No guard. On the public demo board the dry run of commit `60c9be73` (before the performance pass and the amendments) ended its 7 runs by their rules too, and so did the 5 runs of the paired check on that board at `521c1ac9` |
 | Is the result legal and complete? | Passes | C's best passes P1, P2 and G1 to G3 with no decoupling and no connector violation; O has none either |
 | Is it better than the generators? | Passes | C's best ranks 1; F's best ranks 7 and S's best 8, each with 2 decoupling violations |
 | Is it as good as a hand placement? | Passes: "beats" | C's best against O: 1336.7 mm of routed signal against 1738.0 (0.77 times), 69 vias off pours against 82, copper quality 57.6 against 59.7, 172 silk entries against 109 |
