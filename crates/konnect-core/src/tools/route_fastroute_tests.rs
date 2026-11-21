@@ -3129,7 +3129,7 @@ fn tuned_search(chosen: Option<crate::fastroute::TuneVariant>) -> Search {
     let routed = record.routed.as_mut().unwrap();
     // `checked_search` pushed a kept Tune row; the candidates replace it.
     routed.held.passes.retain(|row| row["name"] != "tune");
-    routed.held.passes.push(tune_row_of("free", 1, "kept"));
+    routed.held.passes.push(tune_row_of("free", 1, "candidate"));
     routed.held.untuned = Some(routed.held.ses.clone());
     for (at, variant) in [TuneVariant::Free, TuneVariant::PourSafe]
         .into_iter()
@@ -3150,20 +3150,27 @@ fn tuned_search(chosen: Option<crate::fastroute::TuneVariant>) -> Search {
         routed.held.tune.rows.push(tune_row_of(
             if at == 0 { "free" } else { "pour_safe" },
             1,
-            "kept",
+            "candidate",
         ));
     }
     let judged = record.judged.as_mut().unwrap();
-    let rows = vec![
-        json!({ "variant": "free", "judged": true, "rejected": [], "chosen": chosen == Some(TuneVariant::Free) }),
-        json!({ "variant": "pour_safe", "judged": true, "rejected": [], "chosen": chosen == Some(TuneVariant::PourSafe) }),
-    ];
+    let rows = if chosen.is_none() {
+        vec![
+            json!({ "variant": "free", "judged": true, "rejected": ["unconnected items 0 \u{2192} 2"], "chosen": false }),
+            json!({ "variant": "pour_safe", "judged": true, "rejected": [], "reason": "ranked no better than the untuned board", "chosen": false }),
+        ]
+    } else {
+        vec![
+            json!({ "variant": "free", "judged": true, "rejected": [], "chosen": chosen == Some(TuneVariant::Free) }),
+            json!({ "variant": "pour_safe", "judged": true, "rejected": [], "chosen": chosen == Some(TuneVariant::PourSafe) }),
+        ]
+    };
     let choice = route_judge::TuneChoice {
         chosen,
         rows,
         untuned: judged.measures.clone(),
     };
-    choice.apply(&mut routed.held);
+    choice.apply(&mut routed.held).unwrap();
     judged.tune = Some(choice);
     search
 }
@@ -3195,11 +3202,24 @@ fn length_matching_names_the_chosen_candidates_dropped_nets_and_every_candidate(
 }
 
 #[test]
-fn a_run_that_kept_its_untuned_board_lists_no_untuned_nets_and_says_why_in_the_candidates() {
+fn a_run_that_kept_its_untuned_board_lists_every_tune_net_with_the_judges_reason() {
     let search = tuned_search(None);
     let result = result_with(&search, &length_plan());
     let matching = &result["length_matching"];
-    assert_eq!(matching["untuned_nets"], json!([]));
+    // Every net of the tune file is untuned, with one reason, from the judge's rows.
+    let nets: Vec<&str> = matching["untuned_nets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["net"].as_str().unwrap())
+        .collect();
+    assert_eq!(nets, ["S1", "S2"]);
+    for row in matching["untuned_nets"].as_array().unwrap() {
+        assert_eq!(
+            row["reason"],
+            "the judge kept the untuned board: free: unconnected items 0 \u{2192} 2 / pour_safe: ranked no better than the untuned board"
+        );
+    }
     assert_eq!(matching["tune_candidates"].as_array().unwrap().len(), 2);
     assert!(matching["tune_candidates"]
         .as_array()
@@ -3213,6 +3233,40 @@ fn a_run_that_kept_its_untuned_board_lists_no_untuned_nets_and_says_why_in_the_c
     let result = result_with(&checked_search(0.0), &length_plan());
     assert!(result["length_matching"].get("untuned_nets").is_none());
     assert!(result["length_matching"].get("tune_candidates").is_none());
+}
+
+#[test]
+fn a_run_with_no_surviving_candidate_lists_every_tune_net_with_the_last_passs_reason() {
+    let mut search = tuned_search(None);
+    {
+        let routed = search.outcome.runs[0].routed.as_mut().unwrap();
+        routed.held.tune.candidates.clear();
+        routed.held.tune.rows = vec![
+            json!({ "name": "tune", "outcome": "discarded", "variant": "free", "round": 1, "reason": "opened 2" }),
+            json!({ "name": "tune", "outcome": "discarded", "variant": "free", "round": 2, "reason": "changed the copper of GND" }),
+            json!({ "name": "tune", "outcome": "skipped", "variant": "pour_safe", "round": 1, "reason": "no room" }),
+        ];
+        search.outcome.runs[0].judged.as_mut().unwrap().tune = None;
+    }
+    let result = result_with(&search, &length_plan());
+    let matching = &result["length_matching"];
+    assert_eq!(
+        matching["untuned_nets"],
+        json!([
+            { "net": "S1", "reason": "changed the copper of GND" },
+            { "net": "S2", "reason": "changed the copper of GND" },
+        ])
+    );
+    assert_eq!(matching["tune_candidates"], json!([]));
+    // A pass with no reason of its own is named by its outcome.
+    let routed = search.outcome.runs[0].routed.as_mut().unwrap();
+    routed.held.tune.rows =
+        vec![json!({ "name": "tune", "outcome": "failed", "variant": "free", "round": 1 })];
+    let result = result_with(&search, &length_plan());
+    assert_eq!(
+        result["length_matching"]["untuned_nets"][0]["reason"],
+        "the last Tune pass was failed"
+    );
 }
 
 #[test]

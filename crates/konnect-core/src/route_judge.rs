@@ -538,6 +538,14 @@ pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
     }
     let board = crate::scratch_board::copy_project(&ctx.board, &folder)?;
     write_board(&board, &ctx.board_text)?;
+    // The same severities as the judged boards, so that G2 compares like with like.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| !checks.is_empty())
+    {
+        crate::length_probe::force_check_severities(&board)?;
+    }
     let config = OwnConfig::new(ctx, "baseline")?;
     let report = refill(ctx, config.path(), &board)
         .await
@@ -756,6 +764,15 @@ async fn judge_one(
     {
         crate::length_probe::force_length_severities(&board)?;
     }
+    // A call with checks must see dangling and unconnected items whatever the project's
+    // severities say (G4(d), the harm check): forced in this scratch copy only.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| !checks.is_empty())
+    {
+        crate::length_probe::force_check_severities(&board)?;
+    }
 
     // 3. KiCad's refill and DRC, on this judge's own settings copy.
     let config = OwnConfig::new(ctx, folder_name)?;
@@ -949,8 +966,14 @@ pub(crate) async fn judge_lengths(
     )
     .await
     .context("the length probe failed")?;
-    let contacts = crate::fastroute::self_contacts(ses_text, &nets.iter().cloned().collect())
-        .context("the judged session's self contacts could not be read")?;
+    // The pairwise scan is quadratic per layer: off the async threads.
+    let wanted: BTreeSet<String> = nets.iter().cloned().collect();
+    let text = ses_text.to_string();
+    let contacts =
+        tokio::task::spawn_blocking(move || crate::fastroute::self_contacts(&text, &wanted))
+            .await
+            .context("the self-contact scan did not finish")?
+            .context("the judged session's self contacts could not be read")?;
     let faults = crate::length_probe::path_faults(checks, &contacts, drc);
     Ok(Some(crate::length_probe::check(
         checks, &lengths, unmeasured, faults, probe_s,
@@ -974,73 +997,111 @@ impl TuneChoice {
     /// Rewrites the run's `held` from the choice, so that the SES the call writes and
     /// the `kept_pass` it reports are those of the judged board:
     /// - a candidate: `ses`, `kept` ([`crate::fastroute::TUNE_PASS`]) and `unrouted`
-    ///   are its, and the run's Tune row in `passes` is the candidate's last row;
+    ///   are its, the run's Tune row in `passes` is the candidate's last row, and that
+    ///   row in `tune.rows` says `kept`;
     /// - none: `ses`, `kept` and `unrouted` are the untuned board's, which the Tune
-    ///   attempts leave in `held`, and the Tune row in `passes` that says `kept` now
-    ///   says `discarded`, with the lines that rejected the candidates.
-    pub(crate) fn apply(&self, held: &mut crate::fastroute::Held) {
+    ///   attempts leave in `held`, and the Tune row in `passes` that says `candidate`
+    ///   now says `discarded`, with [`TuneChoice::untuned_reason`].
+    ///
+    /// Every other `candidate` row of `tune.rows` says `not_chosen` (an unjudged run's
+    /// rows keep saying `candidate`). An error when the chosen variant is not among the
+    /// run's candidates: the written session would then differ from the judged board,
+    /// so the judge fails.
+    pub(crate) fn apply(&self, held: &mut crate::fastroute::Held) -> Result<()> {
         use crate::fastroute::TUNE_PASS;
-        match self.chosen {
-            Some(variant) => {
-                let Some(candidate) = held
-                    .tune
-                    .candidates
+        let mut chosen_row = None;
+        if let Some(variant) = self.chosen {
+            let candidate = held
+                .tune
+                .candidates
+                .iter()
+                .find(|candidate| candidate.variant == variant)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "the judge chose the {variant:?} Tune candidate, which the run does not hold"
+                    )
+                })?;
+            held.ses = candidate.ses;
+            held.kept = TUNE_PASS;
+            held.unrouted = candidate.unrouted;
+            chosen_row =
+                held.tune.rows.iter().rposition(|row| {
+                    row["variant"] == json!(variant) && row["outcome"] == "candidate"
+                });
+        }
+        for (at, row) in held.tune.rows.iter_mut().enumerate() {
+            if row["outcome"] == "candidate" {
+                row["outcome"] = json!(if Some(at) == chosen_row {
+                    "kept"
+                } else {
+                    "not_chosen"
+                });
+            }
+        }
+        match (self.chosen, chosen_row) {
+            (Some(_), Some(at)) => {
+                let row = held.tune.rows[at].clone();
+                match held
+                    .passes
                     .iter()
-                    .find(|candidate| candidate.variant == variant)
-                    .cloned()
-                else {
-                    return;
-                };
-                held.ses = candidate.ses;
-                held.kept = TUNE_PASS;
-                held.unrouted = candidate.unrouted;
-                let last = held
-                    .tune
-                    .rows
-                    .iter()
-                    .rev()
-                    .find(|row| row["variant"] == json!(variant) && row["outcome"] == "kept")
-                    .cloned();
-                if let Some(row) = last {
-                    match held
-                        .passes
-                        .iter()
-                        .position(|pass| pass["name"] == TUNE_PASS)
-                    {
-                        Some(at) => held.passes[at] = row,
-                        None => held.passes.push(row),
-                    }
+                    .position(|pass| pass["name"] == TUNE_PASS)
+                {
+                    Some(at) => held.passes[at] = row,
+                    None => held.passes.push(row),
                 }
             }
-            None => {
-                let lines: Vec<String> = self
-                    .rows
-                    .iter()
-                    .flat_map(|row| row["rejected"].as_array().cloned().unwrap_or_default())
-                    .filter_map(|line| line.as_str().map(str::to_string))
-                    .collect();
+            // A chosen candidate whose pass row is missing leaves `passes` as it is.
+            (Some(_), None) => {}
+            (None, _) => {
+                let why = self.untuned_reason();
                 if let Some(row) = held
                     .passes
                     .iter_mut()
-                    .find(|pass| pass["name"] == TUNE_PASS && pass["outcome"] == "kept")
+                    .find(|pass| pass["name"] == TUNE_PASS && pass["outcome"] == "candidate")
                 {
                     row["outcome"] = json!("discarded");
-                    row["reason"] = json!(format!(
-                        "the judge rejected it ({}); the run keeps its untuned board",
-                        lines.join("; ")
-                    ));
+                    row["reason"] = json!(format!("the judge kept the untuned board: {why}"));
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Why the judge kept the untuned board, from the candidates' rows: each candidate's
+    /// `tune_harm` lines, or the reason it was not judged or ranked no better
+    /// ("free: unconnected items 21 → 25 / pour_safe: ranked no better than the untuned
+    /// board").
+    pub(crate) fn untuned_reason(&self) -> String {
+        let parts: Vec<String> = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let variant = row["variant"].as_str()?;
+                let lines: Vec<&str> = row["rejected"]
+                    .as_array()
+                    .map(|lines| lines.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let why = if lines.is_empty() {
+                    row["reason"].as_str()?.to_string()
+                } else {
+                    lines.join("; ")
+                };
+                Some(format!("{variant}: {why}"))
+            })
+            .collect();
+        parts.join(" / ")
     }
 }
 
 /// Row LT, L23: one line for each measure on which `tuned` is worse than `untuned`
-/// (the same run): unconnected items; violations of a DRC type, except the keys
-/// [`crate::length_probe::counts_in_g2`] leaves out; G3 lines; tracks below their
-/// floor. Each line names both counts ("unconnected items 21 → 25"). Counts
-/// and not gate lines: tuning may leave a failing gate failing, but never make a
-/// board worse.
+/// (the same run), by the numbers and not by the count of gate lines (a line such as
+/// "N narrow path(s)" is one line whatever N is): unconnected items; each DRC
+/// type's violations, except the keys [`crate::length_probe::counts_in_g2`] leaves out;
+/// the audit's undersized nets and narrow paths; tracks below their floor; the routed
+/// share (any drop) and the audit's completion (true to false). Each line names both
+/// values ("unconnected items 21 → 25"). Stitching vias are not compared: the judge
+/// adds them to repair pours, and what they leave open is in `unconnected`.
 pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
     let (before, after) = (&untuned.measures, &tuned.measures);
     let mut lines = Vec::new();
@@ -1059,17 +1120,42 @@ pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
             lines.push(format!("{rule} violations {was} \u{2192} {count}"));
         }
     }
-    if tuned.gates.g3.len() > untuned.gates.g3.len() {
-        lines.push(format!(
-            "G3 lines {} \u{2192} {}",
-            untuned.gates.g3.len(),
-            tuned.gates.g3.len()
-        ));
+    for (name, was, now) in [
+        (
+            "nets undersized",
+            before.nets_undersized,
+            after.nets_undersized,
+        ),
+        ("narrow paths", before.narrow_paths, after.narrow_paths),
+    ] {
+        if now.unwrap_or(0.0) > was.unwrap_or(0.0) {
+            lines.push(format!(
+                "{name} {} \u{2192} {}",
+                was.unwrap_or(0.0),
+                now.unwrap_or(0.0)
+            ));
+        }
     }
     if after.below_floor > before.below_floor {
         lines.push(format!(
             "tracks below their floor {} \u{2192} {}",
             before.below_floor, after.below_floor
+        ));
+    }
+    // A routed share that drops, or that the audit no longer gives.
+    match (before.routed_share, after.routed_share) {
+        (Some(was), Some(now)) if now < was => {
+            lines.push(format!("routed share {was} \u{2192} {now}"));
+        }
+        (Some(was), None) => lines.push(format!("routed share {was} \u{2192} none")),
+        _ => {}
+    }
+    if before.audit_complete == Some(true) && after.audit_complete != Some(true) {
+        lines.push(format!(
+            "audit completion true \u{2192} {}",
+            after
+                .audit_complete
+                .map_or("none".to_string(), |complete| complete.to_string())
         ));
     }
     lines
@@ -1079,9 +1165,10 @@ pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
 /// the `Free` candidate in `run-<i>`; the `PourSafe` candidate in
 /// `run-<i>-pour-safe` only when `Free` is missing, rejected or fails G4. A candidate
 /// with a [`tune_harm`] line is rejected (a candidate the judge fails on is rejected
-/// with that error: the untuned board stands). Among the candidates left, the best by
-/// the rank key ([`rank`]; the first on a tie) is the run's board; with none, the
-/// untuned board is. Returns the chosen board's [`Judged`] with the [`TuneChoice`];
+/// with that error: the untuned board stands). The pool is the untuned board and every
+/// candidate left: the best by the rank key ([`rank`]) is the run's board, and on an
+/// exact tie the untuned board wins, then the first candidate: no meander without a gain
+/// (a candidate that overshoots a window cannot beat the untuned board). Returns the chosen board's [`Judged`] with the [`TuneChoice`];
 /// the scheduler rewrites the run's `held` from it ([`TuneChoice::apply`]). A failure
 /// of the untuned judge fails the judge.
 async fn judge_candidates(
@@ -1152,18 +1239,21 @@ async fn judge_candidates(
         rows.push(row);
     }
 
+    // The pool: the untuned board first, then the candidates tuning did not make worse.
     let keys = {
-        let refs: Vec<&Judged> = harmless.iter().map(|(_, _, judged)| judged).collect();
+        let refs: Vec<&Judged> = std::iter::once(&untuned)
+            .chain(harmless.iter().map(|(_, _, judged)| judged))
+            .collect();
         rank(&refs)
     };
-    // The least key; the first candidate (`Free`) on a tie.
+    // The least key; the earliest on a tie, so the untuned board, then `Free`.
     let best = keys
         .iter()
         .enumerate()
         .min_by_key(|(at, key)| (**key, *at))
-        .map(|(at, _)| at);
+        .map_or(0, |(at, _)| at);
     let untuned_measures = untuned.measures.clone();
-    let (chosen, judged) = match best {
+    let (chosen, judged) = match best.checked_sub(1) {
         Some(at) => {
             let (row, variant, judged) = harmless.swap_remove(at);
             rows[row]["chosen"] = json!(true);
@@ -1171,6 +1261,14 @@ async fn judge_candidates(
         }
         None => (None, untuned),
     };
+    // A candidate that was not harmful and still not chosen says why.
+    for (row, _, _) in &harmless {
+        rows[*row]["reason"] = json!(if chosen.is_some() {
+            "ranked below the chosen candidate"
+        } else {
+            "ranked no better than the untuned board"
+        });
+    }
     Ok((
         judged,
         TuneChoice {

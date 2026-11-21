@@ -13,7 +13,7 @@ use crate::tools::route_lengths::Window;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The probe rules' name prefix; rule `n` (from 1) is `__konnect_len_<n, 4 digits>`.
@@ -241,6 +241,59 @@ pub(crate) fn force_length_severities(board: &Path) -> Result<()> {
         .with_context(|| format!("write the project file '{}'", project.display()))
 }
 
+/// The rules whose findings G4(d) reads, with the least severity the judge gives each in
+/// a call that checks lengths (KiCad's own defaults): a project that sets
+/// `track_dangling` or `unconnected_items` to `ignore` would hide a net's stub or break
+/// from `path_faults`, and from `tune_harm` and G1.
+pub(crate) const CHECK_SEVERITIES: [(&str, &str); 2] = [
+    ("track_dangling", "warning"),
+    ("unconnected_items", "error"),
+];
+
+/// KiCad's severities, least first; any other word counts as `ignore`.
+fn severity_level(severity: &str) -> u8 {
+    match severity {
+        "warning" => 1,
+        "error" => 2,
+        _ => 0,
+    }
+}
+
+/// The judge copy's `.kicad_pro` for a call with checks (S3): the project's own text
+/// with each of [`CHECK_SEVERITIES`] at least at its level. A key at that level or higher
+/// (or `error` for a `warning` floor) stays as it is; a key that is missing or lower is
+/// set to the level. Everything else is kept. Only ever applied to a scratch copy.
+pub(crate) fn check_severities_text(project_text: &str) -> Result<String> {
+    let mut project = parse_project(project_text)?;
+    let severities = rule_severities(&mut project)?;
+    for (key, floor) in CHECK_SEVERITIES {
+        let now = severities.get(key).and_then(Value::as_str).unwrap_or("");
+        if severity_level(now) < severity_level(floor) {
+            severities.insert(key.to_string(), json!(floor));
+        }
+    }
+    serde_json::to_string_pretty(&project).context("write the judge copy's project file")
+}
+
+/// [`check_severities_text`] applied to the `.kicad_pro` beside `board` (a judge's
+/// scratch copy); left alone when the copy has none.
+pub(crate) fn force_check_severities(board: &Path) -> Result<()> {
+    let project = board.with_extension("kicad_pro");
+    if !project.is_file() {
+        return Ok(());
+    }
+    let own = std::fs::read_to_string(&project)
+        .with_context(|| format!("read the project file '{}'", project.display()))?;
+    let forced = check_severities_text(&own).with_context(|| {
+        format!(
+            "the project file '{}' cannot be made to report dangling and unconnected items",
+            project.display()
+        )
+    })?;
+    std::fs::write(&project, forced)
+        .with_context(|| format!("write the project file '{}'", project.display()))
+}
+
 /// `kicad-cli pcb drc --output <out> --format json --units mm <board>`: no refill,
 /// no save, no schematic parity.
 pub(crate) fn probe_drc_args<'a>(out: &'a str, board: &'a str) -> Vec<&'a str> {
@@ -433,8 +486,9 @@ pub(crate) async fn probe_lengths(
 /// misses summed. A net of `faults` (L22, [`path_faults`]) has its window's lower
 /// bound as its miss, as if no length were usable: a finite number, so that the rank
 /// still orders the runs (an unmeasured net would set every such run to the same
-/// largest key). A net in no group has no window, so its fault adds no miss (G4(d)
-/// still fails the run).
+/// largest key). A faulted net in no group has no window: it adds the longer measured
+/// length of its pair as its miss (also as if no length were usable), and counts as
+/// unmeasured when its pair is not measured.
 pub(crate) fn check(
     checks: &LengthChecks,
     lengths: &BTreeMap<String, f64>,
@@ -512,6 +566,20 @@ pub(crate) fn check(
         .collect();
     // A checked net with no length is unmeasured whatever the caller listed.
     let mut unmeasured = unmeasured;
+    // A faulted net in no group has no window (S6): its pair's longer length is its miss.
+    let grouped: BTreeSet<&String> = checks.groups.iter().flat_map(|g| &g.nets).collect();
+    let mut charged: BTreeSet<&String> = BTreeSet::new();
+    for pair in &checks.pairs {
+        for net in [&pair.positive, &pair.negative] {
+            if !faults.contains_key(net) || grouped.contains(net) || !charged.insert(net) {
+                continue;
+            }
+            match (lengths.get(&pair.positive), lengths.get(&pair.negative)) {
+                (Some(positive), Some(negative)) => miss_mm += positive.max(*negative),
+                _ => unmeasured.push(net.clone()),
+            }
+        }
+    }
     unmeasured.extend(
         checks
             .nets()

@@ -1077,11 +1077,12 @@ fn a_net_with_no_copper_equals_a_net_that_is_not_there() {
 
 #[test]
 fn a_session_that_cannot_be_read_is_an_error_naming_which_one() {
-    let arc = session(&[("A", "(wire (qarc F.Cu 2500 0 0 10 0 0 10))".to_string())]);
+    // (A `qarc` is skipped, not an error: see `a_qarc_is_skipped_...`.)
+    let not_a_path = session(&[("A", "(wire (polygon F.Cu 2500 0 0 10 0 0 10))".to_string())]);
     for (what, text) in [
         ("not a session", "(pcb board)".to_string()),
         ("not balanced", "(session b (routes".to_string()),
-        ("a wire that is not a path", arc.clone()),
+        ("a wire that is not a path", not_a_path),
         (
             "an odd coordinate count",
             session(&[("A", "(wire (path F.Cu 2500 0 0 10))".to_string())]),
@@ -2032,6 +2033,30 @@ fn sessions_that_do_not_parse_are_an_error_naming_which() {
     assert!(format!("{error:#}").contains("before"), "{error:#}");
     let error = new_self_contacts(&good, "not a session", &names(&["A"])).unwrap_err();
     assert!(format!("{error:#}").contains("after"), "{error:#}");
+}
+
+#[test]
+fn a_qarc_is_skipped_and_the_straight_pieces_are_still_checked() {
+    // An arc is not a straight piece: it is no contact and no error (the importer accepts
+    // it), and the net's straight pieces are checked as before.
+    let arc = "(wire (qarc F.Cu 2000 0 0 5000 5000 5000 0))".to_string();
+    let cross =
+        wire("F.Cu", 200, &[(0, 0), (1000, 1000)]) + &wire("F.Cu", 200, &[(0, 1000), (1000, 0)]);
+    let found = self_contacts(&session(&[("A", arc.clone() + &cross)]), &names(&["A"])).unwrap();
+    assert!(found["A"].iter().any(|c| c.kind == ContactKind::Crossing));
+    assert!(
+        self_contacts(&session(&[("A", arc.clone())]), &names(&["A"]))
+            .unwrap()
+            .is_empty()
+    );
+    // Control: the straight pieces alone give the same contacts.
+    assert_eq!(
+        self_contacts(&session(&[("A", cross)]), &names(&["A"])).unwrap(),
+        found
+    );
+    // Control: another shape that is not a path is still an error.
+    let polygon = "(wire (polygon F.Cu 0 0 0 10 10 10))".to_string();
+    assert!(self_contacts(&session(&[("A", polygon)]), &names(&["A"])).is_err());
 }
 
 // ---- on a system that cannot isolate a run ---------------------------------
@@ -4435,7 +4460,7 @@ int main(int argc, char **argv) {
     async fn a_tune_pass_that_changes_only_group_nets_is_kept() {
         let (fixture, held) = tune_run(&base(), &tuned_base(), "", &["A"], 30).await;
         let held = held.unwrap();
-        assert_eq!(tune_row(&held), ("tune", "kept", None));
+        assert_eq!(tune_row(&held), ("tune", "candidate", None));
         // The candidate is kept beside the untuned session, which the run still holds
         // until the judge chooses (L23).
         assert_eq!(held.kept, "full");
@@ -4538,7 +4563,7 @@ int main(int argc, char **argv) {
             ("C", wire("B.Cu", 200, &[(0, 2000), (0, 8000)])),
         ]);
         let (_fixture, held) = tune_run(&base(), &only_a, "", &["A"], 30).await;
-        assert_eq!(tune_row(&held.unwrap()).1, "kept");
+        assert_eq!(tune_row(&held.unwrap()).1, "candidate");
     }
 
     #[tokio::test]
@@ -4622,7 +4647,7 @@ int main(int argc, char **argv) {
             )
             .await;
             let held = held.unwrap();
-            assert_eq!(tune_row(&held), ("tune", "kept", None));
+            assert_eq!(tune_row(&held), ("tune", "candidate", None));
             // The candidate holds its count; the run's own stays the untuned one.
             assert_eq!(held.tune.candidates[0].unrouted, expected);
             assert_eq!((held.kept, held.unrouted), ("full", 1));
@@ -4942,7 +4967,7 @@ int main(int argc, char **argv) {
             let rows: Vec<_> = held.passes.iter().map(|r| r["outcome"].clone()).collect();
             let tune_row = held.passes.last().unwrap();
             assert_eq!(tune_row["name"], "tune", "{rows:?}");
-            assert_eq!(tune_row["outcome"], "kept", "{tune_row}");
+            assert_eq!(tune_row["outcome"], "candidate", "{tune_row}");
             assert_eq!(held.tune.candidates.len(), 1);
             let full = dir.path().join(name).join("full/full.ses");
             assert!(changed_outside(
@@ -5058,6 +5083,31 @@ int main(int argc, char **argv) {
         mode: NextMode<'_>,
         deadline: Instant,
     ) -> Attempt {
+        attempt_at(
+            variant,
+            held,
+            rounds,
+            control,
+            nets,
+            mode,
+            deadline,
+            &Instant::now,
+        )
+        .await
+    }
+
+    /// [`attempt`] with the time the room rule reads fixed by `clock`.
+    #[allow(clippy::too_many_arguments)] // the parts of one attempt, each read once
+    async fn attempt_at(
+        variant: TuneVariant,
+        held: &str,
+        rounds: &[(&str, String)],
+        control: &str,
+        nets: &[&str],
+        mode: NextMode<'_>,
+        deadline: Instant,
+        clock: Clock<'_>,
+    ) -> Attempt {
         let fixture = Fixture::new("");
         let held_path = fixture.path().join("held.ses");
         std::fs::write(&held_path, held).unwrap();
@@ -5113,6 +5163,7 @@ int main(int argc, char **argv) {
             &held_path,
             0,
             deadline,
+            clock,
             &mut outcome,
         )
         .await;
@@ -5165,7 +5216,7 @@ int main(int argc, char **argv) {
                 row["variant"].clone(),
                 row["round"].clone()
             ),
-            (json!("tune"), json!("kept"), json!("free"), json!(1))
+            (json!("tune"), json!("candidate"), json!("free"), json!(1))
         );
         assert!(run.outcome.seconds > 0.0);
         // The pass gets its own heights and never the call's pairs file.
@@ -5214,7 +5265,7 @@ int main(int argc, char **argv) {
             "{reasons:?}"
         );
         assert!(reasons[0].1.contains("tuned again without"), "{reasons:?}");
-        assert_eq!(reasons[1], ("kept".to_string(), String::new()));
+        assert_eq!(reasons[1], ("candidate".to_string(), String::new()));
         assert_eq!(run.outcome.rows[1]["round"], json!(2));
         assert_eq!(run.outcome.rows[1]["variant"], json!("free"));
         // Round 2 is given its own tune file and the same held session.
@@ -5275,7 +5326,10 @@ int main(int argc, char **argv) {
         assert!(reasons.iter().all(|(outcome, _)| outcome == "discarded"));
         assert!(reasons[0].1.starts_with("meanders touch their own net: X"));
         assert!(reasons[1].1.starts_with("meanders touch their own net: Y"));
-        assert_eq!(reasons[2].1, "meanders touch their own net: Z");
+        assert_eq!(
+            reasons[2].1,
+            "meanders touch their own net: Z (no round left)"
+        );
         assert!(run.folder("tune-r3").is_dir());
         assert!(!run.folder("tune-r4").exists(), "no fourth pass");
         assert_eq!(run.outcome.rows[2]["round"], json!(3));
@@ -5333,16 +5387,20 @@ int main(int argc, char **argv) {
             ("tune", rows_session(&XYZ, &["X"])),
             ("tune-r2", rows_session(&XYZ, &[])),
         ];
-        // The pass takes 3 s or more (a started process can take seconds more on a
-        // busy machine): with 8 s in all, less than twice that is left at any load.
-        let run = attempt(
+        // The deadline is far away (so no pass is ever killed), and the clock the room
+        // rule reads stands at the deadline: nothing is left, which is less than twice any
+        // pass, whatever the machine's load.
+        let deadline = soon(3600);
+        let at_deadline = move || deadline;
+        let run = attempt_at(
             TuneVariant::Free,
             &held,
             &sessions,
-            "delay_ms=3000\n",
+            "",
             &XYZ,
             NextMode::Without,
-            soon(8),
+            deadline,
+            &at_deadline,
         )
         .await;
         assert!(kept_of(&run).is_none());
@@ -5351,20 +5409,20 @@ int main(int argc, char **argv) {
             run.reasons(),
             [(
                 "discarded".to_string(),
-                "meanders touch their own net: X".to_string()
+                "meanders touch their own net: X (the deadline leaves no room)".to_string()
             )]
         );
         assert!(!run.folder("tune-r2").exists());
-        // Control: a pass of 0.3 s with 10 s in all leaves far more than twice, so the
-        // second round runs and is kept.
+        // Control: the real clock with the same deadline leaves far more than twice the
+        // pass, so the second round runs and is kept.
         let run = attempt(
             TuneVariant::Free,
             &held,
             &sessions,
-            "delay_ms=300\n",
+            "",
             &XYZ,
             NextMode::Without,
-            soon(10),
+            deadline,
         )
         .await;
         assert_eq!(

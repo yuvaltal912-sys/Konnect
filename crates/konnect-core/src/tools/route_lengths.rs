@@ -1136,7 +1136,7 @@ pub(crate) fn kicad_group_rule_pinned(
     format!(
         "(rule {} (constraint length (min {}mm) (max {}mm)) (condition \"{}\"))",
         custom_rules::quote(name),
-        mm_text(longest_mm - tolerance_mm - RULE_SLACK_MM),
+        mm_text((longest_mm - tolerance_mm - RULE_SLACK_MM).max(0.0)),
         mm_text(longest_mm + RULE_SLACK_MM),
         net_condition(group.nets.iter().map(|net| net.dsn.as_str()))
     )

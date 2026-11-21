@@ -381,15 +381,16 @@ candidate's DRC is not clean. After `apply_specctra_ses`, add them with `create_
 rule)` (dry run first) so KiCad keeps checking the lengths after hand edits.
 A pair inside a group is tuned net by net (`pairs_tuned_net_by_net`): its
 coupling is not held along the meanders. The judge compares each tuned board with
-the same run's untuned board and rejects a tuned one that has more unconnected
-items, more violations of any DRC type, more width failures or more tracks below
-their floor; the run then keeps its untuned board and the fourth gate shows what
-is missing. `length_matching.tune_candidates` says what was judged, rejected
-and chosen, and `untuned_nets` lists each net left untuned and why (its meanders
-touched its own copper). A checked net whose copper crosses or overlaps itself, or
+the same run's untuned board and rejects a tuned one that is worse in unconnected
+items, in any DRC type, in undersized nets or narrow paths, in tracks below their
+floor, or in the audit's routed share or completion; the untuned board then joins
+the ranking, so a tuned board that does not rank better (an overshot window, say)
+loses to it, and the fourth gate shows what is missing.
+`length_matching.tune_candidates` says what was judged, rejected and chosen.
+`untuned_nets` lists every tune-file net the written session leaves untuned, each with its reason: every net with "the judge kept the untuned board: ..." when the judge keeps the untuned board, every net with the last pass's reason when no candidate survived its passes, otherwise the chosen candidate's dropped nets. A checked net whose copper crosses or overlaps itself, or
 that KiCad reports as dangling or unconnected, fails the fourth gate: KiCad's
-length would count copper the signal does not travel. On a board with another
-net's pour on an inner layer, a second pour-safe candidate is tuned and judged
+length would count copper the signal does not travel (in a call with checks the
+judge reads those two findings whatever the project's severities say). When the DSN has a pour of a net outside the tune file, a second pour-safe candidate is tuned and judged
 only when the first is rejected or misses. A group that holds a pair with
 `max_skew_mm` is suggested as a `length` rule pinned to the routed lengths,
 because KiCad checks one `skew` rule for a net; the pair keeps its own `skew`

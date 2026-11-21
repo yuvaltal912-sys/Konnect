@@ -2714,3 +2714,14 @@ fn a_group_without_a_declared_pair_skew_or_in_target_mode_keeps_its_own_rule() {
         steps[1]
     );
 }
+
+#[test]
+fn a_pinned_rules_minimum_is_never_negative() {
+    // A longest net shorter than the tolerance: the window starts at 0, not below it.
+    let plan = two_group_plan();
+    let rule = kicad_group_rule_pinned(&plan.groups[0], "n", 0.3);
+    assert!(rule.contains("(min 0mm) (max 0.3001mm)"), "{rule}");
+    assert!(!rule.contains("-"), "{rule}");
+    // Control: a longer net keeps its own minimum.
+    assert!(kicad_group_rule_pinned(&plan.groups[0], "n", 0.6).contains("(min 0.0999mm)"));
+}

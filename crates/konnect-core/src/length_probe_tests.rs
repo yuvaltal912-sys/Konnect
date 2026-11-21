@@ -1658,7 +1658,7 @@ fn a_faulted_net_misses_by_its_windows_lower_bound_whatever_its_length() {
         0.0,
     );
     assert!((miss_of(&measures, "a") - 41.5).abs() < 1e-9);
-    // A net in no group has no window: its fault adds no miss (G4(d) still fails it).
+    // A net in no group has no window: its fault adds its pair's longer length (S6).
     let pair = checks_of(
         vec![],
         vec![CheckedPair {
@@ -1674,7 +1674,11 @@ fn a_faulted_net_misses_by_its_windows_lower_bound_whatever_its_length() {
         faults,
         0.0,
     );
-    assert_eq!(measures.miss_mm, 0.0);
+    assert!(
+        (measures.miss_mm - 40.0).abs() < 1e-9,
+        "{}",
+        measures.miss_mm
+    );
 }
 
 #[test]
@@ -1776,4 +1780,187 @@ fn measures_with_faults_survive_a_round_trip_and_an_older_record_reads() {
         serde_json::from_value::<LengthMeasures>(value).unwrap(),
         clean
     );
+}
+
+#[test]
+fn a_faulted_net_in_no_group_adds_its_pairs_longer_length_as_its_miss() {
+    let pair = |positive: &str, negative: &str| CheckedPair {
+        positive: positive.into(),
+        negative: negative.into(),
+        max_skew_mm: 0.1,
+    };
+    let checks = checks_of(vec![], vec![pair("p", "n")]);
+    let fault = BTreeMap::from([(
+        "p".to_string(),
+        PathFault {
+            contacts: 1,
+            dangling: 0,
+        },
+    )]);
+    let measures = check(
+        &checks,
+        &lengths_of(&[("p", 40.0), ("n", 40.05)]),
+        vec![],
+        fault.clone(),
+        0.0,
+    );
+    // The longer of the two lengths: as if no length were usable.
+    assert!(
+        (measures.miss_mm - 40.05).abs() < 1e-9,
+        "{}",
+        measures.miss_mm
+    );
+    assert!(measures.unmeasured.is_empty());
+    // Both nets faulted: the pair is charged once per net, once each.
+    let both = BTreeMap::from([
+        ("p".to_string(), fault["p"].clone()),
+        ("n".to_string(), fault["p"].clone()),
+    ]);
+    let measures = check(
+        &checks,
+        &lengths_of(&[("p", 40.0), ("n", 40.05)]),
+        vec![],
+        both,
+        0.0,
+    );
+    assert!(
+        (measures.miss_mm - 80.1).abs() < 1e-9,
+        "{}",
+        measures.miss_mm
+    );
+    // An unmeasured pair: the net counts as unmeasured.
+    let measures = check(
+        &checks,
+        &lengths_of(&[("p", 40.0)]),
+        vec![],
+        fault.clone(),
+        0.0,
+    );
+    assert!(
+        measures.unmeasured.contains(&"p".to_string()),
+        "{:?}",
+        measures.unmeasured
+    );
+    // Control: a net of a group has its window's bound, not its pair's length.
+    let grouped = checks_of(
+        vec![group(
+            "g",
+            &["p", "x"],
+            Window::Target {
+                target_mm: 40.0,
+                tolerance_mm: 0.5,
+            },
+        )],
+        vec![pair("p", "n")],
+    );
+    let measures = check(
+        &grouped,
+        &lengths_of(&[("p", 40.0), ("n", 40.0), ("x", 40.0)]),
+        vec![],
+        fault.clone(),
+        0.0,
+    );
+    assert!(
+        (measures.miss_mm - 39.5).abs() < 1e-9,
+        "{}",
+        measures.miss_mm
+    );
+    // Control: no fault, no miss.
+    let measures = check(
+        &checks,
+        &lengths_of(&[("p", 40.0), ("n", 40.05)]),
+        vec![],
+        BTreeMap::new(),
+        0.0,
+    );
+    assert_eq!(measures.miss_mm, 0.0);
+}
+
+#[test]
+fn a_crossing_on_a_pair_only_net_ranks_below_a_pair_that_only_misses_its_skew() {
+    let checks = checks_of(
+        vec![],
+        vec![CheckedPair {
+            positive: "p".into(),
+            negative: "n".into(),
+            max_skew_mm: 0.1,
+        }],
+    );
+    let lengths = |n: f64| lengths_of(&[("p", 40.0), ("n", n)]);
+    let crossed = check(
+        &checks,
+        &lengths(40.0),
+        vec![],
+        BTreeMap::from([(
+            "p".to_string(),
+            PathFault {
+                contacts: 1,
+                dangling: 0,
+            },
+        )]),
+        0.0,
+    );
+    // 0.5 mm over the skew, the 0.4 mm past the maximum counts as its miss.
+    let skewed = check(&checks, &lengths(40.5), vec![], BTreeMap::new(), 0.0);
+    let key = |m: &LengthMeasures| key_part(true, Some(m), &BTreeMap::new());
+    assert!(
+        key(&skewed) < key(&crossed),
+        "{:?} {:?}",
+        key(&skewed),
+        key(&crossed)
+    );
+    assert_eq!(key(&skewed)[1], 40);
+}
+
+#[test]
+fn the_judge_copys_project_gets_dangling_and_unconnected_items_at_least_at_kicads_defaults() {
+    let project = |dangling: Option<&str>, open: Option<&str>| {
+        let mut rules = serde_json::Map::new();
+        rules.insert("clearance".into(), json!("ignore"));
+        if let Some(level) = dangling {
+            rules.insert("track_dangling".into(), json!(level));
+        }
+        if let Some(level) = open {
+            rules.insert("unconnected_items".into(), json!(level));
+        }
+        json!({"board": {"design_settings": {"rule_severities": rules}}, "other": 1}).to_string()
+    };
+    let read = |text: &str| severities(text);
+    // ignore is raised; warning is enough for dangling and not for unconnected items;
+    // error stays; a missing key is set; another check is left alone.
+    for (own, wanted) in [
+        ((Some("ignore"), Some("ignore")), ("warning", "error")),
+        ((Some("warning"), Some("warning")), ("warning", "error")),
+        ((Some("error"), Some("error")), ("error", "error")),
+        ((None, None), ("warning", "error")),
+        ((Some("nonsense"), Some("error")), ("warning", "error")),
+    ] {
+        let forced = check_severities_text(&project(own.0, own.1)).unwrap();
+        let found = read(&forced);
+        assert_eq!(found["track_dangling"], wanted.0, "{own:?}");
+        assert_eq!(found["unconnected_items"], wanted.1, "{own:?}");
+        assert_eq!(found["clearance"], "ignore");
+        let whole: Value = serde_json::from_str(&forced).unwrap();
+        assert_eq!(whole["other"], 1, "everything else is kept");
+    }
+    // A project that is not a JSON object cannot be forced.
+    assert!(check_severities_text("[1]").is_err());
+}
+
+#[test]
+fn the_check_severities_are_forced_in_the_copy_beside_the_board_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("b.kicad_pcb");
+    std::fs::write(&board, "(kicad_pcb)").unwrap();
+    // No project file: nothing to force, nothing created.
+    force_check_severities(&board).unwrap();
+    assert!(!dir.path().join("b.kicad_pro").exists());
+    std::fs::write(
+        dir.path().join("b.kicad_pro"),
+        r#"{"board": {"design_settings": {"rule_severities": {"track_dangling": "ignore"}}}}"#,
+    )
+    .unwrap();
+    force_check_severities(&board).unwrap();
+    let text = std::fs::read_to_string(dir.path().join("b.kicad_pro")).unwrap();
+    assert_eq!(severities(&text)["track_dangling"], "warning");
 }

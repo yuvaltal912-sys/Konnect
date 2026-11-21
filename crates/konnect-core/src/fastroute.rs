@@ -663,7 +663,8 @@ pub(crate) struct Held {
     /// `full`, `fallback`, `polish` or, after a kept Tune pass, [`TUNE_PASS`].
     pub kept: &'static str,
     /// One row per pass: `name`, `outcome` (`kept`, `discarded`, `skipped` or
-    /// `failed`), `unrouted`, `seconds`, and `reason` for a pass discarded, skipped
+    /// `failed`; the Tune row of a candidate the judge has not chosen yet says
+    /// `candidate`), `unrouted`, `seconds`, and `reason` for a pass discarded, skipped
     /// or failed (a failed pass's reason is its error, cut to 300 characters).
     pub passes: Vec<Value>,
     pub seconds: f64,
@@ -1154,7 +1155,8 @@ struct RawCopper {
 
 /// Reads every `(net NAME (wire …) (via …))` of `(routes (network_out …))` with the
 /// session's own `resolution`. A net named in two `net` entries is one net. A
-/// session that does not parse, or a wire that is not a `path`, is an error.
+/// session that does not parse, or a wire that is not a `path` or a `qarc`, is an
+/// error; a `qarc` is skipped.
 fn raw_copper(ses_text: &str) -> Result<RawCopper> {
     let session = parse_specctra(ses_text, "session")?;
     let (routes, um_per_unit) = session_routes(&session)?;
@@ -1174,6 +1176,11 @@ fn raw_copper(ses_text: &str) -> Result<RawCopper> {
                     let Some(head) = shape.head() else { continue };
                     let form = head.to_ascii_lowercase();
                     if WIRE_DESCRIPTORS.contains(&form.as_str()) {
+                        continue;
+                    }
+                    // An arc is not a straight piece: contacts with arcs are not
+                    // checked (fastroute writes none; the importer accepts a `qarc`).
+                    if form == "qarc" {
                         continue;
                     }
                     if form != "path" {
@@ -1453,6 +1460,12 @@ fn piece_key(piece: &Piece, um_per_unit: f64) -> (i64, [i64; 4]) {
 /// copies, so neither the judged board nor KiCad's length holds them; fastroute
 /// copies its trace-end bridges when it loads a session). `by_layer` is one net's
 /// pieces by layer; the first of each repeat stays.
+///
+/// The key is not the importer's exactly: the width is rounded to 1 µm
+/// ([`session_um`]) and the ends are in the session's ticks, where the importer compares
+/// exact floats. Two pieces whose widths differ by less than half a micrometre merge
+/// here and are two tracks in KiCad. fastroute writes widths on its own grid, so the two
+/// keys agree on every session it writes; this pins the difference rather than hides it.
 fn merge_exact_repeats(by_layer: &mut BTreeMap<&str, Vec<Piece>>) {
     for pieces in by_layer.values_mut() {
         let mut seen = BTreeSet::new();
@@ -1694,6 +1707,10 @@ fn contact_summary(contacts: &[SelfContact]) -> String {
     format!("its copper touches itself: {}", parts.join(", "))
 }
 
+/// The time source of [`tune_attempt`]'s room rule: `Instant::now` in production, a fixed
+/// time in the tests of the rule, so that they do not depend on how fast a process runs.
+pub(crate) type Clock<'a> = &'a (dyn Fn() -> Instant + Sync);
+
 /// What comparing a Tune pass's session with the held one found: the nets outside
 /// the tune file it changed, and the nets whose new copper touches itself (L21).
 struct Compared {
@@ -1717,7 +1734,10 @@ struct Compared {
 ///
 /// `first` is the round-1 inputs (the call's tune file); the rows go into `outcome`.
 /// A round whose pass is passed over for contacts is a `discarded` row too, so every
-/// pass run has one row.
+/// pass run has one row. The row of the pass a candidate comes from says `candidate`
+/// until the judge chooses (L23, `route_judge::TuneChoice::apply`). A discard for lack of
+/// rounds or time says so ("(no round left)", "(the deadline leaves no room)"). `clock`
+/// gives the time the room rule reads.
 #[allow(clippy::too_many_arguments)] // the parts of one pass, each read once
 pub(crate) async fn tune_attempt(
     binary: &Binary,
@@ -1731,6 +1751,7 @@ pub(crate) async fn tune_attempt(
     held_ses: &Path,
     held_unrouted: usize,
     deadline: Instant,
+    clock: Clock<'_>,
     outcome: &mut TuneOutcome,
 ) -> std::result::Result<Option<TuneCandidate>, PassError> {
     // The Tune pass gets its own heights and never the call's pairs file.
@@ -1836,9 +1857,12 @@ pub(crate) async fn tune_attempt(
             return Ok(None);
         }
         if compared.contacts.is_empty() {
-            outcome
-                .rows
-                .push(row("kept", Some(pass.unrouted), Some(pass.seconds), None));
+            outcome.rows.push(row(
+                "candidate",
+                Some(pass.unrouted),
+                Some(pass.seconds),
+                None,
+            ));
             return Ok(Some(TuneCandidate {
                 variant,
                 ses: pass.ses,
@@ -1855,7 +1879,7 @@ pub(crate) async fn tune_attempt(
             &format!("meanders touch their own net: {}", named_nets(&touching)),
             QUOTE_CHARS,
         );
-        let room = deadline_leaves_room(deadline, pass.seconds);
+        let room = room_for_another_pass(deadline.saturating_duration_since(clock()), pass.seconds);
         let again = if round < TUNE_ROUNDS_MAX && room {
             dropped_nets.extend(touching.iter().cloned());
             let next_folder = folder.join(variant.folder_name(round + 1));
@@ -1881,7 +1905,15 @@ pub(crate) async fn tune_attempt(
                 nets = listed;
             }
             Ok(None) => {
-                outcome.rows.push(discard(reason));
+                // Why there is no next round: the limit, the time, or no group left.
+                let why_not = if round >= TUNE_ROUNDS_MAX {
+                    " (no round left)"
+                } else if !room {
+                    " (the deadline leaves no room)"
+                } else {
+                    ""
+                };
+                outcome.rows.push(discard(format!("{reason}{why_not}")));
                 return Ok(None);
             }
             Err(error) => {
@@ -1940,6 +1972,7 @@ pub(crate) async fn tune_held(
         &untuned,
         held.unrouted,
         deadline,
+        &Instant::now,
         &mut outcome,
     )
     .await?;
@@ -1966,6 +1999,7 @@ pub(crate) async fn tune_held(
                 &untuned,
                 held.unrouted,
                 deadline,
+                &Instant::now,
                 &mut outcome,
             )
             .await?;

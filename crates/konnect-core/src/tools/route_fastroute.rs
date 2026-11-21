@@ -1582,34 +1582,72 @@ const SHARED_COMPLETE_WHEN_END: &str =
 const JUDGED_COMPLETE_WHEN_END: &str = "fastroute's count does not show that. The judge's check on a copy of the board does: `status` follows it when every judge gate passed and the judge added no stitching via (`completion.judged`).";
 
 /// Row LT, L15: `length_matching`'s `untuned_nets` and `tune_candidates` for the
-/// winner; `None` when the run had no Tune pass.
-/// - `untuned_nets`: each net the chosen candidate's passes dropped from the tune file
-///   (`net`, `reason`: L21); empty when no candidate was chosen, because the board is
-///   then the untuned one and `tune_candidates` says why.
+/// winner; `None` when the run had no Tune pass. `tune_nets` are the DSN names of the
+/// tune file's nets.
+/// - `untuned_nets`: every tune-file net the written session leaves untuned, each with
+///   its reason (`net`, `reason`):
+///   - the judge kept the untuned board: every net, "the judge kept the untuned board:
+///     <the rejection or rank reason>" ([`route_judge::TuneChoice::untuned_reason`]);
+///   - no candidate survived its passes: every net, with the last pass's reason;
+///   - otherwise the chosen candidate's dropped nets (L21), each with its reason.
 /// - `tune_candidates`: one row per candidate the judge saw (`route_judge::TuneChoice`
-///   rows: `variant`, `passes`, `dropped`, `judged`, `g4_failed`, `rejected`, `chosen`).
-fn tuning_fields(routed: &Routed, judged: &Judged) -> Option<(Value, Value)> {
+///   rows: `variant`, `passes`, `dropped`, `judged`, `g4_failed`, `rejected`, `reason`,
+///   `chosen`).
+fn tuning_fields(
+    routed: &Routed,
+    judged: &Judged,
+    tune_nets: &std::collections::BTreeSet<String>,
+) -> Option<(Value, Value)> {
     if routed.held.tune.rows.is_empty() {
         return None;
     }
-    let chosen = judged.tune.as_ref().and_then(|choice| choice.chosen);
-    let untuned: Vec<Value> = chosen
-        .and_then(|variant| {
-            routed
+    let every_net = |reason: &str| -> Vec<Value> {
+        tune_nets
+            .iter()
+            .map(|net| json!({ "net": net, "reason": reason }))
+            .collect()
+    };
+    let untuned: Vec<Value> = match (&judged.tune, judged.tune.as_ref().and_then(|c| c.chosen)) {
+        (_, Some(variant)) => routed
+            .held
+            .tune
+            .candidates
+            .iter()
+            .find(|candidate| candidate.variant == variant)
+            .map(|candidate| {
+                candidate
+                    .dropped
+                    .iter()
+                    .map(|(net, reason)| json!({ "net": net, "reason": reason }))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        (Some(choice), None) => every_net(&format!(
+            "the judge kept the untuned board: {}",
+            choice.untuned_reason()
+        )),
+        (None, None) => {
+            // No candidate survived its passes: the last pass that ran says why.
+            let last = routed
                 .held
                 .tune
-                .candidates
+                .rows
                 .iter()
-                .find(|candidate| candidate.variant == variant)
-        })
-        .map(|candidate| {
-            candidate
-                .dropped
-                .iter()
-                .map(|(net, reason)| json!({ "net": net, "reason": reason }))
-                .collect()
-        })
-        .unwrap_or_default();
+                .rev()
+                .find(|row| row["outcome"] != "skipped")
+                .or_else(|| routed.held.tune.rows.last());
+            let reason = last
+                .and_then(|row| {
+                    row["reason"].as_str().map(str::to_string).or_else(|| {
+                        row["outcome"]
+                            .as_str()
+                            .map(|outcome| format!("the last Tune pass was {outcome}"))
+                    })
+                })
+                .unwrap_or_else(|| "no Tune candidate survived".to_string());
+            every_net(&reason)
+        }
+    };
     let candidates = judged
         .tune
         .as_ref()
@@ -1791,7 +1829,7 @@ pub(crate) fn result_json(
         result
             .get_mut("length_matching")
             .and_then(Value::as_object_mut),
-        tuning_fields(routed, judged),
+        tuning_fields(routed, judged, &lengths.tune_nets()),
     ) {
         body.insert("untuned_nets".into(), untuned);
         body.insert("tune_candidates".into(), candidates);

@@ -823,7 +823,7 @@ fn tuned(routed: &mut Routed) {
             passes: 1,
         });
         routed.held.tune.rows.push(json!({
-            "name": "tune", "outcome": "kept", "unrouted": at, "seconds": 1.0,
+            "name": "tune", "outcome": "candidate", "unrouted": at, "seconds": 1.0,
             "variant": variant, "round": 1
         }));
     }
@@ -1788,4 +1788,31 @@ async fn a_judged_runs_held_session_follows_the_judges_choice_among_its_tune_can
         (held.ses.clone(), held.kept),
         (PathBuf::from("variant.ses"), "full")
     );
+}
+
+// Row LT, N1: a choice the run cannot follow fails the judge, so a session that differs from
+// the judged board is never written.
+#[tokio::test(start_paused = true)]
+async fn a_choice_naming_a_candidate_the_run_does_not_hold_fails_the_judge() {
+    use crate::fastroute::TuneVariant;
+    use crate::route_judge::TuneChoice;
+    // The runs are routed without Tune candidates, and the judge names one.
+    let fake = fake(
+        |_| (10, None),
+        |_| {
+            let mut run = judged(1.0, false);
+            run.tune = Some(TuneChoice {
+                chosen: Some(TuneVariant::PourSafe),
+                rows: Vec::new(),
+                untuned: run.measures.clone(),
+            });
+            (10, Ok(run))
+        },
+    );
+    let outcome = run(&plan(1, 1, None, 1), &fake).await;
+    assert_eq!(outcomes(&outcome), vec!["judge_failed"]);
+    let reason = outcome.runs[0].reason.as_deref().unwrap();
+    assert!(reason.contains("does not hold"), "{reason}");
+    assert!(outcome.runs[0].judged.is_none());
+    assert_eq!(outcome.winner, None);
 }
