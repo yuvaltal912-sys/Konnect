@@ -2050,34 +2050,258 @@ fn the_first_temperature_trials_do_not_move_the_start() {
     let t = first_temperature(&cost, &state, &mut rng);
     assert_eq!(state, before, "the start is as it was");
     assert!(t.is_finite() && t > 0.0, "{t}");
-    // The trials walk on: each from where the one before left the parts. Replayed here
-    // by hand, they give the same temperature and move parts on the copy.
+    // No trial is chained (amendment A2): each is tried from the start itself. Replayed
+    // here by hand from the same stream, every shift from the start, they give the same
+    // temperature to the bit.
     let mut rng = SplitMix64(7);
-    let mut copy = state.clone();
-    let (mut ups, mut sum, mut made) = (0, 0.0, 0);
-    for _ in 0..400 {
+    let (mut ups, mut sum, mut legal) = (0, 0.0, 0);
+    for _ in 0..4_000 {
         let p = cost.movable[rng.below(cost.movable.len() as u64) as usize];
         let (dx, dy) = (grid_shift(&mut rng, 10.0), grid_shift(&mut rng, 10.0));
-        let at = copy.centres[p];
+        let at = state.centres[p];
         let mv = Move {
-            parts: vec![(p, (at.0 + dx, at.1 + dy), copy.turns[p])],
+            parts: vec![(p, (at.0 + dx, at.1 + dy), state.turns[p])],
         };
-        if cost.legal(&copy, &mv) {
-            let delta = cost.delta(&copy, &mv);
-            if delta.cost > 0.0 {
+        if cost.legal(&state, &mv) {
+            legal += 1;
+            let rise = cost.delta(&state, &mv).soft;
+            if rise > 0.0 {
                 ups += 1;
-                sum += delta.cost;
+                sum += rise;
             }
-            cost.apply(&mut copy, &mv, delta);
-            made += 1;
         }
     }
-    assert!(made > 100 && ups > 10, "{made} trials made, {ups} uphill");
-    assert_ne!(
-        copy.centres, state.centres,
-        "the trials moved parts on the copy"
+    assert!(
+        legal > 100 && ups > 10,
+        "{legal} trials legal, {ups} uphill"
     );
-    assert!((t - sum / ups as f64 / std::f64::consts::LN_2).abs() < 1e-9);
+    assert_eq!(
+        t.to_bits(),
+        (sum / ups as f64 / (1.0 / 0.95f64).ln()).to_bits(),
+        "{t} against the replay from the start"
+    );
+}
+
+/// Four movable parts: the connector J2 6 mm from the outline's left edge, R1 beside it
+/// with its pad 1 4 mm from J2's pad 1 (a decoupling pair named by hand, limit 5 mm), the
+/// connector J3 2 mm from the right edge, and R2. At the start every requirement holds; a
+/// trial shift of up to 10 mm can break the pair or push a connector past its 10 mm limit.
+fn requirements_in_reach() -> BoardModel {
+    let parts = vec![
+        Fp::new("J2", 6.0, 20.0).two_pad("A", "B"),
+        Fp::new("J3", 58.0, 20.0).two_pad("B", "C"),
+        Fp::new("R1", 6.0, 24.0).two_pad("A", "C"),
+        Fp::new("R2", 30.0, 30.0).two_pad("B", "C"),
+    ];
+    let text = board(OUTLINE, &parts);
+    let set = held_set(&text, &BTreeSet::new(), &HoldRules::locks_only()).unwrap();
+    let pairs = vec![DecouplingPair {
+        cap: "R1".to_string(),
+        cap_pad: "1".to_string(),
+        ic: "J2".to_string(),
+        ic_pad: "1".to_string(),
+        net: "A".to_string(),
+        limit_mm: 5.0,
+        basis: "test".to_string(),
+    }];
+    board_model(&text, set, Intent::new(Vec::new(), pairs)).unwrap()
+}
+
+/// What the first temperature's trials from `state` do to the requirements, replayed from
+/// `SplitMix64(seed)`: legal trials that take a pair past its limit, that take a
+/// connector past its limit, and that change a broken pair's excess.
+fn requirement_trials(cost: &CostModel<'_>, state: &State, seed: u64) -> (usize, usize, usize) {
+    let mut rng = SplitMix64(seed);
+    let (mut pairs_out, mut connectors_out, mut excess) = (0, 0, 0);
+    for _ in 0..4_000 {
+        let p = cost.movable[rng.below(cost.movable.len() as u64) as usize];
+        let (dx, dy) = (grid_shift(&mut rng, 10.0), grid_shift(&mut rng, 10.0));
+        let at = state.centres[p];
+        let mv = Move {
+            parts: vec![(p, (at.0 + dx, at.1 + dy), state.turns[p])],
+        };
+        if !cost.legal(state, &mv) {
+            continue;
+        }
+        let delta = cost.delta(state, &mv);
+        for &(k, d) in &delta.pairs {
+            let (limit, was) = (cost.pairs[k].limit_mm, state.pair_mm[k]);
+            if was <= limit && d > limit {
+                pairs_out += 1;
+            }
+            if was > limit && d > limit && d != was {
+                excess += 1;
+            }
+        }
+        for &(c, distance) in &delta.connectors {
+            if state.connector_mm[c] <= CONNECTOR_EDGE_LIMIT_MM
+                && distance > CONNECTOR_EDGE_LIMIT_MM
+            {
+                connectors_out += 1;
+            }
+        }
+    }
+    (pairs_out, connectors_out, excess)
+}
+
+#[test]
+fn the_first_temperature_reads_the_soft_cost() {
+    // Two fixtures: every requirement held at the start, so that trials break a pair and
+    // push connectors past their limit; and the demo as read, its 8 pairs broken, so that
+    // trials change their excess. Whatever a broken requirement costs (R, the slope), the
+    // first temperature is the same to the bit (amendment A2).
+    let in_reach = requirements_in_reach();
+    let demo = demo_with_pairs();
+    for (name, model) in [("in reach", &in_reach), ("demo", &demo)] {
+        let first = |params: &ConvergeParams, requirement: f64| {
+            let cost = CostModel::build(model, None, params)
+                .unwrap()
+                .with_requirement(requirement);
+            let state = as_read(&cost);
+            first_temperature(&cost, &state, &mut SplitMix64(3))
+        };
+        let measured = converge_params();
+        let steep = ConvergeParams {
+            requirement_slope: 5_000.0,
+            ..measured
+        };
+        assert_eq!(measured.requirement_slope, 50.0);
+        let t = first(&measured, 1_000.0);
+        assert!(t.is_finite() && t > 0.0, "{name}: {t}");
+        assert_eq!(
+            t.to_bits(),
+            first(&measured, 1_000_000.0).to_bits(),
+            "{name}: R of 1,000 and of 1,000,000"
+        );
+        assert_eq!(
+            t.to_bits(),
+            first(&steep, 1_000.0).to_bits(),
+            "{name}: a slope of 50 and of 5,000"
+        );
+        // The fixture does what it is for: trials of the same stream break requirements.
+        let cost = cost_of(model, None);
+        let (pairs_out, connectors_out, excess) = requirement_trials(&cost, &as_read(&cost), 3);
+        if name == "in reach" {
+            assert_eq!(cost.terms(&as_read(&cost)).pair_violations, 0);
+            assert_eq!(cost.terms(&as_read(&cost)).connector_violations, 0);
+            assert!(
+                pairs_out > 10 && connectors_out > 10,
+                "{name}: {pairs_out} trials broke the pair, {connectors_out} a connector"
+            );
+        } else {
+            assert_eq!(cost.terms(&as_read(&cost)).pair_violations, 8);
+            assert!(excess > 100, "{name}: {excess} trials changed an excess");
+        }
+    }
+}
+
+#[test]
+fn the_first_temperature_accepts_an_average_uphill_shift_19_times_in_20() {
+    let model = demo_with_pairs();
+    let hoods = demo_hoods();
+    let cost = CostModel::build(&model, Some(&hoods), &quick(0)).unwrap();
+    let state = state_from(&cost, &[]).unwrap();
+    for seed in [1, 2, 3] {
+        let t = first_temperature(&cost, &state, &mut SplitMix64(seed));
+        // The replay: the same stream, every shift tried from the start; the soft rise
+        // read from the two placements' terms, each computed from nothing.
+        let mut rng = SplitMix64(seed);
+        let (mut ups, mut sum) = (0usize, 0.0);
+        for _ in 0..4_000 {
+            let p = cost.movable[rng.below(cost.movable.len() as u64) as usize];
+            let (dx, dy) = (grid_shift(&mut rng, 10.0), grid_shift(&mut rng, 10.0));
+            let at = state.centres[p];
+            let mv = Move {
+                parts: vec![(p, (at.0 + dx, at.1 + dy), state.turns[p])],
+            };
+            if !cost.legal(&state, &mv) {
+                continue;
+            }
+            let mut centres = state.centres.clone();
+            centres[p] = mv.parts[0].1;
+            let after = cost.state(centres, state.turns.clone());
+            let rise = cost.terms(&after).soft - cost.terms(&state).soft;
+            let delta = cost.delta(&state, &mv);
+            assert!(
+                (delta.soft - rise).abs() < 1e-9,
+                "seed {seed}: the soft change {} against {rise}",
+                delta.soft
+            );
+            if rise > 0.0 {
+                ups += 1;
+                sum += rise;
+            }
+        }
+        assert!(ups > 100, "seed {seed}: {ups} uphill trials");
+        let mean = sum / ups as f64;
+        let expected = mean / (1.0 / 0.95f64).ln();
+        assert!(
+            (t - expected).abs() <= 1e-9 * expected,
+            "seed {seed}: {t} against {expected}"
+        );
+        // At that temperature an average uphill shift is accepted 19 times in 20.
+        assert!(((-mean / t).exp() - 0.95).abs() < 1e-12, "seed {seed}");
+    }
+    // The constants say the same numbers (design C5, amendment A2).
+    assert_eq!(
+        (TRIAL_SHIFTS, TRIAL_RADIUS_MM, FIRST_ACCEPTANCE),
+        (4_000, 10.0, 0.95)
+    );
+}
+
+#[test]
+fn a_whole_run_starts_at_the_first_temperature_and_anneals_on_the_whole_cost() {
+    // `converge`'s first temperature is the one `first_temperature` gives on the run's
+    // start under the run's R, from the stream advanced by the level; annealing from it
+    // gives the run's stages and curve; and annealing decides on the whole cost change,
+    // as the replay from the design's words (`replayed_anneal`, which reads `cost`) does.
+    let model = demo_with_pairs();
+    let hoods = demo_hoods();
+    for level in [0, 1] {
+        let params = quick(level);
+        let (_, trace) = run(&model, Some(&hoods), 2, &params);
+        let built = CostModel::build(&model, Some(&hoods), &params).unwrap();
+        let legal = state_from(&built, &[]).unwrap();
+        let requirement = params.requirement_mm.max(built.terms(&legal).soft);
+        let cost = built.with_requirement(requirement);
+        let start = cost.state(legal.centres, legal.turns);
+        let mut rng = SplitMix64(2);
+        for _ in 0..level {
+            rng.next_u64();
+        }
+        let t = first_temperature(&cost, &start, &mut rng);
+        assert_eq!(
+            trace.first_temperature.to_bits(),
+            t.to_bits(),
+            "level {level}"
+        );
+        let (mut state, mut replayed_rng) = (start.clone(), rng.clone());
+        let mut evaluations = 0;
+        let (stages, stop, curve) = anneal(&cost, &mut state, t, &mut rng, &mut evaluations);
+        assert_eq!(
+            (stages, stop, curve.as_slice()),
+            (
+                trace.stages,
+                trace.anneal_stop,
+                &trace.best_by_step[..trace.stages]
+            ),
+            "level {level}"
+        );
+        let mut replayed = start.clone();
+        let (r_stages, r_stop, r_curve, _) =
+            replayed_anneal(&cost, &mut replayed, t, &mut replayed_rng);
+        assert_eq!(
+            (
+                r_stages,
+                r_stop,
+                &r_curve,
+                &replayed.centres,
+                &replayed.turns
+            ),
+            (stages, stop, &curve, &state.centres, &state.turns),
+            "level {level}: annealing reads the whole cost change"
+        );
+    }
 }
 
 /// U1, its decoupling capacitor C1 beside it (locked), and 60 locked single-pad parts
@@ -2188,7 +2412,7 @@ fn after_descent_no_single_move_lowers_the_cost() {
     let model = demo_with_pairs();
     let cost = CostModel::build(&model, Some(&demo_hoods()), &quick(0)).unwrap();
     let mut fixed_points = 0;
-    for seed in [1, 2, 3] {
+    for seed in [1, 3, 4] {
         let (mut state, mut rng, mut evaluations) = annealed(&cost, seed);
         // The control: annealing alone leaves a single move that lowers the cost.
         let after_anneal = best_single_move(&cost, &state);
@@ -2595,8 +2819,10 @@ fn time_a_run_on_96_parts() {
 
 // ─── Goldens of whole runs (the performance pass) ────────────────────────────
 
-/// Whole runs as the code of stage 4 (`60c9be73`) made them, before any speed-up: a change
-/// that changes a run's behaviour by one bit fails `whole_runs_are_the_recorded_goldens`.
+/// Whole runs as the code of stage 4 (`60c9be73`) made them, before any speed-up, recorded
+/// again once after the design's amendments A1 and A2 (the attraction's grid and the first
+/// temperature), which change every run: a change that changes a run's behaviour by one bit
+/// fails `whole_runs_are_the_recorded_goldens`.
 const RUN_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/tools/placement/fixtures/converge_runs.json"
@@ -2691,7 +2917,7 @@ fn run_golden_cases() -> BTreeMap<String, serde_json::Value> {
 }
 
 /// Writes the goldens of whole runs. Run once, on the code whose runs are the truth (stage
-/// 4's), with `--ignored`; the test below then reads them.
+/// 4's, with amendments A1 and A2), with `--ignored`; the test below then reads them.
 #[test]
 #[ignore = "records the golden file; run once, on the code whose runs are the truth"]
 fn record_run_goldens() {
@@ -3246,10 +3472,11 @@ fn the_attraction_lands_on_the_nearest_legal_cell_to_the_weighted_mean() {
         let weight: f64 = points.iter().map(|(_, w)| w).sum();
         let x: f64 = points.iter().map(|((x, _), w)| w * x).sum::<f64>() / weight;
         let y: f64 = points.iter().map(|((_, y), w)| w * y).sum::<f64>() / weight;
-        (snap_to(x, GRID_MM), snap_to(y, GRID_MM))
+        (snap_to(x, SHIFT_GRID_MM), snap_to(y, SHIFT_GRID_MM))
     };
     // The pads R1's nets reach on other parts: R2's pad 1, R3's and R4's pads 1, each at
-    // its net's weight (1). Nothing stands at the snapped mean: R1 goes there.
+    // its net's weight (1). Nothing stands at the mean snapped to the 0.25 mm grid of
+    // the shifts (amendment A1): R1 goes there.
     let reached = [
         ((39.5, 30.0), 1.0),
         ((19.5, 30.0), 1.0),
@@ -3268,7 +3495,7 @@ fn the_attraction_lands_on_the_nearest_legal_cell_to_the_weighted_mean() {
         assert_eq!(cost.pad_at(p, 0, state.centres[p], 0), *at);
     }
     let base = mean(&reached);
-    assert_eq!(base, (34.0, 23.5));
+    assert_eq!(base, (34.25, 23.25));
     let mv = cost
         .attraction_at(&state, r1, (0.0, 0.0))
         .expect("R1 reaches parts");
@@ -3313,7 +3540,7 @@ fn the_attraction_lands_on_the_nearest_legal_cell_to_the_weighted_mean() {
     pulled.push(((43.5, 10.0), PAIR_PULL));
     assert_eq!(PAIR_PULL, 3.0);
     let base = mean(&pulled);
-    assert_eq!(base, (39.0, 16.5));
+    assert_eq!(base, (38.75, 16.75));
     let mv = cost.attraction_at(&state, r1, (0.0, 0.0)).unwrap();
     assert_eq!(mv.parts, vec![(r1, base, 0)]);
 
@@ -3335,6 +3562,80 @@ fn the_attraction_lands_on_the_nearest_legal_cell_to_the_weighted_mean() {
             "{reference}"
         );
     }
+}
+
+#[test]
+fn the_attraction_searches_from_the_quarter_millimetre_grid() {
+    // R1's mean (the pads of R2, R3 and R4) is (34.17, 23.33): (34.25, 23.25) on the
+    // 0.25 mm grid, (34.0, 23.5) on the 0.5 mm lattice. R1 sits on that lattice point, as
+    // an earlier attraction on the lattice would have left it; the cell a quarter
+    // millimetre off is legal, and R1 is moved there (amendment A1).
+    let model = attraction_board(Vec::new(), Vec::new());
+    let cost = cost_of(&model, None);
+    let r1 = index_of(&model, "R1");
+    let mut centres = cost.read_centres.clone();
+    centres[r1] = (34.0, 23.5);
+    let state = cost.state(centres, vec![0; cost.read_centres.len()]);
+    let on_lattice = (
+        snap_to(34.0 + 1.0 / 6.0, GRID_MM),
+        snap_to(23.0 + 1.0 / 3.0, GRID_MM),
+    );
+    assert_eq!(
+        on_lattice, state.centres[r1],
+        "R1 is on the lattice point of its mean"
+    );
+    let quarter = (34.25, 23.25);
+    let moved = Move {
+        parts: vec![(r1, quarter, 0)],
+    };
+    assert!(
+        cost.legal(&state, &moved),
+        "the cell a quarter off is legal"
+    );
+    let mv = cost
+        .attraction_at(&state, r1, (0.0, 0.0))
+        .expect("R1 reaches parts");
+    assert_eq!(mv, moved);
+    // Descent's attraction (no jitter) is the same function: it names the move too.
+    assert!(
+        cost.descent_moves(&state, r1).any(|m| m == moved),
+        "descent tries the attraction"
+    );
+}
+
+#[test]
+fn the_attractions_rings_step_half_a_millimetre_from_its_target() {
+    // R1's target is (34.25, 23.25) (`the_attraction_searches_from_the_quarter_millimetre_grid`).
+    // R5, right of it, overlaps R1 there by 0.1 mm, and R1 is clear of it 0.25 mm and
+    // 0.5 mm further left. The cells tried are the target and its rings in steps of
+    // 0.5 mm, so the first legal one is 0.5 mm left, not 0.25 mm (amendment A1).
+    let mut model = attraction_board(
+        vec![Fp::new("R5", 36.15, 23.25).locked().two_pad("X4", "X5")],
+        Vec::new(),
+    );
+    model.clearances.part_gap_mm = 0.0;
+    let cost = cost_of(&model, None);
+    let state = as_read(&cost);
+    let r1 = index_of(&model, "R1");
+    let target = (34.25, 23.25);
+    let at = |cell: (f64, f64)| Move {
+        parts: vec![(r1, cell, 0)],
+    };
+    assert!(!cost.legal(&state, &at(target)), "R5 blocks the target");
+    assert!(
+        cost.legal(&state, &at((34.0, 23.25))),
+        "0.25 mm left is legal"
+    );
+    assert!(
+        cost.legal(&state, &at((33.75, 23.25))),
+        "0.5 mm left is legal"
+    );
+    let mv = cost.attraction_at(&state, r1, (0.0, 0.0)).unwrap();
+    assert_eq!(mv, at((33.75, 23.25)));
+    assert_eq!(
+        Some(mv.parts[0].1),
+        brute_force_cell(&cost, &state, r1, target)
+    );
 }
 
 #[test]

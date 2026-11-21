@@ -486,6 +486,11 @@ pub(crate) struct Move {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Delta {
     pub cost: f64,
+    /// The change of the soft cost (`Terms::soft`): `cost` without the requirement terms
+    /// of the pairs and connectors (no R and no excess slope). Summed on its own, beside
+    /// `cost`, so that it does not depend on R or the slope to the bit; the first
+    /// temperature reads it (amendment A2), annealing and descent read `cost`.
+    soft: f64,
     nets: Vec<(usize, NetTree)>,
     crossings: i64,
     pairs: Vec<(usize, f64)>,
@@ -1389,7 +1394,8 @@ impl<'a> CostModel<'a> {
                     (at, turns)
                 })
         };
-        let mut cost = 0.0;
+        // `soft` takes every change `cost` takes but the requirement terms.
+        let (mut cost, mut soft) = (0.0, 0.0);
 
         // The nets of the moved parts, each rebuilt once.
         let mut changed: Vec<usize> = mv
@@ -1402,7 +1408,9 @@ impl<'a> CostModel<'a> {
         let trees: Vec<(usize, NetTree)> =
             changed.iter().map(|&n| (n, self.tree(n, &place))).collect();
         for (n, tree) in &trees {
-            cost += self.nets[*n].weight * (tree.mm - state.net_mm[*n]);
+            let change = self.nets[*n].weight * (tree.mm - state.net_mm[*n]);
+            cost += change;
+            soft += change;
         }
 
         // Their crossings: against every eligible net that did not change, and among
@@ -1430,7 +1438,9 @@ impl<'a> CostModel<'a> {
                     - self.crossings_of(old(n), old(m));
             }
         }
-        cost += params.crossing_mm * crossings as f64;
+        let crossing = params.crossing_mm * crossings as f64;
+        cost += crossing;
+        soft += crossing;
 
         let mut touched: Vec<usize> = mv
             .parts
@@ -1445,6 +1455,8 @@ impl<'a> CostModel<'a> {
             .collect();
         for &(k, d) in &pairs {
             cost += self.pair_cost(k, d) - self.pair_cost(k, state.pair_mm[k]);
+            // The pair's plain distance is soft; its requirement past the limit is not.
+            soft += d - state.pair_mm[k];
         }
 
         let connectors: Vec<(usize, f64)> = mv
@@ -1474,7 +1486,9 @@ impl<'a> CostModel<'a> {
             .map(|p| (p, self.neighbour_distance(p, &place)))
             .collect();
         for &(p, mm) in &neighbours {
-            cost += params.neighbour_weight * (mm - state.neighbour_mm[p]);
+            let change = params.neighbour_weight * (mm - state.neighbour_mm[p]);
+            cost += change;
+            soft += change;
         }
 
         // The label conflicts of every pair of parts with a moved part in it, once: a pair
@@ -1495,10 +1509,13 @@ impl<'a> CostModel<'a> {
                 labels += after as i64 - before as i64;
             }
         }
-        cost += params.label_mm * labels as f64;
+        let label = params.label_mm * labels as f64;
+        cost += label;
+        soft += label;
 
         Delta {
             cost,
+            soft,
             nets: trees,
             crossings,
             pairs,
@@ -1700,12 +1717,16 @@ impl<'a> CostModel<'a> {
     }
 
     /// The attraction of `part`: the mean of the pads its nets reach on other parts (a
-    /// pair's pad counts three times), jittered by up to `jitter_mm`, then the nearest
-    /// legal cell on the 0.5 mm grid within 25 rings. `None` when the part reaches no
-    /// other part or no cell is legal.
+    /// pair's pad counts three times), jittered by up to `jitter_mm` and snapped to the
+    /// 0.25 mm grid of the shifts; then the nearest legal cell among that point and the
+    /// points around it in steps of 0.5 mm, within 25 rings (amendment A1). `None` when
+    /// the part reaches no other part or no cell is legal.
     ///
     /// A pad counts by its net's weight in the cost (a rail's by `rail_weight`), as the
-    /// experiment weighed it. A jitter of 0 draws nothing from `rng`.
+    /// experiment weighed it. A jitter of 0 draws nothing from `rng`. The search's centre
+    /// is on the 0.25 mm grid and not on the fixed 0.5 mm lattice, so a part that an
+    /// attraction placed before does not get its own cell back whenever the mean has moved
+    /// by a quarter millimetre (the experiment's `prop_attract`).
     fn attraction(
         &self,
         state: &State,
@@ -1756,9 +1777,10 @@ impl<'a> CostModel<'a> {
         if weight <= 0.0 {
             return None;
         }
+        // The target on the shifts' 0.25 mm grid (amendment A1); the rings step 0.5 mm.
         let base = (
-            snap_to(sx / weight + jitter.0, GRID_MM),
-            snap_to(sy / weight + jitter.1, GRID_MM),
+            snap_to(sx / weight + jitter.0, SHIFT_GRID_MM),
+            snap_to(sy / weight + jitter.1, SHIFT_GRID_MM),
         );
         let mut mv = Move {
             parts: vec![(part, base, state.turns[part])],
@@ -1781,8 +1803,9 @@ impl<'a> CostModel<'a> {
         Some(mv)
     }
 
-    /// The first cell of `nearest_cells` around `base` (rings 0 to 24 on `GRID_MM`) at
-    /// which `legal` holds, or `None`. It is the cell
+    /// The first cell of `nearest_cells` around `base` (rings 0 to 24 in steps of
+    /// `GRID_MM`, from `base` wherever it lies: the attraction's base is on the 0.25 mm
+    /// grid, making room's on the 0.5 mm grid) at which `legal` holds, or `None`. It is the cell
     /// `nearest_cells().iter().map(cell).find(legal)` gives, found with fewer calls of
     /// `legal`, on one condition: `legal(cell)` is false whenever part `part`, its box of
     /// `size` at the cell, is not `Legality::clear_of` some part `j` of `blockers` at
@@ -1924,12 +1947,17 @@ const SHIFT_GRID_MM: f64 = 0.25;
 /// A decoupling pair's pad counts this many times in the attraction (design C4).
 const PAIR_PULL: f64 = 3.0;
 
-/// The rings of a nearest-legal-cell search on `GRID_MM`: ring 0 and 24 more (design C4).
+/// The rings of a nearest-legal-cell search in steps of `GRID_MM`: ring 0 and 24 more
+/// (design C4, amendment A1).
 const CELL_RINGS: i64 = 25;
 
-/// The first temperature's trials (design C5): this many shifts of up to this far.
-const TRIAL_SHIFTS: usize = 400;
+/// The first temperature's trials (design C5, amendment A2): this many shifts of up to
+/// this far on each axis, each tried from the start and none made.
+const TRIAL_SHIFTS: usize = 4_000;
 const TRIAL_RADIUS_MM: f64 = 10.0;
+/// The share of times an average uphill shift is accepted at the first temperature
+/// (design C5, amendment A2): the run starts melted.
+const FIRST_ACCEPTANCE: f64 = 0.95;
 /// The first temperature when no trial went uphill.
 const COLD_START_TEMPERATURE: f64 = 50.0;
 
@@ -2076,13 +2104,18 @@ fn centres_of(
     Ok((centres, turns))
 }
 
-/// The first temperature: 400 trial shifts of up to 10 mm on each axis (0.25 mm grid)
-/// of parts drawn uniformly, each from where the trial before it left the parts, every
-/// legal one made, all of it on a copy: `state` is not changed. The mean of the uphill
-/// cost changes over ln 2, so that about half of such moves are accepted (50 when none
-/// was uphill).
+/// The first temperature (amendment A2): 4,000 trial shifts of up to 10 mm on each axis
+/// (0.25 mm grid) of parts drawn uniformly, each tried from `state` itself and none
+/// made: `state` is not changed. Over the legal trials whose soft cost rises (the cost
+/// change without the requirement terms of the pairs and connectors: no R and no
+/// excess), the mean rise over ln(1 / 0.95), so that an average uphill shift is
+/// accepted 19 times in 20 (50 when no trial was uphill).
+///
+/// The soft rise is `Delta::soft`, computed by `delta` beside the whole change. Each
+/// trial draws from `rng`, in this order and whether or not it is legal: the part
+/// (`below` the count of movable parts), then the offset on x, then on y (one `unit`
+/// each, `grid_shift`).
 fn first_temperature(cost: &CostModel<'_>, state: &State, rng: &mut SplitMix64) -> f64 {
-    let mut copy = state.clone();
     let count = cost.movable.len() as u64;
     let (mut uphill, mut sum) = (0usize, 0.0);
     for _ in 0..TRIAL_SHIFTS {
@@ -2091,24 +2124,23 @@ fn first_temperature(cost: &CostModel<'_>, state: &State, rng: &mut SplitMix64) 
             grid_shift(rng, TRIAL_RADIUS_MM),
             grid_shift(rng, TRIAL_RADIUS_MM),
         );
-        let at = copy.centres[part];
+        let at = state.centres[part];
         let mv = Move {
-            parts: vec![(part, (at.0 + dx, at.1 + dy), copy.turns[part])],
+            parts: vec![(part, (at.0 + dx, at.1 + dy), state.turns[part])],
         };
-        if !cost.legal(&copy, &mv) {
+        if !cost.legal(state, &mv) {
             continue;
         }
-        let delta = cost.delta(&copy, &mv);
-        if delta.cost > 0.0 {
+        let rise = cost.delta(state, &mv).soft;
+        if rise > 0.0 {
             uphill += 1;
-            sum += delta.cost;
+            sum += rise;
         }
-        cost.apply(&mut copy, &mv, delta);
     }
     if uphill == 0 {
         COLD_START_TEMPERATURE
     } else {
-        sum / uphill as f64 / std::f64::consts::LN_2
+        sum / uphill as f64 / (1.0 / FIRST_ACCEPTANCE).ln()
     }
 }
 
