@@ -5,6 +5,7 @@ use super::*;
 use crate::intent_width_report::WidthReport;
 use crate::specctra_ses::{SesArc, SesImportPlan, SesTrack, SesVia};
 use crate::tools::cli::{DrcReport, DrcViolation, ReportItem};
+use sha2::{Digest, Sha256};
 
 // ------------------------------------------------------------------ prepare
 
@@ -1204,6 +1205,13 @@ struct Exported {
 /// the design the recorded session names) with the top pour left out, and writes the
 /// recorded Freerouting session of the rounded board beside it.
 fn exported(dir: &Path) -> Exported {
+    exported_as(dir, false)
+}
+
+/// [`exported`]; with `over_ipc` the DSN and its manifest come from the board as
+/// KiCad's memory writes it (`board_identity::tests::ipc_form`), while the file
+/// beside them stays the saved text: the live board of a real export.
+fn exported_as(dir: &Path, over_ipc: bool) -> Exported {
     use crate::specctra::{export_dsn_with_options, ExportOptions, PourPolicy};
     use konnect_ipc::{IpcEffectiveRoutingRules, IpcRoutingRules};
 
@@ -1211,6 +1219,11 @@ fn exported(dir: &Path) -> Exported {
     let ses_text = include_str!("../tests/fixtures/specctra_rounded_board.freerouting-2.3.0.ses");
     let board = dir.join("specctra_rounded_board.kicad_pcb");
     std::fs::write(&board, board_text).unwrap();
+    let exported_text = if over_ipc {
+        crate::board_identity::tests::ipc_form(board_text)
+    } else {
+        board_text.to_string()
+    };
 
     let rules: IpcEffectiveRoutingRules = ["GND", "VCC"]
         .into_iter()
@@ -1230,7 +1243,7 @@ fn exported(dir: &Path) -> Exported {
         .collect();
     let bundle = export_dsn_with_options(
         &board,
-        board_text,
+        &exported_text,
         &rules,
         ExportOptions {
             pours: PourPolicy::from_argument(Some(&json!({
@@ -1897,8 +1910,19 @@ exit 0
     /// private settings copy, a library folder beside the board, and `planes` as the
     /// nets the run's router got as planes (the fake report decides what is open).
     fn harness(planes: &[&str], default: String, canned: &[(usize, String)]) -> Harness {
+        harness_as(planes, default, canned, false)
+    }
+
+    /// [`harness`]; with `over_ipc` the export is of the IPC text of the board and
+    /// the saved file differs in bytes (see [`exported_as`]).
+    fn harness_as(
+        planes: &[&str],
+        default: String,
+        canned: &[(usize, String)],
+        over_ipc: bool,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
-        let Exported { dsn, ses } = exported(dir.path());
+        let Exported { dsn, ses } = exported_as(dir.path(), over_ipc);
         put(dir.path(), "lib.pretty/a.kicad_mod", "(footprint \"a\")");
 
         let fake = dir.path().join("fake");
@@ -2064,6 +2088,66 @@ exit 0
         let h = harness(&[], json!({"violations": []}).to_string(), &[]);
         let error = baseline(&h.ctx).await.unwrap_err();
         assert!(format!("{error:#}").contains("unconnected"), "{error:#}");
+    }
+
+    /// F1 (Row LT's verification): the preflight took the saved file of a board
+    /// exported over IPC by its tree, then the run's import-plan call refused it by
+    /// bytes, so every run of a live board was `judge_failed`. The run now takes the
+    /// same identity. Controls: a board that changed since the export, and a
+    /// manifest without the tree hash, still fail the run at that step.
+    #[tokio::test]
+    async fn a_run_is_judged_on_the_saved_file_of_a_board_exported_over_ipc() {
+        let mut h = harness_as(&[], drc_json(&["GND"], &["clearance"]), &[], true);
+        let recorded = h.ctx.manifest["source_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            recorded,
+            format!("{:x}", Sha256::digest(h.ctx.board_text.as_bytes())),
+            "the byte hash is of the IPC text, not the saved file"
+        );
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("the planner must not be called"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert!(judged.board.is_file(), "the session was written and judged");
+
+        // A board that changed since the export: the run fails at the import step.
+        let saved = h.ctx.board_text.clone();
+        h.ctx.board_text = saved.replacen("(at ", "(at 1", 1);
+        assert_ne!(h.ctx.board_text, saved);
+        let error = judge_with(&h.ctx, &h.routed, &base, &tools)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("the importer refuses the run's session"),
+            "{text}"
+        );
+        assert!(
+            text.contains("saved board does not match routing manifest"),
+            "{text}"
+        );
+        h.ctx.board_text = saved.clone();
+
+        // A manifest from before the tree hash: bytes only, and the bytes differ.
+        let mut body = h.ctx.manifest.clone();
+        body.as_object_mut()
+            .unwrap()
+            .remove("source_canonical_sha256");
+        h.ctx.manifest_text = body.to_string();
+        let error = judge_with(&h.ctx, &h.routed, &base, &tools)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("the importer refuses the run's session"),
+            "{text}"
+        );
+        assert!(
+            text.contains("saved board does not match routing manifest"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

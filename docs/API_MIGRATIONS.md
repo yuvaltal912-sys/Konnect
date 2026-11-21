@@ -38,7 +38,8 @@ judge accepts the saved board when its bytes match `source_sha256` (as before) o
 its tree matches `source_canonical_sha256`. Before this, every DSN exported from a
 live board was refused with "save the board in KiCad, then export the DSN again",
 which saving did not fix. Export the DSN again to get the new field; a manifest
-without it keeps the byte check. The SES importer accepts the field and still checks
+without it keeps the byte check. The route judge also uses the field when it imports each run's session onto its scratch copy of the saved board. The SES importer
+(`apply_specctra_ses`, `plan_specctra_ses_import`) ignores the field and still checks
 the live board against `source_sha256`.
 
 ## Unreleased: one entry skill, `kopper`

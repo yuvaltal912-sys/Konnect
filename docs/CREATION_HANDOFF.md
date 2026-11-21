@@ -461,6 +461,7 @@ Done when each board's `table.md` gives a verdict per family against O and A.
 **The fix (D22 in `ROUTE_SEARCH_DESIGN.md`).**
 - The export also writes `source_canonical_sha256`: the board as a parsed tree, with that footprint metadata dropped, hashed with lengths and atom/string tags (`board_identity.rs`).
 - The judge accepts the saved board when its bytes match `source_sha256` or its tree matches `source_canonical_sha256`. Any other change still refuses. An older manifest gets the byte check only.
+- Closes the importer half (F1, Row LT's verification found it on a live board: 6 runs `judge_failed`): the preflight accepted the tree, but the run's own import-plan call still compared bytes. Both now use one rule, `board_identity::matches_export`; the judge's call is `specctra_ses::parse_import_plan_with(.., SourceCheck::BytesOrTree)`. `parse_import_plan`, which the live import (`apply_specctra_ses`) and every other caller use, keeps the byte check.
 - DRC's live-to-saved check and the judge now share one normalization rule.
 
 **Verified, 2026-11-18.**
@@ -477,6 +478,7 @@ Done when each board's `table.md` gives a verdict per family against O and A.
 - Independent review: sound, with two notes. This record is one. The other is the next bullet.
 - Gate on `7b618aa2`: tests 4929, sandboxed 33, `simulation_live` 95/95; fmt, doc tests, clippy, `deny`, `fix-doc-counts` and the release build green; installed hash and KiCad settings unchanged.
 - **Not verified:** a run on a real live board. The tests model KiCad's IPC text (one line, footprint metadata added); they did not capture it. DRC's live-to-saved check rests on the same rule. The first `route_specctra_dsn` after the next install, from a fresh export of a live board, is the check.
+- F1 fix, 2026-11-21 (branch `claude/judge-live-hash`): `cargo test -p konnect-core --lib -- specctra route_judge board_identity pcb_routing place_route route_search fastroute`: 461 passed, 0 failed; `asset_references` 12/12, `schema_parameter_usage` 5/5; fmt and `clippy --workspace --all-targets -D warnings` clean. 9 of 9 guard breaks caught. `cargo mutants` on the changed functions: no missed mutant in the new lines. Not run: a real `route_specctra_dsn` on a live board (the run needs the fix installed first).
 
 ## Row KE, the `kopper` entry skill
 
