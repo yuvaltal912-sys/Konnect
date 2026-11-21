@@ -16,7 +16,9 @@
 //!
 //! `converge_check`, the other ignored test here, runs family C without routing (design
 //! measurement step 1) on every board that names `converge`, with the same guards, and
-//! writes `<board folder>/converge-check.json`.
+//! writes `<board folder>/converge-check.json`. With `KONNECT_CONVERGE_SILK=1` it also
+//! reads each run's silk entries and parts pulled away on the run's board (design A3),
+//! which starts kicad-cli.
 
 use crate::place_converge::{converge, ConvergeParams, OuterRule, Terms, Trace};
 use crate::place_generators::{
@@ -24,15 +26,20 @@ use crate::place_generators::{
     GENERATOR_VERSION,
 };
 use crate::place_held::HoldRules;
-use crate::place_route::{export_options, isolated_context, rules_from_json, RouteInputs};
+use crate::place_judge::SILK;
+use crate::place_route::{
+    export_candidate, export_options, isolated_context, rules_from_json, RouteInputs,
+};
+use crate::place_schematic::SchematicBaseline;
 use crate::place_search::{
-    converge_all, generate_all, search, search_model, Origin, PlaceRouteCall, Plan, Record,
+    converge_all, generate_all, search, search_model, silk_entries, Origin, PlaceRouteCall, Plan,
+    Record, RouteCall,
 };
 use crate::route_search::Effort;
 use anyhow::{bail, ensure, Context};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -780,12 +787,184 @@ fn port_run_json(seed: u64, trace: &Result<Trace, String>, seconds: f64) -> serd
     serde_json::Value::Object(out)
 }
 
+/// The silk check's scratch folder below a board's folder (`KONNECT_CONVERGE_SILK=1`):
+/// `isolation/`, `input-check/` and one `candidates/c<id>/` per run, each the bench's own
+/// layout. Left in place after the run, for inspection; a later run is refused until it
+/// is moved or removed.
+const SILK_FOLDER: &str = "converge-check-silk";
+
+/// Refuses a silk scratch folder that is there already, whatever it is: an earlier run's
+/// folder (its candidate folders would be refused one by one, after the whole search), a
+/// file, or a link (it would send the check's writes where it points), a dangling one
+/// included.
+fn check_silk_folder(path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        path.symlink_metadata().is_err(),
+        "'{}' exists already; move or remove it first (the silk check writes its scratch boards there)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The silk counts of one unrouted check as `converge-check.json` holds them: each kind of
+/// `place_judge::SILK` and their `sum`, which is the bench table's `silk` column
+/// (`place_search::silk_entries`). No other kind.
+fn silk_json(counts: &BTreeMap<String, usize>) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for kind in SILK {
+        out.insert(
+            (*kind).to_string(),
+            json!(counts.get(*kind).copied().unwrap_or(0)),
+        );
+    }
+    out.insert("sum".into(), json!(silk_entries(counts)));
+    serde_json::Value::Object(out)
+}
+
+/// The input board's silk fields, once per board: `input_silk` (the bench's
+/// `input_unrouted`, shaped by [`silk_json`]) and `input_silk_reason`, a fixed phrase
+/// when the check failed.
+fn input_silk_fields(
+    counts: &Result<BTreeMap<String, usize>, &'static str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "input_silk".into(),
+        counts.as_ref().map_or(serde_json::Value::Null, silk_json),
+    );
+    out.insert("input_silk_reason".into(), json!(counts.as_ref().err()));
+    out
+}
+
+/// The fields design A3 reads for one C run: `silk` ([`silk_json`] of its board's unrouted
+/// check) and `silk_reason`; `schematic_neighbours`, the record's measure as `search.json`
+/// records it (`Record::file_schematic`), and `schematic_neighbours_reason`. A reason is
+/// `null` beside a value and one fixed phrase beside a `null`, never the error's own
+/// text, which can name a part or a path. `schematic_readable`: the input's schematic
+/// gave neighbourhoods.
+fn silk_fields(
+    counts: &Result<BTreeMap<String, usize>, &'static str>,
+    record: &Record,
+    schematic_readable: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "silk".into(),
+        counts.as_ref().map_or(serde_json::Value::Null, silk_json),
+    );
+    out.insert("silk_reason".into(), json!(counts.as_ref().err()));
+    let neighbours = record
+        .schematic_neighbours
+        .as_ref()
+        .map(|measure| serde_json::to_value(measure).expect("a measure is JSON"));
+    let neighbours_reason = match (&neighbours, &record.board_text, schematic_readable) {
+        (Some(_), _, _) => None,
+        (None, None, _) => Some("no board"),
+        (None, Some(_), false) => Some("the input's schematic gives no neighbourhoods"),
+        (None, Some(_), true) => Some("the board could not be measured"),
+    };
+    out.insert("schematic_neighbours".into(), json!(neighbours));
+    out.insert(
+        "schematic_neighbours_reason".into(),
+        json!(neighbours_reason),
+    );
+    out
+}
+
+/// What the silk check gives one board: the input's fields and each run's, in run order.
+struct SilkCheck {
+    input: serde_json::Map<String, serde_json::Value>,
+    runs: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Runs whose silk was read.
+    measured: usize,
+}
+
+/// Design A3's two measures of every run, with no routing call, by the bench's own code:
+/// the input board's unrouted check as `search` makes it (`PlaceRouteCall::unrouted`,
+/// in `<scratch>/input-check`); then for each run its board text (`placements_applied_to`,
+/// as the bench routes it) written by `export_candidate` into `<scratch>/candidates/c<id>`,
+/// as the bench writes a candidate before its routing call, and `PlaceRouteCall::unrouted`
+/// on that copy (`place_route::unrouted_check`; the call first proves the copy on disk is
+/// the record's text). Every check runs one at a time with the bench's scratch
+/// `KICAD_CONFIG_HOME` (`inputs.kicad_config_home`) under `isolated_context`, whose
+/// `ipc_address` nothing listens on. The schematic measure is `Record::file_schematic`'s.
+/// A failed check is a phrase in the file and its full text a line in the log.
+fn silk_check(
+    runtime: &tokio::runtime::Runtime,
+    scratch: &Path,
+    inputs: &RouteInputs,
+    model: &BoardModel,
+    schematic: &Result<SchematicBaseline, String>,
+    runs: &mut [Record],
+) -> anyhow::Result<SilkCheck> {
+    let ctx = isolated_context(&scratch.join("isolation"), &inputs.kicad_cli)?;
+    let call = |board: PathBuf| PlaceRouteCall {
+        inputs: RouteInputs {
+            board,
+            ..inputs.clone()
+        },
+        ctx: Arc::clone(&ctx),
+    };
+    let file_name = inputs
+        .board
+        .file_name()
+        .context("the input board has no file name")?;
+    let input = runtime
+        .block_on(
+            call(inputs.board.clone()).unrouted(model.text.clone(), scratch.join("input-check")),
+        )
+        .map_err(|error| {
+            println!("the input board's unrouted check failed: {error:#}");
+            "the unrouted check failed"
+        });
+    let mut fields = Vec::with_capacity(runs.len());
+    let mut measured = 0usize;
+    for record in runs.iter_mut() {
+        record.file_schematic(schematic);
+        let counts = match &record.board_text {
+            None => Err("no board"),
+            Some(text) => {
+                let folder = scratch
+                    .join("candidates")
+                    .join(format!("c{:04}", record.id));
+                match export_candidate(inputs, &folder, text) {
+                    Err(error) => {
+                        println!("run {}: the export failed: {error:#}", record.id);
+                        Err("the export failed")
+                    }
+                    Ok(_) => runtime
+                        .block_on(call(folder.join(file_name)).unrouted(text.clone(), folder))
+                        .map_err(|error| {
+                            println!("run {}: the unrouted check failed: {error:#}", record.id);
+                            "the unrouted check failed"
+                        }),
+                }
+            }
+        };
+        measured += usize::from(counts.is_ok());
+        fields.push(silk_fields(&counts, record, schematic.is_ok()));
+    }
+    Ok(SilkCheck {
+        input: input_silk_fields(&input),
+        runs: fields,
+        measured,
+    })
+}
+
 /// Family C on one board without routing: the model as the search builds it
 /// (`search_model`: hold rules, clearances, intent, neighbourhoods), phase 1 (the board's
 /// F and S recipes) and phase 1b (`converge_all`) with no routing call, and the port's
-/// check when `port` is set. Writes `<board folder>/converge-check.json`, counts and
-/// numbers only, and refuses a folder that already holds one. Returns the line to print.
-fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyhow::Result<String> {
+/// check when `port` is set. With `silk` (a runtime), [`silk_check`] too: each run's
+/// entry gets the fields of [`silk_fields`] and the file gets [`input_silk_fields`]'s;
+/// without it the file is what it was before the switch existed. Writes
+/// `<board folder>/converge-check.json`, counts and numbers only, and refuses a folder
+/// that already holds one (or, with `silk`, a [`SILK_FOLDER`]). Returns the line to print.
+fn converge_check_board(
+    env: &BenchEnv,
+    board: &BenchBoard,
+    port: bool,
+    silk: Option<&tokio::runtime::Runtime>,
+) -> anyhow::Result<String> {
     let folder = env.folder.join(&board.folder);
     let out = folder.join("converge-check.json");
     ensure!(
@@ -793,13 +972,17 @@ fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyho
         "board {} already holds a converge-check.json; move or remove it first",
         board.name
     );
+    let scratch = folder.join(SILK_FOLDER);
+    if silk.is_some() {
+        check_silk_folder(&scratch).with_context(|| format!("board {}", board.name))?;
+    }
     let (inputs, ai, held) = board_inputs(env, board, &folder)?;
     let plan = board_plan(board, folder.clone(), inputs, ai, held);
     let (params, rule) = plan
         .matrix
         .converge
         .with_context(|| format!("board {} does not name converge", board.name))?;
-    let (model, _) = search_model(&plan)?;
+    let (model, schematic) = search_model(&plan)?;
     let phase_1 = std::time::Instant::now();
     let records = generate_all(&model, &recipes(&plan.matrix), plan.threads, 0);
     let phase_1_s = phase_1.elapsed().as_secs_f64();
@@ -812,7 +995,7 @@ fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyho
                 && r.screen_key.is_some_and(|key| key[0] == 0)
         })
         .count();
-    let (runs, outer) = converge_all(
+    let (mut runs, outer) = converge_all(
         &model,
         &records,
         &params,
@@ -825,7 +1008,35 @@ fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyho
     } else {
         None
     };
-    let file = json!({
+    let mut run_values: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|record| converge_run_json(record, &plan.matrix))
+        .collect();
+    let mut silk_line = String::new();
+    let mut input_fields = None;
+    if let Some(runtime) = silk {
+        let check = silk_check(
+            runtime,
+            &scratch,
+            &plan.route,
+            &model,
+            &schematic,
+            &mut runs,
+        )?;
+        for (value, fields) in run_values.iter_mut().zip(check.runs) {
+            if let serde_json::Value::Object(map) = value {
+                map.extend(fields);
+            }
+        }
+        silk_line = format!(
+            ", silk: input {}, {} of {} run(s) read",
+            check.input["input_silk"]["sum"],
+            check.measured,
+            runs.len()
+        );
+        input_fields = Some(check.input);
+    }
+    let mut file = json!({
         "board": board.name,
         "generator_version": GENERATOR_VERSION,
         "threads": plan.threads,
@@ -836,15 +1047,15 @@ fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyho
             "seconds": phase_1_s,
         },
         "outer": outer,
-        "runs": runs
-            .iter()
-            .map(|record| converge_run_json(record, &plan.matrix))
-            .collect::<Vec<_>>(),
+        "runs": run_values,
         "port_check": port,
     });
+    if let (Some(fields), serde_json::Value::Object(map)) = (input_fields, &mut file) {
+        map.extend(fields);
+    }
     std::fs::write(&out, serde_json::to_string_pretty(&file)?)?;
     Ok(format!(
-        "{}: {} start(s) of {starts_available} (rule for starts: {}), {} effort level(s) (rule for effort: {}), {} run(s), phase 1b {:.1} s, {}",
+        "{}: {} start(s) of {starts_available} (rule for starts: {}), {} effort level(s) (rule for effort: {}), {} run(s), phase 1b {:.1} s{silk_line}, {}",
         board.name,
         outer.starts.len(),
         outer.starts_stop,
@@ -858,13 +1069,22 @@ fn converge_check_board(env: &BenchEnv, board: &BenchBoard, port: bool) -> anyho
 
 /// Family C without routing (design measurement step 1) on every board of `bench.json`
 /// that names `converge`: the same environment and guards as `place_bench`, then
-/// `converge_check_board`. `KONNECT_CONVERGE_PORT_CHECK=1` adds the port's check. Starts
-/// no KiCad and no router.
+/// `converge_check_board`. `KONNECT_CONVERGE_PORT_CHECK=1` adds the port's check.
+/// Starts no router. Starts no KiCad either, unless `KONNECT_CONVERGE_SILK=1`: then
+/// [`silk_check`] runs kicad-cli's refill and DRC on the input board and on each run's
+/// board (design A3), one at a time, in the board's [`SILK_FOLDER`].
 #[test]
 #[ignore = "needs KONNECT_PLACE_BENCH, KONNECT_FASTROUTE, KICAD_CONFIG_HOME and KONNECT_STATE_DIR, as place_bench"]
 fn converge_check() {
     let env = bench_environment().unwrap_or_else(|error| panic!("the bench is refused: {error:#}"));
     let port = std::env::var("KONNECT_CONVERGE_PORT_CHECK").is_ok_and(|value| value == "1");
+    let silk = std::env::var("KONNECT_CONVERGE_SILK").is_ok_and(|value| value == "1");
+    let runtime = silk.then(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    });
     let boards: Vec<&BenchBoard> = env
         .boards
         .iter()
@@ -872,13 +1092,14 @@ fn converge_check() {
         .collect();
     assert!(!boards.is_empty(), "no board of bench.json names converge");
     println!(
-        "bench folder {}, the port's check {}",
+        "bench folder {}, the port's check {}, the silk check {}",
         env.folder.display(),
-        if port { "on" } else { "off" }
+        if port { "on" } else { "off" },
+        if silk { "on" } else { "off" }
     );
     let mut failed = 0usize;
     for board in boards {
-        match converge_check_board(&env, board, port) {
+        match converge_check_board(&env, board, port, runtime.as_ref()) {
             Ok(line) => println!("{line}"),
             Err(error) => {
                 failed += 1;
@@ -1636,6 +1857,176 @@ fn a_converge_check_record_names_no_part_net_or_path() {
         ..Matrix::bench()
     };
     assert!(converge_run_json(&done, &small)["recipe"]["start"]["set"].is_null());
+
+    // The silk check's keys (design A3) hold counts, numbers and fixed phrases only, the
+    // reason a record carries never: it can name a part, a net or a path.
+    let mut measured = done.clone();
+    measured.board_text = Some("(kicad_pcb)".into());
+    measured.schematic_neighbours = Some(check_measure());
+    let mut unmeasured = done.clone();
+    unmeasured.board_text = Some("(kicad_pcb)".into());
+    unmeasured.schematic_neighbours_reason =
+        Some("the schematic /Users/someone/U17.kicad_sch has no VSECRET".into());
+    let counts = check_counts();
+    let cases = [
+        (
+            silk_fields(&Ok(counts.clone()), &measured, true),
+            "a measured run",
+        ),
+        (
+            silk_fields(&Err("the unrouted check failed"), &unmeasured, true),
+            "a run whose measures failed",
+        ),
+        (
+            silk_fields(&Err("no board"), &failed, false),
+            "a failed run without a schematic",
+        ),
+        (input_silk_fields(&Ok(counts)), "the input"),
+        (
+            input_silk_fields(&Err("the unrouted check failed")),
+            "the input, failed",
+        ),
+    ];
+    for (fields, what) in &cases {
+        assert_names_nothing(&serde_json::Value::Object(fields.clone()), what);
+    }
+    let mut words: Vec<String> = cases
+        .iter()
+        .flat_map(|(fields, _)| strings_in(&serde_json::Value::Object(fields.clone())))
+        .collect();
+    words.sort();
+    assert_eq!(
+        words,
+        [
+            "no board",
+            "no board",
+            "the board could not be measured",
+            "the unrouted check failed",
+            "the unrouted check failed",
+        ],
+        "the only words are the fixed phrases"
+    );
+}
+
+/// A measure as `SchematicBaseline::measure` gives one.
+fn check_measure() -> crate::place_schematic::SchematicMeasure {
+    crate::place_schematic::SchematicMeasure {
+        mean_mm: 12.5,
+        ratio_to_input: Some(1.25),
+        parts_pulled_away: 4,
+        parts_measured: 30,
+        parts_unmatched: 2,
+        parts_alone: 1,
+    }
+}
+
+/// An unrouted check's counts: the three silk kinds and one kind that is not silk.
+fn check_counts() -> BTreeMap<String, usize> {
+    [
+        ("silk_overlap", 7usize),
+        ("silk_over_copper", 11),
+        ("silk_edge_clearance", 2),
+        ("clearance", 40),
+    ]
+    .into_iter()
+    .map(|(kind, n)| (kind.to_string(), n))
+    .collect()
+}
+
+#[test]
+fn the_silk_fields_are_the_benchs_silk_kinds_and_sum_and_its_schematic_measure() {
+    let counts = check_counts();
+    let silk = json!({
+        "silk_overlap": 7,
+        "silk_over_copper": 11,
+        "silk_edge_clearance": 2,
+        "sum": 20,
+    });
+    // The sum is the bench's own count (the table's `silk` column), which leaves the
+    // other kinds out.
+    assert_eq!(silk_entries(&counts), 20);
+    assert_eq!(silk_json(&counts), silk);
+    // A kind the check did not report counts 0.
+    assert_eq!(
+        silk_json(&BTreeMap::new()),
+        json!({ "silk_overlap": 0, "silk_over_copper": 0, "silk_edge_clearance": 0, "sum": 0 })
+    );
+
+    let mut record = check_record(
+        210,
+        bench_start(Family::Force, 0),
+        "generated",
+        None,
+        Some(check_trace(90.0)),
+    );
+    record.board_text = Some("(kicad_pcb)".into());
+    record.schematic_neighbours = Some(check_measure());
+    let fields = serde_json::Value::Object(silk_fields(&Ok(counts.clone()), &record, true));
+    assert_eq!(
+        fields,
+        json!({
+            "silk": silk,
+            "silk_reason": null,
+            "schematic_neighbours": {
+                "mean_mm": 12.5,
+                "ratio_to_input": 1.25,
+                "parts_pulled_away": 4,
+                "parts_measured": 30,
+                "parts_unmatched": 2,
+                "parts_alone": 1,
+            },
+            "schematic_neighbours_reason": null,
+        })
+    );
+    // Each `null` has its phrase beside it.
+    record.schematic_neighbours = None;
+    let no_schematic = silk_fields(&Err("the export failed"), &record, false);
+    assert!(no_schematic["silk"].is_null());
+    assert_eq!(no_schematic["silk_reason"], "the export failed");
+    assert!(no_schematic["schematic_neighbours"].is_null());
+    assert_eq!(
+        no_schematic["schematic_neighbours_reason"],
+        "the input's schematic gives no neighbourhoods"
+    );
+    assert_eq!(
+        silk_fields(&Ok(counts.clone()), &record, true)["schematic_neighbours_reason"],
+        "the board could not be measured"
+    );
+    record.board_text = None;
+    assert_eq!(
+        silk_fields(&Err("no board"), &record, true)["schematic_neighbours_reason"],
+        "no board"
+    );
+    // The input's fields, once per board.
+    assert_eq!(
+        serde_json::Value::Object(input_silk_fields(&Ok(counts))),
+        json!({ "input_silk": silk, "input_silk_reason": null })
+    );
+    assert_eq!(
+        serde_json::Value::Object(input_silk_fields(&Err("the unrouted check failed"))),
+        json!({ "input_silk": null, "input_silk_reason": "the unrouted check failed" })
+    );
+}
+
+#[test]
+fn the_silk_scratch_folder_is_refused_when_anything_is_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SILK_FOLDER);
+    check_silk_folder(&path).expect("a folder that is not there is taken");
+    std::fs::create_dir(&path).unwrap();
+    assert!(check_silk_folder(&path).is_err(), "an earlier run's folder");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, "x").unwrap();
+    assert!(check_silk_folder(&path).is_err(), "a file");
+    std::fs::remove_file(&path).unwrap();
+    #[cfg(unix)]
+    {
+        // A dangling link: nothing is there to follow, and the check's writes would still
+        // land where it points.
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &path).unwrap();
+        let refusal = check_silk_folder(&path).expect_err("a dangling link");
+        assert!(refusal.to_string().contains("exists already"), "{refusal}");
+    }
 }
 
 #[test]

@@ -124,19 +124,42 @@ holds them for each board's run.
 
 `converge_check`, an ignored test beside `place_bench`, runs family C on every board that names
 `converge`, with no routing call (the design's measurement step 1). It takes the same
-environment and guards as `place_bench`, starts no KiCad and no router, and writes only
-`<board folder>/converge-check.json` (refused when the file exists): phase 1's counts, the outer
-trace, and per C run its recipe (start family, seed, parameter-set index, level), outcome,
-cost, both stop reasons, stages, sweeps, evaluations, the start and end terms, and seconds.
-`KONNECT_CONVERGE_PORT_CHECK=1` adds the port's check: 5 runs at level 0, seeds 1 to 5, both
-new terms off, from F seed 24 with rail weight 0, and their median cost. Counts and numbers
-only. It repeats phase 1 itself and reads no AI board, so an F or S candidate whose board
-equals A's is a start here and a `duplicate` in the bench: its pool can then differ from the
-bench's.
+environment and guards as `place_bench`, starts no router, starts no KiCad unless
+`KONNECT_CONVERGE_SILK=1` is set (below), and writes only `<board folder>/converge-check.json`
+(refused when the file exists): phase 1's counts, the outer trace, and per C run its recipe
+(start family, seed, parameter-set index, level), outcome, cost, both stop reasons, stages,
+sweeps, evaluations, the start and end terms, and seconds. `KONNECT_CONVERGE_PORT_CHECK=1` adds
+the port's check: 5 runs at level 0, seeds 1 to 5, both new terms off, from F seed 24 with rail
+weight 0, and their median cost. Counts and numbers only. It repeats phase 1 itself and reads
+no AI board, so an F or S candidate whose board equals A's is a start here and a `duplicate` in
+the bench: its pool can then differ from the bench's. Its run ids start after phase 1's records
+with no O or A record before them, so they are not the bench's ids: match runs by their recipe.
+
+`KONNECT_CONVERGE_SILK=1` adds design A3's two measures, with no routing call, by the bench's
+own code, and **starts kicad-cli** (a refill and DRC per board, one at a time, with the scratch
+`KICAD_CONFIG_HOME`; a real `kicad-cli` is needed, so `KONNECT_KICAD_CLI` must not name a
+stand-in). It runs the bench's input check on the input board (`PlaceRouteCall::unrouted`, that
+is `place_route::unrouted_check`), writes each C run's board as the bench writes a candidate
+before its routing call (`export_candidate`), runs the same check on that copy, and adds:
+
+- once per board, `input_silk`: the input's `silk_overlap`, `silk_over_copper`,
+  `silk_edge_clearance` and their `sum` (the bench's `input_unrouted`), and `input_silk_reason`;
+- per C run, `silk` (the same four numbers of the run's board; `sum` is the table's `silk`
+  column) and `silk_reason`, and `schematic_neighbours` (as `search.json` records it: `mean_mm`,
+  `ratio_to_input`, `parts_pulled_away`, `parts_measured`, `parts_unmatched`, `parts_alone`) and
+  `schematic_neighbours_reason`.
+
+A reason is `null` beside a value, and beside a `null` one fixed phrase (`no board`, `the export
+failed`, `the unrouted check failed`, `the input's schematic gives no neighbourhoods`, `the board
+could not be measured`); a failure's own text goes to the log only. The scratch boards stay in
+`<board folder>/converge-check-silk/` (`isolation/`, `input-check/`, `candidates/c<id>/`, the
+bench's layout) for inspection, and a run is refused while that folder exists. Without the
+variable the file is what it was before the variable existed.
 
 ```text
 KONNECT_PLACE_BENCH=<bench folder> KONNECT_FASTROUTE=<any executable fastroute> \
 KICAD_CONFIG_HOME=<bench folder>/scratch/kicad-config \
 KONNECT_STATE_DIR=<bench folder>/scratch/state [KONNECT_CONVERGE_PORT_CHECK=1] \
+[KONNECT_CONVERGE_SILK=1] \
 cargo test -p konnect-core --release --lib place_bench_tests::converge_check -- --exact --ignored --nocapture
 ```

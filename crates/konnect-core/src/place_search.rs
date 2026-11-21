@@ -155,8 +155,9 @@ impl Record {
 
     /// Files the schematic-neighbour measure of this record's board text, when it has one:
     /// the measure, or the reason it could not be taken (no schematic, a board that does
-    /// not parse). Reported only.
-    fn file_schematic(&mut self, baseline: &Result<SchematicBaseline, String>) {
+    /// not parse). Reported only. `pub(crate)` for the bench's `converge_check`, which
+    /// measures family C's runs the same way.
+    pub(crate) fn file_schematic(&mut self, baseline: &Result<SchematicBaseline, String>) {
         let Some(text) = &self.board_text else {
             return;
         };
@@ -1173,6 +1174,15 @@ fn reference_record(
     record
 }
 
+/// The silk entries of an unrouted check: its counts of the `SILK` kinds, summed (the
+/// table's `silk` column and the rank key's silk field). Shared with the bench's
+/// `converge_check`, so the two cannot count differently.
+pub(crate) fn silk_entries(counts: &BTreeMap<String, usize>) -> usize {
+    SILK.iter()
+        .map(|kind| counts.get(*kind).copied().unwrap_or(0))
+        .sum()
+}
+
 /// The judge's view of one called record, filed on the record: the placement gates
 /// from the call's own unrouted baseline, the silk count, and the route result.
 fn file_judgement(
@@ -1189,11 +1199,7 @@ fn file_judgement(
         _ => None,
     };
     let placement = placement_gates(&screened, unrouted, input_unrouted);
-    let silk = unrouted.map(|counts| {
-        SILK.iter()
-            .map(|kind| counts.get(*kind).copied().unwrap_or(0))
-            .sum()
-    });
+    let silk = unrouted.map(silk_entries);
     record.placement_gates = Some(placement.clone());
     record.unrouted = unrouted.cloned();
     if let RouteResult::Routed { gates, .. } = &route {
