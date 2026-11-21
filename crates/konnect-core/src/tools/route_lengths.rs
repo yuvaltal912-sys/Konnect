@@ -489,14 +489,37 @@ impl LengthPlan {
         }
         let names = rule_names(&self.groups);
         for (group, name) in self.groups.iter().zip(&names) {
+            // Row LT, L25: a skew group that holds a pair with its own skew rule is
+            // suggested as a length window pinned to the winner's longest net.
+            let pinned = matches!(group.window, Window::Skew { .. })
+                && group_needs_pinned_rule(group, &self.pairs);
+            let longest = winner
+                .and_then(|measures| {
+                    measures
+                        .groups
+                        .iter()
+                        .find(|m| m.interface == group.interface && m.name == group.name)
+                })
+                .and_then(|m| m.longest_mm);
+            let (rule, note) = match (pinned, longest) {
+                (true, Some(longest)) => (
+                    kicad_group_rule_pinned(group, name, longest),
+                    format!(
+                        " The group holds a pair with its own skew rule, and KiCad checks one skew rule for a net, so this rule is a length window pinned to the routed lengths (the longest net is {} mm): the pair rule keeps checking the pair, and this one the group. It also fails when every net later grows by the same amount, which the judge's skew check would allow.",
+                        mm_text(longest)
+                    ),
+                ),
+                (true, None) => (
+                    kicad_rule_suggestion(group, name),
+                    " The group holds a pair with its own skew rule, and KiCad checks one skew rule for a net: on the nets of that pair KiCad will check only the pair rules, not this one. Route to a winner to get a rule pinned to its lengths.".to_string(),
+                ),
+                (false, _) => (kicad_rule_suggestion(group, name), String::new()),
+            };
             steps.push(format!(
                 "To keep KiCad checking group '{}' of interface '{}' after hand edits, call create_custom_drc_rule with name \"{}\" \
                  and rule {} once apply_specctra_ses has run (dry_run first, then apply with the plan revision it returns). \
-                 The rule is checked by KiCad's own DRC and stays in the board when it is exported again.",
-                group.name,
-                group.interface,
-                name,
-                kicad_rule_suggestion(group, name)
+                 The rule is checked by KiCad's own DRC and stays in the board when it is exported again.{note}",
+                group.name, group.interface, name, rule
             ));
         }
         for pair in &self.pairs {
@@ -1081,6 +1104,40 @@ pub(crate) fn kicad_rule_suggestion(group: &ResolvedGroup, name: &str) -> String
     format!(
         "(rule {} {constraint} (condition \"{}\"))",
         custom_rules::quote(name),
+        net_condition(group.nets.iter().map(|net| net.dsn.as_str()))
+    )
+}
+
+/// Row LT, L25: whether `group` holds a pair of `pairs` (both of its DSN nets are in
+/// the group; every gated pair has a `max_skew_mm`), so that its suggested KiCad rule
+/// must not be a `skew` rule: KiCad checks one rule of each constraint type for an
+/// item, so a `skew` rule on the group and the pair's own `skew` rule on the same nets
+/// would hide one of them.
+pub(crate) fn group_needs_pinned_rule(group: &ResolvedGroup, pairs: &[GatedPair]) -> bool {
+    pairs.iter().any(|pair| {
+        group.nets.iter().any(|net| net.dsn == pair.dsn_positive)
+            && group.nets.iter().any(|net| net.dsn == pair.dsn_negative)
+    })
+}
+
+/// Row LT, L25: the group's KiCad rule as a `length` window pinned to the winner's
+/// longest measured net (`longest_mm`, L): skew mode `(constraint length (min
+/// <L − T − 0.0001>mm) (max <L + 0.0001>mm))`, which KiCad checks beside the pair's own
+/// `skew` rule; target mode is already a `length` rule and stays
+/// [`kicad_rule_suggestion`]. Named `name`, with the same net condition.
+pub(crate) fn kicad_group_rule_pinned(
+    group: &ResolvedGroup,
+    name: &str,
+    longest_mm: f64,
+) -> String {
+    let Window::Skew { tolerance_mm } = group.window else {
+        return kicad_rule_suggestion(group, name);
+    };
+    format!(
+        "(rule {} (constraint length (min {}mm) (max {}mm)) (condition \"{}\"))",
+        custom_rules::quote(name),
+        mm_text(longest_mm - tolerance_mm - RULE_SLACK_MM),
+        mm_text(longest_mm + RULE_SLACK_MM),
         net_condition(group.nets.iter().map(|net| net.dsn.as_str()))
     )
 }

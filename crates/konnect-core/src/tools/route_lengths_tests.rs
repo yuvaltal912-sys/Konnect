@@ -1877,6 +1877,7 @@ fn measures(miss_mm: f64, unmeasured: &[&str]) -> LengthMeasures {
         groups: Vec::new(),
         pairs: Vec::new(),
         unmeasured: strings(unmeasured),
+        paths: Default::default(),
         miss_mm,
         probe_s: 0.1,
     }
@@ -2573,4 +2574,143 @@ fn freerouting_is_told_when_the_intent_declares_lengths() {
     let (_dir, board) = fixture_folder(Some("{ \"length_groups\""), None);
     assert!(freerouting_note(&board).is_none());
     assert!(freerouting_note(Path::new("route-lengths-no-such-board.kicad_pcb")).is_none());
+}
+
+// ─── The rule of a group that holds a pair (L25) ────────────────────────────
+
+/// What a winner measured for `plan`'s group `index`: its longest net.
+fn longest_of(plan: &LengthPlan, index: usize, longest_mm: f64) -> LengthMeasures {
+    LengthMeasures {
+        groups: vec![GroupLengths {
+            interface: plan.groups[index].interface.clone(),
+            name: plan.groups[index].name.clone(),
+            longest_mm: Some(longest_mm),
+            nets: Vec::new(),
+        }],
+        ..measures(0.0, &[])
+    }
+}
+
+#[test]
+fn a_group_needs_a_pinned_rule_only_when_it_holds_both_nets_of_a_gated_pair() {
+    let plan = two_group_plan();
+    let pair = gated("DQS_P", "DQS_N", 0.05, Some("dq_low"));
+    assert!(group_needs_pinned_rule(
+        &plan.groups[0],
+        std::slice::from_ref(&pair)
+    ));
+    // Not the group that holds none of its nets, nor a call with no gated pair.
+    assert!(!group_needs_pinned_rule(
+        &plan.groups[1],
+        std::slice::from_ref(&pair)
+    ));
+    assert!(!group_needs_pinned_rule(&plan.groups[0], &[]));
+    // One net of the pair in the group is not the pair.
+    let half = GatedPair {
+        dsn_negative: "/ELSEWHERE".to_string(),
+        ..pair.clone()
+    };
+    assert!(!group_needs_pinned_rule(&plan.groups[0], &[half]));
+    let other_half = GatedPair {
+        dsn_positive: "/ELSEWHERE".to_string(),
+        ..pair
+    };
+    assert!(!group_needs_pinned_rule(&plan.groups[0], &[other_half]));
+}
+
+#[test]
+fn a_pinned_skew_rule_is_a_length_window_below_the_winners_longest_net() {
+    let plan = two_group_plan();
+    let names = rule_names(&plan.groups);
+    let rule = kicad_group_rule_pinned(&plan.groups[0], &names[0], 42.0);
+    // min L - T - 0.0001, max L + 0.0001; the group's nets as its condition.
+    assert_eq!(
+        rule,
+        "(rule \"1kopper_len_ram_dq_low\" (constraint length (min 41.4999mm) (max 42.0001mm)) (condition \"A.NetName == '/DQ0' || A.NetName == '/DQ1' || A.NetName == '/DQS_P' || A.NetName == '/DQS_N'\"))"
+    );
+    let listed = kicad_length_rules(&format!("(version 1)\n{rule}\n")).unwrap();
+    assert_eq!(
+        listed[0].constraints,
+        vec!["(constraint length (min 41.4999mm) (max 42.0001mm))"]
+    );
+    // The longest net moves the window.
+    assert!(kicad_group_rule_pinned(&plan.groups[0], &names[0], 40.25)
+        .contains("(min 39.7499mm) (max 40.2501mm)"));
+    // A target group already is a length rule, and stays its own.
+    assert_eq!(
+        kicad_group_rule_pinned(&plan.groups[1], &names[1], 99.0),
+        kicad_rule_suggestion(&plan.groups[1], &names[1])
+    );
+}
+
+#[test]
+fn the_next_step_of_a_skew_group_with_a_pair_is_the_pinned_length_rule_beside_the_pair_rule() {
+    let mut plan = two_group_plan();
+    plan.pairs = vec![gated("DQS_P", "DQS_N", 0.05, Some("dq_low"))];
+    let names = rule_names(&plan.groups);
+    let steps = plan.next_steps(Some(&longest_of(&plan, 0, 42.0)), 0);
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert!(
+        steps[0].contains(&kicad_group_rule_pinned(&plan.groups[0], &names[0], 42.0)),
+        "{}",
+        steps[0]
+    );
+    assert!(!steps[0].contains("constraint skew"), "{}", steps[0]);
+    assert!(
+        steps[0].contains("pinned to the routed lengths"),
+        "{}",
+        steps[0]
+    );
+    assert!(steps[0].contains("42 mm"), "{}", steps[0]);
+    // The pair keeps its skew rule, and the group without a pair its own rule.
+    assert!(steps[2].contains(&kicad_pair_rule_suggestion(&plan.pairs[0])));
+    assert!(steps[1].contains(&suggested(&plan, 1)));
+    assert!(!steps[1].contains("pinned"), "{}", steps[1]);
+}
+
+#[test]
+fn without_a_winner_the_skew_rule_stays_with_a_note_that_kicad_checks_only_the_pair_rules() {
+    let mut plan = two_group_plan();
+    plan.pairs = vec![gated("DQS_P", "DQS_N", 0.05, Some("dq_low"))];
+    // No winner, or a winner that measured no longest net for the group.
+    for winner in [None, Some(measures(0.0, &[]))] {
+        let steps = plan.next_steps(winner.as_ref(), 0);
+        assert!(steps[0].contains(&suggested(&plan, 0)), "{}", steps[0]);
+        assert!(steps[0].contains("constraint skew"), "{}", steps[0]);
+        assert!(
+            steps[0].contains("check only the pair rules"),
+            "{}",
+            steps[0]
+        );
+        assert!(
+            !steps[0].contains("pinned to the routed lengths"),
+            "{}",
+            steps[0]
+        );
+    }
+}
+
+#[test]
+fn a_group_without_a_declared_pair_skew_or_in_target_mode_keeps_its_own_rule() {
+    // No gated pair: today's skew rule, no note, whatever the winner measured.
+    let plan = two_group_plan();
+    let measured = longest_of(&plan, 0, 42.0);
+    let steps = plan.next_steps(Some(&measured), 0);
+    assert!(steps[0].contains(&suggested(&plan, 0)));
+    assert!(steps[0].contains("constraint skew"));
+    assert!(
+        !steps[0].contains("pinned") && !steps[0].contains("pair rules"),
+        "{}",
+        steps[0]
+    );
+    // A target group that holds a pair is a length rule already: unchanged, no note.
+    let mut plan = two_group_plan();
+    plan.pairs = vec![gated("A0", "A1", 0.05, Some("addr"))];
+    let steps = plan.next_steps(Some(&longest_of(&plan, 1, 42.0)), 0);
+    assert!(steps[1].contains(&suggested(&plan, 1)));
+    assert!(
+        !steps[1].contains("pinned") && !steps[1].contains("pair rules"),
+        "{}",
+        steps[1]
+    );
 }
