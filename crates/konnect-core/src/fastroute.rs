@@ -952,6 +952,15 @@ impl TuneVariant {
     }
 }
 
+/// Every Tune pass folder a run can hold (L26): `tune`, `tune-r2`, `tune-r3`,
+/// `tune-pour-safe`, `tune-pour-safe-r2`, `tune-pour-safe-r3`.
+pub(crate) fn tune_folder_names() -> Vec<String> {
+    [TuneVariant::Free, TuneVariant::PourSafe]
+        .into_iter()
+        .flat_map(|variant| (1..=TUNE_ROUNDS_MAX).map(move |round| variant.folder_name(round)))
+        .collect()
+}
+
 /// What the Tune pass needs beyond a routing pass.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TuneInputs<'a> {
@@ -1527,9 +1536,6 @@ fn net_contacts(paths: &[SessionPath], um_per_unit: f64) -> Vec<SelfContact> {
 /// for an overlap; a junction (one piece's end on the other, not collinear) is no
 /// contact. Only nets with a contact are in the map. A session that does not parse
 /// is an error.
-// stage 5b: L22's `length_probe::path_faults` calls this on the judged session; until
-// then only the tests do.
-#[allow(dead_code)]
 pub(crate) fn self_contacts(
     ses_text: &str,
     nets: &BTreeSet<String>,
@@ -1903,10 +1909,11 @@ pub(crate) async fn tune_attempt(
 /// adds every pass's time. When a candidate exists `held.untuned` is the session
 /// the routing passes kept.
 ///
-/// Stage 5b has not wired the judge's choice among the candidates (L23) yet. Until
-/// then the `Free` candidate's session flows on exactly as the one kept Tune pass
-/// did: `held.ses` becomes its session, `held.kept` is [`TUNE_PASS`] and
-/// `held.unrouted` its count. A `PourSafe` candidate is recorded and never used.
+/// `held.ses`, `held.kept` and `held.unrouted` stay the routing passes' (the untuned
+/// board) whatever the candidates are: the judge judges the untuned session and each
+/// candidate and chooses (L23), and `route_judge::TuneChoice::apply` then rewrites
+/// them from the choice. A run that is not judged is never a candidate, so nothing
+/// tuned reaches the output without the judge's choice.
 #[allow(clippy::too_many_arguments)] // the parts of one pass, each read once
 pub(crate) async fn tune_held(
     binary: &Binary,
@@ -1985,12 +1992,6 @@ pub(crate) async fn tune_held(
     }
     if !outcome.candidates.is_empty() {
         held.untuned = Some(untuned);
-    }
-    if let Some(candidate) = free {
-        // stage 5b: the judge's choice replaces this (L23).
-        held.ses = candidate.ses;
-        held.kept = TUNE_PASS;
-        held.unrouted = candidate.unrouted;
     }
     held.tune = outcome;
     Ok(held)

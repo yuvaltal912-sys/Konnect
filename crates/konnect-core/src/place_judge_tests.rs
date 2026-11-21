@@ -868,6 +868,7 @@ fn routed_with_lengths(
         groups: vec![],
         pairs: vec![],
         unmeasured: vec![],
+        paths: Default::default(),
         miss_mm,
         probe_s: 0.0,
     });

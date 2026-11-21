@@ -1037,6 +1037,12 @@ impl<'a> Sched<'a> {
         match result {
             Ok(judged) => {
                 record.outcome = "judged";
+                // Row LT, L23: the run's board is the one the judge chose among its
+                // Tune candidates, so the session the call writes and the pass it
+                // reports are that board's.
+                if let (Some(choice), Some(routed)) = (&judged.tune, record.routed.as_mut()) {
+                    choice.apply(&mut routed.held);
+                }
                 record.judged = Some(judged);
                 self.first_judged_at.get_or_insert(at);
                 // A judge that works on some runs is not a deterministic failure.

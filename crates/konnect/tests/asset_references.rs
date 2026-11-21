@@ -1047,6 +1047,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "kicad_violations",
         "pairs_tuned_net_by_net",
         "length_matching_note",
+        "untuned_nets",
+        "tune_candidates",
     ];
 
     let mut phantom = Vec::new();

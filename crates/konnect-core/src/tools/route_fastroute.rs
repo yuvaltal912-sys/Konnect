@@ -44,13 +44,48 @@ pub(crate) const FREEROUTING_ONLY: &[&str] = &[
 pub(crate) const FASTROUTE_ONLY: &[&str] = &["effort", "fastroute_path"];
 
 /// What a run folder holds that this code made, and so may remove when it reduces
-/// the folder to its record: the variant DSN and the four passes' folders
-/// (`fastroute::route_held`). Anything else a run folder holds is left alone.
-///
-/// stage 5b: L26 adds the other Tune pass folders (`tune-r2`, `tune-r3`,
-/// `tune-pour-safe`, ...) and the judge's `run-<i>-untuned` and `run-<i>-pour-safe`
-/// folders here and in [`release_run`]; until then they are left alone.
-const RUN_ENTRIES: &[&str] = &["variant.dsn", "full", "fallback", "polish", "tune"];
+/// the folder to its record: the variant DSN and the three routing passes' folders
+/// (`fastroute::route_held`), and the Tune pass folders
+/// ([`fastroute::tune_folder_names`], which [`reduce_run_folders`] treats on their own:
+/// L26 keeps the log and the session of a discarded or failed pass). Anything else a
+/// run folder holds is left alone.
+const RUN_ENTRIES: &[&str] = &["variant.dsn", "full", "fallback", "polish"];
+
+/// The files of a discarded or failed Tune pass that [`reduce_run_folders`] keeps
+/// (L26): its log and its session. A session and a log are small.
+const KEPT_TUNE_FILES: [&str; 2] = ["fastroute.log", "tune.ses"];
+
+/// The Tune pass folders of a run's record whose pass was `discarded` or `failed`
+/// (the rows of `held.tune.rows`: `variant`, `round`, `outcome`).
+fn tune_folders_to_keep(record: &RunRecord) -> Vec<String> {
+    let Some(routed) = &record.routed else {
+        return Vec::new();
+    };
+    routed
+        .held
+        .tune
+        .rows
+        .iter()
+        .filter(|row| matches!(row["outcome"].as_str(), Some("discarded" | "failed")))
+        .filter_map(|row| {
+            let variant =
+                serde_json::from_value::<fastroute::TuneVariant>(row["variant"].clone()).ok()?;
+            let round = usize::try_from(row["round"].as_u64()?).ok()?;
+            Some(variant.folder_name(round))
+        })
+        .collect()
+}
+
+/// The run index of a judge folder name this code made: `run-<i>`,
+/// `run-<i>-untuned` or `run-<i>-pour-safe` (L23).
+fn judge_folder_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("run-")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let suffix = &rest[digits.len()..];
+    matches!(suffix, "" | "-untuned" | "-pour-safe")
+        .then(|| digits.parse().ok())
+        .flatten()
+}
 
 /// A refusal of one argument, worded as the other refusals of this tool are.
 fn refusal(field: &str, reason: String) -> CallToolResult {
@@ -1114,22 +1149,36 @@ impl Runner for FastrouteRunner {
     }
 }
 
-/// What [`FastrouteRunner::release`] does: removes `<judge root>/run-<i>` and, in
-/// each pass folder of run `i` (the Tune pass's included), `home`, `tmp`, `profile.sb` and `fastroute.log`.
+/// What [`FastrouteRunner::release`] does: removes the judge folders of run `i`
+/// (`<judge root>/run-<i>`, `run-<i>-untuned` and `run-<i>-pour-safe`) and, in each
+/// pass folder of run `i`, `home`, `tmp`, `profile.sb` and `fastroute.log`, except the
+/// `fastroute.log` of a Tune pass folder (L26: the log of a discarded or failed Tune
+/// pass is kept for the record, and [`reduce_run_folders`] removes the rest).
 /// A failure is logged, never raised; no link is followed (`remove_tree`).
 fn release_run(folder: &Path, judge_root: &Path, index: usize, shape: Shape, seed: u64) {
     let run = folder.join(run_folder_name(index, shape, seed));
-    let mut paths = vec![judge_root.join(format!("run-{index}"))];
+    let mut paths: Vec<PathBuf> = ["", "-untuned", "-pour-safe"]
+        .iter()
+        .map(|suffix| judge_root.join(format!("run-{index}{suffix}")))
+        .collect();
     // A run or pass folder that is not a real folder (a link, a file) is not
     // ours: `remove_tree` checks only the last part of a path, so a link here
     // would be followed.
     if is_real_folder(&run) {
-        for pass in ["full", "fallback", "polish", fastroute::TUNE_PASS] {
+        let tune = fastroute::tune_folder_names();
+        let passes = ["full", "fallback", "polish"]
+            .iter()
+            .map(|name| (name.to_string(), true))
+            .chain(tune.into_iter().map(|name| (name, false)));
+        for (pass, log_goes) in passes {
             let pass = run.join(pass);
             if !is_real_folder(&pass) {
                 continue;
             }
             for name in ["home", "tmp", "profile.sb", "fastroute.log"] {
+                if name == "fastroute.log" && !log_goes {
+                    continue;
+                }
                 paths.push(pass.join(name));
             }
         }
@@ -1174,10 +1223,31 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Removes everything in the folder `path` but the entries named in `keep` (a link is
+/// left where it is, as in [`remove_tree`]).
+fn remove_all_but(path: &Path, keep: &[&str]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| keep.contains(&name))
+        {
+            continue;
+        }
+        remove_tree(&entry.path())?;
+    }
+    Ok(())
+}
+
 /// After a search: every run folder but the winner's is reduced to its
 /// `run.json` (its `RunRecord` and, when judged, its measures, gates and
-/// rounds), and `<folder>/judge/run-<i>` of every run but the winner's is removed. The
-/// winner's run folder and judged board stay whole. Only paths inside `folder` are
+/// rounds; with a Tune pass, its rows and the files it kept), and the judge folders of
+/// every run but the winner's (`<folder>/judge/run-<i>`, `run-<i>-untuned`,
+/// `run-<i>-pour-safe`) are removed. The run folder keeps, for each Tune pass that was
+/// discarded or failed, its `fastroute.log` and its session (L26; the pass folders of
+/// the Tune passes it kept go whole). The winner's run folder and judged board stay
+/// whole. Only paths inside `folder` are
 /// touched; a path that is a symbolic link is left alone.
 pub(crate) fn reduce_run_folders(
     folder: &Path,
@@ -1204,10 +1274,27 @@ pub(crate) fn reduce_run_folders(
             "key": key,
             "board_kept": is_winner,
         });
+        // The winner keeps every folder whole.
+        let keep_tune = if is_winner {
+            Vec::new()
+        } else {
+            tune_folders_to_keep(record)
+        };
         if let Some(routed) = &record.routed {
             body["kept_pass"] = json!(routed.held.kept);
             body["passes"] = json!(routed.held.passes);
             body["planes"] = json!(routed.planes);
+            if !routed.held.tune.rows.is_empty() {
+                // Row LT, L26: every Tune pass, and the files kept of those discarded
+                // or failed.
+                body["tune"] = json!({
+                    "rows": routed.held.tune.rows,
+                    "kept_files": keep_tune
+                        .iter()
+                        .flat_map(|name| KEPT_TUNE_FILES.iter().map(move |file| format!("{name}/{file}")))
+                        .collect::<Vec<_>>(),
+                });
+            }
         }
         if let Some(judged) = &record.judged {
             body["judged"] = json!(judged);
@@ -1230,17 +1317,26 @@ pub(crate) fn reduce_run_folders(
                 problems.push(format!("remove {}: {error}", path.display()));
             }
         }
+        // The Tune pass folders (L26): a discarded or failed pass keeps its log and
+        // its session; every other pass folder goes whole.
+        for name in fastroute::tune_folder_names() {
+            let path = run.join(&name);
+            let result = if keep_tune.contains(&name) && is_real_folder(&path) {
+                remove_all_but(&path, &KEPT_TUNE_FILES)
+            } else {
+                remove_tree(&path)
+            };
+            if let Err(error) = result {
+                problems.push(format!("remove {}: {error}", path.display()));
+            }
+        }
     }
     // The judge's scratch boards of the other runs.
     let judge = folder.join("judge");
     if judge.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
         if let Ok(entries) = std::fs::read_dir(&judge) {
             for entry in entries.flatten() {
-                let index = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_prefix("run-"))
-                    .and_then(|number| number.parse::<usize>().ok());
+                let index = entry.file_name().to_str().and_then(judge_folder_index);
                 if index.is_some_and(|index| others.contains(&index)) {
                     if let Err(error) = remove_tree(&entry.path()) {
                         problems.push(format!("remove {}: {error}", entry.path().display()));
@@ -1485,6 +1581,42 @@ const SHARED_COMPLETE_WHEN_END: &str =
     "fastroute's count, and this result's status, do not show that.";
 const JUDGED_COMPLETE_WHEN_END: &str = "fastroute's count does not show that. The judge's check on a copy of the board does: `status` follows it when every judge gate passed and the judge added no stitching via (`completion.judged`).";
 
+/// Row LT, L15: `length_matching`'s `untuned_nets` and `tune_candidates` for the
+/// winner; `None` when the run had no Tune pass.
+/// - `untuned_nets`: each net the chosen candidate's passes dropped from the tune file
+///   (`net`, `reason`: L21); empty when no candidate was chosen, because the board is
+///   then the untuned one and `tune_candidates` says why.
+/// - `tune_candidates`: one row per candidate the judge saw (`route_judge::TuneChoice`
+///   rows: `variant`, `passes`, `dropped`, `judged`, `g4_failed`, `rejected`, `chosen`).
+fn tuning_fields(routed: &Routed, judged: &Judged) -> Option<(Value, Value)> {
+    if routed.held.tune.rows.is_empty() {
+        return None;
+    }
+    let chosen = judged.tune.as_ref().and_then(|choice| choice.chosen);
+    let untuned: Vec<Value> = chosen
+        .and_then(|variant| {
+            routed
+                .held
+                .tune
+                .candidates
+                .iter()
+                .find(|candidate| candidate.variant == variant)
+        })
+        .map(|candidate| {
+            candidate
+                .dropped
+                .iter()
+                .map(|(net, reason)| json!({ "net": net, "reason": reason }))
+                .collect()
+        })
+        .unwrap_or_default();
+    let candidates = judged
+        .tune
+        .as_ref()
+        .map_or_else(Vec::new, |choice| choice.rows.clone());
+    Some((json!(untuned), json!(candidates)))
+}
+
 /// The success result. Today's fields, for the winner: `success: true`, `status` and
 /// `completion` from `integration::completion_report(dsn, ses_output, the winner's
 /// planes, the winner's unrouted, width)`, with `completion.judged` = { unconnected,
@@ -1643,9 +1775,8 @@ pub(crate) fn result_json(
     }
     // Row LT: what was asked of the lengths, what the winner measured, and the KiCad
     // rules that keep checking it (L15, L16).
-    // stage 5b: `held.passes` holds the Free attempt's last row; L15's
-    // `tune_candidates` and `untuned_nets` come from `held.tune`, and L23 makes the
-    // row the chosen candidate's.
+    // `held.passes` holds the chosen candidate's last Tune row (L23 rewrote it); L15's
+    // `tune_candidates` and `untuned_nets` come from the judge's choice.
     let tune_row = routed
         .held
         .passes
@@ -1655,6 +1786,15 @@ pub(crate) fn result_json(
     for (key, value) in lengths.fields(winner_lengths, Some(&judged.measures.violations), tune_row)
     {
         result[key] = value;
+    }
+    if let (Some(body), Some((untuned, candidates))) = (
+        result
+            .get_mut("length_matching")
+            .and_then(Value::as_object_mut),
+        tuning_fields(routed, judged),
+    ) {
+        body.insert("untuned_nets".into(), untuned);
+        body.insert("tune_candidates".into(), candidates);
     }
     let length_steps = lengths.next_steps(
         winner_lengths,

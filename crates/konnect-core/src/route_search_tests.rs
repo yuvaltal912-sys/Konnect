@@ -782,6 +782,7 @@ fn judged(acute: f64, g1_failed: bool) -> Judged {
         },
         board: PathBuf::from("/nonexistent/judged.kicad_pcb"),
         rounds: Vec::new(),
+        tune: None,
     }
 }
 
@@ -803,6 +804,30 @@ fn routed(index: usize, shape: Shape, seed: u64) -> Routed {
         planes: Vec::new(),
         folder: PathBuf::from("run"),
     }
+}
+
+/// A routed run with Row LT's Tune candidates: the untuned session `variant.ses` kept
+/// in `held.ses`, a `Free` and a `PourSafe` candidate beside it.
+fn tuned(routed: &mut Routed) {
+    use crate::fastroute::{TuneCandidate, TuneVariant};
+    routed.held.untuned = Some(routed.held.ses.clone());
+    for (at, variant) in [TuneVariant::Free, TuneVariant::PourSafe]
+        .into_iter()
+        .enumerate()
+    {
+        routed.held.tune.candidates.push(TuneCandidate {
+            variant,
+            ses: PathBuf::from(format!("{}.ses", variant.folder_name(1))),
+            unrouted: at,
+            dropped: Vec::new(),
+            passes: 1,
+        });
+        routed.held.tune.rows.push(json!({
+            "name": "tune", "outcome": "kept", "unrouted": at, "seconds": 1.0,
+            "variant": variant, "round": 1
+        }));
+    }
+    routed.held.passes.push(routed.held.tune.rows[0].clone());
 }
 
 /// How many jobs of one kind ran at once.
@@ -841,6 +866,8 @@ struct Shared {
     deadlines: Mutex<Vec<(usize, Instant)>>,
     judge_starts: Mutex<Vec<(usize, Instant)>>,
     released: Mutex<Vec<usize>>,
+    /// Row LT: every run is routed with two Tune candidates.
+    tuned: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -866,6 +893,7 @@ fn fake_with_baseline(
         deadlines: Mutex::new(Vec::new()),
         judge_starts: Mutex::new(Vec::new()),
         released: Mutex::new(Vec::new()),
+        tuned: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -929,7 +957,13 @@ impl Runner for Fake {
             tokio::select! {
                 _ = tokio::time::sleep(secs(seconds)) => match failure {
                     Some(message) => Err(RouteFailure::Failed(message.to_string())),
-                    None => Ok(routed(index, shape, seed)),
+                    None => {
+                        let mut routed = routed(index, shape, seed);
+                        if shared.tuned.load(Ordering::SeqCst) {
+                            tuned(&mut routed);
+                        }
+                        Ok(routed)
+                    }
                 },
                 _ = tokio::time::sleep_until(deadline) => Err(RouteFailure::Killed),
             }
@@ -1713,4 +1747,45 @@ async fn failures_after_a_success_do_not_stop_launching() {
         Some("order exhausted")
     );
     assert_eq!(outcome.winner, Some(0));
+}
+
+// Row LT, L23: the scheduler rewrites a judged run's `held` from the judge's choice, so
+// the session the call writes and the pass it reports are the judged board's.
+#[tokio::test(start_paused = true)]
+async fn a_judged_runs_held_session_follows_the_judges_choice_among_its_tune_candidates() {
+    use crate::fastroute::TuneVariant;
+    use crate::route_judge::TuneChoice;
+    for (chosen, ses, kept, unrouted) in [
+        (Some(TuneVariant::PourSafe), "tune-pour-safe.ses", "tune", 1),
+        (Some(TuneVariant::Free), "tune.ses", "tune", 0),
+        // None: the untuned session, as routing left it.
+        (None, "variant.ses", "full", 0),
+    ] {
+        let fake = fake(
+            |_| (10, None),
+            move |_| {
+                let mut run = judged(1.0, false);
+                run.tune = Some(TuneChoice {
+                    chosen,
+                    rows: Vec::new(),
+                    untuned: run.measures.clone(),
+                });
+                (10, Ok(run))
+            },
+        );
+        fake.0.tuned.store(true, Ordering::SeqCst);
+        let outcome = run(&plan(1, 1, None, 1), &fake).await;
+        assert_eq!(outcomes(&outcome), vec!["judged"]);
+        let held = &outcome.runs[0].routed.as_ref().unwrap().held;
+        assert_eq!(held.ses, PathBuf::from(ses), "{chosen:?}");
+        assert_eq!((held.kept, held.unrouted), (kept, unrouted), "{chosen:?}");
+    }
+    // Control: a run with no Tune candidates keeps its session.
+    let fake = fake(|_| (10, None), |_| good(10));
+    let outcome = run(&plan(1, 1, None, 1), &fake).await;
+    let held = &outcome.runs[0].routed.as_ref().unwrap().held;
+    assert_eq!(
+        (held.ses.clone(), held.kept),
+        (PathBuf::from("variant.ses"), "full")
+    );
 }

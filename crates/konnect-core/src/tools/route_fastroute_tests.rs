@@ -832,6 +832,7 @@ fn judged(board: PathBuf) -> Judged {
         },
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
+        tune: None,
     }
 }
 
@@ -2093,6 +2094,7 @@ fn length_measures(short_by: f64) -> crate::length_probe::LengthMeasures {
         }],
         pairs: Vec::new(),
         unmeasured: Vec::new(),
+        paths: Default::default(),
         miss_mm: short_by,
         probe_s: 0.2,
     }
@@ -2861,4 +2863,410 @@ fn a_winner_released_during_the_search_has_no_judged_board_and_says_why() {
         .contains("session"));
     assert!(result["artifacts"]["judged_board"].is_null());
     assert!(result["search"]["winner"]["judged_board"].is_null());
+}
+
+// ─── Row LT, L26: the Tune files a reduced run keeps ─────────────────────────
+
+/// A Tune pass row as `tune_attempt` writes it.
+fn tune_row_of(variant: &str, round: u64, outcome: &str) -> Value {
+    json!({
+        "name": "tune", "outcome": outcome, "unrouted": 0, "seconds": 3.0,
+        "variant": variant, "round": round
+    })
+}
+
+/// Writes the files a Tune pass folder holds into `run/<folder>`.
+fn write_tune_folder(run: &Path, folder: &str) {
+    for file in [
+        "fastroute.log",
+        "tune.ses",
+        "tune.ses.args",
+        "tune.json",
+        "tune.txt",
+        "profile.sb",
+        "home/x",
+        "tmp/y",
+    ] {
+        let path = run.join(folder).join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "z").unwrap();
+    }
+}
+
+fn names_in(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A search whose runs 0 (the winner) and 1 each made four Tune pass folders; the
+/// rows say which passes were discarded, failed or kept.
+fn search_with_tune_folders() -> Search {
+    let mut search = finished_search();
+    let rows = vec![
+        tune_row_of("free", 1, "discarded"),
+        tune_row_of("free", 2, "kept"),
+        tune_row_of("pour_safe", 1, "failed"),
+        tune_row_of("pour_safe", 2, "discarded"),
+    ];
+    for index in [0, 1] {
+        let record = &mut search.outcome.runs[index];
+        let run = search
+            .folder
+            .join(run_folder_name(record.index, record.shape, record.seed));
+        for folder in ["tune", "tune-r2", "tune-pour-safe", "tune-pour-safe-r2"] {
+            write_tune_folder(&run, folder);
+        }
+        record.routed.as_mut().unwrap().held.tune.rows = rows.clone();
+    }
+    search
+}
+
+#[test]
+fn a_reduced_run_keeps_the_log_and_session_of_each_discarded_or_failed_tune_pass() {
+    let search = search_with_tune_folders();
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let loser = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    // The three discarded or failed passes keep exactly their log and session; the
+    // kept pass's folder goes whole, like every other pass folder.
+    for folder in ["tune", "tune-pour-safe", "tune-pour-safe-r2"] {
+        assert_eq!(
+            names_in(&loser.join(folder)),
+            vec!["fastroute.log".to_string(), "tune.ses".to_string()],
+            "{folder}"
+        );
+    }
+    assert!(!loser.join("tune-r2").exists());
+    assert_eq!(
+        names_in(&loser),
+        ["run.json", "tune", "tune-pour-safe", "tune-pour-safe-r2"]
+    );
+    // The run's record names them, and has every pass row.
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(loser.join("run.json")).unwrap()).unwrap();
+    let kept: Vec<&str> = record["tune"]["kept_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            "tune/fastroute.log",
+            "tune/tune.ses",
+            "tune-pour-safe/fastroute.log",
+            "tune-pour-safe/tune.ses",
+            "tune-pour-safe-r2/fastroute.log",
+            "tune-pour-safe-r2/tune.ses",
+        ]
+    );
+    assert_eq!(record["tune"]["rows"].as_array().unwrap().len(), 4);
+    // The winner keeps every folder whole, and its record names nothing as kept.
+    let winner = search.folder.join(run_folder_name(0, Shape::AsExported, 1));
+    assert!(winner.join("tune-r2/tune.ses.args").is_file());
+    assert!(winner.join("tune/home/x").is_file());
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(winner.join("run.json")).unwrap()).unwrap();
+    assert_eq!(record["tune"]["kept_files"], json!([]));
+}
+
+#[test]
+fn a_kept_or_absent_tune_pass_leaves_todays_reduced_folder() {
+    // Every Tune pass was kept: the loser's folders go whole, so only the record stays.
+    let mut search = search_with_tune_folders();
+    for index in [0, 1] {
+        search.outcome.runs[index]
+            .routed
+            .as_mut()
+            .unwrap()
+            .held
+            .tune
+            .rows = vec![
+            tune_row_of("free", 1, "kept"),
+            tune_row_of("free", 2, "kept"),
+        ];
+    }
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let loser = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    assert_eq!(names_in(&loser), ["run.json"]);
+    // A run with no Tune rows at all (no groups, or none ran) is the same.
+    let mut search = search_with_tune_folders();
+    for index in [0, 1] {
+        search.outcome.runs[index]
+            .routed
+            .as_mut()
+            .unwrap()
+            .held
+            .tune
+            .rows
+            .clear();
+    }
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let loser = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    assert_eq!(names_in(&loser), ["run.json"]);
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(loser.join("run.json")).unwrap()).unwrap();
+    assert!(record.get("tune").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_a_kept_tune_folder_is_never_followed() {
+    let search = search_with_tune_folders();
+    let outside = search.root.join("outside");
+    std::fs::create_dir_all(outside.join("inner")).unwrap();
+    std::fs::write(outside.join("inner/precious.txt"), "keep").unwrap();
+    let loser = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    std::os::unix::fs::symlink(&outside, loser.join("tune/link")).unwrap();
+    // A Tune pass folder that is itself a link.
+    std::fs::remove_dir_all(loser.join("tune-pour-safe")).unwrap();
+    std::os::unix::fs::symlink(&outside, loser.join("tune-pour-safe")).unwrap();
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    assert!(outside.join("inner/precious.txt").is_file());
+    assert!(!outside.join("run.json").exists());
+}
+
+#[test]
+fn the_judge_folders_of_every_run_but_the_winners_are_removed() {
+    let search = finished_search();
+    for index in [0, 1, 2] {
+        for suffix in ["", "-untuned", "-pour-safe"] {
+            let board = search
+                .folder
+                .join(format!("judge/run-{index}{suffix}/r0/board.kicad_pcb"));
+            std::fs::create_dir_all(board.parent().unwrap()).unwrap();
+            std::fs::write(board, "(kicad_pcb)").unwrap();
+        }
+    }
+    // Folders this search never made are left alone, whatever they are called.
+    for stranger in [
+        "run-1-other",
+        "run-1x",
+        "run--untuned",
+        "run-1-untuned-copy",
+    ] {
+        let path = search.folder.join("judge").join(stranger);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep"), "x").unwrap();
+    }
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let judge = search.folder.join("judge");
+    // The winner's three folders stay (the judged board may be any of them).
+    for suffix in ["", "-untuned", "-pour-safe"] {
+        assert!(
+            judge
+                .join(format!("run-0{suffix}/r0/board.kicad_pcb"))
+                .is_file(),
+            "run-0{suffix}"
+        );
+    }
+    for index in [1, 2] {
+        for suffix in ["", "-untuned", "-pour-safe"] {
+            assert!(
+                !judge.join(format!("run-{index}{suffix}")).exists(),
+                "run-{index}{suffix}"
+            );
+        }
+    }
+    for stranger in [
+        "run-1-other",
+        "run-1x",
+        "run--untuned",
+        "run-1-untuned-copy",
+    ] {
+        assert!(judge.join(stranger).join("keep").is_file(), "{stranger}");
+    }
+}
+
+#[test]
+fn a_release_removes_every_judge_folder_of_the_run_and_keeps_the_tune_logs() {
+    let search = search_with_tune_folders();
+    for suffix in ["", "-untuned", "-pour-safe"] {
+        for index in [0, 1] {
+            let board = search
+                .folder
+                .join(format!("judge/run-{index}{suffix}/r0/board.kicad_pcb"));
+            std::fs::create_dir_all(board.parent().unwrap()).unwrap();
+            std::fs::write(board, "(kicad_pcb)").unwrap();
+        }
+    }
+    let judge = search.folder.join("judge");
+    release_run(&search.folder, &judge, 1, Shape::Omitted, 1);
+    for suffix in ["", "-untuned", "-pour-safe"] {
+        assert!(!judge.join(format!("run-1{suffix}")).exists(), "{suffix}");
+        assert!(judge.join(format!("run-0{suffix}")).is_dir(), "{suffix}");
+    }
+    let loser = search.folder.join(run_folder_name(1, Shape::Omitted, 1));
+    // In every Tune pass folder the sandbox and the profile go; the log stays for
+    // `reduce_run_folders`, which keeps it for a discarded or failed pass (L26).
+    for folder in ["tune", "tune-r2", "tune-pour-safe", "tune-pour-safe-r2"] {
+        let folder = loser.join(folder);
+        for gone in ["home", "tmp", "profile.sb"] {
+            assert!(!folder.join(gone).exists(), "{gone}");
+        }
+        for kept in ["fastroute.log", "tune.ses", "tune.ses.args", "tune.json"] {
+            assert!(folder.join(kept).is_file(), "{kept}");
+        }
+    }
+    // The routing passes' logs go, as before.
+    assert!(!loser.join("full/fastroute.log").exists());
+    // The other run is untouched.
+    let winner = search.folder.join(run_folder_name(0, Shape::AsExported, 1));
+    assert!(winner.join("tune/home/x").is_file());
+}
+
+// ─── Row LT, L15 and L23: the result of a run whose Tune candidates were judged ──
+
+/// A winner (run 0) with its Tune candidates and the judge's choice among them.
+fn tuned_search(chosen: Option<crate::fastroute::TuneVariant>) -> Search {
+    use crate::fastroute::{TuneCandidate, TuneVariant};
+    let mut search = checked_search(0.0);
+    let record = &mut search.outcome.runs[0];
+    let routed = record.routed.as_mut().unwrap();
+    // `checked_search` pushed a kept Tune row; the candidates replace it.
+    routed.held.passes.retain(|row| row["name"] != "tune");
+    routed.held.passes.push(tune_row_of("free", 1, "kept"));
+    routed.held.untuned = Some(routed.held.ses.clone());
+    for (at, variant) in [TuneVariant::Free, TuneVariant::PourSafe]
+        .into_iter()
+        .enumerate()
+    {
+        routed.held.tune.candidates.push(TuneCandidate {
+            variant,
+            ses: routed
+                .folder
+                .join(format!("{}/tune.ses", variant.folder_name(1))),
+            unrouted: at,
+            dropped: vec![(
+                format!("/N{at}"),
+                "its copper touches itself: 1 crossing".to_string(),
+            )],
+            passes: 2,
+        });
+        routed.held.tune.rows.push(tune_row_of(
+            if at == 0 { "free" } else { "pour_safe" },
+            1,
+            "kept",
+        ));
+    }
+    let judged = record.judged.as_mut().unwrap();
+    let rows = vec![
+        json!({ "variant": "free", "judged": true, "rejected": [], "chosen": chosen == Some(TuneVariant::Free) }),
+        json!({ "variant": "pour_safe", "judged": true, "rejected": [], "chosen": chosen == Some(TuneVariant::PourSafe) }),
+    ];
+    let choice = route_judge::TuneChoice {
+        chosen,
+        rows,
+        untuned: judged.measures.clone(),
+    };
+    choice.apply(&mut routed.held);
+    judged.tune = Some(choice);
+    search
+}
+
+#[test]
+fn length_matching_names_the_chosen_candidates_dropped_nets_and_every_candidate() {
+    use crate::fastroute::TuneVariant;
+    let search = tuned_search(Some(TuneVariant::PourSafe));
+    let result = result_with(&search, &length_plan());
+    let matching = &result["length_matching"];
+    // The pour-safe candidate's own dropped net, with its reason.
+    assert_eq!(
+        matching["untuned_nets"],
+        json!([{ "net": "/N1", "reason": "its copper touches itself: 1 crossing" }])
+    );
+    let candidates = matching["tune_candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[1]["variant"], "pour_safe");
+    assert_eq!(candidates[1]["chosen"], true);
+    assert_eq!(candidates[0]["chosen"], false);
+    // The Tune row is the chosen candidate's; the pass the result reports is `tune`.
+    assert_eq!(matching["tune_pass"]["variant"], "pour_safe");
+    assert_eq!(result["result_pass"], "tune");
+    assert_eq!(result["search"]["winner"]["kept"], "tune");
+    // The free candidate chosen names its own nets.
+    let result = result_with(&tuned_search(Some(TuneVariant::Free)), &length_plan());
+    assert_eq!(result["length_matching"]["untuned_nets"][0]["net"], "/N0");
+    assert_eq!(result["length_matching"]["tune_pass"]["variant"], "free");
+}
+
+#[test]
+fn a_run_that_kept_its_untuned_board_lists_no_untuned_nets_and_says_why_in_the_candidates() {
+    let search = tuned_search(None);
+    let result = result_with(&search, &length_plan());
+    let matching = &result["length_matching"];
+    assert_eq!(matching["untuned_nets"], json!([]));
+    assert_eq!(matching["tune_candidates"].as_array().unwrap().len(), 2);
+    assert!(matching["tune_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["chosen"] == false));
+    // The pass the run reports is the routing's, and the Tune row says it was rejected.
+    assert_eq!(result["result_pass"], "full");
+    assert_eq!(matching["tune_pass"]["outcome"], "discarded");
+    // Control: a call with no Tune pass reports neither field.
+    let result = result_with(&checked_search(0.0), &length_plan());
+    assert!(result["length_matching"].get("untuned_nets").is_none());
+    assert!(result["length_matching"].get("tune_candidates").is_none());
+}
+
+#[test]
+fn the_session_the_call_writes_is_the_chosen_boards() {
+    use crate::fastroute::TuneVariant;
+    let kicad = route_judge::PrivateConfig {
+        home: PathBuf::from("/x/kicad-config"),
+        skipped_links: Vec::new(),
+    };
+    for (chosen, expected) in [
+        (Some(TuneVariant::PourSafe), "(session pour-safe)"),
+        (Some(TuneVariant::Free), "(session free)"),
+        (None, "(session untuned)"),
+    ] {
+        let search = tuned_search(chosen);
+        // The untuned session and each candidate's hold their own text.
+        let routed = search.outcome.runs[0].routed.as_ref().unwrap();
+        for (path, text) in [
+            (routed.held.untuned.clone().unwrap(), "(session untuned)"),
+            (routed.held.tune.candidates[0].ses.clone(), "(session free)"),
+            (
+                routed.held.tune.candidates[1].ses.clone(),
+                "(session pour-safe)",
+            ),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let dsn = search.root.join("board.dsn");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let call = Call {
+            dsn,
+            ses_output: search.root.join("out.ses"),
+            folder: search.folder.clone(),
+            effort: (Effort::M, EffortSource::Default),
+            fallback: WidthFallback::Floor,
+        };
+        let result = conclude(
+            &json!({}),
+            &call,
+            &candidate(),
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+            &kicad,
+            &PairsPlan::default(),
+            &length_plan(),
+        )
+        .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&call.ses_output).unwrap(),
+            expected,
+            "{chosen:?}"
+        );
+    }
 }

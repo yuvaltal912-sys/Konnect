@@ -595,6 +595,7 @@ fn a_skew_group_is_checked_against_its_longest_net() {
         &checks,
         &lengths_of(&[("a", 42.0), ("b", 41.5), ("c", 41.4)]),
         vec![],
+        BTreeMap::new(),
         0.3,
     );
     let g = &measures.groups[0];
@@ -621,7 +622,18 @@ fn the_bound_passes_within_half_a_printed_digit_and_one_step_past_it_fails() {
         )],
         vec![],
     );
-    let miss = |mm: f64| miss_of(&check(&checks, &lengths_of(&[("a", mm)]), vec![], 0.0), "a");
+    let miss = |mm: f64| {
+        miss_of(
+            &check(
+                &checks,
+                &lengths_of(&[("a", mm)]),
+                vec![],
+                BTreeMap::new(),
+                0.0,
+            ),
+            "a",
+        )
+    };
     // Window 41.5 to 42.5. KiCad prints four decimals: a length printed on the bound
     // passes, and so does one that float noise puts a hair past it.
     for on_bound in [42.5, 42.500_04, 41.5, 41.499_96] {
@@ -659,6 +671,7 @@ fn the_half_printed_digit_is_inside_and_a_hair_past_it_is_outside() {
             &checks,
             &lengths_of(&[("a", a), ("p", positive), ("n", 0.0)]),
             vec![],
+            BTreeMap::new(),
             0.0,
         )
     };
@@ -706,6 +719,7 @@ fn a_target_group_checks_every_net_against_the_same_window() {
         &checks,
         &lengths_of(&[("a", 42.1), ("b", 41.2), ("c", 42.6)]),
         vec![],
+        BTreeMap::new(),
         0.0,
     );
     assert_eq!(miss_of(&measures, "a"), 0.0);
@@ -729,6 +743,7 @@ fn a_pair_is_checked_for_its_skew() {
             &checks_of(vec![], vec![pair(max)]),
             &lengths_of(&[("p", p), ("n", n)]),
             vec![],
+            BTreeMap::new(),
             0.0,
         )
     };
@@ -746,6 +761,7 @@ fn a_pair_is_checked_for_its_skew() {
         &checks_of(vec![], vec![pair(0.1)]),
         &lengths_of(&[("p", 10.0)]),
         vec![],
+        BTreeMap::new(),
         0.0,
     );
     assert_eq!(missing.pairs[0].skew_mm, None);
@@ -775,6 +791,7 @@ fn group_and_pair_misses_are_summed_and_unmeasured_nets_are_listed() {
         &checks,
         &lengths_of(&[("a", 11.5), ("b", 8.75)]),
         vec![],
+        BTreeMap::new(),
         0.0,
     );
     assert_eq!(measures.unmeasured, names(&["c"]));
@@ -788,6 +805,7 @@ fn group_and_pair_misses_are_summed_and_unmeasured_nets_are_listed() {
         &checks,
         &lengths_of(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]),
         names(&["c", "z"]),
+        BTreeMap::new(),
         0.0,
     );
     assert_eq!(measures.unmeasured, names(&["c", "z"]));
@@ -799,7 +817,13 @@ fn a_skew_group_with_no_measured_net_has_nothing_to_miss() {
         vec![group("dq", &["a", "b"], Window::Skew { tolerance_mm: 0.5 })],
         vec![],
     );
-    let measures = check(&checks, &BTreeMap::new(), names(&["a", "b"]), 0.0);
+    let measures = check(
+        &checks,
+        &BTreeMap::new(),
+        names(&["a", "b"]),
+        BTreeMap::new(),
+        0.0,
+    );
     assert_eq!(measures.groups[0].longest_mm, None);
     assert_eq!(measures.miss_mm, 0.0);
     assert_eq!(measures.unmeasured, names(&["a", "b"]));
@@ -821,7 +845,7 @@ fn the_check_of_the_real_probe_reads_its_numbers() {
             max_skew_mm: 1.9,
         }],
     );
-    let measures = check(&checks, &lengths, unmeasured, 0.2);
+    let measures = check(&checks, &lengths, unmeasured, BTreeMap::new(), 0.2);
     assert_eq!(measures.groups[0].longest_mm, Some(54.2499));
     assert_eq!(
         measures.groups[0]
@@ -874,6 +898,7 @@ fn measures_with(groups: Vec<GroupLengths>, pairs: Vec<PairSkew>, miss: f64) -> 
         groups,
         pairs,
         unmeasured: vec![],
+        paths: Default::default(),
         miss_mm: miss,
         probe_s: 0.0,
     }
@@ -911,6 +936,7 @@ fn g4_names_each_failure_in_a_readable_line() {
             miss_mm: 0.10,
         }],
         unmeasured: vec!["/DQ9".into()],
+        paths: Default::default(),
         miss_mm: 1.3,
         probe_s: 0.0,
     };
@@ -1078,7 +1104,13 @@ fn g4_lines_follow_a_real_check_and_flip_with_a_hundredth_of_a_millimetre() {
     );
     let lines = |mm: f64| {
         g4_lines(
-            Some(&check(&checks, &lengths_of(&[("a", mm)]), vec![], 0.0)),
+            Some(&check(
+                &checks,
+                &lengths_of(&[("a", mm)]),
+                vec![],
+                BTreeMap::new(),
+                0.0,
+            )),
             &BTreeMap::new(),
         )
     };
@@ -1388,4 +1420,360 @@ async fn the_probe_reads_a_real_kicad_cli() {
         assert_eq!(lengths.get(net), Some(&0.0), "{net}: pads and no track");
     }
     assert_eq!(unmeasured, names(&["NOSUCHNET"]));
+}
+
+// ---- Row LT, L22: G4(d), a checked net's judged copper is a clean path
+
+const A_DQ10_TUNED: &str = include_str!("../tests/fixtures/length_tuning/a_dq10_tuned.ses");
+const A_DQ8_CROSSING: &str = include_str!("../tests/fixtures/length_tuning/a_dq8_crossing.ses");
+const A_CLEAN: &str = include_str!("../tests/fixtures/length_tuning/a_clean_dq2_dq16.ses");
+const B_C_N_TUNED: &str = include_str!("../tests/fixtures/length_tuning/b_c_n_tuned.ses");
+const B_FB_TUNED: &str = include_str!("../tests/fixtures/length_tuning/b_fb_tuned.ses");
+const B_C_N: &str = "/CM5/DPHY0_P.C_N";
+
+/// The self contacts of `nets` in a session text.
+fn contacts_in(ses: &str, nets: &[&str]) -> BTreeMap<String, Vec<crate::fastroute::SelfContact>> {
+    crate::fastroute::self_contacts(ses, &nets.iter().map(|net| net.to_string()).collect()).unwrap()
+}
+
+/// One target group over `nets`, which are then the checked nets.
+fn checked(nets: &[&str]) -> LengthChecks {
+    checks_of(
+        vec![group(
+            "dq",
+            nets,
+            Window::Target {
+                target_mm: 40.0,
+                tolerance_mm: 0.5,
+            },
+        )],
+        vec![],
+    )
+}
+
+fn no_contacts() -> BTreeMap<String, Vec<crate::fastroute::SelfContact>> {
+    BTreeMap::new()
+}
+
+fn no_drc() -> DrcReport {
+    report_of(vec![])
+}
+
+#[test]
+fn a_checked_net_that_crosses_or_overlaps_itself_has_a_fault_counting_both_kinds() {
+    use crate::fastroute::ContactKind;
+    // A-tuned's /DQ10 overlaps itself and /DQ8 crosses itself; /DQ10 also touches.
+    let found = contacts_in(A_DQ10_TUNED, &["/DQ10"]);
+    let kinds = |kind: ContactKind| found["/DQ10"].iter().filter(|c| c.kind == kind).count();
+    assert!(kinds(ContactKind::Overlap) > 0);
+    let gated = kinds(ContactKind::Overlap) + kinds(ContactKind::Crossing);
+    let faults = path_faults(&checked(&["/DQ10"]), &found, &no_drc());
+    assert_eq!(
+        faults["/DQ10"],
+        PathFault {
+            contacts: gated,
+            dangling: 0
+        }
+    );
+    let crossing = contacts_in(A_DQ8_CROSSING, &["/DQ8"]);
+    assert!(crossing["/DQ8"]
+        .iter()
+        .any(|c| c.kind == ContactKind::Crossing));
+    let faults = path_faults(&checked(&["/DQ8"]), &crossing, &no_drc());
+    assert!(faults["/DQ8"].contacts > 0);
+    assert_eq!(faults["/DQ8"].dangling, 0);
+}
+
+#[test]
+fn a_dangling_or_unconnected_entry_that_names_a_checked_net_is_a_fault() {
+    let checks = checked(&["/DQ2", "/DQ16", "/DQ20"]);
+    let drc = DrcReport {
+        violations: vec![
+            violation(
+                "track_dangling",
+                "Track has unconnected end",
+                &["Track [/DQ2] on F.Cu, length 3 mm"],
+            ),
+            // The same net twice in one entry is one entry.
+            violation(
+                "track_dangling",
+                "Track has unconnected end",
+                &["Track [/DQ2] on F.Cu", "Via [/DQ2] on F.Cu - B.Cu"],
+            ),
+        ],
+        unconnected_items: Some(vec![violation(
+            "unconnected_items",
+            "Missing connection between items",
+            &["Pad 1 [/DQ16] of U1 on F.Cu", "Track [/DQ16] on In1.Cu"],
+        )]),
+        ..report_of(vec![])
+    };
+    let faults = path_faults(&checks, &no_contacts(), &drc);
+    assert_eq!(faults.len(), 2, "{faults:?}");
+    assert_eq!(
+        faults["/DQ2"],
+        PathFault {
+            contacts: 0,
+            dangling: 2
+        }
+    );
+    assert_eq!(
+        faults["/DQ16"],
+        PathFault {
+            contacts: 0,
+            dangling: 1
+        }
+    );
+    // Both causes at once are counted apart.
+    let found = contacts_in(A_DQ8_CROSSING, &["/DQ8"]);
+    let both = path_faults(
+        &checked(&["/DQ8"]),
+        &found,
+        &report_of(vec![violation(
+            "track_dangling",
+            "Track has unconnected end",
+            &["Track [/DQ8] on F.Cu"],
+        )]),
+    );
+    assert!(both["/DQ8"].contacts > 0 && both["/DQ8"].dangling == 1);
+}
+
+#[test]
+fn what_is_not_a_fault_of_a_checked_net_gives_none() {
+    let dangling = |net: &str| {
+        let item = format!("Track [{net}] on F.Cu");
+        violation(
+            "track_dangling",
+            "Track has unconnected end",
+            &[item.as_str()],
+        )
+    };
+    // An unchecked net with every fault, in both sources: no line, no fault.
+    let found = contacts_in(A_DQ8_CROSSING, &["/DQ8"]);
+    let drc = report_of(vec![dangling("/DQ8"), dangling("/DQ99")]);
+    assert!(path_faults(&checked(&["/DQ2"]), &found, &drc).is_empty());
+    // The net's name is matched whole, in brackets: /DQ1 is not /DQ10.
+    let drc = report_of(vec![dangling("/DQ10"), dangling("/DQ1 x")]);
+    assert!(path_faults(&checked(&["/DQ1"]), &no_contacts(), &drc).is_empty());
+    // Another rule that names the net is not a dangling entry.
+    let drc = report_of(vec![violation(
+        "clearance",
+        "Clearance violation",
+        &["Track [/DQ2] on F.Cu"],
+    )]);
+    assert!(path_faults(&checked(&["/DQ2"]), &no_contacts(), &drc).is_empty());
+    // A report with no unconnected category adds nothing.
+    let none = DrcReport {
+        unconnected_items: None,
+        ..report_of(vec![])
+    };
+    assert!(path_faults(&checked(&["/DQ2"]), &no_contacts(), &none).is_empty());
+    // A net of a pair only is checked too.
+    let pair = checks_of(
+        vec![],
+        vec![CheckedPair {
+            positive: "/DQ2".into(),
+            negative: "/DQ16".into(),
+            max_skew_mm: 0.1,
+        }],
+    );
+    let drc = report_of(vec![dangling("/DQ16")]);
+    assert_eq!(path_faults(&pair, &no_contacts(), &drc).len(), 1);
+}
+
+#[test]
+fn touches_and_the_routers_clean_copper_are_not_faults() {
+    // M1's C_N holds two touches (the router's own jogs) and a bridge piece in four
+    // copies; /PCIe-M2/FB holds a copied bridge: one piece each, and the clean nets
+    // of A have no contact at all. None of them is a fault.
+    let found = contacts_in(B_C_N_TUNED, &[B_C_N]);
+    assert_eq!(found[B_C_N].len(), 2, "its two touches");
+    assert!(path_faults(&checked(&[B_C_N]), &found, &no_drc()).is_empty());
+    let found = contacts_in(B_FB_TUNED, &["/PCIe-M2/FB"]);
+    assert!(found.is_empty(), "the copied bridge is one piece");
+    assert!(path_faults(&checked(&["/PCIe-M2/FB"]), &found, &no_drc()).is_empty());
+    let found = contacts_in(A_CLEAN, &["/DQ2", "/DQ16"]);
+    assert!(path_faults(&checked(&["/DQ2", "/DQ16"]), &found, &no_drc()).is_empty());
+}
+
+#[test]
+fn the_fault_lines_name_the_net_the_cause_and_the_count() {
+    assert!(contact_lines(&BTreeMap::new()).is_empty());
+    let faults = BTreeMap::from([
+        (
+            "/DQ10".to_string(),
+            PathFault {
+                contacts: 194,
+                dangling: 0,
+            },
+        ),
+        (
+            "/DQ2".to_string(),
+            PathFault {
+                contacts: 1,
+                dangling: 3,
+            },
+        ),
+    ]);
+    let tail = "so KiCad's length counts copper the signal does not travel";
+    assert_eq!(
+        contact_lines(&faults),
+        vec![
+            format!("/DQ10's copper crosses or overlaps itself 194 time(s), {tail}"),
+            format!("/DQ2's copper crosses or overlaps itself 1 time(s), {tail}"),
+            format!("/DQ2 has 3 dangling or unconnected item(s), {tail}"),
+        ]
+    );
+}
+
+#[test]
+fn a_faulted_net_misses_by_its_windows_lower_bound_whatever_its_length() {
+    let checks = checked(&["a", "b"]);
+    let lengths = lengths_of(&[("a", 40.0), ("b", 40.0)]);
+    let fault = PathFault {
+        contacts: 2,
+        dangling: 0,
+    };
+    let faults = BTreeMap::from([("a".to_string(), fault.clone())]);
+    let measures = check(&checks, &lengths, vec![], faults.clone(), 0.0);
+    // Inside its window by KiCad's length, and still missing by the lower bound.
+    assert!((miss_of(&measures, "a") - 39.5).abs() < 1e-9);
+    assert_eq!(miss_of(&measures, "b"), 0.0);
+    assert!((measures.miss_mm - 39.5).abs() < 1e-9);
+    assert_eq!(measures.paths, faults);
+    // Control: no fault, no miss.
+    let clean = check(&checks, &lengths, vec![], BTreeMap::new(), 0.0);
+    assert_eq!(clean.miss_mm, 0.0);
+    assert!(clean.paths.is_empty());
+    // A skew group's lower bound is the longest net less the tolerance.
+    let skew = checks_of(
+        vec![group("s", &["a", "b"], Window::Skew { tolerance_mm: 0.5 })],
+        vec![],
+    );
+    let measures = check(
+        &skew,
+        &lengths_of(&[("a", 42.0), ("b", 42.0)]),
+        vec![],
+        faults.clone(),
+        0.0,
+    );
+    assert!((miss_of(&measures, "a") - 41.5).abs() < 1e-9);
+    // A net in no group has no window: its fault adds no miss (G4(d) still fails it).
+    let pair = checks_of(
+        vec![],
+        vec![CheckedPair {
+            positive: "a".into(),
+            negative: "b".into(),
+            max_skew_mm: 0.1,
+        }],
+    );
+    let measures = check(
+        &pair,
+        &lengths_of(&[("a", 40.0), ("b", 40.0)]),
+        vec![],
+        faults,
+        0.0,
+    );
+    assert_eq!(measures.miss_mm, 0.0);
+}
+
+#[test]
+fn faulted_runs_with_different_windows_still_rank_apart() {
+    let fault = BTreeMap::from([(
+        "a".to_string(),
+        PathFault {
+            contacts: 1,
+            dangling: 0,
+        },
+    )]);
+    let in_window = |target_mm: f64| {
+        let checks = checks_of(
+            vec![group(
+                "t",
+                &["a"],
+                Window::Target {
+                    target_mm,
+                    tolerance_mm: 0.5,
+                },
+            )],
+            vec![],
+        );
+        check(
+            &checks,
+            &lengths_of(&[("a", target_mm)]),
+            vec![],
+            fault.clone(),
+            0.0,
+        )
+    };
+    let (long, short) = (in_window(40.0), in_window(30.0));
+    let key = |measures: &LengthMeasures| key_part(true, Some(measures), &BTreeMap::new());
+    // A finite miss, not the unmeasured largest key: the run with the nearer window
+    // ranks first.
+    assert_eq!(key(&long)[1], 3950);
+    assert_eq!(key(&short)[1], 2950);
+    assert!(key(&short) < key(&long));
+}
+
+#[test]
+fn a_faulted_nets_window_line_is_left_to_its_fault_line() {
+    let checks = checked(&["a", "b"]);
+    let faults = BTreeMap::from([(
+        "a".to_string(),
+        PathFault {
+            contacts: 1,
+            dangling: 0,
+        },
+    )]);
+    // `a` is inside its window and faulted; `b` is short.
+    let measures = check(
+        &checks,
+        &lengths_of(&[("a", 40.0), ("b", 38.0)]),
+        vec![],
+        faults,
+        0.0,
+    );
+    let lines = g4_lines(Some(&measures), &BTreeMap::new());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("b is 38.00 mm"), "{lines:?}");
+    // The fault itself is `contact_lines`', and G4 holds it (route_judge::gates).
+    assert_eq!(contact_lines(&measures.paths).len(), 1);
+}
+
+#[test]
+fn measures_with_faults_survive_a_round_trip_and_an_older_record_reads() {
+    let faults = BTreeMap::from([(
+        "a".to_string(),
+        PathFault {
+            contacts: 2,
+            dangling: 1,
+        },
+    )]);
+    let measures = check(
+        &checked(&["a"]),
+        &lengths_of(&[("a", 40.0)]),
+        vec![],
+        faults,
+        0.0,
+    );
+    let text = serde_json::to_string(&measures).unwrap();
+    assert_eq!(
+        serde_json::from_str::<LengthMeasures>(&text).unwrap(),
+        measures
+    );
+    // A record written before G4(d) has no `paths`; a clean run writes none.
+    let clean = check(
+        &checked(&["a"]),
+        &lengths_of(&[("a", 40.0)]),
+        vec![],
+        BTreeMap::new(),
+        0.0,
+    );
+    let mut value = serde_json::to_value(&clean).unwrap();
+    assert!(value.get("paths").is_none());
+    value.as_object_mut().unwrap().remove("paths");
+    assert_eq!(
+        serde_json::from_value::<LengthMeasures>(value).unwrap(),
+        clean
+    );
 }

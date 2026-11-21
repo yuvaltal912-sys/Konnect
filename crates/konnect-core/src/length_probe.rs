@@ -122,6 +122,16 @@ pub(crate) struct PairSkew {
     pub miss_mm: f64,
 }
 
+/// Row LT, L22: why a checked net's judged copper is not a clean path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathFault {
+    /// Crossings and overlaps of its session copper (touches are not gated).
+    pub contacts: usize,
+    /// DRC entries of the judged board that name it: `track_dangling` and
+    /// `unconnected_items`.
+    pub dangling: usize,
+}
+
 /// What the length check found on one judged run (`Measures.lengths`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LengthMeasures {
@@ -129,6 +139,10 @@ pub(crate) struct LengthMeasures {
     pub pairs: Vec<PairSkew>,
     /// Checked nets the probe gave no entry for.
     pub unmeasured: Vec<String>,
+    /// Row LT, L22 (G4(d)): the checked nets whose judged copper is not a clean path,
+    /// by net. A net in it has its window's lower bound as its miss in `groups`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub paths: BTreeMap<String, PathFault>,
     /// The sum of every measured net's and pair's miss, mm.
     pub miss_mm: f64,
     /// The probe's own DRC time, seconds.
@@ -416,11 +430,16 @@ pub(crate) async fn probe_lengths(
 /// The measures of a run (L9): each group's nets against `Window::range_mm` (skew
 /// mode against the longest measured net), each pair's skew against its maximum, a
 /// net past a window's end by at most [`PRINTED_HALF_DIGIT_MM`] counted inside; the
-/// misses summed.
+/// misses summed. A net of `faults` (L22, [`path_faults`]) has its window's lower
+/// bound as its miss, as if no length were usable: a finite number, so that the rank
+/// still orders the runs (an unmeasured net would set every such run to the same
+/// largest key). A net in no group has no window, so its fault adds no miss (G4(d)
+/// still fails the run).
 pub(crate) fn check(
     checks: &LengthChecks,
     lengths: &BTreeMap<String, f64>,
     unmeasured: Vec<String>,
+    faults: BTreeMap<String, PathFault>,
     probe_s: f64,
 ) -> LengthMeasures {
     // How far `value` is outside `low..=high`, mm: 0 on a bound, within half a
@@ -450,7 +469,11 @@ pub(crate) fn check(
             .iter()
             .map(|net| {
                 let kicad_mm = lengths.get(net).copied();
-                let miss = kicad_mm.map_or(0.0, |mm| outside(mm, low_mm, high_mm));
+                let miss = if faults.contains_key(net) {
+                    low_mm.max(0.0)
+                } else {
+                    kicad_mm.map_or(0.0, |mm| outside(mm, low_mm, high_mm))
+                };
                 miss_mm += miss;
                 NetLength {
                     net: net.clone(),
@@ -501,9 +524,82 @@ pub(crate) fn check(
         groups,
         pairs,
         unmeasured,
+        paths: faults,
         miss_mm,
         probe_s,
     }
+}
+
+/// Row LT, L22: the faults of the checked nets (`checks.nets()`), from the judged
+/// session's self contacts (`fastroute::self_contacts`; `Touch` left out: the
+/// router's own jogs touch) and the judged board's DRC report: the entries of
+/// `track_dangling` and of `unconnected_items` that name the net as `[<net>]` in an
+/// item description. Nets without a fault are left out.
+pub(crate) fn path_faults(
+    checks: &LengthChecks,
+    contacts: &BTreeMap<String, Vec<crate::fastroute::SelfContact>>,
+    drc: &DrcReport,
+) -> BTreeMap<String, PathFault> {
+    use crate::fastroute::ContactKind;
+    let names = |violation: &crate::tools::cli::DrcViolation, tag: &str| {
+        violation
+            .items
+            .iter()
+            .any(|item| item.description.contains(tag))
+    };
+    let mut faults = BTreeMap::new();
+    for net in checks.nets() {
+        let tag = format!("[{net}]");
+        let crossing = contacts.get(&net).map_or(0, |found| {
+            found
+                .iter()
+                .filter(|contact| {
+                    matches!(contact.kind, ContactKind::Crossing | ContactKind::Overlap)
+                })
+                .count()
+        });
+        let dangling = drc
+            .violations
+            .iter()
+            .filter(|violation| violation.rule == "track_dangling")
+            .chain(drc.unconnected_items.iter().flatten())
+            .filter(|violation| names(violation, &tag))
+            .count();
+        if crossing > 0 || dangling > 0 {
+            faults.insert(
+                net,
+                PathFault {
+                    contacts: crossing,
+                    dangling,
+                },
+            );
+        }
+    }
+    faults
+}
+
+/// Row LT, L22: G4(d)'s lines, one for each cause of each net of `faults`: "<net>'s
+/// copper crosses or overlaps itself <n> time(s)" and "<net> has <n> dangling or
+/// unconnected item(s)", each ending "so KiCad's length counts copper the signal
+/// does not travel".
+pub(crate) fn contact_lines(faults: &BTreeMap<String, PathFault>) -> Vec<String> {
+    const WHY: &str = "so KiCad's length counts copper the signal does not travel";
+    let mut lines = Vec::new();
+    for (net, fault) in faults {
+        if fault.contacts > 0 {
+            lines.push(format!(
+                "{net}'s copper crosses or overlaps itself {} time(s), {WHY}",
+                fault.contacts
+            ));
+        }
+        if fault.dangling > 0 {
+            lines.push(format!(
+                "{net} has {} dangling or unconnected item(s), {WHY}",
+                fault.dangling
+            ));
+        }
+    }
+    lines
 }
 
 /// Whether G2 counts a KiCad rule key: every key but [`LENGTH_RULE_KEYS`].
@@ -532,7 +628,13 @@ pub(crate) fn g4_lines(
     let mut lines = Vec::new();
     if let Some(measures) = measures {
         for group in &measures.groups {
-            for net in group.nets.iter().filter(|net| net.miss_mm > 0.0) {
+            // A net with a path fault has its own lines (G4(d), `contact_lines`): its
+            // miss is its window's lower bound, not a distance from KiCad's length.
+            for net in group
+                .nets
+                .iter()
+                .filter(|net| net.miss_mm > 0.0 && !measures.paths.contains_key(&net.net))
+            {
                 let Some(mm) = net.kicad_mm else { continue };
                 // A miss that rounds to 0.00 is shown with the digits KiCad prints.
                 let digits = if net.miss_mm < 0.005 { 4 } else { 2 };

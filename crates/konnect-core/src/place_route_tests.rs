@@ -511,6 +511,7 @@ fn finished(gates: Gates) -> Finished {
         gates,
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
+        tune: None,
     };
     let dsn = root.join("candidate.dsn");
     let ses = root.join("route.ses");

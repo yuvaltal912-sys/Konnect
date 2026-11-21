@@ -533,6 +533,7 @@ fn length_measures(miss_mm: f64, unmeasured: &[&str]) -> crate::length_probe::Le
         }],
         pairs: vec![],
         unmeasured: unmeasured.iter().map(|net| net.to_string()).collect(),
+        paths: Default::default(),
         miss_mm,
         probe_s: 0.1,
     }
@@ -768,6 +769,7 @@ fn run(s: &Spec) -> Judged {
         },
         board: PathBuf::new(),
         rounds: vec![],
+        tune: None,
     }
 }
 
@@ -2084,6 +2086,214 @@ fn a_round_folder_that_is_a_link_is_not_followed_or_removed() {
     assert!(std::fs::symlink_metadata(root.join("run-0/r1")).is_ok());
 }
 
+// ------------------------------------------------ Row LT, L22 and L23: G4(d), tune_harm
+
+/// A judged run to compare, from the plain run, with its counts set.
+fn counted(unconnected: usize, violations: &[(&str, usize)], g3: usize, below: usize) -> Judged {
+    let mut judged = run(&spec());
+    judged.measures.unconnected = unconnected;
+    judged.measures.violations = rules(violations);
+    judged.measures.below_floor = below;
+    judged.gates.g3 = (0..g3).map(|n| format!("g3 line {n}")).collect();
+    judged
+}
+
+#[test]
+fn tune_harm_names_each_measure_that_tuning_made_worse_with_both_counts() {
+    let untuned = counted(21, &[("clearance", 2)], 1, 0);
+    // One measure worse at a time.
+    let worse = [
+        (
+            counted(25, &[("clearance", 2)], 1, 0),
+            "unconnected items 21 \u{2192} 25",
+        ),
+        (
+            counted(21, &[("clearance", 3)], 1, 0),
+            "clearance violations 2 \u{2192} 3",
+        ),
+        (
+            counted(21, &[("clearance", 2), ("shorting_items", 1)], 1, 0),
+            "shorting_items violations 0 \u{2192} 1",
+        ),
+        (
+            counted(21, &[("clearance", 2)], 2, 0),
+            "G3 lines 1 \u{2192} 2",
+        ),
+        (
+            counted(21, &[("clearance", 2)], 1, 4),
+            "tracks below their floor 0 \u{2192} 4",
+        ),
+    ];
+    for (tuned, line) in worse {
+        assert_eq!(
+            tune_harm(&untuned, &tuned),
+            vec![line.to_string()],
+            "{line}"
+        );
+    }
+    // Everything worse: one line each, in this order.
+    let all = counted(22, &[("clearance", 5), ("silk_overlap", 1)], 3, 2);
+    let lines = tune_harm(&untuned, &all);
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(lines[0].starts_with("unconnected items"));
+    assert!(lines[1].starts_with("clearance"));
+    assert!(lines[2].starts_with("silk_overlap"));
+    assert!(lines[3].starts_with("G3 lines"));
+    assert!(lines[4].starts_with("tracks below"));
+}
+
+#[test]
+fn tune_harm_gives_nothing_for_equal_or_better_measures() {
+    let untuned = counted(21, &[("clearance", 2), ("track_dangling", 3)], 2, 1);
+    // Equal.
+    assert!(tune_harm(
+        &untuned,
+        &counted(21, &[("clearance", 2), ("track_dangling", 3)], 2, 1)
+    )
+    .is_empty());
+    // Better in every measure, and a type that vanished.
+    assert!(tune_harm(&untuned, &counted(18, &[("clearance", 1)], 0, 0)).is_empty());
+    // A failing gate that stays failing is not harm: counts, not lines.
+    let mut worse_lines = counted(21, &[("clearance", 2), ("track_dangling", 3)], 2, 1);
+    worse_lines.gates.g1 = vec!["still open".to_string()];
+    worse_lines.gates.g3 = vec!["other text".to_string(), "more text".to_string()];
+    assert!(tune_harm(&untuned, &worse_lines).is_empty());
+}
+
+#[test]
+fn tune_harm_leaves_kicads_length_and_skew_violations_to_g4() {
+    let untuned = counted(0, &[], 0, 0);
+    let tuned = counted(
+        0,
+        &[("length_out_of_range", 9), ("skew_out_of_range", 1)],
+        0,
+        0,
+    );
+    assert!(tune_harm(&untuned, &tuned).is_empty());
+    // Control: any other new type is harm.
+    let tuned = counted(0, &[("length_out_of_range", 9), ("clearance", 1)], 0, 0);
+    assert_eq!(
+        tune_harm(&untuned, &tuned),
+        vec!["clearance violations 0 \u{2192} 1"]
+    );
+}
+
+#[test]
+fn g4_holds_the_contact_lines_of_a_faulted_net_and_a_clean_run_has_none() {
+    let mut m = measures();
+    let mut lengths = length_measures(0.0, &[]);
+    lengths.paths = BTreeMap::from([(
+        "/DQ0".to_string(),
+        crate::length_probe::PathFault {
+            contacts: 3,
+            dangling: 1,
+        },
+    )]);
+    m.lengths = Some(lengths);
+    let g = gates(&m, &base(&[]));
+    assert_eq!(g.g4.len(), 2, "{:?}", g.g4);
+    assert!(g.g4[0].starts_with("/DQ0's copper crosses or overlaps itself 3 time(s)"));
+    assert!(g.g4[1].starts_with("/DQ0 has 1 dangling or unconnected item(s)"));
+    assert!(g.g1.is_empty() && g.g2.is_empty() && g.g3.is_empty());
+    // Control: the same measures with no fault pass.
+    m.lengths = Some(length_measures(0.0, &[]));
+    assert!(gates(&m, &base(&[])).g4.is_empty());
+}
+
+fn held_with_candidates(variants: &[crate::fastroute::TuneVariant]) -> crate::fastroute::Held {
+    use crate::fastroute::{Held, TuneCandidate, TuneOutcome};
+    let row = |variant: crate::fastroute::TuneVariant, outcome: &str| json!({ "name": "tune", "outcome": outcome, "unrouted": 0, "seconds": 2.0, "variant": variant, "round": 1 });
+    Held {
+        ses: PathBuf::from("/run/full/full.ses"),
+        unrouted: 4,
+        kept: "polish",
+        passes: vec![
+            json!({ "name": "full", "outcome": "kept", "unrouted": 4, "seconds": 9.0 }),
+            row(crate::fastroute::TuneVariant::Free, "kept"),
+        ],
+        seconds: 20.0,
+        untuned: Some(PathBuf::from("/run/full/full.ses")),
+        tune: TuneOutcome {
+            candidates: variants
+                .iter()
+                .enumerate()
+                .map(|(at, variant)| TuneCandidate {
+                    variant: *variant,
+                    ses: PathBuf::from(format!("/run/{}/tune.ses", variant.folder_name(1))),
+                    unrouted: at,
+                    dropped: vec![],
+                    passes: 1,
+                })
+                .collect(),
+            rows: variants
+                .iter()
+                .map(|variant| row(*variant, "kept"))
+                .collect(),
+            seconds: 4.0,
+        },
+    }
+}
+
+#[test]
+fn a_chosen_candidate_rewrites_the_held_run_to_its_board() {
+    use crate::fastroute::TuneVariant::{Free, PourSafe};
+    let mut held = held_with_candidates(&[Free, PourSafe]);
+    let choice = TuneChoice {
+        chosen: Some(PourSafe),
+        rows: vec![],
+        untuned: measures(),
+    };
+    choice.apply(&mut held);
+    assert_eq!(held.ses, PathBuf::from("/run/tune-pour-safe/tune.ses"));
+    assert_eq!(held.kept, "tune");
+    assert_eq!(held.unrouted, 1, "the pour-safe candidate's own count");
+    // The run's Tune row is the chosen candidate's.
+    assert_eq!(held.passes.len(), 2);
+    assert_eq!(held.passes[1]["variant"], json!("pour_safe"));
+    // The untuned session stays on record.
+    assert_eq!(held.untuned, Some(PathBuf::from("/run/full/full.ses")));
+}
+
+#[test]
+fn no_candidate_chosen_leaves_the_untuned_board_and_says_why_in_the_tune_row() {
+    use crate::fastroute::TuneVariant::{Free, PourSafe};
+    let mut held = held_with_candidates(&[Free, PourSafe]);
+    let choice = TuneChoice {
+        chosen: None,
+        rows: vec![
+            json!({ "variant": "free", "rejected": ["unconnected items 21 \u{2192} 25"] }),
+            json!({ "variant": "pour_safe", "rejected": ["clearance violations 0 \u{2192} 2"] }),
+        ],
+        untuned: measures(),
+    };
+    choice.apply(&mut held);
+    assert_eq!(held.ses, PathBuf::from("/run/full/full.ses"));
+    assert_eq!((held.kept, held.unrouted), ("polish", 4));
+    let row = &held.passes[1];
+    assert_eq!(row["outcome"], json!("discarded"));
+    let reason = row["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("unconnected items 21 \u{2192} 25"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("clearance violations 0 \u{2192} 2"),
+        "{reason}"
+    );
+    assert!(reason.contains("untuned board"), "{reason}");
+    // A choice that names a candidate the run does not hold changes nothing.
+    let mut held = held_with_candidates(&[Free]);
+    let before = held.clone();
+    TuneChoice {
+        chosen: Some(PourSafe),
+        rows: vec![],
+        untuned: measures(),
+    }
+    .apply(&mut held);
+    assert_eq!(held.ses, before.ses);
+    assert_eq!(held.kept, before.kept);
+}
+
 // -------------------------------- the round logic, with a fake kicad-cli (no KiCad)
 
 #[cfg(unix)]
@@ -2800,5 +3010,402 @@ exit 0
             "the audit ran for real"
         );
         let _keep_dir_alive = &h.dir;
+    }
+    // ------------------------------------------------ Row LT, L22: G4(d) in the judge
+
+    /// A KiCad report whose one `track_dangling` entry names `net`.
+    fn dangling_json(net: &str) -> String {
+        json!({
+            "violations": [{
+                "type": "track_dangling",
+                "severity": "warning",
+                "description": "Track has unconnected end",
+                "items": [{ "description": format!("Track [{net}] on F.Cu, length 3 mm") }]
+            }],
+            "unconnected_items": [],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_checked_net_named_in_a_dangling_entry_fails_g4_with_its_windows_lower_bound() {
+        // Calls: 1 the baseline, 2 the routed board's refill, 3 the probe.
+        let mut h = harness(
+            &[],
+            drc_json(&[], &[]),
+            &[
+                (2, dangling_json("GND")),
+                (3, probe_json(&[("GND", 40.0), ("VCC", 40.0)])),
+            ],
+        );
+        h.ctx.lengths = Some(dq_checks(&["GND", "VCC"]));
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        let lengths = judged.measures.lengths.as_ref().unwrap();
+        assert_eq!(
+            lengths.paths["GND"],
+            crate::length_probe::PathFault {
+                contacts: 0,
+                dangling: 1
+            }
+        );
+        assert_eq!(lengths.paths.len(), 1);
+        // Both nets are inside the window by KiCad's length; GND's miss is the lower
+        // bound, and G4 names it.
+        assert!((lengths.groups[0].nets[0].miss_mm - 39.5).abs() < 1e-9);
+        assert_eq!(lengths.groups[0].nets[1].miss_mm, 0.0);
+        assert_eq!(judged.gates.g4.len(), 1, "{:?}", judged.gates.g4);
+        assert!(
+            judged.gates.g4[0].starts_with("GND has 1 dangling or unconnected item(s)"),
+            "{:?}",
+            judged.gates.g4
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_checked_net_crosses_itself_fails_g4_in_the_judge() {
+        let mut h = harness(
+            &[],
+            drc_json(&[], &[]),
+            &[(3, probe_json(&[("GND", 40.0), ("VCC", 40.0)]))],
+        );
+        // VCC's recorded wire runs along y = -506062 (units of 0.1 um); a wire straight
+        // down across it makes the net cross itself.
+        let ses = std::fs::read_to_string(&h.routed.held.ses).unwrap();
+        let crossing = ses.replacen(
+            "(net VCC\n",
+            "(net VCC\n        (wire\n          (path F.Cu 2000\n            1050000 -510000\n            1050000 -503000\n          )\n        )\n",
+            1,
+        );
+        assert_ne!(crossing, ses, "the recorded session has a net VCC");
+        let crossed = h.dir.path().join("crossed.ses");
+        std::fs::write(&crossed, crossing).unwrap();
+        h.routed.held.ses = crossed;
+        h.ctx.lengths = Some(dq_checks(&["GND", "VCC"]));
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        let lengths = judged.measures.lengths.as_ref().unwrap();
+        assert_eq!(lengths.paths.keys().collect::<Vec<_>>(), ["VCC"]);
+        assert_eq!(lengths.paths["VCC"].contacts, 1);
+        assert!(judged.gates.g4[0].starts_with("VCC's copper crosses or overlaps itself 1 time(s)"));
+        // Control: the recorded session itself is clean.
+        let mut h = harness(
+            &[],
+            drc_json(&[], &[]),
+            &[(3, probe_json(&[("GND", 40.0), ("VCC", 40.0)]))],
+        );
+        h.ctx.lengths = Some(dq_checks(&["GND", "VCC"]));
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert!(judged.measures.lengths.unwrap().paths.is_empty());
+        assert!(judged.gates.g4.is_empty(), "{:?}", judged.gates.g4);
+    }
+
+    // ----------------------------------------- Row LT, L23 and L24: judge_candidates
+
+    use crate::fastroute::{TuneCandidate, TuneVariant};
+
+    /// Gives the harness's run its untuned session and the `variants` as candidates,
+    /// each a copy of the session in `<name>.ses` (a candidate's `ses` may be pointed
+    /// elsewhere by the test), and their kept rows.
+    fn with_candidates(h: &mut Harness, variants: &[TuneVariant]) {
+        let untuned = h.routed.held.ses.clone();
+        h.routed.held.untuned = Some(untuned.clone());
+        for variant in variants {
+            let ses = h.dir.path().join(format!("{}.ses", variant.folder_name(1)));
+            std::fs::copy(&untuned, &ses).unwrap();
+            h.routed.held.tune.candidates.push(TuneCandidate {
+                variant: *variant,
+                ses,
+                unrouted: 0,
+                dropped: vec![(
+                    "GND".to_string(),
+                    "its copper touches itself: 2 crossings".to_string(),
+                )],
+                passes: 2,
+            });
+            h.routed.held.tune.rows.push(json!({
+                "name": "tune", "outcome": "kept", "unrouted": 0, "seconds": 1.0,
+                "variant": variant, "round": 1
+            }));
+        }
+        h.routed
+            .held
+            .passes
+            .push(h.routed.held.tune.rows[0].clone());
+    }
+
+    /// The canned reports of judges in order: each judge is two kicad-cli runs (its
+    /// refill, then its probe), the first after the baseline's call 1.
+    fn canned_judges(judges: &[(String, String)]) -> Vec<(usize, String)> {
+        judges
+            .iter()
+            .enumerate()
+            .flat_map(|(at, (refill, probe))| {
+                [(2 + 2 * at, refill.clone()), (3 + 2 * at, probe.clone())]
+            })
+            .collect()
+    }
+
+    fn refill_ok() -> String {
+        drc_json(&[], &[])
+    }
+
+    /// A probe report with VCC at `vcc` mm (the window is 39.5 to 40.5 mm).
+    fn vcc(mm: f64) -> String {
+        probe_json(&[("GND", 40.0), ("VCC", mm)])
+    }
+
+    async fn judged_with_candidates(
+        variants: &[TuneVariant],
+        judges: &[(String, String)],
+    ) -> (Harness, Judged) {
+        let mut h = harness(&[], drc_json(&[], &[]), &canned_judges(judges));
+        h.ctx.lengths = Some(dq_checks(&["GND", "VCC"]));
+        with_candidates(&mut h, variants);
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        (h, judged)
+    }
+
+    fn folder_of(h: &Harness, judged: &Judged) -> String {
+        judged
+            .board
+            .strip_prefix(&h.ctx.root)
+            .unwrap()
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_harmful_free_candidate_loses_to_a_harmless_pour_safe_one() {
+        let (h, judged) = judged_with_candidates(
+            &[TuneVariant::Free, TuneVariant::PourSafe],
+            &[
+                (refill_ok(), vcc(39.0)),
+                // Free adds a clearance violation the untuned board does not have.
+                (drc_json(&[], &["clearance"]), vcc(40.0)),
+                (refill_ok(), vcc(39.4)),
+            ],
+        )
+        .await;
+        let choice = judged
+            .tune
+            .as_ref()
+            .expect("a run with candidates records its choice");
+        assert_eq!(choice.chosen, Some(TuneVariant::PourSafe));
+        assert_eq!(
+            choice.rows[0]["rejected"],
+            json!(["clearance violations 0 \u{2192} 1"])
+        );
+        assert_eq!(choice.rows[0]["judged"], json!(true));
+        assert_eq!(choice.rows[0]["chosen"], json!(false));
+        assert_eq!(choice.rows[1]["rejected"], json!([]));
+        assert_eq!(choice.rows[1]["chosen"], json!(true));
+        assert_eq!(choice.rows[1]["variant"], json!("pour_safe"));
+        assert_eq!(choice.rows[1]["passes"], json!(2));
+        assert_eq!(
+            choice.rows[1]["dropped"],
+            json!([{ "net": "GND", "reason": "its copper touches itself: 2 crossings" }])
+        );
+        // The judged board is the pour-safe candidate's, in its own folder; the three
+        // judges each ran their refill and their probe after the baseline.
+        assert_eq!(folder_of(&h, &judged), "run-0-pour-safe");
+        assert_eq!(h.calls().len(), 7);
+        assert!(h.ctx.root.join("run-0-untuned").is_dir());
+        assert!(h.ctx.root.join("run-0").is_dir());
+        // Its measures are the candidate's: VCC at 39.4 is 0.1 mm short.
+        assert!((judged.measures.lengths.as_ref().unwrap().miss_mm - 0.1).abs() < 1e-9);
+        assert_eq!(choice.untuned.violations.get("clearance"), None);
+    }
+
+    #[tokio::test]
+    async fn when_both_candidates_are_harmless_the_better_rank_wins() {
+        // Free fails G4 by 0.1 mm; the pour-safe candidate passes it.
+        let (h, judged) = judged_with_candidates(
+            &[TuneVariant::Free, TuneVariant::PourSafe],
+            &[
+                (refill_ok(), vcc(39.0)),
+                (refill_ok(), vcc(39.4)),
+                (refill_ok(), vcc(40.0)),
+            ],
+        )
+        .await;
+        let choice = judged.tune.as_ref().unwrap();
+        assert_eq!(choice.chosen, Some(TuneVariant::PourSafe));
+        assert_eq!(choice.rows[0]["g4_failed"], json!(true));
+        assert_eq!(choice.rows[1]["g4_failed"], json!(false));
+        assert!(judged.gates.g4.is_empty(), "{:?}", judged.gates.g4);
+        assert_eq!(folder_of(&h, &judged), "run-0-pour-safe");
+        // A tie goes to the first candidate, Free.
+        let (h, judged) = judged_with_candidates(
+            &[TuneVariant::Free, TuneVariant::PourSafe],
+            &[
+                (refill_ok(), vcc(39.0)),
+                (refill_ok(), vcc(39.4)),
+                (refill_ok(), vcc(39.4)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            judged.tune.as_ref().unwrap().chosen,
+            Some(TuneVariant::Free)
+        );
+        assert_eq!(folder_of(&h, &judged), "run-0");
+    }
+
+    #[tokio::test]
+    async fn a_harmless_free_candidate_that_passes_g4_leaves_the_pour_safe_one_unjudged() {
+        let (h, judged) = judged_with_candidates(
+            &[TuneVariant::Free, TuneVariant::PourSafe],
+            &[
+                (refill_ok(), vcc(39.0)),
+                (refill_ok(), vcc(40.0)),
+                (refill_ok(), vcc(40.0)),
+            ],
+        )
+        .await;
+        let choice = judged.tune.as_ref().unwrap();
+        assert_eq!(choice.chosen, Some(TuneVariant::Free));
+        assert_eq!(
+            h.calls().len(),
+            5,
+            "the baseline and two judges: pour-safe is not judged"
+        );
+        assert!(!h.ctx.root.join("run-0-pour-safe").exists());
+        assert_eq!(choice.rows[1]["variant"], json!("pour_safe"));
+        assert_eq!(choice.rows[1]["judged"], json!(false));
+        assert_eq!(choice.rows[1]["chosen"], json!(false));
+        assert!(choice.rows[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("free candidate"));
+        assert_eq!(folder_of(&h, &judged), "run-0");
+        assert!(judged.gates.g4.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pour_safe_candidate_alone_is_judged_in_its_own_folder() {
+        // The free pass was discarded: only the pour-safe candidate exists.
+        let (h, judged) = judged_with_candidates(
+            &[TuneVariant::PourSafe],
+            &[(refill_ok(), vcc(39.0)), (refill_ok(), vcc(40.0))],
+        )
+        .await;
+        assert_eq!(
+            judged.tune.as_ref().unwrap().chosen,
+            Some(TuneVariant::PourSafe)
+        );
+        assert_eq!(folder_of(&h, &judged), "run-0-pour-safe");
+        assert!(!h.ctx.root.join("run-0").exists());
+    }
+
+    #[tokio::test]
+    async fn when_every_candidate_is_harmful_the_untuned_board_stands_with_its_own_g4() {
+        let (h, judged) = judged_with_candidates(
+            &[TuneVariant::Free, TuneVariant::PourSafe],
+            &[
+                (refill_ok(), vcc(39.0)),
+                // Free opens an item; pour-safe adds a violation. Both pass G4.
+                (drc_json(&["GND"], &[]), vcc(40.0)),
+                (drc_json(&[], &["clearance", "clearance"]), vcc(40.0)),
+            ],
+        )
+        .await;
+        let choice = judged.tune.as_ref().unwrap();
+        assert_eq!(choice.chosen, None);
+        assert_eq!(
+            choice.rows[0]["rejected"],
+            json!(["unconnected items 0 \u{2192} 1"])
+        );
+        assert_eq!(
+            choice.rows[1]["rejected"],
+            json!(["clearance violations 0 \u{2192} 2"])
+        );
+        assert!(choice.rows.iter().all(|row| row["chosen"] == json!(false)));
+        // The board, the measures and G4 are the untuned board's: VCC at 39.0 is short.
+        assert_eq!(folder_of(&h, &judged), "run-0-untuned");
+        assert_eq!(judged.measures, choice.untuned);
+        assert_eq!(judged.gates.g4.len(), 1, "{:?}", judged.gates.g4);
+        assert!(
+            judged.gates.g4[0].contains("VCC is 39.00 mm"),
+            "{:?}",
+            judged.gates.g4
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_the_judge_cannot_read_is_rejected_and_the_untuned_board_stands() {
+        let mut h = harness(
+            &[],
+            drc_json(&[], &[]),
+            &canned_judges(&[(refill_ok(), vcc(39.0))]),
+        );
+        h.ctx.lengths = Some(dq_checks(&["GND", "VCC"]));
+        with_candidates(&mut h, &[TuneVariant::Free]);
+        h.routed.held.tune.candidates[0].ses = h.dir.path().join("absent.ses");
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        let choice = judged.tune.as_ref().unwrap();
+        assert_eq!(choice.chosen, None);
+        assert_eq!(choice.rows[0]["judged"], json!(false));
+        let line = choice.rows[0]["rejected"][0].as_str().unwrap();
+        assert!(line.starts_with("the judge failed on it:"), "{line}");
+        assert_eq!(folder_of(&h, &judged), "run-0-untuned");
+        // Control: a failure of the untuned session is the judge's failure.
+        let mut h = harness(&[], drc_json(&[], &[]), &[]);
+        with_candidates(&mut h, &[TuneVariant::Free]);
+        h.routed.held.untuned = Some(h.dir.path().join("absent.ses"));
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let error = judge_with(&h.ctx, &h.routed, &base, &tools)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("untuned session"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_without_candidates_is_judged_once_in_its_own_folder_with_no_choice() {
+        let mut h = harness(&[], drc_json(&[], &[]), &[]);
+        h.routed.held.untuned = Some(h.routed.held.ses.clone());
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| panic!("no planes, no planner"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert!(judged.tune.is_none());
+        assert_eq!(folder_of(&h, &judged), "run-0");
+        assert!(!h.ctx.root.join("run-0-untuned").exists());
+        assert_eq!(h.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_choice_rewrites_the_held_run_to_the_judged_board() {
+        let (mut h, judged) = judged_with_candidates(
+            &[TuneVariant::Free, TuneVariant::PourSafe],
+            &[
+                (refill_ok(), vcc(39.0)),
+                (drc_json(&[], &["clearance"]), vcc(40.0)),
+                (refill_ok(), vcc(40.0)),
+            ],
+        )
+        .await;
+        let pour_safe = h.routed.held.tune.candidates[1].ses.clone();
+        judged.tune.as_ref().unwrap().apply(&mut h.routed.held);
+        // The session the call would write, and the pass it would report, are those of
+        // the judged board.
+        assert_eq!(h.routed.held.ses, pour_safe);
+        assert_eq!(h.routed.held.kept, "tune");
+        assert_eq!(folder_of(&h, &judged), "run-0-pour-safe");
     }
 }

@@ -1453,6 +1453,23 @@ fn a_tune_candidates_folder_names_its_variant_and_round() {
     );
 }
 
+#[test]
+fn every_tune_pass_folder_a_run_can_hold_is_named_once() {
+    // L26 reduces and releases exactly these.
+    assert_eq!(
+        tune_folder_names(),
+        [
+            "tune",
+            "tune-r2",
+            "tune-r3",
+            "tune-pour-safe",
+            "tune-pour-safe-r2",
+            "tune-pour-safe-r3"
+        ]
+    );
+    assert_eq!(TUNE_ROUNDS_MAX, 3, "the list follows the rounds");
+}
+
 // ---- Row LT, L21: self contacts ----------------------------------------------
 
 type FixtureText = &'static str;
@@ -4419,11 +4436,18 @@ int main(int argc, char **argv) {
         let (fixture, held) = tune_run(&base(), &tuned_base(), "", &["A"], 30).await;
         let held = held.unwrap();
         assert_eq!(tune_row(&held), ("tune", "kept", None));
-        assert_eq!(held.kept, TUNE_PASS);
-        assert_eq!(held.ses, fixture.path().join("held/tune/tune.ses"));
+        // The candidate is kept beside the untuned session, which the run still holds
+        // until the judge chooses (L23).
+        assert_eq!(held.kept, "full");
+        assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
         assert_eq!(held.unrouted, 0);
-        // Its session is the one the run now holds.
-        assert_eq!(std::fs::read_to_string(&held.ses).unwrap(), tuned_base());
+        let candidate = &held.tune.candidates[0];
+        assert_eq!(candidate.ses, fixture.path().join("held/tune/tune.ses"));
+        assert_eq!(candidate.unrouted, 0);
+        assert_eq!(
+            std::fs::read_to_string(&candidate.ses).unwrap(),
+            tuned_base()
+        );
         // The row joins the others, and the pass's time joins the run's.
         assert_eq!(row(&held, 0), ("full", "kept", None));
         assert_eq!(row(&held, 1).1, "skipped");
@@ -4599,7 +4623,9 @@ int main(int argc, char **argv) {
             .await;
             let held = held.unwrap();
             assert_eq!(tune_row(&held), ("tune", "kept", None));
-            assert_eq!((held.kept, held.unrouted), (TUNE_PASS, expected));
+            // The candidate holds its count; the run's own stays the untuned one.
+            assert_eq!(held.tune.candidates[0].unrouted, expected);
+            assert_eq!((held.kept, held.unrouted), ("full", 1));
         }
     }
 
@@ -4742,7 +4768,7 @@ int main(int argc, char **argv) {
             ))),
         )
         .await;
-        assert_eq!(held.kept, TUNE_PASS, "{:?}", held.passes);
+        assert_eq!(held.tune.candidates.len(), 1, "{:?}", held.passes);
         for name in ["full", "fallback", "polish"] {
             let args = args_of_pass("with_pair", name);
             let at = |prefix: &str| args.iter().position(|t| t.starts_with(prefix));
@@ -4793,7 +4819,7 @@ int main(int argc, char **argv) {
             ))),
         )
         .await;
-        assert_eq!(held.kept, TUNE_PASS);
+        assert_eq!(held.tune.candidates.len(), 1);
         for (name, neck, optimizer, initial) in [
             ("full", 0.0, true, None),
             ("fallback", 120.0, false, Some("no_pair/full/full.ses")),
@@ -4917,11 +4943,11 @@ int main(int argc, char **argv) {
             let tune_row = held.passes.last().unwrap();
             assert_eq!(tune_row["name"], "tune", "{rows:?}");
             assert_eq!(tune_row["outcome"], "kept", "{tune_row}");
-            assert_eq!(held.kept, TUNE_PASS);
+            assert_eq!(held.tune.candidates.len(), 1);
             let full = dir.path().join(name).join("full/full.ses");
             assert!(changed_outside(
                 &std::fs::read_to_string(&full).unwrap(),
-                &std::fs::read_to_string(&held.ses).unwrap(),
+                &std::fs::read_to_string(&held.tune.candidates[0].ses).unwrap(),
                 &nets
             )
             .unwrap()
@@ -5634,13 +5660,17 @@ int main(int argc, char **argv) {
                     "{planes:?}"
                 );
             }
-            // Until the judge chooses (stage 5b), the Free candidate flows on, as the
-            // one kept Tune pass did, and the untuned session is kept beside it.
-            assert_eq!(held.kept, TUNE_PASS);
-            assert_eq!(held.ses, fixture.path().join("held/tune/tune.ses"));
+            // The run holds its untuned session until the judge chooses (L23): the
+            // candidates are kept beside it, and `TuneChoice::apply` rewrites it.
+            assert_eq!(held.kept, "full");
+            assert_eq!(held.ses, fixture.path().join("held/full/full.ses"));
             assert_eq!(
                 held.untuned,
                 Some(fixture.path().join("held/full/full.ses"))
+            );
+            assert_eq!(
+                held.tune.candidates[0].ses,
+                fixture.path().join("held/tune/tune.ses")
             );
             assert_eq!(held.passes.len(), 4, "{:?}", held.passes);
             assert_eq!(held.tune.rows.len(), if runs { 2 } else { 1 });
@@ -5656,9 +5686,9 @@ int main(int argc, char **argv) {
     }
 
     #[tokio::test]
-    async fn a_pour_safe_candidate_alone_does_not_replace_the_held_session_yet() {
+    async fn a_pour_safe_candidate_alone_does_not_replace_the_held_session() {
         // Free changes another net's copper and is discarded; the pour-safe pass is
-        // fine. Stage 5b's judge will use it; until then the run keeps its session.
+        // fine. The judge chooses it or not (L23); the run keeps its session.
         let (fixture, held) = candidates_run(&moved_b(), &tuned_base(), &["GND"], "", 60).await;
         let variants: Vec<TuneVariant> = held.tune.candidates.iter().map(|c| c.variant).collect();
         assert_eq!(variants, [TuneVariant::PourSafe]);
