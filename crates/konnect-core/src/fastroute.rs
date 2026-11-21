@@ -1477,6 +1477,19 @@ fn raw_pieces(paths: &[SessionPath]) -> BTreeMap<&str, Vec<Piece>> {
     by_layer
 }
 
+/// Whether two pieces are so far apart that nothing of L21 can hold between them
+/// (a speed-up of the pairwise scan): their bounding boxes are farther apart on
+/// an axis than half the sum of their widths plus the margin, which is more than a
+/// touch needs, so no pair that [`piece_contact`] names is ever skipped.
+fn too_far_apart(first: &Piece, second: &Piece, ticks_per_um: f64) -> bool {
+    let reach_um = (first.width_um + second.width_um) as f64 / 2.0 + CONTACT_MARGIN_UM as f64;
+    let reach = (reach_um * ticks_per_um).ceil() as i128;
+    (0..2).any(|axis| {
+        first.a[axis].max(first.b[axis]) + reach < second.a[axis].min(second.b[axis])
+            || second.a[axis].max(second.b[axis]) + reach < first.a[axis].min(first.b[axis])
+    })
+}
+
 /// Every self contact (L21) of one net, from its raw paths: pieces of the net on one
 /// layer, compared pairwise.
 fn net_contacts(paths: &[SessionPath], um_per_unit: f64) -> Vec<SelfContact> {
@@ -1485,14 +1498,7 @@ fn net_contacts(paths: &[SessionPath], um_per_unit: f64) -> Vec<SelfContact> {
     for (layer, pieces) in raw_pieces(paths) {
         for (at, first) in pieces.iter().enumerate() {
             for second in &pieces[at + 1..] {
-                // Pieces farther apart than their widths can reach touch nothing.
-                let reach = (((first.width_um + second.width_um) as f64 / 2.0 + 1.0) * ticks_per_um)
-                    .ceil() as i128;
-                if (0..2).any(|axis| {
-                    first.a[axis].max(first.b[axis]) + reach < second.a[axis].min(second.b[axis])
-                        || second.a[axis].max(second.b[axis]) + reach
-                            < first.a[axis].min(first.b[axis])
-                }) {
+                if too_far_apart(first, second, ticks_per_um) {
                     continue;
                 }
                 let Some(kind) = piece_contact(first, second, ticks_per_um) else {

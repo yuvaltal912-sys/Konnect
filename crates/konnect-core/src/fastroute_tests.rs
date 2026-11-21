@@ -1744,6 +1744,58 @@ fn a_touch_is_closer_than_half_the_widths_minus_a_micrometre() {
 }
 
 #[test]
+fn pieces_are_too_far_apart_only_beyond_the_reach_of_their_widths_on_an_axis() {
+    // Widths 200 and 200 µm at 10000 ticks per µm: the reach is 201 µm (half the
+    // sum, 200, plus the 1 µm margin), 2 010 000 ticks.
+    let piece = |width_um: i64, a: [i128; 2], b: [i128; 2]| Piece { width_um, a, b };
+    let um = |x: i128| x * 10_000;
+    let first = piece(200, [0, 0], [um(1000), 0]);
+    let right = |gap_ticks: i128| piece(200, [um(1000) + gap_ticks, 0], [um(2000) + gap_ticks, 0]);
+    let reach = um(201);
+    assert!(!too_far_apart(&first, &right(0), 10_000.0));
+    assert!(
+        !too_far_apart(&first, &right(um(200)), 10_000.0),
+        "200 µm is within reach"
+    );
+    assert!(
+        !too_far_apart(&first, &right(reach), 10_000.0),
+        "exactly the reach is not beyond it"
+    );
+    assert!(too_far_apart(&first, &right(reach + 1), 10_000.0));
+    assert!(too_far_apart(&first, &right(um(5000)), 10_000.0));
+    // Either order of the two pieces.
+    assert!(too_far_apart(&right(reach + 1), &first, 10_000.0));
+    assert!(!too_far_apart(&right(reach), &first, 10_000.0));
+    // The other axis, in both orders.
+    let above = |gap_ticks: i128| piece(200, [0, um(1000) + gap_ticks], [0, um(2000) + gap_ticks]);
+    let tall = piece(200, [0, 0], [0, um(1000)]);
+    assert!(!too_far_apart(&tall, &above(reach), 10_000.0));
+    assert!(too_far_apart(&tall, &above(reach + 1), 10_000.0));
+    assert!(too_far_apart(&above(reach + 1), &tall, 10_000.0));
+    assert!(!too_far_apart(&above(reach), &tall, 10_000.0));
+    // Apart on one axis only is enough; near on both is not apart.
+    let corner = piece(200, [um(1000) + reach + 1, um(1000)], [um(2000), um(1000)]);
+    assert!(too_far_apart(&first, &corner, 10_000.0));
+    let near = piece(200, [um(1000), um(100)], [um(2000), um(100)]);
+    assert!(!too_far_apart(&first, &near, 10_000.0));
+    // The reach follows the widths: half their sum plus the margin.
+    let narrow = piece(100, [0, 0], [um(1000), 0]);
+    let narrow_right = |gap: i128| piece(100, [um(1000) + gap, 0], [um(2000) + gap, 0]);
+    assert!(!too_far_apart(&narrow, &narrow_right(um(101)), 10_000.0));
+    assert!(too_far_apart(&narrow, &narrow_right(um(101) + 1), 10_000.0));
+    let mixed = piece(400, [um(1000) + um(251), 0], [um(2000), 0]);
+    assert!(
+        !too_far_apart(&first, &mixed, 10_000.0),
+        "(200 + 400) / 2 + 1 = 301"
+    );
+    let mixed_far = piece(400, [um(1000) + um(302), 0], [um(2000), 0]);
+    assert!(too_far_apart(&first, &mixed_far, 10_000.0));
+    // The ticks per µm scale the reach.
+    assert!(!too_far_apart(&first, &right(um(201) / 10), 1_000.0));
+    assert!(too_far_apart(&first, &right(um(201) / 10 + 1), 1_000.0));
+}
+
+#[test]
 fn a_session_that_does_not_parse_has_no_contacts_to_give() {
     assert!(self_contacts("not a session", &names(&["A"])).is_err());
     assert!(self_contacts("(session x)", &names(&["A"])).is_err());
