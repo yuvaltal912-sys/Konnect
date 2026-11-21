@@ -9,6 +9,10 @@ code. The owner approved its three decisions as recommended on 2026-11-20 ("Yes,
 recommended") and started the build the same day, on branch `claude/length-tuning` (this
 design with main `0a3fc504` merged in). Sonnet 5.5 (high) agents write the bodies.
 
+The verification of 2026-11-21 failed its measure of success, and findings F2 to F6 came
+back to the design: see "Addendum: the verification findings F2 to F6" at the end (L20 to
+L27, owner decisions 4 to 6, designed and not built).
+
 ## What the owner asked for
 
 - On 2026-11-20 he asked whether 1 Kopper has serpentine (meander) routing. fastroute has it
@@ -1391,3 +1395,600 @@ document and the handoff line only.
   project (L16: suggested, not written).
 - **Placement for length:** Row PS does not know about groups. Its candidates route through
   this call and are judged by it.
+
+## Addendum: the verification findings F2 to F6 (2026-11-21)
+
+Status: designed, not built. The verification of 2026-11-21 failed its measure of success
+(`target/creation-research/length-tuning/verify/RESULTS.md`, git-ignored). Per the design's
+own rule, the owner sent findings F2 to F6 back here ("גם וגם", 2026-11-21). Claude Opus 5.5
+designed this addendum on branch `claude/length-tuning-design-674041`, with `claude/length-tuning`
+(`735ce4ae`, the build) merged in. F1, the judge refusing live-exported boards, is fixed in its
+own PR from main and is not covered here.
+
+### What was checked, and how
+
+- **No routing ran.** Every number below comes from the verification's run folders, read by
+  scripts. The scripts are in this session's scratch folder, and the numbers they gave are
+  quoted here. Sources read: fastroute x18 (`tuning.rs`, `pipeline/autorouter.rs`,
+  `pipeline/mod.rs`, `board/routing_board.rs`, `board/item.rs`, `fr-settings/src/settings.rs`,
+  router-design worktree at `2468954`), and this branch's Konnect code.
+- **What is not verified.** The 3 "changed the copper of GND" discards on fixture F cannot be
+  traced: those runs were not judged, so only their `run.json` was kept. The cause given below
+  for them is a hypothesis, and measurement M1 tests it.
+
+### Root causes
+
+**F5: the gap is copper that fastroute lays twice. KiCad measures branches correctly, so the
+verification's hypothesis is wrong.**
+
+- **The importer skips exact repeats.** On A-tuned, the judged board's copper per net was
+  compared with the session's: the board holds every session segment, but less length.
+  Konnect's importer (`specctra_ses.rs`, `parse_network`, about line 670) skips a segment that
+  exactly repeats another (same net, layer, width and ends). The rule was written for
+  Freerouting's duplicates.
+- **The skipped length is the gap, net by net:**
+
+  | Net | Exact repeats in the session | KiCad minus fastroute |
+  |---|---|---|
+  | `/DQ10` | 26 segments, 38.0000 mm | −38.1088 mm |
+  | `/DQ12` | 18.0057 mm | −18.249 mm |
+  | `/DQ13` | 15.5000 mm | −15.643 mm |
+  | `/DQ24` | 8.3000 mm | −8.300 mm |
+
+  The rest is the pad-edge gap.
+- **What a repeat looks like.** One `/DQ10` wire of 180 segments holds segments 51 and 143 with
+  the same ends, and 7 pieces on the one line y = −100.4201 mm.
+- **Why fastroute does it** (`tuning.rs`):
+  - `tune_net_with` ranks every straight segment of the net by length, the legs of its own
+    earlier meanders included.
+  - `try_meander` accepts a meander when `clearance_violation_count` is 0. A trace's own net is
+    never its obstacle (`item.rs`: `!other.shares_net(self)`).
+  - So once the original segments are used up, new meanders are laid on the old ones. They
+    cross and overlap the net's own copper.
+  These are the four large nets. On small ones the pad edge also counts: `/DQ4` repeats
+  1.29 mm against a gap of 0.72 mm.
+- **How much of A-tuned's copper touches itself** (all 32 nets; crossings of a net's own
+  copper on one layer, counted pair by pair, then exact repeats):
+  - **20 of 32 nets** cross or repeat their own copper. Only 12 are clean: `/DQ2`, `/DQ3`,
+    `/DQ5`, `/DQ7`, `/DQ16`, `/DQ17`, `/DQ19`, `/DQ22`, `/DQ23`, `/DQ28`, `/DQ29`, `/DQ31`.
+  - **Most crossings:** `/DQ9` 2110, `/DQ8` 797, `/DQ10` 194, `/DQ12` 148, `/DQ14` 134,
+    `/DQ13` 113, `/DQ15` 109, `/DQ24` 97.
+  - **Repeats without a crossing:** `/DQ0`, `/DQ1`, `/DQ4`, `/DQ6` (0.005 to 1.29 mm).
+  - **The untuned session is clean.** The held session (`full.ses`) has no crossing and no
+    collinear overlap on any DQ net, on A or on B (the review's count, finding 1).
+- **Why multi-pin nets looked guilty.** They are the nets that needed the most extra length:
+  `dq_low` started at a spread of 250 mm. Topology has no part in it.
+- **Worse than the gap: G4 can pass a net with shorted meanders.** Copper of one net that
+  crosses itself is joined there, so the signal skips the loop. KiCad's length is a sum of
+  tracks, and it counts the loop anyway. `/DQ15` crosses itself 109 times, has no repeat, and
+  "passes" at 365.05 mm. 10 of the 24 nets that G4 passed cross themselves.
+
+**F6: the Tune pass's autorouter stage deletes copper it reads as a tail.**
+
+- **Where it happens.** B-tuned's held session (run 6, Full pass, with `--pairs`) has 6 wires
+  and 5 vias on `/CM5/DPHY0_P.D1_N`. Its Tune session has none. The pass's log:
+  - after import: "4 unrouted items (4 of them in ignored net classes)";
+  - pass 1: "routed 0, failed 0, ripped 0";
+  - end of the stage: "6 unrouted".
+  The stage's last step is `remove_tails(board, None)` (`autorouter.rs`, about line 1175). It
+  runs whenever the router ran, so the Tune pass runs it even though every class is ignored.
+- **The "2 routable" in the log are not routable nets.** That number is the 6 at the end minus
+  the 4 counted when the stage started (`autorouter.rs`, about line 1187).
+- **Why D1_N was a tail.** KiCad already sees the held board's D1_N as broken: in the judge's
+  DRC of B-tuned's winner, an `unconnected_items` entry runs from pad 121 (B.Cu, 95.29, 50.30)
+  to a track on In1.Cu at (101.40, 50.38), and there is a `track_dangling` beside it. So the
+  Full pass's pair routing left the net 6 mm short of a pad. The Tune pass's tail removal then
+  took the whole connection, and the part that did reach its pads went with it.
+- **The "no room for meanders" warning about D1_N is misleading.** D1_N was empty when tuning
+  started (−0.00 mm); `D2_N`'s warning is a real lack of room.
+- **Konnect's guard was right to discard.** The pass opened 2 connections.
+- **fastroute has a switch for this.** `--router.autorouter.enabled=false` turns the stage off,
+  and its tail removal with it (`pipeline/mod.rs`, about line 191). Fanout is already off in
+  `PRESET`. A negative `max_passes` will not do: fastroute resets it to 0, which means
+  unlimited (`settings.rs`, about line 974).
+- **Not verified: the 3 GND discards on fixture F.** The same tail removal acting on GND stubs
+  is the likely cause, but those runs kept no pass folder (M1).
+
+**F3: meanders inside another net's pour cut it.**
+
+- **Board A's inner layers are full pours,** GND on In1.Cu and +5V on In2.Cu. Both are typed
+  `signal`, and the DSN carries them as planes. On a plane, the router counts the net's pads as
+  connected and lets other nets cross (the `pours` text of `export_specctra_dsn`).
+- **The routing already cuts them, and the meanders add more cuts.** The control's 21
+  unconnected items come from DQ routing on In1.Cu and In2.Cu (GND 18). The tuned board has 25
+  (GND 22), because `/DQ10`, `/DQ12` and `/DQ15` are meandered on In1.Cu and `/DQ13` on In2.Cu.
+- **fastroute can be told to treat planes as obstacles.** `--router.plane_as_obstacle=true`
+  is read (`fr-settings/src/reflect.rs`, about line 157) and applied after load
+  (`fr-io/src/post_load.rs`, line 237). The default is false. Konnect never sends it.
+- **But its tuner then rejects any trace that touches a plane.** `try_meander` probes the
+  whole replaced trace, and rejects the meander when the probe has any violation
+  (`tuning.rs`, about line 292). Nothing exempts copper that was already there. So with
+  planes as obstacles, no trace that touches another net's plane anywhere gets a meander. On
+  A that means no meander on In1.Cu or In2.Cu, and on a 2-layer board filled on both sides,
+  none at all.
+- **Nothing in the product compares a tuned run with its own untuned session.** The
+  verification's item 4 was the only place that did.
+
+**F4: KiCad checks one rule per constraint type per item.**
+
+- **How KiCad picks rules.** `drc_test_provider_matched_length` puts each track into the item
+  set of the one `skew` rule that wins for it, so a net under two `skew` rules is checked by
+  one only.
+- **The suggested rules for a pair inside a group are both `skew` rules.** So KiCad checks only
+  one of them (measured: `runs/B-tuned/shadowing_check.json`). A `length` rule and a `skew`
+  rule are different constraint types, so both are checked.
+
+**F2: run time at M on a large board is not a length-tuning defect.**
+
+- **What happens at M on board A.** Each run takes 440 to 850 s against a budget of 240 s, so
+  M judges only the run that finishes first.
+- **G1 fails in the untuned control as well,** because the routing cuts the planes (F3's first
+  half).
+- **This addendum changes the measure of success** so that tuning is judged against its own
+  run (L27 and owner decision 6), and it records how much time Row LT adds.
+
+### What can be fixed in Row LT, and what must wait
+
+| Finding | In Row LT | Waits for |
+|---|---|---|
+| F6 | L20: the Tune pass runs with the autorouter off | the pair router's short D1_N: fastroute row FT (owner decision 4) |
+| F5 | L21 and L22: Konnect finds copper that touches itself, leaves those nets untuned, and G4 fails them | meanders that never touch their own net: fastroute row FT |
+| F3 | L23 and L24: the judge compares tuned with untuned; a second, pour-safe Tune candidate (owner decision 5) | nothing |
+| F4 | L25: a pinned length rule for a group that holds a pair; L26: discarded Tune passes keep their log | nothing |
+| F2 | L27: the measure of success judges tuning within each run; Row LT's added time is recorded | effort and budget: Row BN's question, not Row LT's |
+
+### Decisions taken in this addendum (with the reason)
+
+| # | Decision | Reason |
+|---|---|---|
+| L20 | **The Tune pass turns the autorouter off.** `--router.autorouter.enabled=false` comes after `PRESET` and the optimizer switch. `ignore_net_classes` stays, now as a second lock: with the stage off it changes nothing, and `tune_pass_arguments`' doc says so. Routing passes never get it. Step 0b proves it on the real binary (M1) | With the stage off, its final `remove_tails` does not run, so the held session's copper reaches tuning as it is. Tuning, the session write and the report run after `run_pipeline`, whatever the switch says (`main.rs`). Listing every class as ignored stops routing, but not the tail removal. A negative `max_passes` is reset to unlimited. **Side effect:** dangling tails (`D1_N`; and on B, `C_N` and `D0_N`, which the stage also cut) stay in the session, and the tuner may meander them. KiCad then counts a stub the signal never travels, which L22 fails |
+| L21 | **A Tune pass is checked for copper that touches itself.** The keep rule checks in this order: failed, opened, changed outside its nets, then self contact. **What a contact is:** two straight pieces of the net on one layer, taken from the session's raw paths (unmerged, so a repeat stays visible), are a *crossing* when their centre lines cross; an *overlap* when they are collinear and share a stretch longer than 1 µm (exact repeats included; pieces that only meet end to end do not count); a *touch* when their centre lines come closer than half the sum of their widths minus 1 µm. Pieces that share an end point are not compared, unless they overlap. A junction is not compared either: one piece's end lying on the other, the two not collinear. **What counts against a pass:** a tuned net has a self contact when one of its contacts involves a piece that is not in the held session's raw pieces of that net. Pieces are compared by layer, width and ends, rounded to 1 µm, so a contact that the router already made never counts. **What follows:** each net with one is dropped from the tune file, with both nets of a pair it belongs to and its trailing pair group, and the pass runs again from the same held session. At most `TUNE_ROUNDS_MAX` = 3 passes run per candidate, and a round starts only when the deadline leaves at least twice the last pass's time. A pass that still has a contact after its last round is `discarded` ("meanders touch their own net: …"). `length_matching.untuned_nets` lists each dropped net with its reason. Contacts between a wire and its own net's via or pad are not checked | Copper that touches itself is a short across the meander, and KiCad's sum still counts it. Such a board must never pass G4 or be handed over. Dropping a net and tuning again keeps the nets that worked; on A-tuned, 12 of 32 nets were clean. Identity, not counts: a count could hide a held contact replaced by a new one. Touches only matter for new pieces, because the router's own S-bends come closer than a width (the review found them on `/DQ0`, `/DQ3`, `/DQ5`, `/DQ7` and `/DQ22` in the held session). The time rule keeps a round from killing the run at the deadline (D4); a Tune pass took 10 to 74 s on A |
+| L22 | **G4(d): a checked net whose judged copper is not a clean path fails G4,** whichever pass made it (fastroute's pair-skew matching meanders in routing passes too). Two cases: its session copper has a crossing or an overlap (L21's definitions; touches are not gated, since the router's own jogs touch), or the judged board's DRC names the net in a `track_dangling` or `unconnected_items` entry. The line names the net and the cause. The net's miss is then its window's lower bound, as if no length were usable: a finite number, so the rank still orders the runs | KiCad's sum counts a loop the signal skips and a stub it never travels. L20 keeps dangling tails such as `D1_N`'s, and the tuner may meander them. This guard makes G4 read a length the signal travels. A held session has no crossing or overlap on A or B, so a clean board is not failed. A miss of "unmeasured" would set every such run to the same largest key (`key_part`), and would print "KiCad gave no length" |
+| L23 | **The judge compares a tuned run with its own untuned session.** For a run whose Tune pass gave candidates, the judge judges the held session (untuned) and each candidate, by the same steps. `tune_harm` gives a line for each measure where a candidate is worse than the untuned board: more unconnected items; more violations of any DRC type except `length_out_of_range` and `skew_out_of_range`; more G3 lines; more tracks below their floor. A candidate with a line is rejected. Among the rest, the one ranked best by the rank key is the run's board. With none left, the run keeps its untuned board and G4 shows what is missing. **The runner then rewrites `Routed.held`** (`ses`, `kept`, `unrouted`, and the chosen candidate's pass rows) from the choice. So the SES the call writes (`tools/route_fastroute.rs`, about line 816) and the `kept_pass` it reports (about line 1190) are those of the judged board. The Tune row records each candidate: judged, rejected with its lines, or chosen | Tuning must never turn a passing G1, G2 or G3 into a failing one, and best-of-N must never prefer a board that tuning made worse. A comparison within the run is exact (KiCad, with the refill) and leaves routing chance out, as item 4 of the verification did. Cost per tuned judged run: one more judge (A: 25 to 30 s), and a third only when L24's candidate is judged. **Worst case:** 2 candidates × 3 Tune passes (on A each 10 to 74 s) plus 3 judges |
+| L24 | **A pour-safe Tune candidate** (owner decision 5). When the run's DSN has a plane of a net outside the tune file, a second Tune attempt runs from the same held session. It is the free candidate's command line plus `--router.plane_as_obstacle=true` (`TUNE_POUR_SAFE`), with the same DSN, and its passes follow L20 and L21. It runs after the free attempt, and the judge judges it only when the free candidate is rejected or fails G4. Step 0b proves that the switch leaves plane connectivity and the import as they are (M3) | **What it does:** fastroute's tuner probes the whole trace it replaces, so with planes as obstacles a trace that touches another net's plane anywhere gets no meander; only traces clear of every foreign plane are tuned. **On A,** that moves all tuning off In1.Cu and In2.Cu; DQ nets routed mostly there stay short, and G4 says so. **On a 2-layer board filled on both sides** it tunes nothing, so there the free candidate, judged by L23, is the only way to tune. **Why a switch and not a DSN rewrite:** it needs no second DSN and no keepouts, and the session stays the run's own |
+| L25 | **The suggested KiCad rule for a group that holds a pair with `max_skew_mm`** is a `length` rule pinned to the winner's measured longest net, L: skew mode gives `length (min L − T − 0.0001mm) (max L + 0.0001mm)`, and target mode keeps its own `length` window. The pair keeps its `skew` rule. The next step says the group's rule is pinned to the routed lengths. Without a winner, the skew rule stays, with a note that KiCad will check only the pair rules on those nets | A `length` rule and a `skew` rule on one net are both checked, so KiCad can verify the group and its pairs together, which L16 promised. The price: a pinned window also fails when every net later grows by the same amount, which the judge's skew check would allow |
+| L26 | **A discarded or failed Tune pass keeps its `fastroute.log` and its session** when `reduce_run_folders` reduces an unjudged run's folder (every Tune pass folder: `tune`, `tune-r2`, `tune-pour-safe`, …), and the run's record names them. Everything else in the folder goes, as today. `reduce_run_folders` also removes the new judge folders `judge/run-<i>-untuned` and `judge/run-<i>-pour-safe` of every run but the winner's | The GND discards on fixture F could not be traced, because their pass folders were gone. A session and a log are small (A: 183 kB) |
+| L27 | **The measure of success judges tuning within each run** (owner decision 6). It applies to every board and effort, and it is what the verification checks when the untuned control fails G1 | At M on a large board the control fails G1, so "the winner passes G1 to G4" cannot separate tuning from routing. A comparison within the run can |
+
+**Changes to L1 to L19.**
+
+- **L6.** The Tune pass's command line adds L20's switch. Its keep rule gains L21's check, and
+  one call may run up to 3 passes per candidate, and two candidates.
+- **L9.** G4 gains (d) from L22.
+- **L10.** The key is unchanged: a candidate is chosen by it (L23).
+- **L13.** A dropped net drops its pair's trailing group.
+- **L15.** `length_matching` gains `untuned_nets` (net, reason) and `tune_candidates` (variant,
+  passes, dropped nets, judged, rejected lines, chosen). The `tune_pass` row stays, for the
+  chosen candidate.
+- **L16.** As L25 says.
+- **Owner decision 3 comes back** as owner decision 4.
+
+### Decisions for the owner
+
+4. **A fastroute row for the tuner and the pair router (FT).**
+   - **What it changes** in fastroute:
+     - Each meander is checked against its own net's other copper: no crossing, no overlap,
+       and legs at least a clearance apart.
+     - A meander is never laid on segments that an earlier meander made.
+     - The pair router either reaches every pad, or reports the connection as unrouted.
+   - **Its test** is A-tuned's held session: no crossing of a net's own copper, and no exact
+     repeat.
+   - **Recommended:** start it now, in fastroute's own worktree, designed on Opus as Row LT was.
+     Row LT keeps L21 and L22 whatever FT does.
+   - **Alternative:** keep x18. Nets that need a lot of extra length are then left untuned and
+     fail G4.
+   - **Reason:** measurement now shows a fastroute defect, which is the condition the old
+     decision 3 set for a fastroute row. Without FT, board A's bus cannot be tuned correctly.
+5. **Meanders inside another net's pour on the same layer.**
+   - **Recommended:** two candidates per run. Tuning without limits first; then the pour-safe
+     one (L24), when the first cuts a pour or misses a window. Both are judged against the
+     untuned board (L23).
+   - **Alternative:** always pour-safe. One candidate fewer. But no trace that touches another
+     net's pour is ever tuned, so a 2-layer board filled on both sides gets no tuning at all,
+     and on A neither do the inner layers.
+   - **Reason:** tuning that cuts nothing is kept wherever it fits, and a cut that harms the
+     board is never chosen.
+6. **The measure of success when the untuned control fails G1 at M** (L27).
+   - **Recommended:** judge tuning against the same run's untuned board, by counts.
+   - **What must hold:**
+     - in every judged run, the chosen board has no more unconnected items and no more
+       violations of any DRC type than its own untuned board (L23's counts, not gate lines);
+     - the winner passes G4;
+     - KiCad agrees with L25's rules;
+     - no Tune pass is discarded for another net or for opening connections.
+     On fixture F, where G1 passes, the winner must also pass G1 to G4.
+   - **Alternative:** find a public board on which M passes G1 untuned.
+   - **Reason:** the owner's rule keeps the verification at M. On A and B the untuned control
+     fails G1 because of routing, not tuning. Counts, not lines: A-tuned has 25 unconnected
+     items against 21, but both give the same 3 G1 lines.
+
+### Modules (addendum)
+
+No new file. The changes, in addition to the skeletons below:
+
+| Where | Change |
+|---|---|
+| `fastroute.rs` | `tune_pass_arguments` adds [`TUNE_ROUTER_OFF`] after the optimizer switch, and [`TUNE_POUR_SAFE`] for the pour-safe candidate (a `variant` argument). `tune_held` runs [`tune_attempt`] for `Free`, then for `PourSafe` when the DSN has a plane of a net outside the tune file, and returns a [`TuneOutcome`] (candidates, every pass row, seconds). `TuneInputs` is built per round: its `tune` path and `nets` change as nets are dropped. `Held` gains `untuned: Option<PathBuf>` (the held session when a candidate exists) and `tune: TuneOutcome`. `held.ses` stays the untuned session until the judge chooses |
+| `route_search.rs` | `Routed` carries the outcome. After `judge_candidates`, the runner rewrites `Routed.held` (`ses`, `kept`, `unrouted`, pass rows) from the `TuneChoice` (L23) |
+| `route_judge.rs` | `judge_with` takes the session and the run folder name (`run-<i>`, `run-<i>-untuned`, `run-<i>-pour-safe`); `judge` calls `judge_candidates` when `routed.held.tune.candidates` is not empty. `Judged` gains `tune: Option<TuneChoice>`. `gates` adds `length_probe::contact_lines(m.lengths)` to G4 |
+| `length_probe.rs` | `LengthMeasures` gains `paths: BTreeMap<String, PathFault>` (L22), filled by `judge_lengths` from `fastroute::self_contacts` on the judged session and from the DRC report's `track_dangling` and `unconnected_items` entries; `check` sets such a net's miss to its window's lower bound |
+| `tools/route_fastroute.rs` | `reduce_run_folders` keeps the Tune files and removes the new judge folders (L26). `length_matching` adds `untuned_nets` and `tune_candidates`. `next_steps` uses `route_lengths::kicad_group_rule_pinned` when `group_needs_pinned_rule` holds. The runner gives `tune_attempt` a closure over `route_lengths::tune_file_without`, so `fastroute.rs` needs no `LengthPlan` |
+| `tools/route_lengths.rs` | `tune_file_without` (L21) |
+| skill, `API_MIGRATIONS.md`, `1-KOPPER.md`, `CREATION_HANDOFF.md` | the new fields, the pinned rule, the pour-safe candidate |
+
+### Skeletons (addendum)
+
+#### `fastroute.rs` (added)
+
+```rust
+/// Row LT, L20: the Tune pass's switch that turns fastroute's autorouter stage off,
+/// so its final tail removal never deletes held copper.
+pub(crate) const TUNE_ROUTER_OFF: &str = "--router.autorouter.enabled=false";
+
+/// Row LT, L24: the pour-safe candidate's switch: other nets' planes are obstacles,
+/// so the tuner leaves every trace that touches one as it is.
+pub(crate) const TUNE_POUR_SAFE: &str = "--router.plane_as_obstacle=true";
+
+/// Row LT, L21: at most this many Tune passes per candidate, each without the nets
+/// whose copper touched itself in the one before.
+pub(crate) const TUNE_ROUNDS_MAX: usize = 3;
+
+/// Row LT, L21: the margin of a touch, and the shared stretch an overlap needs, µm.
+pub(crate) const CONTACT_MARGIN_UM: i64 = 1;
+
+/// Which Tune candidate (L24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TuneVariant {
+    /// The Tune pass of L6 and L20.
+    Free,
+    /// The same, plus [`TUNE_POUR_SAFE`].
+    PourSafe,
+}
+
+impl TuneVariant {
+    /// The candidate's pass folder below the run folder: `tune`, `tune-pour-safe`;
+    /// round r > 1 adds `-r<r>`.
+    pub(crate) fn folder_name(self, round: usize) -> String {
+        let _ = round;
+        todo!()
+    }
+}
+
+/// How two pieces of one net touch (L21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContactKind {
+    /// The centre lines cross.
+    Crossing,
+    /// Collinear, sharing a stretch longer than [`CONTACT_MARGIN_UM`] (an exact
+    /// repeat included).
+    Overlap,
+    /// Apart, but closer than half the sum of their widths minus
+    /// [`CONTACT_MARGIN_UM`].
+    Touch,
+}
+
+/// One self contact of a net's session copper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct SelfContact {
+    pub layer: String,
+    pub kind: ContactKind,
+    /// The two pieces, as (width µm, [x1, y1, x2, y2] µm), each rounded to 1 µm and
+    /// ordered: what L21 compares with the held session.
+    pub pieces: [(i64, [i64; 4]); 2],
+}
+
+/// Every self contact (L21) of each net of `nets` in a session, from its raw
+/// paths (pieces are not merged: a repeat must stay visible). Pieces of one net on
+/// one layer are compared pairwise. Pieces that share an end point are compared only
+/// for an overlap; a junction (one piece's end on the other, not collinear) is no
+/// contact. A session that does not parse is an error.
+pub(crate) fn self_contacts(
+    ses_text: &str,
+    nets: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<SelfContact>>> {
+    let _ = (ses_text, nets);
+    todo!()
+}
+
+/// The nets of `nets` with a self contact after the Tune pass that involves a piece
+/// not in the held session's raw pieces of that net (layer, width, ends to 1 µm),
+/// with those contacts.
+pub(crate) fn new_self_contacts(
+    before: &str,
+    after: &str,
+    nets: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<SelfContact>>> {
+    let _ = (before, after, nets);
+    todo!()
+}
+
+/// One Tune candidate that passed its keep rule (L21, L24).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct TuneCandidate {
+    pub variant: TuneVariant,
+    /// Its session.
+    pub ses: PathBuf,
+    pub unrouted: usize,
+    /// Nets dropped from the tune file in its rounds, each with its reason.
+    pub dropped: Vec<(String, String)>,
+    /// Passes it ran (1 to [`TUNE_ROUNDS_MAX`]).
+    pub passes: usize,
+}
+
+/// What the Tune attempts of one run gave.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub(crate) struct TuneOutcome {
+    /// Kept candidates, `Free` first.
+    pub candidates: Vec<TuneCandidate>,
+    /// One row per Tune pass run, as every pass row, plus `variant` and `round`.
+    pub rows: Vec<Value>,
+    pub seconds: f64,
+}
+
+/// The tune file of the next round: given every net dropped so far, it writes the
+/// file into the given folder and returns its path and the nets it lists, or `None`
+/// when no group is left (`route_lengths::tune_file_without`, pair partners included).
+pub(crate) type NextTuneFile<'a> =
+    &'a (dyn Fn(&Path, &BTreeSet<String>) -> Result<Option<(PathBuf, BTreeSet<String>)>> + Sync);
+
+/// One candidate's Tune passes (L20, L21), from `held_ses`, in
+/// `folder/<variant folder>`:
+/// 1. A pass with the current tune file ([`run_tune_pass`], with [`TUNE_POUR_SAFE`]
+///    for `PourSafe`).
+/// 2. Killed: `PassError::Killed` ends the run. Failed: a `failed` row, no candidate.
+/// 3. Opened connections (against `held_unrouted`), or changed another net's copper
+///    ([`changed_outside`]): `discarded` with today's reasons, no candidate.
+/// 4. [`new_self_contacts`] names nets: they join the dropped set, `next` writes the
+///    next round's file, and the next round runs. After [`TUNE_ROUNDS_MAX`] rounds,
+///    when `next` gives `None`, or when the deadline leaves less than twice the last
+///    pass's time: `discarded` ("meanders touch their own net: …", at most 5 named),
+///    no candidate.
+/// 5. Else the candidate, with every net dropped on the way.
+///
+/// `first` is the round-1 inputs (the call's tune file); the rows go into `outcome`.
+#[allow(clippy::too_many_arguments)] // the parts of one pass, each read once
+pub(crate) async fn tune_attempt(
+    binary: &Binary,
+    folder: &Path,
+    variant: TuneVariant,
+    dsn: &Path,
+    hints: &RoutingHints,
+    files: CallFiles<'_>,
+    first: &TuneInputs<'_>,
+    next: NextTuneFile<'_>,
+    held_ses: &Path,
+    held_unrouted: usize,
+    deadline: Instant,
+    outcome: &mut TuneOutcome,
+) -> std::result::Result<Option<TuneCandidate>, PassError> {
+    let _ = (
+        binary,
+        folder,
+        variant,
+        dsn,
+        hints,
+        files,
+        first,
+        next,
+        held_ses,
+        held_unrouted,
+        deadline,
+        outcome,
+    );
+    todo!()
+}
+```
+
+#### `tools/route_lengths.rs` (added)
+
+```rust
+/// Row LT, L21: the plan's tune file without the nets of `dropped`: each group
+/// without them (a group left with fewer than 2 nets in skew mode, or with none, is
+/// left out), and the trailing pair group of every pair one of whose nets is
+/// dropped left out. `None` when no group is left.
+pub(crate) fn tune_file_without(plan: &LengthPlan, dropped: &BTreeSet<String>) -> Option<String> {
+    let _ = (plan, dropped);
+    todo!()
+}
+
+/// Row LT, L21: `dropped` with the partner of every resolved pair one of whose nets
+/// it holds.
+pub(crate) fn with_pair_partners(plan: &LengthPlan, dropped: &BTreeSet<String>) -> BTreeSet<String> {
+    let _ = (plan, dropped);
+    todo!()
+}
+
+/// Row LT, L25: whether `group` holds a pair of `pairs` that has `max_skew_mm`, so
+/// that its suggested KiCad rule must not be a `skew` rule.
+pub(crate) fn group_needs_pinned_rule(group: &ResolvedGroup, pairs: &[GatedPair]) -> bool {
+    let _ = (group, pairs);
+    todo!()
+}
+
+/// Row LT, L25: the group's KiCad rule as a `length` window pinned to the winner's
+/// longest measured net (`longest_mm`): skew mode `(constraint length (min <L − T −
+/// 0.0001>mm) (max <L + 0.0001>mm))`; target mode as [`kicad_rule_suggestion`].
+/// Named `name`, with the same net condition.
+pub(crate) fn kicad_group_rule_pinned(group: &ResolvedGroup, name: &str, longest_mm: f64) -> String {
+    let _ = (group, name, longest_mm);
+    todo!()
+}
+```
+
+#### `length_probe.rs` (added)
+
+```rust
+/// Row LT, L22: why a checked net's judged copper is not a clean path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathFault {
+    /// Crossings and overlaps of its session copper (touches are not gated).
+    pub contacts: usize,
+    /// DRC entries of the judged board that name it: `track_dangling` and
+    /// `unconnected_items`.
+    pub dangling: usize,
+}
+
+/// Row LT, L22: the faults of the checked nets (`checks.nets()`), from the judged
+/// session's self contacts (`fastroute::self_contacts`; `Touch` left out) and the
+/// judged board's DRC report. Nets without a fault are left out.
+pub(crate) fn path_faults(
+    checks: &LengthChecks,
+    contacts: &BTreeMap<String, Vec<crate::fastroute::SelfContact>>,
+    drc: &DrcReport,
+) -> BTreeMap<String, PathFault> {
+    let _ = (checks, contacts, drc);
+    todo!()
+}
+
+/// Row LT, L22: G4(d)'s lines, one per net of `faults`: "<net>'s copper crosses
+/// or overlaps itself <n> time(s)" and/or "<net> has <n> dangling or unconnected
+/// item(s)", each ending "so KiCad's length counts copper the signal does not
+/// travel".
+pub(crate) fn contact_lines(faults: &BTreeMap<String, PathFault>) -> Vec<String> {
+    let _ = faults;
+    todo!()
+}
+```
+
+#### `route_judge.rs` (added)
+
+```rust
+/// Row LT, L23: what the judge did with a run's Tune candidates.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct TuneChoice {
+    /// The candidate whose board is the run's; `None`: the untuned board.
+    pub chosen: Option<crate::fastroute::TuneVariant>,
+    /// One row per candidate: `variant`, `judged`, `rejected` (its `tune_harm`
+    /// lines), `chosen`.
+    pub rows: Vec<Value>,
+    /// The untuned board's measures, for the record.
+    pub untuned: Measures,
+}
+
+/// Row LT, L23: one line for each measure on which `tuned` is worse than `untuned`
+/// (the same run): unconnected items; violations of a DRC type, except the keys
+/// `length_probe::counts_in_g2` leaves out; G3 lines; tracks below their floor.
+/// Each line names both counts ("unconnected items 21 → 25").
+pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
+    let _ = (untuned, tuned);
+    todo!()
+}
+
+/// Row LT, L23 and L24: judges the run's untuned session in `run-<i>-untuned`, then
+/// the `Free` candidate in `run-<i>`; the `PourSafe` candidate in
+/// `run-<i>-pour-safe` only when `Free` is missing, rejected or fails G4. Among the
+/// candidates `tune_harm` leaves, the best by the rank key is the run's board; with
+/// none, the untuned board is. Returns the chosen board's `Judged` with
+/// [`TuneChoice`]; the runner rewrites `Routed.held` from it.
+async fn judge_candidates(
+    ctx: &JudgeContext,
+    routed: &Routed,
+    baseline: &Baseline,
+    tools: &dyn ToolCaller,
+) -> Result<(Judged, TuneChoice)> {
+    let _ = (ctx, routed, baseline, tools);
+    todo!()
+}
+```
+
+### Tests, each guard with a negative control (addendum)
+
+| Guard | Test | Negative control |
+|---|---|---|
+| L20 router off | the Tune pass's line holds `--router.autorouter.enabled=false` once, after the optimizer switch | Full, Fallback and Polish lines never hold it (DP's tests unchanged) |
+| L24 switch | the pour-safe candidate's line holds `--router.plane_as_obstacle=true` once; it runs only when the DSN has a plane of a net outside the tune file | the free candidate's line never holds it; a DSN whose only plane is a tuned net's runs no pour-safe candidate |
+| `self_contacts` | fixtures cut from A-tuned's `tune.ses`: `/DQ10`'s segments 51 and 143 (overlap); a crossing pair of `/DQ8`; two legs 0.1 mm apart at width 0.2 mm (touch); a touch on each side of the threshold (half the widths minus 2 µm is a touch, minus 0 µm is not) | `/DQ16` and `/DQ2` (0 contacts); a T-junction; a plain corner; a 45° corner whose copper overlaps near the corner; collinear pieces that meet end to end (no overlap); a crossing on two different layers; a crossing with another net |
+| `new_self_contacts` | a contact with a piece new in the Tune session names the net; a held contact whose piece was replaced by a new contacting piece names it too | a contact already in the held session (the same two pieces) names nothing; the router's S-bend jog (`/DQ0`, held session) names nothing |
+| L21 rounds | fake binaries: one whose first pass makes a contact on net X and whose second does not (candidate kept, X dropped with its reason, the round-2 file without X); one that makes a contact on every pass (`discarded` after 3, "meanders touch their own net"); a deadline that leaves less than twice the last pass's time (no next round, `discarded`) | a fake with no contact runs one pass; a dropped net that is half of a pair drops its partner and the pair group |
+| `tune_file_without`, `with_pair_partners` | a group losing nets, a skew group falling below 2 nets (left out), a pair group of a dropped net (left out); a dropped `P` adds its `N` | an empty `dropped` gives `tune_file_text` exactly, and adds no partner |
+| L22 G4(d) | a checked net whose judged session crosses or overlaps itself, and one that DRC names in `track_dangling`: a G4 line each, and the net's miss is its window's lower bound | an unchecked net with faults gives no line; a checked net with only touches passes; two runs with faulted nets of different windows still rank apart |
+| `tune_harm` | each measure one worse gives its line with both counts | equal or better measures give none; a change only in `length_out_of_range` gives none |
+| `judge_candidates` | fake judges: a harmful Free candidate and a harmless PourSafe one (PourSafe chosen); both harmless (the better rank wins); both harmful (untuned chosen, G4 from the untuned board); then the written SES and `kept_pass` are the chosen board's | a harmless Free candidate that passes G4: PourSafe is not judged (counted calls) |
+| L25 pinned rule | a skew group holding a pair with `max_skew_mm`: the group's rule is `length (min L−T−0.0001mm) (max L+0.0001mm)` from the winner's longest net, the pair rule stays `skew` | a group without a declared pair skew keeps `skew (max …)`; a target-mode group is unchanged |
+| L26 kept files | an unjudged run with a discarded Tune pass keeps each Tune pass folder's `fastroute.log` and session; the new judge folders of non-winners are removed | a kept or absent Tune pass leaves today's reduced folder |
+
+`cargo mutants` adds `self_contacts`, `new_self_contacts`, `path_faults`, `tune_harm`,
+`tune_file_without`, `with_pair_partners` and the round loop of `tune_attempt`.
+
+### Measurements for the parent session
+
+M1 to M3 route nothing (fastroute runs only Tune passes, kicad-cli only DRC). M4 is the
+routing verification. The parent session runs all four; the fixtures stay in
+`target/creation-research/length-tuning/`.
+
+- **M1, step 0b (fastroute only, before any body is written).** On B-tuned run 6's held
+  session (`full/full.ses`, the call's `tune.txt`, and **the run's own `variant.dsn`**, not
+  `job.dsn`, which differs), run the Tune pass's command line with
+  `--router.autorouter.enabled=false` added.
+  - Expected: the report's unrouted count equals the held one, and no net outside the tune
+    file changes (L6's comparison).
+  - Expected for the tuned nets, which L6's comparison does not cover: every held piece of
+    `D1_N`, `C_N` and `D0_N` is still present or replaced only by a meander between its ends.
+    Without the switch, the stage cut `C_N` from 12 wires and 7 vias to 11 and 5, and `D0_N`
+    from 6 and 4 to 5 and 3.
+  - Control: the same command without the switch reproduces "opened 2".
+  - Negative control: A-tuned run 2's held session with the switch gives, for every net, the
+    geometry of the recorded `tune/tune.ses`, because on A the stage removed nothing.
+  - Also: x18 accepts the switch (no "unknown option").
+- **M1b (a routing run).** Fixture F at Fast, with a build that sends the switch and keeps
+  every pass folder: no "changed the copper of GND". If a GND discard remains, its folder says
+  why.
+- **M2 (kicad-cli only).** B-tuned's item 2 board with L25's rule set: the group as a pinned
+  `length` rule and the five pair `skew` rules.
+  - Expected: 9 `length_out_of_range` plus 1 `skew_out_of_range`, the same 10 as G4.
+  - Control: the old rule set, as recorded in `shadowing_check.json` (group alone 9, pairs
+    alone 1, pairs then group 9).
+- **M3 (fastroute and kicad-cli).** A-tuned run 2's held session, M1's command line plus
+  `--router.plane_as_obstacle=true`.
+  - Expected: the import reports 0 errors, the unrouted count equals the held one, no new
+    piece on In1.Cu or In2.Cu, and no net outside the tune file changes.
+  - Expected after the item-4 procedure (ses2board, refill, DRC): 21 unconnected items, the
+    untuned board's count.
+  - Control: the same without the plane switch: 25 unconnected items, as recorded.
+  - Recorded: the nets left short, and `self_contacts` per net.
+- **M4, after the build: the verification again at M** on A, B and F, with owner decision 6's
+  measure of success.
+  - Recorded per judged run: the candidates, rejected lines, dropped nets, and the time Row LT
+    adds (Tune passes and the extra judges).
+  - Expected while FT has not landed: on A the nets that needed most length are dropped
+    (`untuned_nets`) and G4 fails honestly, with no crossing or overlap in any chosen board.
+    On B the Tune pass is kept.
+
+### Verification of this addendum
+
+**Independent review** (Sonnet 5.5, high, 2026-11-21, read-only: no routing, cargo or kicad-cli).
+It checked the claims against fastroute's and Konnect's source and the run folders, and
+reported 12 findings. Each was checked and fixed in this text:
+
+- **Three must-fix.**
+  - G4(d) as first written failed clean boards: the router's own S-bends touch. G4(d) now
+    gates only crossings and overlaps longer than 1 µm, and touches count only against new
+    pieces (L21, L22).
+  - The chosen candidate never reached the written SES. The runner now rewrites
+    `Routed.held` (L23).
+  - The first L24 used DSN keepouts and assumed copper already inside one is exempt. It is
+    not: `try_meander` probes the whole trace. fastroute's own `--router.plane_as_obstacle`
+    replaces the DSN rewrite, and L24, decision 5 and F3 now state what pour-safe tuning
+    cannot do.
+- **Seven should-fix.**
+  - The crossing count covers all 32 nets: 20 are faulted, not 7.
+  - The worst-case cost, and a deadline rule for rounds.
+  - Skeleton gaps: `TuneOutcome`, per-round inputs, where G4(d) is computed, `Deserialize`.
+  - A faulted net's miss is a finite number, not "unmeasured".
+  - Decision 6 uses counts, not gate lines.
+  - L21 compares pieces, not counts.
+  - The measurements:
+    - M1 uses `variant.dsn` and checks `C_N` and `D0_N`.
+    - M1b is named a routing run.
+    - M2 and M3 have controls.
+- **Two notes.** The extra test cases, and L20's side effects (dangling tails stay; L22 fails
+  them).
+
+**Skeleton compile** (2026-11-21). The 4 blocks above were appended by script to a scratch
+checkout of this branch (the merge of `claude/length-tuning` `735ce4ae`). Then
+`cargo check -p konnect-core --tests` ran under both lane locks (`chunk.sh`, 11:34). It
+exited 0 in 20 s. All 24 warnings are `never used` or `never constructed`, each on an item of
+these skeletons. The first draft's blocks had also compiled (11:31, exit 0). The scratch
+checkout was then removed.
