@@ -27,10 +27,14 @@ Nets that must have matched lengths are declared in the design intent, and
     pass runs again (up to 3 passes per candidate). When the DSN has a plane of a net
     outside the tune file, a second, pour-safe candidate
     (`--router.plane_as_obstacle=true`) is tuned too. The judge judges the run's
-    untuned session and each candidate, rejects a candidate that has more unconnected
-    items, more violations of any DRC type except the two length keys, more G3
-    lines or more tracks below their floor than the untuned board, and chooses the
-    best by the rank key; with none left the run keeps its untuned board. The
+    untuned session and each candidate, rejects a candidate that is worse than the
+    untuned board in unconnected items, in any DRC type except the two length keys,
+    in undersized nets or narrow paths, in tracks below their floor, or in the audit's
+    routed share or completion (by the numbers), and chooses the best of the untuned
+    board and the candidates left by the rank key; an exact tie goes to the untuned
+    board. In a call with a group or a pair skew, the judge's scratch projects (the
+    baseline's included) set `track_dangling` to at least `warning` and
+    `unconnected_items` to at least `error`. The
     session the call writes and `result_pass` are the chosen board's; the pour-safe
     candidate is judged only when the free one is rejected or fails G4. Judge
     folders `judge/run-<i>-untuned` and `judge/run-<i>-pour-safe` are removed with
@@ -40,7 +44,7 @@ Nets that must have matched lengths are declared in the design intent, and
     `length` and `skew` rules, on lengths KiCad measures, and (d) that no checked
     net's copper crosses or overlaps itself and that KiCad's DRC names none in a
     `track_dangling` or `unconnected_items` entry (the net's miss is then its window's
-    lower bound). `completion.judged.gates`
+    lower bound, or, for a net in no group, its pair's longer length). `completion.judged.gates`
     gains `g4`; a failed G4 gives `status` `complete_with_gate_failures`, and the
     judged `complete` needs all four gates. `search.runs` rows carry `g4_failed` and
     `length_miss_mm` for a run that was checked.
@@ -49,11 +53,10 @@ Nets that must have matched lengths are declared in the design intent, and
   - New result field `length_matching` when the intent declares a group or a skew,
     or the board's `.kicad_dru` has a `length` or `skew` rule: `groups`, `pairs`,
     `layer_heights`, `kicad_rules`, `kicad_violations`, `tune_pass` (the chosen
-    candidate's row), `untuned_nets` (each net the chosen candidate left untuned,
-    with its reason), `tune_candidates` (each candidate the judge saw: `variant`,
-    `passes`, `dropped`, `judged`, `g4_failed`, `rejected`, `chosen`; both fields
+    candidate's row), `untuned_nets`, `tune_candidates` (each candidate the judge saw: `variant`,
+    `passes`, `dropped`, `judged`, `g4_failed`, `rejected`, `reason`, `chosen`; both fields
     only when the winner's run had a Tune pass), `pairs_tuned_net_by_net`, and
-    `note`. `completion.next_steps` gains the KiCad
+    `note`. `untuned_nets` lists every tune-file net the written session leaves untuned, each with its reason: every net with "the judge kept the untuned board: ..." when the judge keeps the untuned board, every net with the last pass's reason when no candidate survived its passes, otherwise the chosen candidate's dropped nets. `completion.next_steps` gains the KiCad
     rule of each checked group, for `create_custom_drc_rule` after
     `apply_specctra_ses`; a skew group that holds a pair with `max_skew_mm` gets a
     `length` rule pinned to the winner's longest net (KiCad checks one `skew` rule

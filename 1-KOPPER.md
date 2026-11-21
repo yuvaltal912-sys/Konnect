@@ -130,7 +130,7 @@ the short nets with serpentines, and the judge measures every checked net with
 KiCad. A group that cannot be applied refuses the call before anything is routed.
 The judge compares every tuned board with the same run's untuned board and keeps
 the tuned one only when it is no worse (no more open connections, DRC violations,
-width failures); a net whose serpentines touch its own copper is left untuned. A
+width failures or tracks below their floor) and ranks better; a net whose serpentines touch its own copper is left untuned. A
 checked net whose copper crosses or overlaps itself, or that KiCad reports as
 dangling or unconnected, fails the length gate, because KiCad's length would count
 copper the signal does not travel. The routing result carries `length_matching`

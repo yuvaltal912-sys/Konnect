@@ -1828,6 +1828,22 @@ fn a_faulted_net_in_no_group_adds_its_pairs_longer_length_as_its_miss() {
         "{}",
         measures.miss_mm
     );
+    // A faulted net in two pairs is charged once, by the first.
+    let two = checks_of(vec![], vec![pair("p", "n"), pair("p", "m")]);
+    let measures = check(
+        &two,
+        &lengths_of(&[("p", 40.0), ("n", 40.05), ("m", 90.0)]),
+        vec![],
+        fault.clone(),
+        0.0,
+    );
+    // 40.05 once (the first pair's longer length), and the second pair's own skew miss
+    // (m is 50 mm off p, 49.9 mm over its maximum of 0.1).
+    assert!(
+        (measures.miss_mm - 89.95).abs() < 1e-6,
+        "{}",
+        measures.miss_mm
+    );
     // An unmeasured pair: the net counts as unmeasured.
     let measures = check(
         &checks,
