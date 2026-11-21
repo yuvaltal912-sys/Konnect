@@ -30,6 +30,7 @@ use std::path::Path;
 // Board construction (rank 21): footprint lock, rule areas, zone list/delete.
 #[path = "board_construction.rs"]
 mod board_construction;
+pub(crate) use board_construction::check_simple_ring;
 
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
 fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
