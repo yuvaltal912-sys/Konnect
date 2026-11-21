@@ -736,6 +736,125 @@ fn a_pair_inside_a_group_is_listed_in_it_and_its_skew_is_gated_with_the_group() 
     );
 }
 
+#[test]
+fn a_skew_is_matched_to_its_own_pair_when_pairs_share_a_net() {
+    // Three pairs over three nets: each skew names two of them, and any one net also
+    // belongs to another pair.
+    let pairs = pairs_of(vec![
+        resolved_pair("DQ0", "DQ1", "/DQ0", "/DQ1", Some(0.1)),
+        resolved_pair("DQ0", "DQ2", "/DQ0", "/DQ2", Some(0.2)),
+        resolved_pair("DQ1", "DQ2", "/DQ1", "/DQ2", Some(0.3)),
+    ]);
+    let groups = [
+        declared("clk", "clocks", &["/a/CLK", "/b/CLK"], 0.5, None),
+        declared("bus", "bytes", &["DQ0", "DQ1", "DQ2"], 0.5, None),
+    ];
+    let skews = [
+        declared_skew("DQ0", "DQ2", 0.2),
+        declared_skew("DQ1", "DQ2", 0.3),
+        declared_skew("DQ0", "DQ1", 0.1),
+    ];
+    let (_, gated) = resolve(&groups, &skews, &dsn_nets(), &board_nets(), &pairs).unwrap();
+    let seen: Vec<(&str, &str, &str, &str, Option<&str>)> = gated
+        .iter()
+        .map(|pair| {
+            (
+                pair.positive.as_str(),
+                pair.negative.as_str(),
+                pair.dsn_positive.as_str(),
+                pair.dsn_negative.as_str(),
+                pair.group.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("DQ0", "DQ2", "/DQ0", "/DQ2", Some("bytes")),
+            ("DQ1", "DQ2", "/DQ1", "/DQ2", Some("bytes")),
+            ("DQ0", "DQ1", "/DQ0", "/DQ1", Some("bytes")),
+        ]
+    );
+    assert_eq!(
+        gated
+            .iter()
+            .map(|pair| pair.max_skew_mm)
+            .collect::<Vec<_>>(),
+        vec![0.2, 0.3, 0.1]
+    );
+    // A pair that shares only one net with a resolved pair is not that pair.
+    for (positive, negative) in [("DQ0", "/a/CLK"), ("/b/CLK", "DQ2"), ("DQ1", "DQ0")] {
+        let reason = resolve(
+            &[],
+            &[declared_skew(positive, negative, 0.2)],
+            &dsn_nets(),
+            &board_nets(),
+            &pairs,
+        )
+        .expect_err("a pair that is not in the pairs plan")
+        .reason;
+        assert!(
+            reason.contains("not among the pairs routed coupled"),
+            "{positive} {negative}: {reason}"
+        );
+    }
+    // Nor does the reason of a left-out pair stand in for another one.
+    let left_out = |positive: &str, negative: &str, reason: &str| UnresolvedPair {
+        positive: positive.into(),
+        negative: negative.into(),
+        reason: reason.into(),
+    };
+    let unresolved = PairsPlan {
+        unresolved: vec![
+            left_out("DQ0", "DQ1", "reason one"),
+            left_out("DQ0", "DQ2", "reason two"),
+        ],
+        ..PairsPlan::default()
+    };
+    let skew = |positive: &str, negative: &str| {
+        resolve(
+            &[],
+            &[declared_skew(positive, negative, 0.2)],
+            &dsn_nets(),
+            &board_nets(),
+            &unresolved,
+        )
+        .expect_err("left out")
+        .reason
+    };
+    let reason = skew("DQ0", "DQ2");
+    assert!(
+        reason.contains("(reason two)") && !reason.contains("reason one"),
+        "{reason}"
+    );
+    let reason = skew("DQ1", "DQ2");
+    assert!(
+        reason.contains("not among the pairs routed coupled") && !reason.contains("reason"),
+        "{reason}"
+    );
+    let reason = skew("DQ0", "GND");
+    assert!(
+        reason.contains("not among the pairs routed coupled") && !reason.contains("reason"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_pair_outside_every_group_is_gated_with_no_group() {
+    // Neither net of the pair is in a group while other groups exist.
+    let pairs = pairs_of(vec![resolved_pair("DQ0", "DQ1", "/DQ0", "/DQ1", Some(0.2))]);
+    let (_, gated) = resolve(
+        &[declared("clk", "clocks", &["/a/CLK", "/b/CLK"], 0.5, None)],
+        &[declared_skew("DQ0", "DQ1", 0.2)],
+        &dsn_nets(),
+        &board_nets(),
+        &pairs,
+    )
+    .unwrap();
+    assert_eq!(gated.len(), 1);
+    assert_eq!(gated[0].group, None);
+}
+
 // ─── The tune file (L5) ─────────────────────────────────────────────────────
 
 /// A copy of the rules of fastroute's `parse_tune_file` (`crates/fastroute/src/main.rs`),
@@ -1121,6 +1240,29 @@ fn the_shortest_length_is_the_farthest_pad_distance_less_both_circumradii() {
 }
 
 #[test]
+fn a_pad_with_no_net_is_not_a_pad_of_any_net() {
+    // A pad that names no net beside N1's pads, one in N1's own footprint and one far
+    // away, changes nothing: N1's pads are in two footprints, 20 mm apart.
+    let unnetted = |number: &str, dx: f64| {
+        format!("(pad \"{number}\" smd rect (at {dx} 0) (size 1 1) (layers \"F.Cu\"))")
+    };
+    let board = board_of(&[
+        footprint(
+            0.0,
+            0.0,
+            &[pad("1", "N1", 0.0, 1.0, 1.0), unnetted("2", 0.5)],
+        ),
+        footprint(20.0, 0.0, &[pad("1", "N1", 0.0, 1.0, 1.0)]),
+        footprint(100.0, 0.0, &[unnetted("1", 0.0)]),
+    ]);
+    let shortest = shortest_possible_mm(&board, &set(&["N1"])).unwrap();
+    assert!(
+        (shortest["N1"] - (20.0 - 2.0_f64.sqrt())).abs() < 1e-9,
+        "{shortest:?}"
+    );
+}
+
+#[test]
 fn a_net_that_owns_a_zone_is_left_out() {
     let parts = |zone: bool| {
         let mut parts = vec![
@@ -1226,6 +1368,12 @@ fn a_target_below_the_shortest_possible_length_refuses_before_routing() {
     assert!(impossible_target(&[target_group(40.0, 1.0)], &shortest).is_none());
     // One step below the bound refuses.
     assert!(impossible_target(&[target_group(18.0, 0.5)], &shortest).is_some());
+    // The bound exactly at the window's top is within reach; a hair above it is not.
+    let exact: BTreeMap<String, f64> = [("N1".to_string(), 18.5)].into();
+    assert!(impossible_target(&[target_group(18.0, 0.5)], &exact).is_none());
+    assert!(impossible_target(&[target_group(18.0, 0.499)], &exact).is_some());
+    let above: BTreeMap<String, f64> = [("N1".to_string(), 18.500_001)].into();
+    assert!(impossible_target(&[target_group(18.0, 0.5)], &above).is_some());
     // A net with no entry (it owns a zone) is never refused.
     assert!(impossible_target(&[target_group(1.0, 0.5)], &BTreeMap::new()).is_none());
     // A skew-mode group is never refused here, whatever the bound.

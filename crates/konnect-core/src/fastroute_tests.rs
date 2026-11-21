@@ -1162,6 +1162,147 @@ fn a_diagonal_split_at_different_vertices_is_the_same_copper() {
     assert_eq!(changed(&whole, &shifted, &[]), vec!["A".to_string()]);
 }
 
+/// The pieces of net `A` for wires given as lists of points (micrometres), all on one
+/// layer and width.
+fn pieces_of(wires: &[Vec<(i64, i64)>]) -> Vec<(String, i64, [i64; 4])> {
+    let text: String = wires
+        .iter()
+        .map(|points| wire("F.Cu", 250, points))
+        .collect();
+    copper_by_net(&session(&[("A", text)])).unwrap()["A"]
+        .pieces
+        .clone()
+}
+
+/// Both ends of a piece, ordered, so a test does not depend on which end is first.
+fn ends_of(piece: &(String, i64, [i64; 4])) -> [(i64, i64); 2] {
+    let mut ends = [(piece.2[0], piece.2[1]), (piece.2[2], piece.2[3])];
+    ends.sort();
+    ends
+}
+
+/// Collinear pieces merge exactly when they touch or overlap on one line (L6): on every
+/// direction, slope and orientation, and a parallel piece or a gap never merges.
+#[test]
+fn collinear_pieces_merge_on_every_direction_and_only_when_they_touch_or_overlap() {
+    // A step of the line in micrometres; the gcd of its parts is above 1 for several,
+    // so the pieces' own direction vectors differ in size while the line is one.
+    for step in [
+        (30, 0),
+        (0, 40),
+        (20, 20),
+        (20, -20),
+        (30, 60),
+        (60, -30),
+        (-40, 10),
+        (-15, -45),
+        (10, 30),
+    ] {
+        let start = (700, 1100);
+        let at = |k: i64| (start.0 + k * step.0, start.1 + k * step.1);
+        // The same step turned a quarter: a parallel line, with the same positions along
+        // the line.
+        let aside = |k: i64| {
+            let (x, y) = at(k);
+            (x - step.1, y + step.0)
+        };
+        let whole = pieces_of(&[vec![at(0), at(6)]]);
+        assert_eq!(whole.len(), 1, "{step:?}");
+        assert_eq!(ends_of(&whole[0]), {
+            let mut ends = [at(0), at(6)];
+            ends.sort();
+            ends
+        });
+        for (what, wires) in [
+            // Touching, with unequal lengths and either orientation, either order.
+            ("touching", vec![vec![at(0), at(2)], vec![at(2), at(6)]]),
+            (
+                "touching, reversed",
+                vec![vec![at(6), at(2)], vec![at(2), at(0)]],
+            ),
+            (
+                "touching, mixed",
+                vec![vec![at(0), at(2)], vec![at(6), at(2)]],
+            ),
+            (
+                "touching, mixed the other way",
+                vec![vec![at(2), at(0)], vec![at(2), at(6)]],
+            ),
+            (
+                "touching, listed last first",
+                vec![vec![at(2), at(6)], vec![at(0), at(2)]],
+            ),
+            // Overlapping.
+            ("overlapping", vec![vec![at(0), at(4)], vec![at(3), at(6)]]),
+            (
+                "overlapping, mixed",
+                vec![vec![at(4), at(0)], vec![at(3), at(6)]],
+            ),
+            // One inside another.
+            ("contained", vec![vec![at(0), at(6)], vec![at(2), at(3)]]),
+            (
+                "contained, listed after",
+                vec![vec![at(2), at(3)], vec![at(6), at(0)]],
+            ),
+            // One polyline that doubles back.
+            ("doubling back", vec![vec![at(0), at(6), at(2)]]),
+            // Three pieces, the middle one listed last.
+            (
+                "three",
+                vec![vec![at(0), at(1)], vec![at(4), at(6)], vec![at(1), at(4)]],
+            ),
+        ] {
+            assert_eq!(pieces_of(&wires), whole, "{step:?}: {what}");
+        }
+        // A gap leaves two pieces, one on each side of it.
+        let gapped = pieces_of(&[vec![at(0), at(2)], vec![at(4), at(6)]]);
+        assert_eq!(gapped.len(), 2, "{step:?}: a gap");
+        let mut found: Vec<_> = gapped.iter().map(ends_of).collect();
+        found.sort();
+        let ordered = |a: (i64, i64), b: (i64, i64)| {
+            let mut ends = [a, b];
+            ends.sort();
+            ends
+        };
+        let mut want = vec![ordered(at(0), at(2)), ordered(at(4), at(6))];
+        want.sort();
+        assert_eq!(found, want, "{step:?}: a gap");
+        // A piece beside the line never merges, touching in position along it or not.
+        for (what, wires) in [
+            (
+                "beside, touching",
+                vec![vec![at(0), at(3)], vec![aside(3), aside(6)]],
+            ),
+            (
+                "beside, overlapping",
+                vec![vec![at(0), at(6)], vec![aside(0), aside(6)]],
+            ),
+            (
+                "beside, inside",
+                vec![vec![at(0), at(6)], vec![aside(2), aside(3)]],
+            ),
+        ] {
+            let pieces = pieces_of(&wires);
+            assert_eq!(pieces.len(), 2, "{step:?}: {what}");
+        }
+    }
+}
+
+#[test]
+fn a_piece_of_no_length_is_no_copper() {
+    let degenerate = |points: &[(i64, i64)]| pieces_of(&[points.to_vec()]);
+    // A repeated point adds nothing to the piece.
+    assert_eq!(
+        degenerate(&[(100, 100), (100, 100), (500, 100)]),
+        degenerate(&[(100, 100), (500, 100)])
+    );
+    assert_eq!(degenerate(&[(100, 100), (500, 100), (500, 100)]).len(), 1);
+    // A path that never leaves its point is no piece at all.
+    assert!(degenerate(&[(100, 100), (100, 100)]).is_empty());
+    let alone = session(&[("A", wire("F.Cu", 250, &[(100, 100), (100, 100)]))]);
+    assert!(changed(&alone, &session(&[]), &[]).is_empty());
+}
+
 // ---- on a system that cannot isolate a run ---------------------------------
 
 #[cfg(not(target_os = "macos"))]

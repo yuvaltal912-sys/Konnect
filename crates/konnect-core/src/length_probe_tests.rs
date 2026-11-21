@@ -352,6 +352,89 @@ fn actual_mm_is_none_unless_exactly_one_actual_length_is_there() {
 }
 
 #[test]
+fn actual_mm_survives_a_description_that_stops_anywhere() {
+    // The text ends on a digit, a point, a comma, a space, or the start of the unit:
+    // nothing is read past its end.
+    for text in [
+        "actual 5",
+        "5",
+        "actual 52.2760",
+        "actual 5.",
+        "actual 5,",
+        "5.",
+        "actual 5 ",
+        "actual 5 \t",
+        "actual 5 m",
+        "actual 5m",
+        "m",
+        " ",
+    ] {
+        assert_eq!(actual_mm(text), None, "{text:?}");
+    }
+    // A number at the very start of the text is read, with its unit.
+    assert_eq!(actual_mm("5 mm"), Some(5.0));
+    assert_eq!(actual_mm("52.2760 mm"), Some(52.2760));
+    assert_eq!(actual_mm("52,2760mm"), Some(52.2760));
+    assert_eq!(actual_mm("5mm"), Some(5.0));
+    assert_eq!(
+        actual_mm("actual 5 mm"),
+        Some(5.0),
+        "the unit ends the text"
+    );
+    assert_eq!(actual_mm("(actual 5 mm)"), Some(5.0));
+    assert_eq!(actual_mm("actual 5 mm."), Some(5.0));
+}
+
+#[test]
+fn actual_mm_reads_a_length_only_when_the_unit_is_exactly_mm() {
+    // KiCad prints millimetres as `mm` with `--units mm`: a bare `m`, a longer word, or
+    // a unit of another letter is not a length (a metre would be read 1000 times too
+    // small).
+    for text in [
+        "actual 5 m)",
+        "actual 5 m; min 2000.0000 mm",
+        "actual 5 mx",
+        "actual 5 mmx",
+        "actual 5mmx",
+        "a 5 mmx",
+        "actual 5 mil",
+        "actual 5 in",
+        "actual 5 nm",
+        "actual 5 µm",
+    ] {
+        assert_eq!(actual_mm(text), None, "{text}");
+    }
+    // The same number with the unit is read.
+    assert_eq!(actual_mm("actual 5 mm)"), Some(5.0));
+    // A number is its digits and, only with digits after the point, a decimal part: a
+    // point or comma with nothing after it is not part of the number.
+    for text in ["actual 5. mm", "actual 5.mm", "actual 5, mm", "actual 5,mm"] {
+        assert_eq!(actual_mm(text), None, "{text}");
+    }
+    assert_eq!(actual_mm("actual 5.5 mm"), Some(5.5));
+    // A number that follows a number is read on its own: the first does not swallow the
+    // white space between them.
+    assert_eq!(actual_mm("actual 5 6.0000 mm"), Some(6.0));
+    assert_eq!(actual_mm("actual 5 6,0000 mm"), Some(6.0));
+    assert_eq!(actual_mm("2000.0000 mm 7 mm"), Some(7.0));
+    // A number inside a name is not a length, whatever starts the name.
+    for text in [
+        "actual _5 mm",
+        "actual a5 mm",
+        "actual x_5 mm",
+        "actual _52.2760 mm",
+        "actual é5 mm",
+    ] {
+        assert_eq!(actual_mm(text), None, "{text}");
+    }
+    // Text with other numbers around the length does not hide it.
+    assert_eq!(
+        actual_mm("rule '__konnect_len_0001' min length 2000.0000 mm; actual 52.2760 mm"),
+        Some(52.2760)
+    );
+}
+
+#[test]
 fn parse_probe_reads_both_real_reports() {
     for raw in [REPORT, REPORT_IGNORED] {
         let (lengths, unmeasured) = parse_probe(&report(raw), &fixture_nets()).unwrap();
@@ -550,6 +633,60 @@ fn the_bound_passes_within_half_a_printed_digit_and_one_step_past_it_fails() {
     // Negative control: 0.01 mm across a bound flips the verdict.
     assert_eq!(miss(42.49), 0.0);
     assert!((miss(42.51) - 0.01).abs() < 1e-9);
+}
+
+#[test]
+fn the_half_printed_digit_is_inside_and_a_hair_past_it_is_outside() {
+    // The bound itself, plus or minus exactly half of the last printed digit, is still
+    // on the bound; anything past that is a miss.
+    let checks = checks_of(
+        vec![group(
+            "t",
+            &["a"],
+            Window::Target {
+                target_mm: 42.0,
+                tolerance_mm: 0.5,
+            },
+        )],
+        vec![CheckedPair {
+            positive: "p".into(),
+            negative: "n".into(),
+            max_skew_mm: 0.25,
+        }],
+    );
+    let run = |a: f64, positive: f64| {
+        check(
+            &checks,
+            &lengths_of(&[("a", a), ("p", positive), ("n", 0.0)]),
+            vec![],
+            0.0,
+        )
+    };
+    let half = PRINTED_HALF_DIGIT_MM;
+    let beyond = |mm: f64| f64::from_bits(mm.to_bits() + 1);
+    let below = |mm: f64| f64::from_bits(mm.to_bits() - 1);
+    // Group, low side: 41.5 - half is inside, the next float below is not.
+    let at = 41.5 - half;
+    assert_eq!(run(at, 0.0).groups[0].nets[0].miss_mm, 0.0, "low end");
+    assert!(
+        run(below(at), 0.0).groups[0].nets[0].miss_mm > 0.0,
+        "below the low end"
+    );
+    // Group, high side.
+    let at = 42.5 + half;
+    assert_eq!(run(at, 0.0).groups[0].nets[0].miss_mm, 0.0, "high end");
+    assert!(
+        run(beyond(at), 0.0).groups[0].nets[0].miss_mm > 0.0,
+        "above the high end"
+    );
+    // Pair: the other net is 0, so the skew is the positive net's length exactly.
+    let top = 0.25 + half;
+    assert_eq!(run(42.0, top).pairs[0].skew_mm, Some(top));
+    assert_eq!(run(42.0, top).pairs[0].miss_mm, 0.0, "pair, on the bound");
+    assert!(
+        run(42.0, beyond(top)).pairs[0].miss_mm > 0.0,
+        "pair, past the bound"
+    );
 }
 
 #[test]
@@ -829,6 +966,100 @@ fn a_miss_that_rounds_to_zero_is_shown_with_the_digits_kicad_prints() {
     assert_eq!(
         g4_lines(Some(&measures), &BTreeMap::new()),
         vec!["group 'dq' (ram): a is 42.5001 mm, 0.0001 mm above its window 41.5000\u{2013}42.5000 mm"]
+    );
+}
+
+#[test]
+fn a_passing_pair_gets_no_line_beside_a_failing_one() {
+    let pair = |positive: &str, negative: &str, skew: f64, max: f64, miss: f64| PairSkew {
+        positive: positive.into(),
+        negative: negative.into(),
+        skew_mm: Some(skew),
+        max_skew_mm: max,
+        miss_mm: miss,
+    };
+    let measures = measures_with(
+        vec![],
+        vec![
+            pair("/A+", "/A-", 0.10, 0.25, 0.0),
+            pair("/B+", "/B-", 0.35, 0.25, 0.10),
+            pair("/C+", "/C-", 0.05, 0.25, 0.0),
+        ],
+        0.10,
+    );
+    assert_eq!(
+        g4_lines(Some(&measures), &BTreeMap::new()),
+        vec!["pair /B+ / /B-: skew 0.35 mm, 0.10 mm over its maximum 0.25 mm"]
+    );
+    // A pair with no skew (a net unmeasured) has no pair line, whatever its miss.
+    let mut unmeasured = measures_with(vec![], vec![pair("/D+", "/D-", 0.0, 0.25, 0.1)], 0.0);
+    unmeasured.pairs[0].skew_mm = None;
+    assert!(g4_lines(Some(&unmeasured), &BTreeMap::new()).is_empty());
+}
+
+#[test]
+fn a_pair_miss_that_rounds_to_zero_is_shown_with_the_digits_kicad_prints() {
+    let pair = |skew: f64, miss: f64| PairSkew {
+        positive: "/P".into(),
+        negative: "/N".into(),
+        skew_mm: Some(skew),
+        max_skew_mm: 0.25,
+        miss_mm: miss,
+    };
+    let lines = |skew: f64, miss: f64| {
+        g4_lines(
+            Some(&measures_with(vec![], vec![pair(skew, miss)], miss)),
+            &BTreeMap::new(),
+        )
+    };
+    // Under half a hundredth: four digits.
+    assert_eq!(
+        lines(0.2501, 0.0001),
+        vec!["pair /P / /N: skew 0.2501 mm, 0.0001 mm over its maximum 0.2500 mm"]
+    );
+    assert_eq!(
+        lines(0.2549, 0.0049),
+        vec!["pair /P / /N: skew 0.2549 mm, 0.0049 mm over its maximum 0.2500 mm"]
+    );
+    // Half a hundredth and more: two digits.
+    assert_eq!(
+        lines(0.255, 0.005),
+        vec!["pair /P / /N: skew 0.26 mm, 0.01 mm over its maximum 0.25 mm"]
+    );
+    assert_eq!(
+        lines(0.35, 0.10),
+        vec!["pair /P / /N: skew 0.35 mm, 0.10 mm over its maximum 0.25 mm"]
+    );
+}
+
+#[test]
+fn a_group_miss_of_half_a_hundredth_is_shown_with_two_digits() {
+    let lines = |miss: f64| {
+        g4_lines(
+            Some(&measures_with(
+                vec![GroupLengths {
+                    interface: "ram".into(),
+                    name: "dq".into(),
+                    longest_mm: Some(42.0),
+                    nets: vec![net("a", Some(43.0), 41.5, 42.5, miss)],
+                }],
+                vec![],
+                miss,
+            )),
+            &BTreeMap::new(),
+        )
+    };
+    assert_eq!(
+        lines(0.0049),
+        vec!["group 'dq' (ram): a is 43.0000 mm, 0.0049 mm above its window 41.5000\u{2013}42.5000 mm"]
+    );
+    assert_eq!(
+        lines(0.005),
+        vec!["group 'dq' (ram): a is 43.00 mm, 0.01 mm above its window 41.50\u{2013}42.50 mm"]
+    );
+    assert_eq!(
+        lines(0.006),
+        vec!["group 'dq' (ram): a is 43.00 mm, 0.01 mm above its window 41.50\u{2013}42.50 mm"]
     );
 }
 

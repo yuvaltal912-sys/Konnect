@@ -713,6 +713,30 @@ fn an_unknown_key_inside_a_length_group_or_a_pair_is_refused() {
     assert!(matches!(read_text(&text), IntentRead::Unusable { .. }));
 }
 
+/// A tolerance of zero is reported once, on the tolerance: the target is not also
+/// blamed for not exceeding a tolerance that is already refused.
+#[test]
+fn a_tolerance_that_is_refused_is_the_only_problem_of_its_group() {
+    for tolerance in [json!(0), json!(-0.5)] {
+        for target in [json!(0), json!(-3), json!(0.5)] {
+            let reason = refusal_reason(ram(
+                json!([{ "name": "g", "nets": ["D0", "D1"], "tolerance_mm": tolerance,
+                         "target_mm": target }]),
+                json!([]),
+            ))
+            .expect("a tolerance that is not positive is refused");
+            assert!(
+                reason.contains("length_groups[0].tolerance_mm"),
+                "{tolerance} {target}: {reason}"
+            );
+            assert!(
+                !reason.contains("greater than tolerance_mm"),
+                "{tolerance} {target}: {reason}"
+            );
+        }
+    }
+}
+
 /// Each length rule of L1a refuses with the path of what is wrong, and the same
 /// record with the rule met is accepted.
 #[test]
