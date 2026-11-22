@@ -6,7 +6,9 @@ in a Claude Fable 5.2 session; reviewed by an agent that did not write it, and c
 its findings (see "Verification of this document"). Merged as #102 (main `7bd3f77b`); written
 on branch `claude/zone-router-research`, from `fork/main` `517eebf0`. No stage has started: each
 waits for the owner's word. Engine facts are from fastroute `61d6e45` (branch `ft-design`: the
-pinned x18, `1e94751`, plus row FT). KiCad facts are from the KiCad 10.0.1 source.
+pinned x18, `1e94751`, plus row FT). KiCad facts are from the KiCad 10.0.1 source. The section
+"The design on x19" (2026-11-22) brings the design in line with fastroute x19 (branch `gr`,
+`b3ea917`), the build Row GS is about to pin; a line it made wrong says so where it stands.
 
 ## What the owner asked for
 
@@ -127,7 +129,7 @@ uses it as a cheap probe before any engine work.
 - **P1. KiCad's refill is the truth.** The model predicts; the judge's refill and DRC decide.
 - **P2. The model errs to the safe side.** It may miss copper that KiCad fills. It must never
   call a pad connected that KiCad leaves open. Stage ZR1 measures exactly that.
-- **P3. Off by default.** Without `--zones` the engine takes today's code paths, byte for byte.
+- **P3. Off by default.** Without `--x.zones` the engine takes today's code paths, byte for byte.
 - **P4. Nothing is guessed.** Where the model does not cover a board, the pour keeps today's
   reading, and the result names it and the reason:
   - one zone: a hatch fill, rounded or chamfered corners, a setting that cannot be read;
@@ -202,7 +204,9 @@ is a parameter. KiCad keeps the exact polygons.
 3. **Closing.** After the routing passes, and again after the optimizer, the snapshot is
    redrawn from the board as routed. Every stranded group is routed to the main group, with
    tracks, vias and rip-up. A starved pad gets a short track onto the fill, which KiCad counts
-   as a spoke. Rounds repeat until nothing is open or a round closes nothing.
+   as a spoke. Rounds repeat until nothing is open or a round closes nothing. On x19 the group
+   search runs between the second closing and W8, and a third closing runs after W8 only when
+   W8 opened something (corrected for x19: see "The design on x19", Z18).
 
 **When the snapshot is redrawn:** before every autoroute pass and every optimizer pass, when
 the pipeline swaps the board for a saved one, before each closing round, and before the report.
@@ -210,16 +214,20 @@ Between those points a cut made by another net is not yet in it; the closing sta
 last ones. Groups are never stale: they are computed from the snapshot and the board's current
 items, and cached by the board's own change counter, as the engine's contact cache is. The
 parallel pass routes on board copies; each copy shares the snapshot and has its own groups.
+On x19 a group-search move routes on a copy that shares the snapshot too, but redraws its own
+after each member that changed a modelled layer, and W8 is followed by a redraw (corrected for x19: see "The design on x19", Z15
+and Z18).
 
 **Known limit of the cost:** the optimizer compares routes by open connections, vias and
 length. It can shorten a track across a pour. The closing stage after it repairs the
 connection; whether the cost must also enter the optimizer's comparison is decided on ZR3's
-numbers.
+numbers. On x19 the group search has the same blind spot, and in its open count as well; it gets
+a move-local redraw and a "never more pour damage" rule (corrected for x19: see "The design on x19", Z15 and Z17).
 
 ### What Konnect sends and reads
 
-- **Sends** `--zones=<file>`, like `--pairs` and `--tune`. One `zone` line per modelled plane,
-  keyed by the plane's place in the DSN:
+- **Sends** `--x.zones=<file>` (named `--zones` before the x19 addendum, Z21), like `--pairs`
+  and `--tune`. One `zone` line per modelled plane, keyed by the plane's place in the DSN:
 
   ```text
   zones 1
@@ -269,10 +277,10 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 
 | Stage | Where | What | Done when |
 |---|---|---|---|
-| **ZR0** Measure | Konnect | The judge records, per run: open on pour nets before stitching, stitching vias, fill pieces, the largest piece's share, starved thermals, the winner's shape. Plus one probe in the bench: planes from KiCad's real fill of the unrouted board | A baseline table per board and shape, with fastroute. Sessions byte-identical to before |
-| **ZR1** Model | engine, Konnect | `--zones`, the model, the report. Routing unchanged | Zero false connections on every run. Sessions byte-identical with and without `--zones`. The redraw's time recorded |
-| **ZR2** Truth | engine | The model's groups as connectivity, landing points, the closing stage | Open before stitching is 0 and no stitching via is needed, on at least 9 of 10 judged as-exported runs. G1 and G2 pass shares not below ZR0 |
-| **ZR3** Cost | engine | The cut cost, with its weight chosen from a small matrix | Fewer pieces and a larger main piece than ZR2 at the same gate shares; ground track of the winner near the hand routing's |
+| **ZR0** Measure | Konnect | The judge records, per run: open on pour nets before stitching, stitching vias, fill pieces, the largest piece's share, starved thermals, the winner's shape. Plus one probe in the bench: planes from KiCad's real fill of the unrouted board | A baseline table per board and shape, with fastroute x19 and the smart-router switches on, from the main that holds Row GS (corrected for x19, Z14). Sessions byte-identical to before |
+| **ZR1** Model | engine, Konnect | `--x.zones`, the model, the report. Routing unchanged | Zero false connections on every run. Sessions byte-identical with and without `--x.zones`, with count time limits (`--no-time-limits`; x19 note: the redraws change timing under wall-clock limits). The redraw's time recorded |
+| **ZR2** Truth | engine | The model's groups as connectivity, landing points, the closing stage; on x19 also the group search's move-local redraw and the closing order (Z15, Z18) | Open before stitching is 0 and no stitching via is needed, on at least 9 of 10 judged as-exported runs. G1 and G2 pass shares not below ZR0 |
+| **ZR3** Cost | engine | The cut cost, with its weight chosen from a small matrix; on x19 also the group search's "never more pour damage" rule (Z17) | Fewer pieces and a larger main piece than ZR2 at the same gate shares; ground track of the winner near the hand routing's; the search's `pour_worse` and `cut` ends counted |
 | **ZR4** Define | Konnect | `plan_pours`, the intent's `pours`, `add_zone`'s missing settings | On each board with its pours removed, the proposals refill clean and the route passes G1 |
 | **ZR5** Rank | Konnect | Pour measures in the rank key; the skill's order of work | The owner's word, on ZR3's numbers |
 
@@ -300,10 +308,11 @@ ZR4 touches no engine file and may run beside ZR1 to ZR3.
 
 1. **Go ahead with ZR0 and ZR1?** They change no routing: a fastroute baseline, then the model
    beside KiCad's truth. Recommended: yes. The model's error is the one unknown the rest
-   depends on.
-2. **The engine row waits for row FT.** FT is built in fastroute and not yet measured or
-   pinned. Recommended: pin FT first, then build ZR1 on top, so each build change is measured
-   alone.
+   depends on. ZR0 starts only after Row GS has merged: its baseline is x19's (Z14).
+2. **The engine row is built on x19** (rewritten for x19, Z14). FT is no longer pinned alone:
+   x19 carries it with S1, F1 and the group search, and Row GS measures them as one build.
+   Recommended: build ZR1 to ZR3 on `gr` once Row GS has merged, and measure ZR against the
+   pinned x19, each ZR stage with its own pin PR.
 3. **Where pours come from (ZR4).** Recommended: a `pours` list in the design intent, ground
    rail by default, and a read-only planner. He adds the zones, or tells the agent to.
 4. **Ground on both sides of a 2-layer board?** Recommended: yes, bottom as the main plane and
@@ -317,7 +326,7 @@ fastroute, new files in `crates/fr-engine/src/planes/`:
 
 | File | What |
 |---|---|
-| `zones_file.rs` | the `--zones` file |
+| `zones_file.rs` | the `--x.zones` file |
 | `raster.rs` | the grid, bitmaps, stamping, erode and dilate, labelling |
 | `model.rs` | the snapshot, and what the engine asks of it |
 | `graph.rs` | groups of a net, the main group, live pieces |
@@ -329,15 +338,16 @@ fastroute, changes to existing items:
 | Where | Change |
 |---|---|
 | `fr-io/src/structure.rs` | records, per `(plane …)` of the DSN in order, the item it became or that it was skipped; the board keeps the list |
-| `board/routing_board.rs` | `planes: Option<Arc<PlaneModel>>`, shared by board copies |
-| `board/connectivity.rs` | `connected_set` for a net with a modelled pour returns the model's group, with the pour's item only for the main group; `conduction_area_normal_contacts` and its pad, via and trace side use `PlaneModel::live_contact`; the stitching-via joins are skipped for such a net; the contact cache's key gains the model's generation |
-| `pipeline/stats.rs` | the open-count memo's key gains the model's generation |
+| `board/routing_board.rs` | `planes: Option<Arc<PlaneModel>>`, shared by board copies; `set_planes`, which draws the generation and renews the repository epoch (added for x19, Z16) |
+| `board/connectivity.rs` | `connected_set` for a net with a modelled pour returns the model's group, with the pour's item only for the main group; `conduction_area_normal_contacts` and its pad, via and trace side use `PlaneModel::live_contact`; the stitching-via joins are skipped for such a net; the contact cache misses after every redraw because `set_planes` renews the repository epoch (corrected for x19, Z16) |
+| `pipeline/stats.rs` | the open-count memo's key gains the model's generation for a modelled net, and `StatsCache`'s key becomes `(board_hash, generation)` (corrected for x19, Z16) |
 | `autoroute/maze.rs` | `expand_to_door_section` adds `cost::trace_surcharge`; the layer change adds `cost::via_surcharge`; a target door on a modelled pour is taken only where `PlaneModel::landing` finds a point |
 | `autoroute/locator.rs` | a trace end into a modelled pour is placed at the landing point |
-| `pipeline/mod.rs`, `pipeline/optimizer.rs` | the redraw points; `closing::close_planes` after the passes and after the optimizer |
+| `pipeline/mod.rs`, `pipeline/autorouter.rs`, `pipeline/optimizer.rs` | the redraw points, in the pass loops; `closing::close_planes` after the passes and after the optimizer (also when the optimizer is off and the search runs), and after the last copper stage when its redraw finds work; the group search between the second closing and W8; checkpoints read their open count from a redraw (corrected for x19, Z16, Z18) |
+| `pipeline/group_search.rs` | (x19) the move-local redraw in `route_member`, `Value.pour` and its rule, the ends `cut` and `pour_worse` (Z15, Z17) |
 | `pipeline/fanout.rs` | a fanout via into a modelled pour takes its landing point too (Konnect's preset has fanout off) |
-| `fastroute/src/main.rs` | `--zones=FILE`; `--router.scoring.plane_cut_cost=`, `plane_via_cut_cost=`; `mark_stitching_vias` leaves a modelled net's vias unmarked |
-| `fastroute/src/report.rs` | the `planes` section |
+| `fastroute/src/main.rs` | `--x.zones=FILE`, an `--x.` switch (Z21), dropped with `--parity` and `--no-enhancements` as x19's `exp_for_mode` drops the search; the redraw and closing after the pair stages; `--router.scoring.plane_cut_cost=`, `plane_via_cut_cost=`; `mark_stitching_vias` leaves a modelled net's vias unmarked, at load only (x19: Z19) |
+| `fastroute/src/report.rs` | the `planes` section, beside x19's `group_search`, which gains the pour state at its start and end (Z17) |
 
 Konnect, new files in `crates/konnect-core/src/`:
 
@@ -352,12 +362,12 @@ Konnect, changes to existing items:
 | Where | Change |
 |---|---|
 | `specctra.rs` | `pour_fill_rows`: the pours in export order, each with its `(zone …)` node, for `zone_fill` to read |
-| `fastroute.rs` | `CallFiles.zones: Option<&Path>`, sent by `pass_arguments` as `--zones=` after `--layer-heights`, only for a variant with planes |
+| `fastroute.rs` | `CallFiles.zones: Option<&Path>` beside Row GS's `uncounted`, sent by `pass_arguments` as `--x.zones=` after `--layer-heights` and before `--initial-session`, only for a variant with planes; never by `tune_pass_arguments`; the probe sends it (x19: see "Konnect's command line"). `PassOutcome` and `Held` keep the report's `planes` beside `group_search` |
 | `route_judge.rs` | `Measures.pours: Option<PourMeasures>`, filled after the first refill and again after the last |
-| `tools/route_fastroute.rs` | builds the zone plan after the pairs plan, writes `zones.txt`, adds `pours` to the result |
+| `tools/route_fastroute.rs` | builds the zone plan after the pairs plan, writes `zones.txt`, adds `pours` to the result; the engine's `planes` beside `group_search` in `run.json` and `search.winner` (x19) |
 | `tools/design_intent.rs` | `DesignIntent.pours: Vec<PourIntent>`, validated like the other sections |
 | `tools/pcb_board.rs` | `add_zone` gains `thermal_gap`, `thermal_bridge_width` and `island_removal` |
-| `packaging/1-kopper/fastroute.json` | the build that knows `--zones`, in its own PR |
+| `packaging/1-kopper/fastroute.json` | the build that knows `--x.zones`, in its own PR |
 
 ## Skeletons
 
@@ -366,7 +376,7 @@ Bodies are `todo!()`. Compiled as described under "Verification of this document
 ### fastroute: `planes/zones_file.rs`
 
 ```rust
-//! Row ZR: the `--zones` file. One `zone` line per modelled plane of the DSN, `pad` lines for
+//! Row ZR: the `--x.zones` file. One `zone` line per modelled plane of the DSN, `pad` lines for
 //! pads whose thermal values differ from their zone's, `keepout` lines for areas no zone may
 //! fill.
 
@@ -903,12 +913,13 @@ pub struct Closing {
 pub const MAX_ROUNDS: usize = 8;
 
 /// Rounds until nothing is open, a round changes nothing, `MAX_ROUNDS`, or `stop`:
-/// 1. `PlaneModel::build` from the board as it is, set on the board.
+/// 1. `RoutingBoard::set_planes` from the board as it is (x19 addendum, Z16).
 /// 2. `PlaneModel::open_items`. None: done.
 /// 3. [`route_group`] for each stranded group of each modelled net, in the order of
 ///    `NetGroups::stranded`.
 /// 4. [`spoke_track`] for each starved pin.
 /// A failed build ends the stage, leaves the board as it was, and is named in `stopped`.
+/// Ends with a redraw, so the next stage starts from a current snapshot (x19 addendum, Z18).
 pub fn close_planes(board: &mut RoutingBoard, file: &ZonesFile, settings: &RouterSettings, stop: &StopToken) -> Closing {
     todo!()
 }
@@ -1082,7 +1093,7 @@ pub(crate) fn zone_plan(
 }
 
 /// The zones file of a plan (the format in docs/ZONE_ROUTING_DESIGN.md, "What Konnect sends
-/// and reads"), or `None` when the plan models no pour: the call then sends no `--zones`.
+/// and reads"), or `None` when the plan models no pour: the call then sends no `--x.zones`.
 /// Numbers are written with the shortest text that reads back to the same value.
 pub(crate) fn file_text(plan: &ZonePlan) -> Option<String> {
     todo!()
@@ -1255,11 +1266,11 @@ pub struct PourIntent {
 | Only the main group reaches the pour | two pads on two pieces: the smaller side is not `ConnectedToPlane` | the cutting track removed: both are |
 | A piece joins what sits on it | two pads on one stranded piece: one group, one connection routed | the piece cut between them: two groups |
 | A stitching via does not join a modelled net | a bare fixed via off the fill: not in the main group | the net without a `zone` line: joined, as today |
-| A contact is never served stale | a rebuild that strands a pad: the next `connected_set` leaves it out | the generation left out of the cache key: the test must fail |
+| A contact is never served stale | a rebuild that strands a pad: the next `connected_set` leaves it out | `set_planes` without renewing the repository epoch: the test must fail (corrected for x19, Z16) |
 | A skipped plane cannot shift an index | a DSN whose first plane names an unknown net: `build` refuses the second plane's line | both planes loaded: rows in order |
 | A landing is on fill | `landing` inside a knocked-out area gives `None` | the knockout removed: a point |
 | The surcharge never lowers a cost | random segments: the surcharge is 0 or more | weights at 0: exactly today's `expansion_value` |
-| Off by default | a route without `--zones`: the session equals the pinned build's, byte for byte | with `--zones` and ZR2 on, a board with a cut pour gives another session |
+| Off by default | a route without `--x.zones`: the session equals the pinned build's (x19, switches on), byte for byte | with `--x.zones` and ZR2 on, a board with a cut pour gives another session |
 | The closing stage adds no violation | a connection that would break a clearance is dropped | the check off: the violation count rises |
 | A manifest and DSN that disagree model nothing | they disagree on the plane count: every pour `legacy`, with the reason | they agree: rows in order |
 | An uncovered zone is not modelled | a hatch zone, and a zone with rounded corners, are `legacy` rows | the same zones solid and square: `zones` rows |
@@ -1349,7 +1360,9 @@ out of this file into two scratch clones: fastroute at `61d6e45` (the six `plane
 - Nothing was routed, refilled or measured for this document. How well the model matches
   KiCad is unknown until ZR1.
 - The "changes to existing items" tables are a list, not compiled code.
-- Engine line numbers are of `61d6e45`; KiCad's are of 10.0.1.
+- Engine line numbers are of `61d6e45`; KiCad's are of 10.0.1. On x19 (`b3ea917`), of the
+  files cited here, only `autoroute/router.rs` from line 389 on and `autoroute/maze.rs` from
+  line 1178 on moved (`router.rs:466` is `:471`); the addendum's own are of `b3ea917`.
 
 ## What this design does not do
 
@@ -1366,3 +1379,479 @@ out of this file into two scratch clones: fastroute at `61d6e45` (the six `plane
   (row FT).
 - **Windows and Linux:** as the rest of fastroute, macOS first.
 - **Freerouting:** unchanged. It keeps the outline reading and says so.
+
+## The design on x19 (addendum, 2026-11-22)
+
+Status: a document only. Nothing was built, compiled, routed or measured for it. It brings the
+design above in line with fastroute **x19**, the build Row GS is about to pin in Konnect: branch
+`gr` of the local fastroute clone, commit `b3ea917`, not published. x19 is `61d6e45` (the engine
+this design read) plus ten commits, all of them behind switches that are off by default:
+
+| Row | Switch | What it does | Where |
+|---|---|---|---|
+| S1 | `--x.oct_bound` | The optimizer's length bound in the 45-degree metric | `scoring/bounds.rs`, `optimizer.rs` |
+| F1 | `--x.opt_follow_rips=N` | An optimizer candidate routes up to N nets its re-route ripped | `optimizer.rs` (`follow_rips`) |
+| GR | `--x.group_search`, `--x.gs_*` | The group search, a stage after the optimizer and before W8 | `pipeline/group_search.rs`, `pipeline/mod.rs:251-258` |
+
+Row FT was already in `61d6e45`. Konnect's side of Row GS (branch `claude/router-group-search`,
+`e1c3fdf5`, local, not merged) sends `--x.oct_bound`, `--x.opt_follow_rips=2` and
+`--x.group_search` on every routing pass and never on the Tune pass, sends the pour nets as
+`--x.gs_uncounted=<file>`, and pins x19. **Until Row GS merges, x19 is planned, not main.** Where
+this addendum changed a line above, that line says so and points here.
+
+Decisions Z14 to Z21 below extend the design's own table.
+
+### 1. The base of the engine stages
+
+**Z14. ZR1 to ZR3 are built on `gr` (x19), after Row GS has merged.** Their baseline is the
+main that pins x19, with the smart-router switches on as Konnect sends them.
+
+- **Why.** Decision 2 asked for row FT to be measured and pinned alone first, so that each build
+  change is measured alone. That can no longer happen: x19 carries FT together with S1, F1 and
+  the group search, and Row GS measures them as one build. Building ZR on `ft-design` would mean
+  a zone build that Konnect never runs. What stays true of decision 2 is its purpose: ZR is
+  measured alone against the pinned x19, and every ZR stage still has its own pin PR.
+- **Owner decision 2 is rewritten** to say this (below).
+
+**What each file the modules table changes now has to fit around.** `git diff
+ft-design..gr --stat`, read file by file:
+
+| File | x19's change | What the zone change must fit around |
+|---|---|---|
+| `pipeline/stats.rs` | `incomplete_count` split; `incomplete_counts_by_net` added (F1 and the search read the per-net counts) | Both read the same memo, so the model's generation in a modelled net's memo key covers both; `StatsCache`'s key gains it too (Z16). The per-net counts come from the model for a modelled net once Z4 is in `connected_set` |
+| `pipeline/mod.rs` | The group search between the optimizer and W8; `PipelineContext.group_search_never_rip`; `PipelineOutcome.group_search` | The closing stage and the redraw points move (point 3, Z18). `PipelineOutcome` gains the closing's record beside `group_search` |
+| `pipeline/optimizer.rs` | S1's bound; F1's `follow_rips` (reads `incomplete_counts_by_net` before and after each round) | F1 has the optimizer's blind spot (below, "The optimizer"). No new change beyond the design's redraw points |
+| `autoroute/maze.rs` | `check_ripup` refuses to rip an item of a net in `ctrl.protected_nets` (`:1178-1184`) | The cut surcharges go into the expansion (`:630` on), not into `check_ripup`. Protection stops rips, not cuts: a member may still lay copper across a protected pour net's fill (point 2, `MoveEnd::Cut`) |
+| `pipeline/autorouter.rs` | `protected_nets`, `neck_retry`, `pass_panicked`, `tail_nets` (all for the search's members) | The redraw before every pass goes into its pass loop, not into `autoroute_passes_for_optimizing_item` (Z18) |
+| `autoroute/router.rs`, `autoroute/control.rs` | `protected_nets` and `neck_retry` passed through to the maze | A landing point (`PlaneModel::landing`) applies inside the search's moves too: the retry is off there, so a landing that needs the neck width fails the member |
+| `fastroute/src/main.rs` | `exp_for_mode` drops S1, F1 and the search under `--parity` and `--no-enhancements`; the pair nets go to `group_search_never_rip`; the pipeline's second run after the pairs are released (it was there before x19; x19 keeps its `group_search` report) | `--x.zones` is dropped the same way (P3: today's paths, byte for byte, in those modes). The second pipeline run gets the same closing and redraw points. `mark_stitching_vias` (`:808`) stays a load-time step (Z19) |
+| `fastroute/src/report.rs` | The `group_search` object, written before `unrouted` | The `planes` section goes beside it, and `group_search` gains the pour state at its start and end (Z17) |
+| `pipeline/group_search.rs` (new in x19, not in the modules table) | The search | Its move redraws the model on its board copy (Z15), its value gains the pour rule (Z17), and a new end `cut` |
+| `board/item_list.rs` (new setter, not in the modules table) | `set_fixed_state_keeping_version` | Stays safe under the conditions of Z19 |
+
+Untouched by x19: `fr-io/src/structure.rs`, `board/routing_board.rs`, `board/connectivity.rs`,
+`autoroute/locator.rs`, `pipeline/fanout.rs`. Line numbers above them are still `61d6e45`'s,
+except `autoroute/router.rs` from line 389 on (by 4 to 6 lines) and `autoroute/maze.rs` from line
+1178 on (by 7). The lines this design cites in them did not move, but `router.rs:466` is now
+`:471`.
+
+**The fixed-state setter.** `set_fixed_state_keeping_version` (`item_list.rs:222-234`) changes an
+item's fixed state and renews neither the item's version nor the repository's epoch. The group
+search uses it on a move's board copy only: `freeze` makes the copper of the nets no move may
+rip user-fixed, `hold_old_tails` does the same to other nets' tails, and `thaw` gives both back
+before the move's value is read (`try_move_impl`, step 4). What keys on those numbers today:
+
+- the open-count memo: per net, the global epoch and each item's key and version
+  (`stats.rs:124-140`);
+- the contact cache: the repository epoch and the search tree's epoch (`connectivity.rs:127`);
+- the parallel pass's commit check: item versions (`parallel_pass.rs:93`, `:122`). The setter's
+  own comment says that check never sees a search copy; that was read, not re-proved.
+- `StatsCache` keys on `board_hash`, which does hash the fixed state, but the search never
+  reads it: a move reads `incomplete_count` and the violations directly.
+
+None of the keyed caches reads the fixed state, so the setter is safe today. One routing step
+does read it and is meant to: the cycle removal skips a user-fixed trace through a conduction
+area (`trace_ops.rs:343`), so a frozen trace is never removed. With Z4 that walk reads
+`live_contact`, which stays free of the fixed state (condition 1).
+
+**Z19. With zones, the setter stays safe, under four conditions.** The design adds the model's
+snapshot, the groups cached by the change counter (Z11) and the cut measures. Each of them must:
+
+1. **Read no fixed state.** `PlaneModel::build`, `knockouts`, `spokes`, `attachments`,
+   `net_groups`, `live_contact`, `landing`, `open_items` and the `foreign_*` queries depend on
+   geometry and nets only. A user-fixed track of another net is a knockout like any other. The
+   module doc of `planes/` says so, and a test proves it (below).
+2. **Leave the stitching marking at load.** `mark_stitching_vias` reads the fixed state: a via
+   counts as stitching when it is `ShoveFixed` or more and touches nothing
+   (`basic_board.rs:348-362`). It runs once, at load (`main.rs:808`), and its set is kept by id.
+   If a redraw re-ran it, `hold_old_tails` would turn a dangling tail via, made `UserFixed` for
+   the move, into a stitching via joined to the rest of its net. So the design's change ("leaves
+   a modelled net's vias unmarked") goes into that one load-time call and nowhere else.
+3. **Use a process-wide unique number for the model.** Two moves on one thread start from the
+   same baseline, and the pour net's items have the same keys and versions in both. A per-board
+   counter would give their two redraws the same number, and the memo would hand the second move
+   the count of the board before it. Z16 settles this.
+4. **Count all copper in the pour measures.** The search's `counted_copper` skips user-fixed
+   items, which is right for its length (no move can change locked copper). The pour state of
+   Z17 must not copy that filter: it counts what is on the board. It is read after `thaw` in any
+   case.
+
+**Z16. A model is set on a board through one method, and every cache that a model changes
+keys on its generation.**
+
+```rust
+impl RoutingBoard {
+    /// Row ZR: puts a snapshot on this board (a board copy keeps its parent's `Arc` until it
+    /// calls this). The generation is `board::epoch::next_epoch()`, unique in the process, so
+    /// two board copies that redraw on two threads, or one after the other on one thread, never
+    /// share one. Then `PlaneModel::build(self, file, generation)`, or `redraw` of the current
+    /// model when `dirty` is given, then `self.items.touch()`, so the contact cache (keyed by
+    /// the repository epoch) misses, and the new `Arc`.
+    pub fn set_planes(&mut self, file: &ZonesFile, dirty: Option<&[DirtyWindow]>) -> Result<(), String> {
+        todo!()
+    }
+}
+```
+
+Three caches depend on the model, and each must miss after a redraw:
+
+| Cache | Key today | With a model |
+|---|---|---|
+| The contact cache (`connectivity.rs:127`) | the repository and tree epochs | `set_planes` renews the repository epoch |
+| The open-count memo (`stats.rs:124-140`) | per net: the global epoch and each item's key and version | a modelled net's entry also holds the model's generation; other nets' entries are unchanged, so they still hit |
+| `StatsCache` (`stats.rs:20-53`): the full statistics, open count included, read at every pass boundary of the autorouter, the optimizer and multi-start | `board_hash` (`history.rs:31`): the items' content and fixed state, no epoch | the key is `(board_hash, generation)`. Without it, statistics read under a stale snapshot would be served again after the redraw, on the same content |
+
+- **Why not renew the global epoch instead:** it would make every net's memo entry miss, and
+  `route_member` counts every net before and after each member. Each redraw would then cost a
+  full recount.
+- **History:** `BoardHistory` keeps each saved board's score as of the snapshot it had. A
+  restore redraws (as designed), and the closing after the passes reads the truth.
+- **Checkpoints:** a checkpoint's key holds the open count, and `better_than` compares it first
+  (`mod.rs:117-120`), so a key read under a stale snapshot could keep a board with a hidden cut
+  in a killed run's session file. With a model, `PipelineContext::checkpoint` takes the count
+  from a redraw of the board it saves (on a copy), and each closing writes a checkpoint at the
+  stage of the pass it follows.
+- **Lines corrected above:** the modules table's rows for `board/connectivity.rs` and
+  `pipeline/stats.rs`, and the negative control of "A contact is never served stale".
+
+### 2. The group search and the pours
+
+**What the search reads, verified in `group_search.rs`:**
+
+- **The value** (`value`, `counted_copper`): open connections from `stats::incomplete_count`,
+  clearance violations, track length and vias. The length and the vias skip user-fixed copper
+  and every net in `uncounted_nets`.
+- **The rule** (`Value::improves`): never more open connections, violations or vias. Fewer open
+  connections, or as many and fewer violations, win at any cost; otherwise the cost must drop by
+  at least `min_gain_mm`. The vias it counts are counted vias only, so a move may add
+  vias of a pour net and the rule does not see them.
+- **The uncounted nets** (`--x.gs_uncounted`, Konnect's pour nets): out of the cost, but they
+  can be ripped and re-routed as members.
+- **The group** (`route_member`): a net joins when a member leaves it with more open
+  connections than before (`incomplete_counts_by_net` before and after the member).
+
+**The blind spot, a third time.** Two parts of it are plain from the code: the value has no
+pour term, and pour nets cost nothing. The open count itself is the third. With Z4 in
+`connected_set`, `value` reads the model's count with no change to the search: `incomplete_count` → `NetIncompletes` →
+`connected_set`. But the snapshot is the one drawn before the search, and a move routes on a
+copy of it. A member's track across a pour is a knockout the snapshot does not hold. The pour
+net's own items do not change, so its memo entry (same keys, versions and epoch) is served
+again. The move then reads complete while it has stranded a piece. Fixing the value alone does
+not help; the snapshot must follow the move.
+
+**Z15. A move redraws the model on its own board copy, after each member that changed copper
+on a modelled layer.**
+
+- **Where:** in `route_member`, between `autoroute_passes_for_optimizing_item` and the `after`
+  count. Then `opened` holds a pour net that the member cut. That net joins the group as an
+  ordinary member: its open connections are its stranded groups (Z4). They are routed to the
+  main group by the member's ordinary autoroute, not by `closing::route_group`. It is counted
+  against the level's `max_nets`.
+- **Once more at the end of the move:** after the tail removal of step 3
+  (`nets_that_lost_items`) and before step 4 reads the value. So the move's value, and the
+  board a kept move brings with it, have a snapshot equal to what `build` would draw.
+- **The copy's model only:** `set_planes` replaces the copy's `Arc`. The pass's baseline and
+  the other thread's copy keep theirs.
+- **A window, not the whole board:** the windows are measured against the item index the
+  model itself was drawn from, not against the member's start. So the target's rip
+  (`rip_target`, before the first member) and the tail removal are in them too. The redraw
+  covers the boxes of the copper added or removed on modelled layers since that index, grown by
+  the largest knockout and the minimum width. It then labels each touched zone again in full,
+  because pieces are global. When nothing changed on a modelled layer since the model was drawn,
+  there is no redraw.
+- **Cost:** each redraw labels every touched zone again, a full `Labels` per zone (about 16 MB
+  at 100 × 100 mm and 0.05 mm cells). ZR2 records the redraw count and time per move.
+
+```rust
+/// Row ZR: where a board's copper changed on a modelled layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirtyWindow {
+    pub layer: LayerNo,
+    pub bounds: IntBox,
+}
+
+/// The windows of the traces, vias and pins on modelled layers whose id is new on `board`, or
+/// whose id is gone or version differs from `model.drawn_from` (item id -> (key, version) of
+/// the board the model was drawn from, as `parallel_pass` takes it), each grown by `grow` board
+/// units. Empty: no redraw.
+pub fn dirty_windows(board: &RoutingBoard, model: &PlaneModel, grow: f64) -> Vec<DirtyWindow> {
+    todo!()
+}
+
+// `PlaneModel` gains `drawn_from: HashMap<i32, (ItemKey, u64)>`, set by `build` and `redraw`,
+// and, per zone, the piece count before the island rule (for `PourState::pieces`).
+
+impl PlaneModel {
+    /// The snapshot `build` would draw from `board` now, computed from `self` again only inside
+    /// `dirty`: knockouts and spokes of the cells in a window, the opening in each window grown
+    /// by the minimum width, then a full `raster::label` and the island rule of every zone a
+    /// window touches. With `FASTROUTE_VERIFY_CACHES=1` it is compared with a full `build`
+    /// and must be equal.
+    pub fn redraw(&self, board: &RoutingBoard, file: &ZonesFile, dirty: &[DirtyWindow], generation: u64) -> Result<PlaneModel, String> {
+        todo!()
+    }
+}
+```
+
+A new end of a move is needed. Protection stops rips (`check_ripup`), not cuts, so a later
+member may cut a pour net that was routed earlier in the move. Today the search would report
+that as `Reopened`, whose count "must be 0" as a guard. To keep that guard meaningful, a cut gets
+an end of its own. Like `Reopened`, it ends the move, which is given up; the routed net is not
+queued again. The check for it runs just before the check for `Reopened` (`try_move_impl`,
+step 3):
+
+```rust
+pub enum MoveEnd {
+    // … as today …
+    /// Row ZR: a member cut the fill of a modelled net that was already routed in this move.
+    /// Expected with pours, unlike `Reopened`, which stays a guard at 0.
+    Cut(NetNo),
+    /// Row ZR: complete and cheaper, refused because the pour state got worse (Z17).
+    PourWorse,
+}
+```
+
+**Z17. The search's cut cost is a rule, "never more pour damage", not a term of the value.**
+
+```rust
+/// Row ZR: what the pours of a board look like to the search, from its current snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PourState {
+    /// Fill pieces over every modelled zone after the opening and before the island rule, so a
+    /// cut that splits off a piece counts even when KiCad then removes it as an island.
+    pub pieces: u32,
+    /// Thermal pins of a main group with at least one kept spoke and fewer than `min_spokes`.
+    pub starved: u32,
+}
+
+impl PlaneModel {
+    pub fn pour_state(&self) -> PourState {
+        todo!()
+    }
+}
+```
+
+- **`Value` gains `pour: PourState`** (all zero on a board with no model). `Value::improves`
+  gains one more refusal beside its "never more vias": more `pieces`, or more `starved`, than
+  the incumbent. A move refused for that alone ends `PourWorse`, so the report counts what the
+  rule cost.
+- **The open count** is the model's through Z4 and Z15, so a stranded group is already "more
+  open" and refused. `starved` is a separate count because a starved pin is in its main group
+  and so is not open.
+- **Why a rule and not a weight:**
+  1. The judge's key has no pour term until ZR5 (Z10). A weight would turn pour damage into mm
+     at a rate nothing checks. "Never more vias" exists for the same reason.
+  2. The routes a move builds are already priced by ZR3's surcharge in the maze. The search
+     needs a guard that it never accepts a worse pour, not a second price.
+  3. Both counts are whole numbers and can only stay or fall. The search's proof of its end
+     stands as it is: the pair (open, violations) never rises, and while it stands still a kept
+     move lowers the cost by `min_gain_mm`.
+- **What it does not catch:** a neck that narrows without splitting, or fill area lost without a
+  new piece. That is the job of the maze's per-length surcharge. ZR3 records the largest piece's
+  share at the search's start and end, so the numbers show whether the rule is enough.
+- **Not in ZR3:** a move that heals a pour (fewer pieces at a higher cost) is not kept. Taking it
+  would put pieces into the order of the value and change the end proof. It is decided on ZR3's
+  numbers, with ZR5.
+
+**Z20. The uncounted set keeps its content and its meaning for the cost.** It stays the judge's
+`pour_nets`, from the same source (Row GS's G3), less the names `uncounted_file_text` leaves out
+on the safe side. A pour net's length and vias stay out of the cost while the judge's key
+leaves them out, which is until ZR5. What changes is that a modelled pour
+net is no longer free in what matters to it: the model's open count (Z15) and the pour rule
+(Z17) read its copper and the copper that crosses it.
+
+Still free, as today:
+
+- its length, its vias and its corners;
+- every pour the model does not cover: a `legacy` row (P4), and the pours-omitted shape, which
+  sends no zones file.
+
+When ZR5 adds pour terms to the key, the uncounted set follows the key and shrinks.
+
+**The optimizer.** F1's `follow_rips` and the optimizer's own comparison read the same per-net
+counts, from the snapshot drawn before the optimizer pass. A candidate that cuts a pour reads
+complete until the next pass's redraw, as "Known limit of the cost" says. Nothing changes here:
+the closing after the optimizer repairs it before the search starts (point 3), and whether the
+candidates need Z15's redraw too is decided on ZR3's numbers. It would be the same function.
+
+### 3. Where the closing stage and the redraws go
+
+**Z18. One pipeline run on x19 with zones, in order:**
+
+| Step | Snapshot | Closing |
+|---|---|---|
+| Load | `set_planes` after `mark_stitching_vias` (Z19) | |
+| Routing passes | redrawn before each pass, as designed | after the last pass (closing 1) |
+| Optimizer | redrawn before each pass, as designed | after it (closing 2) |
+| Group search | Starts from the board's snapshot. Each move redraws its own copy (Z15). A kept move is applied by a board swap and brings its copy's snapshot, so a swap needs no redraw. A retried move (the pass's step 4) starts from the board just applied | none |
+| W8 (parallel vias) | | |
+| The pair stages, on a pass with `--pairs` (`couple_pairs`, `close_pair_nets`, `match_pair_lengths`, `main.rs:682-704`, after the pipeline) | | |
+| After the last copper stage | redrawn | closing 3, only when the redraw finds an open or starved item (`after_last_stage` in the report) |
+| Report | redrawn | |
+
+- **The closing always ends with a redraw**, so the stage after it starts from a current
+  snapshot. That is a postcondition of `close_planes`.
+- **The redraw "before every pass" is hooked into the pass loops** of
+  `BatchAutorouter::run_batch_loop` (`pipeline/autorouter.rs`) and
+  `BatchOptimizer::run_batch_loop`. It is not in `autoroute_passes_for_optimizing_item`, which
+  optimizer candidates and the search's members call: they route on the snapshot they were given.
+- **Closing 2 runs whenever the search runs,** with the optimizer off too: the search runs
+  without the optimizer (`mod.rs:251-253`).
+- **Why closing 2 comes before the search, not after it.** The search keeps only moves that open
+  nothing in the model's count and make the pours no worse (Z15, Z17), so it leaves no work for
+  a closing. And it never tries a connection that was open when it started (`skip_items`): a
+  group the optimizer stranded and nobody closed would stay stranded for the whole search.
+- **Why W8 stays after the search and the closing.** W8 sizes the vias of the final layer
+  changes, and the closing adds layer changes. But W8 adds vias of supply nets, each one a
+  knockout in another net's pour, and the pair stages lay copper after the pipeline. So the last
+  redraw is a check: on most boards it finds nothing, and closing 3 does not run. When it does,
+  its vias get no parallel vias from W8.
+- **The second pipeline run** (`main.rs`: after the pairs are released, with connections still
+  open) runs the same steps again. The report keeps the last run's closing and `planes`, as it
+  keeps the last run's `group_search`.
+
+**Can a move's board copy share the snapshot, as the parallel pass's copies do?**
+
+- **To route its members, yes.** The baseline's `Arc` is read only, as in the parallel pass.
+- **To judge the move, no.** Its value must come from its own redraw (Z15), with its own epoch
+  (Z16). Each thread then holds at most one extra model, plus the one of the best kept board so
+  far.
+- **Determinism holds:** the redraw reads no clock and draws no random number, so the search's
+  "the same result on 1, 2 and 4 threads" still holds with `--x.zones`, and gets a test.
+
+### ZR0 on x19
+
+- **The baseline is x19's.** ZR0 is measured from the main that holds Row GS, with x19 and the
+  smart-router switches on as Konnect sends them, at effort M. A baseline on x18 would describe an
+  engine Konnect no longer runs.
+- **Where its pour measures sit.**
+  - `Measures.pours` goes in `route_judge.rs`, so it is in every judged run's
+    `run.json` under `judged.measures` and in `search.winner.measures`.
+  - Row GS puts the search's summary beside them: `group_search` at the top of `run.json` and
+    `search.winner.group_search` (`tools/route_fastroute.rs`, `reduce_run_folders` and
+    `winner_json`). ZR0 reads the two side by side. A run whose search kept moves can then be
+    compared on its pours with one whose search kept nothing, which is the first measure of the
+    blind spot of point 2.
+  - From ZR1, the engine's `planes` section takes the same path as `group_search`: read where
+    the report's `group_search` is read (`fastroute.rs`, `PassOutcome` and `Held`), and written
+    beside it in `run.json` and in `search.winner`, as `engine_planes`. `run.json` already has
+    a `planes` key, the variant's plane nets (`reduce_run_folders`).
+  - Row GS's `group_search_summary` keeps `ended_by`, the pass count, `kept_moves`,
+    `largest_group`, and `start` and `end` (length, vias, cost). ZR3 extends it with the ends
+    summed over the passes (`cut` and `pour_worse` among them) and the pour state at the start
+    and the end. Like Row GS's, it is kept for judged runs only.
+
+### Konnect's command line
+
+- **Routing passes.** With Row GS the order is `CANDIDATE_SWITCHES`, `SEARCH_SWITCHES`,
+  `--x.par_via_amps=`, `--x.gs_uncounted=`, `--pairs=`, `--layer-heights=`,
+  `--initial-session=`. `CallFiles.zones` sits beside `CallFiles.uncounted`, and `--x.zones=` goes
+  after `--layer-heights=` and before `--initial-session=`, as the design had it, for a variant
+  with planes only.
+- **The Tune pass** gets neither search switch nor `--x.gs_uncounted` (Row GS's G1). It gets no
+  `--x.zones` either: its autorouter and optimizer are off and it runs no closing, so a model would
+  only cost a redraw. Row FT keeps the tuner off other nets' pours, and the judge's refill checks
+  the result. "What this design does not do" already leaves the tuner unpriced.
+- **The probe.** ZR1's pin PR adds `--x.zones=<scratch>/probe-zones.txt` (a valid file with no
+  `zone` line) before the sentinel, so a build without it is refused before any run, as Row GS's
+  probe does for its switches.
+
+**Z21. The switch is `--x.zones=<file>`, not `--zones=`.** fastroute checks only `--x.`
+arguments for names it does not know (`main.rs:144`, `exp::parse_arg`). Any other unknown
+argument goes to the settings parser, which only warns (`fr-settings/src/cli.rs`). A build
+without `--zones` would pass the probe. As an `--x.` switch, the file is read while the
+arguments are parsed, as `--x.gs_uncounted` is, and `exp_for_mode` drops it with `--parity` and
+`--no-enhancements`. Every `--zones` above now reads `--x.zones`, the two skeleton doc comments
+included.
+
+### The corner limit Row GS records
+
+Row GS records that the search re-routes pour nets without looking at corners, while the judge
+ranks acute corners and right angles on pour copper too. Verified: `rank_measures` puts acute
+corners at position 6 of the key (from 0), above signal length, and right angles at 9. Both are
+the audit's metrics `5.3.*` over all copper. `Value` has no corner term.
+
+ZR neither explains it nor fixes it. The limit comes from the pour nets being uncounted, and
+Z20 keeps them uncounted. With ZR2, the closing adds pour-net tracks where today a pad counts as
+connected by its centre, so the search has more of that copper to move. ZR only makes that new
+copper short and straight: a landing point, and a spoke track straight out from its pin.
+
+The fix belongs to Row GS: a "never more corners" rule in the search's value, over the move's
+nets, uncounted ones included, counted as the audit counts them. It has the shape of Z17 and is
+not part of this row.
+
+### Changes this forces in the text above
+
+- **The status lines** say that this section exists.
+- **"Closing", "When the snapshot is redrawn", "Known limit of the cost":** a sentence each,
+  pointing here (Z15, Z18).
+- **Stages:**
+  - ZR0's baseline is x19's (Z14).
+  - ZR2 adds the move-local redraw (Z15) and the closing order (Z18).
+  - ZR3 adds the pour rule (Z17); its done criterion adds the counts of `pour_worse` and `cut`
+    ends.
+- **The switch** is `--x.zones` everywhere (Z21).
+- **Owner decision 2** is rewritten (Z14). Decision 1 now waits for Row GS's merge, because
+  ZR0's baseline is x19's. The other three decisions are unchanged.
+- **Modules:**
+  - Rows changed: `board/connectivity.rs` and `pipeline/stats.rs` (Z16), `pipeline/mod.rs`,
+    `autorouter.rs` and `optimizer.rs` (Z16, Z18), `fastroute/src/main.rs` (`--x.zones`
+    dropped with the other enhancements), `fastroute/src/report.rs`, Konnect's `fastroute.rs`
+    and `tools/route_fastroute.rs`.
+  - Rows added: `board/routing_board.rs` gains `set_planes`, and `pipeline/group_search.rs` is
+    new.
+- **Tests:** the rows below are added, and the control of "A contact is never served stale" is
+  `set_planes` without renewing the repository epoch.
+
+| Guard | Test | Negative control |
+|---|---|---|
+| A move that strands a piece reads open | a member's track across a modelled pour strands a pad: the move is not kept, and the pour net is in `opened` | no redraw in `route_member`: the move is kept, the test fails |
+| Two moves of one baseline never share a model | two moves on one thread, one of them cutting the pour: two different counts | the generation left out of the memo key: the cutting move reads the baseline's count |
+| Statistics follow the model | a redraw that strands a pad on an unchanged board: the next `StatsCache::score` counts it | the generation left out of the `StatsCache` key: the old count |
+| The move's last redraw sees its tail removal | a move whose tail removal frees fill: the kept board's model equals a full `build` | the redraw after step 3 left out: they differ |
+| The pour rule refuses more damage | a cheaper move that splits a piece and opens nothing ends `pour_worse` | the rule off: kept |
+| A cut is not a reopening | a later member cuts an earlier pour member's fill: `cut`, and `reopened` stays 0 | the end folded into `Reopened`: its count is 1 |
+| Frozen copper does not change the model | `freeze` then `thaw` around `set_planes`: the same fill and groups | a knockout that skips user-fixed items: the fill differs |
+| The stitching marking stays at load | a held tail via with no contact: never joined to the net's other vias | the marking re-run at a redraw: it is joined |
+| A windowed redraw equals a full one | random moves on a fixture: `redraw` equals `build`, cell for cell | a window not grown by the minimum width: they differ |
+| The search stays deterministic with zones | 1, 2 and 4 threads with `--x.zones`: the same session | (as the search's own test) |
+| `--x.zones` is an enhancement | `--parity` with `--x.zones`: today's session, and the drop logged | without `--parity`: the zones file is read |
+| The Tune pass gets no zones | `tune_pass_arguments` holds no `--x.zones=` | the argument added: the test fails |
+
+### Verification of this addendum
+
+- **Read, read-only:**
+  - fastroute: `gr` `b3ea917`, against `ft-design` `61d6e45`, the merge base. `git diff
+    ft-design..gr --stat` lists 30 files, of which 14 are tests and test data. Read in full:
+    `pipeline/group_search.rs`. Read in the parts above: `pipeline/mod.rs`, `optimizer.rs`,
+    `autorouter.rs`, `stats.rs`, `autoroute/maze.rs`, `router.rs`, `control.rs`,
+    `board/item_list.rs`, `epoch.rs`, `connectivity.rs`, `basic_board.rs`, `parallel_pass.rs`,
+    `exp.rs`, `fastroute/src/main.rs`, `report.rs`, and `docs/IMPROVEMENTS.md`'s rows S1, F1
+    and GR.
+  - Konnect: `claude/router-group-search` `e1c3fdf5` (`fastroute.rs`,
+    `tools/route_fastroute.rs`, and the docs it changes) and its design file
+    (`target/creation-research/smart-router-research/skeleton/konnect_uptake.md`), plus
+    `route_judge.rs` on main `5a8273ea`.
+- **Inferred, not checked by a run:**
+  - the cost of a windowed redraw per member;
+  - how many moves the pour rule refuses;
+  - that W8's redraw rarely finds work;
+  - that the parallel pass never sees a search copy (the setter's own comment says so).
+- **Independent review** (Claude Opus 5.5, high, 2026-11-22), read-only against the same
+  sources, of the first draft. It confirmed the cited lines, that Z17 keeps the search's end
+  proof and that the setter is safe, and found 3 must-fix items, 8 should-fix and 13 notes. Each was checked against the code before it was taken; all
+  are fixed in this text:
+  - **Must-fix:** `StatsCache` keys on `board_hash`, which no epoch reaches (now in Z16); the
+    redraw windows missed the target's rip and the last tail removal (now measured from the
+    model's own index, with a redraw at the end of the move, Z15); a non-`--x.` switch cannot be
+    probed (Z21).
+  - **Should-fix:** the pair stages after the pipeline; the run summary and the `planes` key in
+    `run.json`; the memo cost of renewing the global epoch (Z16 now keys modelled nets only);
+    what `Cut` does; a negative control's wording; checkpoints; where the redraw before a pass
+    is hooked; closing 2 with the optimizer off.
+- **The two skeleton doc comments** that named `--zones` (`zones_file.rs`, `zone_fill.rs`) and
+  `close_planes`'s step 1 were changed after the design's compile record; that record is of the
+  text before.
+- **Not done:** the skeletons in this section were not compiled (no build was allowed while Row
+  GS's measurement held the machine). The next stage's PR compiles them, as the design's own
+  were.
