@@ -1856,3 +1856,23 @@ not part of this row.
 - **Not done:** the skeletons in this section were not compiled (no build was allowed while Row
   GS's measurement held the machine). The next stage's PR compiles them, as the design's own
   were.
+
+## ZR0 as built (2026-11-22)
+
+Stage ZR0's measures are built in `crates/konnect-core/src/zone_fill.rs` and filled by the
+judge (`route_judge.rs`, `judge_one`). They differ from the `zone_fill.rs` skeleton above as
+follows, each on purpose:
+
+- **`pour_measures(first_refill, last_board_text, last_refill, pour_nets)`.** It takes no
+  first board text and no engine section: ZR0 has no engine model, and the first board's
+  folder is removed once a stitching round writes the next one, so what ZR0 needs of the
+  first refill (its open count) is taken from its report.
+- **Fields added:** `open_after_stitching` (the same count on the last board) and
+  `unfilled` (pour zone layers with no saved fill, which would otherwise read as whole).
+- **`largest_piece_share` is `Option<f64>`:** `None` when no pour layer has fill.
+- **A piece is one `filled_polygon`.** KiCad 10 saves each piece of a fill as one fractured
+  ring (`pcb_io_kicad_sexpr.cpp`), so its shoelace area is the piece less its holes. No raster.
+- **A failed pour measure is recorded, not raised** (`Measures.pours_error`): the measures
+  feed no gate and no rank key (Z10), so they must not fail a run or reject a Tune
+  candidate.
+- **`kicad_open_pads`, `false_connected` and `false_open` wait for ZR1.**

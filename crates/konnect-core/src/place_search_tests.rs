@@ -161,6 +161,8 @@ fn measures(unconnected: usize, signal_mm: f64) -> Measures {
         stitching_vias: 0,
         route_s: 10.0,
         lengths: None,
+        pours: None,
+        pours_error: None,
     }
 }
 

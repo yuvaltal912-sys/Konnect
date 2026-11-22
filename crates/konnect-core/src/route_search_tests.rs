@@ -769,6 +769,8 @@ fn judged(acute: f64, g1_failed: bool) -> Judged {
             stitching_vias: 0,
             route_s: 1.0,
             lengths: None,
+            pours: None,
+            pours_error: None,
         },
         gates: Gates {
             g1: if g1_failed {

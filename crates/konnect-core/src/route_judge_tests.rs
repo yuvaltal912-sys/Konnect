@@ -329,6 +329,8 @@ fn measures() -> Measures {
         stitching_vias: 0,
         route_s: 10.0,
         lengths: None,
+        pours: None,
+        pours_error: None,
     }
 }
 
@@ -2453,7 +2455,8 @@ mod with_a_fake_kicad_cli {
     /// --save-board <board>`: records `KICAD_CONFIG_HOME` and its arguments in
     /// `calls.log`, counts its calls in `counter`, copies the call's canned report
     /// (`drc.<n>.json`, else `drc.default.json`) to the `--output` path, and leaves
-    /// the board as it is.
+    /// the board as it is, or, when the call has a `board.<n>` file, saves that over the
+    /// board (as `--save-board` saves the refilled board).
     const FAKE_CLI: &str = r#"#!/bin/sh
 dir="$(cd "$(dirname "$0")" && pwd)"
 echo "KICAD_CONFIG_HOME=${KICAD_CONFIG_HOME-unset} $*" >> "$dir/calls.log"
@@ -2467,6 +2470,7 @@ n=$(cat "$dir/counter" 2>/dev/null || echo 0)
 n=$((n + 1))
 echo "$n" > "$dir/counter"
 if [ -f "$dir/drc.$n.json" ]; then cp "$dir/drc.$n.json" "$out"; else cp "$dir/drc.default.json" "$out"; fi
+if [ -f "$dir/board.$n" ]; then cp "$dir/board.$n" "$prev"; fi
 exit 0
 "#;
 
@@ -3199,6 +3203,70 @@ exit 0
         );
         // And no probe ran: nothing from the intent is checked.
         assert_eq!(h.calls().len(), 2);
+    }
+
+    /// Row ZR, ZR0: the pours' open count is the first refill's, before the stitching
+    /// round, and the rest is read from the last board and its report. Control: a call
+    /// with no pour nets records no `pours` at all.
+    #[tokio::test]
+    async fn the_judge_records_the_pours_before_and_after_stitching() {
+        // Call 1 is the baseline, 2 the routed board (GND open, a starved thermal on the
+        // stitched one), 3 the stitched one.
+        let h = harness(
+            &["GND"],
+            drc_json(&["GND"], &[]),
+            &[(3, drc_json(&[], &["starved_thermal"]))],
+        );
+        assert!(h.ctx.pour_nets.contains("GND"), "{:?}", h.ctx.pour_nets);
+        // Only the stitched board (call 3) is saved with a fill: one piece on one of the
+        // GND zone layers, so the pieces can only come from the last board.
+        let layers = crate::zone_fill::pour_fills(&h.ctx.board_text, &h.ctx.pour_nets)
+            .unwrap()
+            .len();
+        assert!(layers >= 1, "the fixture has a GND pour");
+        let filled = h.ctx.board_text.replacen(
+            "(name \"GND_BOTTOM\")",
+            "(name \"GND_BOTTOM\") (filled_polygon (layer \"B.Cu\") (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))",
+            1,
+        );
+        assert_ne!(filled, h.ctx.board_text, "the fixture names GND_BOTTOM");
+        std::fs::write(h.fake.join("board.3"), &filled).unwrap();
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| one_via("GND"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        let pours = judged.measures.pours.as_ref().expect("the call has pours");
+        assert_eq!(judged.measures.pours_error, None);
+        assert_eq!(pours.open_before_stitching, 1, "the routed board's report");
+        assert_eq!(pours.open_after_stitching, 0, "the stitched board's report");
+        assert_eq!(pours.starved_thermals, 1);
+        assert_eq!(pours.pieces, 1, "the stitched board's fill");
+        assert_eq!(pours.unfilled, layers - 1);
+        assert_eq!(pours.largest_piece_share, Some(1.0));
+        assert_eq!((pours.false_connected, pours.false_open), (None, None));
+        // Recorded only: the gates and the key are those of the same measures without it.
+        let mut without = judged.measures.clone();
+        without.pours = None;
+        assert_eq!(gates(&without, &base), judged.gates);
+        assert_eq!(
+            rank_measures(&[(&without, &judged.gates, true)]),
+            rank_measures(&[(&judged.measures, &judged.gates, true)])
+        );
+
+        // Control: no pour nets, no pour measures.
+        let mut h = harness(
+            &["GND"],
+            drc_json(&["GND"], &[]),
+            &[(3, drc_json(&[], &[]))],
+        );
+        h.ctx.pour_nets.clear();
+        let base = baseline(&h.ctx).await.unwrap();
+        let tools = Scripted::new(&h, |_| one_via("GND"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        assert_eq!(judged.measures.pours, None);
+        assert!(serde_json::to_value(&judged.measures)
+            .unwrap()
+            .get("pours")
+            .is_none());
     }
 
     #[tokio::test]
