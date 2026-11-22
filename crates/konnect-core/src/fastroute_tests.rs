@@ -409,6 +409,9 @@ fn tail_keeps_the_end() {
 
 // ---- Row LT: layer heights and the Tune pass's command line -----------------
 
+/// No via padstack has a known disc: [`changed_outside`] then ignores nothing.
+static NO_VIA_RADII: BTreeMap<String, i64> = BTreeMap::new();
+
 fn tune_inputs<'a>(
     file: &'a Path,
     classes: &'a [String],
@@ -421,6 +424,7 @@ fn tune_inputs<'a>(
         nets,
         layer_heights,
         planes: &[],
+        via_radii: &NO_VIA_RADII,
     }
 }
 
@@ -775,7 +779,17 @@ fn session(nets: &[(&str, String)]) -> String {
 }
 
 fn changed(before: &str, after: &str, nets: &[&str]) -> Vec<String> {
-    changed_outside(before, after, &names(nets)).unwrap()
+    changed_outside(before, after, &names(nets), &NO_VIA_RADII).unwrap()
+}
+
+/// [`changed`] with the via discs of a DSN.
+fn changed_with(
+    before: &str,
+    after: &str,
+    nets: &[&str],
+    via_radii: &BTreeMap<String, i64>,
+) -> Vec<String> {
+    changed_outside(before, after, &names(nets), via_radii).unwrap()
 }
 
 /// A session of three nets, the shape most of these tests start from.
@@ -1113,9 +1127,9 @@ fn a_session_that_cannot_be_read_is_an_error_naming_which_one() {
         ("no routes", "(session b (base_design b))".to_string()),
     ] {
         assert!(copper_by_net(&text).is_err(), "{what}");
-        let error = changed_outside(&text, &base(), &names(&[])).unwrap_err();
+        let error = changed_outside(&text, &base(), &names(&[]), &NO_VIA_RADII).unwrap_err();
         assert!(format!("{error:#}").contains("before"), "{what}: {error:#}");
-        let error = changed_outside(&base(), &text, &names(&[])).unwrap_err();
+        let error = changed_outside(&base(), &text, &names(&[]), &NO_VIA_RADII).unwrap_err();
         assert!(format!("{error:#}").contains("after"), "{what}: {error:#}");
     }
     // A wire's descriptors are not shapes.
@@ -1469,6 +1483,172 @@ fn every_tune_pass_folder_a_run_can_hold_is_named_once() {
         ]
     );
     assert_eq!(TUNE_ROUNDS_MAX, 3, "the list follows the rounds");
+}
+
+// ---- the Tune pass's guard and a via stub (M4, decision 7) ------------------------
+
+/// M4's board B, run 6: net `C_N` of `full/full.ses` and of `tune-r2/tune.ses` (the
+/// session round 2 wrote, with `C_N` outside its tune file), and the via padstack of that
+/// run's DSN.
+const M4_B6_HELD: FixtureText = include_str!("../tests/fixtures/length_tuning/m4_b6_c_n_held.ses");
+const M4_B6_ROUND_2: FixtureText =
+    include_str!("../tests/fixtures/length_tuning/m4_b6_c_n_tune_r2.ses");
+const M4_B6_DSN: FixtureText = include_str!("../tests/fixtures/length_tuning/m4_b6_vias.dsn");
+
+#[test]
+fn the_via_discs_of_a_dsn_are_the_smallest_copper_radius_of_each_padstack() {
+    let radii = crate::specctra::via_disc_radii(M4_B6_DSN);
+    // 450 um circles on six layers: a radius of 225 um.
+    assert_eq!(
+        radii,
+        BTreeMap::from([("konnect_via_0001".to_string(), 225)])
+    );
+    let dsn = |library: &str, unit: &str| {
+        format!("(pcb b (resolution um 10) (unit {unit}) (library {library}))")
+    };
+    let stack = |name: &str, shapes: &str| format!("(padstack {name} {shapes} (attach off))");
+    let circles = |first: &str, second: &str| {
+        format!("(shape (circle F.Cu {first})) (shape (circle B.Cu {second}))")
+    };
+    // The smallest circle, rounded down.
+    let found = crate::specctra::via_disc_radii(&dsn(&stack("a", &circles("450", "401")), "um"));
+    assert_eq!(found["a"], 200);
+    // Millimetres are read as such.
+    let found = crate::specctra::via_disc_radii(&dsn(&stack("a", &circles("0.6", "0.6")), "mm"));
+    assert_eq!(found["a"], 300);
+    // No entry: a shape that is not a circle, a diameter that is not positive, another
+    // unit, an unreadable DSN. The guard is then strict.
+    let mixed = stack(
+        "m",
+        "(shape (circle F.Cu 450)) (shape (rect F.Cu 0 0 10 10))",
+    );
+    assert!(crate::specctra::via_disc_radii(&dsn(&mixed, "um")).is_empty());
+    assert!(
+        crate::specctra::via_disc_radii(&dsn(&stack("z", &circles("0", "450")), "um")).is_empty()
+    );
+    assert!(
+        crate::specctra::via_disc_radii(&dsn(&stack("a", &circles("450", "450")), "mil"))
+            .is_empty()
+    );
+    assert!(crate::specctra::via_disc_radii("(pcb b").is_empty());
+    assert!(crate::specctra::via_disc_radii("(session b)").is_empty());
+}
+
+#[test]
+fn m4s_board_b_run_6_compares_equal_with_the_via_stub_the_load_dropped() {
+    // Round 2 of the free candidate wrote `C_N` (outside its tune file) with its 20 um
+    // In1.Cu stub at a via missing and its 0.212 mm bridge three times more: the
+    // stub is the only piece that differs.
+    let radii = crate::specctra::via_disc_radii(M4_B6_DSN);
+    let outside = ["/CM5/DPHY0_P.D0_P", "/CM5/DPHY0_P.D0_N"];
+    assert!(changed_with(M4_B6_HELD, M4_B6_ROUND_2, &outside, &radii).is_empty());
+    // Control: without the via discs the same pair of sessions names the net, as before.
+    assert_eq!(
+        changed(M4_B6_HELD, M4_B6_ROUND_2, &outside),
+        ["/CM5/DPHY0_P.C_N"]
+    );
+    // Only a missing piece is ignored: the other way round the stub is a new piece.
+    assert_eq!(
+        changed_with(M4_B6_ROUND_2, M4_B6_HELD, &outside, &radii),
+        ["/CM5/DPHY0_P.C_N"]
+    );
+    // The net inside the tune file is never compared.
+    assert!(changed_with(M4_B6_HELD, M4_B6_ROUND_2, &["/CM5/DPHY0_P.C_N"], &radii).is_empty());
+}
+
+/// Net `A`: a trace, a via `v` at (1000, 1000) um, and on In1.Cu a stub from the via to
+/// (1000, 1000 + `reach`).
+fn net_with_stub(reach: i64, via_net: &str) -> String {
+    let stub = wire("In1.Cu", 200, &[(1000, 1000), (1000, 1000 + reach)]);
+    let trace = wire("F.Cu", 200, &[(0, 1000), (1000, 1000)]);
+    let via_item = via("v", 1000, 1000);
+    if via_net == "A" {
+        session(&[
+            ("A", trace + &via_item + &stub),
+            ("B", via("w", 5000, 5000)),
+        ])
+    } else {
+        session(&[("A", trace + &stub), ("B", via_item)])
+    }
+}
+
+#[test]
+fn a_missing_piece_is_a_via_stub_only_inside_the_disc_of_a_via_of_its_own_net() {
+    let radii = BTreeMap::from([("v".to_string(), 225), ("w".to_string(), 225)]);
+    let after = session(&[
+        (
+            "A",
+            wire("F.Cu", 200, &[(0, 1000), (1000, 1000)]) + &via("v", 1000, 1000),
+        ),
+        ("B", via("w", 5000, 5000)),
+    ]);
+    // Both ends within the disc, one on its edge (225 um): ignored.
+    assert!(changed_with(&net_with_stub(225, "A"), &after, &[], &radii).is_empty());
+    assert!(changed_with(&net_with_stub(20, "A"), &after, &[], &radii).is_empty());
+    // One micrometre past the disc: named.
+    assert_eq!(
+        changed_with(&net_with_stub(226, "A"), &after, &[], &radii),
+        ["A"]
+    );
+    // Inside a via of another net: named. (The via sits on net B in both sessions.)
+    let after_b = session(&[
+        ("A", wire("F.Cu", 200, &[(0, 1000), (1000, 1000)])),
+        ("B", via("v", 1000, 1000)),
+    ]);
+    assert_eq!(
+        changed_with(&net_with_stub(20, "B"), &after_b, &[], &radii),
+        ["A"]
+    );
+    // A via whose padstack has no known disc: named.
+    assert_eq!(
+        changed_with(&net_with_stub(20, "A"), &after, &[], &BTreeMap::new()),
+        ["A"]
+    );
+    // A smaller disc than the stub reaches: named.
+    let small = BTreeMap::from([("v".to_string(), 10)]);
+    assert_eq!(
+        changed_with(&net_with_stub(20, "A"), &after, &[], &small),
+        ["A"]
+    );
+    // A stub that starts outside the disc and ends inside it: named (both ends count).
+    let outside_start = session(&[
+        (
+            "A",
+            wire("F.Cu", 200, &[(0, 1000), (1000, 1000)])
+                + &via("v", 1000, 1000)
+                + &wire("In1.Cu", 200, &[(1000, 1300), (1000, 1100)]),
+        ),
+        ("B", via("w", 5000, 5000)),
+    ]);
+    assert_eq!(changed_with(&outside_start, &after, &[], &radii), ["A"]);
+}
+
+#[test]
+fn a_via_stub_does_not_excuse_a_changed_via_or_a_new_piece() {
+    let radii = BTreeMap::from([("v".to_string(), 225)]);
+    let held = net_with_stub(20, "A");
+    // The stub is missing and a via moved: named.
+    let moved = session(&[
+        (
+            "A",
+            wire("F.Cu", 200, &[(0, 1000), (1000, 1000)]) + &via("v", 1001, 1000),
+        ),
+        ("B", via("w", 5000, 5000)),
+    ]);
+    assert_eq!(changed_with(&held, &moved, &[], &radii), ["A"]);
+    // The stub is missing and another piece appeared: named.
+    let added = session(&[
+        (
+            "A",
+            wire("F.Cu", 200, &[(0, 1000), (1000, 1000)])
+                + &via("v", 1000, 1000)
+                + &wire("F.Cu", 200, &[(0, 3000), (500, 3000)]),
+        ),
+        ("B", via("w", 5000, 5000)),
+    ]);
+    assert_eq!(changed_with(&held, &added, &[], &radii), ["A"]);
+    // Control: the same sessions with nothing else different are equal.
+    assert!(changed_with(&held, &held, &[], &radii).is_empty());
 }
 
 // ---- Row LT, L21: self contacts ----------------------------------------------
@@ -4973,7 +5153,8 @@ int main(int argc, char **argv) {
             assert!(changed_outside(
                 &std::fs::read_to_string(&full).unwrap(),
                 &std::fs::read_to_string(&held.tune.candidates[0].ses).unwrap(),
-                &nets
+                &nets,
+                &NO_VIA_RADII
             )
             .unwrap()
             .is_empty());
@@ -5092,6 +5273,7 @@ int main(int argc, char **argv) {
             mode,
             deadline,
             &Instant::now,
+            &NO_VIA_RADII,
         )
         .await
     }
@@ -5107,6 +5289,7 @@ int main(int argc, char **argv) {
         mode: NextMode<'_>,
         deadline: Instant,
         clock: Clock<'_>,
+        via_radii: &BTreeMap<String, i64>,
     ) -> Attempt {
         let fixture = Fixture::new("");
         let held_path = fixture.path().join("held.ses");
@@ -5124,7 +5307,10 @@ int main(int argc, char **argv) {
         std::fs::write(&pairs, "pair /X /Y gap=0.2\n").unwrap();
         let classes = class_list(&["c1", "c2"]);
         let nets = names(nets);
-        let first = tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"));
+        let first = TuneInputs {
+            via_radii,
+            ..tune_inputs(&tune_file, &classes, &nets, Some("0,1.58"))
+        };
         let calls = std::sync::Mutex::new(Vec::new());
         let next = |folder: &Path,
                     dropped: &BTreeSet<String>|
@@ -5401,6 +5587,7 @@ int main(int argc, char **argv) {
             NextMode::Without,
             deadline,
             &at_deadline,
+            &NO_VIA_RADII,
         )
         .await;
         assert!(kept_of(&run).is_none());
@@ -5430,6 +5617,61 @@ int main(int argc, char **argv) {
             2,
             "{:?}",
             run.outcome.rows
+        );
+    }
+
+    #[tokio::test]
+    async fn a_via_stub_the_load_dropped_does_not_discard_a_tune_pass() {
+        // Net A is outside the tune file {X}; the pass writes it back without its 20 um
+        // stub at a via, which is all that changed.
+        let with_stub = |stub: bool| {
+            session(&[
+                ("X", wire("F.Cu", 200, &[(0, 0), (5000, 0)])),
+                (
+                    "A",
+                    wire("F.Cu", 200, &[(0, 1000), (1000, 1000)])
+                        + &via("v", 1000, 1000)
+                        + &if stub {
+                            wire("In1.Cu", 200, &[(1000, 1000), (1000, 1020)])
+                        } else {
+                            String::new()
+                        },
+                ),
+            ])
+        };
+        let radii = BTreeMap::from([("v".to_string(), 225)]);
+        let rounds = [("tune", with_stub(false))];
+        let run = attempt_at(
+            TuneVariant::Free,
+            &with_stub(true),
+            &rounds,
+            "",
+            &["X"],
+            NextMode::Without,
+            soon(3600),
+            &Instant::now,
+            &radii,
+        )
+        .await;
+        assert!(kept_of(&run).is_some(), "{:?}", run.outcome.rows);
+        // Control: without the via's disc the pass is discarded for net A, as before.
+        let run = attempt(
+            TuneVariant::Free,
+            &with_stub(true),
+            &rounds,
+            "",
+            &["X"],
+            NextMode::Without,
+            soon(3600),
+        )
+        .await;
+        assert!(kept_of(&run).is_none());
+        assert_eq!(
+            run.reasons(),
+            [(
+                "discarded".to_string(),
+                "changed the copper of A".to_string()
+            )]
         );
     }
 

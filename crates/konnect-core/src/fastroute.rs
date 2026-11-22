@@ -981,6 +981,9 @@ pub(crate) struct TuneInputs<'a> {
     /// run's own variant). The pour-safe candidate (L24) runs only when one of them
     /// is outside `nets`.
     pub planes: &'a [String],
+    /// [`crate::specctra::via_disc_radii`] of the run's DSN: what [`changed_outside`]
+    /// takes for a via stub.
+    pub via_radii: &'a BTreeMap<String, i64>,
 }
 
 /// The tune file of the next round: given every net dropped so far, it writes the
@@ -1306,14 +1309,58 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
     Ok(result)
 }
 
+/// Whether a net's copper differs between the sessions, for [`changed_outside`]: its vias
+/// differ, `after` holds a piece `before` lacks, or `before` holds a piece `after` lacks
+/// that is not a via stub. A *via stub* is a missing held piece whose two ends both lie
+/// within the copper disc of one of the net's own vias in `before` (the padstack's
+/// smallest copper radius in `via_radii`, µm): it connects nothing the via does not, and
+/// it is what fastroute's load-time trace-end bridges leave out of the session it
+/// writes back (FT6). A piece that reaches a micrometre past the disc is not a stub.
+fn copper_differs(
+    before: &NetCopper,
+    after: &NetCopper,
+    via_radii: &BTreeMap<String, i64>,
+) -> bool {
+    if before == after {
+        return false;
+    }
+    if before.vias != after.vias {
+        return true;
+    }
+    if after
+        .pieces
+        .iter()
+        .any(|piece| !before.pieces.contains(piece))
+    {
+        return true;
+    }
+    let inside = |at: [i64; 2], via: &(String, [i64; 2]), radius: i64| {
+        let (dx, dy) = (i128::from(at[0] - via.1[0]), i128::from(at[1] - via.1[1]));
+        dx * dx + dy * dy <= i128::from(radius) * i128::from(radius)
+    };
+    before
+        .pieces
+        .iter()
+        .filter(|piece| !after.pieces.contains(piece))
+        .any(|(_, _, [x1, y1, x2, y2])| {
+            !before.vias.iter().any(|via| {
+                via_radii.get(&via.0).is_some_and(|radius| {
+                    inside([*x1, *y1], via, *radius) && inside([*x2, *y2], via, *radius)
+                })
+            })
+        })
+}
+
 /// The nets outside `nets` whose copper differs between two sessions (one appears
-/// in only one of them, or their [`NetCopper`] differ), sorted: the Tune pass's
-/// guard (L6). A net that has no copper in one session and is missing from the
-/// other is not different.
+/// in only one of them, or their [`NetCopper`] differ, [`copper_differs`]), sorted: the
+/// Tune pass's guard (L6). A net that has no copper in one session and is missing from
+/// the other is not different. `via_radii` is [`crate::specctra::via_disc_radii`] of the
+/// call's DSN.
 pub(crate) fn changed_outside(
     before: &str,
     after: &str,
     nets: &BTreeSet<String>,
+    via_radii: &BTreeMap<String, i64>,
 ) -> Result<Vec<String>> {
     let before = copper_by_net(before).context("the session before the Tune pass")?;
     let after = copper_by_net(after).context("the session after the Tune pass")?;
@@ -1322,7 +1369,13 @@ pub(crate) fn changed_outside(
     Ok(names
         .into_iter()
         .filter(|name| !nets.contains(*name))
-        .filter(|name| before.get(*name).unwrap_or(&empty) != after.get(*name).unwrap_or(&empty))
+        .filter(|name| {
+            copper_differs(
+                before.get(*name).unwrap_or(&empty),
+                after.get(*name).unwrap_or(&empty),
+                via_radii,
+            )
+        })
         .cloned()
         .collect())
 }
@@ -1775,6 +1828,7 @@ pub(crate) async fn tune_attempt(
             nets: &nets,
             layer_heights: first.layer_heights,
             planes: first.planes,
+            via_radii: first.via_radii,
         };
         let result = match std::fs::create_dir_all(&pass_folder) {
             Ok(()) => {
@@ -1830,7 +1884,7 @@ pub(crate) async fn tune_attempt(
                 std::fs::read_to_string(&pass.ses)
                     .with_context(|| format!("{} could not be read", pass.ses.display()))
                     .and_then(|after| {
-                        let changed = changed_outside(&before, &after, &nets)?;
+                        let changed = changed_outside(&before, &after, &nets, first.via_radii)?;
                         let contacts = if changed.is_empty() {
                             new_self_contacts(&before, &after, &nets)?
                         } else {

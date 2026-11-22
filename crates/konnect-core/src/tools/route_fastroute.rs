@@ -1060,6 +1060,8 @@ impl Runner for FastrouteRunner {
                 .collect();
             planes.sort();
             planes.dedup();
+            // The disc of each via padstack of this run's DSN (the Tune pass's guard).
+            let via_radii = crate::specctra::via_disc_radii(&variant);
             // Row LT, L21: the next round's tune file, without the nets that touched
             // themselves.
             let plan = tune.as_ref().map(|tune| Arc::clone(&tune.plan));
@@ -1085,6 +1087,7 @@ impl Runner for FastrouteRunner {
                         nets: &tune.nets,
                         layer_heights: tune.layer_heights.as_deref(),
                         planes: &planes,
+                        via_radii: &via_radii,
                     },
                     next: &next,
                 }),

@@ -2370,6 +2370,75 @@ pub(crate) struct DsnPlane {
     pub layer: String,
 }
 
+/// Row LT, the Tune pass's guard: each padstack of the DSN's library whose every shape
+/// is a circle, with the radius of its smallest copper disc in whole micrometres (half the
+/// smallest circle's diameter, rounded down, so a disc is never taken larger than it is).
+/// The DSN's unit must be `um` or `mm`; a padstack with a shape that is not a circle, a
+/// diameter that is not positive, or a DSN in another unit or that cannot be parsed, gives
+/// no entry, so that the guard that reads it stays strict. Konnect writes through vias
+/// only, one circle on each copper layer, so a via's disc is the same on every layer it
+/// touches.
+pub(crate) fn via_disc_radii(dsn: &str) -> BTreeMap<String, i64> {
+    let Ok(root) = parse_dsn_sexp(dsn) else {
+        return BTreeMap::new();
+    };
+    let named = |node: &SexpNode, name: &str| {
+        node.head()
+            .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    };
+    let children = |node: &SexpNode, name: &str| -> Vec<SexpNode> {
+        node.children()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|child| named(child, name))
+            .cloned()
+            .collect()
+    };
+    if !named(&root, "pcb") {
+        return BTreeMap::new();
+    }
+    let um_per_unit = match children(&root, "unit")
+        .first()
+        .and_then(|unit| unit.get(1))
+        .and_then(SexpNode::as_str)
+    {
+        Some(unit) if unit.eq_ignore_ascii_case("um") => 1.0,
+        Some(unit) if unit.eq_ignore_ascii_case("mm") => 1000.0,
+        _ => return BTreeMap::new(),
+    };
+    let mut radii = BTreeMap::new();
+    for library in children(&root, "library") {
+        for padstack in children(&library, "padstack") {
+            let Some(name) = padstack.get(1).and_then(SexpNode::as_str) else {
+                continue;
+            };
+            let mut smallest: Option<f64> = None;
+            let mut only_circles = true;
+            for shape in children(&padstack, "shape") {
+                for form in shape.children().unwrap_or(&[]).iter().skip(1) {
+                    if !named(form, "circle") {
+                        only_circles = false;
+                        continue;
+                    }
+                    match dsn_number(form, 2, "padstack circle diameter") {
+                        Ok(diameter) if diameter > 0.0 => {
+                            smallest = Some(smallest.map_or(diameter, |least| least.min(diameter)));
+                        }
+                        _ => only_circles = false,
+                    }
+                }
+            }
+            if let (true, Some(diameter)) = (only_circles, smallest) {
+                radii.insert(
+                    name.to_string(),
+                    (diameter * um_per_unit / 2.0).floor() as i64,
+                );
+            }
+        }
+    }
+    radii
+}
+
 /// The conduction areas a DSN gives the router, read from the DSN itself, so
 /// a DSN with no manifest beside it is judged the same way: every
 /// `(structure (plane NET shape))`, and every wire of the `wiring` whose shape
