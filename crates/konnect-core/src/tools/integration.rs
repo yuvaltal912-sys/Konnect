@@ -184,7 +184,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "fastroute_path": {
                         "type": "string",
-                        "description": "fastroute only. The fastroute binary. Default: the environment variable KONNECT_FASTROUTE, else the user config key routing.fastroute_path, else a fastroute file next to the konnect executable (a 1 Kopper package), else ~/.local/share/fastroute/candidate/fastroute. Konnect checks that it is the candidate build before routing."
+                        "description": "fastroute only. The fastroute binary. Default: the environment variable KONNECT_FASTROUTE, else the user config key routing.fastroute_path, else a fastroute file next to the konnect executable (a 1 Kopper package), else ~/.local/share/fastroute/candidate/fastroute. Konnect checks that it is the candidate build before routing, with the smart-router switches every routing pass sends (--x.oct_bound, --x.opt_follow_rips=2 and --x.group_search, the group re-route search, which leaves the pour nets out of its cost); a build without them (fastroute x18) is refused."
                     },
                     "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "java_path": { "type": "string", "description": "Path to a Java executable to use (optional); see check_freerouting." },

@@ -1589,6 +1589,7 @@ async fn judges_a_recorded_session_on_scratch_copies() {
             seconds: 1.5,
             untuned: None,
             tune: Default::default(),
+            group_search: None,
         },
         planes: vec![],
         folder: dir.path().to_path_buf(),
@@ -2300,6 +2301,7 @@ fn held_with_candidates(variants: &[crate::fastroute::TuneVariant]) -> crate::fa
                 .collect(),
             seconds: 4.0,
         },
+        group_search: None,
     }
 }
 
@@ -2337,6 +2339,26 @@ fn a_chosen_candidate_rewrites_the_held_run_to_its_board() {
         .rows
         .iter()
         .all(|row| row["outcome"] == json!("candidate")));
+}
+
+/// Row GS: a chosen Tune candidate (whose report has no group search) leaves the
+/// group search of the routing pass it started from, and so does no choice.
+#[test]
+fn a_tune_choice_keeps_the_routing_passs_group_search() {
+    use crate::fastroute::TuneVariant::{Free, PourSafe};
+    let object = json!({ "ended_by": "converged", "passes": [] });
+    for chosen in [Some(PourSafe), Some(Free), None] {
+        let mut held = held_with_candidates(&[Free, PourSafe]);
+        held.group_search = Some(object.clone());
+        TuneChoice {
+            chosen,
+            rows: vec![],
+            untuned: measures(),
+        }
+        .apply(&mut held)
+        .unwrap();
+        assert_eq!(held.group_search, Some(object.clone()), "{chosen:?}");
+    }
 }
 
 #[test]
@@ -2569,6 +2591,7 @@ exit 0
                 seconds: 2.5,
                 untuned: None,
                 tune: Default::default(),
+                group_search: None,
             },
             planes: planes.iter().map(|net| net.to_string()).collect(),
             folder: dir.path().to_path_buf(),

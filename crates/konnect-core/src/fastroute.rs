@@ -4,8 +4,9 @@
 //! parallel runs keep their memory apart (docs/ROUTE_SEARCH_DESIGN.md, decision 2).
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
-//! (C** + BR1 + W8P, build x18). [`locate`] finds it and [`probe`] proves that the
-//! binary found is that build before anything is routed.
+//! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`]):
+//! build x19. [`locate`] finds it and [`probe`] proves that the binary found is that
+//! build before anything is routed.
 
 use crate::specctra::RoutingHints;
 use crate::specctra_seed::{lists, parse_specctra, session_routes, WIRE_DESCRIPTORS};
@@ -43,8 +44,17 @@ pub(crate) const CANDIDATE_SWITCHES: &[&str] = &[
     "--x.par_via_each_a=0.8975",
 ];
 
-/// The candidate's name, as the research and the owner call it.
-pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P";
+/// The smart-router switches (Row GS), sent on every routing pass after
+/// [`CANDIDATE_SWITCHES`], in this order, and never on a Tune pass (G1):
+/// - `--x.oct_bound`: the optimizer's length bound in the 45-degree metric (S1);
+/// - `--x.opt_follow_rips=2`: an optimizer candidate routes up to 2 nets it ripped (F1);
+/// - `--x.group_search`: the group re-route search after the optimizer.
+pub(crate) const SEARCH_SWITCHES: &[&str] =
+    &["--x.oct_bound", "--x.opt_follow_rips=2", "--x.group_search"];
+
+/// The candidate's name, as the research and the owner call it: build x19, the
+/// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`].
+pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS";
 
 /// Threads per run, for the autorouter and the optimizer each (the research's 7 x 2).
 pub(crate) const THREADS: u32 = 2;
@@ -227,11 +237,12 @@ fn present(path: &Path) -> bool {
 /// [`PROBE_TIMEOUT`]:
 /// 1. `--version`: the first line of its output must start with `fastroute `.
 /// 2. `-de <scratch>/absent.dsn`, then every [`CANDIDATE_SWITCHES`] entry, then
-///    [`SENTINEL_SWITCH`]: the output must contain
-///    `unknown experimental switch --x.konnect_probe_unknown` and must not name any
-///    other switch as unknown. A build that lacks a candidate switch names that one;
-///    a build without experimental switches names none (it goes on to open the
-///    absent DSN and fails on that).
+///    every [`SEARCH_SWITCHES`] entry, then [`SENTINEL_SWITCH`]: the output must
+///    contain `unknown experimental switch --x.konnect_probe_unknown` and must not
+///    name any other switch as unknown. A build that lacks a candidate or search
+///    switch names that one (x18, without the search switches, names
+///    `--x.oct_bound`); a build without experimental switches names none (it goes on
+///    to open the absent DSN and fails on that).
 ///
 /// Returns the binary with its SHA-256 (of the file's bytes) and version line. The
 /// error says which step failed and quotes at most 300 characters of the output.
@@ -268,6 +279,7 @@ pub(crate) async fn probe(path: &Path, source: &'static str, scratch: &Path) -> 
         scratch.join("absent.dsn").display().to_string(),
     ];
     args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
+    args.extend(SEARCH_SWITCHES.iter().map(|switch| switch.to_string()));
     args.push(SENTINEL_SWITCH.to_string());
     let output = sandboxed_output(&profile, &path, &scratch, &args)
         .await
@@ -332,6 +344,10 @@ pub(crate) struct CallFiles<'a> {
     /// (Row LT, L7): routing passes carry it only when the call has a resolved pair.
     /// The Tune pass takes its own ([`TuneInputs::layer_heights`]).
     pub layer_heights: Option<&'a str>,
+    /// The `--x.gs_uncounted` file ([`uncounted_file_text`]): the pour nets, whose
+    /// copper the group search leaves out of its cost as the judge leaves it out of
+    /// its measures. Routing passes only.
+    pub uncounted: Option<&'a Path>,
 }
 
 /// The command line of one pass, every setting once, in this order: `-de <dsn>`,
@@ -340,7 +356,8 @@ pub(crate) struct CallFiles<'a> {
 /// `hints` has one (sent as `250.001` when it is within 1e-9 of 250, as the
 /// Freerouting path does), `--router.autorouter.max_threads=` and
 /// `--router.optimizer.max_threads=` at [`THREADS`], [`CANDIDATE_SWITCHES`],
-/// `--x.par_via_amps=<amps>` when given, `--pairs=<file>` when given,
+/// [`SEARCH_SWITCHES`] (Row GS), `--x.par_via_amps=<amps>` when given,
+/// `--x.gs_uncounted=<file>` when given (Row GS, G3), `--pairs=<file>` when given,
 /// `--layer-heights=<value>` when given (Row LT, L7), and
 /// `--initial-session=<file>` as one token when the pass has one. Numbers are written without a trailing `.0` when
 /// whole. Never `--live`, `--multi-start`, `--max-time` or `--diagnose`.
@@ -369,8 +386,12 @@ pub(crate) fn pass_arguments(
     args.push(format!("--router.autorouter.max_threads={THREADS}"));
     args.push(format!("--router.optimizer.max_threads={THREADS}"));
     args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
+    args.extend(SEARCH_SWITCHES.iter().map(|switch| switch.to_string()));
     if let Some(amps) = files.amps {
         args.push(format!("--x.par_via_amps={}", amps.display()));
+    }
+    if let Some(uncounted) = files.uncounted {
+        args.push(format!("--x.gs_uncounted={}", uncounted.display()));
     }
     if let Some(pairs) = files.pairs {
         args.push(format!("--pairs={}", pairs.display()));
@@ -429,6 +450,43 @@ pub(crate) fn amps_file_text(manifest: &Value) -> Option<String> {
     let mut text = String::new();
     for (net, amps) in &largest {
         text.push_str(&format!("{} {net}\n", number(*amps)));
+    }
+    Some(text)
+}
+
+/// The `--x.gs_uncounted` file from the manifest's `pours`: one net name a line, each
+/// net once, sorted, with a final newline. `None` when the manifest has no pour, or
+/// none of its names can be written.
+/// A name that is empty or holds a line break is left out (one net per line), as
+/// [`amps_file_text`] does. The set is the judge's `pour_nets` (`route_judge.rs`).
+///
+/// fastroute reads the file line by line, trims each line, skips an empty line and a
+/// line that starts with `#` (a comment), and looks each name up ignoring case; a name
+/// the board does not have is logged and skipped (`exp::parse_net_names`,
+/// `group_search::settings_from_exp`). So a name with white space inside is written
+/// as it is, and a name that starts or ends with white space, or starts with `#`, is
+/// left out too: fastroute would read it as another name or as a comment. A pour net
+/// left out is counted in the group search's cost, which is the safe side.
+pub(crate) fn uncounted_file_text(manifest: &Value) -> Option<String> {
+    let names: BTreeSet<&str> = manifest["pours"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["net"].as_str())
+        .filter(|net| {
+            !net.is_empty()
+                && !net.contains(['\n', '\r'])
+                && net.trim() == *net
+                && !net.starts_with('#')
+        })
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for net in names {
+        text.push_str(net);
+        text.push('\n');
     }
     Some(text)
 }
@@ -492,6 +550,9 @@ pub(crate) struct PassOutcome {
     /// The number of entries of the report's `clearance_violations` list.
     pub clearance_violations: usize,
     pub seconds: f64,
+    /// Row GS: the report's `group_search` object as fastroute wrote it, when the
+    /// report has one (the stage ran); `None` for a Tune pass, which never runs it.
+    pub group_search: Option<Value>,
 }
 
 /// Why a pass gave no session.
@@ -652,6 +713,10 @@ async fn run_arguments(
         unrouted: count("unrouted")?,
         clearance_violations: count("clearance_violations")?,
         seconds,
+        group_search: report_value
+            .get("group_search")
+            .filter(|object| !object.is_null())
+            .cloned(),
     })
 }
 
@@ -674,6 +739,11 @@ pub(crate) struct Held {
     pub untuned: Option<PathBuf>,
     /// Row LT: what the Tune attempts gave (every candidate, every pass row).
     pub tune: TuneOutcome,
+    /// Row GS: the `group_search` object of the routing pass the hold sequence kept
+    /// ([`PassOutcome::group_search`]). A kept Tune pass changes neither this nor
+    /// anything the search did: its report has none, so this stays the routing
+    /// pass's it started from.
+    pub group_search: Option<Value>,
 }
 
 /// The hold sequence (design decision 4), each pass in its own subfolder of
@@ -749,6 +819,7 @@ pub(crate) async fn route_held(
     let mut kept = "full";
     let mut kept_ses = full.ses.clone();
     let mut kept_unrouted = full.unrouted;
+    let mut kept_group_search = full.group_search.clone();
 
     // Fallback: only when Full left connections open, and only with a floor.
     let mut fallback_kept: Option<PassOutcome> = None;
@@ -802,6 +873,7 @@ pub(crate) async fn route_held(
                         kept = "fallback";
                         kept_ses = outcome.ses.clone();
                         kept_unrouted = outcome.unrouted;
+                        kept_group_search = outcome.group_search.clone();
                         fallback_kept = Some(outcome);
                     } else {
                         let reason = if outcome.unrouted == full.unrouted {
@@ -853,6 +925,7 @@ pub(crate) async fn route_held(
                     kept = "polish";
                     kept_ses = outcome.ses.clone();
                     kept_unrouted = outcome.unrouted;
+                    kept_group_search = outcome.group_search.clone();
                 } else {
                     passes.push(row(
                         "polish",
@@ -882,6 +955,7 @@ pub(crate) async fn route_held(
         seconds,
         untuned: None,
         tune: TuneOutcome::default(),
+        group_search: kept_group_search,
     };
     match tune {
         Some(tune) => tune_held(binary, folder, dsn, hints, files, &tune, held, deadline).await,
@@ -1016,7 +1090,10 @@ pub(crate) fn layer_heights_argument(value: &str) -> String {
 /// one, the two thread settings at [`THREADS`], [`CANDIDATE_SWITCHES`],
 /// `--x.par_via_amps=` when `files` has it, `--tune=<file>`, `--layer-heights=`
 /// when `files` has it, and `--initial-session=<initial>`. Never `--pairs`,
-/// `--live`, `--multi-start`, `--max-time`, `--diagnose` or a neck width.
+/// `--live`, `--multi-start`, `--max-time`, `--diagnose` or a neck width, and never
+/// a [`SEARCH_SWITCHES`] entry nor `--x.gs_uncounted` (Row GS, G1: with the
+/// optimizer off the group search would rip and straighten the meanders the tuner
+/// just added); `files.uncounted` is ignored.
 #[allow(clippy::too_many_arguments)] // the parts of one command line, each read once
 pub(crate) fn tune_pass_arguments(
     dsn: &Path,
@@ -1811,11 +1888,13 @@ pub(crate) async fn tune_attempt(
     clock: Clock<'_>,
     outcome: &mut TuneOutcome,
 ) -> std::result::Result<Option<TuneCandidate>, PassError> {
-    // The Tune pass gets its own heights and never the call's pairs file.
+    // The Tune pass gets its own heights and never the call's pairs file, nor the
+    // group search's uncounted file (Row GS, G1).
     let files = CallFiles {
         amps: files.amps,
         pairs: None,
         layer_heights: first.layer_heights,
+        uncounted: None,
     };
     let mut tune_file = first.tune.to_path_buf();
     let mut nets = first.nets.clone();

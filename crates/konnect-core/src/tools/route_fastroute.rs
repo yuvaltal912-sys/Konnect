@@ -390,7 +390,9 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 ///    an error result carrying its reason and next step.
 /// 5. The DSN text, `route_search::shapes`, the manifest's hints
 ///    (`specctra::manifest_routing_hints`), the amps file
-///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), the design intent's
+///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), the pour nets
+///    (`fastroute::uncounted_file_text`, written to `<folder>/uncounted.txt` and sent as
+///    `--x.gs_uncounted=<file>` on every routing pass of every run, Row GS), the design intent's
 ///    differential pairs (`route_pairs::plan`, written to `<folder>/pairs.txt` and sent
 ///    as `--pairs=<file>` on every pass of every run), Row LT's length plan
 ///    (`route_lengths::plan`, after the pairs plan and before the search folder holds
@@ -750,6 +752,17 @@ async fn search_and_write(
         }
         None => None,
     };
+    // Row GS, G3: the pour nets, which the group search leaves out of its cost as the
+    // judge leaves them out of its measures.
+    let uncounted = match fastroute::uncounted_file_text(&judge.manifest) {
+        Some(text) => {
+            let path = call.folder.join("uncounted.txt");
+            std::fs::write(&path, text)
+                .map_err(|error| anyhow::anyhow!("write {}: {error}", path.display()))?;
+            Some(path)
+        }
+        None => None,
+    };
     let limits = call.effort.0.limits();
     let cores = std::thread::available_parallelism()
         .map(|cores| cores.get())
@@ -765,6 +778,7 @@ async fn search_and_write(
         dsn_text: Arc::new(dsn_text),
         hints,
         amps,
+        uncounted,
         pairs,
         routing_heights: routing_layer_heights(&lengths_plan, &pairs_plan),
         tune,
@@ -978,6 +992,9 @@ pub(crate) struct FastrouteRunner {
     pub dsn_text: Arc<String>,
     pub hints: RoutingHints,
     pub amps: Option<PathBuf>,
+    /// The call's `--x.gs_uncounted` file (`fastroute::uncounted_file_text`, Row GS),
+    /// none when the manifest has no pour.
+    pub uncounted: Option<PathBuf>,
     /// The call's `--pairs` file (`route_pairs::plan`), none without declared pairs.
     pub pairs: Option<PathBuf>,
     /// The `--layer-heights` value the routing passes get: only with a resolved pair
@@ -1038,6 +1055,7 @@ impl Runner for FastrouteRunner {
         let dsn_text = Arc::clone(&self.dsn_text);
         let hints = self.hints;
         let amps = self.amps.clone();
+        let uncounted = self.uncounted.clone();
         let pairs = self.pairs.clone();
         let routing_heights = self.routing_heights.clone();
         let tune = self.tune.clone();
@@ -1079,6 +1097,7 @@ impl Runner for FastrouteRunner {
                     amps: amps.as_deref(),
                     pairs: pairs.as_deref(),
                     layer_heights: routing_heights.as_deref(),
+                    uncounted: uncounted.as_deref(),
                 },
                 fallback,
                 tune.as_ref().map(|tune| fastroute::TuneRequest {
@@ -1246,7 +1265,8 @@ fn remove_all_but(path: &Path, keep: &[&str]) -> std::io::Result<()> {
 
 /// After a search: every run folder but the winner's is reduced to its
 /// `run.json` (its `RunRecord` and, when judged, its measures, gates and
-/// rounds; with a Tune pass, its rows and the files it kept), and the judge folders of
+/// rounds and its `group_search` summary when it has one, Row GS; with a Tune pass,
+/// its rows and the files it kept), and the judge folders of
 /// every run but the winner's (`<folder>/judge/run-<i>`, `run-<i>-untuned`,
 /// `run-<i>-pour-safe`) are removed. The run folder keeps, for each Tune pass that was
 /// discarded or failed, its `fastroute.log` and its session (L26; the pass folders of
@@ -1302,6 +1322,14 @@ pub(crate) fn reduce_run_folders(
         }
         if let Some(judged) = &record.judged {
             body["judged"] = json!(judged);
+            // Row GS: how each judged run's group search ended, not only the winner's.
+            if let Some(summary) = record
+                .routed
+                .as_ref()
+                .and_then(|r| held_group_search(&r.held))
+            {
+                body["group_search"] = summary;
+            }
         }
         let record_file = run.join("run.json");
         if let Err(error) = std::fs::write(
@@ -1459,13 +1487,15 @@ fn listed_runs(outcome: &SearchOutcome, listing: Listing) -> Vec<&RunRecord> {
     rows
 }
 
-/// The winner's own part of `search`: its identity, verdict and passes. `None`
-/// when no run won, or the winning record lacks what a result needs.
+/// The winner's own part of `search`: its identity, verdict and passes, and
+/// `group_search` ([`group_search_summary`]) when its kept pass's report has a
+/// summary to give (Row GS, G5). `None` when no run won, or the winning record lacks
+/// what a result needs.
 fn winner_json(outcome: &SearchOutcome) -> Option<Value> {
     let position = outcome.winner?;
     let record = outcome.runs.get(position)?;
     let (routed, judged) = (record.routed.as_ref()?, record.judged.as_ref()?);
-    Some(json!({
+    let mut winner = json!({
         "index": record.index,
         "shape": record.shape,
         "seed": record.seed,
@@ -1475,6 +1505,51 @@ fn winner_json(outcome: &SearchOutcome) -> Option<Value> {
         "passes": routed.held.passes,
         "kept": routed.held.kept,
         "key": outcome.keys.get(position).copied().flatten(),
+    });
+    if let Some(summary) = held_group_search(&routed.held) {
+        winner["group_search"] = summary;
+    }
+    Some(winner)
+}
+
+/// [`group_search_summary`] of `held`'s kept routing pass, `None` without one.
+fn held_group_search(held: &crate::fastroute::Held) -> Option<Value> {
+    held.group_search.as_ref().and_then(group_search_summary)
+}
+
+/// What the group search did on the winner's kept pass, from the engine's report
+/// (Row GS, G5). `object` is the report's `group_search` object, as
+/// `fastroute::Held::group_search` keeps it. The summary: `ended_by` (`converged`,
+/// `pass_cap` or `stopped`, as the engine names it), `passes` (their count),
+/// `kept_moves` (the sum of the passes' `kept`), `largest_group` (the largest
+/// `largest_kept_group`, 0 without a pass), `start` and `end` (`length_mm`, `vias`,
+/// `cost_mm`). `None` when the object does not read as one: no `ended_by` string, no
+/// `passes` list, a pass without a whole `kept` or `largest_kept_group`, or a `start`
+/// or `end` without the three numbers. Never an error.
+fn group_search_summary(object: &Value) -> Option<Value> {
+    let ended_by = object["ended_by"].as_str()?;
+    let passes = object["passes"].as_array()?;
+    let mut kept_moves = 0u64;
+    let mut largest_group = 0u64;
+    for pass in passes {
+        kept_moves = kept_moves.checked_add(pass["kept"].as_u64()?)?;
+        largest_group = largest_group.max(pass["largest_kept_group"].as_u64()?);
+    }
+    let value = |key: &str| -> Option<Value> {
+        let value = &object[key];
+        Some(json!({
+            "length_mm": value["length_mm"].as_f64()?,
+            "vias": value["vias"].as_u64()?,
+            "cost_mm": value["cost_mm"].as_f64()?,
+        }))
+    };
+    Some(json!({
+        "ended_by": ended_by,
+        "passes": passes.len(),
+        "kept_moves": kept_moves,
+        "largest_group": largest_group,
+        "start": value("start")?,
+        "end": value("end")?,
     }))
 }
 
@@ -1667,7 +1742,8 @@ fn tuning_fields(
 /// `integration::width_report(dsn, ses_output)`; `method: "local_fastroute_best_of_n"`;
 /// `engine` { name: "fastroute", candidate, path, sha256, version, source, switches,
 /// threads }; `effort` { level, source, budget_s, runs }; `search` { lanes, shapes,
-/// launched, judged, winner { index, shape, seed, gates, measures, passes, kept },
+/// launched, judged, winner { index, shape, seed, gates, measures, passes, kept, and
+/// group_search when the kept pass's report has one (Row GS) },
 /// runs (every record), elapsed_s, budget_overrun_s, stopped_launching, baseline };
 /// `artifacts` { dsn_path, ses_output_path, search_folder, judged_board };
 /// `passes` and `result_pass` of the winner, as the Freerouting hold path names them;

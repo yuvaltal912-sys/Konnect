@@ -3,6 +3,25 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the smart-router switches with fastroute (Row GS)
+
+`route_specctra_dsn` (fastroute) routes every Full, Fallback and Polish pass with
+`--x.oct_bound`, `--x.opt_follow_rips=2` and `--x.group_search`, and with the
+manifest's pour nets in `--x.gs_uncounted`. Design: decision D25 in
+`docs/ROUTE_SEARCH_DESIGN.md`.
+
+- **The candidate build is x19** (`C** + BR1 + W8P + GS`). A fastroute build without
+  the three switches, x18 included, is refused by the probe before anything is
+  routed, with the switch it lacks named; the setup steps say where the candidate
+  goes. A 1 Kopper package that bundles x18 must be built again.
+- **New result field `search.winner.group_search`**: `ended_by`, `passes`,
+  `kept_moves`, `largest_group`, and `start` and `end` with `length_mm`, `vias` and
+  `cost_mm`. It is absent when the winner's kept pass reported no group search.
+  Each judged run's `run.json` in the search folder holds the same summary.
+- The search folder holds `uncounted.txt` when the manifest has pours. Nothing
+  else in the arguments or the result changes, and the Tune pass of Row LT runs as
+  before.
+
 ## Unreleased: matched lengths with fastroute (Row LT)
 
 Nets that must have matched lengths are declared in the design intent, and
