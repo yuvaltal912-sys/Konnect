@@ -444,6 +444,8 @@ The Rust exporter merges the anchor and supported copper primitives on KiCad's n
 - `cargo mutants` (27.1.0), one narrow batch on the tool's guard functions (`verdict_of`, `was_called`, `was_sent`, `gate_failures`, `stable_read`, `read_arguments`, `Planned::of`, `tool_plan`, `run_folder`) with `tools::placement_converge`'s tests: 24 mutants, 19 caught, 5 unviable, 0 missed, 7 minutes (`mutants/run/mutants.out/`). `cargo llvm-cov` was skipped: the 18 source-mutation controls and this batch already show each guard's test failing when the guard breaks.
 - The konnect crate's guards: `asset_references` (the tool's five response words added to `NOT_TOOLS`), `schema_parameter_usage`, `creation_guidance` and `doc_tool_counts` pass; `cargo xtask fix-doc-counts` updated the counts (270 tools, 277 with the meta-tools).
 
+- Full gate on the implementation commit `5c921a43`: green (5,595 tests + 63 sandboxed, 9 doc tests, 95 live simulation tests, clippy, licenses, doc counts unchanged, release build, protected files unchanged, installed hash `3de188bb775ab4ce`; `gate/final/results.json`).
+
 **Not verified.** The live IPC read (no test starts KiCad; the one-board guard and the two-read check run only against a real KiCad). No run on any of the owner's boards. Windows and Linux.
 
 **Limits.** Inherited from family C (Row CL): limit 1 (a board too dense for C's gap rule gives `no_candidate`), limit 4 (no decoupling pair found: capacitors not kept by their ICs; the response notes it), limit 3 (why the tool routes; three calls may still all fail a gate, then `planned_with_gate_failures`). `no_candidate` is tested only for a search with no start.
