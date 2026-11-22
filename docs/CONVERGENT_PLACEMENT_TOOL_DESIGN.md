@@ -3,7 +3,8 @@
 **State, 2026-11-22.** Designed and built on the owner's word ("יש כבר קוד כתוב להנחת רכיבים
 מתכנסת, המשימה שלך היא לבנות כלי"). He chose both open decisions as recommended: a planner that
 writes nothing, and routing the best three candidates before a winner is named. Branch
-`claude/converge-place-tool` from `fork/main` `1506938e`.
+`claude/converge-place-tool` from `fork/main` `1506938e`; merged as
+[#104](https://github.com/yuvaltal912-sys/Konnect/pull/104) (main `6abf6333`).
 
 ## What it is
 
