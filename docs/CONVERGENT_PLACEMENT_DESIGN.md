@@ -1,6 +1,6 @@
 # Convergent placement search: design
 
-Status: approved, built and measured as Row CP, and stopped on the owner's word on 2026-11-21 before the review's fixes, mutants, the final gate and a PR (see [`CREATION_HANDOFF.md`](CREATION_HANDOFF.md) for
+Status: approved, built and measured as Row CP, and merged as #98 on 2026-11-22 (see [`CREATION_HANDOFF.md`](CREATION_HANDOFF.md) for
 where the build stands). Written on 2026-11-20 on branch `claude/convergent-placement-design` from
 `fork/main` `0a3fc504`, by the session the owner asked ("כן, תכתוב"), which runs on Claude
 Fable 5.2. The standing rule gives algorithm design to Opus 5.5; here the owner asked this session
