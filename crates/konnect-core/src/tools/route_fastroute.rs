@@ -1740,7 +1740,8 @@ fn tuning_fields(
 /// gates, all_gates_pass, stitching_vias, judged_board }; `intent_widths`, `width_exceptions`,
 /// `width_exceptions_total` (and `width_unmeasured` when any) from
 /// `integration::width_report(dsn, ses_output)`; `method: "local_fastroute_best_of_n"`;
-/// `engine` { name: "fastroute", candidate, path, sha256, version, source, switches,
+/// `engine` { name: "fastroute", candidate, path, sha256, version, source, switches
+/// (`fastroute::routing_switches`: the candidate switches, then the search switches),
 /// threads }; `effort` { level, source, budget_s, runs }; `search` { lanes, shapes,
 /// launched, judged, winner { index, shape, seed, gates, measures, passes, kept, and
 /// group_search when the kept pass's report has one (Row GS) },
@@ -1865,7 +1866,7 @@ pub(crate) fn result_json(
             "sha256": binary.sha256,
             "version": binary.version,
             "source": binary.source,
-            "switches": fastroute::CANDIDATE_SWITCHES,
+            "switches": fastroute::routing_switches(),
             "threads": fastroute::THREADS,
         },
         "effort": {

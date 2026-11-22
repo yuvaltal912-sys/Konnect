@@ -151,6 +151,23 @@ fn every_routing_pass_sends_the_search_switches_right_after_the_candidate_switch
     }
 }
 
+/// Row GS: `routing_switches` (the result's `engine.switches`) is exactly the fixed
+/// switches a routing pass sends, in the order it sends them.
+#[test]
+fn the_routing_switches_are_the_fixed_switches_of_a_routing_line_in_order() {
+    let switches = routing_switches();
+    let mut expected: Vec<&str> = CANDIDATE_SWITCHES.to_vec();
+    expected.extend(SEARCH_SWITCHES);
+    assert_eq!(switches, expected);
+    let args = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    let sent: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|token| token.starts_with("--x.") || *token == "--no-time-limits")
+        .collect();
+    assert_eq!(sent, switches);
+}
+
 /// Row GS, G3: `--x.gs_uncounted` is sent only when the call has the file, as one
 /// token, after the amps file and before the pairs file and the initial session.
 #[test]

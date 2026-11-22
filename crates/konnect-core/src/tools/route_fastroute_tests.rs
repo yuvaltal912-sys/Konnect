@@ -1447,8 +1447,12 @@ fn the_result_has_every_documented_key() {
     assert_eq!(engine["source"], "argument");
     assert_eq!(engine["threads"], 2);
     assert_eq!(
-        engine["switches"].as_array().unwrap().len(),
-        crate::fastroute::CANDIDATE_SWITCHES.len()
+        engine["switches"],
+        json!(crate::fastroute::CANDIDATE_SWITCHES
+            .iter()
+            .chain(crate::fastroute::SEARCH_SWITCHES)
+            .collect::<Vec<_>>()),
+        "what a routing pass ran: the candidate switches, then the search switches"
     );
     // The effort.
     assert_eq!(result["effort"]["level"], "h");

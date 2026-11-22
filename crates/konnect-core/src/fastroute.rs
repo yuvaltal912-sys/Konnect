@@ -52,6 +52,16 @@ pub(crate) const CANDIDATE_SWITCHES: &[&str] = &[
 pub(crate) const SEARCH_SWITCHES: &[&str] =
     &["--x.oct_bound", "--x.opt_follow_rips=2", "--x.group_search"];
 
+/// Every fixed switch a routing pass sends, in its order: [`CANDIDATE_SWITCHES`],
+/// then [`SEARCH_SWITCHES`] (what the result's `engine.switches` lists).
+pub(crate) fn routing_switches() -> Vec<&'static str> {
+    CANDIDATE_SWITCHES
+        .iter()
+        .chain(SEARCH_SWITCHES)
+        .copied()
+        .collect()
+}
+
 /// The candidate's name, as the research and the owner call it: build x19, the
 /// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`].
 pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS";

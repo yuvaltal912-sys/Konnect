@@ -18,6 +18,8 @@ manifest's pour nets in `--x.gs_uncounted`. Design: decision D25 in
   `kept_moves`, `largest_group`, and `start` and `end` with `length_mm`, `vias` and
   `cost_mm`. It is absent when the winner's kept pass reported no group search.
   Each judged run's `run.json` in the search folder holds the same summary.
+- **`engine.switches`** lists every fixed switch a routing pass sends: the candidate
+  switches, then the three search switches (it listed the candidate switches only).
 - The search folder holds `uncounted.txt` when the manifest has pours. Nothing
   else in the arguments or the result changes, and the Tune pass of Row LT runs as
   before.
