@@ -63,10 +63,11 @@ The original boards are private: no net, part or board name goes into a document
 | `name` | the board's bench name; titles its table, must be unique | required |
 | `folder` | its folder below the bench folder (a plain relative path) | required |
 | `board` | the board file in `<folder>/input/` | the only `.kicad_pcb` there |
-| `time_limit_minutes` | the whole board's limit, generation included | 100 |
+| `time_limit_minutes` | the whole board's limit, generation included, except family C's phase 1b, whose time does not count against it (design C13) | 100 |
 | `effort` | `fast`, `m`, `h` or `xh` | `m` |
 | `hold` | which parts the search holds: `locks` or `rules` (below) | `locks` |
-| `families` | the generator families, any of `force`, `schematic`, `perturb` | `["force", "schematic"]` |
+| `families` | the generator families, any of `force`, `schematic`, `perturb`, `converge` | `["force", "schematic"]` |
+| `converge_terms` | family C's two new cost terms (schematic neighbours, silk labels): `on` or `off` | `on` |
 
 `hold`:
 - `locks`: held are the footprints KiCad locks, `held.json`'s references, and the footprints
@@ -82,6 +83,19 @@ naming `perturb` brings the 128 P recipes back. P edits the owner's own placemen
 meaning in his flow, so it is off by default. O and A are routed as references whatever is
 named. An unknown `hold` value, an unknown family or an empty `families` list is refused before
 anything runs. The hold rules and the matrix are recorded in `search.json`'s plan.
+
+`converge` adds family C, the convergent search (`docs/CONVERGENT_PLACEMENT_DESIGN.md`). It
+refines F's and S's candidates, so it needs `force` or `schematic` named with it and is refused
+alone. It runs after every F, S and P candidate exists (phase 1b), at the design's measured
+parameters and outer rules; its wall time does not count against `time_limit_minutes`.
+`converge_terms: "off"` sets the neighbour weight and the label cost to 0 for that board (the
+design's measurement step 3); any other value than `on` or `off` is refused. With C,
+`search.json` also holds C's parameters and rule (`plan.matrix.converge`), each C record's
+trace (`converge`: the cost term by term at the start and the end, both stop reasons, stages,
+sweeps, evaluations, the best cost after every stage and sweep), and the outer trace (top-level
+`converge`: the starts taken and the best cost after each, the cost by effort level, why each
+rule stopped, seconds). `table.md` gets C's row and verdict, and one line of counts on the
+outer loops.
 
 Per board the folder holds `input/`, `rules.json`, `held.json` (a JSON array of the
 references to hold besides the mode's own: `["J1", "H3"]`, or `[]`) and optionally `ai/board.kicad_pcb`.
@@ -105,3 +119,54 @@ board's folder, and prints one line per board.
 
 The bench does not take the lane locks (native, then instr): the driver that starts it
 holds them for each board's run.
+
+## Family C without routing
+
+`converge_check`, an ignored test beside `place_bench`, runs family C on every board that names
+`converge`, with no routing call (the design's measurement step 1). It takes the same
+environment and guards as `place_bench`, starts no router, starts no KiCad unless
+`KONNECT_CONVERGE_SILK=1` is set (below), and writes `<board folder>/converge-check.json`
+(refused when the file exists; with the silk check, also the scratch folder below):
+phase 1's counts, the outer trace, and per C run its recipe
+(start family, seed, parameter-set index, level), outcome, cost, both stop reasons, stages,
+sweeps, evaluations, the start and end terms, and seconds. `KONNECT_CONVERGE_PORT_CHECK=1` adds
+the port's check: 5 runs at level 0, seeds 1 to 5, both new terms off, from F seed 24 with rail
+weight 0, and their median cost. Counts and numbers only. It repeats phase 1 itself and reads
+no AI board, so an F or S candidate whose board equals A's is a start here and a `duplicate` in
+the bench: its pool can then differ from the bench's. Its run ids start after phase 1's records
+with no O or A record before them, so they are not the bench's ids: match runs by their recipe.
+
+`KONNECT_CONVERGE_SILK=1` adds design A3's two measures, with no routing call, by the bench's
+own code, and **starts kicad-cli** (a refill and DRC per board text, that is on the input and on each
+run's board, one at a time, with the scratch `KICAD_CONFIG_HOME`; a real `kicad-cli` is needed: a
+report without the unconnected-items category is refused, as the bench's own check refuses it, but
+a stand-in that returns a whole report is not detected, so `KONNECT_KICAD_CLI` must not name
+one). It runs the bench's input check on the input board (`PlaceRouteCall::unrouted`, that
+is `place_route::unrouted_check`), writes each C run's board as the bench writes a candidate
+before its routing call (`export_candidate`), runs the same check on that copy, and adds:
+
+- once per board, `input_silk`: the input's `silk_overlap`, `silk_over_copper`,
+  `silk_edge_clearance` and their `sum` (the bench's `input_unrouted`), and `input_silk_reason`;
+- per C run, `silk` (the same four numbers of the run's board; `sum` is the table's `silk`
+  column) and `silk_reason`, and `schematic_neighbours` (as `search.json` records it: `mean_mm`,
+  `ratio_to_input`, `parts_pulled_away`, `parts_measured`, `parts_unmatched`, `parts_alone`) and
+  `schematic_neighbours_reason`.
+
+A reason is `null` beside a value, and beside a `null` one fixed phrase (`no board`, `the export
+failed`, `the unrouted check failed`, `the silk check could not start`, `the input's schematic
+gives no neighbourhoods`, `the board could not be measured`); a failure's own text goes to the log
+only. If the silk check reads none of a board's runs, the file is still written (every `silk` is
+`null` with its reason) and the test fails with a message that says so. The scratch boards stay in
+`<board folder>/converge-check-silk/` (`isolation/`, `input-check/`, `candidates/c<id>/` with the
+id padded to four digits, as the bench's layout has it) for inspection, and a run is refused
+while that folder exists. Without the variable the file is what it was before the variable
+existed. Both switches are on only for the value `1`; the header line the test prints says
+which are on.
+
+```text
+KONNECT_PLACE_BENCH=<bench folder> KONNECT_FASTROUTE=<any executable fastroute> \
+KICAD_CONFIG_HOME=<bench folder>/scratch/kicad-config \
+KONNECT_STATE_DIR=<bench folder>/scratch/state [KONNECT_CONVERGE_PORT_CHECK=1] \
+[KONNECT_CONVERGE_SILK=1] \
+cargo test -p konnect-core --release --lib place_bench_tests::converge_check -- --exact --ignored --nocapture
+```

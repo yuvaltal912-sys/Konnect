@@ -268,7 +268,7 @@ fn resolve_executable(cli: &str) -> Option<PathBuf> {
 }
 
 /// KiCad's violations counted by rule key.
-fn violations_by_rule(drc: &crate::tools::cli::DrcReport) -> BTreeMap<String, usize> {
+pub(crate) fn violations_by_rule(drc: &crate::tools::cli::DrcReport) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for violation in &drc.violations {
         *counts.entry(violation.rule.clone()).or_insert(0) += 1;
@@ -277,8 +277,9 @@ fn violations_by_rule(drc: &crate::tools::cli::DrcReport) -> BTreeMap<String, us
 }
 
 /// The unconnected items of a report; a report that has no such category is an
-/// error, never zero.
-fn unconnected_total(drc: &crate::tools::cli::DrcReport) -> Result<usize> {
+/// error, never zero. Shared with `place_route::unrouted_counts`, so that the placement
+/// bench's unrouted check refuses what the judge's baseline refuses.
+pub(crate) fn unconnected_total(drc: &crate::tools::cli::DrcReport) -> Result<usize> {
     drc.unconnected_items.as_ref().map(Vec::len).context(
         "the DRC report has no unconnected-items category; an unrouted board cannot be told from a routed one",
     )
