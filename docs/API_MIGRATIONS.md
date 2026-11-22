@@ -39,7 +39,11 @@ Nets that must have matched lengths are declared in the design intent, and
     candidate is judged only when the free one is rejected or fails G4. Judge
     folders `judge/run-<i>-untuned` and `judge/run-<i>-pour-safe` are removed with
     the other runs' boards, and a run folder keeps the `fastroute.log` and `tune.ses`
-    of each discarded or failed Tune pass (`run.json` names them under `tune`).
+    of each discarded or failed Tune pass (`run.json` names them under `tune`). A Tune pass
+    is not discarded for "changed the copper of <net>" when the net lost only a via stub:
+    a held piece with both ends inside the copper disc of one of that net's own vias
+    (the padstack's smallest copper radius in the call's DSN), which fastroute's
+    load-time trace-end bridges leave out of the session it writes back.
   - Judge gate **G4** checks the groups, the pair skews and KiCad's own
     `length` and `skew` rules, on lengths KiCad measures, and (d) that no checked
     net's copper crosses or overlaps itself and that KiCad's DRC names none in a
