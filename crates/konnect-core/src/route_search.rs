@@ -807,6 +807,8 @@ pub(crate) async fn search(plan: &SearchPlan, runner: Arc<dyn Runner>) -> Search
 }
 
 /// A finished job, as the scheduler's `select!` hands it over.
+// One event is moved once into the loop; a box would only add an allocation per run.
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Baseline(std::result::Result<Result<Baseline>, JoinError>),
     Judge(std::result::Result<(Id, Result<Judged>), JoinError>),
@@ -1032,6 +1034,16 @@ impl<'a> Sched<'a> {
         let record = &mut self.runs[index];
         record.judged_s = Some(judged_s);
         record.judge_s = Some(took.as_secs_f64());
+        // Row LT, L23: the run's board is the one the judge chose among its Tune
+        // candidates, so the session the call writes and the pass it reports are that
+        // board's. A choice the run cannot follow fails the judge: the written session
+        // would differ from the judged board.
+        let result = result.and_then(|judged| {
+            if let (Some(choice), Some(routed)) = (&judged.tune, record.routed.as_mut()) {
+                choice.apply(&mut routed.held)?;
+            }
+            Ok(judged)
+        });
         match result {
             Ok(judged) => {
                 record.outcome = "judged";

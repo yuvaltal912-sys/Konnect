@@ -296,10 +296,49 @@ pub(crate) struct RoutingBounds {
     pub width_mm: f64,
 }
 
-/// The DSN exporter only translates unconditional, explicit-mm minima.
+/// Row LT (docs/LENGTH_TUNING_DESIGN.md, L19): the constraints that change nothing
+/// the DSN carries. A rule whose every constraint is one of these is skipped by
+/// `routing_bounds`, its `condition`, `layer` and `severity` clauses unread; a rule
+/// that mixes one of these with any other constraint is projected or refused as
+/// before.
+pub(crate) const DSN_NEUTRAL_CONSTRAINTS: [&str; 2] = ["length", "skew"];
+
+/// Whether `rule` is skipped by `routing_bounds` (L19): it has at least one
+/// `constraint` clause, every one of them is a [`DSN_NEUTRAL_CONSTRAINTS`] kind, and
+/// its other clauses are only `condition`, `layer` and `severity`.
+pub(crate) fn is_dsn_neutral(rule: &Rule) -> bool {
+    let Some(children) = rule.node.children() else {
+        return false;
+    };
+    let mut constraints = 0usize;
+    for clause in children.iter().skip(2) {
+        match clause.head() {
+            Some("condition" | "layer" | "severity") => {}
+            Some("constraint") => {
+                let kind = clause
+                    .children()
+                    .and_then(|args| args.get(1))
+                    .and_then(SexpNode::as_str);
+                if !kind.is_some_and(|kind| DSN_NEUTRAL_CONSTRAINTS.contains(&kind)) {
+                    return false;
+                }
+                constraints += 1;
+            }
+            _ => return false,
+        }
+    }
+    constraints > 0
+}
+
+/// The DSN exporter only translates unconditional, explicit-mm minima. A rule that
+/// only checks length or skew changes nothing the DSN carries and is skipped
+/// ([`is_dsn_neutral`]).
 pub(crate) fn routing_bounds(source: &str) -> Result<RoutingBounds> {
     let mut out = RoutingBounds::default();
     for r in parse(source)? {
+        if is_dsn_neutral(&r) {
+            continue;
+        }
         let clauses = &r.node.children().unwrap()[2..];
         ensure!(
             clauses.iter().all(|c| c.head() == Some("constraint")),
@@ -485,5 +524,95 @@ mod tests {
                 "{rule}"
             );
         }
+    }
+    const LENGTH_RULE: &str = "(rule \"Len\" (condition \"A.NetClass == 'DDR'\") (layer \"outer\") (severity warning) (constraint length (min 10mm) (max 12mm) (opt 11mm)))";
+    const SKEW_RULE: &str =
+        "(rule \"Skew\" (condition \"A.inDiffPair('/D+')\") (constraint skew (max 0.1mm)))";
+    fn first_rule(rule: &str) -> Rule {
+        parse(&format!("(version 1){rule}")).unwrap().remove(0)
+    }
+    #[test]
+    fn length_and_skew_rules_are_dsn_neutral_whatever_their_selectors() {
+        for rule in [
+            LENGTH_RULE,
+            SKEW_RULE,
+            "(rule \"Both\" (constraint length (max 12mm)) (constraint skew (max 0.1mm)))",
+            "(rule \"Bare\" (constraint skew (max 0.1mm)))",
+            "(rule \"Odd\" (condition \"A.NetName == 'X'\") (constraint length (min 1mm + 2mm)))",
+        ] {
+            assert!(is_dsn_neutral(&first_rule(rule)), "{rule}");
+            assert_eq!(
+                routing_bounds(&format!("(version 1){rule}"))
+                    .unwrap()
+                    .clearance_mm,
+                0.0,
+                "{rule}"
+            );
+        }
+        // Skipped rules do not hide the projection of the others.
+        let b = routing_bounds(&format!(
+            "(version 1){LENGTH_RULE}(rule \"C\" (constraint clearance (min 0.3mm))){SKEW_RULE}"
+        ))
+        .unwrap();
+        assert_eq!(b.clearance_mm, 0.3);
+    }
+    #[test]
+    fn rules_that_are_not_only_length_or_skew_stay_projected_or_refused() {
+        // Negative controls of L19: today's messages, unchanged.
+        let selectors = "custom DRC rules contain selectors outside the DSN profile";
+        let profile = "custom DRC constraint is outside the DSN profile";
+        for (rule, message) in [
+            // a rule mixing length with clearance, either order
+            (
+                "(rule \"M\" (constraint length (min 1mm)) (constraint clearance (min 0.2mm)))",
+                profile,
+            ),
+            (
+                "(rule \"M\" (constraint clearance (min 0.2mm)) (constraint length (min 1mm)))",
+                profile,
+            ),
+            (
+                "(rule \"M\" (condition \"A.NetClass == 'X'\") (constraint length (min 1mm)) (constraint clearance (min 0.2mm)))",
+                selectors,
+            ),
+            // a conditioned clearance rule
+            (FIRST, selectors),
+            (
+                "(rule \"X\" (condition \"1 == 1\") (constraint track_width (min 0.2mm)))",
+                selectors,
+            ),
+            // other constraint kinds are not neutral
+            ("(rule \"X\" (constraint hole_clearance (min 0.2mm)))", profile),
+            ("(rule \"X\" (constraint diff_pair_gap (min 0.2mm)))", profile),
+            (
+                "(rule \"X\" (constraint assertion \"A.Width > 0.1mm\"))",
+                profile,
+            ),
+        ] {
+            let parsed = first_rule(rule);
+            assert!(!is_dsn_neutral(&parsed), "{rule}");
+            let error = routing_bounds(&format!("(version 1){rule}")).unwrap_err();
+            assert_eq!(error.to_string(), message, "{rule}");
+        }
+    }
+    #[test]
+    fn a_rule_without_a_constraint_or_with_an_unknown_clause_is_not_neutral() {
+        // `parse` refuses both shapes, so the rules are built by hand.
+        let by_hand = |text: &str| Rule {
+            name: "X".into(),
+            span: 0..text.len(),
+            expressions: Vec::new(),
+            node: node(text).unwrap(),
+        };
+        assert!(is_dsn_neutral(&by_hand(
+            "(rule \"X\" (constraint length (min 1mm)))"
+        )));
+        assert!(!is_dsn_neutral(&by_hand(
+            "(rule \"X\" (condition \"1 == 1\"))"
+        )));
+        assert!(!is_dsn_neutral(&by_hand("(rule \"X\")")));
+        assert!(!is_dsn_neutral(&by_hand(
+            "(rule \"X\" (note \"y\") (constraint length (min 1mm)))"
+        )));
     }
 }

@@ -1,0 +1,33 @@
+(pcb CM5_MINIMA_3.kicad_pcb
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad Konnect)
+    (host_version 0.13.0)
+  )
+  (resolution um 10)
+  (unit um)
+  (library
+    (padstack konnect_via_0001
+      (shape
+        (circle F.Cu 450)
+      )
+      (shape
+        (circle In1.Cu 450)
+      )
+      (shape
+        (circle In2.Cu 450)
+      )
+      (shape
+        (circle In3.Cu 450)
+      )
+      (shape
+        (circle In4.Cu 450)
+      )
+      (shape
+        (circle B.Cu 450)
+      )
+      (attach off)
+    )
+  )
+)

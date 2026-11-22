@@ -392,6 +392,7 @@ fn measures() -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 12.34,
+        lengths: None,
     }
 }
 
@@ -452,7 +453,7 @@ fn baseline() -> Baseline {
 fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
     let keys = runs
         .iter()
-        .map(|record| record.judged.as_ref().map(|_| [0; 10]))
+        .map(|record| record.judged.as_ref().map(|_| [0; 13]))
         .collect();
     SearchOutcome {
         runs,
@@ -499,6 +500,8 @@ fn finished(gates: Gates) -> Finished {
                 json!({ "name": "full", "outcome": "kept", "unrouted": 0, "seconds": 12.3 }),
             ],
             seconds: 12.3,
+            untuned: None,
+            tune: Default::default(),
         },
         planes: vec![],
         folder: run,
@@ -508,6 +511,7 @@ fn finished(gates: Gates) -> Finished {
         gates,
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
+        tune: None,
     };
     let dsn = root.join("candidate.dsn");
     let ses = root.join("route.ses");
@@ -531,6 +535,7 @@ fn no_gate_failures() -> Gates {
         g1: vec![],
         g2: vec![],
         g3: vec![],
+        g4: vec![],
     }
 }
 
@@ -546,6 +551,7 @@ fn success_result(finished: &Finished) -> CallToolResult {
         &[Shape::AsExported, Shape::Omitted],
         &finished.outcome,
         &crate::tools::route_pairs::PairsPlan::default(),
+        &crate::tools::route_lengths::LengthPlan::default(),
     );
     assert_eq!(result["success"], true, "{result}");
     CallToolResult::json(&result)
@@ -584,6 +590,7 @@ fn no_winner(baseline: std::result::Result<Baseline, String>) -> CallToolResult 
         &[Shape::AsExported, Shape::Omitted],
         &outcome,
         &crate::tools::route_pairs::PairsPlan::default(),
+        &crate::tools::route_lengths::LengthPlan::default(),
     )["search"]
         .clone();
     assert!(search["winner"].is_null());
@@ -592,6 +599,7 @@ fn no_winner(baseline: std::result::Result<Baseline, String>) -> CallToolResult 
         &outcome,
         search,
         &crate::tools::route_pairs::PairsPlan::default(),
+        &crate::tools::route_lengths::LengthPlan::default(),
     );
     assert!(result.is_error);
     result
@@ -666,6 +674,7 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         g1: vec!["3 connections open".into()],
         g2: vec![],
         g3: vec!["a width".into()],
+        g4: vec![],
     });
     let RouteResult::Routed { gates, .. } = read_route_result(&success_result(&failing)) else {
         panic!("a winner with failed gates is still routed");

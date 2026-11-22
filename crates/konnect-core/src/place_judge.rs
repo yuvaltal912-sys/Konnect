@@ -340,7 +340,7 @@ pub(crate) struct Judged {
 }
 
 /// A candidate's rank key; the least is the best.
-pub(crate) type Key = [i64; 16];
+pub(crate) type Key = [i64; 19];
 
 /// The key of every judged candidate at once (the length steps need the pool):
 /// 0. P1 or P2 failed;
@@ -349,12 +349,14 @@ pub(crate) type Key = [i64; 16];
 /// 3. KiCad's unconnected count after the refill and stitching (`i64::MAX` when not
 ///    routed): a candidate that routes less can never win by being shorter;
 /// 4. G2 failed; 5. G3 failed;
-/// 6. decoupling violations; 7. connector violations (requirements before preferences);
-/// 8. to 13. the routing key's acute corners, signal and power length steps, right
-///    angles, vias off the pour nets and minus copper quality, from
-///    `route_judge::rank_measures`, the steps taken against the shortest routed
-///    candidate that passes P1, P2 and G1 (so an illegal placement cannot set them);
-/// 14. silk entries; 15. minus the placement score.
+/// 6. G4 failed; 7. the intent's length miss; 8. KiCad's own length and skew
+///    violations (Row LT: `route_judge::rank_measures`' positions 3 to 5);
+/// 9. decoupling violations; 10. connector violations (requirements before preferences);
+/// 11. to 16. the routing key's quality measures (`route_judge::KEY_QUALITY`): acute corners,
+///     signal and power length steps, right angles, vias off the pour nets, minus copper quality.
+///     They come from `route_judge::rank_measures`, the steps taken against the shortest routed
+///     candidate that passes P1, P2 and G1 (so an illegal placement cannot set them);
+/// 17. silk entries; 18. minus the placement score.
 ///
 /// Missing values sort last. Ties go to the lower id, so O, then A, then the
 /// generated candidates in recipe order: a generated candidate must be strictly
@@ -392,7 +394,7 @@ pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
         .iter()
         .enumerate()
         .map(|(position, run)| {
-            let mut key = [i64::MAX; 16];
+            let mut key = [i64::MAX; 19];
             key[0] = i64::from(!run.placement.pass());
             key[1] = i64::from(!routing_of.contains_key(&position));
             if let Some((measures, gates, route)) = routing_of.get(&position) {
@@ -400,12 +402,14 @@ pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
                 key[3] = measures.unconnected as i64;
                 key[4] = i64::from(!gates.g2.is_empty());
                 key[5] = i64::from(!gates.g3.is_empty());
-                key[8..14].copy_from_slice(&route[3..9]);
+                // G4 failed, the intent miss and KiCad's own length violations.
+                key[6..9].copy_from_slice(&route[3..6]);
+                key[11..17].copy_from_slice(&route[crate::route_judge::KEY_QUALITY]);
             }
-            key[6] = run.screen.decoupling_violations as i64;
-            key[7] = run.screen.connector_violations as i64;
-            key[14] = run.silk.map_or(i64::MAX, |silk| silk as i64);
-            key[15] = -run.screen.score;
+            key[9] = run.screen.decoupling_violations as i64;
+            key[10] = run.screen.connector_violations as i64;
+            key[17] = run.silk.map_or(i64::MAX, |silk| silk as i64);
+            key[18] = -run.screen.score;
             key
         })
         .collect()

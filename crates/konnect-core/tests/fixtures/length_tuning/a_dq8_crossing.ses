@@ -1,0 +1,33 @@
+(session cut
+  (base_design cut)
+  (placement
+    (resolution um 10)
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad Konnect)
+      (host_version "0.13.0")
+    )
+    (library_out 
+    )
+    (network_out 
+      (net "/DQ8"
+        (wire
+          (path F.Cu 2000
+            1474201 -1084430
+            1474201 -1074430
+          )
+        )
+        (wire
+          (path F.Cu 2000
+            1471849 -1084780
+            1476092 -1080537
+          )
+        )
+      )
+    )
+  )
+)

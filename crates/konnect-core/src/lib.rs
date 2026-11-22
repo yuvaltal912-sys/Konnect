@@ -9,6 +9,8 @@ pub mod gates;
 pub mod guidance;
 pub(crate) mod intent_width_report;
 pub mod kicad_install;
+pub(crate) mod layer_heights;
+pub(crate) mod length_probe;
 pub mod mcp;
 pub(crate) mod native_specctra_bridge;
 pub mod observability;

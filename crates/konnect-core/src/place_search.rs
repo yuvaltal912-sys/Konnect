@@ -105,7 +105,7 @@ pub(crate) struct Record {
     pub placement_gates: Option<PlacementGates>,
     /// The candidate's unrouted check, counts by DRC type (`search.baseline`).
     pub unrouted: Option<BTreeMap<String, usize>>,
-    /// The routing winner's G1 to G3 lines. In `search.json` only: they can name nets.
+    /// The routing winner's G1 to G4 lines. In `search.json` only: they can name nets.
     pub route_gates: Option<Gates>,
     /// How near this board keeps the parts that the schematic draws next to each other,
     /// against the input's (design D23). Reported only: it is not in the rank key. `None`
@@ -1748,7 +1748,7 @@ fn outer_loops_line(outer: &OuterTrace, records: &[Record]) -> String {
 
 /// `table.md` of one board, counts only, no net or part names: one row per routed
 /// candidate in rank order (rank, origin, family and seed, P1, P2, G1, unconnected,
-/// G2, G3, decoupling, connector, acute, signal and power mm, vias off the pours,
+/// G2, G3, G4, decoupling, connector, acute, signal and power mm, vias off the pours,
 /// copper quality, silk, placement score, and the two reported-only schematic-neighbour
 /// columns of D23), then one row per family and reference (best
 /// rank, median rank of its routed candidates, how many pass every gate, how many were
@@ -1792,9 +1792,9 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
          schematic neighbours, and `pulled away`: the parts that moved away from them, against \
          the input) are reported only; they do not rank.\n\n",
     );
-    text.push_str("| rank | origin | P1 | P2 | G1 | unconnected | G2 | G3 | decoupling | connector | acute | signal mm | power mm | vias off pours | copper quality | silk | score | sch. nbr mm | pulled away |\n");
+    text.push_str("| rank | origin | P1 | P2 | G1 | unconnected | G2 | G3 | G4 | decoupling | connector | acute | signal mm | power mm | vias off pours | copper quality | silk | score | sch. nbr mm | pulled away |\n");
     text.push_str(
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let mut routed: Vec<&Record> = outcome
         .records
@@ -1813,7 +1813,7 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             continue;
         };
         text.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} |\n",
             record.rank.unwrap_or_default(),
             record.label(&plan.matrix),
             pass_word(judged.placement.p1.is_empty()),
@@ -1822,6 +1822,7 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
             measures.unconnected,
             pass_word(gates.g2.is_empty()),
             pass_word(gates.g3.is_empty()),
+            pass_word(gates.g4.is_empty()),
             judged.screen.decoupling_violations,
             judged.screen.connector_violations,
             number(measures.acute),

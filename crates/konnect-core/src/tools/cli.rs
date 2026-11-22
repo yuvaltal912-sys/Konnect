@@ -1116,6 +1116,31 @@ pub async fn refill_drc_on_private_copy_with_config(
     parse_drc_report(&serde_json::from_str(&json_str)?)
 }
 
+/// Row LT: `kicad-cli` run with `args` (a `pcb drc --output <out_path> --format json …`
+/// line the caller built) on a private copy, then its report read. `KICAD_CONFIG_HOME`
+/// is `config_home` when given, so kicad-cli does not write the user's own KiCad
+/// settings; a timeout kills the child, which is only safe on a private copy (the
+/// judge's length probe). The caller names the same `out_path` in `args`.
+pub(crate) async fn drc_report_from_args(
+    cli: &str,
+    args: &[&str],
+    out_path: &Path,
+    config_home: Option<&Path>,
+) -> Result<DrcReport> {
+    run_cli_owned_with_env(
+        cli,
+        args,
+        LONG_TIMEOUT,
+        true,
+        config_home.map(|home| ("KICAD_CONFIG_HOME", home)),
+    )
+    .await?;
+    let json_str = tokio::fs::read_to_string(out_path)
+        .await
+        .context("DRC output file not found")?;
+    parse_drc_report(&serde_json::from_str(&json_str)?)
+}
+
 /// The `kicad-cli pcb drc` argument list. Split out so a test can pin what is
 /// sent without running kicad-cli.
 ///
@@ -1223,7 +1248,7 @@ fn enrich_drc_items(report: &mut DrcReport, board_source: &str) {
 
 /// Split out so it can be tested against a real `kicad-cli` report without
 /// running kicad-cli.
-fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
+pub(crate) fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
     fn category(raw: &serde_json::Value, key: &str) -> Option<Vec<DrcViolation>> {
         Some(
             raw.get(key)?

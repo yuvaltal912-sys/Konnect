@@ -267,7 +267,7 @@ fn export_tools() -> Vec<ToolDef> {
              editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. Saved project/rule files and live class preferences are revision-bound. Exactly one PCB must be open. Unconditional numeric clearance/track-width minima use a conservative Rust projection; other custom rule forms refuse export. Native require mode refuses custom rules. The supported \
+             is used. Saved project/rule files and live class preferences are revision-bound. Exactly one PCB must be open. Unconditional numeric clearance/track-width minima use a conservative Rust projection; other custom rule forms refuse export, but length and skew rules are skipped (they do not constrain the router; the routing judge checks them). Native require mode refuses custom rules. The supported \
              profile: 2 to 32 copper layers in stack order (a KiCad power layer is a Specctra \
              power layer the router keeps tracks off), SMD or through-hole footprints on either \
              side (a back-side part is written with its pads at their true board positions on \
