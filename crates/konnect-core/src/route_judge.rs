@@ -65,6 +65,10 @@ pub(crate) struct JudgeContext {
     /// them writes the owner's real settings. `prepare` sets `None`; the caller sets
     /// it once the search folder exists.
     pub kicad_config_home: Option<PathBuf>,
+    /// Row LT: what the call's length plan checks (`route_lengths::LengthPlan::
+    /// checks`); `None` or empty: no probe, no G4(a) or G4(b). `prepare` sets `None`;
+    /// the caller sets it after the plan is built.
+    pub lengths: Option<Arc<crate::length_probe::LengthChecks>>,
 }
 
 /// The unrouted board, refilled and checked the same way every run is (G2's
@@ -236,6 +240,7 @@ pub(crate) fn prepare(
         floors_mm,
         root: root.to_path_buf(),
         kicad_config_home: None,
+        lengths: None,
     })
 }
 
@@ -525,6 +530,14 @@ pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
     }
     let board = crate::scratch_board::copy_project(&ctx.board, &folder)?;
     write_board(&board, &ctx.board_text)?;
+    // The same severities as the judged boards, so that G2 compares like with like.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| !checks.is_empty())
+    {
+        crate::length_probe::force_check_severities(&board)?;
+    }
     let config = OwnConfig::new(ctx, "baseline")?;
     let report = refill(ctx, config.path(), &board)
         .await
@@ -578,6 +591,10 @@ pub(crate) struct Measures {
     pub stitching_vias: usize,
     /// The route's own time, seconds.
     pub route_s: f64,
+    /// Row LT: what the length probe found, when the call checks a group or a pair
+    /// skew (`length_probe::check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lengths: Option<crate::length_probe::LengthMeasures>,
 }
 
 /// Each gate passes when its list is empty; each entry is one readable line.
@@ -586,11 +603,15 @@ pub(crate) struct Gates {
     pub g1: Vec<String>,
     pub g2: Vec<String>,
     pub g3: Vec<String>,
+    /// Row LT, length (L9): the intent's groups and pair skews on KiCad's own
+    /// lengths, and KiCad's own `length` and `skew` rules, absolute.
+    #[serde(default)]
+    pub g4: Vec<String>,
 }
 
 impl Gates {
     pub(crate) fn all_pass(&self) -> bool {
-        self.g1.is_empty() && self.g2.is_empty() && self.g3.is_empty()
+        self.g1.is_empty() && self.g2.is_empty() && self.g3.is_empty() && self.g4.is_empty()
     }
 }
 
@@ -604,6 +625,12 @@ pub(crate) struct Judged {
     /// One row per stitching round: `round`, `open_before`, `proposals`,
     /// `written_vias`, `open_after`, or `planner_refused`.
     pub rounds: Vec<Value>,
+    /// Row LT, L23: what the judge did with the run's Tune candidates, for a run that
+    /// had any. `board`, `measures` and `gates` are then the chosen board's, and the
+    /// scheduler rewrites the run's `Routed.held` from the choice
+    /// ([`TuneChoice::apply`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tune: Option<TuneChoice>,
 }
 
 /// One run, judged by Konnect itself under `ctx.root/run-<index>`:
@@ -627,10 +654,16 @@ pub(crate) struct Judged {
 ///    `scratch_board::write_planned` into `r<n>` (project copied the same way),
 ///    refill and DRC; the round's row records the counts.
 /// 5. `audit_layout_quality` through the tool registry on the last board.
-/// 6. [`measure`], then [`gates`]. The folders of earlier rounds are removed whole
+/// 6. Row LT: [`judge_lengths`] on the last board when the call checks a group or a
+///    pair skew.
+/// 7. [`measure`], then [`gates`]. The folders of earlier rounds are removed whole
 ///    (board, report and copied project files), once the next round's board is
 ///    written and checked; the last round's folder is kept, and its board is named in
 ///    `Judged::board`.
+///
+/// Row LT, L23: a run whose Tune pass gave candidates (`routed.held.tune.candidates`)
+/// is judged by [`judge_candidates`]: steps 1 to 7 on its untuned session and on each
+/// candidate, and the result is the chosen board's, with [`Judged::tune`] set.
 pub(crate) async fn judge(
     ctx: &JudgeContext,
     routed: &Routed,
@@ -659,18 +692,46 @@ impl ToolCaller for RegistryTools {
     }
 }
 
-/// [`judge`] with the tool calls behind [`ToolCaller`].
+/// [`judge`] with the tool calls behind [`ToolCaller`]: the run's one session in
+/// `run-<index>`, or, when the Tune pass gave candidates, [`judge_candidates`].
 async fn judge_with(
     ctx: &JudgeContext,
     routed: &Routed,
     baseline: &Baseline,
     tools: &dyn ToolCaller,
 ) -> Result<Judged> {
+    if routed.held.tune.candidates.is_empty() {
+        return judge_one(
+            ctx,
+            routed,
+            baseline,
+            tools,
+            &routed.held.ses,
+            &format!("run-{}", routed.index),
+        )
+        .await;
+    }
+    let (mut judged, choice) = judge_candidates(ctx, routed, baseline, tools).await?;
+    judged.tune = Some(choice);
+    Ok(judged)
+}
+
+/// Steps 1 to 7 of [`judge`] on one session of the run, in `ctx.root/<folder_name>`
+/// (`run-<index>`, `run-<index>-untuned`, `run-<index>-pour-safe`; the folder name
+/// also names the judge's own KiCad settings copy).
+async fn judge_one(
+    ctx: &JudgeContext,
+    routed: &Routed,
+    baseline: &Baseline,
+    tools: &dyn ToolCaller,
+    session: &Path,
+    folder_name: &str,
+) -> Result<Judged> {
     // 1. The session, read by the importer's own checks: a session it would refuse
     //    is a failed judge.
-    let ses_text = tokio::fs::read_to_string(&routed.held.ses)
+    let ses_text = tokio::fs::read_to_string(session)
         .await
-        .with_context(|| format!("read the session '{}'", routed.held.ses.display()))?;
+        .with_context(|| format!("read the session '{}'", session.display()))?;
     let plan = crate::specctra_ses::parse_import_plan_with(
         &ctx.board,
         &ctx.board_text,
@@ -683,7 +744,7 @@ async fn judge_with(
         .context("the width report of the run's session")?;
 
     // 2. The session written into a scratch copy of the saved board.
-    let run_dir = ctx.root.join(format!("run-{}", routed.index));
+    let run_dir = ctx.root.join(folder_name);
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir)
             .with_context(|| format!("clear the old run folder '{}'", run_dir.display()))?;
@@ -691,9 +752,27 @@ async fn judge_with(
     let mut board = crate::scratch_board::copy_project(&ctx.board, &run_dir.join("r0"))?;
     let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan)?;
     write_board(&board, &routed_text)?;
+    // The board's own length and skew rules must be seen whatever the project's
+    // severities say (G4(c)): forced in this scratch copy's project, never the owner's.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| checks.board_rules)
+    {
+        crate::length_probe::force_length_severities(&board)?;
+    }
+    // A call with checks must see dangling and unconnected items whatever the project's
+    // severities say (G4(d), the harm check): forced in this scratch copy only.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| !checks.is_empty())
+    {
+        crate::length_probe::force_check_severities(&board)?;
+    }
 
     // 3. KiCad's refill and DRC, on this judge's own settings copy.
-    let config = OwnConfig::new(ctx, &format!("run-{}", routed.index))?;
+    let config = OwnConfig::new(ctx, folder_name)?;
     let mut drc = refill(ctx, config.path(), &board)
         .await
         .context("refill and DRC of the routed board")?;
@@ -817,8 +896,25 @@ async fn judge_with(
     let audit: Value =
         serde_json::from_str(&text).context("the layout audit result is not JSON")?;
 
-    // 6. Measures and gates.
-    let measures = measure(
+    // 6. Row LT: KiCad's own lengths of the checked nets, on a copy of the last board.
+    let lengths = match ctx.lengths.as_deref() {
+        Some(checks) => {
+            judge_lengths(
+                ctx,
+                checks,
+                config.path(),
+                &board,
+                &run_dir,
+                &ses_text,
+                &drc,
+            )
+            .await?
+        }
+        None => None,
+    };
+
+    // 7. Measures and gates.
+    let mut measures = measure(
         ctx,
         &drc,
         &audit,
@@ -827,13 +923,357 @@ async fn judge_with(
         stitching_vias,
         routed.held.seconds,
     )?;
+    measures.lengths = lengths;
     let gates = gates(&measures, baseline);
     Ok(Judged {
         measures,
         gates,
         board,
         rounds,
+        tune: None,
     })
+}
+
+/// Row LT, step 6 of the judge (after the audit): when `checks` is not empty,
+/// `length_probe::probe_lengths` on the last board, in `<run dir>/lengths`, with the
+/// run's own KiCad settings; G4(d)'s faults of the checked nets
+/// (`length_probe::path_faults`, from `fastroute::self_contacts` of the judged
+/// session's text `ses_text` and the last board's `drc` report); then
+/// `length_probe::check`. `None` when nothing is checked. A probe error, or a session
+/// the self-contact scan cannot read, fails the judge.
+pub(crate) async fn judge_lengths(
+    ctx: &JudgeContext,
+    checks: &crate::length_probe::LengthChecks,
+    config: Option<&Path>,
+    board: &Path,
+    run_dir: &Path,
+    ses_text: &str,
+    drc: &crate::tools::cli::DrcReport,
+) -> Result<Option<crate::length_probe::LengthMeasures>> {
+    if checks.is_empty() {
+        return Ok(None);
+    }
+    let nets = checks.nets();
+    let (lengths, unmeasured, probe_s) = crate::length_probe::probe_lengths(
+        &ctx.kicad_cli,
+        config,
+        board,
+        &run_dir.join(crate::length_probe::PROBE_FOLDER),
+        &nets,
+    )
+    .await
+    .context("the length probe failed")?;
+    // The pairwise scan is quadratic per layer: off the async threads.
+    let wanted: BTreeSet<String> = nets.iter().cloned().collect();
+    let text = ses_text.to_string();
+    let contacts =
+        tokio::task::spawn_blocking(move || crate::fastroute::self_contacts(&text, &wanted))
+            .await
+            .context("the self-contact scan did not finish")?
+            .context("the judged session's self contacts could not be read")?;
+    let faults = crate::length_probe::path_faults(checks, &contacts, drc);
+    Ok(Some(crate::length_probe::check(
+        checks, &lengths, unmeasured, faults, probe_s,
+    )))
+}
+
+/// Row LT, L23: what the judge did with a run's Tune candidates.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct TuneChoice {
+    /// The candidate whose board is the run's; `None`: the untuned board.
+    pub chosen: Option<crate::fastroute::TuneVariant>,
+    /// One row per candidate: `variant`, `passes`, `dropped` (net and reason),
+    /// `judged`, `g4_failed`, `rejected` (its [`tune_harm`] lines, or why the judge
+    /// failed on it), `chosen`, and `reason` for a candidate that was not judged.
+    pub rows: Vec<Value>,
+    /// The untuned board's measures, for the record.
+    pub untuned: Measures,
+}
+
+impl TuneChoice {
+    /// Rewrites the run's `held` from the choice, so that the SES the call writes and
+    /// the `kept_pass` it reports are those of the judged board:
+    /// - a candidate: `ses`, `kept` ([`crate::fastroute::TUNE_PASS`]) and `unrouted`
+    ///   are its, the run's Tune row in `passes` is the candidate's last row, and that
+    ///   row in `tune.rows` says `kept`;
+    /// - none: `ses`, `kept` and `unrouted` are the untuned board's, which the Tune
+    ///   attempts leave in `held`, and the Tune row in `passes` that says `candidate`
+    ///   now says `discarded`, with [`TuneChoice::untuned_reason`].
+    ///
+    /// Every other `candidate` row of `tune.rows` says `not_chosen` (an unjudged run's
+    /// rows keep saying `candidate`). An error when the chosen variant is not among the
+    /// run's candidates: the written session would then differ from the judged board,
+    /// so the judge fails.
+    pub(crate) fn apply(&self, held: &mut crate::fastroute::Held) -> Result<()> {
+        use crate::fastroute::TUNE_PASS;
+        let mut chosen_row = None;
+        if let Some(variant) = self.chosen {
+            let candidate = held
+                .tune
+                .candidates
+                .iter()
+                .find(|candidate| candidate.variant == variant)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "the judge chose the {variant:?} Tune candidate, which the run does not hold"
+                    )
+                })?;
+            held.ses = candidate.ses;
+            held.kept = TUNE_PASS;
+            held.unrouted = candidate.unrouted;
+            chosen_row =
+                held.tune.rows.iter().rposition(|row| {
+                    row["variant"] == json!(variant) && row["outcome"] == "candidate"
+                });
+        }
+        for (at, row) in held.tune.rows.iter_mut().enumerate() {
+            if row["outcome"] == "candidate" {
+                row["outcome"] = json!(if Some(at) == chosen_row {
+                    "kept"
+                } else {
+                    "not_chosen"
+                });
+            }
+        }
+        match (self.chosen, chosen_row) {
+            (Some(_), Some(at)) => {
+                let row = held.tune.rows[at].clone();
+                match held
+                    .passes
+                    .iter()
+                    .position(|pass| pass["name"] == TUNE_PASS)
+                {
+                    Some(at) => held.passes[at] = row,
+                    None => held.passes.push(row),
+                }
+            }
+            // A chosen candidate whose pass row is missing leaves `passes` as it is.
+            (Some(_), None) => {}
+            (None, _) => {
+                let why = self.untuned_reason();
+                if let Some(row) = held
+                    .passes
+                    .iter_mut()
+                    .find(|pass| pass["name"] == TUNE_PASS && pass["outcome"] == "candidate")
+                {
+                    row["outcome"] = json!("discarded");
+                    row["reason"] = json!(format!("the judge kept the untuned board: {why}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Why the judge kept the untuned board, from the candidates' rows: each candidate's
+    /// `tune_harm` lines, or the reason it was not judged or ranked no better
+    /// ("free: unconnected items 21 → 25 / pour_safe: ranked no better than the untuned
+    /// board").
+    pub(crate) fn untuned_reason(&self) -> String {
+        let parts: Vec<String> = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let variant = row["variant"].as_str()?;
+                let lines: Vec<&str> = row["rejected"]
+                    .as_array()
+                    .map(|lines| lines.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let why = if lines.is_empty() {
+                    row["reason"].as_str()?.to_string()
+                } else {
+                    lines.join("; ")
+                };
+                Some(format!("{variant}: {why}"))
+            })
+            .collect();
+        parts.join(" / ")
+    }
+}
+
+/// Row LT, L23: one line for each measure on which `tuned` is worse than `untuned`
+/// (the same run), by the numbers and not by the count of gate lines (a line such as
+/// "N narrow path(s)" is one line whatever N is): unconnected items; each DRC
+/// type's violations, except the keys [`crate::length_probe::counts_in_g2`] leaves out;
+/// the audit's undersized nets and narrow paths; tracks below their floor; the routed
+/// share (any drop) and the audit's completion (true to false). Each line names both
+/// values ("unconnected items 21 → 25"). Stitching vias are not compared: the judge
+/// adds them to repair pours, and what they leave open is in `unconnected`.
+pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
+    let (before, after) = (&untuned.measures, &tuned.measures);
+    let mut lines = Vec::new();
+    if after.unconnected > before.unconnected {
+        lines.push(format!(
+            "unconnected items {} \u{2192} {}",
+            before.unconnected, after.unconnected
+        ));
+    }
+    for (rule, count) in &after.violations {
+        if !crate::length_probe::counts_in_g2(rule) {
+            continue;
+        }
+        let was = before.violations.get(rule).copied().unwrap_or(0);
+        if *count > was {
+            lines.push(format!("{rule} violations {was} \u{2192} {count}"));
+        }
+    }
+    for (name, was, now) in [
+        (
+            "nets undersized",
+            before.nets_undersized,
+            after.nets_undersized,
+        ),
+        ("narrow paths", before.narrow_paths, after.narrow_paths),
+    ] {
+        if now.unwrap_or(0.0) > was.unwrap_or(0.0) {
+            lines.push(format!(
+                "{name} {} \u{2192} {}",
+                was.unwrap_or(0.0),
+                now.unwrap_or(0.0)
+            ));
+        }
+    }
+    if after.below_floor > before.below_floor {
+        lines.push(format!(
+            "tracks below their floor {} \u{2192} {}",
+            before.below_floor, after.below_floor
+        ));
+    }
+    // A routed share that drops, or that the audit no longer gives.
+    match (before.routed_share, after.routed_share) {
+        (Some(was), Some(now)) if now < was => {
+            lines.push(format!("routed share {was} \u{2192} {now}"));
+        }
+        (Some(was), None) => lines.push(format!("routed share {was} \u{2192} none")),
+        _ => {}
+    }
+    if before.audit_complete == Some(true) && after.audit_complete != Some(true) {
+        lines.push(format!(
+            "audit completion true \u{2192} {}",
+            after
+                .audit_complete
+                .map_or("none".to_string(), |complete| complete.to_string())
+        ));
+    }
+    lines
+}
+
+/// Row LT, L23 and L24: judges the run's untuned session in `run-<i>-untuned`, then
+/// the `Free` candidate in `run-<i>`; the `PourSafe` candidate in
+/// `run-<i>-pour-safe` only when `Free` is missing, rejected or fails G4. A candidate
+/// with a [`tune_harm`] line is rejected (a candidate the judge fails on is rejected
+/// with that error: the untuned board stands). The pool is the untuned board and every
+/// candidate left: the best by the rank key ([`rank`]) is the run's board, and on an
+/// exact tie the untuned board wins, then the first candidate: no meander without a gain
+/// (a candidate that overshoots a window cannot beat the untuned board). Returns the chosen board's [`Judged`] with the [`TuneChoice`];
+/// the scheduler rewrites the run's `held` from it ([`TuneChoice::apply`]). A failure
+/// of the untuned judge fails the judge.
+async fn judge_candidates(
+    ctx: &JudgeContext,
+    routed: &Routed,
+    baseline: &Baseline,
+    tools: &dyn ToolCaller,
+) -> Result<(Judged, TuneChoice)> {
+    use crate::fastroute::TuneVariant;
+    let held = &routed.held;
+    let index = routed.index;
+    let untuned_ses = held.untuned.clone().unwrap_or_else(|| held.ses.clone());
+    let untuned = judge_one(
+        ctx,
+        routed,
+        baseline,
+        tools,
+        &untuned_ses,
+        &format!("run-{index}-untuned"),
+    )
+    .await
+    .context("judging the run's untuned session")?;
+
+    let mut rows: Vec<Value> = Vec::new();
+    // (row, variant, judged) of each candidate tuning did not make worse.
+    let mut harmless: Vec<(usize, TuneVariant, Judged)> = Vec::new();
+    let mut free_is_enough = false;
+    for candidate in &held.tune.candidates {
+        let mut row = json!({
+            "variant": candidate.variant,
+            "passes": candidate.passes,
+            "dropped": candidate
+                .dropped
+                .iter()
+                .map(|(net, reason)| json!({ "net": net, "reason": reason }))
+                .collect::<Vec<_>>(),
+            "judged": false,
+            "rejected": [],
+            "chosen": false,
+        });
+        if candidate.variant == TuneVariant::PourSafe && free_is_enough {
+            row["reason"] =
+                json!("the free candidate was not worse than the untuned board and passes G4");
+            rows.push(row);
+            continue;
+        }
+        let folder = match candidate.variant {
+            TuneVariant::Free => format!("run-{index}"),
+            TuneVariant::PourSafe => format!("run-{index}-pour-safe"),
+        };
+        match judge_one(ctx, routed, baseline, tools, &candidate.ses, &folder).await {
+            Err(error) => {
+                row["rejected"] = json!([format!("the judge failed on it: {error:#}")]);
+            }
+            Ok(judged) => {
+                let harm = tune_harm(&untuned, &judged);
+                row["judged"] = json!(true);
+                row["g4_failed"] = json!(!judged.gates.g4.is_empty());
+                row["rejected"] = json!(harm);
+                if harm.is_empty() {
+                    if candidate.variant == TuneVariant::Free && judged.gates.g4.is_empty() {
+                        free_is_enough = true;
+                    }
+                    harmless.push((rows.len(), candidate.variant, judged));
+                }
+            }
+        }
+        rows.push(row);
+    }
+
+    // The pool: the untuned board first, then the candidates tuning did not make worse.
+    let keys = {
+        let refs: Vec<&Judged> = std::iter::once(&untuned)
+            .chain(harmless.iter().map(|(_, _, judged)| judged))
+            .collect();
+        rank(&refs)
+    };
+    // The least key; the earliest on a tie, so the untuned board, then `Free`.
+    let best = keys
+        .iter()
+        .enumerate()
+        .min_by_key(|(at, key)| (**key, *at))
+        .map_or(0, |(at, _)| at);
+    let untuned_measures = untuned.measures.clone();
+    let (chosen, judged) = match best.checked_sub(1) {
+        Some(at) => {
+            let (row, variant, judged) = harmless.swap_remove(at);
+            rows[row]["chosen"] = json!(true);
+            (Some(variant), judged)
+        }
+        None => (None, untuned),
+    };
+    // A candidate that was not harmful and still not chosen says why.
+    for (row, _, _) in &harmless {
+        rows[*row]["reason"] = json!(if chosen.is_some() {
+            "ranked below the chosen candidate"
+        } else {
+            "ranked no better than the untuned board"
+        });
+    }
+    Ok((
+        judged,
+        TuneChoice {
+            chosen,
+            rows,
+            untuned: untuned_measures,
+        },
+    ))
 }
 
 /// The measures of a run from its parts: KiCad's last report, the audit's JSON, the
@@ -907,6 +1347,7 @@ pub(crate) fn measure(
         longest_below_mm,
         stitching_vias,
         route_s,
+        lengths: None,
     })
 }
 
@@ -985,6 +1426,12 @@ fn arc_length_mm(start: [f64; 2], mid: [f64; 2], end: [f64; 2]) -> f64 {
 ///   intent-width net with at most [`BELOW_INTENT_SHARE`] of its length and no
 ///   stretch longer than [`BELOW_INTENT_SECTION_MM`] below its intent width; audit
 ///   4.2 nets undersized 0 and 4.3 narrow paths 0 when the audit gave them.
+/// - G4 length (Row LT, L9): every checked group and pair skew meets its window on
+///   KiCad's own lengths, no checked net is unmeasured, and KiCad's own DRC has 0
+///   `length_out_of_range` and 0 `skew_out_of_range`, absolute. G2 does not count
+///   those two keys. (d) (L22): no checked net's copper crosses or overlaps itself,
+///   or is named in a `track_dangling` or `unconnected_items` entry of the judged
+///   board's DRC.
 pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
     let mut g1 = Vec::new();
     if m.unconnected != 0 {
@@ -1008,6 +1455,10 @@ pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
 
     let mut g2 = Vec::new();
     for (rule, count) in &m.violations {
+        // Row LT: KiCad's length and skew rules are G4's, absolute (L9).
+        if !crate::length_probe::counts_in_g2(rule) {
+            continue;
+        }
         let allowed = baseline.violations.get(rule).copied().unwrap_or(0);
         if *count > allowed {
             g2.push(format!(
@@ -1060,20 +1511,40 @@ pub(crate) fn gates(m: &Measures, baseline: &Baseline) -> Gates {
         g3.push(format!("the audit finds {narrow} narrow path(s) (4.3)"));
     }
 
-    Gates { g1, g2, g3 }
+    let mut g4 = crate::length_probe::g4_lines(m.lengths.as_ref(), &m.violations);
+    // Row LT, L22 (G4(d)): a checked net whose copper is not a clean path.
+    if let Some(lengths) = &m.lengths {
+        g4.extend(crate::length_probe::contact_lines(&lengths.paths));
+    }
+
+    Gates { g1, g2, g3, g4 }
 }
 
-/// A run's rank key; the least is the best.
-pub(crate) type Key = [i64; 10];
+/// Row LT: the length of the rank key (docs/LENGTH_TUNING_DESIGN.md, L10): G1, G2,
+/// G3, G4, intent miss, KiCad's length violations, then the ten-entry key's
+/// measures from acute corners on. `Key` is `[i64; KEY_LEN]`.
+pub(crate) const KEY_LEN: usize = 13;
 
-/// The rank key of decision 12 for every judged run at once (the length steps need
-/// the shortest): G1, G2 and G3 failed (0 or 1 each); acute corners (whole);
-/// signal length over the shortest signal length among the runs that pass G1 (among
-/// all judged runs when none does), in steps of
+/// Where the quality measures sit in the key (acute corners to minus copper
+/// quality): what the placement key copies (it read `3..9` before Row LT).
+pub(crate) const KEY_QUALITY: std::ops::Range<usize> = 6..12;
+
+/// A run's rank key; the least is the best.
+pub(crate) type Key = [i64; KEY_LEN];
+
+/// The rank key of decision 12 and L10 for every judged run at once (the length
+/// steps need the shortest): G1, G2, G3 and G4 failed (0 or 1 each); the intent
+/// miss (the sum of every measured net's distance outside its window, in 0.01 mm
+/// steps; `i64::MAX` when a checked net is unmeasured; 0 when nothing is checked);
+/// KiCad's own length and skew violations; then [`KEY_QUALITY`]: acute corners
+/// (whole); signal length over the shortest signal length among the runs that pass G1
+/// (among all judged runs when none does), in steps of
 /// [`LENGTH_STEP`] (`round(ratio / step)`); power length the same; right angles
 /// (whole); vias off the pour nets; minus copper quality (rounded to whole points);
-/// route seconds (rounded down). A measure the audit did not give sorts last
-/// (`i64::MAX`). When every run's length of a category is 0, that step is 0 for all.
+/// and last the route seconds (rounded down). A measure the audit did not give sorts
+/// last (`i64::MAX`). When every run's length of a category is 0, that step is 0 for
+/// all. Without length groups, pair skews or KiCad length rules, positions 3 to 5
+/// are 0 for every run and the order is the one before Row LT.
 pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
     let runs: Vec<(&Measures, &Gates, bool)> = judged
         .iter()
@@ -1127,10 +1598,15 @@ pub(crate) fn rank_measures(runs: &[(&Measures, &Gates, bool)]) -> Vec<Key> {
     let whole = |value: Option<f64>| value.map_or(i64::MAX, |value| value.round() as i64);
     runs.iter()
         .map(|&(m, g, _)| {
+            let [g4, miss, kicad] =
+                crate::length_probe::key_part(!g.g4.is_empty(), m.lengths.as_ref(), &m.violations);
             [
                 i64::from(!g.g1.is_empty()),
                 i64::from(!g.g2.is_empty()),
                 i64::from(!g.g3.is_empty()),
+                g4,
+                miss,
+                kicad,
                 whole(m.acute),
                 step(m.signal_mm, shortest_signal),
                 step(m.power_mm, shortest_power),

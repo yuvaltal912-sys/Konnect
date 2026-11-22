@@ -1,0 +1,382 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-11-20T16:44:18",
+    "ignored_checks": [
+        {
+            "description": "Items shorting two nets",
+            "key": "shorting_items"
+        },
+        {
+            "description": "Tracks crossing",
+            "key": "tracks_crossing"
+        },
+        {
+            "description": "Clearance violation",
+            "key": "clearance"
+        },
+        {
+            "description": "Via is not connected or connected on only one layer",
+            "key": "via_dangling"
+        },
+        {
+            "description": "Track has unconnected end",
+            "key": "track_dangling"
+        },
+        {
+            "description": "Thermal relief connection to zone incomplete",
+            "key": "starved_thermal"
+        },
+        {
+            "description": "Board edge clearance violation",
+            "key": "copper_edge_clearance"
+        },
+        {
+            "description": "Hole clearance violation",
+            "key": "hole_clearance"
+        },
+        {
+            "description": "Drilled hole too close to other hole",
+            "key": "hole_to_hole"
+        },
+        {
+            "description": "Drilled holes co-located",
+            "key": "holes_co_located"
+        },
+        {
+            "description": "Track width",
+            "key": "track_width"
+        },
+        {
+            "description": "Track angle",
+            "key": "track_angle"
+        },
+        {
+            "description": "Track segment length",
+            "key": "track_segment_length"
+        },
+        {
+            "description": "Hole size out of range",
+            "key": "drill_out_of_range"
+        },
+        {
+            "description": "Micro via hole size out of range",
+            "key": "microvia_drill_out_of_range"
+        },
+        {
+            "description": "Courtyards overlap",
+            "key": "courtyards_overlap"
+        },
+        {
+            "description": "Footprint has no courtyard defined",
+            "key": "missing_courtyard"
+        },
+        {
+            "description": "Footprint has malformed courtyard",
+            "key": "malformed_courtyard"
+        },
+        {
+            "description": "Board has malformed outline",
+            "key": "invalid_outline"
+        },
+        {
+            "description": "Solder mask aperture bridges items with different nets",
+            "key": "solder_mask_bridge"
+        },
+        {
+            "description": "Track endpoint not centered on via",
+            "key": "track_not_centered_on_via"
+        },
+        {
+            "description": "Tuning profile track geometries",
+            "key": "tuning_profile_track_geometries"
+        },
+        {
+            "description": "Duplicate footprints",
+            "key": "duplicate_footprints"
+        },
+        {
+            "description": "Missing footprint",
+            "key": "missing_footprint"
+        },
+        {
+            "description": "Extra footprint",
+            "key": "extra_footprint"
+        },
+        {
+            "description": "Footprint attributes don't match symbol",
+            "key": "footprint_symbol_mismatch"
+        },
+        {
+            "description": "Footprint doesn't match symbol's footprint filters",
+            "key": "footprint_filters_mismatch"
+        },
+        {
+            "description": "Pad net doesn't match schematic",
+            "key": "net_conflict"
+        },
+        {
+            "description": "Missing connection between items",
+            "key": "unconnected_items"
+        },
+        {
+            "description": "Skew between tracks out of range",
+            "key": "skew_out_of_range"
+        },
+        {
+            "description": "Too many or too few vias on a connection",
+            "key": "too_many_vias"
+        },
+        {
+            "description": "Differential pair gap out of range",
+            "key": "diff_pair_gap_out_of_range"
+        },
+        {
+            "description": "Differential uncoupled length too long",
+            "key": "diff_pair_uncoupled_length_too_long"
+        },
+        {
+            "description": "Silkscreen clearance",
+            "key": "silk_overlap"
+        },
+        {
+            "description": "Silkscreen clipped by solder mask",
+            "key": "silk_over_copper"
+        },
+        {
+            "description": "Silkscreen clipped by board edge",
+            "key": "silk_edge_clearance"
+        },
+        {
+            "description": "Text height out of range",
+            "key": "text_height"
+        },
+        {
+            "description": "Text thickness out of range",
+            "key": "text_thickness"
+        },
+        {
+            "description": "Items not allowed",
+            "key": "items_not_allowed"
+        },
+        {
+            "description": "Copper zones intersect",
+            "key": "zones_intersect"
+        },
+        {
+            "description": "Isolated copper fill",
+            "key": "isolated_copper"
+        },
+        {
+            "description": "Footprint is not valid",
+            "key": "footprint"
+        },
+        {
+            "description": "Padstack is questionable",
+            "key": "padstack"
+        },
+        {
+            "description": "PTH inside courtyard",
+            "key": "pth_inside_courtyard"
+        },
+        {
+            "description": "NPTH inside courtyard",
+            "key": "npth_inside_courtyard"
+        },
+        {
+            "description": "Item on a disabled copper layer",
+            "key": "item_on_disabled_layer"
+        },
+        {
+            "description": "Unresolved text variable",
+            "key": "unresolved_variable"
+        },
+        {
+            "description": "Footprint component type doesn't match footprint pads",
+            "key": "footprint_type_mismatch"
+        },
+        {
+            "description": "Footprint not found in libraries",
+            "key": "lib_footprint_issues"
+        },
+        {
+            "description": "Footprint doesn't match copy in library",
+            "key": "lib_footprint_mismatch"
+        },
+        {
+            "description": "Through hole pad has no hole",
+            "key": "through_hole_pad_without_hole"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "10.0.8",
+    "schematic_parity": [],
+    "source": "specctra_pours_routing.kicad_pcb",
+    "unconnected_items": [],
+    "violations": [
+        {
+            "description": "Track length out of range (rule '__konnect_len_0001' min length 2000.0000 mm; actual 52.2760 mm)",
+            "items": [
+                {
+                    "description": "Pad 1 [S1] of R12 on F.Cu",
+                    "pos": {
+                        "x": 141.0,
+                        "y": 132.95
+                    },
+                    "uuid": "543a480b-fdde-5f27-9e5e-72008319c2e4"
+                },
+                {
+                    "description": "Pad 1 [S1] of R1 on F.Cu",
+                    "pos": {
+                        "x": 107.05,
+                        "y": 108.0
+                    },
+                    "uuid": "40fbb846-0904-5c96-a96d-475f27a7eb1c"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0002' min length 2000.0000 mm; actual 37.5011 mm)",
+            "items": [
+                {
+                    "description": "Via [S2] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 125.0005,
+                        "y": 109.1188
+                    },
+                    "uuid": "b0c6e4f1-c8d2-4e16-bf1e-8e98b6b7a6aa"
+                },
+                {
+                    "description": "Via [S2] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 125.0005,
+                        "y": 132.9811
+                    },
+                    "uuid": "94f20b0f-af12-419f-bf5b-87342161e85b"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0003' min length 2000.0000 mm; actual 36.3050 mm)",
+            "items": [
+                {
+                    "description": "Via [S3] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 127.9535,
+                        "y": 109.1188
+                    },
+                    "uuid": "918fcf37-39d2-4873-9577-d638c62a0c8f"
+                },
+                {
+                    "description": "Via [S3] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 127.4635,
+                        "y": 131.3802
+                    },
+                    "uuid": "3dcf1b20-b119-4e9c-8992-3325618ee98d"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0004' min length 2000.0000 mm; actual 54.2499 mm)",
+            "items": [
+                {
+                    "description": "Via [S4] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 107.2825,
+                        "y": 129.9445
+                    },
+                    "uuid": "dddf4110-196c-4db2-b4b7-226c79e4e2e0"
+                },
+                {
+                    "description": "Via [S4] on F.Cu - B.Cu",
+                    "pos": {
+                        "x": 116.1415,
+                        "y": 109.9476
+                    },
+                    "uuid": "b0edd6d2-0f82-4f1c-a226-a247d9fa8fc0"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0005' min length 2000.0000 mm; actual 33.1560 mm)",
+            "items": [
+                {
+                    "description": "Pad 1 [S5] of R8 on F.Cu",
+                    "pos": {
+                        "x": 140.05,
+                        "y": 120.0
+                    },
+                    "uuid": "230fd78d-f02f-5aad-8fd1-44dcd860ae88"
+                },
+                {
+                    "description": "Pad 1 [S5] of R5 on F.Cu",
+                    "pos": {
+                        "x": 108.0,
+                        "y": 120.95
+                    },
+                    "uuid": "806bae15-41aa-57bc-ac26-ba805bd7b3ef"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0006' min length 2000.0000 mm; actual 12.3816 mm)",
+            "items": [
+                {
+                    "description": "Pad 1 [S6] of R6 on F.Cu",
+                    "pos": {
+                        "x": 118.05,
+                        "y": 120.0
+                    },
+                    "uuid": "d04d8405-e01f-56f2-8f76-c827da34063c"
+                },
+                {
+                    "description": "Pad 1 [S6] of R7 on F.Cu",
+                    "pos": {
+                        "x": 130.0,
+                        "y": 120.95
+                    },
+                    "uuid": "62e366a8-1149-5f86-86fe-7434bb0730f8"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        },
+        {
+            "description": "Track length out of range (rule '__konnect_len_0007' min length 2000.0000 mm; actual 0.0000 mm)",
+            "items": [
+                {
+                    "description": "Pad 2 [GND] of R6 on F.Cu",
+                    "pos": {
+                        "x": 119.95,
+                        "y": 120.0
+                    },
+                    "uuid": "429c4159-b511-5e80-b475-65aa5574a08e"
+                },
+                {
+                    "description": "Pad 2 [GND] of R2 on F.Cu",
+                    "pos": {
+                        "x": 119.0,
+                        "y": 107.05
+                    },
+                    "uuid": "eb4d1f6b-cb78-578f-af95-f32a2eb90867"
+                }
+            ],
+            "severity": "error",
+            "type": "length_out_of_range"
+        }
+    ]
+}

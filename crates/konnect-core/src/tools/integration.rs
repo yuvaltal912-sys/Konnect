@@ -165,7 +165,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         arc_tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN and create a new SES file; an existing output is never replaced. The default engine is fastroute's best-of-N search: it routes variants of the DSN in parallel for the time `effort` allows (`fast` = 2 runs, `m` = 240 s, `h` = 720 s, `xh` = 2400 s), Konnect judges every run itself on scratch copies of the board (complete, KiCad DRC no worse than the unrouted board, track widths) and writes the best session; every level runs for its whole time (no run cap); `search` counts every outcome and lists the best runs (`search.json` in the search folder lists every run), `completion.judged` the winner's verdict, and `status` is never `complete` of either kind unless the winner passes all three gates (`incomplete` when connections stay open after the refill and stitching, else `complete_with_gate_failures`). When every gate passes and the judge added no stitching via, `status` is the judge's, not the router's count (which takes a connection a pour makes for one it left); `completion.router_unrouted` keeps the count. `engine: \"freerouting\"` routes with the local Freerouting JAR instead; the rest of this description is that engine. It uses the documented session/job state machine and never sends board data to a cloud service. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
+            "Route an existing Specctra DSN and create a new SES file; an existing output is never replaced. The default engine is fastroute's best-of-N search: it routes variants of the DSN in parallel for the time `effort` allows (`fast` = 2 runs, `m` = 240 s, `h` = 720 s, `xh` = 2400 s), Konnect judges every run itself on scratch copies of the board (complete, KiCad DRC no worse than the unrouted board, track widths) and writes the best session; every level runs for its whole time (no run cap); `search` counts every outcome and lists the best runs (`search.json` in the search folder lists every run), `completion.judged` the winner's verdict, and `status` is never `complete` of either kind unless the winner passes all four gates (`incomplete` when connections stay open after the refill and stitching, else `complete_with_gate_failures`; the fourth gate checks the design intent's length groups and pair skews, and the board's own KiCad length and skew rules, as KiCad measures them: with a group or skew declared, `length_matching` says what was tuned, measured and not checked, and the next steps give KiCad rules that keep checking it). When every gate passes and the judge added no stitching via, `status` is the judge's, not the router's count (which takes a connection a pour makes for one it left); `completion.router_unrouted` keeps the count. `engine: \"freerouting\"` routes with the local Freerouting JAR instead (it does not tune lengths: a design intent with a length group or pair skew gets `length_matching_note`); the rest of this description is that engine. It uses the documented session/job state machine and never sends board data to a cloud service. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
             json!({
                 "type": "object",
                 "properties": {
@@ -4003,6 +4003,17 @@ async fn route_with_freerouting(
     if let Some(error) = width_error {
         result["width_report_error"] = json!(error);
     }
+    // Row LT (L14): Freerouting does not tune lengths. A board whose design intent
+    // declares a length group or a pair skew still routes; the note keeps the gap
+    // visible. The board is the manifest's, as for the completion steps.
+    let intent_board = crate::specctra::manifest_beside(&dsn)
+        .and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from));
+    if let Some(note) = intent_board
+        .as_deref()
+        .and_then(super::route_lengths::freerouting_note)
+    {
+        result["length_matching_note"] = json!(note);
+    }
     // Only a session that holds a wire the report could not measure carries
     // these; the status is then never "complete".
     if width_report.unmeasured_total > 0 {
@@ -7091,6 +7102,80 @@ done
                 "Freerouting reports 0 unrouted connections and was given no pour as a plane."
             );
         }
+    }
+
+    /// Row LT (L14): Freerouting routes a board whose design intent declares a length
+    /// group or a pair skew as it always did, and says it did not tune or check
+    /// lengths. Without either, the result has no such field.
+    #[tokio::test]
+    async fn freerouting_says_it_does_not_tune_lengths_when_the_intent_declares_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = routing_java(dir.path());
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let manifest = json!({ "board_path": board.display().to_string() });
+        let write_intent = |interface: serde_json::Value| {
+            std::fs::create_dir_all(dir.path().join(".konnect")).unwrap();
+            std::fs::write(
+                dir.path().join(".konnect/design_intent.json"),
+                json!({ "schema_version": 1, "rails": [], "currents": [],
+                        "interfaces": [interface] })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        // No intent: no note.
+        let result = route_with(
+            dir.path(),
+            &java,
+            "none",
+            "(pcb board (structure))",
+            Some(manifest.clone()),
+        )
+        .await;
+        assert!(result.get("length_matching_note").is_none(), "{result}");
+        // An intent with a pair and no length declaration: no note either.
+        write_intent(json!({ "name": "bus", "kind": "bus", "nets": ["A", "B"],
+            "differential_pairs": [{ "positive": "A", "negative": "B" }] }));
+        let result = route_with(
+            dir.path(),
+            &java,
+            "plain",
+            "(pcb board (structure))",
+            Some(manifest.clone()),
+        )
+        .await;
+        assert!(result.get("length_matching_note").is_none(), "{result}");
+        // A length group: the note, and the result is otherwise the same.
+        write_intent(json!({ "name": "bus", "kind": "bus", "nets": ["A", "B"],
+            "length_groups": [{ "name": "g", "nets": ["A", "B"], "tolerance_mm": 0.5 }] }));
+        let grouped = route_with(
+            dir.path(),
+            &java,
+            "group",
+            "(pcb board (structure))",
+            Some(manifest.clone()),
+        )
+        .await;
+        let note = grouped["length_matching_note"].as_str().expect("a note");
+        assert!(
+            note.contains("Freerouting does not tune lengths") && note.contains("fastroute"),
+            "{note}"
+        );
+        assert_eq!(grouped["success"], true);
+        assert!(grouped.get("length_matching").is_none(), "{grouped}");
+        // A declared pair skew alone also earns the note.
+        write_intent(json!({ "name": "bus", "kind": "bus", "nets": ["A", "B"],
+            "differential_pairs": [{ "positive": "A", "negative": "B", "max_skew_mm": 0.2 }] }));
+        let skewed = route_with(
+            dir.path(),
+            &java,
+            "skew",
+            "(pcb board (structure))",
+            Some(manifest),
+        )
+        .await;
+        assert!(skewed["length_matching_note"].is_string(), "{skewed}");
     }
 
     /// Track below a widened net's intent width is listed, and the status

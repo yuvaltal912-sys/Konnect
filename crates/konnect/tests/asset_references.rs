@@ -1035,6 +1035,20 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Result fields of `route_specctra_dsn` (D23: differential pairs).
         "differential_pairs",
         "differential_pairs_unresolved",
+        // Design-intent fields and result fields of `route_specctra_dsn` (Row LT:
+        // length matching), and the rules file's extension.
+        "length_groups",
+        "tolerance_mm",
+        "target_mm",
+        "max_skew_mm",
+        "kicad_dru",
+        "length_matching",
+        "kicad_rules",
+        "kicad_violations",
+        "pairs_tuned_net_by_net",
+        "length_matching_note",
+        "untuned_nets",
+        "tune_candidates",
     ];
 
     let mut phantom = Vec::new();

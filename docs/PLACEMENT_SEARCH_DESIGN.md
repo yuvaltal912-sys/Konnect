@@ -1437,7 +1437,7 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
 
 /// `table.md` of one board, counts only, no net or part names: one row per routed
 /// candidate in rank order (rank, origin, family and seed, P1, P2, G1, unconnected,
-/// G2, G3, decoupling, connector, acute, signal and power mm, vias off the pours,
+/// G2, G3, G4, decoupling, connector, acute, signal and power mm, vias off the pours,
 /// copper quality, silk, placement score), then one row per family and reference (best
 /// rank, median rank of its routed candidates, how many pass every gate, how many were
 /// generated, failed, duplicates and screened out), then each family's verdict against

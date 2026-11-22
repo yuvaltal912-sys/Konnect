@@ -1,0 +1,33 @@
+(session cut
+  (base_design cut)
+  (placement
+    (resolution um 10)
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad Konnect)
+      (host_version "0.13.0")
+    )
+    (library_out 
+    )
+    (network_out 
+      (net "/PCIe-M2/FB"
+        (wire
+          (path F.Cu 1500
+            1274140 -715590
+            1273150 -714600
+          )
+        )
+        (wire
+          (path F.Cu 1500
+            1273150 -714600
+            1274140 -715590
+          )
+        )
+      )
+    )
+  )
+)

@@ -13,6 +13,7 @@ fn declared(positive: &str, negative: &str) -> DeclaredPair {
     DeclaredPair {
         positive: positive.to_string(),
         negative: negative.to_string(),
+        max_skew_mm: None,
     }
 }
 
@@ -107,6 +108,7 @@ fn a_pair_resolves_and_keeps_both_spellings() {
             dsn_positive: "/CAN_H".to_string(),
             dsn_negative: "/CAN_L".to_string(),
             gap_mm: None,
+            max_skew_mm: None,
         }]
     );
 }
@@ -408,6 +410,7 @@ fn pair(dsn_positive: &str, dsn_negative: &str, gap_mm: Option<f64>) -> Resolved
         dsn_positive: dsn_positive.to_string(),
         dsn_negative: dsn_negative.to_string(),
         gap_mm,
+        max_skew_mm: None,
     }
 }
 
@@ -665,5 +668,81 @@ fn a_board_with_no_folder_reads_the_current_one_and_finds_nothing() {
     assert_eq!(
         plan(Path::new("route-pairs-no-such-board.kicad_pcb"), "(pcb x)"),
         PairsPlan::default()
+    );
+}
+
+// ─── Row LT: a pair's declared skew ─────────────────────────────────────────
+
+fn pair_with_skew(
+    dsn_positive: &str,
+    dsn_negative: &str,
+    gap_mm: Option<f64>,
+    max_skew_mm: Option<f64>,
+) -> ResolvedPair {
+    ResolvedPair {
+        max_skew_mm,
+        ..pair(dsn_positive, dsn_negative, gap_mm)
+    }
+}
+
+#[test]
+fn the_file_writes_half_of_a_declared_skew_after_the_gap() {
+    let plan = PairsPlan {
+        resolved: vec![
+            pair_with_skew("/D0_P", "/D0_N", Some(0.2), Some(0.3)),
+            pair_with_skew("/D1_P", "/D1_N", None, Some(0.05)),
+            pair_with_skew("/D2_P", "/D2_N", Some(0.15), None),
+            pair_with_skew("/D3_P", "/D3_N", None, None),
+        ],
+        ..PairsPlan::default()
+    };
+    assert_eq!(
+        plan.file_text().as_deref(),
+        Some(
+            "pair /D0_P /D0_N gap=0.2 skew=0.15\n\
+             pair /D1_P /D1_N skew=0.025\n\
+             pair /D2_P /D2_N gap=0.15\n\
+             pair /D3_P /D3_N\n"
+        )
+    );
+}
+
+#[test]
+fn a_pair_without_a_declared_skew_has_no_skew_word() {
+    // The negative control of the pairs row: DP's lines are as they were.
+    let plan = PairsPlan {
+        resolved: vec![
+            pair("/CAN_H", "/CAN_L", Some(0.2)),
+            pair("USB_P", "USB_N", None),
+        ],
+        ..PairsPlan::default()
+    };
+    let text = plan.file_text().unwrap();
+    assert!(!text.contains("skew"), "{text}");
+}
+
+#[test]
+fn the_declared_skew_travels_from_the_intent_to_the_resolved_pair() {
+    let intent: DesignIntent = serde_json::from_value(json!({
+        "schema_version": 1,
+        "interfaces": [{
+            "name": "ddr", "kind": "ddr", "nets": ["D0P", "D0N", "D1P", "D1N"],
+            "differential_pairs": [
+                { "positive": "D0P", "negative": "D0N", "max_skew_mm": 0.2 },
+                { "positive": "D1P", "negative": "D1N" }
+            ]
+        }]
+    }))
+    .unwrap();
+    let declared_pairs = declared_pairs(&intent);
+    assert_eq!(declared_pairs[0].max_skew_mm, Some(0.2));
+    assert_eq!(declared_pairs[1].max_skew_mm, None);
+    let nets = names(&["/D0P", "/D0N", "/D1P", "/D1N"]);
+    let plan = resolve_pairs(&declared_pairs, &nets, None);
+    assert_eq!(plan.resolved[0].max_skew_mm, Some(0.2));
+    assert_eq!(plan.resolved[1].max_skew_mm, None);
+    assert_eq!(
+        plan.file_text().as_deref(),
+        Some("pair /D0P /D0N skew=0.1\npair /D1P /D1N\n")
     );
 }

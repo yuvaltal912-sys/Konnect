@@ -15,6 +15,7 @@ use crate::specctra::RoutingHints;
 use crate::tools::integration::{
     completion_report, width_fallback_argument, width_report, WidthFallback, WidthOutcome,
 };
+use crate::tools::route_lengths::{self, LengthPlan};
 use crate::tools::route_pairs;
 use crate::tools::{get_path, ToolContext};
 use anyhow::Result;
@@ -43,9 +44,48 @@ pub(crate) const FREEROUTING_ONLY: &[&str] = &[
 pub(crate) const FASTROUTE_ONLY: &[&str] = &["effort", "fastroute_path"];
 
 /// What a run folder holds that this code made, and so may remove when it reduces
-/// the folder to its record: the variant DSN and the three passes' folders
-/// (`fastroute::route_held`). Anything else a run folder holds is left alone.
+/// the folder to its record: the variant DSN and the three routing passes' folders
+/// (`fastroute::route_held`), and the Tune pass folders
+/// ([`fastroute::tune_folder_names`], which [`reduce_run_folders`] treats on their own:
+/// L26 keeps the log and the session of a discarded or failed pass). Anything else a
+/// run folder holds is left alone.
 const RUN_ENTRIES: &[&str] = &["variant.dsn", "full", "fallback", "polish"];
+
+/// The files of a discarded or failed Tune pass that [`reduce_run_folders`] keeps
+/// (L26): its log and its session. A session and a log are small.
+const KEPT_TUNE_FILES: [&str; 2] = ["fastroute.log", "tune.ses"];
+
+/// The Tune pass folders of a run's record whose pass was `discarded` or `failed`
+/// (the rows of `held.tune.rows`: `variant`, `round`, `outcome`).
+fn tune_folders_to_keep(record: &RunRecord) -> Vec<String> {
+    let Some(routed) = &record.routed else {
+        return Vec::new();
+    };
+    routed
+        .held
+        .tune
+        .rows
+        .iter()
+        .filter(|row| matches!(row["outcome"].as_str(), Some("discarded" | "failed")))
+        .filter_map(|row| {
+            let variant =
+                serde_json::from_value::<fastroute::TuneVariant>(row["variant"].clone()).ok()?;
+            let round = usize::try_from(row["round"].as_u64()?).ok()?;
+            Some(variant.folder_name(round))
+        })
+        .collect()
+}
+
+/// The run index of a judge folder name this code made: `run-<i>`,
+/// `run-<i>-untuned` or `run-<i>-pour-safe` (L23).
+fn judge_folder_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("run-")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let suffix = &rest[digits.len()..];
+    matches!(suffix, "" | "-untuned" | "-pour-safe")
+        .then(|| digits.parse().ok())
+        .flatten()
+}
 
 /// A refusal of one argument, worded as the other refusals of this tool are.
 fn refusal(field: &str, reason: String) -> CallToolResult {
@@ -352,7 +392,11 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 ///    (`specctra::manifest_routing_hints`), the amps file
 ///    (`fastroute::amps_file_text`, written to `<folder>/amps.txt`), the design intent's
 ///    differential pairs (`route_pairs::plan`, written to `<folder>/pairs.txt` and sent
-///    as `--pairs=<file>` on every pass of every run), `width_fallback`
+///    as `--pairs=<file>` on every pass of every run), Row LT's length plan
+///    (`route_lengths::plan`, after the pairs plan and before the search folder holds
+///    anything: a group or skew that cannot be applied is a refusal, `invalid_configuration`,
+///    "Nothing was routed."; `<folder>/tune.txt` when there is a group, and the Tune
+///    pass after the hold sequence of every run), `width_fallback`
 ///    (default floor, as `integration::width_arguments` reads it), the plan
 ///    (`launch_order`, `lanes(available cores, effort)`, `HANG_CAP`).
 /// 6. `route_search::search` with a [`FastrouteRunner`].
@@ -617,6 +661,41 @@ async fn search_and_write(
         Ok(judge) => judge,
         Err(refused) => return Ok(preflight_refusal(&refused)),
     };
+    let dsn_text = crate::freerouting_mcp::read_dsn(&call.dsn)?;
+    // The pairs the design intent declares, then its length groups and pair skews
+    // (Row LT), both resolved against this DSN's nets. A group that cannot be
+    // applied refuses the call here, before the search folder holds anything: a
+    // pair left out still routes as two nets, a group left out is a requirement
+    // silently not met (L4).
+    let pairs_plan = route_pairs::plan(&judge.board, &dsn_text);
+    let intent_path = crate::tools::design_intent::design_intent_path(
+        judge.board.parent().unwrap_or_else(|| Path::new(".")),
+    );
+    let lengths_plan =
+        match route_lengths::plan(&judge.board, &judge.board_text, &dsn_text, &pairs_plan) {
+            Ok(plan) => plan,
+            Err(refusal) => return Ok(route_lengths::refusal_result(&refusal, &intent_path)),
+        };
+    // The Tune pass lists every net class of the DSN so that the autorouter routes
+    // nothing (L6); a DSN whose classes cannot be read cannot be tuned safely.
+    let classes = if lengths_plan.groups.is_empty() {
+        Vec::new()
+    } else {
+        match crate::specctra::dsn_class_names(&dsn_text) {
+            Ok(classes) => classes,
+            Err(error) => {
+                return Ok(route_lengths::refusal_result(
+                    &route_lengths::LengthRefusal {
+                        reason: format!(
+                            "The DSN's net classes could not be read ({error:#}), so the design intent's length groups cannot be tuned."
+                        ),
+                        next_step: "Export the DSN again with export_specctra_dsn, then call route_specctra_dsn again.".to_string(),
+                    },
+                    &intent_path,
+                ));
+            }
+        }
+    };
     std::fs::create_dir_all(&judge_root)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", judge_root.display()))?;
     // The judge's KiCad runs on a private copy of the KiCad settings, so that
@@ -636,7 +715,6 @@ async fn search_and_write(
     };
     let kicad_config_home = kicad_config.home.clone();
     judge.kicad_config_home = Some(kicad_config_home.clone());
-    let dsn_text = crate::freerouting_mcp::read_dsn(&call.dsn)?;
     let shapes = match route_search::shapes(&dsn_text)
         .and_then(|shapes| preflight_variants(&dsn_text, &shapes).map(|()| shapes))
     {
@@ -652,10 +730,15 @@ async fn search_and_write(
             ));
         }
     };
-    // The pairs the design intent declares, resolved against this DSN's nets. Read
-    // before the judge moves into the runner.
-    let pairs_plan = route_pairs::plan(&judge.board, &dsn_text);
     let pairs = route_pairs::write_file(&call.folder, &pairs_plan)?;
+    let tune = route_lengths::write_file(&call.folder, &lengths_plan)?.map(|file| TuneFiles {
+        file,
+        classes,
+        nets: lengths_plan.tune_nets(),
+        layer_heights: lengths_plan.heights.switch_value(),
+        plan: Arc::new(lengths_plan.clone()),
+    });
+    judge.lengths = judge_checks(&lengths_plan);
     let hints = crate::specctra::manifest_routing_hints(&call.dsn);
     let amps = match fastroute::amps_file_text(&judge.manifest) {
         Some(text) => {
@@ -682,6 +765,8 @@ async fn search_and_write(
         hints,
         amps,
         pairs,
+        routing_heights: routing_layer_heights(&lengths_plan, &pairs_plan),
+        tune,
         fallback: call.fallback,
         folder: call.folder.clone(),
         judge: Arc::new(judge),
@@ -697,13 +782,35 @@ async fn search_and_write(
         &outcome,
         &kicad_config,
         &pairs_plan,
+        &lengths_plan,
     )
+}
+
+/// What the judge checks for this call (L8, L9): the plan's groups and pair skews, or
+/// `None` when it has none and the board has no length or skew rules of its own, so
+/// that the judge runs no probe and G4 has no intent lines (L18). A board with such
+/// rules always gets checks (its `board_rules` flag), even with no group or pair.
+fn judge_checks(plan: &LengthPlan) -> Option<Arc<crate::length_probe::LengthChecks>> {
+    (!plan.is_empty() || !plan.kicad_rules.is_empty()).then(|| Arc::new(plan.checks()))
+}
+
+/// The `--layer-heights` value of the routing passes (L7): only when the call has a
+/// resolved pair, because fastroute reads the heights only when it measures a net
+/// (a pair's skew); a call without a pair keeps DP's exact command lines. The Tune
+/// pass takes the plan's heights whenever there are any ([`TuneFiles`]).
+fn routing_layer_heights(plan: &LengthPlan, pairs: &route_pairs::PairsPlan) -> Option<String> {
+    if pairs.resolved.is_empty() {
+        None
+    } else {
+        plan.heights.switch_value()
+    }
 }
 
 /// Steps 7 to 9 once the search has run: `search.json`, then either the no-winner
 /// error ([`no_winner_result`]) or the winner's session at `ses_output_path`, the
 /// reduced run folders and the result ([`result_json`]). `pairs_plan` is the call's
-/// differential pairs plan, reported in both results.
+/// differential pairs plan and `lengths_plan` its length plan (Row LT); both are
+/// reported in both results.
 #[allow(clippy::too_many_arguments)] // the parts of one finished search, each read once
 pub(crate) fn conclude(
     args: &Value,
@@ -714,6 +821,7 @@ pub(crate) fn conclude(
     outcome: &SearchOutcome,
     kicad_config: &route_judge::PrivateConfig,
     pairs_plan: &route_pairs::PairsPlan,
+    lengths_plan: &LengthPlan,
 ) -> Result<CallToolResult> {
     let settings = |search: &mut Value| {
         search["kicad_config_home"] = json!(text(&kicad_config.home));
@@ -736,7 +844,13 @@ pub(crate) fn conclude(
     else {
         let mut search = search_json(plan, shapes, outcome, Listing::Best);
         settings(&mut search);
-        return Ok(no_winner_result(call, outcome, search, pairs_plan));
+        return Ok(no_winner_result(
+            call,
+            outcome,
+            search,
+            pairs_plan,
+            lengths_plan,
+        ));
     };
     let routed = winner.routed.as_ref().expect("filtered above");
     let session = std::fs::read_to_string(&routed.held.ses).map_err(|error| {
@@ -759,6 +873,7 @@ pub(crate) fn conclude(
         shapes,
         outcome,
         pairs_plan,
+        lengths_plan,
     );
     settings(&mut result["search"]);
     if let Err(error) = reduced {
@@ -778,6 +893,7 @@ pub(crate) fn no_winner_result(
     outcome: &SearchOutcome,
     mut search: Value,
     pairs: &route_pairs::PairsPlan,
+    lengths: &LengthPlan,
 ) -> CallToolResult {
     if let Err(error) = reduce_run_folders(&call.folder, outcome) {
         search["reduce_error"] = json!(format!("{error:#}"));
@@ -816,6 +932,7 @@ pub(crate) fn no_winner_result(
         {
             let mut fields = vec![("search", search)];
             fields.extend(pairs.fields());
+            fields.extend(lengths.fields(None, None, None));
             fields
         },
     )
@@ -862,11 +979,33 @@ pub(crate) struct FastrouteRunner {
     pub amps: Option<PathBuf>,
     /// The call's `--pairs` file (`route_pairs::plan`), none without declared pairs.
     pub pairs: Option<PathBuf>,
+    /// The `--layer-heights` value the routing passes get: only with a resolved pair
+    /// ([`routing_layer_heights`], L7).
+    pub routing_heights: Option<String>,
+    /// What the Tune pass needs, none without a length group (L6, L18).
+    pub tune: Option<TuneFiles>,
     pub fallback: WidthFallback,
     /// The search folder: run `i` lives in `run-<i, 3 digits>-<shape>-s<seed>`.
     pub folder: PathBuf,
     pub judge: Arc<JudgeContext>,
     pub tools: Arc<ToolContext>,
+}
+
+/// The Tune pass's inputs as the runner owns them (Row LT, L6): what
+/// `fastroute::TuneInputs` borrows.
+#[derive(Debug, Clone)]
+pub(crate) struct TuneFiles {
+    /// The call's `tune.txt`.
+    pub file: PathBuf,
+    /// Every net class of the DSN.
+    pub classes: Vec<String>,
+    /// The DSN names of the nets the tune file lists.
+    pub nets: std::collections::BTreeSet<String>,
+    /// The Tune pass's own `--layer-heights` value (L7): sent whenever the call has
+    /// heights.
+    pub layer_heights: Option<String>,
+    /// The call's length plan: the next round's tune file is written from it (L21).
+    pub plan: Arc<route_lengths::LengthPlan>,
 }
 
 /// A shape's name as the run folders and the result spell it.
@@ -899,6 +1038,8 @@ impl Runner for FastrouteRunner {
         let hints = self.hints;
         let amps = self.amps.clone();
         let pairs = self.pairs.clone();
+        let routing_heights = self.routing_heights.clone();
+        let tune = self.tune.clone();
         let fallback = self.fallback;
         let folder = self.folder.join(run_folder_name(index, shape, seed));
         Box::pin(async move {
@@ -919,6 +1060,15 @@ impl Runner for FastrouteRunner {
                 .collect();
             planes.sort();
             planes.dedup();
+            // The disc of each via padstack of this run's DSN (the Tune pass's guard).
+            let via_radii = crate::specctra::via_disc_radii(&variant);
+            // Row LT, L21: the next round's tune file, without the nets that touched
+            // themselves.
+            let plan = tune.as_ref().map(|tune| Arc::clone(&tune.plan));
+            let next = |folder: &Path, dropped: &std::collections::BTreeSet<String>| match &plan {
+                Some(plan) => route_lengths::write_file_without(folder, plan, dropped),
+                None => Ok(None),
+            };
             let held = fastroute::route_held(
                 &binary,
                 &folder,
@@ -927,8 +1077,20 @@ impl Runner for FastrouteRunner {
                 fastroute::CallFiles {
                     amps: amps.as_deref(),
                     pairs: pairs.as_deref(),
+                    layer_heights: routing_heights.as_deref(),
                 },
                 fallback,
+                tune.as_ref().map(|tune| fastroute::TuneRequest {
+                    inputs: fastroute::TuneInputs {
+                        tune: &tune.file,
+                        classes: &tune.classes,
+                        nets: &tune.nets,
+                        layer_heights: tune.layer_heights.as_deref(),
+                        planes: &planes,
+                        via_radii: &via_radii,
+                    },
+                    next: &next,
+                }),
                 deadline,
             )
             .await
@@ -990,22 +1152,36 @@ impl Runner for FastrouteRunner {
     }
 }
 
-/// What [`FastrouteRunner::release`] does: removes `<judge root>/run-<i>` and, in
-/// each pass folder of run `i`, `home`, `tmp`, `profile.sb` and `fastroute.log`.
+/// What [`FastrouteRunner::release`] does: removes the judge folders of run `i`
+/// (`<judge root>/run-<i>`, `run-<i>-untuned` and `run-<i>-pour-safe`) and, in each
+/// pass folder of run `i`, `home`, `tmp`, `profile.sb` and `fastroute.log`, except the
+/// `fastroute.log` of a Tune pass folder (L26: the log of a discarded or failed Tune
+/// pass is kept for the record, and [`reduce_run_folders`] removes the rest).
 /// A failure is logged, never raised; no link is followed (`remove_tree`).
 fn release_run(folder: &Path, judge_root: &Path, index: usize, shape: Shape, seed: u64) {
     let run = folder.join(run_folder_name(index, shape, seed));
-    let mut paths = vec![judge_root.join(format!("run-{index}"))];
+    let mut paths: Vec<PathBuf> = ["", "-untuned", "-pour-safe"]
+        .iter()
+        .map(|suffix| judge_root.join(format!("run-{index}{suffix}")))
+        .collect();
     // A run or pass folder that is not a real folder (a link, a file) is not
     // ours: `remove_tree` checks only the last part of a path, so a link here
     // would be followed.
     if is_real_folder(&run) {
-        for pass in ["full", "fallback", "polish"] {
+        let tune = fastroute::tune_folder_names();
+        let passes = ["full", "fallback", "polish"]
+            .iter()
+            .map(|name| (name.to_string(), true))
+            .chain(tune.into_iter().map(|name| (name, false)));
+        for (pass, log_goes) in passes {
             let pass = run.join(pass);
             if !is_real_folder(&pass) {
                 continue;
             }
             for name in ["home", "tmp", "profile.sb", "fastroute.log"] {
+                if name == "fastroute.log" && !log_goes {
+                    continue;
+                }
                 paths.push(pass.join(name));
             }
         }
@@ -1050,10 +1226,31 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Removes everything in the folder `path` but the entries named in `keep` (a link is
+/// left where it is, as in [`remove_tree`]).
+fn remove_all_but(path: &Path, keep: &[&str]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| keep.contains(&name))
+        {
+            continue;
+        }
+        remove_tree(&entry.path())?;
+    }
+    Ok(())
+}
+
 /// After a search: every run folder but the winner's is reduced to its
 /// `run.json` (its `RunRecord` and, when judged, its measures, gates and
-/// rounds), and `<folder>/judge/run-<i>` of every run but the winner's is removed. The
-/// winner's run folder and judged board stay whole. Only paths inside `folder` are
+/// rounds; with a Tune pass, its rows and the files it kept), and the judge folders of
+/// every run but the winner's (`<folder>/judge/run-<i>`, `run-<i>-untuned`,
+/// `run-<i>-pour-safe`) are removed. The run folder keeps, for each Tune pass that was
+/// discarded or failed, its `fastroute.log` and its session (L26; the pass folders of
+/// the Tune passes it kept go whole). The winner's run folder and judged board stay
+/// whole. Only paths inside `folder` are
 /// touched; a path that is a symbolic link is left alone.
 pub(crate) fn reduce_run_folders(
     folder: &Path,
@@ -1080,10 +1277,27 @@ pub(crate) fn reduce_run_folders(
             "key": key,
             "board_kept": is_winner,
         });
+        // The winner keeps every folder whole.
+        let keep_tune = if is_winner {
+            Vec::new()
+        } else {
+            tune_folders_to_keep(record)
+        };
         if let Some(routed) = &record.routed {
             body["kept_pass"] = json!(routed.held.kept);
             body["passes"] = json!(routed.held.passes);
             body["planes"] = json!(routed.planes);
+            if !routed.held.tune.rows.is_empty() {
+                // Row LT, L26: every Tune pass, and the files kept of those discarded
+                // or failed.
+                body["tune"] = json!({
+                    "rows": routed.held.tune.rows,
+                    "kept_files": keep_tune
+                        .iter()
+                        .flat_map(|name| KEPT_TUNE_FILES.iter().map(move |file| format!("{name}/{file}")))
+                        .collect::<Vec<_>>(),
+                });
+            }
         }
         if let Some(judged) = &record.judged {
             body["judged"] = json!(judged);
@@ -1106,17 +1320,26 @@ pub(crate) fn reduce_run_folders(
                 problems.push(format!("remove {}: {error}", path.display()));
             }
         }
+        // The Tune pass folders (L26): a discarded or failed pass keeps its log and
+        // its session; every other pass folder goes whole.
+        for name in fastroute::tune_folder_names() {
+            let path = run.join(&name);
+            let result = if keep_tune.contains(&name) && is_real_folder(&path) {
+                remove_all_but(&path, &KEPT_TUNE_FILES)
+            } else {
+                remove_tree(&path)
+            };
+            if let Err(error) = result {
+                problems.push(format!("remove {}: {error}", path.display()));
+            }
+        }
     }
     // The judge's scratch boards of the other runs.
     let judge = folder.join("judge");
     if judge.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
         if let Ok(entries) = std::fs::read_dir(&judge) {
             for entry in entries.flatten() {
-                let index = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_prefix("run-"))
-                    .and_then(|number| number.parse::<usize>().ok());
+                let index = entry.file_name().to_str().and_then(judge_folder_index);
                 if index.is_some_and(|index| others.contains(&index)) {
                     if let Err(error) = remove_tree(&entry.path()) {
                         problems.push(format!("remove {}: {error}", entry.path().display()));
@@ -1152,6 +1375,23 @@ fn run_rows(runs: &[&RunRecord]) -> Vec<Value> {
                     if key.ends_with("_s") {
                         if let Some(seconds) = value.as_f64() {
                             *value = json!(round1(seconds));
+                        }
+                    }
+                }
+                // Row LT (L15): G4 and the intent's miss, only for a run that was
+                // checked for length, so that a call without groups reads as before.
+                if let Some(judged) = &record.judged {
+                    let lengths = judged.measures.lengths.as_ref();
+                    if lengths.is_some() || !judged.gates.g4.is_empty() {
+                        object.insert("g4_failed".into(), json!(!judged.gates.g4.is_empty()));
+                    }
+                    if let Some(lengths) = lengths {
+                        object.insert(
+                            "length_miss_mm".into(),
+                            json!((lengths.miss_mm * 1000.0).round() / 1000.0),
+                        );
+                        if !lengths.unmeasured.is_empty() {
+                            object.insert("length_unmeasured".into(), json!(lengths.unmeasured));
                         }
                     }
                 }
@@ -1288,8 +1528,9 @@ fn search_json(
 
 /// The `status` of a fastroute result, from the judge's gates first.
 /// - G1 failed (connections open after the refill and the stitching): `incomplete`.
-/// - G2 (DRC) or G3 (widths) failed: `complete_with_gate_failures`, never `complete`.
-/// - Every gate passed and the judge added no stitching via: the winner's session alone,
+/// - G2 (DRC), G3 (widths) or G4 (lengths, Row LT) failed: `complete_with_gate_failures`,
+///   never `complete`.
+/// - Every gate passed (all four) and the judge added no stitching via: the winner's session alone,
 ///   applied to a copy of the board and refilled, leaves nothing open, which is what the
 ///   router's own count cannot show (D21). The router's `incomplete` (its count, which
 ///   takes a connection a pour makes for one it left) and its plane `unverified` give way.
@@ -1311,7 +1552,7 @@ pub(crate) fn judged_status(
 ) -> &'static str {
     if !gates.g1.is_empty() {
         "incomplete"
-    } else if !gates.g2.is_empty() || !gates.g3.is_empty() {
+    } else if !gates.g2.is_empty() || !gates.g3.is_empty() || !gates.g4.is_empty() {
         "complete_with_gate_failures"
     } else if stitching_vias > 0 {
         router_status
@@ -1343,6 +1584,80 @@ const SHARED_COMPLETE_WHEN_END: &str =
     "fastroute's count, and this result's status, do not show that.";
 const JUDGED_COMPLETE_WHEN_END: &str = "fastroute's count does not show that. The judge's check on a copy of the board does: `status` follows it when every judge gate passed and the judge added no stitching via (`completion.judged`).";
 
+/// Row LT, L15: `length_matching`'s `untuned_nets` and `tune_candidates` for the
+/// winner; `None` when the run had no Tune pass. `tune_nets` are the DSN names of the
+/// tune file's nets.
+/// - `untuned_nets`: every tune-file net the written session leaves untuned, each with
+///   its reason (`net`, `reason`):
+///   - the judge kept the untuned board: every net, "the judge kept the untuned board:
+///     <the rejection or rank reason>" ([`route_judge::TuneChoice::untuned_reason`]);
+///   - no candidate survived its passes: every net, with the last pass's reason;
+///   - otherwise the chosen candidate's dropped nets (L21), each with its reason.
+/// - `tune_candidates`: one row per candidate the judge saw (`route_judge::TuneChoice`
+///   rows: `variant`, `passes`, `dropped`, `judged`, `g4_failed`, `rejected`, `reason`,
+///   `chosen`).
+fn tuning_fields(
+    routed: &Routed,
+    judged: &Judged,
+    tune_nets: &std::collections::BTreeSet<String>,
+) -> Option<(Value, Value)> {
+    if routed.held.tune.rows.is_empty() {
+        return None;
+    }
+    let every_net = |reason: &str| -> Vec<Value> {
+        tune_nets
+            .iter()
+            .map(|net| json!({ "net": net, "reason": reason }))
+            .collect()
+    };
+    let untuned: Vec<Value> = match (&judged.tune, judged.tune.as_ref().and_then(|c| c.chosen)) {
+        (_, Some(variant)) => routed
+            .held
+            .tune
+            .candidates
+            .iter()
+            .find(|candidate| candidate.variant == variant)
+            .map(|candidate| {
+                candidate
+                    .dropped
+                    .iter()
+                    .map(|(net, reason)| json!({ "net": net, "reason": reason }))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        (Some(choice), None) => every_net(&format!(
+            "the judge kept the untuned board: {}",
+            choice.untuned_reason()
+        )),
+        (None, None) => {
+            // No candidate survived its passes: the last pass that ran says why.
+            let last = routed
+                .held
+                .tune
+                .rows
+                .iter()
+                .rev()
+                .find(|row| row["outcome"] != "skipped")
+                .or_else(|| routed.held.tune.rows.last());
+            let reason = last
+                .and_then(|row| {
+                    row["reason"].as_str().map(str::to_string).or_else(|| {
+                        row["outcome"]
+                            .as_str()
+                            .map(|outcome| format!("the last Tune pass was {outcome}"))
+                    })
+                })
+                .unwrap_or_else(|| "no Tune candidate survived".to_string());
+            every_net(&reason)
+        }
+    };
+    let candidates = judged
+        .tune
+        .as_ref()
+        .map_or_else(Vec::new, |choice| choice.rows.clone());
+    Some((json!(untuned), json!(candidates)))
+}
+
 /// The success result. Today's fields, for the winner: `success: true`, `status` and
 /// `completion` from `integration::completion_report(dsn, ses_output, the winner's
 /// planes, the winner's unrouted, width)`, with `completion.judged` = { unconnected,
@@ -1356,7 +1671,10 @@ const JUDGED_COMPLETE_WHEN_END: &str = "fastroute's count does not show that. Th
 /// `artifacts` { dsn_path, ses_output_path, search_folder, judged_board };
 /// `passes` and `result_pass` of the winner, as the Freerouting hold path names them;
 /// `differential_pairs` and `differential_pairs_unresolved` (and
-/// `differential_pairs_note` when the design intent could not be used), from `pairs`.
+/// `differential_pairs_note` when the design intent could not be used), from `pairs`;
+/// and, when `lengths` is reported (Row LT, L15), `length_matching` with the winner's
+/// measures and the Tune pass's row, and the length lines of `completion.next_steps`
+/// (L16).
 #[allow(clippy::too_many_arguments)] // the parts of one finished call, each read once
 pub(crate) fn result_json(
     dsn: &Path,
@@ -1368,6 +1686,7 @@ pub(crate) fn result_json(
     shapes: &[Shape],
     outcome: &crate::route_search::SearchOutcome,
     pairs: &route_pairs::PairsPlan,
+    lengths: &LengthPlan,
 ) -> Value {
     let search = search_json(plan, shapes, outcome, Listing::Best);
     let winner = outcome
@@ -1380,7 +1699,11 @@ pub(crate) fn result_json(
             "error": "no run was routed and judged",
             "search": search,
         });
-        for (key, value) in pairs.fields() {
+        for (key, value) in pairs
+            .fields()
+            .into_iter()
+            .chain(lengths.fields(None, None, None))
+        {
             result[key] = value;
         }
         return result;
@@ -1490,6 +1813,39 @@ pub(crate) fn result_json(
     });
     for (key, value) in pairs.fields() {
         result[key] = value;
+    }
+    // Row LT: what was asked of the lengths, what the winner measured, and the KiCad
+    // rules that keep checking it (L15, L16).
+    // `held.passes` holds the chosen candidate's last Tune row (L23 rewrote it); L15's
+    // `tune_candidates` and `untuned_nets` come from the judge's choice.
+    let tune_row = routed
+        .held
+        .passes
+        .iter()
+        .find(|row| row["name"] == fastroute::TUNE_PASS);
+    let winner_lengths = judged.measures.lengths.as_ref();
+    for (key, value) in lengths.fields(winner_lengths, Some(&judged.measures.violations), tune_row)
+    {
+        result[key] = value;
+    }
+    if let (Some(body), Some((untuned, candidates))) = (
+        result
+            .get_mut("length_matching")
+            .and_then(Value::as_object_mut),
+        tuning_fields(routed, judged, &lengths.tune_nets()),
+    ) {
+        body.insert("untuned_nets".into(), untuned);
+        body.insert("tune_candidates".into(), candidates);
+    }
+    let length_steps = lengths.next_steps(
+        winner_lengths,
+        crate::length_probe::kicad_rule_violations(&judged.measures.violations),
+    );
+    if let Some(steps) = result["completion"]["next_steps"].as_array_mut() {
+        for line in length_steps {
+            let number = steps.len() + 1;
+            steps.push(json!({ "step": number, "manual": line }));
+        }
     }
     if let Some(error) = width_error {
         result["width_report_error"] = json!(error);

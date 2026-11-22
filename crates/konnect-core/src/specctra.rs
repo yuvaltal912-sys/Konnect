@@ -2370,6 +2370,75 @@ pub(crate) struct DsnPlane {
     pub layer: String,
 }
 
+/// Row LT, the Tune pass's guard: each padstack of the DSN's library whose every shape
+/// is a circle, with the radius of its smallest copper disc in whole micrometres (half the
+/// smallest circle's diameter, rounded down, so a disc is never taken larger than it is).
+/// The DSN's unit must be `um` or `mm`; a padstack with a shape that is not a circle, a
+/// diameter that is not positive, or a DSN in another unit or that cannot be parsed, gives
+/// no entry, so that the guard that reads it stays strict. Konnect writes through vias
+/// only, one circle on each copper layer, so a via's disc is the same on every layer it
+/// touches.
+pub(crate) fn via_disc_radii(dsn: &str) -> BTreeMap<String, i64> {
+    let Ok(root) = parse_dsn_sexp(dsn) else {
+        return BTreeMap::new();
+    };
+    let named = |node: &SexpNode, name: &str| {
+        node.head()
+            .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    };
+    let children = |node: &SexpNode, name: &str| -> Vec<SexpNode> {
+        node.children()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|child| named(child, name))
+            .cloned()
+            .collect()
+    };
+    if !named(&root, "pcb") {
+        return BTreeMap::new();
+    }
+    let um_per_unit = match children(&root, "unit")
+        .first()
+        .and_then(|unit| unit.get(1))
+        .and_then(SexpNode::as_str)
+    {
+        Some(unit) if unit.eq_ignore_ascii_case("um") => 1.0,
+        Some(unit) if unit.eq_ignore_ascii_case("mm") => 1000.0,
+        _ => return BTreeMap::new(),
+    };
+    let mut radii = BTreeMap::new();
+    for library in children(&root, "library") {
+        for padstack in children(&library, "padstack") {
+            let Some(name) = padstack.get(1).and_then(SexpNode::as_str) else {
+                continue;
+            };
+            let mut smallest: Option<f64> = None;
+            let mut only_circles = true;
+            for shape in children(&padstack, "shape") {
+                for form in shape.children().unwrap_or(&[]).iter().skip(1) {
+                    if !named(form, "circle") {
+                        only_circles = false;
+                        continue;
+                    }
+                    match dsn_number(form, 2, "padstack circle diameter") {
+                        Ok(diameter) if diameter > 0.0 => {
+                            smallest = Some(smallest.map_or(diameter, |least| least.min(diameter)));
+                        }
+                        _ => only_circles = false,
+                    }
+                }
+            }
+            if let (true, Some(diameter)) = (only_circles, smallest) {
+                radii.insert(
+                    name.to_string(),
+                    (diameter * um_per_unit / 2.0).floor() as i64,
+                );
+            }
+        }
+    }
+    radii
+}
+
 /// The conduction areas a DSN gives the router, read from the DSN itself, so
 /// a DSN with no manifest beside it is judged the same way: every
 /// `(structure (plane NET shape))`, and every wire of the `wiring` whose shape
@@ -2457,6 +2526,92 @@ pub(crate) fn dsn_net_names(dsn: &str) -> Result<Vec<String>> {
             .filter(|n| is(n, "net"))
         {
             let name = dsn_atom(net, 1, "network net name")?.to_string();
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The root of a DSN for the Row LT readers: its S-expression, which must be a `pcb`.
+fn pcb_root(dsn: &str) -> Result<SexpNode> {
+    let root = parse_dsn_sexp(dsn)
+        .map_err(|_| anyhow::anyhow!("the DSN is not a readable S-expression"))?;
+    if root
+        .head()
+        .is_none_or(|head| !head.eq_ignore_ascii_case("pcb"))
+    {
+        bail!("the DSN's root is not 'pcb'");
+    }
+    Ok(root)
+}
+
+/// The children of `node` whose keyword is `name`, in any letter case.
+fn keyword_children<'a>(node: &'a SexpNode, name: &str) -> Vec<&'a SexpNode> {
+    node.children()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|child| {
+            child
+                .head()
+                .is_some_and(|head| head.eq_ignore_ascii_case(name))
+        })
+        .collect()
+}
+
+/// Row LT: the layers of a DSN's `structure`, as the DSN names them, in file order,
+/// which is how fastroute numbers them. Refused when a layer has no
+/// `(property (index N))` or the file order is not the index order: a height list
+/// read against the wrong layers would count vias wrongly without any error.
+/// Keywords match in any letter case; a DSN that does not parse is an error.
+pub(crate) fn dsn_layer_names(dsn: &str) -> Result<Vec<String>> {
+    let root = pcb_root(dsn)?;
+    let mut names: Vec<String> = Vec::new();
+    for structure in keyword_children(&root, "structure") {
+        for layer in keyword_children(structure, "layer") {
+            let name = dsn_atom(layer, 1, "layer name")?.to_string();
+            let index = keyword_children(layer, "property")
+                .into_iter()
+                .flat_map(|property| keyword_children(property, "index"))
+                .next()
+                .with_context(|| format!("the DSN layer '{name}' has no (property (index N))"))?;
+            let index = dsn_atom(index, 1, "layer index")?
+                .parse::<usize>()
+                .with_context(|| {
+                    format!("the index of the DSN layer '{name}' is not an integer")
+                })?;
+            if index != names.len() {
+                bail!(
+                    "the DSN lists layer '{name}' at position {} with index {index}: its file \
+                     order is not its index order",
+                    names.len()
+                );
+            }
+            if names.contains(&name) {
+                bail!("the DSN lists the layer '{name}' twice");
+            }
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Row LT: the net classes of a DSN's `network` (`(class NAME net …)`), in file
+/// order, each once: what the Tune pass lists in
+/// `--router.autorouter.ignore_net_classes`. A class name holding a comma cannot be
+/// listed (fastroute splits the value at commas); it is left out, and the Tune
+/// pass's other-net check (L6) still guards its nets.
+pub(crate) fn dsn_class_names(dsn: &str) -> Result<Vec<String>> {
+    let root = pcb_root(dsn)?;
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    for network in keyword_children(&root, "network") {
+        for class in keyword_children(network, "class") {
+            let name = dsn_atom(class, 1, "network class name")?.to_string();
+            if name.contains(',') {
+                continue;
+            }
             if seen.insert(name.clone()) {
                 names.push(name);
             }
@@ -4908,6 +5063,10 @@ mod hole_clearance_tests;
 #[cfg(test)]
 #[path = "specctra_pours_tests.rs"]
 mod pours_tests;
+
+#[cfg(test)]
+#[path = "specctra_lengths_tests.rs"]
+mod lengths_tests;
 
 #[cfg(test)]
 #[path = "specctra_custom_pad_tests.rs"]

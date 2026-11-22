@@ -122,6 +122,25 @@ Differential pairs declared in the design intent
 (`interfaces[].differential_pairs`) are routed coupled. The routing result lists
 them, and any pair it left out with the reason.
 
+## Matched lengths
+
+Nets that must have matched lengths are declared in the design intent
+(`interfaces[].length_groups`, and `max_skew_mm` on a pair). fastroute lengthens
+the short nets with serpentines, and the judge measures every checked net with
+KiCad. A group that cannot be applied refuses the call before anything is routed.
+The judge compares every tuned board with the same run's untuned board and keeps
+the tuned one only when it is no worse (no more open connections, DRC violations,
+width failures or tracks below their floor) and ranks better; a net whose serpentines touch its own copper is left untuned. A
+checked net whose copper crosses or overlaps itself, or that KiCad reports as
+dangling or unconnected, fails the length gate, because KiCad's length would count
+copper the signal does not travel. The routing result carries `length_matching`
+(what was asked, each net's length and miss, the nets left untuned and why, and the
+tuned boards the judge saw) and, in `completion.next_steps`, the KiCad rules that keep
+checking it. A winner that misses a window has `status`
+`complete_with_gate_failures`.
+Freerouting does not tune lengths and says so. The design:
+`docs/LENGTH_TUNING_DESIGN.md`.
+
 ## Change the fastroute build
 
 Edit `packaging/1-kopper/fastroute.json` (`build`, `engine_commit`, `sha256`) in

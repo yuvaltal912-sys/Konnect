@@ -160,6 +160,7 @@ fn measures(unconnected: usize, signal_mm: f64) -> Measures {
         longest_below_mm: BTreeMap::new(),
         stitching_vias: 0,
         route_s: 10.0,
+        lengths: None,
     }
 }
 
@@ -169,6 +170,7 @@ fn routed(unconnected: usize, signal_mm: f64) -> RouteResult {
             g1: Vec::new(),
             g2: Vec::new(),
             g3: Vec::new(),
+            g4: Vec::new(),
         },
         measures: measures(unconnected, signal_mm),
         unrouted: BTreeMap::new(),
@@ -190,6 +192,8 @@ enum Step {
     /// Routed, with a G1 line that names a net and an unrouted check that has a
     /// `clearance` entry.
     Diagnosed,
+    /// Routed, with a G4 line that names a net: a length window was missed.
+    LengthMissed,
 }
 
 struct Shared {
@@ -251,9 +255,22 @@ impl RouteCall for Fake {
                         g1: vec!["net SECRETNET is not fully routed".to_string()],
                         g2: Vec::new(),
                         g3: Vec::new(),
+                        g4: Vec::new(),
                     },
                     measures: measures(0, 100.0),
                     unrouted: BTreeMap::from([("clearance".to_string(), 3)]),
+                    status: "ok".into(),
+                    call: json!({"engine": {"name": "fake"}, "effort": "m"}),
+                },
+                Step::LengthMissed => RouteResult::Routed {
+                    gates: Gates {
+                        g1: Vec::new(),
+                        g2: Vec::new(),
+                        g3: Vec::new(),
+                        g4: vec!["group 'dq': SECRETNET is 41.20 mm, 0.62 mm below".to_string()],
+                    },
+                    measures: measures(0, 100.0),
+                    unrouted: BTreeMap::new(),
                     status: "ok".into(),
                     call: json!({"engine": {"name": "fake"}, "effort": "m"}),
                 },
@@ -1429,6 +1446,58 @@ async fn the_table_prints_a_code_for_a_stop_never_the_reason() {
     search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
     let table_text = std::fs::read_to_string(setup.plan.folder.join("table.md")).unwrap();
     assert!(!table_text.contains("Routing stopped"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_table_has_a_g4_column_and_a_length_miss_fails_it() {
+    let setup = setup(100_000);
+    let outcome = search(&setup.plan, Arc::new(fake(10, |_, _| Step::LengthMissed)))
+        .await
+        .unwrap();
+    let table_text = table(&setup.plan, &outcome);
+    let header = table_text
+        .lines()
+        .find(|line| line.starts_with("| rank |"))
+        .unwrap();
+    let columns: Vec<&str> = header
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let g4 = columns
+        .iter()
+        .position(|column| *column == "G4")
+        .expect("a G4 column");
+    assert_eq!(columns[g4 - 1], "G3");
+    let row = table_text
+        .lines()
+        .skip_while(|line| !line.starts_with("| rank |"))
+        .nth(2)
+        .expect("a routed row");
+    let cells: Vec<&str> = row
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    assert_eq!(cells.len(), columns.len(), "{header}\n{row}");
+    assert_eq!(cells[g4], "fail", "{row}");
+    assert_eq!(cells[g4 - 1], "pass", "G3 is not what failed: {row}");
+    // The line that names a net stays out of the counts-only table.
+    assert!(!table_text.contains("SECRETNET"), "{table_text}");
+    // Negative control: a candidate with no length miss passes the column.
+    let outcome = search(&setup.plan, Arc::new(fake(10, good))).await.unwrap();
+    let table_text = table(&setup.plan, &outcome);
+    let row = table_text
+        .lines()
+        .skip_while(|line| !line.starts_with("| rank |"))
+        .nth(2)
+        .unwrap();
+    let cells: Vec<&str> = row
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    assert_eq!(cells[g4], "pass", "{row}");
 }
 
 #[tokio::test(start_paused = true)]
