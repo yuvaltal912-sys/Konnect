@@ -3,8 +3,9 @@
 Status: research, and a design down to function skeletons, 2026-11-22. Nothing is built. Nothing
 new was measured: every number below comes from a recorded run and names its record. Designed
 in a Claude Fable 5.2 session; reviewed by an agent that did not write it, and corrected from
-its findings (see "Verification of this document"). Branch `claude/zone-router-research`, from
-`fork/main` `517eebf0`. Engine facts are from fastroute `61d6e45` (branch `ft-design`: the
+its findings (see "Verification of this document"). Merged as #102 (main `7bd3f77b`); written
+on branch `claude/zone-router-research`, from `fork/main` `517eebf0`. No stage has started: each
+waits for the owner's word. Engine facts are from fastroute `61d6e45` (branch `ft-design`: the
 pinned x18, `1e94751`, plus row FT). KiCad facts are from the KiCad 10.0.1 source.
 
 ## What the owner asked for
