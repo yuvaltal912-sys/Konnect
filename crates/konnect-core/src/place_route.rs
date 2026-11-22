@@ -89,8 +89,7 @@ fn project_clearance_um(board: &Path, key: &str) -> Option<i64> {
 /// The options `export_specctra_dsn` builds for `board` with its defaults: pours
 /// `fixed`, `min_copper_edge_clearance` and `min_hole_clearance` from the
 /// `.kicad_pro` beside it, widths from intent on, duplicate references refused.
-// Used only by the bench (an ignored test): no product code calls the search.
-#[allow(dead_code)]
+// The bench and `plan_convergent_placement` (Row CT).
 pub(crate) fn export_options(board: &Path) -> ExportOptions {
     ExportOptions {
         // The handler's `PourPolicy::from_argument(None)`.
@@ -158,8 +157,7 @@ fn block_head(block: &str) -> &str {
 /// The input board with every top-level `(segment …)`, `(arc …)` and `(via …)` and
 /// every teardrop zone removed, each with the whitespace before it; every other byte
 /// kept. Quote-aware block scanning. Errs on text that does not parse as a board.
-// Used only by the bench (an ignored test): no product code calls the search.
-#[allow(dead_code)]
+// The bench and `plan_convergent_placement` (Row CT).
 pub(crate) fn strip_routing(text: &str) -> anyhow::Result<String> {
     let tree = konnect_sexp::parse_sexp(text).context("the board text does not parse")?;
     anyhow::ensure!(
@@ -444,8 +442,7 @@ pub(crate) fn unrouted_counts(
 ///
 /// The router is `ToolRouter::new()`: the judge resolves its tools in the static
 /// registry (`route_judge`'s `find_tool`), so no toolset has to be loaded.
-// Used only by the bench (an ignored test): no product code calls the search.
-#[allow(dead_code)]
+// The bench and `plan_convergent_placement` (Row CT).
 pub(crate) fn isolated_context(folder: &Path, kicad_cli: &str) -> anyhow::Result<Arc<ToolContext>> {
     anyhow::ensure!(
         folder.is_absolute(),

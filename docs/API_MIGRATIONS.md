@@ -4108,3 +4108,18 @@ open, falling back to the saved file otherwise. Scoring policy and every existin
 field are unchanged; the response adds `source`, either `"ipc"` or `"saved_file"`
 (matching `run_drc`'s own source-disclosure convention), so a caller can tell
 which board state was judged.
+
+## Unreleased: `plan_convergent_placement`, a whole-board placement plan (minor release)
+
+A new read-only tool in the `placement` toolset (Row CT,
+[`CONVERGENT_PLACEMENT_TOOL_DESIGN.md`](CONVERGENT_PLACEMENT_TOOL_DESIGN.md)). For a
+board open in KiCad it runs the placement bench's convergent search on a scratch copy:
+KiCad's locked footprints stay, every other part may move and turn, the first three
+candidates are routed with fastroute at `effort` (default `m`) and the winner is named
+by the bench's gates and rank key. The response's `apply_with` holds the winner as
+exact `set_component_placements` arguments; the tool applies nothing. Arguments:
+`board` (required), `effort`, `fastroute_path`. The board must be the only one open
+in KiCad. `status`: `planned`, `planned_with_gate_failures`, `no_candidate`,
+`not_routed`. `planned_from` names the board state the plan is for (the live text's
+SHA-256 and its count of tracks, arcs, vias and teardrop zones). No existing tool or field changed; the
+`placement` toolset now lists 7 tools.

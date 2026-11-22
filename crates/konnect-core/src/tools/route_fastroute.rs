@@ -562,7 +562,8 @@ fn with_fields(mut result: CallToolResult, fields: Vec<(&str, Value)>) -> CallTo
 }
 
 /// The error result for a binary that cannot be used, with the setup steps.
-fn unavailable_result(located: &Located) -> CallToolResult {
+/// `plan_convergent_placement` refuses with it too.
+pub(crate) fn unavailable_result(located: &Located) -> CallToolResult {
     let (kind, message) = match located {
         Located::NotConfigured { default_path } => (
             ToolErrorKind::FileNotFound {

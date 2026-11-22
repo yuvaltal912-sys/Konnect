@@ -89,7 +89,7 @@ fn force_params() -> ForceParams {
 }
 
 /// 8 + 8 + 8 recipes.
-fn small_matrix() -> Matrix {
+pub(crate) fn small_matrix() -> Matrix {
     Matrix {
         force_seeds: (1..=8).collect(),
         force: vec![force_params()],
@@ -181,7 +181,7 @@ fn routed(unconnected: usize, signal_mm: f64) -> RouteResult {
 
 /// What the fake router does on its n-th call (from 0).
 #[derive(Clone)]
-enum Step {
+pub(crate) enum Step {
     Routed {
         unconnected: usize,
         signal_mm: f64,
@@ -208,9 +208,31 @@ struct Shared {
     unrouted: Result<BTreeMap<String, usize>, String>,
 }
 
-struct Fake(Arc<Shared>);
+pub(crate) struct Fake(Arc<Shared>);
 
-fn fake(wall_s: u64, steps: impl Fn(usize, usize) -> Step + Send + Sync + 'static) -> Fake {
+impl Fake {
+    /// The same router, whose unrouted check of the input board fails.
+    pub(crate) fn with_failing_input_check(mut self) -> Self {
+        Arc::get_mut(&mut self.0).unwrap().unrouted = Err("kicad-cli is missing".into());
+        self
+    }
+
+    /// The ids of the candidates the routing phase called, in call order.
+    pub(crate) fn called_ids(&self) -> Vec<usize> {
+        self.0
+            .starts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect()
+    }
+}
+
+pub(crate) fn fake(
+    wall_s: u64,
+    steps: impl Fn(usize, usize) -> Step + Send + Sync + 'static,
+) -> Fake {
     fake_walls(move |_| wall_s, steps)
 }
 
@@ -301,13 +323,13 @@ impl RouteCall for Fake {
     }
 }
 
-struct Setup {
+pub(crate) struct Setup {
     _dir: tempfile::TempDir,
-    root: PathBuf,
-    plan: Plan,
+    pub(crate) root: PathBuf,
+    pub(crate) plan: Plan,
 }
 
-fn setup(time_limit_s: u64) -> Setup {
+pub(crate) fn setup(time_limit_s: u64) -> Setup {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let input = root.join("input");
@@ -336,6 +358,8 @@ fn setup(time_limit_s: u64) -> Setup {
         ai_board: None,
         caller_held: BTreeSet::new(),
         hold: HoldRules::default(),
+        schematic: None,
+        routed: Routed::Every,
     };
     std::fs::create_dir_all(&plan.folder).unwrap();
     Setup {
@@ -368,7 +392,7 @@ fn count(outcome: &Outcome, name: &str) -> usize {
     outcome.records.iter().filter(|r| r.outcome == name).count()
 }
 
-fn good(_n: usize, _id: usize) -> Step {
+pub(crate) fn good(_n: usize, _id: usize) -> Step {
     Step::Routed {
         unconnected: 0,
         signal_mm: 100.0,
@@ -1905,7 +1929,7 @@ fn the_search_never_writes_the_input_board() {
 /// Writes the schematic of the fixture board next to it (`input/board.kicad_sch`): a flat
 /// sheet, U1 with its capacitors close together, the resistors in a chain, J1 and H1 apart.
 /// The fixture's footprints carry no path, so they match by reference.
-fn write_schematic(setup: &Setup) {
+pub(crate) fn write_schematic(setup: &Setup) {
     let at = [
         ("U1", 0.0, 0.0),
         ("C1", 5.0, 0.0),
@@ -2085,7 +2109,7 @@ async fn the_measure_does_not_change_a_key_or_a_rank() {
 
 /// The measured parameters at `level` with 20 proposals per part and stage, not 200, as
 /// the whole-run tests of `place_converge` use them: only the stage length differs.
-fn quick(level: u32) -> ConvergeParams {
+pub(crate) fn quick(level: u32) -> ConvergeParams {
     ConvergeParams {
         stage_per_part: 20,
         ..ConvergeParams::measured(level)
@@ -2765,6 +2789,8 @@ fn outcome_of(records: Vec<Record>, converge: Option<OuterTrace>) -> Outcome {
         clearances: Clearances::default(),
         input_unrouted: BTreeMap::new(),
         converge,
+        model: model(),
+        schematic_reason: None,
     }
 }
 
@@ -2986,4 +3012,83 @@ async fn family_c_runs_without_a_readable_schematic_and_its_records_rerun() {
         refused.contains("other schematic neighbourhoods"),
         "{refused}"
     );
+}
+
+// ─── Row CT: the tool's two seams ────────────────────────────────────────────
+
+/// The setup's plan with family C on at the reduced stage length, no reference call, and
+/// `routed` as given.
+fn converging(setup: &mut Setup, routed: Routed) {
+    setup.plan.matrix = small_matrix().only(&[Family::Force, Family::Schematic, Family::Converge]);
+    setup.plan.matrix.converge = Some((quick(0), OuterRule::measured()));
+    setup.plan.reference_calls = 0;
+    setup.plan.drawn_per_family = 0;
+    setup.plan.routed = routed;
+}
+
+#[tokio::test(start_paused = true)]
+async fn converge_only_routes_family_c_alone_and_screens_every_other_record_out() {
+    let mut setup = setup(100_000);
+    converging(&mut setup, Routed::ConvergeOnly);
+    let router = Arc::new(fake(10, good));
+    let outcome = search(&setup.plan, router.clone()).await.unwrap();
+    let called = router.called_ids();
+    let group = |id: usize| outcome.records.iter().find(|r| r.id == id).unwrap().group();
+    assert!(!called.is_empty(), "family C's candidates are routed");
+    assert!(called.len() <= setup.plan.best_per_family, "{called:?}");
+    assert!(called.iter().all(|&id| group(id) == "C"), "{called:?}");
+    for record in outcome.records.iter().filter(|r| r.group() != "C") {
+        assert_ne!(
+            record.outcome,
+            "routed",
+            "record {} of {}",
+            record.id,
+            record.group()
+        );
+        assert!(record.judged.is_none());
+    }
+    let file = search_json(&setup.plan, &outcome);
+    assert_eq!(file["plan"]["routed"], "converge_only");
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_routes_the_other_families_too_and_its_file_is_unchanged() {
+    // The bench's switch, with the same plan otherwise: F's and S's best are routed, and
+    // `search.json` carries none of the tool's keys.
+    let mut setup = setup(100_000);
+    converging(&mut setup, Routed::Every);
+    let router = Arc::new(fake(10, good));
+    let outcome = search(&setup.plan, router.clone()).await.unwrap();
+    let called = router.called_ids();
+    let group = |id: usize| outcome.records.iter().find(|r| r.id == id).unwrap().group();
+    assert!(
+        called.iter().any(|&id| matches!(group(id), "F" | "S")),
+        "{called:?}"
+    );
+    assert!(called.iter().any(|&id| group(id) == "C"), "{called:?}");
+    let file = search_json(&setup.plan, &outcome);
+    assert!(file["plan"].get("routed").is_none());
+    assert!(file["plan"].get("schematic").is_none());
+}
+
+#[test]
+fn a_named_schematic_root_is_the_one_family_c_reads() {
+    // The setup writes no schematic beside the board: without a name the measure has a
+    // reason and C has no neighbourhoods; with the root named elsewhere it reads that one.
+    let mut setup = setup(100_000);
+    let (model, schematic) = search_model(&setup.plan).unwrap();
+    assert!(model.hoods.is_none());
+    assert!(schematic.unwrap_err().contains("board.kicad_sch"));
+
+    write_schematic(&setup);
+    let elsewhere = setup.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let written = setup.root.join("input").join("board.kicad_sch");
+    let root = elsewhere.join("named.kicad_sch");
+    std::fs::rename(&written, &root).unwrap();
+    setup.plan.schematic = Some(root.clone());
+    let (model, schematic) = search_model(&setup.plan).unwrap();
+    assert!(schematic.is_ok(), "{:?}", schematic.err());
+    assert!(model.hoods.is_some());
+    assert!(!written.exists(), "nothing was read beside the board");
 }

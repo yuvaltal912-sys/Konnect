@@ -161,7 +161,7 @@ fn pcb_layout_says_which_tools_honour_a_footprint_lock() {
         &outline_step,
         &[
             "set_footprint_lock",
-            "Only `auto_place_from_schematic` and `refine_placement_force_directed` hold",
+            "Only `auto_place_from_schematic`, `refine_placement_force_directed` and `plan_convergent_placement` hold",
             "`move_component`",
             "`set_component_placements`",
             "do not check the lock",
