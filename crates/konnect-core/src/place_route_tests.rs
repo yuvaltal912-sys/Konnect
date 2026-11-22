@@ -502,6 +502,7 @@ fn finished(gates: Gates) -> Finished {
             seconds: 12.3,
             untuned: None,
             tune: Default::default(),
+            group_search: None,
         },
         planes: vec![],
         folder: run,

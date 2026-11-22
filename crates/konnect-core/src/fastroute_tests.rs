@@ -35,6 +35,7 @@ fn args_of(pass: &Pass, hints: &RoutingHints, amps: Option<&Path>) -> Vec<String
             amps,
             pairs: None,
             layer_heights: None,
+            uncounted: None,
         },
     )
 }
@@ -90,7 +91,156 @@ fn pass_arguments_follow_the_documented_order() {
         .map(|s| s.to_string()),
     );
     expected.extend(CANDIDATE_SWITCHES.iter().map(|s| s.to_string()));
+    expected.extend(SEARCH_SWITCHES.iter().map(|s| s.to_string()));
     assert_eq!(args, expected);
+}
+
+/// Row GS: the three smart-router switches, as the design names them, none of them
+/// a candidate switch.
+#[test]
+fn the_search_switches_are_s1_f1_and_the_group_search_in_this_order() {
+    assert_eq!(
+        SEARCH_SWITCHES,
+        ["--x.oct_bound", "--x.opt_follow_rips=2", "--x.group_search"]
+    );
+    for switch in SEARCH_SWITCHES {
+        assert!(!CANDIDATE_SWITCHES.contains(switch), "{switch}");
+    }
+    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS");
+}
+
+/// Row GS, G1: Full, Fallback and Polish each send every search switch once, right
+/// after the candidate switches, whatever per-call files the line carries.
+#[test]
+fn every_routing_pass_sends_the_search_switches_right_after_the_candidate_switches() {
+    let uncounted = Path::new("/d/with space/uncounted.txt");
+    for pass in [
+        pass("full", 0.0, true, None),
+        pass("fallback", 120.0, false, Some("/d/full.ses")),
+        pass("polish", 0.0, true, Some("/d/fallback.ses")),
+    ] {
+        for files in [
+            CallFiles::default(),
+            CallFiles {
+                amps: Some(Path::new("/d/amps.txt")),
+                pairs: Some(Path::new("/d/pairs.txt")),
+                layer_heights: Some("0,1.58"),
+                uncounted: Some(uncounted),
+            },
+        ] {
+            let args = args_with(&pass, &hints(Some(250), Some(120)), files);
+            let last_candidate = args
+                .iter()
+                .position(|token| token == CANDIDATE_SWITCHES.last().unwrap())
+                .unwrap();
+            let search: Vec<&str> = args
+                [last_candidate + 1..last_candidate + 1 + SEARCH_SWITCHES.len()]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(search, SEARCH_SWITCHES, "{}: {args:?}", pass.name);
+            for switch in SEARCH_SWITCHES {
+                assert_eq!(
+                    args.iter().filter(|token| token == switch).count(),
+                    1,
+                    "{}: {switch}",
+                    pass.name
+                );
+            }
+        }
+    }
+}
+
+/// Row GS: `routing_switches` (the result's `engine.switches`) is exactly the fixed
+/// switches a routing pass sends, in the order it sends them.
+#[test]
+fn the_routing_switches_are_the_fixed_switches_of_a_routing_line_in_order() {
+    let switches = routing_switches();
+    let mut expected: Vec<&str> = CANDIDATE_SWITCHES.to_vec();
+    expected.extend(SEARCH_SWITCHES);
+    assert_eq!(switches, expected);
+    let args = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    let sent: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|token| token.starts_with("--x.") || *token == "--no-time-limits")
+        .collect();
+    assert_eq!(sent, switches);
+}
+
+/// Row GS, G2: the probe's step 2 sends every switch Konnect sends, in the routing
+/// line's order, then the uncounted file, and the sentinel last: fastroute stops at the
+/// first unknown switch, so a switch after the sentinel would never be checked.
+#[test]
+fn the_probe_line_sends_every_switch_then_the_uncounted_file_and_the_sentinel_last() {
+    let scratch = Path::new("/s/probe");
+    let args = probe_arguments(scratch);
+    let mut expected = vec!["-de".to_string(), "/s/probe/absent.dsn".to_string()];
+    expected.extend(routing_switches().iter().map(|switch| switch.to_string()));
+    expected.push(format!("--x.gs_uncounted=/s/probe/{PROBE_UNCOUNTED}"));
+    expected.push(SENTINEL_SWITCH.to_string());
+    assert_eq!(args, expected);
+    assert_eq!(args.last().map(String::as_str), Some(SENTINEL_SWITCH));
+    assert_eq!(
+        args.iter()
+            .filter(|token| *token == SENTINEL_SWITCH)
+            .count(),
+        1
+    );
+}
+
+/// Row GS, G3: `--x.gs_uncounted` is sent only when the call has the file, as one
+/// token, after the amps file and before the pairs file and the initial session.
+#[test]
+fn the_uncounted_switch_is_present_only_when_given_after_the_amps_file() {
+    let none = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    assert!(!none
+        .iter()
+        .any(|token| token.starts_with("--x.gs_uncounted")));
+    let uncounted = Path::new("/d/with space/uncounted.txt");
+    let some = args_with(
+        &pass("fallback", 120.0, false, Some("/d/full.ses")),
+        &hints(None, None),
+        CallFiles {
+            amps: Some(Path::new("/d/amps.txt")),
+            pairs: Some(Path::new("/d/pairs.txt")),
+            layer_heights: None,
+            uncounted: Some(uncounted),
+        },
+    );
+    assert_eq!(
+        value(&some, "--x.gs_uncounted="),
+        Some("/d/with space/uncounted.txt")
+    );
+    assert_eq!(
+        some.iter()
+            .filter(|token| token.starts_with("--x.gs_uncounted"))
+            .count(),
+        1
+    );
+    assert!(!some
+        .iter()
+        .any(|token| token == "/d/with space/uncounted.txt"));
+    let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
+    assert!(at("--x.group_search") < at("--x.par_via_amps="));
+    assert!(at("--x.par_via_amps=") < at("--x.gs_uncounted="));
+    assert!(at("--x.gs_uncounted=") < at("--pairs="));
+    assert!(at("--pairs=") < at("--initial-session="));
+    // Without it the rest of the line is the same.
+    let only = args_with(
+        &pass("full", 0.0, true, None),
+        &hints(None, None),
+        CallFiles {
+            uncounted: Some(uncounted),
+            ..CallFiles::default()
+        },
+    );
+    let without: Vec<&String> = only
+        .iter()
+        .filter(|token| !token.starts_with("--x.gs_uncounted"))
+        .collect();
+    let plain = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
+    assert_eq!(without, plain.iter().collect::<Vec<_>>());
 }
 
 #[test]
@@ -115,6 +265,7 @@ fn every_pass_kind_sends_each_setting_once_and_nothing_forbidden() {
                     amps,
                     pairs,
                     layer_heights: None,
+                    uncounted: None,
                 },
             );
             let mut seen = HashSet::new();
@@ -132,7 +283,11 @@ fn every_pass_kind_sends_each_setting_once_and_nothing_forbidden() {
                     );
                 }
             }
-            for switch in CANDIDATE_SWITCHES.iter().chain(PRESET.iter()) {
+            for switch in CANDIDATE_SWITCHES
+                .iter()
+                .chain(SEARCH_SWITCHES.iter())
+                .chain(PRESET.iter())
+            {
                 assert_eq!(
                     args.iter()
                         .filter(|token| token.as_str() == *switch)
@@ -206,6 +361,7 @@ fn pairs_switch_is_present_only_when_given() {
             amps: Some(amps),
             pairs: Some(pairs),
             layer_heights: None,
+            uncounted: None,
         },
     );
     assert_eq!(value(&some, "--pairs="), Some("/d/with space/pairs.txt"));
@@ -227,6 +383,7 @@ fn pairs_switch_is_present_only_when_given() {
             amps: None,
             pairs: Some(pairs),
             layer_heights: None,
+            uncounted: None,
         },
     );
     assert_eq!(value(&only, "--pairs="), Some("/d/with space/pairs.txt"));
@@ -334,6 +491,114 @@ fn amps_file_is_none_without_a_usable_row() {
         ]))),
         None
     );
+}
+
+// ---- uncounted_file_text (Row GS, G3) ---------------------------------------
+
+fn pours(nets: &[Value]) -> Value {
+    json!({ "pours": nets.iter().map(|net| json!({ "net": net, "layer": "F.Cu" })).collect::<Vec<_>>() })
+}
+
+/// The judge's pour nets, one a line, each once, sorted: two pours of one net give
+/// one line.
+#[test]
+fn the_uncounted_file_lists_each_pour_net_once_sorted() {
+    assert_eq!(
+        uncounted_file_text(&pours(&[json!("VBUS"), json!("GND"), json!("GND")])),
+        Some("GND\nVBUS\n".to_string())
+    );
+    // The fixture's two GND pours, as the export writes them.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/specctra_pours_routing.dsn.konnect.json"
+    ))
+    .unwrap();
+    assert_eq!(uncounted_file_text(&fixture), Some("GND\n".to_string()));
+}
+
+/// No pour, or no name fastroute would read as that net: no file.
+#[test]
+fn the_uncounted_file_is_none_without_a_pour() {
+    assert_eq!(uncounted_file_text(&json!({})), None);
+    assert_eq!(uncounted_file_text(&pours(&[])), None);
+    assert_eq!(uncounted_file_text(&json!({ "pours": {} })), None);
+    assert_eq!(
+        uncounted_file_text(&json!({ "pours": [{ "layer": "F.Cu" }, { "net": 3 }] })),
+        None
+    );
+    assert_eq!(
+        uncounted_file_text(&pours(&[json!(""), json!("A\nB"), json!("C\r")])),
+        None
+    );
+}
+
+/// fastroute trims each line and skips `#` lines (`exp::parse_net_names`): a name
+/// with a line break, white space at an end, or a leading `#` is left out; white
+/// space inside a name is kept.
+#[test]
+fn the_uncounted_file_leaves_out_what_fastroute_would_read_as_another_name() {
+    let text = uncounted_file_text(&pours(&[
+        json!("GND"),
+        json!("A\nB"),
+        json!("C\rD"),
+        json!(" LEAD"),
+        json!("TRAIL "),
+        json!("TAB\t"),
+        json!("#HASH"),
+        json!("Net (U1-Pad2)"),
+        json!("/sheet/AGND"),
+    ]))
+    .unwrap();
+    assert_eq!(text, "/sheet/AGND\nGND\nNet (U1-Pad2)\n");
+    // A `#` inside a name is no comment.
+    assert_eq!(
+        uncounted_file_text(&pours(&[json!("A#1")])),
+        Some("A#1\n".to_string())
+    );
+}
+
+/// fastroute matches uncounted names ignoring case: a pour net whose name another,
+/// counted net of the manifest repeats in another letter case is left out (counted),
+/// so that the other net is not left out of the cost with it. Two pours that differ by
+/// case are both pour nets, and both are written.
+#[test]
+fn the_uncounted_file_leaves_out_a_pour_net_another_net_repeats_in_another_case() {
+    let manifest = |nets: &[&str], pours_of: &[&str]| -> Value {
+        let mut manifest = pours(&pours_of.iter().map(|net| json!(net)).collect::<Vec<_>>());
+        manifest["nets"] = json!(nets
+            .iter()
+            .map(|name| json!({ "name": name, "pins": [] }))
+            .collect::<Vec<_>>());
+        manifest
+    };
+    assert_eq!(
+        uncounted_file_text(&manifest(&["GND", "gnd", "VBUS", "S1"], &["GND", "VBUS"])),
+        Some("VBUS\n".to_string())
+    );
+    assert_eq!(
+        uncounted_file_text(&manifest(&["Agnd", "AGND"], &["AGND"])),
+        None
+    );
+    // Final and plain sigma differ in lower case and agree in upper case; Java's
+    // `compareToIgnoreCase` takes them as one letter, so this is a collision too.
+    assert_eq!(
+        uncounted_file_text(&manifest(&["ΣNET", "ςNET"], &["ΣNET"])),
+        None
+    );
+    // Control: no other net in another case, or the other one is a pour too.
+    assert_eq!(
+        uncounted_file_text(&manifest(&["GND", "VBUS", "S1"], &["GND", "VBUS"])),
+        Some("GND\nVBUS\n".to_string())
+    );
+    assert_eq!(
+        uncounted_file_text(&manifest(&["GND", "gnd"], &["GND", "gnd"])),
+        Some("GND\ngnd\n".to_string())
+    );
+    // The fixture's own nets: GND only once, so it stays.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/specctra_pours_routing.dsn.konnect.json"
+    ))
+    .unwrap();
+    assert_eq!(uncounted_file_text(&fixture), Some("GND\n".to_string()));
 }
 
 // ---- sandbox_profile ------------------------------------------------------
@@ -490,6 +755,7 @@ fn the_layer_heights_switch_is_one_token_after_pairs_and_only_when_given() {
                 amps: Some(Path::new("/d/amps.txt")),
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: Some("0,1.58"),
+                uncounted: None,
             },
         );
         let at = |prefix: &str| with.iter().position(|token| token.starts_with(prefix));
@@ -513,6 +779,7 @@ fn the_layer_heights_switch_is_one_token_after_pairs_and_only_when_given() {
                 amps: Some(Path::new("/d/amps.txt")),
                 pairs: None,
                 layer_heights: Some("0,1.58"),
+                uncounted: None,
             },
         );
         let heights_at = heights_only
@@ -536,6 +803,7 @@ fn tune_pass_arguments_follow_the_documented_order() {
             amps: Some(Path::new("/d/amps.txt")),
             pairs: None,
             layer_heights: Some("0,1.58"),
+            uncounted: None,
         },
         &class_list(&["konnect_class_0001", "power"]),
         Some("0,1.58"),
@@ -603,6 +871,7 @@ fn tune_pass_arguments_leave_out_what_is_not_given_and_never_send_a_forbidden_se
                 amps,
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: heights,
+                uncounted: None,
             },
             &classes,
             heights,
@@ -668,6 +937,41 @@ fn tune_pass_arguments_leave_out_what_is_not_given_and_never_send_a_forbidden_se
     );
 }
 
+/// Row GS, G1: a Tune pass, of either variant, never sends a search switch nor the
+/// uncounted file, even when the call's files hold one.
+#[test]
+fn the_tune_line_holds_no_search_switch_and_no_uncounted_file() {
+    let nets = names(&["A"]);
+    let classes = class_list(&["a"]);
+    for variant in [TuneVariant::Free, TuneVariant::PourSafe] {
+        let args = tune_pass_arguments(
+            Path::new("/d/in.dsn"),
+            Path::new("/d/out.ses"),
+            Path::new("/d/out.json"),
+            &hints(Some(500), Some(120)),
+            CallFiles {
+                amps: Some(Path::new("/d/amps.txt")),
+                pairs: Some(Path::new("/d/pairs.txt")),
+                layer_heights: Some("0,1.58"),
+                uncounted: Some(Path::new("/d/uncounted.txt")),
+            },
+            variant,
+            &tune_inputs(Path::new("/d/tune.txt"), &classes, &nets, Some("0,1.58")),
+            Path::new("/d/held.ses"),
+        );
+        for token in &args {
+            let key = key(token);
+            assert!(
+                !SEARCH_SWITCHES
+                    .iter()
+                    .any(|switch| self::key(switch) == key),
+                "{variant:?}: {token}"
+            );
+            assert!(!token.starts_with("--x.gs_"), "{variant:?}: {token}");
+        }
+    }
+}
+
 /// The Tune line and the Polish line (the routing pass nearest to it: the optimizer
 /// on, no neck) differ in exactly the Tune pass's settings and nothing else.
 #[test]
@@ -676,6 +980,7 @@ fn the_polish_line_differs_from_the_tune_line_in_exactly_the_tune_settings() {
         amps: Some(Path::new("/d/amps.txt")),
         pairs: Some(Path::new("/d/pairs.txt")),
         layer_heights: Some("0,1.58"),
+        uncounted: Some(Path::new("/d/uncounted.txt")),
     };
     let hint = hints(Some(500), Some(120));
     let polish = pass_arguments(
@@ -700,7 +1005,14 @@ fn the_polish_line_differs_from_the_tune_line_in_exactly_the_tune_settings() {
     let only_tune: BTreeSet<_> = tune_keys.difference(&polish_keys).cloned().collect();
     assert_eq!(
         only_polish,
-        names(&["--pairs", "--router.neck_width_um"]),
+        names(&[
+            "--pairs",
+            "--router.neck_width_um",
+            "--x.oct_bound",
+            "--x.opt_follow_rips",
+            "--x.group_search",
+            "--x.gs_uncounted",
+        ]),
         "what the Tune pass does not send"
     );
     assert_eq!(
@@ -1356,6 +1668,7 @@ fn variant_args(variant: TuneVariant, classes: &[String]) -> Vec<String> {
             amps: Some(Path::new("/d/amps.txt")),
             pairs: None,
             layer_heights: Some("0,1.58"),
+            uncounted: None,
         },
         variant,
         &tune_inputs(Path::new("/d/tune.txt"), classes, &nets, Some("0,1.58")),
@@ -1410,6 +1723,7 @@ fn no_routing_pass_line_ever_holds_the_tune_switches() {
                 amps: Some(Path::new("/d/amps.txt")),
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: Some("0,1.58"),
+                uncounted: None,
             },
         );
         for token in &args {
@@ -2410,7 +2724,7 @@ int main(int argc, char **argv) {
         sleep(30);
         return 0;
     }
-    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL, *tune = NULL, *heights = NULL;
+    const char *dsn = NULL, *ses = NULL, *report = NULL, *pairs = NULL, *tune = NULL, *heights = NULL, *uncounted = NULL;
     int version = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) version = 1;
@@ -2420,6 +2734,7 @@ int main(int argc, char **argv) {
         else if (strncmp(argv[i], "--pairs=", 8) == 0) pairs = argv[i] + 8;
         else if (strncmp(argv[i], "--tune=", 7) == 0) tune = argv[i] + 7;
         else if (strncmp(argv[i], "--layer-heights=", 16) == 0) heights = argv[i] + 16;
+        else if (strncmp(argv[i], "--x.gs_uncounted=", 17) == 0) uncounted = argv[i] + 17;
     }
     if (version) {
         char text[256] = "fastroute 0.1.14";
@@ -2441,9 +2756,24 @@ int main(int argc, char **argv) {
                 printf("fastroute: unknown experimental switch --x.konnect_probe_unknown\n");
             return 2;
         }
+        // As fastroute parses its arguments (`exp::parse_arg`, in order): the first
+        // unknown experimental switch is named, and nothing after it is looked at.
+        // Unknown are the sentinel, with `lacks_search=1` (a build without the
+        // smart-router switches, x18) the three search switches and
+        // `--x.gs_uncounted`, and with `lacks=<prefix>` the switches that start so.
+        char lacks[256] = "";
+        cfg("lacks", lacks, sizeof lacks);
+        int lacks_search = cfg_int("lacks_search", 0);
         for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "--x.konnect_probe_unknown") == 0) {
-                printf("fastroute: unknown experimental switch %s\n", argv[i]);
+            const char *a = argv[i];
+            int search = strcmp(a, "--x.oct_bound") == 0
+                || strncmp(a, "--x.opt_follow_rips", 19) == 0
+                || strcmp(a, "--x.group_search") == 0
+                || strncmp(a, "--x.gs_uncounted=", 17) == 0;
+            int lacked = lacks[0] && strncmp(a, lacks, strlen(lacks)) == 0;
+            int sentinel = strcmp(a, "--x.konnect_probe_unknown") == 0;
+            if ((search && lacks_search) || lacked || sentinel) {
+                printf("fastroute: unknown experimental switch %s\n", a);
                 return 2;
             }
         }
@@ -2497,6 +2827,30 @@ int main(int argc, char **argv) {
             fclose(out);
         }
         if (in) fclose(in);
+    }
+
+    if (uncounted) {
+        // What the run could read of its uncounted file, beside the session.
+        snprintf(path, sizeof path, "%s.uncounted", ses);
+        FILE *out = fopen(path, "w");
+        FILE *in = fopen(uncounted, "r");
+        if (out) {
+            if (in) {
+                char buf[1024];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+            } else {
+                fputs("UNREADABLE\n", out);
+            }
+            fclose(out);
+        }
+        if (in) fclose(in);
+    }
+
+    if (cfg_int("echo_uncounted", 0)) {
+        // As echo_pairs, for the uncounted file alone (the reason keeps 300 characters).
+        fprintf(stderr, "UNCOUNTED_ARG=%s\n", uncounted ? uncounted : "none");
+        return 3;
     }
 
     if (cfg_int("echo_pairs", 0)) {
@@ -2557,7 +2911,15 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < unrouted; i++) fputs(i ? ",{}" : "{}", r);
                 fputs("],\"clearance_violations\":[", r);
                 for (int i = 0; i < violations; i++) fputs(i ? ",{}" : "{}", r);
-                fputs("]}", r);
+                fputs("]", r);
+                // `group_search.<pass>=<json>` (or `group_search=`): the group search's
+                // report object of this pass.
+                snprintf(key, sizeof key, "group_search.%s", pass);
+                if (cfg(key, val, sizeof val) || cfg("group_search", val, sizeof val)) {
+                    fputs(",\"group_search\":", r);
+                    fputs(val, r);
+                }
+                fputs("}", r);
             }
             fclose(r);
         }
@@ -2759,6 +3121,69 @@ int main(int argc, char **argv) {
                 .unwrap_err()
         );
         assert!(text.contains("names --x.par_vias_net"), "{text}");
+    }
+
+    /// Row GS, G2: a build without the smart-router switches (x18) is refused before
+    /// any run, with `--x.oct_bound` named (the first it meets); a build without one
+    /// of them is refused with that one named. The fake that knows all three passes.
+    #[tokio::test]
+    async fn probe_refuses_a_build_without_the_search_switches_and_names_the_first() {
+        let fixture = Fixture::new("mode=candidate\nlacks_search=1\n");
+        let text = format!(
+            "{:#}",
+            probe(&fixture.binary, "argument", &fixture.scratch())
+                .await
+                .unwrap_err()
+        );
+        assert!(text.contains("probe step 2"), "{text}");
+        assert!(text.contains("names --x.oct_bound"), "{text}");
+        assert!(text.contains(CANDIDATE_NAME), "{text}");
+        for switch in SEARCH_SWITCHES {
+            let lacks = switch.split('=').next().unwrap();
+            let fixture = Fixture::new(&format!("mode=candidate\nlacks={lacks}\n"));
+            let text = format!(
+                "{:#}",
+                probe(&fixture.binary, "argument", &fixture.scratch())
+                    .await
+                    .unwrap_err()
+            );
+            assert!(
+                text.contains(&format!("names {switch}")),
+                "{switch}: {text}"
+            );
+        }
+        // Control: the fake that knows the three switches is the candidate.
+        let fixture = Fixture::new("mode=candidate\n");
+        probe(&fixture.binary, "argument", &fixture.scratch())
+            .await
+            .unwrap();
+    }
+
+    /// Row GS: the probe sends `--x.gs_uncounted` with an empty file it writes in its
+    /// scratch folder, so a build that lacks the switch is refused with it named; a
+    /// build that knows it passes, and the file is there and empty.
+    #[tokio::test]
+    async fn probe_refuses_a_build_without_the_uncounted_switch_and_names_it() {
+        let fixture = Fixture::new("mode=candidate\nlacks=--x.gs_uncounted\n");
+        let text = format!(
+            "{:#}",
+            probe(&fixture.binary, "argument", &fixture.scratch())
+                .await
+                .unwrap_err()
+        );
+        assert!(text.contains("names --x.gs_uncounted="), "{text}");
+        assert!(text.contains(PROBE_UNCOUNTED), "{text}");
+        // Control: the fake that knows it passes, and the file it was given is empty.
+        let fixture = Fixture::new("mode=candidate\n");
+        probe(&fixture.binary, "argument", &fixture.scratch())
+            .await
+            .unwrap();
+        let file = fixture
+            .scratch()
+            .canonicalize()
+            .unwrap()
+            .join(PROBE_UNCOUNTED);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
     }
 
     #[tokio::test]
@@ -3177,6 +3602,7 @@ int main(int argc, char **argv) {
                 amps: Some(&amps),
                 pairs: None,
                 layer_heights: None,
+                uncounted: None,
             },
             pass.clone(),
             soon(30),
@@ -3198,6 +3624,7 @@ int main(int argc, char **argv) {
                 amps: Some(&amps),
                 pairs: None,
                 layer_heights: None,
+                uncounted: None,
             },
             &pass,
         );
@@ -3615,6 +4042,7 @@ int main(int argc, char **argv) {
                 amps: None,
                 pairs: Some(&pairs),
                 layer_heights: None,
+                uncounted: None,
             },
             WidthFallback::Floor,
             None,
@@ -3641,6 +4069,134 @@ int main(int argc, char **argv) {
             .unwrap();
             assert_eq!(read, text, "{name}: what the sandboxed run read");
         }
+    }
+
+    /// Row GS: every pass of the hold sequence gets the search switches once each and
+    /// the call's uncounted file, which the sandboxed run can read; the Tune pass after
+    /// it gets neither.
+    #[tokio::test]
+    async fn every_pass_of_the_hold_gets_the_search_switches_and_the_uncounted_file() {
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=0\n");
+        let uncounted = fixture.path().join("uncounted.txt");
+        std::fs::write(&uncounted, "GND\nNet (U1-Pad2)\n").unwrap();
+        let tune_file = fixture.path().join("tune.txt");
+        std::fs::write(&tune_file, "group g tolerance=0.25\n  A\n  B\n").unwrap();
+        let (nets, classes) = (names(&["A", "B"]), class_list(&["c"]));
+        let held = route_held(
+            &fixture.binary(),
+            &fixture.path().join("held"),
+            &fixture.dsn(),
+            &floor_hints(),
+            CallFiles {
+                uncounted: Some(&uncounted),
+                ..CallFiles::default()
+            },
+            WidthFallback::Floor,
+            Some(tune_request(tune_inputs(&tune_file, &classes, &nets, None))),
+            soon(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.passes.len(), 4, "{:?}", held.passes);
+        let expected = format!("--x.gs_uncounted={}", uncounted.display());
+        for name in ["full", "fallback", "polish"] {
+            let args = pass_args(&fixture, name);
+            assert_eq!(
+                args.iter().filter(|token| **token == expected).count(),
+                1,
+                "{name}: {args:?}"
+            );
+            for switch in SEARCH_SWITCHES {
+                assert_eq!(
+                    args.iter().filter(|token| token == switch).count(),
+                    1,
+                    "{name}: {switch}"
+                );
+            }
+            let read = std::fs::read_to_string(
+                fixture
+                    .path()
+                    .join("held")
+                    .join(name)
+                    .join(format!("{name}.ses.uncounted")),
+            )
+            .unwrap();
+            assert_eq!(read, "GND\nNet (U1-Pad2)\n", "{name}: what the run read");
+        }
+        let tune = pass_args(&fixture, TUNE_PASS);
+        assert!(
+            !tune
+                .iter()
+                .any(|token| token.starts_with("--x.gs_")
+                    || SEARCH_SWITCHES.contains(&token.as_str())),
+            "{tune:?}"
+        );
+    }
+
+    /// Row GS: `Held::group_search` is the report object of the pass the sequence
+    /// kept: Full's when it ends there, Polish's when Polish is kept, Fallback's when
+    /// Polish is discarded, and none when the kept pass's report has none.
+    #[tokio::test]
+    async fn the_held_group_search_is_the_kept_passs_report_object() {
+        let objects = "group_search.full={\"ended_by\":\"converged\",\"n\":1}\n\
+                       group_search.fallback={\"ended_by\":\"pass_cap\",\"n\":2}\n\
+                       group_search.polish={\"ended_by\":\"stopped\",\"n\":3}\n";
+        let cases = [
+            ("unrouted.full=0\n", "full", Some(1)),
+            (
+                "unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n",
+                "polish",
+                Some(3),
+            ),
+            (
+                "unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=2\n",
+                "fallback",
+                Some(2),
+            ),
+            ("unrouted.full=3\nunrouted.fallback=3\n", "full", Some(1)),
+        ];
+        for (control, kept, n) in cases {
+            let fixture = Fixture::new(&format!("{control}{objects}"));
+            let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 60)
+                .await
+                .unwrap();
+            assert_eq!(held.kept, kept, "{control}");
+            assert_eq!(
+                held.group_search
+                    .as_ref()
+                    .and_then(|object| object["n"].as_u64()),
+                n,
+                "{control}: {:?}",
+                held.group_search
+            );
+        }
+        // Control: a report without the object leaves none, even when another pass
+        // had one.
+        let fixture = Fixture::new(
+            "unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n\
+             group_search.full={\"ended_by\":\"converged\"}\n",
+        );
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 60)
+            .await
+            .unwrap();
+        assert_eq!(held.kept, "polish");
+        assert_eq!(held.group_search, None);
+        // A pass outcome reads it where it reads `unrouted`.
+        let fixture = Fixture::new("unrouted=2\ngroup_search.full={\"ended_by\":\"converged\"}\n");
+        let outcome = run_full(&fixture, &floor_hints(), 30).await.unwrap();
+        assert_eq!(outcome.unrouted, 2);
+        assert_eq!(
+            outcome.group_search,
+            Some(json!({ "ended_by": "converged" }))
+        );
+        let fixture = Fixture::new("unrouted=2\n");
+        assert_eq!(
+            run_full(&fixture, &floor_hints(), 30)
+                .await
+                .unwrap()
+                .group_search,
+            None
+        );
     }
 
     /// The DSN of the runner tests: one plane, two components and two nets, in the
@@ -3677,6 +4233,7 @@ int main(int argc, char **argv) {
             dsn_text: Arc::new(RUNNER_DSN.to_string()),
             hints: floor_hints(),
             amps: None,
+            uncounted: None,
             pairs,
             routing_heights: None,
             tune: None,
@@ -3760,11 +4317,15 @@ int main(int argc, char **argv) {
         std::fs::write(&pairs, "pair /CAN_H /CAN_L skew=0.1\n").unwrap();
         let tune_file = search.join("tune.txt");
         std::fs::write(&tune_file, "group lt1 tolerance=0.25\n  /CAN_H\n  /CAN_L\n").unwrap();
+        // Row GS: the runner with routing heights also has the call's uncounted file.
+        let uncounted = search.join("uncounted.txt");
+        std::fs::write(&uncounted, "GND\n").unwrap();
         let runner = |routing_heights: Option<&str>, tune: Option<TuneFiles>| FastrouteRunner {
             binary: fixture.binary(),
             dsn_text: Arc::new(RUNNER_DSN.to_string()),
             hints: floor_hints(),
             amps: None,
+            uncounted: routing_heights.map(|_| uncounted.clone()),
             pairs: Some(pairs.clone()),
             routing_heights: routing_heights.map(str::to_string),
             tune,
@@ -3842,6 +4403,20 @@ int main(int argc, char **argv) {
                 !tuned.iter().any(|arg| arg.starts_with("--pairs")),
                 "{tuned:?}"
             );
+            // Row GS: the routing pass has the search switches and the uncounted
+            // file; the Tune pass has neither (G1).
+            assert!(
+                full.contains(&format!("--x.gs_uncounted={}", uncounted.display())),
+                "{full:?}"
+            );
+            for switch in SEARCH_SWITCHES {
+                assert!(full.contains(&switch.to_string()), "{switch}: {full:?}");
+                assert!(!tuned.contains(&switch.to_string()), "{switch}: {tuned:?}");
+            }
+            assert!(
+                !tuned.iter().any(|arg| arg.starts_with("--x.gs_")),
+                "{tuned:?}"
+            );
         }
         // Control: no Tune inputs and no routing heights, the call of a board
         // without groups or pairs: three routing rows, no `--tune`, no heights.
@@ -3859,6 +4434,14 @@ int main(int argc, char **argv) {
                 .any(|arg| arg.starts_with("--tune") || arg.starts_with("--layer-heights")),
             "{full:?}"
         );
+        // Without the file, no `--x.gs_uncounted`; the search switches still go.
+        assert!(
+            !full.iter().any(|arg| arg.starts_with("--x.gs_uncounted")),
+            "{full:?}"
+        );
+        for switch in SEARCH_SWITCHES {
+            assert!(full.contains(&switch.to_string()), "{switch}: {full:?}");
+        }
     }
 
     /// One call of `route_specctra_dsn`'s fastroute engine through its real path
@@ -4081,12 +4664,25 @@ int main(int argc, char **argv) {
         dsn_edit: &dyn Fn(&str) -> String,
         board_edit: &dyn Fn(&str) -> String,
     ) -> PoursCall {
+        pours_call_with("echo_pairs=1\n", intent, dru, dsn_edit, board_edit, &|_| {}).await
+    }
+
+    /// [`pours_call`] with the fake's `control` and an edit of the manifest (made
+    /// before it is pinned to the board).
+    async fn pours_call_with(
+        control: &str,
+        intent: Option<&str>,
+        dru: Option<&str>,
+        dsn_edit: &dyn Fn(&str) -> String,
+        board_edit: &dyn Fn(&str) -> String,
+        manifest_edit: &dyn Fn(&mut Value),
+    ) -> PoursCall {
         use crate::router::ToolRouter;
         use crate::tools::route_fastroute::{prepare_call, route_located};
         use crate::tools::{ServerConfig, ToolContext};
         use std::sync::Arc;
 
-        let fixture = Fixture::new("echo_pairs=1\n");
+        let fixture = Fixture::new(control);
         let root = fixture.path().to_path_buf();
         let project = root.join("project");
         let exported = root.join("exported");
@@ -4106,6 +4702,7 @@ int main(int argc, char **argv) {
         let dsn = exported.join("board.dsn");
         std::fs::write(&dsn, dsn_edit(POURS_DSN)).unwrap();
         let mut manifest: Value = serde_json::from_str(POURS_MANIFEST).unwrap();
+        manifest_edit(&mut manifest);
         manifest["board_path"] = json!(board.display().to_string());
         manifest["source_sha256"] = json!(format!("{:x}", Sha256::digest(board_text.as_bytes())));
         std::fs::write(
@@ -4146,6 +4743,52 @@ int main(int argc, char **argv) {
 
     fn unchanged(text: &str) -> String {
         text.to_string()
+    }
+
+    /// Row GS, G3, through the real call path: the manifest's pour nets (the fixture's
+    /// two GND pours) go into `uncounted.txt` in the call's folder, and every run of the
+    /// search is given its path. Control: a manifest without pours writes no file and
+    /// no run gets the switch.
+    #[tokio::test]
+    async fn a_call_gives_every_run_the_pour_nets_as_the_uncounted_file() {
+        let call = pours_call_with(
+            "echo_uncounted=1\n",
+            None,
+            None,
+            &unchanged,
+            &unchanged,
+            &|_| {},
+        )
+        .await;
+        assert!(call.result.is_error, "every fake pass fails");
+        assert_eq!(
+            std::fs::read_to_string(call.kept().join("uncounted.txt")).unwrap(),
+            "GND\n"
+        );
+        let given = format!("UNCOUNTED_ARG={}/uncounted.txt", call.search().display());
+        let reasons = call.reasons();
+        assert_eq!(reasons.len(), 2, "{}", call.body);
+        for reason in &reasons {
+            assert!(reason.contains(&given), "{reason} lacks {given}");
+        }
+
+        let call = pours_call_with(
+            "echo_uncounted=1\n",
+            None,
+            None,
+            &unchanged,
+            &unchanged,
+            &|manifest| {
+                manifest.as_object_mut().unwrap().remove("pours").unwrap();
+            },
+        )
+        .await;
+        assert!(!call.kept().join("uncounted.txt").exists());
+        let reasons = call.reasons();
+        assert_eq!(reasons.len(), 2, "{}", call.body);
+        for reason in &reasons {
+            assert!(reason.contains("UNCOUNTED_ARG=none"), "{reason}");
+        }
     }
 
     /// The fixture's interface `bus` (its six signals) with extra keys.
@@ -4609,6 +5252,7 @@ int main(int argc, char **argv) {
                 amps: None,
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
+                uncounted: None,
             },
             WidthFallback::None,
             Some(tune_request(tune_inputs(
@@ -4986,6 +5630,7 @@ int main(int argc, char **argv) {
                 amps: None,
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
+                uncounted: None,
             },
             Some(tune_request(tune_inputs(
                 &tune_file,
@@ -5365,6 +6010,7 @@ int main(int argc, char **argv) {
                 amps: None,
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
+                uncounted: None,
             },
             &first,
             &next,

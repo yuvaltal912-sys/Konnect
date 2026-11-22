@@ -3,6 +3,37 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the smart-router switches with fastroute (Row GS)
+
+`route_specctra_dsn` (fastroute) routes every Full, Fallback and Polish pass with
+`--x.oct_bound`, `--x.opt_follow_rips=2` and `--x.group_search`, and with the
+manifest's pour nets in `--x.gs_uncounted`. Design: decision D25 in
+`docs/ROUTE_SEARCH_DESIGN.md`.
+
+- **The candidate build is x19** (`C** + BR1 + W8P + GS`). A fastroute build without
+  the three switches or `--x.gs_uncounted`, x18 included, is refused by the probe
+  before anything is routed, with the switch it lacks named; the setup steps say
+  where the candidate goes. A 1 Kopper package that bundles x18 must be built again.
+  The probe proves that a build knows the switches, not which build it is:
+  `engine.sha256` in the result, and the package pin, say that.
+- **`plan_convergent_placement` changes too.** It locates fastroute the same way and
+  routes its candidates through the same call, so it refuses x18 and its candidates
+  are routed with the group search. Its measured parameters and timings (Rows PS, CP
+  and CT) were measured on x18 and are not measured again here. The placement bench
+  routes through the same call.
+- **New result field `search.winner.group_search`**: `ended_by`, `passes`,
+  `kept_moves`, `largest_group`, and `start` and `end` with `length_mm`, `vias` and
+  `cost_mm`. It is absent when the winner's kept pass reported no group search.
+  Each judged run's `run.json` in the search folder holds the same summary.
+- **`engine.switches`** lists every fixed switch a routing pass sends: the candidate
+  switches, then the three search switches (it listed the candidate switches only).
+- The search folder holds `uncounted.txt` when the manifest has pours. Nothing
+  else in the arguments changes.
+- **The Tune pass and the pair passes change with the engine.** x19 carries the
+  engine's row FT (the tuner keeps off its own net, pair nets end clean), so Row LT's
+  Tune pass and Row DP's pairs route differently on x19 even though the Tune pass
+  gets no search switch. Checked by pipe on the public fixture (Row GS section of `CREATION_HANDOFF.md`): Row LT's case still tunes in one round with nothing dropped and passes G4, and Row DP's pair stays coupled at its 0.3 mm gap.
+
 ## Unreleased: matched lengths with fastroute (Row LT)
 
 Nets that must have matched lengths are declared in the design intent, and

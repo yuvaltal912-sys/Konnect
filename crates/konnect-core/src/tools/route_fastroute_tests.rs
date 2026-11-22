@@ -616,7 +616,7 @@ fn the_setup_names_the_default_place_the_three_ways_and_the_alternative() {
         "routing.fastroute_path",
         "engine: \\\"freerouting\\\"",
         "Nothing is downloaded",
-        "C** + BR1 + W8P",
+        "C** + BR1 + W8P + GS",
     ] {
         assert!(text.contains(needle), "{needle} is missing from {text}");
     }
@@ -853,6 +853,7 @@ fn routed(root: &Path, index: usize, shape: Shape, seed: u64, planes: &[&str]) -
             seconds: 12.3,
             untuned: None,
             tune: Default::default(),
+            group_search: None,
         },
         planes: planes.iter().map(|net| net.to_string()).collect(),
         folder,
@@ -1057,6 +1058,220 @@ fn a_reduced_run_keeps_its_record_measures_and_gates() {
     assert!(failed.get("judged").is_none());
 }
 
+// ─── Row GS: what the group search did ───────────────────────────────────────
+
+/// A `group_search` object as fastroute x19 writes it (`report.rs`): two passes.
+fn group_search_object() -> Value {
+    json!({
+        "ended_by": "converged",
+        "passes": [
+            { "level": 0, "tried": 12, "kept": 3, "ends": { "kept": 3, "no_gain": 9 },
+              "largest_kept_group": 2, "length_mm": 101.5, "vias": 9, "cost_mm": 119.5 },
+            { "level": 1, "tried": 7, "kept": 1, "ends": { "kept": 1, "no_gain": 6 },
+              "largest_kept_group": 4, "length_mm": 100.25, "vias": 8, "cost_mm": 116.25 }
+        ],
+        "start": { "incomplete": 0, "violations": 0, "length_mm": 104.0, "vias": 10, "cost_mm": 124.0 },
+        "end": { "incomplete": 0, "violations": 0, "length_mm": 100.25, "vias": 8, "cost_mm": 116.25 },
+        "bound_mm": 80.0,
+        "via_mm": 2.0,
+        "worst": [{ "net": "S1", "length_mm": 30.0, "bound_mm": 20.0, "vias": 2 }]
+    })
+}
+
+fn summary_of_the_object() -> Value {
+    json!({
+        "ended_by": "converged",
+        "passes": 2,
+        "kept_moves": 4,
+        "largest_group": 4,
+        "start": { "length_mm": 104.0, "vias": 10, "cost_mm": 124.0 },
+        "end": { "length_mm": 100.25, "vias": 8, "cost_mm": 116.25 },
+    })
+}
+
+/// The summary: how it ended, the passes, the moves kept, the largest group kept,
+/// and the start and end values; nothing of the rest (`worst` names nets).
+#[test]
+fn the_group_search_summary_reads_the_reports_object() {
+    assert_eq!(
+        group_search_summary(&group_search_object()),
+        Some(summary_of_the_object())
+    );
+    // No pass: no move, no group.
+    let mut none = group_search_object();
+    none["passes"] = json!([]);
+    none["ended_by"] = json!("pass_cap");
+    let summary = group_search_summary(&none).unwrap();
+    assert_eq!(summary["passes"], 0);
+    assert_eq!(summary["kept_moves"], 0);
+    assert_eq!(summary["largest_group"], 0);
+    assert_eq!(summary["ended_by"], "pass_cap");
+}
+
+/// An object that does not read as one gives no summary, never an error.
+#[test]
+fn a_group_search_object_that_does_not_read_gives_no_summary() {
+    type Edit = Box<dyn Fn(&mut Value)>;
+    let broken: Vec<(&str, Edit)> = vec![
+        ("not an object", Box::new(|o| *o = json!("converged"))),
+        (
+            "no ended_by",
+            Box::new(|o| {
+                o.as_object_mut().unwrap().remove("ended_by");
+            }),
+        ),
+        ("ended_by not text", Box::new(|o| o["ended_by"] = json!(1))),
+        ("passes not a list", Box::new(|o| o["passes"] = json!({}))),
+        (
+            "a pass without kept",
+            Box::new(|o| {
+                o["passes"][1].as_object_mut().unwrap().remove("kept");
+            }),
+        ),
+        (
+            "a negative kept",
+            Box::new(|o| o["passes"][0]["kept"] = json!(-1)),
+        ),
+        (
+            "a fractional group",
+            Box::new(|o| o["passes"][0]["largest_kept_group"] = json!(1.5)),
+        ),
+        (
+            "a pass without its group",
+            Box::new(|o| {
+                o["passes"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("largest_kept_group");
+            }),
+        ),
+        (
+            "no start",
+            Box::new(|o| {
+                o.as_object_mut().unwrap().remove("start");
+            }),
+        ),
+        (
+            "an end without vias",
+            Box::new(|o| {
+                o["end"].as_object_mut().unwrap().remove("vias");
+            }),
+        ),
+        (
+            "a start length as text",
+            Box::new(|o| o["start"]["length_mm"] = json!("104")),
+        ),
+        (
+            "an end cost missing",
+            Box::new(|o| {
+                o["end"].as_object_mut().unwrap().remove("cost_mm");
+            }),
+        ),
+    ];
+    for (what, edit) in broken {
+        let mut object = group_search_object();
+        edit(&mut object);
+        assert_eq!(group_search_summary(&object), None, "{what}");
+    }
+}
+
+/// `finished_search` with a group search on the winner (run 0) and on run 1.
+fn searched() -> Search {
+    let mut search = finished_search();
+    for position in [0, 1] {
+        search.outcome.runs[position]
+            .routed
+            .as_mut()
+            .unwrap()
+            .held
+            .group_search = Some(group_search_object());
+    }
+    search
+}
+
+/// The winner's part of the result says what its group search did; without the
+/// object, or with one that does not read, it has no `group_search`.
+#[test]
+fn the_winner_carries_its_group_search_summary() {
+    let search = searched();
+    let winner = winner_json(&search.outcome).unwrap();
+    assert_eq!(winner["group_search"], summary_of_the_object());
+    let found = search_json(
+        &plan(),
+        &[Shape::AsExported],
+        &search.outcome,
+        Listing::Best,
+    );
+    assert_eq!(found["winner"]["group_search"], summary_of_the_object());
+    // Control: no object, no key.
+    let plain = finished_search();
+    assert!(winner_json(&plain.outcome)
+        .unwrap()
+        .get("group_search")
+        .is_none());
+    let mut broken = searched();
+    broken.outcome.runs[0]
+        .routed
+        .as_mut()
+        .unwrap()
+        .held
+        .group_search = Some(json!({}));
+    assert!(winner_json(&broken.outcome)
+        .unwrap()
+        .get("group_search")
+        .is_none());
+}
+
+/// `run.json` keeps the summary of every judged run, the winner's too, and of no
+/// run that was not judged.
+#[test]
+fn every_judged_runs_record_keeps_its_group_search_summary() {
+    let mut search = searched();
+    // Run 2 failed its route; give a judged-less record an object anyway.
+    search.outcome.runs[2].routed = Some(routed(&search.folder, 2, Shape::AsExported, 2, &[]));
+    search.outcome.runs[2]
+        .routed
+        .as_mut()
+        .unwrap()
+        .held
+        .group_search = Some(group_search_object());
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let record = |index: usize, shape: Shape, seed: u64| -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(
+                search
+                    .folder
+                    .join(run_folder_name(index, shape, seed))
+                    .join("run.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        record(0, Shape::AsExported, 1)["group_search"],
+        summary_of_the_object()
+    );
+    assert_eq!(
+        record(1, Shape::Omitted, 1)["group_search"],
+        summary_of_the_object()
+    );
+    assert!(record(2, Shape::AsExported, 2)
+        .get("group_search")
+        .is_none());
+    // Control: judged runs without the object have none.
+    let plain = finished_search();
+    reduce_run_folders(&plain.folder, &plain.outcome).unwrap();
+    let text = std::fs::read_to_string(
+        plain
+            .folder
+            .join(run_folder_name(1, Shape::Omitted, 1))
+            .join("run.json"),
+    )
+    .unwrap();
+    assert!(!text.contains("group_search"), "{text}");
+}
+
 #[test]
 fn only_what_the_search_made_is_removed() {
     let search = finished_search();
@@ -1225,15 +1440,19 @@ fn the_result_has_every_documented_key() {
     // The engine.
     let engine = &result["engine"];
     assert_eq!(engine["name"], "fastroute");
-    assert_eq!(engine["candidate"], "C** + BR1 + W8P");
+    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS");
     assert_eq!(engine["path"], "/x/fastroute");
     assert_eq!(engine["sha256"], "ab".repeat(32));
     assert_eq!(engine["version"], "fastroute 0.1.14");
     assert_eq!(engine["source"], "argument");
     assert_eq!(engine["threads"], 2);
     assert_eq!(
-        engine["switches"].as_array().unwrap().len(),
-        crate::fastroute::CANDIDATE_SWITCHES.len()
+        engine["switches"],
+        json!(crate::fastroute::CANDIDATE_SWITCHES
+            .iter()
+            .chain(crate::fastroute::SEARCH_SWITCHES)
+            .collect::<Vec<_>>()),
+        "what a routing pass ran: the candidate switches, then the search switches"
     );
     // The effort.
     assert_eq!(result["effort"]["level"], "h");
@@ -1686,7 +1905,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P, build x18);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS, build x19);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a
@@ -2683,6 +2902,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         dsn_text: Arc::new(String::new()),
         hints: RoutingHints::default(),
         amps: None,
+        uncounted: None,
         pairs: None,
         routing_heights: None,
         tune: None,
