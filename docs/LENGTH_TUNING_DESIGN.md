@@ -2076,3 +2076,79 @@ match.
 | N2, N7, N9 | **Wording only.** | N2: the `tune.rows` entry of a candidate the judge did not choose says `not_chosen`, and an unjudged run's says `candidate`. N7: a discard for lack of rounds or time adds "(no round left)" or "(the deadline leaves no room)". N9: the skill says "a pour of a net outside the tune file", and `1-KOPPER.md` adds "tracks below their floor" |
 | N10, N11 | **No change in this PR.** | N10 is a recorded cost: the pour-safe passes are paid even when their candidate is never judged. N11, a killed later pass losing the run, keeps D4 as written. The 2× rule makes it rare, and keeping the held session in that case is a follow-up, not a correctness fix |
 | S4, N4, N6, N8 | **Mechanical, as the parent session plans.** | N4: `self_contacts` in `spawn_blocking`. N6: a comment that pins the rounded key against the importer's exact key |
+
+### M4: diagnosis and the PR verdict (2026-11-22)
+
+M4 ran at effort M on `f160b478` (Row LT with main merged in, so F1 is fixed). The record is
+`target/creation-research/length-tuning/verify/M4.md` (git-ignored). Below is what board B's run 6
+folders show (L26 kept them). No routing ran for this diagnosis.
+
+**Round 2's "changed the copper of `C_N`" is a load-time artefact, not tuning.**
+- **Why `C_N` was outside the tune file.** Round 1 (free) dropped `C_P` and `D1_P` for self
+  contacts. `with_pair_partners` dropped `C_N` and `D1_N` with them. So in round 2, `C_N` was
+  outside the tune file (`tune-r2/tune.txt` lists only D0, D2 and D3).
+- **What changed on it.** Against the held `full.ses`, round 2's session holds `C_N` with
+  12 → 14 wires and 43.547 → 44.165 mm. That is three copies of its 0.212 mm bridge, which
+  fastroute makes when it loads a session (FT6), minus its 20 µm stub inside a via, which the
+  load drops.
+- **The copies are not what tripped the guard.** `changed_outside` already takes exact repeats
+  as one piece: `/PCIe-M2/FB`, also outside the tune file, got the same kind of copy (1 → 2
+  wires) and was not named. What it named is the lost stub. The parent session's guess is right
+  about the cause (C_N dropped, then the re-import), but the fix is not a repeat merge.
+
+**Pour-safe's "opened 2" is fastroute's own count, not lost copper.**
+- **The candidate.** It was the pour-safe candidate, round 1, in runs 2 and 6.
+- **What `--router.plane_as_obstacle=true` changes at load.** The planes block fastroute's
+  load-time trace-end bridges: 250 are skipped against 59, and 401 trace ends are joined to a
+  pad centre against 592. So fastroute's connectivity reads 2 more connections open (6 against
+  4).
+- **The copper it writes** is the held copper, minus the same 20 µm `C_N` stub. Nothing opens in
+  KiCad's terms.
+- **It also tuned nothing:** "8 still short". On this 6-layer board every DQ trace touches a GND
+  plane, so with planes as obstacles none can take a meander. The guard's discard is
+  conservative and costs no tuning.
+
+**One small Konnect fix (in this PR).**
+- **The change.** `changed_outside` ignores a held piece of a net outside the tune file that is
+  missing after the pass, when both its ends lie within the copper disc of one via of that net,
+  on the piece's layer, in the held session.
+- **Where the disc comes from.** The via padstack's smallest copper radius, read from the
+  call's DSN (`specctra::via_disc_radii`). `changed_outside` gains that map.
+- **Why it is safe.** Such a piece connects nothing the via does not, and it is fastroute's
+  load-time bridge handling (FT6).
+- **Its test.** M4's B run 6, `full.ses` against `tune-r2/tune.ses`, with `C_N` outside the
+  tune file, compares equal.
+- **Its negative controls.** A missing piece reaching 1 µm past the disc is still named. So is
+  a missing piece inside a via of another net.
+- "Opened" stays fastroute's count: a pour-safe discard on such a board loses nothing.
+
+**The PR verdict: the build is correct, and ready for a PR with its limits documented, once
+that fix is in.**
+- **What M4 shows.** Every guard does what the design says:
+  - no chosen board is worse than its untuned board (item 1);
+  - KiCad agrees with G4 under L25's rules (item 3);
+  - F passes G1 to G4 (item 5);
+  - the fastroute-to-KiCad gap fell from 38 mm to at most 0.72 mm.
+- **Why item 2 fails, line by line.** Each G4 line on A and B has a named cause that Row LT
+  cannot remove:
+  - nets L21 dropped for self contacts (fastroute x18's tuner, which FT1 and FT2 fix);
+  - dangling held copper from the pair router (`C_N`, `D0_N`, `D1_N`, which FT3 fixes);
+  - no room for meanders: A with the FT build still leaves 31 lines with 0 nets dropped, so
+    board A's 250 mm bus spread does not fit.
+- **Why item 4 fails.** Item 4's discards are the two load-time artefacts above.
+- **The addendum agrees.** Its own M4 expectation was "G4 fails honestly"; decision 6's item 2
+  was written for a fixed fastroute.
+
+### Decision for the owner (M4)
+
+7. **How to close Row LT.**
+   - **Recommended: open the PR now**, with the via-stub fix and these limits written into the
+     PR and the handoff. Decision 6's items 2 and 4 become, for x18: "each G4 line and each
+     discard has a named cause in the result (`untuned_nets`, fastroute's 'no room', a G4(d)
+     line), and none is a Konnect defect". Once FT lands, B is verified again at M, with
+     decision 6 as written.
+   - **Alternative:** hold the PR until FT lands and B passes G4.
+   - **Reason:**
+     - The PR is correct as it stands: it never makes a board worse, and every failure is named.
+     - Holding it adds no correctness. A may never pass G4: the FT build also leaves 31 lines
+       for lack of room.
