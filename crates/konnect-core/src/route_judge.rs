@@ -8,10 +8,10 @@
 
 use crate::board_identity;
 use crate::route_search::Routed;
+use crate::specctra_ses::SourceCheck;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,30 +84,21 @@ pub(crate) struct Baseline {
 ///
 /// The export hashes KiCad's in-memory text of the board (IPC), and KiCad saves
 /// that board in a different layout and without each footprint's library
-/// metadata, so the saved bytes almost never hash to `source_sha256`. True when:
-/// - the saved bytes' SHA-256 is the manifest's `source_sha256` (a board exported
-///   from a file, or text that happens to match), or
-/// - the manifest has `source_canonical_sha256` and the saved text's
-///   [`board_identity::canonical_sha256`] equals it: the same board as a tree.
+/// metadata, so the saved bytes almost never hash to `source_sha256`. The rule is
+/// [`board_identity::matches_export`], which the judge's import-plan call
+/// ([`SourceCheck::BytesOrTree`]) uses too, so the preflight and the run cannot
+/// disagree: the bytes match `source_sha256`, or the manifest has
+/// `source_canonical_sha256` and the saved text is the same board as a tree.
 ///
 /// A manifest without `source_canonical_sha256` (an export before it was written)
 /// gets the byte check only. A saved file that does not parse matches only by
 /// bytes.
 pub(crate) fn saved_board_matches(saved: &[u8], manifest: &Value) -> bool {
-    let bytes = format!("{:x}", Sha256::digest(saved));
-    if manifest["source_sha256"]
-        .as_str()
-        .is_some_and(|recorded| recorded.eq_ignore_ascii_case(&bytes))
-    {
-        return true;
-    }
-    let Some(recorded) = manifest["source_canonical_sha256"].as_str() else {
-        return false;
-    };
-    std::str::from_utf8(saved)
-        .ok()
-        .and_then(|text| board_identity::canonical_sha256(text).ok())
-        .is_some_and(|canonical| recorded.eq_ignore_ascii_case(&canonical))
+    board_identity::matches_export(
+        saved,
+        manifest["source_sha256"].as_str(),
+        manifest["source_canonical_sha256"].as_str(),
+    )
 }
 
 /// Everything the judge needs, checked before anything is routed. Each refusal
@@ -642,9 +633,13 @@ pub(crate) struct Judged {
 }
 
 /// One run, judged by Konnect itself under `ctx.root/run-<index>`:
-/// 1. `specctra_ses::parse_import_plan(ctx.board, ctx.board_text, ctx.manifest_text,
-///    session)`: a session the importer would refuse fails the judge (an error,
-///    not a candidate).
+/// 1. `specctra_ses::parse_import_plan_with(ctx.board, ctx.board_text,
+///    ctx.manifest_text, session, SourceCheck::BytesOrTree)`: a session the importer
+///    would refuse fails the judge (an error, not a candidate). The judge works on
+///    the saved board, so it accepts the same identity as the preflight
+///    ([`saved_board_matches`]): the bytes of `source_sha256` or the tree of
+///    `source_canonical_sha256`. The live import (`apply_specctra_ses`) keeps the
+///    byte check only.
 /// 2. `scratch_board::copy_project` into `r0`, then `scratch_board::write_routing`
 ///    of the plan over the saved text, written as `r0/<board file name>`.
 /// 3. `tools::cli::refill_drc_on_private_copy_with_config` on that board (every
@@ -736,11 +731,12 @@ async fn judge_one(
     let ses_text = tokio::fs::read_to_string(session)
         .await
         .with_context(|| format!("read the session '{}'", session.display()))?;
-    let plan = crate::specctra_ses::parse_import_plan(
+    let plan = crate::specctra_ses::parse_import_plan_with(
         &ctx.board,
         &ctx.board_text,
         &ctx.manifest_text,
         &ses_text,
+        SourceCheck::BytesOrTree,
     )
     .context("the importer refuses the run's session")?;
     let widths = crate::intent_width_report::intent_width_report(&ctx.manifest, &ses_text)

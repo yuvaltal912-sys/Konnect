@@ -13,6 +13,14 @@ Specctra DSN syntax. Copyright 2024 Topola contributors; used under the MIT
 license. The MIT permission grant and warranty disclaimer reproduced below
 apply to this dependency.
 
+## iOverlay
+
+Konnect uses `i_overlay` to merge the copper primitives of custom pads.
+`i_overlay`, `i_float` and `i_shape` are copyright (c) 2023 iShape-Rust.
+`i_key_sort` and `i_tree` are copyright (c) 2024 iShape-Rust. The MIT
+permission grant and warranty disclaimer below apply to all five crates.
+[iOverlay](https://github.com/iShape-Rust/iOverlay)
+
 ## kicad-mcp-pro
 
 Portions of Konnect — including the JLCPCB pick-and-place rotation

@@ -273,7 +273,10 @@ fn export_tools() -> Vec<ToolDef> {
              side (a back-side part is written with its pads at their true board positions on \
              B.Cu, never mirrored by the router; KiCad's native exporter is not adopted for it), \
              circle, rectangle, rounded-rectangle and oval pads (a rounded rectangle is written \
-             as its bounding rectangle, never smaller than the copper), and one closed outline \
+             as its bounding rectangle, never smaller than the copper). A custom pad can combine \
+             a circular or rectangular anchor, filled circles, unstroked filled rectangles and \
+             straight-edged polygons, and round-ended lines. Their polygonized union must be one convex copper region. \
+             Supports one closed outline \
              of lines, arcs, a rectangle, a circle or a polygon, where arcs and circles become \
              chords within 5 um. Pad angles are written relative to their part, and a drill \
              offset moves the padstack copper off its hole. Repeated or empty pad numbers get \
@@ -287,7 +290,7 @@ fn export_tools() -> Vec<ToolDef> {
              completion is judged by KiCad's DRC after a refill. Rule areas that forbid tracks or \
              vias always become keepouts. Both come from the zone outline (not the fill). A \
              teardrop zone belongs to the routing and is left out (teardrops_skipped). Locked straight tracks and vias are fixed wiring; \
-             unlocked routing, routed arcs, custom pad shapes, local clearance overrides, \
+             unlocked routing, routed arcs, unsupported custom pad geometry, local clearance overrides, \
              copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
@@ -351,7 +354,7 @@ fn export_tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
                         "default": "disable",
-                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback. A board with teardrops, or with references renamed by allow_duplicate_references, always gets the Rust export ('require' is refused), since KiCad's exporter writes teardrops as planes and cannot rename."
+                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback. A board with teardrops, or with references renamed by allow_duplicate_references, always gets the Rust export ('require' is refused), since KiCad's exporter writes teardrops as planes and cannot rename. Custom pad polygons also use the Rust export because the native bridge cannot verify their geometry."
                     }
                 },
                 "required": ["board", "output"]
@@ -782,7 +785,7 @@ fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
 
 /// Board features only the Rust exporter writes as the router needs them:
 /// footprints that share a Reference, renamed (`allow_duplicate_references`),
-/// and teardrops, which KiCad's native exporter writes as planes of their net.
+/// teardrops which KiCad writes as planes, and unverified native custom-pad polygons.
 /// When the board has any, the native exporter must not replace the Rust DSN.
 /// Returns whether the Rust export is kept for these reasons and the notes for
 /// 'prefer'; 'require' is refused.
@@ -966,13 +969,7 @@ async fn handle_export_specctra_dsn(
     let mut bridge_pid = None;
     let mut bridge_protocol_version = None;
     let mut bridge_diagnostics = Vec::new();
-    let mut rust_only = Vec::new();
-    if !baseline.renamed_references.is_empty() {
-        rust_only.push("footprints share a Reference");
-    }
-    if baseline.teardrops_skipped > 0 {
-        rust_only.push("the board has teardrops");
-    }
+    let rust_only = baseline.rust_only_bridge_reasons();
     let (keep_rust, rust_notes) = match rust_only_bridge(native_bridge_mode, &rust_only) {
         Ok(choice) => choice,
         Err(reason) => return Ok(CallToolResult::error(reason)),

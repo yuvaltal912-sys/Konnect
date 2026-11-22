@@ -72,10 +72,10 @@ struct Manifest {
     schema_version: u32,
     board_path: String,
     source_sha256: String,
-    /// Written by the export for the route judge; the importer checks the live
-    /// board against `source_sha256` and does not read this.
+    /// Written by the export (D22). Read only under [`SourceCheck::BytesOrTree`],
+    /// the route judge's check of the saved board; [`parse_import_plan`] checks
+    /// the live board against `source_sha256` alone.
     #[serde(default)]
-    #[allow(dead_code)]
     source_canonical_sha256: Option<String>,
     coordinate_unit: String,
     resolution: u32,
@@ -218,15 +218,43 @@ struct ManifestPadstack {
     drill_um: Option<i64>,
 }
 
+/// How `source_sha256` is checked against the board text given to the importer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceCheck {
+    /// The text's SHA-256 must equal `source_sha256`. The live import and every
+    /// caller but the route judge.
+    Bytes,
+    /// The route judge's check of a saved board (D22): the bytes of
+    /// `source_sha256`, or, when the manifest has `source_canonical_sha256`, the
+    /// same board as a tree ([`crate::board_identity::matches_export`]).
+    BytesOrTree,
+}
+
 pub(crate) fn parse_import_plan(
     board_path: &Path,
     board_source: &str,
     manifest_source: &str,
     ses_source: &str,
 ) -> Result<SesImportPlan> {
+    parse_import_plan_with(
+        board_path,
+        board_source,
+        manifest_source,
+        ses_source,
+        SourceCheck::Bytes,
+    )
+}
+
+pub(crate) fn parse_import_plan_with(
+    board_path: &Path,
+    board_source: &str,
+    manifest_source: &str,
+    ses_source: &str,
+    source_check: SourceCheck,
+) -> Result<SesImportPlan> {
     let manifest: Manifest =
         serde_json::from_str(manifest_source).context("parse Specctra reverse manifest")?;
-    let snapshot = validate_manifest(board_path, board_source, &manifest)?;
+    let snapshot = validate_manifest(board_path, board_source, &manifest, source_check)?;
 
     let root = parse_sexp(ses_source).context("parse Specctra SES")?;
     require_head(&root, "session")?;
@@ -311,6 +339,7 @@ fn validate_manifest(
     board_path: &Path,
     board_source: &str,
     manifest: &Manifest,
+    source_check: SourceCheck,
 ) -> Result<crate::routing_context::Snapshot> {
     if manifest.schema_version != 1 {
         bail!(
@@ -369,13 +398,29 @@ fn validate_manifest(
     if manifest.supported_profile.custom_rules != context.rules.is_some() {
         bail!("manifest custom-rule profile disagrees with the saved rules");
     }
-    let actual_hash = sha256_hex(board_source.as_bytes());
-    if actual_hash != manifest.source_sha256 {
-        bail!(
-            "live board revision does not match routing manifest (expected {}, got {})",
-            manifest.source_sha256,
-            actual_hash
-        );
+    match source_check {
+        SourceCheck::Bytes => {
+            let actual_hash = sha256_hex(board_source.as_bytes());
+            if actual_hash != manifest.source_sha256 {
+                bail!(
+                    "live board revision does not match routing manifest (expected {}, got {})",
+                    manifest.source_sha256,
+                    actual_hash
+                );
+            }
+        }
+        SourceCheck::BytesOrTree => {
+            if !crate::board_identity::matches_export(
+                board_source.as_bytes(),
+                Some(&manifest.source_sha256),
+                manifest.source_canonical_sha256.as_deref(),
+            ) {
+                bail!(
+                    "saved board does not match routing manifest: neither its bytes (expected {}) nor its tree match",
+                    manifest.source_sha256
+                );
+            }
+        }
     }
     validate_manifest_relations(manifest)?;
     Ok(context)
@@ -1127,6 +1172,121 @@ mod tests {
         std::fs::write(&board, &source).unwrap();
         let export = export_dsn(&board, &source, &rules()).unwrap();
         (dir, board, source, export.manifest)
+    }
+
+    /// A board exported from KiCad's memory (IPC text) and the file KiCad saved for
+    /// it: same tree, other bytes. Returns the folder, the saved board's path and
+    /// text, and the manifest of the export of the IPC text.
+    fn live_export() -> (tempfile::TempDir, std::path::PathBuf, String, String) {
+        let saved = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb").to_string();
+        let live = crate::board_identity::tests::ipc_form(&saved);
+        assert_ne!(live, saved, "the two texts differ byte for byte");
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, &saved).unwrap();
+        let export = export_dsn(&board, &live, &rules()).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_ne!(
+            body["source_sha256"].as_str(),
+            Some(sha256_hex(saved.as_bytes()).as_str()),
+            "the byte hash is of the IPC text"
+        );
+        assert_eq!(
+            body["source_canonical_sha256"].as_str(),
+            Some(
+                crate::board_identity::canonical_sha256(&saved)
+                    .unwrap()
+                    .as_str()
+            ),
+            "the tree hash is shared"
+        );
+        (dir, board, saved, export.manifest)
+    }
+
+    /// The judge's check of a saved board (D22, `SourceCheck::BytesOrTree`) takes
+    /// the saved file of a board exported over IPC; the live import's check
+    /// (`parse_import_plan`) still wants the exported bytes. Controls: the live
+    /// bytes pass the judge's check too, and the live import takes them.
+    #[test]
+    fn the_judge_check_accepts_a_saved_board_by_tree_and_the_importer_still_wants_bytes() {
+        let (_dir, board, saved, manifest) = live_export();
+        let live = crate::board_identity::tests::ipc_form(&saved);
+
+        let plan = parse_import_plan_with(
+            &board,
+            &saved,
+            &manifest,
+            sample_ses(),
+            SourceCheck::BytesOrTree,
+        )
+        .unwrap();
+        assert!(!plan.tracks.is_empty(), "the session imports");
+
+        // The live import: the saved file is not the exported text.
+        let error = parse_import_plan(&board, &saved, &manifest, sample_ses())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("live board revision does not match routing manifest"),
+            "{error}"
+        );
+        // Controls: the exported bytes pass both.
+        parse_import_plan(&board, &live, &manifest, sample_ses()).unwrap();
+        parse_import_plan_with(
+            &board,
+            &live,
+            &manifest,
+            sample_ses(),
+            SourceCheck::BytesOrTree,
+        )
+        .unwrap();
+    }
+
+    /// Negative controls of the judge's check: a board that changed since the
+    /// export, a manifest from before `source_canonical_sha256`, and a saved text
+    /// that does not parse each still refuse it.
+    #[test]
+    fn the_judge_check_refuses_a_changed_board_and_a_manifest_without_the_tree_hash() {
+        let (_dir, board, saved, manifest) = live_export();
+        let judge = |text: &str, manifest: &str| {
+            parse_import_plan_with(
+                &board,
+                text,
+                manifest,
+                sample_ses(),
+                SourceCheck::BytesOrTree,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+        };
+        let identity = "saved board does not match routing manifest";
+
+        // A footprint moved after the export.
+        let moved = saved.replacen("(at ", "(at 1", 1);
+        assert_ne!(moved, saved);
+        let error = judge(&moved, &manifest).unwrap_err();
+        assert!(error.contains(identity), "{error}");
+
+        // A manifest without the tree hash: bytes only, and the bytes differ.
+        let mut body: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .remove("source_canonical_sha256");
+        let legacy = body.to_string();
+        let error = judge(&saved, &legacy).unwrap_err();
+        assert!(error.contains(identity), "{error}");
+        // Control: the same manifest and the bytes it names are accepted.
+        let live = crate::board_identity::tests::ipc_form(&saved);
+        judge(&live, &legacy).unwrap();
+
+        // A recorded tree hash that is not this board's.
+        body["source_canonical_sha256"] = serde_json::json!("0".repeat(64));
+        let error = judge(&saved, &body.to_string()).unwrap_err();
+        assert!(error.contains(identity), "{error}");
+
+        // A saved text that does not parse has no tree, only bytes.
+        let error = judge("(kicad_pcb (unclosed", &manifest).unwrap_err();
+        assert!(!error.is_empty());
     }
 
     /// Two footprints with one Reference would give two pads one DSN pin name.
