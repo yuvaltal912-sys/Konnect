@@ -8,7 +8,7 @@ on branch `claude/zone-router-research`, from `fork/main` `517eebf0`. No stage h
 waits for the owner's word. Engine facts are from fastroute `61d6e45` (branch `ft-design`: the
 pinned x18, `1e94751`, plus row FT). KiCad facts are from the KiCad 10.0.1 source. The section
 "The design on x19" (2026-11-22) brings the design in line with fastroute x19 (branch `gr`,
-`b3ea917`), the build Row GS is about to pin; a line it made wrong says so where it stands.
+`b3ea917`), the build Row GS pins (merged as #108); a line it made wrong says so where it stands.
 
 ## What the owner asked for
 
@@ -1382,8 +1382,9 @@ out of this file into two scratch clones: fastroute at `61d6e45` (the six `plane
 
 ## The design on x19 (addendum, 2026-11-22)
 
-Status: a document only. Nothing was built, compiled, routed or measured for it. It brings the
-design above in line with fastroute **x19**, the build Row GS is about to pin in Konnect: branch
+Status: a document only, merged as #106 (main `b78371d2`). Nothing was built, compiled, routed
+or measured for it. It brings the
+design above in line with fastroute **x19**, the build Row GS pins in Konnect (merged as #108): branch
 `gr` of the local fastroute clone, commit `b3ea917`, not published. x19 is `61d6e45` (the engine
 this design read) plus ten commits, all of them behind switches that are off by default:
 
