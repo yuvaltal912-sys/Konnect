@@ -1382,7 +1382,8 @@ out of this file into two scratch clones: fastroute at `61d6e45` (the six `plane
 
 ## The design on x19 (addendum, 2026-11-22)
 
-Status: a document only. Nothing was built, compiled, routed or measured for it. It brings the
+Status: a document only, merged as #106 (main `b78371d2`). Nothing was built, compiled, routed
+or measured for it. It brings the
 design above in line with fastroute **x19**, the build Row GS is about to pin in Konnect: branch
 `gr` of the local fastroute clone, commit `b3ea917`, not published. x19 is `61d6e45` (the engine
 this design read) plus ten commits, all of them behind switches that are off by default:
