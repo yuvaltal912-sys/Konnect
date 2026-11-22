@@ -2141,6 +2141,9 @@ that fix is in.**
 
 ### Decision for the owner (M4)
 
+**Approved:** the owner approved decision 7 as recommended on 2026-11-22 ("Yes, as
+recommended").
+
 7. **How to close Row LT.**
    - **Recommended: open the PR now**, with the via-stub fix and these limits written into the
      PR and the handoff. Decision 6's items 2 and 4 become, for x18: "each G4 line and each
