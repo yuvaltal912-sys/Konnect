@@ -895,13 +895,16 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
 
 /// The nets outside `nets` whose copper differs between two sessions (one appears
 /// in only one of them, or their [`NetCopper`] differ), sorted: the Tune pass's
-/// guard (L6).
+/// guard (L6). A missing held piece that is a via stub is not a change (M4, decision 7):
+/// both its ends lie within the copper disc of one via of the net, `via_radii` being
+/// `specctra::via_disc_radii` of the call's DSN (padstack to radius in µm).
 pub(crate) fn changed_outside(
     before: &str,
     after: &str,
     nets: &std::collections::BTreeSet<String>,
+    via_radii: &BTreeMap<String, i64>,
 ) -> Result<Vec<String>> {
-    let _ = (before, after, nets);
+    let _ = (before, after, nets, via_radii);
     todo!()
 }
 
@@ -1216,7 +1219,7 @@ pub(crate) async fn judge_lengths(
 | routing passes unchanged (L6, L7) | with a tune file in the call, Full, Fallback and Polish get no `--tune`; with a resolved pair they get `--layer-heights` after `--pairs` | a call with groups but no pair, and a call with neither, get exactly DP's routing command lines (DP's own tests unchanged) |
 | Tune pass arguments | optimizer off, every class ignored, `--tune`, `--initial-session`, never `--pairs` or a neck width, each setting once | the Polish pass's line from `pass_arguments` differs from it in exactly those settings |
 | Tune pass keep rule | fake binaries: one that tunes only group nets (kept); one that also moves another net's wire (discarded, the net named); one that opens a connection (discarded); one that fails (failed, the input kept); one that hangs (killed, the run ends) | the first fake without `--tune` support fails with its own message |
-| `changed_outside` | identical sessions: none; a group net's wire moved: none; another net's wire or via moved, added or removed: named; one trace split into two collinear pieces: equal; letter case of keywords | a wire moved by 0.4 µm compares equal (rounding is the rule) and one moved by 2 µm differs |
+| `changed_outside` | identical sessions: none; a group net's wire moved: none; another net's wire or via moved, added or removed: named; one trace split into two collinear pieces: equal; letter case of keywords | a wire moved by 0.4 µm compares equal (rounding is the rule) and one moved by 2 µm differs; a missing piece with both ends in one via's disc of its own net (M4's B run 6 `C_N`, a 20 µm stub): equal; a piece 1 µm past the disc, inside another net's via, between two vias of one net, or with no known padstack disc: named |
 | probe files (L8) | one rule per net, numbered, `severity error`, `min 2000mm`; every listed severity set to `ignore`, and `length_out_of_range` set to `error` (added when missing); arguments: no refill, no save, `--units mm` | a project without a `rule_severities` object still gives a probe that measures (KiCad's defaults, only slower); a project that sets `length_out_of_range` to `ignore` gets `error` in the probe copy |
 | `actual_mm` and `parse_probe` | a report captured from a real `kicad-cli` run on a fixture with probe rules (stored as a test file); the same description with translated words; a decimal comma; the net cross-checked through `[net]` items; a missing net is unmeasured | a description holding only the probe's own number gives `None`; two entries for one net, or an entry naming another net, is an error |
 | check and G4 (L9) | skew window, target window, pair skew: each passes on the bound (within half a printed digit) and fails one step past it; misses summed | changing one length by 0.01 mm across a bound flips its line |
@@ -2117,7 +2120,8 @@ folders show (L26 kept them). No routing ran for this diagnosis.
 **One small Konnect fix (in this PR).**
 - **The change.** `changed_outside` ignores a held piece of a net outside the tune file that is
   missing after the pass, when both its ends lie within the copper disc of one via of that net,
-  on the piece's layer, in the held session.
+  on any layer (Konnect's export makes every via a through via with one equal circle per
+  copper layer), in the held session.
 - **Where the disc comes from.** The via padstack's smallest copper radius, read from the
   call's DSN (`specctra::via_disc_radii`). `changed_outside` gains that map.
 - **Why it is safe.** Such a piece connects nothing the via does not, and it is fastroute's

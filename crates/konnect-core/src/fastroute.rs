@@ -1315,7 +1315,11 @@ pub(crate) fn copper_by_net(ses_text: &str) -> Result<BTreeMap<String, NetCopper
 /// within the copper disc of one of the net's own vias in `before` (the padstack's
 /// smallest copper radius in `via_radii`, µm): it connects nothing the via does not, and
 /// it is what fastroute's load-time trace-end bridges leave out of the session it
-/// writes back (FT6). A piece that reaches a micrometre past the disc is not a stub.
+/// writes back (FT6). A piece that reaches a micrometre past the disc is not a stub, and
+/// neither is one between two vias (one via must hold both ends). The disc is taken on
+/// any copper layer: Konnect's export makes every via a through via with one equal circle
+/// per copper layer (`specctra.rs`, the via padstacks, and the refusal of blind, buried
+/// and unlocked vias), so a via's disc is the same on every layer.
 fn copper_differs(
     before: &NetCopper,
     after: &NetCopper,

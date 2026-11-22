@@ -1624,6 +1624,28 @@ fn a_missing_piece_is_a_via_stub_only_inside_the_disc_of_a_via_of_its_own_net() 
 }
 
 #[test]
+fn a_trace_between_two_vias_of_one_net_is_not_a_stub() {
+    // Net A has vias `v` and `v2` 700 um apart, and an In1.Cu trace between their
+    // centres: each end is inside the disc of one via, but no one via holds both.
+    let radii = BTreeMap::from([("v".to_string(), 225), ("v2".to_string(), 225)]);
+    let vias = via("v", 1000, 1000) + &via("v2", 1700, 1000);
+    let with_trace = session(&[(
+        "A",
+        vias.clone() + &wire("In1.Cu", 200, &[(1000, 1000), (1700, 1000)]),
+    )]);
+    let without = session(&[("A", vias)]);
+    assert_eq!(changed_with(&with_trace, &without, &[], &radii), ["A"]);
+    // Control: a stub of the same net inside one of the two discs is still ignored.
+    let with_stub = session(&[(
+        "A",
+        via("v", 1000, 1000)
+            + &via("v2", 1700, 1000)
+            + &wire("In1.Cu", 200, &[(1700, 1000), (1700, 1100)]),
+    )]);
+    assert!(changed_with(&with_stub, &without, &[], &radii).is_empty());
+}
+
+#[test]
 fn a_via_stub_does_not_excuse_a_changed_via_or_a_new_piece() {
     let radii = BTreeMap::from([("v".to_string(), 225)]);
     let held = net_with_stub(20, "A");

@@ -145,3 +145,49 @@ fn a_class_name_with_a_comma_is_left_out() {
     let text = dsn(&[], &["\"a b\"", "plain"]);
     assert_eq!(dsn_class_names(&text).unwrap(), names(&["a b", "plain"]));
 }
+
+/// The exporter and the Tune pass's via-stub guard (`via_disc_radii`) agree: a real export
+/// with two via sizes gives each via padstack of the DSN's `(via ...)` list an entry, at half
+/// its diameter, and nothing else is a via.
+#[test]
+fn the_via_discs_of_a_real_export_are_half_the_diameter_of_each_via_padstack() {
+    use konnect_ipc::{IpcEffectiveRoutingRules, IpcRoutingRules};
+    let rule = |via_diameter_mm: f64| IpcRoutingRules {
+        class_name: "Default".to_string(),
+        constituents: vec!["Default".to_string()],
+        track_width_mm: Some(0.25),
+        clearance_mm: Some(0.2),
+        via_diameter_mm: Some(via_diameter_mm),
+        via_drill_mm: Some(0.3),
+    };
+    let rules: IpcEffectiveRoutingRules = [
+        ("GND".to_string(), rule(0.6)),
+        ("VCC".to_string(), rule(0.8)),
+    ]
+    .into_iter()
+    .collect();
+    let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+    let dsn = export_dsn(Path::new("board.kicad_pcb"), source, &rules)
+        .unwrap()
+        .dsn;
+    let radii = via_disc_radii(&dsn);
+    // The padstacks the structure lists as vias.
+    let listed: Vec<String> = dsn
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("(via konnect_via_"))
+        .map(|rest| {
+            format!("konnect_via_{rest}")
+                .trim_end_matches(')')
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+        .expect("the structure lists its via padstacks");
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    for name in &listed {
+        assert!(radii.contains_key(name), "{name} has no disc: {radii:?}");
+    }
+    let mut found: Vec<i64> = listed.iter().map(|name| radii[name]).collect();
+    found.sort_unstable();
+    assert_eq!(found, [300, 400], "half of 600 um and of 800 um");
+}
