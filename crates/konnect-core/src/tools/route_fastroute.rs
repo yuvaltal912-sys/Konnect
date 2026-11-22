@@ -1488,8 +1488,9 @@ fn listed_runs(outcome: &SearchOutcome, listing: Listing) -> Vec<&RunRecord> {
 }
 
 /// The winner's own part of `search`: its identity, verdict and passes, and
-/// `group_search` ([`group_search_summary`]) when its kept pass's report has a
-/// summary to give (Row GS, G5). `None` when no run won, or the winning record lacks
+/// `group_search` ([`group_search_summary`]) when the report of its kept routing pass
+/// (the routing pass a kept Tune pass started from, when there is one) has a summary
+/// to give (Row GS, G5). `None` when no run won, or the winning record lacks
 /// what a result needs.
 fn winner_json(outcome: &SearchOutcome) -> Option<Value> {
     let position = outcome.winner?;
@@ -1517,8 +1518,10 @@ fn held_group_search(held: &crate::fastroute::Held) -> Option<Value> {
     held.group_search.as_ref().and_then(group_search_summary)
 }
 
-/// What the group search did on the winner's kept pass, from the engine's report
-/// (Row GS, G5). `object` is the report's `group_search` object, as
+/// What the group search did on the winner's kept routing pass, from the engine's
+/// report (Row GS, G5): that pass's search only, never the other passes' of the run,
+/// and with differential pairs the last pipeline run of the pass that ran the stage
+/// (fastroute re-runs its pipeline once after it releases the pairs). `object` is the report's `group_search` object, as
 /// `fastroute::Held::group_search` keeps it. The summary: `ended_by` (`converged`,
 /// `pass_cap` or `stopped`, as the engine names it), `passes` (their count),
 /// `kept_moves` (the sum of the passes' `kept`), `largest_group` (the largest
@@ -1744,7 +1747,7 @@ fn tuning_fields(
 /// (`fastroute::routing_switches`: the candidate switches, then the search switches),
 /// threads }; `effort` { level, source, budget_s, runs }; `search` { lanes, shapes,
 /// launched, judged, winner { index, shape, seed, gates, measures, passes, kept, and
-/// group_search when the kept pass's report has one (Row GS) },
+/// group_search when the kept routing pass's report has one (Row GS) },
 /// runs (every record), elapsed_s, budget_overrun_s, stopped_launching, baseline };
 /// `artifacts` { dsn_path, ses_output_path, search_folder, judged_board };
 /// `passes` and `result_pass` of the winner, as the Freerouting hold path names them;

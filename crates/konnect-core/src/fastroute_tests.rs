@@ -168,6 +168,27 @@ fn the_routing_switches_are_the_fixed_switches_of_a_routing_line_in_order() {
     assert_eq!(sent, switches);
 }
 
+/// Row GS, G2: the probe's step 2 sends every switch Konnect sends, in the routing
+/// line's order, then the uncounted file, and the sentinel last: fastroute stops at the
+/// first unknown switch, so a switch after the sentinel would never be checked.
+#[test]
+fn the_probe_line_sends_every_switch_then_the_uncounted_file_and_the_sentinel_last() {
+    let scratch = Path::new("/s/probe");
+    let args = probe_arguments(scratch);
+    let mut expected = vec!["-de".to_string(), "/s/probe/absent.dsn".to_string()];
+    expected.extend(routing_switches().iter().map(|switch| switch.to_string()));
+    expected.push(format!("--x.gs_uncounted=/s/probe/{PROBE_UNCOUNTED}"));
+    expected.push(SENTINEL_SWITCH.to_string());
+    assert_eq!(args, expected);
+    assert_eq!(args.last().map(String::as_str), Some(SENTINEL_SWITCH));
+    assert_eq!(
+        args.iter()
+            .filter(|token| *token == SENTINEL_SWITCH)
+            .count(),
+        1
+    );
+}
+
 /// Row GS, G3: `--x.gs_uncounted` is sent only when the call has the file, as one
 /// token, after the amps file and before the pairs file and the initial session.
 #[test]
@@ -533,6 +554,51 @@ fn the_uncounted_file_leaves_out_what_fastroute_would_read_as_another_name() {
         uncounted_file_text(&pours(&[json!("A#1")])),
         Some("A#1\n".to_string())
     );
+}
+
+/// fastroute matches uncounted names ignoring case: a pour net whose name another,
+/// counted net of the manifest repeats in another letter case is left out (counted),
+/// so that the other net is not left out of the cost with it. Two pours that differ by
+/// case are both pour nets, and both are written.
+#[test]
+fn the_uncounted_file_leaves_out_a_pour_net_another_net_repeats_in_another_case() {
+    let manifest = |nets: &[&str], pours_of: &[&str]| -> Value {
+        let mut manifest = pours(&pours_of.iter().map(|net| json!(net)).collect::<Vec<_>>());
+        manifest["nets"] = json!(nets
+            .iter()
+            .map(|name| json!({ "name": name, "pins": [] }))
+            .collect::<Vec<_>>());
+        manifest
+    };
+    assert_eq!(
+        uncounted_file_text(&manifest(&["GND", "gnd", "VBUS", "S1"], &["GND", "VBUS"])),
+        Some("VBUS\n".to_string())
+    );
+    assert_eq!(
+        uncounted_file_text(&manifest(&["Agnd", "AGND"], &["AGND"])),
+        None
+    );
+    // Final and plain sigma differ in lower case and agree in upper case; Java's
+    // `compareToIgnoreCase` takes them as one letter, so this is a collision too.
+    assert_eq!(
+        uncounted_file_text(&manifest(&["ΣNET", "ςNET"], &["ΣNET"])),
+        None
+    );
+    // Control: no other net in another case, or the other one is a pour too.
+    assert_eq!(
+        uncounted_file_text(&manifest(&["GND", "VBUS", "S1"], &["GND", "VBUS"])),
+        Some("GND\nVBUS\n".to_string())
+    );
+    assert_eq!(
+        uncounted_file_text(&manifest(&["GND", "gnd"], &["GND", "gnd"])),
+        Some("GND\ngnd\n".to_string())
+    );
+    // The fixture's own nets: GND only once, so it stays.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/specctra_pours_routing.dsn.konnect.json"
+    ))
+    .unwrap();
+    assert_eq!(uncounted_file_text(&fixture), Some("GND\n".to_string()));
 }
 
 // ---- sandbox_profile ------------------------------------------------------
@@ -2690,9 +2756,11 @@ int main(int argc, char **argv) {
                 printf("fastroute: unknown experimental switch --x.konnect_probe_unknown\n");
             return 2;
         }
-        // `lacks_search=1`: a build without the smart-router switches (x18), and
-        // `lacks=<switch>`: a build without that one. Like fastroute, it names the
-        // first unknown switch in argument order and stops.
+        // As fastroute parses its arguments (`exp::parse_arg`, in order): the first
+        // unknown experimental switch is named, and nothing after it is looked at.
+        // Unknown are the sentinel, with `lacks_search=1` (a build without the
+        // smart-router switches, x18) the three search switches and
+        // `--x.gs_uncounted`, and with `lacks=<prefix>` the switches that start so.
         char lacks[256] = "";
         cfg("lacks", lacks, sizeof lacks);
         int lacks_search = cfg_int("lacks_search", 0);
@@ -2700,16 +2768,12 @@ int main(int argc, char **argv) {
             const char *a = argv[i];
             int search = strcmp(a, "--x.oct_bound") == 0
                 || strncmp(a, "--x.opt_follow_rips", 19) == 0
-                || strcmp(a, "--x.group_search") == 0;
+                || strcmp(a, "--x.group_search") == 0
+                || strncmp(a, "--x.gs_uncounted=", 17) == 0;
             int lacked = lacks[0] && strncmp(a, lacks, strlen(lacks)) == 0;
-            if ((search && lacks_search) || lacked) {
+            int sentinel = strcmp(a, "--x.konnect_probe_unknown") == 0;
+            if ((search && lacks_search) || lacked || sentinel) {
                 printf("fastroute: unknown experimental switch %s\n", a);
-                return 2;
-            }
-        }
-        for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "--x.konnect_probe_unknown") == 0) {
-                printf("fastroute: unknown experimental switch %s\n", argv[i]);
                 return 2;
             }
         }
@@ -3093,6 +3157,33 @@ int main(int argc, char **argv) {
         probe(&fixture.binary, "argument", &fixture.scratch())
             .await
             .unwrap();
+    }
+
+    /// Row GS: the probe sends `--x.gs_uncounted` with an empty file it writes in its
+    /// scratch folder, so a build that lacks the switch is refused with it named; a
+    /// build that knows it passes, and the file is there and empty.
+    #[tokio::test]
+    async fn probe_refuses_a_build_without_the_uncounted_switch_and_names_it() {
+        let fixture = Fixture::new("mode=candidate\nlacks=--x.gs_uncounted\n");
+        let text = format!(
+            "{:#}",
+            probe(&fixture.binary, "argument", &fixture.scratch())
+                .await
+                .unwrap_err()
+        );
+        assert!(text.contains("names --x.gs_uncounted="), "{text}");
+        assert!(text.contains(PROBE_UNCOUNTED), "{text}");
+        // Control: the fake that knows it passes, and the file it was given is empty.
+        let fixture = Fixture::new("mode=candidate\n");
+        probe(&fixture.binary, "argument", &fixture.scratch())
+            .await
+            .unwrap();
+        let file = fixture
+            .scratch()
+            .canonicalize()
+            .unwrap()
+            .join(PROBE_UNCOUNTED);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
     }
 
     #[tokio::test]

@@ -11,9 +11,16 @@ manifest's pour nets in `--x.gs_uncounted`. Design: decision D25 in
 `docs/ROUTE_SEARCH_DESIGN.md`.
 
 - **The candidate build is x19** (`C** + BR1 + W8P + GS`). A fastroute build without
-  the three switches, x18 included, is refused by the probe before anything is
-  routed, with the switch it lacks named; the setup steps say where the candidate
-  goes. A 1 Kopper package that bundles x18 must be built again.
+  the three switches or `--x.gs_uncounted`, x18 included, is refused by the probe
+  before anything is routed, with the switch it lacks named; the setup steps say
+  where the candidate goes. A 1 Kopper package that bundles x18 must be built again.
+  The probe proves that a build knows the switches, not which build it is:
+  `engine.sha256` in the result, and the package pin, say that.
+- **`plan_convergent_placement` changes too.** It locates fastroute the same way and
+  routes its candidates through the same call, so it refuses x18 and its candidates
+  are routed with the group search. Its measured parameters and timings (Rows PS, CP
+  and CT) were measured on x18 and are not measured again here. The placement bench
+  routes through the same call.
 - **New result field `search.winner.group_search`**: `ended_by`, `passes`,
   `kept_moves`, `largest_group`, and `start` and `end` with `length_mm`, `vias` and
   `cost_mm`. It is absent when the winner's kept pass reported no group search.
@@ -21,8 +28,12 @@ manifest's pour nets in `--x.gs_uncounted`. Design: decision D25 in
 - **`engine.switches`** lists every fixed switch a routing pass sends: the candidate
   switches, then the three search switches (it listed the candidate switches only).
 - The search folder holds `uncounted.txt` when the manifest has pours. Nothing
-  else in the arguments or the result changes, and the Tune pass of Row LT runs as
-  before.
+  else in the arguments changes.
+- **The Tune pass and the pair passes change with the engine.** x19 carries the
+  engine's row FT (the tuner keeps off its own net, pair nets end clean), so Row LT's
+  Tune pass and Row DP's pairs route differently on x19 even though the Tune pass
+  gets no search switch. [[PLACEHOLDER GS-FT: the by-pipe Row LT and Row DP checks on
+  x19, against x18's records]]
 
 ## Unreleased: matched lengths with fastroute (Row LT)
 

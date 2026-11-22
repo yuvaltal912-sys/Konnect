@@ -5,8 +5,12 @@
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
 //! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`]):
-//! build x19. [`locate`] finds it and [`probe`] proves that the binary found is that
-//! build before anything is routed.
+//! build x19. [`locate`] finds a binary and [`probe`] proves, before anything is
+//! routed, that it knows every experimental switch Konnect sends. That is not proof
+//! that it is x19: an earlier engine commit may know the same switches, and x18 and
+//! x19 both print `fastroute 0.1.14`. What identifies the build is its SHA-256: the
+//! 1 Kopper package checks it against `packaging/1-kopper/fastroute.json`, and every
+//! result reports it as `engine.sha256`.
 
 use crate::specctra::RoutingHints;
 use crate::specctra_seed::{lists, parse_specctra, session_routes, WIRE_DESCRIPTORS};
@@ -108,7 +112,7 @@ pub(crate) const PRESET: &[&str] = &[
 /// How long one probe step may take before it is killed.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The binary Konnect will run, proven to be the candidate build.
+/// The binary Konnect will run, proven to know every switch Konnect sends ([`probe`]).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Binary {
     /// Canonical path.
@@ -241,18 +245,24 @@ fn present(path: &Path) -> bool {
     )
 }
 
-/// Proves `path` is the candidate build. Each step runs sandboxed
+/// Proves that `path` is a fastroute that knows every experimental switch Konnect
+/// sends; its SHA-256, not the probe, says which build it is. Each step runs sandboxed
 /// ([`sandbox_profile`] with `scratch` as the run folder), with the environment
 /// cleared to `HOME`, `TMPDIR` and `PATH` as in [`run_pass`], and is killed after
 /// [`PROBE_TIMEOUT`]:
 /// 1. `--version`: the first line of its output must start with `fastroute `.
-/// 2. `-de <scratch>/absent.dsn`, then every [`CANDIDATE_SWITCHES`] entry, then
-///    every [`SEARCH_SWITCHES`] entry, then [`SENTINEL_SWITCH`]: the output must
-///    contain `unknown experimental switch --x.konnect_probe_unknown` and must not
-///    name any other switch as unknown. A build that lacks a candidate or search
-///    switch names that one (x18, without the search switches, names
-///    `--x.oct_bound`); a build without experimental switches names none (it goes on
-///    to open the absent DSN and fails on that).
+/// 2. [`probe_arguments`]: `-de <scratch>/absent.dsn`, every [`CANDIDATE_SWITCHES`]
+///    entry, every [`SEARCH_SWITCHES`] entry, `--x.gs_uncounted=<scratch>/probe-uncounted.txt`
+///    (an empty file the probe writes; fastroute reads it as it parses the switch, and an
+///    empty file names no net), then [`SENTINEL_SWITCH`], last. fastroute parses its
+///    arguments in order and stops at the first unknown experimental switch
+///    (`exp::parse_arg`), so the sentinel is named only when every switch before it was
+///    accepted. The output must contain
+///    `unknown experimental switch --x.konnect_probe_unknown` and must not name any
+///    other switch as unknown. A build that lacks one of the switches names that one
+///    (x18, without the search switches, names `--x.oct_bound`); a build without
+///    experimental switches names none (it goes on to open the absent DSN and fails on
+///    that).
 ///
 /// Returns the binary with its SHA-256 (of the file's bytes) and version line. The
 /// error says which step failed and quotes at most 300 characters of the output.
@@ -283,14 +293,11 @@ pub(crate) async fn probe(path: &Path, source: &'static str, scratch: &Path) -> 
         );
     }
 
-    // Step 2: every candidate switch is accepted, and only the sentinel is unknown.
-    let mut args = vec![
-        "-de".to_string(),
-        scratch.join("absent.dsn").display().to_string(),
-    ];
-    args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
-    args.extend(SEARCH_SWITCHES.iter().map(|switch| switch.to_string()));
-    args.push(SENTINEL_SWITCH.to_string());
+    // Step 2: every switch Konnect sends is accepted, and only the sentinel is unknown.
+    let uncounted = scratch.join(PROBE_UNCOUNTED);
+    std::fs::write(&uncounted, "")
+        .with_context(|| format!("{} could not be written", uncounted.display()))?;
+    let args = probe_arguments(&scratch);
     let output = sandboxed_output(&profile, &path, &scratch, &args)
         .await
         .context("probe step 2 (candidate switches)")?;
@@ -325,6 +332,28 @@ pub(crate) async fn probe(path: &Path, source: &'static str, scratch: &Path) -> 
         version,
         source,
     })
+}
+
+/// The empty `--x.gs_uncounted` file of the probe's step 2, in its scratch folder.
+pub(crate) const PROBE_UNCOUNTED: &str = "probe-uncounted.txt";
+
+/// The probe's step 2 command line for `scratch` ([`probe`]): `-de <scratch>/absent.dsn`,
+/// [`CANDIDATE_SWITCHES`], [`SEARCH_SWITCHES`], `--x.gs_uncounted=<scratch>/`
+/// [`PROBE_UNCOUNTED`], and [`SENTINEL_SWITCH`] last: fastroute stops at the first
+/// unknown switch, so a switch after the sentinel would never be checked.
+pub(crate) fn probe_arguments(scratch: &Path) -> Vec<String> {
+    let mut args = vec![
+        "-de".to_string(),
+        scratch.join("absent.dsn").display().to_string(),
+    ];
+    args.extend(CANDIDATE_SWITCHES.iter().map(|switch| switch.to_string()));
+    args.extend(SEARCH_SWITCHES.iter().map(|switch| switch.to_string()));
+    args.push(format!(
+        "--x.gs_uncounted={}",
+        scratch.join(PROBE_UNCOUNTED).display()
+    ));
+    args.push(SENTINEL_SWITCH.to_string());
+    args
 }
 
 /// One pass of the hold sequence.
@@ -475,19 +504,34 @@ pub(crate) fn amps_file_text(manifest: &Value) -> Option<String> {
 /// the board does not have is logged and skipped (`exp::parse_net_names`,
 /// `group_search::settings_from_exp`). So a name with white space inside is written
 /// as it is, and a name that starts or ends with white space, or starts with `#`, is
-/// left out too: fastroute would read it as another name or as a comment. A pour net
-/// left out is counted in the group search's cost, which is the safe side.
+/// left out too: fastroute would read it as another name or as a comment. And since
+/// fastroute matches ignoring case, a pour net is left out when the manifest's `nets`
+/// hold a net that is not a pour net and whose name differs from it only by letter
+/// case: fastroute would leave that net, which the judge counts, out of the cost too.
+/// A pour net left out is counted in the group search's cost, which is the safe side.
 pub(crate) fn uncounted_file_text(manifest: &Value) -> Option<String> {
-    let names: BTreeSet<&str> = manifest["pours"]
+    let pours: BTreeSet<&str> = manifest["pours"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|row| row["net"].as_str())
+        .collect();
+    let others: Vec<&str> = manifest["nets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["name"].as_str())
+        .filter(|name| !pours.contains(name))
+        .collect();
+    let names: BTreeSet<&str> = pours
+        .iter()
+        .copied()
         .filter(|net| {
             !net.is_empty()
                 && !net.contains(['\n', '\r'])
                 && net.trim() == *net
                 && !net.starts_with('#')
+                && !others.iter().any(|other| same_ignoring_case(net, other))
         })
         .collect();
     if names.is_empty() {
@@ -499,6 +543,14 @@ pub(crate) fn uncounted_file_text(manifest: &Value) -> Option<String> {
         text.push('\n');
     }
     Some(text)
+}
+
+/// Whether two names are one to fastroute, which compares net names ignoring case
+/// (Java's `compareToIgnoreCase`, character by character after upper- and lower-casing).
+/// Either casing counts, so this errs towards "the same", the safe side for
+/// [`uncounted_file_text`].
+fn same_ignoring_case(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase() || a.to_uppercase() == b.to_uppercase()
 }
 
 /// The sandbox profile of one run folder (macOS `sandbox-exec`):
