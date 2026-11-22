@@ -37,7 +37,7 @@ pub(crate) mod evaluate;
 pub(crate) mod force_core;
 #[cfg(test)]
 mod force_core_tests;
-mod objectives;
+pub(crate) mod objectives;
 mod plan_status;
 #[cfg(test)]
 mod scoring_tests;
@@ -215,7 +215,7 @@ const CONNECTOR_CAP: i64 = 30;
 const DECOUPLING_POINTS: i64 = 15;
 const DECOUPLING_CAP: i64 = 30;
 /// A connector (J*) should sit within this distance of some board edge.
-const CONNECTOR_EDGE_LIMIT_MM: f64 = 10.0;
+pub(crate) const CONNECTOR_EDGE_LIMIT_MM: f64 = 10.0;
 
 fn metric_fanout_limit(args: &serde_json::Value) -> Result<usize, CallToolResult> {
     match args.get("max_net_references") {
@@ -1566,7 +1566,7 @@ fn footprint_references(tree: &SexpNode) -> BTreeSet<String> {
 /// The leading alphabetic run of a reference designator: `"C12"` → `"C"`,
 /// `"CN3"` → `"CN"` (which is *not* a capacitor), `"J1"` → `"J"`. An exact
 /// prefix match, so jumpers (JP) and connectors sold as CN never misclassify.
-fn ref_prefix(reference: &str) -> &str {
+pub(crate) fn ref_prefix(reference: &str) -> &str {
     let end = reference
         .find(|c: char| !c.is_ascii_alphabetic())
         .unwrap_or(reference.len());

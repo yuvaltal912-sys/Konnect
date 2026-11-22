@@ -828,6 +828,68 @@ exit 0
     assert!(unrouted_check(&inputs, &bench.root.join("checks"))
         .await
         .is_err());
+    // A report whose JSON parses but has no unconnected-items category is refused, not
+    // counted as a board with no such entries (`unrouted_counts`).
+    std::fs::write(
+        fake.join("drc.json"),
+        json!({ "violations": [violation("silk_overlap")] }).to_string(),
+    )
+    .unwrap();
+    let error = unrouted_check(&inputs, &bench.root.join("incomplete"))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no unconnected-items category"),
+        "{error:#}"
+    );
+}
+
+/// A report with these violation types and, when `unconnected` is `Some`, that many
+/// unconnected items.
+fn drc_report(rules: &[&str], unconnected: Option<usize>) -> crate::tools::cli::DrcReport {
+    let violation = |rule: &str| crate::tools::cli::DrcViolation {
+        severity: "error".into(),
+        description: "x".into(),
+        rule: rule.into(),
+        pos: None,
+        items: Vec::new(),
+    };
+    crate::tools::cli::DrcReport {
+        violations: rules.iter().map(|rule| violation(rule)).collect(),
+        unconnected_items: unconnected
+            .map(|n| (0..n).map(|_| violation("unconnected_items")).collect()),
+        schematic_parity: None,
+        ownership_diagnostic: None,
+        schematic_parity_diagnostic: None,
+    }
+}
+
+#[test]
+fn an_unrouted_check_refuses_a_report_without_the_unconnected_items_category() {
+    // The bench's own per-candidate check (`route_judge::baseline`) turns such a report
+    // into an error, never a zero; the silk check, which reads the same counts, must not
+    // take it for a board with no entries.
+    let rules = ["silk_overlap", "clearance", "silk_overlap"];
+    let counts = unrouted_counts(&drc_report(&rules, Some(0))).unwrap();
+    assert_eq!(
+        counts,
+        BTreeMap::from([
+            ("clearance".to_string(), 1),
+            ("silk_overlap".to_string(), 2)
+        ])
+    );
+    // A report that lists none and has the category is a checked zero.
+    assert!(unrouted_counts(&drc_report(&[], Some(3)))
+        .unwrap()
+        .is_empty());
+    // The same violations without the category: refused, and the error says why.
+    let error = unrouted_counts(&drc_report(&rules, None)).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no unconnected-items category"),
+        "{error:#}"
+    );
+    // The judge's requirement and this one are one.
+    assert!(crate::route_judge::unconnected_total(&drc_report(&rules, None)).is_err());
 }
 
 // ─── isolated_context ────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ pub mod observability;
 pub mod outcome;
 #[cfg(test)]
 mod place_bench_tests;
+pub(crate) mod place_converge;
 pub(crate) mod place_generators;
 pub(crate) mod place_held;
 pub(crate) mod place_judge;
