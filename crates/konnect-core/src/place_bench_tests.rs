@@ -33,7 +33,7 @@ use crate::place_route::{
 use crate::place_schematic::SchematicBaseline;
 use crate::place_search::{
     converge_all, generate_all, search, search_model, silk_entries, Origin, PlaceRouteCall, Plan,
-    Record, RouteCall,
+    Record, RouteCall, Routed,
 };
 use crate::route_search::Effort;
 use anyhow::{bail, ensure, Context};
@@ -511,6 +511,8 @@ fn board_plan(
         ai_board,
         caller_held,
         hold: board.hold_rules(),
+        schematic: None,
+        routed: Routed::Every,
     }
 }
 

@@ -657,6 +657,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // plan_convergent_placement's response fields and statuses (Row CT).
+        "apply_with",
+        "gate_failures",
+        "planned_with_gate_failures",
+        "no_candidate",
+        "not_routed",
         // Specctra export result field (creation PR 16b).
         "intent_widths",
         // Manufacturing and trace-current response fields and statuses

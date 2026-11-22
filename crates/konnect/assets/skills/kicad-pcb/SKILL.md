@@ -67,7 +67,7 @@ Load additional toolsets as needed:
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
 load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
-load_toolset('placement')        # score_placement and read-only query_board_region
+load_toolset('placement')        # score_placement, read-only query_board_region, plan_convergent_placement
 load_toolset('pcb_export')       # export_specctra_dsn and refill_zones
 load_toolset('integration')      # check_freerouting and local route_specctra_dsn
 ```
@@ -103,7 +103,8 @@ Follow this sequence for a clean PCB workflow:
    antenna keepouts now with `add_rule_area` (its defaults are KiCad's: tracks, vias
    and pads forbidden; set `copperpour` in its `keepout` to keep pours out too), and
    lock fixed parts (connectors, mounting) with `set_footprint_lock`. Only
-   `auto_place_from_schematic` and `refine_placement_force_directed` hold a locked
+   `auto_place_from_schematic`, `refine_placement_force_directed` and
+   `plan_convergent_placement` hold a locked
    footprint, and `update_pcb_from_schematic` keeps a locked orphan instead of
    deleting it. `move_component`, `rotate_component`, `flip_component`,
    `set_component_placements`, `align_components` and `place_decoupling_caps` do not
@@ -268,6 +269,16 @@ an unproved outline is not completion evidence.
   sit on the edge. `run_design_review`, `audit_manufacturing` and
   `validate_for_manufacturing` run the same containment check on courtyards,
   pads and silkscreen text.
+- `plan_convergent_placement` (placement toolset) plans a whole board for a board
+  open in KiCad: the parts locked in KiCad stay, the convergent search places the
+  rest, and it routes its three best candidates to pick the winner (minutes). It
+  writes nothing. Show the user **winner**, **candidates** and **notes**; only on
+  their explicit OK call `create_checkpoint`, then `set_component_placements` with
+  **apply_with.arguments** exactly as returned: the plan is legal as a whole, so it
+  is the one plan applied in one batch instead of the small batches above. Then
+  steps 5 to 7 of the loop above still apply. A winner whose status is
+  **planned_with_gate_failures** is shown with its **gate_failures**; the statuses
+  **no_candidate** and **not_routed** carry no plan.
 - `place_decoupling_caps`, `auto_place_from_schematic` and
   `refine_placement_force_directed` still refuse any outline that is not a
   provable rectangle; on a rounded or notched board place parts with small

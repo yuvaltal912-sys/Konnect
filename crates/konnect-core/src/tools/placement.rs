@@ -197,6 +197,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
     ];
     tools.extend(crate::tools::board_geometry::tools());
+    tools.extend(crate::tools::placement_converge::tools());
     tools
 }
 

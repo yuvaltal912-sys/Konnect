@@ -1779,8 +1779,7 @@ impl Matrix {
     /// iterations);
     /// S seeds 1..=32 x {raw, polished with rail weight 0.5}; P seeds 1..=64 x
     /// {4 edits within 2 mm, 12 edits within 5 mm}, swaps and turns on. 288 recipes.
-    // Used only by the bench (an ignored test): no product code calls the search.
-    #[allow(dead_code)]
+    // The bench and `plan_convergent_placement` (Row CT).
     pub(crate) fn bench() -> Self {
         let force = |rail_weight: f64| ForceParams {
             rail_weight,
@@ -1827,8 +1826,7 @@ impl Matrix {
     /// This matrix with only the recipes of `families` left: the others get no seed, so
     /// `recipes` makes none of them, and family C is off unless it is named. What is kept
     /// is unchanged, so the F and S recipes are the same ones with or without P or C.
-    // Used only by the bench (an ignored test): no product code calls the search.
-    #[allow(dead_code)]
+    // The bench and `plan_convergent_placement` (Row CT).
     pub(crate) fn only(mut self, families: &[Family]) -> Self {
         if !families.contains(&Family::Force) {
             self.force_seeds.clear();

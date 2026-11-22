@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **269 registered tools** + **7 always-visible meta-tools** = **276 total**
+- **270 registered tools** + **7 always-visible meta-tools** = **277 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -258,7 +258,7 @@ and Windows servers do not.
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
-| `set_footprint_lock` | Read (`locked` omitted) or set the lock flag of placed footprints in the saved file. KiCad 6's bare `locked` token and `(locked no)` are read and replaced. Writes preview first and apply only with the preview's `revision`. Only `auto_place_from_schematic` and `refine_placement_force_directed` hold a locked footprint, and `update_pcb_from_schematic` keeps a locked orphan instead of deleting it; `move_component`, `rotate_component`, `flip_component`, `set_component_placements`, `align_components` and `place_decoupling_caps` do not check the lock. |
+| `set_footprint_lock` | Read (`locked` omitted) or set the lock flag of placed footprints in the saved file. KiCad 6's bare `locked` token and `(locked no)` are read and replaced. Writes preview first and apply only with the preview's `revision`. Only `auto_place_from_schematic`, `refine_placement_force_directed` and `plan_convergent_placement` hold a locked footprint, and `update_pcb_from_schematic` keeps a locked orphan instead of deleting it; `move_component`, `rotate_component`, `flip_component`, `set_component_placements`, `align_components` and `place_decoupling_caps` do not check the lock. |
 | `add_rule_area` | Add a rule area (keepout zone) — rectangle or simple polygon, one or more copper layers (`*.Cu` = all), the five keepout flags (default, as KiCad's own new rule area: tracks, vias and pads forbidden; copper pours and footprints allowed). One that forbids tracks or vias is exported by `export_specctra_dsn` as a keepout per layer, so Freerouting routes around it. Unique names; preview then apply with `revision`. |
 | `list_zones` | List top-level copper zones and rule areas from the saved file: UUID, name, kind, net, layers, keepout flags, priority, corners, bounding box (an arc edge's bulge included). |
 | `delete_zone` | Delete copper zones or rule areas by UUID or unique name; preview then apply with `revision`. A name or UUID that more than one zone carries is refused before anything is written. Zones inside footprints are not touched. |
@@ -318,8 +318,8 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `placement` · 6 tools
-**Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
+### `placement` · 7 tools
+**Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts, plan a whole board with the convergent placement search; the row planners report their own before/after score.
 **Source:** [`crates/konnect-core/src/tools/placement.rs`](crates/konnect-core/src/tools/placement.rs)
 
 | Tool | Description |
@@ -329,6 +329,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `place_decoupling_caps` | Plan (dry-run default) or apply a row of decoupling caps beside an IC, from `capacitor_references` the caller supplies — never discovered by shared nets, since GND alone pairs a cap with nearly every IC on the board. Reports a blocked plan status naming why it can't apply (a target outside the board outline, or no score improvement) before anything is written. |
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | **Deprecated:** diagnostic planning only. It can return a deterministic net-clustered starting plan and before/after scores, but autonomous whole-board mutation is retired. `dry_run: false` returns structured `plan_blocked` without writing; apply bounded, explicit `move_component` operations instead. |
+| `plan_convergent_placement` | Read-only whole-board placement plan by the convergent placement search, for a board open in KiCad (the only board open). KiCad's locked footprints stay; every other part may move and turn. On a scratch copy in Konnect's state folder it generates starts, refines them until the search's stop rules end it (by convergence, not by time), routes the first three candidates with fastroute at `effort` (default `m`) and names the winner by the placement bench's gates and rank key, so a call takes minutes. `apply_with` holds the winner as exact `set_component_placements` arguments; nothing is applied. `status` is `planned`, `planned_with_gate_failures`, `no_candidate` or `not_routed` (the last two carry no placements). |
 | `refine_placement_force_directed` | **Deprecated:** diagnostic deterministic spring embedder, not a recommended bulk-placement workflow. Dry-run reports applicability and displacement; non-converged, non-improving (including score ties), hard-fail, off-board, unbounded, or over-limit plans cannot apply. A board outline that is not provably rectangular is refused with `plan_blocked` before any plan is made. Use explicit moves for justified score-neutral changes. |
 
 ---

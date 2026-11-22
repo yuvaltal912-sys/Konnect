@@ -173,7 +173,7 @@ impl Record {
     }
 
     /// The family letter of the record's group: `O`, `A`, `F`, `S`, `P` or `C`.
-    fn group(&self) -> &'static str {
+    pub(crate) fn group(&self) -> &'static str {
         match &self.origin {
             Origin::Owner { .. } => "O",
             Origin::Ai { .. } => "A",
@@ -185,7 +185,7 @@ impl Record {
     /// run of family C names its start (the start's family, seed and parameter-set index
     /// in `matrix`, `-` when the set is not one of the matrix's) and its effort level: the
     /// starts of F and S share seeds, and the levels of one start share its seed.
-    fn label(&self, matrix: &Matrix) -> String {
+    pub(crate) fn label(&self, matrix: &Matrix) -> String {
         match &self.origin {
             Origin::Owner { call } => format!("O call {call}"),
             Origin::Ai { call, .. } => format!("A call {call}"),
@@ -263,6 +263,22 @@ pub(crate) struct Plan {
     /// The rules that hold a part besides KiCad's lock and the caller's list
     /// (`HoldRules::default()`, or `HoldRules::locks_only()` in the owner's flow).
     pub hold: HoldRules,
+    /// The root schematic whose neighbourhoods family C and the measure read; `None`:
+    /// the one beside `route.board` (`<board>.kicad_sch`), as the bench lays it out. The
+    /// placement tool names the owner's own, beside his board (Row CT, T6).
+    pub schematic: Option<PathBuf>,
+    /// Which records the routing phase calls (Row CT, T8).
+    pub routed: Routed,
+}
+
+/// Which records the routing phase calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Routed {
+    /// The bench: everything `routing_order` gives, references and every family.
+    Every,
+    /// The placement tool (Row CT, T8): family C's records only, in their order in
+    /// `routing_order`; every other record is screened out.
+    ConvergeOnly,
 }
 
 /// How one board's search ended.
@@ -282,6 +298,11 @@ pub(crate) struct Outcome {
     pub input_unrouted: BTreeMap<String, usize>,
     /// Family C's outer loops (phase 1b); `None` when the matrix leaves the family off.
     pub converge: Option<OuterTrace>,
+    /// The model the search ran on, and why the schematic could not be read when it
+    /// could not: the placement tool rebuilds its winner from this model, not from a
+    /// second read of files the user may have saved since (Row CT, T9).
+    pub model: BoardModel,
+    pub schematic_reason: Option<String>,
 }
 
 /// The routing phase's two jobs, so that the scheduler is tested with fakes on a
@@ -1385,12 +1406,20 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     }
 
     // Phase 2.
-    let order = routing_order(
+    let mut order = routing_order(
         &records,
         plan.best_per_family,
         plan.drawn_per_family,
         plan.draw_seed,
     );
+    if plan.routed == Routed::ConvergeOnly {
+        let converged: BTreeSet<usize> = records
+            .iter()
+            .filter(|r| r.group() == "C")
+            .map(|r| r.id)
+            .collect();
+        order.retain(|id| converged.contains(id));
+    }
     let chosen: BTreeSet<usize> = order.iter().copied().collect();
     for record in &mut records {
         if record.outcome == "generated" && !chosen.contains(&record.id) {
@@ -1486,6 +1515,8 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
         clearances: model.clearances,
         input_unrouted,
         converge: outer,
+        schematic_reason: schematic.as_ref().err().cloned(),
+        model,
     };
     std::fs::write(
         plan.folder.join("search.json"),
@@ -1521,7 +1552,10 @@ pub(crate) fn search_model(
     let input_failures = movable_failure_keys(&evaluated, &held)?;
     // The schematic neighbourhoods, fixed once from the input board's project (D23). A
     // missing or unreadable schematic is a reason on every record, not an error.
-    let schematic = SchematicBaseline::read(&plan.route.board, &tree);
+    let schematic = match &plan.schematic {
+        Some(root) => SchematicBaseline::read_root(root, &tree),
+        None => SchematicBaseline::read(&plan.route.board, &tree),
+    };
     let mut model = board_model(&text, held, intent)?;
     model.input_failures = input_failures;
     model.clearances = Clearances::from_inputs(&plan.route.rules, &plan.route.options);
@@ -1539,6 +1573,12 @@ pub(crate) fn search_model(
 /// held or intent SHA-256 differ from this build's model, or when the rebuilt text's
 /// SHA-256 is not `board_sha256`.
 pub(crate) fn rerun(model: &BoardModel, record: &Record) -> anyhow::Result<String> {
+    rebuild(model, record).map(|(_, text)| text)
+}
+
+/// [`rerun`] with the candidate too: the placements that make the proved board text
+/// from the input (the placement tool returns them, Row CT, T9).
+pub(crate) fn rebuild(model: &BoardModel, record: &Record) -> anyhow::Result<(Candidate, String)> {
     let Origin::Generated {
         recipe,
         generator_version,
@@ -1605,7 +1645,7 @@ pub(crate) fn rerun(model: &BoardModel, record: &Record) -> anyhow::Result<Strin
         "the rebuilt board of candidate {} is not the recorded one",
         record.id
     );
-    Ok(text)
+    Ok((candidate, text))
 }
 
 // ─── The records on disk and the table ───────────────────────────────────────
@@ -1659,6 +1699,13 @@ pub(crate) fn search_json(plan: &Plan, outcome: &Outcome) -> serde_json::Value {
     }
     if let Some(outer) = &outcome.converge {
         file["converge"] = json!(outer);
+    }
+    // The tool's keys only in the tool's file (Row CT): the bench's is what it was.
+    if plan.routed == Routed::ConvergeOnly {
+        file["plan"]["routed"] = json!("converge_only");
+    }
+    if let Some(root) = &plan.schematic {
+        file["plan"]["schematic"] = json!(root.display().to_string());
     }
     file
 }
@@ -1943,4 +1990,4 @@ pub(crate) fn table(plan: &Plan, outcome: &Outcome) -> String {
 
 #[cfg(test)]
 #[path = "place_search_tests.rs"]
-mod tests;
+pub(crate) mod tests;

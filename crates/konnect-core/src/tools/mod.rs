@@ -52,6 +52,7 @@ pub mod pcb_routing;
 pub(crate) mod pcb_sync;
 mod placed_footprint_models;
 pub mod placement;
+pub(crate) mod placement_converge;
 pub mod project;
 #[cfg(test)]
 mod project_file_writer_tests;

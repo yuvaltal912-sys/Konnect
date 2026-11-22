@@ -57,8 +57,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
              again with the same arguments plus expected_revision to apply. Applying refuses \
              while KiCad holds the board open or its lock file is present, writes only if the \
              file still matches the preview, and reads the file back. Of Konnect's placement tools, only \
-             auto_place_from_schematic and refine_placement_force_directed hold a locked \
-             footprint where it is, and update_pcb_from_schematic keeps a locked orphan \
+             auto_place_from_schematic, refine_placement_force_directed and \
+             plan_convergent_placement hold a locked footprint where it is, and update_pcb_from_schematic keeps a locked orphan \
              footprint instead of deleting it. move_component, rotate_component, flip_component, \
              set_component_placements, align_components and place_decoupling_caps do not check \
              the lock, so keep locked references out of them. Routing never moves a footprint: \

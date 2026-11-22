@@ -418,7 +418,13 @@ impl SchematicBaseline {
     /// schematic is the `.kicad_sch` with the board's file stem in the same folder. Errs with
     /// the reason when the schematic cannot be read or no part has a neighbour.
     pub(crate) fn read(board_path: &Path, board: &SexpNode) -> Result<Self, String> {
-        let sheets = read_sheets(&board_path.with_extension("kicad_sch"))?;
+        Self::read_root(&board_path.with_extension("kicad_sch"), board)
+    }
+
+    /// [`Self::read`] from the root schematic `root` itself, wherever it is (the
+    /// placement tool reads the owner's own, beside his board, Row CT, T6).
+    pub(crate) fn read_root(root: &Path, board: &SexpNode) -> Result<Self, String> {
+        let sheets = read_sheets(root)?;
         Self::from_sheets(&sheets, board)
     }
 
