@@ -32,8 +32,7 @@ manifest's pour nets in `--x.gs_uncounted`. Design: decision D25 in
 - **The Tune pass and the pair passes change with the engine.** x19 carries the
   engine's row FT (the tuner keeps off its own net, pair nets end clean), so Row LT's
   Tune pass and Row DP's pairs route differently on x19 even though the Tune pass
-  gets no search switch. [[PLACEHOLDER GS-FT: the by-pipe Row LT and Row DP checks on
-  x19, against x18's records]]
+  gets no search switch. Checked by pipe on the public fixture (Row GS section of `CREATION_HANDOFF.md`): Row LT's case still tunes in one round with nothing dropped and passes G4, and Row DP's pair stays coupled at its 0.3 mm gap.
 
 ## Unreleased: matched lengths with fastroute (Row LT)
 
