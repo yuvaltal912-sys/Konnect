@@ -752,6 +752,24 @@ fn the_record_counts_the_pad_lists() {
     assert_eq!(short["redraw_s"], 0.42);
 }
 
+#[test]
+fn the_result_record_cuts_each_closings_left_open_list_to_its_count() {
+    let mut zr2 = planes_example();
+    zr2["closings"] = json!([
+        {"name": "after_routing", "rounds": [], "left_open": [{"item": "U1-1", "kind": "stranded"}, {"item": "#7", "kind": "starved"}], "left_open_count": 2, "stopped": null},
+        {"name": "after_last_stage", "rounds": [], "left_open": [{"item": "U2-3", "kind": "stranded"}], "stopped": null}
+    ]);
+    let full = engine_planes_record(&zr2, true);
+    assert_eq!(full["closings"][0]["left_open"][0]["item"], "U1-1");
+    let short = engine_planes_record(&zr2, false);
+    for (i, count) in [(0, 2), (1, 1)] {
+        let closing = &short["closings"][i];
+        assert!(closing.get("left_open").is_none(), "{closing}");
+        assert_eq!(closing["left_open_count"], count);
+    }
+    assert!(!short.to_string().contains("U1-1") && !short.to_string().contains("U2-3"));
+}
+
 /// The base board, refilled: the F.Cu GND pour filled over R2's two pads only, the B.Cu
 /// pour filled away from every pad.
 pub(crate) fn refilled() -> String {

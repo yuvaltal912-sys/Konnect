@@ -111,6 +111,27 @@ the engine's prediction with KiCad's refill, pad by pad. Design: stage ZR1 in
   stay, both counts are `null`, and `pours_error` gives the reason. A failed comparison
   never fails the judged run.
 
+### Stage ZR2: the model as the routing truth, and the closing stage
+
+`route_specctra_dsn` (fastroute) needs build x21 (`C** + BR1 + W8P + GS + ZR2`). With
+`--x.zones` the engine routes the modelled pour nets by its fill model and closes what
+is left open before the board is written. Design: "ZR2 as built" in
+`docs/ZONE_ROUTING_DESIGN.md`. Konnect's arguments, the gates and the rank key do not
+change.
+
+- **The report's `planes` object gains keys**, which `engine_planes` in each judged
+  run's `run.json` carries as fastroute wrote them:
+  - `closings`: one object per closing, with `name`, `rounds` (`open_before`, `routed`,
+    `spoke_tracks`, `open_after`), `left_open` (`item`, `kind`), `left_open_count` and
+    `stopped`;
+  - `closing_spoke_tracks`, `redraw_total_s`, `redraws_reused`, `redraw_points`,
+    `search_cut_ends`.
+  `left_open` is the router's view of what is still open, so it can name a pad that
+  `connected_pads` holds.
+- **In `search.winner.engine_planes`** each closing's `left_open` list is given as its
+  `left_open_count` only.
+- A reader of an x20 result, which has none of these keys, reads them as absent.
+
 ## Unreleased: the smart-router switches with fastroute (Row GS)
 
 `route_specctra_dsn` (fastroute) routes every Full, Fallback and Polish pass with
