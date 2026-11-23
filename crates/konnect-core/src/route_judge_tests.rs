@@ -308,7 +308,7 @@ fn prepare_refuses_a_kicad_cli_that_is_not_an_executable_file() {
 
 // -------------------------------------------------------------------- gates
 
-fn measures() -> Measures {
+pub(crate) fn measures() -> Measures {
     Measures {
         unconnected: 0,
         violations: BTreeMap::new(),
@@ -1456,15 +1456,15 @@ fn unconnected_on_counts_nothing_when_the_report_has_no_unconnected_category() {
 
 /// The files of a recorded export: a DSN with its manifest beside it, the saved
 /// board (named as the recorded session's design) and the session.
-struct Exported {
-    dsn: PathBuf,
-    ses: PathBuf,
+pub(crate) struct Exported {
+    pub(crate) dsn: PathBuf,
+    pub(crate) ses: PathBuf,
 }
 
 /// Exports `specctra_pours_policy.kicad_pcb` (written as `specctra_rounded_board`,
 /// the design the recorded session names) with the top pour left out, and writes the
 /// recorded Freerouting session of the rounded board beside it.
-fn exported(dir: &Path) -> Exported {
+pub(crate) fn exported(dir: &Path) -> Exported {
     exported_as(dir, false)
 }
 

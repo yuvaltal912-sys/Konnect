@@ -1656,4 +1656,4 @@ pub(crate) fn unconnected_on(drc: &crate::tools::cli::DrcReport, nets: &[String]
 
 #[cfg(test)]
 #[path = "route_judge_tests.rs"]
-mod tests;
+pub(crate) mod tests;
