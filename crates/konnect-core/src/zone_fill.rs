@@ -149,6 +149,10 @@ fn is_island(polygon: &SexpNode) -> bool {
 /// The measures of one judged run. `first_refill` is the DRC right after the session
 /// was written and refilled; `last_board_text` and `last_refill` are the last board the
 /// judge wrote (after the stitching rounds) and its DRC.
+///
+/// Row ZR, ZR5 part 1: the judge goes through [`pour_record`], which reads the board's
+/// fills once for these measures and the damage both, so only the tests call this.
+#[cfg(test)]
 pub(crate) fn pour_measures(
     first_refill: &DrcReport,
     last_board_text: &str,
