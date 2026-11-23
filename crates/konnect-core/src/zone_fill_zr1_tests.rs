@@ -851,6 +851,7 @@ fn the_comparison_is_recorded_beside_the_zr0_measures_never_as_a_failure() {
         starved_thermals: 0,
         false_connected: None,
         false_open: None,
+        damage: None,
     };
     let base = || {
         let mut measures = crate::route_judge::Measures {

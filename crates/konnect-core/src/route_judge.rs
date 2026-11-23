@@ -82,6 +82,14 @@ pub(crate) struct Baseline {
     /// KiCad's violations by type (rule key).
     pub violations: BTreeMap<String, usize>,
     pub unconnected: usize,
+    /// Row ZR, ZR5 part 1: the pour nets' layer fills of the refilled baseline board
+    /// (`pour_damage::layer_fills`), when the call has pour nets and they could be read:
+    /// the "before" of every run's `pours.damage`. Recorded only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pour_fills: Option<Vec<crate::pour_damage::LayerFill>>,
+    /// Row ZR, ZR5 part 1: why `pour_fills` could not be read. Never fails the baseline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pour_fills_error: Option<String>,
 }
 
 /// Whether the saved board is the board the DSN was exported from.
@@ -548,10 +556,39 @@ pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
     let report = refill(ctx, config.path(), &board)
         .await
         .context("the unrouted board's refill and DRC failed")?;
+    let (pour_fills, pour_fills_error) = baseline_fills(&board, &ctx.pour_nets).await;
     Ok(Baseline {
         violations: violations_by_rule(&report),
         unconnected: unconnected_total(&report)?,
+        pour_fills,
+        pour_fills_error,
     })
+}
+
+/// Row ZR, ZR5 part 1: the layer fills of the refilled baseline `board`, read off the
+/// async threads, or why they could not be read; neither when the call has no pour net.
+/// Never an error: the pour record never fails the baseline (PK3, recorded only).
+async fn baseline_fills(
+    board: &Path,
+    pour_nets: &BTreeSet<String>,
+) -> (Option<Vec<crate::pour_damage::LayerFill>>, Option<String>) {
+    if pour_nets.is_empty() {
+        return (None, None);
+    }
+    let path = board.to_path_buf();
+    let nets = pour_nets.clone();
+    let read = tokio::task::spawn_blocking(move || -> Result<_> {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read the baseline board '{}'", path.display()))?;
+        let fills = crate::zone_fill::pour_fills(&text, &nets)?;
+        Ok(crate::pour_damage::layer_fills(&fills))
+    })
+    .await
+    .context("the baseline's pour fills did not finish");
+    match read.and_then(|read| read) {
+        Ok(rows) => (Some(rows), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    }
 }
 
 /// Writes a new scratch board; the file must not exist yet.
@@ -936,8 +973,14 @@ async fn judge_one(
     )?;
     measures.lengths = lengths;
     if let Some(first_drc) = first_drc {
-        let taken =
-            crate::zone_fill::pour_record(&board, first_drc, drc.clone(), &ctx.pour_nets).await;
+        let taken = crate::zone_fill::pour_record(
+            &board,
+            first_drc,
+            drc.clone(),
+            &ctx.pour_nets,
+            baseline.pour_fills.as_deref(),
+        )
+        .await;
         crate::zone_fill::record_pours(&mut measures, taken);
         if let Some(engine) = engine {
             crate::zone_fill::record_comparison(

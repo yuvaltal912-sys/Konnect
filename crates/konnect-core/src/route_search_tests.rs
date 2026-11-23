@@ -742,6 +742,8 @@ fn baseline() -> Baseline {
     Baseline {
         violations: BTreeMap::new(),
         unconnected: 0,
+        pour_fills: None,
+        pour_fills_error: None,
     }
 }
 

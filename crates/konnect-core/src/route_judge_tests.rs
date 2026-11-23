@@ -341,6 +341,8 @@ fn base(violations: &[(&str, usize)]) -> Baseline {
             .map(|(k, n)| (k.to_string(), *n))
             .collect(),
         unconnected: 3,
+        pour_fills: None,
+        pour_fills_error: None,
     }
 }
 

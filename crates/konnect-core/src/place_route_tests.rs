@@ -449,6 +449,8 @@ fn baseline() -> Baseline {
         ]
         .into(),
         unconnected: 41,
+        pour_fills: None,
+        pour_fills_error: None,
     }
 }
 

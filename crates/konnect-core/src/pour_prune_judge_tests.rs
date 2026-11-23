@@ -223,6 +223,8 @@ fn clean_baseline() -> Baseline {
     Baseline {
         violations: BTreeMap::new(),
         unconnected: 0,
+        pour_fills: None,
+        pour_fills_error: None,
     }
 }
 
@@ -792,6 +794,7 @@ async fn a_kept_prune_keeps_the_runs_pad_comparison() {
         starved_thermals: 45,
         false_connected: Some(1),
         false_open: Some(2),
+        damage: None,
     };
     outcome.runs[0].judged.as_mut().unwrap().measures.pours = Some(sentinel.clone());
     // The routing pass's model, which the pruned session's judge must not compare with

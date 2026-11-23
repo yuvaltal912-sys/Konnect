@@ -920,6 +920,8 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
         baseline: Ok(Baseline {
             violations: BTreeMap::new(),
             unconnected: 41,
+            pour_fills: None,
+            pour_fills_error: None,
         }),
         pour_prune: None,
     }
