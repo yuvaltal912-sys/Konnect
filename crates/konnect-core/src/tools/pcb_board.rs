@@ -551,6 +551,9 @@ impl ZoneSettings {
     ///
     /// `Err(message)` for a value of the wrong type, an unknown `pad_connection` or
     /// `island_removal`, and everything [`ZoneSettings::check`] refuses.
+    ///
+    /// `add_zone_impl` calls this before it tries either path: a call it refuses has
+    /// reached neither KiCad (`attempt_ipc_write`) nor the board file.
     pub(crate) fn from_args(args: &serde_json::Value) -> Result<ZoneSettings, String> {
         todo!()
     }
@@ -586,6 +589,13 @@ impl ZoneSettings {
 /// not `Always`, `(island_removal_mode N)` after them, followed for `BelowArea` by
 /// `(island_area_min A)`. With the default settings the text is byte for byte what
 /// `format_zone_polygon` wrote, apart from the fresh UUID.
+///
+/// The net's name and the layer are written escaped, as the zone's name already is: the
+/// planner writes names it read off the board, and one that holds `"` or `\` must come
+/// back out as text KiCad and Konnect's own parser read. The two nodes come from
+/// `konnect_sexp::net::NetRef::zone_net_nodes` and `zone_layer_node`, which this stage
+/// makes escape `\` and `"` (they wrote the name raw); a name without those two
+/// characters is written as before.
 pub(crate) fn zone_sexp(
     net: &konnect_sexp::net::NetRef,
     layer: &str,

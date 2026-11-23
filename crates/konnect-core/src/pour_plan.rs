@@ -60,6 +60,20 @@ pub(crate) struct ExistingPour {
     pub priority: u32,
 }
 
+/// A rule area of the board that keeps tracks, vias or pads out and lets copper pours in,
+/// on one copper layer (PP15). KiCad keeps a fill out of a rule area only when the area
+/// forbids pours (`zone_filler.cpp:2306`, `GetDoNotAllowZoneFills`), so a pour on this
+/// layer fills inside it. `add_rule_area`'s own default is such an area.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OpenRuleArea {
+    pub layer: String,
+    /// The area's name; `None` when it has none.
+    pub name: Option<String>,
+    pub uuid: Option<String>,
+    /// What the area keeps out, of `tracks`, `vias` and `pads`, in that order.
+    pub forbids: Vec<String>,
+}
+
 /// What a plan reads off a board.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoardFacts {
@@ -73,6 +87,9 @@ pub(crate) struct BoardFacts {
     /// The copper pours of the board, one row per zone and copper layer. Rule areas and
     /// teardrops are not pours.
     pub existing: Vec<ExistingPour>,
+    /// The board's rule areas that keep tracks, vias or pads out and let pours in, one
+    /// row per area and copper layer: in stack order, then by name, then by UUID.
+    pub open_rule_areas: Vec<OpenRuleArea>,
 }
 
 /// The facts of a board's text:
@@ -81,12 +98,20 @@ pub(crate) struct BoardFacts {
 ///   the repeated last corner dropped;
 /// - `pads` from `specctra::pad_pins`, counted by net;
 /// - `existing` from `specctra::pour_fill_rows`, each row's priority read from its
-///   `(zone …)` node (`(priority N)`, 0 when absent).
+///   `(zone …)` node (`(priority N)`, 0 when absent);
+/// - `open_rule_areas`: every `(zone …)` of the board's root that has a `(keepout …)`
+///   node, is no teardrop, has `not_allowed` for at least one of `tracks`, `vias` and
+///   `pads`, and does not have `(copperpour not_allowed)`; one row for each of its copper
+///   layers that the stack has (`*.Cu` is every copper layer of the stack).
 ///
-/// An error wherever the Specctra export itself refuses the board (an outline that is not
-/// one closed loop, a copper stack it does not support, a zone or a footprint it cannot
-/// read), with the export's own reason: pours are defined before the export (Z8), so a
-/// board that cannot be exported gets no plan (PP10).
+/// An error wherever one of those four readers of the Specctra export refuses the board,
+/// with the reader's own reason: a copper stack the export does not support, an outline
+/// that is not one closed loop, a footprint it cannot write (one with a rule area or a
+/// zone of its own is among them, so `open_rule_areas` and `existing` need not look
+/// inside footprints), a copper zone with no net or with an outline it cannot read.
+/// Pours are defined before the export (Z8), so a board these readers refuse gets no
+/// plan (PP10). The export's other refusals (locked routing it cannot write, copper
+/// graphics on the board) are the export's to report when it runs.
 pub(crate) fn board_facts(board_text: &str) -> Result<BoardFacts> {
     todo!()
 }
@@ -116,9 +141,11 @@ pub(crate) fn project_rules(
 
 /// The supply nets on the board, in the order the rules read them: the ground nets by
 /// pads (most first), then by name; then the power nets the same way.
-/// - A net with a role and no pad on the board is left out.
-/// - A net that `asked` names and that has no role is added as power, with the source
-///   "asked for in the design intent".
+/// - A net with no pad on the board is left out, whether it has a role or the record
+///   asks for it: a net the board does not have never takes a layer from one it has
+///   (`division` reports an asked one as an unmet request).
+/// - A net that `asked` names, that has a pad and no role, is added as power, with the
+///   source "asked for in the design intent".
 /// - A ground net that `asked` names without layers is moved to the head of the ground
 ///   nets, and a power net that `asked` names without layers to the head of the power
 ///   nets, in the record's order (PP7).
@@ -162,24 +189,35 @@ pub(crate) struct Division {
 }
 
 /// The division (PP5 to PP7). One net a layer, whole layers only.
-/// 1. **Asked, with layers.** Each entry of `asked` that names layers takes each of them
-///    for its net, and that net gets no other layer. A layer the board's stack does not
-///    have, and a net with no pad on the board, are left out as unmet requests.
+/// 1. **Asked, with layers.** Each entry of `asked` that names layers, and whose net is
+///    in `nets`, takes each of its layers that the stack has, in the record's order. A
+///    layer the stack does not have is left out as an unmet request. (The record's own
+///    validation refuses two entries on one layer; should it happen, the first entry
+///    takes the layer and the other is an unmet request.)
 /// 2. **The rule,** for the layers step 1 left free. `ground` is the first ground net of
-///    `nets` that no entry of `asked` names with layers, and `power` the first such power
-///    net (`supply_nets` has put a net asked without layers first):
+///    `nets` and `power` the first power net (`supply_nets` has put a net asked without
+///    layers first, and the net with the most pads otherwise):
 ///    - 2 layers: `ground` on both;
 ///    - 4 layers: `ground` on `F.Cu`, `In1.Cu` and `B.Cu`; `power` on `In2.Cu`, and
-///      `ground` there when there is no `power`;
+///      `ground` there when the board has no power net;
 ///    - any other count: nothing, and one `left_out` row with no net and no layer says
 ///      that this stack has no rule and that the design intent's `pours` can name layers.
-///    A layer the rule gives to `ground` when there is none stays free, with one
-///    `left_out` row for that layer and no net. Its reason says which it is: no ground
-///    net is known (and the design intent's `rails` can record one), or the only ground
-///    net was asked for on other layers.
-/// 3. **Left out,** each with its reason: every supply net of `nets` that got no layer
-///    ("each layer takes one whole-layer pour, and every layer has one"), and an asked
-///    net without layers that the rule gave no layer (an unmet request).
+///
+///    The rule never places a net that an entry of `asked` names with layers, and never
+///    puts another net of the kind in its place: the owner has placed that net himself,
+///    and a second ground net over a layer he left clear is a pour nobody asked for. Each
+///    layer the rule would have given that net stays free, with one `left_out` row (the
+///    layer, no net) whose reason names the net and says that the design intent's `pours`
+///    place it and can name this layer too. A layer the rule gives to `ground` on a board
+///    with no ground net stays free the same way; its reason says that no ground net is
+///    known and that the design intent's `rails` can record one.
+/// 3. **Left out,** each with a reason that is true of it:
+///    - every entry of `asked` whose net is not in `nets` (it has no pad on the board):
+///      an unmet request, one row for the entry;
+///    - an asked net without layers that got no layer: an unmet request;
+///    - every other net of `nets` that got no layer: which net the rule chose in its
+///      place, or that this stack has no layer for a net of its kind by rule, and that
+///      the design intent's `pours` can ask for it.
 pub(crate) fn division(
     stack: &[CopperLayer],
     nets: &[SupplyNet],
@@ -241,13 +279,17 @@ pub(crate) struct PourPlan {
     /// In stack order.
     pub proposals: Vec<ProposedZone>,
     pub not_proposed: Vec<NotProposed>,
+    /// The rule areas a proposal's pour fills inside (PP15): every row of
+    /// `BoardFacts::open_rule_areas` whose layer has a proposal.
+    pub filled_rule_areas: Vec<OpenRuleArea>,
 }
 
 /// The plan of a board: [`supply_nets`], [`division`], then each slot through
 /// [`against_existing`] (a refused slot is `not_proposed` with the reason), then
-/// [`settings_for`] and the board's outline for every slot that stays. `intent` is the
-/// project's record when it has one: its `pours` are the requests, its `fab_target` the
-/// fab's minima.
+/// [`settings_for`] and the board's outline for every slot that stays, and last
+/// `filled_rule_areas` from the layers that have a proposal. `intent` is the project's
+/// record when it has one: its `pours` are the requests, its `fab_target` the fab's
+/// minima.
 pub(crate) fn plan(
     facts: &BoardFacts,
     roles: &SupplyRoles,

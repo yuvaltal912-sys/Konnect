@@ -60,10 +60,15 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          `asked: true` there is a request of the design intent that could not be met. \
          `check` gives KiCad's unconnected items per proposed net before and after, the \
          DRC rules whose count rose, the starved thermals, and `clean` (no rule of \
-         severity error rose). `status`: planned, planned_with_findings (the check is \
-         not clean, or a request could not be met) or nothing_to_propose. Show the user \
-         the plan and call add_zone once per proposal only on their OK; then \
-         refill_zones and save_project before export_specctra_dsn.",
+         severity error rose and no more thermal pads are starved). \
+         `rule_areas_filled` lists every rule area on a proposed layer that keeps \
+         tracks, vias or pads out and lets copper pours in: KiCad fills the pour inside \
+         it. `status`: planned, planned_with_findings (the check is not clean, a request \
+         could not be met, or a pour fills inside such a rule area) or \
+         nothing_to_propose. Show the user the plan and call add_zone once per proposal \
+         only on their OK, then refill_zones and save_project. Add the zones before \
+         export_specctra_dsn or after the routed session is imported, never between the \
+         two: the import checks the board against what was exported.",
         json!({
             "type": "object",
             "properties": {
@@ -88,11 +93,15 @@ pub(crate) fn tools() -> Vec<ToolDef> {
 ///    export refuses, and a project file that does not read, are error results that say
 ///    what to fix and that nothing was planned.
 /// 5. A plan with no proposal is returned as [`NOTHING_TO_PROPOSE`], with no check.
-/// 6. The check (PP11): `konnect_sexp::writer::state_root`, `pour_check::run_folder`,
-///    `route_judge::private_kicad_config` into `<folder>/kicad-config`, then
-///    `pour_check::check` with `pour_check::KicadCli`. A check that fails is an error
-///    result: it names the step and the folder, and says that a plan is returned only
-///    after KiCad has filled it, so nothing is proposed (PP12).
+/// 6. The check (PP11): `konnect_sexp::writer::state_root`, `pour_check::run_folder`
+///    (its stamp is the milliseconds since the Unix epoch, as `placement_converge` stamps
+///    its folders), `route_judge::private_kicad_config` into `<folder>/kicad-config`,
+///    then `pour_check::check` with `pour_check::KicadCli` (kicad-cli is
+///    `ctx.config.kicad_cli`). `<folder>/kicad-config` is removed when the check ends,
+///    whatever its outcome, as the judge removes its own (`route_judge::OwnConfig`): it
+///    is a copy of the user's KiCad settings, not a record. A check that fails is an
+///    error result: it names the step and the folder, and says that a plan is returned
+///    only after KiCad has filled it, so nothing is proposed (PP12).
 /// 7. [`withdraw_unfilled`], then [`result_json`] with the read's provenance
 ///    (`board_source::provenance`).
 async fn handle_plan_pours(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
@@ -139,17 +148,20 @@ fn sidecars(board: &Path) -> Result<Sidecars, CallToolResult> {
 
 /// Moves every proposal that KiCad filled nothing of from `plan.proposals` to
 /// `plan.not_proposed` (the reason says that KiCad fills nothing of it on that layer;
-/// `asked` is kept), and drops its row from `check.fills`, so that the two lists stay in
-/// step. `check.clean`, `open` and `risen` are not changed: a zone with no fill adds no
+/// `asked` is kept), drops its row from `check.fills`, so that the two lists stay in
+/// step, and drops from `plan.filled_rule_areas` every row whose layer has no proposal
+/// left. `check.clean`, `open` and `risen` are not changed: a zone with no fill adds no
 /// copper.
 pub(crate) fn withdraw_unfilled(plan: &mut PourPlan, check: &mut FillCheck) {
     todo!()
 }
 
-/// [`PLANNED`], [`PLANNED_WITH_FINDINGS`] or [`NOTHING_TO_PROPOSE`]:
-/// - no proposal: [`NOTHING_TO_PROPOSE`];
-/// - a check that is not clean, or a `not_proposed` row with `asked`:
-///   [`PLANNED_WITH_FINDINGS`];
+/// [`PLANNED`], [`PLANNED_WITH_FINDINGS`] or [`NOTHING_TO_PROPOSE`], in this order:
+/// - no proposal (none was made, or KiCad's fill withdrew every one):
+///   [`NOTHING_TO_PROPOSE`], whatever else is true; `not_proposed` and `next_steps`
+///   carry a request that could not be met;
+/// - a check that is not clean, a `not_proposed` row with `asked`, or a row of
+///   `plan.filled_rule_areas`: [`PLANNED_WITH_FINDINGS`];
 /// - else [`PLANNED`].
 pub(crate) fn status(plan: &PourPlan, check: Option<&FillCheck>) -> &'static str {
     todo!()
@@ -162,7 +174,9 @@ pub(crate) fn status(plan: &PourPlan, check: Option<&FillCheck>) -> &'static str
 ///   `pour_plan::add_zone_arguments` and `fill` the proposal's row of `check.fills`
 ///   (`{pieces, area_mm2, largest_piece_share}`, areas to 3 decimals);
 /// - `not_proposed`: `[{net, layer, reason, asked}]`;
-/// - `check`, when there is one: `{clean, open, risen, starved_thermals, folder}`;
+/// - `rule_areas_filled`: `plan.filled_rule_areas` as `[{layer, name, uuid, forbids}]`;
+/// - `check`, whenever one ran (also when it withdrew every proposal): `{clean, open,
+///   risen, starved_thermals_before, starved_thermals, folder}`;
 /// - `next_steps` ([`next_steps`]).
 /// Provenance is added by the handler.
 pub(crate) fn result_json(
@@ -177,11 +191,19 @@ pub(crate) fn result_json(
 /// What to do with the result, each line naming only tools and arguments of the
 /// registry:
 /// - proposals: show the user the plan; on their OK call `add_zone` once per proposal
-///   with its `add_zone` arguments; then `refill_zones` and `save_project` before
-///   `export_specctra_dsn`;
+///   with its `add_zone` arguments, then `refill_zones` and `save_project`. The zones go
+///   in before `export_specctra_dsn` or after the routed session is imported, never
+///   between the two (the import checks the board against what was exported). Which of
+///   the two orders to use is the skill's to say, not this tool's;
 /// - a check that is not clean: the rules that rose, and that the user decides;
+/// - a row of `filled_rule_areas`: the area, what it keeps out, and that the pour of
+///   that layer fills inside it; when copper must stay out of it, `delete_zone` the area
+///   and `add_rule_area` it again with `keepout.copperpour` true, then call `plan_pours`
+///   again;
 /// - a role that comes from a net's name: confirm it with the user, or record the rails
 ///   with `set_design_intent`;
+/// - a request that could not be met (`asked` in `not_proposed`): what it asked for and
+///   why not;
 /// - no proposal: what `not_proposed` asks for (a ground rail in the design intent's
 ///   `rails`, or a `pours` request).
 fn next_steps(plan: &PourPlan, check: Option<&FillCheck>) -> Vec<String> {

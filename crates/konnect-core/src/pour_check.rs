@@ -90,23 +90,30 @@ pub(crate) struct FillCheck {
     pub open: Vec<NetOpen>,
     /// By rule, then severity.
     pub risen: Vec<Risen>,
-    /// KiCad's `starved_thermal` violations with the proposals.
+    /// KiCad's `starved_thermal` violations without the proposals, at any severity.
+    pub starved_thermals_before: usize,
+    /// KiCad's `starved_thermal` violations with the proposals, at any severity.
     pub starved_thermals: usize,
-    /// No rule of severity `error` rose. A proposal KiCad filled nothing of is not part
-    /// of this: the tool withdraws it.
+    /// No rule of severity `error` rose, and `starved_thermal` did not rise at any
+    /// severity: a project may report it as a warning, and a pad of the pour's net with
+    /// too few spokes is a finding all the same. A proposal KiCad filled nothing of is
+    /// not part of this: the tool withdraws it.
     pub clean: bool,
 }
 
 /// The verdict of two reports and the refilled board (pure):
 /// - `fills`: for each proposal, the row of its net and layer in
-///   `zone_fill::pour_fills(refilled_text, the proposed nets)`. A proposal with no row is
-///   an error (a zone that was written is always read back).
+///   `zone_fill::pour_fills(refilled_text, the proposed nets)`. The plan proposes a net
+///   only on a layer where it has no pour yet (PP8), so that row is the proposal's own.
+///   A proposal with no row is an error (a zone that was written is always read back).
 /// - `open`: `route_judge::unconnected_on` of each proposed net in `without` and in
 ///   `with`.
 /// - `risen`: the violations of each report counted by rule and severity; every pair
 ///   whose count in `with` is above its count in `without`.
-/// - `starved_thermals`: `with`'s violations of `zone_fill::STARVED_THERMAL`.
-/// - `clean`: no `risen` row has the severity `error`.
+/// - `starved_thermals_before` and `starved_thermals`: the violations of
+///   `zone_fill::STARVED_THERMAL` in `without` and in `with`.
+/// - `clean`: no `risen` row has the severity `error`, and `starved_thermals` is not
+///   above `starved_thermals_before`.
 ///
 /// An error when either report has no unconnected-items category: an unrouted board
 /// could then not be told from a routed one (`route_judge::unconnected_total`).
@@ -127,10 +134,13 @@ pub(crate) fn run_folder(state: &Path, board_text: &str, stamp: &str) -> Result<
 }
 
 /// A scratch project in `folder/<name>`: the project files beside `board`
-/// (`scratch_board::copy_project`), `text` written as the board, and the four rules a
-/// pour can break reported at least as warnings (`length_probe::force_prune_severities`:
-/// isolated copper and starved thermals among them), in the scratch copy only. Returns
-/// the scratch board's path.
+/// (`scratch_board::copy_project`) and `text` written as the board. The scratch copy's
+/// project reports what a pour changes whatever the project's own severities say, in the
+/// scratch copy only: the four rules a pour can break at least as warnings
+/// (`length_probe::force_prune_severities`: isolated copper and starved thermals among
+/// them), and unconnected items as errors (`length_probe::force_check_severities`), so
+/// that `open` counts real items on a project that ignores them. Returns the scratch
+/// board's path.
 fn scratch(folder: &Path, name: &str, board: &Path, text: &str) -> Result<PathBuf> {
     todo!()
 }

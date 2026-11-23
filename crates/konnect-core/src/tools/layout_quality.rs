@@ -1269,6 +1269,9 @@ pub(crate) struct SupplyRoles {
 /// The texts are given, not read: `intent_text` is the design-intent record and
 /// `project_text` the `.kicad_pro`, each `None` when the project has none. A record that
 /// does not read gives no rail (the caller refuses such a record before it calls this).
+/// `intent_roles` takes a board path and reads the files beside it only when it is given
+/// no captured texts; this passes the texts (`CapturedInputs`), so the path it passes is
+/// never read.
 pub(crate) fn supply_roles(
     nets: &BTreeSet<String>,
     intent_text: Option<&str>,
