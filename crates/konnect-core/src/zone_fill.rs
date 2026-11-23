@@ -1274,6 +1274,15 @@ pub(crate) fn zone_plan(
         }
     }
 
+    // 4b. Another net's legacy zone on a modelled zone's layer: the engine knocks it out by
+    // its outline and knows no clearance of its own, while KiCad keeps the larger of the
+    // two zones' clearances. So each modelled zone takes the larger, and a legacy zone
+    // whose clearance cannot be read makes the other nets' modelled zones on its layer
+    // legacy.
+    if board_reasons.is_empty() {
+        raise_to_legacy_clearances(&mut plan, &rows, &pins, min_clearance_mm);
+    }
+
     // 5. The rule areas that keep pours out.
     for zone in tree.find_all("zone") {
         let Some(keepout) = zone.find("keepout") else {
@@ -1456,6 +1465,95 @@ fn pad_lines(
         .collect();
     lines.sort_by(|a, b| (&a.component, &a.pin).cmp(&(&b.component, &b.pin)));
     (lines, demoted)
+}
+
+/// A zone's own clearance (`connect_pads (clearance …)`, else KiCad's default 0.5), or
+/// why it cannot be read.
+fn zone_clearance(zone: &SexpNode) -> std::result::Result<f64, String> {
+    match zone.find("connect_pads") {
+        None => Ok(DEFAULT_ZONE_CLEARANCE_MM),
+        Some(node) => Ok(non_negative(node, "clearance")?.unwrap_or(DEFAULT_ZONE_CLEARANCE_MM)),
+    }
+}
+
+/// Step 4b of [`zone_plan`]: each modelled zone's clearance raised to at least that of
+/// every legacy zone of another net on its layer (that zone's own clearance, raised to the
+/// board minimum as KiCad raises it); first, every modelled zone of another net on the
+/// layer of a legacy zone whose clearance cannot be read becomes legacy, with the reason.
+fn raise_to_legacy_clearances(
+    plan: &mut ZonePlan,
+    rows: &[crate::specctra::PourFillRow<'_>],
+    pins: &[crate::specctra::PadPin],
+    min_clearance_mm: f64,
+) {
+    let clearance_of = |legacy: &LegacyZone| -> std::result::Result<f64, String> {
+        let mut found = None;
+        for row in rows.iter().filter(|row| {
+            row.net == legacy.net && row.layer == legacy.layer && row.uuid == legacy.uuid
+        }) {
+            let clearance = zone_clearance(row.zone)?;
+            found = Some(found.map_or(clearance, |seen: f64| seen.max(clearance)));
+        }
+        found
+            .map(|clearance| clearance.max(min_clearance_mm))
+            .ok_or_else(|| "the zone is not among the board's pours".to_string())
+    };
+    let mut unreadable: Vec<(String, String, String)> = Vec::new();
+    for legacy in &plan.legacy {
+        if let Err(reason) = clearance_of(legacy) {
+            unreadable.push((legacy.net.clone(), legacy.layer.clone(), reason));
+        }
+    }
+    if !unreadable.is_empty() {
+        let (kept, out): (Vec<ZoneRow>, Vec<ZoneRow>) = std::mem::take(&mut plan.zones)
+            .into_iter()
+            .partition(|zone| {
+                !unreadable
+                    .iter()
+                    .any(|(net, layer, _)| *layer == zone.layer && *net != zone.net)
+            });
+        plan.zones = kept;
+        for zone in out {
+            let (net, _, reason) = unreadable
+                .iter()
+                .find(|(net, layer, _)| *layer == zone.layer && *net != zone.net)
+                .expect("partitioned on it");
+            plan.legacy.push(LegacyZone {
+                reason: format!(
+                    "the legacy zone of net '{net}' on {} has a clearance that cannot be read ({reason}), so the model cannot keep it",
+                    zone.layer
+                ),
+                net: zone.net,
+                layer: zone.layer,
+                uuid: zone.uuid,
+            });
+        }
+        // A pad line of a net left with no modelled zone goes too.
+        let nets: BTreeSet<&str> = plan.zones.iter().map(|zone| zone.net.as_str()).collect();
+        plan.pads.retain(|line| {
+            pins.iter().any(|pin| {
+                pin.component == line.component
+                    && pin.pin == line.pin
+                    && pin.net.as_deref().is_some_and(|net| nets.contains(net))
+            })
+        });
+    }
+    let legacy: Vec<(String, String, f64)> = plan
+        .legacy
+        .iter()
+        .filter_map(|legacy| {
+            clearance_of(legacy)
+                .ok()
+                .map(|clearance| (legacy.net.clone(), legacy.layer.clone(), clearance))
+        })
+        .collect();
+    for zone in &mut plan.zones {
+        for (net, layer, clearance) in &legacy {
+            if *layer == zone.layer && *net != zone.net {
+                zone.settings.clearance_mm = zone.settings.clearance_mm.max(*clearance);
+            }
+        }
+    }
 }
 
 /// A number with the shortest text that reads back to the same value (Rust's `{}`).

@@ -1610,3 +1610,79 @@ fn track_to_track_teardrops_uncover_the_board() {
     let plan = plan_with(&text, &teardrop("padvia"), None);
     assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
 }
+
+/// Each modelled zone's net, layer and clearance.
+fn zone_clearances(plan: &ZonePlan) -> Vec<(&str, &str, f64)> {
+    plan.zones
+        .iter()
+        .map(|zone| {
+            (
+                zone.net.as_str(),
+                zone.layer.as_str(),
+                zone.settings.clearance_mm,
+            )
+        })
+        .collect()
+}
+
+/// The base board with a VCC pour on F.Cu (after the GND ones) of clearance `clearance`,
+/// hatch-filled (so sent as legacy) when `hatch`.
+fn with_vcc_pour(clearance: &str, hatch: bool) -> String {
+    let text = board(false);
+    let start = text.find(&format!("(uuid \"{F_ZONE_UUID}\")")).unwrap();
+    let start = text[..start].rfind("\t(zone\n").unwrap();
+    let end = text[start..].find("\n\t)\n").unwrap() + start + 4;
+    let fill = if hatch {
+        "(fill yes (mode hatch) (thermal_gap 0.5) (thermal_bridge_width 0.5))"
+    } else {
+        "(fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))"
+    };
+    let zone = format!(
+        "\t(zone (net \"VCC\") (layer \"F.Cu\") (uuid \"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\") (hatch edge 0.5) (connect_pads (clearance {clearance})) (min_thickness 0.25) {fill} (polygon (pts (xy 90 40) (xy 120 40) (xy 120 60) (xy 90 60))))\n"
+    );
+    format!("{}{zone}{}", &text[..end], &text[end..])
+}
+
+#[test]
+fn a_modelled_zone_keeps_the_clearance_of_another_nets_legacy_zone() {
+    let exported_from = with_vcc_pour("0.8", false);
+    // VCC's hatch pour (legacy) of 0.8 shares F.Cu with GND's pour of 0.5: GND F.Cu takes
+    // 0.8; GND B.Cu, on another layer, keeps 0.5.
+    let plan = plan_with(&exported_from, &with_vcc_pour("0.8", true), None);
+    assert_eq!(
+        zone_clearances(&plan),
+        [("GND", "B.Cu", 0.5), ("GND", "F.Cu", 0.8)],
+        "{:?}",
+        reasons(&plan)
+    );
+    assert!(plan.legacy.iter().any(|zone| zone.net == "VCC"));
+    // A legacy clearance that does not read: GND's F.Cu pour becomes legacy, B.Cu stays.
+    let plan = plan_with(&exported_from, &with_vcc_pour("abc", true), None);
+    assert_eq!(zone_clearances(&plan), [("GND", "B.Cu", 0.5)]);
+    let gnd_top = plan
+        .legacy
+        .iter()
+        .find(|zone| zone.net == "GND" && zone.layer == "F.Cu")
+        .unwrap();
+    assert!(
+        gnd_top.reason.contains("legacy zone of net 'VCC' on F.Cu"),
+        "{}",
+        gnd_top.reason
+    );
+    // Controls: a smaller legacy clearance raises nothing; the VCC pour modelled itself
+    // leaves each zone its own clearance.
+    let plan = plan_with(&exported_from, &with_vcc_pour("0.3", true), None);
+    assert_eq!(
+        zone_clearances(&plan),
+        [("GND", "B.Cu", 0.5), ("GND", "F.Cu", 0.5)]
+    );
+    let plan = plan_with(&exported_from, &with_vcc_pour("0.8", false), None);
+    assert_eq!(
+        zone_clearances(&plan),
+        [
+            ("GND", "B.Cu", 0.5),
+            ("GND", "F.Cu", 0.5),
+            ("VCC", "F.Cu", 0.8)
+        ]
+    );
+}
