@@ -2102,9 +2102,9 @@ Stage ZR2 is engine work: fastroute build **x21**, branch `zr2-truth`, commit `2
 
 ### The measurement (2026-11-23)
 
-One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's release build of Konnect (`808c260d`), each in its own routing hold with a hard timeout. The boards are those of "The x19 baseline". Every as-exported judged run was compared.
+One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's release build of Konnect (`808c260d`: this branch's only Konnect change, the cut of `left_open` in the result, is covered by its unit test, not by this measurement), each in its own routing hold with a hard timeout. The boards are those of "The x19 baseline". Every as-exported judged run was compared.
 
-| Board | As-exported runs | KiCad open before stitching 0 | Stitching vias needed | G1 passing (ZR0 → ZR2) | G2 passing (ZR0 → ZR2) | False connections, false opens |
+| Board | As-exported runs | Runs with KiCad open 0 on the pour nets before stitching | Runs with a stitching via | G1 passing, runs (ZR0 → ZR2) | G2 passing, runs (ZR0 → ZR2) | False connections, false opens |
 |---|---|---|---|---|---|---|
 | dash | 1 | 1 | 0 | 0/7 → 1/1 | 7/7 → 1/1 | 0, 0 |
 | B5 | 6 | 6 | 0 | 0/28 → 6/6 | 7/28 → 6/6 | 0, 0 |
@@ -2112,7 +2112,8 @@ One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's
 | `ecc` | 663 | 663 | 0 | 710/710 → 663/663 | 710/710 → 663/663 | 0, 0 |
 | `pours` | 675 | 673 | 0 | 575/707 → 673/675 | 537/707 → 572/675 | 0, 0 |
 
-- **The done criterion holds on every board.** KiCad's open count before stitching is 0 and no stitching via is needed on at least 9 of 10 as-exported runs (the lowest share is `pours`, 673 of 675). The G1 and G2 pass shares are not below ZR0's.
+- **G1 and G2** are the judge's gates: G1, KiCad counts every net complete after the refill and the stitching; G2, DRC is clean. They cover every net, not only the pour nets, so a `pic` run can be open 0 on its pour and still fail G1 on a signal net. ZR0 and ZR2 judged different numbers of runs, so compare the shares, not the counts.
+- **The done criterion holds on every board.** KiCad's open count on the pour nets before stitching is 0, with no stitching via, on at least 9 of 10 as-exported runs. The lowest share is `pours`, 673 of 675. On its other 2 runs the stitching planner refused, as in ZR0 ("saved project required"), so no via was placed and those 2 fail G1. The G1 and G2 pass shares are not below ZR0's on any board.
 - **Zero false connections and zero false opens** in 1,382 compared runs. ZR1 had 52 false opens on the owner's two boards. No engine error and no `pours_error`.
 - **The winners:** B5 and `pic` are now as exported, with their pours as planes. dash, `ecc` and `pours` are still pours omitted. In ZR0 and ZR1 every winner was pours omitted.
 - **Fewer runs are judged** in a call of about the same length: dash 3, B5 16, `pic` 73, `ecc` 1,325, `pours` 1,349 (ZR1: 11, 51, 165, 1,442, 1,417). An as-exported run now routes the closings and draws the model many times.
