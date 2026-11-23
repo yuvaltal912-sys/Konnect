@@ -1389,14 +1389,14 @@ async fn the_full_judges_comparison_reads_the_calls_mode() {
 }
 
 /// The keys the prune takes again read `ctx.rank`. A second judged run beside the winner
-/// has a better copper quality (today's key puts it first) and far more track on the
-/// pour net (the pour key puts it last): the kept prune replaces the winner under
-/// `pours` and is rejected under `routing`, where the winner would no longer rank first.
-/// Control: `replace_winner` given `RankMode::Routing` in place of `ctx.rank`.
+/// is below it by today's key and above it by the pour key: the kept prune replaces the
+/// winner under `routing` and is rejected under `pours`, where the winner would no
+/// longer rank first. Control: `replace_winner` given `RankMode::Routing` in place of
+/// `ctx.rank`.
 #[tokio::test]
 async fn the_keys_taken_again_read_the_calls_mode() {
     use crate::pour_rank::RankMode;
-    for (mode, kept) in [(RankMode::Routing, false), (RankMode::Pours, true)] {
+    for (mode, kept) in [(RankMode::Routing, true), (RankMode::Pours, false)] {
         let mut h = H::new(drc(&[], &[]));
         h.session(&via_session());
         h.ctx.rank = mode;
@@ -1405,9 +1405,14 @@ async fn the_keys_taken_again_read_the_calls_mode() {
         let mut second = outcome.runs[0].clone();
         second.index = 1;
         {
+            // Today's key puts it last (a lower copper quality); the pour key first: it
+            // has no pour record (0 in the pour entries), where the winner's pour
+            // measures have no damage, as this harness's baseline has no fill rows
+            // (`i64::MAX` there).
             let judged = second.judged.as_mut().unwrap();
-            judged.measures.copper_quality = judged.measures.copper_quality.map(|q| q + 10.0);
-            judged.measures.pour_track_mm += 1000.0;
+            judged.measures.copper_quality = judged.measures.copper_quality.map(|q| q - 10.0);
+            judged.measures.pours = None;
+            judged.measures.pours_error = None;
         }
         outcome.runs.push(second);
         outcome.keys.push(None);
