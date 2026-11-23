@@ -781,3 +781,118 @@ fn the_plan_of_the_fixture_without_pours_is_the_rule() {
     assert_eq!(plan.nets.len(), 1);
     assert_eq!(plan.nets[0].source, "name");
 }
+
+// ─── Added for the mutants batch's misses (phase A) ────────────────────────────
+
+/// A left-out net's reason names what the rule did instead: the net it poured, or that
+/// the design intent's pours took every layer the rule has for its kind.
+#[test]
+fn a_left_out_nets_reason_says_what_the_rule_did_instead() {
+    let plan = plan_of(
+        &facts(4, &[("GND", 30), ("+5V", 10), ("+3V3", 20)]),
+        &roles(&["GND"], &["+5V", "+3V3"]),
+        None,
+    );
+    let row = plan
+        .not_proposed
+        .iter()
+        .find(|r| r.net.as_deref() == Some("+5V"))
+        .unwrap();
+    assert!(
+        row.reason.contains("the rule pours +3V3 in its place"),
+        "{}",
+        row.reason
+    );
+
+    let record = asks(json!([{ "net": "MOTOR", "layers": ["F.Cu", "B.Cu"] }]));
+    let plan = plan_of(
+        &facts(2, &[("GND", 40), ("MOTOR", 2)]),
+        &roles(&["GND"], &[]),
+        Some(&record),
+    );
+    assert_eq!(laid(&plan), [("F.Cu", "MOTOR"), ("B.Cu", "MOTOR")]);
+    let row = plan
+        .not_proposed
+        .iter()
+        .find(|r| r.net.as_deref() == Some("GND"))
+        .unwrap();
+    assert!(
+        row.reason.contains("taken by the design intent's pours"),
+        "{}",
+        row.reason
+    );
+}
+
+/// Two entries on one layer (the record's own validation refuses it): the first takes
+/// the layer, the second is an unmet request that names the first.
+#[test]
+fn the_first_of_two_entries_on_one_layer_takes_it() {
+    let record = asks(json!([{ "net": "GND", "layers": ["B.Cu"] }]));
+    let mut pours = record.pours.clone();
+    pours.push(PourIntent {
+        net: "AGND".into(),
+        layers: vec!["B.Cu".into()],
+        notes: None,
+    });
+    let r = roles(&["GND", "AGND"], &[]);
+    let nets = supply_nets(&r, &facts(2, &[("GND", 40), ("AGND", 6)]).pads, &pours);
+    let division = division(&stack(2), &nets, &pours);
+    let on_back: Vec<&str> = division
+        .slots
+        .iter()
+        .filter(|s| s.layer == "B.Cu")
+        .map(|s| s.net.as_str())
+        .collect();
+    assert_eq!(on_back, ["GND"]);
+    let row = division
+        .left_out
+        .iter()
+        .find(|row| row.net.as_deref() == Some("AGND") && row.layer.as_deref() == Some("B.Cu"))
+        .expect("AGND's request is unmet");
+    assert!(row.asked);
+    assert!(row.reason.contains("gives to GND"), "{}", row.reason);
+}
+
+/// A net with no pad is left out even when the pad map names it with 0, and a net asked
+/// for that already has a role keeps it, once.
+#[test]
+fn supply_nets_keep_each_net_once_with_its_own_role() {
+    let r = roles(&["GND"], &["+5V"]);
+    let pads: BTreeMap<String, usize> = [("GND".to_string(), 4), ("+5V".to_string(), 0)].into();
+    let nets = supply_nets(&r, &pads, &[]);
+    assert_eq!(
+        nets.iter().map(|n| n.net.as_str()).collect::<Vec<_>>(),
+        ["GND"]
+    );
+
+    let pads: BTreeMap<String, usize> = [("GND".to_string(), 4), ("+5V".to_string(), 2)].into();
+    for asked in [
+        asks(json!([{ "net": "GND" }])),
+        asks(json!([{ "net": "+5V" }])),
+    ] {
+        let nets = supply_nets(&r, &pads, &asked.pours);
+        let roles: Vec<(&str, SupplyRole)> =
+            nets.iter().map(|n| (n.net.as_str(), n.role)).collect();
+        assert_eq!(
+            roles,
+            [("GND", SupplyRole::Ground), ("+5V", SupplyRole::Power)],
+            "{:?}",
+            asked.pours
+        );
+        assert!(nets.iter().all(|n| n.source == "name"));
+    }
+    // A net with no role is added as power beside the board's own power nets.
+    let pads: BTreeMap<String, usize> = [
+        ("GND".to_string(), 4),
+        ("+5V".to_string(), 2),
+        ("MOTOR".to_string(), 3),
+    ]
+    .into();
+    let nets = supply_nets(&r, &pads, &asks(json!([{ "net": "MOTOR" }])).pours);
+    let motor: Vec<&SupplyNet> = nets.iter().filter(|n| n.net == "MOTOR").collect();
+    assert_eq!(motor.len(), 1, "{nets:?}");
+    assert_eq!(motor[0].role, SupplyRole::Power);
+    assert_eq!(motor[0].source, ASKED_SOURCE);
+    // Asked for without layers, it heads the power nets.
+    assert_eq!(nets[1].net, "MOTOR");
+}
