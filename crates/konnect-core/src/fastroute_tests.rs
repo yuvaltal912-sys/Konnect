@@ -171,8 +171,9 @@ fn the_routing_switches_are_the_fixed_switches_of_a_routing_line_in_order() {
 }
 
 /// Row GS, G2: the probe's step 2 sends every switch Konnect sends, in the routing
-/// line's order, then the uncounted file, and the sentinel last: fastroute stops at the
-/// first unknown switch, so a switch after the sentinel would never be checked.
+/// line's order, then the uncounted file, then (Row ZR, stage ZR1) the zones file, and the
+/// sentinel last: fastroute stops at the first unknown switch, so a switch after the
+/// sentinel would never be checked.
 #[test]
 fn the_probe_line_sends_every_switch_then_the_uncounted_file_and_the_sentinel_last() {
     let scratch = Path::new("/s/probe");
@@ -180,6 +181,7 @@ fn the_probe_line_sends_every_switch_then_the_uncounted_file_and_the_sentinel_la
     let mut expected = vec!["-de".to_string(), "/s/probe/absent.dsn".to_string()];
     expected.extend(routing_switches().iter().map(|switch| switch.to_string()));
     expected.push(format!("--x.gs_uncounted=/s/probe/{PROBE_UNCOUNTED}"));
+    expected.push(format!("--x.zones=/s/probe/{PROBE_ZONES}"));
     expected.push(SENTINEL_SWITCH.to_string());
     assert_eq!(args, expected);
     assert_eq!(args.last().map(String::as_str), Some(SENTINEL_SWITCH));
@@ -3275,6 +3277,32 @@ int main(int argc, char **argv) {
             .unwrap()
             .join(PROBE_UNCOUNTED);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+    }
+
+    /// Row ZR, stage ZR1: the probe sends `--x.zones` with a valid zones file that models
+    /// nothing, so a build without the fill model (x19) is refused with the switch named; a
+    /// build that knows it passes, and the file it was given is the header alone.
+    #[tokio::test]
+    async fn probe_refuses_a_build_without_the_zones_switch_and_names_it() {
+        let fixture = Fixture::new("mode=candidate\nlacks=--x.zones\n");
+        let text = format!(
+            "{:#}",
+            probe(&fixture.binary, "argument", &fixture.scratch())
+                .await
+                .unwrap_err()
+        );
+        assert!(text.contains("names --x.zones="), "{text}");
+        assert!(text.contains(PROBE_ZONES), "{text}");
+        // Control: the fake that knows it passes, and the file holds no `zone` line.
+        let fixture = Fixture::new("mode=candidate\n");
+        probe(&fixture.binary, "argument", &fixture.scratch())
+            .await
+            .unwrap();
+        let file = fixture.scratch().canonicalize().unwrap().join(PROBE_ZONES);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text, PROBE_ZONES_TEXT);
+        assert!(text.starts_with("zones 1\n"));
+        assert!(!text.lines().any(|line| line.starts_with("zone ")));
     }
 
     #[tokio::test]
