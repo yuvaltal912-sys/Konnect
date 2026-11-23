@@ -324,8 +324,9 @@ and merges before ZR3's measurement; then a second key beside today's, off until
    top as fill. Both are in the checklist's spirit; the model handles the top fill's islands.
 5. **When the skill stops saying "pours last".** Recommended: only after ZR2's table shows the
    as-exported shape at 0 open before stitching. The text of the change is in
-   [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), "The skill's order of work"; it is applied on
-   his word.
+   [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), "The skill's order of work".
+   **Answered 2026-11-23:** as recommended there, once stages ZR4 and ZR2 are merged; the
+   change is a PR of its own.
 
 ## Modules
 
