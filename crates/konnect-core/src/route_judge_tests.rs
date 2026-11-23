@@ -1106,6 +1106,7 @@ fn context() -> JudgeContext {
         kicad_config_home: None,
         lengths: None,
         pad_names: None,
+        rank: crate::pour_rank::RankMode::Routing,
     }
 }
 
@@ -1716,6 +1717,7 @@ async fn prune_recorded_ground_vias(vias: &[(&str, &str)]) -> crate::pour_prune:
     );
     let original_gates = judged.gates.clone();
     let key = rank(&[&judged])[0];
+    let pour_key = crate::pour_rank::pour_keys(&[(&judged.measures, &judged.gates, true)])[0];
     let mut outcome = crate::route_search::SearchOutcome {
         runs: vec![crate::route_search::RunRecord {
             index: 0,
@@ -1733,6 +1735,8 @@ async fn prune_recorded_ground_vias(vias: &[(&str, &str)]) -> crate::pour_prune:
         }],
         winner: Some(0),
         keys: vec![Some(key)],
+        pour_keys: vec![Some(pour_key)],
+        rank: crate::pour_rank::RankMode::Routing,
         elapsed: std::time::Duration::from_secs(0),
         budget_overrun: None,
         stopped_launching: Some("fixed run count".to_string()),

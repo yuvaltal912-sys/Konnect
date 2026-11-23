@@ -662,6 +662,11 @@ pub(crate) trait Runner: Send + Sync + 'static {
     /// The unrouted board's DRC, G2's baseline. Started at t0, beside the first
     /// wave; every judge waits for it.
     fn baseline(&self) -> BoxFuture<Result<Baseline>>;
+
+    /// Row ZR, ZR5 part 2 (PK12): which key ranks this search's runs: the mode of the
+    /// judge context the runner judges with (`JudgeContext::rank`). The search's winner
+    /// and the runs it releases follow it.
+    fn rank(&self) -> crate::pour_rank::RankMode;
 }
 
 /// One run of a search, as the result reports it.
@@ -703,8 +708,15 @@ pub(crate) struct SearchOutcome {
     pub runs: Vec<RunRecord>,
     /// The index of the winning run, if any run was judged.
     pub winner: Option<usize>,
-    /// Each judged run's rank key, by index (`None` for a run not judged).
+    /// Each judged run's rank key, by index (`None` for a run not judged): today's key,
+    /// whatever key ranked (PK10).
     pub keys: Vec<Option<Key>>,
+    /// Row ZR, ZR5 part 2 (PK10): each judged run's pour key, by index, beside `keys`,
+    /// whatever key ranked.
+    pub pour_keys: Vec<Option<crate::pour_rank::PourKey>>,
+    /// Row ZR, ZR5 part 2: the key that chose `winner` ([`Runner::rank`]), which the
+    /// result's listing sorts by.
+    pub rank: crate::pour_rank::RankMode,
     pub elapsed: Duration,
     /// When no run was judged by the budget: how far past it the first was (D7).
     pub budget_overrun: Option<Duration>,
@@ -759,8 +771,10 @@ pub(crate) struct SearchOutcome {
 ///   [`KEPT_WHOLE`] best by the rank key so far are released too.
 /// - At the cut, jobs that have already finished are collected first, so a judge that
 ///   ended at the same instant as the budget is not lost.
-/// - The winner is the least [`crate::route_judge::rank`] key over the judged runs,
-///   ties to the lower index.
+/// - The winner is the least key over the judged runs of the runner's mode
+///   ([`Runner::rank`], `pour_rank::ranking_of`), ties to the lower index; the
+///   released runs are those outside the best by the same key. Both keys of every
+///   judged run are kept (`keys`, `pour_keys`).
 pub(crate) async fn search(plan: &SearchPlan, runner: Arc<dyn Runner>) -> SearchOutcome {
     let t0 = Instant::now();
     let budget_at = plan.limits.budget.map(|b| t0 + b);
@@ -906,10 +920,11 @@ impl<'a> Sched<'a> {
             return;
         }
         let refs: Vec<&Judged> = judged.iter().map(|(_, j)| *j).collect();
-        let mut ranked: Vec<(Key, usize)> = crate::route_judge::rank(&refs)
-            .into_iter()
-            .zip(judged.iter().map(|(index, _)| *index))
-            .collect();
+        let mut ranked: Vec<(Vec<i64>, usize)> =
+            crate::pour_rank::ranking_of(self.runner.rank(), &refs)
+                .into_iter()
+                .zip(judged.iter().map(|(index, _)| *index))
+                .collect();
         ranked.sort();
         let beyond: Vec<usize> = ranked[KEPT_WHOLE..]
             .iter()
@@ -1214,24 +1229,40 @@ impl<'a> Sched<'a> {
             _ => None,
         };
 
-        // One rank call over the judged runs, in index order.
+        // One call of each key over the judged runs, in index order (PK10), and the
+        // winner by the key of the runner's mode (PK12).
+        let rank = self.runner.rank();
         let judged: Vec<(usize, &Judged)> = self
             .runs
             .iter()
             .filter_map(|r| r.judged.as_ref().map(|j| (r.index, j)))
             .collect();
         let mut keys: Vec<Option<Key>> = vec![None; self.runs.len()];
+        let mut pour_keys: Vec<Option<crate::pour_rank::PourKey>> = vec![None; self.runs.len()];
+        let mut ranking: Vec<Option<Vec<i64>>> = vec![None; self.runs.len()];
         if !judged.is_empty() {
             let refs: Vec<&Judged> = judged.iter().map(|(_, j)| *j).collect();
-            for ((index, _), key) in judged.iter().zip(crate::route_judge::rank(&refs)) {
+            let pooled: Vec<(
+                &crate::route_judge::Measures,
+                &crate::route_judge::Gates,
+                bool,
+            )> = refs.iter().map(|j| (&j.measures, &j.gates, true)).collect();
+            let today = crate::route_judge::rank(&refs);
+            let poured = crate::pour_rank::pour_keys(&pooled);
+            let ranked = crate::pour_rank::ranking_of(rank, &refs);
+            for (((index, _), key), (pour_key, ranked)) in
+                judged.iter().zip(today).zip(poured.into_iter().zip(ranked))
+            {
                 keys[*index] = Some(key);
+                pour_keys[*index] = Some(pour_key);
+                ranking[*index] = Some(ranked);
             }
         }
         let winner = judged
             .iter()
             .map(|(index, _)| *index)
-            .filter(|index| keys[*index].is_some())
-            .min_by(|a, b| keys[*a].cmp(&keys[*b]).then(a.cmp(b)));
+            .filter(|index| ranking[*index].is_some())
+            .min_by(|a, b| ranking[*a].cmp(&ranking[*b]).then(a.cmp(b)));
 
         let stopped_launching = if self.plan.order.is_empty() {
             None
@@ -1260,6 +1291,8 @@ impl<'a> Sched<'a> {
             runs: self.runs,
             winner,
             keys,
+            pour_keys,
+            rank,
             elapsed,
             budget_overrun,
             stopped_launching,

@@ -910,10 +910,16 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
         .iter()
         .map(|record| record.judged.as_ref().map(|_| [0; 13]))
         .collect();
+    let pour_keys = runs
+        .iter()
+        .map(|record| record.judged.as_ref().map(|_| [0; 17]))
+        .collect();
     SearchOutcome {
         runs,
         winner,
         keys,
+        pour_keys,
+        rank: crate::pour_rank::RankMode::Routing,
         elapsed: Duration::from_millis(61_234),
         budget_overrun: None,
         stopped_launching: Some("the launch rule".to_string()),
@@ -1661,6 +1667,7 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
         folder: search.folder.clone(),
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
+        rank: (RankMode::Routing, RankSource::Fixed),
     };
     let finished = outcome(Vec::new(), None);
     let error = no_winner_result(
@@ -1741,6 +1748,7 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
             folder: search.folder.clone(),
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
+            rank: (RankMode::Routing, RankSource::Fixed),
         };
         let Search {
             _dir, mut outcome, ..
@@ -1858,6 +1866,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         folder,
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
+        rank: (RankMode::Routing, RankSource::Fixed),
     };
     let search = search_json(
         &plan(),
@@ -1915,6 +1924,7 @@ fn a_failed_search_keeps_its_records_and_not_its_boards() {
         folder: search.folder.clone(),
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
+        rank: (RankMode::Routing, RankSource::Fixed),
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(
@@ -1959,6 +1969,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
         folder: search.root.join("absent.search"),
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
+        rank: (RankMode::Routing, RankSource::Fixed),
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(
@@ -2563,6 +2574,7 @@ fn a_search_with_no_winner_reports_the_length_plan_unmeasured() {
         folder: search.folder.clone(),
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
+        rank: (RankMode::Routing, RankSource::Fixed),
     };
     let mut outcome = outcome(Vec::new(), None);
     outcome.baseline = Err("kicad-cli failed".to_string());
@@ -2976,6 +2988,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         kicad_config_home: None,
         lengths: None,
         pad_names: None,
+        rank: crate::pour_rank::RankMode::Routing,
     };
     let runner = FastrouteRunner {
         binary: fake_binary(&search.root),
@@ -3604,6 +3617,7 @@ fn the_session_the_call_writes_is_the_chosen_boards() {
             folder: search.folder.clone(),
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
+            rank: (RankMode::Routing, RankSource::Fixed),
         };
         let result = conclude(
             &json!({}),
@@ -3657,6 +3671,7 @@ fn the_zone_plan_writes_the_zones_file_only_when_it_models_a_pour() {
         kicad_config_home: None,
         lengths: None,
         pad_names: None,
+        rank: crate::pour_rank::RankMode::Routing,
     };
     let folder = dir.path().join("call");
     std::fs::create_dir_all(&folder).unwrap();

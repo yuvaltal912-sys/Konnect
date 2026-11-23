@@ -73,6 +73,9 @@ pub(crate) struct JudgeContext {
     /// (`zone_fill::ZonePlan::names`), for KiCad's side of the pad comparison. `prepare`
     /// sets `None`; the caller sets it when the call sends a zones file.
     pub pad_names: Option<Arc<crate::zone_fill::PadNames>>,
+    /// Row ZR, ZR5 part 2 (PK9, PK12): which key ranks this call's runs, the one place a
+    /// call's mode is kept. `prepare` sets today's key; the caller sets the call's mode.
+    pub rank: crate::pour_rank::RankMode,
 }
 
 /// The unrouted board, refilled and checked the same way every run is (G2's
@@ -254,6 +257,7 @@ pub(crate) fn prepare(
         kicad_config_home: None,
         lengths: None,
         pad_names: None,
+        rank: crate::pour_rank::RankMode::Routing,
     })
 }
 
@@ -1386,7 +1390,8 @@ pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
 /// `run-<i>-pour-safe` only when `Free` is missing, rejected or fails G4. A candidate
 /// with a [`tune_harm`] line is rejected (a candidate the judge fails on is rejected
 /// with that error: the untuned board stands). The pool is the untuned board and every
-/// candidate left: the best by the rank key ([`rank`]) is the run's board, and on an
+/// candidate left: the best by the call's ranking key (`pour_rank::ranking_of` with
+/// `ctx.rank`, Row ZR, ZR5 part 2) is the run's board, and on an
 /// exact tie the untuned board wins, then the first candidate: no meander without a gain
 /// (a candidate that overshoots a window cannot beat the untuned board). Returns the chosen board's [`Judged`] with the [`TuneChoice`];
 /// the scheduler rewrites the run's `held` from it ([`TuneChoice::apply`]). A failure
@@ -1465,13 +1470,13 @@ async fn judge_candidates(
         let refs: Vec<&Judged> = std::iter::once(&untuned)
             .chain(harmless.iter().map(|(_, _, judged)| judged))
             .collect();
-        rank(&refs)
+        crate::pour_rank::ranking_of(ctx.rank, &refs)
     };
     // The least key; the earliest on a tie, so the untuned board, then `Free`.
     let best = keys
         .iter()
         .enumerate()
-        .min_by_key(|(at, key)| (**key, *at))
+        .min_by(|(a, x), (b, y)| x.cmp(y).then(a.cmp(b)))
         .map_or(0, |(at, _)| at);
     let untuned_measures = untuned.measures.clone();
     let (chosen, judged) = match best.checked_sub(1) {
@@ -1786,40 +1791,9 @@ pub(crate) fn rank(judged: &[&Judged]) -> Vec<Key> {
 /// pool still gets a key, stepped against the pool's shortest, but never sets a step
 /// (a candidate with an illegal placement ranks, and does not move the others).
 pub(crate) fn rank_measures(runs: &[(&Measures, &Gates, bool)]) -> Vec<Key> {
-    // The shortest judged length of a category, among runs that have any: a run with
-    // none of it is at least as short as the shortest, and its step is 0.
-    // The reference is the shortest among the pool's runs that pass G1 (complete): a
-    // degenerate run that is not complete must not set the steps. When none passes,
-    // the shortest among the pool; when the pool is empty, among all runs.
-    let in_pool: Vec<&(&Measures, &Gates, bool)> = runs.iter().filter(|run| run.2).collect();
-    let complete: Vec<&(&Measures, &Gates, bool)> = in_pool
-        .iter()
-        .copied()
-        .filter(|run| run.1.g1.is_empty())
-        .collect();
-    let pool: Vec<&(&Measures, &Gates, bool)> = if !complete.is_empty() {
-        complete
-    } else if !in_pool.is_empty() {
-        in_pool
-    } else {
-        runs.iter().collect()
-    };
-    let shortest = |length: fn(&Measures) -> f64| -> Option<f64> {
-        pool.iter()
-            .map(|run| length(run.0))
-            .filter(|mm| *mm > 0.0)
-            .fold(None, |least: Option<f64>, mm| {
-                Some(least.map_or(mm, |least| least.min(mm)))
-            })
-    };
-    let step = |mm: f64, shortest: Option<f64>| -> i64 {
-        match shortest {
-            Some(shortest) if mm > 0.0 => (mm / shortest / LENGTH_STEP).round() as i64,
-            _ => 0,
-        }
-    };
-    let shortest_signal = shortest(|m| m.signal_mm);
-    let shortest_power = shortest(|m| m.power_mm);
+    let step = length_step;
+    let shortest_signal = shortest_length(runs, |m| m.signal_mm);
+    let shortest_power = shortest_length(runs, |m| m.power_mm);
     // A measure the audit did not give sorts last.
     let whole = |value: Option<f64>| value.map_or(i64::MAX, |value| value.round() as i64);
     runs.iter()
@@ -1844,6 +1818,48 @@ pub(crate) fn rank_measures(runs: &[(&Measures, &Gates, bool)]) -> Vec<Key> {
             ]
         })
         .collect()
+}
+
+/// The pool rule of [`rank_measures`] (Row ZR, ZR5 part 2: shared with the pour key,
+/// `pour_rank::pour_keys`): the shortest length of a category, among the runs that
+/// have any. The reference is the shortest among the pool's runs (the `bool`) that pass
+/// G1 (complete): a degenerate run that is not complete must not set the steps. When
+/// none passes, the shortest among the pool; when the pool is empty, among all runs.
+/// `None` when no run of that set has any of it.
+pub(crate) fn shortest_length(
+    runs: &[(&Measures, &Gates, bool)],
+    length: fn(&Measures) -> f64,
+) -> Option<f64> {
+    let in_pool: Vec<&(&Measures, &Gates, bool)> = runs.iter().filter(|run| run.2).collect();
+    let complete: Vec<&(&Measures, &Gates, bool)> = in_pool
+        .iter()
+        .copied()
+        .filter(|run| run.1.g1.is_empty())
+        .collect();
+    let pool: Vec<&(&Measures, &Gates, bool)> = if !complete.is_empty() {
+        complete
+    } else if !in_pool.is_empty() {
+        in_pool
+    } else {
+        runs.iter().collect()
+    };
+    // A run with none of it is at least as short as the shortest, and its step is 0.
+    pool.iter()
+        .map(|run| length(run.0))
+        .filter(|mm| *mm > 0.0)
+        .fold(None, |least: Option<f64>, mm| {
+            Some(least.map_or(mm, |least| least.min(mm)))
+        })
+}
+
+/// The length step of [`rank_measures`] (shared with the pour key):
+/// `round(mm / shortest / LENGTH_STEP)`, half away from zero; 0 when the run has none of
+/// the length or there is no shortest to step against.
+pub(crate) fn length_step(mm: f64, shortest: Option<f64>) -> i64 {
+    match shortest {
+        Some(shortest) if mm > 0.0 => (mm / shortest / LENGTH_STEP).round() as i64,
+        _ => 0,
+    }
 }
 
 /// The unconnected items that name one of `nets` as `[<net>]` in an item's

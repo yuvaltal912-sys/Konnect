@@ -3833,11 +3833,13 @@ pub(crate) async fn handle_route_specctra_dsn(
         Err(refusal) => Ok(refusal),
         Ok(super::route_fastroute::Engine::Freerouting) => route_with_freerouting(args, &ctx).await,
         // Row ZR, ZR0b (P12): this tool delivers a session, so its winner is pruned.
+        // Row ZR, ZR5 part 2 (PK9): its key is the user config's `routing.rank_key`.
         Ok(super::route_fastroute::Engine::Fastroute) => {
             super::route_fastroute::route_with_fastroute(
                 args,
                 ctx,
                 super::route_fastroute::PourPrune::Winner,
+                super::route_fastroute::RankChoice::UserConfig,
             )
             .await
         }

@@ -574,7 +574,14 @@ async fn a_board_that_changes_mid_prune_ends_the_loop_with_the_state_accepted_so
     let units = units(&text, &nets).unwrap();
     let checker = JudgeChecker::new(&h.ctx, &base, &tools, &text, 0, 2.5).unwrap();
     let original = checked(checker.check(&text, None).await.unwrap());
-    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    let pruned = pour_prune::prune_loop(
+        &text,
+        &units,
+        &original,
+        &checker,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await;
     assert_eq!(pruned.ended_by, "check_error");
     assert!(
         pruned
@@ -609,7 +616,14 @@ async fn the_prunes_project_reports_dangling_vias_whatever_the_project_says() {
     assert_eq!(original.violations.get("via_dangling"), Some(&1));
 
     let units = units(&text, &set(&["GND"])).unwrap();
-    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    let pruned = pour_prune::prune_loop(
+        &text,
+        &units,
+        &original,
+        &checker,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await;
     let via = units
         .iter()
         .position(|unit| unit.kind == pour_prune::UnitKind::Via)
@@ -620,7 +634,12 @@ async fn the_prunes_project_reports_dangling_vias_whatever_the_project_says() {
     let two = lone_vias(&[(1000000, -550000), (1000000, -560000)]);
     let added = checked(checker.check(&two, Some(&original)).await.unwrap());
     assert_eq!(
-        pour_prune::refusals(&original, &original, &added),
+        pour_prune::refusals(
+            &original,
+            &original,
+            &added,
+            crate::pour_rank::RankMode::Routing
+        ),
         vec!["rule:via_dangling"]
     );
 }
@@ -636,6 +655,7 @@ async fn searched(h: &H, tools: &Tools) -> SearchOutcome {
         .unwrap();
     assert!(judged.gates.all_pass(), "{:?}", judged.gates);
     let key = rank(&[&judged])[0];
+    let pour_key = crate::pour_rank::pour_keys(&[(&judged.measures, &judged.gates, true)])[0];
     SearchOutcome {
         runs: vec![RunRecord {
             index: 0,
@@ -653,6 +673,8 @@ async fn searched(h: &H, tools: &Tools) -> SearchOutcome {
         }],
         winner: Some(0),
         keys: vec![Some(key)],
+        pour_keys: vec![Some(pour_key)],
+        rank: crate::pour_rank::RankMode::Routing,
         elapsed: Duration::from_secs(5),
         budget_overrun: None,
         stopped_launching: Some("fixed run count".to_string()),
@@ -714,6 +736,9 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
     // A stale key: the prune takes the keys again.
     let stale: Key = [7; KEY_LEN];
     outcome.keys = vec![Some(stale)];
+    // Row ZR, ZR5 part 2: the pour key too.
+    let stale_pour: crate::pour_rank::PourKey = [8; crate::pour_rank::POUR_KEY_LEN];
+    outcome.pour_keys = vec![Some(stale_pour)];
     let text = h.text();
 
     let record = prune(&h, &tools, &mut outcome).await;
@@ -752,6 +777,12 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
     assert!(judged.board.is_file());
     assert_eq!(judged.tune, Some(tune));
     assert_eq!(outcome.keys, vec![Some(rank(&[judged])[0])]);
+    assert_eq!(
+        outcome.pour_keys,
+        vec![Some(
+            crate::pour_rank::pour_keys(&[(&judged.measures, &judged.gates, true)])[0]
+        )]
+    );
     assert_eq!(outcome.winner, Some(0));
     assert!(
         !h.ctx.root.join("run-0-prune").exists(),
@@ -766,6 +797,7 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
         Some(json!({
             "session": original_ses.to_string_lossy(),
             "key": stale,
+            "pour_key": stale_pour,
             "judged_board": original_board.to_string_lossy(),
         }))
     );
@@ -1208,7 +1240,14 @@ async fn a_via_whose_removal_loses_a_fill_piece_stays_with_fill() {
     let vias: Vec<usize> = (0..units.len())
         .filter(|&i| units[i].kind == pour_prune::UnitKind::Via)
         .collect();
-    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    let pruned = pour_prune::prune_loop(
+        &text,
+        &units,
+        &original,
+        &checker,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await;
     assert_eq!(pruned.removed, BTreeSet::from([vias[1]]), "{pruned:?}");
     assert_eq!(pruned.kept_alone, BTreeMap::from([("fill".to_string(), 1)]));
     assert_eq!(pruned.checks, 2, "the first via is final: not asked again");

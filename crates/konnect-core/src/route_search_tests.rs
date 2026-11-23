@@ -874,6 +874,8 @@ struct Shared {
     released: Mutex<Vec<usize>>,
     /// Row LT: every run is routed with two Tune candidates.
     tuned: std::sync::atomic::AtomicBool,
+    /// Row ZR, ZR5 part 2: the search ranks by the pour key (else today's).
+    pours: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -900,6 +902,7 @@ fn fake_with_baseline(
         judge_starts: Mutex::new(Vec::new()),
         released: Mutex::new(Vec::new()),
         tuned: std::sync::atomic::AtomicBool::new(false),
+        pours: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -996,6 +999,14 @@ impl Runner for Fake {
         let mut released = self.0.released.lock().unwrap();
         assert!(!released.contains(&index), "run {index} released twice");
         released.push(index);
+    }
+
+    fn rank(&self) -> crate::pour_rank::RankMode {
+        if self.0.pours.load(Ordering::SeqCst) {
+            crate::pour_rank::RankMode::Pours
+        } else {
+            crate::pour_rank::RankMode::Routing
+        }
     }
 
     fn baseline(&self) -> BoxFuture<Result<Baseline>> {

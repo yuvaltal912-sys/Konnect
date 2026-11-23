@@ -459,10 +459,16 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
         .iter()
         .map(|record| record.judged.as_ref().map(|_| [0; 13]))
         .collect();
+    let pour_keys = runs
+        .iter()
+        .map(|record| record.judged.as_ref().map(|_| [0; 17]))
+        .collect();
     SearchOutcome {
         runs,
         winner,
         keys,
+        pour_keys,
+        rank: crate::pour_rank::RankMode::Routing,
         elapsed: Duration::from_millis(61_234),
         budget_overrun: None,
         stopped_launching: Some("the launch rule".to_string()),
@@ -717,6 +723,7 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         &args,
         ctx.clone(),
         crate::tools::route_fastroute::PourPrune::Off,
+        crate::place_route::CANDIDATE_RANK,
     )
     .await
     .unwrap();
@@ -740,6 +747,7 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         &args,
         ctx,
         crate::tools::route_fastroute::PourPrune::Off,
+        crate::place_route::CANDIDATE_RANK,
     )
     .await
     .unwrap();
