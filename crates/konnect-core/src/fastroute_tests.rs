@@ -36,6 +36,7 @@ fn args_of(pass: &Pass, hints: &RoutingHints, amps: Option<&Path>) -> Vec<String
             pairs: None,
             layer_heights: None,
             uncounted: None,
+            zones: None,
         },
     )
 }
@@ -126,6 +127,7 @@ fn every_routing_pass_sends_the_search_switches_right_after_the_candidate_switch
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: Some("0,1.58"),
                 uncounted: Some(uncounted),
+                zones: None,
             },
         ] {
             let args = args_with(&pass, &hints(Some(250), Some(120)), files);
@@ -206,6 +208,7 @@ fn the_uncounted_switch_is_present_only_when_given_after_the_amps_file() {
             pairs: Some(Path::new("/d/pairs.txt")),
             layer_heights: None,
             uncounted: Some(uncounted),
+            zones: None,
         },
     );
     assert_eq!(
@@ -232,6 +235,7 @@ fn the_uncounted_switch_is_present_only_when_given_after_the_amps_file() {
         &hints(None, None),
         CallFiles {
             uncounted: Some(uncounted),
+            zones: None,
             ..CallFiles::default()
         },
     );
@@ -241,6 +245,75 @@ fn the_uncounted_switch_is_present_only_when_given_after_the_amps_file() {
         .collect();
     let plain = args_of(&pass("full", 0.0, true, None), &hints(None, None), None);
     assert_eq!(without, plain.iter().collect::<Vec<_>>());
+}
+
+/// Row ZR, ZR1: `--x.zones` is sent only when the call gives it, as one token, after
+/// `--layer-heights=` and before `--initial-session=` ("Konnect's command line").
+#[test]
+fn the_zones_switch_is_present_only_when_given_after_the_layer_heights() {
+    let files = |zones: Option<&'static Path>| CallFiles {
+        amps: Some(Path::new("/d/amps.txt")),
+        pairs: Some(Path::new("/d/pairs.txt")),
+        layer_heights: Some("0,1.58"),
+        uncounted: Some(Path::new("/d/uncounted.txt")),
+        zones,
+    };
+    let fallback = pass("fallback", 120.0, false, Some("/d/full.ses"));
+    let none = args_with(&fallback, &hints(None, None), files(None));
+    assert!(!none.iter().any(|token| token.starts_with("--x.zones")));
+    let some = args_with(
+        &fallback,
+        &hints(None, None),
+        files(Some(Path::new("/d/with space/zones.txt"))),
+    );
+    assert_eq!(value(&some, "--x.zones="), Some("/d/with space/zones.txt"));
+    assert_eq!(
+        some.iter()
+            .filter(|token| token.starts_with("--x.zones"))
+            .count(),
+        1
+    );
+    let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
+    assert!(at("--x.gs_uncounted=") < at("--pairs="));
+    assert!(at("--pairs=") < at("--layer-heights="));
+    assert!(at("--layer-heights=") < at("--x.zones="));
+    assert!(at("--x.zones=") < at("--initial-session="));
+    // Without it the rest of the line is the same.
+    let without: Vec<&String> = some
+        .iter()
+        .filter(|token| !token.starts_with("--x.zones"))
+        .collect();
+    assert_eq!(without, none.iter().collect::<Vec<_>>());
+}
+
+/// Row ZR, ZR1 ("The Tune pass gets no zones"): neither Tune variant sends
+/// `--x.zones`, even when the call's files hold one.
+#[test]
+fn the_tune_line_holds_no_zones_file() {
+    let nets = names(&["A"]);
+    let classes = class_list(&["a"]);
+    for variant in [TuneVariant::Free, TuneVariant::PourSafe] {
+        let args = tune_pass_arguments(
+            Path::new("/d/in.dsn"),
+            Path::new("/d/out.ses"),
+            Path::new("/d/out.json"),
+            &hints(Some(500), Some(120)),
+            CallFiles {
+                amps: Some(Path::new("/d/amps.txt")),
+                pairs: Some(Path::new("/d/pairs.txt")),
+                layer_heights: Some("0,1.58"),
+                uncounted: Some(Path::new("/d/uncounted.txt")),
+                zones: Some(Path::new("/d/zones.txt")),
+            },
+            variant,
+            &tune_inputs(Path::new("/d/tune.txt"), &classes, &nets, Some("0,1.58")),
+            Path::new("/d/held.ses"),
+        );
+        assert!(
+            !args.iter().any(|token| token.contains("zones")),
+            "{variant:?}: {args:?}"
+        );
+    }
 }
 
 #[test]
@@ -266,6 +339,7 @@ fn every_pass_kind_sends_each_setting_once_and_nothing_forbidden() {
                     pairs,
                     layer_heights: None,
                     uncounted: None,
+                    zones: None,
                 },
             );
             let mut seen = HashSet::new();
@@ -362,6 +436,7 @@ fn pairs_switch_is_present_only_when_given() {
             pairs: Some(pairs),
             layer_heights: None,
             uncounted: None,
+            zones: None,
         },
     );
     assert_eq!(value(&some, "--pairs="), Some("/d/with space/pairs.txt"));
@@ -384,6 +459,7 @@ fn pairs_switch_is_present_only_when_given() {
             pairs: Some(pairs),
             layer_heights: None,
             uncounted: None,
+            zones: None,
         },
     );
     assert_eq!(value(&only, "--pairs="), Some("/d/with space/pairs.txt"));
@@ -756,6 +832,7 @@ fn the_layer_heights_switch_is_one_token_after_pairs_and_only_when_given() {
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: Some("0,1.58"),
                 uncounted: None,
+                zones: None,
             },
         );
         let at = |prefix: &str| with.iter().position(|token| token.starts_with(prefix));
@@ -780,6 +857,7 @@ fn the_layer_heights_switch_is_one_token_after_pairs_and_only_when_given() {
                 pairs: None,
                 layer_heights: Some("0,1.58"),
                 uncounted: None,
+                zones: None,
             },
         );
         let heights_at = heights_only
@@ -804,6 +882,7 @@ fn tune_pass_arguments_follow_the_documented_order() {
             pairs: None,
             layer_heights: Some("0,1.58"),
             uncounted: None,
+            zones: None,
         },
         &class_list(&["konnect_class_0001", "power"]),
         Some("0,1.58"),
@@ -872,6 +951,7 @@ fn tune_pass_arguments_leave_out_what_is_not_given_and_never_send_a_forbidden_se
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: heights,
                 uncounted: None,
+                zones: None,
             },
             &classes,
             heights,
@@ -954,6 +1034,7 @@ fn the_tune_line_holds_no_search_switch_and_no_uncounted_file() {
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: Some("0,1.58"),
                 uncounted: Some(Path::new("/d/uncounted.txt")),
+                zones: None,
             },
             variant,
             &tune_inputs(Path::new("/d/tune.txt"), &classes, &nets, Some("0,1.58")),
@@ -981,6 +1062,7 @@ fn the_polish_line_differs_from_the_tune_line_in_exactly_the_tune_settings() {
         pairs: Some(Path::new("/d/pairs.txt")),
         layer_heights: Some("0,1.58"),
         uncounted: Some(Path::new("/d/uncounted.txt")),
+        zones: None,
     };
     let hint = hints(Some(500), Some(120));
     let polish = pass_arguments(
@@ -1669,6 +1751,7 @@ fn variant_args(variant: TuneVariant, classes: &[String]) -> Vec<String> {
             pairs: None,
             layer_heights: Some("0,1.58"),
             uncounted: None,
+            zones: None,
         },
         variant,
         &tune_inputs(Path::new("/d/tune.txt"), classes, &nets, Some("0,1.58")),
@@ -1724,6 +1807,7 @@ fn no_routing_pass_line_ever_holds_the_tune_switches() {
                 pairs: Some(Path::new("/d/pairs.txt")),
                 layer_heights: Some("0,1.58"),
                 uncounted: None,
+                zones: None,
             },
         );
         for token in &args {
@@ -2919,6 +3003,13 @@ int main(int argc, char **argv) {
                     fputs(",\"group_search\":", r);
                     fputs(val, r);
                 }
+                // `planes.<pass>=<json>` (or `planes=`): the zone model's report object
+                // of this pass (Row ZR, ZR1).
+                snprintf(key, sizeof key, "planes.%s", pass);
+                if (cfg(key, val, sizeof val) || cfg("planes", val, sizeof val)) {
+                    fputs(",\"planes\":", r);
+                    fputs(val, r);
+                }
                 fputs("}", r);
             }
             fclose(r);
@@ -3603,6 +3694,7 @@ int main(int argc, char **argv) {
                 pairs: None,
                 layer_heights: None,
                 uncounted: None,
+                zones: None,
             },
             pass.clone(),
             soon(30),
@@ -3625,6 +3717,7 @@ int main(int argc, char **argv) {
                 pairs: None,
                 layer_heights: None,
                 uncounted: None,
+                zones: None,
             },
             &pass,
         );
@@ -4043,6 +4136,7 @@ int main(int argc, char **argv) {
                 pairs: Some(&pairs),
                 layer_heights: None,
                 uncounted: None,
+                zones: None,
             },
             WidthFallback::Floor,
             None,
@@ -4089,6 +4183,7 @@ int main(int argc, char **argv) {
             &floor_hints(),
             CallFiles {
                 uncounted: Some(&uncounted),
+                zones: None,
                 ..CallFiles::default()
             },
             WidthFallback::Floor,
@@ -4131,6 +4226,52 @@ int main(int argc, char **argv) {
                     || SEARCH_SWITCHES.contains(&token.as_str())),
             "{tune:?}"
         );
+    }
+
+    /// Row ZR, ZR1: `Held::planes` is the report object of the pass the sequence kept,
+    /// as `Held::group_search` is; none when the kept pass's report has none.
+    #[tokio::test]
+    async fn the_held_planes_are_the_kept_passs_report_object() {
+        let objects = "planes.full={\"version\":1,\"n\":1}\n\
+                       planes.fallback={\"version\":1,\"n\":2}\n\
+                       planes.polish={\"version\":1,\"n\":3}\n";
+        let cases = [
+            ("unrouted.full=0\n", "full", Some(1)),
+            (
+                "unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n",
+                "polish",
+                Some(3),
+            ),
+            (
+                "unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=2\n",
+                "fallback",
+                Some(2),
+            ),
+            ("unrouted.full=3\nunrouted.fallback=3\n", "full", Some(1)),
+        ];
+        for (control, kept, n) in cases {
+            let fixture = Fixture::new(&format!("{control}{objects}"));
+            let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 60)
+                .await
+                .unwrap();
+            assert_eq!(held.kept, kept, "{control}");
+            assert_eq!(
+                held.planes.as_ref().and_then(|object| object["n"].as_u64()),
+                n,
+                "{control}: {:?}",
+                held.planes
+            );
+        }
+        // Control: a kept pass whose report has none leaves none.
+        let fixture = Fixture::new(
+            "unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n\
+             planes.full={\"version\":1}\n",
+        );
+        let held = hold(&fixture, &floor_hints(), WidthFallback::Floor, 60)
+            .await
+            .unwrap();
+        assert_eq!(held.kept, "polish");
+        assert_eq!(held.planes, None);
     }
 
     /// Row GS: `Held::group_search` is the report object of the pass the sequence
@@ -4234,6 +4375,7 @@ int main(int argc, char **argv) {
             hints: floor_hints(),
             amps: None,
             uncounted: None,
+            zones: None,
             pairs,
             routing_heights: None,
             tune: None,
@@ -4251,6 +4393,7 @@ int main(int argc, char **argv) {
                 root: search.join("judge"),
                 kicad_config_home: None,
                 lengths: None,
+                pad_names: None,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),
@@ -4296,6 +4439,97 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// Row ZR, ZR1, through the production runner: a run of the as-exported variant
+    /// (which has a plane) sends the call's zones file on every routing pass; a run of
+    /// the pours-omitted variant (no plane) never does. Control: a runner without the
+    /// file sends it on no run.
+    #[tokio::test]
+    async fn only_a_variant_with_planes_gets_the_zones_file() {
+        use crate::route_judge::JudgeContext;
+        use crate::route_search::{Runner, Shape};
+        use crate::router::ToolRouter;
+        use crate::tools::route_fastroute::FastrouteRunner;
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("unrouted.full=3\nunrouted.fallback=1\nunrouted.polish=1\n");
+        let search = fixture.path().join("search");
+        std::fs::create_dir_all(&search).unwrap();
+        let zones = search.join("zones.txt");
+        std::fs::write(&zones, "zones 1\n").unwrap();
+        let runner = |zones: Option<PathBuf>| FastrouteRunner {
+            binary: fixture.binary(),
+            dsn_text: Arc::new(RUNNER_DSN.to_string()),
+            hints: floor_hints(),
+            amps: None,
+            uncounted: None,
+            zones,
+            pairs: None,
+            routing_heights: None,
+            tune: None,
+            fallback: WidthFallback::Floor,
+            folder: search.clone(),
+            judge: Arc::new(JudgeContext {
+                board: fixture.path().join("board.kicad_pcb"),
+                board_text: String::new(),
+                manifest: json!({}),
+                manifest_text: "{}".to_string(),
+                kicad_cli: String::new(),
+                pour_nets: Default::default(),
+                power_nets: Default::default(),
+                floors_mm: Default::default(),
+                root: search.join("judge"),
+                kicad_config_home: None,
+                lengths: None,
+                pad_names: None,
+            }),
+            tools: Arc::new(ToolContext::new(
+                ServerConfig::default(),
+                Arc::new(ToolRouter::new()),
+            )),
+        };
+        let switch = format!("--x.zones={}", zones.display());
+        let args_of = |routed: &crate::route_search::Routed, name: &str| {
+            std::fs::read_to_string(routed.folder.join(name).join(format!("{name}.ses.args")))
+                .unwrap()
+        };
+        let with = runner(Some(zones.clone()));
+        for (index, shape, seed, sent) in [
+            (0, Shape::AsExported, 1, 1),
+            (1, Shape::Omitted, 1, 0),
+            (2, Shape::AsExported, 2, 1),
+            (3, Shape::Omitted, 2, 0),
+        ] {
+            let routed = with.route(index, shape, seed, soon(60)).await.unwrap();
+            assert_eq!(routed.held.kept, "polish", "run {index}");
+            assert_eq!(routed.planes.is_empty(), sent == 0, "run {index}");
+            for name in ["full", "fallback", "polish"] {
+                let args = args_of(&routed, name);
+                assert_eq!(
+                    args.lines().filter(|line| *line == switch).count(),
+                    sent,
+                    "run {index} pass {name}: {args}"
+                );
+                assert_eq!(
+                    args.lines()
+                        .filter(|line| line.starts_with("--x.zones"))
+                        .count(),
+                    sent,
+                    "run {index} pass {name}: {args}"
+                );
+            }
+        }
+        // Control: no zones file, no switch, whatever the variant.
+        let without = runner(None);
+        let routed = without
+            .route(10, Shape::AsExported, 1, soon(60))
+            .await
+            .unwrap();
+        for name in ["full", "fallback", "polish"] {
+            assert!(!args_of(&routed, name).contains("--x.zones"), "{name}");
+        }
+    }
+
     /// Row LT, L6 and L7, through the production runner: with the call's Tune inputs
     /// every run ends with the Tune pass, which gets `--tune`, every class ignored
     /// and its own layer heights, and never `--pairs`; the routing passes get the
@@ -4326,6 +4560,7 @@ int main(int argc, char **argv) {
             hints: floor_hints(),
             amps: None,
             uncounted: routing_heights.map(|_| uncounted.clone()),
+            zones: None,
             pairs: Some(pairs.clone()),
             routing_heights: routing_heights.map(str::to_string),
             tune,
@@ -4343,6 +4578,7 @@ int main(int argc, char **argv) {
                 root: search.join("judge"),
                 kicad_config_home: None,
                 lengths: None,
+                pad_names: None,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),
@@ -5253,6 +5489,7 @@ int main(int argc, char **argv) {
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
                 uncounted: None,
+                zones: None,
             },
             WidthFallback::None,
             Some(tune_request(tune_inputs(
@@ -5631,6 +5868,7 @@ int main(int argc, char **argv) {
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
                 uncounted: None,
+                zones: None,
             },
             Some(tune_request(tune_inputs(
                 &tune_file,
@@ -6011,6 +6249,7 @@ int main(int argc, char **argv) {
                 pairs: Some(&pairs),
                 layer_heights: Some("9,9"),
                 uncounted: None,
+                zones: None,
             },
             &first,
             &next,

@@ -394,7 +394,10 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 ///    (`fastroute::uncounted_file_text`, written to `<folder>/uncounted.txt` and sent as
 ///    `--x.gs_uncounted=<file>` on every routing pass of every run, Row GS), the design intent's
 ///    differential pairs (`route_pairs::plan`, written to `<folder>/pairs.txt` and sent
-///    as `--pairs=<file>` on every pass of every run), Row LT's length plan
+///    as `--pairs=<file>` on every pass of every run), Row ZR's zone plan
+///    ([`zone_plan_file`], written to `<folder>/zones.txt` when it models a pour and sent
+///    as `--x.zones=<file>` on the routing passes of a variant with planes; the result's
+///    `pours`), Row LT's length plan
 ///    (`route_lengths::plan`, after the pairs plan and before the search folder holds
 ///    anything: a group or skew that cannot be applied is a refusal, `invalid_configuration`,
 ///    "Nothing was routed."; `<folder>/tune.txt` when there is a group, and the Tune
@@ -734,6 +737,10 @@ async fn search_and_write(
         }
     };
     let pairs = route_pairs::write_file(&call.folder, &pairs_plan)?;
+    // Row ZR, ZR1: each pour's fill settings for the engine's model, after the pairs
+    // plan. Recorded only: it changes no routing, and a plan that cannot be made sends
+    // no zones file and says why in `pours`.
+    let (zones, pours) = zone_plan_file(&call.folder, &mut judge, &dsn_text)?;
     let tune = route_lengths::write_file(&call.folder, &lengths_plan)?.map(|file| TuneFiles {
         file,
         classes,
@@ -779,6 +786,7 @@ async fn search_and_write(
         hints,
         amps,
         uncounted,
+        zones,
         pairs,
         routing_heights: routing_layer_heights(&lengths_plan, &pairs_plan),
         tune,
@@ -788,7 +796,7 @@ async fn search_and_write(
         tools: ctx,
     });
     let outcome = route_search::search(&plan, runner).await;
-    conclude(
+    let result = conclude(
         args,
         call,
         &binary,
@@ -798,7 +806,54 @@ async fn search_and_write(
         &kicad_config,
         &pairs_plan,
         &lengths_plan,
-    )
+    )?;
+    Ok(with_fields(result, vec![("pours", pours)]))
+}
+
+/// Row ZR, ZR1: the call's zone plan (`zone_fill::zone_plan` of the saved board, its
+/// manifest, the DSN, and the project and custom rules saved beside the board), its
+/// zones file written as `<folder>/zones.txt` when the plan models a pour (the file
+/// the routing passes of a variant with planes are sent as `--x.zones`), and the
+/// result's `pours` field (`zone_fill::ZonePlan::result_json`). When the file is
+/// written, the judge gets the plan's pad names. A plan that cannot be made, or a
+/// project or rules file that exists and cannot be read, gives no file and
+/// `pours: {"error": …}`; only a zones file that cannot be written is an error.
+fn zone_plan_file(
+    folder: &Path,
+    judge: &mut JudgeContext,
+    dsn_text: &str,
+) -> Result<(Option<PathBuf>, Value)> {
+    let read = |extension: &str| -> std::result::Result<Option<String>, String> {
+        let path = judge.board.with_extension(extension);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read {}: {error}", path.display())),
+        }
+    };
+    let plan = read("kicad_pro").and_then(|project| {
+        let rules = read("kicad_dru")?;
+        crate::zone_fill::zone_plan(
+            &judge.board_text,
+            Some(&judge.manifest),
+            dsn_text,
+            project.as_deref(),
+            rules.as_deref(),
+        )
+        .map_err(|error| format!("{error:#}"))
+    });
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(reason) => return Ok((None, json!({ "error": reason }))),
+    };
+    let Some(text) = crate::zone_fill::file_text(&plan) else {
+        return Ok((None, plan.result_json(None)));
+    };
+    let path = folder.join(crate::zone_fill::ZONES_FILE);
+    std::fs::write(&path, text)
+        .map_err(|error| anyhow::anyhow!("write {}: {error}", path.display()))?;
+    judge.pad_names = Some(Arc::new(plan.names.clone()));
+    Ok((Some(path.clone()), plan.result_json(Some(&path))))
 }
 
 /// What the judge checks for this call (L8, L9): the plan's groups and pair skews, or
@@ -995,6 +1050,9 @@ pub(crate) struct FastrouteRunner {
     /// The call's `--x.gs_uncounted` file (`fastroute::uncounted_file_text`, Row GS),
     /// none when the manifest has no pour.
     pub uncounted: Option<PathBuf>,
+    /// The call's `--x.zones` file (`zone_fill::file_text`, Row ZR, ZR1), none when the
+    /// plan models no pour. Sent only to the routing passes of a variant with planes.
+    pub zones: Option<PathBuf>,
     /// The call's `--pairs` file (`route_pairs::plan`), none without declared pairs.
     pub pairs: Option<PathBuf>,
     /// The `--layer-heights` value the routing passes get: only with a resolved pair
@@ -1056,6 +1114,7 @@ impl Runner for FastrouteRunner {
         let hints = self.hints;
         let amps = self.amps.clone();
         let uncounted = self.uncounted.clone();
+        let zones = self.zones.clone();
         let pairs = self.pairs.clone();
         let routing_heights = self.routing_heights.clone();
         let tune = self.tune.clone();
@@ -1098,6 +1157,9 @@ impl Runner for FastrouteRunner {
                     pairs: pairs.as_deref(),
                     layer_heights: routing_heights.as_deref(),
                     uncounted: uncounted.as_deref(),
+                    // Row ZR: the model is of the planes, so a variant without any
+                    // (pours omitted) gets no zones file.
+                    zones: zones.as_deref().filter(|_| !planes.is_empty()),
                 },
                 fallback,
                 tune.as_ref().map(|tune| fastroute::TuneRequest {
@@ -1330,6 +1392,10 @@ pub(crate) fn reduce_run_folders(
             {
                 body["group_search"] = summary;
             }
+            // Row ZR, ZR1: what the engine's model said on the same pass.
+            if let Some(object) = record.routed.as_ref().and_then(|r| r.held.planes.as_ref()) {
+                body["engine_planes"] = crate::zone_fill::engine_planes_record(object, true);
+            }
         }
         let record_file = run.join("run.json");
         if let Err(error) = std::fs::write(
@@ -1509,6 +1575,10 @@ fn winner_json(outcome: &SearchOutcome) -> Option<Value> {
     });
     if let Some(summary) = held_group_search(&routed.held) {
         winner["group_search"] = summary;
+    }
+    // Row ZR, ZR1: the engine's model of the same pass, its pad lists as counts.
+    if let Some(object) = &routed.held.planes {
+        winner["engine_planes"] = crate::zone_fill::engine_planes_record(object, false);
     }
     Some(winner)
 }

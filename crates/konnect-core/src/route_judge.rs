@@ -69,6 +69,10 @@ pub(crate) struct JudgeContext {
     /// checks`); `None` or empty: no probe, no G4(a) or G4(b). `prepare` sets `None`;
     /// the caller sets it after the plan is built.
     pub lengths: Option<Arc<crate::length_probe::LengthChecks>>,
+    /// Row ZR, ZR1: the saved board's pads named as the DSN names them
+    /// (`zone_fill::ZonePlan::names`), for KiCad's side of the pad comparison. `prepare`
+    /// sets `None`; the caller sets it when the call sends a zones file.
+    pub pad_names: Option<Arc<crate::zone_fill::PadNames>>,
 }
 
 /// The unrouted board, refilled and checked the same way every run is (G2's
@@ -241,6 +245,7 @@ pub(crate) fn prepare(
         root: root.to_path_buf(),
         kicad_config_home: None,
         lengths: None,
+        pad_names: None,
     })
 }
 
@@ -716,6 +721,7 @@ async fn judge_with(
             tools,
             &routed.held.ses,
             &format!("run-{}", routed.index),
+            routed.held.planes.as_ref(),
         )
         .await;
     }
@@ -727,6 +733,15 @@ async fn judge_with(
 /// Steps 1 to 7 of [`judge`] on one session of the run, in `ctx.root/<folder_name>`
 /// (`run-<index>`, `run-<index>-untuned`, `run-<index>-pour-safe`; the folder name
 /// also names the judge's own KiCad settings copy).
+///
+/// Row ZR, ZR1: `engine` is the `planes` object of the routing pass that made this
+/// session (`fastroute::Held::planes`; `None` for a Tune candidate, whose board the
+/// model is not of). When the run has pour nets and `engine` reads with no error of the
+/// engine's, KiCad's open pads of the modelled nets are taken on the first refilled
+/// board, before any stitching round (`zone_fill::kicad_open_record`, which reads the
+/// board right then: a stitching round removes that board's folder), and compared
+/// after the measures (`zone_fill::record_comparison`). Neither side's failure fails
+/// the judge.
 async fn judge_one(
     ctx: &JudgeContext,
     routed: &Routed,
@@ -734,6 +749,7 @@ async fn judge_one(
     tools: &dyn ToolCaller,
     session: &Path,
     folder_name: &str,
+    engine: Option<&Value>,
 ) -> Result<Judged> {
     // 1. The session, read by the importer's own checks: a session it would refuse
     //    is a failed judge.
@@ -786,6 +802,28 @@ async fn judge_one(
         .context("refill and DRC of the routed board")?;
     // Row ZR, ZR0: the pours' open count is taken before any stitching round.
     let first_drc = (!ctx.pour_nets.is_empty()).then(|| drc.clone());
+    // Row ZR, ZR1: the engine's prediction, and KiCad's open pads of the modelled nets
+    // on this first refilled board, before a stitching round removes it.
+    let engine = engine
+        .filter(|_| first_drc.is_some())
+        .map(crate::zone_fill::planes_object);
+    let (kicad_open, kicad_unconnected) = match &engine {
+        Some(Ok(planes)) if planes.error.is_none() => {
+            let nets: Vec<String> = planes.nets.iter().cloned().collect();
+            (
+                Some(
+                    crate::zone_fill::kicad_open_record(
+                        &board,
+                        ctx.pad_names.clone(),
+                        planes.nets.clone(),
+                    )
+                    .await,
+                ),
+                unconnected_on(&drc, &nets),
+            )
+        }
+        _ => (None, 0),
+    };
 
     // 4. Stitching, for the nets the router got as planes.
     let planes = &routed.planes;
@@ -938,6 +976,14 @@ async fn judge_one(
         let taken =
             crate::zone_fill::pour_record(&board, first_drc, drc.clone(), &ctx.pour_nets).await;
         crate::zone_fill::record_pours(&mut measures, taken);
+        if let Some(engine) = engine {
+            crate::zone_fill::record_comparison(
+                &mut measures,
+                engine,
+                kicad_open,
+                kicad_unconnected,
+            );
+        }
     }
     let gates = gates(&measures, baseline);
     Ok(Judged {
@@ -1200,6 +1246,7 @@ async fn judge_candidates(
         tools,
         &untuned_ses,
         &format!("run-{index}-untuned"),
+        held.planes.as_ref(),
     )
     .await
     .context("judging the run's untuned session")?;
@@ -1231,7 +1278,7 @@ async fn judge_candidates(
             TuneVariant::Free => format!("run-{index}"),
             TuneVariant::PourSafe => format!("run-{index}-pour-safe"),
         };
-        match judge_one(ctx, routed, baseline, tools, &candidate.ses, &folder).await {
+        match judge_one(ctx, routed, baseline, tools, &candidate.ses, &folder, None).await {
             Err(error) => {
                 row["rejected"] = json!([format!("the judge failed on it: {error:#}")]);
             }

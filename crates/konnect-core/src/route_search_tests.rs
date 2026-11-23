@@ -803,6 +803,7 @@ fn routed(index: usize, shape: Shape, seed: u64) -> Routed {
             untuned: None,
             tune: Default::default(),
             group_search: None,
+            planes: None,
         },
         planes: Vec::new(),
         folder: PathBuf::from("run"),

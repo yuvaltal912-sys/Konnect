@@ -387,6 +387,10 @@ pub(crate) struct CallFiles<'a> {
     /// copper the group search leaves out of its cost as the judge leaves it out of
     /// its measures. Routing passes only.
     pub uncounted: Option<&'a Path>,
+    /// Row ZR, stage ZR1: the `--x.zones` file (`zone_fill::file_text`), each modelled
+    /// pour's fill settings. Given only for a variant with planes and a plan that
+    /// models at least one pour; routing passes only, never the Tune pass.
+    pub zones: Option<&'a Path>,
 }
 
 /// The command line of one pass, every setting once, in this order: `-de <dsn>`,
@@ -397,7 +401,8 @@ pub(crate) struct CallFiles<'a> {
 /// `--router.optimizer.max_threads=` at [`THREADS`], [`CANDIDATE_SWITCHES`],
 /// [`SEARCH_SWITCHES`] (Row GS), `--x.par_via_amps=<amps>` when given,
 /// `--x.gs_uncounted=<file>` when given (Row GS, G3), `--pairs=<file>` when given,
-/// `--layer-heights=<value>` when given (Row LT, L7), and
+/// `--layer-heights=<value>` when given (Row LT, L7), `--x.zones=<file>` when given
+/// (Row ZR, ZR1), and
 /// `--initial-session=<file>` as one token when the pass has one. Numbers are written without a trailing `.0` when
 /// whole. Never `--live`, `--multi-start`, `--max-time` or `--diagnose`.
 pub(crate) fn pass_arguments(
@@ -437,6 +442,9 @@ pub(crate) fn pass_arguments(
     }
     if let Some(heights) = files.layer_heights {
         args.push(layer_heights_argument(heights));
+    }
+    if let Some(zones) = files.zones {
+        args.push(format!("--x.zones={}", zones.display()));
     }
     if let Some(initial) = &pass.initial_session {
         args.push(format!("--initial-session={}", initial.display()));
@@ -615,6 +623,9 @@ pub(crate) struct PassOutcome {
     /// Row GS: the report's `group_search` object as fastroute wrote it, when the
     /// report has one (the stage ran); `None` for a Tune pass, which never runs it.
     pub group_search: Option<Value>,
+    /// Row ZR, ZR1: the report's `planes` object as fastroute wrote it, when the report
+    /// has one (the pass was sent `--x.zones`); `None` otherwise, a Tune pass included.
+    pub planes: Option<Value>,
 }
 
 /// Why a pass gave no session.
@@ -779,6 +790,10 @@ async fn run_arguments(
             .get("group_search")
             .filter(|object| !object.is_null())
             .cloned(),
+        planes: report_value
+            .get("planes")
+            .filter(|object| !object.is_null())
+            .cloned(),
     })
 }
 
@@ -806,6 +821,10 @@ pub(crate) struct Held {
     /// anything the search did: its report has none, so this stays the routing
     /// pass's it started from.
     pub group_search: Option<Value>,
+    /// Row ZR, ZR1: the `planes` object of the same routing pass
+    /// ([`PassOutcome::planes`]); a kept Tune pass leaves it as it is, as it leaves
+    /// [`Held::group_search`].
+    pub planes: Option<Value>,
 }
 
 /// The hold sequence (design decision 4), each pass in its own subfolder of
@@ -882,6 +901,7 @@ pub(crate) async fn route_held(
     let mut kept_ses = full.ses.clone();
     let mut kept_unrouted = full.unrouted;
     let mut kept_group_search = full.group_search.clone();
+    let mut kept_planes = full.planes.clone();
 
     // Fallback: only when Full left connections open, and only with a floor.
     let mut fallback_kept: Option<PassOutcome> = None;
@@ -936,6 +956,7 @@ pub(crate) async fn route_held(
                         kept_ses = outcome.ses.clone();
                         kept_unrouted = outcome.unrouted;
                         kept_group_search = outcome.group_search.clone();
+                        kept_planes = outcome.planes.clone();
                         fallback_kept = Some(outcome);
                     } else {
                         let reason = if outcome.unrouted == full.unrouted {
@@ -988,6 +1009,7 @@ pub(crate) async fn route_held(
                     kept_ses = outcome.ses.clone();
                     kept_unrouted = outcome.unrouted;
                     kept_group_search = outcome.group_search.clone();
+                    kept_planes = outcome.planes.clone();
                 } else {
                     passes.push(row(
                         "polish",
@@ -1018,6 +1040,7 @@ pub(crate) async fn route_held(
         untuned: None,
         tune: TuneOutcome::default(),
         group_search: kept_group_search,
+        planes: kept_planes,
     };
     match tune {
         Some(tune) => tune_held(binary, folder, dsn, hints, files, &tune, held, deadline).await,
@@ -1155,7 +1178,9 @@ pub(crate) fn layer_heights_argument(value: &str) -> String {
 /// `--live`, `--multi-start`, `--max-time`, `--diagnose` or a neck width, and never
 /// a [`SEARCH_SWITCHES`] entry nor `--x.gs_uncounted` (Row GS, G1: with the
 /// optimizer off the group search would rip and straighten the meanders the tuner
-/// just added); `files.uncounted` is ignored.
+/// just added); `files.uncounted` is ignored. Never `--x.zones` either (Row ZR: its
+/// autorouter and optimizer are off and it runs no closing, so a model would only cost
+/// a redraw); `files.zones` is ignored.
 #[allow(clippy::too_many_arguments)] // the parts of one command line, each read once
 pub(crate) fn tune_pass_arguments(
     dsn: &Path,
@@ -1951,12 +1976,13 @@ pub(crate) async fn tune_attempt(
     outcome: &mut TuneOutcome,
 ) -> std::result::Result<Option<TuneCandidate>, PassError> {
     // The Tune pass gets its own heights and never the call's pairs file, nor the
-    // group search's uncounted file (Row GS, G1).
+    // group search's uncounted file (Row GS, G1), nor the zones file (Row ZR).
     let files = CallFiles {
         amps: files.amps,
         pairs: None,
         layer_heights: first.layer_heights,
         uncounted: None,
+        zones: None,
     };
     let mut tune_file = first.tune.to_path_buf();
     let mut nets = first.nets.clone();
