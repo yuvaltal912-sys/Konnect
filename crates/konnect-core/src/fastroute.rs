@@ -5,10 +5,11 @@
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
 //! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`])
-//! and the fill model of Row ZR, stages ZR1 and ZR2 (`--x.zones`): build x21. [`locate`] finds a
+//! and the fill model of Row ZR, stages ZR1 to ZR3 (`--x.zones`, and from ZR3 its cut cost,
+//! [`ZONES_CUT_SWITCH`]): build x22. [`locate`] finds a
 //! binary and [`probe`] proves, before anything is routed, that it knows every
-//! experimental switch Konnect sends. That is not proof that it is x21: an earlier
-//! engine commit may know the same switches, and x18 to x21 all print
+//! experimental switch Konnect sends. That is not proof that it is x22: an earlier
+//! engine commit may know the same switches, and x18 to x22 all print
 //! `fastroute 0.1.14`. What identifies the build is its SHA-256: the
 //! 1 Kopper package checks it against `packaging/1-kopper/fastroute.json`, and every
 //! result reports it as `engine.sha256`.
@@ -67,11 +68,18 @@ pub(crate) fn routing_switches() -> Vec<&'static str> {
         .collect()
 }
 
-/// The candidate's name, as the research and the owner call it: build x21, the
+/// The candidate's name, as the research and the owner call it: build x22, the
 /// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`], and the
-/// fill model of Row ZR, stages ZR1 and ZR2 (`--x.zones`: the model, and from ZR2 the
-/// model as the engine's connectivity with the closing stage).
-pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR2";
+/// fill model of Row ZR, stages ZR1 to ZR3 (`--x.zones`: the model; from ZR2 the model as
+/// the engine's connectivity with the closing stage; from ZR3 the cut cost in the maze and
+/// the group search's "never more pour damage" rule).
+pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR3";
+
+/// Row ZR, stage ZR3: the cut cost's weights, sent with every `--x.zones` (never without
+/// it: the engine refuses a cut cost with no model). Per length (a share of the maze step's
+/// own cost), per via and per thermal spoke (both in vias). Provisional until ZR3's weight
+/// matrix picks them.
+pub(crate) const ZONES_CUT_SWITCH: &str = "--x.zones_cut=1,1,2";
 
 /// Threads per run, for the autorouter and the optimizer each (the research's 7 x 2).
 pub(crate) const THREADS: u32 = 2;
@@ -355,7 +363,8 @@ pub(crate) const PROBE_ZONES_TEXT: &str = "zones 1\ncell_mm 0.05\nmin_spokes 2\n
 
 /// The probe's step 2 command line for `scratch` ([`probe`]): `-de <scratch>/absent.dsn`,
 /// [`CANDIDATE_SWITCHES`], [`SEARCH_SWITCHES`], `--x.gs_uncounted=<scratch>/`
-/// [`PROBE_UNCOUNTED`], `--x.zones=<scratch>/`[`PROBE_ZONES`], and [`SENTINEL_SWITCH`] last: fastroute stops at the first
+/// [`PROBE_UNCOUNTED`], `--x.zones=<scratch>/`[`PROBE_ZONES`], [`ZONES_CUT_SWITCH`] (Row ZR,
+/// stage ZR3), and [`SENTINEL_SWITCH`] last: fastroute stops at the first
 /// unknown switch, so a switch after the sentinel would never be checked.
 pub(crate) fn probe_arguments(scratch: &Path) -> Vec<String> {
     let mut args = vec![
@@ -369,6 +378,7 @@ pub(crate) fn probe_arguments(scratch: &Path) -> Vec<String> {
         scratch.join(PROBE_UNCOUNTED).display()
     ));
     args.push(format!("--x.zones={}", scratch.join(PROBE_ZONES).display()));
+    args.push(ZONES_CUT_SWITCH.to_string());
     args.push(SENTINEL_SWITCH.to_string());
     args
 }
@@ -418,8 +428,8 @@ pub(crate) struct CallFiles<'a> {
 /// `--router.optimizer.max_threads=` at [`THREADS`], [`CANDIDATE_SWITCHES`],
 /// [`SEARCH_SWITCHES`] (Row GS), `--x.par_via_amps=<amps>` when given,
 /// `--x.gs_uncounted=<file>` when given (Row GS, G3), `--pairs=<file>` when given,
-/// `--layer-heights=<value>` when given (Row LT, L7), `--x.zones=<file>` when given
-/// (Row ZR, ZR1), and
+/// `--layer-heights=<value>` when given (Row LT, L7), `--x.zones=<file>` and right after it
+/// [`ZONES_CUT_SWITCH`] when given (Row ZR, ZR1 and ZR3), and
 /// `--initial-session=<file>` as one token when the pass has one. Numbers are written without a trailing `.0` when
 /// whole. Never `--live`, `--multi-start`, `--max-time` or `--diagnose`.
 pub(crate) fn pass_arguments(
@@ -462,6 +472,7 @@ pub(crate) fn pass_arguments(
     }
     if let Some(zones) = files.zones {
         args.push(format!("--x.zones={}", zones.display()));
+        args.push(ZONES_CUT_SWITCH.to_string());
     }
     if let Some(initial) = &pass.initial_session {
         args.push(format!("--initial-session={}", initial.display()));

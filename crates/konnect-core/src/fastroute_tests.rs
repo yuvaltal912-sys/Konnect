@@ -107,7 +107,7 @@ fn the_search_switches_are_s1_f1_and_the_group_search_in_this_order() {
     for switch in SEARCH_SWITCHES {
         assert!(!CANDIDATE_SWITCHES.contains(switch), "{switch}");
     }
-    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS + ZR2");
+    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS + ZR3");
 }
 
 /// Row GS, G1: Full, Fallback and Polish each send every search switch once, right
@@ -182,6 +182,7 @@ fn the_probe_line_sends_every_switch_then_the_uncounted_file_and_the_sentinel_la
     expected.extend(routing_switches().iter().map(|switch| switch.to_string()));
     expected.push(format!("--x.gs_uncounted=/s/probe/{PROBE_UNCOUNTED}"));
     expected.push(format!("--x.zones=/s/probe/{PROBE_ZONES}"));
+    expected.push(ZONES_CUT_SWITCH.to_string());
     expected.push(SENTINEL_SWITCH.to_string());
     assert_eq!(args, expected);
     assert_eq!(args.last().map(String::as_str), Some(SENTINEL_SWITCH));
@@ -263,6 +264,8 @@ fn the_zones_switch_is_present_only_when_given_after_the_layer_heights() {
     let fallback = pass("fallback", 120.0, false, Some("/d/full.ses"));
     let none = args_with(&fallback, &hints(None, None), files(None));
     assert!(!none.iter().any(|token| token.starts_with("--x.zones")));
+    // Row ZR, stage ZR3: never a cut cost without the zones file (the engine refuses it)
+    assert!(!none.iter().any(|token| token == ZONES_CUT_SWITCH));
     let some = args_with(
         &fallback,
         &hints(None, None),
@@ -271,11 +274,19 @@ fn the_zones_switch_is_present_only_when_given_after_the_layer_heights() {
     assert_eq!(value(&some, "--x.zones="), Some("/d/with space/zones.txt"));
     assert_eq!(
         some.iter()
-            .filter(|token| token.starts_with("--x.zones"))
+            .filter(|token| token.starts_with("--x.zones="))
             .count(),
         1
     );
+    // Row ZR, stage ZR3: the cut cost once, right after the zones file
+    assert_eq!(
+        some.iter()
+            .filter(|token| token.starts_with("--x.zones_cut="))
+            .collect::<Vec<_>>(),
+        vec![ZONES_CUT_SWITCH]
+    );
     let at = |prefix: &str| some.iter().position(|t| t.starts_with(prefix)).unwrap();
+    assert_eq!(at("--x.zones_cut="), at("--x.zones=") + 1);
     assert!(at("--x.gs_uncounted=") < at("--pairs="));
     assert!(at("--pairs=") < at("--layer-heights="));
     assert!(at("--layer-heights=") < at("--x.zones="));
@@ -3305,6 +3316,23 @@ int main(int argc, char **argv) {
         assert!(!text.lines().any(|line| line.starts_with("zone ")));
     }
 
+    /// Row ZR, stage ZR3: the probe sends the cut cost too, so a build without it (x21) is
+    /// refused with the switch named.
+    #[tokio::test]
+    async fn probe_refuses_a_build_without_the_cut_cost_and_names_it() {
+        let fixture = Fixture::new("mode=candidate\nlacks=--x.zones_cut\n");
+        let text = format!(
+            "{:#}",
+            probe(&fixture.binary, "argument", &fixture.scratch())
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            text.contains(&format!("names {ZONES_CUT_SWITCH}")),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn probe_refuses_a_version_line_that_is_not_fastroutes() {
         for version in ["not fastroute 1.0", "fastroute", " fastroute 0.1.14", ""] {
@@ -4540,7 +4568,15 @@ int main(int argc, char **argv) {
                 );
                 assert_eq!(
                     args.lines()
-                        .filter(|line| line.starts_with("--x.zones"))
+                        .filter(|line| line.starts_with("--x.zones="))
+                        .count(),
+                    sent,
+                    "run {index} pass {name}: {args}"
+                );
+                // Row ZR, stage ZR3: the cut cost goes with the zones file, and only with it
+                assert_eq!(
+                    args.lines()
+                        .filter(|line| *line == ZONES_CUT_SWITCH)
                         .count(),
                     sent,
                     "run {index} pass {name}: {args}"
