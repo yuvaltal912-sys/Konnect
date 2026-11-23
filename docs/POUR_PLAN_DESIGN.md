@@ -393,7 +393,7 @@ In the build's PR:
   `pours`.
 - `tool-directory.md`, `README.md`, `DEV.md`: the `plan_pours` row, `add_zone`'s row, the
   counts. `cargo xtask fix-doc-counts` rewrites the counts there and in
-  `packaging/metadata.json` and `plugin/plugin.json` (270 tools become 271).
+  `packaging/metadata.json` and `plugin/plugin.json` (the registered count goes up by one, from 270 to 271).
 - The `kicad-pcb` skill:
   - `add_zone`'s new arguments and a short `plan_pours` entry in "Copper Pour".
   - **The order of work does not change here.** "Pours last" stays the skill's order until

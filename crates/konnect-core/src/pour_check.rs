@@ -7,8 +7,9 @@
 
 use crate::pour_plan::ProposedZone;
 use crate::tools::cli::DrcReport;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -46,7 +47,14 @@ pub(crate) struct KicadCli {
 
 impl Refill for KicadCli {
     fn refill<'a>(&'a self, board: &'a Path) -> RefillCall<'a> {
-        todo!()
+        Box::pin(async move {
+            crate::tools::cli::refill_drc_on_private_copy_with_config(
+                &self.kicad_cli,
+                board,
+                Some(&self.config_home),
+            )
+            .await
+        })
     }
 }
 
@@ -123,14 +131,107 @@ pub(crate) fn verdict(
     with: &DrcReport,
     refilled_text: &str,
 ) -> Result<FillCheck> {
-    todo!()
+    // Only that the category is there: `open` counts it per net.
+    crate::route_judge::unconnected_total(without)
+        .context("the DRC of the board without the proposals")?;
+    crate::route_judge::unconnected_total(with)
+        .context("the DRC of the board with the proposals")?;
+    let nets: BTreeSet<String> = zones.iter().map(|zone| zone.net.clone()).collect();
+    let rows = crate::zone_fill::pour_fills(refilled_text, &nets)?;
+    let mut fills = Vec::with_capacity(zones.len());
+    for zone in zones {
+        let mut own = rows
+            .iter()
+            .filter(|row| row.net == zone.net && row.layer == zone.layer);
+        let Some(row) = own.next() else {
+            bail!(
+                "the refilled board has no zone of {} on {}, though the check wrote one",
+                zone.net,
+                zone.layer
+            );
+        };
+        if own.next().is_some() {
+            bail!(
+                "the refilled board has more than one zone of {} on {}, so the proposal's own \
+                 fill cannot be told apart",
+                zone.net,
+                zone.layer
+            );
+        }
+        fills.push(ProposalFill {
+            net: zone.net.clone(),
+            layer: zone.layer.clone(),
+            pieces: row.pieces_mm2.len(),
+            area_mm2: row.pieces_mm2.iter().sum(),
+            largest_piece_share: row.largest_share(),
+        });
+    }
+    let open = nets
+        .iter()
+        .map(|net| {
+            let one = std::slice::from_ref(net);
+            NetOpen {
+                net: net.clone(),
+                before: crate::route_judge::unconnected_on(without, one),
+                after: crate::route_judge::unconnected_on(with, one),
+            }
+        })
+        .collect();
+    let counts = |report: &DrcReport| {
+        let mut by_rule: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for violation in report.all() {
+            *by_rule
+                .entry((violation.rule.clone(), violation.severity.clone()))
+                .or_default() += 1;
+        }
+        by_rule
+    };
+    let (counts_without, counts_with) = (counts(without), counts(with));
+    let risen: Vec<Risen> = counts_with
+        .iter()
+        .filter_map(|((rule, severity), &after)| {
+            let before = counts_without
+                .get(&(rule.clone(), severity.clone()))
+                .copied()
+                .unwrap_or(0);
+            (after > before).then(|| Risen {
+                rule: rule.clone(),
+                severity: severity.clone(),
+                before,
+                after,
+            })
+        })
+        .collect();
+    let starved = |report: &DrcReport| {
+        report
+            .all()
+            .filter(|violation| violation.rule == crate::zone_fill::STARVED_THERMAL)
+            .count()
+    };
+    let (starved_thermals_before, starved_thermals) = (starved(without), starved(with));
+    let clean = !risen.iter().any(|row| row.severity == "error")
+        && starved_thermals <= starved_thermals_before;
+    Ok(FillCheck {
+        fills,
+        open,
+        risen,
+        starved_thermals_before,
+        starved_thermals,
+        clean,
+    })
 }
 
 /// The folder of one call: `<state>/pour-plans/<stamp>-<the first 8 characters of the
 /// SHA-256 of board_text>`, created with its parents. One that exists already is an
 /// error: two calls never share a folder.
 pub(crate) fn run_folder(state: &Path, board_text: &str, stamp: &str) -> Result<PathBuf> {
-    todo!()
+    let plans = state.join(PLANS_FOLDER);
+    std::fs::create_dir_all(&plans).with_context(|| format!("create '{}'", plans.display()))?;
+    let digest = crate::place_held::sha256_hex(board_text.as_bytes());
+    let folder = plans.join(format!("{stamp}-{}", &digest[..8]));
+    std::fs::create_dir(&folder)
+        .with_context(|| format!("create the plan's folder '{}'", folder.display()))?;
+    Ok(folder)
 }
 
 /// A scratch project in `folder/<name>`: the project files beside `board`
@@ -142,7 +243,11 @@ pub(crate) fn run_folder(state: &Path, board_text: &str, stamp: &str) -> Result<
 /// that `open` counts real items on a project that ignores them. Returns the scratch
 /// board's path.
 fn scratch(folder: &Path, name: &str, board: &Path, text: &str) -> Result<PathBuf> {
-    todo!()
+    let copy = crate::scratch_board::copy_project(board, &folder.join(name))?;
+    std::fs::write(&copy, text).with_context(|| format!("write '{}'", copy.display()))?;
+    crate::length_probe::force_prune_severities(&copy)?;
+    crate::length_probe::force_check_severities(&copy)?;
+    Ok(copy)
 }
 
 /// The check of one plan, in `folder` (made by [`run_folder`]):
@@ -162,7 +267,29 @@ pub(crate) async fn check(
     zones: &[ProposedZone],
     refill: &dyn Refill,
 ) -> Result<FillCheck> {
-    todo!()
+    let without = scratch(folder, WITHOUT, board, board_text)
+        .context("step 1, the scratch project of the board as it was read")?;
+    let with_text = crate::pour_plan::with_zones(board_text, zones)
+        .context("step 1, the board with the proposals")?;
+    let with = scratch(folder, WITH, board, &with_text)
+        .context("step 1, the scratch project of the board with the proposals")?;
+    let report_without = refill
+        .refill(&without)
+        .await
+        .context("step 2, kicad-cli's refill and DRC of the board as it was read")?;
+    let report_with = refill
+        .refill(&with)
+        .await
+        .context("step 2, kicad-cli's refill and DRC of the board with the proposals")?;
+    let zones = zones.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let refilled = std::fs::read_to_string(&with)
+            .with_context(|| format!("read the refilled board '{}'", with.display()))?;
+        verdict(&zones, &report_without, &report_with, &refilled)
+    })
+    .await
+    .context("step 3, the verdict")?
+    .context("step 3, the verdict")
 }
 
 #[cfg(test)]

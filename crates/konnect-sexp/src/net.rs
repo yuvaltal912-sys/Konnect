@@ -171,22 +171,34 @@ pub enum NetRef {
 impl NetRef {
     /// The `(net …)` node — and for the legacy shape its `(net_name …)`
     /// companion — exactly as a zone should embed them.
+    ///
+    /// The name is written escaped (`\` and `"` behind a backslash), so a name
+    /// that holds either reads back whole; every other name is written as it is.
     pub fn zone_net_nodes(&self) -> String {
         match self {
-            NetRef::ByName(name) => format!("(net \"{name}\")"),
-            NetRef::ById { id, name } => format!("(net {id}) (net_name \"{name}\")"),
+            NetRef::ByName(name) => format!("(net \"{}\")", escape_quoted(name)),
+            NetRef::ById { id, name } => {
+                format!("(net {id}) (net_name \"{}\")", escape_quoted(name))
+            }
         }
     }
 
     /// The layer node in the same format's convention: KiCad 10 writes
     /// `(layers …)` (plural, and zones may span several); legacy single-layer
-    /// zones use `(layer …)`.
+    /// zones use `(layer …)`. The layer is written escaped as the net's name is.
     pub fn zone_layer_node(&self, layer: &str) -> String {
+        let layer = escape_quoted(layer);
         match self {
             NetRef::ByName(_) => format!("(layers \"{layer}\")"),
             NetRef::ById { .. } => format!("(layer \"{layer}\")"),
         }
     }
+}
+
+/// `value` as the inside of a quoted S-expression string: `\` and `"` behind a
+/// backslash, as KiCad writes them and the parser reads them.
+fn escape_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Resolve how to write a reference to `name` on this board.
@@ -274,6 +286,57 @@ mod tests {
         // shape-based reader becomes a shape-based guesser.
         assert_eq!(net_name(&node("(layer \"F.Cu\")")), None);
         assert_eq!(net_id(&node("(at 1 2)")), None);
+    }
+
+    /// Row ZR, stage ZR4: a zone's net name and layer are written escaped, so a name
+    /// with a quote or a backslash reads back whole, and every other name is
+    /// written byte for byte as before.
+    #[test]
+    fn zone_nodes_escape_a_quote_and_a_backslash_and_nothing_else() {
+        let odd = "A\"B\\C";
+        for net in [
+            NetRef::ByName(odd.to_string()),
+            NetRef::ById {
+                id: "3".to_string(),
+                name: odd.to_string(),
+            },
+        ] {
+            let text = format!(
+                "(zone {} {})",
+                net.zone_net_nodes(),
+                net.zone_layer_node(odd)
+            );
+            let parsed = parse_sexp(&text).expect("the escaped text parses");
+            let name = match &net {
+                NetRef::ByName(_) => parsed.find("net").and_then(net_name),
+                NetRef::ById { .. } => parsed.find_str("net_name"),
+            };
+            assert_eq!(name, Some(odd), "{text}");
+            let layer = parsed
+                .find("layers")
+                .or_else(|| parsed.find("layer"))
+                .and_then(|node| node.get(1))
+                .and_then(SexpNode::as_str);
+            assert_eq!(layer, Some(odd), "{text}");
+        }
+        for plain in ["GND", "/Sheet/+3V3", "Net-(U1-Pad3)"] {
+            assert_eq!(
+                NetRef::ByName(plain.to_string()).zone_net_nodes(),
+                format!("(net \"{plain}\")")
+            );
+            assert_eq!(
+                NetRef::ById {
+                    id: "7".to_string(),
+                    name: plain.to_string()
+                }
+                .zone_net_nodes(),
+                format!("(net 7) (net_name \"{plain}\")")
+            );
+        }
+        assert_eq!(
+            NetRef::ByName("GND".into()).zone_layer_node("B.Cu"),
+            "(layers \"B.Cu\")"
+        );
     }
 
     #[test]

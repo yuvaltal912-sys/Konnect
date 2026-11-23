@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **270 registered tools** + **7 always-visible meta-tools** = **277 total**
+- **271 registered tools** + **7 always-visible meta-tools** = **278 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -239,7 +239,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 17 tools
+### `pcb_board` · 18 tools
 **Purpose:** Board outline (rectangle or polygon), layers, physical stackup, zones and rule areas (keepouts), footprint locks, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs), [`board_construction.rs`](crates/konnect-core/src/tools/board_construction.rs)
 
@@ -262,6 +262,7 @@ and Windows servers do not.
 | `add_rule_area` | Add a rule area (keepout zone) — rectangle or simple polygon, one or more copper layers (`*.Cu` = all), the five keepout flags (default, as KiCad's own new rule area: tracks, vias and pads forbidden; copper pours and footprints allowed). One that forbids tracks or vias is exported by `export_specctra_dsn` as a keepout per layer, so Freerouting routes around it. Unique names; preview then apply with `revision`. |
 | `list_zones` | List top-level copper zones and rule areas from the saved file: UUID, name, kind, net, layers, keepout flags, priority, corners, bounding box (an arc edge's bulge included). |
 | `delete_zone` | Delete copper zones or rule areas by UUID or unique name; preview then apply with `revision`. A name or UUID that more than one zone carries is refused before anything is written. Zones inside footprints are not touched. |
+| `plan_pours` | Read-only: plan the board's copper pours. Divides the copper layers among the ground and power nets by rule (2 layers: the ground net with the most pads on both; 4 layers: ground on F.Cu, In1.Cu and B.Cu, the largest power net on In2.Cu), with the design intent's `pours` as explicit requests that win. Whole-layer pours on the board's own outline; existing zones are never changed. KiCad refills and checks the plan on a scratch copy before it is returned; each proposal is the exact arguments of `add_zone`. |
 
 The three `board_construction` writers (`set_footprint_lock` with `locked`, `add_rule_area`, `delete_zone`) have no live IPC path: they refuse while KiCad holds the board open or its lock file is present, bind the preview revision to the board path, saved bytes and request, write only if the file is unchanged, and read it back. A mismatched revision is refused as `stale_target` (reason `revision_mismatch`) without naming the current one: preview again to get it.
 

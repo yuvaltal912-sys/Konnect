@@ -2780,3 +2780,53 @@ fn netclasses_from_source_survives_crafted_patterns() {
     assert_eq!(classes.len(), 1, "{classes:?}");
     assert_eq!(classes["N_CLEAN"], vec!["Clean".to_string()]);
 }
+
+/// Row ZR, stage ZR4 (PP4): `supply_roles` gives exactly the ground and power nets, with
+/// their sources, that the audit's `net_roles` reports for the same board, record and
+/// project file. A 0 V rail named `REF` is ground; a net that only its name makes ground
+/// has the source `name`; a netclass that reads as power makes power.
+#[test]
+fn supply_roles_are_the_audits_net_roles() {
+    let intent = json!({ "schema_version": 1, "rails": [
+        { "name": "REF0", "nets": ["FB1"], "voltage_v": 0.0 },
+        { "name": "IN", "nets": ["VIN1"], "voltage_v": 12.0 }
+    ] });
+    let pro = json!({ "net_settings": { "classes": [], "netclass_patterns": [
+        { "netclass": "Power", "pattern": "SW2" }] } });
+    let f = fx("buck.kicad_pcb", Some(intent.clone()), Some(pro.clone()));
+    let report = run(&f);
+    let text = std::fs::read_to_string(&f.board).unwrap();
+    let tree = parse_sexp(&text).unwrap();
+    let mut nets = BTreeSet::new();
+    fn collect(node: &SexpNode, out: &mut BTreeSet<String>) {
+        if node.head() == Some("net") {
+            if let Some(name) = node.get(1).and_then(SexpNode::as_str) {
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        for child in node.children().unwrap_or(&[]) {
+            collect(child, out);
+        }
+    }
+    collect(&tree, &mut nets);
+    let intent_text = serde_json::to_string_pretty(&intent).unwrap();
+    let pro_text = pro.to_string();
+    let roles = supply_roles(&nets, Some(&intent_text), Some(&pro_text));
+    let as_json = |map: &BTreeMap<String, String>| -> Value {
+        Value::Object(map.iter().map(|(n, s)| (n.clone(), json!(s))).collect())
+    };
+    assert_eq!(
+        as_json(&roles.ground),
+        report["net_roles"]["ground"]["nets"]
+    );
+    assert_eq!(as_json(&roles.power), report["net_roles"]["power"]["nets"]);
+    assert!(roles.ground["FB1"].starts_with("design_intent rail 'REF0'"));
+    assert_eq!(roles.ground["GND"], "name");
+    assert_eq!(roles.power["SW2"], "netclass 'Power'");
+    assert_eq!(roles.netclass["SW2"], vec!["Power".to_string()]);
+    // Without the record, FB1 is no supply net: the rail was its only source.
+    let bare = supply_roles(&nets, None, Some(&pro_text));
+    assert!(!bare.ground.contains_key("FB1") && !bare.power.contains_key("FB1"));
+}

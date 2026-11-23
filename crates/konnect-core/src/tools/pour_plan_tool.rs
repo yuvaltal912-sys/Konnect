@@ -10,15 +10,17 @@
 //! side (the response); every rule of the plan is `pour_plan`'s and every measure
 //! `pour_check`'s.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::pour_check::FillCheck;
-use crate::pour_plan::PourPlan;
+use crate::pour_plan::{NotProposed, PourPlan};
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
-use crate::tools::design_intent::DesignIntent;
-use crate::tools::{ToolContext, ToolDef};
+use crate::tools::design_intent::{self, DesignIntent, IntentRead};
+use crate::tools::{get_path, invalid_arg, ToolContext, ToolDef};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 /// The `sources` word for what kicad-cli measured on a scratch copy.
 pub(crate) const FROM_KICAD_CLI: &str = "kicad_cli";
@@ -105,7 +107,171 @@ pub(crate) fn tools() -> Vec<ToolDef> {
 /// 7. [`withdraw_unfilled`], then [`result_json`] with the read's provenance
 ///    (`board_source::provenance`).
 async fn handle_plan_pours(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
-    todo!()
+    // 1. The arguments.
+    let board = get_path(args, "board")?;
+    if board.extension().and_then(|e| e.to_str()) != Some("kicad_pcb") {
+        return Ok(invalid_arg("board", "must be a .kicad_pcb file"));
+    }
+    if let Err(error) = std::fs::canonicalize(&board) {
+        return Ok(invalid_arg(
+            "board",
+            &format!("'{}' cannot be found: {error}", board.display()),
+        ));
+    }
+    let source = match BoardSource::from_args(args) {
+        Ok(source) => source,
+        Err(refusal) => return Ok(refusal),
+    };
+    plan_pours_in(ctx, &board, source, None).await
+}
+
+/// Steps 2 to 7 of [`handle_plan_pours`]. `state` is Konnect's state folder, `None` for
+/// `konnect_sexp::writer::state_root` (the tests give their own, so that no test writes
+/// below the user's real state folder).
+async fn plan_pours_in(
+    ctx: &ToolContext,
+    board: &Path,
+    source: BoardSource,
+    state: Option<&Path>,
+) -> anyhow::Result<CallToolResult> {
+    let board = board.to_path_buf();
+    // 2. The board, 3. the files beside it.
+    let read = match board_text(ctx, &board, source).await? {
+        Ok(read) => read,
+        Err(refusal) => return Ok(refusal),
+    };
+    let sidecars = match sidecars(&board) {
+        Ok(sidecars) => sidecars,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    // 4. The plan, off the async threads.
+    let text = read.text.clone();
+    let inputs = sidecars.clone();
+    let planned = tokio::task::spawn_blocking(move || plan_of(&text, &inputs)).await?;
+    let mut plan = match planned {
+        Ok(plan) => plan,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let board_sha256 = crate::place_held::sha256_hex(read.text.as_bytes());
+    let mut sources = json!({ "board": read.from });
+    if sidecars.project_text.is_some() {
+        sources["project_rules"] = json!(board_source::FROM_PROJECT_FILE);
+    }
+
+    // 5. Nothing to propose: no check.
+    if plan.proposals.is_empty() {
+        let mut body = result_json(&board, &board_sha256, &plan, None);
+        board_source::provenance(&mut body, sources, read.evidence);
+        return Ok(CallToolResult::json(&body));
+    }
+
+    // 6. KiCad's fill (PP11, PP12).
+    let (folder, outcome) = match run_check(ctx, &board, &read.text, &plan, state).await {
+        Ok(done) => done,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let mut check = match outcome {
+        Ok(check) => check,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCad's fill of the plan failed ({error:#}). The scratch copies are in '{}'. \
+                 A plan is returned only after KiCad has filled it, so nothing is proposed.",
+                folder.display()
+            )))
+        }
+    };
+
+    // 7. The response.
+    withdraw_unfilled(&mut plan, &mut check);
+    sources["check"] = json!(FROM_KICAD_CLI);
+    let mut body = result_json(&board, &board_sha256, &plan, Some((&check, &folder)));
+    board_source::provenance(&mut body, sources, read.evidence);
+    Ok(CallToolResult::json(&body))
+}
+
+/// Step 4 of the handler: the board's facts, the roles of its nets that have a pad, the
+/// project's rules and the plan. `Err` is the message of an error result: what to fix,
+/// and that nothing was planned.
+fn plan_of(text: &str, sidecars: &Sidecars) -> Result<PourPlan, String> {
+    let facts = crate::pour_plan::board_facts(text).map_err(|error| {
+        format!(
+            "The board cannot be planned: {error:#}. Pours are defined before the Specctra \
+             export, and the export refuses this board too. Fix that, then call plan_pours \
+             again. Nothing was planned."
+        )
+    })?;
+    let nets: BTreeSet<String> = facts.pads.keys().cloned().collect();
+    let intent_text = sidecars.intent.as_ref().map(|(_, text)| text.as_str());
+    let roles = crate::tools::supply_roles(&nets, intent_text, sidecars.project_text.as_deref());
+    let rules =
+        crate::pour_plan::project_rules(sidecars.project_text.as_deref()).map_err(|reason| {
+            format!(
+                "The project file beside the board cannot be read for the pours' settings \
+                 ({reason}). Repair it, then call plan_pours again. Nothing was planned."
+            )
+        })?;
+    let intent = sidecars.intent.as_ref().map(|(intent, _)| intent);
+    Ok(crate::pour_plan::plan(&facts, &roles, &rules, intent))
+}
+
+/// Step 6 of the handler: the call's folder, a private copy of KiCad's settings in
+/// `<folder>/kicad-config` for the length of the check, and the check. `Err` is the
+/// message of an error result for a folder or a settings copy that cannot be made; the
+/// check's own outcome comes back with the folder. The settings copy is removed whatever
+/// the outcome.
+async fn run_check(
+    ctx: &ToolContext,
+    board: &Path,
+    text: &str,
+    plan: &PourPlan,
+    state: Option<&Path>,
+) -> Result<(PathBuf, anyhow::Result<FillCheck>), String> {
+    let refused = |what: String| {
+        format!(
+            "{what}. A plan is returned only after KiCad has filled it, so nothing is proposed."
+        )
+    };
+    let state = match state {
+        Some(state) => state.to_path_buf(),
+        None => konnect_sexp::writer::state_root().map_err(|error| {
+            refused(format!("Konnect's state folder cannot be found ({error})"))
+        })?,
+    };
+    let folder = crate::pour_check::run_folder(&state, text, &stamp())
+        .map_err(|error| refused(format!("The plan's folder cannot be made ({error:#})")))?;
+    let config = folder.join("kicad-config");
+    let _removal = RemoveOnDrop(config.clone());
+    if let Err(error) = crate::route_judge::private_kicad_config(&config) {
+        return Err(refused(format!(
+            "The private copy of KiCad's settings in '{}' cannot be made ({error:#})",
+            config.display()
+        )));
+    }
+    let cli = crate::pour_check::KicadCli {
+        kicad_cli: ctx.config.kicad_cli.clone(),
+        config_home: config.clone(),
+    };
+    let outcome = crate::pour_check::check(&folder, board, text, &plan.proposals, &cli).await;
+    Ok((folder, outcome))
+}
+
+/// Removes a folder when dropped, whatever happened before it: the settings copy is a
+/// copy of the user's KiCad settings, not a record.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Milliseconds since the Unix epoch: the first part of the call's folder name.
+fn stamp() -> String {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}", since.as_millis())
 }
 
 /// The board's text and where it came from.
@@ -127,7 +293,30 @@ async fn board_text(
     board: &Path,
     source: BoardSource,
 ) -> anyhow::Result<Result<BoardText, CallToolResult>> {
-    todo!()
+    let observation =
+        board_source::read_board(ctx, board, source, "pour plan", |client, document| {
+            client.save_document_to_string_in(document)
+        })
+        .await?;
+    Ok(match observation {
+        board_source::BoardRead::Refused(refusal) => Err(refusal),
+        board_source::BoardRead::Live(text) => Ok(BoardText {
+            text,
+            from: board_source::FROM_IPC,
+            evidence: board_source::live_evidence(),
+        }),
+        board_source::BoardRead::Saved(why) => match std::fs::read_to_string(board) {
+            Ok(text) => Ok(BoardText {
+                text,
+                from: board_source::FROM_SAVED_BOARD,
+                evidence: why.evidence(),
+            }),
+            Err(error) => Err(CallToolResult::error(format!(
+                "The saved board '{}' cannot be read ({error}). Nothing was planned.",
+                board.display()
+            ))),
+        },
+    })
 }
 
 /// The files beside the board that a plan reads.
@@ -143,7 +332,40 @@ pub(crate) struct Sidecars {
 /// design-intent record that exists and cannot be used (`design_intent::unusable`), are
 /// refusals: a plan never guesses past a file that is there.
 fn sidecars(board: &Path) -> Result<Sidecars, CallToolResult> {
-    todo!()
+    let project = board.with_extension("kicad_pro");
+    let project_text = match std::fs::read_to_string(&project) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let reason = format!("unreadable: {error}");
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidConfiguration {
+                    path: project.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "The project file '{}' exists and cannot be read ({reason}). The pours' \
+                     settings depend on its rules, so nothing was planned. Repair it, then \
+                     call plan_pours again.",
+                    project.display()
+                ),
+            ));
+        }
+    };
+    let project_dir = match board.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let path = design_intent::design_intent_path(project_dir);
+    let intent = match design_intent::read_design_intent(&path) {
+        IntentRead::Absent => None,
+        IntentRead::Loaded { intent, text } => Some((*intent, text)),
+        IntentRead::Unusable { reason } => return Err(design_intent::unusable(&path, reason)),
+    };
+    Ok(Sidecars {
+        project_text,
+        intent,
+    })
 }
 
 /// Moves every proposal that KiCad filled nothing of from `plan.proposals` to
@@ -153,7 +375,35 @@ fn sidecars(board: &Path) -> Result<Sidecars, CallToolResult> {
 /// left. `check.clean`, `open` and `risen` are not changed: a zone with no fill adds no
 /// copper.
 pub(crate) fn withdraw_unfilled(plan: &mut PourPlan, check: &mut FillCheck) {
-    todo!()
+    let empty: Vec<(String, String)> = check
+        .fills
+        .iter()
+        .filter(|fill| fill.pieces == 0)
+        .map(|fill| (fill.net.clone(), fill.layer.clone()))
+        .collect();
+    let is_empty = |net: &str, layer: &str| empty.iter().any(|(n, l)| n == net && l == layer);
+    let mut kept = Vec::with_capacity(plan.proposals.len());
+    for zone in std::mem::take(&mut plan.proposals) {
+        if is_empty(&zone.net, &zone.layer) {
+            plan.not_proposed.push(NotProposed {
+                reason: format!(
+                    "KiCad fills nothing of a {} pour on {}: clearances, other copper and rule \
+                     areas leave it no copper, so the zone would add none",
+                    zone.net, zone.layer
+                ),
+                net: Some(zone.net),
+                layer: Some(zone.layer),
+                asked: zone.asked,
+            });
+        } else {
+            kept.push(zone);
+        }
+    }
+    plan.proposals = kept;
+    check.fills.retain(|fill| !is_empty(&fill.net, &fill.layer));
+    let proposals = &plan.proposals;
+    plan.filled_rule_areas
+        .retain(|area| proposals.iter().any(|zone| zone.layer == area.layer));
 }
 
 /// [`PLANNED`], [`PLANNED_WITH_FINDINGS`] or [`NOTHING_TO_PROPOSE`], in this order:
@@ -164,7 +414,16 @@ pub(crate) fn withdraw_unfilled(plan: &mut PourPlan, check: &mut FillCheck) {
 ///   `plan.filled_rule_areas`: [`PLANNED_WITH_FINDINGS`];
 /// - else [`PLANNED`].
 pub(crate) fn status(plan: &PourPlan, check: Option<&FillCheck>) -> &'static str {
-    todo!()
+    if plan.proposals.is_empty() {
+        return NOTHING_TO_PROPOSE;
+    }
+    let unclean = check.is_some_and(|check| !check.clean);
+    let unmet = plan.not_proposed.iter().any(|row| row.asked);
+    if unclean || unmet || !plan.filled_rule_areas.is_empty() {
+        PLANNED_WITH_FINDINGS
+    } else {
+        PLANNED
+    }
 }
 
 /// The response:
@@ -178,6 +437,7 @@ pub(crate) fn status(plan: &PourPlan, check: Option<&FillCheck>) -> &'static str
 /// - `check`, whenever one ran (also when it withdrew every proposal): `{clean, open,
 ///   risen, starved_thermals_before, starved_thermals, folder}`;
 /// - `next_steps` ([`next_steps`]).
+///
 /// Provenance is added by the handler.
 pub(crate) fn result_json(
     board: &Path,
@@ -185,7 +445,65 @@ pub(crate) fn result_json(
     plan: &PourPlan,
     check: Option<(&FillCheck, &Path)>,
 ) -> Value {
-    todo!()
+    let fill_of = |net: &str, layer: &str| {
+        check
+            .and_then(|(check, _)| {
+                check
+                    .fills
+                    .iter()
+                    .find(|fill| fill.net == net && fill.layer == layer)
+            })
+            .map(|fill| {
+                json!({
+                    "pieces": fill.pieces,
+                    "area_mm2": round3(fill.area_mm2),
+                    "largest_piece_share": fill.largest_piece_share,
+                })
+            })
+            .unwrap_or(Value::Null)
+    };
+    let proposals: Vec<Value> = plan
+        .proposals
+        .iter()
+        .map(|zone| {
+            json!({
+                "net": zone.net,
+                "layer": zone.layer,
+                "asked": zone.asked,
+                "reason": zone.reason,
+                "add_zone": crate::pour_plan::add_zone_arguments(board, zone),
+                "fill": fill_of(&zone.net, &zone.layer),
+            })
+        })
+        .collect();
+    let fill_check = check.map(|(check, _)| check);
+    let mut body = json!({
+        "status": status(plan, fill_check),
+        "board": board.display().to_string(),
+        "board_sha256": board_sha256,
+        "stack": plan.stack,
+        "nets": plan.nets,
+        "proposals": proposals,
+        "not_proposed": plan.not_proposed,
+        "rule_areas_filled": plan.filled_rule_areas,
+        "next_steps": next_steps(plan, fill_check),
+    });
+    if let Some((check, folder)) = check {
+        body["check"] = json!({
+            "clean": check.clean,
+            "open": check.open,
+            "risen": check.risen,
+            "starved_thermals_before": check.starved_thermals_before,
+            "starved_thermals": check.starved_thermals,
+            "folder": folder.display().to_string(),
+        });
+    }
+    body
+}
+
+/// A value to 3 decimals.
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
 }
 
 /// What to do with the result, each line naming only tools and arguments of the
@@ -207,7 +525,100 @@ pub(crate) fn result_json(
 /// - no proposal: what `not_proposed` asks for (a ground rail in the design intent's
 ///   `rails`, or a `pours` request).
 fn next_steps(plan: &PourPlan, check: Option<&FillCheck>) -> Vec<String> {
-    todo!()
+    let mut steps = Vec::new();
+    if !plan.proposals.is_empty() {
+        steps.push(
+            "Show the user this plan. On their OK call add_zone once per proposal with its \
+             add_zone arguments, then refill_zones and save_project. Add the zones before \
+             export_specctra_dsn or after the routed session is imported, never between the \
+             two: the import checks the board against what was exported."
+                .to_string(),
+        );
+    }
+    if let Some(check) = check.filter(|check| !check.clean) {
+        let mut rose: Vec<String> = check
+            .risen
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} ({}) {} to {}",
+                    row.rule, row.severity, row.before, row.after
+                )
+            })
+            .collect();
+        if check.starved_thermals > check.starved_thermals_before {
+            rose.push(format!(
+                "starved thermal pads at any severity {} to {}",
+                check.starved_thermals_before, check.starved_thermals
+            ));
+        }
+        steps.push(format!(
+            "KiCad's check of the plan is not clean: {}. Show the user what rose; the user \
+             decides whether to add the zones as they are.",
+            rose.join(", ")
+        ));
+    }
+    for area in &plan.filled_rule_areas {
+        let label = match (&area.name, &area.uuid) {
+            (Some(name), _) => format!("'{name}'"),
+            (None, Some(uuid)) => format!("with UUID {uuid}"),
+            (None, None) => "with no name".to_string(),
+        };
+        steps.push(format!(
+            "The rule area {label} on {layer} keeps {forbids} out and lets copper pours in, so \
+             the {layer} pour fills inside it. If copper must stay out of it (an antenna \
+             keepout, say), delete_zone the area and add_rule_area it again with \
+             keepout.copperpour true, then call plan_pours again.",
+            layer = area.layer,
+            forbids = area.forbids.join(", "),
+        ));
+    }
+    let by_name: Vec<&str> = plan
+        .nets
+        .iter()
+        .filter(|net| net.source == "name")
+        .map(|net| net.net.as_str())
+        .collect();
+    if !by_name.is_empty() {
+        steps.push(format!(
+            "The roles of {} come from their names only. Confirm them with the user, or record \
+             the rails with set_design_intent (section 'rails').",
+            by_name.join(", ")
+        ));
+    }
+    for row in plan.not_proposed.iter().filter(|row| row.asked) {
+        let what = match (&row.net, &row.layer) {
+            (Some(net), Some(layer)) => format!("{net} on {layer}"),
+            (Some(net), None) => net.clone(),
+            (None, Some(layer)) => layer.clone(),
+            (None, None) => "a pour".to_string(),
+        };
+        steps.push(format!(
+            "The design intent asks for {what}, and it is not met: {}.",
+            row.reason
+        ));
+    }
+    if plan.proposals.is_empty() {
+        let no_ground = !plan
+            .nets
+            .iter()
+            .any(|net| net.role == crate::pour_plan::SupplyRole::Ground);
+        let no_rule = plan
+            .not_proposed
+            .iter()
+            .any(|row| row.net.is_none() && row.layer.is_none());
+        steps.push(if no_ground || no_rule {
+            "Nothing is proposed. To change that, record the board's ground net as a 0 V rail \
+             with set_design_intent (section 'rails'), or ask for pours by net and layer with \
+             set_design_intent (section 'pours'), then call plan_pours again."
+                .to_string()
+        } else {
+            "Nothing is proposed: not_proposed gives the reason for each pour that was \
+             considered."
+                .to_string()
+        });
+    }
+    steps
 }
 
 #[cfg(test)]

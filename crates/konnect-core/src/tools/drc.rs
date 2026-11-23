@@ -1332,6 +1332,9 @@ mod tests {
                 name: "issue408-live-refill",
                 priority: 1,
                 connection: kiapi::board::types::ZoneConnectionStyle::ZcsFull,
+                thermal_gap_mm: konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM,
+                thermal_bridge_mm: konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM,
+                islands: konnect_ipc::builders::ZoneIslands::Always,
             },
             net.netcode,
         );

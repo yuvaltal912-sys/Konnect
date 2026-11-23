@@ -1277,7 +1277,26 @@ pub(crate) fn supply_roles(
     intent_text: Option<&str>,
     project_text: Option<&str>,
 ) -> SupplyRoles {
-    todo!()
+    let params = Params::from_args(&json!({}))
+        .unwrap_or_else(|_| unreachable!("the audit's default thresholds always read"));
+    let captured = CapturedInputs {
+        project: project_text,
+        intent: intent_text,
+    };
+    let mut pairs = Vec::new();
+    // The texts are captured, so this path is never read.
+    let (_, roles) = intent_roles(
+        Path::new("supply-roles.kicad_pcb"),
+        nets,
+        &params,
+        &mut pairs,
+        Some(&captured),
+    );
+    SupplyRoles {
+        ground: roles.ground,
+        power: roles.power,
+        netclass: roles.netclass.into_iter().collect(),
+    }
 }
 
 /// Row ZR, stage ZR1 (Z13): for each net of `nets`, the pads that are not in a group

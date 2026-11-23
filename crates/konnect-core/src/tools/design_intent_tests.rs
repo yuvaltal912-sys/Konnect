@@ -53,7 +53,13 @@ fn an_absent_record_reads_as_absent_with_every_section_missing() {
     assert_eq!(body["source"], "absent", "{body}");
     assert!(body["revision"].is_null(), "{body}");
     assert!(body["intent"].is_null(), "{body}");
-    assert_eq!(body["missing_sections"], json!(SECTIONS), "{body}");
+    // Row ZR, stage ZR4: `pours` is a section but never "missing": without requests the
+    // planner has its rule.
+    assert_eq!(
+        body["missing_sections"],
+        json!(["rails", "currents", "interfaces", "fab_target"]),
+        "{body}"
+    );
     assert_eq!(body["net_names_checked"], false, "{body}");
     assert!(file_text(dir.path()).is_none(), "a read writes nothing");
 }
@@ -193,7 +199,12 @@ fn sections_clear_with_an_empty_list_or_null() {
     assert!(!set(dir.path(), "rails", json!([]), Some(&r)).is_error);
 
     let read = body(&get_design_intent_at(dir.path()));
-    assert_eq!(read["missing_sections"], json!(SECTIONS), "{read}");
+    // `pours` is never listed as missing (Row ZR, stage ZR4).
+    assert_eq!(
+        read["missing_sections"],
+        json!(["rails", "currents", "interfaces", "fab_target"]),
+        "{read}"
+    );
     assert!(read["intent"].get("fab_target").is_none(), "{read}");
 }
 
@@ -963,4 +974,148 @@ fn non_finite_lengths_are_refused_by_the_validator() {
         !validate(&intent).is_empty(),
         "validate includes the length rules"
     );
+}
+
+// ─── Row ZR, stage ZR4: the section `pours` ─────────────────────────────────────
+
+/// A record without `pours` is written as before: setting another section leaves no
+/// `pours` key in the text, and an old record writes back byte for byte.
+#[test]
+fn a_record_without_pours_is_written_as_before() {
+    let dir = project();
+    let result = set(dir.path(), "rails", rails(), None);
+    assert!(!result.is_error, "{:?}", body(&result));
+    let text = file_text(dir.path()).unwrap();
+    assert!(!text.contains("pours"), "{text}");
+    let IntentRead::Loaded { intent, text } = read_text(OLD_RECORD) else {
+        panic!("an old record loads")
+    };
+    assert!(intent.pours.is_empty());
+    assert_eq!(serde_json::to_string_pretty(&*intent).unwrap() + "\n", text);
+}
+
+/// What `set_design_intent` says of `value` as the section `pours` on a fresh project:
+/// `None` when it is accepted, else the refusal's reason.
+fn pours_refusal(value: Value) -> Option<String> {
+    let dir = project();
+    let result = set(dir.path(), "pours", value, None);
+    if !result.is_error {
+        return None;
+    }
+    assert_eq!(kind(&result).as_deref(), Some("invalid_argument"));
+    assert!(file_text(dir.path()).is_none(), "a refusal wrote the file");
+    Some(
+        body(&result)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+#[test]
+fn a_pour_request_is_exact_or_refused() {
+    let cases = [
+        (
+            json!([{ "net": "GND" }, { "net": "GND", "layers": ["B.Cu"] }]),
+            "pours[1].net: 'GND' is listed twice",
+        ),
+        (
+            json!([{ "net": "GND", "layers": ["B.Cu", "B.Cu"] }]),
+            "pours[0].layers[1]: 'B.Cu' is listed twice in this entry",
+        ),
+        (
+            json!([
+                { "net": "GND", "layers": ["B.Cu"] },
+                { "net": "+5V", "layers": ["F.Cu", "B.Cu"] }
+            ]),
+            "pours[1].layers[1]: 'B.Cu' is already asked for by pours[0]",
+        ),
+        (
+            json!([{ "net": "GND", "layers": ["F.SilkS"] }]),
+            "pours[0].layers[0]: 'F.SilkS' is not a copper layer",
+        ),
+        (
+            json!([{ "net": "GND", "layers": ["In0.Cu"] }]),
+            "pours[0].layers[0]: 'In0.Cu' is not a copper layer",
+        ),
+        (
+            json!([{ "net": "GND", "layers": ["In31.Cu"] }]),
+            "pours[0].layers[0]: 'In31.Cu' is not a copper layer",
+        ),
+        (
+            json!([{ "net": "GND", "layers": ["In01.Cu"] }]),
+            "pours[0].layers[0]: 'In01.Cu' is not a copper layer",
+        ),
+        (json!([{ "net": "" }]), "pours[0].net: is empty"),
+        (
+            json!([{ "net": "  " }]),
+            "pours[0].net: '  ' is only whitespace",
+        ),
+    ];
+    for (value, expected) in cases {
+        let reason = pours_refusal(value.clone()).unwrap_or_else(|| panic!("{value} is accepted"));
+        assert!(
+            reason.contains(expected),
+            "{value}: '{reason}' lacks '{expected}'"
+        );
+    }
+    for value in [
+        json!([{ "net": "GND", "layers": ["F.Cu", "In1.Cu", "In30.Cu", "B.Cu"] }]),
+        json!([{ "net": "GND" }, { "net": "+5V", "layers": ["In2.Cu"], "notes": "supply" }]),
+        json!([{ "net": "+5V ", "layers": [] }]),
+    ] {
+        assert_eq!(pours_refusal(value.clone()), None, "{value}");
+    }
+}
+
+#[test]
+fn pours_is_a_section_like_the_others() {
+    let dir = project();
+    let pours = json!([
+        { "net": "+5V", "layers": ["F.Cu"], "notes": "the supply side" },
+        { "net": "AGND" }
+    ]);
+    let result = set(dir.path(), "pours", pours.clone(), None);
+    assert!(!result.is_error, "{:?}", body(&result));
+    let read = body(&get_design_intent_at(dir.path()));
+    assert_eq!(read["intent"]["pours"], pours, "{read}");
+    assert!(
+        !read["missing_sections"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("pours")),
+        "{read}"
+    );
+
+    let revision = current_revision(dir.path());
+    let result = set(dir.path(), "pours", json!([]), Some(&revision));
+    assert!(!result.is_error, "{:?}", body(&result));
+    let text = file_text(dir.path()).unwrap();
+    assert!(
+        !text.contains("pours"),
+        "an empty list clears the section: {text}"
+    );
+
+    let revision = current_revision(dir.path());
+    let result = set(
+        dir.path(),
+        "pours",
+        json!({ "net": "GND" }),
+        Some(&revision),
+    );
+    assert!(result.is_error);
+    let reason = body(&result)["error"]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("must be an array of objects"), "{reason}");
+
+    // An unknown key in an entry is refused: the record is closed.
+    let result = set(
+        dir.path(),
+        "pours",
+        json!([{ "net": "GND", "clearance": 0.3 }]),
+        Some(&revision),
+    );
+    assert!(result.is_error);
 }
