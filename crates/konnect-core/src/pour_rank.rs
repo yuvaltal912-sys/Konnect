@@ -327,4 +327,4 @@ pub(crate) fn rank_report(
 
 #[cfg(test)]
 #[path = "pour_rank_tests.rs"]
-mod tests;
+pub(crate) mod tests;

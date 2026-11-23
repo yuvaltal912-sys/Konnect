@@ -3865,3 +3865,329 @@ fn the_prune_record_is_in_search_and_in_the_winners_run_json_only() {
 fn the_placement_tools_routing_calls_do_not_prune() {
     assert_eq!(crate::place_route::CANDIDATE_PRUNE, PourPrune::Off);
 }
+
+// ─── Row ZR, ZR5 part 2: the setting and the two keys ────────────────────────
+
+/// `finished_search` with keys on which the two keys disagree: today's key puts run 0
+/// first, the pour key run 1. `mode` is the key that ranked, and the winner is its
+/// choice.
+fn split_search(mode: RankMode) -> Search {
+    let mut search = finished_search();
+    let mut today = [0; 13];
+    today[7] = 50;
+    let mut later = today;
+    later[7] = 55;
+    search.outcome.keys = vec![Some(today), Some(later), None];
+    let mut cut = [0; 17];
+    cut[8] = 10;
+    cut[9] = 50;
+    let mut whole = [0; 17];
+    whole[9] = 55;
+    search.outcome.pour_keys = vec![Some(cut), Some(whole), None];
+    search.outcome.rank = mode;
+    search.outcome.winner = Some(match mode {
+        RankMode::Routing => 0,
+        RankMode::Pours => 1,
+    });
+    search
+}
+
+fn listed_indexes(search: &Search) -> Vec<u64> {
+    search_json(
+        &plan(),
+        &[Shape::AsExported, Shape::Omitted],
+        &search.outcome,
+        Listing::Best,
+    )["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["index"].as_u64().unwrap())
+        .collect()
+}
+
+/// PK12: the result's listing sorts the judged runs by the key that ranked. Control:
+/// the listing left on `keys` under `pours`.
+#[test]
+fn the_listing_sorts_by_the_key_that_ranked() {
+    assert_eq!(
+        listed_indexes(&split_search(RankMode::Routing)),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        listed_indexes(&split_search(RankMode::Pours)),
+        vec![1, 0, 2]
+    );
+}
+
+/// PK10: `run.json` of every run and the winner have both keys whatever the mode.
+/// Control: `pour_key` written only under `pours`.
+#[test]
+fn both_keys_are_written_whatever_the_mode() {
+    for mode in [RankMode::Routing, RankMode::Pours] {
+        let search = split_search(mode);
+        reduce_run_folders(&search.folder, &search.outcome).unwrap();
+        for (position, record) in search.outcome.runs.iter().enumerate() {
+            let run = search
+                .folder
+                .join(run_folder_name(record.index, record.shape, record.seed));
+            let body: Value =
+                serde_json::from_str(&std::fs::read_to_string(run.join("run.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                body["key"],
+                json!(search.outcome.keys[position]),
+                "{mode:?} {position}"
+            );
+            assert_eq!(
+                body["pour_key"],
+                json!(search.outcome.pour_keys[position]),
+                "{mode:?} {position}"
+            );
+            assert!(body.get("pour_key").is_some(), "{mode:?} {position}");
+        }
+        let winner = winner_json(&search.outcome).unwrap();
+        let at = search.outcome.winner.unwrap();
+        assert_eq!(winner["key"], json!(search.outcome.keys[at]), "{mode:?}");
+        assert_eq!(
+            winner["pour_key"],
+            json!(search.outcome.pour_keys[at]),
+            "{mode:?}"
+        );
+    }
+}
+
+/// PK10: `search.rank` of the result and of `search.json` says which key ranked, where
+/// the mode came from, and which run the other key puts first. Controls: released runs
+/// left out of `other_winner`; the other mode's keys read from the ranking key.
+#[test]
+fn the_result_says_which_key_ranked_and_what_the_other_key_chose() {
+    let kicad = route_judge::PrivateConfig {
+        home: PathBuf::from("/x/kicad-config"),
+        skipped_links: Vec::new(),
+    };
+    for (mode, source, winner, other) in [
+        (RankMode::Routing, RankSource::Default, 0, 1),
+        (RankMode::Pours, RankSource::UserConfig, 1, 0),
+    ] {
+        let search = split_search(mode);
+        let dsn = search.root.join("board.dsn");
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        let call = Call {
+            dsn,
+            ses_output: search.root.join("out.ses"),
+            folder: search.folder.clone(),
+            effort: (Effort::M, EffortSource::Default),
+            fallback: WidthFallback::Floor,
+            rank: (mode, source),
+        };
+        let result = conclude(
+            &json!({}),
+            &call,
+            &candidate(),
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+            &kicad,
+            &PairsPlan::default(),
+            &LengthPlan::default(),
+        )
+        .unwrap();
+        assert!(!result.is_error, "{mode:?}");
+        let expected = json!({
+            "ranked_by": mode.name(),
+            "source": source,
+            "other_key": mode.other().name(),
+            "other_winner": other,
+            "same_winner": false,
+        });
+        assert_eq!(body(&result)["search"]["winner"]["index"], winner);
+        assert_eq!(body(&result)["search"]["rank"], expected, "{mode:?}");
+        let every: Value = serde_json::from_str(
+            &std::fs::read_to_string(call.folder.join("search.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(every["rank"], expected, "{mode:?}");
+    }
+}
+
+// ─── The setting is read on every call (PK9) ─────────────────────────────────
+
+#[test]
+fn the_rank_key_comes_from_the_user_config_whatever_else_it_holds() {
+    let read = |text: Option<&str>| {
+        let (_dir, path) = config_file(text);
+        call_rank_at(RankChoice::UserConfig, &path)
+    };
+    assert_eq!(
+        read(None).unwrap(),
+        (RankMode::Routing, RankSource::Default)
+    );
+    assert_eq!(
+        read(Some(r#"{"routing": {"effort": "h"}}"#)).unwrap(),
+        (RankMode::Routing, RankSource::Default)
+    );
+    assert_eq!(
+        read(Some(r#"{"routing": {"rank_key": null}}"#)).unwrap(),
+        (RankMode::Routing, RankSource::Default)
+    );
+    assert_eq!(
+        read(Some(r#"{"routing": {"rank_key": "pours"}}"#)).unwrap(),
+        (RankMode::Pours, RankSource::UserConfig)
+    );
+    assert_eq!(
+        read(Some(
+            r#"{"routing": {"effort": "h", "fastroute_path": "/opt/fastroute", "rank_key": "pours"}}"#
+        ))
+        .unwrap(),
+        (RankMode::Pours, RankSource::UserConfig)
+    );
+    assert_eq!(
+        read(Some(r#"{"routing": {"rank_key": "routing"}}"#)).unwrap(),
+        (RankMode::Routing, RankSource::UserConfig)
+    );
+    // The effort and path readers read what they read.
+    let (_dir, path) = config_file(Some(
+        r#"{"routing": {"effort": "h", "fastroute_path": "/opt/fastroute", "rank_key": "pours"}}"#,
+    ));
+    assert_eq!(
+        routing_config_at(&path).unwrap(),
+        (Some(json!("h")), Some(PathBuf::from("/opt/fastroute")))
+    );
+}
+
+/// A setting that is there and cannot be read, or a config that cannot be used, refuses
+/// the call: `invalid_configuration`, naming the value and both names. Control: a silent
+/// fall to the default.
+#[test]
+fn a_rank_key_that_names_no_mode_or_a_broken_config_refuses_the_call() {
+    for text in [
+        r#"{"routing": {"rank_key": "pour"}}"#,
+        r#"{"routing": {"rank_key": 3}}"#,
+        r#"{"routing": {"rank_key": ""}}"#,
+    ] {
+        let (_dir, path) = config_file(Some(text));
+        let refused = call_rank_at(RankChoice::UserConfig, &path).expect_err(text);
+        assert_eq!(kind(&refused), "invalid_configuration", "{text}");
+        let said = message(&refused);
+        for word in ["routing.rank_key", "routing or pours"] {
+            assert!(said.contains(word), "{text}: {said}");
+        }
+    }
+    for text in [
+        "{not json",
+        r#"{"routing": "fast"}"#,
+        r#"{"routing": {"fastroute_path": 7}}"#,
+    ] {
+        let (_dir, path) = config_file(Some(text));
+        let refused = call_rank_at(RankChoice::UserConfig, &path).expect_err(text);
+        assert_eq!(kind(&refused), "invalid_configuration", "{text}");
+        assert!(message(&refused).contains("routed nothing"), "{text}");
+    }
+}
+
+/// PK13: a fixed mode reads nothing, so even a config that cannot be used does not
+/// refuse it; the placement tools' constant is today's key, fixed. Control: the
+/// constant set to `UserConfig`.
+#[test]
+fn a_fixed_mode_reads_no_config_and_placement_fixes_todays_key() {
+    let (_dir, broken) = config_file(Some("{not json"));
+    let (_dir2, pours) = config_file(Some(r#"{"routing": {"rank_key": "pours"}}"#));
+    for path in [&broken, &pours] {
+        assert_eq!(
+            call_rank_at(crate::place_route::CANDIDATE_RANK, path).unwrap(),
+            (RankMode::Routing, RankSource::Fixed)
+        );
+        assert_eq!(
+            call_rank_at(RankChoice::Fixed(RankMode::Pours), path).unwrap(),
+            (RankMode::Pours, RankSource::Fixed)
+        );
+    }
+    assert_eq!(
+        crate::place_route::CANDIDATE_RANK,
+        RankChoice::Fixed(RankMode::Routing)
+    );
+}
+
+/// PK11: the engine's input does not depend on the mode. The same call, once under each
+/// mode, through its real path (`route_located`) with a fastroute that fails every pass:
+/// both write the same `uncounted.txt` (the pour net), and the mode reaches the judge's
+/// context. Control: the uncounted file emptied under `pours`.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_engine_gets_the_same_uncounted_file_under_both_modes() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let mut written = Vec::new();
+    for mode in [RankMode::Routing, RankMode::Pours] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let board_text = "(kicad_pcb (version 20260206))\n";
+        let board = root.join("b.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        let dsn = root.join("board.dsn");
+        std::fs::write(
+            &dsn,
+            "(pcb board.kicad_pcb\n  (resolution um 10)\n  (unit um)\n  (structure\n    \
+             (layer F.Cu\n      (type signal)\n    )\n    (boundary\n      \
+             (path pcb 0 0 0 100 0 100 100 0 100)\n    )\n    (plane GND\n      \
+             (polygon F.Cu 0 1 1 9 1 9 9 1 9)\n    )\n    (via konnect_via_0001)\n    \
+             (rule\n      (width 200)\n      (clearance 200)\n    )\n  )\n  (placement\n    \
+             (component img_C1\n      (place C1 1000 -1000 front 90)\n      \
+             (place C2 2000 -1000 front 90)\n    )\n  )\n  (library\n    \
+             (image img_C1\n      (pin pad_1 1 0 0)\n    )\n  )\n  (network\n    \
+             (net GND\n      (pins C1-1 C2-1)\n    )\n  )\n  (wiring\n  )\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("board.dsn.konnect.json"),
+            json!({
+                "schema_version": 1,
+                "board_path": board.display().to_string(),
+                "source_sha256": format!("{:x}", Sha256::digest(board_text.as_bytes())),
+                "pours": [{ "net": "GND", "layer": "F.Cu" }],
+                "nets": [{ "name": "GND" }, { "name": "SIG" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let executable = |name: &str, text: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let cli = executable("kicad-cli", "#!/bin/sh\nexit 0\n");
+        let fastroute = executable("fastroute", "#!/bin/sh\nexit 3\n");
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let args = json!({
+            "dsn_path": dsn,
+            "ses_output_path": root.join("out.ses"),
+            "effort": "fast",
+        });
+        let mut call = prepare_call(&args).unwrap().expect("good arguments");
+        call.rank = (mode, RankSource::Fixed);
+        let binary = Binary {
+            path: fastroute,
+            sha256: "00".repeat(32),
+            version: "fastroute test".to_string(),
+            source: "argument",
+        };
+        let result = route_located(&args, ctx, call, Located::Found(binary), PourPrune::Off)
+            .await
+            .unwrap();
+        assert!(result.is_error, "every pass fails: {mode:?}");
+        let kept = root.join("out.search.failed-1");
+        let uncounted = std::fs::read_to_string(kept.join("uncounted.txt"))
+            .unwrap_or_else(|error| panic!("{mode:?}: {error}: {}", message(&result)));
+        assert!(uncounted.contains("GND"), "{mode:?}: {uncounted}");
+        written.push(uncounted);
+    }
+    assert_eq!(written[0], written[1]);
+}

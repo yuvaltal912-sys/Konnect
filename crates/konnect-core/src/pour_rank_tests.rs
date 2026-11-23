@@ -7,7 +7,7 @@ use crate::route_judge::{rank_measures, Gates, Measures};
 use crate::zone_fill::PourMeasures;
 use serde_json::json;
 
-fn passing() -> Gates {
+pub(crate) fn passing() -> Gates {
     Gates {
         g1: vec![],
         g2: vec![],
@@ -21,7 +21,12 @@ fn measures() -> Measures {
 }
 
 /// Pour measures with a damage of these three numbers and `starved` starved thermals.
-fn pours(starved: usize, lost_fills: usize, plane_loss: f64, area_loss: f64) -> PourMeasures {
+pub(crate) fn pours(
+    starved: usize,
+    lost_fills: usize,
+    plane_loss: f64,
+    area_loss: f64,
+) -> PourMeasures {
     PourMeasures {
         open_before_stitching: 0,
         open_after_stitching: 0,
@@ -41,7 +46,7 @@ fn pours(starved: usize, lost_fills: usize, plane_loss: f64, area_loss: f64) -> 
     }
 }
 
-fn with_pours(mut m: Measures, pours: PourMeasures) -> Measures {
+pub(crate) fn with_pours(mut m: Measures, pours: PourMeasures) -> Measures {
     m.pours = Some(pours);
     m
 }
@@ -558,4 +563,62 @@ fn the_report_names_the_least_of_the_other_key() {
     assert_eq!(report["same_winner"], false);
     let report = rank_report(RankMode::Routing, RankSource::Default, &[], &[], None);
     assert_eq!(report["other_winner"], Value::Null);
+}
+
+// ─── Each site follows the mode: the shared pool ─────────────────────────────
+
+/// Measures on which the two keys disagree: `signal_mm` decides today's key (its signal
+/// step, entry 7), `plane_loss` decides the pour key first (its plane step, entry 8,
+/// before the signal step at 9). Every gate passes; nothing else differs.
+pub(crate) fn split(signal_mm: f64, plane_loss: f64) -> Measures {
+    let mut m = with_pours(measures(), pours(0, 0, plane_loss, 0.0));
+    m.signal_mm = signal_mm;
+    m
+}
+
+/// A judged run of [`split`] measures.
+pub(crate) fn split_judged(signal_mm: f64, plane_loss: f64) -> Judged {
+    Judged {
+        measures: split(signal_mm, plane_loss),
+        gates: passing(),
+        board: std::path::PathBuf::from("/nowhere/judged.kicad_pcb"),
+        rounds: vec![],
+        tune: None,
+    }
+}
+
+/// The two judged runs every site test uses: `short` wins today's key, `whole` the pour
+/// key.
+pub(crate) fn short_and_whole() -> (Judged, Judged) {
+    (split_judged(100.0, 0.5), split_judged(110.0, 0.0))
+}
+
+#[test]
+fn the_shared_pool_splits_the_two_keys() {
+    let (short, whole) = short_and_whole();
+    let today = crate::route_judge::rank(&[&short, &whole]);
+    assert!(today[0] < today[1], "{today:?}");
+    let poured = ranking_of(RankMode::Pours, &[&short, &whole]);
+    assert!(poured[1] < poured[0], "{poured:?}");
+}
+
+#[test]
+fn a_runs_tuned_choice_follows_the_mode() {
+    use crate::route_judge::tuned_choice;
+    let (short, whole) = short_and_whole();
+    // The untuned board first, then the candidates.
+    assert_eq!(tuned_choice(RankMode::Routing, &[&short, &whole]), 0);
+    assert_eq!(tuned_choice(RankMode::Pours, &[&short, &whole]), 1);
+    assert_eq!(tuned_choice(RankMode::Routing, &[&whole, &short]), 1);
+    assert_eq!(tuned_choice(RankMode::Pours, &[&whole, &short]), 0);
+    // An exact tie keeps the untuned board under both modes, then the first candidate.
+    for mode in [RankMode::Routing, RankMode::Pours] {
+        assert_eq!(tuned_choice(mode, &[&whole, &whole.clone()]), 0, "{mode:?}");
+        assert_eq!(
+            tuned_choice(mode, &[&short, &whole, &whole.clone()]),
+            if mode == RankMode::Pours { 1 } else { 0 },
+            "{mode:?}"
+        );
+    }
+    assert_eq!(tuned_choice(RankMode::Pours, &[]), 0);
 }

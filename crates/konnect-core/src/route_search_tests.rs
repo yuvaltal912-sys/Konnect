@@ -1589,6 +1589,48 @@ async fn a_route_in_flight_that_succeeds_lifts_the_stop() {
     assert_eq!(outcome.winner, Some(0));
 }
 
+/// Row ZR, ZR5 part 2 (PK12): the search's winner and the runs it releases follow the
+/// runner's mode. Twelve runs judged one by one: run i has a signal length that grows
+/// with i (today's key prefers the early runs) and a plane loss that shrinks with i
+/// (the pour key prefers the late ones). Both keys are kept for every judged run.
+/// Control: `finish` or `release_beyond_the_best` left on `route_judge::rank`.
+#[tokio::test(start_paused = true)]
+async fn the_winner_and_the_released_runs_follow_the_mode() {
+    use crate::pour_rank::RankMode;
+    let pool = |i: usize| {
+        crate::pour_rank::tests::split_judged(100.0 + 2.0 * i as f64, 0.05 * (11 - i) as f64)
+    };
+    for (mode, winner, released) in [
+        (RankMode::Routing, 0, vec![8, 9, 10, 11]),
+        (RankMode::Pours, 11, vec![0, 1, 2, 3]),
+    ] {
+        let fake = fake(|_| (10, None), move |i| (5, Ok(pool(i))));
+        fake.0
+            .pours
+            .store(mode == RankMode::Pours, Ordering::SeqCst);
+        let outcome = run(&plan(1, 1, Some(100_000), 12), &fake).await;
+        assert_eq!(outcomes(&outcome), vec!["judged"; 12], "{mode:?}");
+        assert_eq!(outcome.rank, mode);
+        assert_eq!(outcome.winner, Some(winner), "{mode:?}");
+        assert_eq!(fake.released(), released, "{mode:?}");
+        // Both keys, by index, whatever ranked.
+        let judged: Vec<Judged> = (0..12).map(pool).collect();
+        let refs: Vec<&Judged> = judged.iter().collect();
+        let pooled: Vec<(&Measures, &Gates, bool)> =
+            refs.iter().map(|j| (&j.measures, &j.gates, true)).collect();
+        let today: Vec<Option<Key>> = crate::route_judge::rank(&refs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let poured: Vec<Option<crate::pour_rank::PourKey>> = crate::pour_rank::pour_keys(&pooled)
+            .into_iter()
+            .map(Some)
+            .collect();
+        assert_eq!(outcome.keys, today, "{mode:?}");
+        assert_eq!(outcome.pour_keys, poured, "{mode:?}");
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn runs_outside_the_best_are_released_and_the_best_are_kept() {
     // Twelve runs judged one by one, each with more acute corners than the last but

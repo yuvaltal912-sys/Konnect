@@ -1385,6 +1385,18 @@ pub(crate) fn tune_harm(untuned: &Judged, tuned: &Judged) -> Vec<String> {
     lines
 }
 
+/// The position in `pool` (the untuned board first, then the harmless candidates) of the
+/// board a run keeps: the least key of `rank` (`pour_rank::ranking_of`, Row ZR, ZR5
+/// part 2, PK12), the earliest on a tie, so the untuned board, then `Free`. 0 for an
+/// empty pool.
+pub(crate) fn tuned_choice(rank: crate::pour_rank::RankMode, pool: &[&Judged]) -> usize {
+    crate::pour_rank::ranking_of(rank, pool)
+        .iter()
+        .enumerate()
+        .min_by(|(a, x), (b, y)| x.cmp(y).then(a.cmp(b)))
+        .map_or(0, |(at, _)| at)
+}
+
 /// Row LT, L23 and L24: judges the run's untuned session in `run-<i>-untuned`, then
 /// the `Free` candidate in `run-<i>`; the `PourSafe` candidate in
 /// `run-<i>-pour-safe` only when `Free` is missing, rejected or fails G4. A candidate
@@ -1466,18 +1478,12 @@ async fn judge_candidates(
     }
 
     // The pool: the untuned board first, then the candidates tuning did not make worse.
-    let keys = {
+    let best = {
         let refs: Vec<&Judged> = std::iter::once(&untuned)
             .chain(harmless.iter().map(|(_, _, judged)| judged))
             .collect();
-        crate::pour_rank::ranking_of(ctx.rank, &refs)
+        tuned_choice(ctx.rank, &refs)
     };
-    // The least key; the earliest on a tie, so the untuned board, then `Free`.
-    let best = keys
-        .iter()
-        .enumerate()
-        .min_by(|(a, x), (b, y)| x.cmp(y).then(a.cmp(b)))
-        .map_or(0, |(at, _)| at);
     let untuned_measures = untuned.measures.clone();
     let (chosen, judged) = match best.checked_sub(1) {
         Some(at) => {

@@ -1709,3 +1709,169 @@ fn the_route_seconds_never_refuse_the_pruned_session() {
         full_judge_refusal(&original, &worse, crate::pour_rank::RankMode::Routing)
     );
 }
+
+// --- Row ZR, ZR5 part 2: every clause that ranks reads the call's ranking key (PK12)
+
+/// Clause (c) names the ranking key's places: a candidate with a longer signal step is
+/// `key:7` under today's key and `key:9` under the pour key. Control: clause (c) left
+/// on `rank_measures` under `pours` names `key:7`.
+#[test]
+fn the_key_clause_names_the_places_of_the_ranking_key() {
+    use crate::pour_rank::RankMode;
+    let base = checked(0, &[("x", 1)]);
+    let longer = with(|rest| rest.measures.signal_mm = 110.0);
+    assert_eq!(
+        refusals(&base, &base, &longer, RankMode::Routing),
+        vec!["key:7"]
+    );
+    assert_eq!(
+        refusals(&base, &base, &longer, RankMode::Pours),
+        vec!["key:9"]
+    );
+    // A pour track that grows is refused only under the pour key (entry 14).
+    let tracked = with(|rest| rest.measures.pour_track_mm = 50.0);
+    assert!(refusals(&base, &base, &tracked, RankMode::Routing).is_empty());
+    assert_eq!(
+        refusals(&base, &base, &tracked, RankMode::Pours),
+        vec!["key:14"]
+    );
+    // The seconds never refuse, under either key.
+    let slower = with(|rest| rest.measures.route_s = 99.0);
+    for mode in [RankMode::Routing, RankMode::Pours] {
+        assert!(refusals(&base, &base, &slower, mode).is_empty(), "{mode:?}");
+    }
+}
+
+/// The full judge's final comparison follows the mode: a pruned session that keeps the
+/// signal but loses plane is refused only under `pours`; one that lengthens the signal
+/// and keeps the plane is refused under both, at the signal step's place of each key.
+/// Control: the comparison left on `route_judge::rank`.
+#[test]
+fn the_full_judges_comparison_follows_the_mode() {
+    use crate::pour_rank::tests::split_judged;
+    use crate::pour_rank::RankMode;
+    let original = split_judged(100.0, 0.0);
+    let cut = split_judged(100.0, 0.1);
+    assert_eq!(full_judge_refusal(&original, &cut, RankMode::Routing), None);
+    assert_eq!(
+        full_judge_refusal(&original, &cut, RankMode::Pours),
+        Some(
+            "the pruned session's rank key is above the original's at position 8 (2 > 0)"
+                .to_string()
+        )
+    );
+    let longer = split_judged(110.0, 0.0);
+    assert_eq!(
+        full_judge_refusal(&original, &longer, RankMode::Routing),
+        Some(
+            "the pruned session's rank key is above the original's at position 7 (55 > 50)"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        full_judge_refusal(&original, &longer, RankMode::Pours),
+        Some(
+            "the pruned session's rank key is above the original's at position 9 (55 > 50)"
+                .to_string()
+        )
+    );
+}
+
+/// Two judged runs on which the keys disagree, `winner` the one the key of `mode` puts
+/// first; both keys taken as the search takes them.
+fn split_runs(mode: crate::pour_rank::RankMode) -> SearchOutcome {
+    use crate::pour_rank::tests::short_and_whole;
+    let (short, whole) = short_and_whole();
+    let mut outcome = two_runs();
+    outcome.runs[0].judged = Some(short);
+    outcome.runs[1].judged = Some(whole);
+    let refs: Vec<&Judged> = outcome
+        .runs
+        .iter()
+        .filter_map(|r| r.judged.as_ref())
+        .collect();
+    let pooled: Vec<(&Measures, &Gates, bool)> = refs
+        .iter()
+        .map(|judged| (&judged.measures, &judged.gates, true))
+        .collect();
+    let keys = route_judge::rank(&refs).into_iter().map(Some).collect();
+    let pour_keys = crate::pour_rank::pour_keys(&pooled)
+        .into_iter()
+        .map(Some)
+        .collect();
+    outcome.keys = keys;
+    outcome.pour_keys = pour_keys;
+    outcome.rank = mode;
+    outcome.winner = Some(match mode {
+        crate::pour_rank::RankMode::Routing => 0,
+        crate::pour_rank::RankMode::Pours => 1,
+    });
+    outcome
+}
+
+/// The keys the prune takes again follow the mode, both keys are taken again, and
+/// `before` holds both of the winner's keys. Under `pours` run 1 won; its pruned board
+/// keeps it first by the pour key though today's key puts run 0 first: kept. Under
+/// `routing` run 0's pruned board loses all its plane and is kept (today's key does not
+/// read the plane); the same board is refused under `pours`. Control: `replace_winner`
+/// ranking by `route_judge::rank`.
+#[test]
+fn the_keys_the_prune_takes_again_follow_the_mode() {
+    use crate::pour_rank::tests::split_judged;
+    use crate::pour_rank::RankMode;
+    // Pours: run 1 (whole plane, longer signal) is pruned to an even longer signal.
+    let mut outcome = split_runs(RankMode::Pours);
+    let before_keys = (outcome.keys[1], outcome.pour_keys[1]);
+    let before = replace_winner(
+        &mut outcome,
+        1,
+        PathBuf::from("/nowhere/run-1/pruned.ses"),
+        split_judged(130.0, 0.0),
+        RankMode::Pours,
+    )
+    .expect("still first by the pour key");
+    assert_eq!(before["key"], json!(before_keys.0));
+    assert_eq!(before["pour_key"], json!(before_keys.1));
+    let refs: Vec<&Judged> = outcome
+        .runs
+        .iter()
+        .filter_map(|r| r.judged.as_ref())
+        .collect();
+    let pooled: Vec<(&Measures, &Gates, bool)> = refs
+        .iter()
+        .map(|judged| (&judged.measures, &judged.gates, true))
+        .collect();
+    let again: Vec<Option<Key>> = route_judge::rank(&refs).into_iter().map(Some).collect();
+    let poured_again: Vec<Option<crate::pour_rank::PourKey>> = crate::pour_rank::pour_keys(&pooled)
+        .into_iter()
+        .map(Some)
+        .collect();
+    assert_eq!(outcome.keys, again);
+    assert_eq!(outcome.pour_keys, poured_again);
+    assert_ne!(outcome.pour_keys[1], before_keys.1);
+
+    // Routing: run 0 (short signal, half its plane lost) is pruned to a board that loses
+    // all of its plane: today's key does not see it, kept.
+    let mut outcome = split_runs(RankMode::Routing);
+    assert!(replace_winner(
+        &mut outcome,
+        0,
+        PathBuf::from("/nowhere/run-0/pruned.ses"),
+        split_judged(100.0, 1.0),
+        RankMode::Routing,
+    )
+    .is_ok());
+    // The pour key puts run 1 first after that prune: refused under `pours`.
+    let mut outcome = split_runs(RankMode::Pours);
+    outcome.winner = Some(0);
+    assert_eq!(
+        replace_winner(
+            &mut outcome,
+            0,
+            PathBuf::from("/nowhere/run-0/pruned.ses"),
+            split_judged(100.0, 1.0),
+            RankMode::Pours,
+        ),
+        Err("the pruned winner would no longer rank first among the judged runs".to_string())
+    );
+}
