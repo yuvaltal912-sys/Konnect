@@ -4779,9 +4779,15 @@ int main(int argc, char **argv) {
             "effort": "fast",
         });
         let call = prepare_call(&args).unwrap().expect("good arguments");
-        let result = route_located(&args, ctx, call, Located::Found(fixture.binary()))
-            .await
-            .unwrap();
+        let result = route_located(
+            &args,
+            ctx,
+            call,
+            Located::Found(fixture.binary()),
+            crate::pour_prune::PourPrune::Off,
+        )
+        .await
+        .unwrap();
         assert!(result.is_error, "every fake pass fails");
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text");
@@ -4990,9 +4996,15 @@ int main(int argc, char **argv) {
             "effort": "fast",
         });
         let call = prepare_call(&args).unwrap().expect("good arguments");
-        let result = route_located(&args, ctx, call, Located::Found(fixture.binary()))
-            .await
-            .unwrap();
+        let result = route_located(
+            &args,
+            ctx,
+            call,
+            Located::Found(fixture.binary()),
+            crate::pour_prune::PourPrune::Off,
+        )
+        .await
+        .unwrap();
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
             panic!("expected text");
         };
@@ -6979,5 +6991,327 @@ int main(int argc, char **argv) {
         .await;
         assert!(fixture.path().join("held/tune-pour-safe").is_dir());
         assert_eq!(held.tune.candidates.len(), 2);
+    }
+
+    // ─── Row ZR, ZR0b: the winner's ground vias through the real call path ───────
+
+    /// The rounded board's recorded session with a GND via at (107, 52) mm and a stub
+    /// wire to it from the middle of the session's GND wire: a via the GND pour makes
+    /// redundant, with its one wire.
+    fn stub_via_session() -> String {
+        let base = include_str!("../tests/fixtures/specctra_rounded_board.freerouting-2.3.0.ses");
+        assert_eq!(base.matches("      (net GND\n").count(), 1);
+        base.replacen(
+            "      (net GND\n",
+            "      (net GND
+        (via konnect_via_0001 1070000 -520000)
+        (wire
+          (path F.Cu 2000
+            1070000 -500000
+            1070000 -520000
+          )
+        )
+",
+            1,
+        )
+    }
+
+    /// Stands in for kicad-cli's refill and DRC on the rounded board: logs each call,
+    /// reports a clean board, and saves the board "refilled": the GND_TOP pour gets the
+    /// one fill piece (`fill.sed`) that joins R1's GND pad to the GND wire, as KiCad's
+    /// fill of that pour would.
+    const REFILL_CLI: &str = r#"#!/bin/sh
+dir="$(cd "$(dirname "$0")" && pwd)"
+echo "$*" >> "$dir/calls.log"
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--output" ]; then out="$a"; fi
+  prev="$a"
+done
+echo '{"violations":[],"unconnected_items":[]}' > "$out"
+sed -f "$dir/fill.sed" "$prev" > "$prev.filled" && mv "$prev.filled" "$prev"
+exit 0
+"#;
+    const FILL_SED: &str = "s/(name \"GND_TOP\")/(name \"GND_TOP\") (filled_polygon (layer \"F.Cu\") (pts (xy 100.2 49.7) (xy 105.2 49.7) (xy 105.2 50.3) (xy 100.2 50.3)))/\n";
+
+    /// One successful call of `route_specctra_dsn`'s fastroute engine through
+    /// `route_located` on the rounded board (the judge tests' export, every run routed
+    /// to [`stub_via_session`] by the fake), with the fake refill above and `prune`.
+    struct PruneCall {
+        body: Value,
+        exported: PathBuf,
+        session: String,
+        cli: PathBuf,
+        _keep: tempfile::TempDir,
+    }
+
+    impl PruneCall {
+        fn search(&self) -> PathBuf {
+            self.exported.join("out.search")
+        }
+        fn delivered(&self) -> String {
+            std::fs::read_to_string(self.exported.join("out.ses")).unwrap()
+        }
+        fn calls(&self) -> usize {
+            std::fs::read_to_string(self.cli.join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+        /// The winner's run folder.
+        fn winner(&self) -> PathBuf {
+            PathBuf::from(self.body["artifacts"]["passes_folder"].as_str().unwrap())
+        }
+        /// Every path below the search folder whose name contains `part`.
+        fn named(&self, part: &str) -> Vec<PathBuf> {
+            fn walk(path: &Path, part: &str, out: &mut Vec<PathBuf>) {
+                for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if entry.file_name().to_string_lossy().contains(part) {
+                        out.push(path.clone());
+                    }
+                    if path.is_dir() {
+                        walk(&path, part, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.search(), part, &mut out);
+            out
+        }
+    }
+
+    /// What every call of these tests starts from: the fake fastroute routing every run to
+    /// [`stub_via_session`], the rounded board's export in `exported`, and the refill fake
+    /// in `cli` (`script`), with a tool context that runs it.
+    struct CallSetup {
+        fixture: Fixture,
+        exported: PathBuf,
+        dsn: PathBuf,
+        session: String,
+        cli: PathBuf,
+        script: PathBuf,
+        ctx: std::sync::Arc<crate::tools::ToolContext>,
+    }
+
+    fn call_setup() -> CallSetup {
+        use crate::router::ToolRouter;
+        use crate::tools::{ServerConfig, ToolContext};
+        use std::sync::Arc;
+
+        let fixture = Fixture::new("");
+        let root = fixture.path().to_path_buf();
+        let exported = root.join("exported");
+        std::fs::create_dir_all(&exported).unwrap();
+        let dsn = crate::route_judge::tests::exported(&exported).dsn;
+        let session = stub_via_session();
+        let routed = root.join("routed.ses");
+        std::fs::write(&routed, &session).unwrap();
+        fixture.set_control(&format!("copy_session={}\n", routed.display()));
+        let cli = root.join("cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let script =
+            crate::tools::cli::test_support::write_script(&cli, "kicad-cli", REFILL_CLI, "");
+        std::fs::write(cli.join("fill.sed"), FILL_SED).unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: script.display().to_string(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        CallSetup {
+            fixture,
+            exported,
+            dsn,
+            session,
+            cli,
+            script,
+            ctx,
+        }
+    }
+
+    async fn prune_call(prune: crate::pour_prune::PourPrune) -> PruneCall {
+        use crate::tools::route_fastroute::{prepare_call, route_located};
+
+        let CallSetup {
+            fixture,
+            exported,
+            dsn,
+            session,
+            cli,
+            ctx,
+            ..
+        } = call_setup();
+        let args = json!({
+            "dsn_path": dsn,
+            "ses_output_path": exported.join("out.ses"),
+            "effort": "fast",
+        });
+        let call = prepare_call(&args).unwrap().expect("good arguments");
+        let result = route_located(&args, ctx, call, Located::Found(fixture.binary()), prune)
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert!(!result.is_error, "{body}");
+        PruneCall {
+            body,
+            exported,
+            session,
+            cli,
+            _keep: fixture.dir,
+        }
+    }
+
+    /// With `Winner` the call delivers the pruned session: the via and its stub go, the
+    /// result's `search.pour_prune`, `search.json` and the winner's `run.json` say so, and
+    /// the original session stays in the winner's folder.
+    #[tokio::test]
+    async fn the_call_delivers_the_winners_pruned_session_and_reports_it() {
+        let call = prune_call(crate::pour_prune::PourPrune::Winner).await;
+        let record = &call.body["search"]["pour_prune"];
+        assert_eq!(record["outcome"], "pruned", "{record}");
+        assert_eq!(record["nets"], json!(["GND"]), "{record}");
+        assert_eq!(
+            (
+                &record["vias_before"],
+                &record["vias_removed"],
+                &record["wires_removed"]
+            ),
+            (&json!(1), &json!(1), &json!(1)),
+            "{record}"
+        );
+        assert_eq!(record["track_mm_removed"], 2.0);
+        // The delivered session is the pruned text: the call's routed session less the
+        // via and its stub, and the file the record's `before` does not name.
+        let units =
+            crate::pour_prune::units(&call.session, &BTreeSet::from(["GND".to_string()])).unwrap();
+        assert_eq!(units.len(), 3, "the via, its stub and the GND wire");
+        let pruned = crate::pour_prune::without(&call.session, &units, &BTreeSet::from([0, 1]));
+        assert_eq!(call.delivered(), pruned);
+        assert_eq!(
+            std::fs::read_to_string(call.winner().join("pruned.ses")).unwrap(),
+            pruned
+        );
+        let before = record["before"]["session"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(before).unwrap(), call.session);
+        // The judged board is the pruned session's.
+        assert!(
+            call.body["completion"]["judged"]["judged_board"]
+                .as_str()
+                .unwrap()
+                .contains("/judge/run-0-pruned/"),
+            "{}",
+            call.body["completion"]["judged"]
+        );
+        // search.json and the winner's run.json carry the same record.
+        let read = |path: PathBuf| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        assert_eq!(
+            &read(call.search().join("search.json"))["pour_prune"],
+            record
+        );
+        assert_eq!(&read(call.winner().join("run.json"))["pour_prune"], record);
+        // The prune's scratch folder is gone.
+        assert!(call
+            .named("-prune")
+            .iter()
+            .all(|path| !path.ends_with("run-0-prune")));
+    }
+
+    /// P12: with `Off` the call is today's: no prune record, no pruned session, no prune
+    /// folder, no kicad-cli run beyond the baseline and the two judges, and the routed
+    /// session delivered as it is. Control: the switch ignored (the prune always runs).
+    #[tokio::test]
+    async fn with_the_switch_off_the_call_runs_no_prune() {
+        let off = prune_call(crate::pour_prune::PourPrune::Off).await;
+        assert!(
+            off.body["search"].get("pour_prune").is_none(),
+            "{}",
+            off.body["search"]
+        );
+        let json: Value = serde_json::from_str(
+            &std::fs::read_to_string(off.search().join("search.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(json.get("pour_prune").is_none());
+        assert!(off.named("prune").is_empty(), "{:?}", off.named("prune"));
+        assert_eq!(off.calls(), 3, "the baseline and the two judged runs");
+        assert_eq!(off.delivered(), off.session);
+        // The same call with the prune on runs more and delivers less.
+        let on = prune_call(crate::pour_prune::PourPrune::Winner).await;
+        assert!(on.calls() > 3);
+        assert_ne!(on.delivered(), on.session);
+    }
+
+    /// P12 through the placement tools' own routing call: `place_route::route_candidate`
+    /// on the session the call above prunes with `Winner` delivers it as routed, makes no
+    /// pruned session, no prune folder and no `pour_prune`, and runs kicad-cli for the
+    /// baseline and the two judged runs only. Control: `route_candidate` passes `Winner`.
+    #[tokio::test]
+    async fn the_placement_tools_routing_call_never_prunes() {
+        let setup = call_setup();
+        let inputs = crate::place_route::RouteInputs {
+            board: setup.exported.join("specctra_rounded_board.kicad_pcb"),
+            rules: Default::default(),
+            options: Default::default(),
+            effort: crate::route_search::Effort::Fast,
+            fastroute: setup.fixture.binary.clone(),
+            kicad_cli: setup.script.display().to_string(),
+            kicad_config_home: setup.fixture.path().join("bench-kicad-config"),
+        };
+        let folder = setup.fixture.path().join("candidate");
+        std::fs::create_dir_all(&folder).unwrap();
+        let result =
+            crate::place_route::route_candidate(setup.ctx.clone(), &inputs, &setup.dsn, &folder)
+                .await;
+        assert!(
+            matches!(result, crate::place_judge::RouteResult::Routed { .. }),
+            "{result:?}"
+        );
+        assert!(!format!("{result:?}").contains("pour_prune"), "{result:?}");
+        let search = folder.join("route.search");
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(search.join("search.json")).unwrap())
+                .unwrap();
+        assert!(json.get("pour_prune").is_none());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("route.ses")).unwrap(),
+            setup.session,
+            "delivered as routed"
+        );
+        let named = {
+            let mut found = Vec::new();
+            for entry in walk_all(&search) {
+                if entry.to_string_lossy().contains("prune") {
+                    found.push(entry);
+                }
+            }
+            found
+        };
+        assert!(named.is_empty(), "{named:?}");
+        let calls = std::fs::read_to_string(setup.cli.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 3, "the baseline and the two judged runs");
+    }
+
+    /// Every path below `root`.
+    fn walk_all(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            let path = entry.path();
+            out.push(path.clone());
+            if path.is_dir() {
+                out.extend(walk_all(&path));
+            }
+        }
+        out
     }
 }

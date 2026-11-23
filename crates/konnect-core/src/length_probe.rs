@@ -275,6 +275,52 @@ pub(crate) fn check_severities_text(project_text: &str) -> Result<String> {
     serde_json::to_string_pretty(&project).context("write the judge copy's project file")
 }
 
+/// Row ZR, ZR0b (P11): the rules a removed ground via or wire can break that the
+/// prune's DRC clause must see, each at least a warning in the prune's own scratch
+/// project. A project that ignores one would let a dangling stub, a floating via, an
+/// isolated piece of copper or a pad with too few spokes through.
+pub(crate) const PRUNE_SEVERITIES: [&str; 4] = [
+    "track_dangling",
+    "via_dangling",
+    "isolated_copper",
+    "starved_thermal",
+];
+
+/// The prune's scratch copy's `.kicad_pro` (P11): the project's own text with each of
+/// [`PRUNE_SEVERITIES`] at least `warning`. A key at `warning` or `error` keeps its
+/// severity; a key that is missing, `ignore` or any other word is set to `warning`.
+/// Everything else is kept. Only ever applied to a scratch copy.
+pub(crate) fn prune_severities_text(project_text: &str) -> Result<String> {
+    let mut project = parse_project(project_text)?;
+    let severities = rule_severities(&mut project)?;
+    for key in PRUNE_SEVERITIES {
+        let now = severities.get(key).and_then(Value::as_str).unwrap_or("");
+        if severity_level(now) < severity_level("warning") {
+            severities.insert(key.to_string(), json!("warning"));
+        }
+    }
+    serde_json::to_string_pretty(&project).context("write the prune copy's project file")
+}
+
+/// [`prune_severities_text`] applied to the `.kicad_pro` beside `board` (the prune's
+/// scratch copy); left alone when the copy has none (KiCad's defaults report all four).
+pub(crate) fn force_prune_severities(board: &Path) -> Result<()> {
+    let project = board.with_extension("kicad_pro");
+    if !project.is_file() {
+        return Ok(());
+    }
+    let own = std::fs::read_to_string(&project)
+        .with_context(|| format!("read the project file '{}'", project.display()))?;
+    let forced = prune_severities_text(&own).with_context(|| {
+        format!(
+            "the project file '{}' cannot be made to report dangling, isolated and starved copper",
+            project.display()
+        )
+    })?;
+    std::fs::write(&project, forced)
+        .with_context(|| format!("write the project file '{}'", project.display()))
+}
+
 /// [`check_severities_text`] applied to the `.kicad_pro` beside `board` (a judge's
 /// scratch copy); left alone when the copy has none.
 pub(crate) fn force_check_severities(board: &Path) -> Result<()> {

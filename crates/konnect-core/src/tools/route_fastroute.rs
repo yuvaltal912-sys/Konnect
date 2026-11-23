@@ -6,6 +6,7 @@
 use crate::fastroute::{self, Binary, Located, PassError};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
+pub(crate) use crate::pour_prune::PourPrune;
 use crate::route_judge::{self, Baseline, JudgeContext, Judged, Refusal};
 use crate::route_search::{
     self, BoxFuture, Effort, EffortSource, RouteFailure, Routed, RunRecord, Runner, SearchOutcome,
@@ -77,14 +78,18 @@ fn tune_folders_to_keep(record: &RunRecord) -> Vec<String> {
 }
 
 /// The run index of a judge folder name this code made: `run-<i>`,
-/// `run-<i>-untuned` or `run-<i>-pour-safe` (L23).
+/// `run-<i>-untuned` or `run-<i>-pour-safe` (L23), `run-<i>-pruned` or `run-<i>-prune`
+/// (Row ZR, ZR0b: the full judge of the pruned session and the prune's checks).
 fn judge_folder_index(name: &str) -> Option<usize> {
     let rest = name.strip_prefix("run-")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let suffix = &rest[digits.len()..];
-    matches!(suffix, "" | "-untuned" | "-pour-safe")
-        .then(|| digits.parse().ok())
-        .flatten()
+    matches!(
+        suffix,
+        "" | "-untuned" | "-pour-safe" | "-pruned" | "-prune"
+    )
+    .then(|| digits.parse().ok())
+    .flatten()
 }
 
 /// A refusal of one argument, worded as the other refusals of this tool are.
@@ -410,9 +415,14 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 /// 8. The winner's session to `ses_output_path` (`konnect_sexp::write_new_atomic`),
 ///    `<folder>/search.json` with the whole outcome, then [`reduce_run_folders`].
 /// 9. The result ([`result_json`]).
+///
+/// `prune` (Row ZR, ZR0b, P12): with `Winner`, the winner's redundant ground vias are
+/// removed after step 6 (`pour_prune::prune_winner`), so steps 8 and 9 write and report
+/// the pruned session when it was kept; with `Off` nothing of that runs.
 pub(crate) async fn route_with_fastroute(
     args: &Value,
     ctx: Arc<ToolContext>,
+    prune: PourPrune,
 ) -> Result<CallToolResult> {
     let call = match prepare_call(args)? {
         Ok(call) => call,
@@ -423,7 +433,7 @@ pub(crate) async fn route_with_fastroute(
         Ok(Err(refusal)) => return finish(&call.folder, Ok(refusal)),
         Err(error) => return finish(&call.folder, Err(error)),
     };
-    route_located(args, ctx, call, located).await
+    route_located(args, ctx, call, located, prune).await
 }
 
 /// Step 3: where the binary is, and whether it is the candidate build. The
@@ -473,9 +483,10 @@ pub(crate) async fn route_located(
     ctx: Arc<ToolContext>,
     call: Call,
     located: Located,
+    prune: PourPrune,
 ) -> Result<CallToolResult> {
     let result = match located {
-        Located::Found(binary) => search_and_write(args, ctx, &call, binary).await,
+        Located::Found(binary) => search_and_write(args, ctx, &call, binary, prune).await,
         other => Ok(unavailable_result(&other)),
     };
     finish(&call.folder, result)
@@ -654,13 +665,14 @@ fn preflight_variants(dsn_text: &str, shapes: &[Shape]) -> Result<()> {
     Ok(())
 }
 
-/// Steps 4 to 9: judge preflight, the DSN's variants, the search, and what
-/// follows from its outcome.
+/// Steps 4 to 9: judge preflight, the DSN's variants, the search, the prune of the
+/// winner when `prune` asks for it, and what follows from the outcome.
 async fn search_and_write(
     args: &Value,
     ctx: Arc<ToolContext>,
     call: &Call,
     binary: Binary,
+    prune: PourPrune,
 ) -> Result<CallToolResult> {
     let judge_root = call.folder.join("judge");
     let mut judge = match route_judge::prepare(&call.dsn, &judge_root, &ctx.config.kicad_cli) {
@@ -780,6 +792,8 @@ async fn search_and_write(
         order: route_search::launch_order(&shapes, limits),
         hang_cap: route_search::HANG_CAP,
     };
+    let judge = Arc::new(judge);
+    let tools = Arc::clone(&ctx);
     let runner = Arc::new(FastrouteRunner {
         binary: binary.clone(),
         dsn_text: Arc::new(dsn_text),
@@ -792,10 +806,14 @@ async fn search_and_write(
         tune,
         fallback: call.fallback,
         folder: call.folder.clone(),
-        judge: Arc::new(judge),
+        judge: Arc::clone(&judge),
         tools: ctx,
     });
-    let outcome = route_search::search(&plan, runner).await;
+    let mut outcome = route_search::search(&plan, runner).await;
+    // Row ZR, ZR0b (P1): once, on the winner, before anything is written.
+    if prune == PourPrune::Winner {
+        crate::pour_prune::prune_winner(&judge, tools, &mut outcome).await;
+    }
     let result = conclude(
         args,
         call,
@@ -1330,7 +1348,8 @@ fn remove_all_but(path: &Path, keep: &[&str]) -> std::io::Result<()> {
 /// rounds and its `group_search` summary when it has one, Row GS; with a Tune pass,
 /// its rows and the files it kept), and the judge folders of
 /// every run but the winner's (`<folder>/judge/run-<i>`, `run-<i>-untuned`,
-/// `run-<i>-pour-safe`) are removed. The run folder keeps, for each Tune pass that was
+/// `run-<i>-pour-safe`, and Row ZR, ZR0b's `run-<i>-pruned` and `run-<i>-prune`) are
+/// removed. The winner's `run.json` also holds `pour_prune` when the prune ran. The run folder keeps, for each Tune pass that was
 /// discarded or failed, its `fastroute.log` and its session (L26; the pass folders of
 /// the Tune passes it kept go whole). The winner's run folder and judged board stay
 /// whole. Only paths inside `folder` are
@@ -1360,6 +1379,10 @@ pub(crate) fn reduce_run_folders(
             "key": key,
             "board_kept": is_winner,
         });
+        // Row ZR, ZR0b: the winner's record says what the prune of its ground vias did.
+        if let (true, Some(prune)) = (is_winner, &outcome.pour_prune) {
+            body["pour_prune"] = json!(prune);
+        }
         // The winner keeps every folder whole.
         let keep_tune = if is_winner {
             Vec::new()
@@ -1665,6 +1688,10 @@ fn search_json(
         "stopped_launching": outcome.stopped_launching,
         "baseline": baseline_json(&outcome.baseline),
     });
+    // Row ZR, ZR0b: what the prune of the winner's ground vias did; absent when it was off.
+    if let Some(record) = &outcome.pour_prune {
+        search["pour_prune"] = json!(record);
+    }
     if listing == Listing::Best && rows.len() < outcome.runs.len() {
         search["runs_listed"] = json!(format!(
             "{} of {} runs: the {LISTED_RUNS} best judged by the rank key, then up to {LISTED_RUNS} that were not judged; search.json in the search folder lists every run",

@@ -231,6 +231,11 @@ pub(crate) fn export_candidate(
     Ok(dsn)
 }
 
+/// Row ZR, ZR0b (P12): the placement tools deliver placements, not sessions, so their
+/// routing calls never prune the winner's ground vias (a prune costs minutes a
+/// candidate and would change what their key ranks).
+pub(crate) const CANDIDATE_PRUNE: crate::pour_prune::PourPrune = crate::pour_prune::PourPrune::Off;
+
 /// One best-of-N routing call: `route_fastroute::route_with_fastroute` with
 /// `{dsn_path, ses_output_path: <folder>/route.ses, engine: "fastroute",
 /// effort: inputs.effort.name(), fastroute_path: inputs.fastroute}` (the effort as the
@@ -257,7 +262,7 @@ pub(crate) async fn route_candidate(
         return failed("a path of the routing call is not UTF-8 text".to_string());
     };
     let args = routing_arguments(dsn_path, &ses_path, inputs.effort, fastroute);
-    match crate::tools::route_fastroute::route_with_fastroute(&args, ctx).await {
+    match crate::tools::route_fastroute::route_with_fastroute(&args, ctx, CANDIDATE_PRUNE).await {
         Ok(result) => read_route_result(&result),
         Err(error) => failed(format!("{error:#}")),
     }

@@ -465,6 +465,7 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
         budget_overrun: None,
         stopped_launching: Some("the launch rule".to_string()),
         baseline: Ok(baseline()),
+        pour_prune: None,
     }
 }
 
@@ -710,9 +711,13 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         "effort": "ludicrous",
     });
     let ctx = isolated_context(&done.root.join("iso"), "kicad-cli").unwrap();
-    let refused = crate::tools::route_fastroute::route_with_fastroute(&args, ctx.clone())
-        .await
-        .unwrap();
+    let refused = crate::tools::route_fastroute::route_with_fastroute(
+        &args,
+        ctx.clone(),
+        crate::tools::route_fastroute::PourPrune::Off,
+    )
+    .await
+    .unwrap();
     assert!(refused.is_error);
     match read_route_result(&refused) {
         RouteResult::Failed { stage, reason } => {
@@ -729,9 +734,13 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         "effort": "m",
         "fastroute_path": done.root.join("no-such-fastroute"),
     });
-    let missing = crate::tools::route_fastroute::route_with_fastroute(&args, ctx)
-        .await
-        .unwrap();
+    let missing = crate::tools::route_fastroute::route_with_fastroute(
+        &args,
+        ctx,
+        crate::tools::route_fastroute::PourPrune::Off,
+    )
+    .await
+    .unwrap();
     assert!(missing.is_error);
     match read_route_result(&missing) {
         RouteResult::Failed { stage, reason } => {
