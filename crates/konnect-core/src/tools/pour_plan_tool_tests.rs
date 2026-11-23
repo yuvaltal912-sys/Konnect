@@ -808,6 +808,18 @@ async fn the_real_thing_fills_clean() {
         );
     }
     assert_eq!(body["check"]["starved_thermals"], 0, "{body}");
+    // The pours join every GND pad. KiCad reports a pad with no spoke at all as
+    // unconnected, not as a starved thermal (`drc_test_provider_zone_connections.cpp:176`),
+    // so `clean` alone would not see a plan whose spokes KiCad cannot make.
+    let gnd = body["check"]["open"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["net"] == "GND")
+        .unwrap()
+        .clone();
+    assert!(gnd["before"].as_u64().unwrap() > 0, "{gnd}");
+    assert_eq!(gnd["after"], 0, "{body}");
 }
 
 /// The same fixture with a rule area over part of the board that keeps tracks and vias

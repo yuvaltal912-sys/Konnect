@@ -1,7 +1,7 @@
 # The pours a board should have: design of stage ZR4 (`plan_pours`)
 
-Status: a design down to function skeletons, 2026-11-23. Nothing is built: every body is
-`todo!()`. Stage ZR4 of Row ZR ([ZONE_ROUTING_DESIGN.md](ZONE_ROUTING_DESIGN.md), "Defining
+Status: designed down to function skeletons on 2026-11-23, and built on 2026-11-24 on
+branch `claude/zr4-pour-plan-build` (see "As built" and "Measured"). Stage ZR4 of Row ZR ([ZONE_ROUTING_DESIGN.md](ZONE_ROUTING_DESIGN.md), "Defining
 zones" and the stage table). Designed in a Claude Fable 5.2 session on branch
 `claude/zr4-pour-plan-79cc54`, from `fork/main` `c4c34369`. **Reviewed** by an agent that
 did not write it (Claude Opus 5.5, high, read only); its two must-fix items and its other
@@ -13,7 +13,7 @@ findings are in this text (see "Verification of this document"). An agent on Cla
 | # | Question | His answer |
 |---|---|---|
 | 3 | Where do a board's pours come from? | "אני לא רוצה שהברירת מחדל תהיה אדמה, אני רוצה שהוא יתן את החלוקה האופטימלית ביותר. אלא אם אני מבקש מפורשות משהו אחר". The default is the best division of the copper among the board's nets, not ground only. An explicit request of his wins |
-| 4 | How is the best division chosen? | "כללים + מילוי KiCad עכשיו (Recommended)". Stackup rules now, and every plan filled by KiCad on a scratch copy before it is returned. The tool only proposes; zones enter the board through `add_zone` on his OK. Ranking candidate divisions by routing each one comes with ZR5 |
+| 4 | How is the best division chosen? | "כללים + מילוי KiCad עכשיו (Recommended)". Stackup rules now, and every plan filled by KiCad on a scratch copy before it is returned. The tool only proposes; zones enter the board through `add_zone` on his OK. Ranking candidate divisions by routing each one comes later: since the owner's decision 3 for ZR5 (2026-11-23) it is its own stage, after the pour key is on |
 
 Decision 4 as the design first asked it ("ground on both sides of a 2-layer board?") is
 answered inside this one: yes, by rule. Both of his measured boards already pour ground on
@@ -61,7 +61,7 @@ and the record are never written.
 |---|---|---|
 | PP1 | A read-only planner. A zone enters a board only through `add_zone`, called by the AI on the owner's OK | The owner's answer to decision 4. P5 of the row ("no hidden write"), Q1 ("a second opinion, never the author") and Z8 (zones are defined before the export, by an explicit tool) |
 | PP2 | The default is a division of the copper among the ground and power nets. The record's `pours` are explicit requests and win | The owner's answer to decision 3, in his words above |
-| PP3 | The division is one, made by rules. Candidate divisions ranked by routing come with ZR5 | The owner's answer to decision 4, and "Why routing cannot choose the division yet" |
+| PP3 | The division is one, made by rules. Candidate divisions ranked by routing come later, as a stage of their own after the pour key is on (the owner's decision 3 for ZR5, 2026-11-23: "כן, כמו שהמלצת בשלוש ההחלטות") | The owner's answer to decision 4, and "Why routing cannot choose the division yet" |
 | PP4 | A net's role is the layout audit's: a design-intent rail (0 V is ground), then a netclass whose name reads as power, then the net's name. The result gives each role's source, and a role that comes from a name is named in `next_steps` for the user to confirm | One definition of ground and power for the audit, the ground-via prune (its P3) and the planner. The owner asked for a default that works without a request. A name is a weaker fact than a rail, so it is shown, never hidden |
 | PP5 | Whole-layer pours only, one net a layer | A local pour needs a shape, and no shape can be judged before routing can rank a division (PP3). A second whole-layer pour on a layer gets only what the first leaves |
 | PP6 | The rule. 2 layers: the ground net with the most pads on both. 4 layers: that net on `F.Cu`, `In1.Cu` and `B.Cu`, the power net with the most pads on `In2.Cu` (ground there when no power net is known). Any other layer count: nothing by rule, only what the record asks for | The owner's answer to decision 4 names exactly this. "Most pads" is a fact of the board and is what a plane serves. A 6-layer stack has no single standard, and a guess there is worse than a request. The layer table's types are reported and not read: KiCad's default type is `signal`, so it says nothing on most boards |
@@ -415,9 +415,9 @@ In the build's PR:
 
 ## What this design does not do
 
-- **Local pours and split planes.** Whole layers only (PP5). They are candidates for ZR5,
+- **Local pours and split planes.** Whole layers only (PP5). They are candidates for the candidate-divisions stage (after the pour key is on),
   where routing can rank them.
-- **A choice among divisions.** One division by rule (PP3). ZR5 adds candidates.
+- **A choice among divisions.** One division by rule (PP3). The candidate-divisions stage, after the pour key is on, adds candidates.
 - **Stacks other than 2 and 4 layers** by rule (PP6). Requests work on any stack.
 - **Settings in the record.** `pours` names nets and layers. A setting is changed in the
   proposal's arguments.
@@ -438,15 +438,58 @@ In the build's PR:
   reports. The copy of KiCad's settings is not kept.
 - **Windows and Linux:** macOS first, as the rest of the row.
 
-## For ZR5
+## For the candidate divisions (after ZR5's pour key)
 
-- The plan's division is one candidate. ZR5 adds others (ground on one side only, a power
+ZR5 puts pour measures into the rank key. Candidate divisions are their own stage, after
+that key is on (the owner's decision 3 for ZR5, 2026-11-23).
+
+- The plan's division is one candidate. That stage adds others (ground on one side only, a power
   net on a layer, local pours) and routes each on a scratch copy, as
   `plan_convergent_placement` routes its three.
 - `pour_plan::with_zones`, `ProposedZone` and `pour_check`'s scratch projects are what that
   needs of this stage.
 - Clearance is a candidate dimension there too: PP9's floor is what the fill supports before
   routing; routing may say more.
+
+## As built (2026-11-24)
+
+Built by Claude Opus 5.5 (high) from this file and the skeleton, on branch
+`claude/zr4-pour-plan-build`. The build was in two phases. Phase A was the bodies, the
+tests, the negative controls and a mutants batch. An agent that did not write the diff
+then reviewed it. Phase B was the review's items, the merge of `fork/main` `e07ff839`,
+the gate, the measurement and these documents. No decision changed. What differs from
+the skeleton:
+
+- `ZoneSettings::to_args` takes `self`, not `&self`: clippy refuses `to_*(&self)` on a
+  `Copy` type.
+- `ZoneSettings::spec` is new. It maps the settings to `ZoneSpec` once for the IPC path,
+  so the two paths cannot drift apart.
+- The handler's steps 2 to 7 are in a private `plan_pours_in`, which takes the state
+  folder. The tests give their own state folder, so no test writes below the user's
+  real one.
+- `board_facts` refuses a pour whose `(priority …)` is not a whole number. The skeleton
+  said only "0 when absent".
+- A slot is `asked` when a request put the net there. That covers a request without
+  layers whose net took the rule's layer of its kind.
+- **Review item 1.** A slot that `against_existing` refuses because its own net already
+  pours that layer is not an unmet request (`asked: false`): the board already meets
+  it. A request that another net's pour blocks stays unmet.
+- **Review item 2.** When a placed net's requested layers are not on the board, the
+  reason of each free layer says so.
+- **A fact of KiCad found by the control of "The real thing fills clean".** KiCad
+  reports a thermal pad that gets no spoke at all as unconnected, not as a starved
+  thermal (`drc_test_provider_zone_connections.cpp:176`). Raising the minimum width
+  above the pads' short side made a plan that KiCad filled, that connected no pad
+  (GND open 11 before, 11 after), and that `check.clean` still called clean. The test
+  now also asserts that the pours join every GND pad (`open` after is 0), and the
+  control fails it. `clean` itself is unchanged, as PP11 defines it. A plan whose
+  pours connect nothing is visible only in `check.open`. The decision is the owner's.
+- Tests: one or more for every row of the tables above. Negative controls: 82, every
+  one caught (`target/creation-research/zone-routing/zr4/controls/RECORD.md`).
+- Mutants: one narrow batch on the new guards, 122 mutants. 108 were caught, 6 were
+  unviable and 8 were missed. Three tests were added, and the 8 were run once more: 7
+  were caught. One survives, in `supply_nets` (`||` to `&&`). No valid record can
+  reach the case it changes (`zr4/mutants/RECORD.md`).
 
 ## Verification of this document
 
