@@ -712,6 +712,9 @@ pub(crate) struct SearchOutcome {
     /// `the launch rule`, `fixed run count`, or one of the two failure stops.
     pub stopped_launching: Option<String>,
     pub baseline: std::result::Result<Baseline, String>,
+    /// Row ZR, ZR0b: what the prune of the winner's redundant ground vias did
+    /// (`pour_prune::prune_winner`). `None`: the prune was off for this call.
+    pub pour_prune: Option<crate::pour_prune::PruneRecord>,
 }
 
 /// The timed search (decisions 6 to 9):
@@ -1261,6 +1264,7 @@ impl<'a> Sched<'a> {
             budget_overrun,
             stopped_launching,
             baseline,
+            pour_prune: None,
         }
     }
 }

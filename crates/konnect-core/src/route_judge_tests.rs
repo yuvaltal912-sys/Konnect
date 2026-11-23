@@ -2444,6 +2444,12 @@ fn the_untuned_reason_names_each_candidates_lines_or_reason() {
     );
 }
 
+// ------------- Row ZR, ZR0b: the prune's judge parts, checker and prune_winner (no KiCad)
+
+#[cfg(unix)]
+#[path = "pour_prune_judge_tests.rs"]
+mod prune;
+
 // -------------------------------- the round logic, with a fake kicad-cli (no KiCad)
 
 #[cfg(unix)]

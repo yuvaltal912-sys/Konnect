@@ -1980,3 +1980,49 @@ fn the_check_severities_are_forced_in_the_copy_beside_the_board_only() {
     let text = std::fs::read_to_string(dir.path().join("b.kicad_pro")).unwrap();
     assert_eq!(severities(&text)["track_dangling"], "warning");
 }
+
+/// Row ZR, ZR0b (P11): the prune's copy reports a dangling track or via, isolated copper
+/// and a starved thermal at least as warnings. Control: a rule at `error` lowered, or
+/// `ignore` kept, fails.
+#[test]
+fn the_prunes_copy_reports_its_four_rules_at_least_as_warnings() {
+    for own in ["ignore", "warning", "error", "nonsense"] {
+        let mut rules = serde_json::Map::new();
+        rules.insert("clearance".into(), json!("ignore"));
+        for key in PRUNE_SEVERITIES {
+            rules.insert(key.into(), json!(own));
+        }
+        let text = json!({"board": {"design_settings": {"rule_severities": rules}}, "other": 1})
+            .to_string();
+        let forced = prune_severities_text(&text).unwrap();
+        let found = severities(&forced);
+        let wanted = if own == "error" { "error" } else { "warning" };
+        for key in PRUNE_SEVERITIES {
+            assert_eq!(found[key], wanted, "{key} from {own}");
+        }
+        assert_eq!(found["clearance"], "ignore", "another check is left alone");
+        let whole: Value = serde_json::from_str(&forced).unwrap();
+        assert_eq!(whole["other"], 1, "everything else is kept");
+    }
+    // A project that does not list them gets all four.
+    let found = severities(&prune_severities_text("{}").unwrap());
+    for key in PRUNE_SEVERITIES {
+        assert_eq!(found[key], "warning", "{key}");
+    }
+    assert!(prune_severities_text("[1]").is_err());
+
+    // The copy beside a board: none when there is no project, forced when there is one.
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("b.kicad_pcb");
+    std::fs::write(&board, "(kicad_pcb)").unwrap();
+    force_prune_severities(&board).unwrap();
+    assert!(!dir.path().join("b.kicad_pro").exists());
+    std::fs::write(
+        dir.path().join("b.kicad_pro"),
+        r#"{"board": {"design_settings": {"rule_severities": {"via_dangling": "ignore"}}}}"#,
+    )
+    .unwrap();
+    force_prune_severities(&board).unwrap();
+    let text = std::fs::read_to_string(dir.path().join("b.kicad_pro")).unwrap();
+    assert_eq!(severities(&text)["via_dangling"], "warning");
+}

@@ -3,6 +3,42 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the winner's redundant ground vias are removed (Row ZR, stage ZR0b)
+
+`route_specctra_dsn` (fastroute) removes, from the winning session only, the vias of
+ground pours that the filled pours make redundant, each with the wires that end at it.
+Design: stage ZR0b in `docs/ZONE_ROUTING_DESIGN.md`. No argument changes.
+
+- **The delivered session can hold fewer ground vias and wires than the router
+  wrote.** A via goes only when KiCad's refill and DRC on a copy of the board find no
+  more unconnected items and no more violations of any rule, no pour loses fill, and
+  the judge's rank key and the layout audit's stitching, decoupling-loop and scored
+  checks are no worse. The pruned session is then judged in full again and replaces
+  the winner only when it passes every gate with no stitching via and its rank key is
+  no higher; otherwise the router's session is delivered as before. Only nets the
+  layout audit calls ground are touched (a pour the design intent makes a power rail
+  is left alone), and only a winner that passed every gate without stitching.
+- **When the pruned session is kept**, `ses_output_path`, `completion.judged`,
+  `search.winner` and `artifacts.judged_board` are the pruned session's. It is
+  `pruned.ses` in the winner's run folder and its judged board is under
+  `judge/run-<index>-pruned`; the router's session and its judged board stay in the
+  search folder.
+- **New result field `search.pour_prune`**, also in `search.json` and in the winner's
+  `run.json`: `outcome` (`pruned`, `nothing_removed`, `rejected`, `skipped` or
+  `failed`), `reason` (why, when it was not pruned), `nets` and `nets_left_alone`,
+  `vias_before`, `vias_removed`, `wires_removed`, `track_mm_removed`,
+  `vias_kept_with` and `vias_kept_alone` (for the vias that stayed, how many each
+  check refused, tried with their wires and alone), `checks` and `audits` (the KiCad
+  runs and layout audits it made), `ended_by`, `seconds`, and, when the pruned session
+  is delivered, `before` (the router's session, its rank key and its judged board).
+- **The prune's time comes after the search**, outside the effort's time: about a
+  KiCad check a via tried, sequentially. `search.pour_prune.seconds` says how long it
+  took.
+- `plan_convergent_placement` and the placement bench do not prune: their candidates'
+  routing is unchanged, and their results have no `pour_prune`.
+- A reader of an older result, which has no `search.pour_prune`, reads the prune as
+  not run.
+
 ## Unreleased: the judge's pour measures (Row ZR, stage ZR0)
 
 `route_specctra_dsn` (fastroute) records what each judged run did to the board's

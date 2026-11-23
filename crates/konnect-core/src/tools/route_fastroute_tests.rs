@@ -497,9 +497,15 @@ async fn a_dsn_with_no_manifest_beside_it_is_refused_before_anything_routes() {
         .expect("the arguments are good");
     // The search folder exists from here on.
     assert!(call.folder.is_dir());
-    let result = route_located(&args, ctx(), call, Located::Found(fake_binary(&paths.root)))
-        .await
-        .unwrap();
+    let result = route_located(
+        &args,
+        ctx(),
+        call,
+        Located::Found(fake_binary(&paths.root)),
+        PourPrune::Off,
+    )
+    .await
+    .unwrap();
     assert!(result.is_error);
     assert_eq!(kind(&result), "handler_error");
     let refusal = body(&result);
@@ -914,6 +920,7 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
             violations: BTreeMap::new(),
             unconnected: 41,
         }),
+        pour_prune: None,
     }
 }
 
@@ -3545,4 +3552,117 @@ fn the_session_the_call_writes_is_the_chosen_boards() {
             "{chosen:?}"
         );
     }
+}
+
+// ─── Row ZR, ZR0b: the prune's record and folders ───────────────────────────
+
+/// The judge folders the prune makes belong to their run. Control: the two names left
+/// out of `judge_folder_index`, `run-3-pruned` and `run-3-prune` give none.
+#[test]
+fn the_prunes_judge_folders_belong_to_their_run() {
+    assert_eq!(judge_folder_index("run-3-pruned"), Some(3));
+    assert_eq!(judge_folder_index("run-3-prune"), Some(3));
+    for stranger in [
+        "run-3-prunedx",
+        "run-3-prunes",
+        "run-3-pruned-copy",
+        "run--pruned",
+    ] {
+        assert_eq!(judge_folder_index(stranger), None, "{stranger}");
+    }
+}
+
+/// A record of a prune that was kept, as the result reports it.
+fn prune_record() -> crate::pour_prune::PruneRecord {
+    crate::pour_prune::PruneRecord {
+        outcome: "pruned",
+        reason: None,
+        nets: vec!["GND".to_string()],
+        nets_left_alone: vec!["VCC".to_string()],
+        vias_before: 4,
+        vias_removed: 2,
+        wires_removed: 3,
+        track_mm_removed: 1.25,
+        vias_kept_with: BTreeMap::from([("rule:track_dangling".to_string(), 2)]),
+        vias_kept_alone: BTreeMap::from([("unconnected".to_string(), 2)]),
+        checks: 9,
+        audits: 7,
+        ended_by: Some("done"),
+        seconds: 12.5,
+        before: Some(json!({ "session": "/s/full.ses", "key": null, "judged_board": null })),
+    }
+}
+
+/// `search.pour_prune` (the result and `search.json`) and the winner's `run.json` carry
+/// the record; no other run's record does, and the winner's `-pruned` judge folder stays
+/// while another run's goes. With the prune off (`None`) no key is written anywhere.
+/// Control: the record left out of `search_json` or `reduce_run_folders`.
+#[test]
+fn the_prune_record_is_in_search_and_in_the_winners_run_json_only() {
+    let mut search = finished_search();
+    search.outcome.pour_prune = Some(prune_record());
+    let wanted = serde_json::to_value(prune_record()).unwrap();
+    for listing in [Listing::Every, Listing::Best] {
+        let shown = search_json(
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+            listing,
+        );
+        assert_eq!(shown["pour_prune"], wanted, "{listing:?}");
+    }
+    for index in [0, 1] {
+        let folder = search.folder.join(format!("judge/run-{index}-pruned/r0"));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("board.kicad_pcb"), "(kicad_pcb)").unwrap();
+    }
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let record_of = |index: usize, shape: Shape| -> Value {
+        let text = std::fs::read_to_string(
+            search
+                .folder
+                .join(run_folder_name(index, shape, 1))
+                .join("run.json"),
+        )
+        .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    assert_eq!(record_of(0, Shape::AsExported)["pour_prune"], wanted);
+    assert!(record_of(1, Shape::Omitted).get("pour_prune").is_none());
+    assert!(search
+        .folder
+        .join("judge/run-0-pruned/r0/board.kicad_pcb")
+        .is_file());
+    assert!(!search.folder.join("judge/run-1-pruned").exists());
+
+    // The prune off: no key in either listing or in any run's record.
+    let search = finished_search();
+    assert!(search.outcome.pour_prune.is_none());
+    for listing in [Listing::Every, Listing::Best] {
+        let shown = search_json(
+            &plan(),
+            &[Shape::AsExported, Shape::Omitted],
+            &search.outcome,
+            listing,
+        );
+        assert!(shown.get("pour_prune").is_none(), "{listing:?}");
+    }
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    for (index, shape) in [(0, Shape::AsExported), (1, Shape::Omitted)] {
+        let text = std::fs::read_to_string(
+            search
+                .folder
+                .join(run_folder_name(index, shape, 1))
+                .join("run.json"),
+        )
+        .unwrap();
+        assert!(!text.contains("pour_prune"), "run {index}");
+    }
+}
+
+/// P12: the placement tools' routing calls never prune. Control: the constant set to
+/// `Winner`.
+#[test]
+fn the_placement_tools_routing_calls_do_not_prune() {
+    assert_eq!(crate::place_route::CANDIDATE_PRUNE, PourPrune::Off);
 }

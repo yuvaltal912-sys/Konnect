@@ -6,16 +6,20 @@
 //! Nothing here writes to the user's board or project: every board is a scratch copy
 //! under the search folder's `judge` folder.
 
-// until prune_winner lands (ZR0b builder B removes this)
-#![allow(dead_code)]
-
-use crate::route_judge::{Gates, Measures};
-use crate::route_search::{child_blocks, has_head, items, root_block, Block};
+use crate::route_judge::{
+    self, Baseline, Gates, JudgeContext, Judged, Key, Measures, OwnConfig, ScratchError, ToolCaller,
+};
+use crate::route_search::{
+    child_blocks, has_head, items, root_block, Block, Routed, SearchOutcome,
+};
 use crate::zone_fill::ZoneLayerFill;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// The most KiCad checks one prune makes before it ends with the state accepted so far.
 pub(crate) const MAX_CHECKS: usize = 400;
@@ -895,6 +899,713 @@ pub(crate) async fn prune_loop(
         error,
         last: run.current,
     }
+}
+
+// ─── The production checker ──────────────────────────────────────────────────
+
+/// The judge folder of the loop's checks of run `index` (removed after the prune).
+fn prune_folder(index: usize) -> String {
+    format!("run-{index}-prune")
+}
+
+/// The judge folder of the full judge of run `index`'s pruned session (P14).
+fn pruned_folder(index: usize) -> String {
+    format!("run-{index}-pruned")
+}
+
+/// The fill of every pour zone of the call on the board kicad-cli saved, read and parsed
+/// off the async threads (as `zone_fill::pour_record` reads it).
+async fn fills_of(board: &Path, pour_nets: &BTreeSet<String>) -> Result<Vec<ZoneLayerFill>> {
+    let path = board.to_path_buf();
+    let nets = pour_nets.clone();
+    tokio::task::spawn_blocking(move || -> Result<Vec<ZoneLayerFill>> {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read the checked board '{}'", path.display()))?;
+        crate::zone_fill::pour_fills(&text, &nets)
+    })
+    .await
+    .context("the pours' fill could not be read")?
+}
+
+/// The production checker. One check: [`route_judge::routed_scratch`] of the text in
+/// `<judge root>/run-<index>-prune/c` (cleared before each check; its own settings copy,
+/// as `judge_one` makes one a run) with the prune's severities forced (P11). An importer
+/// refusal: the ORIGINAL session text is parsed again by the importer
+/// (`parse_import_plan_with`, the judge's arguments); when that fails too the check is
+/// an error (the board or the manifest changed, P10), else
+/// `CheckOutcome::ImporterRefused`. Then the DRC's counts; when `current` is given and
+/// [`drc_refusals`] is not empty, stop there (`rest: None`). Else the fills
+/// (`zone_fill::pour_fills` of the saved board, off the async threads) and
+/// `route_judge::judge_light` (the audit, the measures, the gates), and `rest`.
+/// Counts its KiCad runs and its audits.
+pub(crate) struct JudgeChecker<'c> {
+    ctx: &'c JudgeContext,
+    baseline: &'c Baseline,
+    tools: &'c dyn ToolCaller,
+    /// The winner's own session text (P10's second parse).
+    original: &'c str,
+    index: usize,
+    route_s: f64,
+    /// `<judge root>/kicad-config/run-<index>-prune`, removed with the checker.
+    config: OwnConfig,
+    kicad_runs: AtomicUsize,
+    audits: AtomicUsize,
+}
+
+impl<'c> JudgeChecker<'c> {
+    /// A checker of run `index`'s sessions, with its own copy of the call's KiCad
+    /// settings. `route_s` is the run's route time (the light judge's measures carry it).
+    pub(crate) fn new(
+        ctx: &'c JudgeContext,
+        baseline: &'c Baseline,
+        tools: &'c dyn ToolCaller,
+        original: &'c str,
+        index: usize,
+        route_s: f64,
+    ) -> Result<Self> {
+        Ok(Self {
+            ctx,
+            baseline,
+            tools,
+            original,
+            index,
+            route_s,
+            config: OwnConfig::new(ctx, &prune_folder(index))?,
+            kicad_runs: AtomicUsize::new(0),
+            audits: AtomicUsize::new(0),
+        })
+    }
+
+    /// KiCad refills and DRCs this checker has run.
+    pub(crate) fn kicad_runs(&self) -> usize {
+        self.kicad_runs.load(Ordering::Relaxed)
+    }
+
+    /// Layout audits this checker has asked for.
+    pub(crate) fn audits(&self) -> usize {
+        self.audits.load(Ordering::Relaxed)
+    }
+
+    async fn check_text(&self, ses_text: &str, current: Option<&Checked>) -> Result<CheckOutcome> {
+        let ctx = self.ctx;
+        let run_dir = ctx.root.join(prune_folder(self.index)).join("c");
+        let scratch = match route_judge::routed_scratch(
+            ctx,
+            ses_text,
+            &run_dir,
+            self.config.path(),
+            true,
+        )
+        .await
+        {
+            Ok(scratch) => scratch,
+            Err(ScratchError::Importer(refused)) => {
+                // P10: the candidate, or what it is checked against?
+                crate::specctra_ses::parse_import_plan_with(
+                    &ctx.board,
+                    &ctx.board_text,
+                    &ctx.manifest_text,
+                    self.original,
+                    crate::specctra_ses::SourceCheck::BytesOrTree,
+                )
+                .context(
+                    "the winner's own session no longer passes the importer: the board, its project files or the manifest changed during the prune",
+                )?;
+                return Ok(CheckOutcome::ImporterRefused(format!("{refused:#}")));
+            }
+            Err(ScratchError::Other(error)) => return Err(error),
+        };
+        self.kicad_runs.fetch_add(1, Ordering::Relaxed);
+        let unconnected = route_judge::unconnected_total(&scratch.drc)?;
+        let violations = route_judge::violations_by_rule(&scratch.drc);
+        // P7: the audit runs only after (a) and (b) pass.
+        if let Some(current) = current {
+            if !drc_refusals(current, unconnected, &violations).is_empty() {
+                return Ok(CheckOutcome::Checked(Checked {
+                    unconnected,
+                    violations,
+                    rest: None,
+                }));
+            }
+        }
+        let fills = fills_of(&scratch.board, &ctx.pour_nets).await?;
+        self.audits.fetch_add(1, Ordering::Relaxed);
+        let (measures, gates, audit) =
+            route_judge::judge_light(ctx, self.baseline, self.tools, &scratch, self.route_s)
+                .await?;
+        Ok(CheckOutcome::Checked(Checked {
+            unconnected,
+            violations,
+            rest: Some(CheckedRest {
+                fills,
+                measures,
+                gates,
+                audit: audit_items(&audit),
+            }),
+        }))
+    }
+}
+
+impl Checker for JudgeChecker<'_> {
+    fn check<'a>(&'a self, ses_text: &'a str, current: Option<&'a Checked>) -> CheckFuture<'a> {
+        Box::pin(self.check_text(ses_text, current))
+    }
+}
+
+// ─── The prune of a finished search ──────────────────────────────────────────
+
+/// What the result reports about the prune (`search.pour_prune`, the winner's
+/// `run.json`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct PruneRecord {
+    /// `pruned` (the delivered session is the pruned one), `nothing_removed`, `rejected`
+    /// (the full judge of the pruned session was refused, P9), `skipped`, `failed`.
+    pub outcome: &'static str,
+    /// Why, for `rejected`, `skipped` and `failed`; the loop's error when it ended
+    /// `check_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The ground pour nets whose vias were tried, and the pour nets left alone (P3).
+    pub nets: Vec<String>,
+    pub nets_left_alone: Vec<String>,
+    pub vias_before: usize,
+    pub vias_removed: usize,
+    /// Wires that went with their via, and their length.
+    pub wires_removed: usize,
+    pub track_mm_removed: f64,
+    /// For the vias that stayed, the clauses that refused them ([`Pruned`]).
+    pub vias_kept_with: BTreeMap<String, usize>,
+    pub vias_kept_alone: BTreeMap<String, usize>,
+    /// KiCad runs and audits of the prune, the original's check included.
+    pub checks: usize,
+    pub audits: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<&'static str>,
+    pub seconds: f64,
+    /// The original winner, when the delivered session is the pruned one: its session
+    /// path, its key, its judged board (null when it was released).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<Value>,
+}
+
+impl PruneRecord {
+    fn new(outcome: &'static str, reason: Option<String>) -> Self {
+        Self {
+            outcome,
+            reason,
+            nets: Vec::new(),
+            nets_left_alone: Vec::new(),
+            vias_before: 0,
+            vias_removed: 0,
+            wires_removed: 0,
+            track_mm_removed: 0.0,
+            vias_kept_with: BTreeMap::new(),
+            vias_kept_alone: BTreeMap::new(),
+            checks: 0,
+            audits: 0,
+            ended_by: None,
+            seconds: 0.0,
+            before: None,
+        }
+    }
+
+    fn ended(mut self, outcome: &'static str, reason: impl Into<Option<String>>) -> Self {
+        self.outcome = outcome;
+        self.reason = reason.into();
+        self
+    }
+}
+
+/// The winner of a finished search, owned, so that the prune runs as a task of its own.
+struct Winner {
+    index: usize,
+    routed: Routed,
+    judged: Judged,
+    baseline: Baseline,
+}
+
+/// What the prune decided. `kept`: the pruned session's path and its full judge, which
+/// replace the winner's when every run's keys are taken again (the record's outcome is
+/// then `pruned`).
+struct Decision {
+    record: PruneRecord,
+    kept: Option<(PathBuf, Judged)>,
+    /// Files this prune wrote that go when the original stays: `pruned.ses` and the
+    /// `-pruned` judge folder.
+    written: Vec<PathBuf>,
+}
+
+impl Decision {
+    fn of(record: PruneRecord) -> Self {
+        Self {
+            record,
+            kept: None,
+            written: Vec::new(),
+        }
+    }
+}
+
+/// Step 1: the winner when it may be pruned, else why not (P8).
+fn winner_of(ctx: &JudgeContext, outcome: &SearchOutcome) -> std::result::Result<Winner, String> {
+    if ctx.pour_nets.is_empty() {
+        return Err("the call has no pour net".to_string());
+    }
+    let Some(index) = outcome.winner else {
+        return Err("no run won".to_string());
+    };
+    let Some(record) = outcome.runs.get(index) else {
+        return Err("no run won".to_string());
+    };
+    let (Some(routed), Some(judged)) = (&record.routed, &record.judged) else {
+        return Err("the winning record has no routed session or no judged board".to_string());
+    };
+    if !judged.gates.all_pass() {
+        return Err("the winner fails a gate".to_string());
+    }
+    if !judged.rounds.is_empty() {
+        return Err(format!(
+            "the judge wrote {} stitching round(s) for the winner",
+            judged.rounds.len()
+        ));
+    }
+    // A failed baseline judges no run, so it leaves no winner either.
+    let baseline = outcome
+        .baseline
+        .as_ref()
+        .map_err(|error| format!("the unrouted board's baseline failed: {error}"))?;
+    Ok(Winner {
+        index: record.index,
+        routed: routed.clone(),
+        judged: judged.clone(),
+        baseline: baseline.clone(),
+    })
+}
+
+/// The first clause of P9 that refuses the pruned session's full judge against the
+/// original's, `None` when the pruned one may replace it.
+fn full_judge_refusal(original: &Judged, pruned: &Judged) -> Option<String> {
+    let gates = &pruned.gates;
+    if let Some(line) = gates
+        .g1
+        .iter()
+        .chain(&gates.g2)
+        .chain(&gates.g3)
+        .chain(&gates.g4)
+        .next()
+    {
+        return Some(format!(
+            "the full judge of the pruned session fails a gate: {line}"
+        ));
+    }
+    if !pruned.rounds.is_empty() {
+        return Some(format!(
+            "the full judge of the pruned session wrote {} stitching round(s)",
+            pruned.rounds.len()
+        ));
+    }
+    let keys = route_judge::rank(&[original, pruned]);
+    let (was, now) = (keys.first()?, keys.get(1)?);
+    (0..route_judge::KEY_LEN - 1)
+        .find(|&position| now[position] > was[position])
+        .map(|position| {
+            format!(
+                "the pruned session's rank key is above the original's at position {position} ({} > {})",
+                now[position], was[position]
+            )
+        })
+}
+
+/// The KiCad runs one full judge made: the refill, each stitching round that wrote a
+/// board, and the length probe when it ran.
+fn kicad_runs_of(judged: &Judged) -> usize {
+    1 + judged
+        .rounds
+        .iter()
+        .filter(|row| row.get("open_after").is_some())
+        .count()
+        + usize::from(judged.measures.lengths.is_some())
+}
+
+/// Removes a file or a folder this prune made; a link is never followed or removed, and
+/// a path that is already gone is fine.
+fn remove_own(path: &Path) {
+    let Ok(meta) = path.symlink_metadata() else {
+        return;
+    };
+    let removed = if meta.file_type().is_symlink() {
+        Ok(())
+    } else if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    if let Err(error) = removed {
+        tracing::warn!(
+            "the ground-via prune could not remove '{}': {error}",
+            path.display()
+        );
+    }
+}
+
+/// Steps 2 to 5 of [`prune_winner`], on an owned winner.
+async fn decide(ctx: Arc<JudgeContext>, tools: Arc<dyn ToolCaller>, winner: Winner) -> Decision {
+    let ctx: &JudgeContext = &ctx;
+    let tools: &dyn ToolCaller = &*tools;
+    let record = PruneRecord::new("failed", None);
+    let held = &winner.routed.held;
+    let text = match tokio::fs::read_to_string(&held.ses).await {
+        Ok(text) => text,
+        Err(error) => {
+            return Decision::of(record.ended(
+                "failed",
+                format!(
+                    "the winner's session '{}' could not be read: {error}",
+                    held.ses.display()
+                ),
+            ))
+        }
+    };
+    let checker = match JudgeChecker::new(
+        ctx,
+        &winner.baseline,
+        tools,
+        &text,
+        winner.index,
+        held.seconds,
+    ) {
+        Ok(checker) => checker,
+        Err(error) => {
+            return Decision::of(record.ended(
+                "failed",
+                format!("the prune's KiCad settings copy could not be made: {error:#}"),
+            ))
+        }
+    };
+    let mut decision = decide_with(ctx, tools, &winner, &text, &checker, record).await;
+    decision.record.checks += checker.kicad_runs();
+    decision.record.audits += checker.audits();
+    decision
+}
+
+/// [`decide`] once the checker is made: steps 2 to 5.
+async fn decide_with(
+    ctx: &JudgeContext,
+    tools: &dyn ToolCaller,
+    winner: &Winner,
+    text: &str,
+    checker: &JudgeChecker<'_>,
+    mut record: PruneRecord,
+) -> Decision {
+    // 2. The original's whole check.
+    let original = match checker.check(text, None).await {
+        Ok(CheckOutcome::Checked(checked)) => checked,
+        Ok(CheckOutcome::ImporterRefused(why)) => {
+            return Decision::of(record.ended(
+                "failed",
+                format!("the importer refuses the winner's own session: {why}"),
+            ))
+        }
+        Err(error) => {
+            return Decision::of(record.ended(
+                "failed",
+                format!("the check of the winner's own session failed: {error:#}"),
+            ))
+        }
+    };
+    let Some(rest) = &original.rest else {
+        return Decision::of(record.ended(
+            "failed",
+            "the check of the winner's own session has no audit".to_string(),
+        ));
+    };
+
+    // 3. The nets (P3), then the units of those nets.
+    let (nets, left): (BTreeSet<String>, BTreeSet<String>) = ctx
+        .pour_nets
+        .iter()
+        .cloned()
+        .partition(|net| rest.audit.ground.contains(net));
+    record.nets = nets.iter().cloned().collect();
+    record.nets_left_alone = left.into_iter().collect();
+    if nets.is_empty() {
+        return Decision::of(record.ended(
+            "skipped",
+            "no pour net of the call is ground by the audit's net roles".to_string(),
+        ));
+    }
+    let units = match units(text, &nets) {
+        Ok(units) => units,
+        Err(error) => {
+            return Decision::of(record.ended(
+                "failed",
+                format!("the winner's session could not be cut into units: {error:#}"),
+            ))
+        }
+    };
+    record.vias_before = units.iter().filter(|u| u.kind == UnitKind::Via).count();
+    if record.vias_before == 0 {
+        return Decision::of(record.ended("skipped", "no via on a ground pour net".to_string()));
+    }
+
+    // 4. The loop.
+    let pruned = prune_loop(text, &units, &original, checker).await;
+    let removed: Vec<&Unit> = pruned
+        .removed
+        .iter()
+        .filter_map(|&index| units.get(index))
+        .collect();
+    record.vias_removed = removed.iter().filter(|u| u.kind == UnitKind::Via).count();
+    record.wires_removed = removed.iter().filter(|u| u.kind == UnitKind::Wire).count();
+    record.track_mm_removed =
+        (removed.iter().map(|u| u.length_mm).sum::<f64>() * 1000.0).round() / 1000.0;
+    record.vias_kept_with = pruned.kept_with.clone();
+    record.vias_kept_alone = pruned.kept_alone.clone();
+    record.ended_by = Some(pruned.ended_by);
+    if pruned.removed.is_empty() {
+        return Decision::of(record.ended("nothing_removed", pruned.error));
+    }
+    if let Some(error) = &pruned.error {
+        record.reason = Some(error.clone());
+    }
+
+    // 5. The pruned session, written beside the original and judged in full (P9).
+    let session = winner.routed.folder.join("pruned.ses");
+    let pruned_text = without(text, &units, &pruned.removed);
+    if let Err(error) = konnect_sexp::write_new_atomic(&session, &pruned_text) {
+        return Decision::of(record.ended(
+            "failed",
+            format!(
+                "the pruned session '{}' could not be written: {error}",
+                session.display()
+            ),
+        ));
+    }
+    let folder = pruned_folder(winner.index);
+    let written = vec![session.clone(), ctx.root.join(&folder)];
+    let judged = match route_judge::judge_session(
+        ctx,
+        &winner.routed,
+        &winner.baseline,
+        tools,
+        &session,
+        &folder,
+    )
+    .await
+    {
+        Ok(judged) => judged,
+        Err(error) => {
+            return Decision {
+                record: record.ended(
+                    "failed",
+                    format!("the full judge of the pruned session failed: {error:#}"),
+                ),
+                kept: None,
+                written,
+            }
+        }
+    };
+    record.checks += kicad_runs_of(&judged);
+    record.audits += 1;
+    if let Some(refused) = full_judge_refusal(&winner.judged, &judged) {
+        return Decision {
+            record: record.ended("rejected", refused),
+            kept: None,
+            written,
+        };
+    }
+    Decision {
+        record: record.ended("pruned", pruned.error),
+        kept: Some((session, judged)),
+        written,
+    }
+}
+
+/// Aborts the prune's task when the call that waits for it is dropped, so that no
+/// kicad-cli outlives the call.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Seconds as a number rounded to 0.1.
+fn round1(seconds: f64) -> f64 {
+    (seconds * 10.0).round() / 10.0
+}
+
+/// The judged board's path, or null when it is no longer there.
+fn board_or_null(judged: &Judged) -> Value {
+    if judged.board.is_file() {
+        json!(judged.board.to_string_lossy())
+    } else {
+        Value::Null
+    }
+}
+
+/// Every judged run's key, by index, with the winner's judged replaced by `pruned`: one
+/// `rank` call over every judged run, as the search takes them.
+fn keys_with(outcome: &SearchOutcome, winner: usize, pruned: &Judged) -> Vec<Option<Key>> {
+    let judged: Vec<(usize, &Judged)> = outcome
+        .runs
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            let judged = if position == winner {
+                Some(pruned)
+            } else {
+                record.judged.as_ref()
+            };
+            judged.map(|judged| (position, judged))
+        })
+        .collect();
+    let mut keys: Vec<Option<Key>> = vec![None; outcome.runs.len()];
+    let refs: Vec<&Judged> = judged.iter().map(|(_, judged)| *judged).collect();
+    for ((position, _), key) in judged.iter().zip(route_judge::rank(&refs)) {
+        if let Some(slot) = keys.get_mut(*position) {
+            *slot = Some(key);
+        }
+    }
+    keys
+}
+
+/// Step 5's replacement: the winner's session and judged become the pruned ones, and the
+/// keys are taken again. `Err` (nothing changed) when the winner would no longer rank
+/// first, which P9's key clause rules out.
+fn replace_winner(
+    outcome: &mut SearchOutcome,
+    winner: usize,
+    session: PathBuf,
+    mut judged: Judged,
+) -> std::result::Result<Value, String> {
+    let Some(record) = outcome.runs.get(winner) else {
+        return Err("the winning record is gone".to_string());
+    };
+    let (Some(routed), Some(original)) = (&record.routed, &record.judged) else {
+        return Err("the winning record has no routed session or no judged board".to_string());
+    };
+    judged.tune = original.tune.clone();
+    let keys = keys_with(outcome, winner, &judged);
+    let first = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(position, key)| key.map(|key| (key, position)))
+        .min()
+        .map(|(_, position)| position);
+    if first != Some(winner) {
+        return Err(
+            "the pruned winner would no longer rank first among the judged runs".to_string(),
+        );
+    }
+    let before = json!({
+        "session": routed.held.ses.to_string_lossy(),
+        "key": outcome.keys.get(winner).copied().flatten(),
+        "judged_board": board_or_null(original),
+    });
+    if let Some(record) = outcome.runs.get_mut(winner) {
+        if let Some(routed) = record.routed.as_mut() {
+            routed.held.ses = session;
+        }
+        record.judged = Some(judged);
+    }
+    outcome.keys = keys;
+    Ok(before)
+}
+
+/// ZR0b on a finished search. Changes `outcome` only when the prune is kept; always
+/// sets `outcome.pour_prune`.
+///
+/// 1. `skipped` with its reason when: the call has no pour net; no run won, or the
+///    winning record has no `routed` or no `judged`; the winner fails a gate, or its
+///    `judged.rounds` is not empty (P8).
+/// 2. The original's whole check (`JudgeChecker::check(text, None)`). An error or an
+///    importer refusal: `failed`.
+/// 3. The nets: the call's pour nets that the original's audit lists as ground (P3);
+///    the others go to `nets_left_alone`. None: `skipped`. [`units`] of those nets; no
+///    via among them: `skipped`.
+/// 4. [`prune_loop`]. Nothing removed: `nothing_removed` (with the counts, the kept
+///    clauses, `ended_by`, and the loop's error as the reason when it ended
+///    `check_error`).
+/// 5. Else the pruned text is written to `<winner's run folder>/pruned.ses`
+///    (`write_new_atomic`) and judged in full: `route_judge::judge_session` on that file
+///    in `judge/run-<index>-pruned`. An error: `failed`. P9: when every gate passes,
+///    `rounds` is empty, and no entry but the last of the pruned key is above the
+///    original's (`rank` over the two): the winner's `routed.held.ses` becomes
+///    `pruned.ses`, its `judged` becomes the pruned one with the original's `tune`
+///    carried over, and `outcome.keys` is taken again by one `rank` call over every
+///    judged run (the winner does not change: its key did not rise). `pruned`. Else
+///    `rejected` with the first failing clause, `pruned.ses` and the `-pruned` judge
+///    folder removed, `outcome` otherwise unchanged.
+/// 6. The loop's scratch folder `judge/run-<index>-prune` is removed in every case.
+///
+/// Never an error and never a panic for the call: whatever fails, the original winner is
+/// delivered and the record says what happened. Steps 2 to 5 run as a task of their own
+/// on owned copies, so that a panic in them is a `failed` record, not the call's; the
+/// task is aborted when the call is dropped.
+pub(crate) async fn prune_winner(
+    ctx: &JudgeContext,
+    tools: Arc<crate::tools::ToolContext>,
+    outcome: &mut SearchOutcome,
+) {
+    prune_winner_with(ctx, Arc::new(route_judge::RegistryTools(tools)), outcome).await
+}
+
+/// [`prune_winner`] with the registry behind a [`ToolCaller`] (the tests script the
+/// audit and the stitching planner).
+pub(crate) async fn prune_winner_with(
+    ctx: &JudgeContext,
+    tools: Arc<dyn ToolCaller>,
+    outcome: &mut SearchOutcome,
+) {
+    let started = std::time::Instant::now();
+    let decision = match winner_of(ctx, outcome) {
+        Err(reason) => Decision::of(PruneRecord::new("skipped", Some(reason))),
+        Ok(winner) => {
+            let index = winner.index;
+            // What the task may write; on a panic only what was not there before goes.
+            let new_paths: Vec<PathBuf> = [
+                winner.routed.folder.join("pruned.ses"),
+                ctx.root.join(pruned_folder(index)),
+            ]
+            .into_iter()
+            .filter(|path| path.symlink_metadata().is_err())
+            .collect();
+            let task = tokio::spawn(decide(Arc::new(ctx.clone()), tools, winner));
+            let _abort = AbortOnDrop(task.abort_handle());
+            let decision = match task.await {
+                Ok(decision) => decision,
+                Err(error) => Decision {
+                    record: PruneRecord::new("failed", Some(format!("the prune stopped: {error}"))),
+                    kept: None,
+                    written: new_paths,
+                },
+            };
+            // 6. The loop's scratch folder, in every case.
+            remove_own(&ctx.root.join(prune_folder(index)));
+            decision
+        }
+    };
+    let Decision {
+        mut record,
+        kept,
+        written,
+    } = decision;
+    let winner = outcome.winner;
+    match (kept, winner) {
+        (Some((session, judged)), Some(winner)) => {
+            match replace_winner(outcome, winner, session, judged) {
+                Ok(before) => record.before = Some(before),
+                Err(reason) => {
+                    record = record.ended("rejected", reason);
+                    written.iter().for_each(|path| remove_own(path));
+                }
+            }
+        }
+        _ => written.iter().for_each(|path| remove_own(path)),
+    }
+    record.seconds = round1(started.elapsed().as_secs_f64());
+    outcome.pour_prune = Some(record);
 }
 
 #[cfg(test)]

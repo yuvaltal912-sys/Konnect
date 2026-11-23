@@ -1316,3 +1316,131 @@ async fn two_runs_ask_the_same_sets_in_the_same_order() {
     assert_whole(&first, &a);
     assert_eq!(vias_of(&first.units).len(), 5);
 }
+
+// --- replace_winner (builder B)
+
+/// A judged run whose audit gave `quality` as its copper quality.
+fn judged_at(quality: f64) -> Judged {
+    let mut measures = crate::route_judge::tests::measures();
+    measures.copper_quality = Some(quality);
+    Judged {
+        measures,
+        gates: Gates {
+            g1: vec![],
+            g2: vec![],
+            g3: vec![],
+            g4: vec![],
+        },
+        board: std::path::PathBuf::from("/nowhere/board.kicad_pcb"),
+        rounds: vec![],
+        tune: None,
+    }
+}
+
+fn run_record(index: usize, judged: Judged) -> crate::route_search::RunRecord {
+    crate::route_search::RunRecord {
+        index,
+        shape: crate::route_search::Shape::AsExported,
+        seed: index as u64,
+        launched_s: 0.0,
+        routed_s: Some(1.0),
+        judged_s: Some(2.0),
+        route_s: Some(1.0),
+        judge_s: Some(1.0),
+        outcome: "judged",
+        reason: None,
+        routed: Some(Routed {
+            index,
+            shape: crate::route_search::Shape::AsExported,
+            seed: index as u64,
+            dsn: PathBuf::from("/nowhere/variant.dsn"),
+            held: crate::fastroute::Held {
+                ses: PathBuf::from(format!("/nowhere/run-{index}/full.ses")),
+                unrouted: 0,
+                kept: "full",
+                passes: vec![],
+                seconds: 1.0,
+                untuned: None,
+                tune: Default::default(),
+                group_search: None,
+            },
+            planes: vec![],
+            folder: PathBuf::from(format!("/nowhere/run-{index}")),
+        }),
+        judged: Some(judged),
+    }
+}
+
+/// Two judged runs: run 0 won at copper quality 90, run 1 has 85.
+fn two_runs() -> SearchOutcome {
+    let runs = vec![
+        run_record(0, judged_at(90.0)),
+        run_record(1, judged_at(85.0)),
+    ];
+    let refs: Vec<&Judged> = runs.iter().filter_map(|r| r.judged.as_ref()).collect();
+    let keys = crate::route_judge::rank(&refs)
+        .into_iter()
+        .map(Some)
+        .collect();
+    SearchOutcome {
+        runs,
+        winner: Some(0),
+        keys,
+        elapsed: std::time::Duration::from_secs(1),
+        budget_overrun: None,
+        stopped_launching: None,
+        baseline: Ok(Baseline {
+            violations: BTreeMap::new(),
+            unconnected: 0,
+        }),
+        pour_prune: None,
+    }
+}
+
+/// The winner is replaced only while it still ranks first over every judged run; else
+/// nothing changes. Control: the check removed, a pruned winner that ranks below run 1
+/// is delivered.
+#[test]
+fn a_pruned_winner_that_would_not_rank_first_replaces_nothing() {
+    let mut outcome = two_runs();
+    let keys = outcome.keys.clone();
+    let refused = replace_winner(
+        &mut outcome,
+        0,
+        PathBuf::from("/nowhere/run-0/pruned.ses"),
+        judged_at(80.0),
+    );
+    assert_eq!(
+        refused,
+        Err("the pruned winner would no longer rank first among the judged runs".to_string())
+    );
+    assert_eq!(outcome.keys, keys);
+    let winner = outcome.runs[0].routed.as_ref().unwrap();
+    assert_eq!(winner.held.ses, PathBuf::from("/nowhere/run-0/full.ses"));
+    assert_eq!(outcome.runs[0].judged, Some(judged_at(90.0)));
+
+    // Still first: replaced, and the keys are taken again.
+    let kept = replace_winner(
+        &mut outcome,
+        0,
+        PathBuf::from("/nowhere/run-0/pruned.ses"),
+        judged_at(95.0),
+    )
+    .unwrap();
+    assert_eq!(kept["session"], "/nowhere/run-0/full.ses");
+    assert_eq!(kept["judged_board"], Value::Null, "the board is not there");
+    let winner = outcome.runs[0].routed.as_ref().unwrap();
+    assert_eq!(winner.held.ses, PathBuf::from("/nowhere/run-0/pruned.ses"));
+    assert_eq!(outcome.runs[0].judged, Some(judged_at(95.0)));
+    let refs: Vec<&Judged> = outcome
+        .runs
+        .iter()
+        .filter_map(|r| r.judged.as_ref())
+        .collect();
+    let again: Vec<Option<Key>> = crate::route_judge::rank(&refs)
+        .into_iter()
+        .map(Some)
+        .collect();
+    assert_eq!(outcome.keys, again);
+    assert_ne!(outcome.keys, keys);
+}
