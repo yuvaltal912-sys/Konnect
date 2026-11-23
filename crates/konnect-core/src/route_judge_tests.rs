@@ -1808,6 +1808,53 @@ async fn prunes_one_of_two_recorded_ground_vias_on_scratch_copies() {
     }
 }
 
+/// Row ZR, ZR5 part 1: "before" is the board's fill before routing. The fixture is saved
+/// with no fill; the baseline's rows are the fills of its scratch board as the real
+/// kicad-cli refilled and saved it. Not run in the ordinary gate:
+///
+/// ```text
+/// KICAD_CONFIG_HOME=<scratch folder> KONNECT_TEST_KICAD_CLI=<path to kicad-cli> \
+///   cargo test -p konnect-core --lib the_baseline_rows_are_the_refilled_fill -- --ignored
+/// ```
+#[tokio::test]
+#[ignore = "needs kicad-cli (KICAD_CONFIG_HOME must name a scratch folder)"]
+async fn the_baseline_rows_are_the_refilled_fill_on_scratch_copies() {
+    assert!(
+        std::env::var_os("KICAD_CONFIG_HOME").is_some(),
+        "LEAD: set KICAD_CONFIG_HOME to a scratch folder, or KiCad re-saves the real settings"
+    );
+    let cli = std::env::var("KONNECT_TEST_KICAD_CLI")
+        .unwrap_or_else(|_| "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let Exported { dsn, .. } = exported(dir.path());
+    let root = dir.path().join("search").join("judge");
+    let ctx = prepare(&dsn, &root, &cli).expect("preflight");
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(
+        !ctx.board_text.contains("filled_polygon"),
+        "saved with no fill"
+    );
+    assert!(!ctx.pour_nets.is_empty(), "the fixture has pour nets");
+
+    let base = baseline(&ctx).await.expect("the unrouted board's baseline");
+    assert_eq!(base.pour_fills_error, None);
+    let rows = base.pour_fills.expect("the call has pour nets");
+    let refilled = std::fs::read_to_string(
+        root.join("baseline")
+            .join("specctra_rounded_board.kicad_pcb"),
+    )
+    .unwrap();
+    let expected = crate::pour_damage::layer_fills(
+        &crate::zone_fill::pour_fills(&refilled, &ctx.pour_nets).unwrap(),
+    );
+    eprintln!("baseline rows: {rows:?}");
+    assert_eq!(rows, expected);
+    assert!(
+        rows.iter().any(|row| row.pieces > 0 && row.area_mm2 > 0.0),
+        "{rows:?}"
+    );
+}
+
 // ------------------------------------------------- rank reference (G1-passing runs)
 
 #[test]
@@ -3466,6 +3513,94 @@ exit 0
             .unwrap()
             .get("pours")
             .is_none());
+    }
+
+    /// Row ZR, ZR5 part 1: the baseline's rows are the fills of its REFILLED scratch
+    /// board (call 1 saves a filled board over it; the saved board has no fill), and the
+    /// judge takes every run's damage against them, from the last board's fills.
+    #[tokio::test]
+    async fn the_damage_is_against_the_refilled_baseline() {
+        // Call 1 is the baseline, 2 the routed board (GND open), 3 the stitched one.
+        let h = harness(
+            &["GND"],
+            drc_json(&["GND"], &[]),
+            &[(3, drc_json(&[], &[]))],
+        );
+        assert!(
+            !h.ctx.board_text.contains("filled_polygon"),
+            "saved with no fill"
+        );
+        let filled = |side: f64| {
+            h.ctx.board_text.replacen(
+                "(name \"GND_BOTTOM\")",
+                &format!("(name \"GND_BOTTOM\") (filled_polygon (layer \"B.Cu\") (pts (xy 0 0) (xy 10 0) (xy 10 {side}) (xy 0 {side})))"),
+                1,
+            )
+        };
+        std::fs::write(h.fake.join("board.1"), filled(10.0)).unwrap();
+        std::fs::write(h.fake.join("board.3"), filled(5.0)).unwrap();
+        let base = baseline(&h.ctx).await.unwrap();
+        assert_eq!(base.pour_fills_error, None);
+        let rows = base.pour_fills.clone().expect("the call has pour nets");
+        let bottom = rows
+            .iter()
+            .find(|row| row.net == "GND" && row.layer == "B.Cu")
+            .expect("a GND row on B.Cu");
+        assert_eq!((bottom.pieces, bottom.largest_mm2), (1, 100.0));
+        assert_eq!(
+            rows.iter().filter(|row| row.pieces > 0).count(),
+            1,
+            "only the refilled piece: {rows:?}"
+        );
+
+        let tools = Scripted::new(&h, |_| one_via("GND"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+        let pours = judged.measures.pours.as_ref().unwrap();
+        let damage = pours.damage.as_ref().expect("the baseline has its rows");
+        assert_eq!(damage.layers.len(), rows.len());
+        assert_eq!(damage.lost_fills, 0);
+        assert!((damage.plane_loss - 0.5).abs() < 1e-12, "{damage:?}");
+        assert!((damage.area_loss - 0.5).abs() < 1e-12, "{damage:?}");
+        // Recorded only: the gates and the key are those of the same measures without it.
+        let mut without = judged.measures.clone();
+        without.pours.as_mut().unwrap().damage = None;
+        assert_eq!(gates(&without, &base), judged.gates);
+        assert_eq!(
+            rank_measures(&[(&without, &judged.gates, true)]),
+            rank_measures(&[(&judged.measures, &judged.gates, true)])
+        );
+
+        // Control: no pour nets, no rows and no error.
+        let mut h = harness(&[], drc_json(&[], &[]), &[]);
+        h.ctx.pour_nets.clear();
+        let base = baseline(&h.ctx).await.unwrap();
+        assert_eq!((base.pour_fills, base.pour_fills_error), (None, None));
+    }
+
+    /// Row ZR, ZR5 part 1: a baseline board whose fills cannot be read fails nothing:
+    /// `pour_fills` is absent with its error, the baseline stands, the run is judged
+    /// and its `damage` is absent.
+    #[tokio::test]
+    async fn a_baseline_fill_that_cannot_be_read_fails_nothing() {
+        let h = harness(
+            &["GND"],
+            drc_json(&["GND"], &[]),
+            &[(3, drc_json(&[], &[]))],
+        );
+        std::fs::write(h.fake.join("board.1"), "(kicad_pcb (zone").unwrap();
+        let base = baseline(&h.ctx).await.expect("the baseline stands");
+        assert_eq!(base.pour_fills, None);
+        let error = base.pour_fills_error.clone().expect("the reason");
+        assert!(error.contains("does not parse"), "{error}");
+        assert_eq!(base.unconnected, 1);
+
+        let tools = Scripted::new(&h, |_| one_via("GND"));
+        let judged = judge_with(&h.ctx, &h.routed, &base, &tools)
+            .await
+            .expect("the run is judged");
+        assert_eq!(judged.measures.pours_error, None);
+        let pours = judged.measures.pours.as_ref().expect("ZR0's measures");
+        assert_eq!(pours.damage, None);
     }
 
     /// Row ZR, ZR1: with the engine's `planes` object on the kept pass, KiCad's side is

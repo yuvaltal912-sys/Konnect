@@ -1841,6 +1841,45 @@ fn a_baseline_that_failed_is_reported_beside_the_runs() {
     );
 }
 
+/// Row ZR, ZR5 part 1: the baseline's pour rows, or why there are none, are in the
+/// result; neither for a call with no pour net.
+#[test]
+fn the_baseline_writes_its_pour_rows_or_their_error() {
+    let rows = vec![crate::pour_damage::LayerFill {
+        net: "GND".into(),
+        layer: "B.Cu".into(),
+        pieces: 1,
+        largest_mm2: 4000.0,
+        area_mm2: 4000.0,
+        islands: 0,
+    }];
+    let with = |pour_fills, pour_fills_error| {
+        baseline_json(&Ok(Baseline {
+            violations: BTreeMap::new(),
+            unconnected: 61,
+            pour_fills,
+            pour_fills_error,
+        }))
+    };
+    assert_eq!(
+        with(Some(rows), None),
+        json!({
+            "ok": true, "violations": {}, "unconnected": 61,
+            "pour_fills": [{"net": "GND", "layer": "B.Cu", "pieces": 1, "largest_mm2": 4000.0,
+                            "area_mm2": 4000.0, "islands": 0}]
+        })
+    );
+    assert_eq!(
+        with(None, Some("the board went away".into())),
+        json!({ "ok": true, "violations": {}, "unconnected": 61,
+                "pour_fills_error": "the board went away" })
+    );
+    assert_eq!(
+        with(None, None),
+        json!({ "ok": true, "violations": {}, "unconnected": 61 })
+    );
+}
+
 #[test]
 fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
     let dir = tempfile::tempdir().unwrap();

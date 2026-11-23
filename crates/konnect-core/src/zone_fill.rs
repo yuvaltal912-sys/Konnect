@@ -151,7 +151,12 @@ pub(crate) fn pour_measures(
     pour_nets: &BTreeSet<String>,
 ) -> Result<PourMeasures> {
     let fills = pour_fills(last_board_text, pour_nets)?;
-    Ok(measures_of_fills(first_refill, &fills, last_refill, pour_nets))
+    Ok(measures_of_fills(
+        first_refill,
+        &fills,
+        last_refill,
+        pour_nets,
+    ))
 }
 
 /// [`pour_measures`] from the last board's fills, already read; no damage.
