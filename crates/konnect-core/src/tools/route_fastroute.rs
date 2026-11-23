@@ -1286,7 +1286,8 @@ fn remove_all_but(path: &Path, keep: &[&str]) -> std::io::Result<()> {
 /// rounds and its `group_search` summary when it has one, Row GS; with a Tune pass,
 /// its rows and the files it kept), and the judge folders of
 /// every run but the winner's (`<folder>/judge/run-<i>`, `run-<i>-untuned`,
-/// `run-<i>-pour-safe`) are removed. The run folder keeps, for each Tune pass that was
+/// `run-<i>-pour-safe`, and Row ZR, ZR0b's `run-<i>-pruned` and `run-<i>-prune`) are
+/// removed. The winner's `run.json` also holds `pour_prune` when the prune ran. The run folder keeps, for each Tune pass that was
 /// discarded or failed, its `fastroute.log` and its session (L26; the pass folders of
 /// the Tune passes it kept go whole). The winner's run folder and judged board stay
 /// whole. Only paths inside `folder` are

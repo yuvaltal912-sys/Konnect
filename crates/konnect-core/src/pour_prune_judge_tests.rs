@@ -889,6 +889,20 @@ async fn the_other_skips_say_why_and_change_nothing() {
                 h.session(FIXTURE_SES);
             }),
         ),
+        (
+            "the winning record has no routed session or no judged board",
+            Box::new(|_: &mut H, outcome: &mut SearchOutcome| outcome.runs[0].judged = None),
+        ),
+        (
+            "the winning record has no routed session or no judged board",
+            Box::new(|_: &mut H, outcome: &mut SearchOutcome| outcome.runs[0].routed = None),
+        ),
+        (
+            "the unrouted board's baseline failed: the baseline broke",
+            Box::new(|_: &mut H, outcome: &mut SearchOutcome| {
+                outcome.baseline = Err("the baseline broke".to_string());
+            }),
+        ),
     ];
     for (why, change) in cases {
         let mut h = H::new(drc(&[], &[]));
@@ -999,34 +1013,142 @@ async fn a_loop_that_errs_before_any_removal_removes_nothing_and_says_why() {
         "{:?}",
         record.reason
     );
+    // Nothing removed is 0 mm, never -0 (an empty f64 sum). Control: the sum back.
+    let shown = serde_json::to_value(&record).unwrap();
+    assert_eq!(shown["track_mm_removed"].to_string(), "0.0");
     assert_eq!(outcome_json(&outcome), before);
     assert_no_prune_files(&h);
 }
 
-/// Never a panic for the call. Control: the prune run in place of its own task, the
-/// panic is the call's.
+/// Never a panic for the call: at the first candidate's audit (audit 2), and at the full
+/// judge's audit (audit 3), when `pruned.ses` and `run-0-pruned` are already written and
+/// must go again. Controls: the prune run in place of its own task, the panic is the
+/// call's; the panic arm's clean-up removed, the two paths stay.
 #[tokio::test]
 async fn a_panic_in_the_prune_is_a_failed_record_and_the_original_is_delivered() {
+    for at in [2usize, 3] {
+        let mut h = H::new(drc(&[], &[]));
+        h.session(&via_session());
+        let session = pruned_ses(&h);
+        let judge = h.ctx.root.join("run-0-pruned");
+        let written = Arc::new(Mutex::new(None));
+        let seen = written.clone();
+        let tools = Arc::new(Tools::audit(move |n, _| {
+            if n == at {
+                *seen.lock().unwrap() = Some((session.is_file(), judge.is_dir()));
+                panic!("a scripted audit that breaks at audit {at}");
+            }
+            (false, audit_json(80.0))
+        }));
+        let mut outcome = searched(&h, &tools).await;
+        let before = outcome_json(&outcome);
+        let record = prune(&h, &tools, &mut outcome).await;
+        assert_eq!(record.outcome, "failed", "{at}: {record:?}");
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("the prune stopped")),
+            "{at}: {:?}",
+            record.reason
+        );
+        let there = *written.lock().unwrap();
+        assert_eq!(
+            there,
+            Some((at == 3, at == 3)),
+            "{at}: what was written at the panic"
+        );
+        assert_eq!(outcome_json(&outcome), before, "{at}");
+        assert_no_prune_files(&h);
+    }
+}
+
+/// N4: the importer no longer takes the winner's own session (its project changed after
+/// the search judged it): `failed`, with the importer's reason and no KiCad run.
+/// Control: the original's check parses the original again, and the record reads as a
+/// failed check.
+#[tokio::test]
+async fn an_original_the_importer_no_longer_takes_is_a_failed_record() {
     let mut h = H::new(drc(&[], &[]));
     h.session(&via_session());
-    let tools = Arc::new(Tools::audit(|n, _| {
-        assert!(n < 2, "a scripted audit that breaks on the candidate");
-        (false, audit_json(80.0))
-    }));
+    let project = h.project(r#"{"board": {}}"#);
+    let tools = Arc::new(Tools::clean());
     let mut outcome = searched(&h, &tools).await;
+    std::fs::write(&project, r#"{"board": {"changed": true}}"#).unwrap();
     let before = outcome_json(&outcome);
+    let calls = h.calls().len();
     let record = prune(&h, &tools, &mut outcome).await;
     assert_eq!(record.outcome, "failed", "{record:?}");
+    let reason = record.reason.clone().unwrap_or_default();
     assert!(
-        record
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with("the prune stopped")),
-        "{:?}",
-        record.reason
+        reason.starts_with("the importer no longer takes the winner's own session"),
+        "{reason}"
     );
+    assert!(
+        reason.contains("the importer refuses the run's session"),
+        "{reason}"
+    );
+    assert_eq!(h.calls().len(), calls, "no KiCad run");
+    assert_eq!((record.checks, record.audits), (0, 0));
     assert_eq!(outcome_json(&outcome), before);
     assert_no_prune_files(&h);
+}
+
+/// (d) through the production checker (S2): the fill is read from the board kicad-cli
+/// saved. The original's refill leaves two pieces on GND_BOTTOM; removing the first via
+/// leaves one, so that via stays with `fill`, final: it is not asked in the second sweep
+/// that removing the second via starts. Controls: no fill read, or the owner's saved board
+/// read in place of the refilled scratch.
+#[tokio::test]
+async fn a_via_whose_removal_loses_a_fill_piece_stays_with_fill() {
+    let mut h = H::new(drc(&[], &[]));
+    h.session(&lone_vias(&[(1000000, -550000), (1100000, -550000)]));
+    let filled = |corners: &[f64]| -> String {
+        let pieces: Vec<String> = corners
+            .iter()
+            .map(|x| {
+                format!(
+                    "(filled_polygon (layer \"B.Cu\") (pts (xy {x} 40) (xy {} 40) (xy {} 45) (xy {x} 45)))",
+                    x + 5.0,
+                    x + 5.0
+                )
+            })
+            .collect();
+        h.ctx.board_text.replacen(
+            "(name \"GND_BOTTOM\")",
+            &format!("(name \"GND_BOTTOM\") {}", pieces.join(" ")),
+            1,
+        )
+    };
+    // Call 1 is the original's check, 2 the first via alone, 3 the second via alone.
+    std::fs::write(h.fake.join("board.1"), filled(&[90.0, 110.0])).unwrap();
+    std::fs::write(h.fake.join("board.2"), filled(&[90.0])).unwrap();
+    std::fs::write(h.fake.join("board.3"), filled(&[90.0, 110.0])).unwrap();
+    let base = clean_baseline();
+    let tools = Tools::clean();
+    let text = h.text();
+    let checker = JudgeChecker::new(&h.ctx, &base, &tools, &text, 0, 2.5).unwrap();
+    let original = checked(checker.check(&text, None).await.unwrap());
+    let bottom: f64 = original
+        .rest
+        .as_ref()
+        .unwrap()
+        .fills
+        .iter()
+        .filter(|fill| fill.zone_uuid.as_deref() == Some("44444444-4444-4444-8444-444444444441"))
+        .flat_map(|fill| fill.pieces_mm2.iter())
+        .sum();
+    assert_eq!(bottom, 50.0, "the refilled board's two pieces");
+
+    let units = units(&text, &set(&["GND"])).unwrap();
+    let vias: Vec<usize> = (0..units.len())
+        .filter(|&i| units[i].kind == pour_prune::UnitKind::Via)
+        .collect();
+    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    assert_eq!(pruned.removed, BTreeSet::from([vias[1]]), "{pruned:?}");
+    assert_eq!(pruned.kept_alone, BTreeMap::from([("fill".to_string(), 1)]));
+    assert_eq!(pruned.checks, 2, "the first via is final: not asked again");
+    assert_eq!(h.calls().len(), 3);
 }
 
 impl H {

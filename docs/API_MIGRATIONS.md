@@ -26,14 +26,16 @@ Design: stage ZR0b in `docs/ZONE_ROUTING_DESIGN.md`. No argument changes.
 - **New result field `search.pour_prune`**, also in `search.json` and in the winner's
   `run.json`: `outcome` (`pruned`, `nothing_removed`, `rejected`, `skipped` or
   `failed`), `reason` (why, when it was not pruned), `nets` and `nets_left_alone`,
-  `vias_before`, `vias_removed`, `wires_removed`, `track_mm_removed`,
+  `vias_before`, `vias_removed`, `wires_removed`, `track_mm_removed` (for `rejected`,
+  what the prune would have removed: the delivered session keeps them all),
   `vias_kept_with` and `vias_kept_alone` (for the vias that stayed, how many each
   check refused, tried with their wires and alone), `checks` and `audits` (the KiCad
   runs and layout audits it made), `ended_by`, `seconds`, and, when the pruned session
   is delivered, `before` (the router's session, its rank key and its judged board).
-- **The prune's time comes after the search**, outside the effort's time: about a
-  KiCad check a via tried, sequentially. `search.pour_prune.seconds` says how long it
-  took.
+- **The prune's time comes after the search**, outside the effort's time: one or two
+  KiCad refills and DRCs a ground via a sweep, most with a layout audit, at most three
+  sweeps and 400 checks, then one full judge, all one after another.
+  `search.pour_prune.seconds` says how long it took.
 - `plan_convergent_placement` and the placement bench do not prune: their candidates'
   routing is unchanged, and their results have no `pour_prune`.
 - A reader of an older result, which has no `search.pour_prune`, reads the prune as

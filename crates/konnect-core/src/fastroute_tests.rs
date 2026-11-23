@@ -6815,9 +6815,21 @@ exit 0
         }
     }
 
-    async fn prune_call(prune: crate::pour_prune::PourPrune) -> PruneCall {
+    /// What every call of these tests starts from: the fake fastroute routing every run to
+    /// [`stub_via_session`], the rounded board's export in `exported`, and the refill fake
+    /// in `cli` (`script`), with a tool context that runs it.
+    struct CallSetup {
+        fixture: Fixture,
+        exported: PathBuf,
+        dsn: PathBuf,
+        session: String,
+        cli: PathBuf,
+        script: PathBuf,
+        ctx: std::sync::Arc<crate::tools::ToolContext>,
+    }
+
+    fn call_setup() -> CallSetup {
         use crate::router::ToolRouter;
-        use crate::tools::route_fastroute::{prepare_call, route_located};
         use crate::tools::{ServerConfig, ToolContext};
         use std::sync::Arc;
 
@@ -6842,6 +6854,29 @@ exit 0
             },
             Arc::new(ToolRouter::new()),
         ));
+        CallSetup {
+            fixture,
+            exported,
+            dsn,
+            session,
+            cli,
+            script,
+            ctx,
+        }
+    }
+
+    async fn prune_call(prune: crate::pour_prune::PourPrune) -> PruneCall {
+        use crate::tools::route_fastroute::{prepare_call, route_located};
+
+        let CallSetup {
+            fixture,
+            exported,
+            dsn,
+            session,
+            cli,
+            ctx,
+            ..
+        } = call_setup();
         let args = json!({
             "dsn_path": dsn,
             "ses_output_path": exported.join("out.ses"),
@@ -6945,5 +6980,71 @@ exit 0
         let on = prune_call(crate::pour_prune::PourPrune::Winner).await;
         assert!(on.calls() > 3);
         assert_ne!(on.delivered(), on.session);
+    }
+
+    /// P12 through the placement tools' own routing call: `place_route::route_candidate`
+    /// on the session the call above prunes with `Winner` delivers it as routed, makes no
+    /// pruned session, no prune folder and no `pour_prune`, and runs kicad-cli for the
+    /// baseline and the two judged runs only. Control: `route_candidate` passes `Winner`.
+    #[tokio::test]
+    async fn the_placement_tools_routing_call_never_prunes() {
+        let setup = call_setup();
+        let inputs = crate::place_route::RouteInputs {
+            board: setup.exported.join("specctra_rounded_board.kicad_pcb"),
+            rules: Default::default(),
+            options: Default::default(),
+            effort: crate::route_search::Effort::Fast,
+            fastroute: setup.fixture.binary.clone(),
+            kicad_cli: setup.script.display().to_string(),
+            kicad_config_home: setup.fixture.path().join("bench-kicad-config"),
+        };
+        let folder = setup.fixture.path().join("candidate");
+        std::fs::create_dir_all(&folder).unwrap();
+        let result =
+            crate::place_route::route_candidate(setup.ctx.clone(), &inputs, &setup.dsn, &folder)
+                .await;
+        assert!(
+            matches!(result, crate::place_judge::RouteResult::Routed { .. }),
+            "{result:?}"
+        );
+        assert!(!format!("{result:?}").contains("pour_prune"), "{result:?}");
+        let search = folder.join("route.search");
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(search.join("search.json")).unwrap())
+                .unwrap();
+        assert!(json.get("pour_prune").is_none());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("route.ses")).unwrap(),
+            setup.session,
+            "delivered as routed"
+        );
+        let named = {
+            let mut found = Vec::new();
+            for entry in walk_all(&search) {
+                if entry.to_string_lossy().contains("prune") {
+                    found.push(entry);
+                }
+            }
+            found
+        };
+        assert!(named.is_empty(), "{named:?}");
+        let calls = std::fs::read_to_string(setup.cli.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 3, "the baseline and the two judged runs");
+    }
+
+    /// Every path below `root`.
+    fn walk_all(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            let path = entry.path();
+            out.push(path.clone());
+            if path.is_dir() {
+                out.extend(walk_all(&path));
+            }
+        }
+        out
     }
 }

@@ -1444,3 +1444,48 @@ fn a_pruned_winner_that_would_not_rank_first_replaces_nothing() {
     assert_eq!(outcome.keys, again);
     assert_ne!(outcome.keys, keys);
 }
+
+// --- review S3 (builder B)
+
+/// (e) and (f) on a board where 4.1 measured nothing and 3.2 gave no count: nothing to
+/// compare, nothing refused, so such a board still prunes. Controls: `(None, _) => true`
+/// in either arm of `loops_worse`.
+#[test]
+fn a_board_with_no_decoupling_loops_and_no_stitching_count_refuses_nothing() {
+    let none = with(|r| {
+        r.audit.loops_measured = None;
+        r.audit.worst_loop_mm = None;
+        r.audit.median_loop_mm = None;
+        r.audit.mean_loop_area_mm2 = None;
+        r.audit.pin_loops.clear();
+        r.audit.unstitched_layer_changes = None;
+    });
+    assert!(refusals(&none, &none, &none).is_empty());
+    assert!(!loops_worse(
+        &none.rest.as_ref().unwrap().audit,
+        &none.rest.as_ref().unwrap().audit
+    ));
+}
+
+/// S7 in the loop itself: every accepted state is 0.06 mm² of mean loop area above the
+/// one before. The second via passes against the state before it and is refused against
+/// the original, so it stays with `loops`. Control: the loop gives `refusals` the current
+/// state in place of the original.
+#[tokio::test]
+async fn the_loop_compares_the_tolerance_clauses_with_the_original() {
+    let ses = loop_session(&[0, 0]);
+    let script = Script::new(&ses, |removed| {
+        let mut state = original();
+        state.rest.as_mut().unwrap().audit.mean_loop_area_mm2 =
+            Some(4.0 + 0.06 * removed.len() as f64);
+        Answer::Checked(state)
+    });
+    let pruned = run(&ses, &script).await;
+    let vias = vias_of(&script.units);
+    assert_eq!(pruned.removed, idx(&[vias[0]]));
+    assert_eq!(
+        pruned.kept_alone,
+        BTreeMap::from([("loops".to_string(), 1)])
+    );
+    assert_whole(&script, &pruned);
+}

@@ -1617,6 +1617,159 @@ async fn judges_a_recorded_session_on_scratch_copies() {
     assert_eq!(judged.measures.route_s, 1.5);
 }
 
+/// Row ZR, ZR0b, with the real kicad-cli: the recorded session of the rounded board with a
+/// GND via and a stub wire from R1's GND pad to it (a pad the GND_TOP fill connects
+/// anyway: the kind of via the prune exists for), judged by the real judge as the winner
+/// of a one-run search, then `pour_prune::prune_winner`. Not run in the ordinary gate.
+///
+/// LEAD: run it by hand, after it compiles:
+///
+/// ```text
+/// KICAD_CONFIG_HOME=<scratch folder> KONNECT_TEST_KICAD_CLI=<path to kicad-cli> \
+///   cargo test -p konnect-core --lib prunes_a_recorded_ground_via -- --ignored --nocapture
+/// ```
+///
+/// It asserts only what does not hang on the KiCad version: the winner passes every gate
+/// with no stitching round (P8, else the prune skips it, and the test stops there saying
+/// which gate stands in the way), the prune ran end to end and ended `pruned` or
+/// `nothing_removed`, and a kept prune delivers a session without the via, judged under
+/// `run-0-pruned` with 0 unconnected items and the original's gates. It prints the record.
+#[tokio::test]
+#[ignore = "needs kicad-cli (KICAD_CONFIG_HOME must name a scratch folder)"]
+async fn prunes_a_recorded_ground_via_on_scratch_copies() {
+    assert!(
+        std::env::var_os("KICAD_CONFIG_HOME").is_some(),
+        "LEAD: set KICAD_CONFIG_HOME to a scratch folder, or KiCad re-saves the real settings"
+    );
+    let cli = std::env::var("KONNECT_TEST_KICAD_CLI")
+        .unwrap_or_else(|_| "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let Exported { dsn, ses } = exported(dir.path());
+    let recorded = std::fs::read_to_string(&ses).unwrap();
+    // R1's GND pad is at (100.5, 50) mm: the stub runs right to (102, 50), then up to the
+    // via at (102, 49.5), clear of the VCC track below and of R1's silk text above.
+    let via = "(via konnect_via_0001 1020000 -495000)";
+    assert_eq!(recorded.matches("      (net GND\n").count(), 1);
+    let session = recorded.replacen(
+        "      (net GND\n",
+        &format!(
+            "      (net GND
+        {via}
+        (wire
+          (path F.Cu 2000
+            1005000 -500000
+            1020000 -500000
+            1020000 -495000
+          )
+        )
+"
+        ),
+        1,
+    );
+
+    let search = dir.path().join("search");
+    let root = search.join("judge");
+    let ctx = prepare(&dsn, &root, &cli).expect("preflight");
+    std::fs::create_dir_all(&root).unwrap();
+    let base = baseline(&ctx).await.expect("the unrouted board's baseline");
+    let folder = search.join("run-000-as_exported-s0");
+    std::fs::create_dir_all(&folder).unwrap();
+    let held_ses = folder.join("full.ses");
+    std::fs::write(&held_ses, &session).unwrap();
+    let routed = Routed {
+        index: 0,
+        shape: crate::route_search::Shape::AsExported,
+        seed: 0,
+        dsn: dsn.clone(),
+        held: crate::fastroute::Held {
+            ses: held_ses.clone(),
+            unrouted: 0,
+            kept: "full",
+            passes: vec![],
+            seconds: 1.5,
+            untuned: None,
+            tune: Default::default(),
+            group_search: None,
+        },
+        planes: vec![],
+        folder,
+    };
+    let tools = tool_context(&cli);
+    let judged = judge(&ctx, &routed, &base, tools.clone())
+        .await
+        .expect("judge");
+    eprintln!(
+        "baseline: {base:?}\nthe winner: unconnected {}, violations {:?}, gates {:#?}",
+        judged.measures.unconnected, judged.measures.violations, judged.gates
+    );
+    assert!(
+        judged.gates.all_pass() && judged.rounds.is_empty(),
+        "P8: a winner is pruned only when it passes every gate with no stitching round; this one does not: {:#?}",
+        judged.gates
+    );
+    let original_gates = judged.gates.clone();
+    let key = rank(&[&judged])[0];
+    let mut outcome = crate::route_search::SearchOutcome {
+        runs: vec![crate::route_search::RunRecord {
+            index: 0,
+            shape: crate::route_search::Shape::AsExported,
+            seed: 0,
+            launched_s: 0.0,
+            routed_s: Some(1.5),
+            judged_s: None,
+            route_s: Some(1.5),
+            judge_s: None,
+            outcome: "judged",
+            reason: None,
+            routed: Some(routed),
+            judged: Some(judged),
+        }],
+        winner: Some(0),
+        keys: vec![Some(key)],
+        elapsed: std::time::Duration::from_secs(0),
+        budget_overrun: None,
+        stopped_launching: Some("fixed run count".to_string()),
+        baseline: Ok(base),
+        pour_prune: None,
+    };
+
+    crate::pour_prune::prune_winner(&ctx, tools, &mut outcome).await;
+    let record = outcome
+        .pour_prune
+        .clone()
+        .expect("the prune always says what it did");
+    eprintln!(
+        "pour_prune: {}",
+        serde_json::to_string_pretty(&record).unwrap()
+    );
+    assert!(
+        matches!(record.outcome, "pruned" | "nothing_removed"),
+        "{record:?}"
+    );
+    assert!(record.nets.contains(&"GND".to_string()), "{record:?}");
+    assert_eq!(record.vias_before, 1, "{record:?}");
+    if record.outcome == "pruned" {
+        let won = &outcome.runs[0];
+        let delivered = &won.routed.as_ref().unwrap().held.ses;
+        assert!(delivered.ends_with("pruned.ses"), "{}", delivered.display());
+        assert!(!std::fs::read_to_string(delivered).unwrap().contains(via));
+        let pruned = won.judged.as_ref().unwrap();
+        assert!(
+            pruned.board.starts_with(root.join("run-0-pruned")),
+            "{}",
+            pruned.board.display()
+        );
+        assert_eq!(pruned.measures.unconnected, 0);
+        assert_eq!(pruned.gates, original_gates);
+    } else {
+        assert_eq!(outcome.runs[0].routed.as_ref().unwrap().held.ses, held_ses);
+    }
+    assert!(
+        !root.join("run-0-prune").exists(),
+        "the scratch folder goes"
+    );
+}
+
 // ------------------------------------------------- rank reference (G1-passing runs)
 
 #[test]

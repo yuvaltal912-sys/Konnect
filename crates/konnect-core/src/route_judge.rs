@@ -728,8 +728,9 @@ async fn judge_with(
 }
 
 /// Steps 1 to 7 of [`judge`] on one session of the run, in `ctx.root/<folder_name>`
-/// (`run-<index>`, `run-<index>-untuned`, `run-<index>-pour-safe`; the folder name
-/// also names the judge's own KiCad settings copy).
+/// (`run-<index>`, `run-<index>-untuned`, `run-<index>-pour-safe`, and Row ZR, ZR0b's
+/// `run-<index>-pruned` through [`judge_session`]; the folder name also names the
+/// judge's own KiCad settings copy). The prune's own checks use `run-<index>-prune`.
 async fn judge_one(
     ctx: &JudgeContext,
     routed: &Routed,
@@ -939,8 +940,8 @@ impl ScratchError {
 /// Steps 1 to 3 of [`judge`] on a session TEXT: the importer's plan and the width
 /// report, the scratch board `<run_dir>/r0/<board file>` with the routing written and
 /// the severities forced as the call's checks ask (and, with `prune_rules`, P11's four
-/// rules at least warnings), and KiCad's refill and DRC on `config`. `run_dir` is
-/// cleared first. The importer's refusal is told apart from every other error.
+/// rules at least warnings), and KiCad's refill and DRC on `config`. The importer's
+/// refusal is told apart from every other error.
 ///
 /// The order is [`judge_one`]'s: the importer and the width report, then `run_dir` is
 /// cleared (so a session the importer refuses leaves the folder as it was), then the

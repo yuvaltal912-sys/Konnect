@@ -52,7 +52,9 @@ pub(crate) enum UnitKind {
 /// would apply as ONE item set (it applies an exact repeat once, so cutting one of two
 /// would remove nothing). Vias: the same net and point (whatever the padstack). Wires:
 /// the same net and the same set of segment keys, a segment key being the importer's
-/// (layer, width, the two ends sorted), so a reversed path is a repeat.
+/// (layer, width, the two ends sorted), so a reversed path is a repeat. The importer
+/// drops a repeated SEGMENT too: a wire block whose segments all lie in another block is
+/// its own unit, cutting it changes no copper, and the record's wire counts can count it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Unit {
     pub kind: UnitKind,
@@ -930,10 +932,12 @@ async fn fills_of(board: &Path, pour_nets: &BTreeSet<String>) -> Result<Vec<Zone
 /// The production checker. One check: [`route_judge::routed_scratch`] of the text in
 /// `<judge root>/run-<index>-prune/c` (cleared before each check; its own settings copy,
 /// as `judge_one` makes one a run) with the prune's severities forced (P11). An importer
-/// refusal: the ORIGINAL session text is parsed again by the importer
-/// (`parse_import_plan_with`, the judge's arguments); when that fails too the check is
-/// an error (the board or the manifest changed, P10), else
-/// `CheckOutcome::ImporterRefused`. Then the DRC's counts; when `current` is given and
+/// refusal of a candidate (`current` given): the ORIGINAL session text is parsed again by
+/// the importer (`parse_import_plan_with`, the judge's arguments); when that fails too the
+/// check is an error (the board or the manifest changed, P10), else
+/// `CheckOutcome::ImporterRefused`. The original's own check (`current` `None`) checks that
+/// very text, so its refusal is `ImporterRefused` with no second parse: the board or the
+/// manifest changed since the search judged it. Then the DRC's counts; when `current` is given and
 /// [`drc_refusals`] is not empty, stop there (`rest: None`). Else the fills
 /// (`zone_fill::pour_fills` of the saved board, off the async threads) and
 /// `route_judge::judge_light` (the audit, the measures, the gates), and `rest`.
@@ -1000,17 +1004,20 @@ impl<'c> JudgeChecker<'c> {
         {
             Ok(scratch) => scratch,
             Err(ScratchError::Importer(refused)) => {
-                // P10: the candidate, or what it is checked against?
-                crate::specctra_ses::parse_import_plan_with(
-                    &ctx.board,
-                    &ctx.board_text,
-                    &ctx.manifest_text,
-                    self.original,
-                    crate::specctra_ses::SourceCheck::BytesOrTree,
-                )
-                .context(
-                    "the winner's own session no longer passes the importer: the board, its project files or the manifest changed during the prune",
-                )?;
+                // P10: the candidate, or what it is checked against? The original's own
+                // check is of the original text: a second parse would only repeat it.
+                if current.is_some() {
+                    crate::specctra_ses::parse_import_plan_with(
+                        &ctx.board,
+                        &ctx.board_text,
+                        &ctx.manifest_text,
+                        self.original,
+                        crate::specctra_ses::SourceCheck::BytesOrTree,
+                    )
+                    .context(
+                        "the winner's own session no longer passes the importer: the board, its project files or the manifest changed during the prune",
+                    )?;
+                }
                 return Ok(CheckOutcome::ImporterRefused(format!("{refused:#}")));
             }
             Err(ScratchError::Other(error)) => return Err(error),
@@ -1069,15 +1076,22 @@ pub(crate) struct PruneRecord {
     pub nets: Vec<String>,
     pub nets_left_alone: Vec<String>,
     pub vias_before: usize,
+    /// The vias the loop removed, the wires that went with them, and their length. For
+    /// `rejected` (and a `failed` full judge) what the prune WOULD have removed: the
+    /// delivered session keeps them all.
     pub vias_removed: usize,
-    /// Wires that went with their via, and their length.
     pub wires_removed: usize,
     pub track_mm_removed: f64,
     /// For the vias that stayed, the clauses that refused them ([`Pruned`]).
     pub vias_kept_with: BTreeMap<String, usize>,
     pub vias_kept_alone: BTreeMap<String, usize>,
-    /// KiCad runs and audits of the prune, the original's check included.
+    /// The KiCad refills and DRCs that gave a report the prune read: the original's
+    /// check, every candidate the importer took, and the full judge's refill, its
+    /// stitching rounds and its length probe. A refill whose report could not be read is
+    /// not counted, and an importer refusal runs no KiCad.
     pub checks: usize,
+    /// The layout audits the prune asked for (the original's, the candidates' that passed
+    /// the DRC, the full judge's).
     pub audits: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_by: Option<&'static str>,
@@ -1302,7 +1316,9 @@ async fn decide_with(
         Ok(CheckOutcome::ImporterRefused(why)) => {
             return Decision::of(record.ended(
                 "failed",
-                format!("the importer refuses the winner's own session: {why}"),
+                format!(
+                    "the importer no longer takes the winner's own session, which the search judged (the board, its project files or the manifest changed since): {why}"
+                ),
             ))
         }
         Err(error) => {
@@ -1356,8 +1372,9 @@ async fn decide_with(
         .collect();
     record.vias_removed = removed.iter().filter(|u| u.kind == UnitKind::Via).count();
     record.wires_removed = removed.iter().filter(|u| u.kind == UnitKind::Wire).count();
-    record.track_mm_removed =
-        (removed.iter().map(|u| u.length_mm).sum::<f64>() * 1000.0).round() / 1000.0;
+    // Folded from +0.0: an empty `sum` of f64 is -0.0, which the record would print.
+    let track_mm = removed.iter().fold(0.0, |mm, unit| mm + unit.length_mm);
+    record.track_mm_removed = (track_mm * 1000.0).round() / 1000.0;
     record.vias_kept_with = pruned.kept_with.clone();
     record.vias_kept_alone = pruned.kept_alone.clone();
     record.ended_by = Some(pruned.ended_by);
