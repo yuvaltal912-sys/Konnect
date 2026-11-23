@@ -1489,3 +1489,80 @@ async fn the_loop_compares_the_tolerance_clauses_with_the_original() {
     );
     assert_whole(&script, &pruned);
 }
+
+// --- cargo mutants (builder B): the edges and the seconds
+
+/// (d) and (f) at their edge: a value exactly its tolerance worse than the original's is
+/// kept; only beyond it refuses. Controls (the mutants it was written for): `>` to `>=` in
+/// `loops_worse`'s aggregate and pin comparisons, `<` to `<=` in the fill clause.
+#[test]
+fn a_value_exactly_at_its_tolerance_is_kept() {
+    type Change<'a> = &'a dyn Fn(&mut CheckedRest);
+    let base = checked(0, &[("x", 1)]);
+    let kept = |change: Change| {
+        let candidate = with(|r| change(r));
+        refusals(&base, &base, &candidate)
+    };
+    // The base's 4.1: worst 10, median 5, mean area 4, pin U1.3 (5 mm, 2 mm²); its fill
+    // on F.Cu is one 50 mm² piece.
+    let at: [(&str, Change); 6] = [
+        ("worst", &|r| {
+            r.audit.worst_loop_mm = Some(10.0 + LOOP_TOLERANCE_MM)
+        }),
+        ("median", &|r| {
+            r.audit.median_loop_mm = Some(5.0 + LOOP_TOLERANCE_MM)
+        }),
+        ("mean area", &|r| {
+            r.audit.mean_loop_area_mm2 = Some(4.0 + LOOP_AREA_TOLERANCE_MM2)
+        }),
+        ("pin length", &|r| {
+            r.audit
+                .pin_loops
+                .insert("U1.3".into(), (5.0 + LOOP_TOLERANCE_MM, 2.0));
+        }),
+        ("pin area", &|r| {
+            r.audit
+                .pin_loops
+                .insert("U1.3".into(), (5.0, 2.0 + LOOP_AREA_TOLERANCE_MM2));
+        }),
+        ("fill", &|r| {
+            r.fills[1].pieces_mm2 = vec![50.0 - FILL_TOLERANCE_MM2]
+        }),
+    ];
+    for (what, change) in at {
+        assert!(kept(change).is_empty(), "{what} at its tolerance");
+    }
+    // A little beyond refuses, each by its clause.
+    assert_eq!(
+        kept(&|r| {
+            r.audit
+                .pin_loops
+                .insert("U1.3".into(), (5.0 + 2.0 * LOOP_TOLERANCE_MM, 2.0));
+        }),
+        vec!["loops"]
+    );
+    assert_eq!(
+        kept(&|r| r.fills[1].pieces_mm2 = vec![50.0 - 2.0 * FILL_TOLERANCE_MM2]),
+        vec!["fill"]
+    );
+}
+
+/// P9: every entry of the key but the last (the route seconds) decides the full judge of
+/// the pruned session. Both full judges read the same run's route seconds today, so the
+/// last entry is equal in every real call; this pins the rule itself. Control (the mutant
+/// it was written for): the range `0..KEY_LEN - 1` taken as `0..KEY_LEN`.
+#[test]
+fn the_route_seconds_never_refuse_the_pruned_session() {
+    let original = judged_at(90.0);
+    let mut slower = judged_at(90.0);
+    slower.measures.route_s = original.measures.route_s + 100.0;
+    assert_eq!(full_judge_refusal(&original, &slower), None);
+    // Control of the test itself: a lower copper quality refuses at its position.
+    let worse = judged_at(80.0);
+    assert!(
+        full_judge_refusal(&original, &worse)
+            .is_some_and(|reason| reason.contains("at position 11")),
+        "{:?}",
+        full_judge_refusal(&original, &worse)
+    );
+}
