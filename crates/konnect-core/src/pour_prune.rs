@@ -1503,6 +1503,9 @@ fn replace_winner(
         return Err("the winning record has no routed session or no judged board".to_string());
     };
     judged.tune = original.tune.clone();
+    // Row ZR, ZR1: the comparison is of the routing pass's board, which the pruned
+    // session's judge does not make; the original run's stays with the run.
+    crate::zone_fill::carry_comparison(&original.measures, &mut judged.measures);
     let keys = keys_with(outcome, winner, &judged);
     let first = keys
         .iter()

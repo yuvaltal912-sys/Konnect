@@ -105,6 +105,7 @@ the engine's prediction with KiCad's refill, pad by pad. Design: stage ZR1 in
   board, when the engine reports an error (its text is then in `pours_error`), and when
   KiCad counts 0 unconnected items on the modelled nets while the grouping finds a pad
   open.
+  For a winner whose pruned session was delivered, these two are the comparison of the router's own session, which the engine modelled; the pruned session was never modelled.
 - **`pours_error` may now sit beside `pours`**: when the comparison could not be made
   (a pad that cannot be named, a `planes` object that does not read), the ZR0 measures
   stay, both counts are `null`, and `pours_error` gives the reason. A failed comparison

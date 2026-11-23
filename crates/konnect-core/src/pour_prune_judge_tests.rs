@@ -772,6 +772,66 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
     assert_eq!(shown["vias_kept_with"], json!({}));
 }
 
+/// Row ZR, ZR1: a kept prune keeps the router's own session's pad comparison, as it
+/// keeps its Tune choice: the pruned winner has the original's `false_connected` and
+/// `false_open` and the pruned board's own other pour measures, as its full judge
+/// measured them. Controls: the copy removed, the two read the pruned judge's `None`;
+/// `judge_session` given the engine planes, a `pours_error` appears.
+#[tokio::test]
+async fn a_kept_prune_keeps_the_runs_pad_comparison() {
+    let mut h = H::new(drc(&[], &[]));
+    h.session(&via_session());
+    let tools = Arc::new(Tools::clean());
+    let mut outcome = searched(&h, &tools).await;
+    let sentinel = crate::zone_fill::PourMeasures {
+        open_before_stitching: 41,
+        open_after_stitching: 42,
+        pieces: 43,
+        largest_piece_share: Some(0.25),
+        unfilled: 44,
+        starved_thermals: 45,
+        false_connected: Some(1),
+        false_open: Some(2),
+    };
+    outcome.runs[0].judged.as_mut().unwrap().measures.pours = Some(sentinel.clone());
+    // The routing pass's model, which the pruned session's judge must not compare with
+    // (`judge_session` passes no engine planes): compared, it would fail for want of pad
+    // names and leave a `pours_error`.
+    outcome.runs[0].routed.as_mut().unwrap().held.planes = Some(json!({
+        "version": 1, "error": null, "nets": ["GND"], "connected_pads": [],
+        "open_pads": [], "starved_pads": [], "pieces": 1, "closing_routed": 0,
+        "redraws": 1, "redraw_s": 0.1
+    }));
+
+    let record = prune(&h, &tools, &mut outcome).await;
+    assert_eq!(record.outcome, "pruned", "{record:?}");
+    let judged = outcome.runs[0].judged.as_ref().unwrap();
+    assert!(judged.board.starts_with(h.ctx.root.join("run-0-pruned")));
+    let pours = judged
+        .measures
+        .pours
+        .as_ref()
+        .expect("the full judge measured the pruned board's pours");
+    assert_eq!(
+        (pours.false_connected, pours.false_open),
+        (Some(1), Some(2))
+    );
+    // The rest is the pruned board's own, not the original's.
+    assert_ne!(
+        (
+            pours.open_before_stitching,
+            pours.open_after_stitching,
+            pours.pieces,
+            pours.unfilled,
+            pours.starved_thermals,
+        ),
+        (41, 42, 43, 44, 45)
+    );
+    assert_ne!(pours.largest_piece_share, Some(0.25));
+    assert_eq!(judged.measures.pours_error, None);
+    assert_eq!(outcome.keys, vec![Some(rank(&[judged])[0])]);
+}
+
 /// P9, each clause: a pruned session whose full judge fails a gate, writes a stitching
 /// round, or has a higher key entry is `rejected`; its files go and the outcome is as it
 /// was. The control of each clause is the clause removed (controls.md).

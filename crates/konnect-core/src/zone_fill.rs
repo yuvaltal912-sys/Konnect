@@ -59,9 +59,14 @@ pub(crate) struct PourMeasures {
     /// the first refilled board (ZR1, [`compare_pads`]). `None` when the run's pass sent
     /// no zones file or its report has no usable `planes`, for a Tune candidate's board
     /// (the model is of the routing pass's board), and when the two sides cannot be
-    /// compared.
+    /// compared. For a winner whose pruned session was delivered, these two are the
+    /// comparison of the router's own session, which the engine modelled; the pruned
+    /// session was never modelled.
     pub false_connected: Option<usize>,
-    /// Pads the engine's model left open and KiCad connects (ZR1), `None` as above.
+    /// Pads the engine's model left open and KiCad connects (ZR1), `None` as above. For a
+    /// winner whose pruned session was delivered, these two are the comparison of the
+    /// router's own session, which the engine modelled; the pruned session was never
+    /// modelled.
     pub false_open: Option<usize>,
 }
 
@@ -1553,6 +1558,24 @@ fn raise_to_legacy_clearances(
                 zone.settings.clearance_mm = zone.settings.clearance_mm.max(*clearance);
             }
         }
+    }
+}
+
+/// Row ZR, ZR0b: the comparison of `from` (the run's own judged measures) carried into
+/// `to` (the pruned winner's), which the pruned judge leaves empty: `false_connected`,
+/// `false_open`, and `from`'s `pours_error` when `to` has none. Only when both carry the
+/// ZR0 pour measures (`from`'s `pours_error` beside `pours` is the comparison's own).
+pub(crate) fn carry_comparison(
+    from: &crate::route_judge::Measures,
+    to: &mut crate::route_judge::Measures,
+) {
+    let (Some(source), Some(target)) = (from.pours.as_ref(), to.pours.as_mut()) else {
+        return;
+    };
+    target.false_connected = source.false_connected;
+    target.false_open = source.false_open;
+    if to.pours_error.is_none() {
+        to.pours_error = from.pours_error.clone();
     }
 }
 
