@@ -4,11 +4,12 @@
 //! parallel runs keep their memory apart (docs/ROUTE_SEARCH_DESIGN.md, decision 2).
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
-//! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`]):
-//! build x19. [`locate`] finds a binary and [`probe`] proves, before anything is
-//! routed, that it knows every experimental switch Konnect sends. That is not proof
-//! that it is x19: an earlier engine commit may know the same switches, and x18 and
-//! x19 both print `fastroute 0.1.14`. What identifies the build is its SHA-256: the
+//! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`])
+//! and the fill model of Row ZR, stage ZR1 (`--x.zones`): build x20. [`locate`] finds a
+//! binary and [`probe`] proves, before anything is routed, that it knows every
+//! experimental switch Konnect sends. That is not proof that it is x20: an earlier
+//! engine commit may know the same switches, and x18, x19 and x20 all print
+//! `fastroute 0.1.14`. What identifies the build is its SHA-256: the
 //! 1 Kopper package checks it against `packaging/1-kopper/fastroute.json`, and every
 //! result reports it as `engine.sha256`.
 
@@ -66,9 +67,10 @@ pub(crate) fn routing_switches() -> Vec<&'static str> {
         .collect()
 }
 
-/// The candidate's name, as the research and the owner call it: build x19, the
-/// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`].
-pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS";
+/// The candidate's name, as the research and the owner call it: build x20, the
+/// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`], and the
+/// fill model of Row ZR, stage ZR1 (`--x.zones`).
+pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR1";
 
 /// Threads per run, for the autorouter and the optimizer each (the research's 7 x 2).
 pub(crate) const THREADS: u32 = 2;
@@ -254,13 +256,16 @@ fn present(path: &Path) -> bool {
 /// 2. [`probe_arguments`]: `-de <scratch>/absent.dsn`, every [`CANDIDATE_SWITCHES`]
 ///    entry, every [`SEARCH_SWITCHES`] entry, `--x.gs_uncounted=<scratch>/probe-uncounted.txt`
 ///    (an empty file the probe writes; fastroute reads it as it parses the switch, and an
-///    empty file names no net), then [`SENTINEL_SWITCH`], last. fastroute parses its
+///    empty file names no net), `--x.zones=<scratch>/probe-zones.txt` ([`PROBE_ZONES_TEXT`],
+///    a valid zones file with no `zone` line, so it models nothing; Row ZR, stage ZR1),
+///    then [`SENTINEL_SWITCH`], last. fastroute parses its
 ///    arguments in order and stops at the first unknown experimental switch
 ///    (`exp::parse_arg`), so the sentinel is named only when every switch before it was
 ///    accepted. The output must contain
 ///    `unknown experimental switch --x.konnect_probe_unknown` and must not name any
 ///    other switch as unknown. A build that lacks one of the switches names that one
-///    (x18, without the search switches, names `--x.oct_bound`); a build without
+///    (x18, without the search switches, names `--x.oct_bound`; x19, without the fill
+///    model, names `--x.zones=`); a build without
 ///    experimental switches names none (it goes on to open the absent DSN and fails on
 ///    that).
 ///
@@ -297,6 +302,9 @@ pub(crate) async fn probe(path: &Path, source: &'static str, scratch: &Path) -> 
     let uncounted = scratch.join(PROBE_UNCOUNTED);
     std::fs::write(&uncounted, "")
         .with_context(|| format!("{} could not be written", uncounted.display()))?;
+    let zones = scratch.join(PROBE_ZONES);
+    std::fs::write(&zones, PROBE_ZONES_TEXT)
+        .with_context(|| format!("{} could not be written", zones.display()))?;
     let args = probe_arguments(&scratch);
     let output = sandboxed_output(&profile, &path, &scratch, &args)
         .await
@@ -337,9 +345,16 @@ pub(crate) async fn probe(path: &Path, source: &'static str, scratch: &Path) -> 
 /// The empty `--x.gs_uncounted` file of the probe's step 2, in its scratch folder.
 pub(crate) const PROBE_UNCOUNTED: &str = "probe-uncounted.txt";
 
+/// The `--x.zones` file of the probe's step 2, in its scratch folder (Row ZR, stage ZR1).
+pub(crate) const PROBE_ZONES: &str = "probe-zones.txt";
+
+/// The probe's zones file: the header the engine requires (each key exactly once) and no
+/// `zone` line, so the build reads and checks the switch and models nothing.
+pub(crate) const PROBE_ZONES_TEXT: &str = "zones 1\ncell_mm 0.05\nmin_spokes 2\nedge_clearance_mm 0.3\nhole_clearance_mm 0.25\nteardrop_mm 0\n";
+
 /// The probe's step 2 command line for `scratch` ([`probe`]): `-de <scratch>/absent.dsn`,
 /// [`CANDIDATE_SWITCHES`], [`SEARCH_SWITCHES`], `--x.gs_uncounted=<scratch>/`
-/// [`PROBE_UNCOUNTED`], and [`SENTINEL_SWITCH`] last: fastroute stops at the first
+/// [`PROBE_UNCOUNTED`], `--x.zones=<scratch>/`[`PROBE_ZONES`], and [`SENTINEL_SWITCH`] last: fastroute stops at the first
 /// unknown switch, so a switch after the sentinel would never be checked.
 pub(crate) fn probe_arguments(scratch: &Path) -> Vec<String> {
     let mut args = vec![
@@ -352,6 +367,7 @@ pub(crate) fn probe_arguments(scratch: &Path) -> Vec<String> {
         "--x.gs_uncounted={}",
         scratch.join(PROBE_UNCOUNTED).display()
     ));
+    args.push(format!("--x.zones={}", scratch.join(PROBE_ZONES).display()));
     args.push(SENTINEL_SWITCH.to_string());
     args
 }
@@ -387,6 +403,10 @@ pub(crate) struct CallFiles<'a> {
     /// copper the group search leaves out of its cost as the judge leaves it out of
     /// its measures. Routing passes only.
     pub uncounted: Option<&'a Path>,
+    /// Row ZR, stage ZR1: the `--x.zones` file (`zone_fill::file_text`), each modelled
+    /// pour's fill settings. Given only for a variant with planes and a plan that
+    /// models at least one pour; routing passes only, never the Tune pass.
+    pub zones: Option<&'a Path>,
 }
 
 /// The command line of one pass, every setting once, in this order: `-de <dsn>`,
@@ -397,7 +417,8 @@ pub(crate) struct CallFiles<'a> {
 /// `--router.optimizer.max_threads=` at [`THREADS`], [`CANDIDATE_SWITCHES`],
 /// [`SEARCH_SWITCHES`] (Row GS), `--x.par_via_amps=<amps>` when given,
 /// `--x.gs_uncounted=<file>` when given (Row GS, G3), `--pairs=<file>` when given,
-/// `--layer-heights=<value>` when given (Row LT, L7), and
+/// `--layer-heights=<value>` when given (Row LT, L7), `--x.zones=<file>` when given
+/// (Row ZR, ZR1), and
 /// `--initial-session=<file>` as one token when the pass has one. Numbers are written without a trailing `.0` when
 /// whole. Never `--live`, `--multi-start`, `--max-time` or `--diagnose`.
 pub(crate) fn pass_arguments(
@@ -437,6 +458,9 @@ pub(crate) fn pass_arguments(
     }
     if let Some(heights) = files.layer_heights {
         args.push(layer_heights_argument(heights));
+    }
+    if let Some(zones) = files.zones {
+        args.push(format!("--x.zones={}", zones.display()));
     }
     if let Some(initial) = &pass.initial_session {
         args.push(format!("--initial-session={}", initial.display()));
@@ -615,6 +639,9 @@ pub(crate) struct PassOutcome {
     /// Row GS: the report's `group_search` object as fastroute wrote it, when the
     /// report has one (the stage ran); `None` for a Tune pass, which never runs it.
     pub group_search: Option<Value>,
+    /// Row ZR, ZR1: the report's `planes` object as fastroute wrote it, when the report
+    /// has one (the pass was sent `--x.zones`); `None` otherwise, a Tune pass included.
+    pub planes: Option<Value>,
 }
 
 /// Why a pass gave no session.
@@ -779,6 +806,10 @@ async fn run_arguments(
             .get("group_search")
             .filter(|object| !object.is_null())
             .cloned(),
+        planes: report_value
+            .get("planes")
+            .filter(|object| !object.is_null())
+            .cloned(),
     })
 }
 
@@ -806,6 +837,10 @@ pub(crate) struct Held {
     /// anything the search did: its report has none, so this stays the routing
     /// pass's it started from.
     pub group_search: Option<Value>,
+    /// Row ZR, ZR1: the `planes` object of the same routing pass
+    /// ([`PassOutcome::planes`]); a kept Tune pass leaves it as it is, as it leaves
+    /// [`Held::group_search`].
+    pub planes: Option<Value>,
 }
 
 /// The hold sequence (design decision 4), each pass in its own subfolder of
@@ -882,6 +917,7 @@ pub(crate) async fn route_held(
     let mut kept_ses = full.ses.clone();
     let mut kept_unrouted = full.unrouted;
     let mut kept_group_search = full.group_search.clone();
+    let mut kept_planes = full.planes.clone();
 
     // Fallback: only when Full left connections open, and only with a floor.
     let mut fallback_kept: Option<PassOutcome> = None;
@@ -936,6 +972,7 @@ pub(crate) async fn route_held(
                         kept_ses = outcome.ses.clone();
                         kept_unrouted = outcome.unrouted;
                         kept_group_search = outcome.group_search.clone();
+                        kept_planes = outcome.planes.clone();
                         fallback_kept = Some(outcome);
                     } else {
                         let reason = if outcome.unrouted == full.unrouted {
@@ -988,6 +1025,7 @@ pub(crate) async fn route_held(
                     kept_ses = outcome.ses.clone();
                     kept_unrouted = outcome.unrouted;
                     kept_group_search = outcome.group_search.clone();
+                    kept_planes = outcome.planes.clone();
                 } else {
                     passes.push(row(
                         "polish",
@@ -1018,6 +1056,7 @@ pub(crate) async fn route_held(
         untuned: None,
         tune: TuneOutcome::default(),
         group_search: kept_group_search,
+        planes: kept_planes,
     };
     match tune {
         Some(tune) => tune_held(binary, folder, dsn, hints, files, &tune, held, deadline).await,
@@ -1155,7 +1194,9 @@ pub(crate) fn layer_heights_argument(value: &str) -> String {
 /// `--live`, `--multi-start`, `--max-time`, `--diagnose` or a neck width, and never
 /// a [`SEARCH_SWITCHES`] entry nor `--x.gs_uncounted` (Row GS, G1: with the
 /// optimizer off the group search would rip and straighten the meanders the tuner
-/// just added); `files.uncounted` is ignored.
+/// just added); `files.uncounted` is ignored. Never `--x.zones` either (Row ZR: its
+/// autorouter and optimizer are off and it runs no closing, so a model would only cost
+/// a redraw); `files.zones` is ignored.
 #[allow(clippy::too_many_arguments)] // the parts of one command line, each read once
 pub(crate) fn tune_pass_arguments(
     dsn: &Path,
@@ -1951,12 +1992,13 @@ pub(crate) async fn tune_attempt(
     outcome: &mut TuneOutcome,
 ) -> std::result::Result<Option<TuneCandidate>, PassError> {
     // The Tune pass gets its own heights and never the call's pairs file, nor the
-    // group search's uncounted file (Row GS, G1).
+    // group search's uncounted file (Row GS, G1), nor the zones file (Row ZR).
     let files = CallFiles {
         amps: files.amps,
         pairs: None,
         layer_heights: first.layer_heights,
         uncounted: None,
+        zones: None,
     };
     let mut tune_file = first.tune.to_path_buf();
     let mut nets = first.nets.clone();

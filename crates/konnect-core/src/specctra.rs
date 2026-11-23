@@ -108,6 +108,10 @@ struct PadModel {
     rotation_degrees: f64,
     net: Option<String>,
     padstack: PadstackKey,
+    /// Row ZR: the pad's place among its footprint's `(pad …)` entries, from 0.
+    source_index: usize,
+    /// Row ZR: the pad's `uuid`, when it has one.
+    uuid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +133,8 @@ struct FootprintModel {
     /// Copper graphics and visible copper text, as image keepout shapes in
     /// footprint space.
     copper_keepouts: Vec<dsn::Shape>,
+    /// Row ZR: the footprint's place among the board's `(footprint …)` entries, from 0.
+    source_index: usize,
 }
 
 /// An unplated hole in image coordinates.
@@ -2210,6 +2216,20 @@ pub(crate) fn zones(
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
 ) -> Result<Vec<ZoneModel>> {
+    Ok(zone_rows(tree, net_table, copper_layers)?
+        .into_iter()
+        .map(|(zone, _)| zone)
+        .collect())
+}
+
+/// [`zones`], each row with the board's `(zone …)` node it came from: the one place
+/// that decides which zones the export writes and in what order, so that Row ZR's
+/// [`pour_fill_rows`] cannot disagree with it.
+fn zone_rows<'a>(
+    tree: &'a SexpNode,
+    net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
+) -> Result<Vec<(ZoneModel, &'a SexpNode)>> {
     let mut out = Vec::new();
     for zone in tree.find_all("zone") {
         if is_teardrop(zone) {
@@ -2280,14 +2300,281 @@ pub(crate) fn zones(
             .filter(|name| !name.is_empty())
             .map(str::to_string);
         for layer in copper {
-            out.push(ZoneModel {
-                kind,
-                layer,
-                net: net.clone(),
-                outline: outline.clone(),
-                uuid: uuid.clone(),
-                name: zone_name.clone(),
-            });
+            out.push((
+                ZoneModel {
+                    kind,
+                    layer,
+                    net: net.clone(),
+                    outline: outline.clone(),
+                    uuid: uuid.clone(),
+                    name: zone_name.clone(),
+                },
+                zone,
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Row ZR: one copper pour on one copper layer, in the export's order (the order of
+/// the manifest's `pours` rows and, among the pours written, of the DSN's `(plane …)`
+/// entries), with the board's `(zone …)` node that holds its fill settings.
+#[derive(Debug, Clone)]
+pub(crate) struct PourFillRow<'a> {
+    pub zone: &'a SexpNode,
+    pub net: String,
+    pub layer: String,
+    pub uuid: Option<String>,
+}
+
+/// Row ZR: the board's pours in export order ([`zone_rows`], pours only), each with its
+/// `(zone …)` node. An error where the export itself would refuse the board's zones.
+pub(crate) fn pour_fill_rows(tree: &SexpNode) -> Result<Vec<PourFillRow<'_>>> {
+    let copper = copper_layers(tree)?;
+    let table = top_level_net_table(tree);
+    Ok(zone_rows(tree, &table, &copper)?
+        .into_iter()
+        .filter(|(zone, _)| zone.kind == ZoneKind::Plane)
+        .filter_map(|(zone, node)| {
+            Some(PourFillRow {
+                zone: node,
+                net: zone.net?,
+                layer: zone.layer,
+                uuid: zone.uuid,
+            })
+        })
+        .collect())
+}
+
+/// Row ZR: one copper pad as the export names it in the DSN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PadPin {
+    /// The DSN component: the footprint's Reference, or its `<reference>_DUP<n>` name.
+    pub component: String,
+    /// The DSN pin id ([`pin_ids`]: a repeated number is `<number>@<n>`).
+    pub pin: String,
+    pub net: Option<String>,
+    /// The footprint's place among the board's `(footprint …)` entries, from 0.
+    pub footprint_index: usize,
+    /// The pad's place among its footprint's `(pad …)` entries, from 0.
+    pub pad_index: usize,
+    pub footprint_uuid: String,
+    pub pad_uuid: Option<String>,
+    /// The DSN writes the pad as a `circle` (a KiCad circle, or an oval of equal sides
+    /// in whole micrometres).
+    pub dsn_round: bool,
+}
+
+impl PadPin {
+    /// `<component>-<pin>`, as the DSN's `(pins …)` and the engine's report write it.
+    pub(crate) fn dsn_name(&self) -> String {
+        format!("{}-{}", self.component, self.pin)
+    }
+}
+
+/// Row ZR: every copper pad the export writes, named as the export names it (the same
+/// [`footprints`] pass, with repeated references allowed, as an export that wrote them
+/// had them allowed). An error where the export would refuse the board's footprints.
+pub(crate) fn pad_pins(tree: &SexpNode) -> Result<Vec<PadPin>> {
+    let copper = copper_layers(tree)?;
+    let table = top_level_net_table(tree);
+    let (footprints, _, _, _) = footprints(tree, &table, &copper, true)?;
+    Ok(footprints
+        .iter()
+        .flat_map(|footprint| {
+            footprint.pads.iter().map(move |pad| PadPin {
+                component: footprint.reference.clone(),
+                pin: pad.dsn_id.clone(),
+                net: pad.net.clone(),
+                footprint_index: footprint.source_index,
+                pad_index: pad.source_index,
+                footprint_uuid: footprint.kiid.clone(),
+                pad_uuid: pad.uuid.clone(),
+                dsn_round: pad.padstack.shape == PadShape::Circle,
+            })
+        })
+        .collect())
+}
+
+/// Row ZR: a rule area's outline for the zones file's `keepout` line: as the export
+/// writes a zone's polygon ([`zone_outline`]: DSN micrometres, Y up, closed), except that
+/// an arc bulging out of the area (it turns the way the outline winds) is written
+/// circumscribed, so the polygon holds the whole arc: a
+/// chord lies inside its arc by the sagitta, which would let the model fill a sliver of
+/// the area. The arc's ends stay on it; between them each edge lies on a tangent of a
+/// circle 1 um wider than the arc (the micrometre rounding cannot move an edge inside),
+/// with no edge more than [`ARC_TOLERANCE_MM`] beyond it. An arc that bulges into the area
+/// keeps its chords, which lie outside the area already.
+pub(crate) fn zone_outline_covering_um(zone: &SexpNode) -> Result<Vec<(i64, i64)>> {
+    enum Item {
+        Point((f64, f64)),
+        Arc((f64, f64), (f64, f64), (f64, f64)),
+    }
+    let polygons = zone.find_all("polygon");
+    let [polygon] = polygons.as_slice() else {
+        bail!("expected one outline polygon, found {}", polygons.len());
+    };
+    let pts = polygon.find("pts").context("outline has no points")?;
+    let mut items = Vec::new();
+    for item in pts.children().unwrap_or(&[]).iter().skip(1) {
+        match item.head() {
+            Some("xy") => items.push(Item::Point((
+                finite_number(item.get_f64(1), "zone x")?,
+                finite_number(item.get_f64(2), "zone y")?,
+            ))),
+            Some("arc") => items.push(Item::Arc(
+                xy_mm(item, "start")?,
+                xy_mm(item, "mid")?,
+                xy_mm(item, "end")?,
+            )),
+            Some(other) => bail!("outline holds an unsupported '{other}'"),
+            None => {}
+        }
+    }
+    // The winding, from the outline with its arcs as chords.
+    let mut inscribed: Vec<(f64, f64)> = Vec::new();
+    for item in &items {
+        match *item {
+            Item::Point(point) => inscribed.push(point),
+            Item::Arc(start, mid, end) => {
+                inscribed.push(start);
+                inscribed.extend(arc_inner_points(start, mid, end)?);
+                inscribed.push(end);
+            }
+        }
+    }
+    let twice_area: f64 = (0..inscribed.len())
+        .map(|i| {
+            let (x0, y0) = inscribed[i];
+            let (x1, y1) = inscribed[(i + 1) % inscribed.len()];
+            x0 * y1 - x1 * y0
+        })
+        .sum();
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for item in &items {
+        match *item {
+            Item::Point(point) => points.push(point),
+            Item::Arc(start, mid, end) => {
+                if points.last() != Some(&start) {
+                    points.push(start);
+                }
+                let turn =
+                    (mid.0 - start.0) * (end.1 - mid.1) - (mid.1 - start.1) * (end.0 - mid.0);
+                if turn * twice_area > 0.0 {
+                    points.extend(arc_circumscribed_points(start, mid, end)?);
+                } else {
+                    points.extend(arc_inner_points(start, mid, end)?);
+                }
+                points.push(end);
+            }
+        }
+    }
+    let mut outline = points.into_iter().map(to_dsn).collect::<Result<Vec<_>>>()?;
+    outline.dedup();
+    if outline.first() == outline.last() && outline.len() > 1 {
+        outline.pop();
+    }
+    if outline.len() < 3 {
+        bail!("outline has fewer than three corners");
+    }
+    let first = outline[0];
+    outline.push(first);
+    Ok(outline)
+}
+
+/// The corners strictly between `start` and `end` of a polyline that circumscribes the arc
+/// through `mid`: one on each tangent crossing of a circle 1 um wider than the arc, at
+/// equal angles, few enough that no edge is more than [`ARC_TOLERANCE_MM`] beyond that
+/// circle. Three collinear points are a straight line (none).
+fn arc_circumscribed_points(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+) -> Result<Vec<(f64, f64)>> {
+    const MARGIN_MM: f64 = 0.001;
+    let (ax, ay) = start;
+    let (bx, by) = mid;
+    let (cx, cy) = end;
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if d.abs() < 1e-9 {
+        return Ok(Vec::new());
+    }
+    let (a2, b2, c2) = (ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy);
+    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let radius = ((ax - ux).powi(2) + (ay - uy).powi(2)).sqrt();
+    if !radius.is_finite() || radius <= 0.0 {
+        bail!("unsupported outline: an arc has no usable radius");
+    }
+    let angle = |(x, y): (f64, f64)| (y - uy).atan2(x - ux);
+    let tau = std::f64::consts::TAU;
+    let counter_clockwise = (bx - ax) * (cy - by) - (by - ay) * (cx - bx) > 0.0;
+    let (from, to) = (angle(start), angle(end));
+    let sweep = if counter_clockwise {
+        (to - from).rem_euclid(tau)
+    } else {
+        -((from - to).rem_euclid(tau))
+    };
+    let wider = radius + MARGIN_MM;
+    // An edge on a tangent of the wider circle strays wider / cos(step / 2) - wider.
+    let step = 2.0 * (wider / (wider + ARC_TOLERANCE_MM)).acos();
+    let segments = (sweep.abs() / step).ceil().max(2.0);
+    if segments > MAX_ARC_SEGMENTS as f64 {
+        bail!("unsupported outline: an arc would need more than {MAX_ARC_SEGMENTS} edges");
+    }
+    let segments = segments as usize;
+    let half = sweep / segments as f64 / 2.0;
+    let corner = wider / half.cos();
+    Ok((0..segments)
+        .map(|k| {
+            let theta = from + sweep * (k as f64 + 0.5) / segments as f64;
+            (ux + corner * theta.cos(), uy + corner * theta.sin())
+        })
+        .collect())
+}
+
+/// Row ZR: the board's copper layers, in stack order (as the export reads them).
+pub(crate) fn board_copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
+    copper_layers(tree)
+}
+
+/// Row ZR: the DSN's `(structure (plane NET shape))` entries in file order, each with
+/// the layer of its shape: the order fastroute numbers planes by (the zones file's
+/// `plane_index`). The wiring's conduction areas are not planes and are not listed.
+pub(crate) fn dsn_plane_order(dsn: &str) -> Result<Vec<DsnPlane>> {
+    const SHAPES: &[&str] = &["polygon", "rect", "circle", "path", "polyline_path"];
+    let root = pcb_root(dsn)?;
+    let mut planes = Vec::new();
+    for structure in keyword_children(&root, "structure") {
+        for plane in keyword_children(structure, "plane") {
+            let net = dsn_atom(plane, 1, "plane net")?.to_string();
+            let shape = SHAPES
+                .iter()
+                .find_map(|name| keyword_children(plane, name).into_iter().next())
+                .with_context(|| format!("the plane of net '{net}' has no shape"))?;
+            let layer = dsn_atom(shape, 1, "plane layer")?.to_string();
+            planes.push(DsnPlane { net, layer });
+        }
+    }
+    Ok(planes)
+}
+
+/// Row ZR: the pins of each net of the DSN's `network`, as the DSN writes them
+/// (`(pins U3-5 …)`), by net name.
+pub(crate) fn dsn_net_pins(dsn: &str) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let root = pcb_root(dsn)?;
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for network in keyword_children(&root, "network") {
+        for net in keyword_children(network, "net") {
+            let name = dsn_atom(net, 1, "network net name")?.to_string();
+            let pins = out.entry(name).or_default();
+            for list in keyword_children(net, "pins") {
+                for pin in list.children().unwrap_or(&[]).iter().skip(1) {
+                    if let Some(pin) = pin.as_str() {
+                        pins.insert(pin.to_string());
+                    }
+                }
+            }
         }
     }
     Ok(out)
@@ -3155,7 +3442,12 @@ fn footprints(
     let mut references = BTreeSet::new();
     let mut without_pads = 0;
     let mut padless_keepouts = Vec::new();
-    for (footprint, dsn_name) in tree.find_all("footprint").into_iter().zip(&names) {
+    for (footprint_index, (footprint, dsn_name)) in tree
+        .find_all("footprint")
+        .into_iter()
+        .zip(&names)
+        .enumerate()
+    {
         // Named by Reference in messages, else by UUID, so a footprint that
         // is refused can be found.
         let label = property_value(footprint, "Reference")
@@ -3232,7 +3524,7 @@ fn footprints(
             footprint_copper_keepouts(footprint, copper_layers, rotation_degrees, &reference)?;
         let mut pads = Vec::new();
         let mut holes = Vec::new();
-        for pad in footprint.find_all("pad") {
+        for (pad_index, pad) in footprint.find_all("pad").into_iter().enumerate() {
             let number = pad
                 .get(1)
                 .and_then(SexpNode::as_str)
@@ -3466,6 +3758,8 @@ fn footprints(
                     offset_x_um,
                     offset_y_um,
                 },
+                source_index: pad_index,
+                uuid: pad.find_str("uuid").map(str::to_string),
             });
         }
         // Stable order: by KiCad number, then position, so repeated numbers
@@ -3489,6 +3783,7 @@ fn footprints(
             pads,
             holes,
             copper_keepouts,
+            source_index: footprint_index,
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));

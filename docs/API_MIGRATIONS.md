@@ -68,6 +68,49 @@ routing, the gates or the rank key changes.
   candidate; `pours` is then absent.
 - A reader of an older result, which has neither field, reads them as absent.
 
+### Stage ZR1: the engine's fill model beside KiCad's refill
+
+`route_specctra_dsn` (fastroute) tells the engine each pour's fill settings and compares
+the engine's prediction with KiCad's refill, pad by pad. Design: stage ZR1 in
+`docs/ZONE_ROUTING_DESIGN.md`. The routing, the gates and the rank key do not change.
+
+- **The search folder holds `zones.txt`** when the call's zone plan models at least one
+  pour. The Full, Fallback and Polish passes of a variant with planes (as exported) are
+  sent `--x.zones=<folder>/zones.txt`, after `--layer-heights=` and before
+  `--initial-session=`; the pours-omitted variant and the Tune pass never are. A
+  fastroute build that does not know `--x.zones` refuses that pass, so such a call needs
+  the engine build that does (the package pin, in its own change).
+- **New result field `pours`**: the call's zone plan. `zones`, the pours the engine
+  models (`plane_index`, `net`, `layer`, `uuid`, `settings`: `clearance_mm`,
+  `min_width_mm`, `connect`, `thermal_gap_mm`, `thermal_bridge_mm`, `priority`,
+  `islands`); `legacy`, the pours sent as today or left out, each with its `reason`;
+  `pad_lines` and `keepouts` (counts); `min_spokes`, `edge_clearance_mm`,
+  `hole_clearance_mm`, `teardrop_mm`; `zones_file` (`null` when nothing is modelled).
+  A plan that cannot be made is `{"error": …}` and sends no file. Present on a
+  successful result and on the no-winner error.
+- **New `run.json` field `engine_planes`** in each judged run's record, beside
+  `group_search`: the report's `planes` object of the run's kept routing pass, as
+  fastroute wrote it, with `connected_pads` given as `connected_pad_count`. The key
+  `planes` (the variant's plane nets) is unchanged.
+- **New field `search.winner.engine_planes`**: the same, with the open and starved pad
+  lists given as `open_pad_count` and `starved_pad_count` too. Absent when the winner's
+  pass reported no `planes` (the pours-omitted variant, or no zones file).
+- **`pours.false_connected` and `pours.false_open` are filled** for a judged run whose
+  pass reported `planes` with no error: the pads the engine called connected that KiCad's
+  first refill (before any stitching round) does not, and the pads the engine left open
+  that KiCad connects. KiCad's side is the layout audit's grouping over the saved fills,
+  read with the engine's rule: a pad is connected only when its copper group holds more
+  than half its net's pads, so a tie leaves every pad of the net open (check 3.3 keeps
+  its own main group). `null` for the pours-omitted variant, for a Tune candidate's
+  board, when the engine reports an error (its text is then in `pours_error`), and when
+  KiCad counts 0 unconnected items on the modelled nets while the grouping finds a pad
+  open.
+  For a winner whose pruned session was delivered, these two are the comparison of the router's own session, which the engine modelled; the pruned session was never modelled.
+- **`pours_error` may now sit beside `pours`**: when the comparison could not be made
+  (a pad that cannot be named, a `planes` object that does not read), the ZR0 measures
+  stay, both counts are `null`, and `pours_error` gives the reason. A failed comparison
+  never fails the judged run.
+
 ## Unreleased: the smart-router switches with fastroute (Row GS)
 
 `route_specctra_dsn` (fastroute) routes every Full, Fallback and Polish pass with

@@ -670,6 +670,21 @@ fn stitching_vias(m: &Model, refs: &RefMap, probe: &mut impl Probe) -> anyhow::R
 /// A pad's label (`REF.number`) and UUID.
 type PadRef = (String, Option<String>);
 
+/// The pads of `net` by copper group ([`routing::pad_groups`]), the main group first:
+/// most pads, a tie to the lower group id. Each group keeps the net's pad order. The
+/// grouping check 3.3 reports, and Row ZR's judge reads (`zone_fill::kicad_open_pads`).
+pub(super) fn ranked_pad_groups(m: &Model, net: &str) -> Vec<Vec<super::PadIx>> {
+    let pad_list = m.pads.get(net).cloned().unwrap_or_default();
+    let exact = routing::pad_groups(m, net);
+    let mut by_group: HashMap<usize, Vec<super::PadIx>> = HashMap::new();
+    for (&pi, &grp) in pad_list.iter().zip(&exact) {
+        by_group.entry(grp).or_default().push(pi);
+    }
+    let mut parts: Vec<(usize, Vec<super::PadIx>)> = by_group.into_iter().collect();
+    parts.sort_by_key(|(grp, pads)| (std::cmp::Reverse(pads.len()), *grp));
+    parts.into_iter().map(|(_, pads)| pads).collect()
+}
+
 fn ground_connectivity(m: &Model) -> CheckOut {
     let id = "3.3";
     let name = "ground_pours_connected";
@@ -711,15 +726,18 @@ fn ground_connectivity(m: &Model) -> CheckOut {
         // Pad groups come from the real shapes (a pad 0.15 mm short of its copper is cut off,
         // as for KiCad); the raster only tells which of its copper is anchored to a pad.
         let pad_list = m.pads.get(net).cloned().unwrap_or_default();
-        let exact = routing::pad_groups(m, net);
-        let mut with_pad: HashMap<usize, Vec<PadRef>> = HashMap::new();
-        for (&pi, &grp) in pad_list.iter().zip(&exact) {
-            let (fp, pad) = m.pad(pi);
-            with_pad
-                .entry(grp)
-                .or_default()
-                .push((format!("{}.{}", m.fp_ref(fp), pad.number), pad.uuid.clone()));
-        }
+        let ranked: Vec<Vec<PadRef>> = ranked_pad_groups(m, net)
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|pi| {
+                        let (fp, pad) = m.pad(pi);
+                        (format!("{}.{}", m.fp_ref(fp), pad.number), pad.uuid.clone())
+                    })
+                    .collect()
+            })
+            .collect();
         let mut anchored: BTreeSet<u32> = BTreeSet::new();
         let mut unplaced = 0usize;
         for &pi in &pad_list {
@@ -755,8 +773,8 @@ fn ground_connectivity(m: &Model) -> CheckOut {
             .collect();
         floating.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let net_pads: usize = pad_list.len();
-        let main = with_pad.values().map(Vec::len).max().unwrap_or(0);
-        let groups = with_pad.len();
+        let main = ranked.first().map_or(0, Vec::len);
+        let groups = ranked.len();
         pads_total += net_pads;
         pads_main += main;
         islands += floating.len();
@@ -772,9 +790,7 @@ fn ground_connectivity(m: &Model) -> CheckOut {
             "grid_step_mm": r3(g.step),
         }));
         if groups > 1 {
-            let mut parts: Vec<(&usize, &Vec<PadRef>)> = with_pad.iter().collect();
-            parts.sort_by_key(|p| (std::cmp::Reverse(p.1.len()), *p.0));
-            let minor_pads: Vec<&PadRef> = parts.iter().skip(1).flat_map(|p| p.1.iter()).collect();
+            let minor_pads: Vec<&PadRef> = ranked.iter().skip(1).flatten().collect();
             let minor: Vec<String> = minor_pads.iter().map(|p| p.0.clone()).take(8).collect();
             out.findings.push(Finding {
                 severity: "error",

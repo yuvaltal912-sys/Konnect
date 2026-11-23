@@ -1363,6 +1363,7 @@ fn run_record(index: usize, judged: Judged) -> crate::route_search::RunRecord {
                 untuned: None,
                 tune: Default::default(),
                 group_search: None,
+                planes: None,
             },
             planes: vec![],
             folder: PathBuf::from(format!("/nowhere/run-{index}")),
@@ -1443,6 +1444,61 @@ fn a_pruned_winner_that_would_not_rank_first_replaces_nothing() {
         .collect();
     assert_eq!(outcome.keys, again);
     assert_ne!(outcome.keys, keys);
+}
+
+/// Row ZR, ZR1: a kept prune keeps the original run's pad comparison (the pruned judge
+/// makes none), as it keeps its Tune choice; the pruned board's own pour measures stay.
+/// Control: the carry left out, the counts read `None`.
+#[test]
+fn a_pruned_winner_keeps_the_runs_pad_comparison() {
+    let pours = |pieces, false_connected, false_open| crate::zone_fill::PourMeasures {
+        open_before_stitching: 0,
+        open_after_stitching: 0,
+        pieces,
+        largest_piece_share: Some(1.0),
+        unfilled: 0,
+        starved_thermals: 0,
+        false_connected,
+        false_open,
+    };
+    let mut outcome = two_runs();
+    {
+        let original = outcome.runs[0].judged.as_mut().unwrap();
+        original.measures.pours = Some(pours(3, Some(1), Some(2)));
+    }
+    let mut pruned = judged_at(95.0);
+    pruned.measures.pours = Some(pours(2, None, None));
+    replace_winner(
+        &mut outcome,
+        0,
+        PathBuf::from("/nowhere/run-0/pruned.ses"),
+        pruned,
+    )
+    .unwrap();
+    let measures = &outcome.runs[0].judged.as_ref().unwrap().measures;
+    let taken = measures.pours.as_ref().unwrap();
+    assert_eq!(
+        (taken.false_connected, taken.false_open),
+        (Some(1), Some(2))
+    );
+    assert_eq!(taken.pieces, 2, "the pruned board's own fill");
+    assert_eq!(measures.pours_error, None);
+
+    // A comparison that failed on the run keeps its reason.
+    let mut outcome = two_runs();
+    {
+        let original = outcome.runs[0].judged.as_mut().unwrap();
+        original.measures.pours = Some(pours(3, None, None));
+        original.measures.pours_error = Some("KiCad's open pads could not be read".into());
+    }
+    let mut pruned = judged_at(95.0);
+    pruned.measures.pours = Some(pours(2, None, None));
+    replace_winner(&mut outcome, 0, PathBuf::from("/p.ses"), pruned).unwrap();
+    let measures = &outcome.runs[0].judged.as_ref().unwrap().measures;
+    assert_eq!(
+        measures.pours_error.as_deref(),
+        Some("KiCad's open pads could not be read")
+    );
 }
 
 // --- review S3 (builder B)

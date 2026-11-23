@@ -622,7 +622,7 @@ fn the_setup_names_the_default_place_the_three_ways_and_the_alternative() {
         "routing.fastroute_path",
         "engine: \\\"freerouting\\\"",
         "Nothing is downloaded",
-        "C** + BR1 + W8P + GS",
+        "C** + BR1 + W8P + GS + ZR1",
     ] {
         assert!(text.contains(needle), "{needle} is missing from {text}");
     }
@@ -862,6 +862,7 @@ fn routed(root: &Path, index: usize, shape: Shape, seed: u64, planes: &[&str]) -
             untuned: None,
             tune: Default::default(),
             group_search: None,
+            planes: None,
         },
         planes: planes.iter().map(|net| net.to_string()).collect(),
         folder,
@@ -1281,6 +1282,73 @@ fn every_judged_runs_record_keeps_its_group_search_summary() {
     assert!(!text.contains("group_search"), "{text}");
 }
 
+/// Row ZR, ZR1: a `planes` object as fastroute writes it into its report.
+fn planes_object() -> Value {
+    json!({
+        "version": 1, "error": null, "cell_mm": 0.05, "nets": ["GND"],
+        "connected_pads": ["R1-2", "R2-1"], "open_pads": ["R3-1"], "starved_pads": [],
+        "pieces": 2, "closing_routed": 0, "redraws": 1, "redraw_s": 0.25
+    })
+}
+
+/// Row ZR, ZR1: the engine's `planes` take the path of `group_search`: in a judged
+/// run's `run.json` as `engine_planes` (the connected list as its count, the open list
+/// kept), beside the variant's own `planes` key, and in `search.winner` with every pad
+/// list as a count. Control: no object, no key.
+#[test]
+fn the_engine_planes_are_kept_beside_the_group_search() {
+    let mut search = finished_search();
+    for position in [0, 1] {
+        search.outcome.runs[position]
+            .routed
+            .as_mut()
+            .unwrap()
+            .held
+            .planes = Some(planes_object());
+    }
+    let winner = winner_json(&search.outcome).unwrap();
+    assert_eq!(winner["engine_planes"]["connected_pad_count"], 2);
+    assert_eq!(winner["engine_planes"]["open_pad_count"], 1);
+    assert!(winner["engine_planes"].get("open_pads").is_none());
+    assert_eq!(winner["engine_planes"]["redraw_s"], 0.25);
+    reduce_run_folders(&search.folder, &search.outcome).unwrap();
+    let record = |index: usize, shape: Shape, seed: u64| -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(
+                search
+                    .folder
+                    .join(run_folder_name(index, shape, seed))
+                    .join("run.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let loser = record(1, Shape::Omitted, 1);
+    assert_eq!(loser["engine_planes"]["open_pads"], json!(["R3-1"]));
+    assert_eq!(loser["engine_planes"]["connected_pad_count"], 2);
+    assert!(loser["engine_planes"].get("connected_pads").is_none());
+    assert!(
+        loser["planes"].is_array(),
+        "the variant's plane nets stay: {loser}"
+    );
+    // Control: without the object neither place has the key.
+    let plain = finished_search();
+    assert!(winner_json(&plain.outcome)
+        .unwrap()
+        .get("engine_planes")
+        .is_none());
+    reduce_run_folders(&plain.folder, &plain.outcome).unwrap();
+    let text = std::fs::read_to_string(
+        plain
+            .folder
+            .join(run_folder_name(1, Shape::Omitted, 1))
+            .join("run.json"),
+    )
+    .unwrap();
+    assert!(!text.contains("engine_planes"), "{text}");
+}
+
 #[test]
 fn only_what_the_search_made_is_removed() {
     let search = finished_search();
@@ -1449,7 +1517,7 @@ fn the_result_has_every_documented_key() {
     // The engine.
     let engine = &result["engine"];
     assert_eq!(engine["name"], "fastroute");
-    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS");
+    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS + ZR1");
     assert_eq!(engine["path"], "/x/fastroute");
     assert_eq!(engine["sha256"], "ab".repeat(32));
     assert_eq!(engine["version"], "fastroute 0.1.14");
@@ -1914,7 +1982,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS, build x19);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS + ZR1, build x20);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a
@@ -2905,6 +2973,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         root: judge_root.clone(),
         kicad_config_home: None,
         lengths: None,
+        pad_names: None,
     };
     let runner = FastrouteRunner {
         binary: fake_binary(&search.root),
@@ -2912,6 +2981,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         hints: RoutingHints::default(),
         amps: None,
         uncounted: None,
+        zones: None,
         pairs: None,
         routing_heights: None,
         tune: None,
@@ -3552,6 +3622,79 @@ fn the_session_the_call_writes_is_the_chosen_boards() {
             "{chosen:?}"
         );
     }
+}
+
+/// Row ZR, ZR1: the call's zone plan on the repository's pour fixture: `zones.txt` in
+/// the call's folder, the judge given the plan's pad names, and `pours` naming the file.
+/// Controls: a DSN whose planes do not match writes no file and gives the judge no
+/// names; a project file that exists and cannot be read is `pours.error`.
+#[test]
+fn the_zone_plan_writes_the_zones_file_only_when_it_models_a_pour() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("board.kicad_pcb");
+    std::fs::copy(fixtures.join("specctra_pours_routing.kicad_pcb"), &board).unwrap();
+    std::fs::copy(
+        fixtures.join("specctra_pours_routing.kicad_pro"),
+        board.with_extension("kicad_pro"),
+    )
+    .unwrap();
+    let dsn = std::fs::read_to_string(fixtures.join("specctra_pours_routing.dsn")).unwrap();
+    let manifest_text =
+        std::fs::read_to_string(fixtures.join("specctra_pours_routing.dsn.konnect.json")).unwrap();
+    let context = || JudgeContext {
+        board: board.clone(),
+        board_text: std::fs::read_to_string(&board).unwrap(),
+        manifest: serde_json::from_str(&manifest_text).unwrap(),
+        manifest_text: manifest_text.clone(),
+        kicad_cli: String::new(),
+        pour_nets: Default::default(),
+        power_nets: Default::default(),
+        floors_mm: Default::default(),
+        root: dir.path().join("judge"),
+        kicad_config_home: None,
+        lengths: None,
+        pad_names: None,
+    };
+    let folder = dir.path().join("call");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut judge = context();
+    let (zones, pours) = zone_plan_file(&folder, &mut judge, &dsn).unwrap();
+    let file = folder.join(crate::zone_fill::ZONES_FILE);
+    assert_eq!(zones.as_deref(), Some(file.as_path()));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.starts_with("zones 1\n"), "{text}");
+    assert_eq!(text.matches("\nzone ").count(), 2, "{text}");
+    assert!(
+        text.contains("edge_clearance_mm 0.3\n"),
+        "the project's value: {text}"
+    );
+    assert_eq!(pours["zones"].as_array().unwrap().len(), 2, "{pours}");
+    assert_eq!(pours["zones_file"], json!(file.display().to_string()));
+    assert!(judge.pad_names.is_some());
+    // Control: the DSN's planes taken out, nothing to model: no file, no names.
+    let (stripped, _) = crate::route_search::strip_planes(&dsn).unwrap();
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut judge = context();
+    let (zones, pours) = zone_plan_file(&other, &mut judge, &stripped).unwrap();
+    assert_eq!(zones, None);
+    assert!(!other.join(crate::zone_fill::ZONES_FILE).exists());
+    assert_eq!(pours["zones_file"], Value::Null);
+    assert_eq!(pours["legacy"].as_array().unwrap().len(), 2, "{pours}");
+    assert!(judge.pad_names.is_none());
+    // A project that exists and does not read: an error, no file.
+    std::fs::remove_file(board.with_extension("kicad_pro")).unwrap();
+    std::fs::create_dir(board.with_extension("kicad_pro")).unwrap();
+    let third = dir.path().join("third");
+    std::fs::create_dir_all(&third).unwrap();
+    let mut judge = context();
+    let (zones, pours) = zone_plan_file(&third, &mut judge, &dsn).unwrap();
+    assert_eq!(zones, None);
+    assert!(
+        pours["error"].as_str().unwrap().contains("kicad_pro"),
+        "{pours}"
+    );
 }
 
 // ─── Row ZR, ZR0b: the prune's record and folders ───────────────────────────

@@ -1103,6 +1103,7 @@ fn context() -> JudgeContext {
         root: PathBuf::from("/r"),
         kicad_config_home: None,
         lengths: None,
+        pad_names: None,
     }
 }
 
@@ -1592,6 +1593,7 @@ async fn judges_a_recorded_session_on_scratch_copies() {
             untuned: None,
             tune: Default::default(),
             group_search: None,
+            planes: None,
         },
         planes: vec![],
         folder: dir.path().to_path_buf(),
@@ -1692,6 +1694,7 @@ async fn prune_recorded_ground_vias(vias: &[(&str, &str)]) -> crate::pour_prune:
             untuned: None,
             tune: Default::default(),
             group_search: None,
+            planes: None,
         },
         planes: vec![],
         folder,
@@ -2490,6 +2493,7 @@ fn held_with_candidates(variants: &[crate::fastroute::TuneVariant]) -> crate::fa
             seconds: 4.0,
         },
         group_search: None,
+        planes: None,
     }
 }
 
@@ -2788,6 +2792,7 @@ exit 0
                 untuned: None,
                 tune: Default::default(),
                 group_search: None,
+                planes: None,
             },
             planes: planes.iter().map(|net| net.to_string()).collect(),
             folder: dir.path().to_path_buf(),
@@ -3459,6 +3464,71 @@ exit 0
             .unwrap()
             .get("pours")
             .is_none());
+    }
+
+    /// Row ZR, ZR1: with the engine's `planes` object on the kept pass, KiCad's side is
+    /// taken on the FIRST refilled board (its folder is gone once the stitching round
+    /// has run), and each pad the model called connected that KiCad's grouping leaves
+    /// out of a majority group is a false connection. Control: the fill joins both GND
+    /// pads, nothing is false.
+    #[tokio::test]
+    async fn the_judge_counts_a_false_connection_on_the_first_refilled_board() {
+        let judged_with_fill = |(x0, x1): (f64, f64)| async move {
+            // Call 1 is the baseline, 2 the routed board (GND open), 3 the stitched one.
+            let mut h = harness(
+                &["GND"],
+                drc_json(&["GND"], &[]),
+                &[(3, drc_json(&[], &[]))],
+            );
+            h.ctx.pad_names = Some(Arc::new(
+                crate::zone_fill::PadNames::from_board(&h.ctx.board_text).unwrap(),
+            ));
+            h.routed.held.planes = Some(json!({
+                "version": 1, "error": null, "nets": ["GND"],
+                "connected_pads": ["R1-2", "R2-1"], "open_pads": [], "starved_pads": [],
+                "pieces": 1, "closing_routed": 0, "redraws": 1, "redraw_s": 0.1
+            }));
+            // The routed board's refill: the top GND pour filled from x0 to x1 only. The
+            // stitched board's (call 3): filled over both GND pads, so a reading of the
+            // last board instead of the first would find nothing open.
+            let filled = |x0: f64, x1: f64| {
+                h.ctx.board_text.replacen(
+                    "(name \"GND_TOP\")",
+                    &format!("(name \"GND_TOP\") (filled_polygon (layer \"F.Cu\") (pts (xy {x0} 48) (xy {x1} 48) (xy {x1} 52) (xy {x0} 52)))"),
+                    1,
+                )
+            };
+            assert_ne!(
+                filled(x0, x1),
+                h.ctx.board_text,
+                "the fixture names GND_TOP"
+            );
+            std::fs::write(h.fake.join("board.2"), filled(x0, x1)).unwrap();
+            std::fs::write(h.fake.join("board.3"), filled(99.0, 111.0)).unwrap();
+            let base = baseline(&h.ctx).await.unwrap();
+            let tools = Scripted::new(&h, |_| one_via("GND"));
+            let judged = judge_with(&h.ctx, &h.routed, &base, &tools).await.unwrap();
+            // The stitching round ran, so the first board's folder is gone.
+            assert_eq!(h.rounds_left(), vec!["r1"]);
+            judged
+        };
+        // R2's GND pad only: one pad each, no group holds a majority, so KiCad's side
+        // leaves both open, and the model called both connected.
+        let judged = judged_with_fill((108.0, 111.0)).await;
+        assert_eq!(judged.measures.pours_error, None);
+        let pours = judged.measures.pours.as_ref().unwrap();
+        assert_eq!(
+            (pours.false_connected, pours.false_open),
+            (Some(2), Some(0))
+        );
+        // Control: both GND pads on the fill.
+        let judged = judged_with_fill((99.0, 111.0)).await;
+        assert_eq!(judged.measures.pours_error, None);
+        let pours = judged.measures.pours.as_ref().unwrap();
+        assert_eq!(
+            (pours.false_connected, pours.false_open),
+            (Some(0), Some(0))
+        );
     }
 
     #[tokio::test]

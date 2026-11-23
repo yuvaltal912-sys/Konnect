@@ -2030,3 +2030,58 @@ delivered one.
   (the via is the back pour's only link, and KiCad's `isolated_copper` count would rise); with
   two it removes one, with its stub, and keeps the other for the same reason. The numbers
   above are from the owner's boards, as counts.
+
+## ZR1 as built (2026-11-23)
+
+Stage ZR1 is built in two parts. The engine part is fastroute build **x20**: branch `zr1-fill-model`, commit `c13a28f`, which is x19's `gr` `b3ea917` plus the `planes/` model, the plane record, `--x.zones` and the report's `planes` object. Konnect pins it in `packaging/1-kopper/fastroute.json`. The Konnect part is `zone_fill.rs`'s zone plan, the zones file, and the judge's pad-by-pad comparison. ZR1 changes no routing, no gate and no rank key.
+
+### The engine
+
+- **The model is drawn once,** on the board as routed, after the last copper stage of the last pipeline run, and only with `--x.zones`. Nothing writes to the board. The report's `planes` object lists every pin of a modelled net as connected or open, and the starved thermal pins.
+- **Safe-side choices** beyond the text above, each so the model never calls a pin connected that KiCad leaves open:
+  1. **A strict majority.** A pin counts as connected only when its net's main group holds more than half the net's pins; otherwise every pin of that net is open. Being in the main group is not monotone in copper, and only a majority is sure to be KiCad's main group too. Konnect's side of the comparison uses the same rule.
+  2. **Other zones.** An other-net zone that may pour first knocks the zone out by its whole outline, grown by the larger of the two zones' clearances and the class clearance. A same-net zone with no `zone` line takes its outline out of a lower modelled zone.
+  3. **Keepouts.** Every DSN keepout, and every `keepout` line of the file, is grown by a cell.
+  4. **Holes.** A pad's hole is bounded by the pad itself. A via's drill is the larger of its padstack name's drill and the scaled one.
+  5. **Thermal pads.** Every thermal pad of the zone's net on the layer gets its gap knocked out, even one that only grazes the outline.
+  6. **Spokes.** A spoke is dropped when another net blocks any cell of it, when it only meets another spoke, or when its far end is off the opened fill.
+  7. **Teardrops.** A teardrop is measured from where the track leaves the pad, and continues as a disc where the track ends first.
+  8. **Islands.** `remove` clears every unattached piece.
+  9. **A size cap.** Cells times modelled zones are capped at 40 M, and a model past the cap is a build error in `planes.error`.
+- **Known limit:** an other-net zone with no `zone` line has no clearance the engine knows. Konnect raises each modelled zone's clearance to that of every other-net legacy zone on its layer instead.
+
+### Konnect
+
+- **`zone_plan`** reads the saved `.kicad_pro` and `.kicad_dru` beside the board.
+- **Each zone's clearance** is raised to the board's `min_clearance`, and to that of every other-net legacy zone on its layer.
+- **The pad lines** carry each pad's resolved connection, gap, bridge and angle (the angle modulo 90, relative to the pad).
+- **P4 refusals, added to those in "Principles":**
+  - a board-wide reason, making every pour legacy: a custom rule that sets a clearance, connection, spoke or `disallow` value; per-layer padstack values (a clearance on any net; connection or thermal on a pour net); `start_end_only` vias; a convex-hull custom pad of any net on a modelled layer; track-to-track teardrops; an unreadable project, teardrop or keepout value; DSN pin names that differ from the board's;
+  - a net's zones made legacy: a pad whose roundness the DSN and KiCad's filler disagree on, a pad that needs a line under two zones with different values, a pad that would need an empty name.
+- **The comparison** (`compare_pads`) is taken on the first refilled board, before any stitching round:
+  - KiCad's side is the layout audit's own grouping over the saved fills (`pads_off_main_group`, which check 3.3 now shares), with the same strict-majority rule.
+  - A failed side leaves both counts `None`, with its reason in `pours_error`.
+  - A Tune candidate's board is not compared.
+  - A pruned winner (ZR0b) keeps the router session's two counts: the engine modelled that session, never the pruned one.
+- **The probe** sends `--x.zones=<scratch>/probe-zones.txt`, a valid file with no `zone` line, so x19 is refused before any run.
+
+### The measurement (2026-11-23)
+
+One `route_specctra_dsn` call per board at effort M, with x20 and this branch's release build, each in its own routing hold, on the five boards of "The x19 baseline". Every as-exported judged run was compared.
+
+| Board | Runs compared | False connections | False opens (total, runs with any) | Model build, longest |
+|---|---|---|---|---|
+| dash | 6 | 0 | 10, 3 | 0.40 s |
+| B5 | 26 | 0 | 42, 25 | 0.34 s |
+| `pic` | 83 | 0 | 0, 0 | 0.84 s |
+| `ecc` | 721 | 0 | 0, 0 | 0.07 s |
+| `pours` | 709 | 0 | 0, 0 | 0.15 s |
+
+- **Zero false connections** in 1,545 compared runs, and no engine error or `pours_error`.
+- **False opens** are at most 2.2 % of the modelled pads (B5, 73 a run), under the 1 in 20 of "Verification plan".
+- **Sessions are byte-identical** with and without `--x.zones` on all five boards: x20 driven directly with a routing pass's switches and the call's own files, `--no-time-limits`. The reports differ only by `planes` and the run time.
+- **The winners** are pours omitted on all five boards, as in ZR0.
+- **Judged run counts:** dash 11, B5 51, `pic` 165, `ecc` 1,442, `pours` 1,417. `pic` is about 10 % below ZR0's 183 and Row GS's 185, which is the cost of drawing the model on every as-exported run there.
+- **The ground-via prune** (ZR0b): dash 41 checks in 85 s, B5 41 checks in 77 s. The other three boards have no via on a ground pour net.
+
+**Not verified:** a model drawn more than once per run (ZR2), and boards whose pads have no UUID (older than KiCad 7). On those the comparison is recorded as a `pours_error`, never as a count.
