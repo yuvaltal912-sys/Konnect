@@ -107,7 +107,7 @@ fn the_search_switches_are_s1_f1_and_the_group_search_in_this_order() {
     for switch in SEARCH_SWITCHES {
         assert!(!CANDIDATE_SWITCHES.contains(switch), "{switch}");
     }
-    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS + ZR1");
+    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS + ZR2");
 }
 
 /// Row GS, G1: Full, Fallback and Polish each send every search switch once, right

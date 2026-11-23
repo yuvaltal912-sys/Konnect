@@ -2097,3 +2097,44 @@ One `route_specctra_dsn` call per board at effort M, with x20 and this branch's 
 - **The ground-via prune** (ZR0b): dash 41 checks in 85 s, B5 41 checks in 77 s. The other three boards have no via on a ground pour net.
 
 **Not verified:** a model drawn more than once per run (ZR2), and boards whose pads have no UUID (older than KiCad 7). On those the comparison is recorded as a `pours_error`, never as a count.
+
+## ZR2 as built (2026-11-23)
+
+Stage ZR2 is engine work: fastroute build **x21**, branch `zr2-truth`, commit `20d7c96` (the branch's head `be366d8` adds one doc comment after it). That is x20's `c13a28f` plus the model as the routing's connectivity, the landing points, the closing stage and the redraw points. Konnect pins the measured binary (SHA-256 `46d79d56`) in `packaging/1-kopper/fastroute.json`. fastroute's release builds are not byte-reproducible (a rebuild of the same source gave another hash), so the pinned file is that binary, kept with the records and in the owner's iCloud. Konnect also renames the candidate `C** + BR1 + W8P + GS + ZR2`, and cuts the closings' open-pad lists to counts in the result. Konnect sends nothing new: `--x.zones` turns ZR2 on as it turned ZR1 on. The gates and the rank key do not change.
+
+### The engine
+
+- **The model is the truth for a modelled net.** `connected_set` of such a net is the model's group. Two pads join through a pour only where the model's piece holds both. Contacts with a modelled plane need the item on the zone's fill, so the cycle rules through a plane are piece-aware.
+- **Landing points.** The maze takes a target door on a modelled pour only at a landing point. That is a cell whose disc lies under the fill, centred on live fill, nearest to where the route enters. The locator places the track end there, nearest to the next via or door. The via optimizer moves a plane via only onto live fill.
+- **The closing stage.** It runs after the routing passes, after the optimizer, and after the last stage when a redraw finds work. Each round routes every stranded group to its net's main group, with rip-up. It adds a spoke track for each starved thermal, per zone it is starved on. A connection is kept only when the group then joins the main group, no violation is added, and its own net's open count goes down. A round that does not lower the open count ends the stage. Each closing ends with a redraw.
+- **Redraws.** The model is drawn again at the top of every autorouter and optimizer pass, on every swap to a saved board, at checkpoints, in the closings, and after each group-search member (Z15). It is drawn only when the copper changed. A two-slot cache reuses a model drawn before for the same copper.
+- **The main group, two readings.** The router's main group (`NetGroups::main`) is usually the group with the most pins. There are two exceptions. A net with nothing on its pours takes the largest piece as a pin-less main group. Where the most-pins group holds no pour cell while another group does, the main group is the group holding the largest piece, so the pour stays live once one pad has landed on it. The report's pad split keeps ZR1's rule: the most pins, with a strict majority. So the closing's `left_open`, which is the router's view, can list a pad that the split calls connected.
+- **Islands.** A zone whose every piece is an island keeps them, as KiCad does: a pour that only vias will reach is not wiped.
+- **Fanout.** `--x.zones` with the fanout on is refused. Konnect's passes send it off.
+
+### The measurement (2026-11-23)
+
+One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's release build of Konnect (`808c260d`: this branch's only Konnect change, the cut of `left_open` in the result, is covered by its unit test, not by this measurement), each in its own routing hold with a hard timeout. The boards are those of "The x19 baseline". Every as-exported judged run was compared.
+
+| Board | As-exported runs | Runs with KiCad open 0 on the pour nets before stitching | Runs with a stitching via | G1 passing, runs (ZR0 → ZR2) | G2 passing, runs (ZR0 → ZR2) | False connections, false opens |
+|---|---|---|---|---|---|---|
+| dash | 1 | 1 | 0 | 0/7 → 1/1 | 7/7 → 1/1 | 0, 0 |
+| B5 | 6 | 6 | 0 | 0/28 → 6/6 | 7/28 → 6/6 | 0, 0 |
+| `pic` | 37 | 37 | 0 | 1/92 → 25/37 | 0/92 → 35/37 | 0, 0 |
+| `ecc` | 663 | 663 | 0 | 710/710 → 663/663 | 710/710 → 663/663 | 0, 0 |
+| `pours` | 675 | 673 | 0 | 575/707 → 673/675 | 537/707 → 572/675 | 0, 0 |
+
+- **G1 and G2** are the judge's gates: G1, KiCad counts every net complete after the refill and the stitching; G2, DRC is clean. They cover every net, not only the pour nets, so a `pic` run can be open 0 on its pour and still fail G1 on a signal net. ZR0 and ZR2 judged different numbers of runs, so compare the shares, not the counts.
+- **The done criterion holds on every board.** KiCad's open count on the pour nets before stitching is 0, with no stitching via, on at least 9 of 10 as-exported runs. The lowest share is `pours`, 673 of 675. On its other 2 runs the stitching planner refused, as in ZR0 ("saved project required"), so no via was placed and those 2 fail G1. The G1 and G2 pass shares are not below ZR0's on any board.
+- **Zero false connections and zero false opens** in 1,382 compared runs. ZR1 had 52 false opens on the owner's two boards. No engine error and no `pours_error`.
+- **The winners:** B5 and `pic` are now as exported, with their pours as planes. dash, `ecc` and `pours` are still pours omitted. In ZR0 and ZR1 every winner was pours omitted.
+- **Fewer runs are judged** in a call of about the same length: dash 3, B5 16, `pic` 73, `ecc` 1,325, `pours` 1,349 (ZR1: 11, 51, 165, 1,442, 1,417). An as-exported run now routes the closings and draws the model many times.
+- **Model draws:** the longest was 0.34 s (`pic`). The median was at most 0.074 s.
+- **Sessions are byte-identical to x20's without `--x.zones`** on all five boards (x20 and x21 driven directly with a routing pass's switches and the call's own files, `--no-time-limits`).
+
+### Limits
+
+- **The closing's partial-group path has no board test.** A stranded group is joined only in part when a rip splits it mid-round. The helper that picks what is left (`still_to_route`) is tested on its own.
+- **The last redraw of a group-search move** has no control that bites (C10). The member's own tail removal already runs before it.
+- **No windowed redraw.** A redraw reuses the fixed layers and draws the rest in full.
+- **A unit-level difference from KiCad:** the model decides islands per plane, KiCad per zone across its layers. Both err on the safe side for connections.

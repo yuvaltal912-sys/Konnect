@@ -345,6 +345,15 @@ fn a_piece_saved_as_an_island_is_flagged_in_the_board_read() {
             ..row("GND", "B.Cu", 2, 100.0, 104.0)
         }]
     );
+    // KiCad also reads `true` and `false` (`parseMaybeAbsentBool`).
+    let text = format!(
+        "(kicad_pcb (net 0 \"\") (net 1 \"GND\") (zone (net \"GND\") (layer \"B.Cu\") (uuid \"z1\") {} {}))",
+        piece(0.0, 10.0, " (island true)"),
+        piece(20.0, 3.0, " (island false)"),
+    );
+    let fills = pour_fills(&text, &gnd).unwrap();
+    assert_eq!(fills[0].pieces_mm2, vec![100.0, 9.0]);
+    assert_eq!(fills[0].islands, vec![true, false]);
 }
 
 #[test]
