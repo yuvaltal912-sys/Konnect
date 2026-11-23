@@ -73,7 +73,7 @@ pub(crate) struct PourMeasures {
     /// modelled.
     pub false_open: Option<usize>,
     /// Row ZR, ZR5 part 1: what the routing did to the pours against the judge's baseline
-    /// (`pour_damage::pour_damage`), when the baseline has its fill rows. Recorded only.
+    /// (`pour_damage::pour_damage`), when the baseline has its fill rows. The pour key reads it when `routing.rank_key` is `pours`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damage: Option<crate::pour_damage::PourDamage>,
 }

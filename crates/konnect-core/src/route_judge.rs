@@ -87,7 +87,8 @@ pub(crate) struct Baseline {
     pub unconnected: usize,
     /// Row ZR, ZR5 part 1: the pour nets' layer fills of the refilled baseline board
     /// (`pour_damage::layer_fills`), when the call has pour nets and they could be read:
-    /// the "before" of every run's `pours.damage`. Recorded only.
+    /// the "before" of every run's `pours.damage`, which the pour key reads when
+    /// `routing.rank_key` is `pours` (ZR5 part 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pour_fills: Option<Vec<crate::pour_damage::LayerFill>>,
     /// Row ZR, ZR5 part 1: why `pour_fills` could not be read. Never fails the baseline.
@@ -643,11 +644,13 @@ pub(crate) struct Measures {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lengths: Option<crate::length_probe::LengthMeasures>,
     /// Row ZR, ZR0: the pours of the run (`zone_fill::pour_measures`), when the call
-    /// has pour nets. Recorded only: no gate and no rank-key position reads it (Z10).
+    /// has pour nets. No gate and no position of today's rank key reads it (Z10); the
+    /// pour key (`pour_rank::pour_keys`, ZR5 part 2) reads it, and it ranks only when
+    /// `routing.rank_key` is `pours`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pours: Option<crate::zone_fill::PourMeasures>,
     /// Row ZR, ZR0: why the pours could not be measured, when they could not. A
-    /// failed pour measure never fails the judged run: it is recorded only.
+    /// failed pour measure never fails the judged run; in the pour key it sorts last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pours_error: Option<String>,
 }

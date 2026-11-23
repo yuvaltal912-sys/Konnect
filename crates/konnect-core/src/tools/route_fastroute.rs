@@ -177,7 +177,8 @@ pub(crate) fn route_engine(args: &Value) -> std::result::Result<Engine, CallTool
 }
 
 /// The user config values this engine reads: `routing.effort` and
-/// `routing.fastroute_path`, from the user config file `get_effective_config` and
+/// `routing.fastroute_path` (and `routing.rank_key`, read apart by [`call_rank_at`] on
+/// every call of the route tool), from the user config file `get_effective_config` and
 /// `save_user_config` use (`tools::config`). A missing file or key is `None`; a file
 /// that does not parse is an error (the call is refused, as `load_user_config`
 /// refuses it).
@@ -187,35 +188,8 @@ pub(crate) fn user_routing_config() -> Result<(Option<Value>, Option<PathBuf>)> 
 
 /// [`user_routing_config`] for the config file at `path`.
 fn routing_config_at(path: &Path) -> Result<(Option<Value>, Option<PathBuf>)> {
-    routing_settings_at(path).map(|settings| (settings.effort, settings.fastroute_path))
-}
-
-/// The user config's routing settings, as the routing calls read them.
-#[derive(Debug, Default, PartialEq)]
-struct RoutingSettings {
-    effort: Option<Value>,
-    fastroute_path: Option<PathBuf>,
-    /// Row ZR, ZR5 part 2 (PK9): `routing.rank_key` as written; `pour_rank::
-    /// resolve_rank_mode` judges it.
-    rank_key: Option<Value>,
-}
-
-/// The routing settings of the config file at `path`: a missing file or key is `None`;
-/// a file that does not parse, a `routing` that is not an object or a
-/// `routing.fastroute_path` that is not a non-empty string is an error.
-fn routing_settings_at(path: &Path) -> Result<RoutingSettings> {
-    let object = crate::tools::config::read_user_config_object(path)
-        .map_err(|reason| anyhow::anyhow!("the user config at {} {reason}", path.display()))?;
-    let Some(object) = object else {
-        return Ok(RoutingSettings::default());
-    };
-    let routing = match &object["routing"] {
-        Value::Null => return Ok(RoutingSettings::default()),
-        Value::Object(routing) => routing,
-        _ => anyhow::bail!(
-            "the user config at {}: `routing` must be an object",
-            path.display()
-        ),
+    let Some(routing) = routing_object_at(path)? else {
+        return Ok((None, None));
     };
     let effort = routing
         .get("effort")
@@ -229,35 +203,57 @@ fn routing_settings_at(path: &Path) -> Result<RoutingSettings> {
             path.display()
         ),
     };
-    let rank_key = routing
-        .get("rank_key")
-        .filter(|value| !value.is_null())
-        .cloned();
-    Ok(RoutingSettings {
-        effort,
-        fastroute_path,
-        rank_key,
-    })
+    Ok((effort, fastroute_path))
+}
+
+/// The `routing` object of the config file at `path`: `None` for a missing file or key
+/// (or a JSON null); an error for a file that does not parse or a `routing` that is not
+/// an object. What each key holds is judged by the reader that reads it.
+fn routing_object_at(path: &Path) -> Result<Option<serde_json::Map<String, Value>>> {
+    let object = crate::tools::config::read_user_config_object(path)
+        .map_err(|reason| anyhow::anyhow!("the user config at {} {reason}", path.display()))?;
+    let Some(mut object) = object else {
+        return Ok(None);
+    };
+    match object["routing"].take() {
+        Value::Null => Ok(None),
+        Value::Object(routing) => Ok(Some(routing)),
+        _ => anyhow::bail!(
+            "the user config at {}: `routing` must be an object",
+            path.display()
+        ),
+    }
+}
+
+/// Row ZR, ZR5 part 2 (PK9): `routing.rank_key` of the config file at `path`, as
+/// written (`None` when it is missing or null); [`routing_object_at`]'s errors only. A
+/// bad value of another key (`routing.fastroute_path`, say) is not this reader's: it
+/// refuses only the calls that read that key.
+fn rank_key_at(path: &Path) -> Result<Option<Value>> {
+    Ok(routing_object_at(path)?
+        .and_then(|mut routing| routing.remove("rank_key"))
+        .filter(|value| !value.is_null()))
 }
 
 /// Row ZR, ZR5 part 2 (PK9, PK13): the mode of a routing call and where it came from.
 /// `Fixed(mode)` is that mode and reads nothing. `UserConfig` reads the config file at
 /// `path` (the route tool passes the user config), whatever the call's arguments: a file
-/// that cannot be used, or a `routing.rank_key` that names no mode, is the call's
-/// refusal (`invalid_configuration`), and nothing is guessed.
+/// that does not parse, a `routing` that is not an object, or a `routing.rank_key` that
+/// names no mode, is the call's refusal (`invalid_configuration`, naming `path`), and
+/// nothing is guessed. A bad value of another key does not refuse here ([`rank_key_at`]).
 pub(crate) fn call_rank_at(
     choice: RankChoice,
     path: &Path,
 ) -> std::result::Result<(RankMode, RankSource), CallToolResult> {
     let config = match choice {
         RankChoice::Fixed(mode) => return Ok((mode, RankSource::Fixed)),
-        RankChoice::UserConfig => match routing_settings_at(path) {
-            Ok(settings) => settings.rank_key,
-            Err(error) => return Err(config_refusal(&error)),
+        RankChoice::UserConfig => match rank_key_at(path) {
+            Ok(rank_key) => rank_key,
+            Err(error) => return Err(config_refusal_at(&error, path)),
         },
     };
     crate::pour_rank::resolve_rank_mode(config.as_ref())
-        .map_err(|message| config_refusal(&anyhow::anyhow!("{message}")))
+        .map_err(|message| config_refusal_at(&anyhow::anyhow!("{message}"), path))
 }
 
 /// What to do when no fastroute binary can be used: where the default place is, the
@@ -323,12 +319,15 @@ pub(crate) struct Call {
 
 /// The refusal for a user config that cannot be read for routing.
 fn config_refusal(error: &anyhow::Error) -> CallToolResult {
+    config_refusal_at(error, &crate::tools::config::user_config_path())
+}
+
+/// [`config_refusal`] for the config file at `path`, the one that was read.
+fn config_refusal_at(error: &anyhow::Error, path: &Path) -> CallToolResult {
     let reason = format!("{error:#}");
     CallToolResult::error_kind(
         ToolErrorKind::InvalidConfiguration {
-            path: crate::tools::config::user_config_path()
-                .display()
-                .to_string(),
+            path: path.display().to_string(),
             reason: reason.clone(),
         },
         format!(
@@ -484,21 +483,34 @@ pub(crate) async fn route_with_fastroute(
     prune: PourPrune,
     rank: RankChoice,
 ) -> Result<CallToolResult> {
-    let rank = match call_rank_at(rank, &crate::tools::config::user_config_path()) {
-        Ok(rank) => rank,
-        Err(refusal) => return Ok(refusal),
-    };
-    let mut call = match prepare_call(args)? {
+    let call = match prepare_ranked_call(args, rank, &crate::tools::config::user_config_path())? {
         Ok(call) => call,
         Err(refusal) => return Ok(refusal),
     };
-    call.rank = rank;
     let located = match locate_binary(args, &call).await {
         Ok(Ok(located)) => located,
         Ok(Err(refusal)) => return finish(&call.folder, Ok(refusal)),
         Err(error) => return finish(&call.folder, Err(error)),
     };
     route_located(args, ctx, call, located, prune).await
+}
+
+/// Row ZR, ZR5 part 2: the call's mode ([`call_rank_at`] of the config file at
+/// `config`), then [`prepare_call`], and the call given that mode. A refusal of the mode
+/// comes first, before the search folder is made.
+pub(crate) fn prepare_ranked_call(
+    args: &Value,
+    rank: RankChoice,
+    config: &Path,
+) -> Result<std::result::Result<Call, CallToolResult>> {
+    let rank = match call_rank_at(rank, config) {
+        Ok(rank) => rank,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    Ok(prepare_call(args)?.map(|mut call| {
+        call.rank = rank;
+        call
+    }))
 }
 
 /// Step 3: where the binary is, and whether it is the candidate build. The

@@ -4073,17 +4073,101 @@ fn a_rank_key_that_names_no_mode_or_a_broken_config_refuses_the_call() {
         for word in ["routing.rank_key", "routing or pours"] {
             assert!(said.contains(word), "{text}: {said}");
         }
+        // The refusal names the file that was read.
+        assert_eq!(
+            body(&refused)["error"]["path"],
+            json!(path.display().to_string()),
+            "{text}"
+        );
     }
-    for text in [
-        "{not json",
-        r#"{"routing": "fast"}"#,
-        r#"{"routing": {"fastroute_path": 7}}"#,
-    ] {
+    for text in ["{not json", r#"{"routing": "fast"}"#] {
         let (_dir, path) = config_file(Some(text));
         let refused = call_rank_at(RankChoice::UserConfig, &path).expect_err(text);
         assert_eq!(kind(&refused), "invalid_configuration", "{text}");
         assert!(message(&refused).contains("routed nothing"), "{text}");
+        assert_eq!(
+            body(&refused)["error"]["path"],
+            json!(path.display().to_string()),
+            "{text}"
+        );
     }
+}
+
+/// The rank read refuses only what keeps it from reading `routing.rank_key`: a bad
+/// value of another key refuses only the calls that read that key. A call that passes
+/// both `effort` and `fastroute_path` reads neither, and is not refused for them.
+/// Control: the rank read judging `routing.fastroute_path` too.
+#[test]
+fn a_bad_value_of_another_key_does_not_refuse_the_rank_read() {
+    for (text, mode, source) in [
+        (
+            r#"{"routing": {"fastroute_path": 7}}"#,
+            RankMode::Routing,
+            RankSource::Default,
+        ),
+        (
+            r#"{"routing": {"effort": "ludicrous", "fastroute_path": "", "rank_key": "pours"}}"#,
+            RankMode::Pours,
+            RankSource::UserConfig,
+        ),
+    ] {
+        let (_dir, path) = config_file(Some(text));
+        assert_eq!(
+            call_rank_at(RankChoice::UserConfig, &path).unwrap(),
+            (mode, source),
+            "{text}"
+        );
+        let paths = Paths::new();
+        let mut args = paths.args();
+        args["effort"] = json!("m");
+        args["fastroute_path"] = json!("/x/fastroute");
+        let call = prepare_ranked_call(&args, RankChoice::UserConfig, &path)
+            .unwrap()
+            .expect("not refused for a key the call does not read");
+        assert_eq!(call.rank, (mode, source), "{text}");
+        // The readers of those keys still refuse them.
+        assert!(routing_config_at(&path).is_err(), "{text}");
+    }
+}
+
+/// The call carries the mode it was given (`route_with_fastroute` goes through
+/// `prepare_ranked_call`): `pours` in the config is the call's mode; a fixed mode reads
+/// nothing. Control: the mode not set on the call.
+#[test]
+fn a_ranked_call_carries_its_mode() {
+    let (_dir, pours) = config_file(Some(r#"{"routing": {"rank_key": "pours"}}"#));
+    let (_dir2, broken) = config_file(Some("{not json"));
+    for (choice, path, expected) in [
+        (
+            RankChoice::UserConfig,
+            &pours,
+            (RankMode::Pours, RankSource::UserConfig),
+        ),
+        (
+            RankChoice::Fixed(RankMode::Routing),
+            &pours,
+            (RankMode::Routing, RankSource::Fixed),
+        ),
+        (
+            RankChoice::Fixed(RankMode::Pours),
+            &broken,
+            (RankMode::Pours, RankSource::Fixed),
+        ),
+    ] {
+        let paths = Paths::new();
+        let call = prepare_ranked_call(&paths.args(), choice, path)
+            .unwrap()
+            .expect("good arguments");
+        assert_eq!(call.rank, expected, "{choice:?}");
+    }
+    // A refused mode makes no search folder.
+    let paths = Paths::new();
+    let refused = prepare_ranked_call(&paths.args(), RankChoice::UserConfig, &broken)
+        .unwrap()
+        .err()
+        .expect("refused");
+    assert_eq!(kind(&refused), "invalid_configuration");
+    paths.assert_untouched();
 }
 
 /// PK13: a fixed mode reads nothing, so even a config that cannot be used does not
@@ -4111,8 +4195,10 @@ fn a_fixed_mode_reads_no_config_and_placement_fixes_todays_key() {
 
 /// PK11: the engine's input does not depend on the mode. The same call, once under each
 /// mode, through its real path (`route_located`) with a fastroute that fails every pass:
-/// both write the same `uncounted.txt` (the pour net), and the mode reaches the judge's
-/// context. Control: the uncounted file emptied under `pours`.
+/// both write the same `uncounted.txt` (the pour net), and the no-winner result's
+/// `search.rank` names the call's mode. Controls: the uncounted file emptied under
+/// `pours`; the call's mode not given to the judge context (the search then ranks by
+/// another mode than the report names, which a debug assertion stops).
 #[cfg(unix)]
 #[tokio::test]
 async fn the_engine_gets_the_same_uncounted_file_under_both_modes() {
@@ -4183,6 +4269,12 @@ async fn the_engine_gets_the_same_uncounted_file_under_both_modes() {
             .await
             .unwrap();
         assert!(result.is_error, "every pass fails: {mode:?}");
+        assert_eq!(
+            body(&result)["search"]["rank"]["ranked_by"],
+            json!(mode.name()),
+            "{}",
+            message(&result)
+        );
         let kept = root.join("out.search.failed-1");
         let uncounted = std::fs::read_to_string(kept.join("uncounted.txt"))
             .unwrap_or_else(|error| panic!("{mode:?}: {error}: {}", message(&result)));
