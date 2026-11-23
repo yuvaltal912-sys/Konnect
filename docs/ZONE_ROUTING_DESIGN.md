@@ -287,6 +287,9 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 
 ZR4 touches no engine file and may run beside ZR1 to ZR3.
 
+ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23): a
+second key beside today's, off until the owner's word.
+
 ## Decisions taken in this design (with the reason)
 
 | # | Decision | Reason |
@@ -319,7 +322,9 @@ ZR4 touches no engine file and may run beside ZR1 to ZR3.
 4. **Ground on both sides of a 2-layer board?** Recommended: yes, bottom as the main plane and
    top as fill. Both are in the checklist's spirit; the model handles the top fill's islands.
 5. **When the skill stops saying "pours last".** Recommended: only after ZR2's table shows the
-   as-exported shape at 0 open before stitching.
+   as-exported shape at 0 open before stitching. The text of the change is in
+   [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), "The skill's order of work"; it is applied on
+   his word.
 
 ## Modules
 
@@ -1669,6 +1674,10 @@ Still free, as today:
   sends no zones file.
 
 When ZR5 adds pour terms to the key, the uncounted set follows the key and shrinks.
+
+**ZR5's design (2026-11-23) leaves the uncounted set as it is**
+([POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), PK11). The pour track enters the pour key as a
+tie-break only, and one engine input keeps the two keys comparable on the same runs.
 
 **The optimizer.** F1's `follow_rips` and the optimizer's own comparison read the same per-net
 counts, from the snapshot drawn before the optimizer pass. A candidate that cuts a pour reads
