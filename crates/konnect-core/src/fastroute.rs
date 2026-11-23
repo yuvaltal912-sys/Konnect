@@ -5,10 +5,10 @@
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
 //! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`])
-//! and the fill model of Row ZR, stage ZR1 (`--x.zones`): build x20. [`locate`] finds a
+//! and the fill model of Row ZR, stages ZR1 and ZR2 (`--x.zones`): build x21. [`locate`] finds a
 //! binary and [`probe`] proves, before anything is routed, that it knows every
-//! experimental switch Konnect sends. That is not proof that it is x20: an earlier
-//! engine commit may know the same switches, and x18, x19 and x20 all print
+//! experimental switch Konnect sends. That is not proof that it is x21: an earlier
+//! engine commit may know the same switches, and x18 to x21 all print
 //! `fastroute 0.1.14`. What identifies the build is its SHA-256: the
 //! 1 Kopper package checks it against `packaging/1-kopper/fastroute.json`, and every
 //! result reports it as `engine.sha256`.
@@ -67,10 +67,11 @@ pub(crate) fn routing_switches() -> Vec<&'static str> {
         .collect()
 }
 
-/// The candidate's name, as the research and the owner call it: build x20, the
+/// The candidate's name, as the research and the owner call it: build x21, the
 /// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`], and the
-/// fill model of Row ZR, stage ZR1 (`--x.zones`).
-pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR1";
+/// fill model of Row ZR, stages ZR1 and ZR2 (`--x.zones`: the model, and from ZR2 the
+/// model as the engine's connectivity with the closing stage).
+pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR2";
 
 /// Threads per run, for the autorouter and the optimizer each (the research's 7 x 2).
 pub(crate) const THREADS: u32 = 2;

@@ -1802,7 +1802,8 @@ pub(crate) fn engine_planes(report: &Value) -> Option<EnginePlanes> {
 /// run's `run.json` and in `search.winner`): the object as fastroute wrote it, with
 /// `connected_pads` replaced by its count (`connected_pad_count`). With `lists` false the
 /// open and starved pad lists are replaced by their counts too (`open_pad_count`,
-/// `starved_pad_count`), for the result.
+/// `starved_pad_count`), and each of ZR2's `closings` loses its `left_open` list (it keeps
+/// fastroute's own `left_open_count`), for the result.
 pub(crate) fn engine_planes_record(object: &Value, lists: bool) -> Value {
     let mut record = object.clone();
     if let Some(map) = record.as_object_mut() {
@@ -1814,6 +1815,22 @@ pub(crate) fn engine_planes_record(object: &Value, lists: bool) -> Value {
             if let Some(items) = map.remove(key) {
                 let name = format!("{}_count", key.trim_end_matches('s'));
                 map.insert(name, json!(items.as_array().map_or(0, Vec::len)));
+            }
+        }
+        if !lists {
+            for closing in map
+                .get_mut("closings")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(closing) = closing.as_object_mut() {
+                    if let Some(items) = closing.remove("left_open") {
+                        closing
+                            .entry("left_open_count")
+                            .or_insert_with(|| json!(items.as_array().map_or(0, Vec::len)));
+                    }
+                }
             }
         }
     }
