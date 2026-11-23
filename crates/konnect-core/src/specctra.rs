@@ -2360,6 +2360,9 @@ pub(crate) struct PadPin {
     pub pad_index: usize,
     pub footprint_uuid: String,
     pub pad_uuid: Option<String>,
+    /// The DSN writes the pad as a `circle` (a KiCad circle, or an oval of equal sides
+    /// in whole micrometres).
+    pub dsn_round: bool,
 }
 
 impl PadPin {
@@ -2387,15 +2390,147 @@ pub(crate) fn pad_pins(tree: &SexpNode) -> Result<Vec<PadPin>> {
                 pad_index: pad.source_index,
                 footprint_uuid: footprint.kiid.clone(),
                 pad_uuid: pad.uuid.clone(),
+                dsn_round: pad.padstack.shape == PadShape::Circle,
             })
         })
         .collect())
 }
 
-/// Row ZR: a zone's outline in DSN micrometres (Y up), closed (the first corner again at
-/// the end), arcs as chords, as the export writes a zone's polygon.
-pub(crate) fn zone_outline_um(zone: &SexpNode) -> Result<Vec<(i64, i64)>> {
-    zone_outline(zone)
+/// Row ZR: a rule area's outline for the zones file's `keepout` line: as the export
+/// writes a zone's polygon ([`zone_outline`]: DSN micrometres, Y up, closed), except that
+/// an arc bulging out of the area (it turns the way the outline winds) is written
+/// circumscribed, so the polygon holds the whole arc: a
+/// chord lies inside its arc by the sagitta, which would let the model fill a sliver of
+/// the area. The arc's ends stay on it; between them each edge lies on a tangent of a
+/// circle 1 um wider than the arc (the micrometre rounding cannot move an edge inside),
+/// with no edge more than [`ARC_TOLERANCE_MM`] beyond it. An arc that bulges into the area
+/// keeps its chords, which lie outside the area already.
+pub(crate) fn zone_outline_covering_um(zone: &SexpNode) -> Result<Vec<(i64, i64)>> {
+    enum Item {
+        Point((f64, f64)),
+        Arc((f64, f64), (f64, f64), (f64, f64)),
+    }
+    let polygons = zone.find_all("polygon");
+    let [polygon] = polygons.as_slice() else {
+        bail!("expected one outline polygon, found {}", polygons.len());
+    };
+    let pts = polygon.find("pts").context("outline has no points")?;
+    let mut items = Vec::new();
+    for item in pts.children().unwrap_or(&[]).iter().skip(1) {
+        match item.head() {
+            Some("xy") => items.push(Item::Point((
+                finite_number(item.get_f64(1), "zone x")?,
+                finite_number(item.get_f64(2), "zone y")?,
+            ))),
+            Some("arc") => items.push(Item::Arc(
+                xy_mm(item, "start")?,
+                xy_mm(item, "mid")?,
+                xy_mm(item, "end")?,
+            )),
+            Some(other) => bail!("outline holds an unsupported '{other}'"),
+            None => {}
+        }
+    }
+    // The winding, from the outline with its arcs as chords.
+    let mut inscribed: Vec<(f64, f64)> = Vec::new();
+    for item in &items {
+        match *item {
+            Item::Point(point) => inscribed.push(point),
+            Item::Arc(start, mid, end) => {
+                inscribed.push(start);
+                inscribed.extend(arc_inner_points(start, mid, end)?);
+                inscribed.push(end);
+            }
+        }
+    }
+    let twice_area: f64 = (0..inscribed.len())
+        .map(|i| {
+            let (x0, y0) = inscribed[i];
+            let (x1, y1) = inscribed[(i + 1) % inscribed.len()];
+            x0 * y1 - x1 * y0
+        })
+        .sum();
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for item in &items {
+        match *item {
+            Item::Point(point) => points.push(point),
+            Item::Arc(start, mid, end) => {
+                if points.last() != Some(&start) {
+                    points.push(start);
+                }
+                let turn =
+                    (mid.0 - start.0) * (end.1 - mid.1) - (mid.1 - start.1) * (end.0 - mid.0);
+                if turn * twice_area > 0.0 {
+                    points.extend(arc_circumscribed_points(start, mid, end)?);
+                } else {
+                    points.extend(arc_inner_points(start, mid, end)?);
+                }
+                points.push(end);
+            }
+        }
+    }
+    let mut outline = points.into_iter().map(to_dsn).collect::<Result<Vec<_>>>()?;
+    outline.dedup();
+    if outline.first() == outline.last() && outline.len() > 1 {
+        outline.pop();
+    }
+    if outline.len() < 3 {
+        bail!("outline has fewer than three corners");
+    }
+    let first = outline[0];
+    outline.push(first);
+    Ok(outline)
+}
+
+/// The corners strictly between `start` and `end` of a polyline that circumscribes the arc
+/// through `mid`: one on each tangent crossing of a circle 1 um wider than the arc, at
+/// equal angles, few enough that no edge is more than [`ARC_TOLERANCE_MM`] beyond that
+/// circle. Three collinear points are a straight line (none).
+fn arc_circumscribed_points(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+) -> Result<Vec<(f64, f64)>> {
+    const MARGIN_MM: f64 = 0.001;
+    let (ax, ay) = start;
+    let (bx, by) = mid;
+    let (cx, cy) = end;
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if d.abs() < 1e-9 {
+        return Ok(Vec::new());
+    }
+    let (a2, b2, c2) = (ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy);
+    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let radius = ((ax - ux).powi(2) + (ay - uy).powi(2)).sqrt();
+    if !radius.is_finite() || radius <= 0.0 {
+        bail!("unsupported outline: an arc has no usable radius");
+    }
+    let angle = |(x, y): (f64, f64)| (y - uy).atan2(x - ux);
+    let tau = std::f64::consts::TAU;
+    let counter_clockwise = (bx - ax) * (cy - by) - (by - ay) * (cx - bx) > 0.0;
+    let (from, to) = (angle(start), angle(end));
+    let sweep = if counter_clockwise {
+        (to - from).rem_euclid(tau)
+    } else {
+        -((from - to).rem_euclid(tau))
+    };
+    let wider = radius + MARGIN_MM;
+    // An edge on a tangent of the wider circle strays wider / cos(step / 2) - wider.
+    let step = 2.0 * (wider / (wider + ARC_TOLERANCE_MM)).acos();
+    let segments = (sweep.abs() / step).ceil().max(2.0);
+    if segments > MAX_ARC_SEGMENTS as f64 {
+        bail!("unsupported outline: an arc would need more than {MAX_ARC_SEGMENTS} edges");
+    }
+    let segments = segments as usize;
+    let half = sweep / segments as f64 / 2.0;
+    let corner = wider / half.cos();
+    Ok((0..segments)
+        .map(|k| {
+            let theta = from + sweep * (k as f64 + 0.5) / segments as f64;
+            (ux + corner * theta.cos(), uy + corner * theta.sin())
+        })
+        .collect())
 }
 
 /// Row ZR: the board's copper layers, in stack order (as the export reads them).

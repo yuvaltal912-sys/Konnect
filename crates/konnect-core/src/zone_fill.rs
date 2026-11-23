@@ -279,6 +279,8 @@ const DEFAULT_ISLAND_AREA_MM2: f64 = 10.0;
 const DEFAULT_MIN_SPOKES: u32 = 2;
 const DEFAULT_EDGE_CLEARANCE_MM: f64 = 0.5;
 const DEFAULT_HOLE_CLEARANCE_MM: f64 = 0.25;
+/// `rules.min_clearance`'s default (`DEFAULT_MINCLEARANCE`).
+const DEFAULT_MIN_CLEARANCE_MM: f64 = 0.0;
 /// `TEARDROP_PARAMETERS::m_TdMaxLen`'s default, mm.
 const DEFAULT_TEARDROP_MAX_LENGTH_MM: f64 = 1.0;
 /// The last board file version whose custom pads with a round anchor default to
@@ -639,16 +641,31 @@ fn named_copper_layers(node: &SexpNode, copper: &[String]) -> Vec<String> {
     out
 }
 
-/// The header values from the saved project (`board.design_settings.rules`), else
-/// KiCad's defaults: `(min_spokes, edge_clearance_mm, hole_clearance_mm)`, or why a
-/// value cannot be read.
-fn project_header(project_text: Option<&str>) -> std::result::Result<(u32, f64, f64), String> {
+/// The project rules the plan reads (`board.design_settings.rules`), else KiCad's
+/// defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProjectRules {
+    min_spokes: u32,
+    edge_clearance_mm: f64,
+    hole_clearance_mm: f64,
+    /// `min_clearance`: KiCad raises every copper-to-copper clearance to it, a zone's
+    /// fill included (`drc_engine.cpp`, the board minimum after the local overrides).
+    min_clearance_mm: f64,
+    /// `teardrop_options[].td_ontrackend`: KiCad makes track-to-track teardrops, which
+    /// the model does not carry (off by default).
+    track_teardrops: bool,
+}
+
+/// [`ProjectRules`] from the saved project, or why a value cannot be read.
+fn project_header(project_text: Option<&str>) -> std::result::Result<ProjectRules, String> {
     let Some(text) = project_text else {
-        return Ok((
-            DEFAULT_MIN_SPOKES,
-            DEFAULT_EDGE_CLEARANCE_MM,
-            DEFAULT_HOLE_CLEARANCE_MM,
-        ));
+        return Ok(ProjectRules {
+            min_spokes: DEFAULT_MIN_SPOKES,
+            edge_clearance_mm: DEFAULT_EDGE_CLEARANCE_MM,
+            hole_clearance_mm: DEFAULT_HOLE_CLEARANCE_MM,
+            min_clearance_mm: DEFAULT_MIN_CLEARANCE_MM,
+            track_teardrops: false,
+        });
     };
     let project: Value = serde_json::from_str(text)
         .map_err(|error| format!("the project file is not JSON ({error})"))?;
@@ -673,11 +690,28 @@ fn project_header(project_text: Option<&str>) -> std::result::Result<(u32, f64, 
                 format!("the project's min_resolved_spokes ({value}) is not a whole number")
             })?,
     };
-    Ok((
-        spokes,
-        number("min_copper_edge_clearance", DEFAULT_EDGE_CLEARANCE_MM)?,
-        number("min_hole_clearance", DEFAULT_HOLE_CLEARANCE_MM)?,
-    ))
+    Ok(ProjectRules {
+        min_spokes: spokes,
+        edge_clearance_mm: number("min_copper_edge_clearance", DEFAULT_EDGE_CLEARANCE_MM)?,
+        hole_clearance_mm: number("min_hole_clearance", DEFAULT_HOLE_CLEARANCE_MM)?,
+        min_clearance_mm: number("min_clearance", DEFAULT_MIN_CLEARANCE_MM)?,
+        track_teardrops: {
+            let mut on = false;
+            let options = &project["board"]["design_settings"]["teardrop_options"];
+            for entry in options.as_array().into_iter().flatten() {
+                match entry.get("td_ontrackend") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Bool(value)) => on |= *value,
+                    Some(value) => {
+                        return Err(format!(
+                            "the project's teardrop_options td_ontrackend ({value}) is not true or false"
+                        ))
+                    }
+                }
+            }
+            on
+        },
+    })
 }
 
 /// The largest `max_length` of a pad or via with teardrops on (`(teardrops … (enabled
@@ -735,8 +769,10 @@ fn some_of(items: &[String]) -> String {
 fn uncovered_board(
     tree: &SexpNode,
     pour_nets: &BTreeSet<String>,
+    zone_layers: &BTreeSet<String>,
     rules_text: Option<&str>,
 ) -> Vec<String> {
+    let copper = crate::specctra::board_copper_layers(tree).unwrap_or_default();
     let mut reasons = Vec::new();
     if let Some(text) = rules_text {
         match crate::custom_rules::parse(text) {
@@ -773,6 +809,7 @@ fn uncovered_board(
         .collect();
     let (mut unused, mut overrides, mut drilled, mut layered, mut spokes) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut clearances, mut hulls) = (Vec::new(), Vec::new());
     let machined = |node: &SexpNode| {
         [
             "backdrill",
@@ -821,6 +858,31 @@ fn uncovered_board(
             }
             if machined(pad) {
                 drilled.push(label.clone());
+            }
+            // A per-layer clearance of any net's pad: another net's larger clearance
+            // knocks out more of a pour than the DSN's pad clearance says.
+            if pad.find("padstack").is_some_and(|stack| {
+                stack
+                    .find_all("layer")
+                    .iter()
+                    .any(|layer| layer.find("clearance").is_some())
+            }) {
+                clearances.push(label.clone());
+            }
+            // A custom pad of any net knocked out by its convex hull (zone_filler.cpp,
+            // `addKnockout`) on a modelled zone's layer: the DSN and the engine use its
+            // outline.
+            let convexhull = pad.get(3).and_then(SexpNode::as_str) == Some("custom")
+                && pad
+                    .find("options")
+                    .and_then(|options| options.find_str("clearance"))
+                    == Some("convexhull");
+            if convexhull
+                && named_copper_layers(pad, &copper)
+                    .iter()
+                    .any(|layer| zone_layers.contains(layer))
+            {
+                hulls.push(label.clone());
             }
             let on_pour_net = pad
                 .find("net")
@@ -871,6 +933,11 @@ fn uncovered_board(
         (
             &spokes,
             "are custom pads of a pour net with spoke shapes of their own",
+        ),
+        (&clearances, "are pads with a layer-specific clearance"),
+        (
+            &hulls,
+            "are custom pads knocked out by their convex hull on a modelled zone's layer",
         ),
     ] {
         if !items.is_empty() {
@@ -991,7 +1058,8 @@ fn pad_values(
 ///    A pad whose values differ between those zones, where one line cannot say both,
 ///    makes its net's zones `legacy`.
 /// 5. `keepouts`: each rule area with `copperpour not_allowed`, per copper layer, corners
-///    as the export writes a zone (DSN micrometres, Y up), without the closing repeat.
+///    in DSN micrometres (Y up), without the closing repeat, its outward arcs
+///    circumscribed (`specctra::zone_outline_covering_um`).
 /// 6. `min_spokes`, the edge clearance and the hole clearance from the project file
 ///    (`project_text`), else KiCad's defaults. `teardrop_mm`: the largest `max_length` of
 ///    a pad or via that has teardrops on, else 0.
@@ -1022,11 +1090,15 @@ pub(crate) fn zone_plan(
         ..ZonePlan::default()
     };
     let mut board_reasons: Vec<String> = Vec::new();
+    let mut min_clearance_mm = DEFAULT_MIN_CLEARANCE_MM;
+    let mut track_teardrops = false;
     match project_header(project_text) {
-        Ok((spokes, edge, hole)) => {
-            plan.min_spokes = spokes;
-            plan.edge_clearance_mm = edge;
-            plan.hole_clearance_mm = hole;
+        Ok(rules) => {
+            track_teardrops = rules.track_teardrops;
+            plan.min_spokes = rules.min_spokes;
+            plan.edge_clearance_mm = rules.edge_clearance_mm;
+            plan.hole_clearance_mm = rules.hole_clearance_mm;
+            min_clearance_mm = rules.min_clearance_mm;
         }
         Err(reason) => board_reasons.push(reason),
     }
@@ -1123,12 +1195,16 @@ pub(crate) fn zone_plan(
             continue;
         };
         match fill_settings(row.zone) {
-            Ok(settings) => plan.zones.push(ZoneRow {
+            Ok(mut settings) => plan.zones.push(ZoneRow {
+                // KiCad raises the zone's clearance to the board's minimum.
+                settings: {
+                    settings.clearance_mm = settings.clearance_mm.max(min_clearance_mm);
+                    settings
+                },
                 plane_index,
                 net: row.net.clone(),
                 layer: row.layer.clone(),
                 uuid: row.uuid.clone(),
-                settings,
             }),
             Err(reason) => plan.legacy.push(legacy(row, reason)),
         }
@@ -1136,7 +1212,21 @@ pub(crate) fn zone_plan(
 
     // 3. What makes the whole board uncovered.
     let pour_nets: BTreeSet<String> = rows.iter().map(|row| row.net.clone()).collect();
-    board_reasons.extend(uncovered_board(&tree, &pour_nets, rules_text));
+    let zone_layers: BTreeSet<String> = plan.zones.iter().map(|zone| zone.layer.clone()).collect();
+    // Track-to-track teardrops: on in the project, or already on the board as teardrop
+    // zones of a track end. Only pad and via teardrops reach the header.
+    let track_end_zones = tree.find_all("zone").into_iter().any(|zone| {
+        zone.find("attr")
+            .and_then(|attr| attr.find("teardrop"))
+            .and_then(|teardrop| teardrop.find_str("type"))
+            == Some("track_end")
+    });
+    if !plan.zones.is_empty() && (track_teardrops || track_end_zones) {
+        board_reasons.push(
+            "the board makes track-to-track teardrops, which the model does not carry".to_string(),
+        );
+    }
+    board_reasons.extend(uncovered_board(&tree, &pour_nets, &zone_layers, rules_text));
 
     // 4. The pads of the modelled nets, and the names the judge will need.
     let pins = match crate::specctra::pad_pins(&tree) {
@@ -1165,65 +1255,7 @@ pub(crate) fn zone_plan(
             }
         }
         if board_reasons.is_empty() {
-            let version = tree.find_str("version").and_then(|v| v.parse::<u64>().ok());
-            let footprints = tree.find_all("footprint");
-            let mut demoted: BTreeMap<String, String> = BTreeMap::new();
-            let mut lines: Vec<PadRow> = Vec::new();
-            for pin in &pins {
-                let Some(net) = pin.net.as_deref().filter(|net| modelled.contains(*net)) else {
-                    continue;
-                };
-                let Some(footprint) = footprints.get(pin.footprint_index) else {
-                    continue;
-                };
-                let Some(pad) = footprint.find_all("pad").get(pin.pad_index).copied() else {
-                    continue;
-                };
-                let layers = named_copper_layers(pad, &copper);
-                let under: Vec<&ZoneRow> = plan
-                    .zones
-                    .iter()
-                    .filter(|zone| zone.net == net && layers.contains(&zone.layer))
-                    .collect();
-                let mut values = Vec::new();
-                for zone in &under {
-                    match pad_values(pad, footprint, &zone.settings, version) {
-                        Ok(value) => values.push((value, zone)),
-                        Err(reason) => {
-                            demoted
-                                .entry(net.to_string())
-                                .or_insert(format!("pad {}: {reason}", pin.dsn_name()));
-                        }
-                    }
-                }
-                let differs = values.iter().any(|((connect, gap, bridge, angle), zone)| {
-                    let own = &zone.settings;
-                    *connect != own.connect
-                        || *gap != own.thermal_gap_mm
-                        || *bridge != own.thermal_bridge_mm
-                        || *angle != 0.0
-                });
-                if !differs {
-                    continue;
-                }
-                let first = values[0].0;
-                if values.iter().any(|(value, _)| *value != first) {
-                    demoted.entry(net.to_string()).or_insert(format!(
-                        "pad {} resolves to other thermal values under each zone of its net, which one pad line cannot say",
-                        pin.dsn_name()
-                    ));
-                    continue;
-                }
-                let (connect, gap, bridge, angle) = first;
-                lines.push(PadRow {
-                    component: pin.component.clone(),
-                    pin: pin.pin.clone(),
-                    connect,
-                    thermal_gap_mm: gap,
-                    thermal_bridge_mm: bridge,
-                    angle_deg: angle,
-                });
-            }
+            let (lines, demoted) = pad_lines(&tree, &pins, &plan.zones, &copper);
             if !demoted.is_empty() {
                 let (kept, out): (Vec<ZoneRow>, Vec<ZoneRow>) = std::mem::take(&mut plan.zones)
                     .into_iter()
@@ -1237,18 +1269,7 @@ pub(crate) fn zone_plan(
                         uuid: zone.uuid,
                     });
                 }
-                lines.retain(|line| {
-                    pins.iter().any(|pin| {
-                        pin.component == line.component
-                            && pin.pin == line.pin
-                            && pin
-                                .net
-                                .as_ref()
-                                .is_some_and(|net| !demoted.contains_key(net))
-                    })
-                });
             }
-            lines.sort_by(|a, b| (&a.component, &a.pin).cmp(&(&b.component, &b.pin)));
             plan.pads = lines;
         }
     }
@@ -1265,7 +1286,7 @@ pub(crate) fn zone_plan(
         if layers.is_empty() {
             continue;
         }
-        let mut corners = match crate::specctra::zone_outline_um(zone) {
+        let mut corners = match crate::specctra::zone_outline_covering_um(zone) {
             Ok(corners) => corners,
             Err(error) => {
                 board_reasons.push(format!(
@@ -1302,6 +1323,139 @@ pub(crate) fn zone_plan(
     }
 
     Ok(plan)
+}
+
+/// Why a pad's roundness differs between the DSN (`dsn_round`, what the engine reads) and
+/// KiCad's filler, which builds round spokes for a `circle` pad or an `oval` of exactly
+/// equal sides (zone_filler.cpp, `circular`), layer by layer (a padstack layer's own
+/// `shape` counts); `None` when they agree on every layer the pad states.
+fn round_mismatch(pad: &SexpNode, dsn_round: bool) -> Option<String> {
+    let nanometres = |node: &SexpNode, at: usize| {
+        node.get_f64(at)
+            .filter(|mm| mm.is_finite())
+            .map(|mm| (mm * 1e6).round() as i64)
+    };
+    let round = |shape: Option<&str>, size: Option<&SexpNode>| match shape {
+        Some("circle") => true,
+        Some("oval") => size.is_some_and(|size| {
+            nanometres(size, 1).is_some() && nanometres(size, 1) == nanometres(size, 2)
+        }),
+        _ => false,
+    };
+    let mut kicad = vec![round(
+        pad.get(3).and_then(SexpNode::as_str),
+        pad.find("size"),
+    )];
+    if let Some(stack) = pad.find("padstack") {
+        for layer in stack.find_all("layer") {
+            if let Some(shape) = layer.find_str("shape") {
+                kicad.push(round(Some(shape), layer.find("size").or(pad.find("size"))));
+            }
+        }
+    }
+    kicad.iter().any(|round| *round != dsn_round).then(|| {
+        if dsn_round {
+            "the DSN writes it as a circle and KiCad's filler does not take it as round, so their spokes would differ".to_string()
+        } else {
+            "KiCad's filler takes it as round and the DSN does not write it as a circle, so their spokes would differ".to_string()
+        }
+    })
+}
+
+/// The `pad` lines of the modelled zones `zones` (step 4 of [`zone_plan`]), and the nets
+/// whose zones must become legacy, with the reason: a pad whose roundness the DSN and
+/// KiCad's filler disagree on ([`round_mismatch`]), a pad value that does not read, a pad
+/// whose values differ between its net's zones where one line cannot say both, and a pad
+/// that needs a line but whose component or pin name is empty (the engine refuses `""`).
+/// Lines of a demoted net are dropped; the rest are sorted by component and pin.
+fn pad_lines(
+    tree: &SexpNode,
+    pins: &[crate::specctra::PadPin],
+    zones: &[ZoneRow],
+    copper: &[String],
+) -> (Vec<PadRow>, BTreeMap<String, String>) {
+    let modelled: BTreeSet<&str> = zones.iter().map(|zone| zone.net.as_str()).collect();
+    let version = tree.find_str("version").and_then(|v| v.parse::<u64>().ok());
+    let footprints = tree.find_all("footprint");
+    let mut demoted: BTreeMap<String, String> = BTreeMap::new();
+    let mut lines: Vec<(String, PadRow)> = Vec::new();
+    for pin in pins {
+        let Some(net) = pin.net.as_deref().filter(|net| modelled.contains(*net)) else {
+            continue;
+        };
+        let Some(footprint) = footprints.get(pin.footprint_index) else {
+            continue;
+        };
+        let Some(pad) = footprint.find_all("pad").get(pin.pad_index).copied() else {
+            continue;
+        };
+        if let Some(reason) = round_mismatch(pad, pin.dsn_round) {
+            demoted
+                .entry(net.to_string())
+                .or_insert(format!("pad {}: {reason}", pin.dsn_name()));
+            continue;
+        }
+        let layers = named_copper_layers(pad, copper);
+        let under: Vec<&ZoneRow> = zones
+            .iter()
+            .filter(|zone| zone.net == net && layers.contains(&zone.layer))
+            .collect();
+        let mut values = Vec::new();
+        for zone in &under {
+            match pad_values(pad, footprint, &zone.settings, version) {
+                Ok(value) => values.push((value, zone)),
+                Err(reason) => {
+                    demoted
+                        .entry(net.to_string())
+                        .or_insert(format!("pad {}: {reason}", pin.dsn_name()));
+                }
+            }
+        }
+        let differs = values.iter().any(|((connect, gap, bridge, angle), zone)| {
+            let own = &zone.settings;
+            *connect != own.connect
+                || *gap != own.thermal_gap_mm
+                || *bridge != own.thermal_bridge_mm
+                || *angle != 0.0
+        });
+        if !differs {
+            continue;
+        }
+        let first = values[0].0;
+        if values.iter().any(|(value, _)| *value != first) {
+            demoted.entry(net.to_string()).or_insert(format!(
+                "pad {} resolves to other thermal values under each zone of its net, which one pad line cannot say",
+                pin.dsn_name()
+            ));
+            continue;
+        }
+        if pin.component.is_empty() || pin.pin.is_empty() {
+            demoted.entry(net.to_string()).or_insert(format!(
+                "pad {} needs a pad line, and an empty component or pin name cannot be written",
+                pin.dsn_name()
+            ));
+            continue;
+        }
+        let (connect, gap, bridge, angle) = first;
+        lines.push((
+            net.to_string(),
+            PadRow {
+                component: pin.component.clone(),
+                pin: pin.pin.clone(),
+                connect,
+                thermal_gap_mm: gap,
+                thermal_bridge_mm: bridge,
+                angle_deg: angle,
+            },
+        ));
+    }
+    let mut lines: Vec<PadRow> = lines
+        .into_iter()
+        .filter(|(net, _)| !demoted.contains_key(net))
+        .map(|(_, line)| line)
+        .collect();
+    lines.sort_by(|a, b| (&a.component, &a.pin).cmp(&(&b.component, &b.pin)));
+    (lines, demoted)
 }
 
 /// A number with the shortest text that reads back to the same value (Rust's `{}`).
@@ -1495,8 +1649,9 @@ pub(crate) fn engine_planes_record(object: &Value, lists: bool) -> Value {
     record
 }
 
-/// KiCad's side of the comparison (Z13): the pads of each net of `nets` outside the
-/// net's main copper group on the refilled board `refilled_board_text` (saved at
+/// KiCad's side of the comparison (Z13): the pads of each net of `nets` not in a copper
+/// group holding more than half the net's pads (the engine's main-group rule: on a tie
+/// every pad of the net is open) on the refilled board `refilled_board_text` (saved at
 /// `refilled_board`), by the layout audit's own grouping over the board's saved fills
 /// (`tools::pads_off_main_group`), named as the DSN names them through `names` (the
 /// saved board's pads by footprint and pad UUID). A pad with no copper is no DSN pin and
@@ -1601,7 +1756,8 @@ pub(crate) fn record_comparison(
             return;
         }
     };
-    if engine.error.is_some() {
+    if let Some(error) = &engine.error {
+        measures.pours_error = Some(format!("the engine's model reported an error: {error}"));
         return;
     }
     match kicad_open {

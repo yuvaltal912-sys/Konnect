@@ -899,6 +899,16 @@ fn the_comparison_is_recorded_beside_the_zr0_measures_never_as_a_failure() {
     assert_eq!(measures.pours.as_ref().unwrap().pieces, 2);
     assert_eq!(measures.pours.as_ref().unwrap().false_connected, None);
     assert!(measures.pours_error.as_deref().unwrap().contains("no UUID"));
+    // The engine's own error: no counts, and its text kept as the engine's.
+    let mut measures = base();
+    let mut failed = planes_example();
+    failed["error"] = json!("zone 2 has no plane");
+    record_comparison(&mut measures, planes_object(&failed), None, 1);
+    assert_eq!(measures.pours.as_ref().unwrap().false_connected, None);
+    assert_eq!(
+        measures.pours_error.as_deref(),
+        Some("the engine's model reported an error: zone 2 has no plane")
+    );
     // The engine's object does not read.
     let mut measures = base();
     record_comparison(&mut measures, Err(anyhow::anyhow!("version 2")), None, 1);
@@ -1032,4 +1042,571 @@ fn zone_plans_of_a_folder() {
         .unwrap();
         std::fs::write(out.join(format!("{name}.summary.txt")), format!("{line}\n")).unwrap();
     }
+}
+
+// ─── Fix round (review of 5168952d) ──────────────────────────────────────────
+
+/// The footprint block of `text` whose uuid is `uuid` (`\t(footprint …` to its `\t)`).
+fn footprint_block<'a>(text: &'a str, uuid: &str) -> &'a str {
+    let at = text.find(uuid).unwrap();
+    let start = text[..at].rfind("\t(footprint ").unwrap();
+    let end = text[start..].find("\n\t)\n").unwrap() + start + 4;
+    &text[start..end]
+}
+
+/// The base board with R1 and R2 copied as R3 and R4, 8 mm lower: GND has six pads, three
+/// on each pair.
+fn six_pads() -> String {
+    let text = board(false);
+    let r1 = footprint_block(&text, "11111111-1111-4111-8111-111111111111");
+    let r2 = footprint_block(&text, "22222222-2222-4222-8222-222222222222");
+    let r3 = r1
+        .replace(
+            "11111111-1111-4111-8111-111111111111",
+            "77777777-7777-4777-8777-777777777777",
+        )
+        .replacen("(at 100 50)", "(at 100 58)", 1)
+        .replace("\"Reference\" \"R1\"", "\"Reference\" \"R3\"")
+        .replace("fb481b08-", "fb481b09-")
+        .replace("80cbeaee-", "80cbeaef-");
+    let r4 = r2
+        .replace(
+            "22222222-2222-4222-8222-222222222222",
+            "88888888-8888-4888-8888-888888888888",
+        )
+        .replacen("(at 110 50)", "(at 110 58)", 1)
+        .replace("\"Reference\" \"R2\"", "\"Reference\" \"R4\"")
+        .replace("611a5e55-", "611a5e56-")
+        .replace("10e20b3d-", "10e20b3e-");
+    let end = text.find(r2).unwrap() + r2.len();
+    format!("{}{r3}{r4}{}", &text[..end], &text[end..])
+}
+
+/// `text` with the F.Cu GND pour filled by one rectangle per `(x0, y0, x1, y1)`.
+fn with_f_fills(text: &str, boxes: &[(f64, f64, f64, f64)]) -> String {
+    let polygons: String = boxes
+        .iter()
+        .map(|(x0, y0, x1, y1)| {
+            format!("\n\t\t(filled_polygon (layer \"F.Cu\") (pts (xy {x0} {y0}) (xy {x1} {y0}) (xy {x1} {y1}) (xy {x0} {y1})))")
+        })
+        .collect();
+    let at = text.find(F_ZONE_UUID).unwrap();
+    let end = text[at..].find("\n\t)\n").unwrap() + at;
+    format!("{}{polygons}{}", &text[..end], &text[end..])
+}
+
+#[test]
+fn a_tie_leaves_every_pad_of_the_net_open_on_both_sides() {
+    let text = six_pads();
+    let names = PadNames::from_board(&text).unwrap();
+    let all = set(&["R1-2", "R2-1", "R2-2", "R3-2", "R4-1", "R4-2"]);
+    let at = Path::new("/scratch/r0/board.kicad_pcb");
+    // 3 and 3: no group holds a strict majority, so KiCad's side opens all six.
+    let split = with_f_fills(
+        &text,
+        &[(99.8, 48.0, 111.0, 52.0), (99.8, 56.0, 111.0, 60.0)],
+    );
+    let open = kicad_open_pads(at, &split, &names, &set(&["GND"])).unwrap();
+    assert_eq!(open, all);
+    // The engine's rule gives the same: every pin open, none connected.
+    let mut object = planes_example();
+    object["connected_pads"] = json!([]);
+    object["open_pads"] = json!(all.iter().collect::<Vec<_>>());
+    let engine = planes_object(&object).unwrap();
+    assert_eq!(compare_pads(&engine, &open, 1), (Some(0), Some(0)));
+    // Control: 4 and 2 (a strip joins R3's GND pad to the top group): a majority, so
+    // only the two are open.
+    let four = with_f_fills(
+        &text,
+        &[
+            (99.8, 48.0, 111.0, 52.0),
+            (100.2, 48.0, 100.8, 60.0),
+            (108.0, 56.0, 111.0, 60.0),
+        ],
+    );
+    let open = kicad_open_pads(at, &four, &names, &set(&["GND"])).unwrap();
+    assert_eq!(open, set(&["R4-1", "R4-2"]));
+}
+
+#[test]
+fn the_board_minimum_clearance_raises_each_zone() {
+    let text = board(false).replace(
+        "(connect_pads\n\t\t\t(clearance 0.5)",
+        "(connect_pads\n\t\t\t(clearance 0.2)",
+    );
+    let (dsn, manifest) = exported(&text);
+    let project = |min: f64| {
+        json!({"board": {"design_settings": {"rules": {"min_clearance": min}}}}).to_string()
+    };
+    let clearances = |plan: &ZonePlan| -> Vec<f64> {
+        plan.zones
+            .iter()
+            .map(|zone| zone.settings.clearance_mm)
+            .collect()
+    };
+    let raised = zone_plan(&text, Some(&manifest), &dsn, Some(&project(0.3)), None).unwrap();
+    assert_eq!(clearances(&raised), [0.3, 0.3]);
+    assert!(file_text(&raised)
+        .unwrap()
+        .contains("zone 0 clearance_mm=0.3 "));
+    // Controls: a lower board minimum, and none, leave the zone's own 0.2.
+    let lower = zone_plan(&text, Some(&manifest), &dsn, Some(&project(0.1)), None).unwrap();
+    assert_eq!(clearances(&lower), [0.2, 0.2]);
+    let none = zone_plan(&text, Some(&manifest), &dsn, None, None).unwrap();
+    assert_eq!(clearances(&none), [0.2, 0.2]);
+}
+
+/// R1's VCC pad (not a pour net) as a custom pad with `options`.
+fn custom_vcc_pad(text: &str, options: &str) -> String {
+    let pad = "(pad \"1\" smd roundrect\n\t\t\t(at -0.5 0)\n\t\t\t(size 0.6 0.5)\n\t\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t\t(roundrect_rratio 0.25)\n\t\t\t(net \"VCC\")";
+    assert_eq!(text.matches(pad).count(), 1);
+    text.replace(
+        pad,
+        &format!(
+            "(pad \"1\" smd custom\n\t\t\t(at -0.5 0)\n\t\t\t(size 0.4 0.4)\n\t\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t\t(options {options} (anchor circle))\n\t\t\t(primitives (gr_poly (pts (xy -0.3 -0.2) (xy 0.3 -0.2) (xy 0.3 0.2)) (width 0) (fill yes)))\n\t\t\t(net \"VCC\")"
+        ),
+    )
+}
+
+#[test]
+fn a_convex_hull_custom_pad_on_a_modelled_layer_uncovers_the_board() {
+    let text = board(false);
+    const HULL: &str = "convex hull on a modelled zone's layer";
+    let hull = custom_vcc_pad(&text, "(clearance convexhull)");
+    let plan = plan_with(&text, &hull, None);
+    assert!(plan.zones.is_empty(), "{:?}", plan.zones);
+    assert!(
+        reasons(&plan).iter().all(|r| r.contains(HULL)),
+        "{:?}",
+        reasons(&plan)
+    );
+    // Controls: the same pad knocked out by its outline; and the hull pad when F.Cu's
+    // pour is not modelled (a hatch fill), so no modelled zone is on its layer.
+    let outline = custom_vcc_pad(&text, "(clearance outline)");
+    let plan = plan_with(&text, &outline, None);
+    assert!(
+        reasons(&plan).iter().all(|r| !r.contains(HULL)),
+        "{:?}",
+        reasons(&plan)
+    );
+    let hatch = with_f_fill(
+        &hull,
+        "(fill yes (mode hatch) (thermal_gap 0.5) (thermal_bridge_width 0.5) (island_removal_mode 0))",
+    );
+    let plan = plan_with(&text, &hatch, None);
+    assert!(
+        reasons(&plan).iter().all(|r| !r.contains(HULL)),
+        "{:?}",
+        reasons(&plan)
+    );
+}
+
+/// `text` with `extra` added to the pad whose uuid is `uuid`.
+fn pad_with(text: &str, uuid: &str, extra: &str) -> String {
+    let anchor = format!("(uuid \"{uuid}\")");
+    assert_eq!(text.matches(&anchor).count(), 1);
+    text.replace(&anchor, &format!("{extra}\n\t\t\t{anchor}"))
+}
+
+const R1_VCC: &str = "fb481b08-0972-41e5-a5d9-a4bab9f165c1";
+const R2_GND: &str = "611a5e55-7fda-4eb1-9177-2b7af8a58dba";
+
+#[test]
+fn a_pads_layered_values_override_or_backdrill_uncovers_the_board() {
+    let text = board(false);
+    let thermal = "(padstack (mode front_inner_back) (layer \"Inner\" (thermal_gap 0.3)))";
+    let clearance = "(padstack (mode front_inner_back) (layer \"Inner\" (clearance 0.3)))";
+    for (variant, words) in [
+        (
+            pad_with(&text, R2_GND, thermal),
+            "pour net with layer-specific connection or thermal values",
+        ),
+        (
+            pad_with(&text, R1_VCC, clearance),
+            "pads with a layer-specific clearance",
+        ),
+        (
+            pad_with(&text, R2_GND, "(zone_layer_connections \"F.Cu\")"),
+            "override their zone connection per layer",
+        ),
+        (
+            pad_with(
+                &text,
+                R2_GND,
+                "(backdrill (size 0.4) (layers \"B.Cu\" \"F.Cu\"))",
+            ),
+            "backdrilled or post-machined",
+        ),
+    ] {
+        let plan = plan_with(&text, &variant, None);
+        assert!(plan.zones.is_empty(), "{words}: {:?}", plan.zones);
+        assert!(
+            reasons(&plan).iter().all(|r| r.contains(words)),
+            "{words}: {:?}",
+            reasons(&plan)
+        );
+    }
+    // Control: layered thermal values on a pad of a net with no pour change no zone.
+    let plan = plan_with(&text, &pad_with(&text, R1_VCC, thermal), None);
+    assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
+}
+
+#[test]
+fn a_teardrop_or_keepout_that_does_not_read_uncovers_the_board() {
+    let text = board(false);
+    let teardrop = pad_with(&text, R1_VCC, "(teardrops (max_length abc) (enabled yes))");
+    let plan = plan_with(&text, &teardrop, None);
+    assert!(plan.zones.is_empty());
+    assert!(
+        reasons(&plan)[0].contains("a teardrop setting cannot be read"),
+        "{:?}",
+        reasons(&plan)
+    );
+    // A rule area that keeps pours out, with two outlines the file cannot carry as one.
+    let area = |polygons: &str| {
+        text.replacen(
+            "\t(zone\n",
+            &format!(
+                "\t(zone (layer \"B.Cu\") (uuid \"99999999-9999-4999-8999-999999999999\") (hatch edge 0.5) (connect_pads (clearance 0)) (min_thickness 0.25) (keepout (tracks allowed) (vias allowed) (pads allowed) (copperpour not_allowed) (footprints allowed)) {polygons})\n\t(zone\n"
+            ),
+            1,
+        )
+    };
+    let square = "(polygon (pts (xy 90 40) (xy 92 40) (xy 92 42) (xy 90 42)))";
+    let two = area(&format!(
+        "{square} (polygon (pts (xy 95 40) (xy 97 40) (xy 97 42) (xy 95 42)))"
+    ));
+    let plan = plan_with(&text, &two, None);
+    assert!(plan.zones.is_empty());
+    assert!(
+        reasons(&plan)[0].contains("outline the zones file cannot carry"),
+        "{:?}",
+        reasons(&plan)
+    );
+    // Controls: a teardrop that reads, and the rule area with one outline: a keepout line.
+    let plan = plan_with(
+        &text,
+        &pad_with(&text, R1_VCC, "(teardrops (max_length 0.8) (enabled yes))"),
+        None,
+    );
+    assert_eq!((modelled(&plan).len(), plan.teardrop_mm), (2, 0.8));
+    let plan = plan_with(&text, &area(square), None);
+    assert_eq!(modelled(&plan).len(), 2);
+    assert_eq!(plan.keepouts.len(), 1);
+}
+
+/// One pad and its footprint, parsed.
+fn pad_node(pad: &str, footprint: &str) -> (SexpNode, SexpNode) {
+    (
+        konnect_sexp::parse_sexp(pad).unwrap(),
+        konnect_sexp::parse_sexp(footprint).unwrap(),
+    )
+}
+
+fn thermal_zone() -> FillSettings {
+    fill_settings(&konnect_sexp::parse_sexp("(zone (min_thickness 0.25))").unwrap()).unwrap()
+}
+
+#[test]
+fn a_custom_pad_with_a_round_anchor_takes_45_degrees_after_kicad_6() {
+    let (pad, footprint) = pad_node(
+        "(pad \"1\" smd custom (at 0 0) (size 1 1) (layers \"F.Cu\") (options (clearance outline) (anchor circle)))",
+        "(footprint \"x\")",
+    );
+    let angle = |version| {
+        pad_values(&pad, &footprint, &thermal_zone(), version)
+            .unwrap()
+            .3
+    };
+    assert_eq!(angle(Some(20211014)), 0.0, "KiCad 6.0 files: 90, written 0");
+    assert_eq!(angle(Some(20211015)), 45.0);
+    assert_eq!(angle(None), 45.0);
+    // Control: a rectangular anchor is 90 (0) in any version.
+    let (rect, _) = pad_node(
+        "(pad \"1\" smd custom (at 0 0) (size 1 1) (layers \"F.Cu\") (options (clearance outline) (anchor rect)))",
+        "(footprint \"x\")",
+    );
+    assert_eq!(
+        pad_values(&rect, &footprint, &thermal_zone(), Some(20211015))
+            .unwrap()
+            .3,
+        0.0
+    );
+}
+
+#[test]
+fn the_legacy_thermal_width_token_is_a_pads_bridge() {
+    let footprint = konnect_sexp::parse_sexp("(footprint \"x\")").unwrap();
+    let bridge = |pad: &str| {
+        pad_values(
+            &konnect_sexp::parse_sexp(pad).unwrap(),
+            &footprint,
+            &thermal_zone(),
+            None,
+        )
+        .unwrap()
+        .2
+    };
+    assert_eq!(
+        bridge("(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (thermal_width 0.4))"),
+        0.4
+    );
+    assert_eq!(
+        bridge("(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (thermal_bridge_width 0.3) (thermal_width 0.4))"),
+        0.3,
+        "the newer token wins"
+    );
+    // Control: neither token, the zone's bridge.
+    assert_eq!(
+        bridge("(pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\"))"),
+        0.5
+    );
+}
+
+/// The base board with R2 also called R1 (exported as `R1_DUP2`) and both its pads
+/// numbered 1 (pins `1@1` and `1@2`), its second pad with its own spoke angle.
+fn repeated_names() -> String {
+    let text = board(false).replace("\"Reference\" \"R2\"", "\"Reference\" \"R1\"");
+    let r2 = footprint_block(&text, "22222222-2222-4222-8222-222222222222");
+    let renumbered = r2.replace("(pad \"2\" smd", "(pad \"1\" smd");
+    let text = text.replace(r2, &renumbered);
+    pad_with(
+        &text,
+        "10e20b3d-431e-4a39-a976-77389855efa1",
+        "(thermal_bridge_angle 30)",
+    )
+}
+
+#[test]
+fn repeated_references_and_pad_numbers_keep_the_dsn_names() {
+    let text = repeated_names();
+    let bundle = crate::specctra::export_dsn_with_options(
+        Path::new("/scratch/specctra_rounded_board.kicad_pcb"),
+        &text,
+        &rules(),
+        crate::specctra::ExportOptions {
+            allow_duplicate_references: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(bundle.dsn.contains("R1_DUP2-1@2"), "{}", bundle.dsn);
+    let manifest: Value = serde_json::from_str(&bundle.manifest).unwrap();
+    let plan = zone_plan(&text, Some(&manifest), &bundle.dsn, None, None).unwrap();
+    assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
+    let lines: Vec<(&str, &str)> = plan
+        .pads
+        .iter()
+        .map(|pad| (pad.component.as_str(), pad.pin.as_str()))
+        .collect();
+    assert_eq!(lines, [("R1_DUP2", "1@2")]);
+    assert!(file_text(&plan)
+        .unwrap()
+        .contains("\npad R1_DUP2 1@2 connect=thermal gap_mm=0.5 bridge_mm=0.5 angle_deg=30\n"));
+    // The comparison names the same pads the same way: R2's two pads on the fill, R1's
+    // GND pad off it.
+    let refilled = with_f_fills(&text, &[(108.0, 48.0, 112.0, 52.0)]);
+    let open = kicad_open_pads(
+        Path::new("/scratch/r0/board.kicad_pcb"),
+        &refilled,
+        &plan.names,
+        &set(&["GND"]),
+    )
+    .unwrap();
+    assert_eq!(open, set(&["R1-2"]));
+    // R1's GND pad joined to R2's first pad: R2's second (`1@2`) is the one left.
+    let refilled = with_f_fills(&text, &[(100.2, 48.0, 109.8, 52.0)]);
+    let open = kicad_open_pads(
+        Path::new("/scratch/r0/board.kicad_pcb"),
+        &refilled,
+        &plan.names,
+        &set(&["GND"]),
+    )
+    .unwrap();
+    assert_eq!(open, set(&["R1_DUP2-1@2"]));
+}
+
+#[test]
+fn a_reference_with_a_space_is_written_quoted() {
+    let text = pad_with(
+        &board(false).replace("\"Reference\" \"R2\"", "\"Reference\" \"R 2\""),
+        R2_GND,
+        "(thermal_bridge_angle 30)",
+    );
+    let plan = plan(&text);
+    assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
+    assert!(
+        file_text(&plan)
+            .unwrap()
+            .contains("\npad \"R 2\" 1 connect=thermal gap_mm=0.5 bridge_mm=0.5 angle_deg=30\n"),
+        "{}",
+        file_text(&plan).unwrap()
+    );
+}
+
+#[test]
+fn a_pad_line_with_an_empty_name_is_never_written() {
+    let text = board(true);
+    let tree = konnect_sexp::parse_sexp(&text).unwrap();
+    let copper = crate::specctra::board_copper_layers(&tree).unwrap();
+    let zones = plan(&text).zones;
+    let pins = crate::specctra::pad_pins(&tree).unwrap();
+    // Control: as exported, R1's round pad gets its line and nothing is demoted.
+    let (lines, demoted) = pad_lines(&tree, &pins, &zones, &copper);
+    assert_eq!(lines.len(), 1);
+    assert!(demoted.is_empty());
+    for empty in ["component", "pin"] {
+        let mut named = pins.clone();
+        let round = named
+            .iter_mut()
+            .find(|pin| pin.component == "R1" && pin.pin == "2")
+            .unwrap();
+        if empty == "component" {
+            round.component.clear();
+        } else {
+            round.pin.clear();
+        }
+        let (lines, demoted) = pad_lines(&tree, &named, &zones, &copper);
+        assert!(lines.is_empty(), "{empty}: {lines:?}");
+        assert!(
+            demoted["GND"].contains("empty component or pin name"),
+            "{empty}: {demoted:?}"
+        );
+    }
+}
+
+/// The rule area of `keepout_arc_board` and its arc: from (112, 52) bulging to x 121 at
+/// y 57 and back to (112, 62), the rest of the square straight.
+fn keepout_arc_board() -> String {
+    board(false)
+        .replace("(copperpour allowed)", "(copperpour not_allowed)")
+        .replace(
+            "(xy 112 52) (xy 120 52) (xy 120 62) (xy 112 62)",
+            "(xy 112 52) (arc (start 117 52) (mid 122 57) (end 117 62)) (xy 112 62)",
+        )
+}
+
+#[test]
+fn a_keepout_arc_is_circumscribed() {
+    let text = keepout_arc_board();
+    assert!(text.contains("(mid 122 57)"));
+    let plan = plan(&text);
+    assert_eq!(plan.keepouts.len(), 1);
+    let corners = &plan.keepouts[0].corners;
+    // In DSN micrometres the arc's centre is (117000, -57000), its radius 5000.
+    let inside = |(px, py): (f64, f64)| {
+        let mut inside = false;
+        for i in 0..corners.len() {
+            let (x0, y0) = (corners[i].0 as f64, corners[i].1 as f64);
+            let (x1, y1) = {
+                let next = corners[(i + 1) % corners.len()];
+                (next.0 as f64, next.1 as f64)
+            };
+            if (y0 > py) != (y1 > py) && px < x0 + (py - y0) * (x1 - x0) / (y1 - y0) {
+                inside = !inside;
+            }
+        }
+        inside
+    };
+    // Every point of the arc's open half, 0.1 um inside it, is inside the keepout.
+    for k in 1..400 {
+        let theta = -std::f64::consts::FRAC_PI_2 + std::f64::consts::PI * k as f64 / 400.0;
+        let r = 5000.0 - 0.1;
+        let p = (117000.0 + r * theta.cos(), -57000.0 + r * theta.sin());
+        assert!(
+            inside(p),
+            "the arc point {p:?} is outside the keepout {corners:?}"
+        );
+    }
+    // And nothing goes more than the tolerance and the margin beyond the arc.
+    for &(x, y) in corners {
+        let distance = ((x as f64 - 117000.0).powi(2) + (y as f64 + 57000.0).powi(2)).sqrt();
+        if x > 117000 {
+            assert!(distance <= 5000.0 + 1.0 + 5.0 + 1.0, "{distance}");
+        }
+    }
+}
+
+#[test]
+fn a_pad_the_dsn_and_kicad_see_differently_round_demotes_its_net() {
+    let text = board(false);
+    let r1_gnd = "(pad \"2\" smd roundrect\n\t\t\t(at 0.5 0)\n\t\t\t(size 0.6 0.5)\n\t\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t\t(roundrect_rratio 0.25)\n\t\t\t(net \"GND\")\n\t\t\t(uuid \"80cbeaee";
+    assert_eq!(text.matches(r1_gnd).count(), 1);
+    let oval = |size: &str| {
+        text.replace(
+            r1_gnd,
+            &format!("(pad \"2\" smd oval\n\t\t\t(at 0.5 0)\n\t\t\t(size {size})\n\t\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t\t(net \"GND\")\n\t\t\t(uuid \"80cbeaee"),
+        )
+    };
+    // 0.5 by 0.5001 mm: one size in whole micrometres, so the DSN writes a circle, and
+    // not equal sides to KiCad's filler.
+    let plan = plan_with(&text, &oval("0.5 0.5001"), None);
+    assert!(plan.zones.is_empty(), "{:?}", plan.zones);
+    assert!(
+        reasons(&plan)
+            .iter()
+            .all(|r| r.contains("pad R1-2: the DSN writes it as a circle")),
+        "{:?}",
+        reasons(&plan)
+    );
+    // The other way: a rectangular pad whose F.Cu padstack layer is a circle.
+    let layered = pad_with(
+        &text,
+        R2_GND,
+        "(padstack (mode front_inner_back) (layer \"F.Cu\" (shape circle) (size 0.5 0.5)))",
+    );
+    let plan = plan_with(&text, &layered, None);
+    assert!(plan.zones.is_empty());
+    assert!(
+        reasons(&plan)
+            .iter()
+            .all(|r| r.contains("KiCad's filler takes it as round")),
+        "{:?}",
+        reasons(&plan)
+    );
+    // Control: an oval of exactly equal sides is round to both.
+    let plan = plan_with(&text, &oval("0.5 0.5"), None);
+    assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
+}
+
+#[test]
+fn track_to_track_teardrops_uncover_the_board() {
+    let text = board(false);
+    let (dsn, manifest) = exported(&text);
+    const WORDS: &str = "track-to-track teardrops";
+    let project = |on: bool| {
+        json!({"board": {"design_settings": {"teardrop_options": [
+            {"td_onvia": true, "td_onpthpad": true, "td_onsmdpad": true, "td_ontrackend": on}
+        ]}}})
+        .to_string()
+    };
+    let plan = zone_plan(&text, Some(&manifest), &dsn, Some(&project(true)), None).unwrap();
+    assert!(plan.zones.is_empty());
+    assert!(
+        reasons(&plan).iter().all(|r| r.contains(WORDS)),
+        "{:?}",
+        reasons(&plan)
+    );
+    // A track-end teardrop zone already on the board says the same.
+    let teardrop = |kind: &str| {
+        text.replacen(
+            "\t(zone\n",
+            &format!(
+                "\t(zone (net \"GND\") (layer \"F.Cu\") (uuid \"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\") (hatch edge 0.5) (connect_pads yes (clearance 0)) (min_thickness 0.0254) (attr (teardrop (type {kind}))) (fill yes) (polygon (pts (xy 100 51) (xy 100.2 51) (xy 100.2 51.2))))\n\t(zone\n"
+            ),
+            1,
+        )
+    };
+    let plan = plan_with(&text, &teardrop("track_end"), None);
+    assert!(plan.zones.is_empty());
+    assert!(
+        reasons(&plan).iter().all(|r| r.contains(WORDS)),
+        "{:?}",
+        reasons(&plan)
+    );
+    // Controls: the option off, and a pad teardrop zone.
+    let plan = zone_plan(&text, Some(&manifest), &dsn, Some(&project(false)), None).unwrap();
+    assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
+    let plan = plan_with(&text, &teardrop("padvia"), None);
+    assert_eq!(modelled(&plan).len(), 2, "{:?}", reasons(&plan));
 }

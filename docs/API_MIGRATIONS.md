@@ -58,12 +58,15 @@ the engine's prediction with KiCad's refill, pad by pad. Design: stage ZR1 in
   lists given as `open_pad_count` and `starved_pad_count` too. Absent when the winner's
   pass reported no `planes` (the pours-omitted variant, or no zones file).
 - **`pours.false_connected` and `pours.false_open` are filled** for a judged run whose
-  pass reported `planes` with no error: the pads the engine put in their net's main
-  group that KiCad's first refill (before any stitching round) leaves outside it, by the
-  layout audit's grouping over the saved fills, and the pads the engine left open that
-  KiCad connects. `null` for the pours-omitted variant, for a Tune candidate's board,
-  when the engine reports an error, and when KiCad counts 0 unconnected items on the
-  modelled nets while the grouping finds a pad off the main group.
+  pass reported `planes` with no error: the pads the engine called connected that KiCad's
+  first refill (before any stitching round) does not, and the pads the engine left open
+  that KiCad connects. KiCad's side is the layout audit's grouping over the saved fills,
+  read with the engine's rule: a pad is connected only when its copper group holds more
+  than half its net's pads, so a tie leaves every pad of the net open (check 3.3 keeps
+  its own main group). `null` for the pours-omitted variant, for a Tune candidate's
+  board, when the engine reports an error (its text is then in `pours_error`), and when
+  KiCad counts 0 unconnected items on the modelled nets while the grouping finds a pad
+  open.
 - **`pours_error` may now sit beside `pours`**: when the comparison could not be made
   (a pad that cannot be named, a `planes` object that does not read), the ZR0 measures
   stay, both counts are `null`, and `pours_error` gives the reason. A failed comparison

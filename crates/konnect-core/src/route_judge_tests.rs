@@ -3275,9 +3275,9 @@ exit 0
 
     /// Row ZR, ZR1: with the engine's `planes` object on the kept pass, KiCad's side is
     /// taken on the FIRST refilled board (its folder is gone once the stitching round
-    /// has run), and a pad the model called connected that KiCad's grouping leaves off
-    /// the main group is one false connection. Control: the fill joins both GND pads,
-    /// nothing is false.
+    /// has run), and each pad the model called connected that KiCad's grouping leaves
+    /// out of a majority group is a false connection. Control: the fill joins both GND
+    /// pads, nothing is false.
     #[tokio::test]
     async fn the_judge_counts_a_false_connection_on_the_first_refilled_board() {
         let judged_with_fill = |(x0, x1): (f64, f64)| async move {
@@ -3319,14 +3319,14 @@ exit 0
             assert_eq!(h.rounds_left(), vec!["r1"]);
             judged
         };
-        // R2's GND pad only: R1's is off the main group (a tie of one pad each, either
-        // way one pad), and the model called both connected.
+        // R2's GND pad only: one pad each, no group holds a majority, so KiCad's side
+        // leaves both open, and the model called both connected.
         let judged = judged_with_fill((108.0, 111.0)).await;
         assert_eq!(judged.measures.pours_error, None);
         let pours = judged.measures.pours.as_ref().unwrap();
         assert_eq!(
             (pours.false_connected, pours.false_open),
-            (Some(1), Some(0))
+            (Some(2), Some(0))
         );
         // Control: both GND pads on the fill.
         let judged = judged_with_fill((99.0, 111.0)).await;

@@ -1237,8 +1237,8 @@ pub(super) fn planner_junctions(m: &Model) -> Vec<(String, String, Pt, Vec<Strin
 
 pub(super) use planes::Probe as PlaneProbe;
 
-/// Row ZR, stage ZR1 (Z13): one pad of a net outside the net's main copper group, as the
-/// audit's own grouping (check 3.3, [`planes::ranked_pad_groups`]) finds it.
+/// Row ZR, stage ZR1 (Z13): one pad of a net that is not in a majority copper group of
+/// its net, by the audit's own grouping (check 3.3, [`planes::ranked_pad_groups`]).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OffMainPad {
     pub net: String,
@@ -1250,11 +1250,14 @@ pub(crate) struct OffMainPad {
     pub has_copper: bool,
 }
 
-/// Row ZR, stage ZR1 (Z13): for each net of `nets`, the pads outside its main copper
-/// group on the saved board `board_text` (at `board`), by the audit's own grouping over
-/// the saved fills: the real shapes of the net's tracks, vias, pads and `filled_polygon`s,
-/// touching within 0.01 mm on a shared layer; the main group has the most pads. A net
-/// with no pad gives none. An error when a zone of one of `nets` has no saved fill (its
+/// Row ZR, stage ZR1 (Z13): for each net of `nets`, the pads that are not in a group
+/// holding a strict majority of the net's pads with copper, on the saved board
+/// `board_text` (at `board`), by the audit's own grouping over the saved fills: the real
+/// shapes of the net's tracks, vias, pads and `filled_polygon`s, touching within 0.01 mm
+/// on a shared layer. This is the engine's rule (a pin is connected only when its net's
+/// main group holds more than half the net's pins), so a tie leaves every pad of the net
+/// open; check 3.3 keeps its own main group (most pads, the lower group id on a tie). A
+/// net with no pad gives none. An error when a zone of one of `nets` has no saved fill (its
 /// pads would read as cut off: check 3.3 leaves such a net unjudged for the same reason),
 /// or when the board does not parse.
 pub(crate) fn pads_off_main_group(
@@ -1276,11 +1279,19 @@ pub(crate) fn pads_off_main_group(
                     zone.layers.join("/")
                 );
             }
-            for pi in planes::ranked_pad_groups(m, net)
-                .into_iter()
-                .skip(1)
-                .flatten()
-            {
+            let groups = planes::ranked_pad_groups(m, net);
+            let with_copper = |group: &Vec<PadIx>| {
+                group
+                    .iter()
+                    .filter(|pi| !m.pad_layers(m.pad(**pi).1).is_empty())
+                    .count()
+            };
+            let total: usize = groups.iter().map(with_copper).sum();
+            let majority = groups
+                .first()
+                .is_some_and(|main| 2 * with_copper(main) > total);
+            let skip = usize::from(majority);
+            for pi in groups.into_iter().skip(skip).flatten() {
                 let (fp, pad) = m.pad(pi);
                 out.push(OffMainPad {
                     net: net.clone(),
