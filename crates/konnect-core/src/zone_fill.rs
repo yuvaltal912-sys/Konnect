@@ -29,7 +29,8 @@ pub(crate) struct ZoneLayerFill {
     /// mm², largest first.
     pub pieces_mm2: Vec<f64>,
     /// Row ZR, ZR5: one flag per piece, in the order of `pieces_mm2`: KiCad saved the
-    /// piece with `(island yes)` (kept by the zone's own island rule). The readers of
+    /// piece as an island (kept by the zone's own island rule): `(island yes)`,
+    /// `(island true)` or a bare `(island)` (see `is_island`). The readers of
     /// `pieces_mm2` from before ZR5 read every piece, islands included.
     pub islands: Vec<bool>,
 }
@@ -86,7 +87,7 @@ pub(crate) fn pour_fills(
     board_text: &str,
     pour_nets: &BTreeSet<String>,
 ) -> Result<Vec<ZoneLayerFill>> {
-    let tree = konnect_sexp::parse_sexp(board_text).context("the judged board does not parse")?;
+    let tree = konnect_sexp::parse_sexp(board_text).context("the board does not parse")?;
     let ids = net_ids(&tree);
     let mut out = Vec::new();
     for zone in tree.find_all("zone") {
@@ -133,12 +134,16 @@ pub(crate) fn pour_fills(
     Ok(out)
 }
 
-/// Whether KiCad saved a fill piece as an island: `(island yes)`, or `(island)` alone
-/// (KiCad 10 reads an absent value as yes, `pcb_io_kicad_sexpr_parser.cpp`).
+/// Whether KiCad saved a fill piece as an island: `(island yes)`, `(island true)`, or
+/// `(island)` alone; `(island no)` and `(island false)` are fill (KiCad 10's
+/// `parseMaybeAbsentBool`, `pcb_io_kicad_sexpr_parser.cpp`).
 fn is_island(polygon: &SexpNode) -> bool {
-    polygon
-        .find("island")
-        .is_some_and(|island| island.get(1).and_then(SexpNode::as_str) != Some("no"))
+    polygon.find("island").is_some_and(|island| {
+        !matches!(
+            island.get(1).and_then(SexpNode::as_str),
+            Some("no") | Some("false")
+        )
+    })
 }
 
 /// The measures of one judged run. `first_refill` is the DRC right after the session

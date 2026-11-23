@@ -535,7 +535,9 @@ async fn call_tool(
 /// `tools::cli::refill_drc_on_private_copy_with_config` (with the context's private
 /// KiCad settings); violations counted by `rule`, and the
 /// unconnected items counted (a report with no unconnected category is an error,
-/// never zero).
+/// never zero). Row ZR, ZR5 part 1: when the call has pour nets, the pour fills of the
+/// refilled board (`baseline_fills`), or why they could not be read; that read never
+/// fails the baseline.
 pub(crate) async fn baseline(ctx: &JudgeContext) -> Result<Baseline> {
     let folder = ctx.root.join("baseline");
     if folder.exists() {
