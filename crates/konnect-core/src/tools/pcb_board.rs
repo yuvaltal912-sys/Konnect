@@ -513,6 +513,89 @@ impl PadConnection {
     }
 }
 
+/// Row ZR, stage ZR4: the largest `island_min_area` `add_zone` takes, mm². KiCad reads
+/// the file's `island_area_min` into a 32-bit count of nanometres
+/// (`pcb_io_kicad_sexpr_parser.cpp`, `T_island_area_min`), which holds 2147 mm².
+pub(crate) const MAX_ISLAND_AREA_MM2: f64 = 2000.0;
+
+/// Row ZR, stage ZR4: everything a caller may choose about how a zone fills, read and
+/// checked once for both of `add_zone`'s paths (IPC and the file fallback) and for the
+/// pour planner, whose proposals carry one (`pour_plan::ProposedZone`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ZoneSettings {
+    pub clearance_mm: f64,
+    pub min_width_mm: f64,
+    /// Higher wins where zones overlap.
+    pub priority: u32,
+    pub connection: PadConnection,
+    /// The gap around a pad that connects by thermal relief.
+    pub thermal_gap_mm: f64,
+    /// The width of a thermal spoke. Never below `min_width_mm`: KiCad makes no spoke
+    /// narrower than the zone's minimum width (`zone_filler.cpp`, `spoke_w`).
+    pub thermal_bridge_mm: f64,
+    pub islands: builders::ZoneIslands,
+}
+
+impl ZoneSettings {
+    /// The settings of `add_zone`'s arguments, each read by its literal name:
+    /// - `clearance` (default [`DEFAULT_ZONE_CLEARANCE_MM`]), `min_width` (default
+    ///   [`DEFAULT_ZONE_MIN_WIDTH_MM`]), `priority` (default 0), `pad_connection`
+    ///   (default thermal): as before this stage;
+    /// - `thermal_gap`: default `builders::ZONE_THERMAL_RELIEF_MM`;
+    /// - `thermal_bridge_width`: when absent, the larger of
+    ///   `builders::ZONE_THERMAL_RELIEF_MM` and the minimum width, so that a call that
+    ///   only raises `min_width` still gets spokes;
+    /// - `island_removal`: `always` (default), `never` or `below_area`;
+    /// - `island_min_area`: mm², required with `below_area` and refused with any other
+    ///   mode (an argument that is read by nothing is not accepted).
+    ///
+    /// `Err(message)` for a value of the wrong type, an unknown `pad_connection` or
+    /// `island_removal`, and everything [`ZoneSettings::check`] refuses.
+    pub(crate) fn from_args(args: &serde_json::Value) -> Result<ZoneSettings, String> {
+        todo!()
+    }
+
+    /// Why these values cannot make a zone, each message naming the argument:
+    /// - a clearance or thermal gap that is not a finite number of 0 or more;
+    /// - a minimum width or thermal bridge that is not finite and above 0;
+    /// - a thermal bridge below the minimum width (KiCad would make no spoke at all, and
+    ///   every thermal pad of the net would stay unconnected);
+    /// - an island area that is not finite, not above 0, or above
+    ///   [`MAX_ISLAND_AREA_MM2`].
+    pub(crate) fn check(&self) -> Result<(), String> {
+        todo!()
+    }
+
+    /// These settings as `add_zone` arguments, the inverse of
+    /// [`ZoneSettings::from_args`]: `clearance`, `min_width`, `priority`,
+    /// `pad_connection`, `thermal_gap`, `thermal_bridge_width`, `island_removal` and,
+    /// for `below_area` only, `island_min_area`. Every key is written, the defaults
+    /// included.
+    pub(crate) fn to_args(&self) -> serde_json::Map<String, serde_json::Value> {
+        todo!()
+    }
+}
+
+/// Row ZR, stage ZR4: the `(zone …)` text of `add_zone`'s file fallback, with the
+/// settings. It replaces `format_zone_polygon` and is also what the pour planner writes
+/// into its scratch boards (`pour_plan::with_zones`), so that the zone KiCad checks for a
+/// plan is the zone `add_zone` writes.
+///
+/// The text is `format_zone_polygon`'s, with `(thermal_gap …)` and
+/// `(thermal_bridge_width …)` from the settings, and, only when `settings.islands` is
+/// not `Always`, `(island_removal_mode N)` after them, followed for `BelowArea` by
+/// `(island_area_min A)`. With the default settings the text is byte for byte what
+/// `format_zone_polygon` wrote, apart from the fresh UUID.
+pub(crate) fn zone_sexp(
+    net: &konnect_sexp::net::NetRef,
+    layer: &str,
+    points: &[(f64, f64)],
+    name: &str,
+    settings: &ZoneSettings,
+) -> String {
+    todo!()
+}
+
 /// The JSON schema both zone tools advertise. One definition so `add_zone` and
 /// `add_copper_pour` cannot drift apart again.
 pub(crate) fn zone_schema() -> serde_json::Value {

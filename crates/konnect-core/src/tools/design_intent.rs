@@ -172,6 +172,35 @@ pub struct LengthGroup {
     pub notes: Option<String>,
 }
 
+/// Row ZR, stage ZR4: a pour the owner asks for (docs/POUR_PLAN_DESIGN.md, PP2 and
+/// PP7). The section `pours` of the record is a list of these. `plan_pours` divides the
+/// copper layers by its own rules; every entry here is an explicit request and wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PourIntent {
+    /// The net to pour. Matched against the board's net names exactly.
+    pub net: String,
+    /// Copper layers by KiCad's names (`F.Cu`, `In1.Cu` …, `B.Cu`): the net is poured on
+    /// each of them, whole layer. Empty: the planner gives the net the layer its rule
+    /// has for a net of its kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Every reason the record's `pours` cannot be used, each prefixed with where it is
+/// (`pours[i].layers[j]: …`), as [`validate`] reports. `validate` appends these:
+/// - `net` passes `net_ok` and is listed once in the section;
+/// - each layer is a copper layer name (`F.Cu`, `B.Cu`, or `In<N>.Cu` with N from 1 to
+///   30), listed once in its entry;
+/// - no layer is asked for by two entries: one layer takes one whole-layer pour.
+/// Whether a net or a layer is on the board is not checked here (the record never reads
+/// the board); `plan_pours` reports a request it cannot meet.
+fn validate_pours(pours: &[PourIntent]) -> Vec<String> {
+    todo!()
+}
+
 /// What the board will be built to.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

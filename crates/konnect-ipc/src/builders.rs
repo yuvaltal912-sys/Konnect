@@ -313,6 +313,40 @@ pub const ZONE_THERMAL_RELIEF_MM: f64 = 0.5;
 /// `(hatch edge 0.508)` — the border hatch pcbnew gives a freshly drawn zone.
 pub const ZONE_BORDER_PITCH_MM: f64 = 0.508;
 
+/// Row ZR, stage ZR4: what KiCad does with a fill piece that touches nothing of its net
+/// (`ISLAND_REMOVAL_MODE`). A value of [`ZoneSpec`] (its `islands` field), so that both
+/// of `add_zone`'s paths write the same choice: [`build_zone`] as `island_mode` and
+/// `min_island_area`, the file fallback as `(island_removal_mode …)` and
+/// `(island_area_min …)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZoneIslands {
+    /// Removed: KiCad's default, and what `add_zone` wrote before it took this setting.
+    Always,
+    /// Kept.
+    Never,
+    /// Removed when smaller than this area, mm².
+    BelowArea { area_mm2: f64 },
+}
+
+impl ZoneIslands {
+    /// KiCad's API enum for this choice.
+    pub fn as_ipc(self) -> kiapi::board::types::IslandRemovalMode {
+        todo!()
+    }
+
+    /// `min_island_area` as KiCad's API takes it, in square nanometres (`ZONE::Serialize`
+    /// sends `m_minIslandArea` as it is): the area times 1e12, rounded; 0 unless
+    /// [`ZoneIslands::BelowArea`].
+    pub fn min_area_nm2(self) -> u64 {
+        todo!()
+    }
+
+    /// The number KiCad's board file writes as `island_removal_mode`: 0, 1 or 2.
+    pub fn file_mode(self) -> u8 {
+        todo!()
+    }
+}
+
 /// Everything a caller may choose about a copper pour. The net *code* is not
 /// in here: it is resolved from `net_name` against the live board by
 /// [`crate::client::KiCadIpcClient::add_zone`], which keeps this a pure

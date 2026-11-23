@@ -1250,6 +1250,33 @@ pub(crate) struct OffMainPad {
     pub has_copper: bool,
 }
 
+/// Row ZR, stage ZR4: the ground and power nets of a board, each with the source of its
+/// role, and every net's netclasses: what `plan_pours` divides the copper among.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SupplyRoles {
+    /// Net to the source of its role, in the audit's words (`Roles::ground`).
+    pub ground: BTreeMap<String, String>,
+    /// The same for the power nets (`Roles::power`).
+    pub power: BTreeMap<String, String>,
+    /// Every netclass of a net but `Default` (`Roles::netclass`).
+    pub netclass: BTreeMap<String, Vec<String>>,
+}
+
+/// Row ZR, stage ZR4: the roles of `nets` exactly as `audit_layout_quality` resolves its
+/// `net_roles` with no argument of its own ([`intent_roles`] with the default
+/// thresholds and no extra list): a design-intent rail (0 V is ground, any other
+/// voltage is power), then a netclass whose name reads as power, then the net's name.
+/// The texts are given, not read: `intent_text` is the design-intent record and
+/// `project_text` the `.kicad_pro`, each `None` when the project has none. A record that
+/// does not read gives no rail (the caller refuses such a record before it calls this).
+pub(crate) fn supply_roles(
+    nets: &BTreeSet<String>,
+    intent_text: Option<&str>,
+    project_text: Option<&str>,
+) -> SupplyRoles {
+    todo!()
+}
+
 /// Row ZR, stage ZR1 (Z13): for each net of `nets`, the pads that are not in a group
 /// holding a strict majority of the net's pads with copper, on the saved board
 /// `board_text` (at `board`), by the audit's own grouping over the saved fills: the real
