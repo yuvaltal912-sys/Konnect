@@ -481,8 +481,13 @@ sites and the setting is part 2's.
 konnect-ipc -p konnect-core` exits 0 with 0 errors and 8 warnings, every one an unused
 variable or item of `pour_damage.rs`: nothing calls it yet. 2 bodies are `todo!()`. `cargo fmt
 --all -- --check` is clean. Tests were not compiled or run. Record:
-`target/creation-research/zone-routing/zr5/plan-check/` in the main checkout. Part 2's
-skeleton, `pour_rank.rs`, is in the commit after this one.
+`target/creation-research/zone-routing/zr5/plan-check/` in the main checkout.
+
+**Skeleton compile, part 2** (the same day, the commit after part 1's): with `pour_rank.rs`
+added the same command exits 0 with 0 errors and 47 warnings, 39 of them unused variables
+and items of `pour_rank.rs` and the 8 of part 1. 12 bodies of `pour_rank.rs` are `todo!()`.
+`cargo fmt --all -- --check` is clean. Part 1's builder starts from the commit before this
+one, which does not have the file.
 
 **Not verified.**
 
