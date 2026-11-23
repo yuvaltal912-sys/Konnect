@@ -3,6 +3,33 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the judge's pour measures (Row ZR, stage ZR0)
+
+`route_specctra_dsn` (fastroute) records what each judged run did to the board's
+pours. Design: stage ZR0 in `docs/ZONE_ROUTING_DESIGN.md`. Nothing about the
+routing, the gates or the rank key changes.
+
+- **New measures field `pours`**, in every judged run's measures
+  (`search.winner.measures`, each judged run's `run.json`, and a Tune row's untuned
+  measures), when the manifest has pours; absent otherwise:
+  - `open_before_stitching` and `open_after_stitching`: KiCad's unconnected items
+    on the pour nets after the first refill and on the last board;
+  - `pieces`: a count of fill pieces, summed over every pour zone and copper layer
+    of the last board (a whole pour on two layers counts 2); zones inside
+    footprints are not read;
+  - `largest_piece_share`: the lowest share of a zone layer's fill that its largest
+    piece holds (`null` when nothing is filled);
+  - `unfilled`: pour zone layers with no saved fill;
+  - `starved_thermals`: KiCad's `starved_thermal` violations on the last board,
+    board-wide (the same count as `violations["starved_thermal"]`; 0 when the project
+    ignores the rule);
+  - `false_connected` and `false_open`: `null` until the engine models the fill
+    (stage ZR1).
+- **New measures field `pours_error`**, only when the pours could not be measured:
+  the reason. A failed pour measure never fails the judged run or rejects a Tune
+  candidate; `pours` is then absent.
+- A reader of an older result, which has neither field, reads them as absent.
+
 ## Unreleased: the smart-router switches with fastroute (Row GS)
 
 `route_specctra_dsn` (fastroute) routes every Full, Fallback and Polish pass with

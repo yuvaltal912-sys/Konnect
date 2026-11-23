@@ -595,6 +595,14 @@ pub(crate) struct Measures {
     /// skew (`length_probe::check`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lengths: Option<crate::length_probe::LengthMeasures>,
+    /// Row ZR, ZR0: the pours of the run (`zone_fill::pour_measures`), when the call
+    /// has pour nets. Recorded only: no gate and no rank-key position reads it (Z10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pours: Option<crate::zone_fill::PourMeasures>,
+    /// Row ZR, ZR0: why the pours could not be measured, when they could not. A
+    /// failed pour measure never fails the judged run: it is recorded only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pours_error: Option<String>,
 }
 
 /// Each gate passes when its list is empty; each entry is one readable line.
@@ -776,6 +784,8 @@ async fn judge_one(
     let mut drc = refill(ctx, config.path(), &board)
         .await
         .context("refill and DRC of the routed board")?;
+    // Row ZR, ZR0: the pours' open count is taken before any stitching round.
+    let first_drc = (!ctx.pour_nets.is_empty()).then(|| drc.clone());
 
     // 4. Stitching, for the nets the router got as planes.
     let planes = &routed.planes;
@@ -924,6 +934,11 @@ async fn judge_one(
         routed.held.seconds,
     )?;
     measures.lengths = lengths;
+    if let Some(first_drc) = first_drc {
+        let taken =
+            crate::zone_fill::pour_record(&board, first_drc, drc.clone(), &ctx.pour_nets).await;
+        crate::zone_fill::record_pours(&mut measures, taken);
+    }
     let gates = gates(&measures, baseline);
     Ok(Judged {
         measures,
@@ -1348,6 +1363,8 @@ pub(crate) fn measure(
         stitching_vias,
         route_s,
         lengths: None,
+        pours: None,
+        pours_error: None,
     })
 }
 

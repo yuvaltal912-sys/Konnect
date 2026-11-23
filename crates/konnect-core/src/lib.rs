@@ -37,3 +37,4 @@ pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+pub(crate) mod zone_fill;

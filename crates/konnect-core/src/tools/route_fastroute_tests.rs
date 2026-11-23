@@ -818,6 +818,8 @@ fn measures() -> Measures {
         stitching_vias: 0,
         route_s: 12.34,
         lengths: None,
+        pours: None,
+        pours_error: None,
     }
 }
 

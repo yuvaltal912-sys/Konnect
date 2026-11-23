@@ -1856,3 +1856,59 @@ not part of this row.
 - **Not done:** the skeletons in this section were not compiled (no build was allowed while Row
   GS's measurement held the machine). The next stage's PR compiles them, as the design's own
   were.
+
+## ZR0 as built (2026-11-22)
+
+Stage ZR0's measures are built in `crates/konnect-core/src/zone_fill.rs` and filled by the
+judge (`route_judge.rs`, `judge_one`). They differ from the `zone_fill.rs` skeleton above as
+follows, each on purpose:
+
+- **`pour_measures(first_refill, last_board_text, last_refill, pour_nets)`.** It takes no
+  first board text and no engine section: ZR0 has no engine model, and the first board's
+  folder is removed once a stitching round writes the next one, so what ZR0 needs of the
+  first refill (its open count) is taken from its report.
+- **Fields added:** `open_after_stitching` (the same count on the last board) and
+  `unfilled` (pour zone layers with no saved fill, which would otherwise read as whole).
+- **`largest_piece_share` is `Option<f64>`:** `None` when no pour layer has fill.
+- **A piece is one `filled_polygon`.** KiCad 10 saves each piece of a fill as one fractured
+  ring (`pcb_io_kicad_sexpr.cpp`), so its shoelace area is the piece less its holes. No raster.
+- **A failed pour measure is recorded, not raised** (`Measures.pours_error`): the measures
+  feed no gate and no rank key (Z10), so they must not fail a run or reject a Tune
+  candidate.
+- **`kicad_open_pads`, `false_connected` and `false_open` wait for ZR1.**
+
+### The x19 baseline (2026-11-23)
+
+One `route_specctra_dsn` call per board at effort M (240 s), fastroute x19, the branch's release
+build, each in its own routing hold. Five boards: two of the owner's (dash, B5) and the public
+fixtures `pic`, `ecc` and `pours`. Then the probe: each manifest's pour planes replaced by
+KiCad's real fill of the unrouted board, and one more call on it. Counts are per judged run;
+"open" is KiCad's unconnected items on the pour nets after the first refill.
+
+| Board | Pours as planes (as exported): runs, gates passed, open (median, max) | Pours omitted: runs, gates passed, open |
+|---|---|---|
+| dash | 7, 0, 25 and 28 | 5, 5, 0 |
+| B5 | 28, 0, 11 and 13 | 26, 26, 0 |
+| `pic` | 92, 0, 2 and 5 | 91, 27, 0 |
+| `ecc` | 710, 710, 0 and 0 | 709, 709, 0 |
+| `pours` | 707, 435, 0 and 1 (575 runs at 0) | 707, 602, 0 |
+
+- **The stitching rounds never ran** (Z9). On every as-exported run that left a pour net open,
+  the stitching planner refused: "unsupported local zone_connect override" on dash, B5 and `pic`
+  (the research's change 6, outside this row), and "saved project required for planning rules"
+  on `pours`. So `open_after_stitching` equals `open_before_stitching` in all 5,804 judged runs,
+  and the count Z9 meant to measure how much the engine misses is the open count itself.
+- **The five winners are pours omitted**, the same seeds as Row GS's x19 calls, and the judged
+  counts are within Row GS's spread (dash 12 and 12, B5 54 and 46, `pic` 183 and 185, `ecc` 1,419
+  and 1,400, `pours` 1,414 and 1,428): the measures cost no measurable judge time. No run
+  recorded a `pours_error`.
+- **The fill on the winners:** dash 32 pieces with a lowest largest-piece share of 0.71; B5 13
+  and 0.95; `pic` 3 and 0.92; `ecc` and `pours` whole. No winner has a starved thermal or an
+  unfilled pour layer.
+- **The probe.** The unrouted fill is one piece per plane on all five boards, so the probe
+  changes the planes' shape only (clearance voids, the board edge), not their count. On B5 the
+  as-exported runs went from 0 of 28 passing (open 11) to 4 of 4 passing (open 0). On `pic` they
+  stayed at open 2 (0 of 5 passing); `ecc` and `pours` did not change; on dash no as-exported
+  run was judged in the budget. The fill-shaped planes slow the engine: 11 runs judged on B5
+  instead of 54, 16 on `pic` instead of 183, 2 on dash instead of 12. One board, four runs: it
+  points ZR2's truth at the planes' shape, and it is not yet evidence.
