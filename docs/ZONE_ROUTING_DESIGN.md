@@ -287,8 +287,9 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 
 ZR4 touches no engine file and may run beside ZR1 to ZR3.
 
-ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23): a
-second key beside today's, off until the owner's word.
+ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23), in
+two PRs on the owner's order ("כן, ZR5 קודם"): first the pour record, which changes no rank
+and merges before ZR3's measurement; then a second key beside today's, off until his word.
 
 ## Decisions taken in this design (with the reason)
 
@@ -1677,7 +1678,8 @@ When ZR5 adds pour terms to the key, the uncounted set follows the key and shrin
 
 **ZR5's design (2026-11-23) leaves the uncounted set as it is**
 ([POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), PK11). The pour track enters the pour key as a
-tie-break only, and one engine input keeps the two keys comparable on the same runs.
+tie-break only; and with pour nets in the engine's cost every ground and stitching via would
+cost the search, which could work against ZR0b's prune and ZR2's closing vias.
 
 **The optimizer.** F1's `follow_rips` and the optimizer's own comparison read the same per-net
 counts, from the snapshot drawn before the optimizer pass. A candidate that cuts a pour reads
