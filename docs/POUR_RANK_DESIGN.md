@@ -21,9 +21,10 @@ file.
   work", done on "the owner's word, on ZR3's numbers". Z10: "Pour terms enter the rank key
   last (ZR5). The key reproduces a measured order. Changing it needs its own numbers."
   "Last" there is the last stage, not the last place in the key.
-- **Still his, and not taken here** ("Decisions for the owner" below): when the pour key is
-  switched on; when the skill stops saying "pours last" (the row's decision 5); and whether
-  ranking candidate pour divisions by routing is its own stage.
+- **Three decisions, 2026-11-23:** "כן, כמו שהמלצת בשלוש ההחלטות", to the three under
+  "Decisions for the owner" below, each as recommended: the pour key is switched on after
+  ZR3's table, on his word; the skill stops saying "pours last" once ZR4 and ZR2 are
+  merged; ranking candidate pour divisions by routing is its own stage.
 
 ## The short answer
 
@@ -125,7 +126,7 @@ before a line of part 2 is built.
 | PK12 | Everything that ranks goes through one function with the setting: the search's winner and the runs it releases, the choice among a run's tuned candidates, the prune's "no entry higher" clause, its final comparison and the keys it takes again, and the result's listing | One standard with the search (the prune's own reason, P5). A site left on the other key would keep or drop what the winner's key does not |
 | PK13 | Placement is not changed: its key keeps copying today's quality entries, and the routing calls of the placement tools rank by today's key whatever the setting, through a constant, as they already switch the prune off (`place_route::CANDIDATE_PRUNE`) | Their key ranks placements with today's entries; a candidate's routing winner chosen by another key would be judged by a standard its ranking does not read. In the order of work placement comes before the pours, so a new board's candidates have none. A board placed again with its pours in gets no pour term: a limit, written down |
 | PK14 | Part 2 ships with the setting at `routing`. Switching the default is its own one-line change, on the owner's word | The stage's done criterion is his word on ZR3's numbers |
-| PK15 | The skill's order of work is designed here and applied on the owner's word (the row's decision 5): pours are planned and added before the routing export | It names `plan_pours`, so it follows ZR4's merge; and it is only right once the router connects through a pour (ZR2) |
+| PK15 | The skill's order of work is designed here and applied once stages ZR4 and ZR2 are merged (the row's decision 5, answered by the owner on 2026-11-23): pours are planned and added before the routing export | It names `plan_pours`, so it follows ZR4's merge; and it is only right once the router connects through a pour (ZR2) |
 | PK16 | Ranking candidate pour divisions by routing each one is not in this stage | It can only rank with the pour key, which is off until the owner's word. The measures are built so that it can: damage is against each candidate's own fill before routing, and the plane loss is a share of plane area, so a pour that is added and stays whole lowers it |
 | PK17 | Two PRs: the record first, the key after ZR3's numbers | The owner's order. It also lets numbers confirm the key's open values before they are code |
 | PK18 | The record carries its rows: the "before" rows in the baseline and the "after" rows in each run, beside the numbers made from them | So that a second computation can redo every number, and so that another step, place or sum can be tried on recorded runs without a new measurement (the review: totals alone cannot be checked) |
@@ -384,10 +385,10 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
   default place, so the call names the engine's path.
 - No step and no place is tuned to make a board pass.
 
-## The skill's order of work (PK15; applied only on the owner's word)
+## The skill's order of work (PK15; applied once ZR4 and ZR2 are merged)
 
 Today the `kicad-pcb` skill's "Layout Order" routes at step 5 and adds pours at step 6, and
-says "Do NOT add copper pours before routing is complete". The change, when he says so:
+says "Do NOT add copper pours before routing is complete". The change:
 
 - Step 5 becomes the pours: `plan_pours`, the plan shown to the user, `add_zone` once per
   proposal on their OK, `refill_zones`, `save_project`.
@@ -397,8 +398,9 @@ says "Do NOT add copper pours before routing is complete". The change, when he s
   board that is routed by hand with `route_trace` may still pour last.
 - Rule 10 ("Copper pour last") is rewritten the same way.
 
-It waits for three things: stage ZR4 merged (the tool it names), stage ZR2 merged (a router
-that connects through a pour), and his word.
+It waits for two things: stage ZR4 merged (the tool it names) and stage ZR2 merged (a
+router that connects through a pour). The owner answered on 2026-11-23 that it changes
+then. It is a PR of its own, and its text goes to him like any other.
 
 ## What this design does not do
 
@@ -424,10 +426,22 @@ that connects through a pour), and his word.
    ships off, and is switched on by a one-line change on his word.
 3. **When does the skill stop saying "pours last"** (the row's decision 5)? Recommended:
    when ZR4 and ZR2 are merged and ZR2's table shows the as-exported shape at 0 open
-   before stitching, on his word.
+   before stitching.
 4. **Candidate pour divisions ranked by routing.** The ZR4 design said this "comes with
    ZR5". Recommended: its own stage, after the key is on, because it can only rank with
    that key.
+
+**Answered 2026-11-23, all three as recommended:** "כן, כמו שהמלצת בשלוש ההחלטות". He was
+shown them as: the pour key after ZR3's table, on his word; the skill's order once ZR4 and
+ZR2 are merged; candidate divisions as their own stage after the key is on.
+
+- For 2: part 2's build still starts on his word, and so does the switch after it.
+- For 3: ZR2's final matrix already has the as-exported shape at 0 open before stitching on
+  every run that passes the gates, on all five boards (the replay of its records). So the
+  skill's change waits for the two merges only. It is a PR of its own; its text goes to him
+  like any other.
+- For 4: stage ZR4's own design, which says the ranking "comes with ZR5", is corrected in
+  ZR4's PR.
 
 ## Verification of this document
 
@@ -481,8 +495,13 @@ sites and the setting is part 2's.
 konnect-ipc -p konnect-core` exits 0 with 0 errors and 8 warnings, every one an unused
 variable or item of `pour_damage.rs`: nothing calls it yet. 2 bodies are `todo!()`. `cargo fmt
 --all -- --check` is clean. Tests were not compiled or run. Record:
-`target/creation-research/zone-routing/zr5/plan-check/` in the main checkout. Part 2's
-skeleton, `pour_rank.rs`, is in the commit after this one.
+`target/creation-research/zone-routing/zr5/plan-check/` in the main checkout.
+
+**Skeleton compile, part 2** (the same day, the commit after part 1's): with `pour_rank.rs`
+added the same command exits 0 with 0 errors and 47 warnings, 39 of them unused variables
+and items of `pour_rank.rs` and the 8 of part 1. 12 bodies of `pour_rank.rs` are `todo!()`.
+`cargo fmt --all -- --check` is clean. Part 1's builder starts from the commit before this
+one, which does not have the file.
 
 **Not verified.**
 

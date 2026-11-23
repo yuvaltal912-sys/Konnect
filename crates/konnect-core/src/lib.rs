@@ -26,6 +26,7 @@ pub(crate) mod place_schematic;
 pub(crate) mod place_search;
 pub(crate) mod pour_damage;
 pub(crate) mod pour_prune;
+pub(crate) mod pour_rank;
 pub(crate) mod route_judge;
 pub(crate) mod route_search;
 pub mod router;
