@@ -622,7 +622,7 @@ fn the_setup_names_the_default_place_the_three_ways_and_the_alternative() {
         "routing.fastroute_path",
         "engine: \\\"freerouting\\\"",
         "Nothing is downloaded",
-        "C** + BR1 + W8P + GS",
+        "C** + BR1 + W8P + GS + ZR1",
     ] {
         assert!(text.contains(needle), "{needle} is missing from {text}");
     }
@@ -1517,7 +1517,7 @@ fn the_result_has_every_documented_key() {
     // The engine.
     let engine = &result["engine"];
     assert_eq!(engine["name"], "fastroute");
-    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS");
+    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS + ZR1");
     assert_eq!(engine["path"], "/x/fastroute");
     assert_eq!(engine["sha256"], "ab".repeat(32));
     assert_eq!(engine["version"], "fastroute 0.1.14");
@@ -1982,7 +1982,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS, build x19);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS + ZR1, build x20);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a
