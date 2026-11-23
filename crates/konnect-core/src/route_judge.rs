@@ -352,10 +352,11 @@ async fn refill(
 /// dropped. The baseline and up to three judges run kicad-cli at once, and kicad-cli
 /// re-saves its settings on exit, so no two of them share a settings folder, and
 /// the call's copy itself is never written: every run starts from the same settings.
-struct OwnConfig(Option<PathBuf>);
+/// Row ZR, ZR0b: the prune's checker holds one too (`run-<i>-prune`).
+pub(crate) struct OwnConfig(Option<PathBuf>);
 
 impl OwnConfig {
-    fn new(ctx: &JudgeContext, name: &str) -> Result<Self> {
+    pub(crate) fn new(ctx: &JudgeContext, name: &str) -> Result<Self> {
         let Some(master) = ctx.kicad_config_home.as_deref() else {
             return Ok(Self(None));
         };
@@ -368,7 +369,7 @@ impl OwnConfig {
         Ok(Self(Some(own)))
     }
 
-    fn path(&self) -> Option<&Path> {
+    pub(crate) fn path(&self) -> Option<&Path> {
         self.0.as_deref()
     }
 }
@@ -682,17 +683,19 @@ pub(crate) async fn judge(
 }
 
 /// One registry tool call in flight: whether it refused, and its first text.
-type ToolCall<'a> =
+pub(crate) type ToolCall<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(bool, String)>> + Send + 'a>>;
 
 /// How the judge calls the tools of the registry: whether the call refused
 /// (`is_error`) and its first text. The one implementation is [`RegistryTools`]; the
-/// tests of the round logic put a scripted planner in its place.
-trait ToolCaller: Send + Sync {
+/// tests of the round logic put a scripted planner in its place, and the tests of the
+/// ground-via prune (Row ZR, ZR0b) a scripted audit.
+pub(crate) trait ToolCaller: Send + Sync {
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> ToolCall<'a>;
 }
 
-struct RegistryTools(Arc<crate::tools::ToolContext>);
+/// The production [`ToolCaller`]: the tool registry, in-process.
+pub(crate) struct RegistryTools(pub(crate) Arc<crate::tools::ToolContext>);
 
 impl ToolCaller for RegistryTools {
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> ToolCall<'a> {
@@ -725,8 +728,9 @@ async fn judge_with(
 }
 
 /// Steps 1 to 7 of [`judge`] on one session of the run, in `ctx.root/<folder_name>`
-/// (`run-<index>`, `run-<index>-untuned`, `run-<index>-pour-safe`; the folder name
-/// also names the judge's own KiCad settings copy).
+/// (`run-<index>`, `run-<index>-untuned`, `run-<index>-pour-safe`, and Row ZR, ZR0b's
+/// `run-<index>-pruned` through [`judge_session`]; the folder name also names the
+/// judge's own KiCad settings copy). The prune's own checks use `run-<index>-prune`.
 async fn judge_one(
     ctx: &JudgeContext,
     routed: &Routed,
@@ -735,55 +739,23 @@ async fn judge_one(
     session: &Path,
     folder_name: &str,
 ) -> Result<Judged> {
-    // 1. The session, read by the importer's own checks: a session it would refuse
-    //    is a failed judge.
+    // 1 to 3. The session, read by the importer's own checks (a session it would
+    //    refuse is a failed judge), written into a scratch copy of the saved board,
+    //    then KiCad's refill and DRC on this judge's own settings copy.
     let ses_text = tokio::fs::read_to_string(session)
         .await
         .with_context(|| format!("read the session '{}'", session.display()))?;
-    let plan = crate::specctra_ses::parse_import_plan_with(
-        &ctx.board,
-        &ctx.board_text,
-        &ctx.manifest_text,
-        &ses_text,
-        SourceCheck::BytesOrTree,
-    )
-    .context("the importer refuses the run's session")?;
-    let widths = crate::intent_width_report::intent_width_report(&ctx.manifest, &ses_text)
-        .context("the width report of the run's session")?;
-
-    // 2. The session written into a scratch copy of the saved board.
     let run_dir = ctx.root.join(folder_name);
-    if run_dir.exists() {
-        std::fs::remove_dir_all(&run_dir)
-            .with_context(|| format!("clear the old run folder '{}'", run_dir.display()))?;
-    }
-    let mut board = crate::scratch_board::copy_project(&ctx.board, &run_dir.join("r0"))?;
-    let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan)?;
-    write_board(&board, &routed_text)?;
-    // The board's own length and skew rules must be seen whatever the project's
-    // severities say (G4(c)): forced in this scratch copy's project, never the owner's.
-    if ctx
-        .lengths
-        .as_deref()
-        .is_some_and(|checks| checks.board_rules)
-    {
-        crate::length_probe::force_length_severities(&board)?;
-    }
-    // A call with checks must see dangling and unconnected items whatever the project's
-    // severities say (G4(d), the harm check): forced in this scratch copy only.
-    if ctx
-        .lengths
-        .as_deref()
-        .is_some_and(|checks| !checks.is_empty())
-    {
-        crate::length_probe::force_check_severities(&board)?;
-    }
-
-    // 3. KiCad's refill and DRC, on this judge's own settings copy.
     let config = OwnConfig::new(ctx, folder_name)?;
-    let mut drc = refill(ctx, config.path(), &board)
+    let Scratch {
+        plan,
+        widths,
+        board,
+        drc,
+    } = routed_scratch(ctx, &ses_text, &run_dir, config.path(), false)
         .await
-        .context("refill and DRC of the routed board")?;
+        .map_err(ScratchError::into_error)?;
+    let (mut board, mut drc) = (board, drc);
     // Row ZR, ZR0: the pours' open count is taken before any stitching round.
     let first_drc = (!ctx.pour_nets.is_empty()).then(|| drc.clone());
 
@@ -895,16 +867,7 @@ async fn judge_one(
     }
 
     // 5. The layout audit on the last board: a refusal is a failed judge.
-    let (refused, text) = tools
-        .call(
-            "audit_layout_quality",
-            &json!({ "board": board.display().to_string() }),
-        )
-        .await
-        .context("the layout audit failed")?;
-    ensure!(!refused, "the layout audit refused: {}", clipped(&text));
-    let audit: Value =
-        serde_json::from_str(&text).context("the layout audit result is not JSON")?;
+    let audit = audit(tools, &board).await?;
 
     // 6. Row LT: KiCad's own lengths of the checked nets, on a copy of the last board.
     let lengths = match ctx.lengths.as_deref() {
@@ -947,6 +910,161 @@ async fn judge_one(
         rounds,
         tune: None,
     })
+}
+
+/// What [`routed_scratch`] gives: the plan, the width report, the board's path, the DRC.
+pub(crate) struct Scratch {
+    pub plan: crate::specctra_ses::SesImportPlan,
+    pub widths: crate::intent_width_report::WidthReport,
+    /// `<run_dir>/r0/<board file name>`, refilled and saved by kicad-cli.
+    pub board: PathBuf,
+    pub drc: crate::tools::cli::DrcReport,
+}
+
+/// `Importer`: `parse_import_plan_with` or the width report refused. `Other`: the rest.
+#[derive(Debug)]
+pub(crate) enum ScratchError {
+    Importer(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl ScratchError {
+    /// The error itself, whichever step gave it ([`judge_one`] does not tell them apart).
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        match self {
+            ScratchError::Importer(error) | ScratchError::Other(error) => error,
+        }
+    }
+}
+
+/// Steps 1 to 3 of [`judge`] on a session TEXT: the importer's plan and the width
+/// report, the scratch board `<run_dir>/r0/<board file>` with the routing written and
+/// the severities forced as the call's checks ask (and, with `prune_rules`, P11's four
+/// rules at least warnings), and KiCad's refill and DRC on `config`. The importer's
+/// refusal is told apart from every other error.
+///
+/// The order is [`judge_one`]'s: the importer and the width report, then `run_dir` is
+/// cleared (so a session the importer refuses leaves the folder as it was), then the
+/// board is written and the refill runs. The errors keep `judge_one`'s wording.
+pub(crate) async fn routed_scratch(
+    ctx: &JudgeContext,
+    ses_text: &str,
+    run_dir: &Path,
+    config: Option<&Path>,
+    prune_rules: bool,
+) -> std::result::Result<Scratch, ScratchError> {
+    let plan = crate::specctra_ses::parse_import_plan_with(
+        &ctx.board,
+        &ctx.board_text,
+        &ctx.manifest_text,
+        ses_text,
+        SourceCheck::BytesOrTree,
+    )
+    .context("the importer refuses the run's session")
+    .map_err(ScratchError::Importer)?;
+    let widths = crate::intent_width_report::intent_width_report(&ctx.manifest, ses_text)
+        .context("the width report of the run's session")
+        .map_err(ScratchError::Importer)?;
+    let other = ScratchError::Other;
+
+    // The session written into a scratch copy of the saved board.
+    if run_dir.exists() {
+        std::fs::remove_dir_all(run_dir)
+            .with_context(|| format!("clear the old run folder '{}'", run_dir.display()))
+            .map_err(other)?;
+    }
+    let board =
+        crate::scratch_board::copy_project(&ctx.board, &run_dir.join("r0")).map_err(other)?;
+    let routed_text = crate::scratch_board::write_routing(&ctx.board_text, &plan).map_err(other)?;
+    write_board(&board, &routed_text).map_err(other)?;
+    // The board's own length and skew rules must be seen whatever the project's
+    // severities say (G4(c)): forced in this scratch copy's project, never the owner's.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| checks.board_rules)
+    {
+        crate::length_probe::force_length_severities(&board).map_err(other)?;
+    }
+    // A call with checks must see dangling and unconnected items whatever the project's
+    // severities say (G4(d), the harm check): forced in this scratch copy only.
+    if ctx
+        .lengths
+        .as_deref()
+        .is_some_and(|checks| !checks.is_empty())
+    {
+        crate::length_probe::force_check_severities(&board).map_err(other)?;
+    }
+    // Row ZR, ZR0b (P11): the prune's test can refuse only what KiCad reports.
+    if prune_rules {
+        crate::length_probe::force_prune_severities(&board).map_err(other)?;
+    }
+
+    // KiCad's refill and DRC, on the caller's settings copy.
+    let drc = refill(ctx, config, &board)
+        .await
+        .context("refill and DRC of the routed board")
+        .map_err(other)?;
+    Ok(Scratch {
+        plan,
+        widths,
+        board,
+        drc,
+    })
+}
+
+/// Step 5: the layout audit of `board` through the tool registry; a refusal is an error.
+async fn audit(tools: &dyn ToolCaller, board: &Path) -> Result<Value> {
+    let (refused, text) = tools
+        .call(
+            "audit_layout_quality",
+            &json!({ "board": board.display().to_string() }),
+        )
+        .await
+        .context("the layout audit failed")?;
+    ensure!(!refused, "the layout audit refused: {}", clipped(&text));
+    serde_json::from_str(&text).context("the layout audit result is not JSON")
+}
+
+/// ZR0b: the rest of a light judge on a scratch already made: [`audit`], [`measure`]
+/// (0 stitching vias, `route_s` as given), [`gates`]; no stitching round, no length
+/// probe, no pour record. Returns the measures, the gates and the audit's JSON.
+///
+/// The tools are a [`ToolCaller`] (production: [`RegistryTools`]), so that the tests of
+/// the prune script the audit.
+pub(crate) async fn judge_light(
+    ctx: &JudgeContext,
+    baseline: &Baseline,
+    tools: &dyn ToolCaller,
+    scratch: &Scratch,
+    route_s: f64,
+) -> Result<(Measures, Gates, Value)> {
+    let audit = audit(tools, &scratch.board).await?;
+    let measures = measure(
+        ctx,
+        &scratch.drc,
+        &audit,
+        &scratch.plan,
+        &scratch.widths,
+        0,
+        route_s,
+    )?;
+    let gates = gates(&measures, baseline);
+    Ok((measures, gates, audit))
+}
+
+/// ZR0b: [`judge_one`] on one session file of a run in `ctx.root/<folder_name>`, for a
+/// caller outside this module (the prune's full judge of the pruned session). The
+/// tools are a [`ToolCaller`], as for [`judge_light`].
+pub(crate) async fn judge_session(
+    ctx: &JudgeContext,
+    routed: &Routed,
+    baseline: &Baseline,
+    tools: &dyn ToolCaller,
+    session: &Path,
+    folder_name: &str,
+) -> Result<Judged> {
+    judge_one(ctx, routed, baseline, tools, session, folder_name).await
 }
 
 /// Row LT, step 6 of the judge (after the audit): when `checks` is not empty,
@@ -1656,4 +1774,4 @@ pub(crate) fn unconnected_on(drc: &crate::tools::cli::DrcReport, nets: &[String]
 
 #[cfg(test)]
 #[path = "route_judge_tests.rs"]
-mod tests;
+pub(crate) mod tests;

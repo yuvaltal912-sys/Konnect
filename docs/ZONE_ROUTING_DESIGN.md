@@ -278,6 +278,7 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 | Stage | Where | What | Done when |
 |---|---|---|---|
 | **ZR0** Measure | Konnect | The judge records, per run: open on pour nets before stitching, stitching vias, fill pieces, the largest piece's share, starved thermals, the winner's shape. Plus one probe in the bench: planes from KiCad's real fill of the unrouted board | A baseline table per board and shape, with fastroute x19 and the smart-router switches on, from the main that holds Row GS (corrected for x19, Z14). Sessions byte-identical to before |
+| **ZR0b** Prune (added 2026-11-23, the owner's rule) | Konnect | After the search, the winner's ground vias that the filled pours make redundant leave the delivered session, each with the wires that end at it; KiCad's refill and DRC, the pours' fill and the judge's measures are the test ("ZR0b" below) | Fewer ground vias on the owner's boards with no gate, key entry, fill or audit measure worse, and the delivered session is the judged board |
 | **ZR1** Model | engine, Konnect | `--x.zones`, the model, the report. Routing unchanged | Zero false connections on every run. Sessions byte-identical with and without `--x.zones`, with count time limits (`--no-time-limits`; x19 note: the redraws change timing under wall-clock limits). The redraw's time recorded |
 | **ZR2** Truth | engine | The model's groups as connectivity, landing points, the closing stage; on x19 also the group search's move-local redraw and the closing order (Z15, Z18) | Open before stitching is 0 and no stitching via is needed, on at least 9 of 10 judged as-exported runs. G1 and G2 pass shares not below ZR0 |
 | **ZR3** Cost | engine | The cut cost, with its weight chosen from a small matrix; on x19 also the group search's "never more pour damage" rule (Z17) | Fewer pieces and a larger main piece than ZR2 at the same gate shares; ground track of the winner near the hand routing's; the search's `pour_worse` and `cut` ends counted |
@@ -1912,3 +1913,120 @@ KiCad's real fill of the unrouted board, and one more call on it. Counts are per
   run was judged in the budget. The fill-shaped planes slow the engine: 11 runs judged on B5
   instead of 54, 16 on `pic` instead of 183, 2 on dash instead of 12. One board, four runs: it
   points ZR2's truth at the planes' shape, and it is not yet evidence.
+
+## ZR0b: the winner's redundant ground vias are pruned (2026-11-23)
+
+The owner, 2026-11-23: "צריך להסיר ויות שמטרתן הייתה לחבר פד לאדמה אחרי שהמילוי בולע את
+הניתוב בין הפד לויה". With the pours left out, the router draws ground as a tree of tracks and
+vias. KiCad's fill then connects most of those pads by itself, and a via that tied a pad to the
+other layer is left with nothing to do. Until the engine models the fill (ZR1 to ZR3),
+`route_specctra_dsn` removes such vias from the session it delivers. Konnect only: no engine
+file, no new pin. Code: `crates/konnect-core/src/pour_prune.rs`; the judge's steps it reuses
+are in `route_judge.rs` (`routed_scratch`, `judge_light`, `judge_session`).
+
+### What it does
+
+After the search, on the winner only:
+
+1. Every via of a ground pour net is tried, first together with the wires that end at it,
+   then alone, in the order of the session text.
+2. A candidate session is the winner's text with those blocks cut out. It is read back by the
+   importer's own parser, written to a scratch copy of the board and refilled by KiCad, so the
+   board that is checked is the board the delivered session gives.
+3. The candidate replaces the state accepted so far only when every clause of P5 below holds.
+4. The pruned session is then judged in full, like any run, and replaces the winner only when
+   it passes every gate with no stitching round and no entry of its rank key is higher than
+   the router's session's. Otherwise the router's session is delivered as before.
+5. `search.pour_prune` says what happened: the outcome, the vias and wires removed, and for
+   each via that stayed the clauses that kept it.
+
+### Decisions (the code cites them as P1 to P14)
+
+| # | Decision | Reason |
+|---|---|---|
+| P1 | Once a call, on the winner, after the search and before the result is written | A prune costs about a minute of KiCad and audit runs; on every judged run it would take the judge lanes for most of the budget |
+| P2 | Scope: the vias of ground pour nets, each with the wires that end at it. No other wire goes | The owner's words are about vias and the routing between the pad and the via. Another ground wire is other copper: where the fill does not cover it, removing it is an electrical choice he did not ask for |
+| P3 | Only pour nets the audit of the router's session lists as ground (`net_roles.ground`) | On a power pour, vias in parallel carry current, which no check here sees. The audit's role puts the design intent and the netclass before the name |
+| P4 | The unit is a `(via …)` or `(wire …)` block of the session text; blocks the importer would apply as one item are one unit | The session is what the call delivers, and every candidate goes through the importer |
+| P5 | A candidate is kept only when ALL hold. Against the state accepted so far: (a) KiCad's unconnected count is not higher; (b) no KiCad rule's violation count is higher; (c) no entry of the judge's rank key is higher (seconds left out); (e) the audit's unstitched layer changes (3.2) are not more; (g) no audit check that scored is unscored. Against the router's session, with a tolerance: (d) no pour zone layer's filled area is lower; (f) the decoupling loops (4.1) are not fewer measured, the worst and the median not longer, the mean area not larger, and no listed pin's loop longer or larger | (a) is his rule. (b): a pad whose track was its second spoke becomes `starved_thermal`, a stub becomes `track_dangling`. (c): one standard with the search. (d): a fill island whose only link is the via would vanish with no DRC item. (e) and (f): the two checklist items a DRC-only prune made worse on both measured boards. (g): a check that stops scoring leaves the mean and can raise it. The clauses with a tolerance compare with the router's session, so a tolerance cannot add up over many vias |
+| P6 | Each via with the wires that end at it; if refused, alone. A via whose alone test fails (a) or (d) is final; the others are tried again in a later sweep while a sweep removed something, at most 3 | A via removed alone can leave a stub, which (b) refuses; with its wires it does not. Connectivity and fill islands only fall as copper goes |
+| P7 | The audit runs only after (a) and (b) pass | Most refusals are the DRC's |
+| P8 | Only a winner that passed every gate and whose judge wrote no stitching round is pruned | Then the copper and the fill the loop checks are the judged board's. The judge's stitching (Z9) is never touched |
+| P9 | The pruned session is judged in full (`judge_one`) and replaces the winner only when every gate passes, no stitching round was written and no key entry is higher, full judge against full judge | The full judge is the last word for every run. The loop's own gates and key are never reported: its scratch project has forced severities (P11) |
+| P10 | A candidate text the importer refuses is a refused candidate. Any other error ends the loop with the state accepted so far, which P9 then judges | Every accepted state was checked whole. When a candidate is refused the router's session is parsed again; if that fails too, the board or the manifest changed, and that is an error |
+| P11 | The prune's scratch project reports `track_dangling`, `via_dangling`, `isolated_copper` and `starved_thermal` at least as warnings | (b) can refuse only what KiCad reports |
+| P12 | No schema argument. An internal switch: on for `route_specctra_dsn`, off for the placement tools' routing calls | The placement tools deliver placements, not sessions; a prune there costs minutes a candidate and would change what their key ranks |
+| P13 | The time is reported (`pour_prune.seconds`), outside the effort's budget. Sequential checks; a cap of 400 checks | The budget is the draw's (D6). The loop is finite: at most 2 checks a via a sweep |
+| P14 | The router's session and its judged board stay in the search folder; the pruned session is `pruned.ses` in the winner's run folder and its judged board is under `judge/run-<i>-pruned` | The record shows before and after |
+
+Constants: `MAX_CHECKS` 400, `VIA_SWEEPS` 3, `FILL_TOLERANCE_MM2` 0.01, `LOOP_TOLERANCE_MM`
+0.05, `LOOP_AREA_TOLERANCE_MM2` 0.1.
+
+### Why the test is wider than DRC (measured before the build)
+
+On scratch copies of two of the owner's judged x19 winners, with KiCad's unconnected count and
+violation counts as the only test, 10 of 18 and 14 of 21 ground vias went. The same boards then
+scored lower in Konnect's own audit: one more critical-net layer change had no ground via near
+it (3.2) on both, the worst decoupling loop on one grew from 19 to 47 mm (4.1), two right
+angles appeared where a T junction lost a branch, copper quality fell 4.0 and 0.5 points, and
+two small fill pieces of one board vanished with no DRC item. Removing every other ground wire
+as well took about 90 more KiCad checks on the larger board, and a third of the wires it
+removed lay partly outside the fill. Hence P2 and P5.
+
+### As built
+
+- The design was reviewed twice before the build and the diff once after it, each time by an
+  agent that did not write it. The review of the diff found no must-fix item.
+- `judge_one` is split into `routed_scratch` and `audit`, with no change of behaviour: its
+  kicad-cli calls, folders, error wording and `Judged` are as before. One difference on an
+  error path: its settings copy is now made before the importer step, so a session the
+  importer refuses makes and removes that copy.
+- `prune_winner` never fails the call: its steps run in a task of their own, and a panic or an
+  error leaves the router's session as the winner with the reason in the record.
+- After the keys are taken again, a winner that would no longer rank first is not replaced.
+  P9 makes that impossible today; the guard enforces it.
+- `checks` and `audits` count the full judge of the pruned session too.
+
+### Measured (2026-11-23)
+
+The branch's release build, fastroute x19, effort M, one call a board, each in its own routing
+hold. Every comparison is inside one call: the router's own winning session against the
+delivered one.
+
+| | dash | B5 | `pic`, `ecc`, `pours` |
+|---|---|---|---|
+| Outcome | pruned | pruned | skipped: the winner has no via on a ground pour net |
+| Ground vias | 18 to 12 | 21 to 10 | 0 |
+| Wires that went with them | 11 | 22 | |
+| All vias | 86 to 80 | 53 to 42 | |
+| KiCad checks, audits, seconds | 41, 25, 85 | 41, 27, 77 | 1, 1, about 1 |
+
+- **Nothing got worse.** The winner's rank key is the same before and after on both boards.
+  Every net but the ground net is byte-equal in the session. An independent before-and-after
+  reading of the two judged boards found every pour zone layer's fill area, the 3.2 count,
+  every 4.1 loop, the corners and copper quality unchanged.
+- **The delivered session is the judged board.** It is `pruned.ses` byte for byte, and KiCad's
+  own refill and DRC on a fresh copy of its judged board gives 0 unconnected and the judged
+  violation counts.
+- **Why the others stayed** (a via counts under every clause that refused it): a pad would be
+  left unconnected, 8 and 6; a decoupling loop would grow, 4 and 3; a layer change would lose
+  its ground via, 1 and 2.
+- **The same every time:** B5's repeat delivers the same session bytes.
+- **Cost:** the prune adds about 80 s to a call of about 240 s on these boards.
+
+### Limits
+
+- The other ground wires stay (P2). They are harmless copper inside the pour; removing them is
+  a follow-up on the owner's word, with the numbers above.
+- A via whose stub is split into several wire blocks that meet at a bare point cannot go with
+  its whole stub: the group is the via and the wires that end at it. The record counts vias
+  kept by a with-wires `rule:track_dangling`; on the two measured boards there was none.
+- A winner the judge stitched, and a power pour, are left alone (P8, P3).
+- A call that is dropped mid-prune leaves the prune's scratch files inside its own search
+  folder.
+- The public fixtures' winners hold no ground via, so the public evidence of a real prune is
+  two ignored tests that run the real kicad-cli on the public pours fixture
+  (`route_judge::tests::prunes_`): with one recorded ground via the prune removes nothing
+  (the via is the back pour's only link, and KiCad's `isolated_copper` count would rise); with
+  two it removes one, with its stub, and keeps the other for the same reason. The numbers
+  above are from the owner's boards, as counts.

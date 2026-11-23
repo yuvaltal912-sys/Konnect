@@ -308,7 +308,7 @@ fn prepare_refuses_a_kicad_cli_that_is_not_an_executable_file() {
 
 // -------------------------------------------------------------------- gates
 
-fn measures() -> Measures {
+pub(crate) fn measures() -> Measures {
     Measures {
         unconnected: 0,
         violations: BTreeMap::new(),
@@ -1456,15 +1456,15 @@ fn unconnected_on_counts_nothing_when_the_report_has_no_unconnected_category() {
 
 /// The files of a recorded export: a DSN with its manifest beside it, the saved
 /// board (named as the recorded session's design) and the session.
-struct Exported {
-    dsn: PathBuf,
-    ses: PathBuf,
+pub(crate) struct Exported {
+    pub(crate) dsn: PathBuf,
+    pub(crate) ses: PathBuf,
 }
 
 /// Exports `specctra_pours_policy.kicad_pcb` (written as `specctra_rounded_board`,
 /// the design the recorded session names) with the top pour left out, and writes the
 /// recorded Freerouting session of the rounded board beside it.
-fn exported(dir: &Path) -> Exported {
+pub(crate) fn exported(dir: &Path) -> Exported {
     exported_as(dir, false)
 }
 
@@ -1615,6 +1615,192 @@ async fn judges_a_recorded_session_on_scratch_copies() {
     assert!(copper > 0.0, "the session's copper was measured");
     assert!(judged.measures.routed_share.is_some(), "the audit ran");
     assert_eq!(judged.measures.route_s, 1.5);
+}
+
+/// R1's GND pad is at (100.5, 50) mm: this stub runs right to (102, 50), then up to its via
+/// at (102, 49.5), clear of the VCC track below and of R1's silk text above.
+const R1_GND_VIA: &str = "(via konnect_via_0001 1020000 -495000)";
+const R1_GND_STUB: &str = "        (wire
+          (path F.Cu 2000
+            1005000 -500000
+            1020000 -500000
+            1020000 -495000
+          )
+        )
+";
+/// R2's GND pad is at (109.5, 50) mm, the end of the session's GND wire: this stub runs up
+/// and left at 45 degrees to its via at (108.6, 49.1), clear of that wire, of the VCC
+/// track below and of R2's silk text above.
+const R2_GND_VIA: &str = "(via konnect_via_0001 1086000 -491000)";
+const R2_GND_STUB: &str = "        (wire
+          (path F.Cu 2000
+            1095000 -500000
+            1086000 -491000
+          )
+        )
+";
+
+/// Row ZR, ZR0b, with the real kicad-cli: the recorded session of the rounded board with
+/// the GND vias of `vias` (each `(via, its stub wire)`) at GND pads the GND_TOP fill
+/// connects anyway (the kind of via the prune exists for), judged by the real judge as the
+/// winner of a one-run search, then `pour_prune::prune_winner`. The fixture board is not
+/// changed. It asserts only what does not hang on the KiCad version: the winner passes
+/// every gate with no stitching round (P8, else the prune skips it, and the test stops
+/// there saying which gate stands in the way), the prune ran end to end and ended `pruned`
+/// or `nothing_removed`, and a kept prune delivers a session with as many fewer of those
+/// vias as it removed, judged under `run-0-pruned` with 0 unconnected items and the
+/// original's gates. It prints the record, and returns it.
+async fn prune_recorded_ground_vias(vias: &[(&str, &str)]) -> crate::pour_prune::PruneRecord {
+    assert!(
+        std::env::var_os("KICAD_CONFIG_HOME").is_some(),
+        "LEAD: set KICAD_CONFIG_HOME to a scratch folder, or KiCad re-saves the real settings"
+    );
+    let cli = std::env::var("KONNECT_TEST_KICAD_CLI")
+        .unwrap_or_else(|_| "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let Exported { dsn, ses } = exported(dir.path());
+    let recorded = std::fs::read_to_string(&ses).unwrap();
+    assert_eq!(recorded.matches("      (net GND\n").count(), 1);
+    let blocks: String = vias
+        .iter()
+        .map(|(via, stub)| format!("        {via}\n{stub}"))
+        .collect();
+    let session = recorded.replacen("      (net GND\n", &format!("      (net GND\n{blocks}"), 1);
+    let count = |text: &str| vias.iter().filter(|(via, _)| text.contains(via)).count();
+    assert_eq!(count(&session), vias.len());
+
+    let search = dir.path().join("search");
+    let root = search.join("judge");
+    let ctx = prepare(&dsn, &root, &cli).expect("preflight");
+    std::fs::create_dir_all(&root).unwrap();
+    let base = baseline(&ctx).await.expect("the unrouted board's baseline");
+    let folder = search.join("run-000-as_exported-s0");
+    std::fs::create_dir_all(&folder).unwrap();
+    let held_ses = folder.join("full.ses");
+    std::fs::write(&held_ses, &session).unwrap();
+    let routed = Routed {
+        index: 0,
+        shape: crate::route_search::Shape::AsExported,
+        seed: 0,
+        dsn: dsn.clone(),
+        held: crate::fastroute::Held {
+            ses: held_ses.clone(),
+            unrouted: 0,
+            kept: "full",
+            passes: vec![],
+            seconds: 1.5,
+            untuned: None,
+            tune: Default::default(),
+            group_search: None,
+        },
+        planes: vec![],
+        folder,
+    };
+    let tools = tool_context(&cli);
+    let judged = judge(&ctx, &routed, &base, tools.clone())
+        .await
+        .expect("judge");
+    eprintln!(
+        "baseline: {base:?}\nthe winner: unconnected {}, violations {:?}, gates {:#?}",
+        judged.measures.unconnected, judged.measures.violations, judged.gates
+    );
+    assert!(
+        judged.gates.all_pass() && judged.rounds.is_empty(),
+        "P8: a winner is pruned only when it passes every gate with no stitching round; this one does not: {:#?}",
+        judged.gates
+    );
+    let original_gates = judged.gates.clone();
+    let key = rank(&[&judged])[0];
+    let mut outcome = crate::route_search::SearchOutcome {
+        runs: vec![crate::route_search::RunRecord {
+            index: 0,
+            shape: crate::route_search::Shape::AsExported,
+            seed: 0,
+            launched_s: 0.0,
+            routed_s: Some(1.5),
+            judged_s: None,
+            route_s: Some(1.5),
+            judge_s: None,
+            outcome: "judged",
+            reason: None,
+            routed: Some(routed),
+            judged: Some(judged),
+        }],
+        winner: Some(0),
+        keys: vec![Some(key)],
+        elapsed: std::time::Duration::from_secs(0),
+        budget_overrun: None,
+        stopped_launching: Some("fixed run count".to_string()),
+        baseline: Ok(base),
+        pour_prune: None,
+    };
+
+    crate::pour_prune::prune_winner(&ctx, tools, &mut outcome).await;
+    let record = outcome
+        .pour_prune
+        .clone()
+        .expect("the prune always says what it did");
+    eprintln!(
+        "pour_prune: {}",
+        serde_json::to_string_pretty(&record).unwrap()
+    );
+    assert!(
+        matches!(record.outcome, "pruned" | "nothing_removed"),
+        "{record:?}"
+    );
+    assert!(record.nets.contains(&"GND".to_string()), "{record:?}");
+    assert_eq!(record.vias_before, vias.len(), "{record:?}");
+    let won = &outcome.runs[0];
+    let delivered = &won.routed.as_ref().unwrap().held.ses;
+    if record.outcome == "pruned" {
+        assert!(delivered.ends_with("pruned.ses"), "{}", delivered.display());
+        let text = std::fs::read_to_string(delivered).unwrap();
+        assert_eq!(count(&text), vias.len() - record.vias_removed, "{text}");
+        let pruned = won.judged.as_ref().unwrap();
+        assert!(
+            pruned.board.starts_with(root.join("run-0-pruned")),
+            "{}",
+            pruned.board.display()
+        );
+        assert_eq!(pruned.measures.unconnected, 0);
+        assert_eq!(pruned.gates, original_gates);
+    } else {
+        assert_eq!(delivered, &held_ses);
+    }
+    assert!(
+        !root.join("run-0-prune").exists(),
+        "the scratch folder goes"
+    );
+    record
+}
+
+/// [`prune_recorded_ground_vias`] with one via, at R1's GND pad. Not run in the ordinary
+/// gate. That via is the only link of the B.Cu pour to the GND pads, so KiCad 10 keeps it
+/// (`rule:isolated_copper`).
+///
+/// LEAD: run it by hand, after it compiles:
+///
+/// ```text
+/// KICAD_CONFIG_HOME=<scratch folder> KONNECT_TEST_KICAD_CLI=<path to kicad-cli> \
+///   cargo test -p konnect-core --lib prunes_ -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs kicad-cli (KICAD_CONFIG_HOME must name a scratch folder)"]
+async fn prunes_a_recorded_ground_via_on_scratch_copies() {
+    prune_recorded_ground_vias(&[(R1_GND_VIA, R1_GND_STUB)]).await;
+}
+
+/// [`prune_recorded_ground_vias`] with two vias, one at each GND pad, so that either keeps
+/// the B.Cu pour linked: when the prune is kept, exactly one of them goes. Not run in the
+/// ordinary gate (the command above runs both).
+#[tokio::test]
+#[ignore = "needs kicad-cli (KICAD_CONFIG_HOME must name a scratch folder)"]
+async fn prunes_one_of_two_recorded_ground_vias_on_scratch_copies() {
+    let record =
+        prune_recorded_ground_vias(&[(R1_GND_VIA, R1_GND_STUB), (R2_GND_VIA, R2_GND_STUB)]).await;
+    if record.outcome == "pruned" {
+        assert_eq!(record.vias_removed, 1, "{record:?}");
+    }
 }
 
 // ------------------------------------------------- rank reference (G1-passing runs)
@@ -2443,6 +2629,12 @@ fn the_untuned_reason_names_each_candidates_lines_or_reason() {
         "free: a; b / pour_safe: not judged"
     );
 }
+
+// ------------- Row ZR, ZR0b: the prune's judge parts, checker and prune_winner (no KiCad)
+
+#[cfg(unix)]
+#[path = "pour_prune_judge_tests.rs"]
+mod prune;
 
 // -------------------------------- the round logic, with a fake kicad-cli (no KiCad)
 

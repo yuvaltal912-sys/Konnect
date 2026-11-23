@@ -328,17 +328,17 @@ const STUB_RULE_OFF: &str = "(clearance 0 (type smd_to_turn_gap))";
 
 /// A parenthesised block of the DSN text: `start` at its `(`, `end` after its `)`.
 #[derive(Debug, Clone, Copy)]
-struct Block {
-    start: usize,
-    end: usize,
+pub(crate) struct Block {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// One direct child of a block: an atom (a bare word or a quoted string) or a list.
 #[derive(Debug, Clone, Copy)]
-struct Item {
-    start: usize,
-    end: usize,
-    list: bool,
+pub(crate) struct Item {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) list: bool,
 }
 
 fn skip_whitespace(b: &[u8], mut i: usize) -> usize {
@@ -407,7 +407,7 @@ fn list_end(b: &[u8], open: usize) -> Result<usize> {
 }
 
 /// The direct children of `block`, in order.
-fn items(text: &str, block: Block) -> Result<Vec<Item>> {
+pub(crate) fn items(text: &str, block: Block) -> Result<Vec<Item>> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut i = enter(b, block.start);
@@ -450,7 +450,7 @@ fn items(text: &str, block: Block) -> Result<Vec<Item>> {
 }
 
 /// The nested lists directly inside `block`.
-fn child_blocks(text: &str, block: Block) -> Result<Vec<Block>> {
+pub(crate) fn child_blocks(text: &str, block: Block) -> Result<Vec<Block>> {
     Ok(items(text, block)?
         .into_iter()
         .filter(|i| i.list)
@@ -462,7 +462,7 @@ fn child_blocks(text: &str, block: Block) -> Result<Vec<Block>> {
 }
 
 /// The first word of a block (`plane` for `(plane GND ...)`), or "".
-fn head_of(text: &str, block: Block) -> &str {
+pub(crate) fn head_of(text: &str, block: Block) -> &str {
     let b = text.as_bytes();
     let i = skip_whitespace(b, block.start + 1);
     if i < block.end.saturating_sub(1) && !matches!(b[i], b'(' | b')' | b'"') {
@@ -472,12 +472,12 @@ fn head_of(text: &str, block: Block) -> &str {
     }
 }
 
-fn has_head(text: &str, block: Block, name: &str) -> bool {
+pub(crate) fn has_head(text: &str, block: Block, name: &str) -> bool {
     head_of(text, block).eq_ignore_ascii_case(name)
 }
 
 /// The DSN's root block, `(pcb ...)`.
-fn root_block(text: &str) -> Result<Block> {
+pub(crate) fn root_block(text: &str) -> Result<Block> {
     let b = text.as_bytes();
     let start = skip_whitespace(b, 0);
     if start >= b.len() || b[start] != b'(' {
@@ -712,6 +712,9 @@ pub(crate) struct SearchOutcome {
     /// `the launch rule`, `fixed run count`, or one of the two failure stops.
     pub stopped_launching: Option<String>,
     pub baseline: std::result::Result<Baseline, String>,
+    /// Row ZR, ZR0b: what the prune of the winner's redundant ground vias did
+    /// (`pour_prune::prune_winner`). `None`: the prune was off for this call.
+    pub pour_prune: Option<crate::pour_prune::PruneRecord>,
 }
 
 /// The timed search (decisions 6 to 9):
@@ -1261,6 +1264,7 @@ impl<'a> Sched<'a> {
             budget_overrun,
             stopped_launching,
             baseline,
+            pour_prune: None,
         }
     }
 }
