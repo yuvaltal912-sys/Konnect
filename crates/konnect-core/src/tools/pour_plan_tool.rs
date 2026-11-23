@@ -28,8 +28,9 @@ pub(crate) const FROM_KICAD_CLI: &str = "kicad_cli";
 /// The plan was filled by KiCad and nothing needs a second look.
 pub(crate) const PLANNED: &str = "planned";
 
-/// The plan was filled by KiCad, and the check is not clean or a request of the design
-/// intent could not be met.
+/// The plan was filled by KiCad, and the check is not clean, a request of the design
+/// intent could not be met, or a proposal fills inside a rule area that lets pours in
+/// (PP15).
 pub(crate) const PLANNED_WITH_FINDINGS: &str = "planned_with_findings";
 
 /// No zone is proposed; `not_proposed` says why.

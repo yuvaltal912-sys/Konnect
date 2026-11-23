@@ -758,15 +758,21 @@ impl ZoneSettings {
 }
 
 /// Row ZR, stage ZR4: the `(zone …)` text of `add_zone`'s file fallback, with the
-/// settings. It replaces `format_zone_polygon` and is also what the pour planner writes
-/// into its scratch boards (`pour_plan::with_zones`), so that the zone KiCad checks for a
-/// plan is the zone `add_zone` writes.
+/// settings. It is also what the pour planner writes into its scratch boards
+/// (`pour_plan::with_zones`), so that the zone KiCad checks for a plan is the zone
+/// `add_zone` writes.
 ///
-/// The text is `format_zone_polygon`'s, with `(thermal_gap …)` and
-/// `(thermal_bridge_width …)` from the settings, and, only when `settings.islands` is
-/// not `Always`, `(island_removal_mode N)` after them, followed for `BelowArea` by
+/// A zone in the board's own format: KiCad 10 gets `(net "GND")` and `(layers …)`,
+/// a legacy board keeps the id and `(net_name …)` pair and a singular `(layer …)`; the
+/// net reference comes from [`konnect_sexp::net::net_ref_for_write`], resolved
+/// structurally, never by string offset (#192). Then the optional name and priority (left
+/// out at their defaults, as pcbnew does), `(hatch edge 0.508)`, `(connect_pads …)` with
+/// the clearance, `(min_thickness …)`, and `(fill yes (thermal_gap …)
+/// (thermal_bridge_width …))` from the settings, with `(island_removal_mode N)` inside
+/// it only when `settings.islands` is not `Always`, followed for `BelowArea` by
 /// `(island_area_min A)`. With the default settings the text is byte for byte what
-/// `format_zone_polygon` wrote, apart from the fresh UUID.
+/// `add_zone` wrote before this stage, apart from the fresh UUID (a test keeps that old
+/// text as its oracle).
 ///
 /// The net's name and the layer are written escaped, as the zone's name already is: the
 /// planner writes names it read off the board, and one that holds `"` or `\` must come

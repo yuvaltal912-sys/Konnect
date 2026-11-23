@@ -896,3 +896,87 @@ fn supply_nets_keep_each_net_once_with_its_own_role() {
     // Asked for without layers, it heads the power nets.
     assert_eq!(nets[1].net, "MOTOR");
 }
+
+// ─── Added for the review of phase A ───────────────────────────────────────────
+
+/// A request the board already meets (its net already pours the layer) is no unmet
+/// request; a request that another net's pour blocks still is.
+#[test]
+fn a_request_the_board_already_meets_is_not_unmet() {
+    let mut board = facts(2, &[("GND", 12)]);
+    board.existing.push(ExistingPour {
+        net: "GND".into(),
+        layer: "B.Cu".into(),
+        priority: 0,
+    });
+    let r = roles(&["GND"], &[]);
+    for record in [
+        asks(json!([{ "net": "GND" }])),
+        asks(json!([{ "net": "GND", "layers": ["B.Cu"] }])),
+    ] {
+        let plan = plan_of(&board, &r, Some(&record));
+        let row = plan
+            .not_proposed
+            .iter()
+            .find(|row| row.layer.as_deref() == Some("B.Cu"))
+            .expect("B.Cu is left out");
+        assert!(row.reason.contains("already poured"), "{}", row.reason);
+        assert!(!row.asked, "{:?}: the board meets it", record.pours);
+        assert!(plan.not_proposed.iter().all(|row| !row.asked), "{plan:?}");
+    }
+    // Blocked by another net's pour at priority 0: still unmet.
+    let mut blocked = facts(2, &[("GND", 12), ("+5V", 3)]);
+    blocked.existing.push(ExistingPour {
+        net: "+5V".into(),
+        layer: "B.Cu".into(),
+        priority: 0,
+    });
+    let record = asks(json!([{ "net": "GND", "layers": ["B.Cu"] }]));
+    let plan = plan_of(&blocked, &roles(&["GND"], &["+5V"]), Some(&record));
+    let row = plan
+        .not_proposed
+        .iter()
+        .find(|row| row.layer.as_deref() == Some("B.Cu") && row.net.as_deref() == Some("GND"))
+        .unwrap();
+    assert!(row.asked);
+}
+
+/// A net placed only on layers the stack lacks: the free layer's reason says so.
+#[test]
+fn a_free_layers_reason_says_the_requested_layers_are_not_on_the_board() {
+    let record = asks(json!([{ "net": "GND", "layers": ["In1.Cu"] }]));
+    let plan = plan_of(
+        &facts(2, &[("GND", 12)]),
+        &roles(&["GND"], &[]),
+        Some(&record),
+    );
+    let row = plan
+        .not_proposed
+        .iter()
+        .find(|row| row.layer.as_deref() == Some("F.Cu") && row.net.is_none())
+        .unwrap();
+    assert!(
+        row.reason
+            .contains("place on In1.Cu, which this board does not have"),
+        "{}",
+        row.reason
+    );
+    assert!(!row.reason.contains("other layers"), "{}", row.reason);
+    // Placed on a layer it has: "other layers" is true.
+    let record = asks(json!([{ "net": "GND", "layers": ["B.Cu"] }]));
+    let plan = plan_of(
+        &facts(2, &[("GND", 12)]),
+        &roles(&["GND"], &[]),
+        Some(&record),
+    );
+    let row = plan
+        .not_proposed
+        .iter()
+        .find(|row| row.layer.as_deref() == Some("F.Cu"))
+        .unwrap();
+    assert!(
+        row.reason.contains("place on other layers"),
+        "{}",
+        row.reason
+    );
+}

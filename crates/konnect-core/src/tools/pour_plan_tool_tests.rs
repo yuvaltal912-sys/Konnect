@@ -853,3 +853,45 @@ async fn kicad_fills_inside_a_rule_area_that_lets_pours_in() {
         "KiCad keeps a fill out of an area only when it forbids pours: {areas:?}"
     );
 }
+
+/// The review of phase A, item 1: a request the board already meets is no finding. The
+/// fixture with its F.Cu pour removed (GND is poured on B.Cu at priority 0), and the
+/// record asking for GND without layers, then on B.Cu only.
+#[test]
+fn a_request_the_board_already_meets_is_no_finding() {
+    let first = POURS.find("\t(zone\n").unwrap();
+    let second = first + 1 + POURS[first + 1..].find("\t(zone\n").unwrap();
+    let text = format!("{}{}", &POURS[..first], &POURS[second..]);
+    let facts = crate::pour_plan::board_facts(&text).unwrap();
+    assert_eq!(facts.existing.len(), 1);
+    assert_eq!(facts.existing[0].layer, "B.Cu");
+    let nets: BTreeSet<String> = facts.pads.keys().cloned().collect();
+    let roles = crate::tools::supply_roles(&nets, None, Some(PROJECT));
+    let rules = project_rules(Some(PROJECT)).unwrap();
+    let record = |pours: Value| -> DesignIntent {
+        serde_json::from_value(json!({ "schema_version": 1, "pours": pours })).unwrap()
+    };
+
+    let plan = crate::pour_plan::plan(
+        &facts,
+        &roles,
+        &rules,
+        Some(&record(json!([{ "net": "GND" }]))),
+    );
+    assert_eq!(plan.proposals.len(), 1);
+    let check = clean_check(vec![fill("GND", "F.Cu", 1)]);
+    assert_eq!(status(&plan, Some(&check)), PLANNED);
+    assert!(!next_steps(&plan, Some(&check))
+        .join(" ")
+        .contains("not met"));
+
+    let plan = crate::pour_plan::plan(
+        &facts,
+        &roles,
+        &rules,
+        Some(&record(json!([{ "net": "GND", "layers": ["B.Cu"] }]))),
+    );
+    assert!(plan.proposals.is_empty());
+    assert_eq!(status(&plan, None), NOTHING_TO_PROPOSE);
+    assert!(!next_steps(&plan, None).join(" ").contains("not met"));
+}

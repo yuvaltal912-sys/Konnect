@@ -383,19 +383,22 @@ pub(crate) struct Slot {
     pub net: String,
     /// Why this net on this layer, in one sentence.
     pub reason: String,
-    /// Whether the design intent's `pours` asked for this net on this layer.
+    /// Whether the design intent's `pours` put this net here: an entry that names this
+    /// layer, or an entry without layers whose net took the rule's layer of its kind.
     pub asked: bool,
 }
 
 /// A pour that was considered and is not proposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct NotProposed {
-    /// `None` for a reason that is about the board and not about one net (a stack with no
-    /// rule, no ground net known).
+    /// `None` for a reason that is about the board or a layer and not about one net (a
+    /// stack with no rule, no ground net known, a layer the rule leaves free).
     pub net: Option<String>,
     pub layer: Option<String>,
     pub reason: String,
-    /// Whether the design intent's `pours` asked for it: an unmet request.
+    /// Whether the design intent's `pours` asked for it and the board does not have it:
+    /// an unmet request. A request the board already meets (its net already pours that
+    /// layer) is not one.
     pub asked: bool,
 }
 
@@ -577,12 +580,25 @@ pub(crate) fn division(
                         asked: false,
                     }),
                     Some(net) if placed.contains(net.net.as_str()) => {
+                        let where_placed = if slots.iter().any(|s| s.net == net.net) {
+                            "place on other layers".to_string()
+                        } else {
+                            let named: Vec<&str> = asked
+                                .iter()
+                                .filter(|r| r.net == net.net)
+                                .flat_map(|r| r.layers.iter().map(String::as_str))
+                                .collect();
+                            format!(
+                                "place on {}, which this board does not have",
+                                named.join(", ")
+                            )
+                        };
                         left_out.push(NotProposed {
                             net: None,
                             layer: Some(layer.to_string()),
                             reason: format!(
                                 "the rule would give {layer} to {}, which the design intent's \
-                                 pours place on other layers; the rule puts no other net in its \
+                                 pours {where_placed}; the rule puts no other net in its \
                                  place, and the pours can name {layer} too",
                                 net.net
                             ),
@@ -818,11 +834,17 @@ pub(crate) fn plan(
     let mut proposals = Vec::new();
     for slot in division.slots {
         if let Err(reason) = against_existing(&slot, &facts.existing) {
+            // A request for a layer the net already pours is met by the board itself: it
+            // is no unmet request. Every other refusal leaves a request unmet.
+            let met = facts
+                .existing
+                .iter()
+                .any(|pour| pour.net == slot.net && pour.layer == slot.layer);
             not_proposed.push(NotProposed {
                 net: Some(slot.net),
                 layer: Some(slot.layer),
                 reason,
-                asked: slot.asked,
+                asked: slot.asked && !met,
             });
             continue;
         }
