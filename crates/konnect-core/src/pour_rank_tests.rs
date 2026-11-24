@@ -68,7 +68,7 @@ fn order<K: Ord>(keys: &[K]) -> Vec<usize> {
 /// Where each of today's thirteen entries sits in the pour key (PK2).
 /// Written out here, apart from the module's own `TODAY_AT`, so that the test does not
 /// read the constant it checks.
-const PLACES: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 15, 16];
+const PLACES: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 15, 16];
 
 /// Runs that differ in every measure today's key reads, gates included.
 fn varied() -> (Vec<Measures>, Vec<Gates>) {
@@ -194,10 +194,10 @@ fn todays_entries_sit_at_their_places_in_the_pour_key() {
         .filter(|place| !PLACES.contains(place))
         .collect();
     new.sort_unstable();
-    assert_eq!(new, vec![POUR_FAULTS, PLANE_LOSS, AREA_LOSS, POUR_TRACK]);
+    assert_eq!(new, vec![POUR_FAULTS, PLANE_LOSS, POUR_TRACK, AREA_LOSS]);
     assert_eq!(
-        (POUR_FAULTS, PLANE_LOSS, AREA_LOSS, POUR_TRACK),
-        (7, 8, 13, 14)
+        (POUR_FAULTS, PLANE_LOSS, POUR_TRACK, AREA_LOSS),
+        (7, 8, 9, 14)
     );
 }
 
@@ -283,14 +283,14 @@ fn faults_come_before_the_plane_and_the_plane_before_the_lengths() {
     let mut short = with_pours(measures(), pours(1, 0, 0.0, 0.0));
     short.signal_mm = 100.0;
     let keys = keys_of(&[short.clone(), long.clone()]);
-    assert_eq!(keys[1][9] - keys[0][9], 2, "{keys:?}");
+    assert_eq!(keys[1][10] - keys[0][10], 2, "{keys:?}");
     assert_eq!(order(&keys), vec![1, 0]);
     // The same with the plane: a whole plane over two steps shorter.
     let mut cut_short = with_pours(measures(), pours(0, 0, 0.05, 0.0));
     cut_short.signal_mm = 100.0;
     assert_eq!(order(&keys_of(&[cut_short, long.clone()])), vec![1, 0]);
 
-    // After the vias: the area loss and the pour track break ties, never a via.
+    // After the vias: the area loss breaks ties, never a via.
     let mut fewer_vias_more_area = with_pours(measures(), pours(0, 0, 0.0, 0.5));
     fewer_vias_more_area.vias_off_pour = 0;
     let mut more_vias = with_pours(measures(), pours(0, 0, 0.0, 0.0));
@@ -299,11 +299,63 @@ fn faults_come_before_the_plane_and_the_plane_before_the_lengths() {
         order(&keys_of(&[more_vias, fewer_vias_more_area])),
         vec![1, 0]
     );
-    // And the area loss before the pour track.
+    // PK19: the pour track comes before the area loss now.
     let mut tracked = with_pours(measures(), pours(0, 0, 0.0, 0.0));
     tracked.pour_track_mm = 50.0;
     let lossy = with_pours(measures(), pours(0, 0, 0.0, 0.01));
-    assert_eq!(order(&keys_of(&[lossy, tracked])), vec![1, 0]);
+    assert_eq!(order(&keys_of(&[lossy, tracked])), vec![0, 1]);
+}
+
+// ─── PK19: the ground track before the lengths ───────────────────────────────
+
+/// Two runs that differ only in their signal and pour-track lengths (the same faults and
+/// plane step): A has the shorter signal (50 steps against 51), B one 5 % step less pour
+/// track (0 against 1). Control: the track left at entry 14, A first.
+#[test]
+fn the_track_ranks_before_the_lengths() {
+    let mut a = with_pours(measures(), pours(0, 0, 0.0, 0.0));
+    a.signal_mm = 100.0;
+    a.pour_track_mm = 5.0; // 5 / 100 / 0.05 = 1
+    let mut b = with_pours(measures(), pours(0, 0, 0.0, 0.0));
+    b.signal_mm = 102.0; // 102 / 100 / 0.02 = 51
+    b.pour_track_mm = 0.0;
+    let keys = keys_of(&[a.clone(), b.clone()]);
+    assert_eq!(
+        (keys[0][POUR_TRACK], keys[1][POUR_TRACK]),
+        (1, 0),
+        "{keys:?}"
+    );
+    assert_eq!((keys[0][10], keys[1][10]), (50, 51), "{keys:?}");
+    assert_eq!(order(&keys), vec![1, 0], "pours: B first");
+    assert_eq!(order(&today_of(&[a, b])), vec![0, 1], "routing: A first");
+}
+
+/// The track still ranks after the plane step: B has less track (0 against 1 step) but a
+/// plane step one higher. Control: the track before the plane step, B first.
+#[test]
+fn the_track_still_ranks_after_the_plane_step() {
+    let mut a = with_pours(measures(), pours(0, 0, 0.0, 0.0));
+    a.pour_track_mm = 5.0;
+    let b = with_pours(measures(), pours(0, 0, 0.025, 0.0)); // one 2.5 % step (PK20)
+    let keys = keys_of(&[a, b]);
+    assert_eq!(
+        (keys[0][PLANE_LOSS], keys[1][PLANE_LOSS]),
+        (0, 1),
+        "{keys:?}"
+    );
+    assert_eq!(
+        (keys[0][POUR_TRACK], keys[1][POUR_TRACK]),
+        (1, 0),
+        "{keys:?}"
+    );
+    assert_eq!(order(&keys), vec![0, 1]);
+}
+
+/// Today's key of `runs`, every run in the pool and passing every gate.
+fn today_of(runs: &[Measures]) -> Vec<Key> {
+    let gates = passing();
+    let refs: Vec<(&Measures, &Gates, bool)> = runs.iter().map(|m| (m, &gates, true)).collect();
+    rank_measures(&refs)
 }
 
 // ─── The steps round as the lengths do ───────────────────────────────────────
@@ -311,11 +363,11 @@ fn faults_come_before_the_plane_and_the_plane_before_the_lengths() {
 #[test]
 fn the_two_steps_round_half_away_from_zero() {
     assert_eq!(plane_step(0.0), 0);
-    assert_eq!(plane_step(0.024), 0);
-    assert_eq!(plane_step(0.025), 1);
-    assert_eq!(plane_step(0.074), 1);
-    assert_eq!(plane_step(0.076), 2);
-    assert_eq!(plane_step(1.0), 20);
+    assert_eq!(plane_step(0.012), 0);
+    assert_eq!(plane_step(0.0125), 1);
+    assert_eq!(plane_step(0.037), 1);
+    assert_eq!(plane_step(0.038), 2);
+    assert_eq!(plane_step(1.0), 40);
     assert_eq!(area_step(0.004), 0);
     assert_eq!(area_step(0.005), 1);
     assert_eq!(area_step(1.0), 100);
@@ -328,33 +380,55 @@ fn the_two_steps_round_half_away_from_zero() {
     assert_eq!(area_step(-0.0), 0);
     // The key reads the steps.
     let keys = keys_of(&[with_pours(measures(), pours(0, 0, 0.076, 0.005))]);
-    assert_eq!((keys[0][PLANE_LOSS], keys[0][AREA_LOSS]), (2, 1));
+    assert_eq!((keys[0][PLANE_LOSS], keys[0][AREA_LOSS]), (3, 1));
+}
+
+/// PK20: the plane-loss step is 2.5 % of the planes' area, half away from zero: a 3.5 %
+/// loss and a 2.3 % loss are both one step (1.4 and 0.92). Control: the old 5 % step gives
+/// 1 and 0.
+#[test]
+fn the_plane_step_is_two_and_a_half_percent() {
+    assert_eq!(PLANE_STEP, 0.025);
+    assert_eq!(plane_step(0.035), 1);
+    assert_eq!(plane_step(0.023), 1);
+    let keys = keys_of(&[
+        with_pours(measures(), pours(0, 0, 0.035, 0.0)),
+        with_pours(measures(), pours(0, 0, 0.023, 0.0)),
+    ]);
+    assert_eq!((keys[0][PLANE_LOSS], keys[1][PLANE_LOSS]), (1, 1));
 }
 
 // ─── The pour track is in signal units ───────────────────────────────────────
 
+/// PK19: the step is 5 % of the shortest signal, half away from zero. Control: the 2 %
+/// `LENGTH_STEP` kept, 4, 4 and 1.
 #[test]
-fn the_pour_track_is_stepped_in_two_percent_of_the_shortest_signal() {
-    assert_eq!(pour_track_step(9.0, Some(1000.0)), 0);
-    assert_eq!(pour_track_step(10.0, Some(1000.0)), 1);
-    assert_eq!(pour_track_step(400.0, Some(1000.0)), 20);
+fn the_pour_track_is_stepped_in_five_percent_of_the_shortest_signal() {
+    assert_eq!(POUR_TRACK_STEP, 0.05);
+    assert_eq!(pour_track_step(70.0, Some(1000.0)), 1); // 7 %
+    assert_eq!(pour_track_step(80.0, Some(1000.0)), 2); // 8 %
+    assert_eq!(pour_track_step(24.0, Some(1000.0)), 0); // 2.4 %
+    assert_eq!(pour_track_step(25.0, Some(1000.0)), 1); // 2.5 %: half away from zero
+    assert_eq!(pour_track_step(400.0, Some(1000.0)), 8);
     assert_eq!(pour_track_step(0.0, Some(1000.0)), 0);
     assert_eq!(pour_track_step(400.0, None), 0);
+    // A length that is not above 0 is no track: 0, never a negative step.
+    assert_eq!(pour_track_step(-100.0, Some(1000.0)), 0);
 
     // In the key, against the pool's shortest signal (1000 mm), not the pour track.
     let mut a = measures();
     a.signal_mm = 1000.0;
-    a.pour_track_mm = 9.0;
+    a.pour_track_mm = 24.0;
     let mut b = measures();
     b.signal_mm = 1200.0;
     b.pour_track_mm = 400.0;
     let mut c = measures();
     c.signal_mm = 1100.0;
-    c.pour_track_mm = 10.0;
+    c.pour_track_mm = 70.0;
     let keys = keys_of(&[a, b, c]);
     assert_eq!(
         keys.iter().map(|k| k[POUR_TRACK]).collect::<Vec<_>>(),
-        vec![0, 20, 1]
+        vec![0, 8, 1]
     );
 
     // No signal track in the pool: 0 for all.
@@ -389,11 +463,11 @@ fn a_run_outside_the_pool_or_failing_g1_does_not_set_the_unit() {
         (&incomplete, &open, true),
     ];
     let keys = pour_keys(&runs);
-    // Unit 1000 mm: 400 mm is 20 steps (unit 10 mm would be 2000, unit 20 mm 1000).
-    assert_eq!(keys[0][POUR_TRACK], 20);
+    // Unit 1000 mm: 400 mm is 8 steps of 5 % (unit 10 mm would be 800, unit 20 mm 400).
+    assert_eq!(keys[0][POUR_TRACK], 8);
     // The signal step of today's key uses the same reference.
-    assert_eq!(keys[0][9], rank_measures(&runs)[0][7]);
-    assert_eq!(keys[0][9], 50);
+    assert_eq!(keys[0][10], rank_measures(&runs)[0][7]);
+    assert_eq!(keys[0][10], 50);
 }
 
 // ─── The setting ─────────────────────────────────────────────────────────────
@@ -464,13 +538,13 @@ fn entries_above_names_every_higher_entry_but_the_seconds() {
     );
     assert_eq!(entries_above(&[0, 5, 1, 0], &[1, 4, 2, 99]), vec![0, 2]);
     assert_eq!(entries_above(&[], &[]), Vec::<usize>::new());
-    // A pour key: the signal step is 9.
+    // A pour key: the signal step is 10 (PK19).
     let now = keys_of(&[measures()])[0];
     let mut longer = measures();
     longer.signal_mm = 110.0;
     let keys = keys_of(&[measures(), longer]);
     assert_eq!(keys[0], now);
-    assert_eq!(entries_above(&keys[0], &keys[1]), vec![9]);
+    assert_eq!(entries_above(&keys[0], &keys[1]), vec![10]);
 }
 
 #[test]

@@ -1716,8 +1716,8 @@ fn the_route_seconds_never_refuse_the_pruned_session() {
 // --- Row ZR, ZR5 part 2: every clause that ranks reads the call's ranking key (PK12)
 
 /// Clause (c) names the ranking key's places: a candidate with a longer signal step is
-/// `key:7` under today's key and `key:9` under the pour key. Control: clause (c) left
-/// on `rank_measures` under `pours` names `key:7`.
+/// `key:7` under today's key and `key:10` under the pour key (PK19). Controls: clause (c)
+/// left on `rank_measures` under `pours` names `key:7`; the old layout names `key:9`.
 #[test]
 fn the_key_clause_names_the_places_of_the_ranking_key() {
     use crate::pour_rank::RankMode;
@@ -1729,14 +1729,14 @@ fn the_key_clause_names_the_places_of_the_ranking_key() {
     );
     assert_eq!(
         refusals(&base, &base, &longer, RankMode::Pours),
-        vec!["key:9"]
+        vec!["key:10"]
     );
-    // A pour track that grows is refused only under the pour key (entry 14).
+    // A pour track that grows is refused only under the pour key (entry 9, PK19).
     let tracked = with(|rest| rest.measures.pour_track_mm = 50.0);
     assert!(refusals(&base, &base, &tracked, RankMode::Routing).is_empty());
     assert_eq!(
         refusals(&base, &base, &tracked, RankMode::Pours),
-        vec!["key:14"]
+        vec!["key:9"]
     );
     // The seconds never refuse, under either key.
     let slower = with(|rest| rest.measures.route_s = 99.0);
@@ -1759,7 +1759,7 @@ fn the_full_judges_comparison_follows_the_mode() {
     assert_eq!(
         full_judge_refusal(&original, &cut, RankMode::Pours),
         Some(
-            "the pruned session's rank key is above the original's at position 8 (2 > 0)"
+            "the pruned session's rank key is above the original's at position 8 (4 > 0)"
                 .to_string()
         )
     );
@@ -1774,7 +1774,7 @@ fn the_full_judges_comparison_follows_the_mode() {
     assert_eq!(
         full_judge_refusal(&original, &longer, RankMode::Pours),
         Some(
-            "the pruned session's rank key is above the original's at position 9 (55 > 50)"
+            "the pruned session's rank key is above the original's at position 10 (55 > 50)"
                 .to_string()
         )
     );

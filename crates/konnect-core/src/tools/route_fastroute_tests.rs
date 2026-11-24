@@ -3892,11 +3892,12 @@ fn split_search(mode: RankMode) -> Search {
     let mut later = today;
     later[7] = 55;
     search.outcome.keys = vec![Some(today), Some(later), None];
+    // The plane-loss step at 8, the signal step at 10 (PK19).
     let mut cut = [0; 17];
     cut[8] = 10;
-    cut[9] = 50;
+    cut[10] = 50;
     let mut whole = [0; 17];
-    whole[9] = 55;
+    whole[10] = 55;
     search.outcome.pour_keys = vec![Some(cut), Some(whole), None];
     search.outcome.rank = mode;
     search.outcome.winner = Some(match mode {
