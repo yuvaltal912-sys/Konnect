@@ -505,7 +505,19 @@ async fn deliver(h: &H, tools: Arc<Calls>, outcome: &mut SearchOutcome) -> Deliv
 #[tokio::test]
 async fn the_delivered_session_holds_the_vias_and_its_full_judge_is_the_ranked_board() {
     let h = on(drc(&[], &[]));
-    let tools = Arc::new(Calls::served());
+    // Two changes, one the planner can serve: the delivered board still has one, so a
+    // round in its judge would run (and plan) again.
+    let tools = Arc::new(Calls::new(
+        |_, board, _| {
+            let text = std::fs::read_to_string(board).unwrap_or_default();
+            let mut findings = vec![finding("SIG via 2", &["GND"], (100.0, 40.0))];
+            if !text.contains("(at 106 52)") {
+                findings.push(finding("SIG via 1", &["GND"], SIGNAL_AT));
+            }
+            (false, audit(findings.len(), findings, 80.0))
+        },
+        |_| Ok(proposal(&[(106.0, 52.0)], 0.6)),
+    ));
     let mut outcome = won(&h, &tools).await;
     let record = deliver(&h, tools.clone(), &mut outcome).await;
     assert_eq!(record.outcome, "delivered", "{record:?}");
@@ -531,11 +543,9 @@ async fn the_delivered_session_holds_the_vias_and_its_full_judge_is_the_ranked_b
     // Its judge ran with the round off; the round's record stays with the run.
     assert_eq!(tools.plans().len(), 1, "only the search's judge planned");
     assert_eq!(judged.measures.reference_vias, 0);
-    assert_eq!(
-        judged.measures.checklist.unstitched_layer_changes,
-        Some(0.0)
-    );
+    assert_eq!(judged.measures.checklist.unstitched_layer_changes, Some(1.0));
     assert_eq!(record_of(judged).outcome, "kept");
+    assert_eq!(record_of(judged).remaining.len(), 1);
     assert!(undelivered_nets(judged).is_empty());
     assert_eq!(outcome.keys[0], Some(rank(&[judged])[0]));
 }
