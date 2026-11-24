@@ -2763,4 +2763,6 @@ The plan's "at least 10 %" on the whole-board number (`smart-router-research/pla
 
 The other five are tests, comments and record fields. So the measured results stand for the merged code: its tree outside the documents is `d9cf2f64` plus exactly `09808703`'s changes.
 
+**Gate on `c22339bd`, 2026-11-24: every step green** (fmt; workspace tests 5,945 passed, 0 failed, 187 ignored; sandboxed fastroute 75; doc tests 9; `simulation_live` 95 of 95; clippy `-D warnings`; licenses; `fix-doc-counts` changed nothing; release build `35a6bc32`; the installed Konnect `3de188bb775ab4ce` and the protected files unchanged; record `target/creation-research/zone-routing/zr6/gate/final/`). After the gate only documents changed.
+
 Records: `target/creation-research/zone-routing/zr6/measure/` in the main checkout (`build.sh`, `measure.sh`, `call.py`, `measure.log`, `runs/`, `analyze.py` and `analysis.json`, `replay.py` and `replay.json`).
