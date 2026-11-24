@@ -306,6 +306,25 @@ change.
   `left_open_count` only.
 - A reader of an x20 result, which has none of these keys, reads them as absent.
 
+### Stage ZR3: the cut cost, and no move that adds pour damage
+
+`route_specctra_dsn` (fastroute) needs build x22 (`C** + BR1 + W8P + GS + ZR3`). Every
+routing pass that sends `--x.zones=` now sends `--x.zones_cut=2,2,4` right after it, and
+the probe sends it too, so an x21 build is refused by name. Design: "ZR3 as built" in
+`docs/ZONE_ROUTING_DESIGN.md`. No argument changes; the gates and the rank key do not
+change.
+
+- **The report's `planes` object gains keys**, which `engine_planes` carries as
+  fastroute wrote them: `zones_cut` (the three weights), `zones_cut_applied` and
+  `spokes` (`pins`, `reference`, `kept`, `lost`, `pins_losing`: the thermal pins' kept
+  spokes against the run's first snapshot).
+- **The group search summary** (`group_search` in each judged run's `run.json` and in
+  `search.winner`) keeps, when the engine reports the pour state, the `pour` object of
+  `start` and `end` (`pieces`, `starved`, `spokes_lost`, `largest_share`) and a new
+  `pour_worse` (the moves only the "never more pour damage" rule refused). Without the
+  pour state, as for the pours-omitted variant, the summary is as before.
+- A reader of an x21 result, which has none of these keys, reads them as absent.
+
 ## Unreleased: the smart-router switches with fastroute (Row GS)
 
 `route_specctra_dsn` (fastroute) routes every Full, Fallback and Polish pass with

@@ -458,8 +458,8 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 ///    differential pairs (`route_pairs::plan`, written to `<folder>/pairs.txt` and sent
 ///    as `--pairs=<file>` on every pass of every run), Row ZR's zone plan
 ///    ([`zone_plan_file`], written to `<folder>/zones.txt` when it models a pour and sent
-///    as `--x.zones=<file>` on the routing passes of a variant with planes; the result's
-///    `pours`), Row LT's length plan
+///    as `--x.zones=<file>`, with `--x.zones_cut` right after it, on the routing passes of
+///    a variant with planes; the result's `pours`), Row LT's length plan
 ///    (`route_lengths::plan`, after the pairs plan and before the search folder holds
 ///    anything: a group or skew that cannot be applied is a refusal, `invalid_configuration`,
 ///    "Nothing was routed."; `<folder>/tune.txt` when there is a group, and the Tune
@@ -932,7 +932,8 @@ async fn search_and_write(
 /// Row ZR, ZR1: the call's zone plan (`zone_fill::zone_plan` of the saved board, its
 /// manifest, the DSN, and the project and custom rules saved beside the board), its
 /// zones file written as `<folder>/zones.txt` when the plan models a pour (the file
-/// the routing passes of a variant with planes are sent as `--x.zones`), and the
+/// the routing passes of a variant with planes are sent as `--x.zones`, with
+/// `--x.zones_cut`), and the
 /// result's `pours` field (`zone_fill::ZonePlan::result_json`). When the file is
 /// written, the judge gets the plan's pad names. A plan that cannot be made, or a
 /// project or rules file that exists and cannot be read, gives no file and
@@ -1764,6 +1765,14 @@ fn held_group_search(held: &crate::fastroute::Held) -> Option<Value> {
 /// `cost_mm`). `None` when the object does not read as one: no `ended_by` string, no
 /// `passes` list, a pass without a whole `kept` or `largest_kept_group`, or a `start`
 /// or `end` without the three numbers. Never an error.
+///
+/// Row ZR, stage ZR3: when the engine reports the pour state (fastroute x22 with
+/// `--x.zones` writes `pour` in `start` and `end`), `start` and `end` keep their `pour`
+/// object as written, and `pour_worse` counts the moves that only the "never more pour
+/// damage" rule refused (the passes' `ends.pour_worse`, a missing or unreadable count as
+/// 0). `start` decides: the engine writes `pour` in both or in neither. Without it the
+/// summary is as before, key for key. The `cut` ends are not summed here: the engine's
+/// `planes.search_cut_ends` (ZR2) counts them.
 fn group_search_summary(object: &Value) -> Option<Value> {
     let ended_by = object["ended_by"].as_str()?;
     let passes = object["passes"].as_array()?;
@@ -1775,20 +1784,32 @@ fn group_search_summary(object: &Value) -> Option<Value> {
     }
     let value = |key: &str| -> Option<Value> {
         let value = &object[key];
-        Some(json!({
+        let mut summary = json!({
             "length_mm": value["length_mm"].as_f64()?,
             "vias": value["vias"].as_u64()?,
             "cost_mm": value["cost_mm"].as_f64()?,
-        }))
+        });
+        if let Some(pour) = value.get("pour").filter(|pour| pour.is_object()) {
+            summary["pour"] = pour.clone();
+        }
+        Some(summary)
     };
-    Some(json!({
+    let mut summary = json!({
         "ended_by": ended_by,
         "passes": passes.len(),
         "kept_moves": kept_moves,
         "largest_group": largest_group,
         "start": value("start")?,
         "end": value("end")?,
-    }))
+    });
+    if summary["start"].get("pour").is_some() {
+        let pour_worse = passes
+            .iter()
+            .map(|pass| pass["ends"]["pour_worse"].as_u64().unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
+        summary["pour_worse"] = json!(pour_worse);
+    }
+    Some(summary)
 }
 
 /// The unrouted board's check, as the result reports it.
