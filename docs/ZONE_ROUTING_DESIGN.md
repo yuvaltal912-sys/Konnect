@@ -290,6 +290,10 @@ ZR4 touches no engine file and may run beside ZR1 to ZR3.
 ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23), in
 two PRs on the owner's order ("כן, ZR5 קודם"): first the pour record, which changes no rank
 and merges before ZR3's measurement; then a second key beside today's, off until his word.
+**Part 1, the pour record, is built** (2026-11-24, branch `claude/zr5-pour-record-build`;
+"Part 1 as built" and "Part 1 measured" there): every judged run's `pours.damage` against
+the refilled unrouted board. Part 2 is being built now with the candidate values, with the
+switch off; ZR3's table confirms those values.
 
 ## Decisions taken in this design (with the reason)
 

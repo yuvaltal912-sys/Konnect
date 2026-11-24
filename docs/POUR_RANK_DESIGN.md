@@ -1,7 +1,10 @@
 # Pours in the rank: design of stage ZR5 (the pour record, then the pour key)
 
-Status: a design down to function skeletons, 2026-11-23. Nothing is built: every body is
-`todo!()`. Stage ZR5 of Row ZR ([ZONE_ROUTING_DESIGN.md](ZONE_ROUTING_DESIGN.md), the stage
+Status: a design down to function skeletons, 2026-11-23. **Part 1, the pour record, is
+built** (2026-11-24, branch `claude/zr5-pour-record-build`; "Part 1 as built" and "Part 1
+measured" below). **Part 2, the pour key, is being built now** on its own branch with the
+candidate values of "The pour key" below, with the switch off; ZR3's table confirms those
+values before it is switched on (the owner's timing change). Stage ZR5 of Row ZR ([ZONE_ROUTING_DESIGN.md](ZONE_ROUTING_DESIGN.md), the stage
 table and Z10). Designed in a Claude Fable 5.2 session on branch `claude/zr5-pour-rank-plan`,
 from `fork/main` `c4c34369`. **Reviewed** by an agent that did not write it (Claude Opus 5.5,
 high, read only); its two must-fix items and its other findings are in this text (see
@@ -161,6 +164,14 @@ area_loss    1 - sum over layer fills( min(area after, area before) ) / sum( are
   The stitching vias are not in the delivered session (D21): a limit, as for ZR0's.
 - **Zones of one net that overlap on a layer are not merged:** the largest piece is the
   largest saved piece of any of them. A limit.
+- **KiCad's island flag can sit on the wrong piece in one case** (read in KiCad 10.0.1's
+  source, `zone_filler.cpp` lines 932 to 958; not reproduced). The filler walks a layer's
+  islands from the highest index down: it marks a kept island by its index
+  (`SetIsIsland(layer, idx)`) and deletes a removed one. A deletion at a lower index
+  after that shifts the pieces, and the stored index does not move; the writer prints
+  `(island yes)` by position. So on a zone in the "remove islands below an area" mode,
+  with a kept and a removed island on one layer, the saved flag can mark the wrong
+  piece. The default mode (always remove) and "never remove" are not affected. A limit.
 
 ### What a run records
 
@@ -260,6 +271,119 @@ a board, each in its own routing hold, under the lane locks.
   what `pours.damage` says. The words the skill then quotes go into `NOT_TOOLS` of
   `crates/konnect/tests/asset_references.rs`.
 - `docs/ZONE_ROUTING_DESIGN.md` and `docs/CREATION_HANDOFF.md`: where the stage stands.
+
+### Part 1 as built (2026-11-24)
+
+Built on branch `claude/zr5-pour-record-build` (Claude Opus 5.5), from the plan commit
+`80135c7f`, with `fork/main` `e07ff839` (stage ZR2, fastroute x21) merged in. Everything in
+"Part 1: changes to existing items" is made, and nothing else of the code changes.
+`rank`, `rank_measures` and `Key` are untouched. `pour_rank.rs` is not on this branch.
+
+Where it departs from the skeleton, each with its reason:
+
+1. **The baseline's read is `route_judge::baseline_fills`**, a private function beside
+   `baseline`. The table names the read but not its place. The prune has the same read,
+   but it is private to `pour_prune.rs`, which this part does not touch.
+2. **`pour_record` takes a fifth argument**, `before: Option<&[LayerFill]>`: the
+   baseline's rows.
+3. **`pour_measures` is under `#[cfg(test)]`.** It keeps its signature and its results.
+   The judge goes through `pour_record`, which reads the board's fills once for ZR0's
+   measures and the damage both. So in the library `pour_measures` had no caller, and
+   clippy's `-D warnings` refused it.
+4. **The island flag reads as KiCad reads it:** `(island)`, `(island yes)` and
+   `(island true)` are islands, and `(island no)` and `(island false)` are fill. In
+   `layer_fills`, a piece with no flag (a row built by hand with `islands: vec![]`) is
+   fill.
+5. **The two new `Baseline` fields are left out of its JSON when empty**, so a call with
+   no pour net writes what it wrote before.
+6. **No clamp for numbers that are not finite.** The losses are between 0 and 1 when
+   every area is a finite number of 0 or more. That holds for every board, unless a
+   saved coordinate is `inf` or `nan`. A limit.
+7. **The prune's fill-clause test is in `pour_damage_tests.rs`**, because this part
+   changes only the new field in `pour_prune_tests.rs`.
+
+Tests (counts):
+
+- 22 new tests, 21 of them in the ordinary suite:
+  - 18 in `pour_damage_tests.rs`: every row of the table that needs no KiCad, plus one
+    that every loss is between 0 and 1;
+  - 3 in `route_judge_tests.rs`: with the fake kicad-cli, the damage is against the
+    refilled baseline, and an unreadable baseline fill fails nothing; with the real
+    kicad-cli, ignored, the baseline's rows are the refilled fill;
+  - 1 in `tools/route_fastroute_tests.rs`: `baseline_json`;
+  - the new case: `(island true)` and `(island false)`, in the board-read test.
+- **Negative controls:** 26 run, 25 caught. The one not caught is the table's own
+  "`serde(default)` removed". It cannot fail, because serde reads a missing `Option`
+  field as `None` with or without that attribute. A second control (`skip_serializing_if`
+  removed, so `"damage": null` appears) guards the same test, and it is caught. The
+  attribute stays, as the table asks.
+- **Mutants:** one narrow `cargo mutants` batch on the new code: 63 mutants, 55 caught,
+  7 unviable, 1 missed. The miss is `> 0.0` made `>= 0.0` in the area-loss filter. It
+  is equivalent: a row with no area before adds 0 to both sums. Its one rerun missed
+  again.
+- **The real kicad-cli test passes:** the fixture is saved with no fill, and the
+  baseline's 3 rows are the fills of its refilled scratch board.
+- **The gate**, all nine commands of "Verify", is green on `b490ac72`: workspace tests
+  5,758 passed, 0 failed, 185 ignored. The first gate run, on `036ecfbc`, went red on
+  clippy (the dead `pour_measures` of item 3), and that is fixed.
+- **Review:** an agent that did not write the diff reviewed it and found no bug. Its six
+  small items are taken: a message, `(island false)`, two doc comments, the island limit
+  above, and a better control for each of two guards.
+
+Records: `target/creation-research/zone-routing/zr5/part1/` in the main checkout
+(`controls/`, `mutants/`, `gate/`, `runs/`, `measure/`).
+
+### Part 1 measured (2026-11-24)
+
+Setup:
+
+- The five boards of "Part 1: measurement", each with its own pours.
+- One `route_specctra_dsn` call per board, at effort M.
+- The branch's release build `774814fa`, by pipe: the gate's build, which reports commit
+  `b490ac72`.
+- fastroute x21 (`46d79d56`), the build `packaging/1-kopper/fastroute.json` pins.
+- Each call in its own routing hold, under the lane locks, with a hard timeout of 1,800 s.
+
+Every call ended `complete`. The judged runs: dash 3, B5 15, `pic` 74, `ecc` 1,388,
+`pours` 1,384.
+
+| Criterion | dash | B5 | `pic` | `ecc` | `pours` |
+|---|---|---|---|---|---|
+| R1: baseline rows (pour nets) | 2 (1) | 2 (1) | 1 (1) | 1 (1) | 2 (1) |
+| R1: judged runs with a `damage` and every row | 3 of 3 | 15 of 15 | 74 of 74 | 1,388 of 1,388 | 1,384 of 1,384 |
+| R2: the second computation agrees | yes | yes | yes | yes | yes |
+| R3: runs with an area loss above 0 | 3 | 15 | 74 | 1,388 | 1,384 |
+| R3: losses below 0 or above 1 | 0 | 0 | 0 | 0 | 0 |
+| R4: recorded keys the replay reproduces | 3 of 3 | 15 of 15 | 74 of 74 | 1,388 of 1,388 | 1,384 of 1,384 |
+| R4: the winner has the least key | yes | yes | yes | yes | yes |
+
+**R1 to R4 hold on all five boards.**
+
+- **R1.** Each baseline has exactly the rows that a separate reader finds on the kept
+  baseline board, one for every pour net and layer. No judged run is without a
+  `damage`, and no baseline has a `pour_fills_error`.
+- **R2.** `measure/m2.py` is its own S-expression reader and its own reading of
+  `filled_polygon`, and it shares no code with Konnect. It reads the kept baseline board
+  and the winner's judged board. It gives the winner's `lost_fills` exactly, both losses
+  within 1e-6, and every row's areas within 0.001 mm². On dash the prune's session was
+  delivered, and that session's board and numbers were the ones compared.
+- **R3.** Every judged run has some pour copper gone. A track through a pour always
+  takes some copper.
+- **R4.** The design's replay (`design-replay/replay.py`, which reads `run.json` only)
+  reproduces every recorded key, with the 2 % step. So the record changed no rank.
+- **M5, the judge's seconds a run** (median, this matrix against ZR2's): dash 3.47 and
+  3.65; B5 3.41 and 3.17; `pic` 1.63 and 1.63; `ecc` 0.53 and 0.54; `pours` 0.52 and
+  0.52. Recorded only. The record reads each judged board once more than before, and
+  the baseline once.
+
+Not measured:
+
+- The damage numbers of the owner's two boards (dash, B5). They stay out of this file:
+  counts only.
+- Part 2's key on these runs. That is part 2's measurement.
+
+Records: `target/creation-research/zone-routing/zr5/part1/measure/` in the main checkout
+(`matrix.sh`, `hold.sh`, `analyze.py`, `m2.py`, `result.json`, `m2/`, the runs).
 
 ## The pour key (part 2: the candidate)
 
