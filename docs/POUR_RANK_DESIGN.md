@@ -714,6 +714,12 @@ must-fix; its items are taken).
   runs: the winners are B5 #12, dash #3, `ecc` #8, `pic` #20 and `pours` #610. Record:
   `zr5-part2-candidate/quality_check.py` and `pk20-combined.jsonl` in the supervisor's notes
   folder.
+- **The gate,** every step green on `4e37a950`: workspace tests 5,795 passed, 0 failed,
+  185 ignored; sandboxed fastroute 74; doc tests 9; `simulation_live` 95 of 95; fmt,
+  clippy, deny, `fix-doc-counts`, the release build `93c7242d`; the installed hash
+  `3de188bb775ab4ce` and the protected files unchanged. A first run on the same head had
+  one `simulation_live` failure, the IBIS demo's "Cannot find U1.cache" (the known flake
+  under "Known traps" in the handoff), which passed alone at once and in the second run.
 - **Not measured live:** the zones session's measurement, as above.
 
 ## The skill's order of work (PK15; applied once ZR4 and ZR2 are merged)
