@@ -2204,6 +2204,26 @@ One `route_specctra_dsn` call per board and setting at effort M, each in its own
 - **The search's ends are counted.** `pour_worse` is in each run's summary (16 on `pic`'s as-exported runs, 324 on B5's), and `cut` in `planes.search_cut_ends`. Konnect's summary does not sum `cut` too, as the addendum planned, because the engine already counts it there.
 - **Zero false connections and zero false opens** in 1,423 compared runs at W 2, and no engine or pour error.
 
+### With ZR5 part 2's pour key (2026-11-24)
+
+On the owner's "כן" (relayed by the supervisor session), ZR3 was measured once more with ZR5 part 2's pour key on. The build was a local scratch branch that merges this branch (`3712707a`) and part 2's `f306b3d0` (PR #118), and it is not for pushing. A release build ran with x22, one `route_specctra_dsn` call per board at effort M, each in its own routing hold, with `routing.rank_key: "pours"` in the call's scratch user config. Every call reports `search.rank.ranked_by: "pours"` from the user config.
+
+| Board | Winner (ZR2 → ZR3 with the pour key) | Fill pieces | Main piece's share | Plane loss | Ground track, mm | Starved pins | Signal step against today's key's choice |
+|---|---|---|---|---|---|---|---|
+| dash | omitted → omitted | 32 → 29 | 0.71 → 0.90 | 0.289 → 0.254 | 402 → 375 | 0 → 0 | the same (area step 1 higher) |
+| B5 | as exported → **omitted** | 13 → 13 | 0.94 → 0.95 | 0.036 → 0.036 | 15 → 229 | 0 → 0 | the same run |
+| `pic` | as exported → **as exported** | 2 → 1 | 0.92 → 1.0 | 0.129 → 0.015 | 15.7 → 4.9 | 0 → 0 | 1 higher |
+| `ecc` | omitted → **as exported** | 1 → 1 | 1.0 → 1.0 | 0.059 → 0.0017 | 88 → 0 | 0 → 0 | the same run |
+| `pours` | omitted → omitted | 2 → 2 | 1.0 → 1.0 | 0.035 → 0.023 | 125 → 127 | 0 → 0 | 2 higher |
+
+The measures are the winner's as judged, before the ground-via prune, the same on both sides.
+
+- **The live calls confirm the offline replay of part 2's values on ZR3's runs, run for run.** The pour key's winner is the run the replay named on all five boards. Both keys replay exactly on every judged run (19 of 19 to 1,430 of 1,430), and part 2's three criteria hold. The rank key changes no engine input. Run for run, ZR3's measures come back apart from the run time on every `ecc` and `pours` run and on 56 of 57 `pic` runs. On B5 and dash some pour or ground measures differ a little, as timed runs can.
+- **`pic`: the winner is now the routing with pours as planes.** Its plane loss is 1.5 % against ZR2's 12.9 %. It has one fill piece and a third of ZR2's ground track. `ecc` too: pours as planes, with no ground track against 88 mm.
+- **B5: not met.** The winner is still pours omitted, with 15 times ZR2's ground track. ZR3 lengthens B5's as-exported routings: the best one's signal length over the shortest omitted run's is 1.010 in ZR2, 1.015 at W 0 (Z17 alone), 1.039 at W 1, 1.053 at W 2 and 1.060 at W 4. Its plane loss (3.0 %) and the omitted winner's (3.6 %) fall in the same 5 % step. The entry that separates them, the ground track (9.7 mm against 229 mm), comes after the lengths. Offline, with the ground-track step before the lengths, B5's winner would be as exported with 3.6 mm of ground track, but 5 signal steps (about 10 %) longer. That is a change of the rule, not of a value, and above the owner's line of one step.
+- **Starved pins and lost spokes: met for the winners.** No winner has a pin KiCad calls starved. The two pours-as-planes winners (`pic`, `ecc`) lose no spoke. The pour key's first pour entry counts the record's starved thermals, which equal KiCad's on every run here, so the as-exported runs with a starved pin (1 on B5 and 2 on `pic`, as in ZR3 alone) never win.
+- **The line holds on 3 boards.** On dash the area step is 1 higher, a 0.4 % difference that rounds across a step. On `pours` the signal step is 2 higher, where the owner's line allows 1, for a plane loss of 2.3 % against 3.5 %, which also rounds across a step.
+
 ### Limits
 
 - **The model misses some starved pins KiCad sees.** In the starved runs above the model's `spokes` and starved count are clean while KiCad's DRC is not. One of them had a spoke track the closing stage added, which KiCad does not count. A model-against-KiCad check of the spokes, like ZR1's of the pads, would find out which spokes differ.
