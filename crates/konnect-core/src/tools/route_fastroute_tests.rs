@@ -2856,6 +2856,58 @@ fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
         .measures
         .stitching_vias = 0;
 
+    // Row ZR, ZR6 (S10): a ground via the reference round kept and the session lacks
+    // (its delivery failed) counts as a stitching via does: the router's status stands,
+    // the note says why, and the steps add it after the import.
+    {
+        let judged = search.outcome.runs[0].judged.as_mut().unwrap();
+        let mut round = crate::pour_stitch::StitchRecord::new(Default::default());
+        round.outcome = "kept";
+        round.vias = vec![crate::pour_stitch::StitchVia {
+            net: "GND".to_string(),
+            x_mm: 1.0,
+            y_mm: 2.0,
+            size_mm: 0.6,
+            drill_mm: 0.3,
+        }];
+        judged.reference_stitch = Some(round);
+        judged.measures.reference_vias = 1;
+    }
+    let referenced = result_for(&search);
+    assert_eq!(referenced["status"], "incomplete", "{referenced}");
+    assert_eq!(referenced["completion"]["judged"]["reference_vias"], 1);
+    let reason = referenced["completion"]["reason"].as_str().unwrap();
+    assert!(reason.ends_with(&judged_reference_note(0, 1)), "{reason}");
+    let steps = referenced["completion"]["next_steps"].as_array().unwrap();
+    if steps
+        .iter()
+        .any(|step| step["tool"] == "apply_specctra_ses")
+    {
+        let tools: Vec<&str> = steps[steps.len() - 3..]
+            .iter()
+            .map(|step| step["tool"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tools,
+            vec!["plan_route_refinement", "route_batch", "run_drc"]
+        );
+        assert_eq!(steps[steps.len() - 3]["arguments"]["nets"], json!(["GND"]));
+        assert_eq!(steps.last().unwrap()["step"], json!(steps.len()));
+    }
+    // Delivered (the winner's count back to 0): the judge's status again.
+    search.outcome.runs[0]
+        .judged
+        .as_mut()
+        .unwrap()
+        .measures
+        .reference_vias = 0;
+    let delivered = result_for(&search);
+    assert_eq!(delivered["status"], "complete", "{delivered}");
+    let steps = delivered["completion"]["next_steps"].as_array().unwrap();
+    assert!(!steps
+        .iter()
+        .any(|step| step["tool"] == "plan_route_refinement"));
+
     search.outcome.runs[0].judged.as_mut().unwrap().gates.g1 =
         vec!["1 unconnected item(s) after the refill and stitching".to_string()];
     let open = result_for(&search);

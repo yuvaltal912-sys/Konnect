@@ -637,7 +637,9 @@ impl Scene {
     fn clearance_to(&self, i: usize) -> f64 {
         self.local_clearance
             .get(&self.items[i].id)
-            .map_or(self.rules.clearance, |&local| self.rules.clearance.max(local))
+            .map_or(self.rules.clearance, |&local| {
+                self.rules.clearance.max(local)
+            })
     }
 
     fn assemble(

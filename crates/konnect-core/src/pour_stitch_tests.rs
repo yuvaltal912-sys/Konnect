@@ -86,7 +86,10 @@ fn targets_are_incomplete_when_the_audit_listed_fewer_findings_than_it_counted()
     // A finding without its limit takes the audit's default.
     let mut bare = finding("SIG via a", &["GND"], Some((1.0, 1.0)));
     bare["threshold"] = json!({});
-    assert_eq!(targets(&audit_of(vec![bare], 1.0), &ground()).targets[0].max_mm, 3.0);
+    assert_eq!(
+        targets(&audit_of(vec![bare], 1.0), &ground()).targets[0].max_mm,
+        3.0
+    );
 }
 
 // ─── S3: the planner's vias kept ─────────────────────────────────────────────
@@ -137,11 +140,23 @@ fn only_the_vias_of_a_target_net_within_its_limit_are_kept() {
     };
     let (kept, dropped) = keep_reference_vias(&items, &[target("GND", (10.0, 10.0))]);
     assert!(kept.tracks.is_empty());
-    assert_eq!(kept.vias, vec![via("GND", 12.0, 10.0), via("GND", 13.001, 10.0)]);
+    assert_eq!(
+        kept.vias,
+        vec![via("GND", 12.0, 10.0), via("GND", 13.001, 10.0)]
+    );
     assert_eq!(dropped, 4, "the track and three vias");
 }
 
 // ─── S5: the guard ───────────────────────────────────────────────────────────
+
+/// The two clauses a lower copper quality gives: today's entry 11 and where the pour key
+/// holds it (`pour_rank::TODAY_AT`, the layout of main b64e2f3c).
+fn quality_keys() -> Vec<String> {
+    vec![
+        "key:routing:11".to_string(),
+        format!("key:pours:{}", crate::pour_rank::TODAY_AT[11]),
+    ]
+}
 
 fn pours(starved: usize) -> PourMeasures {
     PourMeasures {
@@ -242,7 +257,10 @@ fn the_unconnected_count_must_stay_equal_and_no_rule_may_rise() {
         before.unconnected = 1 - count;
         after.unconnected = count;
         // A lower count is refused too: a reference via may not close an open.
-        assert_eq!(stitch_refusals(&before, &after, &gnd()), vec!["unconnected"]);
+        assert_eq!(
+            stitch_refusals(&before, &after, &gnd()),
+            vec!["unconnected"]
+        );
     }
     let mut after = checked(0.0);
     after.violations.insert("clearance".into(), 1);
@@ -265,16 +283,25 @@ fn the_unconnected_count_must_stay_equal_and_no_rule_may_rise() {
 fn a_board_with_no_rest_or_no_pour_record_where_one_is_due_is_unchecked() {
     let mut after = checked(0.0);
     after.rest = None;
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["unchecked"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["unchecked"]
+    );
     let mut after = checked(0.0);
     rest(&mut after).measures.pours = None;
     rest(&mut after).measures.pours_error = Some("unreadable".into());
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["unchecked"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["unchecked"]
+    );
     // A call with no pour net takes no record on either side: nothing is due.
     let (mut before, mut after) = (checked(3.0), checked(0.0));
     rest(&mut before).measures.pours = None;
     rest(&mut after).measures.pours = None;
-    assert_eq!(stitch_refusals(&before, &after, &gnd()), Vec::<String>::new());
+    assert_eq!(
+        stitch_refusals(&before, &after, &gnd()),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -293,7 +320,10 @@ fn a_gate_verdict_that_changes_either_way_is_refused() {
     rest(&mut before).gates.g2 = vec!["a".into()];
     rest(&mut after).gates.g2 = vec!["b".into(), "c".into()];
     let refused = stitch_refusals(&before, &after, &gnd());
-    assert!(!refused.iter().any(|c| c.starts_with("gate:")), "{refused:?}");
+    assert!(
+        !refused.iter().any(|c| c.starts_with("gate:")),
+        "{refused:?}"
+    );
 }
 
 #[test]
@@ -303,19 +333,22 @@ fn an_entry_above_in_either_key_is_refused_whatever_the_calls_key() {
     rest(&mut after).measures.copper_quality = Some(80.0);
     assert_eq!(
         stitch_refusals(&checked(3.0), &after, &gnd()),
-        vec!["key:routing:11", "key:pours:15"]
+        quality_keys()
     );
     // A starved thermal: the pour key alone (entry 7).
     let mut after = checked(0.0);
     rest(&mut after).measures.pours = Some(pours(1));
     assert_eq!(
         stitch_refusals(&checked(3.0), &after, &gnd()),
-        vec!["key:pours:7"]
+        vec![format!("key:pours:{}", crate::pour_rank::POUR_FAULTS)]
     );
     // The route seconds are not compared.
     let mut after = checked(0.0);
     rest(&mut after).measures.route_s = 99.0;
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), Vec::<String>::new());
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -330,7 +363,10 @@ fn the_unstitched_count_must_fall() {
     );
     let mut after = checked(0.0);
     rest(&mut after).measures.checklist.unstitched_layer_changes = None;
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["not_better"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["not_better"]
+    );
 }
 
 #[test]
@@ -343,7 +379,10 @@ fn another_nets_fill_may_not_shrink_and_the_stitched_nets_own_is_left_to_the_pou
     );
     // Within the tolerance.
     rest(&mut after).fills[2] = fill("VCC", "In1.Cu", 50.0 - pour_prune::FILL_TOLERANCE_MM2 / 2.0);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), Vec::<String>::new());
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        Vec::<String>::new()
+    );
     // A zone layer that is gone counts as 0.
     rest(&mut after).fills.pop();
     assert_eq!(
@@ -353,7 +392,10 @@ fn another_nets_fill_may_not_shrink_and_the_stitched_nets_own_is_left_to_the_pou
     // The ground net's own fill changes with its own vias: not this clause.
     let mut after = checked(0.0);
     rest(&mut after).fills[0] = fill("GND", "B.Cu", 90.0);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), Vec::<String>::new());
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        Vec::<String>::new()
+    );
     // Unless GND is not a stitched net.
     assert_eq!(
         stitch_refusals(&checked(3.0), &after, &BTreeSet::new()),
@@ -365,31 +407,52 @@ fn another_nets_fill_may_not_shrink_and_the_stitched_nets_own_is_left_to_the_pou
 fn a_check_that_no_longer_scores_and_worse_loops_are_refused() {
     let mut after = checked(0.0);
     rest(&mut after).audit.scored.remove("4.1");
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["unscored"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["unscored"]
+    );
     let mut after = checked(0.0);
     rest(&mut after).audit.worst_loop_mm = Some(5.0 + pour_prune::LOOP_TOLERANCE_MM * 2.0);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["loops"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["loops"]
+    );
 }
 
 #[test]
 fn the_length_off_the_reference_may_rise_by_the_tolerance_only() {
     let mut after = checked(0.0);
     rest(&mut after).measures.checklist.length_off_reference_mm = Some(10.0 + 0.09);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), Vec::<String>::new());
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        Vec::<String>::new()
+    );
     rest(&mut after).measures.checklist.length_off_reference_mm = Some(10.0 + 0.11);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["reference"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["reference"]
+    );
     rest(&mut after).measures.checklist.length_off_reference_mm = None;
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["reference"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["reference"]
+    );
 }
 
 #[test]
 fn more_floating_ground_is_refused() {
     let mut after = checked(0.0);
     rest(&mut after).measures.checklist.floating_ground_mm2 = Some(0.5);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["ground"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["ground"]
+    );
     let mut after = checked(0.0);
     rest(&mut after).measures.checklist.floating_ground_islands = Some(1.0);
-    assert_eq!(stitch_refusals(&checked(3.0), &after, &gnd()), vec!["ground"]);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["ground"]
+    );
 }
 
 #[test]
@@ -407,7 +470,7 @@ fn the_delivery_compares_the_same_vias_and_refuses_a_higher_count() {
     rest(&mut after).measures.copper_quality = Some(80.0);
     assert_eq!(
         delivery_refusals(&checked(0.0), &after, &gnd()),
-        vec!["key:routing:11", "key:pours:15"]
+        quality_keys()
     );
 }
 
@@ -416,8 +479,14 @@ fn the_record_holds_both_boards_as_the_guard_read_them() {
     let (summary_before, summary_after) = summaries(&checked(3.0), &checked(0.0));
     assert_eq!(summary_before.unconnected, 0);
     assert_eq!(summary_before.gates_passed, vec!["g1", "g2", "g3", "g4"]);
-    assert_eq!(summary_before.key_routing.len(), crate::route_judge::KEY_LEN);
-    assert_eq!(summary_before.key_pours.len(), crate::pour_rank::POUR_KEY_LEN);
+    assert_eq!(
+        summary_before.key_routing.len(),
+        crate::route_judge::KEY_LEN
+    );
+    assert_eq!(
+        summary_before.key_pours.len(),
+        crate::pour_rank::POUR_KEY_LEN
+    );
     assert_eq!(summary_before.key_routing, summary_after.key_routing);
     assert_eq!(summary_before.fill_mm2["VCC/In1.Cu/z-VCC-In1.Cu"], 50.0);
     assert_eq!(summary_before.checklist.unstitched_layer_changes, Some(3.0));
@@ -466,9 +535,18 @@ fn manifest() -> Value {
 #[test]
 fn the_padstack_is_the_manifests_round_via_of_the_same_size_and_drill() {
     let m = manifest();
-    assert_eq!(manifest_padstack(&m, 0.6, 0.3).unwrap().as_deref(), Some("via_std"));
-    assert_eq!(manifest_padstack(&m, 0.6009, 0.3).unwrap().as_deref(), Some("via_std"));
-    assert_eq!(manifest_padstack(&m, 0.45, 0.2).unwrap().as_deref(), Some("via_small"));
+    assert_eq!(
+        manifest_padstack(&m, 0.6, 0.3).unwrap().as_deref(),
+        Some("via_std")
+    );
+    assert_eq!(
+        manifest_padstack(&m, 0.6009, 0.3).unwrap().as_deref(),
+        Some("via_std")
+    );
+    assert_eq!(
+        manifest_padstack(&m, 0.45, 0.2).unwrap().as_deref(),
+        Some("via_small")
+    );
     assert_eq!(manifest_padstack(&m, 0.6011, 0.3).unwrap(), None);
     assert_eq!(manifest_padstack(&m, 0.6, 0.35).unwrap(), None);
     assert_eq!(manifest_padstack(&m, 0.8, 0.4).unwrap(), None);
@@ -500,12 +578,21 @@ fn the_vias_go_into_their_nets_block_snapped_to_the_session_grid() {
     let text = write_vias(SESSION, &vias, "konnect_via_0001").unwrap();
     // The GND via after the GND wire, the S 1 via after its own via, VCC in a new block.
     let gnd = text.find("(net GND").unwrap();
-    let gnd_via = text.find("(via \"konnect_via_0001\" 1060000 -520000)").unwrap();
+    let gnd_via = text
+        .find("(via \"konnect_via_0001\" 1060000 -520000)")
+        .unwrap();
     let s1 = text.find("(net \"S 1\"").unwrap();
-    let s1_via = text.find("(via \"konnect_via_0001\" 1010000 -500000)").unwrap();
+    let s1_via = text
+        .find("(via \"konnect_via_0001\" 1010000 -500000)")
+        .unwrap();
     let vcc = text.find("(net \"VCC\"").unwrap();
-    let vcc_via = text.find("(via \"konnect_via_0001\" 900000 -400001)").unwrap();
-    assert!(gnd < gnd_via && gnd_via < s1 && s1 < s1_via && s1_via < vcc && vcc < vcc_via, "{text}");
+    let vcc_via = text
+        .find("(via \"konnect_via_0001\" 900000 -400001)")
+        .unwrap();
+    assert!(
+        gnd < gnd_via && gnd_via < s1 && s1 < s1_via && s1_via < vcc && vcc < vcc_via,
+        "{text}"
+    );
     // The scanner reads it back: every via in its net.
     let all: BTreeSet<String> = ["GND", "S 1", "VCC"].map(str::to_string).into();
     let units = pour_prune::units(&text, &all).unwrap();
@@ -537,7 +624,10 @@ fn a_name_the_session_cannot_hold_is_refused() {
     assert!(write_vias(SESSION, &[via("A\"B", 1.0, 1.0)], "konnect_via_0001").is_err());
     assert!(write_vias("(pcb)", &[via("GND", 1.0, 1.0)], "konnect_via_0001").is_err());
     // No via: the session as it was.
-    assert_eq!(write_vias(SESSION, &[], "konnect_via_0001").unwrap(), SESSION);
+    assert_eq!(
+        write_vias(SESSION, &[], "konnect_via_0001").unwrap(),
+        SESSION
+    );
 }
 
 // ─── S5's retry: what a refusal names ────────────────────────────────────────
@@ -577,7 +667,10 @@ fn zone(net: &str, layer: &str, ring: &[(f64, f64)]) -> String {
 }
 
 fn board(zones: &[String]) -> String {
-    format!("(kicad_pcb (net 0 \"\") (net 1 \"GND\") {})", zones.join(" "))
+    format!(
+        "(kicad_pcb (net 0 \"\") (net 1 \"GND\") {})",
+        zones.join(" ")
+    )
 }
 
 #[test]
@@ -601,21 +694,53 @@ fn a_drc_item_names_the_vias_at_its_position_and_a_fill_clause_the_vias_in_that_
     let named = named_vias(&["unconnected".to_string()], &vias, &drc, &empty, &empty);
     assert_eq!(named, BTreeSet::from([1]));
     // An island reported at one of its vertices names the vias inside it.
-    let island = zone("GND", "B.Cu", &[(18.0, 8.0), (22.0, 8.0), (22.0, 12.0), (18.0, 12.0)]);
+    let island = zone(
+        "GND",
+        "B.Cu",
+        &[(18.0, 8.0), (22.0, 8.0), (22.0, 12.0), (18.0, 12.0)],
+    );
     let drc = report(vec![violation("isolated_copper", (18.0, 8.0))], vec![]);
     let stitched = board(&[island]);
-    let named = named_vias(&["rule:isolated_copper".to_string()], &vias, &drc, &empty, &stitched);
+    let named = named_vias(
+        &["rule:isolated_copper".to_string()],
+        &vias,
+        &drc,
+        &empty,
+        &stitched,
+    );
     assert_eq!(named, BTreeSet::from([1]));
     // A fill clause names the vias in that net's fill on that layer of the board before.
-    let plane = zone("GND", "In1.Cu", &[(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)]);
+    let plane = zone(
+        "GND",
+        "In1.Cu",
+        &[(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)],
+    );
     let before = board(&[plane]);
-    let named = named_vias(&["fill:GND/In1.Cu".to_string()], &vias, &report(vec![], vec![]), &before, &empty);
+    let named = named_vias(
+        &["fill:GND/In1.Cu".to_string()],
+        &vias,
+        &report(vec![], vec![]),
+        &before,
+        &empty,
+    );
     assert_eq!(named, BTreeSet::from([0]));
-    let named = named_vias(&["fill:GND/In2.Cu".to_string()], &vias, &report(vec![], vec![]), &before, &empty);
+    let named = named_vias(
+        &["fill:GND/In2.Cu".to_string()],
+        &vias,
+        &report(vec![], vec![]),
+        &before,
+        &empty,
+    );
     assert!(named.is_empty());
     // A clause that names no copper names no via.
     let drc = report(vec![violation("clearance", (10.0, 10.0))], vec![]);
-    let named = named_vias(&["key:routing:11".to_string(), "loops".to_string()], &vias, &drc, &before, &empty);
+    let named = named_vias(
+        &["key:routing:11".to_string(), "loops".to_string()],
+        &vias,
+        &drc,
+        &before,
+        &empty,
+    );
     assert!(named.is_empty());
 }
 

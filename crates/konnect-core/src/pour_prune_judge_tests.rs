@@ -1439,3 +1439,8 @@ async fn the_keys_taken_again_read_the_calls_mode() {
         }
     }
 }
+
+// ─── Row ZR, ZR6: the reference round in the judge and the delivery (no KiCad) ──
+
+#[path = "pour_stitch_judge_tests.rs"]
+mod stitch;

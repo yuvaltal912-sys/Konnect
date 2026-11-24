@@ -359,7 +359,12 @@ placement orders, judges every run itself on scratch copies of the board
    lengths); `complete_with_gate_failures` and `incomplete` list what failed. When
    every gate passed, `status` is the judge's, not fastroute's own count
    (`completion.router_unrouted`), unless the judge had to add stitching vias
-   (`completion.judged.stitching_vias`): then follow `next_steps`. Report
+   (`completion.judged.stitching_vias`) or ground vias at reference changes the
+   session does not hold (`completion.judged.reference_vias`): then follow
+   `next_steps`. The judge adds a ground via beside each signal via that changes
+   reference plane with none within 3 mm (checklist 3.2) on every judged run, and
+   keeps it only when nothing else gets worse; the winner's go into the written
+   session (`search.reference_stitch` says whether they did, and why not). Report
    every failed gate line to the user. `search` lists the best runs and counts
    every outcome (`search.json` in the search folder lists every run); `search.budget_overrun_s` says when the first judged run came
    after the budget. On a board with pours, `measures.pours.damage` of each

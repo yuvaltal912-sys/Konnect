@@ -563,7 +563,9 @@ pub(crate) fn drc_refusals(
 }
 
 /// The total fill of each zone layer (net, layer, zone UUID), mm².
-pub(crate) fn fill_by_zone_layer(fills: &[ZoneLayerFill]) -> BTreeMap<(&str, &str, Option<&str>), f64> {
+pub(crate) fn fill_by_zone_layer(
+    fills: &[ZoneLayerFill],
+) -> BTreeMap<(&str, &str, Option<&str>), f64> {
     let mut out = BTreeMap::new();
     for fill in fills {
         *out.entry((
@@ -933,7 +935,10 @@ fn pruned_folder(index: usize) -> String {
 
 /// The fill of every pour zone of the call on the board kicad-cli saved, read and parsed
 /// off the async threads (as `zone_fill::pour_record` reads it).
-pub(crate) async fn fills_of(board: &Path, pour_nets: &BTreeSet<String>) -> Result<Vec<ZoneLayerFill>> {
+pub(crate) async fn fills_of(
+    board: &Path,
+    pour_nets: &BTreeSet<String>,
+) -> Result<Vec<ZoneLayerFill>> {
     let path = board.to_path_buf();
     let nets = pour_nets.clone();
     tokio::task::spawn_blocking(move || -> Result<Vec<ZoneLayerFill>> {

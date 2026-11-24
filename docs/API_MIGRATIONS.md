@@ -3,6 +3,50 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: a ground via at every reference change (Row ZR, stage ZR6)
+
+`route_specctra_dsn` (fastroute) adds a ground via beside each signal via that changes
+reference plane with no ground via within `stitch_via_max_mm` (checklist 3.2), on every
+judged run before the rank, and writes the winner's into the delivered session. Design:
+"ZR6" in `docs/ZONE_ROUTING_DESIGN.md`. No argument changes; nothing is removed or
+renamed. The placement tools' routing calls (`plan_convergent_placement`) run without it.
+
+- **A judged run's board can hold vias its session does not.** The judge runs one
+  reference round after the stitching rounds; it keeps the stitched board only when
+  KiCad's unconnected count is equal, no KiCad rule's count is higher, every gate says
+  the same, no entry of either key (`key`, `pour_key`) is higher, 3.2's count is lower,
+  no other net's fill shrinks, and 3.1, 3.3 and 4.1 are not worse. `key` and `pour_key`
+  are then the stitched board's.
+- **New field in each judged run's `run.json`: `judged.reference_stitch`**, when the
+  round ran (the switch is on and the audit counted an unstitched change): `outcome`
+  (`kept`, `refused`, `none_needed`, `no_proposal`, `planner_refused`, `failed`),
+  `reason`, `targets`, `skipped` (`subject`, `reason`), `proposals`, `written_vias`,
+  `dropped`, `vias` (the kept vias: `net`, `x_mm`, `y_mm`, `size_mm`, `drill_mm`),
+  `before` and `after` (each board as the guard read it: `unconnected`, `violations`,
+  `gates_passed`, `key_routing`, `key_pours`, `fill_mm2`, `checklist`, `scored`),
+  `retried` (`dropped_vias`, `because`), `refused_by`, `remaining` (`subject`, `net`,
+  `reason`), `kicad_runs`, `seconds`.
+- **New measures, in every judged run (`measures`, `search.winner.measures`):**
+  `reference_vias` (the vias the round added that the run's session does not hold; 0
+  for a delivered winner) and `checklist` (`length_off_reference_mm`,
+  `unstitched_layer_changes`, `floating_ground_mm2`, `floating_ground_islands`,
+  `worst_loop_mm`: items 3.1, 3.2, 3.3 and 4.1 of the judged board's audit). No gate and
+  no key reads them. A `run.json` recorded before this change has neither; a reader takes
+  0 and nulls.
+- **New field `search.reference_stitch`** (also in `search.json`): what the delivery of
+  the winner's vias did, after the ground-via prune: `outcome` (`delivered`,
+  `nothing_to_deliver`, `rejected`, `no_padstack`, `failed`), `reason`, `vias`,
+  `refused_by`, `seconds`. With `delivered` the written session (`stitched.ses` in the
+  winner's run folder) holds the vias, and the winner's judge is that session's.
+- **`completion.judged.reference_vias`**: the winner's vias the session lacks. When it is
+  above 0, `status` stays the router's as it does for `stitching_vias`, the reason says
+  why, and `completion.next_steps` ends with `plan_route_refinement` (`stitching`, the
+  vias' nets), `route_batch` and `run_drc`.
+- **`plan_route_refinement` is unchanged** (the strict profile). The judge's round calls
+  the planner in-process with a profile that accepts local pad and footprint
+  `zone_connect`, `thermal_*` and `clearance` overrides (the clearance kept per item) and
+  teardrop zones with no UUID (as copper of no net).
+
 ## Unreleased: the ground track before the lengths, and the plane loss in 2.5 % steps, in the pour key (Row ZR, stage ZR5, PK19 and PK20)
 
 The layout of `pour_key` and one of its steps change; `key` and the default

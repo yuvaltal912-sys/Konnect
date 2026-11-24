@@ -1526,7 +1526,9 @@ impl<'a> Planner<'a> {
                                 match self.candidate(scene, "stitching", Vec::new(), vec![n])? {
                                     Outcome::Accepted => {
                                         targets.retain(|(n, p, span)| {
-                                            n != &net || mask & span != *span || dist(*p, at) > limit
+                                            n != &net
+                                                || mask & span != *span
+                                                || dist(*p, at) > limit
                                         });
                                         components = scene.components(&net)?;
                                         if !pending(&components, &targets) {

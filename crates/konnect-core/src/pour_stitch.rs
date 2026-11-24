@@ -130,8 +130,7 @@ pub(crate) fn targets(audit: &Value, ground: &BTreeSet<String>) -> Targets {
             out.skipped.push(skip("not_ground"));
             continue;
         };
-        let (Some(x), Some(y)) = (finding["at"]["x"].as_f64(), finding["at"]["y"].as_f64())
-        else {
+        let (Some(x), Some(y)) = (finding["at"]["x"].as_f64(), finding["at"]["y"].as_f64()) else {
             out.skipped.push(skip("no_position"));
             continue;
         };
@@ -435,7 +434,7 @@ pub(crate) struct StitchRecord {
 }
 
 impl StitchRecord {
-    fn new(before: CheckedSummary) -> Self {
+    pub(crate) fn new(before: CheckedSummary) -> Self {
         Self {
             outcome: "failed",
             reason: None,
@@ -755,9 +754,8 @@ fn reaches_ring(ring: &[(f64, f64)], at: (f64, f64), radius: f64) -> bool {
         return false;
     }
     inside(ring, at)
-        || (0..ring.len()).any(|i| {
-            to_segment(at, ring[i], ring[(i + 1) % ring.len()]) <= radius + RETRY_REACH_MM
-        })
+        || (0..ring.len())
+            .any(|i| to_segment(at, ring[i], ring[(i + 1) % ring.len()]) <= radius + RETRY_REACH_MM)
 }
 
 /// S5's retry: the indices of the `vias` a refusal names.
@@ -1193,7 +1191,7 @@ pub(crate) fn write_vias(ses_text: &str, vias: &[PlannedVia], padstack: &str) ->
             .map_or(network.out.end - 1, |net| net.block.end);
         inserts.push((at, new_nets));
     }
-    inserts.sort_by(|a, b| b.0.cmp(&a.0));
+    inserts.sort_by_key(|insert| std::cmp::Reverse(insert.0));
     let mut out = ses_text.to_string();
     for (at, text) in inserts {
         out.insert_str(at, &text);
@@ -1254,14 +1252,18 @@ struct Delivered {
 
 /// The winner's kept round, or the record of why there is nothing to deliver.
 fn delivery_of(outcome: &SearchOutcome) -> std::result::Result<Delivery, DeliveryRecord> {
-    let nothing = |reason: &str| {
-        DeliveryRecord::new("nothing_to_deliver", Some(reason.to_string()), 0)
-    };
-    let Some(record) = outcome.winner.and_then(|position| outcome.runs.get(position)) else {
+    let nothing =
+        |reason: &str| DeliveryRecord::new("nothing_to_deliver", Some(reason.to_string()), 0);
+    let Some(record) = outcome
+        .winner
+        .and_then(|position| outcome.runs.get(position))
+    else {
         return Err(nothing("no run won"));
     };
     let (Some(routed), Some(judged)) = (&record.routed, &record.judged) else {
-        return Err(nothing("the winning record has no routed session or no judged board"));
+        return Err(nothing(
+            "the winning record has no routed session or no judged board",
+        ));
     };
     let Some(round) = judged
         .reference_stitch
@@ -1297,7 +1299,11 @@ fn delivery_of(outcome: &SearchOutcome) -> std::result::Result<Delivery, Deliver
 
 /// A delivered session's [`Checked`]: its full judge's counts, measures and gates, the
 /// fill of its judged board and its audit again (in-process).
-async fn checked_of(ctx: &JudgeContext, tools: &dyn ToolCaller, judged: &Judged) -> Result<Checked> {
+async fn checked_of(
+    ctx: &JudgeContext,
+    tools: &dyn ToolCaller,
+    judged: &Judged,
+) -> Result<Checked> {
     let audit = route_judge::audit(tools, &judged.board).await?;
     let fills = pour_prune::fills_of(&judged.board, &ctx.pour_nets).await?;
     Ok(Checked {
@@ -1369,18 +1375,19 @@ async fn deliver(ctx: Arc<JudgeContext>, tools: Arc<dyn ToolCaller>, job: Delive
             written,
         );
     }
-    let padstack = match manifest_padstack(&ctx.manifest, size, drill) {
-        Ok(Some(name)) => name,
-        Ok(None) => {
-            return ended(
+    let padstack =
+        match manifest_padstack(&ctx.manifest, size, drill) {
+            Ok(Some(name)) => name,
+            Ok(None) => return ended(
                 "no_padstack",
-                format!("the export manifest has no via padstack of {size} mm with a {drill} mm drill"),
+                format!(
+                    "the export manifest has no via padstack of {size} mm with a {drill} mm drill"
+                ),
                 Vec::new(),
                 written,
-            )
-        }
-        Err(error) => return ended("failed", format!("{error:#}"), Vec::new(), written),
-    };
+            ),
+            Err(error) => return ended("failed", format!("{error:#}"), Vec::new(), written),
+        };
     let text = match tokio::fs::read_to_string(&job.routed.held.ses).await {
         Ok(text) => text,
         Err(error) => {

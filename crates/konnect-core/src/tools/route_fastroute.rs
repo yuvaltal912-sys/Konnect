@@ -8,8 +8,8 @@ use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 pub(crate) use crate::pour_prune::PourPrune;
 pub(crate) use crate::pour_rank::RankChoice;
-pub(crate) use crate::pour_stitch::ReferenceStitch;
 use crate::pour_rank::{RankMode, RankSource};
+pub(crate) use crate::pour_stitch::ReferenceStitch;
 use crate::route_judge::{self, Baseline, JudgeContext, Judged, Refusal};
 use crate::route_search::{
     self, BoxFuture, Effort, EffortSource, RouteFailure, Routed, RunRecord, Runner, SearchOutcome,
@@ -495,11 +495,11 @@ pub(crate) async fn route_with_fastroute(
     rank: RankChoice,
     stitch: ReferenceStitch,
 ) -> Result<CallToolResult> {
-    let mut call =
-        match prepare_ranked_call(args, rank, &crate::tools::config::user_config_path())? {
-            Ok(call) => call,
-            Err(refusal) => return Ok(refusal),
-        };
+    let mut call = match prepare_ranked_call(args, rank, &crate::tools::config::user_config_path())?
+    {
+        Ok(call) => call,
+        Err(refusal) => return Ok(refusal),
+    };
     call.stitch = stitch;
     let located = match locate_binary(args, &call).await {
         Ok(Ok(located)) => located,
