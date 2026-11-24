@@ -2291,12 +2291,12 @@ with no ground via within 3 mm (`stitch_via_max_mm`).
 | | dash | B5 (x21 pair) |
 |---|---|---|
 | 3.2, unstitched layer changes, today's winner → the pour key's | 4 → 7 | 1 → 9 |
-| 3.1, signal length off the reference plane, mm | 31.7 → 39.4 | 177 → 201 |
-| 4.1, the worst decoupling loop, mm | 19 → 36 | |
+| 3.1, signal length off the reference plane | longer | longer |
+| 4.1, the worst decoupling loop | longer | |
 
 - **Why the pours-as-planes routings lose them:** with the pours as planes the router draws no
   ground track or via. With the pours omitted it draws ground as tracks and vias, and some of
-  those vias sat near signal vias. On dash the nearest ground via is 5.5 to 12.2 mm away.
+  those vias sat near signal vias. On dash the nearest ground via is beyond the 3 mm limit.
 - **The key sees 3.2 only through copper quality,** second to last in both keys.
 
 ### What exists already
@@ -2344,7 +2344,7 @@ criterion 1).
 |---|---|---|---|
 | **A. In the engine**, next to each signal via fastroute places | A new build and pin. Konnect has to pass the critical nets and each net's reference planes, which only the audit knows. The group search and the optimizer move vias, so each ground via has to follow its signal via. The pours-omitted shape gets nothing: the engine has no pours there | Every run is ranked stitched, and the router keeps room for the via, which may serve B5's last 5 | Later, and only for what C leaves |
 | **B. In Konnect, on the winner only**, after the search | One planner call, one refill and one audit per call | None: the key chooses among unstitched boards, and the winner is stitched afterwards | No: under "quality first" the key should rank the board that is delivered |
-| **C. In Konnect, on every judged run before the rank** | Only on a run whose audit counts an unstitched change: one in-process planner call, one KiCad refill and DRC (two with S5's retry), one audit. Every other run pays nothing. On dash, B5 and `pic` a run's routing is long (median route 19.5 to 142 s, 7 router lanes against 3 judge lanes), so the judge lanes probably have room. That is an inference: the judge's own time is not recorded. A longer judge can still leave more runs cut at the budget, and the measurement counts them | The key ranks the stitched boards: their copper quality and their pour entries are those of the board delivered | **Recommended** |
+| **C. In Konnect, on every judged run before the rank** | Only on a run whose audit counts an unstitched change: one in-process planner call, one KiCad refill and DRC (two with S5's retry), one audit. Every other run pays nothing. On dash, B5 and `pic` a run's routing is long against its judge (7 router lanes against 3 judge lanes; the route times are in `target/creation-research/zone-routing/zr3/`), so the judge lanes probably have room. That is an inference: the judge's own time is not recorded. A longer judge can still leave more runs cut at the budget, and the measurement counts them | The key ranks the stitched boards: their copper quality and their pour entries are those of the board delivered | **Recommended** |
 
 ### What the stage does (the code cites S1 to S15)
 
@@ -2705,8 +2705,8 @@ The placement tool's call was not made: `plan_convergent_placement` needs the bo
 2. **Every S5 clause holds on every kept round.** An independent replay of the two recorded `CheckedSummary` (`replay.py`) confirms all 34 kept rounds: 14 on B5 and 2 on dash, per key, plus the repeat.
    - The 4 rounds that `loops` refused on B5, per key, are not reproduced by the replay. The record keeps only the worst loop, not the loop count, median or area that `loops_worse` reads.
 3. **The winners with the stage on are not worse than off, per board and key.** On dash (both keys) and B5 only 3.2 and copper quality change:
-   - dash: 61.08 → 66.82, and 65.15 → 68.88 under `routing`;
-   - B5: 59.58 → 61.03.
+   - dash: copper quality higher under both keys;
+   - B5: copper quality higher.
 
    The gates, pieces, plane loss, starved pins, 3.1, 3.3, 4.1 and the unconnected count are unchanged. B5's fill areas differ at the tenth digit. On the other boards the winner is the same run with the same measures.
 4. **The delivery.**
@@ -2727,7 +2727,7 @@ The placement tool's call was not made: `plan_convergent_placement` needs the bo
      - `ecc` 1,472 → 1,434, and 1,481 → 1,490;
      - `pours` 1,251 → 1,252, and 1,309 → 1,315.
    - **Cut at the budget:** the same off and on, except `pic` under `routing`, 3 → 2.
-   - **The round's cost:** one KiCad run and a median of 3 s. B5 spends 57 s per call on 18 rounds.
+   - **The round's cost:** one KiCad run per round (rounds ran on dash and B5 only); the seconds are in each run's record.
    - **The prune's vias removed, off against on:** dash 6 and 6, B5 0 and 0 (11 and 11 under `routing`), `pic` 0 and 0 (2 and 2).
    - **On the 4-layer board:** nothing (below).
 
@@ -2735,15 +2735,15 @@ The placement tool's call was not made: `plan_convergent_placement` needs the bo
 
 **The 4-layer board routed nothing.** In both calls all 7 runs were killed at the hang cap (900 s), as-exported and omitted alike.
 - Omitted runs are not sent `--x.zones`, so the zones are not the whole cause.
-- In Row LT, with x18 and before the group search, its as-exported runs routed in about 455 s. x19's group search made runs 3 to 4 times longer on dash and B5.
+- In Row LT, with x18 and before the group search, its as-exported runs routed in about 455 s. x19's group search made runs much longer on dash and B5 (Row GS's final measurement).
 - So the other-net fill clause, inner-plane antipads and Tune candidates are unmeasured on a real board.
 
 **Against x19, the delivered board of today** (Row GS's final calls, the same placements and effort). Copper quality and 3.2 are under one judge: x19's routing judged again in this measurement's calls, equal to full precision. `pic`'s x19 winner was not judged here, and its copper quality is x19's judge's. On the four boards where both judges scored a run, the two judges agree. The track and via counts are from the delivered sessions.
 
 | Board | Winner, x19 → ZR6 | Copper quality | 3.2 | Plane loss | Ground track, mm | Ground vias | Signal track | Signal vias | All track + 3 mm a via |
 |---|---|---|---|---|---|---|---|---|---|
-| dash | omitted → omitted | 65.15 → 66.82 | 4 → 0 | 0.289 → 0.254 | 437 → 375 | 18 → 18 | -0.8 % | 68 → 67 | -3.2 % |
-| B5 | omitted → as exported | 62.00 → 61.03 | 5 → 2 | 0.036 → 0.030 | 316 → 9.7 | 21 → 12 | +6.5 % | 32 → 30 | -23.4 % |
+| dash | omitted → omitted | higher | 4 → 0 | lower | lower | 18 → 18 | shorter | 68 → 67 | lower, short of 10 % |
+| B5 | omitted → as exported | lower | 5 → 2 | lower | far lower, near his hand routing's | 21 → 12 | longer, within his rule | 32 → 30 | lower, past 10 % |
 | `pic` | omitted → as exported | 60.97 → 65.66 | – | – → 0.011 | 457 → 4.7 | 0 → 0 | +3.5 % | 1 → 4 | -21.4 % |
 | `ecc` | omitted → as exported | 78.90 → 90.42 | – | 0.059 → 0.0017 | 88 → 0 | 0 → 0 | +0.3 % | 0 → 0 | -35.5 % |
 | `pours` | omitted → as exported | 76.64 → 83.07 | 8 → 8 | 0.035 → 0.035 | 125 → 0 | 0 → 2 | +1.9 % | 8 → 8 | -33.2 % |
