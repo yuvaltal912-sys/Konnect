@@ -1064,6 +1064,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "rank_key",
         "pour_key",
         "other_winner",
+        // The result fields of the reference round (Row ZR, ZR6).
+        "reference_vias",
+        "reference_stitch",
     ];
 
     let mut phantom = Vec::new();
