@@ -163,6 +163,8 @@ fn measures(unconnected: usize, signal_mm: f64) -> Measures {
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: Default::default(),
     }
 }
 

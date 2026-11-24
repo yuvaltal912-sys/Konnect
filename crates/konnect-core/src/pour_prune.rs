@@ -109,16 +109,19 @@ enum UnitKey {
 
 /// A `(net …)` block of `network_out`: its block, its name (unquoted) and its direct
 /// `(wire …)` and `(via …)` children.
-struct NetBlock {
-    block: Block,
-    name: String,
-    routes: Vec<Block>,
+pub(crate) struct NetBlock {
+    pub(crate) block: Block,
+    pub(crate) name: String,
+    pub(crate) routes: Vec<Block>,
 }
 
-/// The session's `network_out` nets, and the millimetres of one session unit.
-struct Network {
-    mm_per_unit: f64,
-    nets: Vec<NetBlock>,
+/// The session's `network_out` nets, and the millimetres of one session unit. Row ZR,
+/// ZR6: `out` is the `(network_out …)` block itself, where `pour_stitch::write_vias`
+/// adds a net block.
+pub(crate) struct Network {
+    pub(crate) mm_per_unit: f64,
+    pub(crate) nets: Vec<NetBlock>,
+    pub(crate) out: Block,
 }
 
 fn unquote(atom: &str) -> &str {
@@ -179,7 +182,7 @@ fn mm_per_unit(text: &str, resolution: Block) -> Result<f64> {
     Ok(unit_mm / count)
 }
 
-fn network(text: &str) -> Result<Network> {
+pub(crate) fn network(text: &str) -> Result<Network> {
     let root = root_block(text).context(SCAN)?;
     if !has_head(text, root, "session") {
         bail!("the session text's root block is not (session ...)");
@@ -211,7 +214,11 @@ fn network(text: &str) -> Result<Network> {
             routes,
         });
     }
-    Ok(Network { mm_per_unit, nets })
+    Ok(Network {
+        mm_per_unit,
+        nets,
+        out: network,
+    })
 }
 
 /// A point as written: `[x, y]` as `i64` when both are whole numbers in the text.
@@ -556,7 +563,7 @@ pub(crate) fn drc_refusals(
 }
 
 /// The total fill of each zone layer (net, layer, zone UUID), mm².
-fn fill_by_zone_layer(fills: &[ZoneLayerFill]) -> BTreeMap<(&str, &str, Option<&str>), f64> {
+pub(crate) fn fill_by_zone_layer(fills: &[ZoneLayerFill]) -> BTreeMap<(&str, &str, Option<&str>), f64> {
     let mut out = BTreeMap::new();
     for fill in fills {
         *out.entry((
@@ -571,7 +578,7 @@ fn fill_by_zone_layer(fills: &[ZoneLayerFill]) -> BTreeMap<(&str, &str, Option<&
 
 /// (f) against the original: whether any decoupling-loop measure got worse beyond its
 /// tolerance, or was given and is no longer.
-fn loops_worse(original: &AuditItems, candidate: &AuditItems) -> bool {
+pub(crate) fn loops_worse(original: &AuditItems, candidate: &AuditItems) -> bool {
     let above = |was: Option<f64>, now: Option<f64>, tolerance: f64| match (was, now) {
         (Some(_), None) => true,
         (Some(was), Some(now)) => now > was + tolerance,
@@ -926,7 +933,7 @@ fn pruned_folder(index: usize) -> String {
 
 /// The fill of every pour zone of the call on the board kicad-cli saved, read and parsed
 /// off the async threads (as `zone_fill::pour_record` reads it).
-async fn fills_of(board: &Path, pour_nets: &BTreeSet<String>) -> Result<Vec<ZoneLayerFill>> {
+pub(crate) async fn fills_of(board: &Path, pour_nets: &BTreeSet<String>) -> Result<Vec<ZoneLayerFill>> {
     let path = board.to_path_buf();
     let nets = pour_nets.clone();
     tokio::task::spawn_blocking(move || -> Result<Vec<ZoneLayerFill>> {
@@ -1241,19 +1248,24 @@ fn full_judge_refusal(original: &Judged, pruned: &Judged, rank: RankMode) -> Opt
 }
 
 /// The KiCad runs one full judge made: the refill, each stitching round that wrote a
-/// board, and the length probe when it ran.
-fn kicad_runs_of(judged: &Judged) -> usize {
+/// board, the length probe when it ran, and (Row ZR, ZR6, S11) the refills of its
+/// reference round.
+pub(crate) fn kicad_runs_of(judged: &Judged) -> usize {
     1 + judged
         .rounds
         .iter()
         .filter(|row| row.get("open_after").is_some())
         .count()
         + usize::from(judged.measures.lengths.is_some())
+        + judged
+            .reference_stitch
+            .as_ref()
+            .map_or(0, |round| round.kicad_runs)
 }
 
 /// Removes a file or a folder this prune made; a link is never followed or removed, and
 /// a path that is already gone is fine.
-fn remove_own(path: &Path) {
+pub(crate) fn remove_own(path: &Path) {
     let Ok(meta) = path.symlink_metadata() else {
         return;
     };
@@ -1450,7 +1462,7 @@ async fn decide_with(
 
 /// Aborts the prune's task when the call that waits for it is dropped, so that no
 /// kicad-cli outlives the call.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -1459,7 +1471,7 @@ impl Drop for AbortOnDrop {
 }
 
 /// Seconds as a number rounded to 0.1.
-fn round1(seconds: f64) -> f64 {
+pub(crate) fn round1(seconds: f64) -> f64 {
     (seconds * 10.0).round() / 10.0
 }
 
@@ -1527,7 +1539,7 @@ fn keys_with(outcome: &SearchOutcome, winner: usize, pruned: &Judged, rank: Rank
 /// both keys are taken again. `Err` (nothing changed) when the winner would no longer
 /// rank first by the key of `rank`, which P9's key clause rules out. `before` holds the
 /// winner's two keys before the prune.
-fn replace_winner(
+pub(crate) fn replace_winner(
     outcome: &mut SearchOutcome,
     winner: usize,
     session: PathBuf,

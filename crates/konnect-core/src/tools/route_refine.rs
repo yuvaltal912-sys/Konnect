@@ -18,7 +18,7 @@ mod distance_kernel;
 mod effort;
 #[path = "route_refine_geometry.rs"]
 mod geometry;
-use geometry::{Copper, Rules, Scene};
+use geometry::{Copper, Profile, Rules, Scene};
 
 const MARGIN: f64 = 0.01;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -81,6 +81,13 @@ struct Options {
     radius: f64,
     step: f64,
     chamfer: f64,
+    /// S8: which boards the scene accepts. [`Options::read`] gives `Strict` (the
+    /// registry tool, Z9); only [`plan_reference_stitching`] sets `Lenient`.
+    profile: Profile,
+    /// S9: the arguments of the planner's own audit model (`audit::Params`): `{}` (the
+    /// audit's defaults) for the registry tool; [`plan_reference_stitching`] sets
+    /// `stitch_via_max_mm` to the judge's limit, so one limit holds for both.
+    audit_args: Value,
 }
 impl Options {
     fn read(v: &Value) -> Result<Self> {
@@ -155,6 +162,8 @@ impl Options {
             radius: number("search_radius_mm", 3., 0.1, 20.)?,
             step: number("grid_step_mm", 0.25, 0.05, 1.)?,
             chamfer: number("chamfer_mm", 0.5, 0.01, 5.)?,
+            profile: Profile::Strict,
+            audit_args: json!({}),
         })
     }
     fn includes(&self, net: &str) -> bool {
@@ -263,6 +272,38 @@ async fn handle_plan_route_refinement(args: &Value, _ctx: &ToolContext) -> Resul
 }).await?
 }
 
+/// Row ZR, ZR6 (S3, S8): the judge's reference round's in-process planner call. The
+/// `stitching` kind on `board` for `nets`, at effort `standard`, searching `radius_mm`
+/// around each origin, with the lenient profile ([`Profile::Lenient`]) and the audit's
+/// `stitch_via_max_mm` set to `radius_mm` (S9: one limit for the judge's audit and the
+/// planner; the round passes the findings' own limit). The registry tool and Z9 keep the
+/// strict profile and the audit's defaults. A board the planner refuses is an `Err` with
+/// its reason; nothing is written.
+pub(crate) async fn plan_reference_stitching(
+    board: &Path,
+    nets: &[String],
+    radius_mm: f64,
+) -> Result<Value> {
+    let args = json!({
+        "board": board.display().to_string(),
+        "kinds": ["stitching"],
+        "nets": nets,
+        "search_radius_mm": radius_mm,
+        "effort": "standard",
+    });
+    let started = std::time::Instant::now();
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let mut options = Options::read(&args)?;
+        options.profile = Profile::Lenient;
+        options.audit_args = json!({ "stitch_via_max_mm": radius_mm });
+        let board = get_path(&args, "board")?;
+        let snapshot = Snapshot::read(&board)?;
+        plan(&snapshot, &options, started)
+    })
+    .await
+    .context("the reference planner did not finish")?
+}
+
 /// A refusal can repeat the caller's own argument, net name or a token of the
 /// board file. It is cut to a fixed length so no input can grow the response.
 fn bounded(reason: &str) -> String {
@@ -277,11 +318,18 @@ fn plan(snapshot: &Snapshot, options: &Options, started: std::time::Instant) -> 
     let tree = parse_sexp(&snapshot.content)?;
     ensure!(tree.head() == Some("kicad_pcb"), "not a board");
     let geo = BoardGeometry::from_tree(&tree);
-    let params = audit::Params::from_args(&json!({}))
-        .map_err(|_| anyhow::anyhow!("audit defaults invalid"))?;
+    let params = audit::Params::from_args(&options.audit_args)
+        .map_err(|_| anyhow::anyhow!("audit parameters invalid"))?;
     let mut result = snapshot.model(&tree, &geo, &params, |m| {
         let rules = Rules::read(&snapshot.sidecars)?;
-        let mut scene = Scene::read(&tree, m, rules, options.effort.limits, started)?;
+        let mut scene = Scene::read(
+            &tree,
+            m,
+            rules,
+            options.effort.limits,
+            started,
+            options.profile,
+        )?;
         for n in &options.nets {
             ensure!(
                 scene.items.iter().any(|i| i.net.as_deref() == Some(n)),
@@ -526,6 +574,7 @@ mod snapshot_tests {
                     rules,
                     effort::Limits::standard(),
                     std::time::Instant::now(),
+                    Profile::Strict,
                 )?;
                 let facts = |checks: &[audit::CheckOut]| {
                     checks
@@ -1316,6 +1365,9 @@ impl<'a> Planner<'a> {
     }
     fn stitching(&mut self, scene: &mut Scene, m: &audit::Model) -> Result<()> {
         let checks = audit::planner_planes(m, &mut geometry::PlaneProbe::new(scene, m)?)?;
+        // S9: the reference distance is the audit's own limit, the one its 3.2 findings
+        // were judged by (3.0 by default, as the literal it replaces).
+        let limit = m.params.get("stitch_via_max_mm");
         let mut targets: Vec<(String, Pt, u64)> = Vec::new();
         if let Some(check) = checks.iter().find(|c| c.id == "3.2") {
             for f in &check.findings {
@@ -1450,7 +1502,7 @@ impl<'a> Planner<'a> {
                                 let groups: BTreeSet<_> =
                                     inside.iter().map(|&i| components.0[i]).collect();
                                 let reference = targets.iter().any(|(n, p, span)| {
-                                    n == &net && mask & span == *span && dist(*p, at) <= 3.
+                                    n == &net && mask & span == *span && dist(*p, at) <= limit
                                 });
                                 if mask.count_ones() < 2
                                     || !groups.iter().any(|g| components.1.contains(g))
@@ -1474,7 +1526,7 @@ impl<'a> Planner<'a> {
                                 match self.candidate(scene, "stitching", Vec::new(), vec![n])? {
                                     Outcome::Accepted => {
                                         targets.retain(|(n, p, span)| {
-                                            n != &net || mask & span != *span || dist(*p, at) > 3.
+                                            n != &net || mask & span != *span || dist(*p, at) > limit
                                         });
                                         components = scene.components(&net)?;
                                         if !pending(&components, &targets) {

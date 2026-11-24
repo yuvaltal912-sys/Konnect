@@ -680,6 +680,7 @@ async fn searched(h: &H, tools: &Tools) -> SearchOutcome {
         stopped_launching: Some("fixed run count".to_string()),
         baseline: Ok(base),
         pour_prune: None,
+        reference_stitch: None,
     }
 }
 

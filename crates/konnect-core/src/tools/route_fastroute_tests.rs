@@ -826,6 +826,8 @@ fn measures() -> Measures {
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: Default::default(),
     }
 }
 
@@ -841,6 +843,8 @@ fn judged(board: PathBuf) -> Judged {
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 
@@ -930,6 +934,7 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
             pour_fills_error: None,
         }),
         pour_prune: None,
+        reference_stitch: None,
     }
 }
 
@@ -1668,6 +1673,7 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let finished = outcome(Vec::new(), None);
     let error = no_winner_result(
@@ -1749,6 +1755,7 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
             rank: (RankMode::Routing, RankSource::Fixed),
+            stitch: ReferenceStitch::Off,
         };
         let Search {
             _dir, mut outcome, ..
@@ -1906,6 +1913,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let search = search_json(
         &plan(),
@@ -1964,6 +1972,7 @@ fn a_failed_search_keeps_its_records_and_not_its_boards() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(
@@ -2009,6 +2018,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(
@@ -2614,6 +2624,7 @@ fn a_search_with_no_winner_reports_the_length_plan_unmeasured() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let mut outcome = outcome(Vec::new(), None);
     outcome.baseline = Err("kicad-cli failed".to_string());
@@ -3028,6 +3039,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         lengths: None,
         pad_names: None,
         rank: crate::pour_rank::RankMode::Routing,
+        reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
     };
     let runner = FastrouteRunner {
         binary: fake_binary(&search.root),
@@ -3657,6 +3669,7 @@ fn the_session_the_call_writes_is_the_chosen_boards() {
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
             rank: (RankMode::Routing, RankSource::Fixed),
+            stitch: ReferenceStitch::Off,
         };
         let result = conclude(
             &json!({}),
@@ -3711,6 +3724,7 @@ fn the_zone_plan_writes_the_zones_file_only_when_it_models_a_pour() {
         lengths: None,
         pad_names: None,
         rank: crate::pour_rank::RankMode::Routing,
+        reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
     };
     let folder = dir.path().join("call");
     std::fs::create_dir_all(&folder).unwrap();
@@ -3980,6 +3994,7 @@ fn the_result_says_which_key_ranked_and_what_the_other_key_chose() {
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
             rank: (mode, source),
+            stitch: ReferenceStitch::Off,
         };
         let result = conclude(
             &json!({}),

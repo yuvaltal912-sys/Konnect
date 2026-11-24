@@ -4423,6 +4423,7 @@ int main(int argc, char **argv) {
                 lengths: None,
                 pad_names: None,
                 rank: crate::pour_rank::RankMode::Routing,
+                reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),
@@ -4512,6 +4513,7 @@ int main(int argc, char **argv) {
                 lengths: None,
                 pad_names: None,
                 rank: crate::pour_rank::RankMode::Routing,
+                reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),
@@ -4610,6 +4612,7 @@ int main(int argc, char **argv) {
                 lengths: None,
                 pad_names: None,
                 rank: crate::pour_rank::RankMode::Routing,
+                reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),

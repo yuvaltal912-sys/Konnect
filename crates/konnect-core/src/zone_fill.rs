@@ -246,6 +246,41 @@ pub(crate) fn record_pours(
     }
 }
 
+/// One saved fill piece of a zone on one layer, as its points (Row ZR, ZR6).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FillRing {
+    /// The zone's net; `None` for no net.
+    pub net: Option<String>,
+    pub layer: String,
+    pub points: Vec<(f64, f64)>,
+}
+
+/// Row ZR, ZR6 (S5's retry): every saved `filled_polygon` of the board's zones, rule
+/// areas left out, teardrops and every net included, in file order. The reference round
+/// reads where a refusal's copper lies with it.
+pub(crate) fn fill_rings(board_text: &str) -> Result<Vec<FillRing>> {
+    let tree = konnect_sexp::parse_sexp(board_text).context("the board does not parse")?;
+    let ids = net_ids(&tree);
+    let mut out = Vec::new();
+    for zone in tree.find_all("zone") {
+        if zone.find("keepout").is_some() {
+            continue;
+        }
+        let net = zone_net(zone, &ids);
+        for polygon in zone.find_all("filled_polygon") {
+            let (Some(layer), Some(pts)) = (polygon.find_str("layer"), polygon.find("pts")) else {
+                continue;
+            };
+            out.push(FillRing {
+                net: net.clone(),
+                layer: layer.to_string(),
+                points: xy_points(pts),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// The board's net table, `(net <id> "<name>")`, for board files that name a zone's net
 /// by its id.
 fn net_ids(tree: &SexpNode) -> BTreeMap<String, String> {

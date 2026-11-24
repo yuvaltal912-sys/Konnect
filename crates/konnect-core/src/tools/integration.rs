@@ -3840,6 +3840,8 @@ pub(crate) async fn handle_route_specctra_dsn(
                 ctx,
                 super::route_fastroute::PourPrune::Winner,
                 super::route_fastroute::RankChoice::UserConfig,
+                // Row ZR, ZR6 (S13): this tool's runs get the reference round.
+                super::route_fastroute::ReferenceStitch::On,
             )
             .await
         }

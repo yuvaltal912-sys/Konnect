@@ -154,6 +154,8 @@ fn ranking_of_judged_runs_puts_every_run_in_the_pool() {
             board: std::path::PathBuf::from("/b.kicad_pcb"),
             rounds: vec![],
             tune: None,
+            reference_stitch: None,
+            reference_checked: None,
         })
         .collect();
     let refs: Vec<&Judged> = judged.iter().collect();
@@ -584,6 +586,8 @@ pub(crate) fn split_judged(signal_mm: f64, plane_loss: f64) -> Judged {
         board: std::path::PathBuf::from("/nowhere/judged.kicad_pcb"),
         rounds: vec![],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 

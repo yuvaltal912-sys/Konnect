@@ -236,6 +236,11 @@ pub(crate) fn export_candidate(
 /// candidate and would change what their key ranks).
 pub(crate) const CANDIDATE_PRUNE: crate::pour_prune::PourPrune = crate::pour_prune::PourPrune::Off;
 
+/// Row ZR, ZR6 (S13): the placement tools' routing calls run no reference round: they rank
+/// placements by today's key, and a round per candidate costs a refill each.
+pub(crate) const CANDIDATE_STITCH: crate::pour_stitch::ReferenceStitch =
+    crate::pour_stitch::ReferenceStitch::Off;
+
 /// Row ZR, ZR5 part 2 (PK13): the placement tools' routing calls rank by today's key,
 /// whatever the user config's `routing.rank_key` says, and do not read it: their own key
 /// ranks placements with today's entries (`place_judge`).
@@ -273,6 +278,7 @@ pub(crate) async fn route_candidate(
         ctx,
         CANDIDATE_PRUNE,
         CANDIDATE_RANK,
+        CANDIDATE_STITCH,
     )
     .await
     {
