@@ -2780,3 +2780,194 @@ fn netclasses_from_source_survives_crafted_patterns() {
     assert_eq!(classes.len(), 1, "{classes:?}");
     assert_eq!(classes["N_CLEAN"], vec!["Clean".to_string()]);
 }
+
+/// Row ZR, stage ZR4 (PP4): `supply_roles` gives exactly the ground and power nets, with
+/// their sources, that the audit's `net_roles` reports for the same board, record and
+/// project file. A 0 V rail named `REF` is ground; a net that only its name makes ground
+/// has the source `name`; a netclass that reads as power makes power.
+#[test]
+fn supply_roles_are_the_audits_net_roles() {
+    let intent = json!({ "schema_version": 1, "rails": [
+        { "name": "REF0", "nets": ["FB1"], "voltage_v": 0.0 },
+        { "name": "IN", "nets": ["VIN1"], "voltage_v": 12.0 }
+    ] });
+    let pro = json!({ "net_settings": { "classes": [], "netclass_patterns": [
+        { "netclass": "Power", "pattern": "SW2" }] } });
+    let f = fx("buck.kicad_pcb", Some(intent.clone()), Some(pro.clone()));
+    let report = run(&f);
+    let text = std::fs::read_to_string(&f.board).unwrap();
+    let tree = parse_sexp(&text).unwrap();
+    let mut nets = BTreeSet::new();
+    fn collect(node: &SexpNode, out: &mut BTreeSet<String>) {
+        if node.head() == Some("net") {
+            if let Some(name) = node.get(1).and_then(SexpNode::as_str) {
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        for child in node.children().unwrap_or(&[]) {
+            collect(child, out);
+        }
+    }
+    collect(&tree, &mut nets);
+    let intent_text = serde_json::to_string_pretty(&intent).unwrap();
+    let pro_text = pro.to_string();
+    let roles = supply_roles(&nets, Some(&intent_text), Some(&pro_text));
+    let as_json = |map: &BTreeMap<String, String>| -> Value {
+        Value::Object(map.iter().map(|(n, s)| (n.clone(), json!(s))).collect())
+    };
+    assert_eq!(
+        as_json(&roles.ground),
+        report["net_roles"]["ground"]["nets"]
+    );
+    assert_eq!(as_json(&roles.power), report["net_roles"]["power"]["nets"]);
+    assert!(roles.ground["FB1"].starts_with("design_intent rail 'REF0'"));
+    assert_eq!(roles.ground["GND"], "name");
+    assert_eq!(roles.power["SW2"], "netclass 'Power'");
+    assert_eq!(roles.netclass["SW2"], vec!["Power".to_string()]);
+    // Without the record, FB1 is no supply net: the rail was its only source.
+    let bare = supply_roles(&nets, None, Some(&pro_text));
+    assert!(!bare.ground.contains_key("FB1") && !bare.power.contains_key("FB1"));
+}
+
+// ─── Row ZR, stage ZR4 (PP17): pads the plan's fill does not reach ───────────────
+
+pub(crate) mod pp17 {
+    //! Small KiCad 10 boards for `pads_unreached_by_fill`, shared with `pour_check`'s tests.
+
+    /// A board of two copper layers holding `items`.
+    pub(crate) fn board(items: &[String]) -> String {
+        format!(
+            "(kicad_pcb (version 20260206) (generator \"pcbnew\")\n  (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user))\n{})\n",
+            items.concat()
+        )
+    }
+
+    /// A one-pad footprint `reference` at (x, y): an SMD pad on `layer`, or a through-hole
+    /// pad (`layer` "*.Cu"), of net GND.
+    pub(crate) fn pad(reference: &str, x: f64, y: f64, layer: &str) -> String {
+        let (kind, drill, layers) = if layer == "*.Cu" {
+            (
+                "thru_hole circle",
+                " (drill 0.5)",
+                "\"*.Cu\" \"*.Mask\"".to_string(),
+            )
+        } else {
+            ("smd rect", "", format!("\"{layer}\""))
+        };
+        format!(
+            "  (footprint \"T\" (layer \"F.Cu\") (uuid \"fp-{reference}\") (at {x} {y})\n    (property \"Reference\" \"{reference}\" (at 0 0) (layer \"F.SilkS\") (uuid \"pr-{reference}\"))\n    (pad \"1\" {kind} (at 0 0) (size 1 1){drill} (layers {layers}) (net \"GND\") (uuid \"pad-{reference}\")))\n"
+        )
+    }
+
+    /// A GND zone on `layer` whose saved fill is the square (x, y)..(x + side, y + side);
+    /// `side` 0 gives the zone no fill.
+    pub(crate) fn fill(uuid: &str, layer: &str, x: f64, y: f64, side: f64) -> String {
+        let square = |x: f64, y: f64, s: f64| {
+            format!(
+                "(pts (xy {x} {y}) (xy {} {y}) (xy {} {}) (xy {x} {}))",
+                x + s,
+                x + s,
+                y + s,
+                y + s
+            )
+        };
+        let filled = if side > 0.0 {
+            format!(
+                " (filled_polygon (layer \"{layer}\") {})",
+                square(x, y, side)
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "  (zone (net \"GND\") (layers \"{layer}\") (uuid \"{uuid}\") (hatch edge 0.5) (connect_pads (clearance 0.2)) (min_thickness 0.25) (fill yes) (polygon {}){filled})\n",
+            square(0.0, 0.0, 100.0)
+        )
+    }
+
+    /// A GND track on `layer` from (x1, y1) to (x2, y2).
+    pub(crate) fn track(layer: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+        format!(
+            "  (segment (start {x1} {y1}) (end {x2} {y2}) (width 0.25) (layer \"{layer}\") (net \"GND\") (uuid \"t-{x1}-{x2}\"))\n"
+        )
+    }
+}
+
+fn unreached_of(board_text: &str, layers: &[&str]) -> Vec<String> {
+    let poured: BTreeMap<String, BTreeSet<String>> = [(
+        "GND".to_string(),
+        layers.iter().map(|l| l.to_string()).collect(),
+    )]
+    .into();
+    pads_unreached_by_fill(Path::new("/nowhere/b.kicad_pcb"), board_text, &poured)
+        .unwrap()
+        .into_iter()
+        .map(|pad| pad.label)
+        .collect()
+}
+
+#[test]
+fn a_pad_the_fill_does_not_touch_is_unreached() {
+    use pp17::*;
+    let text = board(&[
+        pad("R1", 10.0, 10.0, "F.Cu"),
+        pad("R2", 50.0, 50.0, "F.Cu"),
+        fill("z1", "F.Cu", 45.0, 45.0, 10.0),
+    ]);
+    assert_eq!(unreached_of(&text, &["F.Cu"]), ["R1.1"]);
+}
+
+#[test]
+fn only_pads_on_a_poured_layer_count() {
+    use pp17::*;
+    let text = board(&[
+        pad("R1", 10.0, 10.0, "B.Cu"),
+        fill("z1", "F.Cu", 45.0, 45.0, 10.0),
+    ]);
+    assert!(unreached_of(&text, &["F.Cu"]).is_empty());
+    assert_eq!(unreached_of(&text, &["F.Cu", "B.Cu"]), ["R1.1"]);
+}
+
+#[test]
+fn fill_of_the_net_on_another_layer_does_not_reach_for_the_proposal() {
+    use pp17::*;
+    // A through-hole pad joined only to an older GND pour on B.Cu; the proposal on F.Cu
+    // gives it no spoke and joins nothing else.
+    let text = board(&[
+        pad("J1", 10.0, 10.0, "*.Cu"),
+        fill("old", "B.Cu", 5.0, 5.0, 10.0),
+        fill("new", "F.Cu", 45.0, 45.0, 10.0),
+    ]);
+    assert_eq!(unreached_of(&text, &["F.Cu"]), ["J1.1"]);
+}
+
+#[test]
+fn a_pad_the_group_joins_is_reached() {
+    use pp17::*;
+    // The same pad, joined to the proposal's fill through a through-hole pad and a track.
+    let text = board(&[
+        pad("J1", 10.0, 10.0, "*.Cu"),
+        pad("J2", 30.0, 10.0, "*.Cu"),
+        track("B.Cu", 10.0, 10.0, 30.0, 10.0),
+        fill("new", "F.Cu", 29.0, 9.0, 10.0),
+    ]);
+    assert!(unreached_of(&text, &["F.Cu"]).is_empty());
+}
+
+#[test]
+fn a_zone_with_no_saved_fill_is_no_error_here() {
+    use pp17::*;
+    let text = board(&[
+        pad("R1", 10.0, 10.0, "F.Cu"),
+        fill("z1", "F.Cu", 0.0, 0.0, 0.0),
+    ]);
+    assert_eq!(unreached_of(&text, &["F.Cu"]), ["R1.1"]);
+    assert!(pads_unreached_by_fill(
+        Path::new("/nowhere/b.kicad_pcb"),
+        "(kicad_pcb",
+        &BTreeMap::new()
+    )
+    .is_err());
+}

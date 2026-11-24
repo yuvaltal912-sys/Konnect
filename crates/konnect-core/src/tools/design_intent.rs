@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The sections `set_design_intent` replaces, in report order.
-const SECTIONS: [&str; 4] = ["rails", "currents", "interfaces", "fab_target"];
+const SECTIONS: [&str; 5] = ["rails", "currents", "interfaces", "fab_target", "pours"];
 
 // ─── Record ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +53,10 @@ pub struct DesignIntent {
     pub interfaces: Vec<Interface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fab_target: Option<FabTarget>,
+    /// Row ZR, stage ZR4: the pours the owner asks for (`plan_pours`). Left out of the
+    /// file when empty, so a record without it is written exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pours: Vec<PourIntent>,
 }
 
 impl DesignIntent {
@@ -63,6 +67,7 @@ impl DesignIntent {
             currents: Vec::new(),
             interfaces: Vec::new(),
             fab_target: None,
+            pours: Vec::new(),
         }
     }
 
@@ -170,6 +175,88 @@ pub struct LengthGroup {
     pub target_mm: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+/// Row ZR, stage ZR4: a pour the owner asks for (docs/POUR_PLAN_DESIGN.md, PP2 and
+/// PP7). The section `pours` of the record is a list of these. `plan_pours` divides the
+/// copper layers by its own rules; every entry here is an explicit request and wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PourIntent {
+    /// The net to pour. Matched against the board's net names exactly.
+    pub net: String,
+    /// Copper layers by KiCad's names (`F.Cu`, `In1.Cu` …, `B.Cu`): the net is poured on
+    /// each of them, whole layer. Empty: the planner gives the net the layer its rule
+    /// has for a net of its kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Every reason the record's `pours` cannot be used, each prefixed with where it is
+/// (`pours[i].layers[j]: …`), as [`validate`] reports. `validate` appends these:
+/// - `net` passes `net_ok` and is listed once in the section;
+/// - each layer is a copper layer name (`F.Cu`, `B.Cu`, or `In<N>.Cu` with N from 1 to
+///   30), listed once in its entry;
+/// - no layer is asked for by two entries: one layer takes one whole-layer pour.
+///
+/// Whether a net or a layer is on the board is not checked here (the record never reads
+/// the board); `plan_pours` reports a request it cannot meet.
+fn validate_pours(pours: &[PourIntent]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut nets = BTreeSet::new();
+    // Layer -> the entry that asked for it first.
+    let mut asked: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, pour) in pours.iter().enumerate() {
+        let at = format!("pours[{i}]");
+        net_ok(&mut problems, &format!("{at}.net"), &pour.net);
+        if !nets.insert(pour.net.as_str()) {
+            problems.push(format!("{at}.net: '{}' is listed twice", pour.net));
+        }
+        let mut in_entry = BTreeSet::new();
+        for (j, layer) in pour.layers.iter().enumerate() {
+            let lat = format!("{at}.layers[{j}]");
+            if !copper_layer_name(layer) {
+                problems.push(format!(
+                    "{lat}: '{layer}' is not a copper layer (F.Cu, B.Cu, or In1.Cu to In30.Cu)"
+                ));
+                continue;
+            }
+            if !in_entry.insert(layer.as_str()) {
+                problems.push(format!("{lat}: '{layer}' is listed twice in this entry"));
+                continue;
+            }
+            match asked.get(layer.as_str()) {
+                Some(&first) => problems.push(format!(
+                    "{lat}: '{layer}' is already asked for by pours[{first}]; one layer takes \
+                     one whole-layer pour"
+                )),
+                None => {
+                    asked.insert(layer.as_str(), i);
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// `F.Cu`, `B.Cu`, or `In<N>.Cu` with N from 1 to 30, written as KiCad writes it (no
+/// leading zero, no sign).
+fn copper_layer_name(layer: &str) -> bool {
+    if layer == "F.Cu" || layer == "B.Cu" {
+        return true;
+    }
+    let Some(digits) = layer
+        .strip_prefix("In")
+        .and_then(|rest| rest.strip_suffix(".Cu"))
+    else {
+        return false;
+    };
+    !digits.is_empty()
+        && !digits.starts_with('0')
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits.parse::<u32>().is_ok_and(|n| (1..=30).contains(&n))
 }
 
 /// What the board will be built to.
@@ -364,6 +451,7 @@ fn validate(intent: &DesignIntent) -> Vec<String> {
         }
     }
     problems.extend(validate_lengths(intent));
+    problems.extend(validate_pours(&intent.pours));
     problems
 }
 
@@ -626,10 +714,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_design_intent",
             "Read the project's design-intent record (<project_dir>/.konnect/design_intent.json): \
-             power rails, currents of other nets, interfaces with impedance targets, and the fab \
-             target. Reviews and audits that depend on intent read it from here. 'source' is \
-             'file' or 'absent' (nothing recorded yet). 'missing_sections' names the empty \
-             sections, so a result that needed one can say so. 'revision' is what \
+             power rails, currents of other nets, interfaces with impedance targets, the fab \
+             target, and the pours asked for (plan_pours). Reviews and audits that depend on \
+             intent read it from here. 'source' is 'file' or 'absent' (nothing recorded \
+             yet). 'missing_sections' names the empty sections, so a result that needed one \
+             can say so. 'revision' is what \
              set_design_intent needs. Net names are not checked against the schematic or board. \
              A file that cannot be used is refused with invalid_configuration.",
             json!({
@@ -654,7 +743,11 @@ pub fn tools() -> Vec<ToolDef> {
              [{name, nets[], tolerance_mm, target_mm?, notes?}], single_ended_impedance_ohm?, \
              differential_impedance_ohm?, notes?}]; 'fab_target' = {house?, layer_count?, \
              board_thickness_mm?, outer_copper_oz?, inner_copper_oz?, min_track_mm?, \
-             min_clearance_mm?, min_via_drill_mm?, min_via_diameter_mm?, notes?} or null to clear. \
+             min_clearance_mm?, min_via_drill_mm?, min_via_diameter_mm?, notes?} or null to clear; \
+             'pours' = [{net, layers?: [copper layer names], notes?}]: the pours the user asks \
+             plan_pours for, each winning over its rules (a net with layers is poured on exactly \
+             those, one without takes the rule's layer of its kind); a net once, no layer in two \
+             entries. A Konnect older than this one refuses a record that has 'pours'. \
              length_groups tune nets to matched lengths (without target_mm: every net within \
              tolerance_mm of the longest; with it: target_mm ± tolerance_mm); max_skew_mm limits \
              a pair's length difference; both are in mm and are used by fastroute routing. An \
@@ -779,6 +872,7 @@ fn replace_section(
         "currents" => intent.currents = parse(value)?,
         "interfaces" => intent.interfaces = parse(value)?,
         "fab_target" => intent.fab_target = parse(value)?,
+        "pours" => intent.pours = parse(value)?,
         other => {
             return Err(invalid_arg(
                 "section",

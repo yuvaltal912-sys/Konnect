@@ -313,6 +313,52 @@ pub const ZONE_THERMAL_RELIEF_MM: f64 = 0.5;
 /// `(hatch edge 0.508)` — the border hatch pcbnew gives a freshly drawn zone.
 pub const ZONE_BORDER_PITCH_MM: f64 = 0.508;
 
+/// Row ZR, stage ZR4: what KiCad does with a fill piece that touches nothing of its net
+/// (`ISLAND_REMOVAL_MODE`). A value of [`ZoneSpec`] (its `islands` field), so that both
+/// of `add_zone`'s paths write the same choice: [`build_zone`] as `island_mode` and
+/// `min_island_area`, the file fallback as `(island_removal_mode …)` and
+/// `(island_area_min …)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZoneIslands {
+    /// Removed: KiCad's default, and what `add_zone` wrote before it took this setting.
+    Always,
+    /// Kept.
+    Never,
+    /// Removed when smaller than this area, mm².
+    BelowArea { area_mm2: f64 },
+}
+
+impl ZoneIslands {
+    /// KiCad's API enum for this choice.
+    pub fn as_ipc(self) -> kiapi::board::types::IslandRemovalMode {
+        use kiapi::board::types::IslandRemovalMode;
+        match self {
+            Self::Always => IslandRemovalMode::IrmAlways,
+            Self::Never => IslandRemovalMode::IrmNever,
+            Self::BelowArea { .. } => IslandRemovalMode::IrmArea,
+        }
+    }
+
+    /// `min_island_area` as KiCad's API takes it, in square nanometres (`ZONE::Serialize`
+    /// sends `m_minIslandArea` as it is): the area times 1e12, rounded; 0 unless
+    /// [`ZoneIslands::BelowArea`].
+    pub fn min_area_nm2(self) -> u64 {
+        match self {
+            Self::BelowArea { area_mm2 } => (area_mm2 * 1e12).round() as u64,
+            Self::Always | Self::Never => 0,
+        }
+    }
+
+    /// The number KiCad's board file writes as `island_removal_mode`: 0, 1 or 2.
+    pub fn file_mode(self) -> u8 {
+        match self {
+            Self::Always => 0,
+            Self::Never => 1,
+            Self::BelowArea { .. } => 2,
+        }
+    }
+}
+
 /// Everything a caller may choose about a copper pour. The net *code* is not
 /// in here: it is resolved from `net_name` against the live board by
 /// [`crate::client::KiCadIpcClient::add_zone`], which keeps this a pure
@@ -332,6 +378,12 @@ pub struct ZoneSpec<'a> {
     pub priority: u32,
     /// How the pour attaches to pads on its net.
     pub connection: kiapi::board::types::ZoneConnectionStyle,
+    /// The gap around a pad that connects by thermal relief, mm.
+    pub thermal_gap_mm: f64,
+    /// The width of a thermal spoke, mm.
+    pub thermal_bridge_mm: f64,
+    /// What KiCad does with a fill piece that touches nothing of the net.
+    pub islands: ZoneIslands,
 }
 
 /// Build a copper `Zone` protobuf message for `create_items`.
@@ -343,9 +395,8 @@ pub struct ZoneSpec<'a> {
 /// hand KiCad a fill that ignores every clearance it knows about.
 pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zone {
     use kiapi::board::types::{
-        CopperZoneSettings, IslandRemovalMode, TeardropSettings, TeardropType,
-        ThermalSpokeSettings, ZoneBorderSettings, ZoneBorderStyle, ZoneConnectionSettings,
-        ZoneFillMode, ZoneType,
+        CopperZoneSettings, TeardropSettings, TeardropType, ThermalSpokeSettings,
+        ZoneBorderSettings, ZoneBorderStyle, ZoneConnectionSettings, ZoneFillMode, ZoneType,
     };
 
     let outline = kiapi::common::types::PolySet {
@@ -370,8 +421,8 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         connection: Some(ZoneConnectionSettings {
             zone_connection: spec.connection as i32,
             thermal_spokes: Some(ThermalSpokeSettings {
-                width: Some(distance(ZONE_THERMAL_RELIEF_MM)),
-                gap: Some(distance(ZONE_THERMAL_RELIEF_MM)),
+                width: Some(distance(spec.thermal_bridge_mm)),
+                gap: Some(distance(spec.thermal_gap_mm)),
                 angle: Some(kiapi::common::types::Angle {
                     value_degrees: 45.0,
                 }),
@@ -379,8 +430,8 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         }),
         clearance: Some(distance(spec.clearance_mm)),
         min_thickness: Some(distance(spec.min_thickness_mm)),
-        island_mode: IslandRemovalMode::IrmAlways as i32,
-        min_island_area: 0,
+        island_mode: spec.islands.as_ipc() as i32,
+        min_island_area: spec.islands.min_area_nm2(),
         fill_mode: ZoneFillMode::ZfmSolid as i32,
         // Only read when fill_mode is ZFM_HATCHED.
         hatch_settings: None,
@@ -766,6 +817,9 @@ pub(crate) mod tests {
                 name: "ground pour",
                 priority: 2,
                 connection: ZoneConnectionStyle::ZcsFull,
+                thermal_gap_mm: ZONE_THERMAL_RELIEF_MM,
+                thermal_bridge_mm: ZONE_THERMAL_RELIEF_MM,
+                islands: ZoneIslands::Always,
             },
             7,
         );
@@ -823,6 +877,66 @@ pub(crate) mod tests {
         assert_eq!(settings.island_mode, IslandRemovalMode::IrmAlways as i32);
     }
 
+    /// Row ZR, stage ZR4: the thermal gap, the spoke width and the island rule reach
+    /// KiCad as the caller chose them, the island area in square nanometres.
+    #[test]
+    fn build_zone_sends_the_thermal_values_and_the_island_rule() {
+        use kiapi::board::types::IslandRemovalMode;
+        let zone_of = |gap: f64, bridge: f64, islands: ZoneIslands| {
+            let zone = build_zone(
+                &ZoneSpec {
+                    layer: "F.Cu",
+                    net_name: "GND",
+                    points: &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                    clearance_mm: 0.2,
+                    min_thickness_mm: 0.25,
+                    name: "",
+                    priority: 0,
+                    connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
+                    thermal_gap_mm: gap,
+                    thermal_bridge_mm: bridge,
+                    islands,
+                },
+                1,
+            );
+            match zone.settings.expect("settings") {
+                kiapi::board::types::zone::Settings::CopperSettings(s) => s,
+                other => panic!("a copper zone must carry CopperZoneSettings, got {other:?}"),
+            }
+        };
+        let s = zone_of(0.3, 0.4, ZoneIslands::BelowArea { area_mm2: 2.5 });
+        let spokes = s
+            .connection
+            .expect("connection")
+            .thermal_spokes
+            .expect("spokes");
+        assert_eq!(spokes.gap.expect("gap").value_nm, 300_000);
+        assert_eq!(spokes.width.expect("width").value_nm, 400_000);
+        assert_eq!(s.island_mode, IslandRemovalMode::IrmArea as i32);
+        assert_eq!(s.min_island_area, 2_500_000_000_000);
+
+        let s = zone_of(0.5, 0.5, ZoneIslands::Never);
+        assert_eq!(s.island_mode, IslandRemovalMode::IrmNever as i32);
+        assert_eq!(s.min_island_area, 0);
+        let s = zone_of(0.5, 0.5, ZoneIslands::Always);
+        assert_eq!(s.island_mode, IslandRemovalMode::IrmAlways as i32);
+        assert_eq!(s.min_island_area, 0);
+    }
+
+    #[test]
+    fn zone_islands_name_kicad_s_file_modes() {
+        assert_eq!(ZoneIslands::Always.file_mode(), 0);
+        assert_eq!(ZoneIslands::Never.file_mode(), 1);
+        assert_eq!(ZoneIslands::BelowArea { area_mm2: 1.0 }.file_mode(), 2);
+        assert_eq!(
+            ZoneIslands::BelowArea {
+                area_mm2: 0.000_001
+            }
+            .min_area_nm2(),
+            1_000_000
+        );
+    }
+
     /// A zone must go over the wire unfilled: the fill polygons are KiCad's to
     /// compute against the design rules, which is why `add_zone` follows the
     /// create with a RefillZones. Sending our own would be a fill that honours
@@ -839,6 +953,9 @@ pub(crate) mod tests {
                 name: "",
                 priority: 0,
                 connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
+                thermal_gap_mm: ZONE_THERMAL_RELIEF_MM,
+                thermal_bridge_mm: ZONE_THERMAL_RELIEF_MM,
+                islands: ZoneIslands::Always,
             },
             1,
         );
@@ -862,6 +979,9 @@ pub(crate) mod tests {
                     name: "",
                     priority: 0,
                     connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
+                    thermal_gap_mm: ZONE_THERMAL_RELIEF_MM,
+                    thermal_bridge_mm: ZONE_THERMAL_RELIEF_MM,
+                    islands: ZoneIslands::Always,
                 },
                 1,
             );

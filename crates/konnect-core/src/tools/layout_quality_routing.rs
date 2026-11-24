@@ -26,6 +26,20 @@ const TOUCH_MM: f64 = 0.01;
 /// shapes touch within [`TOUCH_MM`], so a track that stops 0.15 mm short of its pad is open,
 /// as it is for KiCad. A pad with no copper layer gets a group of its own.
 pub(super) fn pad_groups(m: &Model, net: &str) -> Vec<usize> {
+    net_groups(m, net).pads
+}
+
+/// The copper groups of one net: [`pad_groups`]' grouping, with the group and the layer of
+/// every saved fill ring of the net too (Row ZR, stage ZR4, PP17).
+pub(super) struct NetGroups {
+    /// The group of each pad of the net, aligned with `m.pads[net]`.
+    pub pads: Vec<usize>,
+    /// `(group, layer)` of each `filled_polygon` ring of the net.
+    pub fills: Vec<(usize, String)>,
+}
+
+/// [`pad_groups`]' one union-find over the net's tracks, vias, pads and saved fill.
+pub(super) fn net_groups(m: &Model, net: &str) -> NetGroups {
     use konnect_sexp::board_geometry::Shape;
     struct Item {
         shape: Shape,
@@ -73,12 +87,15 @@ pub(super) fn pad_groups(m: &Model, net: &str) -> Vec<usize> {
             add(pad.shape.clone(), mask, &mut items)
         })
         .collect();
+    let mut fill_item: Vec<(usize, String)> = Vec::new();
     for f in m.fills.iter().filter(|f| f.net.as_deref() == Some(net)) {
         let Some(l) = m.layer_ix(&f.layer) else {
             continue;
         };
         for r in &f.rings {
-            add(Shape::polygon(r.pts.clone()), bit(l), &mut items);
+            if let Some(i) = add(Shape::polygon(r.pts.clone()), bit(l), &mut items) {
+                fill_item.push((i, f.layer.clone()));
+            }
         }
     }
     // Sweep along x; only items whose boxes meet are measured, and never two already joined.
@@ -109,14 +126,19 @@ pub(super) fn pad_groups(m: &Model, net: &str) -> Vec<usize> {
             }
         }
     }
-    pad_item
+    let pads = pad_item
         .iter()
         .enumerate()
         .map(|(k, it)| match it {
             Some(i) => find(&mut parent, *i),
             None => items.len() + k,
         })
-        .collect()
+        .collect();
+    let fills = fill_item
+        .into_iter()
+        .map(|(i, layer)| (find(&mut parent, i), layer))
+        .collect();
+    NetGroups { pads, fills }
 }
 
 pub(super) fn connectivity<'a>(m: &'a Model) -> &'a HashMap<String, Conn> {
