@@ -683,3 +683,113 @@ async fn a_retry_refused_again_ends_the_round_refused() {
         .ends_with("run-0/r0/specctra_rounded_board.kicad_pcb"));
     assert!(!h.ctx.root.join("run-0/s1-retry").exists());
 }
+
+// ─── The review's items (2026-11-24) ─────────────────────────────────────────
+
+/// A DRC report with one unconnected GND item at `at`.
+fn open_at(at: (f64, f64)) -> String {
+    json!({
+        "violations": [],
+        "unconnected_items": [{
+            "type": "unconnected_items",
+            "severity": "error",
+            "description": "Missing connection between items",
+            "items": [{ "description": "Zone [GND] on B.Cu", "pos": { "x": at.0, "y": at.1 } }]
+        }]
+    })
+    .to_string()
+}
+
+/// Item 1: a kept via that closes a post-Z9 open lowers the unconnected count; the retry
+/// drops the via at that open, and the rest is checked and kept with the count equal.
+#[tokio::test]
+async fn a_via_that_closes_an_open_is_dropped_by_the_retry() {
+    // The post-Z9 board (call 1) and the retry's board (call 3) have the open; the first
+    // stitched board (call 2), with the via at (106, 52) too, has none.
+    let h = on(open_at((106.0, 52.3)));
+    h.canned(2, drc(&[], &[]));
+    let tools = Calls::new(
+        |_, board, _| {
+            let text = std::fs::read_to_string(board).unwrap_or_default();
+            if text.contains("(at 106 52)") || text.contains("(at 104 52)") {
+                (false, audit(0, vec![], 80.0))
+            } else {
+                (
+                    false,
+                    audit(1, vec![finding("SIG via 1", &["GND"], SIGNAL_AT)], 80.0),
+                )
+            }
+        },
+        |_| Ok(proposal(&[(106.0, 52.0), (104.0, 52.0)], 0.6)),
+    );
+    let judged = judge(&h, &tools).await;
+    let round = record(&judged);
+    assert_eq!(round.outcome, "kept", "{round:?}");
+    assert_eq!(
+        round.retried,
+        Some(crate::pour_stitch::Retry {
+            dropped_vias: 1,
+            because: vec!["unconnected".to_string()],
+        })
+    );
+    assert_eq!((round.vias[0].x_mm, round.vias[0].y_mm), (104.0, 52.0));
+    assert_eq!((round.written_vias, round.kicad_runs), (1, 2));
+    assert_eq!(judged.measures.unconnected, 1, "the open stays: Z9's work");
+}
+
+/// Item 5: a full list that is still short is recorded, and the round goes on with it.
+#[tokio::test]
+async fn a_full_list_still_short_of_the_count_is_recorded() {
+    let h = on(drc(&[], &[]));
+    let tools = Calls::new(
+        |_, board, args| {
+            let text = std::fs::read_to_string(board).unwrap_or_default();
+            let served = text.contains("(at 106 52)");
+            let count = if served { 2 } else { 3 };
+            let mut listed = vec![finding("SIG via 2", &["VCC"], (100.0, 40.0))];
+            if args.get("max_findings").is_some() && !served {
+                listed.push(finding("SIG via 1", &["GND"], SIGNAL_AT));
+            }
+            (false, audit(count, listed, 80.0))
+        },
+        |_| Ok(proposal(&[(106.0, 52.0)], 0.6)),
+    );
+    let judged = judge(&h, &tools).await;
+    let round = record(&judged);
+    assert_eq!(round.outcome, "kept", "{round:?}");
+    assert!(!round.findings_complete, "{round:?}");
+    assert_eq!(json!(round)["findings_complete"], false);
+    // A list that is whole says so.
+    let h = on(drc(&[], &[]));
+    let judged = judge(&h, &Calls::served()).await;
+    assert!(record(&judged).findings_complete);
+}
+
+/// Item 2: a delivered session that passes the guard but no longer ranks first among the
+/// judged runs is `rejected` (`rank`): the session is the router's, the written files go,
+/// and its vias are counted as undelivered.
+#[tokio::test]
+async fn a_delivered_session_that_no_longer_ranks_first_is_rejected() {
+    let h = on(drc(&[], &[]));
+    let tools = Arc::new(Calls::served());
+    let mut outcome = won(&h, &tools).await;
+    // Another judged run, before the winner, with the same key: on a tie the earlier
+    // run ranks first once the keys are taken again.
+    let mut other = outcome.runs[0].clone();
+    other.index = 7;
+    outcome.runs.insert(0, other);
+    outcome.keys.insert(0, outcome.keys[0]);
+    outcome.pour_keys.insert(0, outcome.pour_keys[0]);
+    outcome.winner = Some(1);
+    let before = outcome.runs[1].routed.as_ref().unwrap().held.ses.clone();
+    let record = deliver(&h, tools.clone(), &mut outcome).await;
+    assert_eq!(record.outcome, "rejected", "{record:?}");
+    assert_eq!(record.refused_by, vec!["rank"]);
+    assert_eq!(record.vias, 1);
+    assert_eq!(outcome.runs[1].routed.as_ref().unwrap().held.ses, before);
+    assert!(!stitched_ses(&h).exists());
+    assert!(!h.ctx.root.join("run-0-stitched").exists());
+    let judged = outcome.runs[1].judged.as_ref().unwrap();
+    assert_eq!(judged.measures.reference_vias, 1);
+    assert_eq!(undelivered_nets(judged), vec!["GND"]);
+}

@@ -130,9 +130,10 @@ The layout of `pour_key` and one of its steps change; `key` and the default
 user-config setting says which key ranks. Design: `docs/POUR_RANK_DESIGN.md`, part 2. No
 argument changes; nothing is removed or renamed.
 
-- **New user-config key `routing.rank_key`**: `"routing"` (today's key, the default) or
-  `"pours"` (the pour key). There is no tool argument. With it absent or `routing`,
-  every ranking is today's, exactly.
+- **New user-config key `routing.rank_key`**: `"routing"` (today's key, the default
+  then) or `"pours"` (the pour key). There is no tool argument. With it absent or
+  `routing`, every ranking was today's, exactly. Since ZR6's PR the default is `pours`
+  (the entry above).
 - **The user config is read on every fastroute call.** Before, a call that passed both
   `effort` and `fastroute_path` did not read it. Now a config file that does not parse,
   a `routing` that is not an object, or a `routing.rank_key` that is not one of the two

@@ -1505,6 +1505,10 @@ pub(crate) fn reduce_run_folders(
         if let (true, Some(prune)) = (is_winner, &outcome.pour_prune) {
             body["pour_prune"] = json!(prune);
         }
+        // Row ZR, ZR6 (S10): and what the delivery of its reference vias did.
+        if let (true, Some(delivery)) = (is_winner, &outcome.reference_stitch) {
+            body["reference_stitch"] = json!(delivery);
+        }
         // The winner keeps every folder whole.
         let keep_tune = if is_winner {
             Vec::new()

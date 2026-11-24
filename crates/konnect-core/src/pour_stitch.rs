@@ -412,6 +412,9 @@ pub(crate) struct StitchRecord {
     pub reason: Option<String>,
     pub targets: usize,
     pub skipped: Vec<Skipped>,
+    /// S2: whether the targets were read from every 3.2 finding; `false` when even the
+    /// second audit (`max_findings: 500`) listed fewer than it counted.
+    pub findings_complete: bool,
     pub proposals: usize,
     /// Vias kept by S3 and written.
     pub written_vias: usize,
@@ -440,6 +443,7 @@ impl StitchRecord {
             reason: None,
             targets: 0,
             skipped: Vec::new(),
+            findings_complete: true,
             proposals: 0,
             written_vias: 0,
             dropped: 0,
@@ -661,6 +665,7 @@ pub(crate) async fn judged_round(
                 board,
                 audit,
                 &before,
+                drc,
             )
             .await
         }
@@ -759,6 +764,10 @@ fn reaches_ring(ring: &[(f64, f64)], at: (f64, f64), radius: f64) -> bool {
 }
 
 /// S5's retry: the indices of the `vias` a refusal names.
+/// - `unconnected` with fewer unconnected items on the stitched board than on the post-Z9
+///   one (`before_drc`): the post-Z9 report's unconnected items, read against the post-Z9
+///   board's fills (`before_text`): a kept via that closes an open sits at what that open
+///   named. With more, or as many, the stitched report's, as for a rule.
 /// - `unconnected` and `rule:<name>`: every item position of the stitched board's DRC
 ///   entries of that category. A position that is a vertex of a saved fill piece of the
 ///   stitched board (within [`VERTEX_MATCH_MM`]) names the vias that reach that piece (an
@@ -771,33 +780,53 @@ pub(crate) fn named_vias(
     refused: &[String],
     vias: &[PlannedVia],
     drc: &DrcReport,
+    before_drc: Option<&DrcReport>,
     before_text: &str,
     stitched_text: &str,
 ) -> BTreeSet<usize> {
-    let mut positions: Vec<(f64, f64)> = Vec::new();
+    let open = |report: &DrcReport| report.unconnected_items.as_ref().map_or(0, Vec::len);
+    // Each position with whether it is on the post-Z9 board (else the stitched one).
+    let mut positions: Vec<((f64, f64), bool)> = Vec::new();
     for clause in refused {
-        let entries: Vec<&crate::tools::cli::DrcViolation> = if clause == "unconnected" {
-            drc.unconnected_items.iter().flatten().collect()
-        } else if let Some(rule) = clause.strip_prefix("rule:") {
-            drc.violations.iter().filter(|v| v.rule == rule).collect()
-        } else {
-            continue;
-        };
+        let (entries, on_before): (Vec<&crate::tools::cli::DrcViolation>, bool) =
+            if clause == "unconnected" {
+                match before_drc.filter(|before| open(before) > open(drc)) {
+                    Some(before) => (before.unconnected_items.iter().flatten().collect(), true),
+                    None => (drc.unconnected_items.iter().flatten().collect(), false),
+                }
+            } else if let Some(rule) = clause.strip_prefix("rule:") {
+                (
+                    drc.violations.iter().filter(|v| v.rule == rule).collect(),
+                    false,
+                )
+            } else {
+                continue;
+            };
         for entry in entries {
-            positions.extend(entry.pos.iter().map(|pos| (pos.x, pos.y)));
+            positions.extend(entry.pos.iter().map(|pos| ((pos.x, pos.y), on_before)));
             positions.extend(
                 entry
                     .items
                     .iter()
                     .filter_map(|item| item.pos.as_ref())
-                    .map(|pos| (pos.x, pos.y)),
+                    .map(|pos| ((pos.x, pos.y), on_before)),
             );
         }
     }
     let mut named = BTreeSet::new();
     if !positions.is_empty() {
-        let rings = crate::zone_fill::fill_rings(stitched_text).unwrap_or_default();
-        for position in positions {
+        let stitched_rings = crate::zone_fill::fill_rings(stitched_text).unwrap_or_default();
+        let before_rings = if positions.iter().any(|(_, on_before)| *on_before) {
+            crate::zone_fill::fill_rings(before_text).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for (position, on_before) in positions {
+            let rings = if on_before {
+                &before_rings
+            } else {
+                &stitched_rings
+            };
             let pieces: Vec<&crate::zone_fill::FillRing> = rings
                 .iter()
                 .filter(|ring| {
@@ -895,6 +924,7 @@ pub(crate) async fn reference_round(
     board: &Path,
     audit: &Value,
     before: &Checked,
+    before_drc: &DrcReport,
 ) -> (Option<Stitched>, StitchRecord) {
     let started = std::time::Instant::now();
     let mut record = StitchRecord::new(summary_alone(before));
@@ -908,6 +938,7 @@ pub(crate) async fn reference_round(
         board,
         audit,
         before,
+        before_drc,
     };
     let kept = match round.steps(&mut record).await {
         Ok(kept) => kept,
@@ -936,6 +967,9 @@ struct Round<'r, 'i> {
     board: &'r Path,
     audit: &'r Value,
     before: &'r Checked,
+    /// The post-Z9 board's report: S5's retry reads its unconnected items when the
+    /// stitched board has fewer.
+    before_drc: &'r DrcReport,
 }
 
 impl Round<'_, '_> {
@@ -949,6 +983,7 @@ impl Round<'_, '_> {
         }
         record.targets = found.targets.len();
         record.skipped = found.skipped.clone();
+        record.findings_complete = found.complete;
         if found.targets.is_empty() {
             record.outcome = "none_needed";
             return Ok(None);
@@ -1033,7 +1068,14 @@ impl Round<'_, '_> {
             }
             if attempt < REFERENCE_ROUNDS {
                 let stitched_text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-                let named = named_vias(&refused, &vias, &drc, &board_text, &stitched_text);
+                let named = named_vias(
+                    &refused,
+                    &vias,
+                    &drc,
+                    Some(self.before_drc),
+                    &board_text,
+                    &stitched_text,
+                );
                 if !named.is_empty() {
                     record.retried = Some(Retry {
                         dropped_vias: named.len(),
@@ -1093,7 +1135,8 @@ pub(crate) fn checklist_items(audit: &Value) -> ChecklistItems {
 /// the importer resolves a session via by) whose diameter and drill equal `size_mm` and
 /// `drill_mm` within 1 µm; `None` when none matches (the delivery is then `no_padstack`).
 /// Only a round through via the importer takes is matched (`shape` `circle`, equal sizes,
-/// a drill). The planner's via is the largest class size raised to the rule minimums, so
+/// a drill, and its `layers` holding every copper layer of the manifest's `layers`, so a
+/// blind via of the same size is never chosen). The planner's via is the largest class size raised to the rule minimums, so
 /// on a board with several via sizes this can be `None`: the measurement records it per
 /// board. A manifest with no `padstacks` list is an error.
 pub(crate) fn manifest_padstack(
@@ -1104,10 +1147,26 @@ pub(crate) fn manifest_padstack(
     let rows = manifest["padstacks"]
         .as_array()
         .context("the manifest has no 'padstacks' list")?;
+    let copper: BTreeSet<&str> = manifest["layers"]
+        .as_array()
+        .context("the manifest has no 'layers' list")?
+        .iter()
+        .filter_map(|layer| layer["dsn_name"].as_str())
+        .collect();
+    ensure!(!copper.is_empty(), "the manifest names no copper layer");
     const TOLERANCE_MM: f64 = 0.001;
     let um = |row: &Value, key: &str| row[key].as_i64().map(|value| value as f64 / 1000.0);
     for row in rows {
         if row["purpose"] != "via" || row["shape"] != "circle" {
+            continue;
+        }
+        let layers: BTreeSet<&str> = row["layers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !copper.is_subset(&layers) {
             continue;
         }
         let (Some(name), Some(x), Some(y), Some(drill)) = (
@@ -1199,7 +1258,12 @@ pub(crate) fn write_vias(ses_text: &str, vias: &[PlannedVia], padstack: &str) ->
     Ok(out)
 }
 
-/// The delivery's record (`search.reference_stitch`).
+/// The delivery's record (`search.reference_stitch`, and the winner's `run.json`).
+///
+/// The vias' net must be one of the call's pour nets (`JudgeContext::pour_nets`): the
+/// delivered session's `vias_off_pour` counts any other net's vias, which the ranked
+/// state's did not (the round adds no via to the session), so such a delivery is always
+/// `rejected` at `key:routing:10`, and the vias are counted as undelivered.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct DeliveryRecord {
     /// `delivered` (the delivered session holds the vias), `nothing_to_deliver`,

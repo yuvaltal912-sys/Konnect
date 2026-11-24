@@ -168,9 +168,9 @@ fn count(value: usize) -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RankMode {
-    /// Today's key (`route_judge::rank_measures`). The default.
+    /// Today's key (`route_judge::rank_measures`), with `routing.rank_key: "routing"`.
     Routing,
-    /// The pour key ([`pour_keys`]).
+    /// The pour key ([`pour_keys`]). The default ([`DEFAULT_RANK_MODE`], Row ZR, ZR6).
     Pours,
 }
 

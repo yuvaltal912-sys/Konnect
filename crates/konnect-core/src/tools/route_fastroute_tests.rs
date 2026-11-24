@@ -3894,6 +3894,33 @@ fn the_prune_record_is_in_search_and_in_the_winners_run_json_only() {
     };
     assert_eq!(record_of(0, Shape::AsExported)["pour_prune"], wanted);
     assert!(record_of(1, Shape::Omitted).get("pour_prune").is_none());
+    // Row ZR, ZR6 (S10): the delivery's record sits beside it, the winner's only.
+    let mut delivered = finished_search();
+    delivered.outcome.reference_stitch = Some(crate::pour_stitch::DeliveryRecord {
+        outcome: "rejected",
+        reason: Some("ranked behind".to_string()),
+        vias: 2,
+        refused_by: vec!["rank".to_string()],
+        seconds: 1.5,
+    });
+    reduce_run_folders(&delivered.folder, &delivered.outcome).unwrap();
+    let delivery_of = |index: usize, shape: Shape| -> Value {
+        let text = std::fs::read_to_string(
+            delivered
+                .folder
+                .join(run_folder_name(index, shape, 1))
+                .join("run.json"),
+        )
+        .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    assert_eq!(
+        delivery_of(0, Shape::AsExported)["reference_stitch"]["refused_by"],
+        json!(["rank"])
+    );
+    assert!(delivery_of(1, Shape::Omitted)
+        .get("reference_stitch")
+        .is_none());
     assert!(search
         .folder
         .join("judge/run-0-pruned/r0/board.kicad_pcb")
@@ -4034,8 +4061,8 @@ fn the_result_says_which_key_ranked_and_what_the_other_key_chose() {
         skipped_links: Vec::new(),
     };
     for (mode, source, winner, other) in [
-        (RankMode::Routing, RankSource::Default, 0, 1),
-        (RankMode::Pours, RankSource::UserConfig, 1, 0),
+        (RankMode::Routing, RankSource::UserConfig, 0, 1),
+        (RankMode::Pours, RankSource::Default, 1, 0),
     ] {
         let search = split_search(mode);
         let dsn = search.root.join("board.dsn");

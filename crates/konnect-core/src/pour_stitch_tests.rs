@@ -524,12 +524,22 @@ fn the_checklist_items_are_read_from_the_audits_metrics() {
 // ─── S10: the padstack and the written session ───────────────────────────────
 
 fn manifest() -> Value {
-    json!({ "padstacks": [
-        { "name": "pad_round", "purpose": "pad", "shape": "circle", "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
-        { "name": "via_oval", "purpose": "via", "shape": "oval", "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
-        { "name": "via_small", "purpose": "via", "shape": "circle", "size_x_um": 450, "size_y_um": 450, "drill_um": 200 },
-        { "name": "via_std", "purpose": "via", "shape": "circle", "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
-    ]})
+    let all = json!(["F.Cu", "In1.Cu", "B.Cu"]);
+    json!({
+        "layers": [
+            { "kicad_name": "F.Cu", "dsn_name": "F.Cu", "index": 0 },
+            { "kicad_name": "In1.Cu", "dsn_name": "In1.Cu", "index": 1 },
+            { "kicad_name": "B.Cu", "dsn_name": "B.Cu", "index": 2 },
+        ],
+        "padstacks": [
+            { "name": "pad_round", "purpose": "pad", "shape": "circle", "layers": all, "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
+            { "name": "via_oval", "purpose": "via", "shape": "oval", "layers": all, "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
+            // A blind via of the standard size, listed before it: never chosen.
+            { "name": "via_blind", "purpose": "via", "shape": "circle", "layers": ["F.Cu", "In1.Cu"], "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
+            { "name": "via_small", "purpose": "via", "shape": "circle", "layers": all, "size_x_um": 450, "size_y_um": 450, "drill_um": 200 },
+            { "name": "via_std", "purpose": "via", "shape": "circle", "layers": all, "size_x_um": 600, "size_y_um": 600, "drill_um": 300 },
+        ]
+    })
 }
 
 #[test]
@@ -551,6 +561,10 @@ fn the_padstack_is_the_manifests_round_via_of_the_same_size_and_drill() {
     assert_eq!(manifest_padstack(&m, 0.6, 0.35).unwrap(), None);
     assert_eq!(manifest_padstack(&m, 0.8, 0.4).unwrap(), None);
     assert!(manifest_padstack(&json!({}), 0.6, 0.3).is_err());
+    // A manifest without its layer table is refused, not read as covering nothing.
+    let mut bare = manifest();
+    bare.as_object_mut().unwrap().remove("layers");
+    assert!(manifest_padstack(&bare, 0.6, 0.3).is_err());
 }
 
 const SESSION: &str = "(session \"b\"
@@ -679,19 +693,47 @@ fn a_drc_item_names_the_vias_at_its_position_and_a_fill_clause_the_vias_in_that_
     let empty = board(&[]);
     // A clearance item at the first via's edge names it alone.
     let drc = report(vec![violation("clearance", (10.7, 10.0))], vec![]);
-    let named = named_vias(&["rule:clearance".to_string()], &vias, &drc, &empty, &empty);
+    let named = named_vias(
+        &["rule:clearance".to_string()],
+        &vias,
+        &drc,
+        None,
+        &empty,
+        &empty,
+    );
     assert_eq!(named, BTreeSet::from([0]));
     // Beyond the reach: none.
     let drc = report(vec![violation("clearance", (10.0, 10.9))], vec![]);
-    let named = named_vias(&["rule:clearance".to_string()], &vias, &drc, &empty, &empty);
+    let named = named_vias(
+        &["rule:clearance".to_string()],
+        &vias,
+        &drc,
+        None,
+        &empty,
+        &empty,
+    );
     assert!(named.is_empty());
     // Only the refusing rule's items are read.
     let drc = report(vec![violation("silk_overlap", (20.0, 10.0))], vec![]);
-    let named = named_vias(&["rule:clearance".to_string()], &vias, &drc, &empty, &empty);
+    let named = named_vias(
+        &["rule:clearance".to_string()],
+        &vias,
+        &drc,
+        None,
+        &empty,
+        &empty,
+    );
     assert!(named.is_empty());
     // An unconnected item names the via at it.
     let drc = report(vec![], vec![violation("unconnected_items", (20.0, 10.2))]);
-    let named = named_vias(&["unconnected".to_string()], &vias, &drc, &empty, &empty);
+    let named = named_vias(
+        &["unconnected".to_string()],
+        &vias,
+        &drc,
+        None,
+        &empty,
+        &empty,
+    );
     assert_eq!(named, BTreeSet::from([1]));
     // An island reported at one of its vertices names the vias inside it.
     let island = zone(
@@ -705,6 +747,7 @@ fn a_drc_item_names_the_vias_at_its_position_and_a_fill_clause_the_vias_in_that_
         &["rule:isolated_copper".to_string()],
         &vias,
         &drc,
+        None,
         &empty,
         &stitched,
     );
@@ -720,6 +763,7 @@ fn a_drc_item_names_the_vias_at_its_position_and_a_fill_clause_the_vias_in_that_
         &["fill:GND/In1.Cu".to_string()],
         &vias,
         &report(vec![], vec![]),
+        None,
         &before,
         &empty,
     );
@@ -728,6 +772,7 @@ fn a_drc_item_names_the_vias_at_its_position_and_a_fill_clause_the_vias_in_that_
         &["fill:GND/In2.Cu".to_string()],
         &vias,
         &report(vec![], vec![]),
+        None,
         &before,
         &empty,
     );
@@ -738,6 +783,7 @@ fn a_drc_item_names_the_vias_at_its_position_and_a_fill_clause_the_vias_in_that_
         &["key:routing:11".to_string(), "loops".to_string()],
         &vias,
         &drc,
+        None,
         &before,
         &empty,
     );
@@ -811,6 +857,7 @@ fn a_position_that_is_no_fill_vertex_names_by_distance_even_beside_a_fill() {
         &["rule:clearance".to_string()],
         &vias,
         &drc,
+        None,
         &board(&[]),
         &stitched,
     );
@@ -830,6 +877,7 @@ fn a_fill_clause_reaches_a_via_by_its_own_radius() {
         &["fill:GND/In1.Cu".to_string()],
         &vias,
         &report(vec![], vec![]),
+        None,
         &board(&[plane]),
         &board(&[]),
     );
@@ -874,4 +922,44 @@ fn an_unchecked_delivery_is_refused_by_that_clause_alone() {
         delivery_refusals(&checked(0.0), &delivered, &gnd()),
         vec!["unchecked"]
     );
+}
+
+/// Review item 1: a kept via that closes an open lowers the unconnected count, so the
+/// stitched report no longer lists that open; the post-Z9 report's item names the via.
+#[test]
+fn a_lower_unconnected_count_names_the_via_at_the_post_z9_open() {
+    let vias = [via("GND", 10.0, 10.0), via("GND", 20.0, 10.0)];
+    let empty = board(&[]);
+    let before = report(vec![], vec![violation("unconnected_items", (20.0, 10.3))]);
+    let after = report(vec![], vec![]);
+    let refused = ["unconnected".to_string()];
+    assert_eq!(
+        named_vias(&refused, &vias, &after, Some(&before), &empty, &empty),
+        BTreeSet::from([1])
+    );
+    // A higher count reads the stitched report, as before.
+    assert_eq!(
+        named_vias(&refused, &vias, &before, Some(&after), &empty, &empty),
+        BTreeSet::from([1])
+    );
+    // An open reported at a vertex of a post-Z9 fill piece names the vias that reach it.
+    let piece = zone(
+        "GND",
+        "B.Cu",
+        &[(8.0, 8.0), (12.0, 8.0), (12.0, 12.0), (8.0, 12.0)],
+    );
+    let at_vertex = report(vec![], vec![violation("unconnected_items", (8.0, 8.0))]);
+    assert_eq!(
+        named_vias(
+            &refused,
+            &vias,
+            &after,
+            Some(&at_vertex),
+            &board(&[piece]),
+            &empty
+        ),
+        BTreeSet::from([0])
+    );
+    // Without the post-Z9 report nothing names it.
+    assert!(named_vias(&refused, &vias, &after, None, &empty, &empty).is_empty());
 }
