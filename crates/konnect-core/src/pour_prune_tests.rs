@@ -592,12 +592,14 @@ fn rest() -> CheckedRest {
                 layer: "B.Cu".into(),
                 zone_uuid: Some("z1".into()),
                 pieces_mm2: vec![100.0, 2.0],
+                islands: vec![],
             },
             ZoneLayerFill {
                 net: "GND".into(),
                 layer: "F.Cu".into(),
                 zone_uuid: Some("z2".into()),
                 pieces_mm2: vec![50.0],
+                islands: vec![],
             },
         ],
         measures: crate::route_judge::tests::measures(),
@@ -1393,6 +1395,8 @@ fn two_runs() -> SearchOutcome {
         baseline: Ok(Baseline {
             violations: BTreeMap::new(),
             unconnected: 0,
+            pour_fills: None,
+            pour_fills_error: None,
         }),
         pour_prune: None,
     }
@@ -1460,6 +1464,7 @@ fn a_pruned_winner_keeps_the_runs_pad_comparison() {
         starved_thermals: 0,
         false_connected,
         false_open,
+        damage: None,
     };
     let mut outcome = two_runs();
     {

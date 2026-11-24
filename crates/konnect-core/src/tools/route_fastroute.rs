@@ -1652,11 +1652,22 @@ fn group_search_summary(object: &Value) -> Option<Value> {
 /// The unrouted board's check, as the result reports it.
 fn baseline_json(baseline: &std::result::Result<Baseline, String>) -> Value {
     match baseline {
-        Ok(baseline) => json!({
-            "ok": true,
-            "violations": baseline.violations,
-            "unconnected": baseline.unconnected,
-        }),
+        Ok(baseline) => {
+            let mut out = json!({
+                "ok": true,
+                "violations": baseline.violations,
+                "unconnected": baseline.unconnected,
+            });
+            // Row ZR, ZR5 part 1: the "before" rows of the pour record, or why there are
+            // none; neither for a call with no pour net.
+            if let Some(rows) = &baseline.pour_fills {
+                out["pour_fills"] = json!(rows);
+            }
+            if let Some(error) = &baseline.pour_fills_error {
+                out["pour_fills_error"] = json!(error);
+            }
+            out
+        }
         Err(error) => json!({ "ok": false, "error": error }),
     }
 }

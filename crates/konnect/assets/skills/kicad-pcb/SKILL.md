@@ -362,7 +362,12 @@ placement orders, judges every run itself on scratch copies of the board
    (`completion.judged.stitching_vias`): then follow `next_steps`. Report
    every failed gate line to the user. `search` lists the best runs and counts
    every outcome (`search.json` in the search folder lists every run); `search.budget_overrun_s` says when the first judged run came
-   after the budget.
+   after the budget. On a board with pours, `measures.pours.damage` of each
+   judged run (the winner's in `search.winner`) says what the routing did to
+   them against the unrouted board's refill (`search.baseline.pour_fills`):
+   `lost_fills` (pour layers that lost all their fill), and `plane_loss` and
+   `area_loss`, shares from 0 to 1 of the planes no longer whole and of the
+   pour copper gone. It is recorded only: it changes no gate and no rank.
 4. Continue from step 4 of the Freerouting round trip: the same import
    review, apply, refill, stitching (`completion.next_steps`) and DRC.
 
