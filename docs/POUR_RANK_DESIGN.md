@@ -515,8 +515,8 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
 
 ### Part 2 as built (2026-11-24)
 
-Branch `claude/zr5-pour-key-build`, which holds part 1's branch (and through it
-`fork/main` `e07ff839`). Built by Claude Opus 5.5; reviewed by an agent that did not write
+Branch `claude/zr5-pour-key-build`, with `fork/main` `78f51580` (part 1, merged as #117)
+merged in. Built by Claude Opus 5.5; reviewed by an agent that did not write
 it (no must-fix; its items are taken below). The four values are the candidate's: 5 %,
 1 %, before the lengths, after the vias. The setting ships at `routing`.
 
@@ -549,6 +549,54 @@ Limits, written down:
 - That `route_candidate` passes `CANDIDATE_RANK` is not tested through a routing call:
   the user config's path comes from `HOME`. The constant's value is tested, as for
   `CANDIDATE_PRUNE`.
+
+### Part 2 measured (2026-11-24)
+
+Setup:
+
+- The five boards of "Part 1: measurement", each with its own pours.
+- Two `route_specctra_dsn` calls per board, at effort M: one with no user config (the
+  default, `routing`), one with `routing.rank_key: "pours"` in a scratch `HOME`'s user
+  config. Each call names the engine's path.
+- The gate's release build `6b6896ab` (commit `b8b84794`), by pipe.
+- fastroute x21 (`46d79d56`), the build `packaging/1-kopper/fastroute.json` pins.
+- Each call in its own routing hold, under the lane locks, with a hard timeout of 1,800 s.
+
+Every call ended `complete`. Judged runs, `routing` and `pours`: dash 3 and 3, B5 16 and
+16, `pic` 77 and 77, `ecc` 1,394 and 1,412, `pours` 1,410 and 1,401.
+
+| Criterion | dash | B5 | `pic` | `ecc` | `pours` |
+|---|---|---|---|---|---|
+| `routing`: `search.rank` says `routing`, from the default | yes | yes | yes | yes | yes |
+| `routing`: the winner has the least recorded `key` | yes | yes | yes | yes | yes |
+| `pours`: `search.rank` says `pours`, from the user config | yes | yes | yes | yes | yes |
+| `pours`: the winner has the least recorded `pour_key` | yes | yes | yes | yes | yes |
+| `pours`: it passes every gate the call's `other_winner` passes | yes | yes | yes | yes | yes |
+| Recorded `pour_key`s the replay reproduces, both calls | 6 of 6 | 32 of 32 | 154 of 154 | 2,806 of 2,806 | 2,811 of 2,811 |
+| Recorded `key`s the replay reproduces, both calls | 6 of 6 | 32 of 32 | 154 of 154 | 2,806 of 2,806 | 2,811 of 2,811 |
+| The two keys choose the same run (`same_winner`) | no | no | no | yes | no |
+
+**Part 2's three criteria hold on all five boards, under both modes.** The replay is
+`design-replay/replay_pour.py`: its own reading of `run.json`, sharing no code with
+Konnect.
+
+**The owner's line, within each `pours` call** (the pour key's winner against the run
+today's key puts first, on the same boards). This is information, not a criterion: the
+line is judged on ZR3's runs.
+
+- B5 and `ecc`: holds.
+- dash: the area-loss step is 1 higher, and the signal step 2 higher (the line allows 1).
+  The plane-loss step is lower.
+- `pic`: the area-loss step is 1 higher. The plane-loss step is lower.
+- `pours`: the signal step is 2 higher. The plane-loss step is lower.
+
+Not measured:
+
+- The candidate table on ZR3's runs: ZR3's runs do not exist yet.
+- The numbers of the owner's two boards (dash, B5) beyond the counts above.
+
+Records: `target/creation-research/zone-routing/zr5/part2/measure/` in the main checkout
+(`matrix.sh`, `hold.sh`, `call.py`, `result.jsonl`, the runs).
 
 ## The skill's order of work (PK15; applied once ZR4 and ZR2 are merged)
 
