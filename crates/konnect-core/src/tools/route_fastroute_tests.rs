@@ -1125,9 +1125,7 @@ fn the_group_search_summary_reads_the_reports_object() {
 /// is not an object, or an object without one, adds nothing.
 #[test]
 fn the_group_search_summary_keeps_the_pour_state_and_counts_pour_worse() {
-    let pour = |pieces: u64, lost: u64| {
-        json!({ "pieces": pieces, "starved": 0, "spokes_lost": lost, "largest_share": 0.875 })
-    };
+    let pour = |pieces: u64, lost: u64| json!({ "pieces": pieces, "starved": 0, "spokes_lost": lost, "largest_share": 0.875 });
     let mut object = group_search_object();
     object["start"]["pour"] = pour(3, 0);
     object["end"]["pour"] = pour(2, 1);
@@ -1138,7 +1136,10 @@ fn the_group_search_summary_keeps_the_pour_state_and_counts_pour_worse() {
     assert_eq!(summary["end"]["pour"], pour(2, 1));
     assert_eq!(summary["pour_worse"], 7);
     // a pass that refused nothing on the pour rule has no `pour_worse` end: counted 0
-    object["passes"][1]["ends"].as_object_mut().unwrap().remove("pour_worse");
+    object["passes"][1]["ends"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pour_worse");
     assert_eq!(group_search_summary(&object).unwrap()["pour_worse"], 2);
     // a pass with no `ends` at all counts 0 too
     object["passes"][0].as_object_mut().unwrap().remove("ends");
