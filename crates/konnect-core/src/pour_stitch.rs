@@ -1375,19 +1375,20 @@ async fn deliver(ctx: Arc<JudgeContext>, tools: Arc<dyn ToolCaller>, job: Delive
             written,
         );
     }
-    let padstack =
-        match manifest_padstack(&ctx.manifest, size, drill) {
-            Ok(Some(name)) => name,
-            Ok(None) => return ended(
+    let padstack = match manifest_padstack(&ctx.manifest, size, drill) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return ended(
                 "no_padstack",
                 format!(
                     "the export manifest has no via padstack of {size} mm with a {drill} mm drill"
                 ),
                 Vec::new(),
                 written,
-            ),
-            Err(error) => return ended("failed", format!("{error:#}"), Vec::new(), written),
-        };
+            )
+        }
+        Err(error) => return ended("failed", format!("{error:#}"), Vec::new(), written),
+    };
     let text = match tokio::fs::read_to_string(&job.routed.held.ses).await {
         Ok(text) => text,
         Err(error) => {

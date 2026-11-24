@@ -543,7 +543,10 @@ async fn the_delivered_session_holds_the_vias_and_its_full_judge_is_the_ranked_b
     // Its judge ran with the round off; the round's record stays with the run.
     assert_eq!(tools.plans().len(), 1, "only the search's judge planned");
     assert_eq!(judged.measures.reference_vias, 0);
-    assert_eq!(judged.measures.checklist.unstitched_layer_changes, Some(1.0));
+    assert_eq!(
+        judged.measures.checklist.unstitched_layer_changes,
+        Some(1.0)
+    );
     assert_eq!(record_of(judged).outcome, "kept");
     assert_eq!(record_of(judged).remaining.len(), 1);
     assert!(undelivered_nets(judged).is_empty());
@@ -658,15 +661,25 @@ async fn a_retry_refused_again_ends_the_round_refused() {
     h.canned(3, item(105.0, 49.0));
     let tools = Calls::new(
         |_, board, _| (false, served(board)),
-        |_| Ok(proposal(&[(106.0, 52.0), (104.0, 52.0), (105.0, 49.0)], 0.6)),
+        |_| {
+            Ok(proposal(
+                &[(106.0, 52.0), (104.0, 52.0), (105.0, 49.0)],
+                0.6,
+            ))
+        },
     );
     let judged = judge(&h, &tools).await;
     let round = record(&judged);
     assert_eq!(round.outcome, "refused", "{round:?}");
     assert_eq!(round.refused_by, vec!["rule:clearance"]);
-    assert_eq!(round.retried.as_ref().map(|retry| retry.dropped_vias), Some(1));
+    assert_eq!(
+        round.retried.as_ref().map(|retry| retry.dropped_vias),
+        Some(1)
+    );
     assert_eq!(round.kicad_runs, 2);
     assert_eq!(h.calls().len(), 3, "no third stitched board");
-    assert!(judged.board.ends_with("run-0/r0/specctra_rounded_board.kicad_pcb"));
+    assert!(judged
+        .board
+        .ends_with("run-0/r0/specctra_rounded_board.kicad_pcb"));
     assert!(!h.ctx.root.join("run-0/s1-retry").exists());
 }

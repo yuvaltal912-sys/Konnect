@@ -800,10 +800,20 @@ fn the_summary_holds_the_drc_counts() {
 fn a_position_that_is_no_fill_vertex_names_by_distance_even_beside_a_fill() {
     let vias = [via("GND", 10.0, 10.0), via("GND", 20.0, 10.0)];
     // A fill piece around the second via, none of its vertices at the item.
-    let piece = zone("GND", "B.Cu", &[(18.0, 8.0), (22.0, 8.0), (22.0, 12.0), (18.0, 12.0)]);
+    let piece = zone(
+        "GND",
+        "B.Cu",
+        &[(18.0, 8.0), (22.0, 8.0), (22.0, 12.0), (18.0, 12.0)],
+    );
     let stitched = board(&[piece]);
     let drc = report(vec![violation("clearance", (10.7, 10.0))], vec![]);
-    let named = named_vias(&["rule:clearance".to_string()], &vias, &drc, &board(&[]), &stitched);
+    let named = named_vias(
+        &["rule:clearance".to_string()],
+        &vias,
+        &drc,
+        &board(&[]),
+        &stitched,
+    );
     assert_eq!(named, BTreeSet::from([0]));
 }
 
@@ -811,7 +821,11 @@ fn a_position_that_is_no_fill_vertex_names_by_distance_even_beside_a_fill() {
 fn a_fill_clause_reaches_a_via_by_its_own_radius() {
     // The plane's edge at x = 15: a 0.6 mm via 0.9 mm off it is out of reach (0.3 + 0.5).
     let vias = [via("GND", 15.9, 10.0), via("GND", 15.7, 10.0)];
-    let plane = zone("GND", "In1.Cu", &[(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)]);
+    let plane = zone(
+        "GND",
+        "In1.Cu",
+        &[(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)],
+    );
     let named = named_vias(
         &["fill:GND/In1.Cu".to_string()],
         &vias,

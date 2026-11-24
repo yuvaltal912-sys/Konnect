@@ -2265,7 +2265,9 @@ async fn route_refine_a_served_change_leaves_the_unserved_one_listed() {
     let (x, y) = first_via(&r);
     assert!((x - 10.).hypot(y - 10.) <= 3.0, "{r}");
     assert!(
-        r["blocked"].to_string().contains("1 reference changes remain"),
+        r["blocked"]
+            .to_string()
+            .contains("1 reference changes remain"),
         "{r}"
     );
 }
