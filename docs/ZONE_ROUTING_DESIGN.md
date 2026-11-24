@@ -2240,6 +2240,27 @@ The measures are the winner's as judged, before the ground-via prune, the same o
 - **Starved pins and lost spokes: met for the winners.** No winner has a pin KiCad calls starved. The two pours-as-planes winners (`pic`, `ecc`) lose no spoke. The pour key's first pour entry counts the record's starved thermals, which equal KiCad's on every run here, so the as-exported runs with a starved pin (1 on B5 and 2 on `pic`, as in ZR3 alone) never win.
 - **The line holds on 3 boards.** On dash the area step is 1 higher, a 0.4 % difference that rounds across a step. On `pours` the signal step is 2 higher, where the owner's line allows 1, for a plane loss of 2.3 % against 3.5 %, which also rounds across a step.
 
+### With PK19 and PK20 (round 2, 2026-11-24)
+
+On the owner's "כן, לשנות" (PK19 and PK20, merged as #119), ZR3 was measured again on a local scratch branch that holds this branch and #119's rule; it is not for pushing. Release builds at W 2 and at W 4 (`--x.zones_cut=4,4,8`, a second setting chosen by the supervisor session to check W 2 on all five boards), x22, one call per board and weight at effort M, each in its own routing hold, with `routing.rank_key: "pours"` in a scratch user config: 10 calls, all `complete`, all ranked by `pours` from the user config. Both keys replay exactly on every judged run of every call, and part 2's criteria hold on all ten.
+
+| Board (W 2) | Winner | As-exported runs complete (G1) | Fill pieces | Main piece's share | Plane loss | Ground track, mm | Spokes lost | Starved pins | Copper quality | Signal against today's key's choice |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dash | omitted | none judged | 29 | 0.90 | 0.254 | 375 | - | 0 | 61.1 | -0.8 % |
+| B5 | **as exported** | 6 of 6 | 12 | 0.95 | 0.030 | 9.7 | 16 | 0 | 59.6 | +6.5 % |
+| `pic` | **as exported** | 16 of 24 | 1 | 1.0 | 0.011 | 4.7 | 0 | 0 | 65.7 | +3.0 % |
+| `ecc` | **as exported** | 728 of 728 | 1 | 1.0 | 0.0017 | 0 | 0 | 0 | 90.4 | the same run |
+| `pours` | **as exported** | 601 of 601 | 3 | 0.99 | 0.035 | 0 | 2 | 0 | 83.1 | +1.9 % |
+
+- **The W 2 winners are the offline replay's on all five boards** (the zr4-zr5 session's replay of #119's rule on these builds).
+- **B5: met.** Pours as planes win, with 9.7 mm of ground track against 316 mm for today's key's choice (229 mm after the ground-via prune), near the owner's hand routing's 9.5 mm, for 6.5 % more signal, which the approved rule accepts. Its copper quality is 2.4 points lower than that choice's.
+- **dash stays pours omitted.** At W 2 no as-exported run is judged in the budget at effort M; at W 4 the one judged has 2 acute angles, which the key reads before any pour entry. Its winner has 4 right angles and copper quality 61.1 against 65.2 for today's key's choice, which has more plane loss (0.289) and ground track (437 mm).
+- **No winner has a starved pin.** The as-exported runs with one (1 on B5, 2 on `pic` at W 2) never win.
+- **W 4 confirms W 2.** `pic`'s as-exported runs are complete 5 of 19 at W 4 against 16 of 24 at W 2. B5's winner is not better at W 4 (ground track 11.1 mm, 17 spokes lost). `pic`'s is a little better (plane loss 0.005, ground track 2.0 mm, copper quality 67.7). `ecc` and `pours` move by at most a step, and dash does not change.
+- **Today's key's choice** on dash and B5 is the run with x19's delivered numbers (Row GS's final measurement: dash 1702.2 mm and B5 762.5 mm of signal; ground track 437 and 316 mm).
+
+Records: `target/creation-research/zone-routing/zr3/combined/` (`README-track.md`, `runs-track/`, `track-combined.json`, `track-shapes.json`, `track-replay.jsonl`).
+
 ### Limits
 
 - **The model misses some starved pins KiCad sees.** In the starved runs above the model's `spokes` and starved count are clean while KiCad's DRC is not. One of them had a spoke track the closing stage added, which KiCad does not count. A model-against-KiCad check of the spokes, like ZR1's of the pads, would find out which spokes differ.
