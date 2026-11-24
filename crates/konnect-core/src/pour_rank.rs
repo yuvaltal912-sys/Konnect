@@ -13,8 +13,8 @@ use crate::route_judge::{Gates, Judged, Key, Measures};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-/// The step of the plane loss in the pour key (PK4): 5 % of the planes' area.
-pub(crate) const PLANE_STEP: f64 = 0.05;
+/// The step of the plane loss in the pour key (PK4, PK20): 2.5 % of the planes' area.
+pub(crate) const PLANE_STEP: f64 = 0.025;
 
 /// The step of the area loss in the pour key (PK6): 1 % of the pour copper.
 pub(crate) const AREA_STEP: f64 = 0.01;

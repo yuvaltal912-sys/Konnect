@@ -1756,7 +1756,7 @@ fn the_full_judges_comparison_follows_the_mode() {
     assert_eq!(
         full_judge_refusal(&original, &cut, RankMode::Pours),
         Some(
-            "the pruned session's rank key is above the original's at position 8 (2 > 0)"
+            "the pruned session's rank key is above the original's at position 8 (4 > 0)"
                 .to_string()
         )
     );

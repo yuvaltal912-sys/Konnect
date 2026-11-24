@@ -111,14 +111,14 @@ Part 1 fixes what is measured. Part 2's steps and places are fixed here as the c
 and the replay computes that candidate, and any other, from part 1's rows on ZR3's runs
 before a line of part 2 is built.
 
-## Decisions (the code cites them as PK1 to PK19)
+## Decisions (the code cites them as PK1 to PK20)
 
 | # | Decision | Reason |
 |---|---|---|
 | PK1 | Today's key is not changed: `Key`, `KEY_LEN`, `KEY_QUALITY`, and every value `rank` and `rank_measures` return. The pour key is a second key beside it | Z10. "Off" is then today's ranking exactly, every existing test of the key keeps guarding it, and the replay checks it on every recorded run |
 | PK2 | The pour key is today's thirteen entries in today's order, with four added: pour faults and the plane-loss step before the lengths; the area-loss step and the pour-track step after the vias. No existing entry changes its meaning | One standard for a board with pours and a board without: with no pour net the four are 0, so the order is today's. The existing entries are a measured order (D12), and inserting leaves their order among themselves intact |
 | PK3 | Pour damage is measured against KiCad's own fill of the board before it was routed (the judge's baseline, refilled by kicad-cli). Only copper that is connected counts: a piece KiCad saved as an island is not fill | The fill before routing is what the routing had to keep. A zone that is two pieces by design costs nothing. KiCad's refill is the truth of the row (P1). An island that a zone's own rule keeps (`(island yes)`) touches nothing of its net, so it is no plane |
-| PK4 | **Plane loss.** For each pour net: its plane before routing is its largest piece on any one layer; what is kept is its largest piece on any one layer after routing (on a layer, never more than that layer's largest piece before). The loss is the area no longer kept over the area of all the nets' planes, a share from 0 to 1. In the key it is stepped at 5 % | The checklist's "keep one side largely continuous": one whole reference plane is what a return path needs, so the best single layer counts. One number sees a split (the largest piece shrinks to a part) and a slot or a lost island (it loses area). Weighted by area, because with equal weights a 30 mm² local pour cut by one track would count like a fifth of the ground plane (the review). By area and not by each layer's ratio, so that a small layer that stayed whole cannot hide a plane that was destroyed |
+| PK4 | **Plane loss.** For each pour net: its plane before routing is its largest piece on any one layer; what is kept is its largest piece on any one layer after routing (on a layer, never more than that layer's largest piece before). The loss is the area no longer kept over the area of all the nets' planes, a share from 0 to 1. In the key it is stepped at 2.5 % since PK20 (2026-11-24; first built at 5 %) | The checklist's "keep one side largely continuous": one whole reference plane is what a return path needs, so the best single layer counts. One number sees a split (the largest piece shrinks to a part) and a slot or a lost island (it loses area). Weighted by area, because with equal weights a 30 mm² local pour cut by one track would count like a fifth of the ground plane (the review). By area and not by each layer's ratio, so that a small layer that stayed whole cannot hide a plane that was destroyed |
 | PK5 | **Pour faults** are KiCad's `starved_thermal` violations on the judged board plus the pour layers that had fill before routing and have none after. One entry, a count, before the plane loss | Each is a spot where a pour stopped doing its job. KiCad calls a starved thermal an error by default. Gate G2 only holds it to the unrouted board's count, and ZR2's matrix has a winner with one more than other runs |
 | PK6 | **Area loss** is the pour copper that is gone: 1 minus the fill area after routing over the fill area before, over every pour layer. In the key it is stepped at 1 %, after the vias. The pieces stay recorded (ZR0) and are not ranked | KiCad deletes a cut-off piece unless something of its net sits on it (`zone_filler.cpp:944`). So of two runs that cut the plane alike, the one whose cut-off piece is kept alive by a ground pad or via has one piece more and more copper. A piece count would rank it worse; the area ranks it better, which is also what the prune holds (P5(d): losing a via-fed island is harm). The first design ranked extra pieces; the review found this |
 | PK7 | **The pour-track step** is the track length on pour nets in units of a share of the shortest signal length of the pool. *Its place and step are PK19's since 2026-11-24 (before the lengths, 5 %); first built as the last of the four, before the copper quality, at 2 % (`LENGTH_STEP`).* Vias on pour nets are not in the key | A ground track that the pour already connects is copper the board does not need, as the owner's own rule says of ground vias (ZR0b). Under a pour it harms nothing electrically, so it breaks ties and never outranks a signal measure. The unit is the signal length because a board's own scale is the fair one and stubs of a few mm then tie. Ground vias are the prune's: it removes the redundant ones from the winner, so a count before the prune would rank vias that are not delivered |
@@ -134,6 +134,7 @@ before a line of part 2 is built.
 | PK17 | Two PRs: the record first, the key after ZR3's numbers | The owner's order. It also lets numbers confirm the key's open values before they are code |
 | PK18 | The record carries its rows: the "before" rows in the baseline and the "after" rows in each run, beside the numbers made from them | So that a second computation can redo every number, and so that another step, place or sum can be tried on recorded runs without a new measurement (the review: totals alone cannot be checked) |
 | PK19 | **The pour-track step moves before the lengths, in steps of 5 %** (the owner's rule change, 2026-11-24). It is now the third of the pour entries, right after the plane-loss step and before the signal length step, and its unit is 5 % of the pool's shortest signal length instead of 2 %. This replaces PK7's place and step; nothing else in the key changes | The replay on the recorded runs ("The ground track before the lengths", below): with the track after the vias, B5 keeps a run whose pours were omitted from the engine and that carries 229 mm of ground track; with it before the lengths at 5 %, B5 wins with its pours as planes, 10 mm of ground track and a plane loss of 3.0 % instead of 3.6 %, at 3 signal steps more (about 6 %). The other four boards keep their winners. The owner was shown that cost and chose the change ("כן, לשנות") |
+| PK20 | **The plane-loss step is 2.5 %** (was 5 %; the owner's decision, 2026-11-24, "כן, 2.5 %"). Its place (entry 8) and its rounding stay | Quality first, his standing rule: offline on the combined runs the 2.5 % step picks better winners on `pours` and `pic` and the same winner on B5, dash and `ecc`. On `pours` that winner has no ground track, a copper quality 3.8 points higher and a slightly shorter signal, for 1.1 % more plane loss. Record: `zr5-part2-candidate/QUALITY.md` in the supervisor's notes folder |
 
 **One measure in two places is a weighting, not a double count.** Starved thermals are also
 held by gate G2 and by the prune's clause (b); the audit's checks 3.1 to 3.4 read planes
@@ -397,7 +398,7 @@ Records: `target/creation-research/zone-routing/zr5/part1/measure/` in the main 
 | 5 | KiCad's own length and skew violations | today 5 |
 | 6 | Acute corners | today 6 |
 | **7** | **Pour faults**: starved thermals plus lost fills | new (PK5) |
-| **8** | **Plane-loss step**: `round(plane_loss / 0.05)` | new (PK4) |
+| **8** | **Plane-loss step**: `round(plane_loss / 0.025)` | new (PK4, PK20) |
 | **9** | **Pour-track step**: `round(pour_track_mm / shortest signal / 0.05)` | new (PK7, PK19) |
 | 10 | Signal length step | today 7 |
 | 11 | Power length step | today 8 |
@@ -410,7 +411,7 @@ Records: `target/creation-research/zone-routing/zr5/part1/measure/` in the main 
 - **The layout since PK19 (2026-11-24).** Built first with the pour-track step at entry 14 in 2 % steps and the four today's entries at 9 to 12; the owner's rule change put the track at 9, in 5 % steps, and moved them to 10 to 13. Part 2's records below were made with the first layout.
 - **The pool is today's.** The shortest signal length of entry 9 is the one today's entry 7
   steps against: among the runs in the pool that pass G1, else the pool, else every run.
-  When no run of it has signal track, entry 14 is 0 for all.
+  When no run of it has signal track, entry 9 is 0 for all.
 - **Four open values:** the two steps (5 % and 1 %) and the two places (before the lengths,
   after the vias). They are the candidate. Part 2 is built now with these four, the switch
   off: asked "לבנות כבר עכשיו את ZR5 חלק 2, עם המתג כבוי?", the owner said "כן"
@@ -638,6 +639,17 @@ both as the replay recorded them.
   trade-offs to judge on quality, not as failures.
 - It applies to the pour key's ranking and to any rule or value the replay judges.
 
+**The plane-loss step at 2.5 % (PK20, 2026-11-24).** Asked "לשנות את מדרגת אובדן המישור
+ל-2.5 %? כן, או להשאיר 5 %", the owner said "כן, 2.5 %" (relayed verbatim by the
+supervisor session). The reason is his standing rule, quality first. Offline, on the
+combined runs, the 2.5 % step picks better winners on `pours` and `pic` and the same winner
+on B5, dash and `ecc`. On `pours` that winner has no ground track, a copper quality 3.8
+points higher and a slightly shorter signal, for 1.1 % more plane loss. Record:
+`zr5-part2-candidate/QUALITY.md` in the supervisor's notes folder. The change:
+`pour_rank::PLANE_STEP = 0.025`; the place (entry 8), the rounding (half away from zero)
+and everything else stay. Its test: a 3.5 % loss and a 2.3 % loss both give step 1 (1.4
+and 0.92); at 5 % they would give 1 and 0, so the old step fails the test.
+
 **The change (PK19), nothing else:**
 - `pour_rank::POUR_TRACK` is entry 9; `TODAY_AT` puts today's entries 7 to 10 at 10 to 13
   (11 and 12 stay at 15 and 16); `AREA_LOSS` is entry 14. `POUR_FAULTS` (7) and
@@ -697,7 +709,7 @@ then. It is a PR of its own, and its text goes to him like any other.
 - **Placement.** PK13.
 - **Candidate pour divisions.** PK16.
 - **A slot that neither splits the plane nor takes much area.** A long thin slot under a
-  fast signal costs little plane area and stays below a 5 % step. The audit's check 3.1
+  fast signal costs little plane area and stays below a 2.5 % step (PK20). The audit's check 3.1
   (a reference plane under critical routes) reads that, inside the copper quality.
 - **Pieces before KiCad's island rule,** which is what the engine's guard counts (Z17). It
   would take one more refill a run with the rule off. The area loss sees the same cut from

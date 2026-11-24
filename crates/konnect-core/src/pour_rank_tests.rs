@@ -334,7 +334,7 @@ fn the_track_ranks_before_the_lengths() {
 fn the_track_still_ranks_after_the_plane_step() {
     let mut a = with_pours(measures(), pours(0, 0, 0.0, 0.0));
     a.pour_track_mm = 5.0;
-    let b = with_pours(measures(), pours(0, 0, 0.05, 0.0));
+    let b = with_pours(measures(), pours(0, 0, 0.025, 0.0)); // one 2.5 % step (PK20)
     let keys = keys_of(&[a, b]);
     assert_eq!(
         (keys[0][PLANE_LOSS], keys[1][PLANE_LOSS]),
@@ -361,11 +361,11 @@ fn today_of(runs: &[Measures]) -> Vec<Key> {
 #[test]
 fn the_two_steps_round_half_away_from_zero() {
     assert_eq!(plane_step(0.0), 0);
-    assert_eq!(plane_step(0.024), 0);
-    assert_eq!(plane_step(0.025), 1);
-    assert_eq!(plane_step(0.074), 1);
-    assert_eq!(plane_step(0.076), 2);
-    assert_eq!(plane_step(1.0), 20);
+    assert_eq!(plane_step(0.012), 0);
+    assert_eq!(plane_step(0.0125), 1);
+    assert_eq!(plane_step(0.037), 1);
+    assert_eq!(plane_step(0.038), 2);
+    assert_eq!(plane_step(1.0), 40);
     assert_eq!(area_step(0.004), 0);
     assert_eq!(area_step(0.005), 1);
     assert_eq!(area_step(1.0), 100);
@@ -378,7 +378,22 @@ fn the_two_steps_round_half_away_from_zero() {
     assert_eq!(area_step(-0.0), 0);
     // The key reads the steps.
     let keys = keys_of(&[with_pours(measures(), pours(0, 0, 0.076, 0.005))]);
-    assert_eq!((keys[0][PLANE_LOSS], keys[0][AREA_LOSS]), (2, 1));
+    assert_eq!((keys[0][PLANE_LOSS], keys[0][AREA_LOSS]), (3, 1));
+}
+
+/// PK20: the plane-loss step is 2.5 % of the planes' area, half away from zero: a 3.5 %
+/// loss and a 2.3 % loss are both one step (1.4 and 0.92). Control: the old 5 % step gives
+/// 1 and 0.
+#[test]
+fn the_plane_step_is_two_and_a_half_percent() {
+    assert_eq!(PLANE_STEP, 0.025);
+    assert_eq!(plane_step(0.035), 1);
+    assert_eq!(plane_step(0.023), 1);
+    let keys = keys_of(&[
+        with_pours(measures(), pours(0, 0, 0.035, 0.0)),
+        with_pours(measures(), pours(0, 0, 0.023, 0.0)),
+    ]);
+    assert_eq!((keys[0][PLANE_LOSS], keys[1][PLANE_LOSS]), (1, 1));
 }
 
 // ─── The pour track is in signal units ───────────────────────────────────────

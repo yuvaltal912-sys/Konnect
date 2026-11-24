@@ -3,10 +3,14 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
-## Unreleased: the ground track before the lengths in the pour key (Row ZR, stage ZR5, PK19)
+## Unreleased: the ground track before the lengths, and the plane loss in 2.5 % steps, in the pour key (Row ZR, stage ZR5, PK19 and PK20)
 
-The layout of `pour_key` changes; `key` and the default `routing.rank_key` (`routing`)
-do not. Design: PK19 in `docs/POUR_RANK_DESIGN.md`. No argument changes.
+The layout of `pour_key` and one of its steps change; `key` and the default
+`routing.rank_key` (`routing`) do not. Design: PK19 and PK20 in
+`docs/POUR_RANK_DESIGN.md`. No argument changes.
+
+- **The plane-loss step (entry 8) is 2.5 %** of the planes' area (was 5 %), rounded half
+  away from zero as before.
 
 - **The pour-track step is entry 9** (was 14), right after the plane-loss step and
   before the signal length step, and it steps in 5 % of the pool's shortest signal
