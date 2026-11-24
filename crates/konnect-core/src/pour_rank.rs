@@ -19,22 +19,26 @@ pub(crate) const PLANE_STEP: f64 = 0.05;
 /// The step of the area loss in the pour key (PK6): 1 % of the pour copper.
 pub(crate) const AREA_STEP: f64 = 0.01;
 
+/// The step of the pour track in the pour key (PK19): 5 % of the pool's shortest signal
+/// length.
+pub(crate) const POUR_TRACK_STEP: f64 = 0.05;
+
 /// The length of the pour key: today's thirteen entries and four more (PK2).
 pub(crate) const POUR_KEY_LEN: usize = 17;
 
 /// A run's pour key; the least is the best. Entries 0 to 6 are today's 0 to 6 (the four
-/// gates, the intent's length miss, KiCad's own length violations, acute corners); 9 to
-/// 12 are today's 7 to 10 (the signal and power length steps, right angles, vias off the
+/// gates, the intent's length miss, KiCad's own length violations, acute corners); 10 to
+/// 13 are today's 7 to 10 (the signal and power length steps, right angles, vias off the
 /// pour nets); 15 and 16 are today's 11 and 12 (minus copper quality, the route seconds).
-/// The four others are [`POUR_FAULTS`], [`PLANE_LOSS`], [`AREA_LOSS`] and
-/// [`POUR_TRACK`].
+/// The four others are [`POUR_FAULTS`] (7), [`PLANE_LOSS`] (8), [`POUR_TRACK`] (9) and
+/// [`AREA_LOSS`] (14).
 pub(crate) type PourKey = [i64; POUR_KEY_LEN];
 
 /// Where each of today's thirteen entries (`route_judge::Key`, in its order) sits in the
-/// pour key (PK2): 0 to 6, then 9 to 12, then 15 and 16. Inserting keeps their order
-/// among themselves.
+/// pour key (PK2, PK19): 0 to 6, then 10 to 13, then 15 and 16. Inserting keeps their
+/// order among themselves.
 pub(crate) const TODAY_AT: [usize; crate::route_judge::KEY_LEN] =
-    [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 15, 16];
+    [0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 15, 16];
 
 /// Entry 7: KiCad's `starved_thermal` violations on the judged board plus the damage's
 /// `lost_fills` (PK5).
@@ -43,11 +47,12 @@ pub(crate) const POUR_FAULTS: usize = 7;
 /// Entry 8: [`plane_step`] of the damage's `plane_loss` (PK4).
 pub(crate) const PLANE_LOSS: usize = 8;
 
-/// Entry 13: [`area_step`] of the damage's `area_loss` (PK6).
-pub(crate) const AREA_LOSS: usize = 13;
+/// Entry 9: [`pour_track_step`] of the run's track length on pour nets (PK7, PK19): after
+/// the plane-loss step, before the signal length step.
+pub(crate) const POUR_TRACK: usize = 9;
 
-/// Entry 14: [`pour_track_step`] of the run's track length on pour nets (PK7).
-pub(crate) const POUR_TRACK: usize = 14;
+/// Entry 14: [`area_step`] of the damage's `area_loss` (PK6).
+pub(crate) const AREA_LOSS: usize = 14;
 
 // ─── The pour key ────────────────────────────────────────────────────────────
 
@@ -58,7 +63,7 @@ pub(crate) fn plane_step(plane_loss: f64) -> i64 {
     share_step(plane_loss, PLANE_STEP)
 }
 
-/// [`PourKey`]'s entry 13 for an area loss: `(area_loss / AREA_STEP).round()`, with the
+/// [`PourKey`]'s entry 14 for an area loss: `(area_loss / AREA_STEP).round()`, with the
 /// same rule for a loss that is not a finite number of 0 or more.
 pub(crate) fn area_step(area_loss: f64) -> i64 {
     share_step(area_loss, AREA_STEP)
@@ -74,19 +79,24 @@ fn share_step(share: f64, step: f64) -> i64 {
     }
 }
 
-/// [`PourKey`]'s entry 14: the track length on pour nets in units of
-/// `route_judge::LENGTH_STEP` of the pool's shortest signal length:
-/// `(pour_track_mm / shortest_signal_mm / LENGTH_STEP).round()`. 0 when the run has no
-/// track on a pour net, and 0 when the pool has no signal length to scale by (`None`): a
-/// step with no unit cannot rank.
+/// [`PourKey`]'s entry 9 (PK19): the track length on pour nets in units of
+/// [`POUR_TRACK_STEP`] of the pool's shortest signal length:
+/// `(pour_track_mm / shortest_signal_mm / POUR_TRACK_STEP).round()`, half away from zero.
+/// 0 when the run has no track on a pour net, and 0 when the pool has no signal length to
+/// scale by (`None`): a step with no unit cannot rank.
 pub(crate) fn pour_track_step(pour_track_mm: f64, shortest_signal_mm: Option<f64>) -> i64 {
-    crate::route_judge::length_step(pour_track_mm, shortest_signal_mm)
+    match shortest_signal_mm {
+        Some(shortest) if pour_track_mm > 0.0 => {
+            (pour_track_mm / shortest / POUR_TRACK_STEP).round() as i64
+        }
+        _ => 0,
+    }
 }
 
 /// The pour key of every run at once (the length steps need the pool), in `runs`' order.
 /// `runs` is what `route_judge::rank_measures` takes: the measures, the gates, and
 /// whether the run is in the pool.
-/// - Entries 0 to 6, 9 to 12, 15 and 16 are the entries of
+/// - Entries 0 to 6, 10 to 13, 15 and 16 are the entries of
 ///   `route_judge::rank_measures(runs)` (see [`PourKey`]), unchanged.
 /// - Entries [`POUR_FAULTS`], [`PLANE_LOSS`] and [`AREA_LOSS`], from the run's pour
 ///   measures (`Measures::pours`) and their `damage` (part 1's record):
@@ -103,8 +113,8 @@ pub(crate) fn pour_track_step(pour_track_mm: f64, shortest_signal_mm: Option<f64
 /// - Entry [`POUR_TRACK`]: [`pour_track_step`] of `Measures::pour_track_mm`, against the
 ///   shortest signal length of the same pool that `rank_measures` steps the signal length
 ///   against (the runs in the pool that pass G1, else the pool, else every run;
-///   `route_judge::shortest_length` and `route_judge::length_step`, the two helpers both
-///   keys call).
+///   `route_judge::shortest_length`, which both keys call), in its own step
+///   ([`POUR_TRACK_STEP`], PK19).
 ///
 /// With no pour net in the call the four entries are 0 for every run, so the pour key
 /// orders the runs exactly as today's key does, ties included (PK2).

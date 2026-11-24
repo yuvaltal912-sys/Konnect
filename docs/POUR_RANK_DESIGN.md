@@ -503,7 +503,9 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
 - **The line the owner is shown for each board:** the pour key's winner has no more pour
   faults, no higher plane-loss step and no higher area-loss step than today's winner, and
   its signal step is at most one above. Where a board does not hold that, the table says
-  which entry and by how much. The word is his.
+  which entry and by how much. The word is his. Since 2026-11-24 the line is information,
+  judged under his standing rule (quality before track length; see "His standing rule"
+  under "The ground track before the lengths"), not a limit.
 - **Part 2's own criteria, fixed now:**
   - with the default mode a call's winner is the least of the recorded `key`s;
   - with `pours` in a scratch user config a call's winner is the least of the recorded
@@ -587,8 +589,10 @@ today's key puts first, on the same boards). This is information, not a criterio
 line is judged on ZR3's runs.
 
 - B5 and `ecc`: holds.
-- dash: the area-loss step is 1 higher, and the signal step 2 higher (the line allows 1).
+- dash: the area-loss step is 1 higher, and the signal step 2 higher (the line says 1).
   The plane-loss step is lower.
+- Read since 2026-11-24 under his standing rule (quality before track length): these are
+  trade-offs to judge on quality, not failures.
 - `pic`: the area-loss step is 1 higher. The plane-loss step is lower.
 - `pours`: the signal step is 2 higher. The plane-loss step is lower.
 
@@ -613,7 +617,7 @@ beside it.
 | Rule | B5 on the combined runs | The other four boards |
 |---|---|---|
 | As merged: after the vias, 2 % | pours omitted; plane loss 3.6 %; ground track 229 mm; signal step ±0 | — |
-| **Before the lengths, 5 % (chosen)** | pours as planes; 3.0 %; 10 mm; **+3** (the owner's one-step line breaks) | the winners as merged |
+| **Before the lengths, 5 % (chosen)** | pours as planes; 3.0 %; 10 mm; **+3** (over the one-step line, which is information) | the winners as merged |
 | Before the lengths, 1 % or 2 % | pours as planes; 3.5 %; 4 mm; +5 | `pours` +4 at 1 % |
 | After the signal step, any step | as merged | as merged |
 
@@ -622,6 +626,17 @@ beside it.
 "כן, לשנות" (2026-11-24, relayed verbatim by the supervisor session). His yes accepts B5's
 +3. It says nothing about dash's area +1 or `pours`' signal +2; the rule change leaves
 both as the replay recorded them.
+
+**His standing rule (2026-11-24).** "המטרה המרכזית היא איכות. אם המסלולים טיפה מתארכים
+והאיכות הכללית משתפרת זה עדיף" (relayed verbatim by the supervisor session). What it means:
+
+- The one-step signal line is no longer a hard limit. It stays as information.
+- A pour key's winner with slightly longer signals is preferred when its overall quality is
+  better: pour faults, plane and area loss, the ground track, and his layout checklist (for
+  example 3.2, layer changes, and 4.1, decoupling loops).
+- The replay's departures from the line on dash (area +1) and `pours` (signal +2) read as
+  trade-offs to judge on quality, not as failures.
+- It applies to the pour key's ranking and to any rule or value the replay judges.
 
 **The change (PK19), nothing else:**
 - `pour_rank::POUR_TRACK` is entry 9; `TODAY_AT` puts today's entries 7 to 10 at 10 to 13

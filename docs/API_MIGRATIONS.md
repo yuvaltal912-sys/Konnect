@@ -3,6 +3,21 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the ground track before the lengths in the pour key (Row ZR, stage ZR5, PK19)
+
+The layout of `pour_key` changes; `key` and the default `routing.rank_key` (`routing`)
+do not. Design: PK19 in `docs/POUR_RANK_DESIGN.md`. No argument changes.
+
+- **The pour-track step is entry 9** (was 14), right after the plane-loss step and
+  before the signal length step, and it steps in 5 % of the pool's shortest signal
+  length (was 2 %).
+- **Today's entries 7 to 10 move to 10 to 13** (were 9 to 12); the area-loss step is
+  entry 14 (was 13). Pour faults (7), the plane-loss step (8), and entries 0 to 6, 15
+  and 16 stay.
+- **A reader of `pour_key` by index** follows: under `pours` the ground-via prune's
+  refusal for a longer signal step is `key:10` (was `key:9`), and a longer pour track is
+  `key:9` (was `key:14`). A `pour_key` recorded before this change uses the old layout.
+
 ## Unreleased: the pour key and `routing.rank_key` (Row ZR, stage ZR5, part 2)
 
 `route_specctra_dsn` (fastroute) computes a second rank key for every judged run, and a
