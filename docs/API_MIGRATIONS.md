@@ -3,6 +3,32 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the pour key and `routing.rank_key` (Row ZR, stage ZR5, part 2)
+
+`route_specctra_dsn` (fastroute) computes a second rank key for every judged run, and a
+user-config setting says which key ranks. Design: `docs/POUR_RANK_DESIGN.md`, part 2. No
+argument changes; nothing is removed or renamed.
+
+- **New user-config key `routing.rank_key`**: `"routing"` (today's key, the default) or
+  `"pours"` (the pour key). There is no tool argument. With it absent or `routing`,
+  every ranking is today's, exactly.
+- **The user config is read on every fastroute call.** Before, a call that passed both
+  `effort` and `fastroute_path` did not read it. Now a config file that does not parse,
+  a `routing` that is not an object, or a `routing.rank_key` that is not one of the two
+  names refuses the call (`invalid_configuration`, naming the file), before anything
+  is made. A bad value of another key still refuses only the calls that read that key.
+  The routing calls of `plan_convergent_placement` rank by today's key and do not read
+  the setting.
+- **New fields.** `pour_key` (17 whole numbers) beside `key` in every judged run's
+  `run.json`, in `search.winner`, and in `search.pour_prune.before`. `search.rank` in
+  the result and in `search.json`: `ranked_by` (`routing` or `pours`), `source`
+  (`user_config`, `default` or `fixed`), `other_key`, `other_winner` (the index of the
+  run the other key puts first among this call's judged runs, `null` when none was
+  judged) and `same_winner`.
+- **What `pours` changes:** which run wins, which judged runs keep their files, which
+  tuned candidate a run keeps, and the key the ground-via prune compares. The engine's
+  input does not change.
+
 ## Unreleased: the winner's redundant ground vias are removed (Row ZR, stage ZR0b)
 
 `route_specctra_dsn` (fastroute) removes, from the winning session only, the vias of

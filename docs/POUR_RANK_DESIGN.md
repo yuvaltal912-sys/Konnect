@@ -286,9 +286,11 @@ a board, each in its own routing hold, under the lane locks.
   steps against: among the runs in the pool that pass G1, else the pool, else every run.
   When no run of it has signal track, entry 14 is 0 for all.
 - **Four open values:** the two steps (5 % and 1 %) and the two places (before the lengths,
-  after the vias). They are the candidate. Before part 2 is built the replay computes the
-  candidate key from part 1's rows on ZR3's runs, and the table below goes to the owner.
-  If his boards show a value wrong, this text is changed first.
+  after the vias). They are the candidate. Part 2 is built now with these four, the switch
+  off: asked "לבנות כבר עכשיו את ZR5 חלק 2, עם המתג כבוי?", the owner said "כן"
+  (2026-11-23, relayed verbatim by the supervisor session). After ZR3's runs, the replay
+  computes the candidate key from part 1's rows on them, and the table below goes to the
+  owner. If his boards show a value wrong, only the values change.
 
 ### The setting, and what every call reports
 
@@ -365,9 +367,11 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
 
 ### Part 2: measurement and the switch
 
-- **Before part 2 is built:** on ZR3's runs, which carry part 1's record, the replay
-  computes the candidate key of every judged run. The table, one row a board: the winner by
-  each key, and for each its shape, the four gates, pour faults, each net's kept share and
+- **After ZR3's runs** (part 2 is built before them, switch off, on the owner's "כן" of
+  2026-11-23; see "Four open values"): on ZR3's runs, which carry part 1's record, the
+  replay computes the candidate key of every judged run. The table, one row a board: the
+  winner by each key, and for each its shape, the four gates, pour faults, each net's kept
+  share and
   layer, the area loss, the pour-track step, the signal step, the vias off the pour nets;
   and whether the two keys choose the same run.
 - **The line the owner is shown for each board:** the pour key's winner has no more pour
@@ -384,6 +388,43 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
   A scratch user config on macOS means a scratch `HOME`, which also moves fastroute's
   default place, so the call names the engine's path.
 - No step and no place is tuned to make a board pass.
+
+### Part 2 as built (2026-11-24)
+
+Branch `claude/zr5-pour-key-build`, which holds part 1's branch (and through it
+`fork/main` `e07ff839`). Built by Claude Opus 5.5; reviewed by an agent that did not write
+it (no must-fix; its items are taken below). The four values are the candidate's: 5 %,
+1 %, before the lengths, after the vias. The setting ships at `routing`.
+
+What differs from the skeleton and the tables above, each with its reason:
+
+- **The search's mode** comes from a required `Runner::rank()`, which the production
+  runner reads from its judge context. `SearchPlan` holds no judge context, and a
+  required method cannot fall to a default. `SearchOutcome` also keeps `rank`, which the
+  listing sorts by.
+- **The call's mode** is settled by `prepare_ranked_call`: `call_rank_at` of the user
+  config, then `prepare_call`. A refusal comes before the search folder is made.
+  `prepare_call` alone gives today's key, fixed (the tests' calls).
+- **The rank read refuses only what keeps it from reading `routing.rank_key`:** a file
+  that does not parse, a `routing` that is not an object, a value that names no mode.
+  A bad value of another key refuses only the calls that read that key (the review).
+  The refusal is `invalid_configuration` and names the file.
+- **`route_judge::tuned_choice`** is the tuned-board choice on its own, so that it has a
+  unit test. `pour_rank::TODAY_AT` holds today's thirteen places in the pour key.
+- **The prune's functions** (`refusals`, `prune_loop`, `full_judge_refusal`,
+  `keys_with`, `replace_winner`) take the mode as an argument; `prune_winner` passes
+  `ctx.rank`.
+- **`search.rank`** is also in `search.json` and in the no-winner result.
+  `same_winner` is `false` when the other key chose no run.
+
+Limits, written down:
+
+- That `judge_candidates` passes the call's mode to `tuned_choice` has no test of its
+  own: the judge's test harness has no pour record that splits the two keys.
+  `tuned_choice` itself is tested under both modes.
+- That `route_candidate` passes `CANDIDATE_RANK` is not tested through a routing call:
+  the user config's path comes from `HOME`. The constant's value is tested, as for
+  `CANDIDATE_PRUNE`.
 
 ## The skill's order of work (PK15; applied once ZR4 and ZR2 are merged)
 
@@ -423,7 +464,8 @@ then. It is a PR of its own, and its text goes to him like any other.
 1. **The order of the two parts.** Answered 2026-11-23: "כן, ZR5 קודם". The record merges
    before ZR3's measurement.
 2. **When is the pour key switched on?** Recommended: part 2 is built after ZR3's table,
-   ships off, and is switched on by a one-line change on his word.
+   ships off, and is switched on by a one-line change on his word. (The build's timing
+   was changed by him the same day: built now, switch off. See "For 2" below.)
 3. **When does the skill stop saying "pours last"** (the row's decision 5)? Recommended:
    when ZR4 and ZR2 are merged and ZR2's table shows the as-exported shape at 0 open
    before stitching.
@@ -435,7 +477,11 @@ then. It is a PR of its own, and its text goes to him like any other.
 shown them as: the pour key after ZR3's table, on his word; the skill's order once ZR4 and
 ZR2 are merged; candidate divisions as their own stage after the key is on.
 
-- For 2: part 2's build still starts on his word, and so does the switch after it.
+- For 2: part 2's build still starts on his word, and so does the switch after it. His
+  word on the build came the same day, before ZR3's table: asked "לבנות כבר עכשיו את ZR5
+  חלק 2, עם המתג כבוי?", he said "כן" (relayed verbatim by the supervisor session). So part
+  2 is built now with the four candidate values and ships with the switch at `routing`;
+  ZR3's table confirms the values or changes them, and the switch stays his word.
 - For 3: ZR2's final matrix already has the as-exported shape at 0 open before stitching on
   every run that passes the gates, on all five boards (the replay of its records). So the
   skill's change waits for the two merges only. It is a PR of its own; its text goes to him
