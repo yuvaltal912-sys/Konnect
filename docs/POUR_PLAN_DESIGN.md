@@ -500,6 +500,36 @@ the skeleton:
   were caught. One survives, in `supply_nets` (`||` to `&&`). No valid record can
   reach the case it changes (`zr4/mutants/RECORD.md`).
 
+**PP16 and PP17, as built (2026-11-24).** They were built from the section "After the
+measurement: PP16 and PP17", and an agent that did not write them reviewed them. It found
+no must-fix and four smaller items, all taken. What differs from that section's skeleton:
+
+- **One union-find.** To share `routing::pad_groups`' union-find without a copy,
+  `pad_groups` now delegates to a new `net_groups`. Its one pass also returns the group
+  and the layer of each fill ring of the net. `pads_unreached_by_fill` reads those.
+- **`ThermalStep`'s values.** A row records the first proposal's gap and bridge. The
+  skeleton gives one pair a row, but a proposal whose minimum width is above the step's
+  floor has a wider bridge.
+- **The tests' scripted fills** now cover the board's outline instead of a small square.
+  Under PP17 the small square left the fixture's pads unreached and would have started
+  a second fill in every older test.
+- **The real fill's second case** raises the minimum width through the design intent's
+  `fab_target.min_track_mm` (1.2 mm).
+- **The review's items:**
+  - the second step's spoke is described as the larger of 0.4 mm and the minimum width;
+  - the second fill's reason names the rise of starved thermals, not their total, and
+    leaves out a cause that is 0;
+  - no output string names a private board;
+  - the real fill's second case also asserts that no error rule other than
+    `starved_thermal` rose.
+- **Controls:** 97 in all, every one caught. Each PP16 and PP17 row has its own, and P15
+  and K2 were run again on the changed code.
+- **Mutants:** one narrow batch on PP16's and PP17's functions, 65 mutants. 51 were
+  caught, 4 were unviable and 10 were missed.
+  - 8 of the misses are outside the list: the regex also matched the audit's
+    `checklist`.
+  - The 2 in scope were caught after two added tests.
+
 ## Measured (2026-11-24)
 
 The design's "Measurement" was run once on the branch's release build (`f497868c`, the
@@ -555,6 +585,46 @@ their copper pours removed. None of them has a rule area. Counts only. Record:
 - PP15 was checked on a real KiCad fill: the ignored test
   `kicad_fills_inside_a_rule_area_that_lets_pours_in` ran on the public fixture with a
   rule area added, and passed. The ignored test `the_real_thing_fills_clean` passed too.
+
+### Measured again, with PP16 and PP17 (2026-11-24)
+
+The same measurement, run once more after PP16 and PP17 were built:
+- the release build of the gated tree (`86533009`, from `b0f47d4e`);
+- fresh scratch copies of the five boards;
+- fastroute x21 at effort M, each routing call in its own hold;
+- run after the zones session's combined measurement had finished.
+
+Record: `target/creation-research/zone-routing/zr4/measure2/`. Counts only. The first
+run's record above stays as it was.
+
+| Board | C1 | C2 | C3 | C4 | C5 | C6 |
+|---|---|---|---|---|---|---|
+| dash | holds | holds | holds | holds | holds | holds |
+| B5 | holds | holds | holds | holds | holds | holds |
+| `pic` | holds | holds | holds | holds | holds | holds |
+| `ecc` | holds | holds | holds | holds | holds | holds |
+| `pours` | holds | holds | holds | holds | holds | holds |
+
+- **C1 to C6 hold on all five boards.**
+- **B5 now plans `planned` and clean.** Its first fill had 2 starved thermals.
+  PP16's second fill, at a gap of 0.3 mm and a spoke of 0.4 mm, had 0 starved and 0
+  unreached pads, and it was kept. The proposals carry those values.
+- The other four boards kept their one fill at 0.5 mm and 0.5 mm, as PP16 expects. None
+  has an unreached pad.
+- KiCad's unconnected items on the ground net go to 0 on every board: from 69 (dash),
+  40 (B5), 39 (`pic`), 6 (`ecc`) and 11 (`pours`). On `pours`, 1 `isolated_copper`
+  warning rose, as before.
+- **C2 on B5** was compared with the kept fill's own report (`with-thermal-1`). The
+  measurement script first compared it with the first fill's report and showed the 2
+  starved thermals that the kept fill does not have. The script was corrected and the
+  comparison recomputed from the same files.
+- **C3:** every re-poured board routes `complete`, and its winner passes all four
+  gates. Against the reference (each board with its own pours), the winner with the
+  plan's pours had:
+  - fill pieces: 14 against 34 (dash), 9 against 13 (B5), 14 against 2 (`pic`), 2
+    against 1 (`ecc`), 2 against 2 (`pours`);
+  - starved thermals: 0 on every board (the reference on B5: 1).
+- The planner takes 1.2 to 3.1 s a board; B5's second fill costs about 1 s more.
 
 ## After the measurement: PP16 and PP17 (2026-11-24)
 
