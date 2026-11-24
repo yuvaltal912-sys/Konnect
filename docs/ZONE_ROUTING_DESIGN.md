@@ -2449,3 +2449,101 @@ fn teardrop_fill_id(fill_index: usize, layer: &str, ids: &BTreeSet<String>) -> S
   - the wider matrix (both keys, a 4-layer board, a placement call, Tune candidates);
   - stronger done criteria;
   - the build details.
+
+## ZR6 as built (2026-11-24)
+
+The owner approved the build verbatim, 2026-11-24: "כן, לבנות" (relayed by the
+supervisor). Built on branch `claude/zr6-stitch-build` from the design commit `17f028f7`,
+with main `b64e2f3c` (PK19 and PK20, #119) merged in before the tests ran, and main
+`e29d1fc3` (ZR4, #120) merged in after the mutants batch; the library tests, the guards
+and the doc counts ran again on that merge. Local, not pushed; the review, the full gate
+and the measurement are the supervisor's.
+
+### Decision by decision
+
+| # | As built | Where |
+|---|---|---|
+| S1 | `judge_one` runs the round after Z9's rounds and the audit, before the length probe, only when `JudgeContext::reference_stitch` is `On` and the audit's `3.2.unstitched_layer_changes` is above 0. Tune candidates go through `judge_one`, so each gets its own round | `route_judge.rs` |
+| S2 | `targets`: a 3.2 finding is a target when its `reference_nets` is one net of `net_roles.ground`; the others are skipped as `two_reference_nets`, `not_ground` (a power net, or no net), or `no_position` (a finding with no point, which the audit never writes). When fewer are listed than counted, `full_findings` audits the board again in-process with `max_findings: 500` | `pour_stitch.rs` |
+| S3 | `InProcessPlanner` calls `route_refine::plan_reference_stitching` (stitching, the targets' nets, radius = the largest limit, effort standard). `keep_reference_vias` keeps a target net's via within the target's limit plus 1 µm; every track and other via is dropped and counted | `pour_stitch.rs`, `tools/route_refine.rs` |
+| S4 | One round (`REFERENCE_ROUNDS` 1) in `<run dir>/s1` (the retry in `<run dir>/s1-retry`), project copied as a Z9 round. `check_board` takes the stitched board's DRC counts, fills, `measure`, pour record (from the first refill) and gates from judge_one's inputs (`RoundInputs`) | `pour_stitch.rs` |
+| S5 | `stitch_refusals`, every clause as designed, both keys through `pour_rank::ranking` and `entries_above` (so the merged PK19 and PK20 layout needs no change here). The retry: `named_vias` reads the refusing DRC entries' item positions (a position that is a vertex of a saved fill piece names the vias that reach that piece; any other names the vias within their radius plus `RETRY_REACH_MM` 0.5 mm) and, for `fill:<net>/<layer>`, the vias that reach that zone layer's fill on the post-Z9 board. No via named, or none left: `refused` | `pour_stitch.rs` |
+| S6 | `Judged::reference_stitch` (`StitchRecord`, in each `run.json`), `Judged::reference_checked` (in memory), `Measures::reference_vias` and `Measures::checklist` (`serde(default)`; `measure` fills `checklist` for every judged run). The record also lists the kept vias (`vias`: net, point, size, drill), which the delivery writes | `route_judge.rs`, `pour_stitch.rs` |
+| S7 | The round runs after Z9 and only adds copper; its rows are not in `Judged::rounds`. Z9 still calls the registry's `plan_route_refinement` with the strict profile | `route_judge.rs` |
+| S8 | `Profile::Strict` / `Profile::Lenient` in the planner's scene. Only `plan_reference_stitching` sets `Lenient`; `Options::read` (the registry tool, Z9) gives `Strict`. (i) A pad's local clearance is the larger of the pad's and its footprint's, kept per item (`Scene::local_clearance`, by pad UUID, read by `clearance_to` in `safe`); an unreadable value refuses the board. (ii) `zone_connect` and the thermal fields are accepted. (iii) A teardrop with no UUID gets `teardrop_fill_id` and no net. A padstack's per-layer override and any other zone with no UUID stay refused | `tools/route_refine_geometry.rs` |
+| S9 | `stitching` reads `m.params.get("stitch_via_max_mm")` in both places. The lenient entry sets the planner's own audit parameter `stitch_via_max_mm` to the round's radius (the findings' limit), so one limit holds for the judge's audit and the planner; the registry tool keeps the audit's defaults (3.0) | `tools/route_refine.rs` |
+| S10 | `deliver_winner` after the prune: the winner's kept vias, the manifest's via padstack (`manifest_padstack`: a round through via within 1 µm), `write_vias` (snapped to the session's units, appended to the net's block or a new one) into `stitched.ses`, the full judge of that session with the round off in `run-<i>-stitched`, `delivery_refusals` against the ranked state (S5 without `not_better`, plus `stitching` when 3.2 is higher), then `pour_prune::replace_winner` (keys again, the winner first). On any other outcome the written files go and the winner keeps `reference_vias`, which `judged_status`, the note (`judged_reference_note`) and `next_steps` (`reference_steps`) count as Z9's | `pour_stitch.rs`, `tools/route_fastroute.rs` |
+| S11 | The vias are written after the prune; `kicad_runs_of` adds the round's refills | `pour_prune.rs` |
+| S12 | The round's seconds are in its record; it runs in the judge lanes, inside the budget | `pour_stitch.rs` |
+| S13 | `ReferenceStitch` through `route_with_fastroute` (`Call::stitch`): `On` for `route_specctra_dsn`, `place_route::CANDIDATE_STITCH` `Off` for the placement tools; `prepare` and `prepare_call` give `Off` | `place_route.rs`, `tools/integration.rs`, `tools/route_fastroute.rs` |
+| S14 | `REFERENCE_ROUNDS` 1, `LENGTH_OFF_REFERENCE_TOLERANCE_MM` 0.1; the prune's `FILL_TOLERANCE_MM2`, `loops_worse` and `fill_by_zone_layer` (now `pub(crate)`) | `pour_stitch.rs`, `pour_prune.rs` |
+| S15 | The planner's own limits stand (2 or 4 layers, through vias, 5,000 tracks): its refusal is `planner_refused` with the reason. The Freerouting path is not judged and runs no round | |
+
+### Where the build differs from the skeleton, and why
+
+- `StitchRecord` has a `vias` list: the delivery needs the kept vias' points, and the
+  record is the one place a run keeps them; it also lets the replay and the user see
+  them.
+- The local clearance is a map in the scene keyed by item id, not a field of `Copper`:
+  the same rule, and no change to the 14 places that build a `Copper`.
+- `ToolCaller` gained `reference_planner()` (default: the in-process planner), so the
+  judge's tests script the planner as they script the audit; `judged_round` builds the
+  post-Z9 check and calls `reference_round`.
+- `zone_fill::fill_rings` (new) and `pour_prune::network` (now `pub(crate)`, with the
+  `network_out` block) are read by the retry and by `write_vias`.
+- The skipped reason `no_position` is added for a finding without a point.
+- Folded in on the owner's word ("כן, לעשות את שלושתם", 2026-11-24): `routing.rank_key`'s
+  default is `pours` (`pour_rank::DEFAULT_RANK_MODE`). The switch itself waits for his yes
+  on this PR's text; the matrix's routing-key calls now set `routing.rank_key: "routing"`.
+
+### Verification of the build
+
+Every cargo run went through the lanes (`light.sh` for pure tests and checks, `instr.sh`
+for tests that start the fake kicad-cli and for the mutants), with the build's own target
+folder. Records: `target/creation-research/zone-routing/zr6/` in the main checkout
+(`controls.jsonl`, `controls-*.log`, `mutants/`).
+
+- **Tests added:** 49 test functions (29 in `pour_stitch_tests.rs`, 13 judge-level ones in
+  `pour_stitch_judge_tests.rs` with the prune tests' fake kicad-cli and a scripted audit
+  and planner, 5 in `tools/route_refine_tests.rs`, 1 in the planner's geometry tests, 1 in
+  `tools/route_fastroute_tests.rs`), and the status scenario added to an existing
+  `route_fastroute` test. They cover every S5 clause and the retry, S2's filters and its
+  completeness check, S3's drop, S8's three acceptances and the refusals that stay, S9's
+  limit, a written session read back by the importer with the snap (the delivered
+  session's full judge parses it and its board holds the via), the delivery's fallback
+  and its status count, the placement switch off, and Z9 with the switch off.
+- **konnect-core library tests:** 4,976 passed, 0 failed, 66 ignored on `f321fd15` (base
+  `b64e2f3c`); 5,080 passed, 0 failed, 68 ignored on the merge with `e29d1fc3`, before and
+  after the default switch (`cargo test -p konnect-core --lib`, under `instr.lock`).
+- **The konnect crate's guards** (`cargo test -p konnect --test asset_references --test
+  schema_parameter_usage --test doc_tool_counts`): 12, 6 and 5 passed on the final tree.
+  `asset_references` first caught the skill's two new result fields as phantom tool names;
+  they are in its `NOT_TOOLS`. `cargo xtask fix-doc-counts`: "documentation already
+  current" (271 registered, 278 with the meta-tools, after ZR4).
+- **Clippy** `-D warnings` on `konnect-core --lib --tests`: clean. `cargo fmt --all --
+  --check`: clean.
+- **Negative controls:** 48 (C01 to C48), each a broken guard, its test run, at least one
+  test ran and failed, the file's own text written back: 48 caught. C48 is the default
+  rank key: with `routing` as the default, 3 of 3 of its tests fail.
+- **Mutants** (`cargo mutants`, in an isolated copy at `51b5c658`, in place, 8 shards under
+  `instr.lock`, the tests `pour_stitch`, `route_refine`, the judge-level ZR6 tests and the
+  status test): 179 mutants of `pour_stitch.rs`'s guards (`targets`,
+  `keep_reference_vias`, `serves`, `stitch_refusals`, `delivery_refusals`, `above`,
+  `pour_record_due`, `named_vias`, `manifest_padstack`, `write_vias`, `Round::steps`), the
+  S8 code in `route_refine_geometry.rs` and S9's lines in `route_refine.rs`: 156 caught,
+  21 missed, 2 unviable, 0 timeouts. Tests were added for the misses (commit `04040d12`),
+  and one batch of only the misses ran on that commit in a fresh copy: 21 caught, 2
+  missed. The two left are in S7's own code on S9's lines, not ZR6's change:
+  `route_refine.rs` `mask & span == *span` with `|` (differs only when a candidate's fill
+  layers exceed the change's reference layers, which needs four copper layers; the
+  planner's fixtures are two-layer) and `dist(*p, at) > limit` with `>=` (differs only for a
+  via exactly at the limit).
+
+**Not verified here:** the review of the diff, the full gate, and the measurement (done
+criteria 1 to 6) are the supervisor's. No KiCad ran: every refill was the fake kicad-cli,
+so S5 on real KiCad DRC, the retry on real `isolated_copper` positions, the lenient
+profile on the owner's boards, and the delivery's importer plan on a real board are
+unmeasured. A board with Tune candidates was not tested at unit level (each candidate goes
+through `judge_one`, which runs the round). The `next_steps` lines are tested directly;
+in the status test's fixture the result has no import steps, so their place in a full
+result is not.
