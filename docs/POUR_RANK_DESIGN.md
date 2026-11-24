@@ -133,7 +133,7 @@ before a line of part 2 is built.
 | PK16 | Ranking candidate pour divisions by routing each one is not in this stage | It can only rank with the pour key, which is off until the owner's word. The measures are built so that it can: damage is against each candidate's own fill before routing, and the plane loss is a share of plane area, so a pour that is added and stays whole lowers it |
 | PK17 | Two PRs: the record first, the key after ZR3's numbers | The owner's order. It also lets numbers confirm the key's open values before they are code |
 | PK18 | The record carries its rows: the "before" rows in the baseline and the "after" rows in each run, beside the numbers made from them | So that a second computation can redo every number, and so that another step, place or sum can be tried on recorded runs without a new measurement (the review: totals alone cannot be checked) |
-| PK19 | **The pour-track step moves before the lengths, in steps of 5 %** (the owner's rule change, 2026-11-24). It is now the third of the pour entries, right after the plane-loss step and before the signal length step, and its unit is 5 % of the pool's shortest signal length instead of 2 %. This replaces PK7's place and step; nothing else in the key changes | The replay on the recorded runs ("The ground track before the lengths", below): with the track after the vias, B5 keeps a run whose pours were omitted from the engine and that carries 229 mm of ground track; with it before the lengths at 5 %, B5 wins with its pours as planes, 10 mm of ground track and a plane loss of 3.0 % instead of 3.6 %, at 3 signal steps more (about 6 %). The other four boards keep their winners. The owner was shown that cost and chose the change ("כן, לשנות") |
+| PK19 | **The pour-track step moves before the lengths, in steps of 5 %** (the owner's rule change, 2026-11-24). It is now the third of the pour entries, right after the plane-loss step and before the signal length step, and its unit is 5 % of the pool's shortest signal length instead of 2 %. This replaces PK7's place and step; nothing else in the key changes | The replay on the recorded runs ("The ground track before the lengths", below): with the track after the vias, B5 keeps a run whose pours were omitted from the engine and that carries a long ground track; with it before the lengths at 5 %, B5 wins with its pours as planes, a far shorter ground track and a lower plane loss, at more signal steps (values in `zr5-part2-candidate/TRACK.md` in the supervisor's notes folder). The other four boards keep their winners. The owner was shown that cost and chose the change ("כן, לשנות") |
 | PK20 | **The plane-loss step is 2.5 %** (was 5 %; the owner's decision, 2026-11-24, "כן, 2.5 %"). Its place (entry 8) and its rounding stay | Quality first, his standing rule: offline on the combined runs the 2.5 % step picks better winners on `pours` and `pic` and the same winner on B5, dash and `ecc`. On `pours` that winner has no ground track, a copper quality 3.8 points higher and a slightly shorter signal, for 1.1 % more plane loss. Record: `zr5-part2-candidate/QUALITY.md` in the supervisor's notes folder |
 
 **One measure in two places is a weighting, not a double count.** Starved thermals are also
@@ -373,9 +373,9 @@ Every call ended `complete`. The judged runs: dash 3, B5 15, `pic` 74, `ecc` 1,3
   takes some copper.
 - **R4.** The design's replay (`design-replay/replay.py`, which reads `run.json` only)
   reproduces every recorded key, with the 2 % step. So the record changed no rank.
-- **M5, the judge's seconds a run** (median, this matrix against ZR2's): dash 3.47 and
-  3.65; B5 3.41 and 3.17; `pic` 1.63 and 1.63; `ecc` 0.53 and 0.54; `pours` 0.52 and
-  0.52. Recorded only. The record reads each judged board once more than before, and
+- **M5, the judge's seconds a run** (median, this matrix against ZR2's): `pic` 1.63 and
+  1.63; `ecc` 0.53 and 0.54; `pours` 0.52 and 0.52; dash's and B5's are in the record
+  below. Recorded only. The record reads each judged board once more than before, and
   the baseline once.
 
 Not measured:
@@ -614,22 +614,22 @@ Records: `target/creation-research/zone-routing/zr5/part2/measure/` in the main 
 **Why.** Part 2 was merged with the pour-track step last of the pour entries (PK7), so it
 only breaks ties after the lengths. The replay of the combined runs (ZR3 with the pour key
 on, the zones session's five calls) and of ZR3's 17 calls showed what that leaves on B5:
-the winner is a run whose pours were omitted from the engine, with 229 mm of track on the
-ground net, while runs with the pours given as planes route ground in 4 to 13 mm. Record:
+the winner is a run whose pours were omitted from the engine, with a long track on the
+ground net, while runs with the pours given as planes route ground in far less. Record:
 `zr5-part2-candidate/TRACK.md` in the supervisor's notes folder, and `track_variants.py`
 beside it.
 
 | Rule | B5 on the combined runs | The other four boards |
 |---|---|---|
-| As merged: after the vias, 2 % | pours omitted; plane loss 3.6 %; ground track 229 mm; signal step ±0 | — |
-| **Before the lengths, 5 % (chosen)** | pours as planes; 3.0 %; 10 mm; **+3** (over the one-step line, which is information) | the winners as merged |
-| Before the lengths, 1 % or 2 % | pours as planes; 3.5 %; 4 mm; +5 | `pours` +4 at 1 % |
+| As merged: after the vias, 2 % | pours omitted; plane loss the highest of the three; ground track the longest; the same signal step | — |
+| **Before the lengths, 5 % (chosen)** | pours as planes; plane loss the lowest; ground track short; **more signal steps** (over the one-step line, which is information) | the winners as merged |
+| Before the lengths, 1 % or 2 % | pours as planes; plane loss between the other two; ground track the shortest; the most signal steps | `pours` +4 at 1 % |
 | After the signal step, any step | as merged | as merged |
 
 **His decision.** Asked "לשנות את הכלל, כך שמסלול האדמה ייבדק לפני האורכים במדרגות של 5 %?
-כן, או להשאיר כמו שזה", with that table and B5's +3 in front of him, the owner said
+כן, או להשאיר כמו שזה", with that table and B5's longer signal in front of him, the owner said
 "כן, לשנות" (2026-11-24, relayed verbatim by the supervisor session). His yes accepts B5's
-+3. It says nothing about dash's area +1 or `pours`' signal +2; the rule change leaves
+longer signal. It says nothing about dash's higher area step or `pours`' signal +2; the rule change leaves
 both as the replay recorded them.
 
 **His standing rule (2026-11-24).** "המטרה המרכזית היא איכות. אם המסלולים טיפה מתארכים
@@ -639,7 +639,7 @@ both as the replay recorded them.
 - A pour key's winner with slightly longer signals is preferred when its overall quality is
   better: pour faults, plane and area loss, the ground track, and his layout checklist (for
   example 3.2, layer changes, and 4.1, decoupling loops).
-- The replay's departures from the line on dash (area +1) and `pours` (signal +2) read as
+- The replay's departures from the line on dash (a higher area step) and `pours` (signal +2) read as
   trade-offs to judge on quality, not as failures.
 - It applies to the pour key's ranking and to any rule or value the replay judges.
 
@@ -681,7 +681,7 @@ and 0.92); at 5 % they would give 1 and 0, so the old step fails the test.
 
 **Verification:**
 - The offline replay with the new layout reproduces the "before the lengths, 5 %" row on the
-  combined runs: B5's winner is the run with its pours as planes (3.0 %, 10 mm, +3), and the
+  combined runs: B5's winner is the run with its pours as planes (the chosen row's plane loss and ground track, and its longer signal), and the
   other four keep their winners.
 - The live measurement belongs to the zones session, with its existing scripts: ZR3 plus
   this branch, x22, `routing.rank_key = "pours"`, the five boards at M. It runs after ZR4's
