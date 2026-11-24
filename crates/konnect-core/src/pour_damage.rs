@@ -1,8 +1,9 @@
 //! Row ZR, stage ZR5, part 1: the pour record (docs/POUR_RANK_DESIGN.md).
 //!
 //! Pure. What the routing did to the pours, measured against KiCad's own fill of the
-//! board before it was routed (PK3). Recorded only: no gate and no entry of the rank key
-//! reads it (PK1), and nothing here reads a file or starts a process.
+//! board before it was routed (PK3). No gate and no entry of today's rank key reads it
+//! (PK1); the pour key (`pour_rank`) reads it when `routing.rank_key` is `pours`. Nothing
+//! here reads a file or starts a process.
 
 use crate::zone_fill::ZoneLayerFill;
 use serde::{Deserialize, Serialize};
