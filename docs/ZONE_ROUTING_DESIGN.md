@@ -291,7 +291,7 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 | **ZR4** Define | Konnect | `plan_pours`, the intent's `pours`, `add_zone`'s missing settings | On each board with its pours removed, the proposals refill clean and the route passes G1 |
 | **ZR5** Rank | Konnect | Pour measures in the rank key; the skill's order of work | The owner's word, on ZR3's numbers |
 
-ZR4 touches no engine file and may run beside ZR1 to ZR3.
+ZR4 touches no engine file and may run beside ZR1 to ZR3. **ZR4 is built** (2026-11-24) on `claude/zr4-pour-plan-build`, measured against its own criteria in [POUR_PLAN_DESIGN.md](POUR_PLAN_DESIGN.md), "Measured": the route passes G1 on all five boards, and the proposals refill clean on four (on B5, two thermal pads starve at PP9's thermal values).
 
 ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23), in
 two PRs on the owner's order ("כן, ZR5 קודם"): first the pour record, which changes no rank

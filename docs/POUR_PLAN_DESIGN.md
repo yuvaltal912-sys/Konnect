@@ -491,6 +491,62 @@ the skeleton:
   were caught. One survives, in `supply_nets` (`||` to `&&`). No valid record can
   reach the case it changes (`zr4/mutants/RECORD.md`).
 
+## Measured (2026-11-24)
+
+The design's "Measurement" was run once on the branch's release build (`f497868c`, the
+gate's copy, from `6f8d205a`). Calls went by pipe, with no KiCad open, and with fastroute
+x21 (`46d79d56`, the pin) at effort M. Each routing call ran in its own routing hold under
+the lane locks. The boards are the five of "The x19 baseline", as scratch copies with
+their copper pours removed. None of them has a rule area. Counts only. Record:
+`target/creation-research/zone-routing/zr4/measure/` (`result.json`,
+`plan-record.json`, the runs).
+
+| Board | C1 | C2 | C3 | C4 | C5 | C6 |
+|---|---|---|---|---|---|---|
+| dash | holds | holds | holds | holds | holds | holds |
+| B5 | **fails** | holds | holds | holds | holds | holds |
+| `pic` | holds | holds | holds | holds | holds | holds |
+| `ecc` | holds | holds | holds | holds | holds | holds |
+| `pours` | holds | holds | holds | holds | holds | holds |
+
+- **C1 fails on B5.** The status is `planned_with_findings`: `starved_thermal`
+  (error) rose from 0 to 2. Two fine-pitch IC pads got 1 spoke where the zone asks
+  for 2.
+  - The cause is PP9's thermal values: a gap and a spoke width of 0.5 mm. B5's own
+    pours use a gap of 0.3 mm and a spoke width of 0.4 mm.
+  - The same scratch board, refilled with those two values and nothing else changed,
+    has 0 starved thermals (`measure/b5_probe.sh`).
+  - So PP9's reason ("what both of the owner's boards use") holds for dash and not for
+    B5. Nothing was tuned; the choice is the owner's.
+- **C1 holds on the other four.** KiCad's unconnected items on the ground net go to 0
+  on every board: from 69 (dash), 39 (`pic`), 6 (`ecc`) and 11 (`pours`). On B5 too,
+  from 40. On `pours`, 1 `isolated_copper` warning rose, as the probe predicted.
+- **C2:** on every board, `add_zone` called with the returned arguments gives the same
+  count for every DRC rule as the check's own report. It also gives the same piece
+  count for every proposal: 1 a layer, and 5 on each layer of `pic`.
+- **C3:** every re-poured board routes `complete`, and its winner passes G1. It
+  passes all four gates on all five boards.
+- **C4:** `plan_pours` changes none of these bytes: the board, the project file, the
+  design-intent record (dash has one), and every file of the given KiCad settings
+  folder (8 to 10 files).
+- **C5:** every board gets two proposals: the ground net with the most pads, on F.Cu
+  and B.Cu, neither `asked`.
+- **C6:** dash, B5 and `pours` give `nothing_to_propose` as they are. `pic` and `ecc`
+  give one proposal, on F.Cu.
+- **Recorded, not criteria.** The planner takes 1.5 to 3.0 s a board. The reference is
+  the same route call on each board with its own pours. Against it, the winner with the
+  plan's pours had:
+  - fill pieces: 14 against 34 (dash), 11 against 13 (B5), 14 against 2 (`pic`),
+    2 against 1 (`ecc`), 2 against 2 (`pours`);
+  - starved thermals: 0 on every board (the reference on B5: 1);
+  - `vias_off_pour`: equal on four boards; 0 against 1 on `pic`.
+- **Not measured,** as the design said: a request of the design intent, a board with a
+  rule area, a 4-layer board, and `add_zone`'s live path. Unit tests cover the first
+  three.
+- PP15 was checked on a real KiCad fill: the ignored test
+  `kicad_fills_inside_a_rule_area_that_lets_pours_in` ran on the public fixture with a
+  rule area added, and passed. The ignored test `the_real_thing_fills_clean` passed too.
+
 ## Verification of this document
 
 **Read against the source** (`c4c34369`): `tools/pcb_board.rs` (`add_zone_impl`,
