@@ -3,6 +3,79 @@ use super::distance_kernel::Prepared;
 use super::*;
 use std::rc::Rc;
 
+/// Which boards the planner accepts (Row ZR, ZR6, S8). The registry tool
+/// `plan_route_refinement` and the judge's Z9 rounds use `Strict`; only the judge's
+/// reference round (`plan_reference_stitching`) uses `Lenient`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Profile {
+    /// Every local override on a pad or footprint and every zone with no UUID refuses
+    /// the board.
+    Strict,
+    /// (i) a pad's or footprint's local `clearance` is honoured per item, as the larger
+    /// of it and the conservative rule; (ii) local `zone_connect`, `thermal_width`,
+    /// `thermal_bridge_width` and `thermal_gap` are accepted (the planner reads saved
+    /// fills, which already have the shape the connection gives); (iii) a teardrop zone
+    /// with no UUID gets a synthetic id ([`teardrop_fill_id`]) and its copper is of no
+    /// known net, an obstacle to every net. Any other zone with no UUID, and a
+    /// padstack's per-layer override, stay refused.
+    Lenient,
+}
+
+/// The local overrides of one pad or footprint that the lenient profile reads (S8).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(super) struct LocalOverrides {
+    pub clearance_mm: Option<f64>,
+}
+
+/// S8 (i): the `(clearance X)` a pad or footprint node gives itself, read and checked
+/// (a finite number from 0 to 100 mm). `zone_connect` and the thermal fields are
+/// accepted unread: the saved fill already has their shape.
+pub(super) fn local_overrides(n: &SexpNode) -> Result<LocalOverrides> {
+    let clearance_mm = match n.find("clearance") {
+        None => None,
+        Some(node) => Some(
+            node.get_f64(1)
+                .filter(|v| v.is_finite() && (0.0..=100.).contains(v))
+                .context("invalid local clearance")?,
+        ),
+    };
+    Ok(LocalOverrides { clearance_mm })
+}
+
+/// S8 (iii): the id a teardrop zone with no UUID gets in the planner's scene, from its
+/// index in the audit model's fills and its layer: `teardrop-<index>-<layer>`, with a
+/// numeric suffix while that name is a UUID of the board (no two items share an id).
+pub(super) fn teardrop_fill_id(fill_index: usize, layer: &str, ids: &BTreeSet<String>) -> String {
+    let base = format!("teardrop-{fill_index}-{layer}");
+    if !ids.contains(&base) {
+        return base;
+    }
+    (1usize..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|id| !ids.contains(id))
+        .expect("an unbounded suffix range always has a free name")
+}
+
+/// S8 (i): each pad's local clearance, by pad UUID: the larger of the pad's own and its
+/// footprint's. Only pads that have one are listed.
+fn local_clearances(tree: &SexpNode) -> Result<BTreeMap<String, f64>> {
+    let mut out = BTreeMap::new();
+    for footprint in tree.find_all("footprint") {
+        let own = local_overrides(footprint)?.clearance_mm;
+        for pad in footprint.find_all("pad") {
+            let pad_own = local_overrides(pad)?.clearance_mm;
+            let largest = match (own, pad_own) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            if let (Some(value), Some(id)) = (largest, pad.find_str("uuid")) {
+                out.insert(id.to_string(), value);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(super) struct Rules {
     pub clearance: f64,
     pub edge: f64,
@@ -320,6 +393,10 @@ pub(super) struct Scene {
     outline_rings: Vec<(Shape, Option<Rc<Prepared>>)>,
     pub rules: Rules,
     pub meter: Meter,
+    /// S8 (i): the local clearance of an item, by item id (lenient profile only; empty
+    /// under the strict one). A new item keeps the larger of this and
+    /// `rules.clearance` to that item.
+    local_clearance: BTreeMap<String, f64>,
 }
 impl Scene {
     pub fn read(
@@ -328,6 +405,7 @@ impl Scene {
         mut rules: Rules,
         limits: effort::Limits,
         started: std::time::Instant,
+        profile: Profile,
     ) -> Result<Self> {
         ensure!(
             (2..=4).contains(&m.layers.len()) && m.layers.len() != 3,
@@ -355,7 +433,15 @@ impl Scene {
         let mut ids = BTreeSet::new();
         let mut nodes = 0;
         let mut groups = Vec::new();
-        inspect(tree, false, &mut ids, &mut locks, &mut groups, &mut nodes)?;
+        inspect(
+            tree,
+            false,
+            profile,
+            &mut ids,
+            &mut locks,
+            &mut groups,
+            &mut nodes,
+        )?;
         resolve_locks(&mut locks, &groups);
         for z in tree.find_all("zone") {
             if let Some(c) = z.find("connect_pads").and_then(|n| n.find("clearance")) {
@@ -482,16 +568,22 @@ impl Scene {
                 layer: e.layers.first().cloned().unwrap_or_default(),
             });
         }
-        for f in &m.fills {
+        for (fill_index, f) in m.fills.iter().enumerate() {
+            // S8 (iii): under the lenient profile a teardrop with no UUID is copper of no
+            // known net (the model reads a zone's net through its UUID); every other zone
+            // with no UUID is refused, as under the strict profile.
+            let (zone, net) = match (f.zone_uuid.as_deref(), profile) {
+                (Some(uuid), _) => (uuid.to_string(), f.net.clone()),
+                (None, Profile::Lenient) if f.teardrop => {
+                    (teardrop_fill_id(fill_index, &f.layer, &ids), None)
+                }
+                (None, _) => bail!("zone UUID absent"),
+            };
             for (i, r) in f.rings.iter().enumerate() {
                 let layer = m.layer_ix(&f.layer).context("fill on unknown layer")?;
                 items.push(Copper {
-                    id: format!(
-                        "{}:fill:{i}:{}",
-                        f.zone_uuid.as_deref().context("zone UUID absent")?,
-                        f.layer
-                    ),
-                    net: f.net.clone(),
+                    id: format!("{zone}:fill:{i}:{}", f.layer),
+                    net: net.clone(),
                     shape: Shape::polygon(r.pts.clone()),
                     mask: 1 << layer,
                     kind: "fill",
@@ -525,7 +617,7 @@ impl Scene {
                 "invalid/unbounded geometry"
             );
         }
-        Self::assemble(
+        let mut scene = Self::assemble(
             items,
             holes,
             m.layers.clone(),
@@ -533,7 +625,21 @@ impl Scene {
             rules,
             limits,
             started,
-        )
+        )?;
+        if profile == Profile::Lenient {
+            scene.local_clearance = local_clearances(tree)?;
+        }
+        Ok(scene)
+    }
+
+    /// The clearance a new item keeps to item `i`: the conservative rule, or the item's
+    /// own local clearance when that is larger (S8 (i)).
+    fn clearance_to(&self, i: usize) -> f64 {
+        self.local_clearance
+            .get(&self.items[i].id)
+            .map_or(self.rules.clearance, |&local| {
+                self.rules.clearance.max(local)
+            })
     }
 
     fn assemble(
@@ -573,6 +679,7 @@ impl Scene {
                 limits,
                 started,
             },
+            local_clearance: BTreeMap::new(),
         })
     }
 
@@ -797,7 +904,9 @@ impl Scene {
                 continue;
             }
             // The copper check comes first, so a place that fails both is named
-            // by its copper clearance.
+            // by its copper clearance. S8 (i): an item's local clearance raises it.
+            let clearance = self.clearance_to(i);
+            let reach = clearance + MARGIN;
             'copper: {
                 if !near_bounds(new_bounds, self.boxes[i], reach) {
                     break 'copper;
@@ -814,7 +923,7 @@ impl Scene {
                 // Inside the margin band. Board coordinates are whole nanometres, so
                 // 1e-9 mm absorbs only floating-point noise, never a real shortfall.
                 let mut saved = f64::INFINITY;
-                if exact && new.kind == "track" && distance + 1e-9 >= self.rules.clearance {
+                if exact && new.kind == "track" && distance + 1e-9 >= clearance {
                     for &o in replaced {
                         let original = &self.items[o];
                         if original.kind == "track"
@@ -1121,6 +1230,7 @@ fn resolve_locks(locks: &mut BTreeSet<String>, groups: &[(String, Vec<String>)])
 fn inspect(
     n: &SexpNode,
     in_footprint: bool,
+    profile: Profile,
     ids: &mut BTreeSet<String>,
     locks: &mut BTreeSet<String>,
     groups: &mut Vec<(String, Vec<String>)>,
@@ -1174,11 +1284,20 @@ fn inspect(
         "thermal_gap",
     ];
     if head == "pad" || head == "footprint" {
-        for field in OVERRIDES {
-            ensure!(
-                n.find(field).is_none(),
-                "unsupported local {field} override"
-            );
+        match profile {
+            Profile::Strict => {
+                for field in OVERRIDES {
+                    ensure!(
+                        n.find(field).is_none(),
+                        "unsupported local {field} override"
+                    );
+                }
+            }
+            // S8 (i) and (ii): the clearance is read (and must be readable), the
+            // connection and thermal fields are accepted.
+            Profile::Lenient => {
+                local_overrides(n)?;
+            }
         }
     }
     // KiCad 9 and 10 can give a via or pad other copper on each layer. One
@@ -1327,7 +1446,7 @@ fn inspect(
     if let Some(children) = n.children() {
         for c in children {
             if matches!(c, SexpNode::List(_)) {
-                inspect(c, footprint, ids, locks, groups, count)?;
+                inspect(c, footprint, profile, ids, locks, groups, count)?;
             }
         }
     }
@@ -1370,6 +1489,20 @@ pub(super) fn test_scene(items: Vec<Copper>) -> Scene {
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+
+    /// Row ZR, ZR6 (S8 iii): a teardrop with no UUID gets its index and layer as its id,
+    /// with the first free suffix when that name is taken.
+    #[test]
+    fn route_refine_teardrop_fill_id_is_unique_on_the_board() {
+        let none = BTreeSet::new();
+        assert_eq!(teardrop_fill_id(3, "F.Cu", &none), "teardrop-3-F.Cu");
+        let taken: BTreeSet<String> = ["teardrop-3-F.Cu", "teardrop-3-F.Cu-1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(teardrop_fill_id(3, "F.Cu", &taken), "teardrop-3-F.Cu-2");
+        assert_eq!(teardrop_fill_id(4, "F.Cu", &taken), "teardrop-4-F.Cu");
+    }
     fn scene(items: Vec<Copper>) -> Scene {
         super::test_scene(items)
     }

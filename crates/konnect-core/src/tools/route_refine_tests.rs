@@ -2092,3 +2092,182 @@ async fn route_refine_gives_chamfer_no_right_angle_that_holds_a_short_track() {
         assert_eq!(r["coverage"]["blocked_total"], 0, "{r}");
     }
 }
+
+// ─── Row ZR, ZR6: the reference round's lenient entry (S8) and its limit (S9) ───
+
+/// The lenient entry on a fixture's board, for GND, at `radius` mm.
+async fn lenient(f: &Fixture, radius: f64) -> anyhow::Result<Value> {
+    super::route_refine::plan_reference_stitching(&f.board, &["GND".to_string()], radius).await
+}
+
+/// The first proposed via's point.
+fn first_via(plan: &Value) -> (f64, f64) {
+    let v = &plan["proposals"][0]["operations"][0]["arguments"]["vias"][0];
+    (v["x"].as_f64().unwrap(), v["y"].as_f64().unwrap())
+}
+
+/// A one-pad SMD footprint whose footprint and pad carry `fp_extra` and `pad_extra`.
+fn pad_with(n: usize, at: (f64, f64), net: usize, fp_extra: &str, pad_extra: &str) -> String {
+    format!("(footprint \"Test:Pad\" (layer \"F.Cu\") (at 0 0) {fp_extra}(uuid {}) (property \"Reference\" \"Q{n}\" (at 0 0) (layer \"F.SilkS\")) (pad \"1\" smd circle (at {} {}) (size 0.8 0.8) (layers \"F.Cu\") {pad_extra}(net {net} \"{}\") (uuid {})))", uid(n + 1000), at.0, at.1, ["", "GND", "SIG", "OTHER"][net], uid(n))
+}
+
+/// S8 (ii): the round's entry takes a board with local connection and thermal overrides,
+/// which the registry tool still refuses; a padstack's per-layer override stays refused.
+#[tokio::test]
+async fn route_refine_reference_entry_accepts_local_connection_overrides() {
+    let board = reference_change()
+        + &pad_with(
+            70,
+            (25., 25.),
+            3,
+            "(zone_connect 2) ",
+            "(zone_connect 2) (thermal_width 0.3) (thermal_bridge_width 0.3) (thermal_gap 0.4) ",
+        );
+    let f = Fixture::new(&board);
+    let strict = f.run(json!({"kinds":["stitching"]})).await;
+    assert_eq!(refusal(&strict), "unsupported local zone_connect override");
+    let plan = lenient(&f, 3.0).await.unwrap();
+    assert_eq!(plan["proposals"].as_array().unwrap().len(), 1, "{plan}");
+    let (x, y) = first_via(&plan);
+    assert!((x - 10.).hypot(y - 10.) <= 3.0, "{plan}");
+    let stack = reference_change().replace(
+        &format!("(net 2) (uuid {}))", uid(51)),
+        &format!(
+            "(padstack (layer \"B.Cu\" (size 0.5))) (net 2) (uuid {}))",
+            uid(51)
+        ),
+    );
+    assert_ne!(stack, reference_change());
+    let refused = lenient(&Fixture::new(&stack), 3.0).await.unwrap_err();
+    assert_eq!(format!("{refused:#}"), "unsupported padstack layer copper");
+}
+
+/// S8 (i): a pad's local clearance is kept by the new via, as the larger of it and the
+/// rule; without the override the same pad does not move the via.
+#[tokio::test]
+async fn route_refine_reference_entry_keeps_a_pads_local_clearance() {
+    let plain = lenient(&Fixture::new(&reference_change()), 3.0)
+        .await
+        .unwrap();
+    let at = first_via(&plain);
+    let near = (at.0, at.1 + 1.5);
+    // The pad 1.5 mm from the via's centre: 0.8 mm of gap, enough for the 0.2 mm rule.
+    let without = reference_change() + &pad_with(71, near, 3, "", "");
+    let plan = lenient(&Fixture::new(&without), 3.0).await.unwrap();
+    assert_eq!(first_via(&plan), at, "{plan}");
+    for (fp, pad) in [
+        ("", "(clearance 2) "),
+        ("(clearance 2) ", ""),
+        ("(clearance 1) ", "(clearance 2) "),
+    ] {
+        let with = reference_change() + &pad_with(71, near, 3, fp, pad);
+        let plan = lenient(&Fixture::new(&with), 3.0).await.unwrap();
+        let q = first_via(&plan);
+        let gap = (q.0 - near.0).hypot(q.1 - near.1) - 0.3 - 0.4;
+        assert!(
+            gap + 1e-6 >= 2.0,
+            "{fp}{pad}: the via is {gap} mm from the pad: {plan}"
+        );
+    }
+    // An unreadable local clearance refuses the board.
+    let bad = reference_change() + &pad_with(71, near, 3, "", "(clearance -1) ");
+    let refused = lenient(&Fixture::new(&bad), 3.0).await.unwrap_err();
+    assert_eq!(format!("{refused:#}"), "invalid local clearance");
+}
+
+/// S8 (iii): a teardrop with no UUID is copper of no known net, an obstacle to the via;
+/// another zone with no UUID stays refused, and the registry tool refuses both.
+#[tokio::test]
+async fn route_refine_reference_entry_takes_a_teardrop_without_uuid_as_an_obstacle() {
+    let plain = lenient(&Fixture::new(&reference_change()), 3.0)
+        .await
+        .unwrap();
+    let at = first_via(&plain);
+    let square = [
+        (at.0 - 0.5, at.1 - 0.5),
+        (at.0 + 0.5, at.1 - 0.5),
+        (at.0 + 0.5, at.1 + 0.5),
+        (at.0 - 0.5, at.1 + 0.5),
+    ];
+    let xy: String = square
+        .iter()
+        .map(|p| format!("(xy {} {})", p.0, p.1))
+        .collect();
+    let zone = |attr: &str| {
+        format!("(zone (net 2) (net_name \"SIG\") (layer \"F.Cu\") {attr}(hatch edge 0.5) (connect_pads (clearance 0)) (min_thickness 0.1) (fill yes) (polygon (pts {xy})) (filled_polygon (layer \"F.Cu\") (pts {xy})))")
+    };
+    let teardrop = reference_change() + &zone("(attr (teardrop (type padvia))) ");
+    let f = Fixture::new(&teardrop);
+    assert_eq!(
+        refusal(&f.run(json!({"kinds":["stitching"]})).await),
+        "zone UUID absent"
+    );
+    let plan = lenient(&f, 3.0).await.unwrap();
+    let q = first_via(&plan);
+    assert_ne!(q, at, "the via moved off the teardrop: {plan}");
+    let outside = (q.0 - at.0).abs().max((q.1 - at.1).abs()) - 0.5;
+    assert!(
+        outside + 1e-6 >= 0.3 + 0.2,
+        "the via keeps clearance to it: {plan}"
+    );
+    let other = reference_change() + &zone("");
+    let refused = lenient(&Fixture::new(&other), 3.0).await.unwrap_err();
+    assert_eq!(format!("{refused:#}"), "zone UUID absent");
+}
+
+/// S9: the planner's reference distance is the audit's `stitch_via_max_mm`, which the
+/// round's entry sets to the findings' limit. A GND pad 2.4 mm from the layer change
+/// lets the search find a via more than 1 mm from it: a reference via under the default
+/// 3 mm, none under a 1 mm limit.
+#[tokio::test]
+async fn route_refine_reference_distance_is_the_audits_stitch_limit() {
+    let board = reference_change() + &pad(72, (10., 12.4), 1, "F.Cu");
+    let f = Fixture::new(&board);
+    let registry = f
+        .run(json!({"kinds":["stitching"], "search_radius_mm": 1.0}))
+        .await;
+    assert_eq!(
+        registry["proposals"].as_array().unwrap().len(),
+        1,
+        "{registry}"
+    );
+    let (x, y) = first_via(&registry);
+    assert!((x - 10.).hypot(y - 10.) > 1.0, "{registry}");
+    let plan = lenient(&f, 1.0).await.unwrap();
+    assert!(plan["proposals"].as_array().unwrap().is_empty(), "{plan}");
+    assert!(
+        plan["blocked"]
+            .to_string()
+            .contains("1 reference changes remain"),
+        "{plan}"
+    );
+}
+
+/// Row ZR, ZR6 (the mutants batch on S9's lines): the change a via serves is taken off the
+/// list, and only that one. A second change, of another signal, at (10, 5) has no
+/// position within 3 mm in both fills: after the first via it is still reported.
+#[tokio::test]
+async fn route_refine_a_served_change_leaves_the_unserved_one_listed() {
+    let second = [
+        pad(80, (4., 5.), 3, "F.Cu"),
+        pad(81, (16., 5.), 3, "B.Cu"),
+        track(82, (4., 5.), (10., 5.), 3),
+        track(83, (10., 5.), (16., 5.), 3).replace("\"F.Cu\"", "\"B.Cu\""),
+        format!(
+            "(via (at 10 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 3) (uuid {}))",
+            uid(84)
+        ),
+    ]
+    .concat();
+    let f = Fixture::new(&(reference_change() + &second));
+    let r = f.run(json!({"kinds":["stitching"]})).await;
+    assert_eq!(r["proposals"].as_array().unwrap().len(), 1, "{r}");
+    let (x, y) = first_via(&r);
+    assert!((x - 10.).hypot(y - 10.) <= 3.0, "{r}");
+    assert!(
+        r["blocked"]
+            .to_string()
+            .contains("1 reference changes remain"),
+        "{r}"
+    );
+}

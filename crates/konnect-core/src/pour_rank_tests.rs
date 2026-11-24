@@ -154,6 +154,8 @@ fn ranking_of_judged_runs_puts_every_run_in_the_pool() {
             board: std::path::PathBuf::from("/b.kicad_pcb"),
             rounds: vec![],
             tune: None,
+            reference_stitch: None,
+            reference_checked: None,
         })
         .collect();
     let refs: Vec<&Judged> = judged.iter().collect();
@@ -471,14 +473,16 @@ fn a_run_outside_the_pool_or_failing_g1_does_not_set_the_unit() {
 // ─── The setting ─────────────────────────────────────────────────────────────
 
 #[test]
-fn no_setting_ranks_by_todays_key_and_pours_names_the_pour_key() {
+fn no_setting_ranks_by_the_pour_key_and_routing_names_todays_key() {
+    // Row ZR, ZR6: the default is the pour key. Control: `routing` as the default.
+    assert_eq!(DEFAULT_RANK_MODE, RankMode::Pours);
     assert_eq!(
         resolve_rank_mode(None),
-        Ok((RankMode::Routing, RankSource::Default))
+        Ok((RankMode::Pours, RankSource::Default))
     );
     assert_eq!(
         resolve_rank_mode(Some(&Value::Null)),
-        Ok((RankMode::Routing, RankSource::Default))
+        Ok((RankMode::Pours, RankSource::Default))
     );
     assert_eq!(
         resolve_rank_mode(Some(&json!("pours"))),
@@ -658,6 +662,8 @@ pub(crate) fn split_judged(signal_mm: f64, plane_loss: f64) -> Judged {
         board: std::path::PathBuf::from("/nowhere/judged.kicad_pcb"),
         rounds: vec![],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 

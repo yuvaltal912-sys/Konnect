@@ -380,6 +380,8 @@ fn a_failed_pour_measure_is_recorded_not_raised() {
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: Default::default(),
     };
     record_pours(&mut m, Err(anyhow::anyhow!("the board went away")));
     assert_eq!(m.pours, None);

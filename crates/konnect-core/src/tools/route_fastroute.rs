@@ -9,6 +9,7 @@ use crate::mcp::protocol::{CallToolResult, ToolContent};
 pub(crate) use crate::pour_prune::PourPrune;
 pub(crate) use crate::pour_rank::RankChoice;
 use crate::pour_rank::{RankMode, RankSource};
+pub(crate) use crate::pour_stitch::ReferenceStitch;
 use crate::route_judge::{self, Baseline, JudgeContext, Judged, Refusal};
 use crate::route_search::{
     self, BoxFuture, Effort, EffortSource, RouteFailure, Routed, RunRecord, Runner, SearchOutcome,
@@ -88,7 +89,7 @@ fn judge_folder_index(name: &str) -> Option<usize> {
     let suffix = &rest[digits.len()..];
     matches!(
         suffix,
-        "" | "-untuned" | "-pour-safe" | "-pruned" | "-prune"
+        "" | "-untuned" | "-pour-safe" | "-pruned" | "-prune" | "-stitched"
     )
     .then(|| digits.parse().ok())
     .flatten()
@@ -315,6 +316,10 @@ pub(crate) struct Call {
     /// gives today's key, fixed; [`route_with_fastroute`] sets the mode of its
     /// [`RankChoice`] ([`call_rank_at`]).
     rank: (RankMode, RankSource),
+    /// Row ZR, ZR6 (S13): whether the judge runs the reference round and the winner's
+    /// session gets its vias. [`prepare_call`] gives `Off`; [`route_with_fastroute`] sets
+    /// its caller's switch.
+    stitch: ReferenceStitch,
 }
 
 /// The refusal for a user config that cannot be read for routing.
@@ -427,6 +432,7 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
         effort,
         fallback,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     }))
 }
 
@@ -477,16 +483,24 @@ pub(crate) fn prepare_call(args: &Value) -> Result<std::result::Result<Call, Cal
 /// refuses the call before anything is made; `Fixed` reads nothing. The mode goes into
 /// the judge context (`JudgeContext::rank`), and the result's `search.rank` reports it
 /// (`pour_rank::rank_report`).
+///
+/// `stitch` (Row ZR, ZR6, S13): with `On` every judged run gets the reference round
+/// (`JudgeContext::reference_stitch`) and, after the prune, the winner's kept reference
+/// vias are written into its session (`pour_stitch::deliver_winner`,
+/// `search.reference_stitch`); with `Off` nothing of that runs.
 pub(crate) async fn route_with_fastroute(
     args: &Value,
     ctx: Arc<ToolContext>,
     prune: PourPrune,
     rank: RankChoice,
+    stitch: ReferenceStitch,
 ) -> Result<CallToolResult> {
-    let call = match prepare_ranked_call(args, rank, &crate::tools::config::user_config_path())? {
+    let mut call = match prepare_ranked_call(args, rank, &crate::tools::config::user_config_path())?
+    {
         Ok(call) => call,
         Err(refusal) => return Ok(refusal),
     };
+    call.stitch = stitch;
     let located = match locate_binary(args, &call).await {
         Ok(Ok(located)) => located,
         Ok(Err(refusal)) => return finish(&call.folder, Ok(refusal)),
@@ -812,6 +826,8 @@ async fn search_and_write(
     judge.kicad_config_home = Some(kicad_config_home.clone());
     // Row ZR, ZR5 part 2: the call's mode, kept in one place.
     judge.rank = call.rank.0;
+    // Row ZR, ZR6 (S13): the reference round, on for the route tool only.
+    judge.reference_stitch = call.stitch;
     let shapes = match route_search::shapes(&dsn_text)
         .and_then(|shapes| preflight_variants(&dsn_text, &shapes).map(|()| shapes))
     {
@@ -891,7 +907,13 @@ async fn search_and_write(
     let mut outcome = route_search::search(&plan, runner).await;
     // Row ZR, ZR0b (P1): once, on the winner, before anything is written.
     if prune == PourPrune::Winner {
-        crate::pour_prune::prune_winner(&judge, tools, &mut outcome).await;
+        crate::pour_prune::prune_winner(&judge, Arc::clone(&tools), &mut outcome).await;
+    }
+    // Row ZR, ZR6 (S10, S11): after the prune, the winner's reference vias go into its
+    // session.
+    if call.stitch == ReferenceStitch::On {
+        outcome.reference_stitch =
+            Some(crate::pour_stitch::deliver_winner_registry(&judge, tools, &mut outcome).await);
     }
     let result = conclude(
         args,
@@ -1484,6 +1506,10 @@ pub(crate) fn reduce_run_folders(
         if let (true, Some(prune)) = (is_winner, &outcome.pour_prune) {
             body["pour_prune"] = json!(prune);
         }
+        // Row ZR, ZR6 (S10): and what the delivery of its reference vias did.
+        if let (true, Some(delivery)) = (is_winner, &outcome.reference_stitch) {
+            body["reference_stitch"] = json!(delivery);
+        }
         // The winner keeps every folder whole.
         let keep_tune = if is_winner {
             Vec::new()
@@ -1840,6 +1866,11 @@ fn search_json(
     if let Some(record) = &outcome.pour_prune {
         search["pour_prune"] = json!(record);
     }
+    // Row ZR, ZR6 (S10): what the delivery of the winner's reference vias did; absent
+    // when the round was off.
+    if let Some(record) = &outcome.reference_stitch {
+        search["reference_stitch"] = json!(record);
+    }
     if listing == Listing::Best && rows.len() < outcome.runs.len() {
         search["runs_listed"] = json!(format!(
             "{} of {} runs: the {LISTED_RUNS} best judged by the rank key, then up to {LISTED_RUNS} that were not judged; search.json in the search folder lists every run",
@@ -1900,6 +1931,43 @@ pub(crate) const JUDGED_STATUS_NOTE: &str = " Every judge gate passed: the judge
 /// judge added: why `status` is still the router's.
 pub(crate) fn judged_stitched_note(vias: usize) -> String {
     format!(" Every judge gate passed, but only after the judge added {vias} stitching via(s) (`completion.judged.stitching_vias`), which are not in this session: `status` stays the router's. Follow `next_steps`; they include the stitching.")
+}
+
+/// Row ZR, ZR6 (S10): what `completion.reason` adds when every gate passed only with
+/// ground vias the judge's reference round added (and maybe Z9's stitching vias), which
+/// the delivered session lacks: why `status` is still the router's.
+pub(crate) fn judged_reference_note(stitching_vias: usize, reference_vias: usize) -> String {
+    let z9 = if stitching_vias > 0 {
+        format!(" and {stitching_vias} stitching via(s) (`completion.judged.stitching_vias`)")
+    } else {
+        String::new()
+    };
+    format!(" Every judge gate passed, but only after the judge added {reference_vias} ground via(s) at reference changes (`completion.judged.reference_vias`){z9}, which are not in this session (`search.reference_stitch` says why): `status` stays the router's. Follow `next_steps`; they include the stitching.")
+}
+
+/// Row ZR, ZR6 (S10): the steps that add the reference vias the delivered session lacks,
+/// after the import's DRC: the read-only planner's `stitching` kind on the reference nets,
+/// the adoption, and the DRC again.
+pub(crate) fn reference_steps(board: &Path, nets: &[String], vias: usize) -> Vec<Value> {
+    let drc = json!({ "board": board, "sync_live_board": true, "refill_zones": true });
+    vec![
+        json!({
+            "tool": "plan_route_refinement",
+            "arguments": { "board": board, "kinds": ["stitching"], "nets": nets,
+                           "search_radius_mm": crate::route_judge::STITCH_RADIUS_MM },
+            "why": format!("The judge added {vias} ground via(s) beside signal vias that change reference plane (checklist 3.2), and this session does not hold them. Ask the read-only planner for them. It refuses a board with local pad overrides or teardrops without a UUID; then place a ground via within 3 mm of each signal via the audit lists under 3.2."),
+        }),
+        json!({
+            "tool": "route_batch",
+            "arguments": { "board": board },
+            "arguments_from": { "vias": "the route_batch operation of each stitching proposal you adopt" },
+            "why": "Adopt the ground vias you support.",
+        }),
+        json!({
+            "tool": "run_drc", "arguments": drc,
+            "why": "Refill, save and check that nothing got worse.",
+        }),
+    ]
 }
 
 /// fastroute's `completion.complete_when`: the shared sentence says the result's status
@@ -2077,6 +2145,7 @@ pub(crate) fn result_json(
         "gates": judged.gates,
         "all_gates_pass": judged.gates.all_pass(),
         "stitching_vias": judged.measures.stitching_vias,
+        "reference_vias": judged.measures.reference_vias,
         "judged_board": judged_board(judged),
     });
     if completion["judged"]["judged_board"].is_null() {
@@ -2084,9 +2153,19 @@ pub(crate) fn result_json(
     }
     let router_status = status;
     let stitching_vias = judged.measures.stitching_vias;
-    let status = judged_status(router_status, &judged.gates, &width, stitching_vias);
+    // Row ZR, ZR6 (S10): the reference vias the judged board has and the session lacks
+    // count as Z9's do.
+    let reference_vias = judged.measures.reference_vias;
+    let status = judged_status(
+        router_status,
+        &judged.gates,
+        &width,
+        stitching_vias + reference_vias,
+    );
     let note = if !judged.gates.all_pass() {
         None
+    } else if reference_vias > 0 {
+        Some(judged_reference_note(stitching_vias, reference_vias))
     } else if stitching_vias > 0 {
         Some(judged_stitched_note(stitching_vias))
     } else if status != router_status {
@@ -2162,6 +2241,22 @@ pub(crate) fn result_json(
     ) {
         body.insert("untuned_nets".into(), untuned);
         body.insert("tune_candidates".into(), candidates);
+    }
+    // Row ZR, ZR6 (S10): the reference vias the session lacks, as Z9's stitching steps.
+    let reference_nets = crate::pour_stitch::undelivered_nets(judged);
+    if !reference_nets.is_empty() {
+        let board = crate::specctra::manifest_beside(dsn)
+            .as_ref()
+            .and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from))
+            .filter(|board| board.is_file());
+        if let (Some(board), Some(steps)) =
+            (board, result["completion"]["next_steps"].as_array_mut())
+        {
+            for mut step in reference_steps(&board, &reference_nets, reference_vias) {
+                step["step"] = json!(steps.len() + 1);
+                steps.push(step);
+            }
+        }
     }
     let length_steps = lengths.next_steps(
         winner_lengths,

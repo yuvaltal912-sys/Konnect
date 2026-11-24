@@ -359,7 +359,12 @@ placement orders, judges every run itself on scratch copies of the board
    lengths); `complete_with_gate_failures` and `incomplete` list what failed. When
    every gate passed, `status` is the judge's, not fastroute's own count
    (`completion.router_unrouted`), unless the judge had to add stitching vias
-   (`completion.judged.stitching_vias`): then follow `next_steps`. Report
+   (`completion.judged.stitching_vias`) or ground vias at reference changes the
+   session does not hold (`completion.judged.reference_vias`): then follow
+   `next_steps`. The judge adds a ground via beside each signal via that changes
+   reference plane with none within 3 mm (checklist 3.2) on every judged run, and
+   keeps it only when nothing else gets worse; the winner's go into the written
+   session (`search.reference_stitch` says whether they did, and why not). Report
    every failed gate line to the user. `search` lists the best runs and counts
    every outcome (`search.json` in the search folder lists every run); `search.budget_overrun_s` says when the first judged run came
    after the budget. On a board with pours, `measures.pours.damage` of each
@@ -367,8 +372,9 @@ placement orders, judges every run itself on scratch copies of the board
    them against the unrouted board's refill (`search.baseline.pour_fills`):
    `lost_fills` (pour layers that lost all their fill), and `plane_loss` and
    `area_loss`, shares from 0 to 1 of the planes no longer whole and of the
-   pour copper gone. It changes no gate, and no rank unless the user config's
-   `routing.rank_key` is `pours`. Every judged run has two keys, `key` (today's)
+   pour copper gone. It changes no gate; it ranks through the pour key, the
+   default, unless the user config's `routing.rank_key` is `routing`. Every
+   judged run has two keys, `key` (today's)
    and `pour_key`; `search.rank` says which ranked and which run the other
    would have put first (`other_winner`). `routing.rank_key` is the user's
    standing choice: never change it unasked.

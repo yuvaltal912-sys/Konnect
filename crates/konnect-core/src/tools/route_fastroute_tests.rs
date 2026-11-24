@@ -826,6 +826,8 @@ fn measures() -> Measures {
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: Default::default(),
     }
 }
 
@@ -841,6 +843,8 @@ fn judged(board: PathBuf) -> Judged {
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 
@@ -930,6 +934,7 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
             pour_fills_error: None,
         }),
         pour_prune: None,
+        reference_stitch: None,
     }
 }
 
@@ -1701,6 +1706,7 @@ fn the_result_reports_the_pairs_as_two_lists_empty_without_pairs() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let finished = outcome(Vec::new(), None);
     let error = no_winner_result(
@@ -1782,6 +1788,7 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
             rank: (RankMode::Routing, RankSource::Fixed),
+            stitch: ReferenceStitch::Off,
         };
         let Search {
             _dir, mut outcome, ..
@@ -1939,6 +1946,7 @@ fn a_search_with_no_judged_run_has_no_winner_and_says_why_in_its_runs() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let search = search_json(
         &plan(),
@@ -1997,6 +2005,7 @@ fn a_failed_search_keeps_its_records_and_not_its_boards() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(
@@ -2042,6 +2051,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let summary = search_json(&plan(), &[Shape::AsExported], &failed, Listing::Best);
     let result = no_winner_result(
@@ -2647,6 +2657,7 @@ fn a_search_with_no_winner_reports_the_length_plan_unmeasured() {
         effort: (Effort::M, EffortSource::Default),
         fallback: WidthFallback::Floor,
         rank: (RankMode::Routing, RankSource::Fixed),
+        stitch: ReferenceStitch::Off,
     };
     let mut outcome = outcome(Vec::new(), None);
     outcome.baseline = Err("kicad-cli failed".to_string());
@@ -2878,6 +2889,58 @@ fn a_connection_the_router_left_to_a_pour_gives_way_to_the_judge() {
         .measures
         .stitching_vias = 0;
 
+    // Row ZR, ZR6 (S10): a ground via the reference round kept and the session lacks
+    // (its delivery failed) counts as a stitching via does: the router's status stands,
+    // the note says why, and the steps add it after the import.
+    {
+        let judged = search.outcome.runs[0].judged.as_mut().unwrap();
+        let mut round = crate::pour_stitch::StitchRecord::new(Default::default());
+        round.outcome = "kept";
+        round.vias = vec![crate::pour_stitch::StitchVia {
+            net: "GND".to_string(),
+            x_mm: 1.0,
+            y_mm: 2.0,
+            size_mm: 0.6,
+            drill_mm: 0.3,
+        }];
+        judged.reference_stitch = Some(round);
+        judged.measures.reference_vias = 1;
+    }
+    let referenced = result_for(&search);
+    assert_eq!(referenced["status"], "incomplete", "{referenced}");
+    assert_eq!(referenced["completion"]["judged"]["reference_vias"], 1);
+    let reason = referenced["completion"]["reason"].as_str().unwrap();
+    assert!(reason.ends_with(&judged_reference_note(0, 1)), "{reason}");
+    let steps = referenced["completion"]["next_steps"].as_array().unwrap();
+    if steps
+        .iter()
+        .any(|step| step["tool"] == "apply_specctra_ses")
+    {
+        let tools: Vec<&str> = steps[steps.len() - 3..]
+            .iter()
+            .map(|step| step["tool"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tools,
+            vec!["plan_route_refinement", "route_batch", "run_drc"]
+        );
+        assert_eq!(steps[steps.len() - 3]["arguments"]["nets"], json!(["GND"]));
+        assert_eq!(steps.last().unwrap()["step"], json!(steps.len()));
+    }
+    // Delivered (the winner's count back to 0): the judge's status again.
+    search.outcome.runs[0]
+        .judged
+        .as_mut()
+        .unwrap()
+        .measures
+        .reference_vias = 0;
+    let delivered = result_for(&search);
+    assert_eq!(delivered["status"], "complete", "{delivered}");
+    let steps = delivered["completion"]["next_steps"].as_array().unwrap();
+    assert!(!steps
+        .iter()
+        .any(|step| step["tool"] == "plan_route_refinement"));
+
     search.outcome.runs[0].judged.as_mut().unwrap().gates.g1 =
         vec!["1 unconnected item(s) after the refill and stitching".to_string()];
     let open = result_for(&search);
@@ -3061,6 +3124,7 @@ fn the_runner_releases_a_run_in_its_own_search_folder() {
         lengths: None,
         pad_names: None,
         rank: crate::pour_rank::RankMode::Routing,
+        reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
     };
     let runner = FastrouteRunner {
         binary: fake_binary(&search.root),
@@ -3690,6 +3754,7 @@ fn the_session_the_call_writes_is_the_chosen_boards() {
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
             rank: (RankMode::Routing, RankSource::Fixed),
+            stitch: ReferenceStitch::Off,
         };
         let result = conclude(
             &json!({}),
@@ -3744,6 +3809,7 @@ fn the_zone_plan_writes_the_zones_file_only_when_it_models_a_pour() {
         lengths: None,
         pad_names: None,
         rank: crate::pour_rank::RankMode::Routing,
+        reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
     };
     let folder = dir.path().join("call");
     std::fs::create_dir_all(&folder).unwrap();
@@ -3861,6 +3927,33 @@ fn the_prune_record_is_in_search_and_in_the_winners_run_json_only() {
     };
     assert_eq!(record_of(0, Shape::AsExported)["pour_prune"], wanted);
     assert!(record_of(1, Shape::Omitted).get("pour_prune").is_none());
+    // Row ZR, ZR6 (S10): the delivery's record sits beside it, the winner's only.
+    let mut delivered = finished_search();
+    delivered.outcome.reference_stitch = Some(crate::pour_stitch::DeliveryRecord {
+        outcome: "rejected",
+        reason: Some("ranked behind".to_string()),
+        vias: 2,
+        refused_by: vec!["rank".to_string()],
+        seconds: 1.5,
+    });
+    reduce_run_folders(&delivered.folder, &delivered.outcome).unwrap();
+    let delivery_of = |index: usize, shape: Shape| -> Value {
+        let text = std::fs::read_to_string(
+            delivered
+                .folder
+                .join(run_folder_name(index, shape, 1))
+                .join("run.json"),
+        )
+        .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    assert_eq!(
+        delivery_of(0, Shape::AsExported)["reference_stitch"]["refused_by"],
+        json!(["rank"])
+    );
+    assert!(delivery_of(1, Shape::Omitted)
+        .get("reference_stitch")
+        .is_none());
     assert!(search
         .folder
         .join("judge/run-0-pruned/r0/board.kicad_pcb")
@@ -4001,8 +4094,8 @@ fn the_result_says_which_key_ranked_and_what_the_other_key_chose() {
         skipped_links: Vec::new(),
     };
     for (mode, source, winner, other) in [
-        (RankMode::Routing, RankSource::Default, 0, 1),
-        (RankMode::Pours, RankSource::UserConfig, 1, 0),
+        (RankMode::Routing, RankSource::UserConfig, 0, 1),
+        (RankMode::Pours, RankSource::Default, 1, 0),
     ] {
         let search = split_search(mode);
         let dsn = search.root.join("board.dsn");
@@ -4014,6 +4107,7 @@ fn the_result_says_which_key_ranked_and_what_the_other_key_chose() {
             effort: (Effort::M, EffortSource::Default),
             fallback: WidthFallback::Floor,
             rank: (mode, source),
+            stitch: ReferenceStitch::Off,
         };
         let result = conclude(
             &json!({}),
@@ -4053,17 +4147,14 @@ fn the_rank_key_comes_from_the_user_config_whatever_else_it_holds() {
         let (_dir, path) = config_file(text);
         call_rank_at(RankChoice::UserConfig, &path)
     };
-    assert_eq!(
-        read(None).unwrap(),
-        (RankMode::Routing, RankSource::Default)
-    );
+    assert_eq!(read(None).unwrap(), (RankMode::Pours, RankSource::Default));
     assert_eq!(
         read(Some(r#"{"routing": {"effort": "h"}}"#)).unwrap(),
-        (RankMode::Routing, RankSource::Default)
+        (RankMode::Pours, RankSource::Default)
     );
     assert_eq!(
         read(Some(r#"{"routing": {"rank_key": null}}"#)).unwrap(),
-        (RankMode::Routing, RankSource::Default)
+        (RankMode::Pours, RankSource::Default)
     );
     assert_eq!(
         read(Some(r#"{"routing": {"rank_key": "pours"}}"#)).unwrap(),
@@ -4136,7 +4227,7 @@ fn a_bad_value_of_another_key_does_not_refuse_the_rank_read() {
     for (text, mode, source) in [
         (
             r#"{"routing": {"fastroute_path": 7}}"#,
-            RankMode::Routing,
+            RankMode::Pours,
             RankSource::Default,
         ),
         (
@@ -4316,4 +4407,34 @@ async fn the_engine_gets_the_same_uncounted_file_under_both_modes() {
         written.push(uncounted);
     }
     assert_eq!(written[0], written[1]);
+}
+
+/// Row ZR, ZR6 (S10): the steps for reference vias a session lacks: the read-only
+/// planner on their nets at the judge's radius, the adoption, the DRC.
+#[test]
+fn the_steps_for_missing_reference_vias_plan_adopt_and_check() {
+    let board = Path::new("/boards/b.kicad_pcb");
+    let steps = reference_steps(board, &["GND".to_string()], 2);
+    let tools: Vec<&str> = steps
+        .iter()
+        .map(|step| step["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tools,
+        vec!["plan_route_refinement", "route_batch", "run_drc"]
+    );
+    assert_eq!(steps[0]["arguments"]["kinds"], json!(["stitching"]));
+    assert_eq!(steps[0]["arguments"]["nets"], json!(["GND"]));
+    assert_eq!(steps[0]["arguments"]["search_radius_mm"], json!(3.0));
+    assert!(steps[0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("2 ground via(s)"));
+    assert_eq!(steps[2]["arguments"]["refill_zones"], json!(true));
+    let note = judged_reference_note(1, 2);
+    assert!(
+        note.contains("2 ground via(s)") && note.contains("1 stitching via(s)"),
+        "{note}"
+    );
+    assert!(!judged_reference_note(0, 2).contains("stitching via(s)"));
 }

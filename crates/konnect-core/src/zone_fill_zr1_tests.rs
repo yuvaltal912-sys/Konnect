@@ -894,6 +894,8 @@ fn the_comparison_is_recorded_beside_the_zr0_measures_never_as_a_failure() {
             lengths: None,
             pours: None,
             pours_error: None,
+            reference_vias: 0,
+            checklist: Default::default(),
         };
         measures.pours = Some(pours.clone());
         measures

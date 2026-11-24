@@ -331,6 +331,8 @@ pub(crate) fn measures() -> Measures {
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: Default::default(),
     }
 }
 
@@ -775,6 +777,8 @@ fn run(s: &Spec) -> Judged {
         board: PathBuf::new(),
         rounds: vec![],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 
@@ -1107,6 +1111,7 @@ fn context() -> JudgeContext {
         lengths: None,
         pad_names: None,
         rank: crate::pour_rank::RankMode::Routing,
+        reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
     }
 }
 
@@ -1742,6 +1747,7 @@ async fn prune_recorded_ground_vias(vias: &[(&str, &str)]) -> crate::pour_prune:
         stopped_launching: Some("fixed run count".to_string()),
         baseline: Ok(base),
         pour_prune: None,
+        reference_stitch: None,
     };
 
     crate::pour_prune::prune_winner(&ctx, tools, &mut outcome).await;

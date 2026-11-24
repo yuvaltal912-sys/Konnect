@@ -680,6 +680,7 @@ async fn searched(h: &H, tools: &Tools) -> SearchOutcome {
         stopped_launching: Some("fixed run count".to_string()),
         baseline: Ok(base),
         pour_prune: None,
+        reference_stitch: None,
     }
 }
 
@@ -1438,3 +1439,8 @@ async fn the_keys_taken_again_read_the_calls_mode() {
         }
     }
 }
+
+// ─── Row ZR, ZR6: the reference round in the judge and the delivery (no KiCad) ──
+
+#[path = "pour_stitch_judge_tests.rs"]
+mod stitch;

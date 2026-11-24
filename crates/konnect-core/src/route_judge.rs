@@ -76,6 +76,11 @@ pub(crate) struct JudgeContext {
     /// Row ZR, ZR5 part 2 (PK9, PK12): which key ranks this call's runs, the one place a
     /// call's mode is kept. `prepare` sets today's key; the caller sets the call's mode.
     pub rank: crate::pour_rank::RankMode,
+    /// Row ZR, ZR6 (S1, S13): whether every judged run gets the reference round
+    /// (`pour_stitch::reference_round`). `prepare` sets `Off`; `route_with_fastroute`
+    /// sets the caller's switch: on for `route_specctra_dsn`, off for the placement
+    /// tools' routing calls.
+    pub reference_stitch: crate::pour_stitch::ReferenceStitch,
 }
 
 /// The unrouted board, refilled and checked the same way every run is (G2's
@@ -259,6 +264,7 @@ pub(crate) fn prepare(
         lengths: None,
         pad_names: None,
         rank: crate::pour_rank::RankMode::Routing,
+        reference_stitch: crate::pour_stitch::ReferenceStitch::Off,
     })
 }
 
@@ -321,7 +327,7 @@ fn clipped(text: &str) -> String {
 /// made by this judge): the board named by `board`, its DRC report and the project
 /// files copied beside them. A folder that is already gone is fine. A link is never
 /// followed or removed, and nothing outside `root` or not named `r<number>` is.
-fn remove_round_folder(root: &Path, board: &Path) -> Result<()> {
+pub(crate) fn remove_round_folder(root: &Path, board: &Path) -> Result<()> {
     let folder = board
         .parent()
         .with_context(|| format!("'{}' has no folder", board.display()))?;
@@ -357,7 +363,7 @@ fn remove_round_folder(root: &Path, board: &Path) -> Result<()> {
 }
 
 /// Refill and DRC of a scratch board, with `config` as kicad-cli's settings folder.
-async fn refill(
+pub(crate) async fn refill(
     ctx: &JudgeContext,
     config: Option<&Path>,
     board: &Path,
@@ -599,7 +605,7 @@ async fn baseline_fills(
 }
 
 /// Writes a new scratch board; the file must not exist yet.
-fn write_board(board: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_board(board: &Path, text: &str) -> Result<()> {
     konnect_sexp::write_new_atomic(board, text)
         .map_err(|error| anyhow::anyhow!("write scratch board '{}': {error}", board.display()))
 }
@@ -655,6 +661,17 @@ pub(crate) struct Measures {
     /// failed pour measure never fails the judged run; in the pour key it sorts last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pours_error: Option<String>,
+    /// Row ZR, ZR6 (S6): the ground vias the reference round added to the judged board
+    /// (`pour_stitch::reference_round`, kept), which the run's session does not hold. 0
+    /// when no round ran or it was not kept, and for a delivered winner whose session
+    /// holds them (S10). No gate and no key reads it; the status counts it (S10).
+    #[serde(default)]
+    pub reference_vias: usize,
+    /// Row ZR, ZR6 (S6): checklist items 3.1, 3.2, 3.3 and 4.1 of the judged board's
+    /// audit (`pour_stitch::checklist_items`), for every judged run. Recorded only: no
+    /// gate and no key reads it.
+    #[serde(default)]
+    pub checklist: crate::pour_stitch::ChecklistItems,
 }
 
 /// Each gate passes when its list is empty; each entry is one readable line.
@@ -691,6 +708,14 @@ pub(crate) struct Judged {
     /// ([`TuneChoice::apply`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tune: Option<TuneChoice>,
+    /// Row ZR, ZR6 (S6): what the reference round did on this run, when it ran (the
+    /// post-Z9 audit counted an unstitched layer change and the switch is on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_stitch: Option<crate::pour_stitch::StitchRecord>,
+    /// Row ZR, ZR6 (S6, S10): the kept round's check of the judged board, with this
+    /// run's final measures and gates, for the delivery's comparison. In memory only.
+    #[serde(skip)]
+    pub reference_checked: Option<crate::pour_prune::Checked>,
 }
 
 /// One run, judged by Konnect itself under `ctx.root/run-<index>`:
@@ -743,6 +768,13 @@ pub(crate) type ToolCall<'a> =
 /// ground-via prune (Row ZR, ZR0b) a scripted audit.
 pub(crate) trait ToolCaller: Send + Sync {
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> ToolCall<'a>;
+
+    /// Row ZR, ZR6 (S3, S8): the planner the reference round calls. Production: the
+    /// in-process lenient entry (`pour_stitch::InProcessPlanner`); the tests of the round
+    /// script it.
+    fn reference_planner(&self) -> &dyn crate::pour_stitch::ReferencePlanner {
+        &crate::pour_stitch::InProcessPlanner
+    }
 }
 
 /// The production [`ToolCaller`]: the tool registry, in-process.
@@ -951,7 +983,45 @@ async fn judge_one(
     }
 
     // 5. The layout audit on the last board: a refusal is a failed judge.
-    let audit = audit(tools, &board).await?;
+    let mut audit = audit(tools, &board).await?;
+
+    // Row ZR, ZR6 (S1): the reference round, after Z9's rounds and the audit, before the
+    // length probe and the measures; only when the post-Z9 audit counts an unstitched
+    // layer change. A kept round replaces the board, its report and its audit.
+    let mut reference_stitch = None;
+    let mut reference_kept: Option<crate::pour_stitch::Stitched> = None;
+    if ctx.reference_stitch == crate::pour_stitch::ReferenceStitch::On
+        && crate::pour_stitch::unstitched(&audit).is_some_and(|count| count > 0.0)
+    {
+        let inputs = crate::pour_stitch::RoundInputs {
+            baseline,
+            routed,
+            plan: &plan,
+            widths: &widths,
+            stitching_vias,
+            first_drc: first_drc.as_ref(),
+        };
+        let (kept, record) = crate::pour_stitch::judged_round(
+            ctx,
+            tools,
+            &inputs,
+            config.path(),
+            &run_dir,
+            &board,
+            &drc,
+            &audit,
+        )
+        .await;
+        reference_stitch = Some(record);
+        if let Some(kept) = kept {
+            // The post-Z9 board's folder is no longer needed (a round folder, `r<n>`).
+            let _ = remove_round_folder(&ctx.root, &board);
+            board = kept.board.clone();
+            drc = kept.drc.clone();
+            audit = kept.audit.clone();
+            reference_kept = Some(kept);
+        }
+    }
 
     // 6. Row LT: KiCad's own lengths of the checked nets, on a copy of the last board.
     let lengths = match ctx.lengths.as_deref() {
@@ -1000,13 +1070,28 @@ async fn judge_one(
             );
         }
     }
+    // Row ZR, ZR6 (S6): the kept round's vias, and its check with this run's final
+    // measures and gates (the delivery compares like with like, S10).
+    let reference_checked = reference_kept.map(|kept| {
+        measures.reference_vias = kept.vias.len();
+        kept.checked
+    });
     let gates = gates(&measures, baseline);
+    let reference_checked = reference_checked.map(|mut checked| {
+        if let Some(rest) = checked.rest.as_mut() {
+            rest.measures = measures.clone();
+            rest.gates = gates.clone();
+        }
+        checked
+    });
     Ok(Judged {
         measures,
         gates,
         board,
         rounds,
         tune: None,
+        reference_stitch,
+        reference_checked,
     })
 }
 
@@ -1112,7 +1197,7 @@ pub(crate) async fn routed_scratch(
 }
 
 /// Step 5: the layout audit of `board` through the tool registry; a refusal is an error.
-async fn audit(tools: &dyn ToolCaller, board: &Path) -> Result<Value> {
+pub(crate) async fn audit(tools: &dyn ToolCaller, board: &Path) -> Result<Value> {
     let (refused, text) = tools
         .call(
             "audit_layout_quality",
@@ -1590,6 +1675,8 @@ pub(crate) fn measure(
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: crate::pour_stitch::checklist_items(audit),
     })
 }
 

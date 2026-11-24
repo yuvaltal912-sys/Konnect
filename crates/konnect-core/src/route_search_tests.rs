@@ -773,6 +773,8 @@ fn judged(acute: f64, g1_failed: bool) -> Judged {
             lengths: None,
             pours: None,
             pours_error: None,
+            reference_vias: 0,
+            checklist: Default::default(),
         },
         gates: Gates {
             g1: if g1_failed {
@@ -787,6 +789,8 @@ fn judged(acute: f64, g1_failed: bool) -> Judged {
         board: PathBuf::from("/nonexistent/judged.kicad_pcb"),
         rounds: Vec::new(),
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 

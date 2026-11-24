@@ -1390,6 +1390,8 @@ fn judged_at(quality: f64) -> Judged {
         board: std::path::PathBuf::from("/nowhere/board.kicad_pcb"),
         rounds: vec![],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     }
 }
 
@@ -1463,6 +1465,7 @@ fn two_runs() -> SearchOutcome {
             pour_fills_error: None,
         }),
         pour_prune: None,
+        reference_stitch: None,
     }
 }
 

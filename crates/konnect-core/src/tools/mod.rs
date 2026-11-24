@@ -68,7 +68,7 @@ pub(crate) mod route_lengths;
 #[cfg(test)]
 mod route_obstacle_tests;
 pub(crate) mod route_pairs;
-mod route_refine;
+pub(crate) mod route_refine;
 #[cfg(test)]
 mod route_refine_tests;
 #[cfg(test)]

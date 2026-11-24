@@ -727,6 +727,9 @@ pub(crate) struct SearchOutcome {
     /// Row ZR, ZR0b: what the prune of the winner's redundant ground vias did
     /// (`pour_prune::prune_winner`). `None`: the prune was off for this call.
     pub pour_prune: Option<crate::pour_prune::PruneRecord>,
+    /// Row ZR, ZR6 (S10): what the delivery of the winner's reference vias did
+    /// (`pour_stitch::deliver_winner`). `None`: the round was off for this call.
+    pub reference_stitch: Option<crate::pour_stitch::DeliveryRecord>,
 }
 
 /// The timed search (decisions 6 to 9):
@@ -1298,6 +1301,7 @@ impl<'a> Sched<'a> {
             stopped_launching,
             baseline,
             pour_prune: None,
+            reference_stitch: None,
         }
     }
 }

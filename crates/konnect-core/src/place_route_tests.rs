@@ -395,6 +395,8 @@ fn measures() -> Measures {
         lengths: None,
         pours: None,
         pours_error: None,
+        reference_vias: 0,
+        checklist: Default::default(),
     }
 }
 
@@ -474,6 +476,7 @@ fn outcome(runs: Vec<RunRecord>, winner: Option<usize>) -> SearchOutcome {
         stopped_launching: Some("the launch rule".to_string()),
         baseline: Ok(baseline()),
         pour_prune: None,
+        reference_stitch: None,
     }
 }
 
@@ -525,6 +528,8 @@ fn finished(gates: Gates) -> Finished {
         board,
         rounds: vec![json!({ "round": 1, "open_before": 2, "open_after": 0 })],
         tune: None,
+        reference_stitch: None,
+        reference_checked: None,
     };
     let dsn = root.join("candidate.dsn");
     let ses = root.join("route.ses");
@@ -724,6 +729,7 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         ctx.clone(),
         crate::tools::route_fastroute::PourPrune::Off,
         crate::place_route::CANDIDATE_RANK,
+        crate::place_route::CANDIDATE_STITCH,
     )
     .await
     .unwrap();
@@ -748,6 +754,7 @@ async fn read_route_result_reads_the_winner_the_baseline_and_failures() {
         ctx,
         crate::tools::route_fastroute::PourPrune::Off,
         crate::place_route::CANDIDATE_RANK,
+        crate::place_route::CANDIDATE_STITCH,
     )
     .await
     .unwrap();
