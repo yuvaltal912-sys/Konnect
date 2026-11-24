@@ -29,6 +29,32 @@ argument changes; nothing is removed or renamed.
   tuned candidate a run keeps, and the key the ground-via prune compares. The engine's
   input does not change.
 
+## Unreleased: the pour record (Row ZR, stage ZR5, part 1)
+
+`route_specctra_dsn` (fastroute) records what the routing did to the board's pours,
+against KiCad's own fill of the board before it was routed. Design: "Pour damage
+(part 1)" in `docs/POUR_RANK_DESIGN.md`. No argument changes. Nothing is removed or
+renamed, and no gate, rank or routing changes.
+
+- **New field `search.baseline.pour_fills`**, also in `search.json`, when the call has
+  pour nets: one row per pour net and copper layer of the unrouted board after KiCad's
+  refill (`net`, `layer`, `pieces`, `largest_mm2`, `area_mm2`, `islands`). A piece KiCad
+  saved as an island (`(island yes)`) is not counted in `pieces`, `largest_mm2` or
+  `area_mm2`, only in `islands`. When the rows cannot be read, `pour_fills` is absent
+  and `pour_fills_error` says why; the baseline still stands.
+- **New field `measures.pours.damage`** in every judged run's `run.json` and in
+  `search.winner.measures`, when the baseline has its rows: `lost_fills` (pour net
+  layers that had fill before routing and have none after), `plane_loss` (the share of
+  the pour nets' planes, each net's largest piece on its best layer, that is no longer
+  kept, weighted by area), `area_loss` (the share of pour copper that is gone), `nets`
+  (one row per pour net: `plane_layer`, `plane_mm2`, `kept_layer`, `kept_mm2`,
+  `kept_share`) and `layers` (the "after" rows, in the baseline's order). Both shares
+  are from 0 to 1, and 0 means undamaged.
+- **Absent when there is nothing to compare:** a call with no pour net has neither
+  field; a run judged against a baseline without rows has no `damage`. A record written
+  before this change still reads: `damage` is optional.
+- A call with no pour net writes exactly what it wrote before.
+
 ## Unreleased: the winner's redundant ground vias are removed (Row ZR, stage ZR0b)
 
 `route_specctra_dsn` (fastroute) removes, from the winning session only, the vias of
