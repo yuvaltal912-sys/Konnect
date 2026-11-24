@@ -5,9 +5,10 @@
 //! the two keys ranks. Nothing here changes today's key (PK1), reads a file or starts a
 //! process.
 //!
-//! The two steps and the two places below are the candidate. Part 2 was built before
-//! ZR3's numbers on the owner's word (2026-11-23); the replay on ZR3's runs confirms the
-//! values or changes them, and only the values move.
+//! The three steps and the places below are the owner's: part 2 was built before ZR3's
+//! numbers with candidate values (2026-11-23), and on 2026-11-24, judged on the replay of
+//! the recorded runs, he moved the ground track before the lengths in 5 % steps (PK19) and
+//! set the plane-loss step at 2.5 % (PK20); the area-loss step stays 1 % after the vias.
 
 use crate::route_judge::{Gates, Judged, Key, Measures};
 use serde::Serialize;

@@ -116,7 +116,7 @@ before a line of part 2 is built.
 | # | Decision | Reason |
 |---|---|---|
 | PK1 | Today's key is not changed: `Key`, `KEY_LEN`, `KEY_QUALITY`, and every value `rank` and `rank_measures` return. The pour key is a second key beside it | Z10. "Off" is then today's ranking exactly, every existing test of the key keeps guarding it, and the replay checks it on every recorded run |
-| PK2 | The pour key is today's thirteen entries in today's order, with four added: pour faults and the plane-loss step before the lengths; the area-loss step and the pour-track step after the vias. No existing entry changes its meaning | One standard for a board with pours and a board without: with no pour net the four are 0, so the order is today's. The existing entries are a measured order (D12), and inserting leaves their order among themselves intact |
+| PK2 | The pour key is today's thirteen entries in today's order, with four added: pour faults and the plane-loss step before the lengths; the area-loss step and the pour-track step after the vias. *Since PK19 (2026-11-24) the pour-track step is before the lengths, after the plane-loss step; the area-loss step stays after the vias.* No existing entry changes its meaning | One standard for a board with pours and a board without: with no pour net the four are 0, so the order is today's. The existing entries are a measured order (D12), and inserting leaves their order among themselves intact |
 | PK3 | Pour damage is measured against KiCad's own fill of the board before it was routed (the judge's baseline, refilled by kicad-cli). Only copper that is connected counts: a piece KiCad saved as an island is not fill | The fill before routing is what the routing had to keep. A zone that is two pieces by design costs nothing. KiCad's refill is the truth of the row (P1). An island that a zone's own rule keeps (`(island yes)`) touches nothing of its net, so it is no plane |
 | PK4 | **Plane loss.** For each pour net: its plane before routing is its largest piece on any one layer; what is kept is its largest piece on any one layer after routing (on a layer, never more than that layer's largest piece before). The loss is the area no longer kept over the area of all the nets' planes, a share from 0 to 1. In the key it is stepped at 2.5 % since PK20 (2026-11-24; first built at 5 %) | The checklist's "keep one side largely continuous": one whole reference plane is what a return path needs, so the best single layer counts. One number sees a split (the largest piece shrinks to a part) and a slot or a lost island (it loses area). Weighted by area, because with equal weights a 30 mm² local pour cut by one track would count like a fifth of the ground plane (the review). By area and not by each layer's ratio, so that a small layer that stayed whole cannot hide a plane that was destroyed |
 | PK5 | **Pour faults** are KiCad's `starved_thermal` violations on the judged board plus the pour layers that had fill before routing and have none after. One entry, a count, before the plane loss | Each is a spot where a pour stopped doing its job. KiCad calls a starved thermal an error by default. Gate G2 only holds it to the unrouted board's count, and ZR2's matrix has a winner with one more than other runs |
@@ -418,6 +418,8 @@ Records: `target/creation-research/zone-routing/zr5/part1/measure/` in the main 
   (2026-11-23, relayed verbatim by the supervisor session). After ZR3's runs, the replay
   computes the candidate key from part 1's rows on them, and the table below goes to the
   owner. If his boards show a value wrong, only the values change.
+  **Today's values (2026-11-24, the owner's decisions PK19 and PK20):** the plane-loss step
+  2.5 %, the pour-track step 5 % before the lengths, the area-loss step 1 % after the vias.
 
 ### The setting, and what every call reports
 
@@ -474,19 +476,19 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
 | Guard | Test | Negative control |
 |---|---|---|
 | Today's key is today's | `ranking(Routing, runs)` equals `route_judge::rank_measures(runs)` entry for entry, on runs that differ in every measure | an entry swapped in that arm |
-| Today's entries keep their order in the pour key | each of the thirteen at its place: 0 to 6, then 9 to 12, 15, 16 | a place shifted by one |
-| No pour record, today's order | runs with no pour measure and no pour error (a call with no pour net; the prune's light judge): entries 7, 8 and 13 are 0. With no track on a pour net either, the two keys sort the runs alike, ties included | the largest number written there: the entries differ |
-| An unmeasured run does not outrank a measured one | two runs alike, the first with `pours_error`: it sorts after the second, and its entries 7, 8 and 13 are the largest number. The same for pour measures with no damage | 0 written for it: the first sorts first |
+| Today's entries keep their order in the pour key | each of the thirteen at its place: 0 to 6, then 10 to 13 (9 to 12 in the first layout, before PK19), 15, 16 | a place shifted by one |
+| No pour record, today's order | runs with no pour measure and no pour error (a call with no pour net; the prune's light judge): entries 7, 8 and 14 are 0 (7, 8 and 13 in the first layout). With no track on a pour net either, the two keys sort the runs alike, ties included | the largest number written there: the entries differ |
+| An unmeasured run does not outrank a measured one | two runs alike, the first with `pours_error`: it sorts after the second, and its entries 7, 8 and 14 (first layout: 13) are the largest number. The same for pour measures with no damage | 0 written for it: the first sorts first |
 | Faults, then the plane, then the lengths | pairs that differ in one entry each; and one starved thermal more against two length steps fewer: the starved run loses | two places exchanged |
-| The steps round as the lengths do | plane: 0.024 is 0, 0.025 is 1, 0.074 is 1, 0.076 is 2. Area: 0.004 is 0, 0.005 is 1. A loss that is not a finite number of 0 or more is the largest number | rounded down: 0.025 is 0 |
-| The pour track is in signal units | the shortest signal 1000 mm: 9 mm is 0, 10 mm is 1, 400 mm is 20. No signal track in the pool: 0 for all | the shortest pour track as the unit: 9 mm is 50 |
+| The steps round as the lengths do | plane (at the first 5 % step; at 2.5 % since PK20: 0.012 is 0, 0.0125 is 1, 0.037 is 1, 0.038 is 2): 0.024 is 0, 0.025 is 1, 0.074 is 1, 0.076 is 2. Area: 0.004 is 0, 0.005 is 1. A loss that is not a finite number of 0 or more is the largest number | rounded down: 0.025 is 0 |
+| The pour track is in signal units | the shortest signal 1000 mm, at the first 2 % step: 9 mm is 0, 10 mm is 1, 400 mm is 20 (at 5 % since PK19: 24 mm is 0, 70 mm is 1, 400 mm is 8). No signal track in the pool: 0 for all | the shortest pour track as the unit: 9 mm is 50 |
 | The pool is today's | a run outside the pool, and one that fails G1, do not set the unit | every run sets it |
 | The default is today's key | no `routing.rank_key`: `Routing`, from the default; `"pours"`: `Pours`, from the user config | `Pours` as the default |
 | A value that is not a name is refused | `"pour"`, `3`, `""`: an error that names `routing.rank_key` and both names; `null` is "not set" | a silent fall to the default |
 | The setting is read whatever the arguments | a call with `effort` and `fastroute_path` given and `routing.rank_key: "pours"` in the config: ranked by `pours` | read only when `effort` is absent: ranked by `routing` |
 | Placement's routing calls rank by today's key | `route_candidate` with `pours` in the config: `ranked_by` is `routing`, and the config is not read | the constant ignored: `pours` |
 | Each site follows the mode | a scripted pool on which the two keys disagree: the search's winner, the runs it releases, a run's tuned choice (an exact tie still keeps the untuned board), the prune's final comparison and the keys it takes again, and the listing each follow the key of the mode, under both modes | per site: left on `route_judge::rank`, its case fails |
-| The prune's refusals name the ranking key's places | a candidate with a longer signal step: `key:9` under `pours`, `key:7` under `routing` | clause (c) left on today's key under `pours`: `key:7` |
+| The prune's refusals name the ranking key's places | a candidate with a longer signal step: `key:10` under `pours` (`key:9` in the first layout), `key:7` under `routing` | clause (c) left on today's key under `pours`: `key:7` |
 | Both keys are written whatever the mode | `run.json`, the winner and the prune's `before` have `key` and `pour_key` under both modes | `pour_key` only under `pours` |
 | The report names the other key's choice | `other_winner` is the least of the other key, ties to the lower index, a released run included; `null` with no judged run; `same_winner` says whether it is the winner | released runs left out |
 | The engine's input is the same | the call writes the same uncounted file under both modes | emptied under `pours` |
@@ -523,7 +525,9 @@ Not touched: `place_judge.rs` (PK13), `fastroute.rs` (PK11), any engine file.
 Branch `claude/zr5-pour-key-build`, with `fork/main` `78f51580` (part 1, merged as #117)
 merged in. Built by Claude Opus 5.5; reviewed by an agent that did not write
 it (no must-fix; its items are taken below). The four values are the candidate's: 5 %,
-1 %, before the lengths, after the vias. The setting ships at `routing`.
+1 %, before the lengths, after the vias. The setting ships at `routing`. (Since PK19 and
+PK20, 2026-11-24: plane 2.5 %, the track 5 % before the lengths, area 1 % after the
+vias; see "The ground track before the lengths".)
 
 What differs from the skeleton and the tables above, each with its reason:
 
@@ -683,6 +687,34 @@ and 0.92); at 5 % they would give 1 and 0, so the old step fails the test.
   this branch, x22, `routing.rank_key = "pours"`, the five boards at M. It runs after ZR4's
   re-measurement (one routing measurement at a time). Every recorded `pour_key` must equal
   the replay's.
+
+### PK19 and PK20 as built (2026-11-24)
+
+Branch `claude/zr5-ground-track-rule`, from main `f3991bde` (part 2, #118) and the design
+commit `9311e57d`. Built by Claude Opus 5.5; reviewed by an agent that did not write it (no
+must-fix; its items are taken).
+
+- **The change is as designed**, in `pour_rank.rs` only: `POUR_TRACK` 9, `TODAY_AT`
+  `[0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 15, 16]`, `AREA_LOSS` 14, a new `POUR_TRACK_STEP`
+  0.05 that `pour_track_step` rounds by, and `PLANE_STEP` 0.025. The prune and
+  `search.rank` take their positions from the ranking key, so no code there changed; their
+  tests name the new places (`key:10` for a longer signal under `pours`, `key:9` for a
+  longer pour track).
+- **Tests:** the design's PK19 table and the PK20 test, and a pour track below 0 is step
+  0 (the mutants batch asked for it). Every existing test that read an index or a step
+  follows.
+- **Controls:** 6, 6 caught (P1 to P5 for the PK19 table's rows, P6 for PK20); the last
+  row (the default does not change) has no control, because its test is unchanged.
+- **Mutants:** one narrow batch on `pour_track_step`, `pour_keys`, `plane_step` and
+  `share_step`: 24, 22 caught, 2 missed. One (the guard `pour_track_mm > 0.0` replaced with
+  `true`) is caught on the rerun by the new test; the other (`>` to `>=` in that guard) is
+  equivalent, since 0 mm is step 0 either way.
+- **The offline check:** the supervisor session's independent replay at the new layout
+  (plane 2.5 %, the track 5 % before the lengths) reproduces the 2.5 % row on the combined
+  runs: the winners are B5 #12, dash #3, `ecc` #8, `pic` #20 and `pours` #610. Record:
+  `zr5-part2-candidate/quality_check.py` and `pk20-combined.jsonl` in the supervisor's notes
+  folder.
+- **Not measured live:** the zones session's measurement, as above.
 
 ## The skill's order of work (PK15; applied once ZR4 and ZR2 are merged)
 
