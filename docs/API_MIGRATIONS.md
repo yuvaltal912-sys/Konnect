@@ -17,7 +17,8 @@ Design: `docs/POUR_PLAN_DESIGN.md`.
   (`pour-plans/<stamp>-<sha8>/`). `check.clean` also needs every pad the pours should
   reach to be reached (`check.unreached`, by net). When KiCad's first fill starves a
   thermal pad or leaves one unreached, the plan is filled once more with smaller thermal
-  values (gap 0.3 mm, spoke 0.4 mm) and the better fill is kept; `check.thermal_steps`
+  values (gap 0.3 mm, spoke the larger of 0.4 mm and the minimum width) and the better
+  fill is kept; `check.thermal_steps`
   lists each fill, and the proposals carry the kept fill's values.
 - **`add_zone` and `add_copper_pour` gain four arguments:** `thermal_gap` (mm, default
   0.5), `thermal_bridge_width` (mm, default the larger of 0.5 and `min_width`),

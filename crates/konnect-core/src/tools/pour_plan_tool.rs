@@ -67,7 +67,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          severity error rose, no more thermal pads are starved, and every pad the pours \
          should reach is reached). When KiCad's first fill starves a thermal pad or \
          leaves one unreached, the check fills the plan once more with smaller thermal \
-         values (gap 0.3 mm, spoke 0.4 mm) and keeps the better fill; \
+         values (gap 0.3 mm, spoke the larger of 0.4 mm and the minimum width) and \
+         keeps the better fill; \
          `check.thermal_steps` lists each fill. \
          `rule_areas_filled` lists every rule area on a proposed layer that keeps \
          tracks, vias or pads out and lets copper pours in: KiCad fills the pour inside \
@@ -599,19 +600,29 @@ fn next_steps(plan: &PourPlan, check: Option<&FillCheck>) -> Vec<String> {
     if let Some(check) = check.filter(|check| check.thermal_steps.len() > 1) {
         let first = &check.thermal_steps[0];
         let second = &check.thermal_steps[1];
+        // The causes the first fill had: the rise of starved thermals (its total stays in
+        // `thermal_steps`) and the unreached pads, each named only when it is above 0.
+        let rise = first
+            .starved_thermals
+            .saturating_sub(check.starved_thermals_before);
+        let mut causes = Vec::new();
+        if rise > 0 {
+            causes.push(format!("starved {rise} more thermal pads"));
+        }
+        if first.unreached_pads > 0 {
+            causes.push(format!("left {} pads unreached", first.unreached_pads));
+        }
         let why = format!(
-            "KiCad's first fill (thermal gap {} mm, spoke {} mm) left {} thermal pads starved \
-             and {} pads unreached",
+            "KiCad's first fill (thermal gap {} mm, spoke {} mm) {}",
             first.thermal_gap_mm,
             first.thermal_bridge_mm,
-            first.starved_thermals,
-            first.unreached_pads
+            causes.join(" and ")
         );
         steps.push(if second.kept {
             format!(
-                "{why}, so the plan uses the smaller thermal values, gap {} mm and spoke {} mm \
-                 (the owner's own on B5), which KiCad fills with fewer faults. Each \
-                 proposal's add_zone arguments carry them.",
+                "{why}, so the plan uses the smaller thermal values, gap {} mm and spoke {} mm, \
+                 which KiCad fills with fewer faults. Each proposal's add_zone arguments carry \
+                 them.",
                 second.thermal_gap_mm, second.thermal_bridge_mm
             )
         } else {

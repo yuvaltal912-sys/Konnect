@@ -720,6 +720,42 @@ fn a_role_from_a_name_is_named_in_the_next_steps() {
 }
 
 #[test]
+fn the_second_fills_reason_names_only_what_rose() {
+    use crate::pour_check::ThermalStep;
+    let plan = plan_with(vec![zone("GND", "F.Cu", false)]);
+    let step = |starved: usize, unreached: usize, kept: bool, gap: f64| ThermalStep {
+        thermal_gap_mm: gap,
+        thermal_bridge_mm: if gap == 0.5 { 0.5 } else { 0.4 },
+        starved_thermals: starved,
+        unreached_pads: unreached,
+        clean: kept,
+        kept,
+    };
+    // 3 starved thermals before the proposals and after the first fill: no rise. The
+    // second fill was started by 2 unreached pads only.
+    let check = FillCheck {
+        starved_thermals_before: 3,
+        starved_thermals: 3,
+        thermal_steps: vec![step(3, 2, false, 0.5), step(3, 0, true, 0.3)],
+        ..clean_check(vec![fill("GND", "F.Cu", 1)])
+    };
+    let steps = next_steps(&plan, Some(&check)).join(" ");
+    assert!(steps.contains("left 2 pads unreached"), "{steps}");
+    assert!(!steps.contains("starved"), "{steps}");
+    assert!(!steps.contains("B5") && !steps.contains("owner"), "{steps}");
+    // A rise of 2 above 1 is named as 2.
+    let check = FillCheck {
+        starved_thermals_before: 1,
+        starved_thermals: 1,
+        thermal_steps: vec![step(3, 0, false, 0.5), step(1, 0, true, 0.3)],
+        ..clean_check(vec![fill("GND", "F.Cu", 1)])
+    };
+    let steps = next_steps(&plan, Some(&check)).join(" ");
+    assert!(steps.contains("starved 2 more thermal pads"), "{steps}");
+    assert!(!steps.contains("unreached"), "{steps}");
+}
+
+#[test]
 fn an_unclean_check_names_what_rose() {
     let plan = plan_with(vec![zone("GND", "F.Cu", false)]);
     let check = FillCheck {
@@ -844,6 +880,14 @@ async fn the_real_thing_fills_clean() {
     assert!(!result.is_error, "{}", text_of(&result));
     let body = body_of(&result);
     assert_eq!(body["check"]["clean"], false, "{body}");
+    // Not clean because of the unreached pads: no rule of severity error other than
+    // starved_thermal rose, so the control of PP17 stays meaningful on another KiCad.
+    for row in body["check"]["risen"].as_array().unwrap() {
+        assert!(
+            row["severity"] != "error" || row["rule"] == "starved_thermal",
+            "{row}"
+        );
+    }
     let unreached = body["check"]["unreached"].as_array().unwrap();
     assert_eq!(unreached.len(), 1, "{body}");
     assert_eq!(unreached[0]["net"], "GND");
