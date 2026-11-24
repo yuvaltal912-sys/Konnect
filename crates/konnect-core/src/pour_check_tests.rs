@@ -830,4 +830,37 @@ fn faults_and_thermal_faults_count_what_the_design_says() {
     fewer.starved_thermals = 1;
     assert_eq!(faults(&fewer), 0);
     assert!(!thermal_fault(&fewer));
+    // A rise counts by how much it rose, not by its new count.
+    let mut risen_from_one = judged(0, false);
+    risen_from_one.risen.push(Risen {
+        rule: "clearance".into(),
+        severity: "error".into(),
+        before: 1,
+        after: 3,
+    });
+    assert_eq!(faults(&risen_from_one), 2);
+}
+
+/// Added for the mutants batch: two unreached pads of one net are one row of that net.
+#[test]
+fn the_unreached_pads_of_one_net_are_one_row() {
+    let text = board_with_pad(Some((20.0, 20.0, 30.0))).replace(
+        "  (zone ",
+        "  (footprint \"T\" (layer \"F.Cu\") (uuid \"fp-R2\") (at 12 10)\n    (property \"Reference\" \"R2\" (at 0 0) (layer \"F.SilkS\") (uuid \"pr-R2\"))\n    (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"GND\") (uuid \"pad-R2\")))\n  (zone ",
+    );
+    let check = verdict(
+        &[proposal("GND", "F.Cu")],
+        &report(vec![], vec![]),
+        &report(vec![], vec![]),
+        &text,
+    )
+    .unwrap();
+    assert_eq!(
+        check.unreached,
+        [NetPads {
+            net: "GND".into(),
+            pads: vec!["R1.1".into(), "R2.1".into()]
+        }]
+    );
+    assert_eq!(faults(&check), 2);
 }
