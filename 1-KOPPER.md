@@ -144,8 +144,8 @@ Freerouting does not tune lengths and says so. The design:
 ## Which key ranks the routing runs
 
 The judge gives every routed run two keys: `key`, the one that ranks by default, and
-`pour_key`, the same with four pour entries added (pour faults and the plane loss
-before the lengths, the pour copper lost and the ground track after the vias). The
+`pour_key`, the same with four pour entries added (pour faults, the plane loss and the
+ground track before the lengths, the pour copper lost after the vias). The
 user config's `routing.rank_key` chooses: `"routing"` (the default) or `"pours"`. It
 is your standing choice: set it with `save_user_config(key_path='routing.rank_key',
 value='pours')`. Every routing result's `search.rank` says which key ranked and which
