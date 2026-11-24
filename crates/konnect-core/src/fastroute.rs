@@ -77,9 +77,10 @@ pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR3";
 
 /// Row ZR, stage ZR3: the cut cost's weights, sent with every `--x.zones` (never without
 /// it: the engine refuses a cut cost with no model). Per length (a share of the maze step's
-/// own cost), per via and per thermal spoke (both in vias). Provisional until ZR3's weight
-/// matrix picks them.
-pub(crate) const ZONES_CUT_SWITCH: &str = "--x.zones_cut=1,1,2";
+/// own cost), per via and per thermal spoke (both in vias). ZR3's weight matrix chose
+/// W = 2 of 0, 0.5, 1, 2 and 4 (L = V = W, S = 2W; `docs/ZONE_ROUTING_DESIGN.md`, "ZR3 as
+/// built").
+pub(crate) const ZONES_CUT_SWITCH: &str = "--x.zones_cut=2,2,4";
 
 /// Threads per run, for the autorouter and the optimizer each (the research's 7 x 2).
 pub(crate) const THREADS: u32 = 2;
