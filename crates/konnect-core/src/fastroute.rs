@@ -268,14 +268,15 @@ fn present(path: &Path) -> bool {
 ///    (an empty file the probe writes; fastroute reads it as it parses the switch, and an
 ///    empty file names no net), `--x.zones=<scratch>/probe-zones.txt` ([`PROBE_ZONES_TEXT`],
 ///    a valid zones file with no `zone` line, so it models nothing; Row ZR, stage ZR1),
-///    then [`SENTINEL_SWITCH`], last. fastroute parses its
+///    [`ZONES_CUT_SWITCH`] right after it (stage ZR3), then [`SENTINEL_SWITCH`], last. fastroute parses its
 ///    arguments in order and stops at the first unknown experimental switch
 ///    (`exp::parse_arg`), so the sentinel is named only when every switch before it was
 ///    accepted. The output must contain
 ///    `unknown experimental switch --x.konnect_probe_unknown` and must not name any
 ///    other switch as unknown. A build that lacks one of the switches names that one
 ///    (x18, without the search switches, names `--x.oct_bound`; x19, without the fill
-///    model, names `--x.zones=`); a build without
+///    model, names `--x.zones=`; x21, without the cut cost, names `--x.zones_cut=`); a
+///    build without
 ///    experimental switches names none (it goes on to open the absent DSN and fails on
 ///    that).
 ///

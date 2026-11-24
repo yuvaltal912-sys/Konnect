@@ -1140,6 +1140,9 @@ fn the_group_search_summary_keeps_the_pour_state_and_counts_pour_worse() {
     // a pass that refused nothing on the pour rule has no `pour_worse` end: counted 0
     object["passes"][1]["ends"].as_object_mut().unwrap().remove("pour_worse");
     assert_eq!(group_search_summary(&object).unwrap()["pour_worse"], 2);
+    // a pass with no `ends` at all counts 0 too
+    object["passes"][0].as_object_mut().unwrap().remove("ends");
+    assert_eq!(group_search_summary(&object).unwrap()["pour_worse"], 0);
     // no pour state (x21, or no `--x.zones`): the summary of before, key for key
     let mut plain = group_search_object();
     plain["passes"][0]["ends"]["pour_worse"] = json!(2);

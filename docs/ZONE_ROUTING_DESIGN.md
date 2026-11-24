@@ -2142,3 +2142,72 @@ One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's
 - **The last redraw of a group-search move** has no control that bites (C10). The member's own tail removal already runs before it.
 - **No windowed redraw.** A redraw reuses the fixed layers and draws the rest in full.
 - **A unit-level difference from KiCad:** the model decides islands per plane, KiCad per zone across its layers. Both err on the safe side for connections.
+
+## ZR3 as built (2026-11-24)
+
+Stage ZR3 is engine work: fastroute build **x22**, branch `zr3-cost`, commit `4053287`. That is x21's `20d7c96` plus the cut cost in the maze and the group search's "never more pour damage" rule, extended to thermal spokes. Konnect pins the measured binary (SHA-256 `cddf5f62`) in `packaging/1-kopper/fastroute.json`, kept with the records and in the owner's iCloud (release builds are not byte-reproducible). Konnect renames the candidate `C** + BR1 + W8P + GS + ZR3` and sends one new switch, `--x.zones_cut=2,2,4`, right after every `--x.zones=` and in the probe, so a build without it is refused by name. The group search summary of each judged run keeps the engine's pour state and counts the moves the pour rule refused (`pour_worse`). The gates and the rank key do not change.
+
+### The engine
+
+- **The switch.** `--x.zones_cut=L,V,S` is experimental and off by default. It is refused without `--x.zones`, and dropped with a warning under `--parity` and `--no-enhancements`. A model that fails to draw while it is set is warned ("the cut cost has no effect"). Each weight is finite, at least 0 and at most 1e6. Off, every maze hook returns 0 before it reads the model: the maze is x21's.
+- **The units.** L is a share of the maze step's own cost: 1.0 doubles a step's cost over another net's live fill. V and S are in the router's via cost (`min_normal_via_cost`): V per modelled layer on which the placed via knocks out live fill of another net, S per kept spoke of another net's thermal pin that the step blocks.
+- **Live fill** is a cell of a kept piece of a zone of another net. The routed net's own pours are free. Fill already cut, or removed as an island, costs nothing more.
+- **A trace step** pays `L × step cost × the share of its centre line over foreign live fill`, sampled once a cell, plus `S × via cost × the spokes it blocks`. A spoke is blocked when the step comes within its half width, the knockout clearance and one cell of the spoke's polygon, as the model blocks spokes.
+- **A via** pays `V × via cost × the layers it knocks out live fill on`, over the span of the via the hop would place (the first covering via of the rule), with each layer's own pad and the hole grown as the model stamps a via.
+- **Thermal relief** (the owner's note, "pad-to-pour connections"): S makes a route go around another net's thermal spokes, and the search rule below never keeps a move that loses one.
+- **Z17, extended.** A board's pour state is three counts: fill pieces before the island rule, starved thermal pins, and spokes lost per (pin, zone) against the run's first snapshot (every redraw carries that reference on). The group search never keeps a move with more of any count. A move refused for that alone ends `pour_worse`.
+- **The report.** `planes` adds `zones_cut` (the three weights), `zones_cut_applied` (the model the cost reads was drawn) and `spokes {pins, reference, kept, lost, pins_losing}`. With `--x.zones`, the group search's `start` and `end` add `pour {pieces, starved, spokes_lost, largest_share}`; without it they are x21's objects byte for byte.
+
+### Verification of the build
+
+- fastroute's workspace tests (518 passed after the fix round), the 16 negative controls of the fix round and the 3 of the second review, each failing as it should.
+- Two reviews of the diff by agents that did not write it: nothing must-fix; every should-fix taken.
+- A narrow mutants batch on the new guards: 131 mutants, 117 caught. Of the 14 missed, 3 were test gaps, closed with assertions and caught on a rerun; 11 are equivalent (speed-only guards whose skipped term is 0).
+- **Off changes nothing.** On the five boards' as-exported DSNs, driven directly with a routing pass's switches and `--no-time-limits`: without `--x.zones`, x22's session is byte-identical to x21's; with `--x.zones`, x22's session with `--x.zones_cut=0,0,0` is byte-identical to x22's without the switch. With `--x.zones` and no cost, x22 differs from x21 on four boards (not `ecc`): that is Z17 alone.
+- Konnect: the summary's new keys have a test and three negative controls (the pour not kept, `pour_worse` always written, only the first pass summed), each failing as it should.
+
+### The measurement
+
+One `route_specctra_dsn` call per board and setting at effort M, each in its own routing hold with a hard timeout, with x22 and a release build of this branch (main `78f51580`, so ZR5 part 1's pour record is in every run). The ZR2 rows are ZR5 part 1's own x21 measurement, which carries the same record. The tables count the as-exported runs, the shape the cost acts on: the pours-omitted runs send no zones file, so neither the cost nor Z17 reaches them, and they are the same as ZR2's.
+
+**The weight matrix** (dash, B5 and `pic`): W in 0, 0.5, 1, 2 and 4, as L = V = W and S = 2W, one Konnect build per weight with only the switch changed. W = 0 is ZR2's maze with Z17.
+
+| `pic`, as exported | runs | G1 | G2 | fill pieces (median) | plane loss (median) | ground track, mm (median) | spokes lost (median) | runs with a starved pin | `pour_worse` |
+|---|---|---|---|---|---|---|---|---|---|
+| ZR2 | 37 | 0.68 | 0.95 | 2 | 0.062 | 17.4 | - | 0 | - |
+| W 0 | 38 | 0.66 | 0.89 | 2 | 0.056 | 16.4 | 6 | 3 | 282 |
+| W 0.5 | 50 | 0.40 | 0.84 | 1 | 0.038 | 11.1 | 3 | 4 | 78 |
+| W 1 | 36 | 0.56 | 0.69 | 1 | 0.029 | 6.7 | 1 | 7 | 72 |
+| **W 2** | 28 | 0.68 | 0.93 | 1 | 0.016 | 4.9 | 0 | 2 | 16 |
+| W 4 | 20 | 0.30 | 1.00 | 1 | 0.0045 | 1.0 | 0 | 0 | 19 |
+
+- **The pours improve steadily with W** on both boards that judged as-exported runs. On B5 every weight from 0.5 up gives 12 fill pieces (ZR2: 14), and the ground track falls to between 0.56 and 0.84 of ZR2's. B5 passes every gate at every weight.
+- **`pic`'s gate shares do not follow W.** Seed by seed, the outcome flips between weights (W 0 against W 1: 11 of 35 seeds went from pass to fail and 6 from fail to pass). One call a weight resolves the pour measures, not gate shares closer than about 0.2.
+- **dash judged no as-exported run** at any weight but 4: each one was cut at the budget at effort M. Its one run at W 4 had 29 fill pieces (ZR2's one run: 27) and less than half ZR2's ground track.
+- **The cost slows an as-exported run:** `pic` judged 38, 50, 36, 28 and 20 of them.
+- **The choice is W = 2** (`--x.zones_cut=2,2,4`). Of the weights above 0, it alone keeps `pic`'s gate shares at W 0's level, which is within the spread of ZR2's. It gives most of W 4's pour gain, without W 4's G1 of 0.30 or its fewest runs.
+
+**The five boards at W = 2.** The three calls above at W 2 count again, since they used the same binary and inputs. `ecc` and `pours` were added.
+
+| Board, as exported | runs | G1, G2 (ZR2 → ZR3) | fill pieces (median, ZR2 → ZR3) | main piece's share (median) | plane loss (median, ZR2 → ZR3) | runs with a starved pin (ZR2 → ZR3) | winner (ZR2 → ZR3) |
+|---|---|---|---|---|---|---|---|
+| dash | 0 | - | - | - | - | - | omitted → omitted |
+| B5 | 8 | 1.0, 1.0 → 1.0, 1.0 | 14 → 12 | 0.942 → 0.954 | 0.044 → 0.035 | 0 of 5 → 1 of 8 | as exported → **omitted** |
+| `pic` | 28 | 0.68, 0.95 → 0.68, 0.93 | 2 → 1 | 0.9998 → 1.0 | 0.062 → 0.016 | 0 of 37 → 2 of 28 | as exported → **omitted** |
+| `ecc` | 730 | 1.0, 1.0 → 1.0, 1.0 | 1 → 1 | 1.0 → 1.0 | 0.069 → 0.0017 | 0 → 0 | omitted → **as exported** |
+| `pours` | 657 | 1.0, 0.85 → 1.0, 0.83 | 2 → 2 | 1.0 → 1.0 | 0.033 → 0.039 | 0 → 0 | omitted → omitted |
+
+- **Fewer pieces and a larger main piece at the same gate shares: met on B5, `pic` and `ecc`**, and flat on `pours`, whose plane loss is a little higher (0.039 against 0.033) at about the same gates. dash has no as-exported run to show.
+- **The winner's ground track: not met.** On B5 and `pic` the winner is now pours omitted, so its ground track is many times ZR2's winner's. On `ecc` the winner is now as exported, with no ground track at all. The cause is the rank key, which this stage does not change. The key puts signal length before any pour measure, and the best as-exported run now routes its signals 2 to 6 % longer to spare the pours (B5: signal step 53 against 50; `pic`: 51 against 50). In ZR2 the as-exported runs won by one via off the pour nets. Z17 alone already moves the winners (W 0 on B5 and `pic`). The pour key of ZR5 part 2 is what puts the pours in the choice.
+- **Starved pins: not met.** 1 run on B5 and 2 on `pic` end with a thermal pin KiCad calls starved, where ZR2 had none. In each of them the engine's model counts no starved pin and no lost spoke. The model's spoke check misses a starved pin that KiCad sees (see "Limits").
+- **Lost spokes:** `pic` loses a median of 0 spokes at W 2 against 6 at W 0, and B5 15 against 19. x21 does not count spokes, so W 0 stands in for ZR2: Z17 can only keep its search from losing more than the routing it starts from.
+- **The search's ends are counted.** `pour_worse` is in each run's summary (16 on `pic`'s as-exported runs, 324 on B5's), and `cut` in `planes.search_cut_ends`. Konnect's summary does not sum `cut` too, as the addendum planned, because the engine already counts it there.
+- **Zero false connections and zero false opens** in 1,423 compared runs at W 2, and no engine or pour error.
+
+### Limits
+
+- **The model misses some starved pins KiCad sees.** In the starved runs above the model's `spokes` and starved count are clean while KiCad's DRC is not. One of them had a spoke track the closing stage added, which KiCad does not count. A model-against-KiCad check of the spokes, like ZR1's of the pads, would find out which spokes differ.
+- **One call a weight.** The pour measures move steadily with W, the gate shares do not, so the choice of W rests on the pour measures and on gates not falling.
+- The plumbing from the hop's via to the via cost's span has no maze-level test: the fixture builder makes 2-layer boards, where a via's span always equals the hop.
+- The maze checks a via at shove depth 0, the inserter at its full shove depth. They pick the same via inside the drillable range; elsewhere the cost can name a via the inserter does not place.
+- The line share is a centre-line estimate. It measures how much of a step lies over the pour, not the copper a wide track takes away; the spokes, which a sliver can cut, get the full reach.
