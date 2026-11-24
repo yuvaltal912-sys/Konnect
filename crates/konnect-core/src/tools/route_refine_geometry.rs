@@ -1489,6 +1489,20 @@ pub(super) fn test_scene(items: Vec<Copper>) -> Scene {
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+
+    /// Row ZR, ZR6 (S8 iii): a teardrop with no UUID gets its index and layer as its id,
+    /// with the first free suffix when that name is taken.
+    #[test]
+    fn route_refine_teardrop_fill_id_is_unique_on_the_board() {
+        let none = BTreeSet::new();
+        assert_eq!(teardrop_fill_id(3, "F.Cu", &none), "teardrop-3-F.Cu");
+        let taken: BTreeSet<String> = ["teardrop-3-F.Cu", "teardrop-3-F.Cu-1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(teardrop_fill_id(3, "F.Cu", &taken), "teardrop-3-F.Cu-2");
+        assert_eq!(teardrop_fill_id(4, "F.Cu", &taken), "teardrop-4-F.Cu");
+    }
     fn scene(items: Vec<Copper>) -> Scene {
         super::test_scene(items)
     }

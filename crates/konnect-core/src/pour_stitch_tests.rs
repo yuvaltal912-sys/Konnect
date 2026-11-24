@@ -759,3 +759,105 @@ fn a_ring_is_reached_from_inside_and_within_the_reach_of_its_edge() {
 fn the_placement_tools_route_with_the_round_off_and_prepare_gives_off() {
     assert_eq!(crate::place_route::CANDIDATE_STITCH, ReferenceStitch::Off);
 }
+
+// ─── The mutants batch's misses (shards 0 to 5), each killed here ────────────
+
+#[test]
+fn a_pour_record_due_on_one_side_only_is_unchecked() {
+    // The stitched board took no record and no error, the post-Z9 one did: due.
+    let mut after = checked(0.0);
+    rest(&mut after).measures.pours = None;
+    rest(&mut after).measures.pours_error = None;
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        vec!["unchecked"]
+    );
+}
+
+#[test]
+fn a_fill_exactly_at_the_tolerance_is_kept() {
+    let mut after = checked(0.0);
+    rest(&mut after).fills[2] = fill("VCC", "In1.Cu", 50.0 - pour_prune::FILL_TOLERANCE_MM2);
+    assert_eq!(
+        stitch_refusals(&checked(3.0), &after, &gnd()),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn the_summary_holds_the_drc_counts() {
+    let mut board = checked(3.0);
+    board.unconnected = 2;
+    let summary = summary_alone(&board);
+    assert_eq!(summary.unconnected, 2);
+    assert_eq!(
+        summary.violations,
+        BTreeMap::from([("silk_overlap".to_string(), 2)])
+    );
+}
+
+#[test]
+fn a_position_that_is_no_fill_vertex_names_by_distance_even_beside_a_fill() {
+    let vias = [via("GND", 10.0, 10.0), via("GND", 20.0, 10.0)];
+    // A fill piece around the second via, none of its vertices at the item.
+    let piece = zone("GND", "B.Cu", &[(18.0, 8.0), (22.0, 8.0), (22.0, 12.0), (18.0, 12.0)]);
+    let stitched = board(&[piece]);
+    let drc = report(vec![violation("clearance", (10.7, 10.0))], vec![]);
+    let named = named_vias(&["rule:clearance".to_string()], &vias, &drc, &board(&[]), &stitched);
+    assert_eq!(named, BTreeSet::from([0]));
+}
+
+#[test]
+fn a_fill_clause_reaches_a_via_by_its_own_radius() {
+    // The plane's edge at x = 15: a 0.6 mm via 0.9 mm off it is out of reach (0.3 + 0.5).
+    let vias = [via("GND", 15.9, 10.0), via("GND", 15.7, 10.0)];
+    let plane = zone("GND", "In1.Cu", &[(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)]);
+    let named = named_vias(
+        &["fill:GND/In1.Cu".to_string()],
+        &vias,
+        &report(vec![], vec![]),
+        &board(&[plane]),
+        &board(&[]),
+    );
+    assert_eq!(named, BTreeSet::from([1]));
+}
+
+#[test]
+fn a_via_goes_inside_a_net_block_with_no_route_and_into_an_empty_network() {
+    let empty_net = "(session \"b\"
+  (routes
+    (resolution um 10)
+    (network_out
+      (net GND
+      )
+    )
+  )
+)";
+    let empty_network = "(session \"b\"
+  (routes
+    (resolution um 10)
+    (network_out
+    )
+  )
+)";
+    let gnd: BTreeSet<String> = BTreeSet::from(["GND".to_string()]);
+    for session in [empty_net, empty_network] {
+        let text = write_vias(session, &[via("GND", 1.0, 2.0)], "konnect_via_0001").unwrap();
+        let units = pour_prune::units(&text, &gnd).unwrap();
+        let points: Vec<[i64; 2]> = units.iter().filter_map(|unit| unit.at).collect();
+        assert_eq!(points, vec![[10000, -20000]], "{text}");
+        // The text still parses as one session.
+        konnect_sexp::parse_sexp(&text).unwrap();
+        assert!(text.trim_end().ends_with(")"), "{text}");
+    }
+}
+
+#[test]
+fn an_unchecked_delivery_is_refused_by_that_clause_alone() {
+    let mut delivered = checked(0.0);
+    delivered.rest = None;
+    assert_eq!(
+        delivery_refusals(&checked(0.0), &delivered, &gnd()),
+        vec!["unchecked"]
+    );
+}

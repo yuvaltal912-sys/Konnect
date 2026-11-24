@@ -2242,3 +2242,30 @@ async fn route_refine_reference_distance_is_the_audits_stitch_limit() {
         "{plan}"
     );
 }
+
+/// Row ZR, ZR6 (the mutants batch on S9's lines): the change a via serves is taken off the
+/// list, and only that one. A second change, of another signal, at (10, 5) has no
+/// position within 3 mm in both fills: after the first via it is still reported.
+#[tokio::test]
+async fn route_refine_a_served_change_leaves_the_unserved_one_listed() {
+    let second = [
+        pad(80, (4., 5.), 3, "F.Cu"),
+        pad(81, (16., 5.), 3, "B.Cu"),
+        track(82, (4., 5.), (10., 5.), 3),
+        track(83, (10., 5.), (16., 5.), 3).replace("\"F.Cu\"", "\"B.Cu\""),
+        format!(
+            "(via (at 10 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 3) (uuid {}))",
+            uid(84)
+        ),
+    ]
+    .concat();
+    let f = Fixture::new(&(reference_change() + &second));
+    let r = f.run(json!({"kinds":["stitching"]})).await;
+    assert_eq!(r["proposals"].as_array().unwrap().len(), 1, "{r}");
+    let (x, y) = first_via(&r);
+    assert!((x - 10.).hypot(y - 10.) <= 3.0, "{r}");
+    assert!(
+        r["blocked"].to_string().contains("1 reference changes remain"),
+        "{r}"
+    );
+}

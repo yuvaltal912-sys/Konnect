@@ -642,3 +642,31 @@ fn the_prunes_kicad_count_holds_the_rounds_refills() {
     judged.reference_stitch = Some(round);
     assert_eq!(pour_prune::kicad_runs_of(&judged), before + 2);
 }
+
+/// The mutants batch's miss in `Round::steps` (shard 4): there is ONE retry. A retry that
+/// is refused again, even by a DRC item that names a via, ends the round `refused`.
+#[tokio::test]
+async fn a_retry_refused_again_ends_the_round_refused() {
+    let h = on(drc(&[], &[]));
+    let item = |x: f64, y: f64| {
+        let mut report: Value = serde_json::from_str(&drc(&[], &["clearance"])).unwrap();
+        report["violations"][0]["items"] =
+            json!([{ "description": "a via", "pos": { "x": x, "y": y } }]);
+        report.to_string()
+    };
+    h.canned(2, item(104.0, 52.0));
+    h.canned(3, item(105.0, 49.0));
+    let tools = Calls::new(
+        |_, board, _| (false, served(board)),
+        |_| Ok(proposal(&[(106.0, 52.0), (104.0, 52.0), (105.0, 49.0)], 0.6)),
+    );
+    let judged = judge(&h, &tools).await;
+    let round = record(&judged);
+    assert_eq!(round.outcome, "refused", "{round:?}");
+    assert_eq!(round.refused_by, vec!["rule:clearance"]);
+    assert_eq!(round.retried.as_ref().map(|retry| retry.dropped_vias), Some(1));
+    assert_eq!(round.kicad_runs, 2);
+    assert_eq!(h.calls().len(), 3, "no third stitched board");
+    assert!(judged.board.ends_with("run-0/r0/specctra_rounded_board.kicad_pcb"));
+    assert!(!h.ctx.root.join("run-0/s1-retry").exists());
+}
