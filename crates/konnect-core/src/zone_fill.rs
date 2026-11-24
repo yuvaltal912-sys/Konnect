@@ -28,6 +28,11 @@ pub(crate) struct ZoneLayerFill {
     pub zone_uuid: Option<String>,
     /// mm², largest first.
     pub pieces_mm2: Vec<f64>,
+    /// Row ZR, ZR5: one flag per piece, in the order of `pieces_mm2`: KiCad saved the
+    /// piece as an island (kept by the zone's own island rule): `(island yes)`,
+    /// `(island true)` or a bare `(island)` (see `is_island`). The readers of
+    /// `pieces_mm2` from before ZR5 read every piece, islands included.
+    pub islands: Vec<bool>,
 }
 
 impl ZoneLayerFill {
@@ -68,6 +73,10 @@ pub(crate) struct PourMeasures {
     /// router's own session, which the engine modelled; the pruned session was never
     /// modelled.
     pub false_open: Option<usize>,
+    /// Row ZR, ZR5 part 1: what the routing did to the pours against the judge's baseline
+    /// (`pour_damage::pour_damage`), when the baseline has its fill rows. Recorded only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damage: Option<crate::pour_damage::PourDamage>,
 }
 
 /// Every pour zone's saved fill on `board_text`, by zone and layer, for the zones whose
@@ -78,7 +87,7 @@ pub(crate) fn pour_fills(
     board_text: &str,
     pour_nets: &BTreeSet<String>,
 ) -> Result<Vec<ZoneLayerFill>> {
-    let tree = konnect_sexp::parse_sexp(board_text).context("the judged board does not parse")?;
+    let tree = konnect_sexp::parse_sexp(board_text).context("the board does not parse")?;
     let ids = net_ids(&tree);
     let mut out = Vec::new();
     for zone in tree.find_all("zone") {
@@ -93,7 +102,7 @@ pub(crate) fn pour_fills(
             continue;
         }
         let uuid = zone.find_str("uuid").map(str::to_string);
-        let mut by_layer: BTreeMap<String, Vec<f64>> = zone_copper_layers(zone)
+        let mut by_layer: BTreeMap<String, Vec<(f64, bool)>> = zone_copper_layers(zone)
             .into_iter()
             .map(|layer| (layer, Vec::new()))
             .collect();
@@ -103,16 +112,21 @@ pub(crate) fn pour_fills(
             };
             let area = ring_area_mm2(&xy_points(pts));
             if area > 0.0 {
-                by_layer.entry(layer.to_string()).or_default().push(area);
+                by_layer
+                    .entry(layer.to_string())
+                    .or_default()
+                    .push((area, is_island(polygon)));
             }
         }
-        for (layer, mut pieces_mm2) in by_layer {
-            pieces_mm2.sort_by(|a, b| b.total_cmp(a));
+        for (layer, mut pieces) in by_layer {
+            pieces.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let (pieces_mm2, islands) = pieces.into_iter().unzip();
             out.push(ZoneLayerFill {
                 net: net.clone(),
                 layer,
                 zone_uuid: uuid.clone(),
                 pieces_mm2,
+                islands,
             });
         }
     }
@@ -120,18 +134,49 @@ pub(crate) fn pour_fills(
     Ok(out)
 }
 
+/// Whether KiCad saved a fill piece as an island: `(island yes)`, `(island true)`, or
+/// `(island)` alone; `(island no)` and `(island false)` are fill (KiCad 10's
+/// `parseMaybeAbsentBool`, `pcb_io_kicad_sexpr_parser.cpp`).
+fn is_island(polygon: &SexpNode) -> bool {
+    polygon.find("island").is_some_and(|island| {
+        !matches!(
+            island.get(1).and_then(SexpNode::as_str),
+            Some("no") | Some("false")
+        )
+    })
+}
+
 /// The measures of one judged run. `first_refill` is the DRC right after the session
 /// was written and refilled; `last_board_text` and `last_refill` are the last board the
 /// judge wrote (after the stitching rounds) and its DRC.
+///
+/// Row ZR, ZR5 part 1: the judge goes through [`pour_record`], which reads the board's
+/// fills once for these measures and the damage both, so only the tests call this.
+#[cfg(test)]
 pub(crate) fn pour_measures(
     first_refill: &DrcReport,
     last_board_text: &str,
     last_refill: &DrcReport,
     pour_nets: &BTreeSet<String>,
 ) -> Result<PourMeasures> {
-    let nets: Vec<String> = pour_nets.iter().cloned().collect();
     let fills = pour_fills(last_board_text, pour_nets)?;
-    Ok(PourMeasures {
+    Ok(measures_of_fills(
+        first_refill,
+        &fills,
+        last_refill,
+        pour_nets,
+    ))
+}
+
+/// [`pour_measures`] from the last board's fills, already read; no damage.
+fn measures_of_fills(
+    first_refill: &DrcReport,
+    fills: &[ZoneLayerFill],
+    last_refill: &DrcReport,
+    pour_nets: &BTreeSet<String>,
+) -> PourMeasures {
+    let nets: Vec<String> = pour_nets.iter().cloned().collect();
+    PourMeasures {
         open_before_stitching: crate::route_judge::unconnected_on(first_refill, &nets),
         open_after_stitching: crate::route_judge::unconnected_on(last_refill, &nets),
         pieces: fills.iter().map(|fill| fill.pieces_mm2.len()).sum(),
@@ -150,24 +195,33 @@ pub(crate) fn pour_measures(
             .count(),
         false_connected: None,
         false_open: None,
-    })
+        damage: None,
+    }
 }
 
 /// [`pour_measures`] of the judged board at `board`, read and parsed off the async
 /// threads (a board with large pours is several megabytes, and up to three judges run at
-/// once).
+/// once). Row ZR, ZR5 part 1: with the baseline's rows (`before`, `Baseline::
+/// pour_fills`), `damage` is taken from the same fills; without them it is `None`.
 pub(crate) async fn pour_record(
     board: &Path,
     first_refill: DrcReport,
     last_refill: DrcReport,
     pour_nets: &BTreeSet<String>,
+    before: Option<&[crate::pour_damage::LayerFill]>,
 ) -> Result<PourMeasures> {
     let path = board.to_path_buf();
     let nets = pour_nets.clone();
+    let before = before.map(<[_]>::to_vec);
     tokio::task::spawn_blocking(move || -> Result<PourMeasures> {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("read the judged board '{}'", path.display()))?;
-        pour_measures(&first_refill, &text, &last_refill, &nets)
+        let fills = pour_fills(&text, &nets)?;
+        let mut measures = measures_of_fills(&first_refill, &fills, &last_refill, &nets);
+        measures.damage = before.map(|before| {
+            crate::pour_damage::pour_damage(&before, &crate::pour_damage::layer_fills(&fills))
+        });
+        Ok(measures)
     })
     .await
     .context("the pour measures did not finish")?
