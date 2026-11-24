@@ -663,6 +663,11 @@ plan_pours(board, board_source?)
 - Whole-layer pours on the board's own outline. Existing zones are never changed
 - KiCad refills and checks the plan on a scratch copy before it is returned.
   Each proposal is the exact arguments of `add_zone`
+- `check.clean` also needs every pad the pours should reach to be reached;
+  `check.unreached` lists the others. When the first fill starves a thermal pad
+  or leaves one unreached, KiCad fills the plan once more with smaller thermal
+  values (gap 0.3 mm, spoke 0.4 mm) and the better fill is kept;
+  `check.thermal_steps` lists each fill
 - `status` is `planned`, `planned_with_findings` or `nothing_to_propose`.
   `not_proposed` says what was left out and why. `rule_areas_filled` lists rule
   areas that keep tracks, vias or pads out but let pours in: the pour fills

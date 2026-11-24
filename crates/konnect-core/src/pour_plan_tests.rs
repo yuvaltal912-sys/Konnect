@@ -980,3 +980,50 @@ fn a_free_layers_reason_says_the_requested_layers_are_not_on_the_board() {
         row.reason
     );
 }
+
+// ─── PP16: the thermal steps ───────────────────────────────────────────────────
+
+#[test]
+fn the_first_thermal_step_is_todays() {
+    use konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM;
+    assert_eq!(
+        THERMAL_STEPS[0],
+        (ZONE_THERMAL_RELIEF_MM, ZONE_THERMAL_RELIEF_MM)
+    );
+    let s = settings_for(&[], &kicad_rules(), None);
+    assert_eq!(
+        (s.thermal_gap_mm, s.thermal_bridge_mm),
+        (THERMAL_STEPS[0].0, THERMAL_STEPS[0].1)
+    );
+    assert_eq!(THERMAL_STEPS[1], (0.3, 0.4));
+}
+
+#[test]
+fn the_bridge_never_drops_below_the_minimum_width() {
+    let mut wide = settings_for(&[], &kicad_rules(), None);
+    wide.min_width_mm = 0.5;
+    wide.thermal_bridge_mm = 0.5;
+    let zone = |settings: ZoneSettings| ProposedZone {
+        net: "GND".into(),
+        layer: "F.Cu".into(),
+        points_mm: OUTLINE.to_vec(),
+        settings,
+        reason: String::new(),
+        asked: false,
+    };
+    let zones = [zone(wide), zone(settings_for(&[], &kicad_rules(), None))];
+    let stepped = with_thermal_step(&zones, 1).unwrap();
+    assert_eq!(stepped[0].settings.thermal_bridge_mm, 0.5);
+    assert_eq!(stepped[1].settings.thermal_bridge_mm, 0.4);
+    for zone in &stepped {
+        assert_eq!(zone.settings.thermal_gap_mm, 0.3);
+        assert_eq!(zone.settings.check(), Ok(()));
+    }
+    // Nothing else changes.
+    let mut back = stepped[1].clone();
+    back.settings.thermal_gap_mm = zones[1].settings.thermal_gap_mm;
+    back.settings.thermal_bridge_mm = zones[1].settings.thermal_bridge_mm;
+    assert_eq!(back, zones[1]);
+    assert_eq!(with_thermal_step(&zones, 0).unwrap(), zones.to_vec());
+    assert!(with_thermal_step(&zones, 2).is_none());
+}

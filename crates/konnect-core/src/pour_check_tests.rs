@@ -6,6 +6,23 @@ use crate::pour_plan::{project_rules, settings_for};
 use crate::tools::cli::{DrcViolation, ReportItem};
 use std::sync::Mutex;
 
+/// [`super::verdict`] of a refilled board that has no project beside it: the tests of the
+/// counts give no path of their own.
+fn verdict(
+    zones: &[ProposedZone],
+    without: &DrcReport,
+    with: &DrcReport,
+    refilled_text: &str,
+) -> Result<FillCheck> {
+    super::verdict(
+        zones,
+        without,
+        with,
+        refilled_text,
+        Path::new("/nowhere/with/board.kicad_pcb"),
+    )
+}
+
 fn proposal(net: &str, layer: &str) -> ProposedZone {
     ProposedZone {
         net: net.into(),
@@ -324,14 +341,21 @@ fn no_unconnected_category_is_an_error_not_zero() {
 struct Scripted {
     without: DrcReport,
     with: DrcReport,
+    /// The report of the second fill, in `with-thermal-1` (PP16).
+    second: DrcReport,
     seen: Mutex<Vec<PathBuf>>,
 }
 
 impl Scripted {
     fn new(without: DrcReport, with: DrcReport) -> Self {
+        Self::stepped(without, with.clone(), with)
+    }
+
+    fn stepped(without: DrcReport, with: DrcReport, second: DrcReport) -> Self {
         Self {
             without,
             with,
+            second,
             seen: Mutex::new(Vec::new()),
         }
     }
@@ -355,7 +379,7 @@ fn filled(text: &str) -> String {
         out.push_str(&part.replacen(
             "\n    (polygon (pts",
             &format!(
-                "\n    (filled_polygon (layer \"{layer}\") (pts (xy 0 0) (xy 5 0) (xy 5 5) (xy 0 5)))\n    (polygon (pts"
+                "\n    (filled_polygon (layer \"{layer}\") (pts (xy 100 100) (xy 150 100) (xy 150 140) (xy 100 140)))\n    (polygon (pts"
             ),
             1,
         ));
@@ -369,10 +393,11 @@ impl Refill for Scripted {
             self.seen.lock().unwrap().push(board.to_path_buf());
             let text = std::fs::read_to_string(board)?;
             std::fs::write(board, filled(&text))?;
-            let with =
-                board.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new(WITH));
-            Ok(if with {
+            let folder = board.parent().and_then(|p| p.file_name());
+            Ok(if folder == Some(std::ffi::OsStr::new(WITH)) {
                 self.with.clone()
+            } else if folder == Some(std::ffi::OsStr::new(WITH_THERMAL_1)) {
+                self.second.clone()
             } else {
                 self.without.clone()
             })
@@ -435,7 +460,8 @@ async fn the_owners_files_are_never_written() {
     let refill = Scripted::new(report(vec![], vec![open_on("GND")]), report(vec![], vec![]));
     let check = check(&folder, &board, &text, &zones, &refill)
         .await
-        .unwrap();
+        .unwrap()
+        .check;
     assert_eq!(
         snapshot(user.path()),
         before,
@@ -571,4 +597,237 @@ exit 0
         calls.trim(),
         format!("KICAD_CONFIG_HOME={}", config.display())
     );
+}
+
+// ─── PP17: the unreached pads in the verdict ───────────────────────────────────
+
+/// A refilled board with one GND pad R1 at (10, 10) on F.Cu and the proposal's F.Cu zone,
+/// whose saved fill is `fill` (a square, or none).
+fn board_with_pad(fill: Option<(f64, f64, f64)>) -> String {
+    let filled = fill
+        .map(|(x, y, side)| format!(" (filled_polygon (layer \"F.Cu\") {})", square(x, y, side)))
+        .unwrap_or_default();
+    format!(
+        "(kicad_pcb (version 20260206) (generator \"pcbnew\")\n  (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal))\n  (footprint \"T\" (layer \"F.Cu\") (uuid \"fp-R1\") (at 10 10)\n    (property \"Reference\" \"R1\" (at 0 0) (layer \"F.SilkS\") (uuid \"pr-R1\"))\n    (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"GND\") (uuid \"pad-R1\")))\n  (zone (net \"GND\") (layers \"F.Cu\") (uuid \"z1\") (hatch edge 0.5) (connect_pads (clearance 0.2)) (min_thickness 0.25) (fill yes) (polygon {}){filled})\n)\n",
+        square(0.0, 0.0, 100.0)
+    )
+}
+
+#[test]
+fn an_unreached_pad_makes_the_plan_not_clean() {
+    // The fill rings R1 at a distance: no spoke, no copper of R1's group.
+    let check = verdict(
+        &[proposal("GND", "F.Cu")],
+        &report(vec![], vec![]),
+        &report(vec![], vec![]),
+        &board_with_pad(Some((20.0, 20.0, 30.0))),
+    )
+    .unwrap();
+    assert_eq!(
+        check.unreached,
+        [NetPads {
+            net: "GND".into(),
+            pads: vec!["R1.1".into()]
+        }]
+    );
+    assert!(!check.clean);
+    assert_eq!(faults(&check), 1);
+    assert!(thermal_fault(&check));
+    // Control by input: the fill over the pad reaches it.
+    let check = verdict(
+        &[proposal("GND", "F.Cu")],
+        &report(vec![], vec![]),
+        &report(vec![], vec![]),
+        &board_with_pad(Some((0.0, 0.0, 30.0))),
+    )
+    .unwrap();
+    assert!(check.unreached.is_empty() && check.clean, "{check:?}");
+}
+
+#[test]
+fn a_withdrawn_proposals_layer_does_not_count_and_is_no_error() {
+    let check = verdict(
+        &[proposal("GND", "F.Cu")],
+        &report(vec![], vec![]),
+        &report(vec![], vec![]),
+        &board_with_pad(None),
+    )
+    .unwrap();
+    assert_eq!(check.fills[0].pieces, 0);
+    assert!(check.unreached.is_empty(), "{:?}", check.unreached);
+}
+
+// ─── PP16: the second fill ─────────────────────────────────────────────────────
+
+fn starved(count: usize) -> Vec<DrcViolation> {
+    many(crate::zone_fill::STARVED_THERMAL, "error", count)
+}
+
+/// The temporary folders stay alive as long as the first two values.
+async fn stepped_check(
+    refill: &Scripted,
+) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, CheckedPlan) {
+    let user = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let board = project(user.path());
+    let text = std::fs::read_to_string(&board).unwrap();
+    let folder = run_folder(state.path(), &text, "7").unwrap();
+    let zones = [proposal("GND", "F.Cu"), proposal("GND", "B.Cu")];
+    let checked = check(&folder, &board, &text, &zones, refill).await.unwrap();
+    (user, state, folder, checked)
+}
+
+fn names(seen: &[PathBuf]) -> Vec<String> {
+    seen.iter()
+        .map(|p| {
+            p.parent()
+                .and_then(|p| p.file_name())
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_clean_first_fill_gets_no_second() {
+    let refill = Scripted::new(report(vec![], vec![]), report(vec![], vec![]));
+    let (_user, _state, _, checked) = stepped_check(&refill).await;
+    assert_eq!(names(&refill.seen.lock().unwrap()), [WITHOUT, WITH]);
+    assert_eq!(checked.check.thermal_steps.len(), 1);
+    assert!(checked.check.thermal_steps[0].kept);
+    assert!(checked.check.thermal_steps[0].clean);
+    assert_eq!(checked.check.thermal_steps[0].thermal_gap_mm, 0.5);
+}
+
+#[tokio::test]
+async fn a_fault_that_is_not_thermal_gets_no_second() {
+    let refill = Scripted::new(
+        report(vec![], vec![]),
+        report(many("clearance", "error", 1), vec![]),
+    );
+    let (_user, _state, _, checked) = stepped_check(&refill).await;
+    assert_eq!(names(&refill.seen.lock().unwrap()), [WITHOUT, WITH]);
+    assert!(!checked.check.clean);
+    assert_eq!(checked.check.thermal_steps.len(), 1);
+}
+
+#[tokio::test]
+async fn a_thermal_fault_gets_the_second_at_b5s_values() {
+    let refill = Scripted::stepped(
+        report(vec![], vec![]),
+        report(starved(2), vec![]),
+        report(vec![], vec![]),
+    );
+    let (_user, _state, folder, checked) = stepped_check(&refill).await;
+    // The board without the proposals is refilled once.
+    assert_eq!(
+        names(&refill.seen.lock().unwrap()),
+        [WITHOUT, WITH, WITH_THERMAL_1]
+    );
+    let second =
+        std::fs::read_to_string(folder.join(WITH_THERMAL_1).join("board.kicad_pcb")).unwrap();
+    assert_eq!(second.matches("(thermal_gap 0.3)").count(), 2, "{second}");
+    assert_eq!(second.matches("(thermal_bridge_width 0.4)").count(), 2);
+    assert!(!second.contains("(thermal_gap 0.5)"));
+    // The kept fill's values are what is returned.
+    assert!(checked
+        .zones
+        .iter()
+        .all(|z| z.settings.thermal_gap_mm == 0.3 && z.settings.thermal_bridge_mm == 0.4));
+    assert!(checked.check.clean);
+    let steps = &checked.check.thermal_steps;
+    assert_eq!(steps.len(), 2);
+    assert!(!steps[0].kept && steps[1].kept);
+    assert_eq!(
+        (steps[0].starved_thermals, steps[1].starved_thermals),
+        (2, 0)
+    );
+    assert_eq!(
+        (steps[1].thermal_gap_mm, steps[1].thermal_bridge_mm),
+        (0.3, 0.4)
+    );
+}
+
+#[tokio::test]
+async fn a_second_fill_that_is_no_better_is_not_kept() {
+    let refill = Scripted::stepped(
+        report(vec![], vec![]),
+        report(starved(1), vec![]),
+        report(starved(1), vec![]),
+    );
+    let (_user, _state, _, checked) = stepped_check(&refill).await;
+    assert!(checked
+        .zones
+        .iter()
+        .all(|z| z.settings.thermal_gap_mm == 0.5 && z.settings.thermal_bridge_mm == 0.5));
+    let steps = &checked.check.thermal_steps;
+    assert!(steps[0].kept && !steps[1].kept);
+    assert_eq!(checked.check.starved_thermals, 1);
+}
+
+/// A check with `faults` errors that rose (not starved thermals) and the cleanliness given.
+fn judged(faults_count: usize, clean: bool) -> FillCheck {
+    FillCheck {
+        fills: Vec::new(),
+        open: Vec::new(),
+        risen: if faults_count > 0 {
+            vec![Risen {
+                rule: "clearance".into(),
+                severity: "error".into(),
+                before: 0,
+                after: faults_count,
+            }]
+        } else {
+            Vec::new()
+        },
+        starved_thermals_before: 0,
+        starved_thermals: 0,
+        unreached: Vec::new(),
+        thermal_steps: Vec::new(),
+        clean,
+    }
+}
+
+#[test]
+fn the_second_is_kept_only_when_better() {
+    assert!(keep_second(&judged(1, false), &judged(0, true)));
+    assert!(keep_second(&judged(2, false), &judged(1, false)));
+    assert!(!keep_second(&judged(1, false), &judged(1, false)));
+    assert!(!keep_second(&judged(1, false), &judged(2, false)));
+    assert!(!keep_second(&judged(0, true), &judged(0, true)));
+}
+
+#[test]
+fn faults_and_thermal_faults_count_what_the_design_says() {
+    let mut check = judged(2, false);
+    check.risen.push(Risen {
+        rule: crate::zone_fill::STARVED_THERMAL.into(),
+        severity: "error".into(),
+        before: 1,
+        after: 4,
+    });
+    check.risen.push(Risen {
+        rule: "isolated_copper".into(),
+        severity: "warning".into(),
+        before: 0,
+        after: 5,
+    });
+    check.starved_thermals_before = 1;
+    check.starved_thermals = 4;
+    check.unreached = vec![NetPads {
+        net: "GND".into(),
+        pads: vec!["R1.1".into(), "R2.1".into()],
+    }];
+    // 2 (clearance) + 3 (starved) + 2 (unreached); the warning and the starved row of
+    // `risen` are not counted twice.
+    assert_eq!(faults(&check), 7);
+    assert!(thermal_fault(&check));
+    let plain = judged(2, false);
+    assert!(!thermal_fault(&plain));
+    let mut fewer = judged(0, true);
+    fewer.starved_thermals_before = 3;
+    fewer.starved_thermals = 1;
+    assert_eq!(faults(&fewer), 0);
+    assert!(!thermal_fault(&fewer));
 }

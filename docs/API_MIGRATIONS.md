@@ -14,7 +14,11 @@ Design: `docs/POUR_PLAN_DESIGN.md`.
   `planned_with_findings` or `nothing_to_propose`), `stack`, `nets`, `proposals`,
   `not_proposed`, `rule_areas_filled`, `check`, `next_steps`, `sources`,
   `source_evidence`. It writes only below Konnect's state folder
-  (`pour-plans/<stamp>-<sha8>/`).
+  (`pour-plans/<stamp>-<sha8>/`). `check.clean` also needs every pad the pours should
+  reach to be reached (`check.unreached`, by net). When KiCad's first fill starves a
+  thermal pad or leaves one unreached, the plan is filled once more with smaller thermal
+  values (gap 0.3 mm, spoke 0.4 mm) and the better fill is kept; `check.thermal_steps`
+  lists each fill, and the proposals carry the kept fill's values.
 - **`add_zone` and `add_copper_pour` gain four arguments:** `thermal_gap` (mm, default
   0.5), `thermal_bridge_width` (mm, default the larger of 0.5 and `min_width`),
   `island_removal` (`always` by default, `never` or `below_area`) and `island_min_area`

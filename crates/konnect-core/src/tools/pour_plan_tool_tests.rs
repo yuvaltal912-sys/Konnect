@@ -34,7 +34,7 @@ if [ ! -f "$dir/empty" ]; then
       s = substr($0, RSTART, RLENGTH); sub(/.*\(layers "/, "", s); sub(/"\).*/, "", s); layer = s
     }
     if ($0 ~ /^    \(polygon \(pts/ && layer != "") {
-      print "    (filled_polygon (layer \"" layer "\") (pts (xy 100 100) (xy 110 100) (xy 110 110) (xy 100 110)))"
+      print "    (filled_polygon (layer \"" layer "\") (pts (xy 100 100) (xy 150 100) (xy 150 140) (xy 100 140)))"
       layer = ""
     }
     print
@@ -42,6 +42,7 @@ if [ ! -f "$dir/empty" ]; then
 fi
 case "$board" in
   */with/*) cp "$dir/with.json" "$out" ;;
+  */with-thermal-1/*) if [ -f "$dir/second.json" ]; then cp "$dir/second.json" "$out"; else cp "$dir/with.json" "$out"; fi ;;
   *) cp "$dir/without.json" "$out" ;;
 esac
 exit 0
@@ -246,7 +247,7 @@ async fn the_planner_writes_nothing_and_returns_the_documented_result() {
         assert_eq!(proposal["add_zone"]["clearance"], 0.2);
         assert_eq!(
             proposal["fill"],
-            json!({"pieces": 1, "area_mm2": 100.0, "largest_piece_share": 1.0})
+            json!({"pieces": 1, "area_mm2": 2000.0, "largest_piece_share": 1.0})
         );
     }
     let check = &body["check"];
@@ -264,6 +265,8 @@ async fn the_planner_writes_nothing_and_returns_the_documented_result() {
             "risen",
             "starved_thermals_before",
             "starved_thermals",
+            "unreached",
+            "thermal_steps",
             "folder"
         ]
         .into_iter()
@@ -483,6 +486,8 @@ fn clean_check(fills: Vec<ProposalFill>) -> FillCheck {
         risen: Vec::new(),
         starved_thermals_before: 0,
         starved_thermals: 0,
+        unreached: Vec::new(),
+        thermal_steps: Vec::new(),
         clean: true,
     }
 }
@@ -820,6 +825,69 @@ async fn the_real_thing_fills_clean() {
         .clone();
     assert!(gnd["before"].as_u64().unwrap() > 0, "{gnd}");
     assert_eq!(gnd["after"], 0, "{body}");
+    assert_eq!(body["check"]["unreached"], json!([]), "{body}");
+    assert_eq!(body["check"]["thermal_steps"].as_array().unwrap().len(), 1);
+
+    // PP17: the minimum width and the spoke raised above the 0805 pads' 1.0 mm short side
+    // (the fab target's minimum track), so that KiCad makes no spoke at either step.
+    let (_root, board, state) = real_project(&pours_without_pours());
+    let intent = board.parent().unwrap().join(".konnect");
+    std::fs::create_dir_all(&intent).unwrap();
+    std::fs::write(
+        intent.join("design_intent.json"),
+        json!({ "schema_version": 1, "fab_target": { "min_track_mm": 1.2 } }).to_string(),
+    )
+    .unwrap();
+    let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state))
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body = body_of(&result);
+    assert_eq!(body["check"]["clean"], false, "{body}");
+    let unreached = body["check"]["unreached"].as_array().unwrap();
+    assert_eq!(unreached.len(), 1, "{body}");
+    assert_eq!(unreached[0]["net"], "GND");
+    assert!(!unreached[0]["pads"].as_array().unwrap().is_empty());
+    // Both steps ran; the bridge stayed at the minimum width.
+    let steps = body["check"]["thermal_steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2, "{body}");
+    assert_eq!(steps[1]["thermal_bridge_width"], 1.2);
+}
+
+/// PP16 through the tool: the first fill starves a thermal, the second is clean, and every
+/// proposal's add_zone arguments carry the second's thermal values.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_kept_fills_values_are_what_is_returned() {
+    let bench = bench(&pours_without_pours());
+    std::fs::write(
+        bench.fake.join("with.json"),
+        report_json(0, &[("starved_thermal", "error")]),
+    )
+    .unwrap();
+    std::fs::write(bench.fake.join("second.json"), report_json(0, &[])).unwrap();
+    let result = bench.run().await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body = body_of(&result);
+    assert_eq!(body["status"], PLANNED, "{body}");
+    for proposal in body["proposals"].as_array().unwrap() {
+        assert_eq!(proposal["add_zone"]["thermal_gap"], 0.3, "{proposal}");
+        assert_eq!(
+            proposal["add_zone"]["thermal_bridge_width"], 0.4,
+            "{proposal}"
+        );
+    }
+    let steps = body["check"]["thermal_steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["kept"], false);
+    assert_eq!(steps[1]["kept"], true);
+    let lines = body["next_steps"].to_string();
+    assert!(lines.contains("smaller thermal values"), "{lines}");
+    let folder = PathBuf::from(body["check"]["folder"].as_str().unwrap());
+    assert!(folder
+        .join(crate::pour_check::WITH_THERMAL_1)
+        .join("board.kicad_pcb")
+        .is_file());
 }
 
 /// The same fixture with a rule area over part of the board that keeps tracks and vias

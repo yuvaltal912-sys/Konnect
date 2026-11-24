@@ -664,6 +664,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_proposed",
         "rule_areas_filled",
         "below_area",
+        // plan_pours's check fields (Row ZR, stage ZR4, PP16).
+        "thermal_steps",
         // plan_convergent_placement's response fields and statuses (Row CT).
         "apply_with",
         "gate_failures",

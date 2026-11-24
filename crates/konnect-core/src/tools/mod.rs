@@ -38,7 +38,9 @@ pub mod integration;
 pub(crate) mod item_render;
 mod jlcpcb_midpoints;
 mod layout_quality;
-pub(crate) use layout_quality::{pads_off_main_group, supply_roles, SupplyRoles};
+pub(crate) use layout_quality::{
+    pads_off_main_group, pads_unreached_by_fill, supply_roles, SupplyRoles,
+};
 mod lcsc_packages;
 pub mod library;
 mod library_footprint;

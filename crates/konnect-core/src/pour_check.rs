@@ -102,11 +102,75 @@ pub(crate) struct FillCheck {
     pub starved_thermals_before: usize,
     /// KiCad's `starved_thermal` violations with the proposals, at any severity.
     pub starved_thermals: usize,
-    /// No rule of severity `error` rose, and `starved_thermal` did not rise at any
-    /// severity: a project may report it as a warning, and a pad of the pour's net with
-    /// too few spokes is a finding all the same. A proposal KiCad filled nothing of is
-    /// not part of this: the tool withdraws it.
+    /// PP17: by net, the nets with an unreached pad only.
+    pub unreached: Vec<NetPads>,
+    /// PP16: one row a fill; one row when the first had no thermal fault.
+    pub thermal_steps: Vec<ThermalStep>,
+    /// No rule of severity `error` rose, `starved_thermal` did not rise at any severity
+    /// (a project may report it as a warning, and a pad of the pour's net with too few
+    /// spokes is a finding all the same), and no pad is unreached (PP17). A proposal
+    /// KiCad filled nothing of is not part of this: the tool withdraws it.
     pub clean: bool,
+}
+
+/// PP17: the unreached pads of one net, by label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct NetPads {
+    pub net: String,
+    pub pads: Vec<String>,
+}
+
+/// PP16: one fill the check made, in the order it made them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ThermalStep {
+    pub thermal_gap_mm: f64,
+    pub thermal_bridge_mm: f64,
+    pub starved_thermals: usize,
+    pub unreached_pads: usize,
+    pub clean: bool,
+    /// The fill whose proposals the plan returns.
+    pub kept: bool,
+}
+
+/// The scratch project of the plan's second fill, at `THERMAL_STEPS[1]` (PP16).
+pub(crate) const WITH_THERMAL_1: &str = "with-thermal-1";
+
+/// PP16: the faults of one fill: the rises of rules of severity error other than
+/// `starved_thermal`, plus `starved_thermals` above `starved_thermals_before`, plus the
+/// unreached pads.
+pub(crate) fn faults(check: &FillCheck) -> usize {
+    let rises: usize = check
+        .risen
+        .iter()
+        .filter(|row| row.severity == "error" && row.rule != crate::zone_fill::STARVED_THERMAL)
+        .map(|row| row.after - row.before)
+        .sum();
+    let starved = check
+        .starved_thermals
+        .saturating_sub(check.starved_thermals_before);
+    let unreached: usize = check.unreached.iter().map(|net| net.pads.len()).sum();
+    rises + starved + unreached
+}
+
+/// PP16: a thermal fault: starved thermals rose, or a pad is unreached.
+pub(crate) fn thermal_fault(check: &FillCheck) -> bool {
+    check.starved_thermals > check.starved_thermals_before || !check.unreached.is_empty()
+}
+
+/// PP16: true when the second fill is kept: it is clean and the first is not, or neither
+/// is clean and it has fewer `faults`. On a tie, false.
+pub(crate) fn keep_second(first: &FillCheck, second: &FillCheck) -> bool {
+    if first.clean {
+        return false;
+    }
+    second.clean || faults(second) < faults(first)
+}
+
+/// A plan as KiCad checked it: the proposals of the fill that was kept, and its check.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CheckedPlan {
+    pub zones: Vec<ProposedZone>,
+    pub check: FillCheck,
 }
 
 /// The verdict of two reports and the refilled board (pure):
@@ -120,8 +184,12 @@ pub(crate) struct FillCheck {
 ///   whose count in `with` is above its count in `without`.
 /// - `starved_thermals_before` and `starved_thermals`: the violations of
 ///   `zone_fill::STARVED_THERMAL` in `without` and in `with`.
-/// - `clean`: no `risen` row has the severity `error`, and `starved_thermals` is not
-///   above `starved_thermals_before`.
+/// - `unreached` (PP17): `tools::pads_unreached_by_fill` of the refilled board at
+///   `refilled_board`, over the proposals whose fill has pieces (a proposal KiCad filled
+///   nothing of is withdrawn, so its layer does not count), grouped by net.
+/// - `thermal_steps`: empty; [`check`] fills it.
+/// - `clean`: no `risen` row has the severity `error`, `starved_thermals` is not above
+///   `starved_thermals_before`, and `unreached` is empty.
 ///
 /// An error when either report has no unconnected-items category: an unrouted board
 /// could then not be told from a routed one (`route_judge::unconnected_total`).
@@ -130,6 +198,7 @@ pub(crate) fn verdict(
     without: &DrcReport,
     with: &DrcReport,
     refilled_text: &str,
+    refilled_board: &Path,
 ) -> Result<FillCheck> {
     // Only that the category is there: `open` counts it per net.
     crate::route_judge::unconnected_total(without)
@@ -209,14 +278,39 @@ pub(crate) fn verdict(
             .count()
     };
     let (starved_thermals_before, starved_thermals) = (starved(without), starved(with));
+    let mut poured: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for fill in fills.iter().filter(|fill| fill.pieces > 0) {
+        poured
+            .entry(fill.net.clone())
+            .or_default()
+            .insert(fill.layer.clone());
+    }
+    let mut unreached: Vec<NetPads> = Vec::new();
+    if !poured.is_empty() {
+        for pad in crate::tools::pads_unreached_by_fill(refilled_board, refilled_text, &poured)
+            .context("the pads the fill should reach")?
+        {
+            match unreached.iter_mut().find(|row| row.net == pad.net) {
+                Some(row) => row.pads.push(pad.label),
+                None => unreached.push(NetPads {
+                    net: pad.net,
+                    pads: vec![pad.label],
+                }),
+            }
+        }
+        unreached.sort_by(|a, b| a.net.cmp(&b.net));
+    }
     let clean = !risen.iter().any(|row| row.severity == "error")
-        && starved_thermals <= starved_thermals_before;
+        && starved_thermals <= starved_thermals_before
+        && unreached.is_empty();
     Ok(FillCheck {
         fills,
         open,
         risen,
         starved_thermals_before,
         starved_thermals,
+        unreached,
+        thermal_steps: Vec::new(),
         clean,
     })
 }
@@ -257,16 +351,21 @@ fn scratch(folder: &Path, name: &str, board: &Path, text: &str) -> Result<PathBu
 ///    and kicad-cli saves its settings again when it exits.
 /// 3. [`verdict`] of the two reports and the refilled `with` board, which is read and
 ///    parsed off the async threads.
+/// 4. PP16: only when that fill has a thermal fault ([`thermal_fault`]), a second fill:
+///    `pour_plan::with_thermal_step(zones, 1)` in [`WITH_THERMAL_1`], refilled and judged
+///    against the same report of the board without the proposals (that board is refilled
+///    once). [`keep_second`] picks the fill whose proposals and check are returned, and
+///    `thermal_steps` gets one row a fill.
 ///
 /// A step that fails is an error that names the step. The folder is kept either way: it
-/// is the record of what KiCad was shown.
+/// is the record of what KiCad was shown, both fills included.
 pub(crate) async fn check(
     folder: &Path,
     board: &Path,
     board_text: &str,
     zones: &[ProposedZone],
     refill: &dyn Refill,
-) -> Result<FillCheck> {
+) -> Result<CheckedPlan> {
     let without = scratch(folder, WITHOUT, board, board_text)
         .context("step 1, the scratch project of the board as it was read")?;
     let with_text = crate::pour_plan::with_zones(board_text, zones)
@@ -277,19 +376,85 @@ pub(crate) async fn check(
         .refill(&without)
         .await
         .context("step 2, kicad-cli's refill and DRC of the board as it was read")?;
-    let report_with = refill
-        .refill(&with)
-        .await
-        .context("step 2, kicad-cli's refill and DRC of the board with the proposals")?;
+    let first = fill_and_judge(&with, zones, &report_without, refill, "step 2").await?;
+    let mut steps = vec![step_row(zones, &first)];
+    if !thermal_fault(&first) {
+        steps[0].kept = true;
+        let mut check = first;
+        check.thermal_steps = steps;
+        return Ok(CheckedPlan {
+            zones: zones.to_vec(),
+            check,
+        });
+    }
+    let stepped = crate::pour_plan::with_thermal_step(zones, 1)
+        .context("step 4, the plan at the second thermal values")?;
+    let with_text = crate::pour_plan::with_zones(board_text, &stepped)
+        .context("step 4, the board with the proposals at the second thermal values")?;
+    let second_board = scratch(folder, WITH_THERMAL_1, board, &with_text)
+        .context("step 4, the scratch project of the second fill")?;
+    let second = fill_and_judge(&second_board, &stepped, &report_without, refill, "step 4").await?;
+    steps.push(step_row(&stepped, &second));
+    let second_kept = keep_second(&first, &second);
+    steps[usize::from(second_kept)].kept = true;
+    let (zones, mut check) = if second_kept {
+        (stepped, second)
+    } else {
+        (zones.to_vec(), first)
+    };
+    check.thermal_steps = steps;
+    Ok(CheckedPlan { zones, check })
+}
+
+/// The refill of the scratch board `board` (written by [`scratch`]) and its [`verdict`]
+/// against `without`. `what` names the step in an error.
+async fn fill_and_judge(
+    board: &Path,
+    zones: &[ProposedZone],
+    without: &DrcReport,
+    refill: &dyn Refill,
+    what: &str,
+) -> Result<FillCheck> {
+    let report = refill.refill(board).await.with_context(|| {
+        format!(
+            "{what}, kicad-cli's refill and DRC of the board with the proposals ('{}')",
+            board.display()
+        )
+    })?;
+    let board = board.to_path_buf();
     let zones = zones.to_vec();
+    let without = without.clone();
     tokio::task::spawn_blocking(move || {
-        let refilled = std::fs::read_to_string(&with)
-            .with_context(|| format!("read the refilled board '{}'", with.display()))?;
-        verdict(&zones, &report_without, &report_with, &refilled)
+        let refilled = std::fs::read_to_string(&board)
+            .with_context(|| format!("read the refilled board '{}'", board.display()))?;
+        verdict(&zones, &without, &report, &refilled, &board)
     })
     .await
-    .context("step 3, the verdict")?
-    .context("step 3, the verdict")
+    .with_context(|| format!("{what}, the verdict"))?
+    .with_context(|| format!("{what}, the verdict"))
+}
+
+/// One row of `thermal_steps`: the fill's thermal values (the first proposal's: every
+/// proposal of one fill carries one step's values, and its bridge differs only where a
+/// minimum width is above the step's floor) and its outcome.
+fn step_row(zones: &[ProposedZone], check: &FillCheck) -> ThermalStep {
+    let (gap, bridge) = zones
+        .first()
+        .map(|zone| {
+            (
+                zone.settings.thermal_gap_mm,
+                zone.settings.thermal_bridge_mm,
+            )
+        })
+        .unwrap_or((f64::NAN, f64::NAN));
+    ThermalStep {
+        thermal_gap_mm: gap,
+        thermal_bridge_mm: bridge,
+        starved_thermals: check.starved_thermals,
+        unreached_pads: check.unreached.iter().map(|net| net.pads.len()).sum(),
+        clean: check.clean,
+        kept: false,
+    }
 }
 
 #[cfg(test)]

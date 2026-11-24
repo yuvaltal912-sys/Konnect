@@ -11,7 +11,7 @@ use crate::tools::design_intent::{DesignIntent, FabTarget, PourIntent};
 use crate::tools::pcb_board::{PadConnection, ZoneSettings};
 use crate::tools::SupplyRoles;
 use anyhow::{bail, Context, Result};
-use konnect_ipc::builders::{ZoneIslands, ZONE_THERMAL_RELIEF_MM};
+use konnect_ipc::builders::ZoneIslands;
 use konnect_sexp::SexpNode;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -783,10 +783,35 @@ pub(crate) fn settings_for(
         min_width_mm,
         priority: 0,
         connection: PadConnection::Thermal,
-        thermal_gap_mm: ZONE_THERMAL_RELIEF_MM,
-        thermal_bridge_mm: ZONE_THERMAL_RELIEF_MM.max(min_width_mm),
+        thermal_gap_mm: THERMAL_STEPS[0].0,
+        thermal_bridge_mm: THERMAL_STEPS[0].1.max(min_width_mm),
         islands: ZoneIslands::Always,
     }
+}
+
+/// PP16: the thermal values the check tries, in order: dash's own, then B5's own.
+/// Each is (gap, bridge floor) in mm; a proposal's bridge is the larger of the floor and
+/// its minimum width. The first is `settings_for`'s (a test holds that it equals
+/// `ZONE_THERMAL_RELIEF_MM` for both), so `add_zone`'s own defaults do not change.
+pub(crate) const THERMAL_STEPS: [(f64, f64); 2] = [(0.5, 0.5), (0.3, 0.4)];
+
+/// PP16: `zones` with the thermal values of `THERMAL_STEPS[step]`: `thermal_gap_mm` is
+/// the gap, `thermal_bridge_mm` the larger of the floor and the zone's own
+/// `min_width_mm`. Nothing else changes, and every result passes `ZoneSettings::check`.
+/// `None` for a step that is not in the table.
+pub(crate) fn with_thermal_step(zones: &[ProposedZone], step: usize) -> Option<Vec<ProposedZone>> {
+    let (gap, floor) = *THERMAL_STEPS.get(step)?;
+    Some(
+        zones
+            .iter()
+            .map(|zone| {
+                let mut zone = zone.clone();
+                zone.settings.thermal_gap_mm = gap;
+                zone.settings.thermal_bridge_mm = floor.max(zone.settings.min_width_mm);
+                zone
+            })
+            .collect(),
+    )
 }
 
 /// One proposed zone: every value `add_zone` takes but the board.

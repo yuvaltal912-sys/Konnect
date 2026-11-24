@@ -12,7 +12,7 @@
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
-use crate::pour_check::FillCheck;
+use crate::pour_check::{CheckedPlan, FillCheck};
 use crate::pour_plan::{NotProposed, PourPlan};
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
@@ -62,8 +62,13 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          `not_proposed` names what was considered and left out, with the reason; \
          `asked: true` there is a request of the design intent that could not be met. \
          `check` gives KiCad's unconnected items per proposed net before and after, the \
-         DRC rules whose count rose, the starved thermals, and `clean` (no rule of \
-         severity error rose and no more thermal pads are starved). \
+         DRC rules whose count rose, the starved thermals, the pads of a proposed net \
+         that its pour should reach and does not (`unreached`), and `clean` (no rule of \
+         severity error rose, no more thermal pads are starved, and every pad the pours \
+         should reach is reached). When KiCad's first fill starves a thermal pad or \
+         leaves one unreached, the check fills the plan once more with smaller thermal \
+         values (gap 0.3 mm, spoke 0.4 mm) and keeps the better fill; \
+         `check.thermal_steps` lists each fill. \
          `rule_areas_filled` lists every rule area on a proposed layer that keeps \
          tracks, vias or pads out and lets copper pours in: KiCad fills the pour inside \
          it. `status`: planned, planned_with_findings (the check is not clean, a request \
@@ -173,7 +178,11 @@ async fn plan_pours_in(
         Err(message) => return Ok(CallToolResult::error(message)),
     };
     let mut check = match outcome {
-        Ok(check) => check,
+        Ok(checked) => {
+            // PP16: the proposals carry the values of the fill that was kept.
+            plan.proposals = checked.zones;
+            checked.check
+        }
         Err(error) => {
             return Ok(CallToolResult::error(format!(
                 "KiCad's fill of the plan failed ({error:#}). The scratch copies are in '{}'. \
@@ -227,7 +236,7 @@ async fn run_check(
     text: &str,
     plan: &PourPlan,
     state: Option<&Path>,
-) -> Result<(PathBuf, anyhow::Result<FillCheck>), String> {
+) -> Result<(PathBuf, anyhow::Result<CheckedPlan>), String> {
     let refused = |what: String| {
         format!(
             "{what}. A plan is returned only after KiCad has filled it, so nothing is proposed."
@@ -496,6 +505,19 @@ pub(crate) fn result_json(
             "risen": check.risen,
             "starved_thermals_before": check.starved_thermals_before,
             "starved_thermals": check.starved_thermals,
+            "unreached": check.unreached,
+            "thermal_steps": check
+                .thermal_steps
+                .iter()
+                .map(|step| json!({
+                    "thermal_gap": step.thermal_gap_mm,
+                    "thermal_bridge_width": step.thermal_bridge_mm,
+                    "starved_thermals": step.starved_thermals,
+                    "unreached_pads": step.unreached_pads,
+                    "clean": step.clean,
+                    "kept": step.kept,
+                }))
+                .collect::<Vec<_>>(),
             "folder": folder.display().to_string(),
         });
     }
@@ -553,11 +575,52 @@ fn next_steps(plan: &PourPlan, check: Option<&FillCheck>) -> Vec<String> {
                 check.starved_thermals_before, check.starved_thermals
             ));
         }
+        let unreached: usize = check.unreached.iter().map(|net| net.pads.len()).sum();
+        if unreached > 0 {
+            rose.push(format!("{unreached} pads the pours do not reach"));
+        }
         steps.push(format!(
             "KiCad's check of the plan is not clean: {}. Show the user what rose; the user \
              decides whether to add the zones as they are.",
             rose.join(", ")
         ));
+    }
+    // PP17: the pads a pour should reach and does not, by net.
+    for net in check.map(|check| check.unreached.as_slice()).unwrap_or(&[]) {
+        steps.push(format!(
+            "The {} pour does not reach {} on its layers: route them to the pour, or change \
+             what keeps the pour from them (a clearance, a rule area, a pad's own \
+             connection).",
+            net.net,
+            net.pads.join(", ")
+        ));
+    }
+    // PP16: the second fill, and why.
+    if let Some(check) = check.filter(|check| check.thermal_steps.len() > 1) {
+        let first = &check.thermal_steps[0];
+        let second = &check.thermal_steps[1];
+        let why = format!(
+            "KiCad's first fill (thermal gap {} mm, spoke {} mm) left {} thermal pads starved \
+             and {} pads unreached",
+            first.thermal_gap_mm,
+            first.thermal_bridge_mm,
+            first.starved_thermals,
+            first.unreached_pads
+        );
+        steps.push(if second.kept {
+            format!(
+                "{why}, so the plan uses the smaller thermal values, gap {} mm and spoke {} mm \
+                 (the owner's own on B5), which KiCad fills with fewer faults. Each \
+                 proposal's add_zone arguments carry them.",
+                second.thermal_gap_mm, second.thermal_bridge_mm
+            )
+        } else {
+            format!(
+                "{why}. A second fill at gap {} mm and spoke {} mm was no better, so the plan \
+                 keeps the first values.",
+                second.thermal_gap_mm, second.thermal_bridge_mm
+            )
+        });
     }
     for area in &plan.filled_rule_areas {
         let label = match (&area.name, &area.uuid) {

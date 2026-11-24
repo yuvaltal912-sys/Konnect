@@ -1355,6 +1355,59 @@ pub(crate) fn pads_off_main_group(
     })
 }
 
+/// Row ZR, stage ZR4 (PP17): one pad that the plan's fill does not reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnreachedPad {
+    pub net: String,
+    /// `REF.number`
+    pub label: String,
+}
+
+/// For each net of `poured` and its layers: the pads of the net with copper on one of
+/// those layers whose copper group on the saved board `board_text` (at `board`) holds no
+/// `filled_polygon` of the net on one of those layers. In the net's pad order. The board
+/// is KiCad's refill, so a zone with no saved fill has no copper: it is no error here,
+/// unlike `pads_off_main_group`. An error only when the board does not parse.
+pub(crate) fn pads_unreached_by_fill(
+    board: &Path,
+    board_text: &str,
+    poured: &BTreeMap<String, BTreeSet<String>>,
+) -> anyhow::Result<Vec<UnreachedPad>> {
+    let tree = parse_sexp(board_text)?;
+    let geometry = BoardGeometry::from_tree(&tree);
+    let params = Params::from_args(&json!({}))
+        .map_err(|_| anyhow::anyhow!("the audit's default thresholds do not read"))?;
+    with_model(board, &tree, &geometry, &params, |m| {
+        let mut out = Vec::new();
+        for (net, layers) in poured {
+            let wanted: BTreeSet<usize> = layers.iter().filter_map(|l| m.layer_ix(l)).collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            // One union-find with check 3.3 and `pads_off_main_group` (routing::pad_groups).
+            let groups = routing::net_groups(m, net);
+            let reached: BTreeSet<usize> = groups
+                .fills
+                .iter()
+                .filter(|(_, layer)| layers.contains(layer))
+                .map(|(group, _)| *group)
+                .collect();
+            let pads = m.pads.get(net).cloned().unwrap_or_default();
+            for (&pi, &group) in pads.iter().zip(&groups.pads) {
+                let (fp, pad) = m.pad(pi);
+                let on_poured = m.pad_layers(pad).iter().any(|l| wanted.contains(l));
+                if on_poured && !reached.contains(&group) {
+                    out.push(UnreachedPad {
+                        net: net.clone(),
+                        label: format!("{}.{}", m.fp_ref(fp), pad.number),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
 pub(super) fn planner_planes(
     m: &Model,
     probe: &mut impl PlaneProbe,
