@@ -284,6 +284,7 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 | **ZR3** Cost | engine | The cut cost, with its weight chosen from a small matrix; on x19 also the group search's "never more pour damage" rule (Z17) | Fewer pieces and a larger main piece than ZR2 at the same gate shares; ground track of the winner near the hand routing's; the search's `pour_worse` and `cut` ends counted |
 | **ZR4** Define | Konnect | `plan_pours`, the intent's `pours`, `add_zone`'s missing settings | On each board with its pours removed, the proposals refill clean and the route passes G1 |
 | **ZR5** Rank | Konnect | Pour measures in the rank key; the skill's order of work | The owner's word, on ZR3's numbers |
+| **ZR6** Return path (designed 2026-11-24, the owner's "כן, לתכנן") | Konnect | A ground via within 3 mm of every signal layer change on a ground pour, on every judged run before the rank, and in the delivered session ("ZR6" below) | On five boards at M, 3.2 of every delivered winner at 0 or each remaining change named with its reason, and no gate, key entry, fill or checklist measure worse |
 
 ZR4 touches no engine file and may run beside ZR1 to ZR3.
 
@@ -2144,3 +2145,291 @@ One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's
 - **The last redraw of a group-search move** has no control that bites (C10). The member's own tail removal already runs before it.
 - **No windowed redraw.** A redraw reuses the fixed layers and draws the rest in full.
 - **A unit-level difference from KiCad:** the model decides islands per plane, KiCad per zone across its layers. Both err on the safe side for connections.
+
+## ZR6: a ground via at every reference change (design, 2026-11-24)
+
+The owner approved the design, verbatim, 2026-11-24: "כן, לתכנן". It answered: "לתכנן שלב
+תפירה שמוסיף ויית אדמה ליד כל מעבר שכבה של אות?". The build waits for his word on this design.
+Konnect only: no engine file, no new pin.
+- **New module:** `crates/konnect-core/src/pour_stitch.rs`.
+- **Changes in:** `route_judge.rs`, `pour_prune.rs`, `tools/route_refine.rs`,
+  `tools/route_refine_geometry.rs`, `tools/route_fastroute.rs`, `place_route.rs`,
+  `tools/integration.rs`.
+
+### The problem, in counts
+
+The zr4-zr5 session audited two of the owner's boards, each the winner under today's key
+against the winner under the pour key. Checklist 3.2 counts the critical-signal layer changes
+with no ground via within 3 mm (`stitch_via_max_mm`).
+
+| | dash | B5 (x21 pair) |
+|---|---|---|
+| 3.2, unstitched layer changes, today's winner → the pour key's | 4 → 7 | 1 → 9 |
+| 3.1, signal length off the reference plane, mm | 31.7 → 39.4 | 177 → 201 |
+| 4.1, the worst decoupling loop, mm | 19 → 36 | |
+
+- **Why the pours-as-planes routings lose them:** with the pours as planes the router draws no
+  ground track or via. With the pours omitted it draws ground as tracks and vias, and some of
+  those vias sat near signal vias. On dash the nearest ground via is 5.5 to 12.2 mm away.
+- **The key sees 3.2 only through copper quality,** second to last in both keys.
+
+### What exists already
+
+- **A planner places exactly these vias.** `plan_route_refinement`'s `stitching` kind works out
+  3.2's findings again (`route_refine.rs`, `stitching`):
+  - It searches rings of up to 3 mm around them, and around the net's pads and fills.
+  - It looks for a spot inside the reference net's saved fill on both reference layers.
+  - Every candidate passes its clearance checks.
+- **The judge calls that planner, but only in Z9.** Z9's rounds run only while a net the router
+  got as a plane has an unconnected item. A board with no such item is never stitched for 3.2,
+  and the pours-omitted shape never is.
+- **On the owner's boards the planner refuses the whole board.**
+  - The first refusal: `unsupported local zone_connect override`. Each of the two boards has 36
+    pads with a local solid connection (`zone_connect 2`).
+  - Then, on B5: `zone UUID absent`. Its 253 teardrop zones have no UUID.
+  - Z9 is refused on these boards today for the same reasons.
+- **Z9's vias are not in the session.** They reach the user only through `next_steps` and the
+  status note (`judged_stitched_note`).
+
+### The probe (read-only, before this design)
+
+The planner was run as built (the release build of ZR3's branch) on scratch copies of the four
+audited boards, with `kinds: ["stitching"]`, the target nets and a 3 mm radius. Then it was run
+again on copies with the two refusals lifted by hand:
+- the `zone_connect` tokens removed;
+- synthetic UUIDs added to B5's teardrop zones.
+
+The planner reads saved fills, so the connection geometry it sees was unchanged. KiCad did not
+check these proposals; the stage does. In B5's row the teardrops had their nets, because the
+audit model reads a zone's net through its UUID. S8 treats them as copper of no known net,
+which is at least as strict, so the build repeats the probe through its own entry (done
+criterion 1).
+
+| Board | Unstitched (3.2) | The planner as built | With the two refusals lifted: vias proposed | Changes served within 3 mm | Left |
+|---|---|---|---|---|---|
+| dash, the pour key's winner | 7 | refused | 5 | **7 of 7** | 0 |
+| dash, today's winner | 4 | refused | 3 | 4 of 4 | 0 |
+| B5, the pour key's winner | 9 | refused | 4 | **4 of 9** | 5: "no safe candidate within the search bounds" |
+| B5, today's winner | 1 | refused | 1 | 1 of 1 | 0 |
+
+### Where it runs: the three choices
+
+| Choice | What it costs | What it changes in the ranking | Verdict |
+|---|---|---|---|
+| **A. In the engine**, next to each signal via fastroute places | A new build and pin. Konnect has to pass the critical nets and each net's reference planes, which only the audit knows. The group search and the optimizer move vias, so each ground via has to follow its signal via. The pours-omitted shape gets nothing: the engine has no pours there | Every run is ranked stitched, and the router keeps room for the via, which may serve B5's last 5 | Later, and only for what C leaves |
+| **B. In Konnect, on the winner only**, after the search | One planner call, one refill and one audit per call | None: the key chooses among unstitched boards, and the winner is stitched afterwards | No: under "quality first" the key should rank the board that is delivered |
+| **C. In Konnect, on every judged run before the rank** | Only on a run whose audit counts an unstitched change: one in-process planner call, one KiCad refill and DRC (two with S5's retry), one audit. Every other run pays nothing. On dash, B5 and `pic` a run's routing is long (median route 19.5 to 142 s, 7 router lanes against 3 judge lanes), so the judge lanes probably have room. That is an inference: the judge's own time is not recorded. A longer judge can still leave more runs cut at the budget, and the measurement counts them | The key ranks the stitched boards: their copper quality and their pour entries are those of the board delivered | **Recommended** |
+
+### What the stage does (the code cites S1 to S15)
+
+| # | Decision | Reason |
+|---|---|---|
+| S1 | One reference round in `judge_one`, after Z9's rounds and the audit, before the length probe (Row LT's step 6) and the measures. It runs for every judged run of `route_specctra_dsn`, both shapes, and for each Tune candidate (`judge_candidates` calls `judge_one`). It runs only when the post-Z9 audit's 3.2 count is above 0, and the comparison state (`before`) is built only then | Choice C. The pours-omitted runs' boards have their pours after the judge's refill too, so both shapes are judged by the same rule. A run with nothing to serve pays nothing |
+| S2 | **Targets:** the audit's 3.2 findings whose `reference_nets` is one net listed in `net_roles.ground`. The rest are recorded as skipped: `two_reference_nets` (a capacitor between the planes is 3.2's own fix, not a via) or `not_ground` (a power plane). When targets plus skipped are fewer than the 3.2 count (the audit lists at most `max_findings`, 40 by default), the round runs the audit once more, in-process, with `max_findings: 500` | The owner's scope: "a ground via … where the board has a ground pour on both layers the via joins". The audit's roles put the design intent and the netclass before the name. A `max_findings` changes no score |
+| S3 | **The planner:** the round calls the planner through a new in-process entry with S8's profile (`ReferencePlanner`): `kinds: ["stitching"]`, the targets' nets, radius `stitch_via_max_mm`, effort `standard`. Only the vias of a target net within the limit of a target are kept; the other proposals (vias that join copper groups) are dropped and counted | One step, one job, so its effect can be measured. Joining groups is Z9's work. Removing copper raises no clearance, but a kept via can sit in a fill island once a dropped proposal no longer anchors it. KiCad then reports it (`isolated_copper`), and S5's retry drops it |
+| S4 | **One round** (`REFERENCE_ROUNDS` 1), written into `<run dir>/s1` as a Z9 round is: refill and DRC, the audit, the fills, `measure`, the pour record (from the first refill, as judge_one takes it) and `gates` of the stitched board, all from judge_one's own inputs (`RoundInputs`) | The planner serves every target it can in one call. The guard needs the stitched board's pour record, or the pours key's entries are 0 on both sides and check nothing |
+| S5 | **The guard.** The stitched board replaces the post-Z9 board only when every clause below holds. With one retry: when a refusal names copper (a DRC item's position, or a zone layer for `fill`), the vias within its reach are dropped and the rest is checked once more. A refusal that names no via ends the round `refused`. | "It must never make any key entry or gate worse." Both keys, so the switch of `routing.rank_key` does not change what is safe. Unconnected count and gates equal: a reference via may not change what the judge's gates say, so the status cannot depend on a via the delivered session might lack (S10). Another net's fill: on a 4-layer board a through via cuts an antipad in an inner plane. 3.1 and 3.3: copper quality is rounded to whole points, so a 3.2 gain could hide a loss there. The retry keeps one bad via from costing every target |
+| S6 | **The record.** `Judged::reference_stitch` (`StitchRecord`), in each `run.json`. Both boards' checks are serialized as S5 read them (`CheckedSummary`: DRC counts, gates, both keys, fill per zone layer, the checklist items, scored checks), so an independent replay can check every kept round. Also recorded: the targets, the skipped findings, the proposals, the written and dropped vias, the retry, the refusing clauses, each remaining change with the planner's reason, the KiCad runs and the seconds. `Measures` gains `reference_vias` and `checklist` (3.1, 3.2, 3.3 and 4.1, for every judged run), with `serde(default)`: recorded, and no key reads them. `Judged::reference_checked` keeps the kept board's `Checked` in memory (not serialized) for S10 | The zr4-zr5 session's replay could not compare 3.2 and 4.1 across runs: only the winner kept its board. With this record the owner's later key question has data |
+| S7 | **Z9 is never undone.** The round runs after Z9's rounds and only adds copper. Its guard compares it with the post-Z9 board, and its rows are not in `Judged::rounds`. So `stitching_vias`, the status note and ZR0b's P8 and P9 read as before. Z9 keeps the registry planner's strict profile | Z9 closes opens. This round serves a checklist item on a board that may have none. With the switch off, nothing Z9 does changes |
+| S8 | **The round's planner profile accepts the owner's boards:** (i) a pad's or footprint's local `clearance` is honoured per item, as the larger of it and the conservative rule; (ii) local `zone_connect`, `thermal_width`, `thermal_bridge_width` and `thermal_gap` are accepted; (iii) a teardrop zone with no UUID gets a synthetic id on the model's fill index, and its copper counts as no known net, an obstacle to every net. Any other zone with no UUID, and a padstack's per-layer override, stay refused. The registry tool and Z9 keep the strict profile. Making them lenient too is its own change with its own measurement: it would start Z9 on these boards | (ii): the planner already demands saved fills, and a saved fill already has the shape the connection gives; its components read that geometry. (i) is the one override a new via's clearance needs. (iii): the audit model reads a zone's net only through its UUID, so a teardrop with no UUID has no net there; keeping clearance to it is at least as strict as KiCad. KiCad's DRC after the refill stays the last word (S5) |
+| S9 | The planner's reference distance reads `stitch_via_max_mm` instead of the literal `3.` (both places in `stitching`) | One limit for the audit and the planner. It changes nothing today: both read the default, 3.0 |
+| S10 | **Delivery: the delivered session holds the vias.** After the prune, the delivered winner's kept vias are written into its session, ZR0b in reverse. That is the pruned winner's vias when the prune replaced it, since P9's full judge runs the round too. Each via is `(via "<padstack>" x y)` in the net's `network_out` block (the block is made if missing), snapped to the session grid. The padstack is the export manifest's via padstack with the planner's diameter and drill: the importer resolves vias by the manifest. That session gets the full judge with the round off. It is delivered (`held.ses` set to `stitched.ses`) only when S5 holds against the ranked state, its 3.2 count is not higher, and, after the keys are taken again, the winner still ranks first, as the prune's `replace_winner` checks. On any other outcome the session goes out as before, and the status note and `next_steps` count the reference vias it lacks, as they count Z9's. It runs whether or not the winner has Z9 rows | A via that lives only on the judge's board reaches the user's board only if an agent redoes the work. In the session it arrives with the import, and the full judge with the round off proves the delivered session is the judged board (ZR0b's principle). The fallback cannot misstate the status, because S5 makes the gates equal with and without the vias |
+| S11 | **The prune keeps them.** The vias are written after the prune, so the prune never sees them. The prune's light checks run no round, and its 3.2 clause still refuses to remove a router via that serves 3.2. The prune's `kicad_runs_of` counts the round's refills inside its full judge | "The ZR0b prune must keep these vias." The order makes it true without a new prune clause |
+| S12 | The round's time is inside the search's budget (the judge lanes run it), reported per run and per call | It may cost judged runs. That is quality information, so it is measured, not capped |
+| S13 | No schema argument. An internal switch, `pour_stitch::ReferenceStitch`, carried through `route_with_fastroute` (`place_route.rs`, `tools/integration.rs`): on for `route_specctra_dsn`, off for the placement tools' routing calls | As ZR0b's P12: the placement tools rank placements by today's key, and a round per candidate costs a refill each |
+| S14 | Constants: `REFERENCE_ROUNDS` 1; `LENGTH_OFF_REFERENCE_TOLERANCE_MM` 0.1; the prune's `FILL_TOLERANCE_MM2` and loop tolerances (`loops_worse` and `fill_by_zone_layer` become `pub(crate)`) | One standard with the prune |
+| S15 | **Where it cannot run.** The planner takes 2 or 4 copper layers, through vias only, and at most 5,000 tracks; any other board ends `planner_refused`, recorded. The Freerouting path is not judged, so ZR6 does not apply to it | Its geometry profile; said here so a refusal is not read as a bug |
+
+### What stays open
+
+- **3.1, signal length off the reference plane.** A via does not change it: the track already
+  runs over a void, or over another net's copper, on its reference layer.
+  - The cause is where the pour is cut.
+  - It belongs in the engine's cost: a term for a critical net that crosses a cut in its own
+    reference plane, as a later engine stage. ZR3's cut cost already charges for cutting
+    another net's pour.
+  - Or it belongs in the key, which is a rule change and his word.
+  - Here it is recorded per run (S6), and S5 keeps the round from making it worse.
+- **4.1, the decoupling loop.** Its ground side runs through the pour.
+  - A ground via beside a capacitor's ground pad can shorten it when the IC's ground runs on
+    the other layer, but placement decides most of it.
+  - It fits as a second target kind of this same round ("decoupling via", under the same
+    `loops` clause), after this stage's numbers.
+  - Here it is recorded per run, and S5 keeps the round from making it worse.
+- **Where copper quality, or 3.1, 3.2 and 4.1, rank in the key.** That is his word, a rule
+  change. This stage's per-run record is its data.
+- **B5's remaining changes.** The probe left 5 of 9 with no position within 3 mm on the judged
+  board. If the measurement confirms that, choice A is the follow-up for them.
+- **Z9 on the owner's boards.** It is refused there today (S8 keeps that). Unblocking it is its
+  own measured change.
+
+### Done criteria and the measurement
+
+**The matrix.** Each call is in its own routing hold, at effort M, with the engine of the main
+the stage is built on. The off and on builds differ only in the switch's constant.
+
+| Calls | What | Why |
+|---|---|---|
+| 20 | Five boards (dash, B5, `pic`, `ecc`, `pours`), stage off and on, under `routing.rank_key: "pours"` and under the default `routing` (no config) | Both keys, since S5 guards both and the default ranks by today's key |
+| 2 | A 4-layer board from the bench (a scratch copy; the builder names it and records why), off and on, under `pours` | The other-net fill clause, and inner-plane antipads |
+| 1 | A placement tool's routing call, on | The round must not run (S13) |
+| 1 | A board with Tune candidates, on | Each candidate gets its own round (S1) |
+
+**Done when:**
+1. **dash's delivered winner has 3.2 at 0** (the probe served 7 of 7). Every other board's
+   delivered winner has 3.2 at 0, or each remaining change is named with the planner's reason.
+   The vias served per board are compared with the probe's, and B5's may differ because of
+   S8 (iii).
+2. **Nothing gets worse, run by run.** On every judged run where the round was kept, an
+   independent replay of the two `CheckedSummary` in `run.json` confirms every S5 clause.
+3. **The winners, stage on against off, per board and key.** Fill pieces, plane loss, starved
+   pins, G1, 3.1, 3.3, 4.1 and copper quality are not worse. 3.2 is lower wherever it was
+   above 0.
+4. **The delivery.**
+   - Its outcome is recorded per board, and dash's is `delivered`.
+   - The delivered session holds the vias, and its full judge (round off) has the ranked 3.2
+     count.
+   - KiCad's DRC gives 0 unconnected and no rule's count higher.
+   - The importer's plan on a scratch copy of the board accepts it.
+5. **Off changes nothing.** With the switch off, the calls give main's results, times aside, and
+   Z9's rows are unchanged.
+6. **Recorded:**
+   - judged runs and runs cut at the budget per call, off against on;
+   - the round's KiCad runs and seconds;
+   - the prune's outcomes and vias removed, off against on (P9 now compares two stitched
+     boards);
+   - on the 4-layer board, the rounds that the fill clause refused, and the retries.
+
+**Tests, each guard with a negative control:**
+- every S5 clause, and the retry;
+- S2's filters, its completeness check and S3's drop;
+- S8's three acceptances, and the refusals that stay;
+- S9's limit;
+- a written session read back by the importer, including the snap;
+- the delivery's fallback and its status count;
+- the placement switch off;
+- Z9 with the switch off unchanged.
+
+### Skeletons
+
+**The new module, `crates/konnect-core/src/pour_stitch.rs`.** These signatures compile against
+main `f3991bde` (`cargo check -p konnect-core --lib`, with the module added; see "Verification
+of this design"). The bodies are the build's:
+
+```rust
+pub(crate) const REFERENCE_ROUNDS: usize = 1;
+pub(crate) const LENGTH_OFF_REFERENCE_TOLERANCE_MM: f64 = 0.1;
+pub(crate) enum ReferenceStitch { On, Off }
+pub(crate) struct Target { pub net: String, pub at: (f64, f64), pub reference_layers: Vec<String>, pub max_mm: f64, pub subject: String }
+pub(crate) struct Skipped { pub subject: String, pub reason: &'static str }
+pub(crate) struct Remaining { pub subject: String, pub net: String, pub reason: String }
+pub(crate) struct Targets { pub targets: Vec<Target>, pub skipped: Vec<Skipped>, pub complete: bool }
+pub(crate) fn targets(audit: &Value, ground: &BTreeSet<String>) -> Targets;
+pub(crate) async fn full_findings(tools: &dyn ToolCaller, board: &Path) -> anyhow::Result<Value>;
+pub(crate) fn keep_reference_vias(items: &Planned, targets: &[Target]) -> (Planned, usize);
+pub(crate) fn stitch_refusals(before: &Checked, stitched: &Checked, stitched_nets: &BTreeSet<String>) -> Vec<String>;
+pub(crate) struct CheckedSummary { pub unconnected: usize, pub violations: BTreeMap<String, usize>, pub gates_passed: Vec<String>,
+    pub key_routing: Vec<i64>, pub key_pours: Vec<i64>, pub fill_mm2: BTreeMap<String, f64>, pub checklist: ChecklistItems, pub scored: Vec<String> }
+pub(crate) struct Retry { pub dropped_vias: usize, pub because: Vec<String> }
+pub(crate) struct StitchRecord { pub outcome: &'static str, pub reason: Option<String>, pub targets: usize, pub skipped: Vec<Skipped>,
+    pub proposals: usize, pub written_vias: usize, pub dropped: usize, pub before: CheckedSummary, pub after: Option<CheckedSummary>,
+    pub retried: Option<Retry>, pub refused_by: Vec<String>, pub remaining: Vec<Remaining>, pub kicad_runs: usize, pub seconds: f64 }
+pub(crate) struct Stitched { pub board: PathBuf, pub drc: DrcReport, pub audit: Value, pub checked: Checked, pub vias: Vec<PlannedVia> }
+pub(crate) struct RoundInputs<'a> { pub baseline: &'a Baseline, pub routed: &'a Routed, pub plan: &'a SesImportPlan,
+    pub widths: &'a WidthReport, pub stitching_vias: usize, pub first_drc: Option<&'a DrcReport> }
+pub(crate) trait ReferencePlanner: Send + Sync {
+    fn plan<'a>(&'a self, board: &'a Path, nets: &'a [String], radius_mm: f64) -> Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send + 'a>>;
+}
+pub(crate) async fn reference_round(ctx: &JudgeContext, tools: &dyn ToolCaller, planner: &dyn ReferencePlanner, inputs: &RoundInputs<'_>,
+    config: Option<&Path>, run_dir: &Path, board: &Path, audit: &Value, before: &Checked) -> (Option<Stitched>, StitchRecord);
+pub(crate) struct ChecklistItems { pub length_off_reference_mm: Option<f64>, pub unstitched_layer_changes: Option<f64>,
+    pub floating_ground_mm2: Option<f64>, pub floating_ground_islands: Option<f64>, pub worst_loop_mm: Option<f64> }
+pub(crate) fn checklist_items(audit: &Value) -> ChecklistItems;
+pub(crate) fn manifest_padstack(manifest: &Value, size_mm: f64, drill_mm: f64) -> anyhow::Result<Option<String>>;
+pub(crate) fn write_vias(ses_text: &str, vias: &[PlannedVia], padstack: &str) -> anyhow::Result<String>;
+pub(crate) struct DeliveryRecord { pub outcome: &'static str, pub reason: Option<String>, pub vias: usize, pub refused_by: Vec<String>, pub seconds: f64 }
+pub(crate) async fn deliver_winner(ctx: &JudgeContext, tools: Arc<dyn ToolCaller>, outcome: &mut SearchOutcome) -> DeliveryRecord;
+```
+
+**Changes in existing files.** These are signatures only; they are not compiled:
+
+```rust
+// route_judge.rs
+pub(crate) struct JudgeContext { /* … */ pub reference_stitch: crate::pour_stitch::ReferenceStitch }
+pub(crate) struct Measures { /* … */
+    #[serde(default)] pub reference_vias: usize,
+    #[serde(default)] pub checklist: crate::pour_stitch::ChecklistItems }
+pub(crate) struct Judged { /* … */
+    pub reference_stitch: Option<crate::pour_stitch::StitchRecord>,
+    #[serde(skip)] pub reference_checked: Option<crate::pour_prune::Checked> }
+// judge_one: after step 5 (the audit), when `ctx.reference_stitch` is On and 3.2's count is
+// above 0, build the post-Z9 `pour_prune::Checked` (DRC counts, `zone_fill::pour_fills`,
+// `measure`, the pour record, `gates`, `pour_prune::audit_items`), then
+// `pour_stitch::reference_round`. A kept round replaces the board, the DRC report and the
+// audit before step 6 (the lengths) and step 7. A ground net's via changes no checked net's
+// length, so the guard runs before the length probe without missing a G4 fault.
+
+// pour_prune.rs: `loops_worse` and `fill_by_zone_layer` become pub(crate);
+// `kicad_runs_of` counts a reference round's refills.
+
+// tools/route_refine.rs: an in-process entry `plan_reference_stitching(board, nets,
+// radius_mm, Profile::Lenient)` (S3, S8); the registry tool keeps `Profile::Strict`.
+// S9: in `stitching`, `dist(*p, at) <= limit` with `limit = m.params.get("stitch_via_max_mm")`.
+
+// tools/route_refine_geometry.rs (S8, under `Profile::Lenient` only)
+struct LocalOverrides { clearance_mm: Option<f64> }                  // read per pad and footprint
+fn local_overrides(n: &SexpNode) -> anyhow::Result<LocalOverrides>;  // zone_connect, thermal_* accepted
+// Copper gains `local_clearance: Option<f64>`; a new item keeps `rules.clearance.max(local)` to it.
+fn teardrop_fill_id(fill_index: usize, layer: &str, ids: &BTreeSet<String>) -> String; // its copper: no known net
+
+// tools/route_fastroute.rs (S10): `pour_stitch::deliver_winner` right after
+// `pour_prune::prune_winner`; `search.reference_stitch` in the result; `judged_status` and
+// its note count undelivered reference vias as they count Z9's.
+// place_route.rs, tools/integration.rs (S13): the switch through `route_with_fastroute`.
+```
+
+### Decisions for the owner
+
+- **Build ZR6 as designed.** That means choice C, the vias delivered in the session, and a
+  planner profile that accepts his boards, for this round only (S8). This is the one
+  decision now.
+- **Later, with this stage's numbers:**
+  - where copper quality, or 3.1, 3.2 and 4.1, rank in the key (a rule change);
+  - whether Z9 and the public planner accept his boards too (its own measured change).
+  - Nothing here depends on either.
+
+### Verification of this design
+
+- **Read:**
+  - the audit's 3.1 and 3.2, and its fill model (`tools/layout_quality_planes.rs`,
+    `tools/layout_quality.rs`);
+  - the planner's `stitching` kind and its board checks (`tools/route_refine.rs`,
+    `tools/route_refine_geometry.rs`);
+  - the judge's Z9 and step order (`route_judge.rs`, `judge_one`);
+  - the prune's clauses, checker, P8 and P9 (`pour_prune.rs`);
+  - the importer's via padstacks (`specctra_ses.rs`);
+  - all on main `f3991bde`.
+- **The probe above:** the planner through the release build of ZR3's branch, by pipe, scratch
+  HOME and KiCad settings, on scratch copies of the four audited boards. The table is its
+  output, in counts.
+- **The new module's skeleton:** compiled against main `f3991bde` (`cargo check -p konnect-core
+  --lib`, with the module added to `lib.rs`); the module is not part of this commit.
+- **Review:** by an agent that did not write it (Opus 5.5, high). It found 5 must-fix and 12
+  should-fix items, and every one is taken into the text above:
+  - the planner profile kept to the round, so the switch off changes nothing;
+  - teardrop zones handled through the model's fill index;
+  - the round given the inputs of its own pour record;
+  - gates and unconnected count equal, so a delivery fallback cannot misstate the status;
+  - the ranked state's check kept for the delivery, with the rank re-checked;
+  - truncated findings;
+  - the manifest's padstacks;
+  - snapping to the session grid;
+  - which full judge runs the round;
+  - 3.1 and 3.3 guarded;
+  - one retry;
+  - the planner's limits;
+  - G4 and the length probe;
+  - the island case of S3's drop;
+  - the wider matrix (both keys, a 4-layer board, a placement call, Tune candidates);
+  - stronger done criteria;
+  - the build details.
