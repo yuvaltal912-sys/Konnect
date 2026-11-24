@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `routing.rank_key` defaults to `pours` (folded into Row ZR, stage ZR6)
+
+**A default change.** With no `routing.rank_key` in the user config (absent, or JSON
+`null`), `route_specctra_dsn` (fastroute) now ranks its runs by the pour key
+(`pour_key`), not by today's key (`key`). `search.rank.ranked_by` says `pours` and
+`source` says `default`. No argument changes.
+
+- **To keep today's ranking**, set `routing.rank_key` to `"routing"`
+  (`save_user_config(key_path='routing.rank_key', value='routing')`).
+- `"pours"` set explicitly ranks as before; both keys are still written for every judged
+  run, and `search.rank.other_winner` names the run today's key would have chosen.
+- The placement tools' routing calls (`plan_convergent_placement`) still rank by today's
+  key and do not read the setting.
+- What follows from the key that ranks is unchanged in kind: the winner, the judged runs
+  that keep their files, the tuned candidate a run keeps, and the key the ground-via
+  prune compares.
+
 ## Unreleased: a ground via at every reference change (Row ZR, stage ZR6)
 
 `route_specctra_dsn` (fastroute) adds a ground via beside each signal via that changes

@@ -4087,17 +4087,14 @@ fn the_rank_key_comes_from_the_user_config_whatever_else_it_holds() {
         let (_dir, path) = config_file(text);
         call_rank_at(RankChoice::UserConfig, &path)
     };
-    assert_eq!(
-        read(None).unwrap(),
-        (RankMode::Routing, RankSource::Default)
-    );
+    assert_eq!(read(None).unwrap(), (RankMode::Pours, RankSource::Default));
     assert_eq!(
         read(Some(r#"{"routing": {"effort": "h"}}"#)).unwrap(),
-        (RankMode::Routing, RankSource::Default)
+        (RankMode::Pours, RankSource::Default)
     );
     assert_eq!(
         read(Some(r#"{"routing": {"rank_key": null}}"#)).unwrap(),
-        (RankMode::Routing, RankSource::Default)
+        (RankMode::Pours, RankSource::Default)
     );
     assert_eq!(
         read(Some(r#"{"routing": {"rank_key": "pours"}}"#)).unwrap(),
@@ -4170,7 +4167,7 @@ fn a_bad_value_of_another_key_does_not_refuse_the_rank_read() {
     for (text, mode, source) in [
         (
             r#"{"routing": {"fastroute_path": 7}}"#,
-            RankMode::Routing,
+            RankMode::Pours,
             RankSource::Default,
         ),
         (
@@ -4358,14 +4355,26 @@ async fn the_engine_gets_the_same_uncounted_file_under_both_modes() {
 fn the_steps_for_missing_reference_vias_plan_adopt_and_check() {
     let board = Path::new("/boards/b.kicad_pcb");
     let steps = reference_steps(board, &["GND".to_string()], 2);
-    let tools: Vec<&str> = steps.iter().map(|step| step["tool"].as_str().unwrap()).collect();
-    assert_eq!(tools, vec!["plan_route_refinement", "route_batch", "run_drc"]);
+    let tools: Vec<&str> = steps
+        .iter()
+        .map(|step| step["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tools,
+        vec!["plan_route_refinement", "route_batch", "run_drc"]
+    );
     assert_eq!(steps[0]["arguments"]["kinds"], json!(["stitching"]));
     assert_eq!(steps[0]["arguments"]["nets"], json!(["GND"]));
     assert_eq!(steps[0]["arguments"]["search_radius_mm"], json!(3.0));
-    assert!(steps[0]["why"].as_str().unwrap().contains("2 ground via(s)"));
+    assert!(steps[0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("2 ground via(s)"));
     assert_eq!(steps[2]["arguments"]["refill_zones"], json!(true));
     let note = judged_reference_note(1, 2);
-    assert!(note.contains("2 ground via(s)") && note.contains("1 stitching via(s)"), "{note}");
+    assert!(
+        note.contains("2 ground via(s)") && note.contains("1 stitching via(s)"),
+        "{note}"
+    );
     assert!(!judged_reference_note(0, 2).contains("stitching via(s)"));
 }

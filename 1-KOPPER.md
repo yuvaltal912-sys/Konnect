@@ -143,12 +143,12 @@ Freerouting does not tune lengths and says so. The design:
 
 ## Which key ranks the routing runs
 
-The judge gives every routed run two keys: `key`, the one that ranks by default, and
-`pour_key`, the same with four pour entries added (pour faults, the plane loss and the
-ground track before the lengths, the pour copper lost after the vias). The
-user config's `routing.rank_key` chooses: `"routing"` (the default) or `"pours"`. It
-is your standing choice: set it with `save_user_config(key_path='routing.rank_key',
-value='pours')`. Every routing result's `search.rank` says which key ranked and which
+The judge gives every routed run two keys: `key`, today's, and `pour_key`, the same
+with four pour entries added (pour faults, the plane loss and the ground track before
+the lengths, the pour copper lost after the vias), which ranks by default. The user
+config's `routing.rank_key` chooses: `"pours"` (the default) or `"routing"`. It is
+your standing choice: set it with `save_user_config(key_path='routing.rank_key',
+value='routing')` to rank by today's key. Every routing result's `search.rank` says which key ranked and which
 run the other key would have put first. A user config that cannot be read now refuses
 every fastroute routing call, even one that names `effort` and `fastroute_path`. The
 placement tool's routing calls always rank by `key`. The design:

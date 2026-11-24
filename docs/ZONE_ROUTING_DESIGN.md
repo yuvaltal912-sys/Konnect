@@ -302,7 +302,9 @@ and merges before ZR3's measurement; then a second key beside today's, off until
 board. **Part 2, the pour key, is built** (2026-11-24, branch `claude/zr5-pour-key-build`;
 "Part 2 as built" and "Part 2 measured" there) with the candidate values and the setting
 `routing.rank_key` at `routing`; ZR3's table confirms the values, and the switch is the
-owner's word.
+owner's word. **The default switch to `pours`** is folded into ZR6's PR on his word ("כן,
+לעשות את שלושתם", 2026-11-24): with no `routing.rank_key` a call ranks by the pour key,
+and `"routing"` ranks by today's. The switch itself waits for his yes on that PR's text.
 
 ## Decisions taken in this design (with the reason)
 
@@ -2284,8 +2286,8 @@ the stage is built on. The off and on builds differ only in the switch's constan
 
 | Calls | What | Why |
 |---|---|---|
-| 20 | Five boards (dash, B5, `pic`, `ecc`, `pours`), stage off and on, under `routing.rank_key: "pours"` and under the default `routing` (no config) | Both keys, since S5 guards both and the default ranks by today's key |
-| 2 | A 4-layer board from the bench (a scratch copy; the builder names it and records why), off and on, under `pours` | The other-net fill clause, and inner-plane antipads |
+| 20 | Five boards (dash, B5, `pic`, `ecc`, `pours`), stage off and on, under the default (no config, which now ranks by `pours`: the default switch folded into this PR) and under an explicit `routing.rank_key: "routing"` in a scratch `HOME`'s user config | Both keys, since S5 guards both; today's key now needs its explicit config |
+| 2 | A 4-layer board from the bench (a scratch copy; the builder names it and records why), off and on, under `pours` (the default, no config) | The other-net fill clause, and inner-plane antipads |
 | 1 | A placement tool's routing call, on | The round must not run (S13) |
 | 1 | A board with Tune candidates, on | Each candidate gets its own round (S1) |
 

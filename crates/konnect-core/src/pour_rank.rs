@@ -225,8 +225,13 @@ pub(crate) enum RankChoice {
     Fixed(RankMode),
 }
 
+/// The mode of a call with no `routing.rank_key` in the user config (Row ZR, ZR6: the
+/// owner's fold of the switch into ZR6's PR, "כן, לעשות את שלושתם", 2026-11-24; the
+/// switch itself waits for his yes on the PR text): the pour key.
+pub(crate) const DEFAULT_RANK_MODE: RankMode = RankMode::Pours;
+
 /// The mode of a call that reads the user config: `routing.rank_key` (`config` is that
-/// value when the config has it), else [`RankMode::Routing`]. A JSON null is "not set".
+/// value when the config has it), else [`DEFAULT_RANK_MODE`]. A JSON null is "not set".
 /// A value that is not a string naming one of the two modes is refused; the message
 /// names `routing.rank_key`, the value and both names, as `route_search::resolve_effort`
 /// does for the effort. There is no tool argument (PK9).
@@ -234,7 +239,7 @@ pub(crate) fn resolve_rank_mode(
     config: Option<&Value>,
 ) -> std::result::Result<(RankMode, RankSource), String> {
     let Some(value) = config.filter(|value| !value.is_null()) else {
-        return Ok((RankMode::Routing, RankSource::Default));
+        return Ok((DEFAULT_RANK_MODE, RankSource::Default));
     };
     let source = "the user config's `routing.rank_key`";
     let Some(text) = value.as_str() else {

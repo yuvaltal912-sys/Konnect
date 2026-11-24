@@ -372,8 +372,9 @@ placement orders, judges every run itself on scratch copies of the board
    them against the unrouted board's refill (`search.baseline.pour_fills`):
    `lost_fills` (pour layers that lost all their fill), and `plane_loss` and
    `area_loss`, shares from 0 to 1 of the planes no longer whole and of the
-   pour copper gone. It changes no gate, and no rank unless the user config's
-   `routing.rank_key` is `pours`. Every judged run has two keys, `key` (today's)
+   pour copper gone. It changes no gate; it ranks through the pour key, the
+   default, unless the user config's `routing.rank_key` is `routing`. Every
+   judged run has two keys, `key` (today's)
    and `pour_key`; `search.rank` says which ranked and which run the other
    would have put first (`other_winner`). `routing.rank_key` is the user's
    standing choice: never change it unasked.
