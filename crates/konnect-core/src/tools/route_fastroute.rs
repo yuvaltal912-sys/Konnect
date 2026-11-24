@@ -1622,6 +1622,12 @@ fn held_group_search(held: &crate::fastroute::Held) -> Option<Value> {
 /// `cost_mm`). `None` when the object does not read as one: no `ended_by` string, no
 /// `passes` list, a pass without a whole `kept` or `largest_kept_group`, or a `start`
 /// or `end` without the three numbers. Never an error.
+///
+/// Row ZR, stage ZR3: when the engine reports the pour state (fastroute x22 with
+/// `--x.zones` writes `pour` in `start` and `end`), `start` and `end` keep their `pour`
+/// object as written, and `pour_worse` counts the moves that only the "never more pour
+/// damage" rule refused (the passes' `ends.pour_worse`, a missing or unreadable count as
+/// 0). Without it the summary is as before, key for key.
 fn group_search_summary(object: &Value) -> Option<Value> {
     let ended_by = object["ended_by"].as_str()?;
     let passes = object["passes"].as_array()?;
@@ -1633,20 +1639,32 @@ fn group_search_summary(object: &Value) -> Option<Value> {
     }
     let value = |key: &str| -> Option<Value> {
         let value = &object[key];
-        Some(json!({
+        let mut summary = json!({
             "length_mm": value["length_mm"].as_f64()?,
             "vias": value["vias"].as_u64()?,
             "cost_mm": value["cost_mm"].as_f64()?,
-        }))
+        });
+        if let Some(pour) = value.get("pour").filter(|pour| pour.is_object()) {
+            summary["pour"] = pour.clone();
+        }
+        Some(summary)
     };
-    Some(json!({
+    let mut summary = json!({
         "ended_by": ended_by,
         "passes": passes.len(),
         "kept_moves": kept_moves,
         "largest_group": largest_group,
         "start": value("start")?,
         "end": value("end")?,
-    }))
+    });
+    if summary["start"].get("pour").is_some() {
+        let pour_worse = passes
+            .iter()
+            .map(|pass| pass["ends"]["pour_worse"].as_u64().unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
+        summary["pour_worse"] = json!(pour_worse);
+    }
+    Some(summary)
 }
 
 /// The unrouted board's check, as the result reports it.

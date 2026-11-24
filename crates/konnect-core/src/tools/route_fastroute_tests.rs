@@ -1120,6 +1120,35 @@ fn the_group_search_summary_reads_the_reports_object() {
     assert_eq!(summary["ended_by"], "pass_cap");
 }
 
+/// Row ZR, stage ZR3: with the engine's pour state (x22 with `--x.zones`), `start` and
+/// `end` keep their `pour` and `pour_worse` sums the passes' refused moves; a `pour` that
+/// is not an object, or an object without one, adds nothing.
+#[test]
+fn the_group_search_summary_keeps_the_pour_state_and_counts_pour_worse() {
+    let pour = |pieces: u64, lost: u64| {
+        json!({ "pieces": pieces, "starved": 0, "spokes_lost": lost, "largest_share": 0.875 })
+    };
+    let mut object = group_search_object();
+    object["start"]["pour"] = pour(3, 0);
+    object["end"]["pour"] = pour(2, 1);
+    object["passes"][0]["ends"]["pour_worse"] = json!(2);
+    object["passes"][1]["ends"]["pour_worse"] = json!(5);
+    let summary = group_search_summary(&object).unwrap();
+    assert_eq!(summary["start"]["pour"], pour(3, 0));
+    assert_eq!(summary["end"]["pour"], pour(2, 1));
+    assert_eq!(summary["pour_worse"], 7);
+    // a pass that refused nothing on the pour rule has no `pour_worse` end: counted 0
+    object["passes"][1]["ends"].as_object_mut().unwrap().remove("pour_worse");
+    assert_eq!(group_search_summary(&object).unwrap()["pour_worse"], 2);
+    // no pour state (x21, or no `--x.zones`): the summary of before, key for key
+    let mut plain = group_search_object();
+    plain["passes"][0]["ends"]["pour_worse"] = json!(2);
+    assert_eq!(group_search_summary(&plain), Some(summary_of_the_object()));
+    plain["start"]["pour"] = json!("3 pieces");
+    plain["end"]["pour"] = json!(null);
+    assert_eq!(group_search_summary(&plain), Some(summary_of_the_object()));
+}
+
 /// An object that does not read as one gives no summary, never an error.
 #[test]
 fn a_group_search_object_that_does_not_read_gives_no_summary() {
