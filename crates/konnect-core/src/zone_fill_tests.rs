@@ -402,7 +402,7 @@ async fn the_record_reads_the_board_at_its_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("judged.kicad_pcb");
     let empty = || report(vec![], vec![]);
-    let missing = pour_record(&path, empty(), empty(), &nets(&["GND"])).await;
+    let missing = pour_record(&path, empty(), empty(), &nets(&["GND"]), None).await;
     assert!(format!("{:#}", missing.unwrap_err()).contains("read the judged board"));
     // control: once the board is there it is measured
     std::fs::write(
@@ -410,7 +410,7 @@ async fn the_record_reads_the_board_at_its_path() {
         board(&[zone("GND", "B.Cu", "z1", &[(0.0, 0.0, 10.0)])]),
     )
     .unwrap();
-    let m = pour_record(&path, empty(), empty(), &nets(&["GND"]))
+    let m = pour_record(&path, empty(), empty(), &nets(&["GND"]), None)
         .await
         .unwrap();
     assert_eq!(m.pieces, 1);

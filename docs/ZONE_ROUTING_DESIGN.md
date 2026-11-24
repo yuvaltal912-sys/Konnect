@@ -293,6 +293,14 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 
 ZR4 touches no engine file and may run beside ZR1 to ZR3.
 
+ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23), in
+two PRs on the owner's order ("כן, ZR5 קודם"): first the pour record, which changes no rank
+and merges before ZR3's measurement; then a second key beside today's, off until his word.
+**Part 1, the pour record, is built** (2026-11-24, branch `claude/zr5-pour-record-build`;
+"Part 1 as built" and "Part 1 measured" there): every judged run's `pours.damage` against
+the refilled unrouted board. Part 2 is being built now with the candidate values, with the
+switch off; ZR3's table confirms those values.
+
 ## Decisions taken in this design (with the reason)
 
 | # | Decision | Reason |
@@ -330,7 +338,10 @@ ZR4 touches no engine file and may run beside ZR1 to ZR3.
    stackup rules now, with every plan filled by KiCad before it is returned, and by routing each
    candidate division in ZR5. Ground on both sides is the rule for 2 layers.
 5. **When the skill stops saying "pours last".** Recommended: only after ZR2's table shows the
-   as-exported shape at 0 open before stitching.
+   as-exported shape at 0 open before stitching. The text of the change is in
+   [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), "The skill's order of work".
+   **Answered 2026-11-23:** as recommended there, once stages ZR4 and ZR2 are merged; the
+   change is a PR of its own.
 
 ## Modules
 
@@ -1683,6 +1694,11 @@ Still free, as today:
   sends no zones file.
 
 When ZR5 adds pour terms to the key, the uncounted set follows the key and shrinks.
+
+**ZR5's design (2026-11-23) leaves the uncounted set as it is**
+([POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), PK11). The pour track enters the pour key as a
+tie-break only; and with pour nets in the engine's cost every ground and stitching via would
+cost the search, which could work against ZR0b's prune and ZR2's closing vias.
 
 **The optimizer.** F1's `follow_rips` and the optimizer's own comparison read the same per-net
 counts, from the snapshot drawn before the optimizer pass. A candidate that cuts a pour reads

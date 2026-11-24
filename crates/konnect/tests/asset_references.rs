@@ -1062,6 +1062,11 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "length_matching_note",
         "untuned_nets",
         "tune_candidates",
+        // Result fields of `route_specctra_dsn` (Row ZR, ZR5 part 1: the pour record).
+        "pour_fills",
+        "lost_fills",
+        "plane_loss",
+        "area_loss",
     ];
 
     let mut phantom = Vec::new();
