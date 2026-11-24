@@ -141,6 +141,19 @@ checking it. A winner that misses a window has `status`
 Freerouting does not tune lengths and says so. The design:
 `docs/LENGTH_TUNING_DESIGN.md`.
 
+## Which key ranks the routing runs
+
+The judge gives every routed run two keys: `key`, the one that ranks by default, and
+`pour_key`, the same with four pour entries added (pour faults and the plane loss
+before the lengths, the pour copper lost and the ground track after the vias). The
+user config's `routing.rank_key` chooses: `"routing"` (the default) or `"pours"`. It
+is your standing choice: set it with `save_user_config(key_path='routing.rank_key',
+value='pours')`. Every routing result's `search.rank` says which key ranked and which
+run the other key would have put first. A user config that cannot be read now refuses
+every fastroute routing call, even one that names `effort` and `fastroute_path`. The
+placement tool's routing calls always rank by `key`. The design:
+`docs/POUR_RANK_DESIGN.md`.
+
 ## Change the fastroute build
 
 Edit `packaging/1-kopper/fastroute.json` (`build`, `engine_commit`, `sha256`) in

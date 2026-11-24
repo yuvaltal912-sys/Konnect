@@ -874,6 +874,8 @@ struct Shared {
     released: Mutex<Vec<usize>>,
     /// Row LT: every run is routed with two Tune candidates.
     tuned: std::sync::atomic::AtomicBool,
+    /// Row ZR, ZR5 part 2: the search ranks by the pour key (else today's).
+    pours: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -900,6 +902,7 @@ fn fake_with_baseline(
         judge_starts: Mutex::new(Vec::new()),
         released: Mutex::new(Vec::new()),
         tuned: std::sync::atomic::AtomicBool::new(false),
+        pours: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -996,6 +999,14 @@ impl Runner for Fake {
         let mut released = self.0.released.lock().unwrap();
         assert!(!released.contains(&index), "run {index} released twice");
         released.push(index);
+    }
+
+    fn rank(&self) -> crate::pour_rank::RankMode {
+        if self.0.pours.load(Ordering::SeqCst) {
+            crate::pour_rank::RankMode::Pours
+        } else {
+            crate::pour_rank::RankMode::Routing
+        }
     }
 
     fn baseline(&self) -> BoxFuture<Result<Baseline>> {
@@ -1576,6 +1587,48 @@ async fn a_route_in_flight_that_succeeds_lifts_the_stop() {
     }
     assert_eq!(outcome.runs[1].outcome, "judged");
     assert_eq!(outcome.winner, Some(0));
+}
+
+/// Row ZR, ZR5 part 2 (PK12): the search's winner and the runs it releases follow the
+/// runner's mode. Twelve runs judged one by one: run i has a signal length that grows
+/// with i (today's key prefers the early runs) and a plane loss that shrinks with i
+/// (the pour key prefers the late ones). Both keys are kept for every judged run.
+/// Control: `finish` or `release_beyond_the_best` left on `route_judge::rank`.
+#[tokio::test(start_paused = true)]
+async fn the_winner_and_the_released_runs_follow_the_mode() {
+    use crate::pour_rank::RankMode;
+    let pool = |i: usize| {
+        crate::pour_rank::tests::split_judged(100.0 + 2.0 * i as f64, 0.05 * (11 - i) as f64)
+    };
+    for (mode, winner, released) in [
+        (RankMode::Routing, 0, vec![8, 9, 10, 11]),
+        (RankMode::Pours, 11, vec![0, 1, 2, 3]),
+    ] {
+        let fake = fake(|_| (10, None), move |i| (5, Ok(pool(i))));
+        fake.0
+            .pours
+            .store(mode == RankMode::Pours, Ordering::SeqCst);
+        let outcome = run(&plan(1, 1, Some(100_000), 12), &fake).await;
+        assert_eq!(outcomes(&outcome), vec!["judged"; 12], "{mode:?}");
+        assert_eq!(outcome.rank, mode);
+        assert_eq!(outcome.winner, Some(winner), "{mode:?}");
+        assert_eq!(fake.released(), released, "{mode:?}");
+        // Both keys, by index, whatever ranked.
+        let judged: Vec<Judged> = (0..12).map(pool).collect();
+        let refs: Vec<&Judged> = judged.iter().collect();
+        let pooled: Vec<(&Measures, &Gates, bool)> =
+            refs.iter().map(|j| (&j.measures, &j.gates, true)).collect();
+        let today: Vec<Option<Key>> = crate::route_judge::rank(&refs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let poured: Vec<Option<crate::pour_rank::PourKey>> = crate::pour_rank::pour_keys(&pooled)
+            .into_iter()
+            .map(Some)
+            .collect();
+        assert_eq!(outcome.keys, today, "{mode:?}");
+        assert_eq!(outcome.pour_keys, poured, "{mode:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]

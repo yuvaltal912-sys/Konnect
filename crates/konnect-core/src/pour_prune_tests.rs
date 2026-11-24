@@ -639,14 +639,14 @@ fn with(change: impl FnOnce(&mut CheckedRest)) -> Checked {
 
 fn refused(candidate: &Checked) -> Vec<String> {
     let base = checked(0, &[("x", 1)]);
-    refusals(&base, &base, candidate)
+    refusals(&base, &base, candidate, crate::pour_rank::RankMode::Routing)
 }
 
 #[test]
 fn equal_is_kept() {
     let base = checked(0, &[("x", 1)]);
     assert!(drc_refusals(&base, 0, &rules(&[("x", 1)])).is_empty());
-    assert!(refusals(&base, &base, &base).is_empty());
+    assert!(refusals(&base, &base, &base, crate::pour_rank::RankMode::Routing).is_empty());
 }
 
 #[test]
@@ -725,11 +725,14 @@ fn more_unstitched_layer_changes_refuse_and_none_on_one_side_refuses() {
     );
     let none = with(|r| r.audit.unstitched_layer_changes = None);
     assert!(
-        refusals(&none, &none, &none).is_empty(),
+        refusals(&none, &none, &none, crate::pour_rank::RankMode::Routing).is_empty(),
         "None on both sides passes"
     );
     let some = with(|_| {});
-    assert_eq!(refusals(&none, &none, &some), vec!["stitching"]);
+    assert_eq!(
+        refusals(&none, &none, &some, crate::pour_rank::RankMode::Routing),
+        vec!["stitching"]
+    );
 }
 
 #[test]
@@ -818,16 +821,41 @@ fn the_tolerances_do_not_add_up_over_accepted_states() {
     let step = |area: f64| with(|r| r.audit.mean_loop_area_mm2 = Some(area));
     let first = step(4.06);
     let second = step(4.12);
-    assert!(refusals(&original, &original, &first).is_empty());
+    assert!(refusals(
+        &original,
+        &original,
+        &first,
+        crate::pour_rank::RankMode::Routing
+    )
+    .is_empty());
     assert_eq!(
-        refusals(&original, &first, &second),
+        refusals(
+            &original,
+            &first,
+            &second,
+            crate::pour_rank::RankMode::Routing
+        ),
         vec!["loops"],
         "0.06 above the state before it, 0.12 above the original"
     );
     let fill = |area: f64| with(|r| r.fills[1].pieces_mm2 = vec![area]);
     let first = fill(49.994);
-    assert!(refusals(&original, &original, &first).is_empty());
-    assert_eq!(refusals(&original, &first, &fill(49.988)), vec!["fill"]);
+    assert!(refusals(
+        &original,
+        &original,
+        &first,
+        crate::pour_rank::RankMode::Routing
+    )
+    .is_empty());
+    assert_eq!(
+        refusals(
+            &original,
+            &first,
+            &fill(49.988),
+            crate::pour_rank::RankMode::Routing
+        ),
+        vec!["fill"]
+    );
 }
 
 #[test]
@@ -835,17 +863,30 @@ fn the_clauses_against_the_current_state_take_its_values() {
     let original = checked(2, &[("x", 3)]);
     let current = checked(1, &[("x", 2)]);
     assert_eq!(
-        refusals(&original, &current, &checked(2, &[("x", 2)])),
+        refusals(
+            &original,
+            &current,
+            &checked(2, &[("x", 2)]),
+            crate::pour_rank::RankMode::Routing
+        ),
         vec!["unconnected"]
     );
     assert_eq!(
-        refusals(&original, &current, &checked(1, &[("x", 3)])),
+        refusals(
+            &original,
+            &current,
+            &checked(1, &[("x", 3)]),
+            crate::pour_rank::RankMode::Routing
+        ),
         vec!["rule:x"]
     );
     let worse = with(|r| r.audit.unstitched_layer_changes = Some(1.0));
     let mut now = worse.clone();
     now.rest.as_mut().unwrap().audit.unstitched_layer_changes = Some(0.0);
-    assert_eq!(refusals(&worse, &now, &worse), vec!["stitching"]);
+    assert_eq!(
+        refusals(&worse, &now, &worse, crate::pour_rank::RankMode::Routing),
+        vec!["stitching"]
+    );
 }
 
 // ------------------------------------------------------------------- the loop
@@ -999,7 +1040,14 @@ fn vias_of(units: &[Unit]) -> Vec<usize> {
 }
 
 async fn run(ses: &str, script: &Script) -> Pruned {
-    prune_loop(ses, &script.units, &original(), script).await
+    prune_loop(
+        ses,
+        &script.units,
+        &original(),
+        script,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await
 }
 
 /// The returned `removed` is a set the checker accepted whole, and `last` is that
@@ -1020,7 +1068,13 @@ fn assert_whole(script: &Script, pruned: &Pruned) {
                 assert_eq!(pruned.last, checked);
                 let current = current.as_ref().expect("checked against a state");
                 assert!(
-                    refusals(&original(), current, &checked).is_empty(),
+                    refusals(
+                        &original(),
+                        current,
+                        &checked,
+                        crate::pour_rank::RankMode::Routing
+                    )
+                    .is_empty(),
                     "{:?} was refused when it was checked",
                     pruned.removed
                 );
@@ -1385,10 +1439,20 @@ fn two_runs() -> SearchOutcome {
         .into_iter()
         .map(Some)
         .collect();
+    let pooled: Vec<(&Measures, &Gates, bool)> = refs
+        .iter()
+        .map(|judged| (&judged.measures, &judged.gates, true))
+        .collect();
+    let pour_keys = crate::pour_rank::pour_keys(&pooled)
+        .into_iter()
+        .map(Some)
+        .collect();
     SearchOutcome {
         runs,
         winner: Some(0),
         keys,
+        pour_keys,
+        rank: crate::pour_rank::RankMode::Routing,
         elapsed: std::time::Duration::from_secs(1),
         budget_overrun: None,
         stopped_launching: None,
@@ -1414,6 +1478,7 @@ fn a_pruned_winner_that_would_not_rank_first_replaces_nothing() {
         0,
         PathBuf::from("/nowhere/run-0/pruned.ses"),
         judged_at(80.0),
+        crate::pour_rank::RankMode::Routing,
     );
     assert_eq!(
         refused,
@@ -1430,6 +1495,7 @@ fn a_pruned_winner_that_would_not_rank_first_replaces_nothing() {
         0,
         PathBuf::from("/nowhere/run-0/pruned.ses"),
         judged_at(95.0),
+        crate::pour_rank::RankMode::Routing,
     )
     .unwrap();
     assert_eq!(kept["session"], "/nowhere/run-0/full.ses");
@@ -1478,6 +1544,7 @@ fn a_pruned_winner_keeps_the_runs_pad_comparison() {
         0,
         PathBuf::from("/nowhere/run-0/pruned.ses"),
         pruned,
+        crate::pour_rank::RankMode::Routing,
     )
     .unwrap();
     let measures = &outcome.runs[0].judged.as_ref().unwrap().measures;
@@ -1498,7 +1565,14 @@ fn a_pruned_winner_keeps_the_runs_pad_comparison() {
     }
     let mut pruned = judged_at(95.0);
     pruned.measures.pours = Some(pours(2, None, None));
-    replace_winner(&mut outcome, 0, PathBuf::from("/p.ses"), pruned).unwrap();
+    replace_winner(
+        &mut outcome,
+        0,
+        PathBuf::from("/p.ses"),
+        pruned,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .unwrap();
     let measures = &outcome.runs[0].judged.as_ref().unwrap().measures;
     assert_eq!(
         measures.pours_error.as_deref(),
@@ -1521,7 +1595,7 @@ fn a_board_with_no_decoupling_loops_and_no_stitching_count_refuses_nothing() {
         r.audit.pin_loops.clear();
         r.audit.unstitched_layer_changes = None;
     });
-    assert!(refusals(&none, &none, &none).is_empty());
+    assert!(refusals(&none, &none, &none, crate::pour_rank::RankMode::Routing).is_empty());
     assert!(!loops_worse(
         &none.rest.as_ref().unwrap().audit,
         &none.rest.as_ref().unwrap().audit
@@ -1562,7 +1636,12 @@ fn a_value_exactly_at_its_tolerance_is_kept() {
     let base = checked(0, &[("x", 1)]);
     let kept = |change: Change| {
         let candidate = with(|r| change(r));
-        refusals(&base, &base, &candidate)
+        refusals(
+            &base,
+            &base,
+            &candidate,
+            crate::pour_rank::RankMode::Routing,
+        )
     };
     // The base's 4.1: worst 10, median 5, mean area 4, pin U1.3 (5 mm, 2 mm²); its fill
     // on F.Cu is one 50 mm² piece.
@@ -1617,13 +1696,182 @@ fn the_route_seconds_never_refuse_the_pruned_session() {
     let original = judged_at(90.0);
     let mut slower = judged_at(90.0);
     slower.measures.route_s = original.measures.route_s + 100.0;
-    assert_eq!(full_judge_refusal(&original, &slower), None);
+    assert_eq!(
+        full_judge_refusal(&original, &slower, crate::pour_rank::RankMode::Routing),
+        None
+    );
     // Control of the test itself: a lower copper quality refuses at its position.
     let worse = judged_at(80.0);
     assert!(
-        full_judge_refusal(&original, &worse)
+        full_judge_refusal(&original, &worse, crate::pour_rank::RankMode::Routing)
             .is_some_and(|reason| reason.contains("at position 11")),
         "{:?}",
-        full_judge_refusal(&original, &worse)
+        full_judge_refusal(&original, &worse, crate::pour_rank::RankMode::Routing)
+    );
+}
+
+// --- Row ZR, ZR5 part 2: every clause that ranks reads the call's ranking key (PK12)
+
+/// Clause (c) names the ranking key's places: a candidate with a longer signal step is
+/// `key:7` under today's key and `key:9` under the pour key. Control: clause (c) left
+/// on `rank_measures` under `pours` names `key:7`.
+#[test]
+fn the_key_clause_names_the_places_of_the_ranking_key() {
+    use crate::pour_rank::RankMode;
+    let base = checked(0, &[("x", 1)]);
+    let longer = with(|rest| rest.measures.signal_mm = 110.0);
+    assert_eq!(
+        refusals(&base, &base, &longer, RankMode::Routing),
+        vec!["key:7"]
+    );
+    assert_eq!(
+        refusals(&base, &base, &longer, RankMode::Pours),
+        vec!["key:9"]
+    );
+    // A pour track that grows is refused only under the pour key (entry 14).
+    let tracked = with(|rest| rest.measures.pour_track_mm = 50.0);
+    assert!(refusals(&base, &base, &tracked, RankMode::Routing).is_empty());
+    assert_eq!(
+        refusals(&base, &base, &tracked, RankMode::Pours),
+        vec!["key:14"]
+    );
+    // The seconds never refuse, under either key.
+    let slower = with(|rest| rest.measures.route_s = 99.0);
+    for mode in [RankMode::Routing, RankMode::Pours] {
+        assert!(refusals(&base, &base, &slower, mode).is_empty(), "{mode:?}");
+    }
+}
+
+/// The full judge's final comparison follows the mode: a pruned session that keeps the
+/// signal but loses plane is refused only under `pours`; one that lengthens the signal
+/// and keeps the plane is refused under both, at the signal step's place of each key.
+/// Control: the comparison left on `route_judge::rank`.
+#[test]
+fn the_full_judges_comparison_follows_the_mode() {
+    use crate::pour_rank::tests::split_judged;
+    use crate::pour_rank::RankMode;
+    let original = split_judged(100.0, 0.0);
+    let cut = split_judged(100.0, 0.1);
+    assert_eq!(full_judge_refusal(&original, &cut, RankMode::Routing), None);
+    assert_eq!(
+        full_judge_refusal(&original, &cut, RankMode::Pours),
+        Some(
+            "the pruned session's rank key is above the original's at position 8 (2 > 0)"
+                .to_string()
+        )
+    );
+    let longer = split_judged(110.0, 0.0);
+    assert_eq!(
+        full_judge_refusal(&original, &longer, RankMode::Routing),
+        Some(
+            "the pruned session's rank key is above the original's at position 7 (55 > 50)"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        full_judge_refusal(&original, &longer, RankMode::Pours),
+        Some(
+            "the pruned session's rank key is above the original's at position 9 (55 > 50)"
+                .to_string()
+        )
+    );
+}
+
+/// Two judged runs on which the keys disagree, `winner` the one the key of `mode` puts
+/// first; both keys taken as the search takes them.
+fn split_runs(mode: crate::pour_rank::RankMode) -> SearchOutcome {
+    use crate::pour_rank::tests::short_and_whole;
+    let (short, whole) = short_and_whole();
+    let mut outcome = two_runs();
+    outcome.runs[0].judged = Some(short);
+    outcome.runs[1].judged = Some(whole);
+    let refs: Vec<&Judged> = outcome
+        .runs
+        .iter()
+        .filter_map(|r| r.judged.as_ref())
+        .collect();
+    let pooled: Vec<(&Measures, &Gates, bool)> = refs
+        .iter()
+        .map(|judged| (&judged.measures, &judged.gates, true))
+        .collect();
+    let keys = route_judge::rank(&refs).into_iter().map(Some).collect();
+    let pour_keys = crate::pour_rank::pour_keys(&pooled)
+        .into_iter()
+        .map(Some)
+        .collect();
+    outcome.keys = keys;
+    outcome.pour_keys = pour_keys;
+    outcome.rank = mode;
+    outcome.winner = Some(match mode {
+        crate::pour_rank::RankMode::Routing => 0,
+        crate::pour_rank::RankMode::Pours => 1,
+    });
+    outcome
+}
+
+/// The keys the prune takes again follow the mode, both keys are taken again, and
+/// `before` holds both of the winner's keys. Under `pours` run 1 won; its pruned board
+/// keeps it first by the pour key though today's key puts run 0 first: kept. Under
+/// `routing` run 0's pruned board loses all its plane and is kept (today's key does not
+/// read the plane); the same board is refused under `pours`. Control: `replace_winner`
+/// ranking by `route_judge::rank`.
+#[test]
+fn the_keys_the_prune_takes_again_follow_the_mode() {
+    use crate::pour_rank::tests::split_judged;
+    use crate::pour_rank::RankMode;
+    // Pours: run 1 (whole plane, longer signal) is pruned to an even longer signal.
+    let mut outcome = split_runs(RankMode::Pours);
+    let before_keys = (outcome.keys[1], outcome.pour_keys[1]);
+    let before = replace_winner(
+        &mut outcome,
+        1,
+        PathBuf::from("/nowhere/run-1/pruned.ses"),
+        split_judged(130.0, 0.0),
+        RankMode::Pours,
+    )
+    .expect("still first by the pour key");
+    assert_eq!(before["key"], json!(before_keys.0));
+    assert_eq!(before["pour_key"], json!(before_keys.1));
+    let refs: Vec<&Judged> = outcome
+        .runs
+        .iter()
+        .filter_map(|r| r.judged.as_ref())
+        .collect();
+    let pooled: Vec<(&Measures, &Gates, bool)> = refs
+        .iter()
+        .map(|judged| (&judged.measures, &judged.gates, true))
+        .collect();
+    let again: Vec<Option<Key>> = route_judge::rank(&refs).into_iter().map(Some).collect();
+    let poured_again: Vec<Option<crate::pour_rank::PourKey>> = crate::pour_rank::pour_keys(&pooled)
+        .into_iter()
+        .map(Some)
+        .collect();
+    assert_eq!(outcome.keys, again);
+    assert_eq!(outcome.pour_keys, poured_again);
+    assert_ne!(outcome.pour_keys[1], before_keys.1);
+
+    // Routing: run 0 (short signal, half its plane lost) is pruned to a board that loses
+    // all of its plane: today's key does not see it, kept.
+    let mut outcome = split_runs(RankMode::Routing);
+    assert!(replace_winner(
+        &mut outcome,
+        0,
+        PathBuf::from("/nowhere/run-0/pruned.ses"),
+        split_judged(100.0, 1.0),
+        RankMode::Routing,
+    )
+    .is_ok());
+    // The pour key puts run 1 first after that prune: refused under `pours`.
+    let mut outcome = split_runs(RankMode::Pours);
+    outcome.winner = Some(0);
+    assert_eq!(
+        replace_winner(
+            &mut outcome,
+            0,
+            PathBuf::from("/nowhere/run-0/pruned.ses"),
+            split_judged(100.0, 1.0),
+            RankMode::Pours,
+        ),
+        Err("the pruned winner would no longer rank first among the judged runs".to_string())
     );
 }

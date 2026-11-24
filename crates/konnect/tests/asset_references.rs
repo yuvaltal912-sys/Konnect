@@ -1069,6 +1069,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "lost_fills",
         "plane_loss",
         "area_loss",
+        // The setting and the result fields of the pour key (Row ZR, ZR5 part 2).
+        "rank_key",
+        "pour_key",
+        "other_winner",
     ];
 
     let mut phantom = Vec::new();
