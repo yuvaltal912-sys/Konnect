@@ -410,6 +410,8 @@ fn the_pour_track_is_stepped_in_five_percent_of_the_shortest_signal() {
     assert_eq!(pour_track_step(400.0, Some(1000.0)), 8);
     assert_eq!(pour_track_step(0.0, Some(1000.0)), 0);
     assert_eq!(pour_track_step(400.0, None), 0);
+    // A length that is not above 0 is no track: 0, never a negative step.
+    assert_eq!(pour_track_step(-100.0, Some(1000.0)), 0);
 
     // In the key, against the pool's shortest signal (1000 mm), not the pour track.
     let mut a = measures();
