@@ -2547,3 +2547,30 @@ unmeasured. A board with Tune candidates was not tested at unit level (each cand
 through `judge_one`, which runs the round). The `next_steps` lines are tested directly;
 in the status test's fixture the result has no import steps, so their place in a full
 result is not.
+
+### The review's items (2026-11-24, `09808703`)
+
+An independent review of `e29d1fc3..4f8c8af7` found no must-fix; its seven other items
+are taken, each with a test and, for a new guard, a negative control (C49 to C53, all
+caught):
+- S5's retry also names the vias that closed an open: with fewer unconnected items on the
+  stitched board, the post-Z9 report's items (read against the post-Z9 fills) name them.
+  The counts must still be equal for the vias to be kept.
+- The delivery refused by the rank (`replace_winner`) is tested: `rejected`, `rank`, the
+  session the router's, the written files gone, the vias counted as undelivered.
+- `DeliveryRecord` says a via of a net outside the call's pour nets is never delivered
+  (`vias_off_pour`, `key:routing:10`).
+- `manifest_padstack` takes only a padstack that holds every copper layer of the
+  manifest's `layers`; a manifest without that table is refused.
+- `StitchRecord.findings_complete` is `false` when even the full audit listed fewer 3.2
+  findings than it counted.
+- The stale "routing is the default" texts are corrected, and the winner's `run.json`
+  holds the delivery's record beside `pour_prune`.
+
+Checked after the measurement's `measure done`: `cargo test -p konnect-core --lib` 5,084
+passed, 0 failed, 68 ignored; the `konnect` crate's guards 12, 6 and 5 passed;
+`fix-doc-counts` no change; clippy `-D warnings` and fmt clean. One mutants batch on the new
+lines of the retry and the padstack: 19 mutants, 18 caught, 1 missed, `open(before) >
+open(drc)` with `>=`, which is equivalent here: the retry sees `unconnected` only when
+`stitch_refusals` found the two counts unequal.
+
