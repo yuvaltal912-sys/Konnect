@@ -30,7 +30,8 @@ on the owner's board". No board of his was written.
   write to a board of his: measure first, as owner decision 4 of
   [`PLACEMENT_SEARCH_DESIGN.md`](PLACEMENT_SEARCH_DESIGN.md) says.
 - **What was measured before this design.** A throwaway experiment on a copy of the owner's
-  board: the converged placements routed 22 to 24 % shorter than his own placement, passed
+  board: the converged placements routed shorter than his own placement (values in
+  `target/creation-research/convergence-study/`), passed
   every gate, and ranked first in the bench (tables below).
 - **What it does not give.** One global best. The experiment showed that the search refines a
   start and does not find a good placement from any start: where a run ends depends on where it
@@ -49,7 +50,7 @@ This document covers placement. Routing has its own design.
 
 ## What was measured
 
-Counts only: the board is the owner's (101 parts, 12 of them locked, 89 movable; 63 % of the
+Counts only: the board is the owner's (101 parts, 12 of them locked, 89 movable; most of the
 board area is courtyards). All of it is on copies, in `target/creation-research/`, which git
 ignores.
 
@@ -58,12 +59,12 @@ this board):
 
 | Finding | Number |
 |---|---|
-| Generated candidates that reach the owner's airwire length | 0 of 480 (best 1.17x, median 1.7x to 2.4x) |
-| How well the cheap airwire length predicts the routed signal length | rank correlation 0.92 to 0.97 |
-| One placement evaluation against one routing call | about 3 ms against 240 s |
-| Routing runs of one placement that pass every gate differ in length by | 1 to 3.5 % |
+| Generated candidates that reach the owner's airwire length | 0 of 480 (every one longer; ratios in `target/creation-research/convergence-study/`) |
+| How well the cheap airwire length predicts the routed signal length | a high rank correlation (values in `target/creation-research/convergence-study/`) |
+| One placement evaluation against one routing call | a tiny share of a routing call's time (times in `target/creation-research/convergence-study/`) |
+| Routing runs of one placement that pass every gate differ in length by | a small share (values in `target/creation-research/convergence-study/`) |
 
-So the cheap number tells which placement routes shorter, it is 80,000 times cheaper than a
+So the cheap number tells which placement routes shorter, it is far cheaper than a
 routing call, and the generators never look at it while they work.
 
 **The experiment** (a Python model of the cost, checked against `score_placement`: the same
@@ -71,53 +72,53 @@ airwire length and crossings on 9 boards, to 4 decimals). Cost = airwire length 
 crossing + the decoupling pairs. Hard rules: locked parts do not move, courtyard boxes keep
 0.3 mm from each other and 0.5 mm from the outline. Every run below ended by its stop rule.
 
-| Start | Search | Runs | Airwire, mm | Crossings | Broken decoupling pairs |
+| Start | Search | Runs | Airwire, against the owner's placement | Crossings | Broken decoupling pairs |
 |---|---|---|---|---|---|
-| the owner's placement itself | none | | 1220 | 128 | 0 |
-| the owner's placement | descent only, 2 to 4 s | 1 | 1035 | 67 | 0 |
-| the owner's placement | annealing, then descent | 2 seeds | 889 to 900 | 28 to 30 | 0 |
-| the generated candidate with the best start | annealing, then descent | 3 seeds | 943 to 995 | 27 to 34 | 0 |
-| 7 other generated candidates (F and S) | annealing, then descent | 9 | 1020 to 1468 | 41 to 163 | 0 in 8 runs, 2 in 1 run |
-| 8 random legal starts | annealing, then descent | 8 | 986 to 1470 | 29 to 131 | 0 |
+| the owner's placement itself | none | | the reference | 128 | 0 |
+| the owner's placement | descent only | 1 | shorter | 67 | 0 |
+| the owner's placement | annealing, then descent | 2 seeds | the shortest | 28 to 30 | 0 |
+| the generated candidate with the best start | annealing, then descent | 3 seeds | shorter | 27 to 34 | 0 |
+| 7 other generated candidates (F and S) | annealing, then descent | 9 | shorter to longer | 41 to 163 | 0 in 8 runs, 2 in 1 run |
+| 8 random legal starts | annealing, then descent | 8 | shorter to longer | 29 to 131 | 0 |
 
-A run at the base effort took 115 to 193 stages and 0.5 to 0.97 million evaluations, 9 to 19 minutes in Python.
+A run at the base effort took 115 to 193 stages and 0.5 to 0.97 million evaluations, in Python (times in `target/creation-research/convergence-study/`).
 Two of the results were written to a board with Konnect's own tools and scored by the real
 `score_placement`: verdict pass, no hard failure, the same airwire length and crossings as the
 model said.
 
 **Routed, in the bench that exists** (effort M, the same judge for all):
 
-| Placement | Calls | Every gate | Signal length, mm | Vias off pours | Copper quality | Silk entries | Rank |
+| Placement | Calls | Every gate | Signal length | Vias off pours | Copper quality | Silk entries | Rank |
 |---|---|---|---|---|---|---|---|
-| the owner's | 3, identical | pass | 1738.0 | 82 | 59.7 | 109 | 2 to 4 |
-| converged, from the best generated start | 1 | pass | 1326.3 (0.76x) | 81 | 61.4 | 160 | 1 |
-| converged, from the owner's placement | 1 | pass | 1348.6 (0.78x) | 64 | 60.7 | 175 | 1 |
+| the owner's | 3, identical | pass | the reference | 82 | the reference | 109 | 2 to 4 |
+| converged, from the best generated start | 1 | pass | shorter | 81 | higher | 160 | 1 |
+| converged, from the owner's placement | 1 | pass | shorter | 64 | higher | 175 | 1 |
 
-The airwire ratio of the placement from the generated start was 0.77 and its routed ratio came
-out 0.76.
+The airwire ratio of the placement from the generated start and its routed ratio came out
+nearly equal (values in `target/creation-research/convergence-study/`).
 
 **What the experiment showed about the search itself:**
 
-- **The start decides much of the end.** From 8 random starts the cost at the end ran from
-  1228 to 2074 (69 % apart). From the 8 generated candidates that were at hand, taken in the
-  order of their start cost, the first gave the best end (1195) and the others 1255 to 2201 (3260 for the
-  run that ended with two broken pairs); the rank correlation between start cost and end cost was 0.62. Between seeds of one start the end
-  differed by 1.5 to 6.6 %.
+- **The start decides much of the end.** From 8 random starts the cost at the end ran over
+  a wide range. From the 8 generated candidates that were at hand, taken in the
+  order of their start cost, the first gave the best end and the others higher ones (the highest for the
+  run that ended with two broken pairs); the rank correlation between start cost and end cost was moderate. Between seeds of one start the end
+  differed far less than between starts (values in `target/creation-research/convergence-study/`).
 - **More effort still pays, and it has not yet been seen to stop paying.** Three starts were
   run at effort levels 0, 1 and 2 (each level cools twice as slowly), one seed each. Cost at
   the end:
 
   | Start | Level 0 | Level 1 (2x) | Level 2 (4x) |
   |---|---|---|---|
-  | the best generated start | 2212 (1138 without its one broken pair) | 1208 | 1124 |
-  | a random start | 1241 | 1139 | 1109 |
-  | another random start | 2046 | 1994 | 1919 |
+  | the best generated start | high, from its one broken pair (low without it) | lower | lower still |
+  | a random start | its level-0 cost | lower | lower still |
+  | another random start | high | lower | lower still |
 
-  Each doubling lowered the cost by 2.5 to 8 %, with no flattening within 4 times the effort
+  Each doubling lowered the cost, with no flattening within 4 times the effort
   (0.7, 1.4 and 3.0 million evaluations). Two cautions. Seeds of one start at level 0 already
-  differ by 6.6 %, and the best of three (1121) equals the level-2 run of the same start, so
+  differ by about as much as a doubling gains, and the best of three equals the level-2 run of the same start, so
   one run per level is a noisy reading. And a bad start stays bad: at 4 times the effort the
-  worse random start was still 70 % above the other two. A first ladder was wrong at its
+  worse random start was still far above the other two (values in `target/creation-research/convergence-study/`). A first ladder was wrong at its
   slowest level (the move radius grew with the stage count) and is not counted.
 - **A requirement can stay broken.** Two of the 25 runs at the base effort, from two starts,
   ended with decoupling capacitors out of range of their IC (2 of them and 1), though their
@@ -126,7 +127,7 @@ out 0.76.
 - **Silk got worse:** 109 entries became 160 and 175 (labels over a neighbour's pads: 52 became
   85 and 97; labels over other silk: 51 became 69 and 70). The cost did not see labels.
 - **4 or 5 parts moved away from their schematic neighbours** (the measure of D23), though the
-  mean distance stayed the same (0.997x and 1.011x). A part that sits only on power nets has
+  mean distance stayed about the same. A part that sits only on power nets has
   nothing in the cost that pulls it anywhere.
 - One board, and one routing call for each converged placement. Not yet a general result.
 
@@ -158,13 +159,13 @@ part: its starts are F's and S's candidates, which know what S0 knows.
 | # | Decision | Reason |
 |---|---|---|
 | C1 | Family C is built into the bench of Row PS: a fourth family beside F, S and P, named `converge` in `bench.json`'s `families` (the default stays F and S). It needs at least one of F and S named with it, and is refused without. C's records come after every record of F, S and P (their ids and their draws in the selection do not change), are checked for duplicates like any candidate's, and get the schematic measure in the same pass. No tool, no registry change, no apply path | Owner decision 4 of the placement-search design: measure first, then the tool. The same references, routing calls and judge make C's result comparable with everything measured so far. C's starts are F's and S's candidates (C8), so a search without them has nothing to refine |
-| C2 | **One cost, in mm; less is better.** `cost = L + 4 X + P + Q + 0.1 N + 0.2 S`. **L**: the airwire length the score measures (the Euclidean spanning tree over the pad sites of each net with 2 to 8 distinct references), plus 0.3 times the same length of each net above 8 references that has no pour on the board; a rail with a pour counts nothing. **X**: the score's proper crossings between the trees of different eligible nets. **P**: for each decoupling pair, the distance d between its two pads, plus R + 50 (d - limit) when d is past the pair's limit. **Q**: for each connector (reference prefix `J`, the score's own rule) whose box centre is farther than 10 mm from the outline, R + 50 times the excess. **R**, what a broken requirement costs, is the larger of 1000 mm and the soft cost (everything but P's and Q's R terms) of the run's own start. **N**: for each part that has schematic neighbours (D23's neighbourhoods, at most 3 parts), its mean centre distance to them, summed. **S**: the number of label conflicts between parts that share a side: a visible silk text of one part whose box lies over another part's courtyard box, or over a silk text of another part | L, X, P are the experiment's cost, unchanged, and L and X are the score's own numbers, so the search and the screen cannot disagree about a placement. 4 mm per crossing and 0.3 for rails are the values the experiment ran with; they were not tuned. The rank key puts decoupling and connector violations before every routing measure (D18, fields 6 and 7), and the cost must order the same way: R is at least the whole soft cost the run starts with, so no placement better than the start can pay for a broken requirement with length. The experiment ran with a fixed 1000 mm, which was below its board's airwire length (1220 mm and more); on that board the runs repaired the pairs all the same, and R is the rule that does not depend on the board's size. A pair that cannot be measured (a pad missing, or on its part twice) counts as broken in every state, as the screen counts it, and changes no move. Q mirrors the `connector_edge` deduction and counts what it counts, held connectors included (theirs is a constant); the experiment's board never met it (no unlocked connector far from an edge) and other boards will. N and S are new, for the two faults the experiment showed. Their weights make them tie-breakers: N pulls a part with a fifth of the force of one two-pin net and with the same order as a rail, so it decides only for a part that nets do not place (the indicator LED on power nets, D23's own example); S is a stand-in for KiCad's three silk checks, which the search cannot run: a neighbour's pads and silk outline lie inside its courtyard box, so a label over that box is a label over its pads or its outline, and a label over a label is the third case. It costs 0.2 mm, so 50 label conflicts weigh 1 % of the airwire length, less than one routed length step, which is where silk stands in the rank key (field 14, after every routed measure) |
+| C2 | **One cost, in mm; less is better.** `cost = L + 4 X + P + Q + 0.1 N + 0.2 S`. **L**: the airwire length the score measures (the Euclidean spanning tree over the pad sites of each net with 2 to 8 distinct references), plus 0.3 times the same length of each net above 8 references that has no pour on the board; a rail with a pour counts nothing. **X**: the score's proper crossings between the trees of different eligible nets. **P**: for each decoupling pair, the distance d between its two pads, plus R + 50 (d - limit) when d is past the pair's limit. **Q**: for each connector (reference prefix `J`, the score's own rule) whose box centre is farther than 10 mm from the outline, R + 50 times the excess. **R**, what a broken requirement costs, is the larger of 1000 mm and the soft cost (everything but P's and Q's R terms) of the run's own start. **N**: for each part that has schematic neighbours (D23's neighbourhoods, at most 3 parts), its mean centre distance to them, summed. **S**: the number of label conflicts between parts that share a side: a visible silk text of one part whose box lies over another part's courtyard box, or over a silk text of another part | L, X, P are the experiment's cost, unchanged, and L and X are the score's own numbers, so the search and the screen cannot disagree about a placement. 4 mm per crossing and 0.3 for rails are the values the experiment ran with; they were not tuned. The rank key puts decoupling and connector violations before every routing measure (D18, fields 6 and 7), and the cost must order the same way: R is at least the whole soft cost the run starts with, so no placement better than the start can pay for a broken requirement with length. The experiment ran with a fixed 1000 mm, which was below its board's airwire length; on that board the runs repaired the pairs all the same, and R is the rule that does not depend on the board's size. A pair that cannot be measured (a pad missing, or on its part twice) counts as broken in every state, as the screen counts it, and changes no move. Q mirrors the `connector_edge` deduction and counts what it counts, held connectors included (theirs is a constant); the experiment's board never met it (no unlocked connector far from an edge) and other boards will. N and S are new, for the two faults the experiment showed. Their weights make them tie-breakers: N pulls a part with a fifth of the force of one two-pin net and with the same order as a rail, so it decides only for a part that nets do not place (the indicator LED on power nets, D23's own example); S is a stand-in for KiCad's three silk checks, which the search cannot run: a neighbour's pads and silk outline lie inside its courtyard box, so a label over that box is a label over its pads or its outline, and a label over a label is the third case. It costs 0.2 mm, so 50 label conflicts weigh 10 mm, a small share of the experiment board's airwire length, less than one routed length step, which is where silk stands in the rank key (field 14, after every routed measure) |
 | C3 | **Hard rules, not costs.** A move is made only if every part it moves is legal after it, by the test that legalizes F and S today (`legalize_turned`'s `legal_at`, pulled out as `Legality`): inside the true outline by `edge_mm`, clear of every part that shares a side with it, clear of the board's copper obstacles. One difference: family C keeps the larger of 2 µm and `part_gap_mm` between **any** two boxes; `legalize` lets two real courtyards touch at 2 µm. Held parts never move. No flips (D5 stays) | Legal by construction means every placement the search visits, and so its result, passes P1; a cost for overlaps would have to be tuned against the lengths and could end on an overlap. The experiment ran exactly this (0.3 mm between all boxes is that board's `part_gap_mm`) and both routed results passed P2. Courtyards that touch leave no room for a label, and silk was a fault the experiment showed. `legalize` itself is unchanged, so F and S boards stay byte for byte (a golden test) |
 | C4 | **The moves** of one movable part, drawn by the seed: a shift within a radius, on a 0.25 mm grid (55 in 100); a turn by 1, 2 or 3 quarter turns about the box centre (12); a swap of centres with another movable part (15); the attraction, which puts the part at the nearest legal cell to the mean of the pads its nets reach (18): the mean is snapped to the 0.25 mm grid of the shifts, and the cells tried are that point and the points around it in steps of 0.5 mm (amendment A1). **Any movable part may turn** (owner decision 1, one switch: `turn_parts`); a part that was read at an angle that is not a multiple of 90° never turns. One more move is not drawn but made on purpose, **making room**: for a decoupling pair past its limit, the capacitor goes to the cell nearest the IC's pad whatever movable parts stand there, and each part it displaces goes to its own nearest legal cell; the whole is one move, made when it lowers the cost. It is tried for every broken pair at the end of each stage and before descent | The first four are the experiment's moves and shares, unchanged. The shift explores, the swap moves a part through a crowd, the attraction is the directed step that the generators lack, and the turn is what a designer does to shorten a connection: in the two routed results 58 and 63 of 89 parts ended turned. Making room is new and was not in the experiment: it is the answer to the runs that ended with capacitors out of range because no single move could free a cell by the IC. It is what generator 8 does when it settles a capacitor right after its IC (D4), as a move |
-| C5 | **The temperature.** A move that lowers the cost is made; one that raises it by c is made with probability exp(-c / T). The first T is read from the board, and the run starts melted (amendment A2): 4,000 trial shifts of up to 10 mm are tried from the start and none is made; over the legal ones whose soft cost rises (the cost without the requirement terms), the mean rise m gives T = m / ln(1 / 0.95), so an average uphill shift is accepted 19 times in 20. A stage is 200 proposals per movable part at one T. At effort level 0, T is multiplied by 0.95 after each stage; level k cools 2^k times as slowly (0.95 to the power 1 / 2^k). The shift radius follows the temperature, not the stage count: half the shorter side of the outline's bbox at the first T, times (T / first T)^0.594, never below 1 mm | Simulated annealing as in the experiment. Accepting some uphill moves early is what lets a part cross a barrier; descent alone stops at the first dip (1035 mm against 889 to 900 mm from the same start). The first T is read from the board, not set: a constant would be hot for one board and cold for another. At level 0 the radius rule is the experiment's (0.97 per stage is 0.95^0.594). Tying it to the temperature is a correction: the experiment first shrank the radius by a factor per stage, which at a slower cooling let the radius grow and ended those runs early and badly. The experiment set the first T from the mean uphill change of 400 trial shifts over ln 2, requirement jumps included, and this design first copied it; the first measurement showed that estimate to be a coin toss, and it was amended (A2, below) |
+| C5 | **The temperature.** A move that lowers the cost is made; one that raises it by c is made with probability exp(-c / T). The first T is read from the board, and the run starts melted (amendment A2): 4,000 trial shifts of up to 10 mm are tried from the start and none is made; over the legal ones whose soft cost rises (the cost without the requirement terms), the mean rise m gives T = m / ln(1 / 0.95), so an average uphill shift is accepted 19 times in 20. A stage is 200 proposals per movable part at one T. At effort level 0, T is multiplied by 0.95 after each stage; level k cools 2^k times as slowly (0.95 to the power 1 / 2^k). The shift radius follows the temperature, not the stage count: half the shorter side of the outline's bbox at the first T, times (T / first T)^0.594, never below 1 mm | Simulated annealing as in the experiment. Accepting some uphill moves early is what lets a part cross a barrier; descent alone stops at the first dip (a longer airwire than annealing reached from the same start). The first T is read from the board, not set: a constant would be hot for one board and cold for another. At level 0 the radius rule is the experiment's (0.97 per stage is 0.95^0.594). Tying it to the temperature is a correction: the experiment first shrank the radius by a factor per stage, which at a slower cooling let the radius grow and ended those runs early and badly. The experiment set the first T from the mean uphill change of 400 trial shifts over ln 2, requirement jumps included, and this design first copied it; the first measurement showed that estimate to be a coin toss, and it was amended (A2, below) |
 | C6 | **The inner stop rule.** After each stage, the gain is the fall of the best cost over the stage, as a share of the best cost at its start. At level 0, annealing ends when 5 stages in a row gained less than 0.1 % and the last stage accepted fewer than 1 % of its proposals as uphill moves (a stage's proposals are the draws that named a move, legal or not). At level k the rule reads the same fall of the temperature: 5 x 2^k stages, each gaining less than 0.1 % / 2^k. The best placement seen is restored, and descent runs: sweeps over every movable part that take the first move that lowers the cost, until a whole sweep makes no move (then no single move of the set lowers the cost) or 3 sweeps in a row gain less than 0.1 %. Guards: 2000 x 2^k stages, 200 sweeps; a run they end is recorded `converged: false` with which guard | This is the owner's request: the stop reads the value. Both conditions are needed: a stage can gain nothing while the search is still hot and wandering. It must end: T falls every stage, so uphill moves die out, and what is left is a descent on a finite grid inside a bounded outline, where the cost can fall only so many times. Every run of the experiment ended by the rule, after 115 to 193 stages at level 0 (294 to 376 at level 1, 622 to 759 at level 2) and 2 to 4 sweeps, so the guards are 10 times away. The rule is scaled with the level because a stage of a slower cooling is a smaller step: unscaled, it would call a slow run quiet while it is still hot |
-| C7 | **The outer stop rules.** "Pays" means: lowers the best cost so far by at least 1 %. **Starts:** runs at level 0 go start by start in the order of C8; the search stops taking starts once 3 starts in a row did not pay (guard: 64 starts). **Effort:** the start whose run is the best is run again at level 1, then 2, and so on, each a new run from the same start; the search stops at the first level that did not pay (guard: level 5). Runs go on all threads at once, but both rules are read in order and nothing past a stop is recorded, so the result does not depend on the number of cores | Both are the same rule: go on while going on pays. 1 % is the least gain worth more work: routing runs of one placement already differ by 1 to 3.5 % in length, so a smaller gain in airwire length is below what a routing call can show. Three starts: replayed on the 8 generated candidates of the experiment in start order, the rule stops after 4 starts and keeps the best of all 8; one start in a row would stop on one unlucky run, since seeds of one start differ by up to 6.6 %. Effort is doubled only on the best start, because a level costs as much as all the levels below it together. In the experiment each doubling still paid 2.5 to 8 % up to level 2, so where the rule for effort stops is not yet known: the first measurement reads it, in Rust, where a level costs seconds and not an hour. The guard at level 5 is 32 times the base effort |
-| C8 | **The starts** are the candidates of families F and S that pass P1, each made legal under C's gap rule first (a part that already keeps the gap stays where it is), in the order of their start cost: the screen's airwire length plus 4 mm per crossing, lowest first, ties to the lower id. The requirement terms are left out of the order | The experiment: a random legal start ended between 1228 and 2074, the best generated start at 1121 to 1195, and a better start gave, on the whole, a better end. So the search is a refiner, and the generators that exist are its global step: F's force relax is what a random start lacks. The requirement terms are left out because every run repairs them, so a start with one broken pair fewer and twice the airwire length is not a better start. F and S candidates take nothing from the owner's placement, which keeps D7's fairness |
+| C7 | **The outer stop rules.** "Pays" means: lowers the best cost so far by at least 1 %. **Starts:** runs at level 0 go start by start in the order of C8; the search stops taking starts once 3 starts in a row did not pay (guard: 64 starts). **Effort:** the start whose run is the best is run again at level 1, then 2, and so on, each a new run from the same start; the search stops at the first level that did not pay (guard: level 5). Runs go on all threads at once, but both rules are read in order and nothing past a stop is recorded, so the result does not depend on the number of cores | Both are the same rule: go on while going on pays. 1 % is the least gain worth more work: routing runs of one placement already differ in length by at least that much, so a smaller gain in airwire length is below what a routing call can show. Three starts: replayed on the 8 generated candidates of the experiment in start order, the rule stops after 4 starts and keeps the best of all 8; one start in a row would stop on one unlucky run, since seeds of one start differ by more than that. Effort is doubled only on the best start, because a level costs as much as all the levels below it together. In the experiment each doubling still paid more than 1 % up to level 2, so where the rule for effort stops is not yet known: the first measurement reads it, in Rust, where a level is far quicker than in Python. The guard at level 5 is 32 times the base effort |
+| C8 | **The starts** are the candidates of families F and S that pass P1, each made legal under C's gap rule first (a part that already keeps the gap stays where it is), in the order of their start cost: the screen's airwire length plus 4 mm per crossing, lowest first, ties to the lower id. The requirement terms are left out of the order | The experiment: a random legal start ended higher than the best generated start, and a better start gave, on the whole, a better end. So the search is a refiner, and the generators that exist are its global step: F's force relax is what a random start lacks. The requirement terms are left out because every run repairs them, so a start with one broken pair fewer and twice the airwire length is not a better start. F and S candidates take nothing from the owner's placement, which keeps D7's fairness |
 | C9 | **Same start and seed, same board.** A run's randomness is `SplitMix64` seeded by its start recipe's seed and its level. No clock, thread id or `HashMap` order reaches a run. At the end of each stage every cache is rebuilt from nothing, so rounding of the running sums does not add up | D3 of the placement-search design. Known limit: the acceptance test calls `exp`, which is the platform's; on another platform one bit may differ and a run may take another path. `rerun` is for the machine that made the record, and macOS comes first |
 | C10 | **The cost's numbers are the score's own.** The net filter and the spanning tree of `tools/placement/objectives.rs` are used, not written again, so ties in a tree resolve the same way; a test compares L and X of the model with `evaluate`'s `routing_metrics` after thousands of random moves | D10's reason: two copies of one measure drift apart. Crossings depend on which of two equal edges a tree takes |
 | C11 | **Records.** Each run is a record of family C. Its recipe holds its start's recipe, its level and every parameter, so `rerun` rebuilds it (it generates the start again, then runs) from the record and a model built as the search builds it: the clearances and the schematic neighbourhoods set. The trace records the SHA-256 of the neighbourhoods the run read, and `rerun` refuses a model whose neighbourhoods differ. The record has `converged` and the run's trace: the cost term by term at the start and the end (the end's from the board as written, anchors rounded to 1 µm, so its airwire length, crossings and violation counts are the screen's own), the first temperature, stages, sweeps, both stop reasons, repairs, evaluations, and the best cost after every stage and sweep. `search.json` also gets the outer trace: the best cost after each start and after each level, and why each rule stopped. `table.md` gets C's row and one line of counts | D21: a record must say what ran and be rebuilt from it. The curves are the evidence that a stop was a convergence |
@@ -183,7 +184,7 @@ C failed to generate on it in the preparation's load check, which is diagnosed a
 1. **May the search turn any part you did not lock, by quarter turns?** F and S turn nothing
    today (D5). Recommendation: yes. Your flow says a locked part is fixed and the rest is the
    search's; in the experiment 58 and 63 of the 89 movable parts ended turned, and those are the
-   placements that routed 22 to 24 % shorter. If a connector or a switch must keep its facing,
+   placements that routed shorter than yours. If a connector or a switch must keep its facing,
    lock it. A no is one switch (`turn_parts`) and nothing else in the design changes; what it
    costs in length was not measured.
 2. **Schematic neighbours and silk labels as weak terms of the cost?** Recommendation: yes,
@@ -199,22 +200,22 @@ C failed to generate on it in the preparation's load check, which is diagnosed a
 
 ## Amendments after the first measurement (2026-11-21)
 
-The first run of the measurement's step 1 **failed the port's check**: a median cost of 1259.8
-against the 1245 fixed in advance. Its five costs were 1208.5, 1210.7, 1259.8, 1342.5 and
-4009.2, the last from a run that ended with one pair out of range. A diagnosis on the same board
+The first run of the measurement's step 1 **failed the port's check**: a median cost above the
+threshold fixed in advance (values in `target/creation-research/convergent-placement/`). Its five costs spread widely, the
+highest from a run that ended with one pair out of range. A diagnosis on the same board
 copy found two causes. Each is corrected here by a design decision with its reason. Nothing else
 changed, and the check is run again with the same start, seeds and threshold; both results are
 reported.
 
 | # | What was wrong | Evidence (the same board copy; counts and numbers only) | The amendment |
 |---|---|---|---|
-| A1 (C4) | The skeleton said that the attraction looks for its cell "on the 0.5 mm grid". The experiment snapped the target to 0.25 mm and stepped 0.5 mm from there. On one fixed 0.5 mm lattice, a part that an attraction placed before gets its own cell back whenever that cell is the nearest legal one, and the draw names no move | The share of attraction draws that name a move, at stage 50: 0.745 in the experiment, 0.294 as built. Under the experiment's own conditions (R 1000, its first temperatures) the build ended at a median of 1213 over 30 runs, against 1163 over 11 runs of the experiment; with the target on the 0.25 mm grid, 1173, and every stage-by-stage figure (moves accepted, uphill moves, evaluations) within 0.01 of the experiment's. Shifts, turns, swaps, the legality test and the cost agreed from the start | The target is snapped to the 0.25 mm grid; the cells tried are that point and the rings around it in steps of 0.5 mm. This is what C4 meant ("the experiment's moves, unchanged"): the skeleton's words were wrong |
-| A2 (C5) | The first temperature was the mean uphill change of 400 chained trial shifts over ln 2, requirement jumps included. About 25 of the 400 trials are legal and uphill, and each one that pushes a pair out of range adds about 150 to the estimate | Over 100 seeds from one start the estimate ran from 11.9 to 538, in two groups: 25 seeds drew no such trial and got 12 to 22. Runs from a first temperature of 15 to 30 ended with a pair out of range in 5 of 16; from 60 upward, in 0 of 40. With A1 in, the cost of the runs that end with every pair in range does not depend on the first temperature (medians of 1172 to 1204 from 15 to 960). The experiment's own model has the same coin toss (10 cold seeds in 100); its 11 runs happened to draw none (68.7 to 256.1). More trials do not settle the estimate while the jumps are in it; without them it is stable (15.8 to 16.9 at 40,000 trials) | The first temperature reads the soft cost alone, from 4,000 trial shifts tried from the start and not made, and is set so that an average uphill shift is accepted 19 times in 20: T = mean rise / ln(1 / 0.95). On the measured board that is about 220: inside the range where no run left a pair out of range, and where the experiment in fact ran (its first temperatures accepted an average uphill shift 85 to 96 times in 100). Whether a broken requirement gets repaired is no longer left to a temperature that a few trials set |
+| A1 (C4) | The skeleton said that the attraction looks for its cell "on the 0.5 mm grid". The experiment snapped the target to 0.25 mm and stepped 0.5 mm from there. On one fixed 0.5 mm lattice, a part that an attraction placed before gets its own cell back whenever that cell is the nearest legal one, and the draw names no move | The share of attraction draws that name a move, at stage 50: far lower as built than in the experiment. Under the experiment's own conditions (R 1000, its first temperatures) the build ended at a higher median over 30 runs than the experiment's over 11 runs; with the target on the 0.25 mm grid, near the experiment's (values in `target/creation-research/convergent-placement/`), and every stage-by-stage figure (moves accepted, uphill moves, evaluations) within 0.01 of the experiment's. Shifts, turns, swaps, the legality test and the cost agreed from the start | The target is snapped to the 0.25 mm grid; the cells tried are that point and the rings around it in steps of 0.5 mm. This is what C4 meant ("the experiment's moves, unchanged"): the skeleton's words were wrong |
+| A2 (C5) | The first temperature was the mean uphill change of 400 chained trial shifts over ln 2, requirement jumps included. About 25 of the 400 trials are legal and uphill, and each one that pushes a pair out of range adds a large jump to the estimate | Over 100 seeds from one start the estimate spread widely, in two groups: 25 seeds drew no such trial and got low values. Runs from a low first temperature ended with a pair out of range in 5 of 16; from higher ones, in 0 of 40. With A1 in, the cost of the runs that end with every pair in range does not depend on the first temperature (medians close together over the whole range tried). The experiment's own model has the same coin toss (10 cold seeds in 100); its 11 runs happened to draw none. More trials do not settle the estimate while the jumps are in it; without them it is stable (at 40,000 trials). Values in `target/creation-research/convergent-placement/` | The first temperature reads the soft cost alone, from 4,000 trial shifts tried from the start and not made, and is set so that an average uphill shift is accepted 19 times in 20: T = mean rise / ln(1 / 0.95). On the measured board that value lies inside the range where no run left a pair out of range, and where the experiment in fact ran (its first temperatures, too, accepted an average uphill shift most of the time). Whether a broken requirement gets repaired is no longer left to a temperature that a few trials set |
 
 Limits. Both amendments rest on one board. 0.95 is a chosen value, the common practice of
-starting an annealing melted, and not a measured optimum: on that board the result is flat from
-a first temperature of 120 to one of 960. A 5-seed median on that board moves by about 30 mm
-between sets of seeds, which is the size of the first failure's margin; the check stays as it
+starting an annealing melted, and not a measured optimum: on that board the result is flat over
+a wide range of first temperatures. A 5-seed median on that board moves between sets of seeds
+by about the size of the first failure's margin; the check stays as it
 was fixed, and the wider sweeps are in the row's records.
 
 Also learned on the way, with no change to the design: on the public demo board and on the
@@ -229,7 +230,7 @@ any paired run existed.
 "Do the new terms earn their place?" did not say which candidates it compares. Read as the bench
 reads a family, by its best routed candidate, the silk half **fails** on the owner's board: 172
 silk entries with the terms on against 154 with them off. The other two halves pass: 3 parts
-pulled away against 5, and 1336.7 mm of routed signal against 1359.2.
+pulled away against 5, and a shorter routed signal with the terms on.
 
 That reading compares two different placements, from two different starts, and the spread
 between starts is wider than the difference it found: the four routed C candidates have 158 to
@@ -1087,12 +1088,13 @@ decision with its reason.
    start (the F recipe of seed 24 with rail weight 0, generator 8's board), 5 runs at level 0
    with seeds 1 to 5 and both new terms off, as the experiment ran (R is this design's: on
    this start it is the start's soft cost, above the experiment's 1000 mm). The experiment's
-   three seeds cost 1121, 1163 and 1195 (943 to 995 mm of airwire, 27 to 34
-   crossings). The port is right when the median of its 5 costs is at most 1245: the
-   experiment's median plus its seed spread of 7 %. Lower is welcome. The experiment's model is
+   three seeds' costs and airwire lengths are in its records (27 to 34
+   crossings). The port is right when the median of its 5 costs is at most a threshold fixed
+   here: the experiment's median plus its seed spread (value in
+   `target/creation-research/convergent-placement/`). Lower is welcome. The experiment's model is
    `target/creation-research/convergence-study/spike1/anneal.py` (with `board.py`), for the
    builder to read beside the skeletons; where the two differ, this document decides.
-   **First run, 2026-11-21: failed, at a median of 1259.8** (see "Amendments after the first
+   **First run, 2026-11-21: failed, at a median above the threshold** (see "Amendments after the first
    measurement"). The check is run again after the two amendments, unchanged.
 2. **The bench, the owner's board**, effort M, 100-minute limit, families F, S and C: O 3
    calls, 4 calls per family.
@@ -1107,7 +1109,7 @@ decision with its reason.
 
 | Question | Passes when |
 |---|---|
-| Is the port the experiment's search? | The check of step 1: a median cost of at most 1245 |
+| Is the port the experiment's search? | The check of step 1: a median cost at most its threshold |
 | Does it stop by convergence? | Every run and both outer loops end by their rules, on every board; no guard |
 | Is the result legal and complete? | C's best candidate passes P1, P2 and G1 to G3 on every board, and has no decoupling or connector violation on a board where O has none |
 | Is it better than the generators? | C's best ranks above the best of F and of S on every board |
@@ -1120,18 +1122,19 @@ routing calls per bench run.
 
 ### The answers on the owner's board (2026-11-21)
 
-Commit `d413bf8c`, release, 15 threads, effort M. Step 2 took 4606 s and step 3 4652 s; each
+Commit `d413bf8c`, release, 15 threads, effort M. Each of steps 2 and 3 (times in
+`target/creation-research/convergent-placement/`)
 routed 15 candidates (O 3, F 4, S 4, C 4). Counts and numbers only. One routing call per
 candidate, and one board: not yet a general result.
 
 | Question | Answer | What was measured |
 |---|---|---|
-| Is the port the experiment's search? | Failed, then passes | First run: a median of 1259.8. After A1 and A2, the same start, seeds and threshold: 1136.2, 1148.2, 1206.1, 1226.3 and 1235.6, a median of 1206.1 against 1245 |
+| Is the port the experiment's search? | Failed, then passes | First run: a median above the threshold. After A1 and A2, the same start, seeds and threshold: all five costs below the threshold, and so their median |
 | Does it stop by convergence? | Passes | Every run ended by its rules (annealing quiet, descent at a fixed point) and both outer rules stopped by their rule: 7 runs in step 1's second run, 7 in step 2, 6 in step 3. No guard. On the public demo board the dry run of commit `60c9be73` (before the performance pass and the amendments) ended its 7 runs by their rules too, and so did the 5 runs of the paired check on that board at `521c1ac9` |
 | Is the result legal and complete? | Passes | C's best passes P1, P2 and G1 to G3 with no decoupling and no connector violation; O has none either |
 | Is it better than the generators? | Passes | C's best ranks 1; F's best ranks 7 and S's best 8, each with 2 decoupling violations |
-| Is it as good as a hand placement? | Passes: "beats" | C's best against O: 1336.7 mm of routed signal against 1738.0 (0.77 times), 69 vias off pours against 82, copper quality 57.6 against 59.7, 172 silk entries against 109 |
-| Do the new terms earn their place? | Not settled | As written, on each run's best: silk fails (172 against 154), parts pulled away pass (3 against 5), length passes (1336.7 mm against 1359.2). Read in pairs from here on: see A3 |
+| Is it as good as a hand placement? | Passes: "beats" | C's best against O: a shorter routed signal, 69 vias off pours against 82, a lower copper quality, 172 silk entries against 109 |
+| Do the new terms earn their place? | Not settled | As written, on each run's best: silk fails (172 against 154), parts pulled away pass (3 against 5), length passes (a shorter routed signal with them on). Read in pairs from here on: see A3 |
 | Does making room work? | Passes | No C run ended with a pair out of range: 0 of 12 in step 1's second run, 0 of 7 in step 2, 0 of 6 in step 3 |
 
 What these runs also showed:
@@ -1145,12 +1148,12 @@ What these runs also showed:
 - **With the terms on, two of the three complete C candidates rank below O** (5 and 6), by 1.0
   and 3.0 acute corners of their routing; with the terms off the three rank 1 to 3. One call
   each.
-- **The rule for effort**: with the terms on, level 1 paid (1360.2 to 1297.4) and level 2 did
-  not (1366.0); with them off, level 1 did not pay (1186.2 to 1185.9). C's search took 66 s and
-  42 s.
-- **The same five starts at level 0, terms on against off** (means): airwire 998 mm against
-  977, crossings 51.8 against 46.6, label conflicts 115 against 159, parts pulled away 4.8
-  against 6.8.
+- **The rule for effort**: with the terms on, level 1 paid and level 2 did
+  not; with them off, level 1 did not pay (the costs, and C's search times, in
+  `target/creation-research/convergent-placement/`).
+- **The same five starts at level 0, terms on against off** (means): airwire longer with them on,
+  more crossings, fewer label conflicts and fewer parts pulled away (the means in
+  `target/creation-research/convergent-placement/`).
 
 ### The paired reading of A3, and the weights (2026-11-21)
 
@@ -1159,16 +1162,17 @@ was first proved against the bench: on the owner's board it gives the four runs 
 routed exactly the bench's silk entries (161, 172, 161, 158) and gives the input the bench's
 109. Means over the pairs, terms on against off:
 
-| Board | Pairs | Silk entries | Parts pulled away | Airwire mm | Crossings |
+| Board | Pairs | Silk entries | Parts pulled away | Airwire | Crossings |
 |---|---|---|---|---|---|
-| The owner's board | 5 | 161.4 against 164.4: passes | 4.8 against 6.8: passes | 998 against 977 | 51.8 against 46.6 |
-| B5 | 6 | 212.5 against 231.2: passes | 1.83 against 2.17: passes | 531 against 511 | 19.2 against 14.8 |
-| B6 | 5 | not read: the export refuses the board (below) | 34.8 against 62.8: passes | 603 against 603 | 1.0 against 1.2 |
+| The owner's board | 5 | fewer with the terms on: passes | fewer with the terms on: passes | longer with the terms on | more with the terms on |
+| B5 | 6 | fewer with the terms on: passes | fewer with the terms on: passes | longer with the terms on | more with the terms on |
+| B6 | 5 | not read: the export refuses the board (below) | fewer with the terms on: passes | equal | fewer with the terms on |
 
 **Both terms stay at their measured weights.** The neighbour term passes on three boards of
 three, the label term on two of the two where it can be read. The label term's effect is small
-(3 entries in 163 on the owner's board, lower on 3 pairs of 5; 19 in 231 on B5, lower on 3 pairs
-of 6), and both terms cost about 2 to 4 % of airwire length on two of the boards. No weight
+(lower on 3 pairs of 5 on the owner's board, and on 3 pairs of 6 on B5; the means in
+`target/creation-research/convergent-placement/`), and both terms cost a little airwire length on two of the boards (values in
+`target/creation-research/convergent-placement/`). No weight
 changed, so the bench of step 2 is the measurement of the final weights.
 
 ### Step 4: B5, B6 and B4 (2026-11-21)
@@ -1177,27 +1181,28 @@ The lock copies hold no schematic; the owner pointed to his project folders, and
 of B5 and B6 were copied into their bench inputs, read-only (B6's two large pin-socket
 connectors are held at his positions, on his word the same day).
 
-**B5** (94 parts, 14 held; commit `521c1ac9`, effort M, 4309 s, with the A reference: one
-Sonnet 5.5 session of 16 minutes, placing by judgement from a neutral start). 18 candidates
+**B5** (94 parts, 14 held; commit `521c1ac9`, effort M, with the A reference: one
+Sonnet 5.5 session, placing by judgement from a neutral start; times in
+`target/creation-research/convergent-placement/`). 18 candidates
 routed (O 3, A 3, F 4, S 4, C 4) and all 18 pass every gate.
 
 | Question | Answer | What was measured |
 |---|---|---|
-| Does it stop by convergence? | Passes | 9 runs, each by its rules; 8 starts and levels 0 to 1, both outer rules by their rule; no guard; 38 s |
+| Does it stop by convergence? | Passes | 9 runs, each by its rules; 8 starts and levels 0 to 1, both outer rules by their rule; no guard |
 | Is the result legal and complete? | Passes | C's four routed candidates pass P1, P2 and G1 to G3 with no decoupling and no connector violation |
 | Is it better than the generators? | Passes | C ranks 1 to 4; F's best ranks 11 and S's best 14 |
-| Is it as good as a hand placement? | "beats" O, and "beats" A | C's best: 778.6 mm of routed signal against 1026.3 (O, 0.76 times) and 1021.6 (A); 42 vias off pours against 39 and 40; copper quality 58.9 against 66.9 and 66.5; 168 silk entries against 0 and 91 |
+| Is it as good as a hand placement? | "beats" O, and "beats" A | C's best: a shorter routed signal than O's and A's; 42 vias off pours against 39 and 40; a lower copper quality than both; 168 silk entries against 0 and 91 |
 | Does making room work? | Passes | No C run ended with a pair out of range |
 
 What B5 also showed:
 
 - **The whole copper-quality gap is the decoupling loop.** The layout audit on the six winning
-  routed boards gives check 4.1 0.27 on O, 0.272 on A and 0.0 on all four C boards: with 4
-  supply pins and a 10 mm threshold, O's median loop is 14.2 mm and C's best 37.0 mm, with one
+  routed boards gives check 4.1 its lowest score on all four C boards and a higher one on O and A: with 4
+  supply pins and a 10 mm threshold, C's best has a longer median loop than O's, with one
   pin left without a capacitor. The tools find no decoupling pair on this board, so C's
   requirement term had nothing to hold, and the bench's decoupling column reads 0 for everyone.
 - **Silk is far worse than the hand placement's**: 168 to 212 entries against 0.
-- **The rule for effort** stopped at level 1 (760.8 against 758.2 did not pay), and that level-1
+- **The rule for effort** stopped at level 1 (level 1 gained less than 1 %, so it did not pay), and that level-1
   placement is the one that routed best.
 - O's own placement has 5 hard failures in the placement screen (courtyards closer than C's
   rule allows itself), so the comparison does not favour C.
@@ -1232,8 +1237,8 @@ reference, two boards routed in all: not yet a general result.
 - **Double the effort on more than the best start.** A start that is second at level 0 could be
   first at level 2. The first measurement shows how often the order of starts changes with the
   level; if it does, this is the first change to design.
-- **Start from the owner's own placement.** It gave the lowest cost in the experiment (889 to
-  900 mm against 943 to 995 mm) and the same routed length within one routing call's noise. In
+- **Start from the owner's own placement.** It gave the lowest cost in the experiment (a shorter
+  airwire than from the best generated start) and the same routed length within one routing call's noise. In
   his flow there is no placement to start from, and family P is off for the same reason.
 - **Move an IC with its capacitors as one body.** An IC whose capacitors are in range moves only
   as far as they stay in range.

@@ -746,9 +746,9 @@ function (`corner_reading::read_junctions`):
   leg drawn in pieces) is real copper and is read piece by piece, every piece
   a leg. Whether a track is shorter than 10 um is decided in whole nanometres,
   so a track of exactly 10 um is a leg wherever it lies. Freerouting leaves
-  such tracks while it routes: in a router trial they were 0.1 um up to 9.6 um
-  long (the longest on a diagonal), and on the seven measured boards each run
-  of them spans at most 9 um. Its 45-degree corner smoothing stops 0.1 um short
+  such tracks while it routes: in a router trial they were all shorter than
+  10 um (the longest on a diagonal), and on the seven measured boards each run
+  of them stays inside the 20-um bound. Its 45-degree corner smoothing stops 0.1 um short
   of the next corner, and it snaps wire ends to via and pad centres. The audit used to read their direction, so a 135-degree bend with a
   0.1-um track at its vertex counted as a 45-degree acid trap.
 - A corner is acute only below 89 degrees, the lower edge of the audit's own
@@ -777,8 +777,8 @@ gains one from a 90-degree bend with a short track and loses one to a joined
 third leg, and two boards each lose one that way; none rises. Short tracks: 15, 14, 14, 15, 13, 12, 13 per board, in 12, 6, 6, 7,
 9, 8, 9 junctions; PR #63 made none of them. Each half matters alone: the
 short-track rule alone leaves 2, 1, 1, 1, 1, 1, 1 after #63, the 89-degree line
-alone 7, 4, 4, 4, 2, 2, 2. No run of short pieces on these boards spans more
-than 9 um, so the 20-um bound changes none of these counts.
+alone 7, 4, 4, 4, 2, 2, 2. No run of short pieces on these boards reaches the
+20-um bound, so it changes none of these counts.
 
 ## Unreleased: per-zone pours and an honest routing status
 
@@ -1016,7 +1016,7 @@ within 0.06 degrees of a right angle is not acute under the corrected reading
 (the trunk itself is straight within 0.1 degree), so `t_junction` makes no row
 for it and reports nothing; #63's 0.06-degree guard can no longer be reached.
 On three of the boards
-95–96 % of ground pads ended in the main ground group, not all: the rest had no
+most ground pads ended in the main ground group, not all: the rest had no
 safe stitching position within the search radius. Such findings stay in
 `blocked`. The audit's acid-trap check does not examine a track end that lands
 mid-segment on another track, so a corner repair is judged there by the
@@ -1275,8 +1275,8 @@ reference board with Freerouting 2.5.0.
   ringless, netless plated hole) by the project's `min_hole_clearance` less the
   smallest class clearance, so the router keeps the hole clearance; the result
   and the manifest record `hole_clearance_um`, and the manifest
-  `supported_profile.hole_keepout_growth_um`. Before, a track could pass 0.21 mm
-  from a hole with a 0.25 mm rule. A board whose footprints hold a rule area or
+  `supported_profile.hole_keepout_growth_um`. Before, a track could pass a hole
+  closer than its 0.25 mm rule. A board whose footprints hold a rule area or
   zone, or draw on Edge.Cuts (a slot or cut-out), is now refused, naming the
   footprint (its Reference, else its UUID), whether or not it has pads: the DSN
   does not carry these yet, and leaving them out let the router cross an

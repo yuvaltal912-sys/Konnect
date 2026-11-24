@@ -98,12 +98,12 @@ hold; the numbers are not fastroute's. Stage ZR0 makes the first fastroute basel
 
 | What the router is given | Router's own open count | Open on ground after KiCad's refill | After 4 stitching rounds | Track on the ground net |
 |---|---|---|---|---|
-| Every pour as a plane (today's default) | 0 | 19, 19, 19 | 6, 9, 8 | 0 mm |
-| Every pour omitted | 0 | 0, 0, 0 | none needed | 583 to 585 mm (hand routing: 81.7 mm) |
-| Only the bottom pour as a plane | 0 | 1, 1, 1 | 0, 0, 0 | 71.6 mm |
+| Every pour as a plane (today's default) | 0 | 19, 19, 19 | 6, 9, 8 | none |
+| Every pour omitted | 0 | 0, 0, 0 | none needed | many times the hand routing's |
+| Only the bottom pour as a plane | 0 | 1, 1, 1 | 0, 0, 0 | near the hand routing's |
 
 - **Row 1:** the router calls 19 open connections closed. Stitching repairs most, not all.
-- **Row 2:** safe, and it lays seven times the ground track of the hand routing.
+- **Row 2:** safe, and it lays many times the ground track of the hand routing.
 - **Row 3:** one pour that happens to stay whole brings the ground net close to the hand
   routing. (Its power nets were still far below their width; that is row S9's subject, not this
   row's.) Getting row 3 on purpose instead of by luck is what this row is after.
@@ -1938,8 +1938,8 @@ KiCad's real fill of the unrouted board, and one more call on it. Counts are per
   counts are within Row GS's spread (dash 12 and 12, B5 54 and 46, `pic` 183 and 185, `ecc` 1,419
   and 1,400, `pours` 1,414 and 1,428): the measures cost no measurable judge time. No run
   recorded a `pours_error`.
-- **The fill on the winners:** dash 32 pieces with a lowest largest-piece share of 0.71; B5 13
-  and 0.95; `pic` 3 and 0.92; `ecc` and `pours` whole. No winner has a starved thermal or an
+- **The fill on the winners:** dash 32 pieces and B5 13 (their lowest largest-piece shares in
+  `target/creation-research/zone-routing/zr0/`); `pic` 3 and 0.92; `ecc` and `pours` whole. No winner has a starved thermal or an
   unfilled pour layer.
 - **The probe.** The unrouted fill is one piece per plane on all five boards, so the probe
   changes the planes' shape only (clearance voids, the board edge), not their count. On B5 the
@@ -1979,7 +1979,7 @@ After the search, on the winner only:
 
 | # | Decision | Reason |
 |---|---|---|
-| P1 | Once a call, on the winner, after the search and before the result is written | A prune costs about a minute of KiCad and audit runs; on every judged run it would take the judge lanes for most of the budget |
+| P1 | Once a call, on the winner, after the search and before the result is written | A prune costs dozens of KiCad and audit runs; on every judged run it would take the judge lanes for most of the budget |
 | P2 | Scope: the vias of ground pour nets, each with the wires that end at it. No other wire goes | The owner's words are about vias and the routing between the pad and the via. Another ground wire is other copper: where the fill does not cover it, removing it is an electrical choice he did not ask for |
 | P3 | Only pour nets the audit of the router's session lists as ground (`net_roles.ground`) | On a power pour, vias in parallel carry current, which no check here sees. The audit's role puts the design intent and the netclass before the name |
 | P4 | The unit is a `(via …)` or `(wire …)` block of the session text; blocks the importer would apply as one item are one unit | The session is what the call delivers, and every candidate goes through the importer |
@@ -2002,11 +2002,11 @@ Constants: `MAX_CHECKS` 400, `VIA_SWEEPS` 3, `FILL_TOLERANCE_MM2` 0.01, `LOOP_TO
 On scratch copies of two of the owner's judged x19 winners, with KiCad's unconnected count and
 violation counts as the only test, 10 of 18 and 14 of 21 ground vias went. The same boards then
 scored lower in Konnect's own audit: one more critical-net layer change had no ground via near
-it (3.2) on both, the worst decoupling loop on one grew from 19 to 47 mm (4.1), two right
-angles appeared where a T junction lost a branch, copper quality fell 4.0 and 0.5 points, and
+it (3.2) on both, the worst decoupling loop on one grew longer (4.1), two right
+angles appeared where a T junction lost a branch, copper quality fell on both, and
 two small fill pieces of one board vanished with no DRC item. Removing every other ground wire
-as well took about 90 more KiCad checks on the larger board, and a third of the wires it
-removed lay partly outside the fill. Hence P2 and P5.
+as well took about 90 more KiCad checks on the larger board, and some of the wires it
+removed lay partly outside the fill (the share in `target/creation-research/smart-router-research/zr0b/`). Hence P2 and P5.
 
 ### As built
 
@@ -2034,7 +2034,7 @@ delivered one.
 | Ground vias | 18 to 12 | 21 to 10 | 0 |
 | Wires that went with them | 11 | 22 | |
 | All vias | 86 to 80 | 53 to 42 | |
-| KiCad checks, audits, seconds | 41, 25, 85 | 41, 27, 77 | 1, 1, about 1 |
+| KiCad checks, audits, seconds | 41, 25, in the record | 41, 27, in the record | 1, 1, about 1 |
 
 - **Nothing got worse.** The winner's rank key is the same before and after on both boards.
   Every net but the ground net is byte-equal in the session. An independent before-and-after
@@ -2047,7 +2047,8 @@ delivered one.
   left unconnected, 8 and 6; a decoupling loop would grow, 4 and 3; a layer change would lose
   its ground via, 1 and 2.
 - **The same every time:** B5's repeat delivers the same session bytes.
-- **Cost:** the prune adds about 80 s to a call of about 240 s on these boards.
+- **Cost:** the prune adds time to a call of about 240 s on these boards (the seconds in
+  `target/creation-research/smart-router-research/zr0b/`).
 
 ### Limits
 
@@ -2106,18 +2107,18 @@ One `route_specctra_dsn` call per board at effort M, with x20 and this branch's 
 
 | Board | Runs compared | False connections | False opens (total, runs with any) | Model build, longest |
 |---|---|---|---|---|
-| dash | 6 | 0 | 10, 3 | 0.40 s |
-| B5 | 26 | 0 | 42, 25 | 0.34 s |
+| dash | 6 | 0 | 10, 3 | under `pic`'s |
+| B5 | 26 | 0 | 42, 25 | under `pic`'s |
 | `pic` | 83 | 0 | 0, 0 | 0.84 s |
 | `ecc` | 721 | 0 | 0, 0 | 0.07 s |
 | `pours` | 709 | 0 | 0, 0 | 0.15 s |
 
 - **Zero false connections** in 1,545 compared runs, and no engine error or `pours_error`.
-- **False opens** are at most 2.2 % of the modelled pads (B5, 73 a run), under the 1 in 20 of "Verification plan".
+- **False opens** stay under the 1 in 20 of "Verification plan" on every board; the highest share is B5's (73 modelled pads a run; the share in `target/creation-research/zone-routing/zr1/`).
 - **Sessions are byte-identical** with and without `--x.zones` on all five boards: x20 driven directly with a routing pass's switches and the call's own files, `--no-time-limits`. The reports differ only by `planes` and the run time.
 - **The winners** are pours omitted on all five boards, as in ZR0.
 - **Judged run counts:** dash 11, B5 51, `pic` 165, `ecc` 1,442, `pours` 1,417. `pic` is about 10 % below ZR0's 183 and Row GS's 185, which is the cost of drawing the model on every as-exported run there.
-- **The ground-via prune** (ZR0b): dash 41 checks in 85 s, B5 41 checks in 77 s. The other three boards have no via on a ground pour net.
+- **The ground-via prune** (ZR0b): dash 41 checks, B5 41 checks (the seconds in `target/creation-research/zone-routing/zr1/`). The other three boards have no via on a ground pour net.
 
 **Not verified:** a model drawn more than once per run (ZR2), and boards whose pads have no UUID (older than KiCad 7). On those the comparison is recorded as a `pours_error`, never as a count.
 
@@ -2152,7 +2153,7 @@ One `route_specctra_dsn` call per board at effort M, with x21 and the ZR1 gate's
 - **Zero false connections and zero false opens** in 1,382 compared runs. ZR1 had 52 false opens on the owner's two boards. No engine error and no `pours_error`.
 - **The winners:** B5 and `pic` are now as exported, with their pours as planes. dash, `ecc` and `pours` are still pours omitted. In ZR0 and ZR1 every winner was pours omitted.
 - **Fewer runs are judged** in a call of about the same length: dash 3, B5 16, `pic` 73, `ecc` 1,325, `pours` 1,349 (ZR1: 11, 51, 165, 1,442, 1,417). An as-exported run now routes the closings and draws the model many times.
-- **Model draws:** the longest was 0.34 s (`pic`). The median was at most 0.074 s.
+- **Model draws:** the longest was 0.34 s (`pic`). The medians were shorter (values in `target/creation-research/zone-routing/zr1/`).
 - **Sessions are byte-identical to x20's without `--x.zones`** on all five boards (x20 and x21 driven directly with a routing pass's switches and the call's own files, `--no-time-limits`).
 
 ### Limits
@@ -2200,9 +2201,9 @@ One `route_specctra_dsn` call per board and setting at effort M, each in its own
 | **W 2** | 28 | 0.68 | 0.93 | 1 | 0.016 | 4.9 | 0 | 2 | 16 |
 | W 4 | 20 | 0.30 | 1.00 | 1 | 0.0045 | 1.0 | 0 | 0 | 19 |
 
-- **The pours improve steadily with W** on both boards that judged as-exported runs. On B5 every weight from 0.5 up gives 12 fill pieces (ZR2: 14), and the ground track falls to between 0.56 and 0.84 of ZR2's. B5 passes every gate at every weight.
+- **The pours improve steadily with W** on both boards that judged as-exported runs. On B5 every weight from 0.5 up gives 12 fill pieces (ZR2: 14), and a shorter ground track than ZR2's. B5 passes every gate at every weight.
 - **`pic`'s gate shares do not follow W.** Seed by seed, the outcome flips between weights (W 0 against W 1: 11 of 35 seeds went from pass to fail and 6 from fail to pass). One call a weight resolves the pour measures, not gate shares closer than about 0.2.
-- **dash judged no as-exported run** at any weight but 4: each one was cut at the budget at effort M. Its one run at W 4 had 29 fill pieces (ZR2's one run: 27) and less than half ZR2's ground track.
+- **dash judged no as-exported run** at any weight but 4: each one was cut at the budget at effort M. Its one run at W 4 had 29 fill pieces (ZR2's one run: 27) and a far shorter ground track than ZR2's.
 - **The cost slows an as-exported run:** `pic` judged 38, 50, 36, 28 and 20 of them.
 - **The choice is W = 2** (`--x.zones_cut=2,2,4`). Of the weights above 0, it alone keeps `pic`'s gate shares at W 0's level, which is within the spread of ZR2's. It gives most of W 4's pour gain, without W 4's G1 of 0.30 or its fewest runs.
 
@@ -2211,13 +2212,13 @@ One `route_specctra_dsn` call per board and setting at effort M, each in its own
 | Board, as exported | runs | G1, G2 (ZR2 → ZR3) | fill pieces (median, ZR2 → ZR3) | main piece's share (median) | plane loss (median, ZR2 → ZR3) | runs with a starved pin (ZR2 → ZR3) | winner (ZR2 → ZR3) |
 |---|---|---|---|---|---|---|---|
 | dash | 0 | - | - | - | - | - | omitted → omitted |
-| B5 | 8 | 1.0, 1.0 → 1.0, 1.0 | 14 → 12 | 0.942 → 0.954 | 0.044 → 0.035 | 0 of 5 → 1 of 8 | as exported → **omitted** |
+| B5 | 8 | all, all → all, all | 14 → 12 | higher | lower | 0 of 5 → 1 of 8 | as exported → **omitted** |
 | `pic` | 28 | 0.68, 0.95 → 0.68, 0.93 | 2 → 1 | 0.9998 → 1.0 | 0.062 → 0.016 | 0 of 37 → 2 of 28 | as exported → **omitted** |
 | `ecc` | 730 | 1.0, 1.0 → 1.0, 1.0 | 1 → 1 | 1.0 → 1.0 | 0.069 → 0.0017 | 0 → 0 | omitted → **as exported** |
 | `pours` | 657 | 1.0, 0.85 → 1.0, 0.83 | 2 → 2 | 1.0 → 1.0 | 0.033 → 0.039 | 0 → 0 | omitted → omitted |
 
 - **Fewer pieces and a larger main piece at the same gate shares: met on B5, `pic` and `ecc`**, and flat on `pours`, whose plane loss is a little higher (0.039 against 0.033) at about the same gates. dash has no as-exported run to show.
-- **The winner's ground track: not met.** On B5 and `pic` the winner is now pours omitted, so its ground track is many times ZR2's winner's. On `ecc` the winner is now as exported, with no ground track at all. The cause is the rank key, which this stage does not change. The key puts signal length before any pour measure, and the best as-exported run now routes its signals 2 to 6 % longer to spare the pours (B5: signal step 53 against 50; `pic`: 51 against 50). In ZR2 the as-exported runs won by one via off the pour nets. Z17 alone already moves the winners (W 0 on B5 and `pic`). The pour key of ZR5 part 2 is what puts the pours in the choice.
+- **The winner's ground track: not met.** On B5 and `pic` the winner is now pours omitted, so its ground track is many times ZR2's winner's. On `ecc` the winner is now as exported, with no ground track at all. The cause is the rank key, which this stage does not change. The key puts signal length before any pour measure, and the best as-exported run now routes its signals longer to spare the pours (B5: more signal steps; `pic`: signal step 51 against 50, 2 % longer). In ZR2 the as-exported runs won by one via off the pour nets. Z17 alone already moves the winners (W 0 on B5 and `pic`). The pour key of ZR5 part 2 is what puts the pours in the choice.
 - **Starved pins: not met.** 1 run on B5 and 2 on `pic` end with a thermal pin KiCad calls starved, where ZR2 had none. In each of them the engine's model counts no starved pin and no lost spoke. The model's spoke check misses a starved pin that KiCad sees (see "Limits").
 - **Lost spokes:** `pic` loses a median of 0 spokes at W 2 against 6 at W 0, and B5 15 against 19. x21 does not count spokes, so W 0 stands in for ZR2: Z17 can only keep its search from losing more than the routing it starts from.
 - **The search's ends are counted.** `pour_worse` is in each run's summary (16 on `pic`'s as-exported runs, 324 on B5's), and `cut` in `planes.search_cut_ends`. Konnect's summary does not sum `cut` too, as the addendum planned, because the engine already counts it there.
@@ -2229,8 +2230,8 @@ On the owner's "כן" (relayed by the supervisor session), ZR3 was measured once
 
 | Board | Winner (ZR2 → ZR3 with the pour key) | Fill pieces | Main piece's share | Plane loss | Ground track, mm | Starved pins | Signal step against today's key's choice |
 |---|---|---|---|---|---|---|---|
-| dash | omitted → omitted | 32 → 29 | 0.71 → 0.90 | 0.289 → 0.254 | 402 → 375 | 0 → 0 | the same (area step 1 higher) |
-| B5 | as exported → **omitted** | 13 → 13 | 0.94 → 0.95 | 0.036 → 0.036 | 15 → 229 | 0 → 0 | the same run |
+| dash | omitted → omitted | 32 → 29 | higher | lower | shorter | 0 → 0 | the same (the area step higher) |
+| B5 | as exported → **omitted** | 13 → 13 | a little higher | the same | far longer | 0 → 0 | the same run |
 | `pic` | as exported → **as exported** | 2 → 1 | 0.92 → 1.0 | 0.129 → 0.015 | 15.7 → 4.9 | 0 → 0 | 1 higher |
 | `ecc` | omitted → **as exported** | 1 → 1 | 1.0 → 1.0 | 0.059 → 0.0017 | 88 → 0 | 0 → 0 | the same run |
 | `pours` | omitted → omitted | 2 → 2 | 1.0 → 1.0 | 0.035 → 0.023 | 125 → 127 | 0 → 0 | 2 higher |
@@ -2239,9 +2240,9 @@ The measures are the winner's as judged, before the ground-via prune, the same o
 
 - **The live calls confirm the offline replay of part 2's values on ZR3's runs, run for run.** The pour key's winner is the run the replay named on all five boards. Both keys replay exactly on every judged run (19 of 19 to 1,430 of 1,430), and part 2's three criteria hold. The rank key changes no engine input. Run for run, ZR3's measures come back apart from the run time on every `ecc` and `pours` run and on 56 of 57 `pic` runs. On B5 and dash some pour or ground measures differ a little, as timed runs can.
 - **`pic`: the winner is now the routing with pours as planes.** Its plane loss is 1.5 % against ZR2's 12.9 %. It has one fill piece and a third of ZR2's ground track. `ecc` too: pours as planes, with no ground track against 88 mm.
-- **B5: not met.** The winner is still pours omitted, with 15 times ZR2's ground track. ZR3 lengthens B5's as-exported routings: the best one's signal length over the shortest omitted run's is 1.010 in ZR2, 1.015 at W 0 (Z17 alone), 1.039 at W 1, 1.053 at W 2 and 1.060 at W 4. Its plane loss (3.0 %) and the omitted winner's (3.6 %) fall in the same 5 % step. The entry that separates them, the ground track (9.7 mm against 229 mm), comes after the lengths. Offline, with the ground-track step before the lengths, B5's winner would be as exported with 3.6 mm of ground track, but 5 signal steps (about 10 %) longer. That is a change of the rule, not of a value, and above the owner's line of one step.
+- **B5: not met.** The winner is still pours omitted, with many times ZR2's ground track. ZR3 lengthens B5's as-exported routings: the best one's signal length over the shortest omitted run's grows from ZR2 to W 0 (Z17 alone), W 1, W 2 and W 4 (the ratios in `target/creation-research/zone-routing/zr3/`). Its plane loss and the omitted winner's fall in the same 5 % step. The entry that separates them, the ground track (far shorter on the as-exported run), comes after the lengths. Offline, with the ground-track step before the lengths, B5's winner would be as exported with a far shorter ground track, but with a longer signal. That is a change of the rule, not of a value, and above the owner's line of one step.
 - **Starved pins and lost spokes: met for the winners.** No winner has a pin KiCad calls starved. The two pours-as-planes winners (`pic`, `ecc`) lose no spoke. The pour key's first pour entry counts the record's starved thermals, which equal KiCad's on every run here, so the as-exported runs with a starved pin (1 on B5 and 2 on `pic`, as in ZR3 alone) never win.
-- **The line holds on 3 boards.** On dash the area step is 1 higher, a 0.4 % difference that rounds across a step. On `pours` the signal step is 2 higher, where the owner's line allows 1, for a plane loss of 2.3 % against 3.5 %, which also rounds across a step.
+- **The line holds on 3 boards.** On dash the area step is 1 higher, a small difference that rounds across a step. On `pours` the signal step is 2 higher, where the owner's line allows 1, for a plane loss of 2.3 % against 3.5 %, which also rounds across a step.
 
 ### With PK19 and PK20 (round 2, 2026-11-24)
 
@@ -2249,18 +2250,20 @@ On the owner's "כן, לשנות" (PK19 and PK20, merged as #119), ZR3 was measu
 
 | Board (W 2) | Winner | As-exported runs complete (G1) | Fill pieces | Main piece's share | Plane loss | Ground track, mm | Spokes lost | Starved pins | Copper quality | Signal against today's key's choice |
 |---|---|---|---|---|---|---|---|---|---|---|
-| dash | omitted | none judged | 29 | 0.90 | 0.254 | 375 | - | 0 | 61.1 | -0.8 % |
-| B5 | **as exported** | 6 of 6 | 12 | 0.95 | 0.030 | 9.7 | 16 | 0 | 59.6 | +6.5 % |
+| dash | omitted | none judged | 29 | as above | as above | as above | - | 0 | lower | shorter |
+| B5 | **as exported** | 6 of 6 | 12 | about today's choice's | lower | far shorter, near his hand routing's | 16 | 0 | lower | longer, within his rule |
 | `pic` | **as exported** | 16 of 24 | 1 | 1.0 | 0.011 | 4.7 | 0 | 0 | 65.7 | +3.0 % |
 | `ecc` | **as exported** | 728 of 728 | 1 | 1.0 | 0.0017 | 0 | 0 | 0 | 90.4 | the same run |
 | `pours` | **as exported** | 601 of 601 | 3 | 0.99 | 0.035 | 0 | 2 | 0 | 83.1 | +1.9 % |
 
+In dash's and B5's rows the words compare with today's key's choice, and "as above" points to the table before; their values are in `target/creation-research/zone-routing/zr3/combined/`.
+
 - **The W 2 winners are the offline replay's on all five boards** (the zr4-zr5 session's replay of #119's rule on these builds).
-- **B5: met.** Pours as planes win, with 9.7 mm of ground track against 316 mm for today's key's choice (229 mm after the ground-via prune), near the owner's hand routing's 9.5 mm, for 6.5 % more signal, which the approved rule accepts. Its copper quality is 2.4 points lower than that choice's.
-- **dash stays pours omitted.** At W 2 no as-exported run is judged in the budget at effort M; at W 4 the one judged has 2 acute angles, which the key reads before any pour entry. Its winner has 4 right angles and copper quality 61.1 against 65.2 for today's key's choice, which has more plane loss (0.289) and ground track (437 mm).
+- **B5: met.** Pours as planes win, with a far shorter ground track than today's key's choice (before and after the ground-via prune), near the owner's hand routing's, for more signal, which the approved rule accepts. Its copper quality is lower than that choice's.
+- **dash stays pours omitted.** At W 2 no as-exported run is judged in the budget at effort M; at W 4 the one judged has 2 acute angles, which the key reads before any pour entry. Its winner has 4 right angles and a lower copper quality than today's key's choice, which has more plane loss and ground track.
 - **No winner has a starved pin.** The as-exported runs with one (1 on B5, 2 on `pic` at W 2) never win.
-- **W 4 confirms W 2.** `pic`'s as-exported runs are complete 5 of 19 at W 4 against 16 of 24 at W 2. B5's winner is not better at W 4 (ground track 11.1 mm, 17 spokes lost). `pic`'s is a little better (plane loss 0.005, ground track 2.0 mm, copper quality 67.7). `ecc` and `pours` move by at most a step, and dash does not change.
-- **Today's key's choice** on dash and B5 is the run with x19's delivered numbers (Row GS's final measurement: dash 1702.2 mm and B5 762.5 mm of signal; ground track 437 and 316 mm).
+- **W 4 confirms W 2.** `pic`'s as-exported runs are complete 5 of 19 at W 4 against 16 of 24 at W 2. B5's winner is not better at W 4 (a longer ground track, 17 spokes lost). `pic`'s is a little better (plane loss 0.005, ground track 2.0 mm, copper quality 67.7). `ecc` and `pours` move by at most a step, and dash does not change.
+- **Today's key's choice** on dash and B5 is the run with x19's delivered numbers (Row GS's final measurement; its signal and ground track lengths are in `target/creation-research/smart-router-research/final/`).
 
 Records: `target/creation-research/zone-routing/zr3/combined/` (`README-track.md`, `runs-track/`, `track-combined.json`, `track-shapes.json`, `track-replay.jsonl`).
 

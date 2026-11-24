@@ -74,7 +74,7 @@ and the record are never written.
 | PP13 | The tool is in the `pcb_board` toolset, beside `add_zone`, `list_zones` and `delete_zone`. It reads the board through the board-source seam (`board_source`), like every other reader | One toolset holds the plan and the tool that applies it. The seam already decides when a saved file may stand in for a live board |
 | PP14 | A proposal carries every `add_zone` argument, the defaults included, and the scratch zones are written by `add_zone`'s own file writer | What KiCad checked is what is added. A default that changes later cannot change an old plan's meaning. **One limit, on the live path:** over IPC KiCad makes a zone from the board's default zone settings and the API then sets every value of the proposal; what the API has no field for (corner smoothing, the lock) stays as the last zone dialog of that KiCad session left it (`zone.cpp:89`, `zone_settings.cpp:209`, `edit_zone_helpers.cpp:84`). A zone that comes out with rounded corners fills a little differently, and the engine's model does not cover it; the route's `pours.legacy` names it. The file path has no such inheritance |
 | PP15 | A rule area that keeps tracks, vias or pads out and lets copper pours in is a finding when a proposal covers its layer: it is listed in `rule_areas_filled`, `next_steps` says how to keep copper out of it, and the status is `planned_with_findings`. The plan still proposes the whole layer | KiCad keeps a fill out of a rule area only when the area forbids pours (`zone_filler.cpp:2306`). `add_rule_area`'s own default, which is KiCad's, forbids tracks, vias and pads and allows pours, so an antenna keepout made with the defaults gets copper under the antenna, and DRC has no rule against it. The plan cannot know whether the area is an antenna or only a no-routing strip, so it says what will happen and leaves the choice (the checklist: "keep intentional isolation barriers and antenna keepouts when adding copper"). Found by the review; none of the five measured boards has a rule area |
-| PP16 | The thermal values in two steps, for the whole plan at once. The check fills the plan first at dash's own values: a gap of 0.5 mm, a bridge of the larger of 0.5 mm and the minimum width. When that fill has a thermal fault (more starved thermals than without the proposals, at any severity, or a pad PP17 finds unreached), KiCad fills the plan once more at B5's own values: a gap of 0.3 mm, a bridge of the larger of 0.4 mm and the minimum width. The second fill is kept when its check is clean and the first's is not, or when neither is clean and it has fewer faults (the rises of rules of severity error other than `starved_thermal`, plus the rise of starved thermals at any severity, plus the unreached pads). On a tie the first stays. Both fills are in `check.thermal_steps`, and the proposals carry the values of the fill that was kept | The measurement (2026-11-24): at dash's values B5 had 2 starved thermals, two fine-pitch IC pads with 1 spoke where the zone asks for 2. At B5's own values the same board had 0. Each step is the owner's own values on one of his boards, so neither is a number of ours, and no value was searched for. A board whose first fill has no thermal fault gets exactly the plan it had before. One more refill costs about a second, and only on a board with a fault. One set for the whole plan: the faults are pads of the plan, not of one layer, and a plan whose pours differ in thermal values for no reason of the board's is harder to read. The owner chose to fix the plan after the failed criterion was reported to him ("תתקן", 2026-11-24) |
+| PP16 | The thermal values in two steps, for the whole plan at once. The check fills the plan first at dash's own values: a gap of 0.5 mm, a bridge of the larger of 0.5 mm and the minimum width. When that fill has a thermal fault (more starved thermals than without the proposals, at any severity, or a pad PP17 finds unreached), KiCad fills the plan once more at B5's own values: a gap of 0.3 mm, a bridge of the larger of 0.4 mm and the minimum width. The second fill is kept when its check is clean and the first's is not, or when neither is clean and it has fewer faults (the rises of rules of severity error other than `starved_thermal`, plus the rise of starved thermals at any severity, plus the unreached pads). On a tie the first stays. Both fills are in `check.thermal_steps`, and the proposals carry the values of the fill that was kept | The measurement (2026-11-24): at dash's values B5 had 2 starved thermals, two fine-pitch IC pads with 1 spoke where the zone asks for 2. At B5's own values the same board had 0. Each step is the owner's own values on one of his boards, so neither is a number of ours, and no value was searched for. A board whose first fill has no thermal fault gets exactly the plan it had before. One more refill is short (the probe below), and only on a board with a fault. One set for the whole plan: the faults are pads of the plan, not of one layer, and a plan whose pours differ in thermal values for no reason of the board's is harder to read. The owner chose to fix the plan after the failed criterion was reported to him ("תתקן", 2026-11-24) |
 | PP17 | `clean` also requires that the pours reach every pad they should. A pad of a proposed net that has copper on a layer the net is poured on (a proposal KiCad filled) is *reached* when its copper group on KiCad's refilled board holds fill of that net on one of those layers. The group is the layout audit's: tracks, vias, pads and the saved fill, touching within 0.01 mm on a shared layer (`routing::pad_groups`). Every unreached pad is listed in `check.unreached`, by net, and makes the plan not clean | Found by the design's own control for the real fill. KiCad reports a thermal pad that gets no spoke at all as unconnected, not as a starved thermal (`drc_test_provider_zone_connections.cpp:176`), so PP11's count missed a plan that connected no pad. `open` alone cannot be the test: before routing, a pad on a layer the plan does not pour stays open by design (a request for B.Cu only leaves the front pads to the routing). The group decides, not the pad's own layer, so a through-hole pad that the back pour joins is not unreached for want of a spoke on the front; KiCad does not report that pad either. A proposal KiCad filled nothing of is withdrawn, so its layer is not a layer the net is poured on |
 
 ### Thermal relief (Z12, and the owner's rule for ZR3)
@@ -98,7 +98,7 @@ and the record are never written.
 
 Before the design was fixed: each of the five boards of "The x19 baseline", unrouted, on
 scratch copies, with its pours removed and with its own pours at three clearances. kicad-cli
-refill and DRC, 20 runs in 21 s under the lane locks. Counts only. "Open on ground" is
+refill and DRC, 20 runs under the lane locks (times in the record below). Counts only. "Open on ground" is
 KiCad's unconnected items that name a ground net.
 
 | Board | No pours: open on ground | 0.2 mm | 0.3 mm | 0.5 mm |
@@ -115,7 +115,7 @@ KiCad's unconnected items that name a ground net.
 - **`pours` reports 1 `isolated_copper` warning with its pours at every clearance** and none
   without them. Hence "errors only" in PP11.
 - **No other rule's count changed on any board.**
-- **One refill and DRC takes about a second** on these boards, so the check costs seconds.
+- **One refill and DRC is short** on these boards (times in the record below), so the check is cheap.
 - This used each board's own pour outlines, not the planner's proposals. `pic` and `ecc` have
   ground on the back only; what the rule's front pour does there is measured in the build.
 
@@ -572,7 +572,7 @@ their copper pours removed. None of them has a rule area. Counts only. Record:
   and B.Cu, neither `asked`.
 - **C6:** dash, B5 and `pours` give `nothing_to_propose` as they are. `pic` and `ecc`
   give one proposal, on F.Cu.
-- **Recorded, not criteria.** The planner takes 1.5 to 3.0 s a board. The reference is
+- **Recorded, not criteria.** The planner's time a board is in the record. The reference is
   the same route call on each board with its own pours. Against it, the winner with the
   plan's pours had:
   - fill pieces: 14 against 34 (dash), 11 against 13 (B5), 14 against 2 (`pic`),
@@ -624,7 +624,7 @@ run's record above stays as it was.
   - fill pieces: 14 against 34 (dash), 9 against 13 (B5), 14 against 2 (`pic`), 2
     against 1 (`ecc`), 2 against 2 (`pours`);
   - starved thermals: 0 on every board (the reference on B5: 1).
-- The planner takes 1.2 to 3.1 s a board; B5's second fill costs about 1 s more.
+- The planner's time a board, and the extra time of B5's second fill, are in the record.
 
 ## After the measurement: PP16 and PP17 (2026-11-24)
 
