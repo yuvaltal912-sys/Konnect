@@ -55,7 +55,7 @@ Steps 1 and 2 read. Step 3 is a pure function of what they read. Step 4 writes o
 Konnect's state folder (`<state>/pour-plans/<stamp>-<sha8>/`). The board, the project file
 and the record are never written.
 
-## Decisions (the code cites them as PP1 to PP15)
+## Decisions (the code cites them as PP1 to PP17)
 
 | # | Decision | Reason |
 |---|---|---|
@@ -67,13 +67,15 @@ and the record are never written.
 | PP6 | The rule. 2 layers: the ground net with the most pads on both. 4 layers: that net on `F.Cu`, `In1.Cu` and `B.Cu`, the power net with the most pads on `In2.Cu` (ground there when no power net is known). Any other layer count: nothing by rule, only what the record asks for | The owner's answer to decision 4 names exactly this. "Most pads" is a fact of the board and is what a plane serves. A 6-layer stack has no single standard, and a guess there is worse than a request. The layer table's types are reported and not read: KiCad's default type is `signal`, so it says nothing on most boards |
 | PP7 | A request with layers gives its net exactly those layers. The rule never places that net, and never puts another net of its kind in its place: the layers the rule would have given it stay free, each named in `not_proposed`. A request without layers puts its net first among the nets of its kind, so the rule's layer of that kind goes to it. A request that cannot be met (a net with no pad on the board, a layer the stack does not have, a net that gets no layer) is reported, with `asked: true`, and the status says so. A net the board does not have never takes a layer from one it has | "Unless I explicitly ask for something else": a request must be exact where it is exact, and visible when it fails. With `GND` asked on `B.Cu` only and a second ground net `AGND` on the board, a rule that moved on to the next ground net would pour `AGND` over the whole front, which nobody asked for (the review's finding). A net with no role that the record asks for is treated as power |
 | PP8 | Existing zones are never changed. A layer that already has a pour of the net is left out. A layer where another net's pour sits at priority 0 is left out too, and the reason says to raise that zone's priority | A whole-layer pour must sit below every other pour of its layer. KiCad breaks a tie of equal priorities by UUID (`ZONE::HigherPriority`, `zone.cpp:436`), which is arbitrary, and has no priority below 0. Two pours of one net at one priority whose outlines meet are a `zones_intersect` error (`drc_test_provider_copper_clearance.cpp:1290`) |
-| PP9 | Settings. Clearance: the largest of the net's class clearances (the Default class included), the project's `min_clearance` and the fab target's. Minimum width: the largest of 0.25 mm (KiCad's default), the project's `min_track_width` and the fab target's minimum track. Thermal pads, gap 0.5 mm, bridge the larger of 0.5 mm and the minimum width. Islands always removed. Priority 0 | Clearance: KiCad fills at the larger of the zone's own clearance and the rules' anyway, so a larger number only removes copper, and the probe below shows what that costs: on B5 the fill is clean at the class clearance and has starved thermals above it. Minimum width: copper narrower than the narrowest track the fab makes is not made reliably. The rest are KiCad's defaults and what both of the owner's boards use |
+| PP9 | Settings. Clearance: the largest of the net's class clearances (the Default class included), the project's `min_clearance` and the fab target's. Minimum width: the largest of 0.25 mm (KiCad's default), the project's `min_track_width` and the fab target's minimum track. Thermal pads, gap 0.5 mm, bridge the larger of 0.5 mm and the minimum width. Islands always removed. Priority 0 | Clearance: KiCad fills at the larger of the zone's own clearance and the rules' anyway, so a larger number only removes copper, and the probe below shows what that costs: on B5 the fill is clean at the class clearance and has starved thermals above it. Minimum width: copper narrower than the narrowest track the fab makes is not made reliably. The thermal values are dash's own (0.5 mm and 0.5 mm); B5's own are smaller, and PP16 steps to them when KiCad starves a pad at dash's. Islands and priority are KiCad's defaults |
 | PP10 | The outline is the board's own, as the Specctra export reads it: one closed loop, arcs as chords. A board that the export's readers of the stack, the outline, the footprints or the zones refuse gets no plan, with the reader's reason | KiCad clips a fill to the board edge with the edge clearance (`zone_filler.cpp:2176`), and keeps it out of every rule area that forbids copper pours (`zone_filler.cpp:2306`); for the other rule areas see PP15. Pours are defined before the export (Z8): a board that cannot be exported cannot be routed, and a second outline reader could disagree with the first. The export's other refusals (locked routing it cannot write, copper graphics) are the export's to report when it runs |
-| PP11 | Every plan is filled by KiCad before it is returned: the board with the proposals and the board without them, refilled and checked by kicad-cli on scratch copies, then compared. `clean` means that no DRC rule of severity error is reported more often with the proposals, and that no more thermal pads are starved, whatever severity the project gives that rule. Warnings that rise are listed. A proposal KiCad fills nothing of is withdrawn | The owner's answer to decision 4, and P1 of the row: KiCad's refill is the truth. Errors only, because a pour that touches no pad yet is `isolated_copper`, a warning, until the routing reaches it (the probe: 1 on `pours`). A starved thermal is different: it is a pad of the pour's own net with too few spokes, and a project that reports it as a warning has the same weak joint. In the scratch project isolated copper and starved thermals are at least warnings and unconnected items are errors, so a project that ignores them cannot hide them, and `open` counts real items |
+| PP11 | Every plan is filled by KiCad before it is returned: the board with the proposals and the board without them, refilled and checked by kicad-cli on scratch copies, then compared. `clean` means that no DRC rule of severity error is reported more often with the proposals, that no more thermal pads are starved, whatever severity the project gives that rule, and that the pours reach every pad they should (PP17). Warnings that rise are listed. A proposal KiCad fills nothing of is withdrawn | The owner's answer to decision 4, and P1 of the row: KiCad's refill is the truth. Errors only, because a pour that touches no pad yet is `isolated_copper`, a warning, until the routing reaches it (the probe: 1 on `pours`). A starved thermal is different: it is a pad of the pour's own net with too few spokes, and a project that reports it as a warning has the same weak joint. In the scratch project isolated copper and starved thermals are at least warnings and unconnected items are errors, so a project that ignores them cannot hide them, and `open` counts real items |
 | PP12 | No check, no plan. When kicad-cli cannot fill the plan, the tool returns an error that names the step and proposes nothing | He was told that every proposal is filled by KiCad before it is returned. An unchecked plan that looks like a checked one would break that |
 | PP13 | The tool is in the `pcb_board` toolset, beside `add_zone`, `list_zones` and `delete_zone`. It reads the board through the board-source seam (`board_source`), like every other reader | One toolset holds the plan and the tool that applies it. The seam already decides when a saved file may stand in for a live board |
 | PP14 | A proposal carries every `add_zone` argument, the defaults included, and the scratch zones are written by `add_zone`'s own file writer | What KiCad checked is what is added. A default that changes later cannot change an old plan's meaning. **One limit, on the live path:** over IPC KiCad makes a zone from the board's default zone settings and the API then sets every value of the proposal; what the API has no field for (corner smoothing, the lock) stays as the last zone dialog of that KiCad session left it (`zone.cpp:89`, `zone_settings.cpp:209`, `edit_zone_helpers.cpp:84`). A zone that comes out with rounded corners fills a little differently, and the engine's model does not cover it; the route's `pours.legacy` names it. The file path has no such inheritance |
 | PP15 | A rule area that keeps tracks, vias or pads out and lets copper pours in is a finding when a proposal covers its layer: it is listed in `rule_areas_filled`, `next_steps` says how to keep copper out of it, and the status is `planned_with_findings`. The plan still proposes the whole layer | KiCad keeps a fill out of a rule area only when the area forbids pours (`zone_filler.cpp:2306`). `add_rule_area`'s own default, which is KiCad's, forbids tracks, vias and pads and allows pours, so an antenna keepout made with the defaults gets copper under the antenna, and DRC has no rule against it. The plan cannot know whether the area is an antenna or only a no-routing strip, so it says what will happen and leaves the choice (the checklist: "keep intentional isolation barriers and antenna keepouts when adding copper"). Found by the review; none of the five measured boards has a rule area |
+| PP16 | The thermal values in two steps, for the whole plan at once. The check fills the plan first at dash's own values: a gap of 0.5 mm, a bridge of the larger of 0.5 mm and the minimum width. When that fill has a thermal fault (more starved thermals than without the proposals, at any severity, or a pad PP17 finds unreached), KiCad fills the plan once more at B5's own values: a gap of 0.3 mm, a bridge of the larger of 0.4 mm and the minimum width. The second fill is kept when its check is clean and the first's is not, or when neither is clean and it has fewer faults (the rises of rules of severity error other than `starved_thermal`, plus the rise of starved thermals at any severity, plus the unreached pads). On a tie the first stays. Both fills are in `check.thermal_steps`, and the proposals carry the values of the fill that was kept | The measurement (2026-11-24): at dash's values B5 had 2 starved thermals, two fine-pitch IC pads with 1 spoke where the zone asks for 2. At B5's own values the same board had 0. Each step is the owner's own values on one of his boards, so neither is a number of ours, and no value was searched for. A board whose first fill has no thermal fault gets exactly the plan it had before. One more refill costs about a second, and only on a board with a fault. One set for the whole plan: the faults are pads of the plan, not of one layer, and a plan whose pours differ in thermal values for no reason of the board's is harder to read. The owner chose to fix the plan after the failed criterion was reported to him ("תתקן", 2026-11-24) |
+| PP17 | `clean` also requires that the pours reach every pad they should. A pad of a proposed net that has copper on a layer the net is poured on (a proposal KiCad filled) is *reached* when its copper group on KiCad's refilled board holds fill of that net on one of those layers. The group is the layout audit's: tracks, vias, pads and the saved fill, touching within 0.01 mm on a shared layer (`routing::pad_groups`). Every unreached pad is listed in `check.unreached`, by net, and makes the plan not clean | Found by the design's own control for the real fill. KiCad reports a thermal pad that gets no spoke at all as unconnected, not as a starved thermal (`drc_test_provider_zone_connections.cpp:176`), so PP11's count missed a plan that connected no pad. `open` alone cannot be the test: before routing, a pad on a layer the plan does not pour stays open by design (a request for B.Cu only leaves the front pads to the routing). The group decides, not the pad's own layer, so a through-hole pad that the back pour joins is not unreached for want of a spoke on the front; KiCad does not report that pad either. A proposal KiCad filled nothing of is withdrawn, so its layer is not a layer the net is poured on |
 
 ### Thermal relief (Z12, and the owner's rule for ZR3)
 
@@ -85,6 +87,9 @@ and the record are never written.
 - The check counts `starved_thermal` without and with the proposals. A plan under which
   the count rises is not `clean`, whatever severity the project gives the rule (it is an
   error in KiCad's defaults and in both of the owner's projects).
+- A pad that gets no spoke at all is not a starved thermal to KiCad but an unconnected
+  item. PP17 finds it on the refilled board, and PP16 tries B5's smaller values before
+  the plan is returned with it.
 - A zone that `add_zone` writes reads back through `zone_fill::fill_settings` with the same
   values, and as a zone the engine's model covers (solid fill, square corners). A test holds
   both.
@@ -138,6 +143,10 @@ Record: `target/creation-research/zone-routing/zr4/design-probe/` in the main ch
   "rule_areas_filled": [],
   "check": {"clean": true, "open": [{"net": "GND", "before": 40, "after": 0}],
             "risen": [], "starved_thermals_before": 0, "starved_thermals": 0,
+            "unreached": [],
+            "thermal_steps": [{"thermal_gap": 0.5, "thermal_bridge_width": 0.5,
+                               "starved_thermals": 0, "unreached_pads": 0, "clean": true,
+                               "kept": true}],
             "folder": "…/pour-plans/…"},
   "next_steps": ["…"],
   "sources": {}, "source_evidence": {}
@@ -546,6 +555,143 @@ their copper pours removed. None of them has a rule area. Counts only. Record:
 - PP15 was checked on a real KiCad fill: the ignored test
   `kicad_fills_inside_a_rule_area_that_lets_pours_in` ran on the public fixture with a
   rule area added, and passed. The ignored test `the_real_thing_fills_clean` passed too.
+
+## After the measurement: PP16 and PP17 (2026-11-24)
+
+The measurement found two faults: C1 failed on B5, and the control for the real fill
+showed that `clean` misses a plan that connects no pad. Both went to the owner, and he
+chose to fix them before the PR ("תתקן", 2026-11-24). The decisions are PP16 and PP17 in
+the table above. Nothing else changes: C1 to C6 stay as they were fixed before the first
+run, and the whole measurement runs again.
+
+### The skeleton
+
+Signatures and contracts. The builder writes the bodies, the tests and the controls.
+
+`pour_plan.rs`:
+
+```rust
+/// PP16: the thermal values the check tries, in order: dash's own, then B5's own.
+/// Each is (gap, bridge floor) in mm; a proposal's bridge is the larger of the floor and
+/// its minimum width. The first is `settings_for`'s (a test holds that it equals
+/// `ZONE_THERMAL_RELIEF_MM` for both), so `add_zone`'s own defaults do not change.
+pub(crate) const THERMAL_STEPS: [(f64, f64); 2] = [(0.5, 0.5), (0.3, 0.4)];
+
+/// PP16: `zones` with the thermal values of `THERMAL_STEPS[step]`: `thermal_gap_mm` is
+/// the gap, `thermal_bridge_mm` the larger of the floor and the zone's own
+/// `min_width_mm`. Nothing else changes, and every result passes `ZoneSettings::check`.
+/// `None` for a step that is not in the table.
+pub(crate) fn with_thermal_step(zones: &[ProposedZone], step: usize) -> Option<Vec<ProposedZone>>;
+```
+
+`tools/layout_quality.rs`, beside `pads_off_main_group`, with the same grouping (one
+union-find, shared with `routing::pad_groups`, not a copy of it):
+
+```rust
+/// Row ZR, stage ZR4 (PP17): one pad that the plan's fill does not reach.
+pub(crate) struct UnreachedPad { pub net: String, /// `REF.number`
+    pub label: String }
+
+/// For each net of `poured` and its layers: the pads of the net with copper on one of
+/// those layers whose copper group on the saved board `board_text` (at `board`) holds no
+/// `filled_polygon` of the net on one of those layers. In the net's pad order. The board
+/// is KiCad's refill, so a zone with no saved fill has no copper: it is no error here,
+/// unlike `pads_off_main_group`. An error only when the board does not parse.
+pub(crate) fn pads_unreached_by_fill(
+    board: &Path,
+    board_text: &str,
+    poured: &BTreeMap<String, BTreeSet<String>>,
+) -> anyhow::Result<Vec<UnreachedPad>>;
+```
+
+`pour_check.rs`:
+
+```rust
+/// PP17: the unreached pads of one net, by label.
+pub(crate) struct NetPads { pub net: String, pub pads: Vec<String> }
+
+/// PP16: one fill the check made, in the order it made them.
+pub(crate) struct ThermalStep {
+    pub thermal_gap_mm: f64,
+    pub thermal_bridge_mm: f64,
+    pub starved_thermals: usize,
+    pub unreached_pads: usize,
+    pub clean: bool,
+    /// The fill whose proposals the plan returns.
+    pub kept: bool,
+}
+
+// `FillCheck` gains:
+//     /// PP17: by net, the nets with an unreached pad only.
+//     pub unreached: Vec<NetPads>,
+//     /// PP16: one row a fill; one row when the first had no thermal fault.
+//     pub thermal_steps: Vec<ThermalStep>,
+// and `clean` also requires `unreached` to be empty.
+
+/// PP16: the faults of one fill: the rises of rules of severity error other than
+/// `starved_thermal`, plus `starved_thermals` above `starved_thermals_before`, plus the
+/// unreached pads.
+pub(crate) fn faults(check: &FillCheck) -> usize;
+
+/// PP16: a thermal fault: starved thermals rose, or a pad is unreached.
+pub(crate) fn thermal_fault(check: &FillCheck) -> bool;
+
+/// PP16: true when the second fill is kept: it is clean and the first is not, or neither
+/// is clean and it has fewer `faults`. On a tie, false.
+pub(crate) fn keep_second(first: &FillCheck, second: &FillCheck) -> bool;
+
+/// A plan as KiCad checked it: the proposals of the fill that was kept, and its check.
+pub(crate) struct CheckedPlan { pub zones: Vec<ProposedZone>, pub check: FillCheck }
+```
+
+- `verdict` takes the refilled board's path too, and fills `unreached` with
+  `pads_unreached_by_fill` over the proposals whose fill has pieces (a proposal KiCad
+  filled nothing of is withdrawn, so its layer does not count). `thermal_steps` is left
+  for `check` to fill.
+- `check` returns `CheckedPlan`. The board without the proposals is refilled once. The
+  first fill is the proposals as given, in [`WITH`]. Only when it has a thermal fault,
+  the second is `with_thermal_step(zones, 1)` in `with-thermal-1`, against the same
+  report of the board without them. `keep_second` picks; `thermal_steps` gets a row a
+  fill. Both folders stay, as records.
+- The handler puts `CheckedPlan::zones` in `plan.proposals` before `withdraw_unfilled`.
+  `result_json` gains `check.unreached` (`[{net, pads}]`) and `check.thermal_steps`
+  (`[{thermal_gap, thermal_bridge_width, starved_thermals, unreached_pads, clean,
+  kept}]`). `next_steps` names the unreached pads of each net (route them, or change
+  what keeps the pour from them), and says when the plan's thermal values were stepped
+  to B5's, and why.
+- The tool's description says that `clean` also needs every pad the pours should reach
+  to be reached, and that the check tries a second, smaller set of thermal values when
+  the first starves a pad. The skill and `docs/API_MIGRATIONS.md` say the same.
+
+### Tests, each guard with a negative control
+
+| Guard | Test | Negative control |
+|---|---|---|
+| An unreached pad makes the plan not clean | a refilled board where the proposal's fill rings a GND pad on its layer with no spoke: `unreached` names it, `clean` is false | `unreached` not read in `clean`: clean |
+| Only pads on a poured layer count | a GND pad only on B.Cu, the plan pours F.Cu only: not listed | the layer filter left out: listed |
+| Fill of the net on another layer does not reach for the proposal | a through-hole GND pad joined only to an older GND pour on B.Cu, the proposal on F.Cu gives it no spoke and joins nothing else: listed | fills on every layer read: not listed |
+| A pad the group joins is reached | the same pad joined to the proposal's fill through a through-hole pad and a track: not listed | the pad's own layer decides instead of the group: listed |
+| A withdrawn proposal's layer does not count, and is no error | a proposal with no fill: no error, its layer's pads not listed | the pieces filter left out: listed, or an error |
+| A clean first fill gets no second | a scripted refill: exactly two refills, one `thermal_steps` row, `kept` | the second always run: three refills |
+| A fault that is not thermal gets no second | the first fill raises `clearance` (error) only: two refills | any unclean fill tried again: three |
+| A thermal fault gets the second, at B5's values | the first fill raises `starved_thermal`: the scratch `with-thermal-1` board has `(thermal_gap 0.3)` and `(thermal_bridge_width 0.4)` in each proposal, and the board without the proposals is refilled once | the second written at the first's values, or the board without them refilled again |
+| The kept fill's values are what is returned | the second is kept: every proposal's `add_zone` has `thermal_gap` 0.3 and `thermal_bridge_width` 0.4 | the first's zones returned |
+| The second is kept only when better | clean against not clean: second; 2 faults against 1: second; 1 against 1: first; clean against clean cannot happen (no second) | `<=` for `<`: the tie keeps the second |
+| The bridge never drops below the minimum width | a minimum width of 0.5: the second step's bridge is 0.5 | the floor alone: 0.4, refused by `ZoneSettings::check` |
+| The first step is today's | `THERMAL_STEPS[0]` equals `ZONE_THERMAL_RELIEF_MM` twice, and `settings_for` uses it | a different first step: the test fails |
+| The real thing (ignored, needs kicad-cli) | the public `pours` fixture: `planned`, `clean`, `unreached` empty; with the minimum width and bridge raised above the smallest ground pad's short side, `clean` is false and `unreached` names the pads | `unreached` not read in `clean`: the second case is clean |
+
+Mutants: one narrow batch on the new and changed functions (`with_thermal_step`,
+`pads_unreached_by_fill`, `faults`, `thermal_fault`, `keep_second`, `verdict`, `check`).
+The misses run once more after any added test.
+
+### The measurement again
+
+The design's "Measurement" as it stands, on a new release build of the final tree, on
+fresh scratch copies of the five boards, under the lane locks, one routing call a board in
+its own hold. Expected from PP16: dash, `pic`, `ecc` and `pours` keep the plan they had
+(one fill, no fault), and B5 keeps its second fill. The new records go beside the first
+run's, which stays.
 
 ## Verification of this document
 
