@@ -574,7 +574,14 @@ async fn a_board_that_changes_mid_prune_ends_the_loop_with_the_state_accepted_so
     let units = units(&text, &nets).unwrap();
     let checker = JudgeChecker::new(&h.ctx, &base, &tools, &text, 0, 2.5).unwrap();
     let original = checked(checker.check(&text, None).await.unwrap());
-    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    let pruned = pour_prune::prune_loop(
+        &text,
+        &units,
+        &original,
+        &checker,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await;
     assert_eq!(pruned.ended_by, "check_error");
     assert!(
         pruned
@@ -609,7 +616,14 @@ async fn the_prunes_project_reports_dangling_vias_whatever_the_project_says() {
     assert_eq!(original.violations.get("via_dangling"), Some(&1));
 
     let units = units(&text, &set(&["GND"])).unwrap();
-    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    let pruned = pour_prune::prune_loop(
+        &text,
+        &units,
+        &original,
+        &checker,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await;
     let via = units
         .iter()
         .position(|unit| unit.kind == pour_prune::UnitKind::Via)
@@ -620,7 +634,12 @@ async fn the_prunes_project_reports_dangling_vias_whatever_the_project_says() {
     let two = lone_vias(&[(1000000, -550000), (1000000, -560000)]);
     let added = checked(checker.check(&two, Some(&original)).await.unwrap());
     assert_eq!(
-        pour_prune::refusals(&original, &original, &added),
+        pour_prune::refusals(
+            &original,
+            &original,
+            &added,
+            crate::pour_rank::RankMode::Routing
+        ),
         vec!["rule:via_dangling"]
     );
 }
@@ -636,6 +655,7 @@ async fn searched(h: &H, tools: &Tools) -> SearchOutcome {
         .unwrap();
     assert!(judged.gates.all_pass(), "{:?}", judged.gates);
     let key = rank(&[&judged])[0];
+    let pour_key = crate::pour_rank::pour_keys(&[(&judged.measures, &judged.gates, true)])[0];
     SearchOutcome {
         runs: vec![RunRecord {
             index: 0,
@@ -653,6 +673,8 @@ async fn searched(h: &H, tools: &Tools) -> SearchOutcome {
         }],
         winner: Some(0),
         keys: vec![Some(key)],
+        pour_keys: vec![Some(pour_key)],
+        rank: crate::pour_rank::RankMode::Routing,
         elapsed: Duration::from_secs(5),
         budget_overrun: None,
         stopped_launching: Some("fixed run count".to_string()),
@@ -714,6 +736,9 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
     // A stale key: the prune takes the keys again.
     let stale: Key = [7; KEY_LEN];
     outcome.keys = vec![Some(stale)];
+    // Row ZR, ZR5 part 2: the pour key too.
+    let stale_pour: crate::pour_rank::PourKey = [8; crate::pour_rank::POUR_KEY_LEN];
+    outcome.pour_keys = vec![Some(stale_pour)];
     let text = h.text();
 
     let record = prune(&h, &tools, &mut outcome).await;
@@ -752,6 +777,12 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
     assert!(judged.board.is_file());
     assert_eq!(judged.tune, Some(tune));
     assert_eq!(outcome.keys, vec![Some(rank(&[judged])[0])]);
+    assert_eq!(
+        outcome.pour_keys,
+        vec![Some(
+            crate::pour_rank::pour_keys(&[(&judged.measures, &judged.gates, true)])[0]
+        )]
+    );
     assert_eq!(outcome.winner, Some(0));
     assert!(
         !h.ctx.root.join("run-0-prune").exists(),
@@ -766,6 +797,7 @@ async fn a_kept_prune_replaces_the_winners_session_and_judge() {
         Some(json!({
             "session": original_ses.to_string_lossy(),
             "key": stale,
+            "pour_key": stale_pour,
             "judged_board": original_board.to_string_lossy(),
         }))
     );
@@ -1208,7 +1240,14 @@ async fn a_via_whose_removal_loses_a_fill_piece_stays_with_fill() {
     let vias: Vec<usize> = (0..units.len())
         .filter(|&i| units[i].kind == pour_prune::UnitKind::Via)
         .collect();
-    let pruned = pour_prune::prune_loop(&text, &units, &original, &checker).await;
+    let pruned = pour_prune::prune_loop(
+        &text,
+        &units,
+        &original,
+        &checker,
+        crate::pour_rank::RankMode::Routing,
+    )
+    .await;
     assert_eq!(pruned.removed, BTreeSet::from([vias[1]]), "{pruned:?}");
     assert_eq!(pruned.kept_alone, BTreeMap::from([("fill".to_string(), 1)]));
     assert_eq!(pruned.checks, 2, "the first via is final: not asked again");
@@ -1284,4 +1323,118 @@ fn export_renamed(folder: &Path, board_text: &str, nets: &[&str]) {
         &bundle.manifest,
     )
     .unwrap();
+}
+
+// ─── Row ZR, ZR5 part 2: the prune reads the call's mode (`ctx.rank`, PK12) ──────
+
+/// The loop's clause (c) reads `ctx.rank`: a candidate whose copper quality is lower is
+/// refused at today's place 11 under `routing` and at the pour key's place 15 under
+/// `pours`. Control: the loop given `RankMode::Routing` in place of `ctx.rank`.
+#[tokio::test]
+async fn the_loops_key_clause_reads_the_calls_mode() {
+    use crate::pour_rank::RankMode;
+    for (mode, place) in [(RankMode::Routing, "key:11"), (RankMode::Pours, "key:15")] {
+        let mut h = H::new(drc(&[], &[]));
+        h.session(&via_session());
+        h.ctx.rank = mode;
+        // Audits: 0 the setup judge, 1 the original's check, from 2 the candidates.
+        let tools = Arc::new(Tools::audit(|n, _| {
+            (false, audit_json(if n >= 2 { 70.0 } else { 80.0 }))
+        }));
+        let mut outcome = searched(&h, &tools).await;
+        let record = prune(&h, &tools, &mut outcome).await;
+        assert_eq!(record.outcome, "nothing_removed", "{mode:?}: {record:?}");
+        let clauses: Vec<&String> = record
+            .vias_kept_with
+            .keys()
+            .chain(record.vias_kept_alone.keys())
+            .collect();
+        assert!(
+            clauses.iter().any(|clause| clause.as_str() == place),
+            "{mode:?}: {clauses:?}"
+        );
+        assert!(
+            clauses
+                .iter()
+                .all(|clause| !clause.starts_with("key:") || clause.as_str() == place),
+            "{mode:?}: {clauses:?}"
+        );
+    }
+}
+
+/// The full judge's comparison reads `ctx.rank`: a pruned session whose full judge has
+/// a lower copper quality is rejected at place 11 under `routing`, 15 under `pours`.
+/// Control: `full_judge_refusal` given `RankMode::Routing` in place of `ctx.rank`.
+#[tokio::test]
+async fn the_full_judges_comparison_reads_the_calls_mode() {
+    use crate::pour_rank::RankMode;
+    for (mode, place) in [(RankMode::Routing, "11"), (RankMode::Pours, "15")] {
+        let mut h = H::new(drc(&[], &[]));
+        h.session(&via_session());
+        h.ctx.rank = mode;
+        // Audits: 0 the setup judge, 1 the original's check, 2 the candidate, 3 the full
+        // judge.
+        let tools = Arc::new(Tools::audit(|n, _| {
+            (false, audit_json(if n == 3 { 70.0 } else { 80.0 }))
+        }));
+        let mut outcome = searched(&h, &tools).await;
+        let record = prune(&h, &tools, &mut outcome).await;
+        assert_eq!(record.outcome, "rejected", "{mode:?}: {record:?}");
+        let reason = record.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("at position {place} ")),
+            "{mode:?}: {reason}"
+        );
+    }
+}
+
+/// The keys the prune takes again read `ctx.rank`. A second judged run beside the winner
+/// is below it by today's key and above it by the pour key: the kept prune replaces the
+/// winner under `routing` and is rejected under `pours`, where the winner would no
+/// longer rank first. Control: `replace_winner` given `RankMode::Routing` in place of
+/// `ctx.rank`.
+#[tokio::test]
+async fn the_keys_taken_again_read_the_calls_mode() {
+    use crate::pour_rank::RankMode;
+    for (mode, kept) in [(RankMode::Routing, true), (RankMode::Pours, false)] {
+        let mut h = H::new(drc(&[], &[]));
+        h.session(&via_session());
+        h.ctx.rank = mode;
+        let tools = Arc::new(Tools::clean());
+        let mut outcome = searched(&h, &tools).await;
+        let mut second = outcome.runs[0].clone();
+        second.index = 1;
+        {
+            // Today's key puts it last (a lower copper quality); the pour key first: it
+            // has no pour record (0 in the pour entries), where the winner's pour
+            // measures have no damage, as this harness's baseline has no fill rows
+            // (`i64::MAX` there).
+            let judged = second.judged.as_mut().unwrap();
+            judged.measures.copper_quality = judged.measures.copper_quality.map(|q| q - 10.0);
+            judged.measures.pours = None;
+            judged.measures.pours_error = None;
+        }
+        outcome.runs.push(second);
+        outcome.keys.push(None);
+        outcome.pour_keys.push(None);
+        outcome.rank = mode;
+        let record = prune(&h, &tools, &mut outcome).await;
+        if kept {
+            assert_eq!(record.outcome, "pruned", "{mode:?}: {record:?}");
+            assert_eq!(outcome.winner, Some(0));
+            assert_eq!(
+                outcome.runs[0].routed.as_ref().unwrap().held.ses,
+                pruned_ses(&h)
+            );
+        } else {
+            assert_eq!(record.outcome, "rejected", "{mode:?}: {record:?}");
+            assert!(
+                record
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("would no longer rank first")),
+                "{mode:?}: {record:?}"
+            );
+        }
+    }
 }

@@ -367,7 +367,11 @@ placement orders, judges every run itself on scratch copies of the board
    them against the unrouted board's refill (`search.baseline.pour_fills`):
    `lost_fills` (pour layers that lost all their fill), and `plane_loss` and
    `area_loss`, shares from 0 to 1 of the planes no longer whole and of the
-   pour copper gone. It is recorded only: it changes no gate and no rank.
+   pour copper gone. It changes no gate, and no rank unless the user config's
+   `routing.rank_key` is `pours`. Every judged run has two keys, `key` (today's)
+   and `pour_key`; `search.rank` says which ranked and which run the other
+   would have put first (`other_winner`). `routing.rank_key` is the user's
+   standing choice: never change it unasked.
 4. Continue from step 4 of the Freerouting round trip: the same import
    review, apply, refill, stitching (`completion.next_steps`) and DRC.
 
@@ -631,15 +635,52 @@ Creates a copper pour area (polygon fill).
 
 ```
 add_zone(board, net_name, layer, points, clearance?, min_width?,
-         name?, priority?, pad_connection?)
+         name?, priority?, pad_connection?, thermal_gap?,
+         thermal_bridge_width?, island_removal?, island_min_area?)
 ```
 
 - Almost always GND net on both F.Cu and B.Cu
-- `points` is the outline polygon; define it slightly inside the board edge
-  (0.5mm inset)
+- `points` is the outline polygon. The board's own outline is fine: KiCad keeps
+  the fill off the board edge by the edge clearance, so no inset is needed
 - `priority` defaults to 0; the higher priority wins where two pours overlap
 - `pad_connection` is `solid` | `thermal` | `none`, defaulting to `thermal`
   as KiCad does
+- `thermal_gap` (default 0.5 mm) and `thermal_bridge_width` (default the larger
+  of 0.5 mm and `min_width`) set the zone's thermal relief. A bridge below
+  `min_width` is refused: KiCad makes no spoke narrower than the minimum width
+- `island_removal` is `always` (default) | `never` | `below_area`; `below_area`
+  needs `island_min_area` in mm² (at most 2000)
+
+### plan_pours
+
+Plans the board's copper pours, read-only: nothing on the board changes.
+
+```
+plan_pours(board, board_source?)
+```
+
+- By rule: on 2 layers the ground net with the most pads on both; on 4 layers
+  that net on F.Cu, In1.Cu and B.Cu and the power net with the most pads on
+  In2.Cu. Other stacks get only what the design intent's `pours` asks for
+- The design intent's `pours` (`set_design_intent`, section `pours`) is the
+  user's request and wins: a net with layers gets exactly those layers
+- Whole-layer pours on the board's own outline. Existing zones are never changed
+- KiCad refills and checks the plan on a scratch copy before it is returned.
+  Each proposal is the exact arguments of `add_zone`
+- `check.clean` also needs every pad the pours should reach to be reached;
+  `check.unreached` lists the others. When the first fill starves a thermal pad
+  or leaves one unreached, KiCad fills the plan once more with smaller thermal
+  values (gap 0.3 mm, spoke the larger of 0.4 mm and the minimum width) and
+  the better fill is kept;
+  `check.thermal_steps` lists each fill
+- `status` is `planned`, `planned_with_findings` or `nothing_to_propose`.
+  `not_proposed` says what was left out and why. `rule_areas_filled` lists rule
+  areas that keep tracks, vias or pads out but let pours in: the pour fills
+  inside them
+- Show the user the plan and call `add_zone` once per proposal only on their OK,
+  then `refill_zones` and `save_project`. Add the zones before
+  `export_specctra_dsn` or after the routed session is imported, never between
+  the two: the import checks the board against what was exported
 - With KiCad running on this board the zone is created over IPC and refilled
   for you, so it appears at once and is in KiCad's undo stack. Without a live
   KiCad it goes into the file instead, and the result says so (`source: file`)

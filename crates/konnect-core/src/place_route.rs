@@ -236,6 +236,12 @@ pub(crate) fn export_candidate(
 /// candidate and would change what their key ranks).
 pub(crate) const CANDIDATE_PRUNE: crate::pour_prune::PourPrune = crate::pour_prune::PourPrune::Off;
 
+/// Row ZR, ZR5 part 2 (PK13): the placement tools' routing calls rank by today's key,
+/// whatever the user config's `routing.rank_key` says, and do not read it: their own key
+/// ranks placements with today's entries (`place_judge`).
+pub(crate) const CANDIDATE_RANK: crate::pour_rank::RankChoice =
+    crate::pour_rank::RankChoice::Fixed(crate::pour_rank::RankMode::Routing);
+
 /// One best-of-N routing call: `route_fastroute::route_with_fastroute` with
 /// `{dsn_path, ses_output_path: <folder>/route.ses, engine: "fastroute",
 /// effort: inputs.effort.name(), fastroute_path: inputs.fastroute}` (the effort as the
@@ -262,7 +268,14 @@ pub(crate) async fn route_candidate(
         return failed("a path of the routing call is not UTF-8 text".to_string());
     };
     let args = routing_arguments(dsn_path, &ses_path, inputs.effort, fastroute);
-    match crate::tools::route_fastroute::route_with_fastroute(&args, ctx, CANDIDATE_PRUNE).await {
+    match crate::tools::route_fastroute::route_with_fastroute(
+        &args,
+        ctx,
+        CANDIDATE_PRUNE,
+        CANDIDATE_RANK,
+    )
+    .await
+    {
         Ok(result) => read_route_result(&result),
         Err(error) => failed(format!("{error:#}")),
     }

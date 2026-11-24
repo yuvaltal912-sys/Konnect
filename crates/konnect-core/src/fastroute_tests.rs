@@ -4450,6 +4450,7 @@ int main(int argc, char **argv) {
                 kicad_config_home: None,
                 lengths: None,
                 pad_names: None,
+                rank: crate::pour_rank::RankMode::Routing,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),
@@ -4538,6 +4539,7 @@ int main(int argc, char **argv) {
                 kicad_config_home: None,
                 lengths: None,
                 pad_names: None,
+                rank: crate::pour_rank::RankMode::Routing,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),
@@ -4643,6 +4645,7 @@ int main(int argc, char **argv) {
                 kicad_config_home: None,
                 lengths: None,
                 pad_names: None,
+                rank: crate::pour_rank::RankMode::Routing,
             }),
             tools: Arc::new(ToolContext::new(
                 ServerConfig::default(),

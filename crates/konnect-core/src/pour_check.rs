@@ -1,0 +1,462 @@
+//! Row ZR, stage ZR4: KiCad's own fill of a pour plan (docs/POUR_PLAN_DESIGN.md, PP11).
+//!
+//! A plan is returned only after KiCad has filled it. The board as it was read, and the
+//! same board with the proposals, are written to scratch copies below Konnect's state
+//! folder, refilled and checked by kicad-cli, and compared. Nothing here writes to the
+//! user's board or project, and kicad-cli runs with a private copy of KiCad's settings.
+
+use crate::pour_plan::ProposedZone;
+use crate::tools::cli::DrcReport;
+use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
+/// The folder below Konnect's state folder that holds one folder per call.
+pub(crate) const PLANS_FOLDER: &str = "pour-plans";
+
+/// The scratch project of the board as it was read.
+pub(crate) const WITHOUT: &str = "without";
+
+/// The scratch project of the board with the proposals.
+pub(crate) const WITH: &str = "with";
+
+/// One refill and DRC in flight.
+pub(crate) type RefillCall<'a> = Pin<Box<dyn Future<Output = Result<DrcReport>> + Send + 'a>>;
+
+/// How the check has KiCad refill a scratch board and report on it. The one production
+/// implementation is [`KicadCli`]; the tests of the check put a scripted one in its
+/// place (as `route_judge::ToolCaller` does for the judge's tools).
+pub(crate) trait Refill: Send + Sync {
+    /// Refills the zones of the scratch board at `board`, saves the refilled board over
+    /// that file and returns its DRC.
+    fn refill<'a>(&'a self, board: &'a Path) -> RefillCall<'a>;
+}
+
+/// kicad-cli, with `config_home` as its `KICAD_CONFIG_HOME`
+/// (`tools::cli::refill_drc_on_private_copy_with_config`), so that it never writes the
+/// owner's own KiCad settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KicadCli {
+    pub kicad_cli: String,
+    /// A private copy of KiCad's settings (`route_judge::private_kicad_config`).
+    pub config_home: PathBuf,
+}
+
+impl Refill for KicadCli {
+    fn refill<'a>(&'a self, board: &'a Path) -> RefillCall<'a> {
+        Box::pin(async move {
+            crate::tools::cli::refill_drc_on_private_copy_with_config(
+                &self.kicad_cli,
+                board,
+                Some(&self.config_home),
+            )
+            .await
+        })
+    }
+}
+
+/// The fill of one proposal, as KiCad saved it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ProposalFill {
+    pub net: String,
+    pub layer: String,
+    /// Fill pieces of the proposal's zone on its layer. 0: KiCad filled nothing of it.
+    pub pieces: usize,
+    pub area_mm2: f64,
+    /// The largest piece's share of the area; `None` without fill.
+    pub largest_piece_share: Option<f64>,
+}
+
+/// KiCad's unconnected items that name one net, without and with the proposals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct NetOpen {
+    pub net: String,
+    pub before: usize,
+    pub after: usize,
+}
+
+/// A DRC rule that KiCad reports more often with the proposals than without.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Risen {
+    /// KiCad's rule key (`starved_thermal`, `isolated_copper`, …).
+    pub rule: String,
+    /// `error` or `warning`, as the report gives it.
+    pub severity: String,
+    pub before: usize,
+    pub after: usize,
+}
+
+/// What KiCad's refill and DRC say about a plan.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct FillCheck {
+    /// One row per proposal, in the plan's order.
+    pub fills: Vec<ProposalFill>,
+    /// One row per proposed net, by name.
+    pub open: Vec<NetOpen>,
+    /// By rule, then severity.
+    pub risen: Vec<Risen>,
+    /// KiCad's `starved_thermal` violations without the proposals, at any severity.
+    pub starved_thermals_before: usize,
+    /// KiCad's `starved_thermal` violations with the proposals, at any severity.
+    pub starved_thermals: usize,
+    /// PP17: by net, the nets with an unreached pad only.
+    pub unreached: Vec<NetPads>,
+    /// PP16: one row a fill; one row when the first had no thermal fault.
+    pub thermal_steps: Vec<ThermalStep>,
+    /// No rule of severity `error` rose, `starved_thermal` did not rise at any severity
+    /// (a project may report it as a warning, and a pad of the pour's net with too few
+    /// spokes is a finding all the same), and no pad is unreached (PP17). A proposal
+    /// KiCad filled nothing of is not part of this: the tool withdraws it.
+    pub clean: bool,
+}
+
+/// PP17: the unreached pads of one net, by label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct NetPads {
+    pub net: String,
+    pub pads: Vec<String>,
+}
+
+/// PP16: one fill the check made, in the order it made them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ThermalStep {
+    pub thermal_gap_mm: f64,
+    pub thermal_bridge_mm: f64,
+    pub starved_thermals: usize,
+    pub unreached_pads: usize,
+    pub clean: bool,
+    /// The fill whose proposals the plan returns.
+    pub kept: bool,
+}
+
+/// The scratch project of the plan's second fill, at `THERMAL_STEPS[1]` (PP16).
+pub(crate) const WITH_THERMAL_1: &str = "with-thermal-1";
+
+/// PP16: the faults of one fill: the rises of rules of severity error other than
+/// `starved_thermal`, plus `starved_thermals` above `starved_thermals_before`, plus the
+/// unreached pads.
+pub(crate) fn faults(check: &FillCheck) -> usize {
+    let rises: usize = check
+        .risen
+        .iter()
+        .filter(|row| row.severity == "error" && row.rule != crate::zone_fill::STARVED_THERMAL)
+        .map(|row| row.after - row.before)
+        .sum();
+    let starved = check
+        .starved_thermals
+        .saturating_sub(check.starved_thermals_before);
+    let unreached: usize = check.unreached.iter().map(|net| net.pads.len()).sum();
+    rises + starved + unreached
+}
+
+/// PP16: a thermal fault: starved thermals rose, or a pad is unreached.
+pub(crate) fn thermal_fault(check: &FillCheck) -> bool {
+    check.starved_thermals > check.starved_thermals_before || !check.unreached.is_empty()
+}
+
+/// PP16: true when the second fill is kept: it is clean and the first is not, or neither
+/// is clean and it has fewer `faults`. On a tie, false.
+pub(crate) fn keep_second(first: &FillCheck, second: &FillCheck) -> bool {
+    if first.clean {
+        return false;
+    }
+    second.clean || faults(second) < faults(first)
+}
+
+/// A plan as KiCad checked it: the proposals of the fill that was kept, and its check.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CheckedPlan {
+    pub zones: Vec<ProposedZone>,
+    pub check: FillCheck,
+}
+
+/// The verdict of two reports and the refilled board (pure):
+/// - `fills`: for each proposal, the row of its net and layer in
+///   `zone_fill::pour_fills(refilled_text, the proposed nets)`. The plan proposes a net
+///   only on a layer where it has no pour yet (PP8), so that row is the proposal's own.
+///   A proposal with no row is an error (a zone that was written is always read back).
+/// - `open`: `route_judge::unconnected_on` of each proposed net in `without` and in
+///   `with`.
+/// - `risen`: the violations of each report counted by rule and severity; every pair
+///   whose count in `with` is above its count in `without`.
+/// - `starved_thermals_before` and `starved_thermals`: the violations of
+///   `zone_fill::STARVED_THERMAL` in `without` and in `with`.
+/// - `unreached` (PP17): `tools::pads_unreached_by_fill` of the refilled board at
+///   `refilled_board`, over the proposals whose fill has pieces (a proposal KiCad filled
+///   nothing of is withdrawn, so its layer does not count), grouped by net.
+/// - `thermal_steps`: empty; [`check`] fills it.
+/// - `clean`: no `risen` row has the severity `error`, `starved_thermals` is not above
+///   `starved_thermals_before`, and `unreached` is empty.
+///
+/// An error when either report has no unconnected-items category: an unrouted board
+/// could then not be told from a routed one (`route_judge::unconnected_total`).
+pub(crate) fn verdict(
+    zones: &[ProposedZone],
+    without: &DrcReport,
+    with: &DrcReport,
+    refilled_text: &str,
+    refilled_board: &Path,
+) -> Result<FillCheck> {
+    // Only that the category is there: `open` counts it per net.
+    crate::route_judge::unconnected_total(without)
+        .context("the DRC of the board without the proposals")?;
+    crate::route_judge::unconnected_total(with)
+        .context("the DRC of the board with the proposals")?;
+    let nets: BTreeSet<String> = zones.iter().map(|zone| zone.net.clone()).collect();
+    let rows = crate::zone_fill::pour_fills(refilled_text, &nets)?;
+    let mut fills = Vec::with_capacity(zones.len());
+    for zone in zones {
+        let mut own = rows
+            .iter()
+            .filter(|row| row.net == zone.net && row.layer == zone.layer);
+        let Some(row) = own.next() else {
+            bail!(
+                "the refilled board has no zone of {} on {}, though the check wrote one",
+                zone.net,
+                zone.layer
+            );
+        };
+        if own.next().is_some() {
+            bail!(
+                "the refilled board has more than one zone of {} on {}, so the proposal's own \
+                 fill cannot be told apart",
+                zone.net,
+                zone.layer
+            );
+        }
+        fills.push(ProposalFill {
+            net: zone.net.clone(),
+            layer: zone.layer.clone(),
+            pieces: row.pieces_mm2.len(),
+            area_mm2: row.pieces_mm2.iter().sum(),
+            largest_piece_share: row.largest_share(),
+        });
+    }
+    let open = nets
+        .iter()
+        .map(|net| {
+            let one = std::slice::from_ref(net);
+            NetOpen {
+                net: net.clone(),
+                before: crate::route_judge::unconnected_on(without, one),
+                after: crate::route_judge::unconnected_on(with, one),
+            }
+        })
+        .collect();
+    let counts = |report: &DrcReport| {
+        let mut by_rule: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for violation in report.all() {
+            *by_rule
+                .entry((violation.rule.clone(), violation.severity.clone()))
+                .or_default() += 1;
+        }
+        by_rule
+    };
+    let (counts_without, counts_with) = (counts(without), counts(with));
+    let risen: Vec<Risen> = counts_with
+        .iter()
+        .filter_map(|((rule, severity), &after)| {
+            let before = counts_without
+                .get(&(rule.clone(), severity.clone()))
+                .copied()
+                .unwrap_or(0);
+            (after > before).then(|| Risen {
+                rule: rule.clone(),
+                severity: severity.clone(),
+                before,
+                after,
+            })
+        })
+        .collect();
+    let starved = |report: &DrcReport| {
+        report
+            .all()
+            .filter(|violation| violation.rule == crate::zone_fill::STARVED_THERMAL)
+            .count()
+    };
+    let (starved_thermals_before, starved_thermals) = (starved(without), starved(with));
+    let mut poured: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for fill in fills.iter().filter(|fill| fill.pieces > 0) {
+        poured
+            .entry(fill.net.clone())
+            .or_default()
+            .insert(fill.layer.clone());
+    }
+    let mut unreached: Vec<NetPads> = Vec::new();
+    if !poured.is_empty() {
+        for pad in crate::tools::pads_unreached_by_fill(refilled_board, refilled_text, &poured)
+            .context("the pads the fill should reach")?
+        {
+            match unreached.iter_mut().find(|row| row.net == pad.net) {
+                Some(row) => row.pads.push(pad.label),
+                None => unreached.push(NetPads {
+                    net: pad.net,
+                    pads: vec![pad.label],
+                }),
+            }
+        }
+        unreached.sort_by(|a, b| a.net.cmp(&b.net));
+    }
+    let clean = !risen.iter().any(|row| row.severity == "error")
+        && starved_thermals <= starved_thermals_before
+        && unreached.is_empty();
+    Ok(FillCheck {
+        fills,
+        open,
+        risen,
+        starved_thermals_before,
+        starved_thermals,
+        unreached,
+        thermal_steps: Vec::new(),
+        clean,
+    })
+}
+
+/// The folder of one call: `<state>/pour-plans/<stamp>-<the first 8 characters of the
+/// SHA-256 of board_text>`, created with its parents. One that exists already is an
+/// error: two calls never share a folder.
+pub(crate) fn run_folder(state: &Path, board_text: &str, stamp: &str) -> Result<PathBuf> {
+    let plans = state.join(PLANS_FOLDER);
+    std::fs::create_dir_all(&plans).with_context(|| format!("create '{}'", plans.display()))?;
+    let digest = crate::place_held::sha256_hex(board_text.as_bytes());
+    let folder = plans.join(format!("{stamp}-{}", &digest[..8]));
+    std::fs::create_dir(&folder)
+        .with_context(|| format!("create the plan's folder '{}'", folder.display()))?;
+    Ok(folder)
+}
+
+/// A scratch project in `folder/<name>`: the project files beside `board`
+/// (`scratch_board::copy_project`) and `text` written as the board. The scratch copy's
+/// project reports what a pour changes whatever the project's own severities say, in the
+/// scratch copy only: the four rules a pour can break at least as warnings
+/// (`length_probe::force_prune_severities`: isolated copper and starved thermals among
+/// them), and unconnected items as errors (`length_probe::force_check_severities`), so
+/// that `open` counts real items on a project that ignores them. Returns the scratch
+/// board's path.
+fn scratch(folder: &Path, name: &str, board: &Path, text: &str) -> Result<PathBuf> {
+    let copy = crate::scratch_board::copy_project(board, &folder.join(name))?;
+    std::fs::write(&copy, text).with_context(|| format!("write '{}'", copy.display()))?;
+    crate::length_probe::force_prune_severities(&copy)?;
+    crate::length_probe::force_check_severities(&copy)?;
+    Ok(copy)
+}
+
+/// The check of one plan, in `folder` (made by [`run_folder`]):
+/// 1. [`scratch`] of [`WITHOUT`] with `board_text`, and of [`WITH`] with
+///    `pour_plan::with_zones(board_text, zones)`.
+/// 2. `refill` on each, one after the other: the two runs share one settings folder,
+///    and kicad-cli saves its settings again when it exits.
+/// 3. [`verdict`] of the two reports and the refilled `with` board, which is read and
+///    parsed off the async threads.
+/// 4. PP16: only when that fill has a thermal fault ([`thermal_fault`]), a second fill:
+///    `pour_plan::with_thermal_step(zones, 1)` in [`WITH_THERMAL_1`], refilled and judged
+///    against the same report of the board without the proposals (that board is refilled
+///    once). [`keep_second`] picks the fill whose proposals and check are returned, and
+///    `thermal_steps` gets one row a fill.
+///
+/// A step that fails is an error that names the step. The folder is kept either way: it
+/// is the record of what KiCad was shown, both fills included.
+pub(crate) async fn check(
+    folder: &Path,
+    board: &Path,
+    board_text: &str,
+    zones: &[ProposedZone],
+    refill: &dyn Refill,
+) -> Result<CheckedPlan> {
+    let without = scratch(folder, WITHOUT, board, board_text)
+        .context("step 1, the scratch project of the board as it was read")?;
+    let with_text = crate::pour_plan::with_zones(board_text, zones)
+        .context("step 1, the board with the proposals")?;
+    let with = scratch(folder, WITH, board, &with_text)
+        .context("step 1, the scratch project of the board with the proposals")?;
+    let report_without = refill
+        .refill(&without)
+        .await
+        .context("step 2, kicad-cli's refill and DRC of the board as it was read")?;
+    let first = fill_and_judge(&with, zones, &report_without, refill, "step 2").await?;
+    let mut steps = vec![step_row(zones, &first)];
+    if !thermal_fault(&first) {
+        steps[0].kept = true;
+        let mut check = first;
+        check.thermal_steps = steps;
+        return Ok(CheckedPlan {
+            zones: zones.to_vec(),
+            check,
+        });
+    }
+    let stepped = crate::pour_plan::with_thermal_step(zones, 1)
+        .context("step 4, the plan at the second thermal values")?;
+    let with_text = crate::pour_plan::with_zones(board_text, &stepped)
+        .context("step 4, the board with the proposals at the second thermal values")?;
+    let second_board = scratch(folder, WITH_THERMAL_1, board, &with_text)
+        .context("step 4, the scratch project of the second fill")?;
+    let second = fill_and_judge(&second_board, &stepped, &report_without, refill, "step 4").await?;
+    steps.push(step_row(&stepped, &second));
+    let second_kept = keep_second(&first, &second);
+    steps[usize::from(second_kept)].kept = true;
+    let (zones, mut check) = if second_kept {
+        (stepped, second)
+    } else {
+        (zones.to_vec(), first)
+    };
+    check.thermal_steps = steps;
+    Ok(CheckedPlan { zones, check })
+}
+
+/// The refill of the scratch board `board` (written by [`scratch`]) and its [`verdict`]
+/// against `without`. `what` names the step in an error.
+async fn fill_and_judge(
+    board: &Path,
+    zones: &[ProposedZone],
+    without: &DrcReport,
+    refill: &dyn Refill,
+    what: &str,
+) -> Result<FillCheck> {
+    let report = refill.refill(board).await.with_context(|| {
+        format!(
+            "{what}, kicad-cli's refill and DRC of the board with the proposals ('{}')",
+            board.display()
+        )
+    })?;
+    let board = board.to_path_buf();
+    let zones = zones.to_vec();
+    let without = without.clone();
+    tokio::task::spawn_blocking(move || {
+        let refilled = std::fs::read_to_string(&board)
+            .with_context(|| format!("read the refilled board '{}'", board.display()))?;
+        verdict(&zones, &without, &report, &refilled, &board)
+    })
+    .await
+    .with_context(|| format!("{what}, the verdict"))?
+    .with_context(|| format!("{what}, the verdict"))
+}
+
+/// One row of `thermal_steps`: the fill's thermal values (the first proposal's: every
+/// proposal of one fill carries one step's values, and its bridge differs only where a
+/// minimum width is above the step's floor) and its outcome.
+fn step_row(zones: &[ProposedZone], check: &FillCheck) -> ThermalStep {
+    let (gap, bridge) = zones
+        .first()
+        .map(|zone| {
+            (
+                zone.settings.thermal_gap_mm,
+                zone.settings.thermal_bridge_mm,
+            )
+        })
+        .unwrap_or((f64::NAN, f64::NAN));
+    ThermalStep {
+        thermal_gap_mm: gap,
+        thermal_bridge_mm: bridge,
+        starved_thermals: check.starved_thermals,
+        unreached_pads: check.unreached.iter().map(|net| net.pads.len()).sum(),
+        clean: check.clean,
+        kept: false,
+    }
+}
+
+#[cfg(test)]
+#[path = "pour_check_tests.rs"]
+mod tests;

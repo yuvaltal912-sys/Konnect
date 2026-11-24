@@ -513,6 +513,327 @@ impl PadConnection {
     }
 }
 
+/// Row ZR, stage ZR4: the largest `island_min_area` `add_zone` takes, mm². KiCad reads
+/// the file's `island_area_min` into a 32-bit count of nanometres
+/// (`pcb_io_kicad_sexpr_parser.cpp`, `T_island_area_min`), which holds 2147 mm².
+pub(crate) const MAX_ISLAND_AREA_MM2: f64 = 2000.0;
+
+/// Row ZR, stage ZR4: everything a caller may choose about how a zone fills, read and
+/// checked once for both of `add_zone`'s paths (IPC and the file fallback) and for the
+/// pour planner, whose proposals carry one (`pour_plan::ProposedZone`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ZoneSettings {
+    pub clearance_mm: f64,
+    pub min_width_mm: f64,
+    /// Higher wins where zones overlap.
+    pub priority: u32,
+    pub connection: PadConnection,
+    /// The gap around a pad that connects by thermal relief.
+    pub thermal_gap_mm: f64,
+    /// The width of a thermal spoke. Never below `min_width_mm`: KiCad makes no spoke
+    /// narrower than the zone's minimum width (`zone_filler.cpp`, `spoke_w`).
+    pub thermal_bridge_mm: f64,
+    pub islands: builders::ZoneIslands,
+}
+
+impl ZoneSettings {
+    /// The settings of `add_zone`'s arguments, each read by its literal name:
+    /// - `clearance` (default [`DEFAULT_ZONE_CLEARANCE_MM`]), `min_width` (default
+    ///   [`DEFAULT_ZONE_MIN_WIDTH_MM`]), `priority` (default 0), `pad_connection`
+    ///   (default thermal): as before this stage;
+    /// - `thermal_gap`: default `builders::ZONE_THERMAL_RELIEF_MM`;
+    /// - `thermal_bridge_width`: when absent, the larger of
+    ///   `builders::ZONE_THERMAL_RELIEF_MM` and the minimum width, so that a call that
+    ///   only raises `min_width` still gets spokes;
+    /// - `island_removal`: `always` (default), `never` or `below_area`;
+    /// - `island_min_area`: mm², required with `below_area` and refused with any other
+    ///   mode (an argument that is read by nothing is not accepted).
+    ///
+    /// `Err(message)` for a value of the wrong type, an unknown `pad_connection` or
+    /// `island_removal`, and everything [`ZoneSettings::check`] refuses.
+    ///
+    /// `add_zone_impl` calls this before it tries either path: a call it refuses has
+    /// reached neither KiCad (`attempt_ipc_write`) nor the board file.
+    pub(crate) fn from_args(args: &serde_json::Value) -> Result<ZoneSettings, String> {
+        fn given<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+            args.get(key).filter(|value| !value.is_null())
+        }
+        fn number(args: &serde_json::Value, key: &str, default: f64) -> Result<f64, String> {
+            match given(args, key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_f64()
+                    .ok_or_else(|| format!("{key} must be a number of millimetres, got {value}")),
+            }
+        }
+        fn word<'a>(args: &'a serde_json::Value, key: &str) -> Result<Option<&'a str>, String> {
+            match given(args, key) {
+                None => Ok(None),
+                Some(value) => value
+                    .as_str()
+                    .map(Some)
+                    .ok_or_else(|| format!("{key} must be a string, got {value}")),
+            }
+        }
+
+        let clearance_mm = number(args, "clearance", DEFAULT_ZONE_CLEARANCE_MM)?;
+        let min_width_mm = number(args, "min_width", DEFAULT_ZONE_MIN_WIDTH_MM)?;
+        let priority = match given(args, "priority") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "priority must be a whole number from 0 to {}, got {value}",
+                        u32::MAX
+                    )
+                })?,
+        };
+        let connection = PadConnection::parse(word(args, "pad_connection")?)?;
+        let thermal_gap_mm = number(
+            args,
+            "thermal_gap",
+            konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM,
+        )?;
+        let thermal_bridge_mm = number(
+            args,
+            "thermal_bridge_width",
+            konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM.max(min_width_mm),
+        )?;
+        let area = given(args, "island_min_area");
+        let islands = match word(args, "island_removal")?.unwrap_or("always") {
+            mode @ ("always" | "never") => {
+                if area.is_some() {
+                    return Err(format!(
+                        "island_min_area is only read with island_removal 'below_area'; it was \
+                         given with '{mode}'. Leave it out, or set island_removal to 'below_area'."
+                    ));
+                }
+                if mode == "always" {
+                    builders::ZoneIslands::Always
+                } else {
+                    builders::ZoneIslands::Never
+                }
+            }
+            "below_area" => {
+                let Some(value) = area else {
+                    return Err(
+                        "island_min_area is required with island_removal 'below_area': the \
+                         area in mm² below which an island is removed."
+                            .to_string(),
+                    );
+                };
+                let area_mm2 = value.as_f64().ok_or_else(|| {
+                    format!("island_min_area must be a number of mm², got {value}")
+                })?;
+                builders::ZoneIslands::BelowArea { area_mm2 }
+            }
+            other => {
+                return Err(format!(
+                    "Unknown island_removal '{other}'. Expected 'always', 'never' or 'below_area'."
+                ))
+            }
+        };
+        let settings = ZoneSettings {
+            clearance_mm,
+            min_width_mm,
+            priority,
+            connection,
+            thermal_gap_mm,
+            thermal_bridge_mm,
+            islands,
+        };
+        settings.check()?;
+        Ok(settings)
+    }
+
+    /// Why these values cannot make a zone, each message naming the argument:
+    /// - a clearance or thermal gap that is not a finite number of 0 or more;
+    /// - a minimum width or thermal bridge that is not finite and above 0;
+    /// - a thermal bridge below the minimum width (KiCad would make no spoke at all, and
+    ///   every thermal pad of the net would stay unconnected);
+    /// - an island area that is not finite, not above 0, or above
+    ///   [`MAX_ISLAND_AREA_MM2`].
+    pub(crate) fn check(&self) -> Result<(), String> {
+        for (key, value) in [
+            ("clearance", self.clearance_mm),
+            ("thermal_gap", self.thermal_gap_mm),
+        ] {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(format!(
+                    "{key} must be a finite number of 0 mm or more, got {value}"
+                ));
+            }
+        }
+        for (key, value) in [
+            ("min_width", self.min_width_mm),
+            ("thermal_bridge_width", self.thermal_bridge_mm),
+        ] {
+            if !(value.is_finite() && value > 0.0) {
+                return Err(format!(
+                    "{key} must be a finite number above 0 mm, got {value}"
+                ));
+            }
+        }
+        if self.thermal_bridge_mm < self.min_width_mm {
+            return Err(format!(
+                "thermal_bridge_width {} mm is below min_width {} mm: KiCad makes no spoke \
+                 narrower than the zone's minimum width, so every thermal pad of the net would \
+                 stay unconnected. Give a thermal_bridge_width of at least {} mm.",
+                self.thermal_bridge_mm, self.min_width_mm, self.min_width_mm
+            ));
+        }
+        if let builders::ZoneIslands::BelowArea { area_mm2 } = self.islands {
+            if !(area_mm2.is_finite() && area_mm2 > 0.0 && area_mm2 <= MAX_ISLAND_AREA_MM2) {
+                return Err(format!(
+                    "island_min_area must be above 0 mm² and at most {MAX_ISLAND_AREA_MM2} mm², \
+                     got {area_mm2}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// These settings as `add_zone` arguments, the inverse of
+    /// [`ZoneSettings::from_args`]: `clearance`, `min_width`, `priority`,
+    /// `pad_connection`, `thermal_gap`, `thermal_bridge_width`, `island_removal` and,
+    /// for `below_area` only, `island_min_area`. Every key is written, the defaults
+    /// included.
+    pub(crate) fn to_args(self) -> serde_json::Map<String, serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        args.insert("clearance".into(), json!(self.clearance_mm));
+        args.insert("min_width".into(), json!(self.min_width_mm));
+        args.insert("priority".into(), json!(self.priority));
+        args.insert("pad_connection".into(), json!(self.connection.as_str()));
+        args.insert("thermal_gap".into(), json!(self.thermal_gap_mm));
+        args.insert("thermal_bridge_width".into(), json!(self.thermal_bridge_mm));
+        args.insert("island_removal".into(), json!(self.island_removal()));
+        if let builders::ZoneIslands::BelowArea { area_mm2 } = self.islands {
+            args.insert("island_min_area".into(), json!(area_mm2));
+        }
+        args
+    }
+
+    /// The zone `add_zone`'s IPC path sends for these settings (`builders::build_zone`).
+    /// One mapping, so that the file path ([`zone_sexp`]) and this one cannot drift.
+    pub(crate) fn spec<'a>(
+        &self,
+        layer: &'a str,
+        net_name: &'a str,
+        points: &'a [(f64, f64)],
+        name: &'a str,
+    ) -> builders::ZoneSpec<'a> {
+        builders::ZoneSpec {
+            layer,
+            net_name,
+            points,
+            clearance_mm: self.clearance_mm,
+            min_thickness_mm: self.min_width_mm,
+            name,
+            priority: self.priority,
+            connection: self.connection.as_ipc(),
+            thermal_gap_mm: self.thermal_gap_mm,
+            thermal_bridge_mm: self.thermal_bridge_mm,
+            islands: self.islands,
+        }
+    }
+
+    /// The `island_removal` word of these settings.
+    fn island_removal(&self) -> &'static str {
+        match self.islands {
+            builders::ZoneIslands::Always => "always",
+            builders::ZoneIslands::Never => "never",
+            builders::ZoneIslands::BelowArea { .. } => "below_area",
+        }
+    }
+
+    /// The island area `add_zone`'s result echoes: the area for `below_area`, else none.
+    fn island_min_area(&self) -> Option<f64> {
+        match self.islands {
+            builders::ZoneIslands::BelowArea { area_mm2 } => Some(area_mm2),
+            builders::ZoneIslands::Always | builders::ZoneIslands::Never => None,
+        }
+    }
+}
+
+/// Row ZR, stage ZR4: the `(zone …)` text of `add_zone`'s file fallback, with the
+/// settings. It is also what the pour planner writes into its scratch boards
+/// (`pour_plan::with_zones`), so that the zone KiCad checks for a plan is the zone
+/// `add_zone` writes.
+///
+/// A zone in the board's own format: KiCad 10 gets `(net "GND")` and `(layers …)`,
+/// a legacy board keeps the id and `(net_name …)` pair and a singular `(layer …)`; the
+/// net reference comes from [`konnect_sexp::net::net_ref_for_write`], resolved
+/// structurally, never by string offset (#192). Then the optional name and priority (left
+/// out at their defaults, as pcbnew does), `(hatch edge 0.508)`, `(connect_pads …)` with
+/// the clearance, `(min_thickness …)`, and `(fill yes (thermal_gap …)
+/// (thermal_bridge_width …))` from the settings, with `(island_removal_mode N)` inside
+/// it only when `settings.islands` is not `Always`, followed for `BelowArea` by
+/// `(island_area_min A)`. With the default settings the text is byte for byte what
+/// `add_zone` wrote before this stage, apart from the fresh UUID (a test keeps that old
+/// text as its oracle).
+///
+/// The net's name and the layer are written escaped, as the zone's name already is: the
+/// planner writes names it read off the board, and one that holds `"` or `\` must come
+/// back out as text KiCad and Konnect's own parser read. The two nodes come from
+/// `konnect_sexp::net::NetRef::zone_net_nodes` and `zone_layer_node`, which this stage
+/// makes escape `\` and `"` (they wrote the name raw); a name without those two
+/// characters is written as before.
+pub(crate) fn zone_sexp(
+    net: &konnect_sexp::net::NetRef,
+    layer: &str,
+    points: &[(f64, f64)],
+    name: &str,
+    settings: &ZoneSettings,
+) -> String {
+    let uuid = new_uuid();
+    let pts: String = points
+        .iter()
+        .map(|(x, y)| format!("\n      (xy {x} {y})"))
+        .collect();
+    // KiCad omits both of these at their defaults, and so do we: an explicit
+    // `(priority 0)` is legal but is not what pcbnew writes.
+    let name_node = if name.is_empty() {
+        String::new()
+    } else {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\n    (name \"{escaped}\")")
+    };
+    let priority_node = if settings.priority == 0 {
+        String::new()
+    } else {
+        format!("\n    (priority {})", settings.priority)
+    };
+    // KiCad writes no island node for its default (always removed).
+    let island_nodes = match settings.islands {
+        builders::ZoneIslands::Always => String::new(),
+        builders::ZoneIslands::Never => format!(
+            " (island_removal_mode {})",
+            builders::ZoneIslands::Never.file_mode()
+        ),
+        builders::ZoneIslands::BelowArea { area_mm2 } => format!(
+            " (island_removal_mode {}) (island_area_min {area_mm2})",
+            settings.islands.file_mode()
+        ),
+    };
+    let connect = settings.connection.sexp_token();
+    let hatch_pitch = builders::ZONE_BORDER_PITCH_MM;
+    format!(
+        "\n  (zone {net_nodes} {layer_node}{name_node} (uuid \"{uuid}\"){priority_node}\n    \
+         (hatch edge {hatch_pitch})\n    (connect_pads{connect} (clearance {clearance}))\n    \
+         (min_thickness {min_width})\n    \
+         (fill yes (thermal_gap {gap}) (thermal_bridge_width {bridge}){island_nodes})\n    \
+         (polygon (pts{pts}\n    ))\n  )",
+        net_nodes = net.zone_net_nodes(),
+        layer_node = net.zone_layer_node(layer),
+        clearance = settings.clearance_mm,
+        min_width = settings.min_width_mm,
+        gap = settings.thermal_gap_mm,
+        bridge = settings.thermal_bridge_mm,
+    )
+}
+
 /// The JSON schema both zone tools advertise. One definition so `add_zone` and
 /// `add_copper_pour` cannot drift apart again.
 pub(crate) fn zone_schema() -> serde_json::Value {
@@ -536,6 +857,25 @@ pub(crate) fn zone_schema() -> serde_json::Value {
                 "description": "How the pour attaches to pads on its net",
                 "enum": ["solid", "thermal", "none"],
                 "default": "thermal"
+            },
+            "thermal_gap": {
+                "type": "number",
+                "description": "Gap in mm between a thermal-relief pad and the pour, 0 or more",
+                "default": builders::ZONE_THERMAL_RELIEF_MM
+            },
+            "thermal_bridge_width": {
+                "type": "number",
+                "description": "Width in mm of a thermal spoke, not below min_width (KiCad makes no narrower spoke). Default: the larger of 0.5 and min_width"
+            },
+            "island_removal": {
+                "type": "string",
+                "description": "What KiCad does with a fill piece that touches nothing of the net: remove it ('always'), keep it ('never'), or remove it when smaller than island_min_area ('below_area')",
+                "enum": ["always", "never", "below_area"],
+                "default": "always"
+            },
+            "island_min_area": {
+                "type": "number",
+                "description": "With island_removal 'below_area' only, and required there: the area in mm² (above 0, at most 2000) below which an island is removed"
             }
         },
         "required": ["board", "net_name", "layer", "points"]
@@ -942,58 +1282,6 @@ fn format_npth_footprint(x: f64, y: f64, spec: &MountingHoleSpec) -> String {
     )
 }
 
-/// A zone S-expression in the same format the rest of the board uses: KiCad 10
-/// gets `(net "GND")` and `(layers …)`, legacy boards keep the id +
-/// `(net_name …)` pair and singular `(layer …)`. The net reference comes from
-/// [`konnect_sexp::net::net_ref_for_write`] — resolved structurally, never by
-/// string offset, which is how zones used to land on net 0 (#192).
-///
-/// Only the fallback path writes this; the live-KiCad path goes through
-/// [`konnect_ipc::builders::build_zone`], and the two are kept in step by
-/// sharing the thermal-relief and hatch-pitch constants.
-#[allow(clippy::too_many_arguments)]
-fn format_zone_polygon(
-    net: &konnect_sexp::net::NetRef,
-    layer: &str,
-    clearance: f64,
-    min_width: f64,
-    points: &[(f64, f64)],
-    name: &str,
-    priority: u32,
-    connection: PadConnection,
-) -> String {
-    let uuid = new_uuid();
-    let pts: String = points
-        .iter()
-        .map(|(x, y)| format!("\n      (xy {x} {y})"))
-        .collect();
-    // KiCad omits both of these at their defaults, and so do we: an explicit
-    // `(priority 0)` is legal but is not what pcbnew writes.
-    let name_node = if name.is_empty() {
-        String::new()
-    } else {
-        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\n    (name \"{escaped}\")")
-    };
-    let priority_node = if priority == 0 {
-        String::new()
-    } else {
-        format!("\n    (priority {priority})")
-    };
-    let connect = connection.sexp_token();
-    let thermal = konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM;
-    let hatch_pitch = konnect_ipc::builders::ZONE_BORDER_PITCH_MM;
-    format!(
-        "\n  (zone {net_nodes} {layer_node}{name_node} (uuid \"{uuid}\"){priority_node}\n    \
-         (hatch edge {hatch_pitch})\n    (connect_pads{connect} (clearance {clearance}))\n    \
-         (min_thickness {min_width})\n    \
-         (fill yes (thermal_gap {thermal}) (thermal_bridge_width {thermal}))\n    \
-         (polygon (pts{pts}\n    ))\n  )",
-        net_nodes = net.zone_net_nodes(),
-        layer_node = net.zone_layer_node(layer),
-    )
-}
-
 /// A standalone filled polygon graphic (`gr_poly`), not tied to a net or zone
 /// fill — used for imported artwork rather than copper pours.
 fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
@@ -1321,6 +1609,8 @@ pub fn tools() -> Vec<ToolDef> {
         super::board_stackup::tool(),
     ];
     tools.extend(board_construction::tools());
+    // Row ZR, stage ZR4: the pour planner, beside the zone tools it hands its plan to.
+    tools.extend(super::pour_plan_tool::tools());
     tools
 }
 
@@ -2776,16 +3066,13 @@ pub(crate) async fn add_zone_impl(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let clearance = args["clearance"]
-        .as_f64()
-        .unwrap_or(DEFAULT_ZONE_CLEARANCE_MM);
-    let min_width = args["min_width"]
-        .as_f64()
-        .unwrap_or(DEFAULT_ZONE_MIN_WIDTH_MM);
     let zone_name = args["name"].as_str().unwrap_or("").to_string();
-    let priority = args["priority"].as_u64().unwrap_or(0) as u32;
-    let connection = match PadConnection::parse(args["pad_connection"].as_str()) {
-        Ok(v) => v,
+    // Read and checked once, before either path is tried: a refused call has reached
+    // neither KiCad nor the board file. The literal names are what the schema guard
+    // reads: "clearance", "min_width", "priority", "pad_connection", "thermal_gap",
+    // "thermal_bridge_width", "island_removal", "island_min_area".
+    let settings = match ZoneSettings::from_args(args) {
+        Ok(settings) => settings,
         Err(message) => return Ok(CallToolResult::error(message)),
     };
     let pts_arr = match args["points"].as_array() {
@@ -2808,8 +3095,12 @@ pub(crate) async fn add_zone_impl(
             "layer": layer,
             "point_count": points.len(),
             "name": zone_name,
-            "priority": priority,
-            "pad_connection": connection.as_str(),
+            "priority": settings.priority,
+            "pad_connection": settings.connection.as_str(),
+            "thermal_gap": settings.thermal_gap_mm,
+            "thermal_bridge_width": settings.thermal_bridge_mm,
+            "island_removal": settings.island_removal(),
+            "island_min_area": settings.island_min_area(),
         })
     };
 
@@ -2818,16 +3109,7 @@ pub(crate) async fn add_zone_impl(
     let name_ipc = zone_name.clone();
     let points_ipc = points.clone();
     let ipc_attempt = attempt_ipc_write(ctx, &board_path, "zone", move |c| {
-        c.add_zone(&konnect_ipc::builders::ZoneSpec {
-            layer: &layer_ipc,
-            net_name: &net_ipc,
-            points: &points_ipc,
-            clearance_mm: clearance,
-            min_thickness_mm: min_width,
-            name: &name_ipc,
-            priority,
-            connection: connection.as_ipc(),
-        })
+        c.add_zone(&settings.spec(&layer_ipc, &net_ipc, &points_ipc, &name_ipc))
     })
     .await?;
 
@@ -2856,12 +3138,10 @@ pub(crate) async fn add_zone_impl(
             board_path.display()
         )));
     };
-    let zone_sexp = format_zone_polygon(
-        &net, &layer, clearance, min_width, &points, &zone_name, priority, connection,
-    );
+    let zone_text = zone_sexp(&net, &layer, &points, &zone_name, &settings);
 
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_text)]);
     write_atomic(&board_path, &new_content)?;
 
     let mut body = describe();
@@ -5919,3 +6199,7 @@ mod single_board_lookup_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pcb_board_zone_tests.rs"]
+mod zone_settings_tests;

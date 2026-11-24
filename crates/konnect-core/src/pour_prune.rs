@@ -6,6 +6,7 @@
 //! Nothing here writes to the user's board or project: every board is a scratch copy
 //! under the search folder's `judge` folder.
 
+use crate::pour_rank::{PourKey, RankMode};
 use crate::route_judge::{
     self, Baseline, Gates, JudgeContext, Judged, Key, Measures, OwnConfig, ScratchError, ToolCaller,
 };
@@ -613,7 +614,9 @@ fn loops_worse(original: &AuditItems, candidate: &AuditItems) -> bool {
 /// `rest` of all three (the candidate's must be there; `original` and `current` always
 /// have it; when one is missing the clause is `unchecked`):
 /// - `key:<position>` for every entry but the last (seconds) of the candidate's key that
-///   is above the current's: `route_judge::rank_measures` over the two, both in the pool.
+///   is above the current's: the call's ranking key over the two, both in the pool
+///   (`pour_rank::ranking` with `rank`, then `pour_rank::entries_above`; Row ZR, ZR5
+///   part 2, PK12), so the position is the ranking key's.
 /// - `stitching`: (e), against `current`. `None` on both sides passes; `None` on one
 ///   side refuses.
 /// - `unscored`: (g), `current.scored` is not a subset of the candidate's.
@@ -624,7 +627,12 @@ fn loops_worse(original: &AuditItems, candidate: &AuditItems) -> bool {
 ///   above the original's plus [`LOOP_TOLERANCE_MM`]; the mean area above plus
 ///   [`LOOP_AREA_TOLERANCE_MM2`]; a pin of both `pin_loops` longer or larger by more than
 ///   the same tolerances; a value that was `Some` and is `None`.
-pub(crate) fn refusals(original: &Checked, current: &Checked, candidate: &Checked) -> Vec<String> {
+pub(crate) fn refusals(
+    original: &Checked,
+    current: &Checked,
+    candidate: &Checked,
+    rank: RankMode,
+) -> Vec<String> {
     let drc = drc_refusals(current, candidate.unconnected, &candidate.violations);
     if !drc.is_empty() {
         return drc;
@@ -635,20 +643,16 @@ pub(crate) fn refusals(original: &Checked, current: &Checked, candidate: &Checke
     };
     let mut out = Vec::new();
 
-    let keys = crate::route_judge::rank_measures(&[
-        (&now.measures, &now.gates, true),
-        (&next.measures, &next.gates, true),
-    ]);
+    let keys = crate::pour_rank::ranking(
+        rank,
+        &[
+            (&now.measures, &now.gates, true),
+            (&next.measures, &next.gates, true),
+        ],
+    );
     // Every entry but the last (the route seconds).
-    for (position, (now, next)) in keys[0]
-        .iter()
-        .zip(&keys[1])
-        .take(crate::route_judge::KEY_LEN - 1)
-        .enumerate()
-    {
-        if next > now {
-            out.push(format!("key:{position}"));
-        }
+    for position in crate::pour_rank::entries_above(&keys[0], &keys[1]) {
+        out.push(format!("key:{position}"));
     }
 
     let stitching_worse = match (
@@ -740,6 +744,8 @@ struct Run<'a> {
     current: Checked,
     removed: BTreeSet<usize>,
     checks: usize,
+    /// The key clause (c) reads (PK12).
+    rank: RankMode,
 }
 
 /// Why the loop stopped early.
@@ -764,7 +770,7 @@ impl Run<'_> {
                 Ok(Attempt::Refused(BTreeSet::from(["importer".to_string()])))
             }
             Ok(CheckOutcome::Checked(checked)) => {
-                let refused = refusals(self.original, &self.current, &checked);
+                let refused = refusals(self.original, &self.current, &checked, self.rank);
                 if refused.is_empty() {
                     Ok(Attempt::Accepted(checked))
                 } else {
@@ -869,12 +875,14 @@ fn kept(
 /// So `current` is always the result of one real check of exactly `removed`; by (a),
 /// (b), (c), (e) and (g) it is never worse than the state before it, and by (d) and (f)
 /// never worse than the original beyond one tolerance.
-/// Deterministic: text order, no clock, no random number.
+/// Deterministic: text order, no clock, no random number. Clause (c) reads the key of
+/// `rank`, the call's mode (Row ZR, ZR5 part 2).
 pub(crate) async fn prune_loop(
     ses_text: &str,
     units: &[Unit],
     original: &Checked,
     checker: &dyn Checker,
+    rank: RankMode,
 ) -> Pruned {
     let mut run = Run {
         ses_text,
@@ -884,6 +892,7 @@ pub(crate) async fn prune_loop(
         current: original.clone(),
         removed: BTreeSet::new(),
         checks: 0,
+        rank,
     };
     let mut last_with = BTreeMap::new();
     let mut last_alone = BTreeMap::new();
@@ -1196,8 +1205,9 @@ fn winner_of(ctx: &JudgeContext, outcome: &SearchOutcome) -> std::result::Result
 }
 
 /// The first clause of P9 that refuses the pruned session's full judge against the
-/// original's, `None` when the pruned one may replace it.
-fn full_judge_refusal(original: &Judged, pruned: &Judged) -> Option<String> {
+/// original's, `None` when the pruned one may replace it. The key clause compares the
+/// two under `rank`, the call's ranking key (Row ZR, ZR5 part 2, PK12).
+fn full_judge_refusal(original: &Judged, pruned: &Judged, rank: RankMode) -> Option<String> {
     let gates = &pruned.gates;
     if let Some(line) = gates
         .g1
@@ -1217,10 +1227,11 @@ fn full_judge_refusal(original: &Judged, pruned: &Judged) -> Option<String> {
             pruned.rounds.len()
         ));
     }
-    let keys = route_judge::rank(&[original, pruned]);
+    let keys = crate::pour_rank::ranking_of(rank, &[original, pruned]);
     let (was, now) = (keys.first()?, keys.get(1)?);
-    (0..route_judge::KEY_LEN - 1)
-        .find(|&position| now[position] > was[position])
+    crate::pour_rank::entries_above(was, now)
+        .first()
+        .copied()
         .map(|position| {
             format!(
                 "the pruned session's rank key is above the original's at position {position} ({} > {})",
@@ -1364,7 +1375,7 @@ async fn decide_with(
     }
 
     // 4. The loop.
-    let pruned = prune_loop(text, &units, &original, checker).await;
+    let pruned = prune_loop(text, &units, &original, checker, ctx.rank).await;
     let removed: Vec<&Unit> = pruned
         .removed
         .iter()
@@ -1423,7 +1434,7 @@ async fn decide_with(
     };
     record.checks += kicad_runs_of(&judged);
     record.audits += 1;
-    if let Some(refused) = full_judge_refusal(&winner.judged, &judged) {
+    if let Some(refused) = full_judge_refusal(&winner.judged, &judged, ctx.rank) {
         return Decision {
             record: record.ended("rejected", refused),
             kept: None,
@@ -1461,9 +1472,18 @@ fn board_or_null(judged: &Judged) -> Value {
     }
 }
 
-/// Every judged run's key, by index, with the winner's judged replaced by `pruned`: one
-/// `rank` call over every judged run, as the search takes them.
-fn keys_with(outcome: &SearchOutcome, winner: usize, pruned: &Judged) -> Vec<Option<Key>> {
+/// What [`keys_with`] takes again: both keys and the ranking key of every judged run, by
+/// index.
+struct KeysAgain {
+    keys: Vec<Option<Key>>,
+    pour_keys: Vec<Option<PourKey>>,
+    ranking: Vec<Option<Vec<i64>>>,
+}
+
+/// Every judged run's keys, by index, with the winner's judged replaced by `pruned`: one
+/// call of each key over every judged run, as the search takes them (PK10), and the
+/// ranking key of `rank` (PK12).
+fn keys_with(outcome: &SearchOutcome, winner: usize, pruned: &Judged, rank: RankMode) -> KeysAgain {
     let judged: Vec<(usize, &Judged)> = outcome
         .runs
         .iter()
@@ -1477,24 +1497,42 @@ fn keys_with(outcome: &SearchOutcome, winner: usize, pruned: &Judged) -> Vec<Opt
             judged.map(|judged| (position, judged))
         })
         .collect();
-    let mut keys: Vec<Option<Key>> = vec![None; outcome.runs.len()];
+    let runs = outcome.runs.len();
+    let mut again = KeysAgain {
+        keys: vec![None; runs],
+        pour_keys: vec![None; runs],
+        ranking: vec![None; runs],
+    };
     let refs: Vec<&Judged> = judged.iter().map(|(_, judged)| *judged).collect();
-    for ((position, _), key) in judged.iter().zip(route_judge::rank(&refs)) {
-        if let Some(slot) = keys.get_mut(*position) {
-            *slot = Some(key);
+    let pooled: Vec<(&Measures, &Gates, bool)> = refs
+        .iter()
+        .map(|judged| (&judged.measures, &judged.gates, true))
+        .collect();
+    let today = route_judge::rank(&refs);
+    let poured = crate::pour_rank::pour_keys(&pooled);
+    let ranked = crate::pour_rank::ranking_of(rank, &refs);
+    for (((position, _), key), (pour_key, ranked)) in
+        judged.iter().zip(today).zip(poured.into_iter().zip(ranked))
+    {
+        if *position < runs {
+            again.keys[*position] = Some(key);
+            again.pour_keys[*position] = Some(pour_key);
+            again.ranking[*position] = Some(ranked);
         }
     }
-    keys
+    again
 }
 
-/// Step 5's replacement: the winner's session and judged become the pruned ones, and the
-/// keys are taken again. `Err` (nothing changed) when the winner would no longer rank
-/// first, which P9's key clause rules out.
+/// Step 5's replacement: the winner's session and judged become the pruned ones, and
+/// both keys are taken again. `Err` (nothing changed) when the winner would no longer
+/// rank first by the key of `rank`, which P9's key clause rules out. `before` holds the
+/// winner's two keys before the prune.
 fn replace_winner(
     outcome: &mut SearchOutcome,
     winner: usize,
     session: PathBuf,
     mut judged: Judged,
+    rank: RankMode,
 ) -> std::result::Result<Value, String> {
     let Some(record) = outcome.runs.get(winner) else {
         return Err("the winning record is gone".to_string());
@@ -1506,11 +1544,12 @@ fn replace_winner(
     // Row ZR, ZR1: the comparison is of the routing pass's board, which the pruned
     // session's judge does not make; the original run's stays with the run.
     crate::zone_fill::carry_comparison(&original.measures, &mut judged.measures);
-    let keys = keys_with(outcome, winner, &judged);
-    let first = keys
+    let again = keys_with(outcome, winner, &judged, rank);
+    let first = again
+        .ranking
         .iter()
         .enumerate()
-        .filter_map(|(position, key)| key.map(|key| (key, position)))
+        .filter_map(|(position, key)| key.as_ref().map(|key| (key, position)))
         .min()
         .map(|(_, position)| position);
     if first != Some(winner) {
@@ -1521,6 +1560,7 @@ fn replace_winner(
     let before = json!({
         "session": routed.held.ses.to_string_lossy(),
         "key": outcome.keys.get(winner).copied().flatten(),
+        "pour_key": outcome.pour_keys.get(winner).copied().flatten(),
         "judged_board": board_or_null(original),
     });
     if let Some(record) = outcome.runs.get_mut(winner) {
@@ -1529,7 +1569,8 @@ fn replace_winner(
         }
         record.judged = Some(judged);
     }
-    outcome.keys = keys;
+    outcome.keys = again.keys;
+    outcome.pour_keys = again.pour_keys;
     Ok(before)
 }
 
@@ -1551,10 +1592,11 @@ fn replace_winner(
 ///    (`write_new_atomic`) and judged in full: `route_judge::judge_session` on that file
 ///    in `judge/run-<index>-pruned`. An error: `failed`. P9: when every gate passes,
 ///    `rounds` is empty, and no entry but the last of the pruned key is above the
-///    original's (`rank` over the two): the winner's `routed.held.ses` becomes
-///    `pruned.ses`, its `judged` becomes the pruned one with the original's `tune`
-///    carried over, and `outcome.keys` is taken again by one `rank` call over every
-///    judged run (the winner does not change: its key did not rise). `pruned`. Else
+///    original's (the call's ranking key over the two, `ctx.rank`): the winner's
+///    `routed.held.ses` becomes `pruned.ses`, its `judged` becomes the pruned one with
+///    the original's `tune` carried over, and `outcome.keys` and `outcome.pour_keys` are
+///    taken again by one call of each key over every judged run (the winner does not
+///    change: its ranking key did not rise). `pruned`. Else
 ///    `rejected` with the first failing clause, `pruned.ses` and the `-pruned` judge
 ///    folder removed, `outcome` otherwise unchanged.
 /// 6. The loop's scratch folder `judge/run-<index>-prune` is removed in every case.
@@ -1614,7 +1656,7 @@ pub(crate) async fn prune_winner_with(
     let winner = outcome.winner;
     match (kept, winner) {
         (Some((session, judged)), Some(winner)) => {
-            match replace_winner(outcome, winner, session, judged) {
+            match replace_winner(outcome, winner, session, judged, ctx.rank) {
                 Ok(before) => record.before = Some(before),
                 Err(reason) => {
                     record = record.ended("rejected", reason);

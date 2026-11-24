@@ -482,6 +482,7 @@ fn the_zr0_measures_read_an_island_as_a_piece() {
 #[test]
 fn the_prunes_fill_clause_reads_an_island_as_fill() {
     use crate::pour_prune::{refusals, AuditItems, Checked, CheckedRest};
+    use crate::pour_rank::RankMode;
     use crate::route_judge::Gates;
     let gnd: BTreeSet<String> = ["GND".to_string()].into();
     let checked = |text: &str| Checked {
@@ -515,7 +516,10 @@ fn the_prunes_fill_clause_reads_an_island_as_fill() {
         checked(&island_board(true, true)),
         checked(&island_board(false, true)),
     ] {
-        assert_eq!(refusals(&original, &original, &lost), vec!["fill"]);
-        assert!(refusals(&original, &original, &original).is_empty());
+        assert_eq!(
+            refusals(&original, &original, &lost, RankMode::Routing),
+            vec!["fill"]
+        );
+        assert!(refusals(&original, &original, &original, RankMode::Routing).is_empty());
     }
 }

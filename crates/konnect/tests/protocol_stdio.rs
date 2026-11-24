@@ -1119,3 +1119,57 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     assert_eq!(last["location_path"], json!(bin_s), "{last}");
     assert_eq!(last["max_depth"], 1, "{last}");
 }
+
+/// Row ZR, ZR5 part 2 (PK9) over real stdio: `route_specctra_dsn` reads the user
+/// config's `routing.rank_key` on every fastroute call, even one that passes both
+/// `effort` and `fastroute_path` (which read nothing of the config before). A value
+/// that names no mode, and a config that does not parse, refuse the call as
+/// `invalid_configuration` before anything is made; `pours` is accepted, and the same
+/// call then stops at its DSN. Control: the setting read only when `effort` is absent.
+#[test]
+fn the_rank_key_is_read_on_every_fastroute_call_over_stdio() {
+    for (text, refused) in [
+        (r#"{"routing": {"rank_key": "pour"}}"#, true),
+        ("{not json", true),
+        (r#"{"routing": {"rank_key": "pours"}}"#, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = user_config_under(tmp.path());
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, text).unwrap();
+        let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+        McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "integration"})));
+        let result = p.call_tool(
+            "route_specctra_dsn",
+            json!({
+                "dsn_path": tmp.path().join("missing.dsn"),
+                "ses_output_path": tmp.path().join("out.ses"),
+                "engine": "fastroute",
+                "effort": "m",
+                "fastroute_path": tmp.path().join("no-fastroute"),
+            }),
+        );
+        assert_eq!(result["isError"], json!(true), "{text}: {result}");
+        let body = McpProcess::tool_body(&result);
+        if refused {
+            assert_eq!(
+                body["error"]["kind"], "invalid_configuration",
+                "{text}: {body}"
+            );
+        } else {
+            assert_ne!(
+                body["error"]["kind"], "invalid_configuration",
+                "{text}: {body}"
+            );
+        }
+        if text.contains("pour\"") {
+            assert!(
+                result.to_string().contains("routing.rank_key"),
+                "{text}: {result}"
+            );
+        }
+        // Nothing was made, and the config is as it was.
+        assert!(!tmp.path().join("out.search").exists(), "{text}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    }
+}
