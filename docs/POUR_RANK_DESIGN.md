@@ -111,7 +111,7 @@ Part 1 fixes what is measured. Part 2's steps and places are fixed here as the c
 and the replay computes that candidate, and any other, from part 1's rows on ZR3's runs
 before a line of part 2 is built.
 
-## Decisions (the code cites them as PK1 to PK18)
+## Decisions (the code cites them as PK1 to PK19)
 
 | # | Decision | Reason |
 |---|---|---|
@@ -121,7 +121,7 @@ before a line of part 2 is built.
 | PK4 | **Plane loss.** For each pour net: its plane before routing is its largest piece on any one layer; what is kept is its largest piece on any one layer after routing (on a layer, never more than that layer's largest piece before). The loss is the area no longer kept over the area of all the nets' planes, a share from 0 to 1. In the key it is stepped at 5 % | The checklist's "keep one side largely continuous": one whole reference plane is what a return path needs, so the best single layer counts. One number sees a split (the largest piece shrinks to a part) and a slot or a lost island (it loses area). Weighted by area, because with equal weights a 30 mm² local pour cut by one track would count like a fifth of the ground plane (the review). By area and not by each layer's ratio, so that a small layer that stayed whole cannot hide a plane that was destroyed |
 | PK5 | **Pour faults** are KiCad's `starved_thermal` violations on the judged board plus the pour layers that had fill before routing and have none after. One entry, a count, before the plane loss | Each is a spot where a pour stopped doing its job. KiCad calls a starved thermal an error by default. Gate G2 only holds it to the unrouted board's count, and ZR2's matrix has a winner with one more than other runs |
 | PK6 | **Area loss** is the pour copper that is gone: 1 minus the fill area after routing over the fill area before, over every pour layer. In the key it is stepped at 1 %, after the vias. The pieces stay recorded (ZR0) and are not ranked | KiCad deletes a cut-off piece unless something of its net sits on it (`zone_filler.cpp:944`). So of two runs that cut the plane alike, the one whose cut-off piece is kept alive by a ground pad or via has one piece more and more copper. A piece count would rank it worse; the area ranks it better, which is also what the prune holds (P5(d): losing a via-fed island is harm). The first design ranked extra pieces; the review found this |
-| PK7 | **The pour-track step** is the track length on pour nets in units of 2 % of the shortest signal length of the pool (`LENGTH_STEP`). It is the last of the four, before the copper quality. Vias on pour nets are not in the key | A ground track that the pour already connects is copper the board does not need, as the owner's own rule says of ground vias (ZR0b). Under a pour it harms nothing electrically, so it breaks ties and never outranks a signal measure. The unit is the signal length because a board's own scale is the fair one and stubs of a few mm then tie. Ground vias are the prune's: it removes the redundant ones from the winner, so a count before the prune would rank vias that are not delivered |
+| PK7 | **The pour-track step** is the track length on pour nets in units of a share of the shortest signal length of the pool. *Its place and step are PK19's since 2026-11-24 (before the lengths, 5 %); first built as the last of the four, before the copper quality, at 2 % (`LENGTH_STEP`).* Vias on pour nets are not in the key | A ground track that the pour already connects is copper the board does not need, as the owner's own rule says of ground vias (ZR0b). Under a pour it harms nothing electrically, so it breaks ties and never outranks a signal measure. The unit is the signal length because a board's own scale is the fair one and stubs of a few mm then tie. Ground vias are the prune's: it removes the redundant ones from the winner, so a count before the prune would rank vias that are not delivered |
 | PK8 | A judge that took no pour record gives 0 in the three damage entries: a call with no pour net, and the prune's light judge. A run whose pour record was tried and failed, or has no damage, gets the largest number there | The first keeps today's order on a board without pours. The prune's light judge (`judge_light`) takes no pour record for any of the three boards it compares, so 0 on all three ranks nothing there; its loop guards the pours with its own clauses (no rule's count higher, no pour layer's fill lower), and its final comparison is of two full judges. The second is the key's own rule ("a measure the audit did not give sorts last"). It is still not a gate: a failed pour measure never fails a run (ZR0) |
 | PK9 | One setting says which key ranks: the user config's `routing.rank_key`, `routing` or `pours`. The default is `routing`. There is no tool argument. `route_specctra_dsn` reads it on every fastroute call, whatever arguments the call has | It is the owner's standing choice, like `routing.effort`, not something an AI picks per call. Today the user config is read only when a call leaves the effort to it (`prepare_call`), so a setting read "where the effort is read" would be ignored whenever `effort` is passed (the review) |
 | PK10 | Both keys are computed and written for every judged run, whatever the setting. Every call says which key ranked and which run the other key puts first among the boards this call judged | Z10 asks for numbers, and this gives them on every real call. It is a report on this call's boards, not a second search: each run's tuned board was chosen, and the winner pruned, under the key that ranked |
@@ -133,6 +133,7 @@ before a line of part 2 is built.
 | PK16 | Ranking candidate pour divisions by routing each one is not in this stage | It can only rank with the pour key, which is off until the owner's word. The measures are built so that it can: damage is against each candidate's own fill before routing, and the plane loss is a share of plane area, so a pour that is added and stays whole lowers it |
 | PK17 | Two PRs: the record first, the key after ZR3's numbers | The owner's order. It also lets numbers confirm the key's open values before they are code |
 | PK18 | The record carries its rows: the "before" rows in the baseline and the "after" rows in each run, beside the numbers made from them | So that a second computation can redo every number, and so that another step, place or sum can be tried on recorded runs without a new measurement (the review: totals alone cannot be checked) |
+| PK19 | **The pour-track step moves before the lengths, in steps of 5 %** (the owner's rule change, 2026-11-24). It is now the third of the pour entries, right after the plane-loss step and before the signal length step, and its unit is 5 % of the pool's shortest signal length instead of 2 %. This replaces PK7's place and step; nothing else in the key changes | The replay on the recorded runs ("The ground track before the lengths", below): with the track after the vias, B5 keeps a run whose pours were omitted from the engine and that carries 229 mm of ground track; with it before the lengths at 5 %, B5 wins with its pours as planes, 10 mm of ground track and a plane loss of 3.0 % instead of 3.6 %, at 3 signal steps more (about 6 %). The other four boards keep their winners. The owner was shown that cost and chose the change ("כן, לשנות") |
 
 **One measure in two places is a weighting, not a double count.** Starved thermals are also
 held by gate G2 and by the prune's clause (b); the audit's checks 3.1 to 3.4 read planes
@@ -397,16 +398,17 @@ Records: `target/creation-research/zone-routing/zr5/part1/measure/` in the main 
 | 6 | Acute corners | today 6 |
 | **7** | **Pour faults**: starved thermals plus lost fills | new (PK5) |
 | **8** | **Plane-loss step**: `round(plane_loss / 0.05)` | new (PK4) |
-| 9 | Signal length step | today 7 |
-| 10 | Power length step | today 8 |
-| 11 | Right angles | today 9 |
-| 12 | Vias off the pour nets | today 10 |
-| **13** | **Area-loss step**: `round(area_loss / 0.01)` | new (PK6) |
-| **14** | **Pour-track step**: `round(pour_track_mm / shortest signal / 0.02)` | new (PK7) |
+| **9** | **Pour-track step**: `round(pour_track_mm / shortest signal / 0.05)` | new (PK7, PK19) |
+| 10 | Signal length step | today 7 |
+| 11 | Power length step | today 8 |
+| 12 | Right angles | today 9 |
+| 13 | Vias off the pour nets | today 10 |
+| **14** | **Area-loss step**: `round(area_loss / 0.01)` | new (PK6) |
 | 15 | Minus copper quality | today 11 |
 | 16 | Route seconds | today 12 |
 
-- **The pool is today's.** The shortest signal length of entry 14 is the one today's entry 7
+- **The layout since PK19 (2026-11-24).** Built first with the pour-track step at entry 14 in 2 % steps and the four today's entries at 9 to 12; the owner's rule change put the track at 9, in 5 % steps, and moved them to 10 to 13. Part 2's records below were made with the first layout.
+- **The pool is today's.** The shortest signal length of entry 9 is the one today's entry 7
   steps against: among the runs in the pool that pass G1, else the pool, else every run.
   When no run of it has signal track, entry 14 is 0 for all.
 - **Four open values:** the two steps (5 % and 1 %) and the two places (before the lengths,
@@ -597,6 +599,63 @@ Not measured:
 
 Records: `target/creation-research/zone-routing/zr5/part2/measure/` in the main checkout
 (`matrix.sh`, `hold.sh`, `call.py`, `result.jsonl`, the runs).
+
+## The ground track before the lengths (the owner's rule change, 2026-11-24)
+
+**Why.** Part 2 was merged with the pour-track step last of the pour entries (PK7), so it
+only breaks ties after the lengths. The replay of the combined runs (ZR3 with the pour key
+on, the zones session's five calls) and of ZR3's 17 calls showed what that leaves on B5:
+the winner is a run whose pours were omitted from the engine, with 229 mm of track on the
+ground net, while runs with the pours given as planes route ground in 4 to 13 mm. Record:
+`zr5-part2-candidate/TRACK.md` in the supervisor's notes folder, and `track_variants.py`
+beside it.
+
+| Rule | B5 on the combined runs | The other four boards |
+|---|---|---|
+| As merged: after the vias, 2 % | pours omitted; plane loss 3.6 %; ground track 229 mm; signal step ±0 | — |
+| **Before the lengths, 5 % (chosen)** | pours as planes; 3.0 %; 10 mm; **+3** (the owner's one-step line breaks) | the winners as merged |
+| Before the lengths, 1 % or 2 % | pours as planes; 3.5 %; 4 mm; +5 | `pours` +4 at 1 % |
+| After the signal step, any step | as merged | as merged |
+
+**His decision.** Asked "לשנות את הכלל, כך שמסלול האדמה ייבדק לפני האורכים במדרגות של 5 %?
+כן, או להשאיר כמו שזה", with that table and B5's +3 in front of him, the owner said
+"כן, לשנות" (2026-11-24, relayed verbatim by the supervisor session). His yes accepts B5's
++3. It says nothing about dash's area +1 or `pours`' signal +2; the rule change leaves
+both as the replay recorded them.
+
+**The change (PK19), nothing else:**
+- `pour_rank::POUR_TRACK` is entry 9; `TODAY_AT` puts today's entries 7 to 10 at 10 to 13
+  (11 and 12 stay at 15 and 16); `AREA_LOSS` is entry 14. `POUR_FAULTS` (7) and
+  `PLANE_LOSS` (8) stay.
+- `pour_track_step` steps by a new `POUR_TRACK_STEP = 0.05` of the pool's shortest signal
+  length, not by `route_judge::LENGTH_STEP`. The pool rule and the rounding are
+  unchanged, and so are the 0 cases (no pour track, no signal length to scale by).
+- Every place that names an entry by its index follows: the prune's refusals (the signal
+  step is `key:10` under `pours`), `search.rank`'s report, the doc comments, the skill,
+  `docs/API_MIGRATIONS.md`, and the handoff's Row ZR.
+- Not changed: today's key (PK1), the setting and its default `routing` (PK9, PK14), the
+  other three pour entries and their steps, placement's constant (PK13), the engine's
+  input (PK11).
+
+**Tests, each guard with a negative control:**
+
+| Guard | Test | Negative control |
+|---|---|---|
+| The track ranks before the lengths | two runs: A has a shorter signal step, B less pour track by one 5 % step, the same faults and plane step: B ranks first under `pours`; under `routing` A does | the track left at entry 14: A first |
+| The track still ranks after the plane step | B has less track but a plane step one higher: A ranks first | the track before the plane step: B first |
+| The step is 5 % of the shortest signal | track = 7 % and 8 % of the shortest signal: steps 1 and 2 (half away from zero); 2.4 %: 0 | `LENGTH_STEP` (2 %) kept: 4, 4 and 1 |
+| Today's entries keep their order | every entry of `rank_measures` is in the pour key at `TODAY_AT`, in order, and a key with no pour net orders runs as today's (PK2) | an index of `TODAY_AT` left at the old place: the test fails |
+| The prune's refusals name the new place | a candidate with a longer signal step under `pours`: `key:10` | the old `key:9` |
+| The default does not change | no user config: `ranked_by` is `routing` | — (unchanged test) |
+
+**Verification:**
+- The offline replay with the new layout reproduces the "before the lengths, 5 %" row on the
+  combined runs: B5's winner is the run with its pours as planes (3.0 %, 10 mm, +3), and the
+  other four keep their winners.
+- The live measurement belongs to the zones session, with its existing scripts: ZR3 plus
+  this branch, x22, `routing.rank_key = "pours"`, the five boards at M. It runs after ZR4's
+  re-measurement (one routing measurement at a time). Every recorded `pour_key` must equal
+  the replay's.
 
 ## The skill's order of work (PK15; applied once ZR4 and ZR2 are merged)
 
