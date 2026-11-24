@@ -2538,6 +2538,21 @@ pub(crate) fn board_copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
     copper_layers(tree)
 }
 
+/// Row ZR, stage ZR4: the board's copper layers in stack order, each with the type the
+/// export gives it ([`copper_stack`]): `signal` or `power`. An error where the export
+/// refuses the stack.
+pub(crate) fn board_copper_stack(tree: &SexpNode) -> Result<Vec<(String, &'static str)>> {
+    copper_stack(tree)
+}
+
+/// Row ZR, stage ZR4: the board's outline as the export reads it
+/// ([`simple_closed_outline`]): one closed loop in DSN micrometres, Y up, arcs as chords
+/// within [`ARC_TOLERANCE_MM`], the first corner repeated at the end. An error where the
+/// export refuses the outline (more than one loop, an open loop, no area).
+pub(crate) fn board_outline_um(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
+    simple_closed_outline(tree)
+}
+
 /// Row ZR: the DSN's `(structure (plane NET shape))` entries in file order, each with
 /// the layer of its shape: the order fastroute numbers planes by (the zones file's
 /// `plane_index`). The wiring's conduction areas are not planes and are not listed.

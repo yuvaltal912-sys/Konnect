@@ -46,6 +46,47 @@ renamed. The placement tools' routing calls (`plan_convergent_placement`) run wi
   the planner in-process with a profile that accepts local pad and footprint
   `zone_connect`, `thermal_*` and `clearance` overrides (the clearance kept per item) and
   teardrop zones with no UUID (as copper of no net).
+## Unreleased: `plan_pours`, the design intent's `pours`, `add_zone`'s settings (Row ZR, stage ZR4)
+
+Design: `docs/POUR_PLAN_DESIGN.md`.
+
+- **New tool `plan_pours(board, board_source?)`** in the `pcb_board` toolset. It is
+  read-only. It divides the copper layers among the board's ground and power nets by
+  rule, has KiCad refill and check that plan on a scratch copy, and returns each zone as
+  the exact arguments of `add_zone`. Result: `status` (`planned`,
+  `planned_with_findings` or `nothing_to_propose`), `stack`, `nets`, `proposals`,
+  `not_proposed`, `rule_areas_filled`, `check`, `next_steps`, `sources`,
+  `source_evidence`. It writes only below Konnect's state folder
+  (`pour-plans/<stamp>-<sha8>/`). `check.clean` also needs every pad the pours should
+  reach to be reached (`check.unreached`, by net). When KiCad's first fill starves a
+  thermal pad or leaves one unreached, the plan is filled once more with smaller thermal
+  values (gap 0.3 mm, spoke the larger of 0.4 mm and the minimum width) and the better
+  fill is kept; `check.thermal_steps`
+  lists each fill, and the proposals carry the kept fill's values.
+- **`add_zone` and `add_copper_pour` gain four arguments:** `thermal_gap` (mm, default
+  0.5), `thermal_bridge_width` (mm, default the larger of 0.5 and `min_width`),
+  `island_removal` (`always` by default, `never` or `below_area`) and `island_min_area`
+  (mm², above 0 and at most 2000; only with `below_area`, and required there). Both the
+  IPC path and the file path write them, and the result echoes all four. A call with
+  none of them writes the zone it wrote before, byte for byte apart from the UUID.
+- **What changes for an old call:**
+  - a call that only raises `min_width` above 0.5 now gets a spoke width of that size;
+    before, it got 0.5, below the minimum width, so KiCad made no spoke at all;
+  - a clearance or thermal gap below 0, a minimum width of 0 or less, a thermal bridge
+    below the minimum width, an unknown `island_removal`, and a value of the wrong type
+    (a string where a number is wanted, a priority that is not a whole number) are now
+    refused, where they used to fall back to the default. A refused call reaches
+    neither KiCad nor the file;
+  - a net name or a layer that holds `"` or `\` is written escaped. It used to be
+    written raw, which broke the board's text. Every other name is written as before.
+- **The design-intent record gains a section `pours`**:
+  `[{net, layers?: [copper layers], notes?}]`. Set it with
+  `set_design_intent(section: "pours")`. Each entry is an explicit request and wins over
+  `plan_pours`'s rule. A record without `pours` is written exactly as before, and
+  `schema_version` stays 1. **A Konnect older than this one refuses the whole record
+  once it has `pours`**, for every tool that reads it, because the record is closed. So
+  install the 1 Kopper package with this stage before `pours` is written into a
+  project. `missing_sections` never lists `pours`.
 
 ## Unreleased: the ground track before the lengths, and the plane loss in 2.5 % steps, in the pour key (Row ZR, stage ZR5, PK19 and PK20)
 

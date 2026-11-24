@@ -255,6 +255,12 @@ a move-local redraw and a "never more pour damage" rule (corrected for x19: see 
 
 ### Defining zones
 
+**Designed down to skeletons in [POUR_PLAN_DESIGN.md](POUR_PLAN_DESIGN.md) (2026-11-23), which replaces this
+section where the two differ.** The owner's answers to decisions 3 and 4 changed two things: the
+default is a division of the copper among the ground and power nets, not the ground rail only, and
+every plan is filled by KiCad on a scratch copy before it is returned. What follows is the first
+design, kept as the record.
+
 A read-only tool, `plan_pours`, shaped like `plan_route_refinement`:
 
 - **Which nets:** the design intent's new `pours` list. Without it, the ground rail only (a rail
@@ -286,7 +292,7 @@ Each stage is its own PR, measured on the public fixtures and the owner's boards
 | **ZR5** Rank | Konnect | Pour measures in the rank key; the skill's order of work | The owner's word, on ZR3's numbers |
 | **ZR6** Return path (designed 2026-11-24, the owner's "כן, לתכנן") | Konnect | A ground via within 3 mm of every signal layer change on a ground pour, on every judged run before the rank, and in the delivered session ("ZR6" below) | On five boards at M, 3.2 of every delivered winner at 0 or each remaining change named with its reason, and no gate, key entry, fill or checklist measure worse |
 
-ZR4 touches no engine file and may run beside ZR1 to ZR3.
+ZR4 touches no engine file and may run beside ZR1 to ZR3. **ZR4 is built** (2026-11-24) on `claude/zr4-pour-plan-build`, measured against its own criteria in [POUR_PLAN_DESIGN.md](POUR_PLAN_DESIGN.md), "Measured": the route passes G1 on all five boards, and, with PP16 and PP17, the proposals refill clean on all five (B5 takes PP16's second thermal step).
 
 ZR5 is designed down to skeletons in [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md) (2026-11-23), in
 two PRs on the owner's order ("כן, ZR5 קודם"): first the pour record, which changes no rank
@@ -327,8 +333,13 @@ owner's word.
    pinned x19, each ZR stage with its own pin PR.
 3. **Where pours come from (ZR4).** Recommended: a `pours` list in the design intent, ground
    rail by default, and a read-only planner. He adds the zones, or tells the agent to.
+   **Answered 2026-11-23:** not ground by default; the planner gives the best division, and an
+   explicit request of his wins (his words are in [POUR_PLAN_DESIGN.md](POUR_PLAN_DESIGN.md)).
 4. **Ground on both sides of a 2-layer board?** Recommended: yes, bottom as the main plane and
    top as fill. Both are in the checklist's spirit; the model handles the top fill's islands.
+   **Answered 2026-11-23,** as part of a wider question (how the best division is chosen): by
+   stackup rules now, with every plan filled by KiCad before it is returned, and by routing each
+   candidate division in ZR5. Ground on both sides is the rule for 2 layers.
 5. **When the skill stops saying "pours last".** Recommended: only after ZR2's table shows the
    as-exported shape at 0 open before stitching. The text of the change is in
    [POUR_RANK_DESIGN.md](POUR_RANK_DESIGN.md), "The skill's order of work".
@@ -1173,6 +1184,9 @@ pub(crate) fn pour_measures(
 ```
 
 ### Konnect: `pour_plan.rs`
+
+Superseded by the skeleton of [POUR_PLAN_DESIGN.md](POUR_PLAN_DESIGN.md) ("The skeleton"), which is code
+on the stage's branch. This block and `PourIntent` below are the first design, kept as the record.
 
 ```rust
 //! Row ZR, stage ZR4: the pours a board should have. Proposed, never written

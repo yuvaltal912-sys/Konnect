@@ -918,6 +918,9 @@ fn adding_a_zone_creates_it_on_the_live_board() {
             name,
             priority: 2,
             connection: ZoneConnectionStyle::ZcsFull,
+            thermal_gap_mm: konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM,
+            thermal_bridge_mm: konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM,
+            islands: konnect_ipc::builders::ZoneIslands::Always,
         })
         .expect("add_zone reported an error");
 

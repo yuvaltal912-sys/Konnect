@@ -657,6 +657,15 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // plan_pours's response fields and statuses, and add_zone's island mode
+        // (Row ZR, stage ZR4).
+        "planned_with_findings",
+        "nothing_to_propose",
+        "not_proposed",
+        "rule_areas_filled",
+        "below_area",
+        // plan_pours's check fields (Row ZR, stage ZR4, PP16).
+        "thermal_steps",
         // plan_convergent_placement's response fields and statuses (Row CT).
         "apply_with",
         "gate_failures",

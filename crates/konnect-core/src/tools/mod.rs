@@ -38,7 +38,9 @@ pub mod integration;
 pub(crate) mod item_render;
 mod jlcpcb_midpoints;
 mod layout_quality;
-pub(crate) use layout_quality::pads_off_main_group;
+pub(crate) use layout_quality::{
+    pads_off_main_group, pads_unreached_by_fill, supply_roles, SupplyRoles,
+};
 mod lcsc_packages;
 pub mod library;
 mod library_footprint;
@@ -54,6 +56,7 @@ pub(crate) mod pcb_sync;
 mod placed_footprint_models;
 pub mod placement;
 pub(crate) mod placement_converge;
+pub(crate) mod pour_plan_tool;
 pub mod project;
 #[cfg(test)]
 mod project_file_writer_tests;
