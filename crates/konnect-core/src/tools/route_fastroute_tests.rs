@@ -622,7 +622,7 @@ fn the_setup_names_the_default_place_the_three_ways_and_the_alternative() {
         "routing.fastroute_path",
         "engine: \\\"freerouting\\\"",
         "Nothing is downloaded",
-        "C** + BR1 + W8P + GS + ZR2",
+        "C** + BR1 + W8P + GS + ZR3",
     ] {
         assert!(text.contains(needle), "{needle} is missing from {text}");
     }
@@ -1126,6 +1126,39 @@ fn the_group_search_summary_reads_the_reports_object() {
     assert_eq!(summary["ended_by"], "pass_cap");
 }
 
+/// Row ZR, stage ZR3: with the engine's pour state (x22 with `--x.zones`), `start` and
+/// `end` keep their `pour` and `pour_worse` sums the passes' refused moves; a `pour` that
+/// is not an object, or an object without one, adds nothing.
+#[test]
+fn the_group_search_summary_keeps_the_pour_state_and_counts_pour_worse() {
+    let pour = |pieces: u64, lost: u64| json!({ "pieces": pieces, "starved": 0, "spokes_lost": lost, "largest_share": 0.875 });
+    let mut object = group_search_object();
+    object["start"]["pour"] = pour(3, 0);
+    object["end"]["pour"] = pour(2, 1);
+    object["passes"][0]["ends"]["pour_worse"] = json!(2);
+    object["passes"][1]["ends"]["pour_worse"] = json!(5);
+    let summary = group_search_summary(&object).unwrap();
+    assert_eq!(summary["start"]["pour"], pour(3, 0));
+    assert_eq!(summary["end"]["pour"], pour(2, 1));
+    assert_eq!(summary["pour_worse"], 7);
+    // a pass that refused nothing on the pour rule has no `pour_worse` end: counted 0
+    object["passes"][1]["ends"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pour_worse");
+    assert_eq!(group_search_summary(&object).unwrap()["pour_worse"], 2);
+    // a pass with no `ends` at all counts 0 too
+    object["passes"][0].as_object_mut().unwrap().remove("ends");
+    assert_eq!(group_search_summary(&object).unwrap()["pour_worse"], 0);
+    // no pour state (x21, or no `--x.zones`): the summary of before, key for key
+    let mut plain = group_search_object();
+    plain["passes"][0]["ends"]["pour_worse"] = json!(2);
+    assert_eq!(group_search_summary(&plain), Some(summary_of_the_object()));
+    plain["start"]["pour"] = json!("3 pieces");
+    plain["end"]["pour"] = json!(null);
+    assert_eq!(group_search_summary(&plain), Some(summary_of_the_object()));
+}
+
 /// An object that does not read as one gives no summary, never an error.
 #[test]
 fn a_group_search_object_that_does_not_read_gives_no_summary() {
@@ -1525,7 +1558,7 @@ fn the_result_has_every_documented_key() {
     // The engine.
     let engine = &result["engine"];
     assert_eq!(engine["name"], "fastroute");
-    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS + ZR2");
+    assert_eq!(engine["candidate"], "C** + BR1 + W8P + GS + ZR3");
     assert_eq!(engine["path"], "/x/fastroute");
     assert_eq!(engine["sha256"], "ab".repeat(32));
     assert_eq!(engine["version"], "fastroute 0.1.14");
@@ -2034,7 +2067,7 @@ fn a_reduce_error_on_a_failed_search_is_reported_and_not_fatal() {
 //                  `specctra_pours_routing`), with its manifest beside it as
 //                  `<dsn>.konnect.json` and the saved board that manifest names,
 //                  unchanged since the export (the judge checks its SHA-256);
-//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS + ZR2, build x21);
+//   FASTROUTE      the candidate build's path (C** + BR1 + W8P + GS + ZR3, build x22);
 //   KICAD_CLI      the path of kicad-cli;
 //   KICAD_CONFIG_HOME  a scratch folder (never the real KiCad settings).
 // It routes at effort `fast` (2 runs at once) into a temp folder and checks that a
