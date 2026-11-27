@@ -1,0 +1,9 @@
+# First cluster job: learn what the node has, then two focused test runs.
+# Submit: scripts/hpc/hpc-submit --cpus 16 --mem 16G --time 0:30:00 --label "first probe" scripts/hpc/plans/first-probe.plan
+#
+# EXPECT  NAME            COMMAND
+any       probe           echo "== tools"; cc --version | head -n 1; cmake --version | head -n 1; ${PROTOC:-protoc} --version; cargo mutants --version; echo "== disk"; df -h "$HOME" "$CARGO_TARGET_DIR" "$TMPDIR"; quota -s 2>/dev/null; echo "== network from the node"; curl -sS -m 10 -o /dev/null -w "crates.io %{http_code}\n" https://index.crates.io/config.json
+# Pure Rust, no C or protoc: proves the pipeline even if the node lacks cmake or protoc.
+pass      sexp-lib        cargo test -p konnect-sexp --locked --lib
+# konnect-core builds nng (cmake, C) and the IPC protos (protoc): tells us if those are there.
+pass      core-converge   cargo test -p konnect-core --locked --lib place_converge
