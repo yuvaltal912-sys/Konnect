@@ -242,7 +242,7 @@ fn read_request(args: &Value) -> Result<Request, CallToolResult> {
         ));
     }
     let wait = args.get("wait_s").and_then(Value::as_u64);
-    if has("wait_s") && forms.first().is_some() {
+    if has("wait_s") && !forms.is_empty() {
         return Err(invalid_arg("wait_s", "goes with a report only"));
     }
     if has("expected_plan_revision") && forms.first() != Some(&"answer") {
