@@ -1954,9 +1954,10 @@ impl KiCadIpcClient {
     /// Merge `classes` into KiCad's in-memory netclasses (`SetNetClasses` with
     /// `MMM_MERGE`, `api_handler_common.cpp:123`): a class of the same name is
     /// updated in place, field by field, and a new name is added; every other
-    /// class is left alone. KiCad answers `Empty` whether or not it applied a
-    /// class (a class sent as `NCT_IMPLICIT` is skipped without a word,
-    /// `netclass.cpp:220`), so a caller reads back with
+    /// class is left alone. Up to 10.0.6 KiCad answers `Empty` whether or not
+    /// it applied a class (a class sent as `NCT_IMPLICIT` is skipped without a
+    /// word, `netclass.cpp:220`); 10.0.7 refuses such a class with
+    /// `AS_BAD_REQUEST`. Either way a caller reads back with
     /// [`Self::get_net_classes`].
     pub fn merge_net_classes(&self, classes: Vec<kiapi::common::project::NetClass>) -> Result<()> {
         let command = kiapi::common::commands::SetNetClasses {

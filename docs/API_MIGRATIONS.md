@@ -24,13 +24,15 @@ Additive except where named. Nothing is removed or renamed.
   but did not confirm it, or the file write failed after it, the refusal says what
   KiCad's copy may hold, and the file is not written.
   **Changed:** `clearance`, `trace_width`, `via_drill` and `via_diameter` must be
-  finite and at most 100 mm, above 0 (a clearance may be 0); before, any number was
-  written.
+  finite and at most 100 mm, above 0 (a clearance may be 0), and `name` must not be
+  empty or hold control characters; before, any value was written. A call that names
+  no value on a class both copies have sends nothing (`kicad_copy: unchanged`).
 - **`get_netclasses`: new `kicad_unsaved`** (and `sources.kicad_unsaved`): the
   netclass settings the KiCad holding the board has in memory and its file does not
   (`netclass`, `field`, `kicad_mm`, `project_file_mm`; `field: priority` with
   `kicad` and `project_file`; or `only_in`). `null` when no KiCad holding the board
-  listed its classes. A `warning` says which copy wins when it is not empty.
+  listed its classes. When it is not empty, a `warning` says that KiCad's next save
+  writes its copy over the file, and how to keep either copy.
 - **`assign_net_to_class` still refuses while KiCad holds the board** (KiCad 10's
   IPC API has no netclass-pattern command); the refusal now names the steps in
   KiCad's Board Setup.

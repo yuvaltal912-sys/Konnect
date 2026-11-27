@@ -210,6 +210,12 @@ mod live {
         pub version: (u32, u32, u32),
         /// Answer `SetNetClasses` with an error status.
         pub refuse_writes: bool,
+        /// Answer `GetVersion` with no payload.
+        pub no_version: bool,
+        /// Answer `GetNetClasses` with no payload.
+        pub no_list: bool,
+        /// What `GetVersion` gives as the full version, when not the plain triple.
+        pub full_version: Option<String>,
         pub classes: Vec<NetClass>,
         /// Answer `SetNetClasses` and apply nothing.
         pub drop_writes: bool,
@@ -224,6 +230,9 @@ mod live {
                 // The KiCad on this Mac (2026-11-27).
                 version: (10, 0, 8),
                 refuse_writes: false,
+                no_version: false,
+                no_list: false,
+                full_version: None,
                 classes: Vec::new(),
                 drop_writes: false,
                 schematic: None,
@@ -261,9 +270,15 @@ mod live {
         }
     }
 
-    fn listed(class: &NetClass) -> NetClass {
+    /// A class as KiCad lists it: `NCT_IMPLICIT` up to 10.0.6 (the bug the
+    /// module docs name), `NCT_EXPLICIT` from 10.0.7.
+    fn listed(class: &NetClass, explicit: bool) -> NetClass {
         let mut class = class.clone();
-        class.r#type = NetClassType::NctImplicit as i32;
+        class.r#type = if explicit {
+            NetClassType::NctExplicit as i32
+        } else {
+            NetClassType::NctImplicit as i32
+        };
         class.constituents = vec![class.name.clone()];
         class
     }
@@ -312,11 +327,18 @@ mod live {
                 )));
             }
             if url.ends_with("GetNetClasses") {
-                let net_classes = state.classes.iter().map(listed).collect();
+                if state.no_list {
+                    return ok(None);
+                }
+                let explicit = state.version >= (10, 0, 7);
+                let net_classes = state.classes.iter().map(|c| listed(c, explicit)).collect();
                 return ok(Some(konnect_ipc::builders::pack_any(
                     &kiapi::common::commands::NetClassesResponse { net_classes },
                     "kiapi.common.commands.NetClassesResponse",
                 )));
+            }
+            if url.ends_with("GetVersion") && state.no_version {
+                return ok(None);
             }
             if url.ends_with("GetVersion") {
                 let (major, minor, patch) = state.version;
@@ -326,7 +348,10 @@ mod live {
                             major,
                             minor,
                             patch,
-                            full_version: format!("{major}.{minor}.{patch}"),
+                            full_version: state
+                                .full_version
+                                .clone()
+                                .unwrap_or_else(|| format!("{major}.{minor}.{patch}")),
                         }),
                     },
                     "kiapi.common.commands.GetVersionResponse",
@@ -798,11 +823,12 @@ mod live {
             )
             .await;
             assert!(result.is_error, "{kicad_has_it}");
-            assert!(
-                text_of(&result).contains("has not saved"),
-                "{}",
-                text_of(&result)
-            );
+            let why = if kicad_has_it {
+                "has not saved"
+            } else {
+                "close and reopen the project"
+            };
+            assert!(text_of(&result).contains(why), "{}", text_of(&result));
             assert_eq!(kicad.lock().unwrap().set_calls, 0);
             assert_eq!(std::fs::read(&project.project_file).unwrap(), before);
         }
@@ -892,7 +918,64 @@ mod live {
             )
             .await,
         );
-        assert_eq!(body["kicad"]["kicad_copy"], "updated");
+        assert_eq!(body["kicad"]["kicad_copy"], "unchanged");
+        assert_eq!(body["kicad"]["read_back"], "not_needed");
         assert_eq!(kicad.lock().unwrap().set_calls, 0);
+    }
+
+    /// Every refusal before the write sends nothing and writes nothing: a
+    /// KiCad that does not say its version, one that does not list its
+    /// classes, a release candidate of the first fixed version, and a project
+    /// file the edit cannot apply to (tried on a copy before KiCad is asked).
+    #[tokio::test]
+    async fn every_refusal_before_the_write_sends_nothing() {
+        for case in ["no_version", "no_list", "rc", "bad_file"] {
+            let project = project();
+            if case == "bad_file" {
+                let mut file = file_json(&project);
+                file["net_settings"]["classes"] = json!({ "not": "an array" });
+                std::fs::write(
+                    &project.project_file,
+                    format!("{}\n", serde_json::to_string_pretty(&file).unwrap()),
+                )
+                .unwrap();
+            }
+            let before = std::fs::read(&project.project_file).unwrap();
+            let kicad = Arc::new(Mutex::new(Kicad {
+                classes: vec![kicad_default()],
+                no_version: case == "no_version",
+                no_list: case == "no_list",
+                version: if case == "rc" { (10, 0, 7) } else { (10, 0, 8) },
+                full_version: (case == "rc").then(|| "10.0.7-rc1".to_string()),
+                ..Default::default()
+            }));
+            let server = spawn(&project.board, kicad.clone());
+            let handler = handler_talking_to(server.address()).await;
+            let result = call(
+                &handler,
+                "create_netclass",
+                &project.board,
+                &json!({ "name": "Power", "trace_width": 0.3 }),
+            )
+            .await;
+            assert!(result.is_error, "{case}: {}", text_of(&result));
+            let why = match case {
+                "no_version" => "did not say which version",
+                "no_list" => "did not list its netclasses",
+                "rc" => "10.0.7-rc1",
+                _ => "not an array",
+            };
+            assert!(
+                text_of(&result).contains(why),
+                "{case}: {}",
+                text_of(&result)
+            );
+            assert_eq!(kicad.lock().unwrap().set_calls, 0, "{case}");
+            assert_eq!(
+                std::fs::read(&project.project_file).unwrap(),
+                before,
+                "{case}"
+            );
+        }
     }
 }

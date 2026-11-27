@@ -249,7 +249,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist. While KiCad holds the board open it works too: it changes \
+             to exist. While KiCad (10.0.7 or later) holds the board open it works too: it changes \
              KiCad's own copy over IPC first and reads it back, then the file, so \
              KiCad's next save keeps the change ('written_to' says which copies). \
              KiCad's open board applies it to its nets at its next DRC or save. \
