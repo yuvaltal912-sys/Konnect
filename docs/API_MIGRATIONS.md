@@ -677,11 +677,31 @@ Nets that must have matched lengths are declared in the design intent, and
   carries neither, so the rule is skipped. A rule that mixes one with another
   constraint is projected or refused as before.
 
+## Unreleased: concave custom pads in Specctra exports
+
+Additive; nothing removed or renamed. `export_specctra_dsn` no longer refuses a
+custom pad whose copper is one concave region without holes (a manufacturer's
+notched or cross-shaped pad). Its pin is the largest convex part of the copper
+that cuts along the copper's own edges can leave around the pad's origin (where
+the router attaches the pin and a hole is drilled), or around the anchor's
+centre when the origin is off the copper, at least 10 µm inside every cut. The
+rest of the copper is written as keepouts of the footprint's image on the pad's
+copper layers, widened by 5 µm like copper graphics. The result lists such pads
+in the new field `concave_custom_pads` (their labels, `REF-number`), and the
+manifest counts their keepouts in `copper_graphic_keepout_count`. A plated
+concave pad needs its drill inside the pin. A keepout blocks the pad's own net
+too, so that net reaches the pad through the pin only; when the rest hems the
+pin in, the connection stays open and the route judge's DRC reports it.
+fastroute's pour model sees the rest as copper of no net, so near a concave pad
+of a pour's own net it keeps the pour back where KiCad connects it; the judge's
+refill decides. A concave pad with no convex part 10 µm around that point is
+refused, with that reason (it was refused as concave before).
+
 ## Unreleased custom pads in Specctra exports
 
 `export_specctra_dsn` accepts a custom copper pad when its anchor and supported
 primitives form one convex polygon on KiCad’s grid and remain convex after
-conversion to the DSN grid. Consumers
+conversion to the DSN grid (a concave one since the entry above). Consumers
 of the reverse manifest can now see `"shape": "custom"` on a padstack. Its
 `size_x_um` and `size_y_um` describe the KiCad anchor. Read the DSN polygon
 for the complete copper boundary. Custom pads use the Rust exporter in native

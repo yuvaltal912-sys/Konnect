@@ -49,6 +49,9 @@ pub(crate) struct ExportBundle {
     pub renamed_references: Vec<serde_json::Value>,
     /// Teardrop zones left out of the DSN (see [`is_teardrop`]).
     pub teardrops_skipped: usize,
+    /// Concave custom pads (`REF-number`): each pin is the largest convex part
+    /// of its copper around the pad's centre, and the rest is image keepouts.
+    pub concave_custom_pads: Vec<String>,
     /// Their polygon identity is validated only by the Rust exporter.
     has_custom_pads: bool,
 }
@@ -131,8 +134,11 @@ struct FootprintModel {
     /// Unplated holes, written as image keepouts on every copper layer.
     holes: Vec<HoleModel>,
     /// Copper graphics and visible copper text, as image keepout shapes in
-    /// footprint space.
+    /// footprint space, and the copper of a concave custom pad that its convex
+    /// pin leaves out.
     copper_keepouts: Vec<dsn::Shape>,
+    /// The concave custom pads, as `REF-number`, split into a pin and keepouts.
+    concave_pads: Vec<String>,
     /// Row ZR: the footprint's place among the board's `(footprint …)` entries, from 0.
     source_index: usize,
 }
@@ -1026,6 +1032,10 @@ pub(crate) fn export_dsn_with_options(
             .into_iter()
             .filter(|zone| is_teardrop(zone))
             .count(),
+        concave_custom_pads: footprints
+            .iter()
+            .flat_map(|footprint| footprint.concave_pads.iter().cloned())
+            .collect(),
     })
 }
 
@@ -3535,8 +3545,9 @@ fn footprints(
         // Footprint copper graphics and visible copper text, in footprint
         // space, as image keepouts. The file holds a back part's graphics
         // already mirrored, like its pads.
-        let copper_keepouts =
+        let mut copper_keepouts =
             footprint_copper_keepouts(footprint, copper_layers, rotation_degrees, &reference)?;
+        let mut concave_pads = Vec::new();
         let mut pads = Vec::new();
         let mut holes = Vec::new();
         for (pad_index, pad) in footprint.find_all("pad").into_iter().enumerate() {
@@ -3750,9 +3761,34 @@ fn footprints(
                 (copper_layers.to_vec(), Some(dx.min(dy)))
             };
             let custom_outline = if shape == PadShape::Custom {
-                custom_pad::outline(pad, drill_dims_mm).map_err(|error| {
+                let copper = custom_pad::outline(pad, drill_dims_mm).map_err(|error| {
                     anyhow::anyhow!("unsupported routing profile: pad {label}: {error:#}")
-                })?
+                })?;
+                if !copper.rest.is_empty() {
+                    concave_pads.push(label.clone());
+                }
+                // The rest of a concave pad's copper, from the pad's frame into the
+                // image's, turned and placed as the router turns and places the pin.
+                // Widened like copper graphics, so a chorded arc still covers it.
+                for ring in &copper.rest {
+                    let coords: Vec<dsn::Point> = ring
+                        .iter()
+                        .chain(ring.first())
+                        .map(|&(x, y)| dsn::Point {
+                            x: x as f64 / f64::from(DSN_RESOLUTION),
+                            y: y as f64 / f64::from(DSN_RESOLUTION),
+                        })
+                        .collect();
+                    for layer in &layers {
+                        let shape = dsn::Shape::Polygon(dsn::Polygon {
+                            layer: layer.clone(),
+                            width: (2.0 * GRAPHIC_TOLERANCE_MM * UM_PER_MM).round(),
+                            coords: coords.clone(),
+                        });
+                        copper_keepouts.push(place_shape(shape, px_um, py_um, relative)?);
+                    }
+                }
+                copper.pin
             } else {
                 Vec::new()
             };
@@ -3798,6 +3834,7 @@ fn footprints(
             pads,
             holes,
             copper_keepouts,
+            concave_pads,
             source_index: footprint_index,
         });
     }

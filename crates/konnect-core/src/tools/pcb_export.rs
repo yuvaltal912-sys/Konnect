@@ -289,7 +289,10 @@ fn export_tools() -> Vec<ToolDef> {
              a pad inside a plane's outline as connected and lets other nets cross the plane, so \
              completion is judged by KiCad's DRC after a refill. Rule areas that forbid tracks or \
              vias always become keepouts. Both come from the zone outline (not the fill). A \
-             teardrop zone belongs to the routing and is left out (teardrops_skipped). Locked straight tracks and vias are fixed wiring; \
+             teardrop zone belongs to the routing and is left out (teardrops_skipped). A concave \
+             custom pad becomes a pin of the largest convex part of its copper around its centre, \
+             and the rest of its copper becomes keepouts of its footprint, so no other net crosses \
+             it (concave_custom_pads lists them). Locked straight tracks and vias are fixed wiring; \
              unlocked routing, routed arcs, unsupported custom pad geometry, local clearance overrides, \
              copper dimensions, KiCad jumper layers, and unrepresentable custom rules and \
              incomplete effective routing rules are refused instead of approximated. It writes a \
@@ -1083,6 +1086,7 @@ async fn handle_export_specctra_dsn(
             "intent_widths": export.intent_widths,
             "renamed_references": export.renamed_references,
             "teardrops_skipped": export.teardrops_skipped,
+            "concave_custom_pads": export.concave_custom_pads,
             "copper_edge_clearance_um": copper_edge_clearance_um,
             "hole_clearance_um": hole_clearance_um,
             "capabilities": {
