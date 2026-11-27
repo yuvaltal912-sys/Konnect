@@ -34,9 +34,10 @@ its result was lost.
   is refused, before KiCad is read, and names the running `run_id`. An unknown or
   malformed `run_id` is an argument error. A report call needs neither KiCad nor the
   board open.
-- **No synchronous mode** and no cancellation: no caller needs either, and a
-  cancel could not be shown to leave no router process behind without starting one.
-  A board's run ends by its own stop rules.
+- **No synchronous mode** and no cancel call: no caller needs either. A board's run
+  ends by its own stop rules. A server that ends (its stdio closed, or a reload)
+  stops its runs first, so their router processes are killed rather than left
+  running; such a run reads `status: failed` with `error` saying the server stopped.
 - **Migration:** after a start, call again with `{"run_id": ..., "wait_s": 300}`
   until `status` is not `running`, then read the result as before.
 

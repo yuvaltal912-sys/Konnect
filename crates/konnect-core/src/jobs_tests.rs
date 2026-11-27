@@ -288,7 +288,7 @@ fn left_running(run: &Run, id: &str) -> PathBuf {
         progress: json!({ "count": 2 }),
         error: None,
     };
-    write_json(&folder.join(RUN_FILE), &record).unwrap();
+    write_json(&folder.join(RUN_FILE), &record, false).unwrap();
     std::fs::write(folder.join(LOCK_FILE), "").unwrap();
     folder
 }
@@ -365,7 +365,7 @@ async fn only_a_run_id_of_this_kind_in_its_folder_is_read() {
     );
     let mut done = read_record(&folder).unwrap();
     done.state = RunState::Done;
-    write_json(&folder.join(RUN_FILE), &done).unwrap();
+    write_json(&folder.join(RUN_FILE), &done, false).unwrap();
     let report = jobs.report(&run.state, &KIND, FIRST, Duration::ZERO).await;
     assert!(
         matches!(&report, Report::Unknown { why } if why.contains("cannot be read")),
@@ -407,6 +407,7 @@ async fn a_claim_never_names_a_run_that_has_ended() {
             board: run.board.display().to_string(),
             pid: 1,
         },
+        false,
     )
     .unwrap();
     let busy = claim_board(&run.state, &KIND, &run.board, "1700000000002-0123456789ab")
@@ -420,7 +421,12 @@ async fn a_claim_never_names_a_run_that_has_ended() {
 async fn a_running_record_beside_its_result_is_done() {
     let run = run_place();
     let folder = left_running(&run, FIRST);
-    write_json(&folder.join(RESULT_FILE), &json!({ "status": "planned" })).unwrap();
+    write_json(
+        &folder.join(RESULT_FILE),
+        &json!({ "status": "planned" }),
+        true,
+    )
+    .unwrap();
     let report = Jobs::default()
         .report(&run.state, &KIND, FIRST, Duration::ZERO)
         .await;
@@ -445,7 +451,8 @@ async fn a_wait_on_another_process_run_lasts_the_wait_asked() {
             "{report:?}"
         );
         assert!(took >= wait, "{took:?} < {wait:?}");
-        assert!(took < wait + Duration::from_secs(1), "{took:?}");
+        // A whole extra poll would overshoot by up to 2 s; a loaded machine by less.
+        assert!(took < wait + Duration::from_millis(1_500), "{took:?}");
     }
     drop(lock);
 }
@@ -481,14 +488,16 @@ async fn the_busy_probe_names_the_running_run_and_keeps_no_lock() {
 async fn a_run_that_blocks_does_not_hold_the_callers_runtime() {
     let run = run_place();
     let jobs = Jobs::default();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     start(
         &jobs,
         &run,
         &run.board,
         FIRST,
         Arc::new(Count::default()),
-        async {
-            std::thread::sleep(Duration::from_millis(1_500));
+        async move {
+            // Blocks its thread until the test lets it go (at most 20 s).
+            let _ = released.recv_timeout(Duration::from_secs(20));
             Ok(json!({}))
         },
     );
@@ -497,15 +506,108 @@ async fn a_run_that_blocks_does_not_hold_the_callers_runtime() {
     let report = jobs
         .report(&run.state, &KIND, FIRST, Duration::from_millis(100))
         .await;
+    let took = waited.elapsed();
     assert!(
         matches!(report, Report::Running { here: true, .. }),
         "{report:?}"
     );
-    assert!(
-        waited.elapsed() < Duration::from_millis(1_000),
-        "{:?}",
-        waited.elapsed()
-    );
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    release.send(()).unwrap();
     let report = jobs.report(&run.state, &KIND, FIRST, LONG).await;
     assert!(matches!(report, Report::Done { .. }), "{report:?}");
+}
+
+/// Set when dropped: a router process is killed when its handle is dropped.
+struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn wait_until(flag: &std::sync::atomic::AtomicBool) -> bool {
+    let started = Instant::now();
+    while !flag.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    flag.load(Ordering::SeqCst)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_server_drops_its_runs_work_and_records_why() {
+    let run = run_place();
+    let jobs = Jobs::default();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Dropped(Arc::clone(&dropped));
+    start(
+        &jobs,
+        &run,
+        &run.board,
+        FIRST,
+        Arc::new(Count::default()),
+        async move {
+            let _router = held;
+            std::future::pending::<()>().await;
+            Ok(json!({}))
+        },
+    );
+    jobs.stop_all(LONG).await;
+    assert!(
+        wait_until(&dropped),
+        "the work was dropped, its routers with it"
+    );
+    let report = Jobs::default()
+        .report(&run.state, &KIND, FIRST, Duration::ZERO)
+        .await;
+    let Report::Failed { record } = &report else {
+        panic!("{report:?}");
+    };
+    assert_eq!(record.error.as_deref(), Some(STOPPED));
+    assert!(claim_board(&run.state, &KIND, &run.board, SECOND)
+        .unwrap()
+        .is_ok());
+}
+
+/// A progress that panics after its first reading.
+#[derive(Default)]
+struct Fragile(AtomicUsize);
+
+impl Progress for Fragile {
+    fn snapshot(&self) -> Value {
+        assert_eq!(
+            self.0.fetch_add(1, Ordering::SeqCst),
+            0,
+            "a broken progress"
+        );
+        json!({})
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_whose_task_unwinds_stops_its_work_and_frees_its_board() {
+    let run = run_place();
+    let jobs = Jobs::default();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Dropped(Arc::clone(&dropped));
+    start(
+        &jobs,
+        &run,
+        &run.board,
+        FIRST,
+        Arc::new(Fragile::default()),
+        async move {
+            let _router = held;
+            std::future::pending::<()>().await;
+            Ok(json!({}))
+        },
+    );
+    // The first progress write panics the run's task.
+    tokio::time::sleep(PERSIST_EVERY + Duration::from_secs(1)).await;
+    assert!(wait_until(&dropped), "no work outlives its run's task");
+    let report = jobs.report(&run.state, &KIND, FIRST, Duration::ZERO).await;
+    assert!(matches!(report, Report::Interrupted { .. }), "{report:?}");
+    assert!(claim_board(&run.state, &KIND, &run.board, SECOND)
+        .unwrap()
+        .is_ok());
 }

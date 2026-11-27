@@ -73,6 +73,9 @@ const SIMULATION_TOOLSET: &str = "simulation";
 const SIMULATION_OFF_REASON: &str =
     "simulation is off in this configuration (set simulation_enabled = true to serve it)";
 
+/// How long a server that ends waits for its background runs to stop and record it.
+const RUNS_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ─── CLI argument parsing (minimal, no clap dependency) ─────────
@@ -229,6 +232,9 @@ async fn main() -> Result<()> {
                 transport::stdio::StdioExit::Eof => {}
                 #[cfg(unix)]
                 transport::stdio::StdioExit::Reload(plan) => {
+                    // Neither exec nor the process's end runs a background run's
+                    // destructors: stop the runs first, so no router is left behind.
+                    konnect_core::stop_background_runs(RUNS_GRACE).await;
                     // exec does not run destructors. Release the old process's
                     // run-registry pair explicitly so the replacement can
                     // register the same PID without leaving stale state.
@@ -260,6 +266,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    // A background run (plan_convergent_placement) lives on a thread of its own, whose
+    // router processes the end of the process would leave running: stop them first.
+    konnect_core::stop_background_runs(RUNS_GRACE).await;
     Ok(())
 }
 

@@ -10,9 +10,14 @@
 //!   It is rewritten every [`PERSIST_EVERY`] while the run runs, and last when it ends.
 //! - `result.json`: the tool's whole result, written before `run.json` says `done`.
 //! - `run.lock`: held under an exclusive lock by the process that runs the run, for as
-//!   long as it runs. A record that says `running` beside a free lock is a run whose
-//!   server stopped before it ended (`interrupted`); a held one is a run of another
-//!   Konnect process, whose progress is read from its `run.json`.
+//!   long as it runs. A record that says `running` beside a held lock is a run of
+//!   another Konnect process, whose progress is read from its `run.json`; beside a free
+//!   lock it is a run whose server stopped before it ended (`interrupted`), unless its
+//!   `result.json` is there, which makes it done.
+//!
+//! The work runs on a thread and runtime of its own, and can be stopped: a server that
+//! ends calls [`stop_background_runs`], which drops each run's work (and with it its
+//! router processes, killed on drop) and records the run as `failed` with the reason.
 //!
 //! One run per board at a time ([`claim_board`]): `<state>/<kind>/.boards/<16 hex of the
 //! board path's SHA-256>.lock`, held under an exclusive lock for the run's whole life,
@@ -122,22 +127,39 @@ fn now_ms() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// `value` as JSON at `path`, by a new file synced to disk and renamed over it, so a
-/// reader never sees half of it, and a `done` record never names a result that a power
-/// loss could still take away.
-fn write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+/// `value` as JSON at `path`, by a new file renamed over it, so a reader never sees half
+/// of it. `durable`: the file is synced before the rename and its folder after it, so a
+/// `done` record does not outlive, across a power loss, the result it names.
+fn write_json(path: &Path, value: &impl Serialize, durable: bool) -> anyhow::Result<()> {
     use std::io::Write as _;
     let text = serde_json::to_string_pretty(value)?;
     let temporary = path.with_extension("json.tmp");
     let mut file = File::create(&temporary)
         .map_err(|error| anyhow::anyhow!("create '{}': {error}", temporary.display()))?;
     file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
+        .and_then(|()| if durable { file.sync_all() } else { Ok(()) })
         .map_err(|error| anyhow::anyhow!("write '{}': {error}", temporary.display()))?;
     drop(file);
     std::fs::rename(&temporary, path)
         .map_err(|error| anyhow::anyhow!("rename to '{}': {error}", path.display()))?;
+    if durable {
+        // A folder cannot be opened for syncing everywhere (Windows): best effort.
+        if let Some(Ok(folder)) = path.parent().map(File::open) {
+            let _ = folder.sync_all();
+        }
+    }
     Ok(())
+}
+
+/// [`write_json`] on the blocking pool, so a slow disk (a full sync on macOS can take
+/// a while under load) never holds a worker of the server's runtime.
+async fn write_json_off<T>(path: PathBuf, value: T, durable: bool) -> anyhow::Result<()>
+where
+    T: Serialize + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || write_json(&path, &value, durable))
+        .await
+        .map_err(|error| anyhow::anyhow!("the write stopped: {error}"))?
 }
 
 fn read_record(folder: &Path) -> Result<RunRecord, String> {
@@ -249,7 +271,15 @@ pub(crate) fn claim_board(
 ) -> anyhow::Result<Result<BoardClaim, Busy>> {
     let (lock, body_path) = board_lock(state, kind, board)?;
     if !take(&lock)? {
-        return Ok(Err(holder(state, kind, &body_path)));
+        let busy = holder(state, kind, &body_path);
+        // A holder that names no run may be another process's `board_busy`, which holds
+        // the lock for a moment only: one more try after it.
+        if busy.run_id.is_some() || {
+            std::thread::sleep(Duration::from_millis(20));
+            !take(&lock)?
+        } {
+            return Ok(Err(busy));
+        }
     }
     write_json(
         &body_path,
@@ -258,6 +288,7 @@ pub(crate) fn claim_board(
             board: board.display().to_string(),
             pid: std::process::id(),
         },
+        false,
     )?;
     Ok(Ok(BoardClaim {
         _lock: lock,
@@ -273,6 +304,8 @@ struct Active {
     started: Instant,
     progress: Arc<dyn Progress>,
     ended: watch::Receiver<bool>,
+    /// Set to stop the run's work.
+    stop: Arc<watch::Sender<bool>>,
 }
 
 /// The runs of this process that have not ended, by folder. Cloning shares them.
@@ -281,10 +314,12 @@ pub(crate) struct Jobs {
     active: Arc<Mutex<BTreeMap<PathBuf, Arc<Active>>>>,
 }
 
-/// What a run's task leaves when it ends, however it ends (an unwind too): the locks
-/// first, so the board is free once the run reads as ended; then the registry entry;
-/// then the signal that wakes the reports that wait.
+/// What a run's task leaves when it ends, however it ends (an unwind too): the stop of
+/// its work, so no work outlives its run's locks; the locks, so the board is free once
+/// the run reads as ended; then the registry entry; then the signal that wakes the
+/// reports that wait.
 struct Leave {
+    stop: Arc<watch::Sender<bool>>,
     held: Option<(BoardClaim, File)>,
     jobs: Jobs,
     folder: PathBuf,
@@ -293,6 +328,7 @@ struct Leave {
 
 impl Drop for Leave {
     fn drop(&mut self) {
+        let _ = self.stop.send(true);
         drop(self.held.take());
         self.jobs.lock().remove(&self.folder);
         if let Some(ended) = self.ended.take() {
@@ -304,11 +340,16 @@ impl Drop for Leave {
 /// What a run's own thread hands back: the work's answer, or why there is none.
 type Answer = Result<anyhow::Result<Value>, String>;
 
+/// Why a stopped run's work was dropped.
+pub(crate) const STOPPED: &str =
+    "the run was stopped before it ended: the Konnect server that ran it stopped";
+
 /// `work` to its end on a runtime of its own (two workers), so the CPU-heavy parts of a
 /// run never hold the server's runtime: the server keeps answering, and its timers
 /// (the progress writes, the reports' deadlines) keep firing. A panic in the work is
-/// its message.
-fn run_alone<W>(work: W) -> Answer
+/// its message. Once `stop` is set (or its sender is gone), the work is dropped at its
+/// next await, which kills its router processes; a CPU-bound phase ends first.
+fn run_alone<W>(work: W, mut stop: watch::Receiver<bool>) -> Answer
 where
     W: Future<Output = anyhow::Result<Value>> + Send + 'static,
 {
@@ -318,13 +359,24 @@ where
         .enable_all()
         .build()
         .map_err(|error| format!("the run's runtime could not start: {error}"))?;
-    let joined = runtime.block_on(async move { tokio::spawn(work).await });
+    let answer = runtime.block_on(async move {
+        let mut task = tokio::spawn(work);
+        tokio::select! {
+            joined = &mut task => joined.map_err(|join| match join.try_into_panic() {
+                Ok(payload) => format!("the run panicked: {}", panic_text(&*payload)),
+                Err(join) => format!("the run stopped: {join}"),
+            }),
+            _ = stop.wait_for(|stop| *stop) => {
+                task.abort();
+                // Until the work's future is dropped, and its routers with it.
+                let _ = task.await;
+                Err(STOPPED.to_string())
+            }
+        }
+    });
     // Nothing of the run is left to wait for: its routers were dropped with its future.
     runtime.shutdown_background();
-    joined.map_err(|join| match join.try_into_panic() {
-        Ok(payload) => format!("the run panicked: {}", panic_text(&*payload)),
-        Err(join) => format!("the run stopped: {join}"),
-    })
+    answer
 }
 
 /// What a report finds.
@@ -395,23 +447,36 @@ impl Jobs {
             progress: progress.snapshot(),
             error: None,
         };
-        write_json(&folder.join(RUN_FILE), &record)?;
+        write_json(&folder.join(RUN_FILE), &record, false)?;
         let (answer_tx, mut answer) = tokio::sync::oneshot::channel::<Answer>();
-        std::thread::Builder::new()
+        let (stop, stop_rx) = watch::channel(false);
+        let stop = Arc::new(stop);
+        let spawned = std::thread::Builder::new()
             .name(format!("konnect-run-{}", record.run_id))
             .spawn(move || {
-                let _ = answer_tx.send(run_alone(work));
-            })
-            .map_err(|error| anyhow::anyhow!("start the run's thread: {error}"))?;
+                let _ = answer_tx.send(run_alone(work, stop_rx));
+            });
+        if let Err(error) = spawned {
+            let failed = RunRecord {
+                state: RunState::Failed,
+                finished_unix_ms: Some(now_ms()),
+                error: Some(format!("the run's thread could not start: {error}")),
+                ..record
+            };
+            let _ = write_json(&folder.join(RUN_FILE), &failed, true);
+            anyhow::bail!("start the run's thread: {error}");
+        }
         let (ended_tx, ended) = watch::channel(false);
         let active = Arc::new(Active {
             record: record.clone(),
             started: Instant::now(),
             progress,
             ended,
+            stop: Arc::clone(&stop),
         });
         self.lock().insert(folder.clone(), Arc::clone(&active));
         let leave = Leave {
+            stop,
             held: Some((claim, run_lock)),
             jobs: self.clone(),
             folder: folder.clone(),
@@ -427,8 +492,9 @@ impl Jobs {
                     _ = tick.tick() => {
                         let mut now = active.record.clone();
                         now.progress = active.progress.snapshot();
-                        if let Err(error) = write_json(&folder.join(RUN_FILE), &now) {
-                            tracing::warn!("run {}: progress not written: {error:#}", now.run_id);
+                        let id = now.run_id.clone();
+                        if let Err(error) = write_json_off(folder.join(RUN_FILE), now, false).await {
+                            tracing::warn!("run {id}: progress not written: {error:#}");
                         }
                     }
                 }
@@ -437,7 +503,8 @@ impl Jobs {
             last.progress = active.progress.snapshot();
             last.finished_unix_ms = Some(now_ms());
             let outcome = match joined {
-                Ok(Ok(Ok(result))) => write_json(&folder.join(RESULT_FILE), &result)
+                Ok(Ok(Ok(result))) => write_json_off(folder.join(RESULT_FILE), result, true)
+                    .await
                     .map_err(|error| format!("the result could not be written: {error:#}")),
                 Ok(Ok(Err(error))) => Err(format!("{error:#}")),
                 Ok(Err(why)) => Err(why),
@@ -450,16 +517,36 @@ impl Jobs {
                     last.error = Some(error);
                 }
             }
-            // Once more on a failure: a `running` record beside a free lock reads as
-            // interrupted (unless `result.json` is there to read).
-            if let Err(error) = write_json(&folder.join(RUN_FILE), &last)
-                .or_else(|_| write_json(&folder.join(RUN_FILE), &last))
+            // Once more after a pause on a failure: a `running` record beside a free lock
+            // reads as interrupted (unless `result.json` is there to read).
+            let id = last.run_id.clone();
+            if write_json_off(folder.join(RUN_FILE), last.clone(), true)
+                .await
+                .is_err()
             {
-                tracing::warn!("run {}: its end was not written: {error:#}", last.run_id);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if let Err(error) = write_json_off(folder.join(RUN_FILE), last, true).await {
+                    tracing::warn!("run {id}: its end was not written: {error:#}");
+                }
             }
             drop(leave);
         });
         Ok(record)
+    }
+
+    /// Stop every run of this process and wait up to `grace` for them to record their
+    /// end (`failed`, [`STOPPED`]). A run in a CPU-bound phase ends that phase first;
+    /// one that has not ended by then reads as interrupted once the process is gone.
+    pub(crate) async fn stop_all(&self, grace: Duration) {
+        let active: Vec<Arc<Active>> = self.lock().values().cloned().collect();
+        for run in &active {
+            let _ = run.stop.send(true);
+        }
+        let deadline = tokio::time::Instant::now() + grace;
+        for run in active {
+            let mut ended = run.ended.clone();
+            let _ = tokio::time::timeout_at(deadline, ended.wait_for(|ended| *ended)).await;
+        }
     }
 
     /// Run `run_id` of `kind` below `state`: waits up to `wait` (at most [`MAX_WAIT`])
@@ -557,7 +644,13 @@ fn read_report(folder: &Path, kind: &JobKind) -> Report {
         // A run whose result was written but whose end was not (a failed last write, a
         // crash between the two): the result is there, so the run is done.
         RunState::Running => match read_result(folder) {
-            Ok(result) => Report::Done { record, result },
+            Ok(result) => Report::Done {
+                record: RunRecord {
+                    state: RunState::Done,
+                    ..record
+                },
+                result,
+            },
             Err(_) => Report::Interrupted { record },
         },
     }
@@ -568,6 +661,13 @@ fn read_result(folder: &Path) -> Result<Value, String> {
     std::fs::read_to_string(&path)
         .map_err(|error| error.to_string())
         .and_then(|text| serde_json::from_str(&text).map_err(|error| error.to_string()))
+}
+
+/// Stop the server's background runs, for a server that is about to end (its stdio
+/// closed, or a reload): their router processes are killed, not left running, and each
+/// run records why it ended. Waits up to `grace`.
+pub async fn stop_background_runs(grace: Duration) {
+    Jobs::global().stop_all(grace).await;
 }
 
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
