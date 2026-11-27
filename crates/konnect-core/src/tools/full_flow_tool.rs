@@ -69,6 +69,8 @@ const P2_FILE: &str = "p2-pours.json";
 const P3_FILE: &str = "p3-placement.json";
 const P4_FILE: &str = "p4-pours.json";
 const EXPORT_FILE: &str = "p4-export-check.json";
+/// The signature of the pours gate A showed (`pours_signature`).
+const P4_SIGNATURE_FILE: &str = "p4-signature.json";
 /// The route's result, in a route folder.
 const ROUTE_FILE: &str = "route.json";
 
@@ -492,12 +494,16 @@ impl FlowIo for LiveIo {
 /// KiCad's own text of `board`, through B's observation of the live board.
 async fn read_live_text(ctx: &ToolContext, board: &Path) -> Result<String, String> {
     use crate::tools::live_board::{observe, LiveBoard};
-    match observe(ctx, board, |client, document| {
-        client.save_document_to_string_in(document)
+    let read = observe(ctx, board, |client, document| {
+        let open = client.get_open_board_paths()?.len();
+        Ok((open, client.save_document_to_string_in(document)?))
     })
-    .await
-    {
-        Ok(LiveBoard::Answered(text)) => Ok(text),
+    .await;
+    match read {
+        Ok(LiveBoard::Answered((1, text))) => Ok(text),
+        Ok(LiveBoard::Answered((open, _))) => Err(format!(
+            "KiCad has {open} boards open; the flow saves KiCad's current board, so it works with one board open only: close the others"
+        )),
         Ok(other) => Err(format!(
             "{} ({})",
             crate::tools::board_safety::not_open_sentence(board),
@@ -877,34 +883,15 @@ async fn start(
         Err(refusal) => return Ok(refusal),
     };
     let flow_id = new_id(&board.display().to_string());
-    if let Err(holder) = mark_open(state, &board, &flow_id)? {
-        return Ok(CallToolResult::error(format!(
-            "Another full flow opened this board at the same moment ({holder}). Nothing new was started."
-        )));
-    }
     let folder = flow_folder(state, &flow_id);
     let made = (|| -> anyhow::Result<()> {
         std::fs::create_dir_all(folder.join("steps"))?;
         Ok(())
     })();
     if let Err(error) = made {
-        clear_open(state, &board, &flow_id);
         let _ = std::fs::remove_dir_all(&folder);
         return Err(error);
     }
-    let binary = match locate_fastroute(call.fastroute_path.as_deref(), &folder).await {
-        Ok(Ok(binary)) => binary,
-        Ok(Err(refusal)) => {
-            clear_open(state, &board, &flow_id);
-            let _ = std::fs::remove_dir_all(&folder);
-            return Ok(refusal);
-        }
-        Err(error) => {
-            clear_open(state, &board, &flow_id);
-            let _ = std::fs::remove_dir_all(&folder);
-            return Err(error);
-        }
-    };
     let effort = match &call.effort {
         Some(effort) => effort.clone(),
         None => crate::tools::route_fastroute::user_routing_config()
@@ -926,11 +913,7 @@ async fn start(
             .placement_effort
             .clone()
             .unwrap_or_else(|| "m".to_string()),
-        fastroute: json!({
-            "path": binary.path.display().to_string(),
-            "version": binary.version,
-            "source": binary.source,
-        }),
+        fastroute: Value::Null,
         planned_from: pre.planned_from,
         routing_items: pre.routing_items,
         nets: pre.nets,
@@ -952,6 +935,33 @@ async fn start(
         stop_reason: None,
         checkpoints: Vec::new(),
     };
+    // The record is on disk before the marker that names it, so a second start that
+    // finds the marker reads the record and is refused (m4).
+    save_flow(state, &flow)?;
+    if let Err(holder) = mark_open(state, &board, &flow_id)? {
+        let _ = std::fs::remove_dir_all(&folder);
+        return Ok(CallToolResult::error(format!(
+            "Another full flow opened this board at the same moment ({holder}). Nothing new was started."
+        )));
+    }
+    let binary = match locate_fastroute(call.fastroute_path.as_deref(), &folder).await {
+        Ok(Ok(binary)) => binary,
+        Ok(Err(refusal)) => {
+            clear_open(state, &board, &flow_id);
+            let _ = std::fs::remove_dir_all(&folder);
+            return Ok(refusal);
+        }
+        Err(error) => {
+            clear_open(state, &board, &flow_id);
+            let _ = std::fs::remove_dir_all(&folder);
+            return Err(error);
+        }
+    };
+    flow.fastroute = json!({
+        "path": binary.path.display().to_string(),
+        "version": binary.version,
+        "source": binary.source,
+    });
     drop(pre.live_text);
     if let Next::Gate(gate) = next(&flow) {
         open_gate(state, &mut flow, gate);
@@ -1083,7 +1093,9 @@ async fn run_leg(
                         &rails,
                         &flow.nets,
                     ) {
-                        stop_flow(&mut flow, step, Stop::new(StopKind::Failed, reason));
+                        // Back to gate A with the reason: the answer there may change
+                        // any key (M4). Nothing has been written.
+                        open_refused_gate(state, &mut flow, &reason);
                         save_flow(state, &flow)?;
                         return Ok(flow);
                     }
@@ -1454,6 +1466,7 @@ async fn pours_after(
         .as_deref()
         .is_some_and(|change| change != "none")
         && flow.approvals.placement != Some(PlacementAnswer::KeepCurrent);
+    flow.facts.p4_on_winner = applies && winner.is_file();
     let base = if applies && winner.is_file() {
         std::fs::read_to_string(&winner)?
     } else {
@@ -1468,24 +1481,23 @@ async fn pours_after(
             Err(stop) => return Ok(Err(stop)),
         };
         write_value(&folder.join(P4_FILE), &body)?;
-        let keys: Vec<String> = proposals
-            .iter()
-            .map(|z| format!("{}@{}", z.net, z.layer))
-            .collect();
-        let changed =
-            flow.facts.zones != proposals.len() || flow.record(Step::PoursAfter).is_some();
         flow.facts.zones = proposals.len();
         flow.facts.fill_clean = body["status"] == crate::tools::pour_plan_tool::PLANNED;
-        // Roles answered again at gate A: the new proposals go back to gate A when
-        // they differ from the ones approved.
-        if changed && flow.approvals.pours.is_some() && body["proposals"] != json!(keys) {
-            if let Ok(old) = read_json(&folder.join("p4-keys.json")) {
-                if old != json!(keys) {
-                    flow.approvals.pours = None;
-                }
+        // P4 ran again (the roles or the placement answered at gate A): when the zones
+        // or their fill check differ from the plan that was approved, the pours go back
+        // to gate A (M3).
+        let signature = pours_signature(&body);
+        let signature_file = folder.join(P4_SIGNATURE_FILE);
+        if let Ok(old) = read_json(&signature_file) {
+            if old != signature && flow.approvals.pours.is_some() {
+                flow.approvals.pours = None;
+                record.not_checked.push(
+                    "the zones changed after the plan was approved, so gate A asks about them again"
+                        .to_string(),
+                );
             }
         }
-        write_value(&folder.join("p4-keys.json"), &json!(keys))?;
+        write_value(&signature_file, &signature)?;
         if !body["check"]["clean"].as_bool().unwrap_or(true) {
             record
                 .not_checked
@@ -1645,6 +1657,18 @@ async fn export_check(
     .await?
     .map(|_| ())
     .map_err(|error| format!("{error:#}")))
+}
+
+/// What gate A approved of the pours: every proposal's `add_zone` arguments and its
+/// fill, and whether the fill check is clean.
+fn pours_signature(pours: &Value) -> Value {
+    let zones: Vec<Value> = pours["proposals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|zone| json!({ "add_zone": zone["add_zone"], "fill": zone["fill"] }))
+        .collect();
+    json!({ "zones": zones, "status": pours["status"], "clean": pours["check"]["clean"] })
 }
 
 /// FF4: the candidates routed with P2's zones. `route` adds the zones to the candidate's
@@ -1839,8 +1863,16 @@ struct Calls<'a> {
     io: &'a dyn FlowIo,
     dir: PathBuf,
     step: Step,
+    /// The attempt's stamp, so a step run again never overwrites an earlier call's file.
+    tag: u128,
     made: usize,
     files: Vec<String>,
+    /// A write of this step succeeded: a later refusal no longer means "nothing changed".
+    wrote: bool,
+    /// F2a and F2b: the verified `after` of each round done, and the checkpoint taken
+    /// before each further round.
+    rounds: Vec<String>,
+    checkpoints: Vec<String>,
 }
 
 /// Why a step's calls ended early.
@@ -1865,16 +1897,28 @@ impl Calls<'_> {
             Called::Answered(result) | Called::Before(result) => body_of(result),
             Called::Erred(error) => json!({ "error": error }),
         };
-        let file = self
-            .dir
-            .join(format!("{}-{:02}-{tool}.json", self.step.id(), self.made));
+        let file = self.dir.join(format!(
+            "{}-{}-{:02}-{tool}.json",
+            self.step.id(),
+            self.tag,
+            self.made
+        ));
         write_value(
             &file,
             &json!({ "tool": tool, "arguments": args, "result": body }),
         )?;
         self.files.push(file.display().to_string());
         Ok(match outcome {
-            Outcome::Succeeded | Outcome::Unchanged => Ok(body),
+            Outcome::Succeeded | Outcome::Unchanged => {
+                self.wrote |= writes;
+                Ok(body)
+            }
+            // A refusal after an earlier write of the same step: the board holds that
+            // write, unsaved (M5).
+            Outcome::Failed if self.wrote => Err(Halt::MayHaveChanged(format!(
+                "{tool} refused after an earlier call of this step changed the board, which KiCad holds unsaved: {}",
+                short(&body)
+            ))),
             Outcome::Failed => Err(Halt::Failed(format!("{tool} refused: {}", short(&body)))),
             Outcome::MayHaveChanged => Err(Halt::MayHaveChanged(format!(
                 "{tool} may have changed the board: {}",
@@ -1986,11 +2030,21 @@ async fn live_step(
         io,
         dir: flow_folder(state, &flow.flow_id).join("steps"),
         step,
+        tag: stamp_ms(),
         made: 0,
         files: Vec::new(),
+        wrote: false,
+        rounds: Vec::new(),
+        checkpoints: Vec::new(),
     };
     let work = step_work(step, state, flow, &mut calls).await?;
     record.result_file = calls.files.last().cloned();
+    record.rounds = calls.rounds.clone();
+    for checkpoint in &calls.checkpoints {
+        if !flow.checkpoints.contains(checkpoint) {
+            flow.checkpoints.push(checkpoint.clone());
+        }
+    }
     let work = match work {
         Ok(work) => work,
         Err(Halt::Failed(why)) => {
@@ -2007,7 +2061,9 @@ async fn live_step(
         }
     };
     record.counts = work.counts;
-    record.rounds = work.rounds;
+    if !work.rounds.is_empty() {
+        record.rounds = work.rounds;
+    }
     record.not_checked = work.not_checked;
     // 6. The verified save.
     match verified_save(io).await {
@@ -2028,6 +2084,9 @@ async fn live_step(
 /// `save_project`, then the live text and the saved file, both read and their
 /// `canonical_sha256` compared: `Ok(hash)` when equal; else why the step is unsaved.
 async fn verified_save(io: &dyn FlowIo) -> Result<String, String> {
+    // `save_project` saves KiCad's current board: the live read checks that it is this
+    // board and that it is the only one open (M6).
+    with_tries(io, || io.live_text()).await?;
     match io.call("save_project", json!({})).await {
         Called::Answered(result) if !result.is_error => {}
         Called::Answered(result) | Called::Before(result) => {
@@ -2112,7 +2171,14 @@ async fn step_work(
         }
         Step::AddZones => {
             let pours = read_json(&attempt.join(P4_FILE))?;
-            let live = calls.io.live_text().await.unwrap_or_default();
+            let live = match with_tries(calls.io, || calls.io.live_text()).await {
+                Ok(live) => live,
+                Err(why) => {
+                    return Ok(Err(Halt::Failed(format!(
+                        "the board cannot be read: {why}"
+                    ))))
+                }
+            };
             let present = zones_present(&live);
             let mut added = 0;
             for args in zone_calls(&pours) {
@@ -2139,11 +2205,13 @@ async fn step_work(
         }
         Step::ApplySession => {
             let body = read_json(&route.join(ROUTE_FILE))?;
-            let Some(args) = step_arguments(&body, "apply_specctra_ses") else {
+            let Some(mut args) = step_arguments(&body, "apply_specctra_ses") else {
                 return Ok(Err(Halt::Failed(
                     "the route's next steps hold no apply_specctra_ses step".to_string(),
                 )));
             };
+            // A new candidate path for every attempt: the apply never replaces one (FF14).
+            args["candidate_output_path"] = json!(candidate_path(&args, &route));
             match calls.write("apply_specctra_ses", args).await? {
                 Ok(applied) => Ok(Ok(plain(counts_of(step, &applied)))),
                 Err(halt) => Ok(Err(halt)),
@@ -2211,6 +2279,15 @@ async fn step_work(
     }
 }
 
+/// A new candidate path for F1, beside the route's own one, unique per attempt.
+fn candidate_path(args: &Value, route: &Path) -> PathBuf {
+    let folder = args["candidate_output_path"]
+        .as_str()
+        .and_then(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| route.to_path_buf());
+    folder.join(format!("candidate-{}.kicad_pcb", stamp_ms()))
+}
+
 /// F2a and F2b (FF10). A round is the planner's call (its arguments as the route's step
 /// gives them); then, when it proposes stitching vias, `route_batch` calls of at most
 /// [`BATCH_CAP`] objects; then `run_drc` with refill. F2a stops when the planner proposes
@@ -2253,9 +2330,31 @@ async fn stitch_rounds(
         (0usize, 0usize, Vec::new(), Vec::new());
     for round in 0..max {
         if round > 0 {
+            // The planner reads the saved board: save, verify, and take a checkpoint of
+            // the round's board before the next round (FF10).
             match verified_save(calls.io).await {
-                Ok(after) => rounds.push(after),
+                Ok(after) => {
+                    rounds.push(after.clone());
+                    calls.rounds.push(after);
+                }
                 Err(why) => return Ok(Err(Halt::MayHaveChanged(why))),
+            }
+            match calls
+                .io
+                .checkpoint(format!(
+                    "full flow: before {} round {}",
+                    step.id(),
+                    round + 1
+                ))
+                .await
+            {
+                Ok(id) => calls.checkpoints.push(id),
+                Err(why) => {
+                    return Ok(Err(Halt::MayHaveChanged(format!(
+                        "no checkpoint could be made before round {} ({why})",
+                        round + 1
+                    ))))
+                }
             }
         }
         let planned = match calls.read("plan_route_refinement", planner.clone()).await? {
@@ -2556,9 +2655,7 @@ async fn already_done(
                 ))
             })
         }
-        Step::ApplySession => Planned::of(&live().await)
-            .map(|planned| planned.routing_items > flow.facts.locked_routing)
-            .unwrap_or(false),
+        Step::ApplySession => routing_count(&live().await) > flow.facts.locked_routing,
         Step::LengthRules => {
             let Ok(route) = read_json(&route_folder(state, flow).join(ROUTE_FILE)) else {
                 return Ok(false);
@@ -2572,6 +2669,16 @@ async fn already_done(
             all
         }
         _ => false,
+    })
+}
+
+/// Top-level tracks, arcs and vias of a board text (teardrop zones are not routing here).
+fn routing_count(text: &str) -> usize {
+    konnect_sexp::parse_sexp(text).map_or(0, |tree| {
+        ["segment", "arc", "via"]
+            .iter()
+            .map(|head| tree.find_all(head).len())
+            .sum()
     })
 }
 
@@ -2612,6 +2719,23 @@ fn placements_at(live: &str, args: &Value) -> bool {
 // ─── Gates, reports, answers, resume, abandon ────────────────────────────────
 
 /// The flow waits at `gate`: its body, `needs` and revision.
+/// Gate A again, for a combination of approvals that is refused: the plan, and the
+/// refusal that names the key to change.
+fn open_refused_gate(state: &Path, flow: &mut FlowRecord, reason: &str) {
+    let mut body = gate_body(state, flow, Gate::Plan);
+    body["refused"] = json!(reason);
+    flow.plan_revision = Some(plan_revision(
+        &flow.flow_id,
+        Gate::Plan,
+        &flow.planned_from,
+        &body,
+    ));
+    flow.gate_body = Some(body);
+    flow.gate = Some(Gate::Plan);
+    flow.state = FlowState::AwaitingAnswer;
+    flow.at = None;
+}
+
 fn open_gate(state: &Path, flow: &mut FlowRecord, gate: Gate) {
     let body = gate_body(state, flow, gate);
     flow.plan_revision = Some(plan_revision(
@@ -2848,6 +2972,13 @@ fn leg_ended(state: &Path, flow: &mut FlowRecord, why: &str) {
         return;
     }
     let step = flow.at.unwrap_or(Step::Preflight);
+    if flow.finished(step) {
+        // The leg ended between two steps: the last one is done as recorded (m2).
+        flow.state = FlowState::Stopped;
+        flow.stop_reason = Some(format!("failed: the leg ended between steps ({why})"));
+        let _ = save_flow(state, flow);
+        return;
+    }
     let calling = flow
         .record(step)
         .is_some_and(|r| r.state == StepState::Calling);
@@ -2921,48 +3052,8 @@ async fn answer(
             flow.state.name()
         )));
     };
-    if flow.plan_revision.as_deref() != Some(revision) {
-        return Ok(CallToolResult::error(format!(
-            "expected_plan_revision is not the current one: the gate's plan_revision is {}. Show the user the current plan (a report gives it) and answer that. Nothing was changed.",
-            flow.plan_revision.as_deref().unwrap_or("none")
-        )));
-    }
-    let merged = match flow.approvals.merged(&given, gate) {
-        Ok(merged) => merged,
-        Err(why) => return Ok(invalid_arg("answer", &why)),
-    };
-    let rails = flow.rail_roles();
-    if let Some(reason) =
-        refused_combination(&merged, &flow.facts, &flow.steps_asked, &rails, &flow.nets)
-    {
-        return Ok(CallToolResult::error(format!(
-            "{reason} Nothing was changed."
-        )));
-    }
-    let roles_changed = gate == Gate::Plan && flow.approvals.roles_changed(&given);
-    flow.approvals = merged;
-    if roles_changed {
-        // P4 again with the new roles; the placement stays the one judged with the
-        // earlier pours, and the record says so.
-        if let Some(mut placed) = flow.record(Step::Placement).cloned() {
-            placed
-                .not_checked
-                .push("placement judged with the earlier pour roles".to_string());
-            flow.put(placed);
-        }
-        flow.records
-            .retain(|record| record.step != Step::PoursAfter);
-    }
-    if gate == Gate::Roles {
-        flow.facts.named_only.clear();
-    }
-    let missing = gate_needs(&flow, gate);
-    if !missing.is_empty() && !roles_changed {
-        let keys: Vec<&str> = missing.iter().map(|need| need.key).collect();
-        return Ok(invalid_arg(
-            "answer",
-            &format!("the gate still needs {}", keys.join(", ")),
-        ));
+    if let Err(refusal) = apply_answer(&mut flow, gate, &given, revision) {
+        return Ok(refusal);
     }
     let board = PathBuf::from(&flow.board);
     let io: Arc<dyn FlowIo> = Arc::new(LiveIo {
@@ -2973,6 +3064,96 @@ async fn answer(
     Ok(CallToolResult::json(&start_leg(
         jobs, state, flow, ctx, io,
     )?))
+}
+
+/// What an answer does to the record, before the next leg, or its refusal (nothing is
+/// changed by a refusal):
+/// 1. `expected_plan_revision` is the gate's;
+/// 2. the approvals merged (`merged`), or, at gate A after a refused combination, the
+///    answer's keys replacing the old ones (`overridden`, M4);
+/// 3. `refused_combination` on the result;
+/// 4. P4 again when the roles changed at gate A, or when the user keeps the current
+///    placement and P4 planned on the winner (m5): gate A comes back when its zones differ;
+/// 5. otherwise every key the gate needs must be answered (gate R included, m3).
+fn apply_answer(
+    flow: &mut FlowRecord,
+    gate: Gate,
+    given: &Approvals,
+    revision: &str,
+) -> Result<(), CallToolResult> {
+    if flow.plan_revision.as_deref() != Some(revision) {
+        return Err(CallToolResult::error(format!(
+            "expected_plan_revision is not the current one: the gate's plan_revision is {}. Show the user the current plan (a report gives it) and answer that. Nothing was changed.",
+            flow.plan_revision.as_deref().unwrap_or("none")
+        )));
+    }
+    let refused_before = gate == Gate::Plan
+        && flow
+            .gate_body
+            .as_ref()
+            .is_some_and(|body| body.get("refused").is_some());
+    let merged = if refused_before {
+        flow.approvals.overridden(given)
+    } else {
+        flow.approvals
+            .merged(given, gate)
+            .map_err(|why| invalid_arg("answer", &why))?
+    };
+    let rails = flow.rail_roles();
+    if let Some(reason) =
+        refused_combination(&merged, &flow.facts, &flow.steps_asked, &rails, &flow.nets)
+    {
+        return Err(CallToolResult::error(format!(
+            "{reason} Nothing was changed."
+        )));
+    }
+    let roles_changed = gate == Gate::Plan && flow.approvals.roles_changed(given);
+    let kept_after_winner = gate == Gate::Plan
+        && merged.placement == Some(PlacementAnswer::KeepCurrent)
+        && flow.facts.p4_on_winner;
+    let replan = roles_changed || kept_after_winner;
+    if gate == Gate::Roles {
+        if let Some(need) = needs_roles(&flow.facts.named_only, &merged) {
+            return Err(invalid_arg(
+                "answer",
+                &format!("the gate still needs {}", need.key),
+            ));
+        }
+    }
+    if !replan {
+        let missing = match gate {
+            Gate::Roles => Vec::new(),
+            Gate::Plan => needs_at_plan(&flow.facts, &flow.steps_asked, &merged),
+            Gate::Routing => needs_routing(&merged, flow.route.and_then(|r| r.all_gates_pass))
+                .into_iter()
+                .collect(),
+        };
+        if !missing.is_empty() {
+            let keys: Vec<&str> = missing.iter().map(|need| need.key).collect();
+            return Err(invalid_arg(
+                "answer",
+                &format!("the gate still needs {}", keys.join(", ")),
+            ));
+        }
+    }
+    flow.approvals = merged;
+    if roles_changed {
+        // The placement stays the one judged with the earlier pours, and the record says so.
+        if let Some(mut placed) = flow.record(Step::Placement).cloned() {
+            placed
+                .not_checked
+                .push("placement judged with the earlier pour roles".to_string());
+            flow.put(placed);
+        }
+    }
+    if replan {
+        flow.records
+            .retain(|record| record.step != Step::PoursAfter);
+    }
+    if gate == Gate::Roles {
+        flow.facts.named_only.clear();
+    }
+    Ok(())
 }
 
 /// A resume. The flow must be stopped and no leg running. For a writing step:
@@ -3059,6 +3240,30 @@ async fn resume_step(
     let Some(record) = flow.record(step).cloned() else {
         return Ok(Err(format!("{} has no record to resume from.", step.id())));
     };
+    if record.state.finished() {
+        // Stopped between two steps (m2): the next step runs as usual.
+        flow.state = FlowState::Running;
+        flow.stop_reason = None;
+        return Ok(Ok(()));
+    }
+    if record.before.is_none() {
+        // The step stopped before its intent was recorded, so no call was sent (M1). It
+        // runs again, and its own checks decide; a board that changed is refused here.
+        if flow
+            .stop_reason
+            .as_deref()
+            .is_some_and(|why| why.starts_with("board_changed"))
+        {
+            return Ok(Err(format!(
+                "The flow stopped because the board changed ({}). Restore the board or abandon the flow.",
+                flow.stop_reason.clone().unwrap_or_default()
+            )));
+        }
+        flow.records.retain(|r| r.step != step);
+        flow.state = FlowState::Running;
+        flow.stop_reason = None;
+        return Ok(Ok(()));
+    }
     // An unsaved step's work is on the board by its own record: only the save again.
     let done = record.state != StepState::Unsaved && already_done(step, state, flow, io).await?;
     let found = match with_tries(io, || io.saved_text()).await {
@@ -3071,7 +3276,11 @@ async fn resume_step(
     };
     match may_resume(&record, done, &found) {
         Ok(Resume::RunAgain) => {
-            flow.records.retain(|r| r.step != step);
+            // It runs again from the board as found: its start, or the end of its last
+            // stitching round (m1).
+            let mut again = StepRecord::new(step, StepState::NotRun);
+            again.before = Some(found.clone());
+            flow.put(again);
         }
         Ok(Resume::RecordDone) => match live_equals_saved(io).await {
             Ok((_, saved)) => {

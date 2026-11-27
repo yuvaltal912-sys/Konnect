@@ -819,14 +819,34 @@ async fn a_failed_read_is_tried_three_times_and_a_write_never_again() {
 }
 
 #[tokio::test]
-async fn a_refused_combination_approved_in_advance_stops_before_any_write() {
+async fn a_refused_combination_approved_in_advance_goes_back_to_gate_a_before_any_write() {
     let mut planned = planned();
     planned.flow.approvals.delete_routing = Some(DeleteAnswer::Keep);
     let fake = Fake::new();
     let flow = leg(&mut planned, &fake).await;
-    assert_eq!(flow.state, FlowState::Stopped);
-    assert!(flow.stop_reason.unwrap().contains("delete_routing"));
+    assert_eq!(flow.state, FlowState::AwaitingAnswer);
+    assert_eq!(flow.gate, Some(Gate::Plan));
+    let body = flow.gate_body.clone().unwrap();
+    assert!(body["refused"].as_str().unwrap().contains("delete_routing"));
     assert!(fake.calls().is_empty());
+    // M4: the answer there may change a key set in advance; one still refused stays.
+    let revision = flow.plan_revision.clone().unwrap();
+    let mut again = flow.clone();
+    let still = Approvals {
+        placement: Some(PlacementAnswer::Apply),
+        ..Approvals::default()
+    };
+    assert!(apply_answer(&mut again, Gate::Plan, &still, &revision).is_err());
+    assert_eq!(again, flow, "a refused answer changes nothing");
+    let fixed = Approvals {
+        delete_routing: Some(DeleteAnswer::Delete),
+        ..Approvals::default()
+    };
+    apply_answer(&mut again, Gate::Plan, &fixed, &revision).unwrap();
+    assert_eq!(again.approvals.delete_routing, Some(DeleteAnswer::Delete));
+    planned.flow = again;
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Done, "{:?}", flow.stop_reason);
 }
 
 #[tokio::test]
@@ -906,8 +926,9 @@ async fn resume_runs_a_step_again_only_at_its_start() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        planned.flow.record(Step::ApplyPlacement).is_none(),
+    assert_eq!(
+        planned.flow.record(Step::ApplyPlacement).map(|r| r.state),
+        Some(StepState::NotRun),
         "it runs again"
     );
     let flow = leg(&mut planned, &fake).await;
@@ -1599,4 +1620,193 @@ fn ff4_the_search_with_and_without_the_pours_on_the_public_fixture() {
     )
     .unwrap();
     println!("FF4: {verdict}; record {}", root.join("ff4.json").display());
+}
+
+// ─── The review's fixes ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn m1_a_stop_before_the_intent_is_resumed() {
+    let mut planned = planned();
+    let fake = Fake::new();
+    // L1 reads fine; then KiCad drops for L2's three reads.
+    fake.script("delete_all_routing", ok(json!({ "status": "ready", "plan_revision": "r", "will_delete": counts(10, 2), "kept_locked": counts(0, 0) })));
+    planned
+        .flow
+        .put(StepRecord::new(Step::Unchanged, StepState::Done));
+    fake.live_failures.store(3, Ordering::SeqCst);
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.at, Some(Step::DeleteRouting));
+    assert!(flow
+        .stop_reason
+        .as_deref()
+        .unwrap()
+        .starts_with("kicad_unreachable"));
+    assert_eq!(flow.record(Step::DeleteRouting).unwrap().before, None);
+    resume_step(&planned.state, &mut planned.flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Done, "{:?}", flow.stop_reason);
+}
+
+#[tokio::test]
+async fn m2_every_apply_attempt_gets_a_new_candidate_path() {
+    let (mut planned, fake) = stopped_at(
+        Step::ApplySession,
+        Called::Answered(CallToolResult::error("rolled back")),
+        "apply_specctra_ses",
+    )
+    .await;
+    resume_step(&planned.state, &mut planned.flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    leg(&mut planned, &fake).await;
+    let files: Vec<PathBuf> =
+        std::fs::read_dir(flow_folder(&planned.state, &planned.flow.flow_id).join("steps"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains("apply_specctra_ses"))
+            .collect();
+    let paths: BTreeSet<String> = files
+        .iter()
+        .map(|f| {
+            read_json(f).unwrap()["arguments"]["candidate_output_path"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(paths.len(), files.len(), "{paths:?}");
+    assert!(files.len() >= 2);
+    assert!(
+        paths
+            .iter()
+            .all(|p| p.starts_with("/r/candidate-") && p.ends_with(".kicad_pcb")),
+        "{paths:?}"
+    );
+}
+
+#[test]
+fn m3_the_pours_signature_sees_every_change_of_the_zones() {
+    let pours = |net: &str, clean: bool| {
+        json!({ "status": "planned", "check": { "clean": clean },
+        "proposals": [{ "net": net, "layer": "F.Cu", "add_zone": { "net_name": net, "layer": "F.Cu" }, "fill": { "pieces": 1 } }] })
+    };
+    let base = pours_signature(&pours("VBUS", true));
+    assert_eq!(base, pours_signature(&pours("VBUS", true)));
+    assert_ne!(
+        base,
+        pours_signature(&pours("5V", true)),
+        "same count, another net"
+    );
+    assert_ne!(
+        base,
+        pours_signature(&pours("VBUS", false)),
+        "same zone, another check"
+    );
+}
+
+#[tokio::test]
+async fn m5_a_refusal_after_an_earlier_write_of_the_step_is_uncertain() {
+    let mut planned = planned();
+    let fake = Fake::new();
+    fake.script("add_zone", ok(json!({ "ok": true })));
+    fake.script(
+        "add_zone",
+        Called::Answered(CallToolResult::error("no outline")),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.at, Some(Step::AddZones));
+    assert_eq!(
+        flow.record(Step::AddZones).unwrap().state,
+        StepState::Uncertain
+    );
+    assert_eq!(flow.board_state, BoardState::Uncertain);
+}
+
+#[tokio::test]
+async fn m6_no_save_is_sent_when_the_board_cannot_be_read() {
+    let fake = Fake::new();
+    fake.live_failures.store(3, Ordering::SeqCst);
+    assert!(verified_save(&fake).await.is_err());
+    assert!(!fake.calls().contains(&"save_project".to_string()));
+}
+
+#[test]
+fn m1_a_stitching_step_resumes_from_its_last_round() {
+    let mut record = StepRecord::new(Step::PlaneStitch, StepState::Uncertain);
+    record.before = Some("start".into());
+    record.rounds = vec!["round-1".into(), "round-2".into()];
+    assert_eq!(may_resume(&record, false, "round-2"), Ok(Resume::RunAgain));
+    assert!(
+        may_resume(&record, false, "round-1").is_err(),
+        "only the last round's board"
+    );
+    let mut flow = planned().flow;
+    let mut again = StepRecord::new(Step::PlaneStitch, StepState::NotRun);
+    again.before = Some("round-2".into());
+    flow.put(again);
+    assert_eq!(flow.expected_before(Step::PlaneStitch), "round-2");
+}
+
+#[tokio::test]
+async fn m2_a_leg_ended_between_steps_keeps_the_done_record() {
+    let mut planned = planned();
+    let fake = Fake::new();
+    fake.route.lock().unwrap()["completion"]["judged"]["all_gates_pass"] = json!(false);
+    leg(&mut planned, &fake).await;
+    // As if the server stopped right after R3 was saved.
+    planned.flow.state = FlowState::Running;
+    planned.flow.at = Some(Step::ImportCheck);
+    save_flow(&planned.state, &planned.flow).unwrap();
+    let mut flow = planned.flow.clone();
+    leg_ended(&planned.state, &mut flow, "stopped");
+    assert_eq!(flow.state, FlowState::Stopped);
+    assert_eq!(
+        flow.record(Step::ImportCheck).unwrap().state,
+        StepState::Done
+    );
+    resume_step(&planned.state, &mut flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.state, FlowState::Running);
+}
+
+#[test]
+fn m3_gate_r_needs_its_roles_and_m5_keeping_the_placement_plans_the_pours_again() {
+    let mut flow = planned().flow;
+    flow.approvals.pour_roles = None;
+    flow.facts.named_only = vec!["VCC".to_string()];
+    flow.gate = Some(Gate::Roles);
+    flow.plan_revision = Some("rev".into());
+    assert!(apply_answer(&mut flow.clone(), Gate::Roles, &Approvals::default(), "rev").is_err());
+    let roles = Approvals {
+        pour_roles: Some(RolesAnswer::AsNamed(AsNamed::AsNamed)),
+        ..Approvals::default()
+    };
+    apply_answer(&mut flow, Gate::Roles, &roles, "rev").unwrap();
+    assert!(flow.facts.named_only.is_empty());
+
+    let mut flow = planned().flow;
+    flow.approvals = Approvals::default();
+    flow.facts.change = Some("small".into());
+    flow.facts.p4_on_winner = true;
+    flow.plan_revision = Some("rev".into());
+    let keep = Approvals {
+        placement: Some(PlacementAnswer::KeepCurrent),
+        delete_routing: Some(DeleteAnswer::Delete),
+        pours: Some(PoursAnswer::Add),
+        routing: Some(RoutingAnswer::ApplyIfComplete),
+        ..Approvals::default()
+    };
+    apply_answer(&mut flow, Gate::Plan, &keep, "rev").unwrap();
+    assert!(
+        flow.record(Step::PoursAfter).is_none(),
+        "P4 runs again on the current placement"
+    );
+    assert!(apply_answer(&mut planned().flow, Gate::Plan, &keep, "stale").is_err());
 }

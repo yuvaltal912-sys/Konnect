@@ -293,6 +293,21 @@ impl Approvals {
         })
     }
 
+    /// `self` with every key `answer` sets replaced: the answer to gate A after a refused
+    /// combination, where any key may change.
+    pub(crate) fn overridden(&self, answer: &Approvals) -> Approvals {
+        Approvals {
+            placement: answer.placement.or(self.placement),
+            delete_routing: answer.delete_routing.or(self.delete_routing),
+            pours: answer.pours.or(self.pours),
+            pour_roles: answer
+                .pour_roles
+                .clone()
+                .or_else(|| self.pour_roles.clone()),
+            routing: answer.routing.or(self.routing),
+        }
+    }
+
     /// Whether `answer` replaces the roles `self` holds with different ones.
     pub(crate) fn roles_changed(&self, answer: &Approvals) -> bool {
         match (&self.pour_roles, &answer.pour_roles) {
@@ -365,6 +380,9 @@ pub(crate) struct PlanFacts {
     pub export_refused: Option<String>,
     /// Nets whose role comes from the name only, after the given roles.
     pub named_only: Vec<String>,
+    /// P4 planned the pours on the search's winner (not on the current placement).
+    #[serde(default)]
+    pub p4_on_winner: bool,
 }
 
 impl PlanFacts {
@@ -679,7 +697,7 @@ impl StepState {
     }
 
     /// Finished for the flow's order: the next step may follow.
-    fn finished(self) -> bool {
+    pub(crate) fn finished(self) -> bool {
         matches!(self, StepState::Done | StepState::Skipped)
     }
 }
@@ -816,6 +834,14 @@ impl FlowRecord {
     /// The `after` a writing step must find: that of the last writing step done, else
     /// `planned_from`.
     pub(crate) fn expected_before(&self, step: Step) -> String {
+        // A step resumed to run again starts from the board its resume found (m1).
+        if let Some(again) = self
+            .record(step)
+            .filter(|record| record.state == StepState::NotRun)
+            .and_then(|record| record.before.clone())
+        {
+            return again;
+        }
         self.records
             .iter()
             .filter(|record| record.step < step && record.step.writes())
@@ -899,7 +925,12 @@ pub(crate) fn may_resume(record: &StepRecord, done: bool, found: &str) -> Result
         return Ok(Resume::RecordDone);
     }
     match &record.before {
-        Some(before) if before == found => Ok(Resume::RunAgain),
+        // At the step's start, or at the end of its last stitching round.
+        Some(before)
+            if before == found || record.rounds.last().is_some_and(|round| round == found) =>
+        {
+            Ok(Resume::RunAgain)
+        }
         Some(before) => {
             Err(format!(
             "board_changed: {} ({}) began on the saved board {before}, and the saved board now \

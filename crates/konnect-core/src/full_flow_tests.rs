@@ -13,6 +13,7 @@ fn facts() -> PlanFacts {
         fill_clean: true,
         export_refused: None,
         named_only: Vec::new(),
+        p4_on_winner: true,
     }
 }
 
