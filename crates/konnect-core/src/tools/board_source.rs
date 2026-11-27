@@ -211,8 +211,8 @@ where
         LiveBoard::NeverReached(message) if live_required => BoardRead::Refused(not_live_enough(
             what,
             format!(
-                "{} (KiCad's IPC API cannot be reached: {message})",
-                crate::tools::board_safety::not_open_sentence(board_path)
+                "{} ({message})",
+                crate::tools::board_safety::unreachable_sentence(board_path)
             ),
         )),
         LiveBoard::NeverReached(_) => BoardRead::Saved(no_live_board(

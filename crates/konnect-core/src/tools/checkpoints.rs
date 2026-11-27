@@ -1158,7 +1158,8 @@ pub(crate) struct EnsuredCheckpoint {
 /// Row BS: a checkpoint holding the project's saved files as they are now. An
 /// existing one is reused when its files are exactly the saved files now (the
 /// same `content_hash`, the identity `create_checkpoint` already reports as
-/// `identical_to`): a new copy would hold the same bytes. Otherwise one is
+/// `identical_to`) and its stored copies still read back as recorded: a new copy
+/// would hold the same bytes. Otherwise one is
 /// taken with `reason` `automatic`, once more if KiCad saved during the copy.
 /// The error is the reason in prose; nothing is listed then.
 pub(crate) fn ensure_checkpoint(
@@ -1177,7 +1178,14 @@ pub(crate) fn ensure_checkpoint(
     );
     if let Some(store) = store_dir(&project, false)? {
         let (manifests, _) = read_store(&store)?;
-        if let Some(found) = manifests.into_iter().find(|m| m.content_hash == now) {
+        // A reused checkpoint must still restore: its stored copies are read
+        // back against their digests, as restore does. One that fails is
+        // passed over, and a fresh one is taken below.
+        if let Some(found) = manifests
+            .into_iter()
+            .filter(|m| m.content_hash == now)
+            .find(|m| load_checkpoint_files(&store, m).is_ok())
+        {
             return Ok(EnsuredCheckpoint {
                 location: location(&found.id),
                 id: found.id,

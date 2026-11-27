@@ -305,9 +305,9 @@ where
             // opens with "the board is not open in KiCad's PCB editor: open …".
             LiveBoard::Unserved { message, .. } => {
                 BoardWrite::Refused(CallToolResult::error(format!(
-                    "The {what} was not made: {message}. The board file was not modified: a \
-                     PCB editor on another endpoint could still hold this board, so editing the \
-                     file directly could be silently overwritten."
+                    "The {what} was not made: {message}. The board file was not modified \
+                     either, in case a PCB editor on another endpoint holds this board: an edit \
+                     to the file could then be silently overwritten."
                 )))
             }
             LiveBoard::Rejected(message) => BoardWrite::Refused(CallToolResult::error(format!(

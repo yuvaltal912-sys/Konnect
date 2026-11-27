@@ -44,6 +44,15 @@ fn says_not_open(message: &str, board: &Path) -> bool {
         .contains(&not_open_sentence(board).to_lowercase())
 }
 
+/// Whether `message` carries the KiCad-down sentence for `board`, and does not
+/// claim the board is closed.
+fn says_unreachable(message: &str, board: &Path) -> bool {
+    message
+        .to_lowercase()
+        .contains(&board_safety::unreachable_sentence(board).to_lowercase())
+        && !says_not_open(message, board)
+}
+
 fn body_of(result: &CallToolResult) -> Value {
     serde_json::from_str(&text_of(result)).expect("a JSON body")
 }
@@ -159,9 +168,10 @@ async fn a_write_refused_for_no_pcb_editor_says_the_board_is_not_open() {
     assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD_TEXT);
 }
 
-/// `board_source: live` with KiCad down reads as plainly as a board not open.
+/// `board_source: live` with KiCad down reads as plainly, without claiming the
+/// board is closed.
 #[tokio::test]
-async fn a_live_read_with_kicad_down_says_the_board_is_not_open() {
+async fn a_live_read_with_kicad_down_says_kicad_cannot_be_reached() {
     let dir = tempfile::tempdir().unwrap();
     let (_, board) = project(dir.path());
     let ctx = ctx_talking_to(String::new());
@@ -178,8 +188,7 @@ async fn a_live_read_with_kicad_down_says_the_board_is_not_open() {
         panic!("live required, KiCad down: refused")
     };
     let message = message_of(&refusal);
-    assert!(says_not_open(&message, &board), "{message}");
-    assert!(message.contains("cannot be reached"), "{message}");
+    assert!(says_unreachable(&message, &board), "{message}");
 }
 
 /// `plan_convergent_placement` reads the live board before its search, so its
@@ -283,8 +292,51 @@ async fn the_route_refuses_at_once_when_kicad_cannot_be_reached() {
             .await
             .unwrap();
     let message = message_of(&result);
-    assert!(says_not_open(&message, &board), "{message}");
-    assert!(message.contains("cannot be reached"), "{message}");
+    assert!(says_unreachable(&message, &board), "{message}");
+    assert!(message.contains(PREFLIGHT_MARK), "{message}");
+}
+
+/// A build that cannot list its open documents: refused, without the claim
+/// that the board is closed.
+#[tokio::test]
+async fn the_route_refuses_without_claiming_closed_when_kicad_cannot_list_boards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let (dsn, ses) = staged_dsn(dir.path(), &board);
+    let server = spawn_kicad_answering(kiapi::common::ApiStatusCode::AsUnimplemented);
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let result =
+        super::integration::handle_route_specctra_dsn(&route_args(&dsn, &ses, json!({})), ctx)
+            .await
+            .unwrap();
+    let message = message_of(&result);
+    assert!(
+        message.starts_with("KiCad cannot say which boards"),
+        "{message}"
+    );
+    assert!(!message.to_lowercase().contains("is not open"), "{message}");
+    assert!(message.contains(PREFLIGHT_MARK), "{message}");
+}
+
+/// KiCad refuses the open-document command outright: it may hold the board, so
+/// the refusal says it did not confirm, not that the board is closed.
+#[tokio::test]
+async fn the_route_refuses_without_claiming_closed_when_kicad_rejects_the_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let (dsn, ses) = staged_dsn(dir.path(), &board);
+    let server = spawn_kicad_answering(kiapi::common::ApiStatusCode::AsBadRequest);
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let result =
+        super::integration::handle_route_specctra_dsn(&route_args(&dsn, &ses, json!({})), ctx)
+            .await
+            .unwrap();
+    let message = message_of(&result);
+    assert!(
+        message.starts_with("KiCad did not confirm that it holds"),
+        "{message}"
+    );
+    assert!(!says_not_open(&message, &board), "{message}");
     assert!(message.contains(PREFLIGHT_MARK), "{message}");
 }
 
@@ -495,8 +547,9 @@ async fn a_bulk_edit_of_a_live_board_says_so_and_names_unsaved_changes() {
         assert!(summary.contains("live board open in KiCad"), "{summary}");
         assert!(summary.contains("Edit > Undo"), "{summary}");
         assert_eq!(note["restore"]["close_the_board_in_kicad_first"], true);
+        assert_eq!(note["restore"]["only_after_the_edit_is_saved"], true);
         assert_eq!(
-            summary.contains("not saved when this call started"),
+            summary.contains("differed from its saved file when this call started"),
             unsaved,
             "{summary}"
         );
@@ -543,8 +596,10 @@ async fn a_bulk_edit_is_refused_when_its_checkpoint_cannot_be_made() {
     assert!(message.contains("not_utf8"), "{message}");
 }
 
+/// No project file beside the board: no checkpoint can protect the edit, so
+/// nothing runs.
 #[tokio::test]
-async fn a_bulk_edit_without_a_project_file_runs_and_says_no_checkpoint_protects_it() {
+async fn a_bulk_edit_without_a_project_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let board = dir.path().join("loose.kicad_pcb");
     std::fs::write(&board, BOARD_TEXT).unwrap();
@@ -555,19 +610,130 @@ async fn a_bulk_edit_without_a_project_file_runs_and_says_no_checkpoint_protects
         calls.clone(),
         ok_reply,
     ));
-    let note = body_of(&call(&tool, &board, arc(ctx_talking_to(String::new()))).await)
-        ["live_project"]
-        .clone();
+    let result = call(&tool, &board, arc(ctx_talking_to(String::new()))).await;
+    assert!(result.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the tool did not run");
+    let message = message_of(&result);
+    assert!(message.starts_with("Nothing was changed"), "{message}");
+    assert!(message.contains("no project file"), "{message}");
+    assert_eq!(body_of(&result)["error"]["kind"], "plan_blocked");
+}
+
+/// A failed call on a live board: no way back is offered that could undo the
+/// user's own earlier edit, and the checkpoint is still named.
+#[tokio::test]
+async fn a_failed_bulk_edit_offers_no_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let tool = board_safety::guard(fake_bulk_edit(
+        "apply_specctra_ses",
+        BoardAccess::LiveOnly,
+        Arc::new(AtomicUsize::new(0)),
+        || {
+            crate::mcp::protocol::CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::HandlerError {
+                    reason: "no session".to_string(),
+                },
+                "the session file is missing",
+            )
+        },
+    ));
+    let note = body_of(&call(&tool, &board, ctx).await)["live_project"].clone();
+    let summary = note["summary"].as_str().unwrap();
+    assert!(!summary.contains("Undo"), "{summary}");
+    assert!(!summary.contains("edited"), "{summary}");
+    assert!(
+        summary.contains("no change to the board is known"),
+        "{summary}"
+    );
+    assert!(note["checkpoint"]["checkpoint_id"].is_string(), "{note}");
+}
+
+/// A live-only edit while KiCad holds another board: refused by the tool, no copy.
+#[tokio::test]
+async fn a_live_only_edit_while_kicad_holds_another_board_takes_no_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let elsewhere = dir.path().join("other.kicad_pcb");
+    std::fs::write(&elsewhere, BOARD_TEXT).unwrap();
+    let server = spawn_kicad_holding_board(&elsewhere, |_| None);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = board_safety::guard(fake_bulk_edit(
+        "apply_specctra_ses",
+        BoardAccess::LiveOnly,
+        calls.clone(),
+        ok_reply,
+    ));
+    call(
+        &tool,
+        &board,
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(note["checkpoint"].is_null(), "{note}");
-    assert!(note["checkpoint_skipped_reason"]
+    assert!(checkpoint_ids(dir.path()).is_empty());
+}
+
+/// The board named by a path that is not canonical (macOS `/var` is a link to
+/// `/private/var`): the same project, the same checkpoint store.
+#[tokio::test]
+async fn a_board_named_by_a_linked_path_checkpoints_its_project() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path());
+    let linked = dir.path().join("amp.kicad_pcb");
+    let tool = board_safety::guard(fake_bulk_edit(
+        "set_component_placements",
+        BoardAccess::LivePreferredWithFallback,
+        Arc::new(AtomicUsize::new(0)),
+        ok_reply,
+    ));
+    let ctx = arc(ctx_talking_to(String::new()));
+    let first = body_of(&call(&tool, &linked, ctx.clone()).await);
+    let second = body_of(&call(&tool, &linked.canonicalize().unwrap(), ctx).await);
+    assert_eq!(checkpoint_ids(dir.path()).len(), 1);
+    assert_eq!(
+        first["live_project"]["checkpoint"]["checkpoint_id"],
+        second["live_project"]["checkpoint"]["checkpoint_id"]
+    );
+}
+
+/// A checkpoint of the same files whose stored copy no longer reads back is not
+/// reused: a fresh one is taken.
+#[tokio::test]
+async fn a_damaged_checkpoint_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let tool = board_safety::guard(fake_bulk_edit(
+        "set_component_placements",
+        BoardAccess::LivePreferredWithFallback,
+        Arc::new(AtomicUsize::new(0)),
+        ok_reply,
+    ));
+    let ctx = arc(ctx_talking_to(String::new()));
+    let first = body_of(&call(&tool, &board, ctx.clone()).await);
+    let id = first["live_project"]["checkpoint"]["checkpoint_id"]
         .as_str()
         .unwrap()
-        .contains("no project file"));
-    assert!(note["summary"]
-        .as_str()
-        .unwrap()
-        .contains("No checkpoint protects this call"));
+        .to_string();
+    std::fs::write(
+        dir.path()
+            .join(".konnect/checkpoints")
+            .join(&id)
+            .join("files/amp.kicad_pcb"),
+        "damaged",
+    )
+    .unwrap();
+    let second = body_of(&call(&tool, &board, ctx).await);
+    assert_eq!(
+        second["live_project"]["checkpoint"]["made_by_this_call"],
+        true
+    );
+    assert_ne!(
+        second["live_project"]["checkpoint"]["checkpoint_id"],
+        id.as_str()
+    );
 }
 
 /// A refusal in plain text keeps its text; the note follows as its own block.
@@ -592,6 +758,7 @@ async fn a_plain_text_result_gets_the_note_as_a_second_block() {
         .as_str()
         .unwrap()
         .starts_with("The call reported an error"));
+    assert!(!text.contains("Undo"), "{text}");
 }
 
 /// Tools that are not bulk edits are returned untouched.
