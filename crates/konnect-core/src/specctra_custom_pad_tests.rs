@@ -557,7 +557,10 @@ fn polygon_points(shape: &dsn::Shape) -> (&str, Vec<(f64, f64)>) {
 }
 
 /// The pin's polygon and the image's keepouts, both in the image frame.
-fn router_copper(pcb: &dsn::Pcb, image: &str, id: &str) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
+/// A ring of image-frame points, in micrometres.
+type Ring = Vec<(f64, f64)>;
+
+fn router_copper(pcb: &dsn::Pcb, image: &str, id: &str) -> (Ring, Vec<Ring>) {
     let image = pcb.library.images.iter().find(|i| i.name == image).unwrap();
     let pin = image.pins.iter().find(|p| p.id == id).unwrap();
     let stack = pin_stack(pcb, &image.name, id);

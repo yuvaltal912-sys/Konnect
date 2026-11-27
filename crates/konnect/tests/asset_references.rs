@@ -680,6 +680,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "not_routed",
         // Specctra export result field (creation PR 16b).
         "intent_widths",
+        // Specctra export result field (row CC, concave custom pads).
+        "concave_custom_pads",
         // Manufacturing and trace-current response fields and statuses
         // (creation PR 11).
         "fab_limits",
