@@ -487,6 +487,11 @@ impl LengthPlan {
                 );
             }
         }
+        // Row RW: every rule in one create_custom_drc_rule call (one preview,
+        // one plan revision, one apply), then one line per rule that needs a
+        // word of its own.
+        let mut batch: Vec<Value> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         let names = rule_names(&self.groups);
         for (group, name) in self.groups.iter().zip(&names) {
             // Row LT, L25: a skew group that holds a pair with its own skew rule is
@@ -504,34 +509,56 @@ impl LengthPlan {
             let (rule, note) = match (pinned, longest) {
                 (true, Some(longest)) => (
                     kicad_group_rule_pinned(group, name, longest),
-                    format!(
-                        " The group holds a pair with its own skew rule, and KiCad checks one skew rule for a net, so this rule is a length window pinned to the routed lengths (the longest net is {} mm): the pair rule keeps checking the pair, and this one the group. It also fails when every net later grows by the same amount, which the judge's skew check would allow.",
+                    Some(format!(
+                        "Rule \"{name}\" (group '{}' of interface '{}') holds a pair with its own skew rule, and KiCad checks one skew rule for a net, so it is a length window pinned to the routed lengths (the longest net is {} mm): the pair rule keeps checking the pair, and this one the group. It also fails when every net later grows by the same amount, which the judge's skew check would allow.",
+                        group.name,
+                        group.interface,
                         mm_text(longest)
-                    ),
+                    )),
                 ),
                 (true, None) => (
                     kicad_rule_suggestion(group, name),
-                    " The group holds a pair with its own skew rule, and KiCad checks one skew rule for a net: on the nets of that pair KiCad will check only the pair rules, not this one. Route to a winner to get a rule pinned to its lengths.".to_string(),
+                    Some(format!(
+                        "Rule \"{name}\" (group '{}' of interface '{}') holds a pair with its own skew rule, and KiCad checks one skew rule for a net: on the nets of that pair KiCad will check only the pair rules, not this one. Route to a winner to get a rule pinned to its lengths.",
+                        group.name, group.interface
+                    )),
                 ),
-                (false, _) => (kicad_rule_suggestion(group, name), String::new()),
+                (false, _) => (kicad_rule_suggestion(group, name), None),
             };
-            steps.push(format!(
-                "To keep KiCad checking group '{}' of interface '{}' after hand edits, call create_custom_drc_rule with name \"{}\" \
-                 and rule {} once apply_specctra_ses has run (dry_run first, then apply with the plan revision it returns). \
-                 The rule is checked by KiCad's own DRC and stays in the board when it is exported again.{note}",
-                group.name, group.interface, name, rule
-            ));
+            batch.push(json!({ "name": name, "rule": rule }));
+            notes.extend(note);
         }
         for pair in &self.pairs {
+            batch.push(json!({
+                "name": pair_rule_name(pair),
+                "rule": kicad_pair_rule_suggestion(pair),
+            }));
+        }
+        // One call holds at most MAX_RULES_PER_CALL rules; a longer list is
+        // split into calls of that size, each with its own preview and revision.
+        let chunks: Vec<&[Value]> = batch.chunks(custom_rules::MAX_RULES_PER_CALL).collect();
+        let calls = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let groups = self.groups.len();
+            let pairs = self.pairs.len();
+            let which = if calls == 1 {
+                "once".to_string()
+            } else {
+                format!(
+                    "(call {} of {calls}, at most {} rules each)",
+                    index + 1,
+                    custom_rules::MAX_RULES_PER_CALL
+                )
+            };
             steps.push(format!(
-                "To keep KiCad checking the skew of the pair '{}' and '{}' after hand edits, call create_custom_drc_rule with name \"{}\" \
-                 and rule {} once apply_specctra_ses has run (dry_run first, then apply with the plan revision it returns).",
-                pair.positive,
-                pair.negative,
-                pair_rule_name(pair),
-                kicad_pair_rule_suggestion(pair)
+                "To keep KiCad checking these lengths after hand edits ({groups} group rule(s), {pairs} pair skew rule(s)), \
+                 once apply_specctra_ses has run call create_custom_drc_rule {which} with the board and rules={}: \
+                 dry_run first, then apply with the plan revision it returns. Add replace_existing=true when the board already has rules of these names from an earlier route. \
+                 The rules are checked by KiCad's own DRC and stay in the board when it is exported again; KiCad may hold the board open.",
+                Value::Array(chunk.to_vec())
             ));
         }
+        steps.extend(notes);
         steps
     }
 }

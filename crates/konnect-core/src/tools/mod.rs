@@ -47,6 +47,7 @@ mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
 pub(crate) mod navigation_target;
+pub(crate) mod netclass_live;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;

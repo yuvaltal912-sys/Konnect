@@ -99,7 +99,7 @@ pub(super) fn uncertain(
     crate::mcp::protocol::CallToolResult::error_kind(crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain{operation:operation.into(),path:path.display().to_string(),reason:reason.clone()},format!("The project write could not be verified: {reason}. Inspect the saved project before retrying."))
 }
 /// A saved project may also be owned by its root schematic editor.
-pub(super) fn schematic_lock_refusal(
+pub(crate) fn schematic_lock_refusal(
     board: &std::path::Path,
 ) -> Option<crate::mcp::protocol::CallToolResult> {
     let schematic = board.with_extension("kicad_sch");
