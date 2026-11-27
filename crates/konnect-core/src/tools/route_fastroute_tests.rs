@@ -2647,6 +2647,38 @@ fn the_result_carries_length_matching_the_tune_row_and_the_rule_steps() {
     assert_eq!(checked["g4_failed"], false);
     assert_eq!(checked["length_miss_mm"], 0.0);
 
+    // Row FF: without a manifest naming the board the rule step stays prose only; with
+    // one it also carries the call in structured form, the line unchanged.
+    let rule_step = |result: &Value| -> Value {
+        result["completion"]["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| {
+                step["manual"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("create_custom_drc_rule"))
+            })
+            .cloned()
+            .unwrap()
+    };
+    assert!(rule_step(&result).get("tool").is_none());
+    std::fs::write(
+        search.root.join("board.dsn.konnect.json"),
+        json!({ "board_path": "/b/board.kicad_pcb" }).to_string(),
+    )
+    .unwrap();
+    let structured = rule_step(&result_with(&search, &length_plan()));
+    assert_eq!(structured["manual"], rule_step(&result)["manual"]);
+    assert_eq!(structured["tool"], "create_custom_drc_rule");
+    assert_eq!(structured["arguments"]["board"], "/b/board.kicad_pcb");
+    assert_eq!(structured["arguments"]["replace_existing"], true);
+    assert!(!structured["arguments"]["rules"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    std::fs::remove_file(search.root.join("board.dsn.konnect.json")).unwrap();
+
     // The same finished search read without a length plan (a call without groups):
     // nothing of Row LT in the result.
     let result = result_with(&search, &LengthPlan::default());

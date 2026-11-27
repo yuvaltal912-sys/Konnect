@@ -175,6 +175,12 @@ async fn handle_plan_convergent_placement(
     if let Some(busy) = board_busy(&state, &PLACEMENT_RUNS, &board)? {
         return Ok(busy_result(&busy));
     }
+    // Row FF (FF12): a full flow open on the board writes it at its approved points.
+    if let Some(flow) = crate::tools::full_flow_tool::open_flow(&state, &board)? {
+        return Ok(CallToolResult::error(format!(
+            "A full flow is open on this board: run {flow}. Call run_full_flow with {{\"run_id\": \"{flow}\"}} for where it stands, or abandon it first. One run per board at a time: nothing new was started."
+        )));
+    }
     let live = match live_input(ctx, &board).await? {
         Ok(live) => live,
         Err(refusal) => return Ok(refusal),
@@ -192,28 +198,9 @@ async fn handle_plan_convergent_placement(
         Ok(binary) => binary,
         Err(refusal) => return Ok(refusal),
     };
-    let project_board = scratch_project(&folder, &board, &live.text)?;
     let live_text = live.text.clone();
-    let kicad_config_home = folder.join("kicad-config");
-    std::fs::create_dir(&kicad_config_home)
-        .with_context(|| format!("create '{}'", kicad_config_home.display()))?;
-    let inputs = RouteInputs {
-        options: export_options(&project_board),
-        board: project_board,
-        rules: live.rules,
-        effort: call.effort,
-        fastroute: binary.path.clone(),
-        kicad_cli: ctx.config.kicad_cli.clone(),
-        kicad_config_home,
-    };
-    let schematic = Some(board.with_extension("kicad_sch")).filter(|root| root.is_file());
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let plan = tool_plan(&folder, inputs.clone(), schematic, threads);
-    let isolated = isolated_context(&folder.join("isolation"), &ctx.config.kicad_cli)?;
-    let routing: Arc<dyn RouteCall> = Arc::new(PlaceRouteCall {
-        inputs,
-        ctx: isolated,
-    });
+    let PreparedSearch { plan, routing, .. } =
+        prepare_search(ctx, &folder, &board, &live, call.effort, &binary.path)?;
     let planned = Planned::of(&live_text)?;
     let fastroute = json!({
         "path": binary.path.display().to_string(),
@@ -232,6 +219,57 @@ async fn handle_plan_convergent_placement(
         },
     )?;
     Ok(CallToolResult::json(&body))
+}
+
+/// What the handler builds before `start_run`: the run folder's scratch project
+/// (`scratch_project`), the private KiCad settings folder, `RouteInputs`, `tool_plan`,
+/// `isolated_context` and the `PlaceRouteCall`. Shared by the tool and `run_full_flow`
+/// (Row FF), so that the flow's search is Row CT's search. `live.text` is the board text
+/// the search plans; `fastroute` is a binary already located.
+pub(crate) fn prepare_search(
+    ctx: &ToolContext,
+    folder: &Path,
+    board: &Path,
+    live: &LiveInput,
+    effort: Effort,
+    fastroute: &Path,
+) -> anyhow::Result<PreparedSearch> {
+    let project_board = scratch_project(folder, board, &live.text)?;
+    let kicad_config_home = folder.join("kicad-config");
+    std::fs::create_dir(&kicad_config_home)
+        .with_context(|| format!("create '{}'", kicad_config_home.display()))?;
+    let inputs = RouteInputs {
+        options: export_options(&project_board),
+        board: project_board,
+        rules: live.rules.clone(),
+        effort,
+        fastroute: fastroute.to_path_buf(),
+        kicad_cli: ctx.config.kicad_cli.clone(),
+        kicad_config_home,
+    };
+    let schematic = Some(board.with_extension("kicad_sch")).filter(|root| root.is_file());
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let plan = tool_plan(folder, inputs.clone(), schematic, threads);
+    let isolated = isolated_context(&folder.join("isolation"), &ctx.config.kicad_cli)?;
+    let routing: Arc<dyn RouteCall> = Arc::new(PlaceRouteCall {
+        inputs: inputs.clone(),
+        ctx: Arc::clone(&isolated),
+    });
+    Ok(PreparedSearch {
+        plan,
+        inputs,
+        routing,
+        isolated,
+    })
+}
+
+/// [`prepare_search`]'s result.
+pub(crate) struct PreparedSearch {
+    pub plan: Plan,
+    pub inputs: RouteInputs,
+    pub routing: Arc<dyn RouteCall>,
+    /// The isolated context the routing calls run under.
+    pub isolated: Arc<ToolContext>,
 }
 
 /// A call either starts a run or reports one.
@@ -336,7 +374,7 @@ pub(crate) struct LiveInput {
 /// is not open, or a KiCad that cannot be reached, is a refusal: the routing export needs
 /// KiCad's own net-class resolution, and the live text holds the user's locks even
 /// before they are saved.
-async fn live_input(
+pub(crate) async fn live_input(
     ctx: &ToolContext,
     board: &Path,
 ) -> anyhow::Result<Result<LiveInput, CallToolResult>> {
@@ -452,7 +490,7 @@ pub(crate) fn scratch_project(folder: &Path, board: &Path, text: &str) -> anyhow
 /// environment variable, the user config, the packaged binary, the home default), and
 /// probed in `<folder>/probe`. Anything but a usable binary is a refusal with
 /// `route_specctra_dsn`'s own setup guidance.
-async fn locate_fastroute(
+pub(crate) async fn locate_fastroute(
     argument: Option<&Path>,
     folder: &Path,
 ) -> anyhow::Result<Result<Binary, CallToolResult>> {
@@ -580,9 +618,25 @@ pub(crate) async fn plan_and_judge_observed(
     planned: &Planned,
     progress: &SearchProgress,
 ) -> anyhow::Result<Value> {
+    Ok(plan_with_outcome(plan, routing, board, planned, progress)
+        .await?
+        .0)
+}
+
+/// [`plan_and_judge_observed`], also returning the search's `Outcome` and the winner's
+/// record id, so a caller can `place_search::rebuild` the winner's board text (Row FF).
+pub(crate) async fn plan_with_outcome(
+    plan: &Plan,
+    routing: Arc<dyn RouteCall>,
+    board: &Path,
+    planned: &Planned,
+    progress: &SearchProgress,
+) -> anyhow::Result<(Value, Outcome, Option<usize>)> {
     let outcome = search_observed(plan, routing, progress).await?;
     let verdict = verdict_of(&outcome.model, &outcome)?;
-    Ok(result_json(plan, &outcome, &verdict, board, planned))
+    let body = result_json(plan, &outcome, &verdict, board, planned);
+    let winner = verdict.winner.as_ref().map(|(id, _)| *id);
+    Ok((body, outcome, winner))
 }
 
 // ─── The run in the background (Row AP2) ─────────────────────────────────────

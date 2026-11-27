@@ -121,9 +121,15 @@ fn bench(board_text: &str) -> Bench {
 
 impl Bench {
     async fn run(&self) -> CallToolResult {
-        plan_pours_in(&self.ctx, &self.board, BoardSource::Auto, Some(&self.state))
-            .await
-            .unwrap()
+        plan_pours_in(
+            &self.ctx,
+            &self.board,
+            BoardSource::Auto,
+            Some(&self.state),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     fn user_folder(&self) -> &Path {
@@ -648,7 +654,22 @@ fn the_next_steps_name_real_tools() {
         .collect();
     assert!(tools.contains("plan_pours"), "the tool is registered");
     // Words that are not tools: the result's own keys and KiCad's rule keys.
-    let not_tools = ["not_proposed", "starved_thermals"];
+    // Row FF: plan_pours's own `pour_roles` argument and its values.
+    let not_tools = [
+        "not_proposed",
+        "starved_thermals",
+        "pour_roles",
+        "as_named",
+        "not_a_supply",
+    ];
+    assert!(
+        crate::router::registry::tools_for("pcb_board")
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "plan_pours")
+            .is_some_and(|t| t.input_schema["properties"]["pour_roles"].is_object()),
+        "pour_roles is an argument of plan_pours"
+    );
     let mut named = BTreeSet::new();
     for step in &all {
         for word in step.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')) {
@@ -833,7 +854,7 @@ fn real_project(board_text: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
 #[ignore = "needs kicad-cli; run with KICAD_CONFIG_HOME set to a scratch folder"]
 async fn the_real_thing_fills_clean() {
     let (_root, board, state) = real_project(&pours_without_pours());
-    let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state))
+    let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state), None)
         .await
         .unwrap();
     assert!(!result.is_error, "{}", text_of(&result));
@@ -874,7 +895,7 @@ async fn the_real_thing_fills_clean() {
         json!({ "schema_version": 1, "fab_target": { "min_track_mm": 1.2 } }).to_string(),
     )
     .unwrap();
-    let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state))
+    let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state), None)
         .await
         .unwrap();
     assert!(!result.is_error, "{}", text_of(&result));
@@ -948,7 +969,7 @@ async fn kicad_fills_inside_a_rule_area_that_lets_pours_in() {
     let mut areas = Vec::new();
     for pours in ["allowed", "not_allowed"] {
         let (_root, board, state) = real_project(&with_node(&pours_without_pours(), &area(pours)));
-        let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state))
+        let result = plan_pours_in(&real_ctx(), &board, BoardSource::Saved, Some(&state), None)
             .await
             .unwrap();
         assert!(!result.is_error, "{}", text_of(&result));
@@ -1018,4 +1039,51 @@ fn a_request_the_board_already_meets_is_no_finding() {
     assert!(plan.proposals.is_empty());
     assert_eq!(status(&plan, None), NOTHING_TO_PROPOSE);
     assert!(!next_steps(&plan, None).join(" ").contains("not met"));
+}
+
+// ─── Row FF: pour_roles ──────────────────────────────────────────────────────
+
+#[test]
+fn pour_roles_reads_as_named_or_a_map_and_refuses_anything_else() {
+    use crate::full_flow::RolesAnswer;
+    assert_eq!(read_pour_roles(&json!({})).unwrap(), None);
+    assert!(matches!(
+        read_pour_roles(&json!({ "pour_roles": "as_named" })).unwrap(),
+        Some(RolesAnswer::AsNamed(_))
+    ));
+    assert!(matches!(
+        read_pour_roles(&json!({ "pour_roles": { "GND": "ground" } })).unwrap(),
+        Some(RolesAnswer::Map(_))
+    ));
+    for bad in [json!("all"), json!({ "GND": "earth" }), json!(["GND"])] {
+        assert!(
+            read_pour_roles(&json!({ "pour_roles": bad })).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn confirmed_roles_say_so_instead_of_asking() {
+    let mut body = json!({ "next_steps": [
+        "Show the user this plan.",
+        format!("The roles of VCC come from their names only. {CONFIRM_ROLES} with the user, then call plan_pours again."),
+    ]});
+    confirmed_roles(&mut body, None);
+    assert!(body["next_steps"][1]
+        .as_str()
+        .unwrap()
+        .contains(CONFIRM_ROLES));
+    confirmed_roles(
+        &mut body,
+        Some(&crate::full_flow::RolesAnswer::AsNamed(
+            crate::full_flow::AsNamed::AsNamed,
+        )),
+    );
+    let line = body["next_steps"][1].as_str().unwrap();
+    assert!(
+        line.starts_with("The roles of VCC come from their names only; pour_roles confirmed them"),
+        "{line}"
+    );
+    assert_eq!(body["next_steps"][0], "Show the user this plan.");
 }

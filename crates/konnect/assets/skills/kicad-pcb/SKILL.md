@@ -69,7 +69,7 @@ load_toolset('config')           # design rule storage: add_design_rule, list_de
 load_toolset('verification')     # run_drc, rules/sizes, check_clearance (explicit anchor/courtyard mode)
 load_toolset('placement')        # score_placement, read-only query_board_region, plan_convergent_placement
 load_toolset('pcb_export')       # export_specctra_dsn and refill_zones
-load_toolset('integration')      # check_freerouting and local route_specctra_dsn
+load_toolset('integration')      # check_freerouting, local route_specctra_dsn, run_full_flow
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -91,6 +91,34 @@ Always call `get_active_toolsets()` first to see what is already loaded.
   netclasses, configuring project constraints, or adjudicating DRC results.
 
 ---
+
+## The full flow in one call (`run_full_flow`)
+
+When the user wants the whole board laid out, from placement through pours to
+routing, use `run_full_flow` (integration toolset) instead of the 15 or so calls
+below. It is a tracked job: `run_full_flow(board)` returns a `run_id` at once;
+call `run_full_flow(run_id, wait_s: 300)` until `status` is not `running`.
+
+- The board must be open in KiCad's PCB editor, alone, saved, with a project
+  file beside it. Set netclass widths, net classes, length groups and pair skews
+  first: the flow routes at the board's rules and never invents one.
+- It plans on scratch copies before anything changes: the pours, the placement
+  search with each candidate routed with those pours, the pours on the winner,
+  and an export check of the board it would build.
+- It stops at a gate only where `approve` did not answer in advance. Gate R comes
+  within seconds when a supply role comes only from a net's name (`pour_roles`).
+  Gate A shows the plan: the parts that move, the routing that goes, the zones,
+  the roles, the export check. Gate B comes only when a judge gate of the route
+  failed (or `routing: ask`). Show the user `gate`; on a plain yes send
+  `answer_with` unchanged, otherwise change the keys the user named. An answer
+  carries `expected_plan_revision`, so it applies to the plan that was shown.
+- Then it writes the live board step by step through the public tools, with a
+  checkpoint before and a verified save after each step. It never retries a write
+  and never restores a checkpoint. A stopped flow says why and gives
+  `restore_checkpoint`'s arguments; `resume: true` continues once the board is
+  where the step left it, `abandon: true` ends it and undoes nothing.
+- The final result lists every step as done, skipped (with why) or not checked.
+  Tell the user from `summary.lines` and `summary.not_checked`.
 
 ## Layout Order
 
@@ -720,8 +748,14 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
 Plans the board's copper pours, read-only: nothing on the board changes.
 
 ```
-plan_pours(board, board_source?)
+plan_pours(board, board_source?, pour_roles?)
 ```
+
+- `pour_roles` confirms or sets the supply roles for this call only:
+  `"as_named"` confirms every role that comes from a net's name; a map
+  `{net: "ground" | "power" | "not_a_supply"}` sets the nets it names (their
+  `source` reads `user`). Nothing is saved, and a role against a design-intent
+  rail is refused: to keep a role, record the rail with `set_design_intent`
 
 - By rule: on 2 layers the ground net with the most pads on both; on 4 layers
   that net on F.Cu, In1.Cu and B.Cu and the power net with the most pads on

@@ -657,6 +657,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
     // KiCad's own vocabulary, and file/format names.
     const NOT_TOOLS: &[&str] = &[
+        // run_full_flow's response field and pour_roles's value (Row FF).
+        "answer_with",
+        "as_named",
+        "not_a_supply",
         // plan_pours's response fields and statuses, and add_zone's island mode
         // (Row ZR, stage ZR4).
         "planned_with_findings",

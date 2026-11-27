@@ -463,28 +463,44 @@ impl LengthPlan {
     /// `kicad_violations` is the winner's count of KiCad's own `length_out_of_range`
     /// and `skew_out_of_range` violations (G4(c)): when it is not 0 the first line says
     /// the session cannot be applied as it is.
+    #[cfg(test)]
     pub(crate) fn next_steps(
         &self,
         winner: Option<&LengthMeasures>,
         kicad_violations: usize,
     ) -> Vec<String> {
-        let mut steps = Vec::new();
+        self.next_step_entries(winner, kicad_violations)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// [`Self::next_steps`], each line with the rules of its `create_custom_drc_rule`
+    /// call when it is one (Row FF): the route result gives that call its structured
+    /// form beside the line.
+    pub(crate) fn next_step_entries(
+        &self,
+        winner: Option<&LengthMeasures>,
+        kicad_violations: usize,
+    ) -> Vec<(String, Option<Vec<Value>>)> {
+        let mut steps: Vec<(String, Option<Vec<Value>>)> = Vec::new();
         if kicad_violations > 0 {
-            steps.push(format!(
+            steps.push((format!(
                 "KiCad's own length or skew rules of the board are violated on this result ({kicad_violations} violation(s), `length_matching.kicad_violations`). \
                  apply_specctra_ses rolls back when the board has a .kicad_dru and the candidate's DRC is not clean, so this session cannot be applied as it is: \
                  change the board's rule or the design intent, or route again at a higher effort."
-            ));
+            ), None));
         }
         if let Some(measures) = winner.filter(|_| !self.is_empty()) {
             if measures.miss_mm > 0.0 || !measures.unmeasured.is_empty() {
-                steps.push(
+                steps.push((
                     "A length window was missed (see `length_matching.groups` and `.pairs` for each net and its miss). \
                      To change that: widen `tolerance_mm` of the group (or `max_skew_mm` of the pair) with set_design_intent, \
                      give the short nets room (fastroute lengthens a net only into free space, so move parts or clear the area around it), \
                      or route again at a higher effort."
                         .to_string(),
-                );
+                    None,
+                ));
             }
         }
         // Row RW: every rule in one create_custom_drc_rule call (one preview,
@@ -550,15 +566,15 @@ impl LengthPlan {
                     custom_rules::MAX_RULES_PER_CALL
                 )
             };
-            steps.push(format!(
+            steps.push((format!(
                 "To keep KiCad checking these lengths after hand edits ({groups} group rule(s), {pairs} pair skew rule(s)), \
                  once apply_specctra_ses has run call create_custom_drc_rule {which} with the board and rules={}: \
                  dry_run first, then apply with the plan revision it returns. Add replace_existing=true when the board already has rules of these names from an earlier route. \
                  The rules are checked by KiCad's own DRC and stay in the board when it is exported again; KiCad may hold the board open.",
                 Value::Array(chunk.to_vec())
-            ));
+            ), Some(chunk.to_vec())));
         }
-        steps.extend(notes);
+        steps.extend(notes.into_iter().map(|note| (note, None)));
         steps
     }
 }

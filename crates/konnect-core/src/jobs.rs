@@ -130,7 +130,7 @@ fn now_ms() -> u64 {
 /// `value` as JSON at `path`, by a new file renamed over it, so a reader never sees half
 /// of it. `durable`: the file is synced before the rename and its folder after it, so a
 /// `done` record does not outlive, across a power loss, the result it names.
-fn write_json(path: &Path, value: &impl Serialize, durable: bool) -> anyhow::Result<()> {
+pub(crate) fn write_json(path: &Path, value: &impl Serialize, durable: bool) -> anyhow::Result<()> {
     use std::io::Write as _;
     let text = serde_json::to_string_pretty(value)?;
     let temporary = path.with_extension("json.tmp");
