@@ -203,11 +203,27 @@ pub(crate) fn guard(mut tool: ToolDef) -> ToolDef {
 enum Held {
     /// KiCad named this exact board as open.
     Open,
-    /// KiCad answered without it, or could not be reached, or no longer holds a
-    /// board it held: a live-only tool refuses on its own.
-    Absent,
-    /// KiCad named the board and then did not answer cleanly: it may hold it.
+    /// KiCad answered, and the board is not among its open boards (`NotOpen`), or
+    /// no PCB editor is open at the endpoint (`AS_UNHANDLED`).
+    Closed,
+    /// Konnect could not see: KiCad unreachable, a build that cannot list its
+    /// boards, or a board it held and no longer reaches. A live-only tool refuses
+    /// on its own here too.
+    NotSeen,
+    /// KiCad answered, but not cleanly (a rejected question, an ambiguous list,
+    /// an unknown outcome): it may hold the board.
     Unknown,
+}
+
+impl Held {
+    /// `board_open_in_kicad`: known only for `Open` and `Closed`.
+    fn open(self) -> Value {
+        match self {
+            Self::Open => json!(true),
+            Self::Closed => json!(false),
+            Self::NotSeen | Self::Unknown => Value::Null,
+        }
+    }
 }
 
 /// What Konnect saw of the board just before the bulk edit.
@@ -224,6 +240,10 @@ async fn liveness(ctx: &ToolContext, board: &Path) -> anyhow::Result<Liveness> {
         Ok(client.save_document_to_string_in(document).ok())
     })
     .await?;
+    let held = |held| Liveness {
+        held,
+        unsaved: None,
+    };
     Ok(match observed {
         LiveBoard::Answered(live) => {
             let saved_path = board.to_path_buf();
@@ -241,18 +261,43 @@ async fn liveness(ctx: &ToolContext, board: &Path) -> anyhow::Result<Liveness> {
             }
         }
         LiveBoard::NotOpen { .. }
-        | LiveBoard::Unserved { .. }
-        | LiveBoard::NeverReached(_)
-        | LiveBoard::Unresolved(_)
-        | LiveBoard::LostAfterObservation { .. } => Liveness {
-            held: Held::Absent,
-            unsaved: None,
-        },
-        LiveBoard::Rejected(_) | LiveBoard::Uncertain(_) | LiveBoard::Recovered(_) => Liveness {
-            held: Held::Unknown,
-            unsaved: None,
-        },
+        | LiveBoard::Unserved {
+            absence: BoardEditorAbsence::NoPcbEditor,
+            ..
+        } => held(Held::Closed),
+        LiveBoard::NeverReached(_)
+        | LiveBoard::Unserved {
+            absence: BoardEditorAbsence::OpenDocumentsUnimplemented,
+            ..
+        }
+        | LiveBoard::LostAfterObservation { .. } => held(Held::NotSeen),
+        LiveBoard::Unresolved(_)
+        | LiveBoard::Rejected(_)
+        | LiveBoard::Uncertain(_)
+        | LiveBoard::Recovered(_) => held(Held::Unknown),
     })
+}
+
+/// How the wrapped call ended, as far as its result says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Succeeded,
+    /// An error that says nothing was applied, or says nothing either way.
+    Failed,
+    /// An error whose kind says the board may have changed.
+    MayHaveChanged,
+}
+
+impl Outcome {
+    fn of(result: &CallToolResult) -> Self {
+        if !result.is_error {
+            return Self::Succeeded;
+        }
+        match crate::mcp::error::extract_error_kind(result).as_deref() {
+            Some("mutation_outcome_uncertain" | "ipc_outcome_unknown") => Self::MayHaveChanged,
+            _ => Self::Failed,
+        }
+    }
 }
 
 /// The checkpoint, then the tool, then `live_project` on its result.
@@ -263,13 +308,20 @@ async fn checkpointed(
     ctx: Arc<ToolContext>,
     inner: ToolHandlerFn,
 ) -> anyhow::Result<CallToolResult> {
-    let Some(board) = args["board"].as_str().map(PathBuf::from) else {
+    // No board path, or no such file: the tool refuses on its own terms (a
+    // missing argument, a board not found), and changes nothing.
+    let Some(board) = args["board"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|board| board.is_file())
+    else {
         return inner(args, ctx).await;
     };
     let live = liveness(&ctx, &board).await?;
-    // A live-only tool refuses a board KiCad does not hold, and changes nothing;
-    // a checkpoint would only add a copy. A board KiCad may hold still gets one.
-    if access == BoardAccess::LiveOnly && live.held == Held::Absent {
+    // A live-only tool refuses a board KiCad does not hold or cannot be seen to
+    // hold, and changes nothing; a checkpoint would only add a copy. A board
+    // KiCad may hold still gets one.
+    if access == BoardAccess::LiveOnly && matches!(live.held, Held::Closed | Held::NotSeen) {
         return inner(args, ctx).await;
     }
     let blocked = |reason: String, message: String| {
@@ -305,14 +357,14 @@ async fn checkpointed(
                 reason.clone(),
                 format!(
                     "Nothing was changed: {tool} edits the real project, and the automatic \
-                         checkpoint that would restore it could not be made ({reason}). Fix that \
-                         and call again; create_checkpoint would fail for the same reason."
+                     checkpoint that would restore it could not be made ({reason}). Fix that \
+                     and call again; create_checkpoint would fail for the same reason."
                 ),
             ))
         }
     };
     let result = inner(args, ctx).await?;
-    let note = live_project_note(&board, &project, live, &checkpoint, result.is_error);
+    let note = live_project_note(&board, &project, live, &checkpoint, Outcome::of(&result));
     Ok(with_note(result, note))
 }
 
@@ -322,7 +374,7 @@ fn live_project_note(
     project: &Path,
     live: Liveness,
     checkpoint: &EnsuredCheckpoint,
-    call_failed: bool,
+    outcome: Outcome,
 ) -> Value {
     let restore_call = format!(
         "restore_checkpoint with project '{}' and checkpoint_id '{}' (it previews first)",
@@ -339,55 +391,66 @@ fn live_project_note(
         },
         checkpoint.created_utc
     );
+    let maybe_open = format!(
+        "{held}. If the board is open in KiCad, Edit > Undo reverts this call; once the edit is \
+         in the saved file, close the board in KiCad and call {restore_call}."
+    );
     let mut summary = Vec::new();
-    if call_failed {
+    match (outcome, live.held) {
         // Nothing here knows whether the failed call changed anything, so no way
         // back is offered that could undo something else.
-        summary.push(format!(
+        (Outcome::Failed, _) => summary.push(format!(
             "The call reported an error, and no change to the board is known to have been made. \
              {held}, in case it did."
-        ));
-    } else {
-        match live.held {
-            Held::Open => {
-                summary.push(format!(
-                    "This call edited the live board open in KiCad ({}): the real project, not \
-                     a copy. Edit > Undo in KiCad reverts it in one step.",
-                    board.display()
-                ));
-                summary.push(format!(
-                    "{held}, from before this call; the edit reaches the saved file only when \
-                     the board is saved. After a save, the way back is to close the board in \
-                     KiCad and call {restore_call}."
-                ));
-            }
-            Held::Absent => {
-                summary.push(format!(
-                    "This call edited the saved board file of the real project ({}), not a copy.",
-                    board.display()
-                ));
-                summary.push(format!("{held}. To go back, call {restore_call}."));
-            }
-            Held::Unknown => {
-                summary.push(format!(
-                    "This call edited the real project ({}), not a copy; Konnect could not \
-                     confirm whether KiCad held the board when it started.",
-                    board.display()
-                ));
-                summary.push(format!(
-                    "{held}. If the board is open in KiCad, Edit > Undo reverts this call; once \
-                     the edit is in the saved file, close the board in KiCad and call \
-                     {restore_call}."
-                ));
-            }
+        )),
+        (Outcome::MayHaveChanged, _) => summary.push(format!(
+            "The call reported that the board may have changed: inspect it before anything else. \
+             {held}, from before this call. If the board is open in KiCad and changed, Edit > \
+             Undo reverts it; once a change is in the saved file, close the board in KiCad and \
+             call {restore_call}."
+        )),
+        (Outcome::Succeeded, Held::Open) => {
+            summary.push(format!(
+                "This call edited the live board open in KiCad ({}): the real project, not a \
+                 copy. Edit > Undo in KiCad reverts it in one step.",
+                board.display()
+            ));
+            summary.push(format!(
+                "{held}, from before this call; the edit reaches the saved file only when the \
+                 board is saved. After a save, the way back is to close the board in KiCad and \
+                 call {restore_call}."
+            ));
+        }
+        (Outcome::Succeeded, Held::Closed) => {
+            summary.push(format!(
+                "This call edited the saved board file of the real project ({}), not a copy.",
+                board.display()
+            ));
+            summary.push(format!("{held}. To go back, call {restore_call}."));
+        }
+        (Outcome::Succeeded, Held::NotSeen) => {
+            summary.push(format!(
+                "This call edited the real project ({}), not a copy; Konnect could not see \
+                 whether KiCad held the board when it started.",
+                board.display()
+            ));
+            summary.push(maybe_open);
+        }
+        (Outcome::Succeeded, Held::Unknown) => {
+            summary.push(format!(
+                "This call edited the real project ({}), not a copy; KiCad did not confirm \
+                 whether it held the board when it started.",
+                board.display()
+            ));
+            summary.push(maybe_open);
         }
     }
     if live.held == Held::Open {
         match live.unsaved {
             Some(true) => summary.push(
                 "The live board differed from its saved file when this call started; that \
-                 difference is not in the checkpoint (save in KiCad first to make it \
-                 restorable)."
+                 difference is not in the checkpoint. Save the board in KiCad before the next \
+                 bulk edit to make it restorable."
                     .to_string(),
             ),
             Some(false) => {}
@@ -398,15 +461,16 @@ fn live_project_note(
             ),
         }
     }
+    let after_save = match live.held {
+        Held::Open => json!(true),
+        Held::Closed => json!(false),
+        Held::NotSeen | Held::Unknown => Value::Null,
+    };
     json!({
         "summary": summary.join(" "),
         "board": board.display().to_string(),
         "project": project.display().to_string(),
-        "board_open_in_kicad": match live.held {
-            Held::Open => json!(true),
-            Held::Absent => json!(false),
-            Held::Unknown => Value::Null,
-        },
+        "board_open_in_kicad": live.held.open(),
         "unsaved_changes_before_call": live.unsaved,
         "checkpoint": {
             "checkpoint_id": checkpoint.id,
@@ -418,8 +482,8 @@ fn live_project_note(
         "restore": {
             "tool": "restore_checkpoint",
             "arguments": { "project": project.display().to_string(), "checkpoint_id": checkpoint.id },
-            "close_the_board_in_kicad_first": live.held != Held::Absent,
-            "only_after_the_edit_is_saved": live.held == Held::Open,
+            "close_the_board_in_kicad_first": after_save,
+            "only_after_the_edit_is_saved": after_save,
         },
     })
 }

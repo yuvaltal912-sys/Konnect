@@ -1,7 +1,7 @@
 //! Row BS, board safety: the plain "board not open", the route pre-flight and the
 //! checkpoint before a bulk edit. Each guard has a test named for it here; the
-//! negative controls in `docs/CREATION_HANDOFF.md` ("Row BS") break each guard and
-//! name the test that fails.
+//! negative controls recorded in `docs/CREATION_HANDOFF.md` ("Row BS") break each
+//! guard and name the test that fails.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -481,7 +481,8 @@ async fn a_bulk_edit_checkpoints_first_and_reuses_it_until_the_files_change() {
     let first = body_of(&call(&tool, &board, ctx.clone()).await);
     assert_eq!(first["success"], true, "the tool's own body is kept");
     let note = &first["live_project"];
-    assert_eq!(note["board_open_in_kicad"], false, "{note}");
+    // KiCad unreachable: Konnect could not see, so it does not say "closed".
+    assert!(note["board_open_in_kicad"].is_null(), "{note}");
     assert_eq!(note["checkpoint"]["made_by_this_call"], true, "{note}");
     let id = note["checkpoint"]["checkpoint_id"]
         .as_str()
@@ -496,7 +497,7 @@ async fn a_bulk_edit_checkpoints_first_and_reuses_it_until_the_files_change() {
     );
     assert!(pro.is_file());
     let summary = note["summary"].as_str().unwrap();
-    assert!(summary.contains("of the real project"), "{summary}");
+    assert!(summary.contains("the real project"), "{summary}");
     assert!(summary.contains("not a copy"), "{summary}");
     assert!(summary.contains(&id), "{summary}");
 
@@ -594,6 +595,120 @@ async fn a_bulk_edit_is_refused_when_its_checkpoint_cannot_be_made() {
     let message = message_of(&result);
     assert!(message.starts_with("Nothing was changed"), "{message}");
     assert!(message.contains("not_utf8"), "{message}");
+}
+
+/// KiCad answers with no PCB editor: the board is closed, the edit went to the
+/// saved file, and restore is the way back.
+#[tokio::test]
+async fn a_bulk_edit_of_a_closed_board_says_the_saved_file_was_edited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_answering(kiapi::common::ApiStatusCode::AsUnhandled);
+    let tool = board_safety::guard(fake_bulk_edit(
+        "set_component_placements",
+        BoardAccess::LivePreferredWithFallback,
+        Arc::new(AtomicUsize::new(0)),
+        ok_reply,
+    ));
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let note = body_of(&call(&tool, &board, ctx).await)["live_project"].clone();
+    assert_eq!(note["board_open_in_kicad"], false, "{note}");
+    assert_eq!(
+        note["restore"]["only_after_the_edit_is_saved"], false,
+        "{note}"
+    );
+    let summary = note["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("saved board file of the real project"),
+        "{summary}"
+    );
+    assert!(!summary.contains("Undo"), "{summary}");
+}
+
+/// KiCad refuses the open-document question: it may hold the board, so a
+/// live-only edit still gets its checkpoint, and nothing claims open or closed.
+#[tokio::test]
+async fn a_live_only_edit_kicad_may_hold_still_gets_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_answering(kiapi::common::ApiStatusCode::AsBadRequest);
+    let tool = board_safety::guard(fake_bulk_edit(
+        "apply_specctra_ses",
+        BoardAccess::LiveOnly,
+        Arc::new(AtomicUsize::new(0)),
+        ok_reply,
+    ));
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let note = body_of(&call(&tool, &board, ctx).await)["live_project"].clone();
+    assert_eq!(checkpoint_ids(dir.path()).len(), 1);
+    assert!(note["board_open_in_kicad"].is_null(), "{note}");
+    assert!(
+        note["restore"]["only_after_the_edit_is_saved"].is_null(),
+        "{note}"
+    );
+    assert!(note["summary"]
+        .as_str()
+        .unwrap()
+        .contains("KiCad did not confirm"));
+}
+
+/// A call whose error says the board may have changed: inspect, and the ways back.
+#[tokio::test]
+async fn a_bulk_edit_that_may_have_changed_the_board_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let tool = board_safety::guard(fake_bulk_edit(
+        "apply_specctra_ses",
+        BoardAccess::LiveOnly,
+        Arc::new(AtomicUsize::new(0)),
+        || {
+            crate::mcp::protocol::CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+                    operation: "apply_specctra_ses".to_string(),
+                    path: "board".to_string(),
+                    reason: "restoration not proven".to_string(),
+                },
+                "SES import may have changed the live board",
+            )
+        },
+    ));
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let summary = body_of(&call(&tool, &board, ctx).await)["live_project"]["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        summary.contains("may have changed: inspect it"),
+        "{summary}"
+    );
+    assert!(summary.contains("Edit > Undo"), "{summary}");
+    assert!(
+        !summary.contains("no change to the board is known"),
+        "{summary}"
+    );
+}
+
+/// A board path that names no file: the tool refuses on its own terms, and no
+/// "no project file" refusal stands in for "board not found".
+#[tokio::test]
+async fn a_missing_board_file_is_left_to_the_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = board_safety::guard(fake_bulk_edit(
+        "set_component_placements",
+        BoardAccess::LivePreferredWithFallback,
+        calls.clone(),
+        ok_reply,
+    ));
+    let result = call(
+        &tool,
+        &dir.path().join("typo.kicad_pcb"),
+        arc(ctx_talking_to(String::new())),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(body_of(&result).get("live_project").is_none());
 }
 
 /// No project file beside the board: no checkpoint can protect the edit, so
