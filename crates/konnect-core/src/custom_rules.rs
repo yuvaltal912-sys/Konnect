@@ -6,6 +6,9 @@ use std::ops::Range;
 
 pub(crate) const PROBE: &str = "__konnect_rule_validation_probe__";
 
+/// The most rules one `create_custom_drc_rule` call takes in `rules` (Row RW).
+pub(crate) const MAX_RULES_PER_CALL: usize = 64;
+
 #[derive(Debug)]
 pub(crate) struct Rule {
     pub name: String,
