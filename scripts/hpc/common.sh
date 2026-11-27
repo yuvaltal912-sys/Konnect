@@ -19,6 +19,12 @@ HPC_SIF=${HPC_SIF:-/truenas/sif_images/pytorch_cuda12.1_ngc.sif}
 HPC_MAX_CPUS=80
 HPC_MAX_MINUTES=240
 
+# protoc for konnect-ipc's build script. The container's protoc 3.12.4 predates proto3
+# optional fields, so prepare.sh installs this release under konnect-hpc/tools/protoc once,
+# after checking its SHA-256 against the digest GitHub publishes for the asset.
+HPC_PROTOC_VERSION=${HPC_PROTOC_VERSION:-36.2}
+HPC_PROTOC_SHA256=${HPC_PROTOC_SHA256:-121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278}
+
 hpc_die() { echo "hpc: $*" >&2; exit 1; }
 
 # Records go to the MAIN checkout's target/hpc-runs (git-ignored, outlives a worktree).

@@ -1,0 +1,9 @@
+# cargo mutants on one file, on the cluster. Measured 2026-11-27 (job 20898, 16 CPUs):
+# 42 mutants in 6 minutes. Needs cargo-mutants in ~/.cargo/bin (docs/HPC_OFFLOAD.md).
+# Submit: scripts/hpc/hpc-submit --cpus 16 --mem 16G --time 0:30:00 --label "mutants probe" scripts/hpc/plans/mutants-probe.plan
+#
+# `any`: cargo mutants exits 2 when a mutant is missed, which reads recorded(exit 2), and
+# hpc-fetch notes it. The lists (caught.txt, missed.txt, ...) come back under out/mutants.out/.
+# EXPECT  NAME             COMMAND
+any       mutants-version  cargo mutants --version
+any       mutants-net      cargo mutants -p konnect-sexp --file crates/konnect-sexp/src/net.rs --jobs 4 --timeout 120 --output "$RUN_OUT"

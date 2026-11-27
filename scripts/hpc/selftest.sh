@@ -59,6 +59,18 @@ cat >"$F/bin/cargo" <<'EOF'
 #!/bin/bash
 case "$1" in fetch) ;; -V) echo "cargo 1.96.0 (fake)" ;; *) exit 1 ;; esac
 EOF
+# curl serves a fake protoc release zip and logs each download; nothing leaves the machine.
+cat >"$F/bin/curl" <<EOF
+#!/bin/bash
+while [ \$# -gt 0 ]; do case "\$1" in -o) out=\$2; shift 2;; -*) shift;; *) url=\$1; shift;; esac; done
+echo "\$url" >> "$F/state/curl-calls"; cp "$F/protoc.zip" "\$out"
+EOF
+mkdir -p "$F/zip/bin" "$F/zip/include"
+printf '#!/bin/bash\necho "libprotoc 36.2"\n' >"$F/zip/bin/protoc"
+chmod +x "$F/zip/bin/protoc"
+(cd "$F/zip" && zip -qr "$F/protoc.zip" bin include)
+HPC_PROTOC_SHA256=$(sha256sum "$F/protoc.zip" | awk '{ print $1 }')
+export HPC_PROTOC_VERSION=36.2 HPC_PROTOC_SHA256
 # GNU stat -c %Y on top of BSD stat, for the Mac.
 cat >"$F/bin/stat" <<'EOF'
 #!/bin/bash
@@ -120,6 +132,7 @@ EOF
 touch "$F/state/no-toolchain"
 check "submit runs, installs the pinned toolchain" 0 "submitted: job" "$sub" "$F/plan/mixed.plan"
 grep -q "installing Rust 1.96.0" "$F/out" && { ok=$((ok + 1)); echo "ok    toolchain install logged"; } || { bad=$((bad + 1)); echo "FAIL  toolchain install not logged"; }
+grep -q "installing protoc 36.2" "$F/out" && [ -x "$F/remote/tools/protoc/bin/protoc" ] && { ok=$((ok + 1)); echo "ok    protoc installed"; } || { bad=$((bad + 1)); echo "FAIL  protoc not installed"; }
 check "fetch: control caught"     0 "caught  *fail  *101 .* ok  *x::guard$" "$fetch"
 check "fetch: named test caught"  0 "named  *fail  *101 .* ok  *x::guard$" "$fetch"
 check "fetch: other test failed"  0 "wrongtest  *fail  *101 .* WRONG-TEST " "$fetch"
@@ -157,6 +170,28 @@ check "killed job reads INCOMPLETE" 0 "INCOMPLETE: 1 of 3" "$fetch"
 killed=$(basename "$(dirname "$(ls -1t "$F/runs"/*/jobid | head -n 1)")")
 echo 0 >"$F/remote/runs/$killed/out/overall" # as if the summary were written but rows were lost
 check "missing rows read INCOMPLETE" 0 "INCOMPLETE: 1 of 3" "$fetch" "$killed"
+
+calls=$(wc -l <"$F/state/curl-calls")
+check "protoc present: no second download" 0 "prepare: protoc 36.2$" "$sub" --cmd true
+[ "$(wc -l <"$F/state/curl-calls")" = "$calls" ] && { ok=$((ok + 1)); echo "ok    protoc not downloaded again"; } || { bad=$((bad + 1)); echo "FAIL  protoc downloaded again"; }
+printf '#!/bin/bash\necho "libprotoc 3.12.4"\n' >"$F/remote/tools/protoc/bin/protoc"
+check "old protoc replaced" 0 "installing protoc 36.2" "$sub" --cmd true
+"$F/remote/tools/protoc/bin/protoc" --version | grep -q "36.2" && { ok=$((ok + 1)); echo "ok    old protoc now 36.2"; } || { bad=$((bad + 1)); echo "FAIL  old protoc kept"; }
+rm -rf "${F:?}/remote/tools/protoc"
+HPC_PROTOC_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+    check "protoc zip with a wrong digest refused" 1 "prepare failed" "$sub" --cmd true
+grep -q "digest is .* expected 0000" "$F/out" && [ ! -e "$F/remote/tools/protoc" ] &&
+    { ok=$((ok + 1)); echo "ok    wrong digest: nothing installed"; } || { bad=$((bad + 1)); echo "FAIL  wrong digest: protoc installed or not reported"; }
+[ ! -d "$F/remote/run.lock" ] && { ok=$((ok + 1)); echo "ok    lock released after the digest refusal"; } || { bad=$((bad + 1)); echo "FAIL  lock left after the digest refusal"; }
+cp "$F/protoc.zip" "$F/protoc.good.zip"
+printf '#!/bin/bash\necho "libprotoc 9.9"\n' >"$F/zip/bin/protoc"
+rm -f "$F/protoc.zip" && (cd "$F/zip" && zip -qr "$F/protoc.zip" bin include)
+HPC_PROTOC_SHA256=$(sha256sum "$F/protoc.zip" | awk '{ print $1 }') \
+    check "zip whose protoc reports another version refused" 1 "prepare failed" "$sub" --cmd true
+grep -q "does not report libprotoc 36.2" "$F/out" && [ ! -e "$F/remote/tools/protoc" ] &&
+    { ok=$((ok + 1)); echo "ok    wrong version: nothing installed"; } || { bad=$((bad + 1)); echo "FAIL  wrong version: protoc installed or not reported"; }
+mv "$F/protoc.good.zip" "$F/protoc.zip"
+check "protoc reinstalled" 0 "installing protoc 36.2" "$sub" --cmd true
 
 touch "$F/state/wrong-rustc"
 check "wrong toolchain refused" 1 "prepare failed" "$sub" --cmd true

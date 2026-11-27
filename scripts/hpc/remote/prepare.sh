@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs on the cluster's LOGIN node, started by hpc-submit over ssh. Light work only:
 # check the quota, take the run lock, check out the exact commit, make sure the pinned
-# toolchain is installed, download crates (`cargo fetch`, no compiling), then sbatch.
+# toolchain and protoc are installed, download crates (`cargo fetch`, no compiling), then sbatch.
 # The last line it prints on success is JOBID=<n>.
 set -euo pipefail
 RUN=${1:?usage: prepare.sh RUN_DIR}
@@ -98,6 +98,31 @@ fi
 (cd "$SRC" && rustc -V | grep -q "^rustc $want ") ||
     { echo "prepare: rustup does not select $want in $SRC" >&2; exit 4; }
 log "toolchain $(cd "$SRC" && rustc -V)"
+
+# 4b. protoc pinned by meta.env; install it once if missing or another version (download
+#     only). The zip is used only if its SHA-256 matches the pinned digest.
+PROTOC_DIR="$ROOT/tools/protoc"
+want_protoc="libprotoc $PROTOC_VERSION"
+if [ "$("$PROTOC_DIR/bin/protoc" --version 2>/dev/null || true)" != "$want_protoc" ]; then
+    log "installing protoc $PROTOC_VERSION (first run only)"
+    heartbeat
+    dl="$RUN/protoc-download" # inside the run folder: a failure's cleanup removes it
+    mkdir -p "$dl"
+    curl -fsSL --retry 2 -o "$dl/protoc.zip" \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
+    got_sha=$(sha256sum "$dl/protoc.zip" | awk '{ print $1 }')
+    [ "$got_sha" = "$PROTOC_SHA256" ] ||
+        { echo "prepare: protoc zip digest is $got_sha, expected $PROTOC_SHA256; not installed" >&2; exit 4; }
+    unzip -q "$dl/protoc.zip" -d "$dl/protoc"
+    [ "$("$dl/protoc/bin/protoc" --version 2>/dev/null || true)" = "$want_protoc" ] ||
+        { echo "prepare: the downloaded protoc does not report $want_protoc" >&2; exit 4; }
+    mkdir -p "$ROOT/tools"
+    rm -rf "$PROTOC_DIR.old"
+    if [ -e "$PROTOC_DIR" ]; then mv "$PROTOC_DIR" "$PROTOC_DIR.old"; fi
+    mv "$dl/protoc" "$PROTOC_DIR"
+    rm -rf "$dl" "$PROTOC_DIR.old"
+fi
+log "protoc $PROTOC_VERSION"
 
 # 5. Crates for Cargo.lock, so the job builds offline.
 heartbeat

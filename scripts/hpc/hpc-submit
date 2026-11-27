@@ -116,6 +116,7 @@ cp "$HERE/remote/prepare.sh" "$HERE/remote/job.sbatch" "$HERE/remote/run-plan.sh
 {
     printf 'RUNID=%q\nSHA=%q\nCPUS=%q\nMEM=%q\nTIME=%q\nLABEL=%q\n' "$RUNID" "$SHA" "$CPUS" "$MEM" "$TIME" "$LABEL"
     printf 'PARTITION=%q\nACCOUNT=%q\nQOS=%q\nSIF=%q\n' "$HPC_PARTITION" "$HPC_ACCOUNT" "$HPC_QOS" "$HPC_SIF"
+    printf 'PROTOC_VERSION=%q\nPROTOC_SHA256=%q\n' "$HPC_PROTOC_VERSION" "$HPC_PROTOC_SHA256"
     printf 'SUBMITTED=%q\n' "$(date '+%F %T %z')"
 } >"$STAGE/upload/meta.env"
 cp "$STAGE/upload/meta.env" "$STAGE/meta.env"

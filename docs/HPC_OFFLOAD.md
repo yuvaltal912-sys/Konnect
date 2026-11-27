@@ -1,10 +1,10 @@
 # Offloading test runs to the BGU HPC cluster
 
-Status 2026-11-27: design and scripts only. `scripts/hpc/selftest.sh` runs them against a fake
-cluster on the Mac (fake ssh, Slurm, container and toolchain; no cargo, no network) and passes;
-each guard was broken once and the self-test caught it. **No real cluster job has run through
-them yet**, and `~/.ssh` is unchanged. The first job, and everything below marked *unmeasured*,
-waits for the owner's yes.
+Status 2026-11-27: working. Four real jobs ran on the cluster on 2026-11-27 (jobs 20894, 20895,
+20896 and 20898, all on `hpc-node5`); the measured values below come from them. Values still
+marked *unmeasured* are not settled by those runs. `scripts/hpc/selftest.sh` also runs the
+scripts against a fake cluster on the Mac (no cargo, no network), and each guard was broken once
+to check that the self-test catches it.
 
 ## Recommendation
 
@@ -25,16 +25,14 @@ VPN interface):
 | Server | OpenSSH 8.7 |
 | Sign-in methods offered | `publickey`, `gssapi-keyex`, `gssapi-with-mic`, `password`. No `keyboard-interactive`, so no one-time code is asked for |
 | Host key (ED25519) | `SHA256:qh8Jj3ykfstzY9arZBGKfnYtTIeBlWAuxHLlO/gJVqw` |
-| This Mac | no `~/.ssh/config`, no key or `known_hosts` entry for this host |
+| Login node | `ece-hpc`, with `sbatch`, `squeue` and `sacct` in `/opt/slurm/bin`; no `apptainer` there (only on the compute nodes, as expected) |
+| This Mac | set up 2026-11-27 as below: key `~/.ssh/id_ed25519_bgu_hpc`, the `bgu-hpc` block; host key checked from the Mac and from the server |
 
 BGU's public HPC docs (hpc.bgu.ac.il) cover the central cluster (`bhn20`), not the ECE one. They
 say the login node is reachable only from the campus network or the VPN, and they use key-based
 sign-in. Without the VPN this Mac was not tested.
 
-Not yet verified: that `ece-hpc.bgu.ac.il` itself has `sbatch`. The web shell may land on another
-login node. Step 4 below checks it.
-
-### One-time sign-in setup (the owner does this; it needs his passphrase and his web-shell session)
+### One-time sign-in setup (done 2026-11-27; the owner does it, with his passphrase and his web-shell session)
 
 1. Make a key on the Mac and keep its passphrase in the macOS keychain:
 
@@ -73,10 +71,8 @@ login node. Step 4 below checks it.
    fingerprint above and the one step 2 printed.
 
    ```bash
-   ssh bgu-hpc 'hostname -f; command -v sbatch squeue sacct apptainer'
+   ssh bgu-hpc 'hostname -f; command -v sbatch squeue sacct'
    ```
-
-   If `sbatch` is missing there, set `HostName` to the name step 2 printed.
 
 Without a key, the password still works: `ssh -fN bgu-hpc`, typed by the owner, opens the master
 connection, and the scripts reuse it until it expires. The scripts always run ssh with
@@ -108,13 +104,24 @@ sessions on hold for about 25 minutes per PR.
 | Focused `cargo test` | **move while the Mac is gated** | small gain otherwise: a warm Mac run takes a minute or two |
 | Linux validation at the end of the series | **move** | owed anyway; this Mac has no Linux |
 
-Costs per run: the upload is a 12 MB git bundle (the whole history; measured), seconds over the
-VPN. Preparation on the login node (checkout, `cargo fetch`) takes seconds once crates are cached.
-*Unmeasured:* the queue wait in the `course` partition, the first cold build (expect 10 to 15
-minutes on 16 CPUs), warm rebuilds on the cluster's network file system, and the home quota against
-a `target/` folder of several GB. The first job measures all of these.
+Measured on the cluster, 2026-11-27 (16 CPUs, 16 GB, `hpc-node5`, x86_64):
 
-Expected gain once it works (*unmeasured*): a mutants batch leaves the Mac's lane altogether, which
+| Cost | Value |
+|---|---|
+| Upload | a 12 MB git bundle (the whole history), seconds over the VPN |
+| Preparation on the login node | about 5 minutes the first time (installing Rust 1.96.0 and fetching every crate); 4 seconds after that |
+| Queue wait | none: all four jobs started the second they were submitted (one afternoon; a busy week may differ) |
+| `konnect-sexp` tests (`--lib`) | 168 s cold, including its build; 32 s warm. 227 passed, 2 ignored |
+| `konnect-core` cold build plus the `place_converge` tests | 245 s for the step, of which the tests took 77 s |
+| `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4` | 42 mutants in 6 minutes |
+| `target/` after those runs | 2.3 GB |
+| Disk | the home folder is on a shared 166 TB file system with 112 TB free; `quota` reports no user quota. The node's `/tmp` has 59 GB free |
+| Network from the compute node | reaches crates.io |
+
+*Unmeasured:* the whole `cargo test --workspace --lib --tests` on Linux, a mutants batch at the
+size of a PR's (100 or more mutants), and the queue at busy times.
+
+Expected gain (*unmeasured* end to end): a mutants batch leaves the Mac's lane altogether, which
 is 20 to 60 minutes of `instr.lock` per batch that gates no longer wait behind. With the 1-job quota,
 the four sessions share one cluster job at a time, so the cluster is a second lane, not four.
 
@@ -157,10 +164,17 @@ Mac: hpc-status (squeue, sacct, progress)     Mac: hpc-fetch (logs back, evidenc
   without KiCad. The fork's later tests have never run on Linux, so the first full Linux run will
   show which ones assume macOS (40 `target_os = "macos"` sites; `fastroute::tests::sandboxed`
   uses the macOS sandbox). List those in the plan's commands with `--skip`, not by deleting tests.
-- **Build needs.** `konnect-core` builds nng (cmake and a C compiler) and the IPC protos (`protoc`;
-  CI pins 3.23.4). If the container lacks `protoc`, put a release under
-  `konnect-hpc/tools/protoc/` (bin and include); `run-plan.sh` picks it up. That download needs the
-  owner's yes.
+- **Known Linux skip.** `place_converge::tests::whole_runs_are_the_recorded_goldens` compares
+  bit-exact costs recorded on the Mac (aarch64). On the cluster (x86_64) one intermediate cost
+  differs by 8 ulp; the end cost and the board are identical. It is a platform difference, not a
+  bug: Linux plans skip it (`-- --skip place_converge::tests::whole_runs_are_the_recorded_goldens`),
+  and the macOS gate still runs it.
+- **Build needs.** `konnect-core` builds nng (cmake and a C compiler; the container has gcc 11.3
+  and cmake 3.24.1) and the IPC protos. The container's `protoc` is 3.12.4, which rejects the
+  protos' proto3 `optional` fields. So `prepare.sh` installs protoc 36.2 under
+  `konnect-hpc/tools/protoc/` when it is missing or another version: it downloads the release zip
+  from GitHub, checks its SHA-256 against the digest GitHub publishes for that asset (pinned in
+  `scripts/hpc/common.sh`), and refuses a mismatch. `run-plan.sh` puts it on `PROTOC`.
 
 ### Plans
 
@@ -186,17 +200,24 @@ is fetched).
 ```
 pass               lib      cargo test -p konnect-core --locked --lib place_converge
 fail:nc/1.patch@caps  guard-1  cargo test -p konnect-core --locked --lib place_converge
-any                mutants  env -u CARGO_TARGET_DIR cargo mutants --no-shuffle -j 8 -f crates/konnect-core/src/place_converge.rs --output "$RUN_OUT" -- --lib
+any                mutants  cargo mutants -p konnect-core --file crates/konnect-core/src/place_converge.rs --jobs 4 --timeout 120 --output "$RUN_OUT"
 ```
+
+Two example plans are in `scripts/hpc/plans/`: `first-probe.plan` (tools, disk and network on the
+node, then two focused test runs) and `mutants-probe.plan` (one file's mutants).
 
 `hpc-fetch` ends `evidence.txt` with one line: `ALL STEPS AS EXPECTED`, `NOT AS EXPECTED`,
 `INCOMPLETE` (steps missing: wall time or a crash), `NOT CLEAN` (every step as expected but Slurm
 reports a state other than `COMPLETED`), or `INVALID` (the cluster checked out another commit).
 
-Mutants on the cluster need `cargo-mutants` 27.1.0 (the Mac's version) installed there first
-(`cargo install cargo-mutants --locked --version 27.1.0`, from a job if the node has network, or on
-the login node). Each mutants copy builds on its own, so unset `CARGO_TARGET_DIR` for that step.
-The job count is to be tuned on the first mutants run.
+Mutants on the cluster use `cargo-mutants` 27.1.0, the Mac's version. It was installed once, on
+2026-11-27, in `~/.cargo/bin` by a separate one-off Slurm job on a compute node (job 20896, 8 CPUs,
+1.5 minutes), with `cargo install --locked cargo-mutants --version 27.1.0` and the home folder's
+default toolchain (1.100), not the pinned one. Repeat that the same way if it is ever missing;
+`env.txt` records the version each job sees. The mutants probe ran with `--jobs 4` on 16 CPUs and
+`CARGO_TARGET_DIR` set as usual: 19 caught, 22 unviable, 1 missed. The missed mutant
+(`names_nets_in_place` in `konnect-sexp/src/net.rs` replaced with `true`) is a gap that is already
+on `main`, not something these scripts caused. Tune `--jobs` on a PR-sized batch.
 
 ### Commands
 
@@ -209,6 +230,7 @@ scripts/hpc/hpc-fetch             # after it ends: logs and evidence.txt
 ```
 
 `--dry-run` builds the run folder and sends nothing. Limits: 1 to 80 CPUs, at most 4:00:00.
+A label takes letters, digits, spaces and `._:#/-` only (no commas).
 After editing the scripts, run `scripts/hpc/selftest.sh` (about 30 seconds, no network).
 Records go to the main checkout's `target/hpc-runs/<run id>/` (git-ignored, and it outlives a
 worktree). Settings (host alias, work folder, partition, account, QoS, image) are at the top of
@@ -227,18 +249,18 @@ worktree). Settings (host alias, work folder, partition, account, QoS, image) ar
   "Linux, BGU cluster, job N" beside the result and never offers it as the macOS gate.
   A run that stopped early reads `INCOMPLETE`.
 - **Outward actions.** A submit sends the owner's code to the university cluster under his
-  account: each job needs his yes, as do the first sign-in setup and any other download onto the
-  cluster. A submit itself downloads two things, which that yes covers: the pinned Rust toolchain
-  from rustup when it is missing (once), and the crates in `Cargo.lock` from crates.io
-  (`cargo fetch`, cached after the first run).
+  account. On 2026-11-27 the owner gave a standing OK to install on the cluster whatever the
+  pipeline needs, without asking each time, on three conditions: official sources only, checksums
+  verified, and builds on compute nodes. A submit downloads three things: the pinned Rust
+  toolchain from rustup when it is missing (once), protoc 36.2 from GitHub when it is missing
+  (once, digest checked), and the crates in `Cargo.lock` from crates.io (`cargo fetch`, cached
+  after the first run). Which jobs to send, and when, stays with the PR's own rules.
 - **Real-project files.** Plans run tests from the repository only. Never put the owner's boards
   or the reference board in a plan.
 
 ## 5. Open items
 
-- First real job (proposed: `scripts/hpc/plans/first-probe.plan`, 16 CPUs, 16 GB, 30 minutes):
-  tools on the node, disk and quota, network from the node, then two focused test runs.
-- Then: the queue wait, cold and warm build times, the home quota against `target/`, whether the
-  node can install `cargo-mutants`, and a first full `cargo test --workspace --lib --tests` on Linux
-  with the list of macOS-only failures.
-- After the first good job: a short pointer in `AGENTS.md` (Tools) and the creation handoff.
+- A first full `cargo test --workspace --lib --tests` on Linux, with the list of macOS-only
+  failures to `--skip`.
+- A PR-sized mutants batch, to tune `--jobs` and compare with the Mac's 23 to 56 minutes.
+- The lane README line in section 4, for the supervisor or the owner to add.
