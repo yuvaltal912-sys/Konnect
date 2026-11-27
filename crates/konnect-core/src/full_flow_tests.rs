@@ -1015,3 +1015,25 @@ fn every_skip_says_why_in_its_own_words() {
         .unwrap()
         .contains("plane-stitching"));
 }
+
+#[test]
+fn keeping_routing_with_as_much_locked_as_unlocked_says_keep() {
+    let mut flow = flow();
+    flow.facts = PlanFacts {
+        unlocked_routing: 2,
+        locked_routing: 2,
+        ..facts()
+    };
+    flow.steps_asked.routing = RunOrSkip::Skip;
+    flow.approvals = Approvals {
+        delete_routing: Some(DeleteAnswer::Keep),
+        placement: Some(PlacementAnswer::KeepCurrent),
+        ..all_approved()
+    };
+    flow.put(StepRecord::new(Step::Preflight, StepState::Done));
+    walk(&mut flow);
+    assert_eq!(
+        why_skipped(&flow, Step::DeleteRouting).as_deref(),
+        Some("delete_routing: keep")
+    );
+}

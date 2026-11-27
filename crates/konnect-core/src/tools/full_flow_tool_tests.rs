@@ -2178,3 +2178,39 @@ async fn resume_keeps_the_right_records() {
         .unwrap();
     assert_eq!(flow.state, FlowState::Running);
 }
+
+#[test]
+fn a_set_key_cannot_change_at_an_unrefused_gate_a() {
+    let mut flow = gated(Gate::Plan);
+    let other = Approvals {
+        placement: Some(PlacementAnswer::KeepCurrent),
+        ..Approvals::default()
+    };
+    assert!(apply_answer(&mut flow, Gate::Plan, &other, "rev").is_err());
+}
+
+#[tokio::test]
+async fn an_interrupted_leg_stops_the_flow() {
+    let planned = planned();
+    let leg = "1700000000003-cccccccccccc";
+    let folder = run_folder_of(&planned.state, &FLOW_LEGS, leg);
+    std::fs::create_dir_all(&folder).unwrap();
+    // A record that says running, with no process holding its lock.
+    write_json(
+        &folder.join(crate::jobs::RUN_FILE),
+        &json!({ "run_id": leg, "tool": "run_full_flow", "board": planned.flow.board, "state": "running",
+                 "pid": 1, "started_unix_ms": 1, "finished_unix_ms": null, "progress": {}, "error": null }),
+        false,
+    )
+    .unwrap();
+    let mut flow = planned.flow.clone();
+    flow.state = FlowState::Running;
+    flow.at = Some(Step::ApplyPlacement);
+    flow.legs = vec![leg.to_string()];
+    save_flow(&planned.state, &flow).unwrap();
+    last_leg_ended(&Jobs::default(), &planned.state, &mut flow)
+        .await
+        .unwrap();
+    assert_eq!(flow.state, FlowState::Stopped);
+    assert!(flow.stop_reason.unwrap().contains("stopped"));
+}

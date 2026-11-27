@@ -1337,7 +1337,7 @@ run, and the test must fail.
 | Negative controls, one per guard | 28 of 28 caught (three controls were rewritten once: their first break was not a break) |
 | Independent review, Sonnet 5.5 high, read-only | round 1: 0 blockers, 6 majors, 6 minors; round 2 on the fixes: 0, 1, 5. All fixed, each with a test |
 | FF4 measurement | as above, 32 minutes at effort m |
-| Mutants | see the handoff's Row FF (cluster job, Linux evidence) |
+| Mutants, on the Mac | 278 mutants: 227 caught, 43 missed, 8 unviable. After tests for the misses, the 43 again: 32 caught. Three more tests with hand controls; 8 left, equivalent or KiCad-only (the handoff's Row FF lists them) |
 
 ### Not verified
 
