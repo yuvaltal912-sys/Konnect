@@ -544,7 +544,7 @@ struct Manifest {
     schema_version: u32,
     id: String,
     label: Option<String>,
-    /// `manual` or `pre_restore`.
+    /// `manual`, `pre_restore`, or `automatic` (Row BS: before a bulk edit).
     reason: String,
     /// Milliseconds since the Unix epoch; orders checkpoints within one second.
     created_unix_ms: u64,
@@ -1141,6 +1141,95 @@ async fn handle_create_checkpoint(
         result["identical_to"] = json!(previous.id);
     }
     Ok(CallToolResult::json(&result))
+}
+
+/// Row BS (board safety): the checkpoint a bulk edit of a live board stands on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnsuredCheckpoint {
+    pub id: String,
+    pub created_utc: String,
+    /// False when an existing checkpoint already held exactly these saved files.
+    pub made_now: bool,
+    pub location: PathBuf,
+    /// KiCad lock files present when it was taken (documents open in KiCad).
+    pub locks_present: Vec<String>,
+}
+
+/// Row BS: a checkpoint holding the project's saved files as they are now. An
+/// existing one is reused when its files are exactly the saved files now (the
+/// same `content_hash`, the identity `create_checkpoint` already reports as
+/// `identical_to`) and its stored copies still read back as recorded: a new copy
+/// would hold the same bytes. Otherwise one is
+/// taken with `reason` `automatic`, once more if KiCad saved during the copy.
+/// The error is the reason in prose; nothing is listed then.
+pub(crate) fn ensure_checkpoint(
+    project_file: &Path,
+    label: &str,
+) -> Result<EnsuredCheckpoint, String> {
+    let project = resolve_project(&json!({ "project": project_file }))
+        .map_err(|refusal| first_text(&refusal))?;
+    let location = |id: &str| project.dir.join(STORE_PARENT).join(STORE_DIR).join(id);
+    let scan = scan_project(&project.dir).map_err(|error| format!("unreadable: {error}"))?;
+    let captured = read_scan(&scan).map_err(|error| error.reason())?;
+    let now = content_hash(
+        captured
+            .iter()
+            .map(|c| (c.path.as_str(), c.sha256.as_str())),
+    );
+    if let Some(store) = store_dir(&project, false)? {
+        let (manifests, _) = read_store(&store)?;
+        // A reused checkpoint must still restore: its stored copies are read
+        // back against their digests, as restore does. One that fails is
+        // passed over, and a fresh one is taken below.
+        if let Some(found) = manifests
+            .into_iter()
+            .filter(|m| m.content_hash == now)
+            .find(|m| load_checkpoint_files(&store, m).is_ok())
+        {
+            return Ok(EnsuredCheckpoint {
+                location: location(&found.id),
+                id: found.id,
+                created_utc: found.created_utc,
+                made_now: false,
+                locks_present: present_locks(
+                    &project,
+                    &captured.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                ),
+            });
+        }
+    }
+    let mut attempt = 0;
+    loop {
+        match create_checkpoint_in(&project, Some(label.to_string()), "automatic") {
+            Ok((manifest, _)) => {
+                return Ok(EnsuredCheckpoint {
+                    location: location(&manifest.id),
+                    id: manifest.id,
+                    created_utc: manifest.created_utc,
+                    made_now: true,
+                    locks_present: manifest.locks_at_creation,
+                })
+            }
+            Err(CreateError::Changed) if attempt == 0 => attempt += 1,
+            Err(error) => {
+                return Err(first_text(
+                    &error.into_result("automatic checkpoint", &project),
+                ))
+            }
+        }
+    }
+}
+
+/// The first text of a result, for an error carried on as prose.
+fn first_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            crate::mcp::protocol::ToolContent::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn newest_manifest(project: &Project) -> Option<Manifest> {

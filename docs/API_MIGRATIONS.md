@@ -35,6 +35,53 @@ step. Before it, a board that `export_specctra_dsn` refused for unlocked routing
   `never_touched.kicad_updated` says (for example "KiCad removed 4 teardrop_zones with
   their tracks").
 
+## Unreleased: board safety (Row BS)
+
+**A behaviour change** for `route_specctra_dsn`, plus additive fields.
+
+- **`route_specctra_dsn` (both engines) checks the board before it starts.** The
+  board named in the DSN's manifest (`board_path`) must be open in KiCad's PCB
+  editor, or the call refuses at once (`editor_unavailable`), before any search
+  folder is made: "The board is not open in KiCad's PCB editor: open <board> and
+  call again. Nothing was routed: …". A DSN with no readable manifest is not
+  checked; the route refuses it with its own reason, as before. **Migration:** a
+  caller that routes a saved board with no KiCad running (a bench, a smoke check)
+  passes the new argument `require_live_board: false` (default `true`).
+- **"Board not open" reads plainly everywhere.** When KiCad answers
+  `GetOpenDocuments` with `AS_UNHANDLED` (no PCB editor at the endpoint), the
+  shared classifier's message now starts with "the board is not open in KiCad's
+  PCB editor: open <board> and call again", followed by KiCad's own answer; every
+  tool built on it carries that message inside its own refusal. `AS_UNIMPLEMENTED`
+  says Konnect cannot confirm the board is open. KiCad unreachable, where a live
+  board is required (`board_source: "live"`, the route pre-flight), reads "KiCad
+  cannot be reached, so Konnect cannot see <board> open in its PCB editor: start
+  KiCad, open the board there and call again". Neither claims the board is
+  closed. Error kinds and which calls refuse are unchanged; only message text
+  changed.
+- **`set_component_placements` and `apply_specctra_ses` checkpoint first.** Before
+  the tool runs, the project's saved files are checkpointed (`create_checkpoint`'s
+  store, `reason` `automatic`, label `automatic: before <tool>`); a checkpoint whose
+  files are exactly the saved files now, and whose stored copies still read back,
+  is reused instead. **Refusals (`plan_blocked`, nothing changed):** no
+  `<board>.kicad_pro` beside the board, or a checkpoint that cannot be made (for
+  example a project over the checkpoint limits, 256 MB or 4096 files). A `board`
+  that names no file is left to the tool's own refusal. `apply_specctra_ses` takes
+  no checkpoint when KiCad answered that it does not hold the board, or could not
+  be seen to hold it (unreachable, unable to list its boards): it refuses on its
+  own then. New result field `live_project`: `summary`, `board`, `project`,
+  `board_open_in_kicad` (`true`, `false` when KiCad answered without the board, or
+  `null` when Konnect could not see or KiCad did not answer cleanly),
+  `unsaved_changes_before_call` (the live board differed from its saved file;
+  `null` when unknown), `checkpoint` (`checkpoint_id`, `created_utc`,
+  `made_by_this_call`, `location`, `locks_present`) and `restore` (`tool`,
+  `arguments`, `close_the_board_in_kicad_first` and `only_after_the_edit_is_saved`,
+  both `null` when unknown). On a live board the way back is Edit > Undo; the
+  checkpoint holds the saved files, so it matters once the edit is saved. On an
+  error result the summary offers no way back (no change is known) unless the
+  error's kind says the board may have changed (`mutation_outcome_uncertain`,
+  `ipc_outcome_unknown`): then it says to inspect the board first. On a
+  plain-text result the field comes as a second text block.
+
 ## Unreleased: project-rule writes while the board is open (Row RW)
 
 Additive except where named. Nothing is removed or renamed.

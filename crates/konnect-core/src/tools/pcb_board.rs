@@ -301,13 +301,20 @@ where
             // `observed_live` and `absence` deliberately unread here. Whether
             // a write should instead treat a proven-absent editor as
             // permission is #577's question, not this one's.
-            LiveBoard::Rejected(message) | LiveBoard::Unserved { message, .. } => {
+            // Row BS: the same refusal, worded for what KiCad said. `message`
+            // opens with "the board is not open in KiCad's PCB editor: open …".
+            LiveBoard::Unserved { message, .. } => {
                 BoardWrite::Refused(CallToolResult::error(format!(
-                    "KiCAD rejected the {what} over IPC: {message}. \
-                 The board file was not modified — KiCAD is reachable and may hold this \
-                 board open, so editing the file directly could be silently overwritten."
+                    "The {what} was not made: {message}. The board file was not modified \
+                     either, in case a PCB editor on another endpoint holds this board: an edit \
+                     to the file could then be silently overwritten."
                 )))
             }
+            LiveBoard::Rejected(message) => BoardWrite::Refused(CallToolResult::error(format!(
+                "KiCAD rejected the {what} over IPC: {message}. \
+                 The board file was not modified — KiCAD is reachable and may hold this \
+                 board open, so editing the file directly could be silently overwritten."
+            ))),
             LiveBoard::NotOpen { message, .. } => BoardWrite::File(NoLiveBoard::NotOpen(message)),
             LiveBoard::Unresolved(error) => {
                 BoardWrite::Refused(crate::tools::ipc_target_error_result(&error))
