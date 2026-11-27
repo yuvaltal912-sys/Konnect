@@ -1,14 +1,11 @@
 # One call from placement to routing (Row FF): design
 
-**State, 2026-11-27.** Designed down to function skeletons on branch
-`claude/full-flow-design-1a7eef`, from `fork/main` `9232b2b6` (Row HS, #124). Nothing is
-built. The owner approved the four decisions at the end of this note as recommended
-("Yes, all four", 2026-11-27, relayed by the supervisor session). The build waits until B,
-C, D and E have merged, and for his word to build.
-
-An agent that did not write the note (Sonnet 5.5, high) checked it against main and the
-four branches. It found 2 blockers, 12 majors and 7 minors, and all of them are folded into
-this text (see "Review"). Real-board results stay out of this note, apart from counts.
+**State, 2026-11-27.** Built on branch `claude/full-flow-design-1a7eef`, from `fork/main`
+`01386bcf` (B to E merged), with `fork/main` `24c2b04a` (#131) merged in. Local, not pushed,
+no PR. The owner approved the four decisions at the end of this note as recommended ("Yes,
+all four") and the build ("כן, לבנות את ו' אחרי שהם ימוזגו"), both relayed by the
+supervisor session. "The build" below says what changed from this design and what was
+verified. Real-board results stay out of this note, apart from counts.
 
 ## What the owner asked for
 
@@ -41,7 +38,8 @@ One new tool, `run_full_flow`. It is a tracked job on D's job module:
 The flow plans everything on a scratch copy first:
 
 1. the pours on the current placement;
-2. the placement search, whose candidates are routed with those pours;
+2. the placement search, whose candidates are routed with those pours (built, then left
+   off by its measurement: see "The build", FF4);
 3. the pours again, on the winning placement;
 4. an export check of the board the flow is about to build.
 
@@ -1297,6 +1295,58 @@ run, and the test must fail.
   - Windows and Linux (macOS first, AGENTS.md).
   - Adding `delete_all_routing` and `add_zone` to B's `BULK_LIVE_EDITS`. F takes its own
     checkpoint before them; adding them is a small follow-up once B and C have merged.
+
+## The build (2026-11-27)
+
+### What changed from the design
+
+- **The interfaces as merged.** C's `kept_locked.export_will_refuse` is a list, not a
+  flag. F takes the import, apply and stitching arguments verbatim from the route's own
+  `completion.next_steps`, with a new `candidate_output_path` for every F1 attempt (the
+  apply never replaces a candidate). `new_call_id` and `unix_ms` were public already.
+  #131 added `delete_all_routing` to B's checkpoint list, and its noop to B's outcomes:
+  F's checkpoint before L2 and the guard's are one checkpoint (`ensure_checkpoint` reuses
+  identical files; a test pins it), and a noop is a success.
+- **`FlowIo`.** The live reads, the checkpoint and the registry calls are one trait, so
+  the whole order and protocol from gate A on is tested with a fake board. Production is
+  `LiveIo` (`registry_call`, what `dispatch_tool` runs).
+- **FF4, owner decision 4: measured, and shipped without.** On the public placement
+  fixture at effort m, the search was run both ways, each winner given its own P4 pours,
+  and the two final routes compared by the pour key. Both routed completely, every gate
+  passed. "With pours" lost by one step of the ground-track entry (30 against 29), with a
+  shorter signal length step (50 against 51) and higher copper quality (93.9 against
+  88.9). "With" was not at least as good, so P2 is skipped and the candidates are routed
+  as they are (`SEARCH_WITH_POURS = false`); `WithPours` stays, tested, for a re-measure.
+  One public fixture only; the record is `target/creation-research/full-flow/ff4-2026-11-27.json`.
+- **F2a's stop.** "0 unconnected items" is read from `run_drc`'s `by_rule` tally for the
+  whole board, not per plane net; the 4-round cap still bounds it.
+- **From the reviews.** A refused combination at L1 reopens gate A with the reason, where
+  any key may change (not a stop). A resume that plans again keeps only the start's
+  approvals, so gate A asks again. P4 runs again when the roles or the placement to apply
+  change at gate A, and the pours are asked again when the zones differ. A refusal after
+  an earlier write of the same step is `uncertain`. Every live read requires one board
+  open, also before each save. Stitching rounds take a checkpoint each and resume from
+  the last round. The start writes `flow.json` before its marker.
+
+### Verified
+
+| Check | Result |
+|---|---|
+| Baseline gate, merge commit `e52f43ca`, in a clean worktree | green, but one timing test, `a_tune_pass_killed_by_the_deadline_ends_the_run`, failed while another session's tests ran, and passed alone: tests 6143 passed, 1 failed, 188 ignored; doc, `simulation_live` (95), Clippy, licenses, doc counts and the release build green; installed Konnect `3de188bb775ab4ce` |
+| Unit and protocol tests | 92 in `full_flow` and `full_flow_tool`, 4 new in `pour_plan`/`pour_plan_tool`, 2 in `route_lengths`/`route_fastroute` |
+| Negative controls, one per guard | 28 of 28 caught (three controls were rewritten once: their first break was not a break) |
+| Independent review, Sonnet 5.5 high, read-only | round 1: 0 blockers, 6 majors, 6 minors; round 2 on the fixes: 0, 1, 5. All fixed, each with a test |
+| FF4 measurement | as above, 32 minutes at effort m |
+| Mutants | see the handoff's Row FF (cluster job, Linux evidence) |
+
+### Not verified
+
+- **No live run.** Nothing here opened KiCad. The live smoke on a public fixture (measurement
+  2) and a run on one of the owner's boards (4) wait for the owner: KiCad opened by him.
+- **No end-to-end run without KiCad.** The live half (`delete_all_routing`,
+  `apply_specctra_ses`, the verified save) has no file mode, so measurement 1 is the FF4
+  run for the scratch half and the fake-board tests for the live half.
+- **The progress of R2.** A report shows the step only, not the route search's run count.
 
 ## Review
 
