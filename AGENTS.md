@@ -21,7 +21,7 @@ Two tracks, two state files. Start with the one for your task; each says where t
 
 ## Never touch
 
-- The installed Konnect at `~/.local/share/konnect/bin/konnect`. Its SHA-256 starts `3de188bb775ab4ce`. Check that at the end of every PR.
+- The installed 1 Kopper package at `~/.local/share/1-kopper` (and its `.previous`). Only `cargo xtask kopper-install`, on the owner's word, changes it. At the end of every PR, check that `bin/konnect`'s SHA-256 still matches `konnect.sha256` in its `1-kopper.json`. The original Konnect at `~/.local/share/konnect` was removed on the owner's word (2026-11-27).
 - `reload_server`. It re-executes the installed binary, so it can never serve this fork.
 - `/Applications/KiCad` and `/Applications/Claude.app`.
 - A live KiCad project. Run `kicad-cli` on scratch copies only, and never pipe it into `head`: the killed process leaves a lock behind.
