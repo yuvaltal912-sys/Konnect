@@ -8,9 +8,10 @@ const PROBE: &str = crate::custom_rules::PROBE;
 const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb");
 
 pub(super) fn tools() -> Vec<ToolDef> {
-    let mut schema = json!({"type":"object","properties":{"board":{"type":"string"},"name":{"type":"string"},"constraint":{"type":"string","enum":["clearance","track_width"]},"minimum_mm":{"type":"number"},"rule":{"type":"string","description":"One complete KiCad (rule ...) statement, with the same name. Conditions, assertions and numeric expressions are compiled by KiCad."},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","name"],"additionalProperties":false});
-    schema["oneOf"] = json!([{"required":["rule"],"not":{"anyOf":[{"required":["constraint"]},{"required":["minimum_mm"]}]}},{"required":["constraint","minimum_mm"],"not":{"required":["rule"]}}]);
-    let create=tool!("create_custom_drc_rule", "Preview or create a named custom DRC rule. Supply one complete KiCad rule or the clearance/track-width minimum shorthand. KiCad compiles the complete candidate and every expression on a private fixture, then DRC runs on a scratch copy of the saved board and project. Apply requires its exact preview revision.", schema, |args,ctx|async move{handle_create_custom_drc_rule(args,ctx).await});
+    let rule_item = json!({"type":"object","properties":{"name":{"type":"string"},"rule":{"type":"string","description":"One complete KiCad (rule ...) statement, with the same name."},"constraint":{"type":"string","enum":["clearance","track_width"]},"minimum_mm":{"type":"number"}},"required":["name"],"additionalProperties":false,"oneOf":[{"required":["rule"],"not":{"anyOf":[{"required":["constraint"]},{"required":["minimum_mm"]}]}},{"required":["constraint","minimum_mm"],"not":{"required":["rule"]}}]});
+    let mut schema = json!({"type":"object","properties":{"board":{"type":"string"},"name":{"type":"string"},"constraint":{"type":"string","enum":["clearance","track_width"]},"minimum_mm":{"type":"number"},"rule":{"type":"string","description":"One complete KiCad (rule ...) statement, with the same name. Conditions, assertions and numeric expressions are compiled by KiCad."},"rules":{"type":"array","minItems":1,"maxItems":MAX_BATCH,"items":rule_item,"description":"Several rules in one write: each item is {name, rule} or {name, constraint, minimum_mm}. One preview, one plan revision and one apply for all of them; nothing is written unless every rule is valid. Instead of name/rule/constraint/minimum_mm."},"replace_existing":{"type":"boolean","default":false,"description":"With rules: replace a rule of the same name in place instead of refusing."},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board"],"additionalProperties":false});
+    schema["oneOf"] = json!([{"required":["name","rule"],"not":{"anyOf":[{"required":["constraint"]},{"required":["minimum_mm"]},{"required":["rules"]},{"required":["replace_existing"]}]}},{"required":["name","constraint","minimum_mm"],"not":{"anyOf":[{"required":["rule"]},{"required":["rules"]},{"required":["replace_existing"]}]}},{"required":["rules"],"not":{"anyOf":[{"required":["name"]},{"required":["rule"]},{"required":["constraint"]},{"required":["minimum_mm"]}]}}]);
+    let create=tool!("create_custom_drc_rule", "Preview or create named custom DRC rules in the board's .kicad_dru: one complete KiCad rule, the clearance/track-width minimum shorthand, or several rules at once in `rules`. KiCad compiles the complete candidate and every expression on a private fixture, then DRC runs on a scratch copy of the board (the board KiCad holds open when it answers over IPC, else the saved file) and the saved project. Works while KiCad holds the board or the schematic open: KiCad never rewrites .kicad_dru on save and re-reads it at its next DRC. Apply requires the exact preview revision.", schema, |args,ctx|async move{handle_create_custom_drc_rule(args,ctx).await});
     let edit_schema = json!({"type":"object","properties":{"board":{"type":"string"},"name":{"type":"string"},"rule":{"type":"string"},"dry_run":{"type":"boolean","default":true},"expected_plan_revision":{"type":"string"}},"required":["board","name","rule"],"additionalProperties":false});
     let mut delete_schema = edit_schema.clone();
     delete_schema["properties"]
@@ -23,7 +24,11 @@ pub(super) fn tools() -> Vec<ToolDef> {
     tool!("delete_custom_drc_rule","Preview or delete exactly one named custom DRC rule, preserving other rules and comments. Validates the remaining rules and runs scratch DRC; apply requires the preview revision.",delete_schema,|args,ctx|async move{handle_rule_change(args,ctx,crate::custom_rules::Operation::Delete).await})]
 }
 
-fn candidate(source: &str, name: &str, constraint: &str, minimum: f64) -> Result<String> {
+/// The most rules one call may write.
+const MAX_BATCH: usize = 64;
+
+/// The rule text of the minimum shorthand, checked.
+fn shorthand_rule(name: &str, constraint: &str, minimum: f64) -> Result<String> {
     ensure!(
         !name.is_empty()
             && name.len() <= 80
@@ -45,15 +50,197 @@ fn candidate(source: &str, name: &str, constraint: &str, minimum: f64) -> Result
         (minimum * 1_000_000.0 - (minimum * 1_000_000.0).round()).abs() < 0.000001,
         "minimum must be an exact number of nanometers"
     );
+    Ok(format!(
+        "(rule \"{}\" (constraint {} (min {:.9}mm)))",
+        name, constraint, minimum
+    ))
+}
+
+#[cfg(test)]
+fn candidate(source: &str, name: &str, constraint: &str, minimum: f64) -> Result<String> {
     crate::custom_rules::change(
         source,
         name,
-        Some(&format!(
-            "(rule \"{}\" (constraint {} (min {:.9}mm)))",
-            name, constraint, minimum
-        )),
+        Some(&shorthand_rule(name, constraint, minimum)?),
         crate::custom_rules::Operation::Create,
     )
+}
+
+/// One rule a call names: a complete rule text, or the minimum shorthand.
+struct RuleInput {
+    name: String,
+    rule: Option<String>,
+    constraint: Option<String>,
+    minimum: Option<f64>,
+}
+
+impl RuleInput {
+    /// The rule text to write: the given rule, or the shorthand's.
+    fn text(&self) -> Result<String> {
+        match (&self.rule, &self.constraint, self.minimum) {
+            (Some(rule), None, None) => Ok(rule.clone()),
+            (None, Some(constraint), Some(minimum)) => {
+                shorthand_rule(&self.name, constraint, minimum)
+            }
+            (Some(_), _, _) => {
+                anyhow::bail!("raw rules cannot be combined with minimum shorthand")
+            }
+            (None, _, _) => anyhow::bail!(
+                "rule '{}' needs either rule or both constraint and minimum_mm",
+                self.name
+            ),
+        }
+    }
+}
+
+/// The rules a call names, in order: `rules` (create only), or the one rule of
+/// `name` with `rule` or `constraint` + `minimum_mm`. Refuses a mixed call, an
+/// empty or oversized batch, a name given twice, and an item with unknown keys.
+fn rule_inputs(args: &Value, operation: crate::custom_rules::Operation) -> Result<Vec<RuleInput>> {
+    use crate::custom_rules::Operation;
+    let Some(batch) = args.get("rules") else {
+        ensure!(
+            args.get("replace_existing").is_none(),
+            "replace_existing goes with rules"
+        );
+        let name = args["name"]
+            .as_str()
+            .context("name is required")?
+            .to_string();
+        let rule = match operation {
+            Operation::Delete => None,
+            _ => args
+                .get("rule")
+                .map(|v| v.as_str().map(str::to_string).context("rule must be text"))
+                .transpose()?,
+        };
+        let constraint = args["constraint"].as_str().map(str::to_string);
+        let minimum = args["minimum_mm"].as_f64();
+        ensure!(
+            !(matches!(operation, Operation::Edit | Operation::Delete)
+                && (args.get("constraint").is_some() || args.get("minimum_mm").is_some())),
+            "raw rules cannot be combined with minimum shorthand"
+        );
+        if matches!(operation, Operation::Edit) {
+            ensure!(rule.is_some(), "rule must be text");
+        }
+        return Ok(vec![RuleInput {
+            name,
+            rule,
+            constraint,
+            minimum,
+        }]);
+    };
+    ensure!(
+        matches!(operation, Operation::Create),
+        "rules belongs to create_custom_drc_rule"
+    );
+    ensure!(
+        ["name", "rule", "constraint", "minimum_mm"]
+            .iter()
+            .all(|key| args.get(*key).is_none()),
+        "rules cannot be combined with name, rule, constraint or minimum_mm"
+    );
+    let items = batch.as_array().context("rules must be an array")?;
+    ensure!(
+        !items.is_empty() && items.len() <= MAX_BATCH,
+        "rules must hold 1 to {MAX_BATCH} rules"
+    );
+    let mut inputs: Vec<RuleInput> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let object = item
+            .as_object()
+            .with_context(|| format!("rules[{index}] must be an object"))?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !["name", "rule", "constraint", "minimum_mm"].contains(&key.as_str()))
+        {
+            anyhow::bail!("rules[{index}] has an unknown key '{key}'");
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .with_context(|| format!("rules[{index}] needs a name"))?
+            .to_string();
+        ensure!(
+            !inputs.iter().any(|other| other.name == name),
+            "rule '{name}' is named twice in rules"
+        );
+        let rule = object
+            .get("rule")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("rules[{index}].rule must be text"))
+            })
+            .transpose()?;
+        let constraint = object
+            .get("constraint")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("rules[{index}].constraint must be text"))
+            })
+            .transpose()?;
+        let minimum = object
+            .get("minimum_mm")
+            .map(|v| {
+                v.as_f64()
+                    .with_context(|| format!("rules[{index}].minimum_mm must be a number"))
+            })
+            .transpose()?;
+        inputs.push(RuleInput {
+            name,
+            rule,
+            constraint,
+            minimum,
+        });
+    }
+    Ok(inputs)
+}
+
+/// The rules file after every input is applied in order, and what was done to
+/// each rule. A batch create refuses a name the file already has unless
+/// `replace_existing`, which replaces that rule in place.
+fn propose(
+    source: &str,
+    inputs: &[RuleInput],
+    operation: crate::custom_rules::Operation,
+    replace_existing: bool,
+) -> Result<(String, Vec<Value>)> {
+    use crate::custom_rules::Operation;
+    let mut proposed = source.to_string();
+    let mut actions = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        ensure!(input.name != PROBE, "name is reserved for validation");
+        let exists = crate::custom_rules::parse(&proposed)?
+            .iter()
+            .any(|rule| rule.name == input.name);
+        let (step, action) = match operation {
+            Operation::Create if exists && replace_existing => (Operation::Edit, "replaced"),
+            Operation::Create if exists => anyhow::bail!(
+                "rule '{}' already exists in the rules file; pass replace_existing=true with \
+                 rules to replace it, or use edit_custom_drc_rule",
+                input.name
+            ),
+            Operation::Create => (Operation::Create, "created"),
+            Operation::Edit => (Operation::Edit, "edited"),
+            Operation::Delete => (Operation::Delete, "deleted"),
+        };
+        let text = match step {
+            Operation::Delete => None,
+            _ => Some(input.text()?),
+        };
+        let next = crate::custom_rules::change(&proposed, &input.name, text.as_deref(), step)?;
+        let action = if next == proposed {
+            "unchanged"
+        } else {
+            action
+        };
+        actions.push(json!({ "name": input.name, "action": action }));
+        proposed = next;
+    }
+    Ok((proposed, actions))
 }
 
 fn revision(board: &Path, original: Option<&str>, result: &str) -> String {
@@ -252,6 +439,44 @@ async fn validate_with_timeout(
 async fn handle_create_custom_drc_rule(args: &Value, ctx: &ToolContext) -> Result<CallToolResult> {
     handle_rule_change(args, ctx, crate::custom_rules::Operation::Create).await
 }
+/// What a rule call checks its candidate against: the board KiCad holds open
+/// when it answers for it over IPC, else the saved board file.
+enum TargetBoard {
+    Live(String),
+    Saved(String),
+}
+
+impl TargetBoard {
+    fn text(&self) -> &str {
+        match self {
+            TargetBoard::Live(text) | TargetBoard::Saved(text) => text,
+        }
+    }
+    /// What the plan revision binds for the board. A live board's text changes
+    /// with every edit in KiCad and is not what this call writes, so only its
+    /// origin is bound; a saved board is bound byte for byte, as before.
+    fn binding(&self) -> &str {
+        match self {
+            TargetBoard::Live(_) => "\u{0}live board held by KiCad",
+            TargetBoard::Saved(text) => text,
+        }
+    }
+}
+
+async fn target_board(ctx: &ToolContext, board: &Path) -> Result<TargetBoard> {
+    let observed = crate::tools::live_board::observe(ctx, board, |client, document| {
+        client.save_document_to_string_in(document)
+    })
+    .await?;
+    Ok(match observed {
+        crate::tools::live_board::LiveBoard::Answered(text) => TargetBoard::Live(text),
+        // A rules file is safe to write whatever KiCad holds (see the tool's
+        // description), so no other answer refuses: the check then runs on
+        // the saved file, and the result says so.
+        _ => TargetBoard::Saved(read_consistent(board)?),
+    })
+}
+
 async fn handle_rule_change(
     args: &Value,
     ctx: &ToolContext,
@@ -259,32 +484,27 @@ async fn handle_rule_change(
 ) -> Result<CallToolResult> {
     use crate::custom_rules::Operation;
     let board = get_path(args, "board")?;
-    let name = args["name"].as_str().context("name is required")?;
     let operation_name = match operation {
         Operation::Create => "create_custom_drc_rule",
         Operation::Edit => "edit_custom_drc_rule",
         Operation::Delete => "delete_custom_drc_rule",
     };
-    let minimum = args["minimum_mm"].as_f64();
-    let constraint = args["constraint"].as_str();
     let dry = match args.get("dry_run") {
         None => true,
         Some(Value::Bool(v)) => *v,
         Some(_) => return Ok(CallToolResult::error("dry_run must be boolean")),
     };
+    let replace_existing = match args.get("replace_existing") {
+        None => false,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return Ok(CallToolResult::error("replace_existing must be boolean")),
+    };
+    let inputs = match rule_inputs(args, operation) {
+        Ok(inputs) => inputs,
+        Err(e) => return Ok(CallToolResult::error(e.to_string())),
+    };
+    let batch = args.get("rules").is_some();
     let board = board.canonicalize()?;
-    if let Some(refusal) = board_lock_refusal(&board) {
-        return Ok(refusal);
-    }
-    if let Some(r) = super::project_json_guard::schematic_lock_refusal(&board) {
-        return Ok(r);
-    }
-    if let Some(r) =
-        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "custom DRC rule")
-            .await?
-    {
-        return Ok(r);
-    }
     ensure!(
         board
             .extension()
@@ -292,44 +512,32 @@ async fn handle_rule_change(
             .is_some_and(|s| s.eq_ignore_ascii_case("kicad_pcb")),
         "board must have the .kicad_pcb extension"
     );
-    let board_source = read_consistent(&board)?;
-    let root = konnect_sexp::parse_sexp(&board_source).context("saved board cannot be parsed")?;
+    // Row RW: KiCad holding the board or the schematic does not stop a rules
+    // write. KiCad never writes `.kicad_dru` when it saves (`pcbnew/files.cpp`
+    // copies it only into a new project on save-as, `:1057-1060` and
+    // `:1203-1206`), and it reads the file again at every DRC run
+    // (`dialog_drc.cpp:367`, `drc_engine.cpp` `InitEngine`). The one writer is
+    // the Board Setup dialog, and only when its own rules text was edited
+    // (`panel_setup_rules.cpp:900`).
+    let target = target_board(ctx, &board).await?;
+    let root = konnect_sexp::parse_sexp(target.text()).context("the board cannot be parsed")?;
     ensure!(
         root.head() == Some("kicad_pcb"),
-        "saved board must have a kicad_pcb root"
+        "the board must have a kicad_pcb root"
     );
     let project_path = board.with_extension("kicad_pro");
     let project = read_project(&project_path)?;
     let path = board.with_extension("kicad_dru");
     let original = read_optional(&path)?;
     let source = original.as_deref().unwrap_or("(version 1)\n");
-    let proposed = match (|| -> Result<String> {
-        if matches!(operation, Operation::Create) && args.get("rule").is_none() {
-            return candidate(
-                source,
-                name,
-                constraint.context("constraint is required")?,
-                minimum.context("minimum_mm is required")?,
-            );
-        }
-        ensure!(
-            args.get("constraint").is_none() && args.get("minimum_mm").is_none(),
-            "raw rules cannot be combined with minimum shorthand"
-        );
-        let raw = if matches!(operation, Operation::Delete) {
-            None
-        } else {
-            Some(args["rule"].as_str().context("rule must be text")?)
-        };
-        crate::custom_rules::change(source, name, raw, operation)
-    })() {
-        Ok(s) => s,
+    let (proposed, actions) = match propose(source, &inputs, operation, replace_existing) {
+        Ok(v) => v,
         Err(e) => return Ok(CallToolResult::error(e.to_string())),
     };
     let changed = proposed != source;
     let plan = target_revision(
         &revision(&board, original.as_deref(), &proposed),
-        &board_source,
+        target.binding(),
         project.as_deref(),
     );
     if !dry && args["expected_plan_revision"].as_str() != Some(plan.as_str()) {
@@ -342,9 +550,9 @@ async fn handle_rule_change(
             "scratch KiCad validation failed: {error:#}"
         )));
     }
-    let target_report = match target_drc(
+    let mut target_report = match target_drc(
         &ctx.config.kicad_cli,
-        &board_source,
+        target.text(),
         project.as_deref(),
         &proposed,
     )
@@ -357,20 +565,17 @@ async fn handle_rule_change(
             )))
         }
     };
+    let live = matches!(target, TargetBoard::Live(_));
+    target_report["source"] = json!(if live {
+        "scratch_copy_of_live_board"
+    } else {
+        "scratch_copy_of_saved_board"
+    });
     if !dry {
-        if let Some(r) =
-            crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "custom DRC rule")
-                .await?
-        {
-            return Ok(r);
-        }
-        if let Some(refusal) = board_lock_refusal(&board) {
-            return Ok(refusal);
-        }
-        if let Some(r) = super::project_json_guard::schematic_lock_refusal(&board) {
-            return Ok(r);
-        }
-        if read_consistent(&board)? != board_source || read_project(&project_path)? != project {
+        // The saved board is bound by the revision, so it must not have moved
+        // while KiCad checked the candidate; a live board is not bound.
+        let board_moved = !live && read_consistent(&board)? != target.text();
+        if board_moved || read_project(&project_path)? != project {
             return Ok(CallToolResult::error(
                 "saved board or project changed during validation; run a fresh preview",
             ));
@@ -406,9 +611,18 @@ async fn handle_rule_change(
             }
         }
     }
-    Ok(CallToolResult::json(
-        &json!({"status":if !changed {"noop"}else if dry {"ready"}else{"applied"},"plan_revision":plan,"rules_file":path.to_string_lossy(),"rules_file_lossy":path.to_str().is_none(),"operation":operation_name,"unrelated_rules_preserved":true,"readback":if dry{"not_written"}else{"saved_bytes_match_candidate"},"validation":"scratch_kicad_drc_probe","target_board_drc":target_report,"rule":{"name":name,"constraint":constraint,"minimum_mm":minimum.map(|m|(m*1_000_000.0).round()/1_000_000.0)}}),
-    ))
+    let mut body = json!({"status":if !changed {"noop"}else if dry {"ready"}else{"applied"},"plan_revision":plan,"rules_file":path.to_string_lossy(),"rules_file_lossy":path.to_str().is_none(),"operation":operation_name,"unrelated_rules_preserved":true,"readback":if dry{"not_written"}else{"saved_bytes_match_candidate"},"validation":"scratch_kicad_drc_probe","target_board_drc":target_report,"rules":actions,"board_source":if live{"live_board"}else{"saved_board"}});
+    if !batch {
+        let input = &inputs[0];
+        body["rule"] = json!({"name":input.name,"constraint":input.constraint,"minimum_mm":input.minimum.map(|m|(m*1_000_000.0).round()/1_000_000.0)});
+    }
+    if live {
+        body["kicad"] = json!("KiCad holds this board open. It reads the rules file again at its next DRC run; until then its interactive router keeps the rules it loaded. Do not edit Custom Rules in KiCad's Board Setup while this write is pending: pressing OK there writes that dialog's own copy.");
+    } else if konnect_sexp::writer::kicad_editor_lock_path(&board).is_some_and(|lock| lock.exists())
+    {
+        body["warning"] = json!("KiCad has a lock on this board but did not answer for it over IPC, so the target DRC ran on the saved board, which can be older than the open one.");
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 fn saved_matches(path: &Path, expected: &str) -> bool {
@@ -438,6 +652,21 @@ pub(super) fn board_lock_refusal(board: &Path) -> Option<CallToolResult> {
 
 fn uncertain(path: &Path, operation: &str, reason: String) -> CallToolResult {
     CallToolResult::error_kind(crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {operation:operation.into(),path:path.display().to_string(),reason:reason.clone()},format!("The rule-file write could not be verified: {reason}. Inspect the saved file before retrying."))
+}
+
+#[cfg(test)]
+pub(super) mod tests_cli {
+    /// A kicad-cli stand-in whose every DRC report carries the probe witness
+    /// and nothing else, so validation and the target DRC both pass.
+    pub(in crate::tools) fn success_cli(dir: &std::path::Path) -> std::path::PathBuf {
+        let body=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n if [ \"$1\" = \"--output\" ]; then shift; out=\"$1\"; fi\n shift\ndone\nprintf '%s' '{{\"violations\":[{{\"type\":\"clearance\",\"description\":\"{}\",\"severity\":\"error\"}}],\"unconnected_items\":[],\"ignored_checks\":[],\"included_severities\":[\"error\",\"warning\",\"exclusion\"]}}' > \"$out\"\n", super::PROBE);
+        crate::tools::cli::test_support::write_script(
+            dir,
+            "rule-batch-cli",
+            &body,
+            "@echo off\r\nexit /b 1\r\n",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -668,23 +897,56 @@ mod tests {
         .is_err());
     }
 
+    /// Row RW: KiCad holding the board no longer stops a rules write. The
+    /// target DRC runs on the board KiCad holds (its unsaved state included),
+    /// and the saved board file is neither read for it nor written.
     #[tokio::test]
-    async fn an_open_board_refuses_even_a_preview() {
+    async fn an_open_board_previews_and_applies_against_the_live_board() {
         let d = tempfile::tempdir().unwrap();
         let board = d.path().join("open.kicad_pcb");
-        std::fs::write(&board, FIXTURE).unwrap();
-        let server =
-            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |_| None);
+        // The saved file is not a board at all: only KiCad's copy can be checked.
+        std::fs::write(&board, "(not_a_board)").unwrap();
+        let live = std::str::from_utf8(FIXTURE).unwrap().to_string();
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+            &board,
+            move |command| {
+                command.type_url.ends_with("SaveDocumentToString").then(|| {
+                    konnect_ipc::builders::pack_any(
+                        &konnect_ipc::gen::kiapi::common::commands::SavedDocumentResponse {
+                            contents: live.clone(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    )
+                })
+            },
+        );
         let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
-        ctx.config.kicad_cli = fake_cli(d.path(), true).to_string_lossy().into_owned();
-        let result = handle_create_custom_drc_rule(
-            &json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        assert!(result.is_error);
+        let cli = super::tests_cli::success_cli(d.path());
+        ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
+        let mut args =
+            json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2});
+        let preview = handle_create_custom_drc_rule(&args, &ctx).await.unwrap();
+        assert!(!preview.is_error, "{preview:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &preview.content[0] else {
+            panic!()
+        };
+        let plan: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(plan["board_source"], "live_board");
+        assert_eq!(
+            plan["target_board_drc"]["source"],
+            "scratch_copy_of_live_board"
+        );
+        assert!(plan["kicad"].as_str().unwrap().contains("next DRC"));
         assert!(!board.with_extension("kicad_dru").exists());
+        args["dry_run"] = json!(false);
+        args["expected_plan_revision"] = plan["plan_revision"].clone();
+        let applied = handle_create_custom_drc_rule(&args, &ctx).await.unwrap();
+        assert!(!applied.is_error, "{applied:?}");
+        assert!(std::fs::read_to_string(board.with_extension("kicad_dru"))
+            .unwrap()
+            .contains("(rule \"safe\""));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "(not_a_board)");
     }
 
     #[tokio::test]
@@ -746,8 +1008,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(rule).unwrap(), proposed);
     }
 
+    /// Row RW: a board KiCad opens while the candidate is being checked does not
+    /// stop the write (KiCad never writes `.kicad_dru` on save); what is written
+    /// is still exactly the validated candidate.
     #[tokio::test]
-    async fn board_opened_during_validation_refuses_apply() {
+    async fn board_opened_during_validation_still_writes_the_validated_candidate() {
         use konnect_ipc::builders::pack_any;
         use konnect_ipc::gen::kiapi;
         let d = tempfile::tempdir().unwrap();
@@ -794,9 +1059,12 @@ mod tests {
         let proposed = candidate("(version 1)\n", "safe", "clearance", 0.2).unwrap();
         let plan = test_plan(&board, None, &proposed);
         let result=handle_create_custom_drc_rule(&json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2,"dry_run":false,"expected_plan_revision":plan}),&ctx).await.unwrap();
-        assert!(result.is_error, "{result:?}");
+        assert!(!result.is_error, "{result:?}");
         assert!(marker.exists());
-        assert!(!board.with_extension("kicad_dru").exists());
+        assert_eq!(
+            std::fs::read_to_string(board.with_extension("kicad_dru")).unwrap(),
+            proposed
+        );
     }
     #[tokio::test]
     async fn served_preview_exposes_the_rule_tool_without_writing() {
@@ -1112,118 +1380,93 @@ mod tests {
         )))
         .is_none());
     }
+    /// Row RW: a KiCad lock on the board, found through the path or an alias of
+    /// it, before the call or appearing while KiCad checks the candidate, no
+    /// longer stops a rules write. KiCad did not answer for this board over IPC
+    /// (it reports another one), so the target DRC ran on the saved file, and the
+    /// result says that it may be older than the open board.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn board_lock_refuses_even_when_ipc_reports_another_board() {
+    async fn a_board_lock_no_longer_refuses_and_says_the_check_used_the_saved_file() {
+        use std::os::unix::fs::symlink;
+        for (through_alias, late) in [(false, false), (true, false), (false, true), (true, true)] {
+            let d = tempfile::tempdir().unwrap();
+            let physical = d.path().join("board.kicad_pcb");
+            let alias = d.path().join("alias.kicad_pcb");
+            let other = d.path().join("other.kicad_pcb");
+            std::fs::write(&physical, FIXTURE).unwrap();
+            std::fs::write(&other, FIXTURE).unwrap();
+            let physical = physical.canonicalize().unwrap();
+            symlink(&physical, &alias).unwrap();
+            let lock = konnect_sexp::writer::kicad_editor_lock_path(&physical).unwrap();
+            if !late {
+                std::fs::write(&lock, "held").unwrap();
+            }
+            let effect = if late {
+                format!("touch '{}'\n", lock.display())
+            } else {
+                String::new()
+            };
+            let body=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n if [ \"$1\" = \"--output\" ]; then shift; out=\"$1\"; fi\n shift\ndone\n{effect}printf '%s' '{{\"unconnected_items\":[],\"violations\":[{{\"type\":\"clearance\",\"description\":\"{PROBE}\"}}]}}' > \"$out\"\n");
+            let cli = crate::tools::cli::test_support::write_script(
+                d.path(),
+                "lock-race",
+                &body,
+                "@echo off\r\nexit /b 1\r\n",
+            );
+            let server =
+                crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
+            let mut ctx =
+                crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
+            ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
+            let named = if through_alias { &alias } else { &physical };
+            let proposed = candidate("(version 1)\n", "safe", "clearance", 0.2).unwrap();
+            let plan = test_plan(&physical, None, &proposed);
+            let result = handle_create_custom_drc_rule(&json!({"board":named,"name":"safe","constraint":"clearance","minimum_mm":0.2,"dry_run":false,"expected_plan_revision":plan}),&ctx).await.unwrap();
+            let case = format!("alias {through_alias}, late {late}");
+            assert!(!result.is_error, "{case}: {result:?}");
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!()
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["board_source"], "saved_board", "{case}");
+            assert!(
+                body["warning"]
+                    .as_str()
+                    .is_some_and(|w| w.contains("saved board")),
+                "{case}: {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(physical.with_extension("kicad_dru")).unwrap(),
+                proposed,
+                "{case}"
+            );
+        }
+    }
+
+    /// The control: with no lock and no KiCad, no warning.
+    #[tokio::test]
+    async fn without_a_lock_there_is_no_saved_file_warning() {
         let d = tempfile::tempdir().unwrap();
         let board = d.path().join("board.kicad_pcb");
-        let other = d.path().join("other.kicad_pcb");
         std::fs::write(&board, FIXTURE).unwrap();
-        std::fs::write(&other, FIXTURE).unwrap();
-        let board = board.canonicalize().unwrap();
-        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
-        std::fs::write(lock, "held").unwrap();
-        let server =
-            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
-        let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
-        ctx.config.kicad_cli = fake_cli(d.path(), true).to_string_lossy().into_owned();
+        let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
+        ctx.config.kicad_cli = super::tests_cli::success_cli(d.path())
+            .to_string_lossy()
+            .into_owned();
         let result = handle_create_custom_drc_rule(
             &json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2}),
             &ctx,
         )
         .await
         .unwrap();
-        assert!(result.is_error);
-        assert!(!board.with_extension("kicad_dru").exists());
-    }
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_board_alias_cannot_hide_the_real_board_lock() {
-        use std::os::unix::fs::symlink;
-        let d = tempfile::tempdir().unwrap();
-        let board = d.path().join("board.kicad_pcb");
-        let alias = d.path().join("alias.kicad_pcb");
-        let other = d.path().join("other.kicad_pcb");
-        std::fs::write(&board, FIXTURE).unwrap();
-        std::fs::write(&other, FIXTURE).unwrap();
-        let board = board.canonicalize().unwrap();
-        symlink(&board, &alias).unwrap();
-        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
-        std::fs::write(lock, "held").unwrap();
-        let server =
-            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
-        let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
-        ctx.config.kicad_cli = fake_cli(d.path(), true).to_string_lossy().into_owned();
-        let result = handle_create_custom_drc_rule(
-            &json!({"board":alias,"name":"safe","constraint":"clearance","minimum_mm":0.2}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        assert!(result.is_error);
+        assert!(!result.is_error, "{result:?}");
         let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
             panic!()
         };
-        assert!(text.contains("KiCad board lock exists"), "{text}");
-        assert!(!board.with_extension("kicad_dru").exists());
-    }
-    #[tokio::test]
-    async fn lock_appearing_during_validation_prevents_apply() {
-        let d = tempfile::tempdir().unwrap();
-        let board = d.path().join("board.kicad_pcb");
-        let other = d.path().join("other.kicad_pcb");
-        std::fs::write(&board, FIXTURE).unwrap();
-        std::fs::write(&other, FIXTURE).unwrap();
-        let board = board.canonicalize().unwrap();
-        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
-        let proposed = candidate("(version 1)\n", "safe", "clearance", 0.2).unwrap();
-        let plan = test_plan(&board, None, &proposed);
-        let body=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n if [ \"$1\" = \"--output\" ]; then shift; out=\"$1\"; fi\n shift\ndone\ntouch '{}'\nprintf '%s' '{{\"unconnected_items\":[],\"violations\":[{{\"type\":\"clearance\",\"description\":\"{PROBE}\"}}]}}' > \"$out\"\n",lock.display());
-        let cli = crate::tools::cli::test_support::write_script(
-            d.path(),
-            "lock-race",
-            &body,
-            "@echo off\r\nexit /b 1\r\n",
-        );
-        let server =
-            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
-        let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
-        ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
-        let result=handle_create_custom_drc_rule(&json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2,"dry_run":false,"expected_plan_revision":plan}),&ctx).await.unwrap();
-        assert!(result.is_error);
-        assert!(lock.exists());
-        assert!(!board.with_extension("kicad_dru").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn alias_lock_appearing_during_validation_prevents_apply() {
-        use std::os::unix::fs::symlink;
-        let d = tempfile::tempdir().unwrap();
-        let physical = d.path().join("board.kicad_pcb");
-        let alias = d.path().join("alias.kicad_pcb");
-        let other = d.path().join("other.kicad_pcb");
-        std::fs::write(&physical, FIXTURE).unwrap();
-        std::fs::write(&other, FIXTURE).unwrap();
-        let physical = physical.canonicalize().unwrap();
-        symlink(&physical, &alias).unwrap();
-        let lock = konnect_sexp::writer::kicad_editor_lock_path(&alias).unwrap();
-        let proposed = candidate("(version 1)\n", "safe", "clearance", 0.2).unwrap();
-        let plan = test_plan(&physical, None, &proposed);
-        let body=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n if [ \"$1\" = \"--output\" ]; then shift; out=\"$1\"; fi\n shift\ndone\ntouch '{}'\nprintf '%s' '{{\"unconnected_items\":[],\"violations\":[{{\"type\":\"clearance\",\"description\":\"{PROBE}\"}}]}}' > \"$out\"\n",lock.display());
-        let cli = crate::tools::cli::test_support::write_script(
-            d.path(),
-            "alias-lock-race",
-            &body,
-            "@echo off\r\nexit /b 1\r\n",
-        );
-        let server =
-            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
-        let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
-        ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
-        let result=handle_create_custom_drc_rule(&json!({"board":alias,"name":"safe","constraint":"clearance","minimum_mm":0.2,"dry_run":false,"expected_plan_revision":plan}),&ctx).await.unwrap();
-        assert!(result.is_error);
-        assert!(lock.exists());
-        assert!(!physical.with_extension("kicad_dru").exists());
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert!(body.get("warning").is_none(), "{body}");
+        assert_eq!(body["board_source"], "saved_board");
     }
     #[tokio::test]
     #[ignore = "requires real KiCad CLI"]

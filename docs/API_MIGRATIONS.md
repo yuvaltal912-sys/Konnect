@@ -3,6 +3,51 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: project-rule writes while the board is open (Row RW)
+
+Additive except where named. Nothing is removed or renamed.
+
+- **`create_netclass` works while KiCad holds the board** (it refused before). It
+  sends the change to KiCad's own copy of the project over IPC (`SetNetClasses`,
+  merge), reads it back (`GetNetClasses`), then writes the same change to the
+  `.kicad_pro`, so KiCad's next save keeps it. New result fields: `written_to`
+  (`["project_file"]`, or `["kicad", "project_file"]`), `kicad` (`kicad_copy`
+  `created`/`updated`, `read_back`, `board_nets_resync: at_next_drc_or_save`,
+  `kicad_unsaved`) and `warning` when KiCad holds settings its file lacks. It still
+  refuses, with nothing written, when KiCad does not list or confirm its classes, or
+  when the schematic is open in a KiCad other than the one holding the board.
+  **Changed:** `clearance`, `trace_width`, `via_drill` and `via_diameter` must be
+  finite and at most 100 mm, above 0 (a clearance may be 0); before, any number was
+  written.
+- **`get_netclasses`: new `kicad_unsaved`** (and `sources.kicad_unsaved`): the
+  netclass settings the KiCad holding the board has in memory and its file does not
+  (`netclass`, `field`, `kicad_mm`, `project_file_mm`, or `only_in`). `null` when no
+  KiCad holding the board listed its classes. A `warning` says to save in KiCad
+  before routing when it is not empty.
+- **`assign_net_to_class` still refuses while KiCad holds the board** (KiCad 10's
+  IPC API has no netclass-pattern command); the refusal now names the steps in
+  KiCad's Board Setup.
+- **`create_custom_drc_rule` takes several rules at once.** New `rules` (1 to 64
+  items, each `{name, rule}` or `{name, constraint, minimum_mm}`) instead of
+  `name`/`rule`/`constraint`/`minimum_mm`, and `replace_existing` (with `rules`
+  only; replaces a rule of the same name in place). One preview, one
+  `plan_revision`, one apply; nothing is written unless every rule is valid. `name`
+  is no longer required at the top level (the schema's `oneOf` asks for it in the
+  single forms). New result fields: `rules` (`name`, `action`: `created`,
+  `replaced`, `edited`, `deleted`, `unchanged`) and `board_source`; the single forms
+  keep `rule`.
+- **The three custom-rule tools work while KiCad holds the board or the schematic**
+  (they refused before). KiCad never writes `.kicad_dru` when it saves and reads it
+  again at every DRC. The target DRC runs on the board KiCad holds when it answers
+  over IPC (`target_board_drc.source: scratch_copy_of_live_board`), else on the
+  saved file. With a live board the plan revision binds the rules file and the
+  project, not the board's text. New `kicad` note on a live board, `warning` when a
+  board lock exists but KiCad did not answer.
+- **`route_specctra_dsn` (fastroute): one rules step.** With length groups or pairs
+  with `max_skew_mm`, `completion.next_steps` gives one `create_custom_drc_rule`
+  call with every rule in `rules=[...]` (JSON), followed by a line for each rule that
+  needs a note; before, one line per rule.
+
 ## Unreleased: the route and placement results say what they did not check
 
 Additive only: no argument changes, nothing removed or renamed, `status` unchanged.

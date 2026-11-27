@@ -406,8 +406,11 @@ each net its length, its window and its miss, `pass` per group, and
 `complete_with_gate_failures`. The next steps give a KiCad rule for each group.
 A session that breaks the board's own length or skew rules cannot be applied:
 `apply_specctra_ses` rolls back when the board has a `.kicad_dru` and the
-candidate's DRC is not clean. After `apply_specctra_ses`, add them with `create_custom_drc_rule(board, name,
-rule)` (dry run first) so KiCad keeps checking the lengths after hand edits.
+candidate's DRC is not clean. After `apply_specctra_ses`, add them all with the
+one `create_custom_drc_rule(board, rules=[...])` call the next step gives (dry run
+first, then apply with its `plan_revision`; add `replace_existing=true` when an
+earlier route already wrote rules of these names) so KiCad keeps checking the
+lengths after hand edits. The board may stay open in KiCad.
 A pair inside a group is tuned net by net (`pairs_tuned_net_by_net`): its
 coupling is not held along the meanders. The judge compares each tuned board with
 the same run's untuned board and rejects a tuned one that is worse in unconnected
@@ -620,7 +623,15 @@ create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?
 ```
 
 The class is written to the project's `.kicad_pro` file, which is where KiCad
-has kept netclasses since v7 — the board file is not modified.
+has kept netclasses since v7 — the board file is not modified. The board may stay
+open in KiCad: the change goes to KiCad's own copy first over IPC and is read
+back, then to the file (`written_to`), so KiCad's next save keeps it. KiCad's
+open board applies it to its nets at its next DRC or save, so before routing
+from the live board, save in KiCad or run `run_drc` with `sync_live_board=true`.
+A width changed in KiCad's own Board Setup is not in the file until KiCad saves:
+`get_netclasses` lists such values in `kicad_unsaved`; when it is not empty, ask
+the user to save in KiCad before routing. `assign_net_to_class` still refuses
+while KiCad holds the board and gives the Board Setup steps instead.
 
 Before creating or updating a class, read `get_netclasses` and the applicable
 design-rule/trace-sizing references. Derive width, clearance, gap, drill, and
@@ -956,7 +967,11 @@ current capacity/thermal relief nor replaces the Freerouting failure policy.
 
 Use `create_custom_drc_rule`, `edit_custom_drc_rule` and `delete_custom_drc_rule`
 to preview saved custom-rule changes before applying the returned revision.
-Close the board and its root schematic before writing rules. General KiCad rule
+The board and schematic may stay open in KiCad (KiCad never rewrites
+`.kicad_dru` on save and reads it again at its next DRC); do not edit Custom
+Rules in KiCad's Board Setup at the same time. Several rules go in one
+`create_custom_drc_rule(board, rules=[...])` call: one preview, one revision,
+one apply. General KiCad rule
 statements are compiled on scratch copies; a successful edit does not establish
 that the board passes DRC.
 
