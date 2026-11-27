@@ -364,7 +364,13 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - **A `noop` result offers no Undo** (`Outcome::Unchanged`, review finding 1). An apply on a board with no routing changes nothing, and an Undo would revert the user's own last edit in KiCad. It reads `status: "noop"` in the JSON body, so it holds for every tool on the list.
 - **Limits are now limits of this tool.** A project over the checkpoint limits (256 MB, 4096 files) can no longer take the apply until it is trimmed; before, it could. Named in `API_MIGRATIONS.md`.
 
-**Verified:** filled in after the final gate.
+**Verified** (records in the main checkout's `target/creation-research/board-safety/`, git-ignored; this session Opus 5.5 high, the reviewer Sonnet 5.5 high):
+- **Baseline gate** on `fork/main` `01386bcf` (a clean detached worktree): fmt; workspace tests 6,069 passed, 0 failed, 187 ignored; sandboxed fastroute 75; doctests 9; `simulation_live` 95; clippy; deny; `fix-doc-counts` no change; release build; installed Konnect hash unchanged.
+- **Tests:** 7 new in `board_safety_tests.rs` (36 there in all), passing; `asset_references` 12 and `schema_parameter_usage` 5 passing.
+- **Negative controls:** 9, one break per guard (on the list, the registered tool wrapped, the preview skip, a missing `dry_run` is a preview, no checkpoint means no delete, a `noop` result seen and given no Undo, the note on a refused apply). All 9 caught, sources restored. E3 first broke a branch the stale refusal does not take (its body is JSON); it was retargeted and its test made to read the note's summary.
+- **Mutants** (`previews_only`, `Outcome::of`): 8 mutants, 7 caught, 1 unviable, 0 missed.
+- **Review:** one round, 0 must-fix, 3 should-fix (a `noop` apply advised Undo; the stale test did not check the refusal; this record was a placeholder), nits. All taken except one nit: a board path that is not a file skips the checkpoint, as for the other two tools (the tool then refuses on its own).
+- **Final gate:** below, after the run.
 
 **Not verified.** No live KiCad: the IPC answers are mock doubles. No Windows or Linux.
 
