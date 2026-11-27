@@ -1,0 +1,77 @@
+#!/bin/bash
+# Copy a finished run's logs and results back to the Mac and write evidence.txt.
+# Refuses while the job is still pending or running. Changes nothing on the cluster.
+#
+#   scripts/hpc/hpc-fetch            newest local run
+#   scripts/hpc/hpc-fetch RUN_ID     that run
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=common.sh
+. "$HERE/common.sh"
+
+RUNID=${1:-$(hpc_latest_run)}
+hpc_valid_run_id "$RUNID"
+STAGE="$(hpc_local_runs)/$RUNID"
+[ -f "$STAGE/jobid" ] || hpc_die "run $RUNID has no job id (dry run, or submit failed: $STAGE)"
+JOBID=$(cat "$STAGE/jobid")
+REMOTE_RUN="$HPC_REMOTE_ROOT/runs/$RUNID"
+hpc_check_connection
+
+sacct_line=$(hpc_remote "sacct -j $JOBID -X -n -P --format=JobID,State,ExitCode,Elapsed,AllocCPUS,ReqMem,AllocTRES,NodeList,Start,End")
+state=$(echo "$sacct_line" | awk -F'|' 'NR == 1 { print $2 }')
+case "$state" in # only states in which the job has ended for good
+    COMPLETED | FAILED | TIMEOUT | CANCELLED* | OUT_OF_MEMORY | NODE_FAIL | BOOT_FAIL | DEADLINE | PREEMPTED) ;;
+    '') hpc_die "sacct knows no job $JOBID yet; try again in a minute" ;;
+    *) hpc_die "job $JOBID is $state; fetch after it ends (scripts/hpc/hpc-status $RUNID)" ;;
+esac
+
+# A fresh copy every time, so a second fetch never mixes in files from the first.
+rm -rf "${STAGE:?}/remote"
+mkdir "$STAGE/remote"
+hpc_remote "tar -C $(printf %q "$REMOTE_RUN") -cf - --exclude=./bin --exclude=./patches --exclude=./scratch ." |
+    tar -C "$STAGE/remote" -xf -
+echo "$sacct_line" >"$STAGE/remote/sacct.txt"
+
+# shellcheck source=/dev/null
+. "$STAGE/meta.env"
+R="$STAGE/remote"
+{
+    echo "# HPC run evidence"
+    echo "run        $RUNID"
+    echo "label      ${LABEL:-}"
+    echo "commit     $SHA"
+    echo "remote     $(sed -n 's/^commit //p' "$R/out/env.txt" 2>/dev/null)"
+    echo "job        $JOBID"
+    echo "requested  cpus=$CPUS mem=$MEM time=$TIME partition=$PARTITION qos=$QOS"
+    echo "$sacct_line" | awk -F'|' '{ printf "sacct      state=%s exit=%s elapsed=%s cpus=%s tres=%s node=%s start=%s end=%s\n", $2, $3, $4, $5, $7, $8, $9, $10 }'
+    { grep -E '^(rustc|kernel|host) ' "$R/out/env.txt" 2>/dev/null || true; } | sed 's/^/env        /'
+    echo
+    if [ -f "$R/out/results.tsv" ]; then
+        column -t -s "$(printf '\t')" "$R/out/results.tsv"
+    else
+        echo "no results.tsv: the plan never started (see slurm-$JOBID.out)"
+    fi
+    steps=$(awk 'NF { n++ } END { print n + 0 }' "$R/plan.txt" 2>/dev/null || echo 0)
+    done_steps=$(awk 'NR > 1 && NF { n++ } END { print n + 0 }' "$R/out/results.tsv" 2>/dev/null || echo 0)
+    remote_sha=$(sed -n 's/^commit //p' "$R/out/env.txt" 2>/dev/null || true)
+    overall=$(cat "$R/out/overall" 2>/dev/null || true)
+    odd=$(awk -F'\t' 'NR > 1 && $9 ~ /^recorded\(exit/ { printf "%s ", $2 }' "$R/out/results.tsv" 2>/dev/null || true)
+    echo
+    if [ -z "$remote_sha" ]; then
+        echo "INCOMPLETE: the plan never started (job state $state; see slurm-$JOBID.out)"
+    elif [ "$remote_sha" != "$SHA" ]; then
+        echo "INVALID: the cluster checked out $remote_sha, not $SHA"
+    elif [ "$done_steps" -lt "$steps" ] || [ -z "$overall" ]; then
+        echo "INCOMPLETE: $done_steps of $steps steps ran (job state $state; wall time or a crash?)"
+    elif [ "$overall" != 0 ]; then
+        echo "NOT AS EXPECTED: see the verdict column and out/steps/*.log"
+    elif [ "$state" != COMPLETED ]; then
+        echo "NOT CLEAN: every step as expected, but Slurm says $state"
+    else
+        echo "ALL STEPS AS EXPECTED ($steps steps)"
+    fi
+    [ -z "$odd" ] || echo "NOTE: record-only steps that exited non-zero: $odd"
+} >"$STAGE/evidence.txt"
+cat "$STAGE/evidence.txt"
+echo
+echo "kept in $STAGE"

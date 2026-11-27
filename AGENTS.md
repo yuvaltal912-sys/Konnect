@@ -34,6 +34,7 @@ Two tracks, two state files. Start with the one for your task; each says where t
 - System `python3` is the wrong interpreter. Use `/opt/homebrew/bin/python3.14 -I`.
 - The toolchain comes from `rust-toolchain.toml`. Put Homebrew first on `PATH` so `cargo` resolves.
 - For substantive Rust changes, use `cargo llvm-cov` when coverage evidence helps; when changing validation, transaction recovery or safety guards, run targeted `cargo mutants` checks. Scope both to the affected code and run them in an isolated checkout, with build and report outputs outside the main checkout. Keep the existing verification gate and per-guard negative controls. Report commands, results, limits and reasons for skipped checks. Skip both tools for docs-only or formatting-only edits.
+- `cargo mutants` batches, negative-control batches and Linux test runs can go to the BGU cluster with `scripts/hpc/` (one job at a time, no lane lock). Its results are Linux evidence and never replace the macOS gate: `docs/HPC_OFFLOAD.md`.
 - Commit with the noreply address, never a personal one:
 
   ```bash
