@@ -601,8 +601,14 @@ still be routed narrower than its current needs; the routing result's
 `width_exceptions` names each such stretch (step 3). Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
+A custom pad must be one copper region without holes. A concave one (a
+manufacturer's notched or cross-shaped pad) becomes a pin of the largest convex
+part of its copper around its centre, and the rest of its copper becomes
+keepouts, listed in `concave_custom_pads`: no other net crosses it, but the
+pad's own net reaches the pad through the pin only, so a pin hemmed in by the
+rest can stay open; the judge's DRC reports that.
 Unlocked routing (remove it with `delete_all_routing`), routed arcs, custom
-pad shapes, local clearance overrides, custom DRC rules, incomplete routing rules, blind/buried vias, copper
+pads with islands or holes, local clearance overrides, custom DRC rules, incomplete routing rules, blind/buried vias, copper
 dimensions and KiCad `jumper` layers are refused. Boards with back-side parts
 use the Rust exporter: KiCad's native exporter is not adopted for them.
 

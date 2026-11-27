@@ -1,6 +1,10 @@
 //! The public fixture has two opposite, asymmetric copper pads of the same anchor size.
+use super::custom_pad::{area2, area2_outside, grown, side, split_concave, Contour};
 use super::tests::{parse_dsn, rules};
 use super::*;
+use i_overlay::core::{fill_rule::FillRule, overlay::Overlay, overlay_rule::OverlayRule};
+use i_overlay::i_float::int::point::IntPoint;
+use i_overlay::i_shape::int::path::ContourExtension;
 
 const BOARD: &str = include_str!("../tests/fixtures/specctra_custom_pad.kicad_pcb");
 const TWO_RESISTORS: &str = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
@@ -75,12 +79,11 @@ fn with_custom_pad(anchor: &str, primitives: &str) -> String {
 }
 
 #[test]
-fn a_custom_pad_must_have_one_convex_copper_region_without_holes() {
+fn a_custom_pad_must_be_one_copper_region_without_holes() {
     let rect = |x1, y1, x2, y2| {
         format!("(gr_rect (start {x1} {y1}) (end {x2} {y2}) (width 0) (fill yes))")
     };
     let disconnected = rect(2.0, 0.0, 3.0, 1.0);
-    let concave = rect(0.2, 0.2, 1.0, 1.0);
     // Four overlapping bars enclose a void to the right of the anchor.
     let hole = [
         rect(0.0, -0.5, 2.0, -0.25),
@@ -88,11 +91,7 @@ fn a_custom_pad_must_have_one_convex_copper_region_without_holes() {
         rect(1.75, -0.5, 2.0, 0.5),
     ]
     .join(" ");
-    for (geometry, reason) in [
-        (disconnected, "disconnected"),
-        (concave, "concave"),
-        (hole, "hole"),
-    ] {
+    for (geometry, reason) in [(disconnected, "disconnected"), (hole, "hole")] {
         let error = format!(
             "{:#}",
             export(&with_custom_pad("rect", &geometry)).unwrap_err()
@@ -100,7 +99,19 @@ fn a_custom_pad_must_have_one_convex_copper_region_without_holes() {
         assert!(error.contains("R1-1") && error.contains(reason), "{error}");
     }
     // Filling the void gives a plain convex contact.
-    export(&with_custom_pad("rect", &rect(0.0, -0.5, 2.0, 0.5))).unwrap();
+    let convex = export(&with_custom_pad("rect", &rect(0.0, -0.5, 2.0, 0.5))).unwrap();
+    assert!(convex.concave_custom_pads.is_empty());
+    // A concave region is exported: a convex pin and a keepout for the rest.
+    let concave = export(&with_custom_pad("rect", &rect(0.2, 0.2, 1.0, 1.0))).unwrap();
+    assert_eq!(concave.concave_custom_pads, ["R1-1"]);
+    let pcb = parse_dsn(&concave.dsn).pcb;
+    let image = pcb
+        .library
+        .images
+        .iter()
+        .find(|i| i.name == "konnect_image_R1")
+        .unwrap();
+    assert_eq!(image.keepouts.0.len(), 1, "{:?}", image.keepouts);
 }
 
 #[test]
@@ -242,6 +253,30 @@ fn a_plated_custom_pads_offset_and_copper_follow_each_layer() {
 #[tokio::test]
 #[ignore = "requires KONNECT_FASTROUTE and KiCad CLI"]
 async fn fastroute_connects_the_custom_pad_fixture_after_kicad_refill() {
+    route_after_kicad_refill(BOARD).await;
+}
+
+#[tokio::test]
+#[ignore = "requires KONNECT_FASTROUTE and KiCad CLI"]
+async fn fastroute_connects_a_concave_custom_pad_after_kicad_refill() {
+    // The owner's capacitor pad at full size, moved clear of the other pad. At a
+    // fifth of the size the tab ends sit 0.25 mm from the pad's centre, too close
+    // for a 0.25 mm track with 0.2 mm clearance to reach the pin between them.
+    let full = CROSS
+        .replace("0.13", "0.65")
+        .replace("0.47", "2.35")
+        .replace("0.25", "1.25")
+        .replace("0.51", "2.55")
+        .replace("0.37", "1.85");
+    let board = with_custom_pad("rect", &full)
+        .replacen("(size 1 1) (options", "(size 2 2) (options", 1)
+        .replacen("(at -0.5 0)", "(at -4 0)", 1);
+    route_after_kicad_refill(&board).await;
+}
+
+/// Route a board with fastroute at effort fast, judge it after KiCad's refill,
+/// and import the session: nothing open, and real tracks.
+async fn route_after_kicad_refill(board: &str) {
     use crate::place_judge::RouteResult;
     use crate::place_route::{
         export_candidate, export_options, isolated_context, route_candidate, RouteInputs,
@@ -249,7 +284,7 @@ async fn fastroute_connects_the_custom_pad_fixture_after_kicad_refill() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("input/board.kicad_pcb");
     std::fs::create_dir(source.parent().unwrap()).unwrap();
-    std::fs::write(&source, BOARD).unwrap();
+    std::fs::write(&source, board).unwrap();
     let cli = crate::kicad_install::find_cli("")
         .expect("KiCad CLI")
         .display()
@@ -266,7 +301,7 @@ async fn fastroute_connects_the_custom_pad_fixture_after_kicad_refill() {
         kicad_cli: cli.clone(),
     };
     let candidate = temp.path().join("candidate");
-    let dsn = export_candidate(&inputs, &candidate, BOARD).unwrap();
+    let dsn = export_candidate(&inputs, &candidate, board).unwrap();
     let ctx = isolated_context(&temp.path().join("isolation"), &cli).unwrap();
     let route = route_candidate(ctx, &inputs, &dsn, &candidate).await;
     let RouteResult::Routed {
@@ -281,7 +316,7 @@ async fn fastroute_connects_the_custom_pad_fixture_after_kicad_refill() {
     let ses = std::fs::read_to_string(candidate.join("route.ses")).unwrap();
     let plan = crate::specctra_ses::parse_import_plan(
         &dsn.with_extension("kicad_pcb"),
-        BOARD,
+        board,
         &manifest,
         &ses,
     )
@@ -481,4 +516,428 @@ fn odd_nanometres_do_not_extend_the_negative_side_of_the_anchor() {
     let error = format!("{:#}", export(&source).unwrap_err());
     assert!(error.contains("disconnected"), "{error}");
     export(&source.replace("-0.500002", "-0.500001")).unwrap();
+}
+
+// ─── Concave custom pads: a convex pin plus keepouts ────────────────────────
+
+/// A plus-shaped pad drawn as one concave polygon, the shape of the owner's
+/// electrolytic capacitor pad, at a fifth of its size: a bar from x = -0.51 to
+/// 0.37 and y = -0.25 to 0.25, crossed by a tab from y = -0.47 to 0.47 that is
+/// 0.26 wide. The anchor is a 0.4 mm square inside the bar.
+const CROSS: &str = "(gr_poly (pts (xy -0.13 0.47) (xy -0.13 0.25) (xy -0.51 0.25) \
+     (xy -0.51 -0.25) (xy -0.13 -0.25) (xy -0.13 -0.47) (xy 0.13 -0.47) (xy 0.13 -0.25) \
+     (xy 0.37 -0.25) (xy 0.37 0.25) (xy 0.13 0.25) (xy 0.13 0.47)) (width 0))";
+
+fn with_cross_pad() -> String {
+    with_custom_pad("rect", CROSS).replacen("(size 1 1) (options", "(size 0.4 0.4) (options", 1)
+}
+
+/// The cross in the pad's own frame with Y up, in micrometres.
+fn in_cross((x, y): (f64, f64)) -> bool {
+    let bar = (-510.0..=370.0).contains(&x) && (-250.0..=250.0).contains(&y);
+    let tab = (-130.0..=130.0).contains(&x) && (-470.0..=470.0).contains(&y);
+    bar || tab
+}
+
+/// Distance in micrometres from a point to the cross's outline, for sampling
+/// clear of the grid, the 5 µm keepout growth and rounding.
+fn near_cross_edge((x, y): (f64, f64), within: f64) -> bool {
+    let near = |v: f64, edges: &[f64]| edges.iter().any(|e| (v - e).abs() <= within);
+    near(x, &[-510.0, 370.0, -130.0, 130.0]) || near(y, &[-250.0, 250.0, -470.0, 470.0])
+}
+
+fn polygon_points(shape: &dsn::Shape) -> (&str, Vec<(f64, f64)>) {
+    let dsn::Shape::Polygon(p) = shape else {
+        panic!("expected a polygon: {shape:?}")
+    };
+    (
+        p.layer.as_str(),
+        p.coords.iter().map(|c| (c.x, c.y)).collect(),
+    )
+}
+
+/// The pin's polygon and the image's keepouts, both in the image frame.
+fn router_copper(pcb: &dsn::Pcb, image: &str, id: &str) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
+    let image = pcb.library.images.iter().find(|i| i.name == image).unwrap();
+    let pin = image.pins.iter().find(|p| p.id == id).unwrap();
+    let stack = pin_stack(pcb, &image.name, id);
+    let [shape] = stack.shapes.as_slice() else {
+        panic!("one pin polygon per layer: {stack:?}")
+    };
+    let (sin, cos) = pin.rotate.unwrap_or(0.0).to_radians().sin_cos();
+    let placed = polygon_points(shape)
+        .1
+        .into_iter()
+        .map(|(x, y)| (x * cos - y * sin + pin.x, x * sin + y * cos + pin.y))
+        .collect();
+    let keepouts = image
+        .keepouts
+        .0
+        .iter()
+        .map(|k| polygon_points(&k.shape).1)
+        .collect();
+    (placed, keepouts)
+}
+
+#[test]
+fn a_concave_custom_pad_is_a_convex_pin_and_keepouts_of_its_other_copper() {
+    let bundle = export(&with_cross_pad()).unwrap();
+    assert_eq!(bundle.concave_custom_pads, ["R1-1"]);
+    let pcb = parse_dsn(&bundle.dsn).pcb;
+    // The pin is the bar, the largest convex part around the pad's centre.
+    let [shape] = pin_stack(&pcb, "konnect_image_R1", "1").shapes.as_slice() else {
+        panic!("expected one pin polygon")
+    };
+    let (layer, pin) = polygon_points(shape);
+    assert_eq!(layer, "F.Cu");
+    let corners: BTreeSet<_> = pin.iter().map(|&(x, y)| (x as i32, y as i32)).collect();
+    assert_eq!(
+        corners,
+        BTreeSet::from([(-510, -250), (370, -250), (370, 250), (-510, 250)])
+    );
+    // The two ends of the tab are keepouts on the pad's layer, at the pad.
+    let image = pcb
+        .library
+        .images
+        .iter()
+        .find(|i| i.name == "konnect_image_R1")
+        .unwrap();
+    assert_eq!(image.keepouts.0.len(), 2, "{:?}", image.keepouts);
+    for keepout in &image.keepouts.0 {
+        let dsn::Shape::Polygon(p) = &keepout.shape else {
+            panic!("{keepout:?}")
+        };
+        assert_eq!((p.layer.as_str(), p.width), ("F.Cu", 10.0));
+    }
+    // Together the router's pin and keepouts are the pad's copper, and the pin
+    // takes no copper the pad does not have.
+    let (placed, keepouts) = router_copper(&pcb, "konnect_image_R1", "1");
+    for x in (-700..=500).step_by(10) {
+        for y in (-600..=600).step_by(10) {
+            let local = (f64::from(x), f64::from(y));
+            if near_cross_edge(local, 8.0) {
+                continue;
+            }
+            let at = (local.0 - 500.0, local.1);
+            let in_pin = konnect_sexp::planar::point_in_ring(at, &placed);
+            let in_keepout = keepouts
+                .iter()
+                .any(|k| konnect_sexp::planar::point_in_ring(at, k));
+            assert_eq!(in_pin || in_keepout, in_cross(local), "at {local:?}");
+            assert!(!in_pin || in_cross(local), "pin copper at {local:?}");
+            assert!(!(in_pin && in_keepout), "pin under a keepout at {local:?}");
+        }
+    }
+    // The manifest counts them with the other copper keepouts.
+    let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
+    assert_eq!(
+        manifest["supported_profile"]["copper_graphic_keepout_count"],
+        2
+    );
+}
+
+#[test]
+fn a_turned_concave_pad_keeps_its_keepouts_on_its_copper() {
+    // Turned 90 degrees in KiCad (counter-clockwise on screen) on a footprint at
+    // 30 degrees. The bar's long end (local x = -0.51) then points down on screen,
+    // which is -Y in the DSN, and its short end (0.37) up.
+    let board = with_cross_pad()
+        .replacen("(at 100 50)", "(at 100 50 30)", 1)
+        .replacen("(at -0.5 0)", "(at -0.5 0 120)", 1);
+    let pcb = parse_dsn(&export(&board).unwrap().dsn).pcb;
+    let (placed, keepouts) = router_copper(&pcb, "konnect_image_R1", "1");
+    let copper = |p: (f64, f64)| {
+        konnect_sexp::planar::point_in_ring(p, &placed)
+            || keepouts
+                .iter()
+                .any(|k| konnect_sexp::planar::point_in_ring(p, k))
+    };
+    // Image frame: the pad sits at (-500, 0).
+    for (p, expected) in [
+        ((-500.0, -450.0), true),         // the long end of the bar
+        ((-500.0, 450.0), false),         // past the short end
+        ((-500.0, 330.0), true),          // inside the short end
+        ((-500.0 - 400.0, 0.0), true),    // one end of the tab, a keepout
+        ((-500.0 + 400.0, 0.0), true),    // the other end
+        ((-500.0 + 400.0, 200.0), false), // beside the tab, past the bar
+    ] {
+        assert_eq!(copper(p), expected, "at {p:?}");
+    }
+    assert!(keepouts.iter().all(|k| k
+        .iter()
+        .all(|&(x, y)| (x + 500.0).abs() <= 480.0 && y.abs() <= 140.0)));
+}
+
+#[test]
+fn a_back_side_concave_pad_keeps_its_keepouts_on_its_copper_layer() {
+    let board = with_cross_pad()
+        .replacen("(layer \"F.Cu\")", "(layer \"B.Cu\")", 1)
+        .replacen("(at 100 50)", "(at 100 50 30)", 1)
+        .replacen("(at -0.5 0)", "(at -0.5 0 210)", 1)
+        .replacen(
+            "(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")",
+            "(layers \"B.Cu\" \"B.Mask\" \"B.Paste\")",
+            1,
+        );
+    let pcb = parse_dsn(&export(&board).unwrap().dsn).pcb;
+    let image = pcb
+        .library
+        .images
+        .iter()
+        .find(|i| i.name == "konnect_image_R1")
+        .unwrap();
+    let pin = image.pins.iter().find(|p| p.id == "1").unwrap();
+    assert_eq!(pin.rotate, Some(180.0));
+    assert!(image
+        .keepouts
+        .0
+        .iter()
+        .all(|k| polygon_points(&k.shape).0 == "B.Cu"));
+    // The router's copper is the cross of the file, turned half a turn at the pad.
+    let (placed, keepouts) = router_copper(&pcb, "konnect_image_R1", "1");
+    for x in (-700..=500).step_by(10) {
+        for y in (-600..=600).step_by(10) {
+            let local = (f64::from(x), f64::from(y));
+            if near_cross_edge(local, 8.0) {
+                continue;
+            }
+            let at = (-local.0 - 500.0, -local.1);
+            let copper = konnect_sexp::planar::point_in_ring(at, &placed)
+                || keepouts
+                    .iter()
+                    .any(|k| konnect_sexp::planar::point_in_ring(at, k));
+            assert_eq!(copper, in_cross(local), "at {local:?}");
+        }
+    }
+}
+
+#[test]
+fn a_plated_concave_pad_keeps_its_other_copper_out_on_every_layer() {
+    let board = with_cross_pad()
+        .replacen("smd custom", "thru_hole custom", 1)
+        .replacen(
+            "(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")",
+            "(drill 0.2) (layers \"*.Cu\" \"*.Mask\")",
+            1,
+        );
+    let pcb = parse_dsn(&export(&board).unwrap().dsn).pcb;
+    let image = pcb
+        .library
+        .images
+        .iter()
+        .find(|i| i.name == "konnect_image_R1")
+        .unwrap();
+    let mut layers: Vec<_> = image
+        .keepouts
+        .0
+        .iter()
+        .map(|k| polygon_points(&k.shape).0.to_string())
+        .collect();
+    layers.sort();
+    assert_eq!(layers, ["B.Cu", "B.Cu", "F.Cu", "F.Cu"]);
+    // The offset moves the copper so that the hole, at the pad's origin, is in
+    // a tab: the split keeps the origin in the pin, so the pin is the tab's bar.
+    let in_tab = board.replacen("(drill 0.2)", "(drill 0.1 (offset 0 0.36))", 1);
+    let pcb = parse_dsn(&export(&in_tab).unwrap().dsn).pcb;
+    let [shape, ..] = pin_stack(&pcb, "konnect_image_R1", "1").shapes.as_slice() else {
+        panic!("expected pin polygons")
+    };
+    let corners: BTreeSet<_> = polygon_points(shape)
+        .1
+        .iter()
+        .map(|&(x, y)| (x as i32, y as i32))
+        .collect();
+    assert_eq!(
+        corners,
+        BTreeSet::from([(-130, -830), (130, -830), (130, 110), (-130, 110)])
+    );
+    // A hole wider than that bar is refused: the pin must hold the drill.
+    let wide = board.replacen("(drill 0.2)", "(drill 0.3 (offset 0 0.36))", 1);
+    let error = format!("{:#}", export(&wide).unwrap_err());
+    assert!(
+        error.contains("R1-1") && error.contains("enclose the drill"),
+        "{error}"
+    );
+}
+
+fn square(x1: i64, y1: i64, x2: i64, y2: i64) -> Contour {
+    vec![
+        IntPoint::new(x1, y1),
+        IntPoint::new(x2, y1),
+        IntPoint::new(x2, y2),
+        IntPoint::new(x1, y2),
+    ]
+}
+
+fn union(rings: &[Contour]) -> Contour {
+    let shapes = Overlay::from_subj(rings).overlay(OverlayRule::Subject, FillRule::NonZero);
+    let mut ring = shapes[0][0].clone();
+    if area2(&ring) < 0 {
+        ring.reverse();
+    }
+    ring
+}
+
+#[test]
+fn the_split_covers_the_copper_exactly_with_a_convex_pin_around_the_centre() {
+    let mm = 1_000_000;
+    let shapes = [
+        // An L, a T, a U and a notched square, all around the origin, each
+        // with the area in mm^2 of its largest convex pin a cut can leave: the
+        // L's upright, the T's stem (its bar's lower edge runs through the
+        // centre), the U's base, and the square below the notch's left edge.
+        (
+            union(&[
+                square(-mm, -mm, 2 * mm, mm / 2),
+                square(-mm, -mm, mm / 2, 3 * mm),
+            ]),
+            6.0,
+        ),
+        (
+            union(&[
+                square(-2 * mm, 0, 2 * mm, mm),
+                square(-mm / 2, -2 * mm, mm / 2, mm),
+            ]),
+            3.0,
+        ),
+        (
+            union(&[
+                square(-2 * mm, -mm, 2 * mm, mm / 2),
+                square(-2 * mm, -mm, -mm, 2 * mm),
+                square(mm, -mm, 2 * mm, 2 * mm),
+            ]),
+            6.0,
+        ),
+        (
+            vec![
+                IntPoint::new(-mm, -mm),
+                IntPoint::new(mm, -mm),
+                IntPoint::new(mm, mm),
+                IntPoint::new(mm / 3, mm / 2),
+                IntPoint::new(-mm, mm),
+            ],
+            3.25,
+        ),
+    ];
+    for (copper, best_mm2) in shapes {
+        let (pin, rest) = split_concave(&copper, IntPoint::new(0, 0)).unwrap();
+        assert!(pin.is_convex() && area2(&pin) > 0, "{pin:?}");
+        let area_mm2 = area2(&pin) as f64 / 2.0 / 1e12;
+        assert!(
+            (area_mm2 - best_mm2).abs() < 1e-3,
+            "{area_mm2} mm2, not {best_mm2}: {pin:?}"
+        );
+        assert!(pin.as_slice().contains_point(IntPoint::new(0, 0)));
+        assert!(
+            area2_outside(&pin, &copper) <= i128::from(40 * mm),
+            "{pin:?}"
+        );
+        let total: i128 = area2(&pin) + rest.iter().map(|r| area2(r)).sum::<i128>();
+        let slack = i128::from(80 * mm);
+        assert!((total - area2(&copper)).abs() <= slack, "{copper:?}");
+        assert!(!rest.is_empty());
+    }
+}
+
+#[test]
+fn no_cut_within_ten_micrometres_of_the_pads_centre_is_made() {
+    // An L whose inner corner is 5 um from the pad's centre: every cut that would
+    // free the pin from the notch passes that close, so the pad is refused.
+    let mm = 1_000_000;
+    let copper = union(&[square(-mm, -mm, mm, 5_000), square(-mm, -mm, 5_000, mm)]);
+    let error = format!(
+        "{:#}",
+        split_concave(&copper, IntPoint::new(0, 0)).unwrap_err()
+    );
+    assert!(error.contains("holds the pad's centre"), "{error}");
+    // 15 um away, the same L splits.
+    let copper = union(&[square(-mm, -mm, mm, 15_000), square(-mm, -mm, 15_000, mm)]);
+    split_concave(&copper, IntPoint::new(0, 0)).unwrap();
+}
+
+#[test]
+fn a_slanted_split_leaves_no_slivers_along_its_cuts() {
+    // The cross turned to every whole degree: each slanted cut crosses the grid
+    // at a rounded point, which must not leave thin copper along the pin as
+    // extra keepouts.
+    let cross = [
+        (-130, 470),
+        (-130, 250),
+        (-510, 250),
+        (-510, -250),
+        (-130, -250),
+        (-130, -470),
+        (130, -470),
+        (130, -250),
+        (370, -250),
+        (370, 250),
+        (130, 250),
+        (130, 470),
+    ];
+    for degrees in 1..90 {
+        let (sin, cos) = f64::from(degrees).to_radians().sin_cos();
+        let mut copper: Contour = cross
+            .iter()
+            .map(|&(x, y)| {
+                let (x, y) = (f64::from(x) * 1000.0, f64::from(y) * 1000.0);
+                IntPoint::new(
+                    (x * cos - y * sin).round() as i64,
+                    (x * sin + y * cos).round() as i64,
+                )
+            })
+            .collect();
+        if area2(&copper) < 0 {
+            copper.reverse();
+        }
+        let (pin, rest) = split_concave(&copper, IntPoint::new(0, 0)).unwrap();
+        // The pin is the bar, 0.88 x 0.5 mm (its cut points may add vertices on
+        // its edges), and the rest the tab's two ends, 0.26 x 0.22 mm each.
+        let bar = 2 * 880_000_i128 * 500_000;
+        assert!(
+            pin.is_convex() && (area2(&pin) - bar).abs() < bar / 1000,
+            "{degrees} degrees: {pin:?}"
+        );
+        assert_eq!(rest.len(), 2, "{degrees} degrees: {rest:?}");
+        for ring in &rest {
+            let tab = 2 * 260_000_i128 * 220_000;
+            assert!(
+                (area2(ring) - tab).abs() < tab / 1000,
+                "{degrees} degrees: {ring:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn growing_a_pin_moves_every_edge_outwards() {
+    // A 2 x 1 mm rectangle grown by 2 nm, and the same rectangle turned 30
+    // degrees: every edge lies 2 nm further out, so the rest of a split never
+    // keeps a sliver along the pin.
+    let rect = square(-1_000_000, -500_000, 1_000_000, 500_000);
+    assert_eq!(
+        grown(&rect, 2.0),
+        square(-1_000_002, -500_002, 1_000_002, 500_002)
+    );
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    let turned: Contour = rect
+        .iter()
+        .map(|p| {
+            let (x, y) = (p.x as f64, p.y as f64);
+            IntPoint::new(
+                (x * cos - y * sin).round() as i64,
+                (x * sin + y * cos).round() as i64,
+            )
+        })
+        .collect();
+    let bigger = grown(&turned, 2.0);
+    for (&p, &q) in turned.iter().zip(turned.iter().cycle().skip(1)) {
+        let offset = bigger
+            .iter()
+            .map(|&v| -side(p, q, v) as f64 / ((q.x - p.x) as f64).hypot((q.y - p.y) as f64))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (offset - 2.0).abs() < 1.0,
+            "edge {p:?}-{q:?} moved {offset} nm"
+        );
+    }
 }
