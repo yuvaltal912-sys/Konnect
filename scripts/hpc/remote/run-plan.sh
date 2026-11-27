@@ -56,7 +56,13 @@ rustc -V | grep -q "^rustc $want " || { echo "toolchain is not $want" >>"$OUT/en
 # cargo does: the first word that is not an option, a `+toolchain` or the value of a global
 # option that takes one (`-C DIR`, `-Z FLAG`, `--config KV`, `--color WHEN`, `--explain CODE`;
 # `--manifest-path` and `--target-dir` too, which cargo rejects before a subcommand anyway).
+#
+# The same wrappers move cargo-mutants' scratch off the node. Its copies (one tree and one target
+# per job) go under TMPDIR, which is the node's local /tmp, about 59 GB: at --jobs 8 on
+# konnect-core they filled it, and 261 of 273 mutants read unviable ("No space left on device",
+# job 20938). For a mutants process TMPDIR is MUT_TMP, a folder of the run on the network home.
 SHIM="$RUN/scratch/bin"
+MUT_TMP="$RUN/scratch/mutants-tmp"
 mkdir -p "$SHIM"
 real_cargo=$(command -v cargo || true)
 real_mutants=$(command -v cargo-mutants || true)
@@ -71,7 +77,10 @@ for a in "\$@"; do
         --manifest-path | --config | -Z | -C | --color | --target-dir | --explain) value=1 ;;
         +* | -*) ;;
         mutants) [ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
-                 unset CARGO_TARGET_DIR; break ;;
+                 unset CARGO_TARGET_DIR
+                 mkdir -p $(printf %q "$MUT_TMP") && export TMPDIR=$(printf %q "$MUT_TMP")
+                 echo "hpc: cargo mutants copies its trees under \$TMPDIR, not the node's /tmp" >&2
+                 break ;;
         *) break ;;
     esac
 done
@@ -82,6 +91,8 @@ if [ -n "$real_mutants" ]; then
 #!/bin/bash
 [ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
 unset CARGO_TARGET_DIR
+mkdir -p $(printf %q "$MUT_TMP") && export TMPDIR=$(printf %q "$MUT_TMP")
+echo "hpc: cargo mutants copies its trees under \$TMPDIR, not the node's /tmp" >&2
 exec $(printf %q "$real_mutants") "\$@"
 EOF
 fi
