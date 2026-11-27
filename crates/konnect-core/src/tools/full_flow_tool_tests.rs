@@ -1392,3 +1392,211 @@ fn the_guards_checkpoint_after_the_flows_is_the_same_one() {
     assert_eq!(guard.id, flow.id);
     assert!(!guard.made_now);
 }
+
+// ─── FF4, owner decision 4: the search with and without the pours (ignored) ──
+
+/// The placement search on the public placement fixture at effort m, once with each
+/// candidate routed as it is and once with P2's pours (`WithPours`). Each winner then
+/// gets its own P4 pours and one final route at m, and the two final routes are compared
+/// by the judge's pour key (lower is better). Needs `KONNECT_FASTROUTE`, and scratch
+/// `KICAD_CONFIG_HOME` and `KONNECT_STATE_DIR`. Writes `ff4.json` into the state folder.
+#[test]
+#[ignore = "starts fastroute and kicad-cli: needs KONNECT_FASTROUTE and scratch KICAD_CONFIG_HOME and KONNECT_STATE_DIR"]
+fn ff4_the_search_with_and_without_the_pours_on_the_public_fixture() {
+    use crate::tools::placement_converge::{run_folder, LiveInput};
+    use konnect_ipc::types::{IpcEffectiveRoutingRules, IpcRoutingRules};
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-sexp/tests/fixtures/placement")
+        .canonicalize()
+        .unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let user = user.path().canonicalize().unwrap();
+    for name in [
+        "placement_fixture.kicad_pcb",
+        "placement_fixture.kicad_pro",
+        "placement_fixture.kicad_sch",
+    ] {
+        std::fs::copy(fixture.join(name), user.join(name)).unwrap();
+    }
+    let board = user.join("placement_fixture.kicad_pcb");
+    let text = std::fs::read_to_string(&board).unwrap();
+    let tree = konnect_sexp::parse_sexp(&text).unwrap();
+    let index = konnect_sexp::board::PcbConnectivityIndex::build(&tree);
+    let rules: IpcEffectiveRoutingRules = index
+        .nets()
+        .into_iter()
+        .filter(|net| !net.is_empty() && !index.pads_of_net(net).is_empty())
+        .map(|net| {
+            (
+                net.to_string(),
+                IpcRoutingRules {
+                    class_name: "Default".to_string(),
+                    constituents: Vec::new(),
+                    track_width_mm: Some(0.2),
+                    clearance_mm: Some(0.2),
+                    via_diameter_mm: Some(0.6),
+                    via_drill_mm: Some(0.3),
+                },
+            )
+        })
+        .collect();
+    let state =
+        PathBuf::from(std::env::var("KONNECT_STATE_DIR").expect("a scratch KONNECT_STATE_DIR"));
+    let kicad_cli = crate::kicad_install::find_cli("")
+        .expect("kicad-cli is installed")
+        .display()
+        .to_string();
+    let ctx = Arc::new(ToolContext::new(
+        ServerConfig {
+            kicad_cli,
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        },
+        Arc::new(ToolRouter::new()),
+    ));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let as_named = RolesAnswer::AsNamed(AsNamed::AsNamed);
+    let pours = |text: &str, folder: &Path| -> Vec<ProposedZone> {
+        std::fs::create_dir_all(folder).unwrap();
+        let (result, plan) = runtime
+            .block_on(crate::tools::pour_plan_tool::plan_text(
+                &ctx,
+                &board,
+                text,
+                Some(&as_named),
+                Some(folder),
+            ))
+            .unwrap();
+        assert!(!result.is_error, "{:?}", body_of(&result));
+        plan.map(|plan| plan.proposals).unwrap_or_default()
+    };
+    let stripped = crate::place_route::strip_routing(&text).unwrap();
+    let root = state.join(format!("ff4-{}", stamp_ms()));
+    let before = pours(&stripped, &root.join("p2"));
+    assert!(!before.is_empty(), "the fixture's ground pour is planned");
+    let live = LiveInput {
+        text: text.clone(),
+        rules,
+    };
+    let mut record = serde_json::Map::new();
+    let mut finals = Vec::new();
+    for with in [false, true] {
+        let name = if with { "with_pours" } else { "without_pours" };
+        let folder =
+            run_folder(&root, &text, &format!("{}{}", stamp_ms(), u8::from(with))).unwrap();
+        let fastroute = runtime
+            .block_on(locate_fastroute(None, &folder))
+            .unwrap()
+            .unwrap_or_else(|refusal| panic!("fastroute: {refusal:?}"));
+        let prepared = prepare_search(
+            &ctx,
+            &folder,
+            &board,
+            &live,
+            crate::route_search::Effort::M,
+            &fastroute.path,
+        )
+        .unwrap();
+        let routing: Arc<dyn RouteCall> = if with {
+            let plain_text = std::fs::read_to_string(&prepared.inputs.board).unwrap();
+            let zoned_text = crate::pour_plan::with_zones(&plain_text, &before).unwrap();
+            let zoned_board =
+                crate::scratch_board::copy_project(&board, &folder.join("zoned")).unwrap();
+            std::fs::write(&zoned_board, &zoned_text).unwrap();
+            let mut inputs = prepared.inputs.clone();
+            inputs.options = crate::place_route::export_options(&zoned_board);
+            inputs.board = zoned_board;
+            Arc::new(WithPours {
+                zoned: Arc::new(crate::place_search::PlaceRouteCall {
+                    inputs,
+                    ctx: Arc::clone(&prepared.isolated),
+                }),
+                zones: before.clone(),
+                plain_text,
+                zoned_text,
+            })
+        } else {
+            Arc::clone(&prepared.routing)
+        };
+        let started = std::time::Instant::now();
+        let planned = crate::tools::placement_converge::Planned::of(&text).unwrap();
+        let (body, outcome, winner) = runtime
+            .block_on(plan_with_outcome(
+                &prepared.plan,
+                routing,
+                &board,
+                &planned,
+                &SearchProgress::default(),
+            ))
+            .unwrap();
+        let search_s = started.elapsed().as_secs_f64();
+        let id = winner.expect("a winner");
+        let found = outcome.records.iter().find(|r| r.id == id).unwrap();
+        let (_, winner_text) = crate::place_search::rebuild(&outcome.model, found).unwrap();
+        let after = pours(&winner_text, &folder.join("p4"));
+        let final_text = crate::pour_plan::with_zones(&winner_text, &after).unwrap();
+        let route = crate::place_search::PlaceRouteCall {
+            inputs: prepared.inputs.clone(),
+            ctx: Arc::clone(&prepared.isolated),
+        };
+        let (result, _) = runtime.block_on(route.route(9_999, final_text, folder.join("final")));
+        let crate::place_judge::RouteResult::Routed {
+            gates,
+            measures,
+            status,
+            ..
+        } = result
+        else {
+            panic!("{name}: the final route did not route: {result:?}");
+        };
+        record.insert(
+            name.to_string(),
+            json!({
+                "search_s": (search_s * 10.0).round() / 10.0,
+                "status": body["status"],
+                "candidates": body["candidates"],
+                "winner_change": body["winner"]["change"],
+                "zones_p4": after.len(),
+                "final": {
+                    "status": status,
+                    "gates_pass": gates.all_pass(),
+                    "unconnected": measures.unconnected,
+                    "signal_mm": measures.signal_mm,
+                    "power_mm": measures.power_mm,
+                    "vias_off_pour": measures.vias_off_pour,
+                    "copper_quality": measures.copper_quality,
+                    "stitching_vias": measures.stitching_vias,
+                },
+                "folder": folder.display().to_string(),
+            }),
+        );
+        finals.push((gates, measures));
+    }
+    let keys = crate::pour_rank::pour_keys(&[
+        (&finals[0].1, &finals[0].0, true),
+        (&finals[1].1, &finals[1].0, true),
+    ]);
+    record.insert(
+        "pour_key".into(),
+        json!({ "without_pours": keys[0].to_vec(), "with_pours": keys[1].to_vec() }),
+    );
+    let verdict = if keys[1] <= keys[0] {
+        "with_pours_at_least_as_good"
+    } else {
+        "without_pours_better"
+    };
+    record.insert("verdict".into(), json!(verdict));
+    std::fs::write(
+        root.join("ff4.json"),
+        serde_json::to_string_pretty(&Value::Object(record)).unwrap(),
+    )
+    .unwrap();
+    println!("FF4: {verdict}; record {}", root.join("ff4.json").display());
+}
