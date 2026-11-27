@@ -278,7 +278,10 @@ an unproved outline is not completion evidence.
   is the one plan applied in one batch instead of the small batches above. Then
   steps 5 to 7 of the loop above still apply. A winner whose status is
   **planned_with_gate_failures** is shown with its **gate_failures**; the statuses
-  **no_candidate** and **not_routed** carry no plan.
+  **no_candidate** and **not_routed** carry no plan. Show **winner.moves** too
+  (each part that moves or turns, and by how much): when **winner.change** is
+  `small` (every move at most 0.5 mm, nothing turned) or `none`, say first that
+  the search found no meaningful placement change, so applying it is optional.
 - `place_decoupling_caps`, `auto_place_from_schematic` and
   `refine_placement_force_directed` still refuse any outline that is not a
   provable rectangle; on a rounded or notched board place parts with small
@@ -422,6 +425,22 @@ only when the first is rejected or misses. A group that holds a pair with
 because KiCad checks one `skew` rule for a net; the pair keeps its own `skew`
 rule. `engine: 'freerouting'` tunes nothing and says so in
 `length_matching_note`.
+
+Read the fastroute result's `summary` before you report it.
+
+- `summary.lengths.line` says whether lengths were checked at all. Without a
+  group or pair skew in the intent, and without length or skew rules on the
+  board, nothing is checked. `status` then does not cover lengths, and
+  `completion.not_checked` lists `lengths`. Tell the user.
+- `summary.lengths.likely_pairs` lists nets whose names read as pairs (CAN_H and
+  CAN_L, TX+ and TX-). Show them. Record the ones the user confirms, then route
+  again.
+- `summary.pours.line` says how the pours reached the router. It names one of
+  three cases: no pour at all (add pours before the export), pours left out at
+  the export, or both ways tried, with each way's judged and passing runs and the
+  way the winner took. Pours the router did not see are not filled by
+  `apply_specctra_ses`: with a winner, the refill step in `completion.next_steps`
+  fills them.
 
 ### Freerouting round trip
 

@@ -981,7 +981,7 @@ fn zone_plan_file(
 /// that the judge runs no probe and G4 has no intent lines (L18). A board with such
 /// rules always gets checks (its `board_rules` flag), even with no group or pair.
 fn judge_checks(plan: &LengthPlan) -> Option<Arc<crate::length_probe::LengthChecks>> {
-    (!plan.is_empty() || !plan.kicad_rules.is_empty()).then(|| Arc::new(plan.checks()))
+    plan.checked().then(|| Arc::new(plan.checks()))
 }
 
 /// The `--layer-heights` value of the routing passes (L7): only when the call has a
@@ -1047,13 +1047,9 @@ pub(crate) fn conclude(
     else {
         let mut search = search_json(plan, shapes, outcome, Listing::Best);
         settings(&mut search);
-        return Ok(no_winner_result(
-            call,
-            outcome,
-            search,
-            pairs_plan,
-            lengths_plan,
-        ));
+        let result = no_winner_result(call, outcome, search, pairs_plan, lengths_plan);
+        let summary = summary_json(&call.dsn, shapes, outcome, pairs_plan, lengths_plan, None);
+        return Ok(with_fields(result, vec![("summary", summary)]));
     };
     let routed = winner.routed.as_ref().expect("filtered above");
     let session = std::fs::read_to_string(&routed.held.ses).map_err(|error| {
@@ -2100,6 +2096,7 @@ pub(crate) fn result_json(
         {
             result[key] = value;
         }
+        result["summary"] = summary_json(dsn, shapes, outcome, pairs, lengths, None);
         return result;
     };
     // The planes the winning variant gave the router, with their layers, from
@@ -2268,6 +2265,19 @@ pub(crate) fn result_json(
             steps.push(json!({ "step": number, "manual": line }));
         }
     }
+    // What the call checked and how it gave the pours, in plain lines; a check
+    // that did not run is named in `completion.not_checked`.
+    result["summary"] = summary_json(
+        dsn,
+        shapes,
+        outcome,
+        pairs,
+        lengths,
+        Some(judged.gates.g4.is_empty()),
+    );
+    if !lengths.checked() {
+        result["completion"]["not_checked"] = json!(["lengths"]);
+    }
     if let Some(error) = width_error {
         result["width_report_error"] = json!(error);
     }
@@ -2276,6 +2286,190 @@ pub(crate) fn result_json(
         result["width_unmeasured_total"] = json!(widths.unmeasured_total);
     }
     result
+}
+
+/// What fills pours the router did not see: `apply_specctra_ses` requests no
+/// refill, the DRC step of `completion.next_steps` does.
+const REFILL_AFTER_IMPORT: &str = "apply_specctra_ses does not fill them: the run_drc step with refill_zones in `completion.next_steps` does.";
+
+/// The same without a winner, whose result has no `completion`.
+const REFILL_WITHOUT_WINNER: &str = "Once a routed session is imported, fill them with run_drc and refill_zones: apply_specctra_ses does not.";
+
+/// The result's `summary`: one plain line each on lengths
+/// ([`LengthPlan::summary_json`]) and pours ([`pours_summary`]), so that a reader
+/// sees what `status` covers and what it does not. `g4_pass` is the winner's G4
+/// verdict, `None` without a judged winner.
+pub(crate) fn summary_json(
+    dsn: &Path,
+    shapes: &[Shape],
+    outcome: &crate::route_search::SearchOutcome,
+    pairs: &route_pairs::PairsPlan,
+    lengths: &LengthPlan,
+    g4_pass: Option<bool>,
+) -> Value {
+    let manifest = crate::specctra::manifest_beside(dsn);
+    let likely = if lengths.checked() {
+        Vec::new()
+    } else {
+        board_likely_pairs(manifest.as_ref(), pairs)
+    };
+    let omitted_at_export = manifest.as_ref().is_some_and(|manifest| {
+        // `pours_omitted` is also true for a board with no pour at all.
+        let profile = &manifest["supported_profile"];
+        profile["pours_omitted"] == true
+            && profile["zone_plane_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+    });
+    json!({
+        "lengths": lengths.summary_json(g4_pass, &likely),
+        "pours": pours_summary(shapes, outcome, omitted_at_export),
+    })
+}
+
+/// [`route_lengths::likely_pairs`] of the board the DSN was exported from (the
+/// manifest's `board_path`), leaving out the nets of the intent's pairs; empty when
+/// the board cannot be found or read. An intent name stands for the board net of
+/// that name or the nets ending with `/` and that name (`route_pairs::resolve_name`),
+/// and a resolved pair's DSN names count too.
+fn board_likely_pairs(
+    manifest: Option<&Value>,
+    pairs: &route_pairs::PairsPlan,
+) -> Vec<route_lengths::LikelyPair> {
+    let Some(board) =
+        manifest.and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from))
+    else {
+        return Vec::new();
+    };
+    let Ok(nets) = std::fs::read_to_string(&board)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| route_lengths::board_net_names(&text))
+    else {
+        return Vec::new();
+    };
+    let names: Vec<&String> = pairs
+        .resolved
+        .iter()
+        .flat_map(|pair| {
+            [
+                &pair.positive,
+                &pair.negative,
+                &pair.dsn_positive,
+                &pair.dsn_negative,
+            ]
+        })
+        .chain(
+            pairs
+                .unresolved
+                .iter()
+                .flat_map(|pair| [&pair.positive, &pair.negative]),
+        )
+        .collect();
+    let declared: std::collections::BTreeSet<String> = nets
+        .iter()
+        .filter(|net| {
+            names
+                .iter()
+                .any(|name| *net == *name || net.ends_with(&format!("/{name}")))
+        })
+        .cloned()
+        .collect();
+    route_lengths::likely_pairs(&nets, &declared)
+}
+
+/// The result's `summary.pours`: how the search gave the board's pours to the
+/// router, run counts by shape, the winner's shape, and one line.
+/// - One shape (`as_exported`): the DSN has no plane. With `omitted_at_export` (the
+///   manifest's `pours_omitted`) the board has pours the export left out; else no
+///   pour was tried.
+/// - Two shapes: both ways were tried; per shape the runs launched, judged and
+///   passing every gate, and the winner's way.
+///
+/// The winner is the outcome's only when its run was judged, as the result's own.
+pub(crate) fn pours_summary(
+    shapes: &[Shape],
+    outcome: &crate::route_search::SearchOutcome,
+    omitted_at_export: bool,
+) -> Value {
+    let winner = outcome
+        .winner
+        .and_then(|position| outcome.runs.get(position))
+        .filter(|record| record.routed.is_some() && record.judged.is_some())
+        .map(|record| record.shape);
+    let rows: Vec<(Shape, usize, usize, usize)> = shapes
+        .iter()
+        .map(|shape| {
+            let runs: Vec<&RunRecord> = outcome
+                .runs
+                .iter()
+                .filter(|record| record.shape == *shape)
+                .collect();
+            let judged: Vec<&&RunRecord> = runs
+                .iter()
+                .filter(|record| record.outcome == "judged")
+                .collect();
+            let passed = judged
+                .iter()
+                .filter(|record| record.judged.as_ref().is_some_and(|j| j.gates.all_pass()))
+                .count();
+            (*shape, runs.len(), judged.len(), passed)
+        })
+        .collect();
+    let tried = shapes.contains(&Shape::Omitted);
+    // The refill step is in `completion.next_steps` only when a run won.
+    let refill_after = if winner.is_some() {
+        REFILL_AFTER_IMPORT
+    } else {
+        REFILL_WITHOUT_WINNER
+    };
+    let line = if !tried && omitted_at_export {
+        format!("Pours: left out at the export (export_specctra_dsn's pours: omit). The router never saw them. {refill_after}")
+    } else if !tried {
+        "Pours: none given to the router. The DSN has no plane, so every run routed without a pour. If the board should have pours, plan_pours proposes them. Add them with add_zone and refill_zones before export_specctra_dsn, then route again.".to_string()
+    } else {
+        let part = |shape: Shape, words: &str| {
+            rows.iter()
+                .find(|row| row.0 == shape)
+                .map(|(_, launched, judged, passed)| {
+                    format!(
+                        "{words}: {launched} run(s), {judged} judged, {passed} passed every gate"
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let won = match winner {
+            Some(Shape::AsExported) => " The winner gave the router the pours as planes.",
+            Some(Shape::Omitted) => {
+                " The winner routed with the pours left out. The router never saw them."
+            }
+            None => " No run won.",
+        };
+        let refill = if winner == Some(Shape::Omitted) {
+            format!(" {REFILL_AFTER_IMPORT}")
+        } else {
+            String::new()
+        };
+        format!(
+            "Pours: tried two ways. {}. {}.{won}{refill}",
+            part(Shape::AsExported, "As planes (the DSN as exported)"),
+            part(Shape::Omitted, "Left out (the planes removed)"),
+        )
+    };
+    json!({
+        "tried": tried,
+        "omitted_at_export": omitted_at_export,
+        "shapes": rows
+            .iter()
+            .map(|(shape, launched, judged, passed)| json!({
+                "shape": shape,
+                "launched": launched,
+                "judged": judged,
+                "all_gates_pass": passed,
+            }))
+            .collect::<Vec<_>>(),
+        "winner_shape": winner,
+        "line": line,
+    })
 }
 
 #[cfg(test)]

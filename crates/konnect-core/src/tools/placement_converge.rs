@@ -652,6 +652,8 @@ pub(crate) fn result_json(
     if let Some(stopped) = &outcome.stopped_routing {
         body["search"]["routing_stopped"] = json!(stopped);
     }
+    // What the winner changes, when it changes little: a note and the first step.
+    let mut small_change: Option<String> = None;
     if let Some((id, placements)) = &verdict.winner {
         let record = converged
             .iter()
@@ -659,6 +661,17 @@ pub(crate) fn result_json(
             .expect("the winner is a record of family C");
         let mut winner = candidate_line(record, &plan.matrix);
         winner["moved_parts"] = json!(placements.len());
+        let moves = moves_of(model, placements);
+        let change = change_of(&moves);
+        winner["moves"] = json!(moves
+            .iter()
+            .take(MAX_LINES)
+            .map(PartMove::json)
+            .collect::<Vec<_>>());
+        winner["moves_total"] = json!(moves.len());
+        winner["largest_move_mm"] = json!(moves.first().map(|m| round(m.distance_mm, 3)));
+        winner["change"] = json!(change.name());
+        small_change = change.line(&moves);
         winner["gate_failures"] = json!(verdict
             .gate_failures
             .iter()
@@ -707,14 +720,147 @@ pub(crate) fn result_json(
     } else {
         body["reasons"] = json!(verdict.reasons);
     }
-    body["notes"] = json!(notes(
-        model,
-        outcome.schematic_reason.as_deref(),
-        plan,
-        planned
-    ));
-    body["next_steps"] = json!(next_steps(verdict, plan, planned));
+    let mut notes = notes(model, outcome.schematic_reason.as_deref(), plan, planned);
+    let mut steps = next_steps(verdict, plan, planned);
+    add_change_note(&mut notes, &mut steps, small_change);
+    body["notes"] = json!(notes);
+    body["next_steps"] = json!(steps);
     body
+}
+
+/// A small or empty change's line, first among the notes and the next steps.
+pub(crate) fn add_change_note(
+    notes: &mut Vec<String>,
+    steps: &mut Vec<String>,
+    line: Option<String>,
+) {
+    if let Some(line) = line {
+        steps.insert(
+            0,
+            format!("{line} Say so when you show the plan, and let the user decide whether to apply it."),
+        );
+        notes.insert(0, line);
+    }
+}
+
+/// The most a part may move, mm, with no part turned, for a plan to count as a
+/// small change: two steps of a 0.25 mm placement grid. A placement that changes the
+/// routing moves parts by a pad pitch or more; a plan below this is the board as it
+/// is, nudged.
+pub(crate) const SMALL_MOVE_MM: f64 = 0.5;
+
+/// One part the winner moves or turns, against the board as it was read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PartMove {
+    pub reference: String,
+    pub dx_mm: f64,
+    pub dy_mm: f64,
+    pub distance_mm: f64,
+    /// The turn in degrees, in (-180, 180]; 0 when the part is not turned.
+    pub rotation_deg: f64,
+}
+
+impl PartMove {
+    fn json(&self) -> Value {
+        json!({
+            "reference": self.reference,
+            "dx_mm": round(self.dx_mm, 3),
+            "dy_mm": round(self.dy_mm, 3),
+            "distance_mm": round(self.distance_mm, 3),
+            "rotation_deg": round(self.rotation_deg, 1),
+        })
+    }
+}
+
+/// How much a plan changes the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Change {
+    /// No part moves or turns.
+    None,
+    /// Every move is at most [`SMALL_MOVE_MM`] and no part turns.
+    Small,
+    /// Anything more.
+    Placement,
+}
+
+impl Change {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Change::None => "none",
+            Change::Small => "small",
+            Change::Placement => "placement",
+        }
+    }
+
+    /// The note for a plan that changes nothing or little; `None` for a placement.
+    pub(crate) fn line(self, moves: &[PartMove]) -> Option<String> {
+        match self {
+            Change::None => Some(
+                "The winner is the board as it is: no part moves or turns, so there is nothing to apply."
+                    .to_string(),
+            ),
+            Change::Small => Some(format!(
+                "The winner barely changes the board: {} part(s) move, the largest by {} mm ({}), and none turns. No meaningful placement change was found; applying it is optional.",
+                moves.len(),
+                round(moves[0].distance_mm, 3),
+                moves[0].reference
+            )),
+            Change::Placement => None,
+        }
+    }
+}
+
+/// The parts `placements` moves or turns against `model`'s parts, the largest move
+/// first (then by reference). A placement equal to the part's own position (within
+/// 1e-6 mm and 1e-6 degrees) is no move. A reference the model lacks is left out:
+/// the winner's placements are rebuilt from the same model, so there is none.
+pub(crate) fn moves_of(model: &BoardModel, placements: &[IpcFootprintPlacement]) -> Vec<PartMove> {
+    let mut moves: Vec<PartMove> = placements
+        .iter()
+        .filter_map(|placement| {
+            let part = model
+                .parts
+                .iter()
+                .find(|part| part.reference.as_deref() == Some(placement.reference.as_str()))?;
+            let dx = placement.x - part.at.0;
+            let dy = placement.y - part.at.1;
+            let mut turn = (placement.rotation - part.rotation_deg).rem_euclid(360.0);
+            if turn > 180.0 {
+                turn -= 360.0;
+            }
+            if turn.abs() < 1e-6 {
+                turn = 0.0;
+            }
+            let distance = dx.hypot(dy);
+            (distance > 1e-6 || turn != 0.0).then(|| PartMove {
+                reference: placement.reference.clone(),
+                dx_mm: dx,
+                dy_mm: dy,
+                distance_mm: distance,
+                rotation_deg: turn,
+            })
+        })
+        .collect();
+    moves.sort_by(|a, b| {
+        b.distance_mm
+            .total_cmp(&a.distance_mm)
+            .then_with(|| a.reference.cmp(&b.reference))
+    });
+    moves
+}
+
+/// [`Change`] of a plan's moves.
+pub(crate) fn change_of(moves: &[PartMove]) -> Change {
+    if moves.is_empty() {
+        Change::None
+    } else if moves
+        .iter()
+        .all(|m| m.distance_mm <= SMALL_MOVE_MM && m.rotation_deg == 0.0)
+    {
+        Change::Small
+    } else {
+        Change::Placement
+    }
 }
 
 /// One routed candidate: its id, label, rank, outcome, cost and route numbers.

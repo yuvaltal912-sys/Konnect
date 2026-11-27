@@ -1353,6 +1353,184 @@ pub(crate) fn freerouting_note(board: &Path) -> Option<String> {
     }
 }
 
+// ─── The result's summary of lengths ─────────────────────────────────────────
+
+/// Two board nets whose names read as the two halves of one signal: a suggestion
+/// for the design intent, never applied by itself.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LikelyPair {
+    pub positive: String,
+    pub negative: String,
+    /// The name pattern that matched, as the result shows it (`_H/_L`).
+    pub pattern: &'static str,
+}
+
+/// The name endings that make a pair, positive then negative, compared without
+/// case, with what a base before them must hold (`None`: anything but nothing).
+/// `+/-` covers D+/D- and TX+/TX-. `_H/_L` and `H/L` count only on a CAN name, as
+/// high and low elsewhere are often two signals (a half bridge's gate drives).
+/// `_A/_B` counts only on a name with 485 in it (RS-485), as A and B elsewhere are
+/// often two signals (encoder phases).
+const PAIR_ENDINGS: &[(&str, &str, Option<&str>)] = &[
+    ("+", "-", None),
+    ("_P", "_N", None),
+    ("_DP", "_DM", None),
+    ("_H", "_L", Some("CAN")),
+    ("H", "L", Some("CAN")),
+    ("_A", "_B", Some("485")),
+];
+
+/// Pairs among `nets` (board net names) by [`PAIR_ENDINGS`], each net in one pair at
+/// most, sorted. A net in `declared` (the nets of the intent's differential pairs) is
+/// never suggested, nor a supply or ground name (`V+`/`V-` are rails, not a pair).
+pub(crate) fn likely_pairs(
+    nets: &BTreeSet<String>,
+    declared: &BTreeSet<String>,
+) -> Vec<LikelyPair> {
+    let by_upper: BTreeMap<String, &String> =
+        nets.iter().map(|net| (net.to_uppercase(), net)).collect();
+    let excluded = |net: &str| {
+        declared.contains(net)
+            || crate::tools::circuit_model::looks_like_rail(last_segment(net))
+            || crate::tools::component_class::is_ground_name(last_segment(net))
+            || is_rail_base(last_segment(net))
+    };
+    let mut taken: BTreeSet<&str> = BTreeSet::new();
+    let mut pairs = Vec::new();
+    for net in nets {
+        let upper = net.to_uppercase();
+        for (positive, negative, base_holds) in PAIR_ENDINGS {
+            let Some(base) = upper.strip_suffix(positive) else {
+                continue;
+            };
+            let base_name = last_segment(base);
+            if base_name.is_empty() || !base_holds.is_none_or(|needed| base_name.contains(needed)) {
+                continue;
+            }
+            let Some(partner) = by_upper.get(&format!("{base}{negative}")) else {
+                continue;
+            };
+            if excluded(net) || excluded(partner) {
+                continue;
+            }
+            if taken.contains(net.as_str()) || taken.contains(partner.as_str()) {
+                continue;
+            }
+            taken.insert(net);
+            taken.insert(partner);
+            pairs.push(LikelyPair {
+                positive: net.clone(),
+                negative: (*partner).clone(),
+                pattern: pattern_text(positive, negative),
+            });
+            break;
+        }
+    }
+    pairs.sort();
+    pairs
+}
+
+/// The name after the last `/` of a hierarchical net name.
+fn last_segment(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// A name of a supply or a terminal pair, not a signal pair, once its `+`/`-` is
+/// cut off: `V+`/`V-`, `VS-`, `BAT+`, `VREF-`, `LED+` and the like.
+fn is_rail_base(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    let base = upper.trim_end_matches(['+', '-']);
+    matches!(
+        base,
+        "V" | "VS"
+            | "VEE"
+            | "VSS"
+            | "VCC"
+            | "VDD"
+            | "VA"
+            | "VD"
+            | "BAT"
+            | "VBAT"
+            | "VREF"
+            | "REF"
+            | "LED"
+            | "PWR"
+            | "VIN"
+            | "VOUT"
+            | "AC"
+            | "DC"
+    )
+}
+
+fn pattern_text(positive: &str, negative: &str) -> &'static str {
+    match (positive, negative) {
+        ("+", "-") => "+/-",
+        ("_P", "_N") => "_P/_N",
+        ("_DP", "_DM") => "_DP/_DM",
+        ("_H", "_L") => "_H/_L",
+        ("H", "L") => "CANH/CANL",
+        _ => "_A/_B (RS-485)",
+    }
+}
+
+impl LengthPlan {
+    /// True when the judge checks lengths on this call: the intent declares a group
+    /// or a pair skew, or the board's `.kicad_dru` has a length or skew rule (the
+    /// same test as the judge's checks, `route_fastroute::judge_checks`).
+    pub(crate) fn checked(&self) -> bool {
+        !self.is_empty() || !self.kicad_rules.is_empty()
+    }
+
+    /// The result's `summary.lengths`: whether lengths were checked, in one line.
+    /// `g4_pass` is the winner's G4 verdict (`None` without a judged winner).
+    /// `likely` is [`likely_pairs`] of the board when nothing was checked; it is
+    /// listed with the step that would check them.
+    pub(crate) fn summary_json(&self, g4_pass: Option<bool>, likely: &[LikelyPair]) -> Value {
+        if !self.checked() {
+            let mut line = "Lengths: not checked. `status` does not cover lengths.".to_string();
+            match &self.note {
+                Some(note) => line.push_str(&format!(" The design intent was not read: {note}.")),
+                None => line.push_str(
+                    " The design intent declares no length group and no pair skew (length_groups, max_skew_mm).",
+                ),
+            }
+            match &self.kicad_rules_note {
+                Some(note) => line.push_str(&format!(
+                    " The board's length and skew rules could not be listed: {note}."
+                )),
+                None => line.push_str(" The board has no length or skew rule in a .kicad_dru."),
+            }
+            let mut body = json!({ "checked": false, "line": line });
+            if !likely.is_empty() {
+                body["likely_pairs"] = json!(likely
+                    .iter()
+                    .map(|pair| json!({
+                        "positive": pair.positive,
+                        "negative": pair.negative,
+                        "pattern": pair.pattern,
+                    }))
+                    .collect::<Vec<_>>());
+                body["next_step"] = json!("These nets read by name as pairs. If they are, show them to the user; on the user's OK, record each with set_design_intent (an interface's differential_pairs with max_skew_mm), then export the DSN and route again: the router then matches and checks their skew.");
+            }
+            return body;
+        }
+        let verdict = match g4_pass {
+            Some(true) => "every checked length is inside its window",
+            Some(false) => "a checked length is outside its window (`completion.judged.gates.g4`)",
+            None => "nothing was judged",
+        };
+        json!({
+            "checked": true,
+            "line": format!(
+                "Lengths: checked ({} group(s) and {} pair skew(s) from the design intent, {} KiCad length or skew rule(s)): {verdict}. See `length_matching`.",
+                self.groups.len(),
+                self.pairs.len(),
+                self.kicad_rules.len()
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "route_lengths_tests.rs"]
 mod tests;

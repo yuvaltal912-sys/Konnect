@@ -3,6 +3,35 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: the route and placement results say what they did not check
+
+Additive only: no argument changes, nothing removed or renamed, `status` unchanged.
+
+- **`route_specctra_dsn` (fastroute): new top-level `summary`**, in the result with a
+  winner and in the one without.
+  - `summary.lengths`: `checked` (the judge checked lengths: the design intent
+    declares a group or a pair skew, or the board's `.kicad_dru` has a length or skew
+    rule) and `line`. When nothing was checked, `likely_pairs` (`positive`,
+    `negative`, `pattern`) lists the board's nets whose names read as pairs (`+/-`,
+    `_P/_N`, `_DP/_DM`, `_H/_L` and `H/L` on a CAN name, `_A/_B` on a name with
+    485), leaving out rails, grounds, terminal pairs (`BAT+`, `VREF-`, `LED+`) and the
+    intent's own pairs (by name, by `/name` on a sub-sheet, and by DSN name), with
+    `next_step`. Suggestions only: nothing is recorded. The line names an intent or a
+    rules file that could not be read.
+  - `summary.pours`: `tried` (the DSN has a plane, so both shapes ran),
+    `omitted_at_export` (the manifest's `pours_omitted` on a board with a pour), `shapes` (`shape`,
+    `launched`, `judged`, `all_gates_pass` per shape), `winner_shape` (only a judged
+    winner) and `line`.
+  - `completion.not_checked` is `["lengths"]` when lengths were not checked. The
+    result without a group still has no `length_matching` (Row LT, L15).
+- **`plan_convergent_placement`: the winner says what moves.** New
+  `winner.moves` (`reference`, `dx_mm`, `dy_mm`, `distance_mm`, `rotation_deg`, at
+  most 8, largest move first; only parts that move or turn), `winner.moves_total`,
+  `winner.largest_move_mm` and `winner.change` (`none`, `small`: every move at most
+  0.5 mm and nothing turned, or `placement`). `winner.moved_parts` keeps its meaning
+  (the placements in `apply_with`). With `none` or `small`, the first of `notes` and of
+  `next_steps` says that no meaningful placement change was found.
+
 ## Unreleased: `routing.rank_key` defaults to `pours` (folded into Row ZR, stage ZR6)
 
 **A default change.** With no `routing.rank_key` in the user config (absent, or JSON
