@@ -3,6 +3,15 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `delete_all_routing`'s apply checkpoints first (Row BS, follow-up)
+
+**Additive.** `delete_all_routing` with `dry_run: false` now gets the automatic
+checkpoint of board safety (below): before it deletes, the project's saved files are
+checkpointed (label `automatic: before delete_all_routing`), or an identical checkpoint
+is reused, and the result carries `live_project`. A checkpoint that cannot be made, or no
+`<board>.kicad_pro`, refuses the apply (`plan_blocked`) and nothing is deleted. The
+preview (`dry_run` missing or `true`) is unchanged: no checkpoint, no `live_project`.
+
 ## Unreleased: `delete_all_routing`, one call for all routing (Row DR)
 
 **A new tool, nothing removed or renamed.** `delete_all_routing` (toolset `pcb_routing`,

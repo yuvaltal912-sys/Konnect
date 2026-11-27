@@ -21,7 +21,8 @@
 //!    files, whose copies still read back, is reused), and the result carries
 //!    `live_project`: that the call edited the real project, how to go back, and what
 //!    the checkpoint does not hold (changes in KiCad that were not saved). No
-//!    checkpoint, no edit.
+//!    checkpoint, no edit. A preview (`delete_all_routing` without `dry_run: false`)
+//!    changes nothing and gets neither.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,8 +37,22 @@ use crate::tools::{BoardAccess, BoardEditorAbsence, ToolContext, ToolDef, ToolHa
 
 /// The tools that change a board in bulk, and so get [`guard`]'s checkpoint.
 /// `set_component_placements` moves many footprints in one call;
-/// `apply_specctra_ses` lays a whole routed session onto the live board.
-pub(crate) const BULK_LIVE_EDITS: &[&str] = &["set_component_placements", "apply_specctra_ses"];
+/// `apply_specctra_ses` lays a whole routed session onto the live board;
+/// `delete_all_routing` removes every track, arc and via (its apply only, see
+/// [`previews_only`]).
+pub(crate) const BULK_LIVE_EDITS: &[&str] = &[
+    "set_component_placements",
+    "apply_specctra_ses",
+    "delete_all_routing",
+];
+
+/// Whether this call of `tool` only previews, and so changes nothing and gets
+/// no checkpoint. `delete_all_routing` deletes only when `dry_run` is exactly
+/// `false`: its handler defaults a missing `dry_run` to true and refuses one
+/// that is not a boolean.
+fn previews_only(tool: &str, args: &Value) -> bool {
+    tool == "delete_all_routing" && args.get("dry_run") != Some(&Value::Bool(false))
+}
 
 /// The label of a checkpoint [`guard`] takes.
 pub(crate) fn checkpoint_label(tool: &str) -> String {
@@ -308,6 +323,10 @@ async fn checkpointed(
     ctx: Arc<ToolContext>,
     inner: ToolHandlerFn,
 ) -> anyhow::Result<CallToolResult> {
+    // A preview changes nothing: no checkpoint, no note.
+    if previews_only(tool, args) {
+        return inner(args, ctx).await;
+    }
     // No board path, or no such file: the tool refuses on its own terms (a
     // missing argument, a board not found), and changes nothing.
     let Some(board) = args["board"]
